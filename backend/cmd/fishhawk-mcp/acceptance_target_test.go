@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // hostOf strips the scheme from an httptest server URL, yielding the host:port
@@ -100,6 +101,30 @@ func TestProbeAcceptanceTargetIdentity_Classification(t *testing.T) {
 			t.Errorf("outcome = %s, want unverifiable (no expected SHA short-circuits before dialing)", res.outcome)
 		}
 	})
+	t.Run("unverifiable: a /healthz redirect is refused, not followed", func(t *testing.T) {
+		// A target whose /healthz 3xx-redirects to another path must NOT be
+		// followed — a compromised or spec-declared target could otherwise point
+		// the probe at an arbitrary internal/external URL. The 3xx is a non-200
+		// so it classifies unverifiable, and the redirect destination is never hit.
+		var redirectFollowed bool
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/healthz" {
+				http.Redirect(w, r, "/exfil", http.StatusFound)
+				return
+			}
+			redirectFollowed = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"git_sha":"abc1234def"}`))
+		}))
+		t.Cleanup(ts.Close)
+		res := probeAcceptanceTargetIdentity(context.Background(), hostOf(ts.URL), probeExpectedSHA)
+		if res.outcome != acceptanceProbeUnverifiable {
+			t.Errorf("outcome = %s, want unverifiable (redirect refused, non-200)", res.outcome)
+		}
+		if redirectFollowed {
+			t.Error("probe followed the /healthz redirect to /exfil; redirects must be refused")
+		}
+	})
 	t.Run("unreachable: no listener", func(t *testing.T) {
 		// A server we immediately close: nothing listens, both schemes fail.
 		ts := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
@@ -108,6 +133,88 @@ func TestProbeAcceptanceTargetIdentity_Classification(t *testing.T) {
 		res := probeAcceptanceTargetIdentity(context.Background(), host, probeExpectedSHA)
 		if res.outcome != acceptanceProbeUnreachable {
 			t.Errorf("outcome = %s, want unreachable (no listener)", res.outcome)
+		}
+	})
+}
+
+// TestAcceptanceProbeSchemeOrder pins the scheme-attempt order — the
+// security-relevant half of the probe: it decides whether a NON-loopback target
+// is tried over https before http. It mirrors the runner's probeSchemeOrder
+// (runner/cmd/fishhawk-runner/previewprobe.go — a separate Go module, not
+// importable), so a divergence from the runner's byte-for-byte logic must be
+// caught here. The loopback/IP-literal cases (http-first, the dev loop) are the
+// only order the httptest-driven probe tests exercise; this covers the https-first
+// branch and the bracketed-IPv6 trim that those never reach.
+func TestAcceptanceProbeSchemeOrder(t *testing.T) {
+	cases := []struct {
+		host string
+		want string // comma-joined scheme order
+	}{
+		{"localhost:8080", "http,https"},           // loopback name + port
+		{"localhost", "http,https"},                // loopback name, no port
+		{"127.0.0.1:9000", "http,https"},           // IPv4 literal + port
+		{"127.0.0.1", "http,https"},                // IPv4 literal, no port
+		{"[::1]:8080", "http,https"},               // bracketed IPv6 + port (SplitHostPort strips)
+		{"::1", "http,https"},                      // bare IPv6 literal -> ParseIP
+		{"[2001:db8::1]", "http,https"},            // bracketed IPv6, NO port -> bracket trim
+		{"preview.example.com:8080", "https,http"}, // non-loopback host -> https first
+		{"preview.example.com", "https,http"},      // non-loopback host, no port
+		{"example.com", "https,http"},              // non-loopback, https first
+	}
+	for _, c := range cases {
+		if got := strings.Join(acceptanceProbeSchemeOrder(c.host), ","); got != c.want {
+			t.Errorf("acceptanceProbeSchemeOrder(%q) = %s, want %s", c.host, got, c.want)
+		}
+	}
+}
+
+// TestAcceptanceSleepCtx pins acceptanceSleepCtx's two outcomes: an early return
+// on a cancelled context (the retry-loop cancellation path) and a full elapse.
+func TestAcceptanceSleepCtx(t *testing.T) {
+	t.Run("cancelled ctx -> false without sleeping", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if acceptanceSleepCtx(ctx, time.Hour) {
+			t.Error("acceptanceSleepCtx = true on a cancelled ctx, want false (early return)")
+		}
+	})
+	t.Run("full sleep -> true", func(t *testing.T) {
+		if !acceptanceSleepCtx(context.Background(), time.Millisecond) {
+			t.Error("acceptanceSleepCtx = false, want true when the sleep elapses")
+		}
+	})
+}
+
+// TestAwaitAcceptanceTargetReady_RetryAndCancel exercises the unreachable-retry
+// loop (attempt > 1) and the ctx-cancellation break the gate-branch tests skip
+// by shrinking attempts to 1. Both use a closed listener so every probe leg is
+// unreachable.
+func TestAwaitAcceptanceTargetReady_RetryAndCancel(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	origInterval := acceptanceQuickPollInterval
+	acceptanceQuickProbeAttempts = 3
+	acceptanceQuickPollInterval = time.Millisecond
+	t.Cleanup(func() {
+		acceptanceQuickProbeAttempts = origAttempts
+		acceptanceQuickPollInterval = origInterval
+	})
+
+	ts := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+	host := hostOf(ts.URL)
+	ts.Close() // nothing listens: every probe is unreachable
+
+	t.Run("retries the unreachable outcome to exhaustion", func(t *testing.T) {
+		res := awaitAcceptanceTargetReady(context.Background(), host, probeExpectedSHA)
+		if res.outcome != acceptanceProbeUnreachable {
+			t.Errorf("outcome = %s, want unreachable after retries", res.outcome)
+		}
+	})
+	t.Run("cancelled ctx breaks the retry loop early", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		res := awaitAcceptanceTargetReady(ctx, host, probeExpectedSHA)
+		if res.outcome != acceptanceProbeUnreachable {
+			t.Errorf("outcome = %s, want unreachable (cancellation returns the last probe)", res.outcome)
 		}
 	})
 }

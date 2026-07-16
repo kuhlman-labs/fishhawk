@@ -43,9 +43,19 @@ const acceptancePreviewCmdEnv = "FISHHAWK_ACCEPTANCE_PREVIEW_CMD"
 // proxy, matching the runner's direct-dial probe so a proxy cannot fake
 // reachability). Package var so tests can substitute a client that trusts an
 // httptest server.
+//
+// Redirects are REFUSED (CheckRedirect returns http.ErrUseLastResponse): a
+// spec-declared or compromised target must not be able to redirect the dispatch
+// host's probe to an arbitrary internal/external URL, widening egress from a
+// host that runs repository-controlled workflows. Leaving the 3xx response
+// unfollowed means a redirect at the declared target classifies as unverifiable
+// (non-200) rather than chasing the Location header off-target.
 var acceptanceProbeHTTPClient = &http.Client{
 	Timeout:   5 * time.Second,
 	Transport: &http.Transport{Proxy: nil},
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 // acceptanceQuickProbeAttempts / acceptanceQuickPollInterval bound the probe:

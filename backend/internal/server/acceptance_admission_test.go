@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -322,6 +323,56 @@ func TestAcceptanceAdmission_NeedsTarget(t *testing.T) {
 			t.Errorf("needs_target = true, want false on a short-circuit hit")
 		}
 	})
+}
+
+// getRunErrRepo wraps an orchestratorRepo and forces GetRun to fail while every
+// other method (GetStage, transitions, …) still works, so the handler's GetRun
+// call in the needs_target augmentation can be driven into its fail-open branch
+// without disturbing the orchestrator's own repo access.
+type getRunErrRepo struct {
+	*orchestratorRepo
+}
+
+func (r *getRunErrRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
+	return nil, errors.New("simulated run-repo transport failure")
+}
+
+// TestAcceptanceAdmission_NeedsTarget_GetRunError_DropsSilently pins the
+// deliberate fail-open branch (#1953): when live validation is required but the
+// handler's GetRun lookup fails, needs_target is dropped silently
+// (short_circuited:false, no hosts) rather than erroring the dispatch — the
+// caller's own spawn path still applies. The orchestrator keeps the working repo;
+// only the server's RunRepo GetRun fails.
+func TestAcceptanceAdmission_NeedsTarget_GetRunError_DropsSilently(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	mixed := []map[string]any{
+		allSkipWithBasisCriteria[0],
+		{"id": "get-returns-200", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1", "blocking": true},
+	}
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, mixed))
+	seam.rr.runs[seam.runID].WorkflowSpec = exampleBytes
+
+	// Rebuild the server with a RunRepo that errors on GetRun; the orchestrator
+	// keeps seam.rr, so the short-circuit evaluation still runs and reports
+	// liveValidationRequired before the failing GetRun drops needs_target.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: &getRunErrRepo{seam.rr}, AuditRepo: seam.au, Orchestrator: seam.o})
+	w := postAdmission(t, s, seam.acceptanceID, testOperatorIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open):\n%s", w.Code, w.Body.String())
+	}
+	var resp acceptanceAdmissionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.ShortCircuited {
+		t.Errorf("short_circuited = true, want false")
+	}
+	if resp.NeedsTarget {
+		t.Errorf("needs_target = true, want false (GetRun error drops it silently)")
+	}
+	if len(resp.TargetHosts) != 0 {
+		t.Errorf("target_hosts = %v, want empty (dropped)", resp.TargetHosts)
+	}
 }
 
 // TestAcceptanceAdmission_NonAdmissibleState_False is the already-settled no-op:

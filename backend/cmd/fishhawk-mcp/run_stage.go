@@ -134,7 +134,7 @@ type RunStageOutput struct {
 	// when the post-run stage fetch failed.
 	StageWaitStatus *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"stage-execution wait status on the durable (run_id, stage_id) handle: status is one of pending, running, succeeded, failed, cancelled. On a synchronous return the stage is normally already terminal (interval omitted); poll fishhawk_get_run_status on the advertised poll_interval_seconds to await a non-terminal stage. Omitted when the post-run stage fetch failed"`
 
-	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed) from the runner_completed event; empty when the runner never reported one"`
+	Outcome        string `json:"outcome,omitempty" jsonschema:"terminal runner outcome (ok | failed | short_circuited | needs_target) from the runner_completed event, or a pre-spawn server/verb resolution: short_circuited when the acceptance-admission endpoint settled the stage with no runner, needs_target when the verb-side acceptance target probe refused to spawn; empty when the runner never reported one"`
 	Turns          int    `json:"turns,omitempty" jsonschema:"agent turn count from the last stage_progress heartbeat"`
 	TokensUsed     int    `json:"tokens_used,omitempty" jsonschema:"tokens consumed; from runner_completed when present, else the last heartbeat's running total"`
 	ElapsedSeconds int    `json:"elapsed_seconds,omitempty" jsonschema:"wall-clock seconds from the last stage_progress heartbeat"`
