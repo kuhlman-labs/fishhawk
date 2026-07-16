@@ -190,8 +190,15 @@ type fakeBackend struct {
 	// or reports the idempotent no-op (transitioned:false) for an already-dispatched
 	// stage. hostDispatchCalledByID counts marker POSTs per stage id so tests can
 	// assert the marker fired exactly once before a spawn.
+	// hostDispatchForceNoop, when true, skips the CAS flip entirely and always
+	// returns transitioned:false / state "dispatched" regardless of the seeded
+	// stage state — modelling the concurrent-invocation loser whose partition
+	// read 'pending' before the winner's marker landed, so run_children's
+	// transitioned:false skip branch (#1945) can be pinned deterministically
+	// instead of relying on goroutine interleaving.
 	hostDispatchStatus     int
 	hostDispatchErrBody    string
+	hostDispatchForceNoop  bool
 	hostDispatchCalledByID map[uuid.UUID]int
 
 	// E22.X fixtures: POST /v0/stages/{id}/fixup (#762).
@@ -629,9 +636,15 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.hostDispatchCalledByID[id]++
 		status := fb.hostDispatchStatus
 		errBody := fb.hostDispatchErrBody
+		forceNoop := fb.hostDispatchForceNoop
 		// Model the CAS marker: flip a seeded pending|awaiting_host_dispatch stage
 		// to dispatched (transitioned:true); an already-dispatched stage is the
 		// idempotent no-op (transitioned:false). The resulting state is echoed back.
+		// forceNoop models a concurrent WINNER having already flipped this stage to
+		// dispatched: it sets the seeded stage straight to "dispatched" (regardless
+		// of its prior state) and always answers the loser's no-op, so a downstream
+		// live read (the post-run stage_state refresh) observes the same state the
+		// marker echoed rather than a stale "pending".
 		transitioned := false
 		state := "dispatched"
 		for _, stages := range fb.stagesByRun {
@@ -639,10 +652,14 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 				if stages[i].ID != id.String() {
 					continue
 				}
-				switch stages[i].State {
-				case "pending", "awaiting_host_dispatch":
+				if forceNoop {
 					stages[i].State = "dispatched"
-					transitioned = true
+				} else {
+					switch stages[i].State {
+					case "pending", "awaiting_host_dispatch":
+						stages[i].State = "dispatched"
+						transitioned = true
+					}
 				}
 				state = stages[i].State
 			}

@@ -512,6 +512,160 @@ func TestRunChildren_HostDispatchMarkerFails_NoSpawnStopsWave(t *testing.T) {
 	}
 }
 
+// --- uuid-parse fail-closed guard (in-closure half; #1945) ---
+
+// TestRunChildren_StageIDUnparseable_FailsClosedStopsWave pins the STAGE-ID
+// half of the in-closure uuid.Parse fail-closed guard at run_children.go:338-348.
+// resolveStage (run_stage.go:1233) returns the backend-provided stage ID string
+// verbatim without itself validating it as a UUID, so a seeded non-UUID
+// implement-stage id reaches the g.Go closure's uuid.Parse(d.stageID) check
+// before any host-dispatch marker call or spawn.
+//
+// The RUN-ID half of the same guard is deliberately NOT exercised here: the
+// partition loop at run_children.go:224-230 already uuid.Parses every
+// child_run_id and marks an unparseable one non-pending ("not a valid UUID;
+// skipped") before dispatch ever runs — covered by
+// TestLatestPlanDecomposed_CorruptPayloadErrors and the partition tests above —
+// so the closure's cerr branch is defensive-only and unreachable in practice.
+// That is the recorded rationale for deliberately closing only the stage-ID
+// half (approved plan risk note).
+func TestRunChildren_StageIDUnparseable_FailsClosedStopsWave(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child0, child1 := uuid.New(), uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedChildRun(fb, child1, "pending")
+	seedPlanDecomposedWaves(fb, parent, []string{child0.String(), child1.String()}, 0, [][]int{{0}, {1}})
+
+	// Overwrite the wave-0 child's implement stage with a non-UUID stage id.
+	// resolveStage matches by Type "implement" and passes the ID through
+	// verbatim, so the partition still marks it pending (State "pending"), but
+	// the g.Go closure's uuid.Parse(d.stageID) guard fails closed.
+	fb.mu.Lock()
+	fb.stagesByRun[child0] = []Stage{{ID: "not-a-uuid", RunID: child0.String(), Type: "implement", State: "pending"}}
+	fb.mu.Unlock()
+
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	// An unparseable stage id is DATA, never a tool error.
+	if err != nil {
+		t.Fatalf("runChildren returned an error for an unparseable stage id (must be data): %v", err)
+	}
+	// Fail closed: NO runner spawned despite the child being partitioned pending.
+	if got := atomic.LoadInt32(&spawns); got != 0 {
+		t.Fatalf("spawned %d runners despite an unparseable stage id; must fail closed", got)
+	}
+	if out.DispatchedCount != 0 {
+		t.Errorf("dispatched_count = %d, want 0 (a uuid-parse fail-closed spawns nothing)", out.DispatchedCount)
+	}
+	byID := map[string]ChildResult{}
+	for _, c := range out.Children {
+		byID[c.RunID] = c
+	}
+	c0 := byID[child0.String()]
+	if c0.Dispatched {
+		t.Errorf("wave-0 child marked dispatched despite an unparseable stage id: %+v", c0)
+	}
+	var sawWarn bool
+	for _, w := range c0.Warnings {
+		if strings.Contains(w, "could not parse child run/stage id") && strings.Contains(w, "NOT spawning") {
+			sawWarn = true
+		}
+	}
+	if !sawWarn {
+		t.Errorf("wave-0 child warnings = %v, want one carrying the uuid-parse fail-closed message", c0.Warnings)
+	}
+	// The partial-wave guard tripped: wave 1 never dispatched, no integrate-wave.
+	if c1 := byID[child1.String()]; c1.Dispatched {
+		t.Errorf("wave-1 child dispatched despite the wave-0 uuid-parse failure; the partial-wave guard did not stop the loop")
+	}
+	fb.mu.Lock()
+	calls := fb.integrateWaveCalledBy[parent]
+	fb.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("integrate-wave calls = %d, want 0 (no integration after a fail-closed wave)", calls)
+	}
+}
+
+// --- concurrent no-op skip (deterministic; #1945) ---
+
+// TestRunChildren_MarkerNoop_SkipsSpawnDeterministic pins the
+// transitioned:false skip branch (run_children.go:359-372) deterministically,
+// forcing the host-dispatch marker to answer the concurrent-invocation no-op
+// via the fakeBackend's hostDispatchForceNoop knob — rather than relying on the
+// lucky goroutine interleaving TestRunChildren_ConcurrentInvocationsNoToolError
+// depends on to occasionally hit this branch.
+func TestRunChildren_MarkerNoop_SkipsSpawnDeterministic(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	childID := uuid.New()
+	seedChildRun(fb, childID, "pending")
+	seedPlanDecomposed(fb, parent, []string{childID.String()}, 0)
+
+	fb.mu.Lock()
+	fb.hostDispatchForceNoop = true
+	fb.mu.Unlock()
+
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	// A marker no-op is DATA, never a tool error.
+	if err != nil {
+		t.Fatalf("runChildren returned an error for a marker no-op (must be data): %v", err)
+	}
+	// The no-op must NEVER spawn a second runner.
+	if got := atomic.LoadInt32(&spawns); got != 0 {
+		t.Fatalf("spawned %d runners despite a marker no-op; must skip to avoid a double-spawn", got)
+	}
+	if out.DispatchedCount != 0 {
+		t.Errorf("dispatched_count = %d, want 0 (a marker no-op spawns nothing)", out.DispatchedCount)
+	}
+	if len(out.Children) != 1 {
+		t.Fatalf("children = %d, want 1", len(out.Children))
+	}
+	c := out.Children[0]
+	if c.Dispatched {
+		t.Errorf("child marked dispatched despite the marker no-op: %+v", c)
+	}
+	if c.StageState != "dispatched" {
+		t.Errorf("child stage_state = %q, want %q (the marker's echoed state)", c.StageState, "dispatched")
+	}
+	var sawWarn bool
+	for _, w := range c.Warnings {
+		if strings.Contains(w, "no-op") && strings.Contains(w, "NOT spawning to avoid a double-spawn") {
+			sawWarn = true
+		}
+	}
+	if !sawWarn {
+		t.Errorf("child warnings = %v, want one carrying the no-op double-spawn-avoidance message", c.Warnings)
+	}
+	// The marker fired exactly once for the child's stage.
+	fb.mu.Lock()
+	stageID := fb.stagesByRun[childID][0].ID
+	calls := fb.hostDispatchCalledByID[uuid.MustParse(stageID)]
+	fb.mu.Unlock()
+	if calls != 1 {
+		t.Errorf("host-dispatch marker calls for the child's stage = %d, want exactly 1", calls)
+	}
+}
+
 // --- discovery: no plan_decomposed entry → clean tool error ---
 
 func TestRunChildren_NoDecompositionErrors(t *testing.T) {
