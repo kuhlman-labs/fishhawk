@@ -1692,6 +1692,127 @@ func TestImplementReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 	}
 }
 
+// TestImplementReview_ConditionClaim_ResolvesOnConfirmingVerdict is the #1956
+// end-to-end integration test crossing every layer: the HTTP approvals handler
+// records claims_concern_ids on the approval_submitted audit payload; the
+// implement-review loop, on ONE confirming (non-reject) verdict, resolves the
+// claimed plan-stage concern to terminal addressed_by_condition and appends a
+// concern_addressed_by_condition lineage entry.
+func TestImplementReview_ConditionClaim_ResolvesOnConfirmingVerdict(t *testing.T) {
+	ar := newFakeApprovalRepo()
+	rr := newApprovalRunRepo()
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: ar,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+	})
+
+	planStage := rr.seedStage(run.StageStateAwaitingApproval)
+	runID := planStage.RunID
+	claimed := seedConcernRow(t, cr, runID, planStage.ID, concern.StageKindPlan, 5, "the retry cap is not enforced")
+
+	// Approve the plan claiming the concern via the HTTP handler.
+	w := submitApproval(t, s, planStage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, claimed.ID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// Run the implement-review loop with a confirming reviewer.
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns},
+		model:   "claude-opus-4-8",
+	}
+	implStageID := uuid.New()
+	s.runImplementReviewInvocations(context.Background(), runID, implStageID,
+		[]reviewerInvocation{{reviewer: reviewer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget)
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{claimed.ID})
+	if rows[0].State != concern.StateAddressedByCondition {
+		t.Fatalf("claimed concern state = %q, want addressed_by_condition", rows[0].State)
+	}
+
+	entries := au.entriesByCategory(CategoryConcernAddressedByCondition)
+	if len(entries) != 1 {
+		t.Fatalf("concern_addressed_by_condition entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode lineage payload: %v", err)
+	}
+	if payload["concern_id"] != claimed.ID.String() {
+		t.Errorf("concern_id = %v, want %s", payload["concern_id"], claimed.ID)
+	}
+	if payload["prior_state"] != string(concern.StateRaised) {
+		t.Errorf("prior_state = %v, want raised", payload["prior_state"])
+	}
+	if payload["reviewer_model"] != "claude-opus-4-8" {
+		t.Errorf("reviewer_model = %v, want claude-opus-4-8", payload["reviewer_model"])
+	}
+	if _, ok := payload["approval_sequence"]; !ok {
+		t.Error("lineage payload missing approval_sequence")
+	}
+	// The confirming_review_sequence must equal the implement_reviewed entry's
+	// audit sequence (the lineage triple's review leg).
+	reviewed := au.entriesByCategory("implement_reviewed")
+	if len(reviewed) != 1 {
+		t.Fatalf("implement_reviewed entries = %d, want 1", len(reviewed))
+	}
+	if payload["confirming_review_sequence"] != float64(reviewed[0].Sequence) {
+		t.Errorf("confirming_review_sequence = %v, want the implement_reviewed sequence %d",
+			payload["confirming_review_sequence"], reviewed[0].Sequence)
+	}
+}
+
+// TestImplementReview_ConditionClaim_RejectLeavesConcernOpen is the #1956
+// reject control: an all-reject review round resolves nothing — the claimed
+// concern stays open (the ONE-confirming-review contract).
+func TestImplementReview_ConditionClaim_RejectLeavesConcernOpen(t *testing.T) {
+	ar := newFakeApprovalRepo()
+	rr := newApprovalRunRepo()
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: ar,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+	})
+
+	planStage := rr.seedStage(run.StageStateAwaitingApproval)
+	runID := planStage.RunID
+	claimed := seedConcernRow(t, cr, runID, planStage.ID, concern.StageKindPlan, 5, "condition")
+
+	w := submitApproval(t, s, planStage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, claimed.ID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject},
+		model:   "claude-opus-4-8",
+	}
+	implStageID := uuid.New()
+	s.runImplementReviewInvocations(context.Background(), runID, implStageID,
+		[]reviewerInvocation{{reviewer: reviewer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget)
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{claimed.ID})
+	if rows[0].State != concern.StateRaised {
+		t.Errorf("claimed concern state = %q, want raised (a reject resolves nothing)", rows[0].State)
+	}
+	if n := len(au.entriesByCategory(CategoryConcernAddressedByCondition)); n != 0 {
+		t.Errorf("concern_addressed_by_condition entries = %d, want 0 on an all-reject round", n)
+	}
+}
+
 // TestImplementReviewLoop_StampsReviewerProvenance asserts the #1768 happy path
 // for the implement loop: a codex-capable reviewer's probed CLI version AND
 // binary path are resolved once via resolveReviewerProvenance and stamped

@@ -640,6 +640,12 @@ type approvalRequest struct {
 	// payload. The DisallowUnknownFields decoder requires the field be declared
 	// here too; reject and assertion-less approve callers pass nil (omitempty).
 	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty"`
+	// ClaimsConcernIDs is the operator-declared list of plan-stage concern ids
+	// this approval's binding condition answers (#1956) the backend validates
+	// pre-Submit and records on the approval audit payload. The
+	// DisallowUnknownFields decoder requires the field be declared here too;
+	// reject and claim-less approve callers pass nil (omitempty).
+	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty"`
 	// ImplementModel is the optional operator override for the implement-stage
 	// model (#1013) — the highest rung of the resolution ladder. The backend
 	// resolves the full ladder at the plan gate, validates the resolved value
@@ -680,7 +686,11 @@ type approvalResult struct {
 // `bindingAssertions` is the
 // operator-declared binding-assertion list (#1171) the backend validates
 // pre-Submit and records on the approval audit payload; nil on reject and
-// assertion-less approve. Returns the updated Stage. 4xx
+// assertion-less approve. `claimsConcernIDs` is the operator-declared list of
+// plan-stage concern ids this approval's binding condition answers (#1956) the
+// backend validates pre-Submit (approve-only, plan-stage-only, open plan-stage
+// concerns of the same run) and records on the approval audit payload; nil on
+// reject and claim-less approve. Returns the updated Stage. 4xx
 // surfaces:
 //   - 400 validation_failed (decision other than approve/reject; a malformed
 //     binding_assertions declaration — unknown type, empty literal, a
@@ -710,7 +720,7 @@ type approvalResult struct {
 //     deployment's per-adapter allow-list; details carry model,
 //     model_source, and adapter. Pre-insert: retry with an allowed
 //     implement_model, or widen the allow-list)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []BindingAssertion, implementModel string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, implementModel string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:            decision,
 		Comment:             comment,
@@ -718,6 +728,7 @@ func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decis
 		AddScopeFiles:       addScopeFiles,
 		RemoveScopeFiles:    removeScopeFiles,
 		BindingAssertions:   bindingAssertions,
+		ClaimsConcernIDs:    claimsConcernIDs,
 		ImplementModel:      implementModel,
 	})
 	if err != nil {

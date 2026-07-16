@@ -2408,6 +2408,13 @@ type ApprovePlanInput struct {
 	// assertion fails the implement stage category-B (park for re-scope/
 	// re-plan). Deterministic substring matching only — never parses prose.
 	BindingAssertions []BindingAssertion `json:"binding_assertions,omitempty" jsonschema:"optional list of deterministic binding-assertion checks the operator declares so an explicit approval condition becomes machine-checkable post-implement. Each check has type ('file_contains' or 'test_asserts'), path (repo-relative; must end in _test.go for test_asserts), and literal (a substring that must appear in the committed file). Evaluated by the runner against the committed scope-only tree; any unsatisfied assertion fails the implement stage category-B. Substring matching only — choose a literal specific enough to be meaningful"`
+	// ClaimsConcernIDs is the OPTIONAL list of plan-stage concern ids this
+	// approval's binding condition answers (#1956). Each claimed concern
+	// auto-resolves to the terminal addressed_by_condition state once ONE
+	// implement review returns a confirming (non-reject) verdict — the operator's
+	// condition is the authority, the reviewer the witness. Validated pre-Submit
+	// (approve-only, plan-stage-only, open plan-stage concerns of the same run).
+	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty" jsonschema:"optional list of plan-stage concern ids (from fishhawk_get_gate_view / the run-status concerns block) that THIS approval's binding condition (in 'reason' or 'binding_assertions') answers. Each claimed concern auto-resolves to the terminal addressed_by_condition state once ONE implement review returns a confirming (non-reject) verdict — the operator's condition is the authority, the reviewer only witnesses — so it lands in the settled ledger instead of demanding a hand waive at the merge gate. Rejected 400 unless each id is an OPEN plan-stage concern of this run; approve-only, plan-stage-only"`
 	// ImplementModel is the optional operator override for the implement-stage
 	// model (#1013) — the top rung of the resolution ladder. The backend
 	// resolves the full ladder at the gate, validates the resolved value
@@ -2571,6 +2578,18 @@ restated. A malformed declaration (unknown type, empty literal, a
 test_asserts path not ending in _test.go) is rejected 400
 validation_failed before any approval row is recorded.
 
+claims_concern_ids (#1956, optional): name the plan-stage concern
+id(s) this approval's binding condition (in 'reason' or
+'binding_assertions') answers — read the ids from
+fishhawk_get_gate_view or the run-status concerns block. Each claimed
+concern auto-resolves to the terminal addressed_by_condition state
+once ONE implement review returns a confirming (non-reject) verdict:
+the operator's condition is the authority, the reviewer only
+witnesses. The resolved concern lands in the gate-view settled ledger
+instead of demanding a hand waive at the merge gate. Each id must be
+an OPEN plan-stage concern of THIS run or the approve is rejected 400
+before any approval row is recorded (approve-only, plan-stage-only).
+
 implement_model (#1013, optional): override the implement-stage model.
 The backend resolves the ladder deployment-default < spec executor.model
 < plan model_recommendation < this override, validates the resolved
@@ -2706,7 +2725,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.BindingAssertions, in.ImplementModel)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.BindingAssertions, in.ClaimsConcernIDs, in.ImplementModel)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -2756,7 +2775,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan for the rationale. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -2834,7 +2853,7 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, "")
 	if err != nil {
 		// The deploy pre-flight 422s (deploy_environment_not_allowed,
 		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
@@ -2865,7 +2884,7 @@ func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
 	}
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
 	}

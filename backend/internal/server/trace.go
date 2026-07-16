@@ -3556,6 +3556,11 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	// full audit history and would otherwise flush an OLDER unpinged
 	// page-class event at this unrelated moment.
 	pagedRejectAppended := false
+	// conditionClaimsResolved tracks whether THIS loop has already fired the
+	// condition-claim resolution hook (E48.9 / #1956): ONE confirming (non-reject)
+	// implement review resolves the operator's claimed plan-stage concerns, so the
+	// hook fires at most once per loop even with heterogeneous reviewers.
+	conditionClaimsResolved := false
 	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider is a deployment CAPABILITY gap, not a
@@ -3662,6 +3667,19 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// Apply the delta-verification resolutions to the concern
 			// store (#984) — same append-gated, best-effort posture.
 			s.applyConcernResolutions(ctx, runID, stageID, verdict.ConcernResolutions)
+			// Condition-claim resolution (E48.9 / #1956): ONE confirming
+			// (non-reject) implement review resolves the operator's claimed
+			// plan-stage concerns to addressed_by_condition — the operator's
+			// binding condition is the authority, the reviewer the witness. The
+			// hook keys on the reviewed run's OWN approval_submitted entries, so
+			// a decomposition parent's consolidated review (parent runID, where
+			// the plan gate lives) resolves correctly while implement-only
+			// children no-op. Fires at most once per loop; idempotent across
+			// later re-review rounds via the already-terminal silent skip.
+			if !conditionClaimsResolved && verdict.Verdict != planreview.VerdictReject {
+				s.resolveConditionClaimedPlanConcerns(ctx, runID, entry.Sequence, model, string(verdict.Verdict))
+				conditionClaimsResolved = true
+			}
 		}
 
 		// Capture this reviewer invocation's agent token cost (#681). The

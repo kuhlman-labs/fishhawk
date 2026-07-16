@@ -5616,6 +5616,53 @@ func TestApprovePlan_NoBindingAssertions_OmitsFieldOnTheWire(t *testing.T) {
 	}
 }
 
+// TestApprovePlan_ClaimsConcernIDs_PlumbedToSubmitApproval pins the #1956
+// wire seam: ApprovePlanInput.ClaimsConcernIDs must reach the approvals
+// request body the backend decodes (MCP input -> client approvalRequest ->
+// HTTP body).
+func TestApprovePlan_ClaimsConcernIDs_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	claims := []string{uuid.New().String(), uuid.New().String()}
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:            runID.String(),
+		Reason:           "the retry cap is now enforced by this condition",
+		ClaimsConcernIDs: claims,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.ClaimsConcernIDs, claims) {
+		t.Errorf("claims_concern_ids = %v, want %v", fb.approvalsBody.ClaimsConcernIDs, claims)
+	}
+}
+
+// TestApprovePlan_NoClaimsConcernIDs_OmitsFieldOnTheWire confirms the
+// byte-identical no-claim path: an approve without claims_concern_ids leaves
+// the field nil on the request body the backend decodes.
+func TestApprovePlan_NoClaimsConcernIDs_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.ClaimsConcernIDs != nil {
+		t.Errorf("claims_concern_ids = %v, want nil when none declared", fb.approvalsBody.ClaimsConcernIDs)
+	}
+}
+
 func TestRejectPlan_HappyPath_ResolvesAndPostsReject(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)

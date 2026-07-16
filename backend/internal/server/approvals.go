@@ -82,6 +82,20 @@ type approvalRequest struct {
 	// pre-Submit via validateBindingAssertions — no enforcement happens at
 	// approve time, only declaration validation.
 	BindingAssertions []bindingAssertion `json:"binding_assertions,omitempty"`
+	// ClaimsConcernIDs is an OPTIONAL list of plan-stage concern ids this
+	// approval's binding condition answers (E48.9 / #1956). It is the
+	// operator-confirmed, explicit lineage link (no NLP/heuristic matching):
+	// each claimed concern auto-resolves to the terminal
+	// addressed_by_condition state once ONE implement review returns a
+	// confirming (non-reject) verdict — the operator's condition is the
+	// authority, the reviewer the witness. Validated pre-Submit via
+	// validateClaimsConcernIDs (approve-only, plan-stage-only, each id an OPEN
+	// plan-stage concern of THIS run), so a malformed claim inserts no approval
+	// row. Recorded on the approval_submitted audit payload alongside
+	// binding_assertions and loaded back by loadApprovalConcernClaims. Declared
+	// here so the DisallowUnknownFields decode accepts it; callers omit it
+	// (omitempty) and stay byte-identical to today.
+	ClaimsConcernIDs []string `json:"claims_concern_ids,omitempty"`
 	// ImplementModel is the OPTIONAL operator override for the implement
 	// stage's model (#1013) — the highest rung of the implement-model
 	// resolution ladder (deployment default < spec executor.model < plan
@@ -308,6 +322,17 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Condition-claim declaration validation (E48.9 / #1956): when an approve
+	// carries claims_concern_ids, validate each claimed id resolves to an OPEN
+	// plan-stage concern of THIS run BEFORE ApprovalRepo.Submit — like the
+	// binding_assertions gate, a malformed claim inserts no approval row so a
+	// corrected retry flows normally. No resolution runs here; the confirming
+	// implement-review hook resolves the claims post-implement. Reject / empty
+	// approves skip this and stay byte-identical to today.
+	if !s.validateClaimsConcernIDs(w, r, stage, req.Decision, req.ClaimsConcernIDs) {
+		return
+	}
+
 	// Author separation-of-duties (E39.4 / #1709): when the stage's gate
 	// carries a forge-neutral approvals block, the change author may not
 	// approve their own change. PRE-Submit like the sibling gates so a
@@ -505,6 +530,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		AddScopeFiles:       req.AddScopeFiles,
 		RemoveScopeFiles:    req.RemoveScopeFiles,
 		BindingAssertions:   req.BindingAssertions,
+		ClaimsConcernIDs:    req.ClaimsConcernIDs,
 		DelegatedRule:       delegatedRule,
 		ResolvedModel:       resolvedModel,
 		PlanModel:           req.PlanModel,
@@ -612,6 +638,7 @@ type approveActionParams struct {
 	AddScopeFiles       []string
 	RemoveScopeFiles    []string
 	BindingAssertions   []bindingAssertion
+	ClaimsConcernIDs    []string
 	DelegatedRule       string
 	ResolvedModel       *ResolvedModel
 	PlanModel           string
@@ -709,7 +736,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -756,7 +783,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.DelegatedRule, id.AuthMethod, channel, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -1264,7 +1291,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, delegatedRule, authMethod, channel string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, delegatedRule, authMethod, channel string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -1338,6 +1365,14 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	// byte-identical to today.
 	if app.Decision == approval.DecisionApprove && len(bindingAssertions) > 0 {
 		auditPayload["binding_assertions"] = bindingAssertions
+	}
+	// Condition-claim declaration (E48.9 / #1956): record the plan-stage
+	// concern ids this approval's binding condition answers, so the confirming
+	// implement-review hook reads them back via loadApprovalConcernClaims. Only
+	// on approve with a non-empty slice; the key is omitted otherwise so a
+	// no-claim approve is byte-identical to today.
+	if app.Decision == approval.DecisionApprove && len(claimsConcernIDs) > 0 {
+		auditPayload["claims_concern_ids"] = claimsConcernIDs
 	}
 	if delegatedRule != "" {
 		auditPayload["delegated"] = delegatedRule
