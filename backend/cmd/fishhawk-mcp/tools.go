@@ -70,6 +70,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetActiveRun(srv, resolver)
 	registerGetPlan(srv, resolver)
 	registerGetRunStatus(srv, resolver)
+	registerGetGateView(srv, resolver)
 	registerAwaitAudit(srv, resolver)
 	registerAwaitReview(srv, resolver)
 	registerListAudit(srv, resolver)

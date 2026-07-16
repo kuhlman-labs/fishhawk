@@ -1670,7 +1670,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// E48.7 (#1954) adds exactly ONE tool — fishhawk_merge_run, the one-verb
 	// operator verdict + queue-merge + await-terminal verb that replaces the
 	// bare merge_pr + post_merge hand ceremony — taking the total 43 -> 44.
-	const wantToolCount = 44
+	//
+	// E48.13 (#1960) adds exactly ONE tool — fishhawk_get_gate_view, the
+	// one-call review-gate decision read (open concerns with full notes, round
+	// history, fix-up claims, re-review confirmations) — taking the total
+	// 44 -> 45.
+	const wantToolCount = 45
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -1689,6 +1694,20 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")
+	}
+
+	// fishhawk_get_gate_view (#1960) must be wire-visible — a registration
+	// regression would otherwise drop the one-call gate decision read without
+	// tripping the count if another tool were added in the same change.
+	var sawGateView bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_get_gate_view" {
+			sawGateView = true
+			break
+		}
+	}
+	if !sawGateView {
+		t.Error("fishhawk_get_gate_view is not registered/visible over ListTools")
 	}
 
 	// fishhawk_revive_run (#1915) must be wire-visible AND its description must

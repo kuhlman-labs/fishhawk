@@ -907,6 +907,168 @@ components:
             fix-up whose concerns all carry a patch can be resolved by the
             near-deterministic apply path instead of a full agent loop.
 
+    GateView:
+      type: object
+      description: |
+        The gate-scoped decision view (#1960): every OPEN concern with its
+        FULL note prose, the per-concern cross-round history reconstructed
+        from the immutable audit payloads (fix-up routing claims + re-review
+        confirmations), the settled ledger, and the run's suppressed
+        relitigations — one read that answers "what is still open at this
+        gate and why". Unlike `RunConcerns`, the note text is NOT elided.
+        History is reconstructed from audit payloads because
+        `concern.state_reason` is overwritten on every transition; there is
+        no stored per-round history. Degradation is visible, never silent:
+        when the audit reads are unavailable the concerns are returned intact
+        with `history_incomplete=true` and `history_gaps` naming each
+        unreadable category.
+      required: [run_id, open, settled, suppressed_relitigations, history_incomplete]
+      properties:
+        run_id:
+          $ref: '#/components/schemas/UUID'
+        stage_kind:
+          type: string
+          enum: [plan, implement]
+          description: Echo of the optional `stage_kind` filter; absent for a whole-run view.
+        open:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewConcern' }
+        settled:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewSettledConcern' }
+        suppressed_relitigations:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewSuppressedRelitigation' }
+        history_incomplete:
+          type: boolean
+          description: |
+            True when one or more audit-derived history joins could not be
+            built (audit repository unconfigured, or a per-category read
+            error). The concerns themselves are always intact — only the
+            `fixups`/`resolutions`/`suppressed_relitigations` cross-
+            references may be missing.
+        history_gaps:
+          type: array
+          items: { type: string }
+          description: The audit categories that failed to read, when `history_incomplete` is true.
+
+    GateViewConcern:
+      type: object
+      description: One OPEN concern with its full decision context.
+      required: [id, stage_kind, origin_review_sequence, severity, category, state, note, has_suggested_patch]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_kind:
+          type: string
+          enum: [plan, implement]
+        round:
+          type: integer
+          description: |
+            Round-of-origin for an implement concern: `1 +` the count of
+            same-stage `stage_fixup_triggered` entries below the origin
+            review sequence. Omitted for plan concerns (no fix-up rounds).
+        origin_review_sequence:
+          type: integer
+          format: int64
+        reviewer_model:
+          type: string
+        severity: { type: string }
+        category: { type: string }
+        state: { type: string }
+        state_reason:
+          type: string
+          description: |
+            The concern's current `state_reason` — overwritten on every
+            transition, so it reflects the LATEST resolution, not the
+            original routing reason (which surfaces on `fixups[].reason`).
+        note:
+          type: string
+          description: The FULL reviewer prose — deliberately not elided.
+        has_suggested_patch: { type: boolean }
+        fixups:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewFixup' }
+        resolutions:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewResolution' }
+
+    GateViewFixup:
+      type: object
+      description: |
+        One fix-up routing claim reconstructed from the
+        `stage_fixup_triggered` entry that named this concern, joined to the
+        outcome from the earliest following `fixup_pushed` / `fixup_no_changes`.
+      required: [sequence, outcome]
+      properties:
+        sequence: { type: integer, format: int64 }
+        reason:
+          type: string
+          description: The operator/driver routing reason recorded on the trigger.
+        outcome:
+          type: string
+          enum: [pushed, no_changes, pending]
+          description: |
+            `pushed` — a fix-up commit landed; `no_changes` — the pass
+            produced nothing; `pending` — no following outcome entry yet.
+        apply_path:
+          type: string
+          description: Fix-up apply provenance (`applied`/`agent`/…), present on a `pushed` outcome.
+        head_sha:
+          type: string
+          description: The pushed commit, present on a `pushed` outcome.
+
+    GateViewResolution:
+      type: object
+      description: |
+        One re-review verdict on this concern, reconstructed from an
+        `implement_reviewed` / `plan_reviewed` entry's `concern_resolutions`.
+      required: [sequence, resolution]
+      properties:
+        sequence: { type: integer, format: int64 }
+        round:
+          type: integer
+          description: Derived for an implement re-review; omitted for a plan re-review.
+        resolution:
+          type: string
+          description: The reviewer verdict (`confirmed`/`reopened`/`superseded`).
+        note:
+          type: string
+
+    GateViewSettledConcern:
+      type: object
+      description: |
+        One settled-ledger row (#1913): a concern in a terminal state
+        (addressed / waived / superseded / deferred) with its state_reason.
+      required: [id, stage_kind, state, severity, category, note]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        stage_kind:
+          type: string
+          enum: [plan, implement]
+        state: { type: string }
+        severity: { type: string }
+        category: { type: string }
+        reviewer_model: { type: string }
+        note:
+          type: string
+          description: The FULL reviewer prose — not elided.
+        state_reason: { type: string }
+
+    GateViewSuppressedRelitigation:
+      type: object
+      description: |
+        One suppressed relitigation (#1913): a re-raise of a settled concern
+        the reviewer would have relitigated, suppressed and recorded.
+      required: [settled_ref, settled_state, severity, category, note, origin_review_sequence]
+      properties:
+        settled_ref: { type: string }
+        settled_state: { type: string }
+        severity: { type: string }
+        category: { type: string }
+        note: { type: string }
+        reviewer_model: { type: string }
+        origin_review_sequence: { type: integer, format: int64 }
+
     RunNextAction:
       type: object
       description: |
@@ -5211,6 +5373,49 @@ paths:
             error `details.suggestions` names the nearest known categories).
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /v0/runs/{run_id}/gate-view:
+    get:
+      operationId: getRunGateView
+      summary: Gate-scoped decision view for a run
+      description: |
+        Answers "what is still open at this gate and why" in ONE call
+        (#1960): every OPEN concern with its FULL note prose, the per-concern
+        cross-round history reconstructed from the immutable audit payloads
+        (fix-up routing claims + re-review confirmations/reopens), the settled
+        ledger, and the run's suppressed relitigations. Replaces the
+        `getRun` + `listRunAudit` stitching an operator otherwise runs at a
+        review or fix-up gate. Unlike the run-status concerns block the note
+        text is NOT elided, and the MCP tool passes the payload through with
+        none of its compaction levers applied. Read-only.
+
+        Auth mirrors `listRunAudit`'s read posture: the full reviewer prose
+        must not be anonymously readable, so an ordinary caller must hold the
+        `read:audit` scope, while a run-bound `mcp:run:<uuid>` token is
+        authorized instead by the cross-run subject guard (own run only).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: stage_kind
+          in: query
+          schema: { type: string, enum: [plan, implement] }
+          description: |
+            Optional. Scopes the open + settled concerns to one stage kind.
+            The operator's narrowing lever when a run carries many concerns.
+      responses:
+        '200':
+          description: The gate view.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GateView' }
+        '400':
+          description: '`validation_failed` — `run_id` not a UUID, or `stage_kind` not `plan`/`implement`.'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` — a token missing the `read:audit` scope; or `cross_run_gate_view` — a run-bound `mcp:run:<uuid>` token reading a run other than its own.'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503':
+          description: '`gate_view_unconfigured` — the concern repository is not configured; or `run_repo_unconfigured` — the run repository is not configured.'
 
   /v0/runs/{run_id}/budget:
     get:

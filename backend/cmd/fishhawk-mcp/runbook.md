@@ -39,7 +39,9 @@ One issue → one run → one PR.
 4. **`fishhawk_dispatch_stage` (implement)** — execute the approved plan.
 5. **`fishhawk_await_review`** — block until the implement review reaches a
    terminal verdict. Re-poll `fishhawk_get_run_status` if it times out; that
-   poll is the authoritative path to a terminal status.
+   poll is the authoritative path to a terminal status. Once the review
+   settles, read the gate with **`fishhawk_get_gate_view`** (see below) to
+   decide fix-up vs merge — one call carrying the full concern notes.
 6. **Approve the PR, then `fishhawk_merge_run`.** Approve the PR with an
    operator verdict (`gh pr review --approve`, under your own GitHub identity —
    App-identity approval is deferred to E39) before every merge — no
@@ -54,6 +56,24 @@ One issue → one run → one PR.
    protection is satisfied.
 
 ## Edge-case playbook
+
+### Reading the review gate (`fishhawk_get_gate_view`)
+
+At a review or fix-up gate, `fishhawk_get_gate_view` answers "what is still open
+and why" in ONE call — do NOT stitch `fishhawk_get_run_status` (whose concerns
+block elides the note text) with `fishhawk_list_audit` (walking `implement_reviewed`
+for the full notes, `stage_fixup_triggered`/`fixup_pushed` for the routing
+history) to reconstruct the same picture. Pass `{run_id, stage_kind:"implement"}`
+(or `plan`); the response gives each OPEN concern with its **full note**, a
+derived `round`, `has_suggested_patch`, and the per-concern `fixups[]` (the prior
+routing reasons + their `pushed`/`no_changes`/`pending` outcomes) and
+`resolutions[]` (the re-review confirmations/reopens) — the exact context for a
+fix-up-vs-merge decision. The settled ledger and `suppressed_relitigations` ride
+along so you can see what was already waived/deferred and what a reviewer tried
+to re-litigate. If `history_incomplete` is true, `history_gaps` names which audit
+join failed — the concerns are still complete; only the cross-references may be
+missing. This surface applies none of the compaction levers, so the notes are
+never truncated.
 
 ### runner_kind:local for the local dogfood loop
 
