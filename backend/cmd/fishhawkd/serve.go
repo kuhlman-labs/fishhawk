@@ -1746,7 +1746,38 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	if err != nil {
 		return fmt.Errorf("campaign auto-merge: %w", err)
 	}
-	return m.gh.EnableAutoMerge(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+	// Primary: queue GitHub auto-merge so the merge fires once branch
+	// protection clears. Safe to call before the operator's gh approval —
+	// auto-merge only lands once required review + checks are satisfied.
+	err = m.gh.EnableAutoMerge(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+	if err == nil {
+		return nil
+	}
+	// enablePullRequestAutoMerge ERRORS on a PR that is ALREADY merge-ready
+	// (GitHub's "Pull request is in clean status" class) — exactly the common
+	// operator flow where the gh approval landed with checks green before this
+	// call. In that state auto-merge is a no-op GitHub rejects, so fall back to
+	// a synchronous REST squash merge to actually land the PR (#1954). Any other
+	// enable failure (auto-merge disabled on the repo, a transient error, …) is
+	// surfaced unchanged — it is NOT the merge-ready class and must not be
+	// laundered into a synchronous merge.
+	if !isAutoMergeCleanStatusError(err) {
+		return err
+	}
+	return m.gh.MergePullRequest(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+}
+
+// isAutoMergeCleanStatusError reports whether an EnableAutoMerge failure is
+// GitHub's "already merge-ready" class — the enablePullRequestAutoMerge
+// mutation rejecting a PR that is in a clean/mergeable status. EnableAutoMerge
+// surfaces the GraphQL message wrapped as githubclient.ErrValidation; this
+// narrows that broad validation class to the clean-status marker so ONLY the
+// merge-ready case triggers the synchronous REST-merge fallback.
+func isAutoMergeCleanStatusError(err error) bool {
+	if !errors.Is(err, githubclient.ErrValidation) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "clean status")
 }
 
 // parseCampaignPRURL splits a GitHub PR html_url into its repo ref and number.

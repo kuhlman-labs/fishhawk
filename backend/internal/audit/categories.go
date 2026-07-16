@@ -29,7 +29,9 @@ import "sort"
 // events, the deployment-dispatch failure, and the campaign-lifecycle
 // markers (advanced / gate-acted / issue-started / issue-settled /
 // issue-restarted / paused) written via audit.AppendGlobalChained. #1941
-// added the failed-run revive audit kind (run_revived, #1915). When a
+// added the failed-run revive audit kind (run_revived, #1915). #1954
+// added the operator merge-verdict kind (merge_verdict_recorded) the
+// one-verb merge endpoint chains before it queues the squash merge. When a
 // new canonical category is introduced, add it here so operators can await
 // it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -98,6 +100,7 @@ var KnownCategories = map[string]struct{}{
 	"issue_commented":                         {},
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
+	"merge_verdict_recorded":                  {},
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},
 	"operator_scope_path_undelivered":         {},

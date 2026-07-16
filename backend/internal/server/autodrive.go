@@ -180,41 +180,37 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 
 	// may_merge(gates_resolved_ci_green) -> merge the PR via the seam.
 	if d, found := res.Decision(delegation.ActionMerge); found && d.Met {
-		// Acceptance-gate AND (E31.17 / #1568): on a run whose workflow declares
-		// an acceptance stage the merge is gated on the acceptance_passed
-		// evidence condition (ADR-049 decision #6). mergeGateReady's structural
-		// checks are kept; the acceptance gate is added as an independent AND at
-		// this call site so its unit tests stay valid. FAIL-CLOSED: a read error
-		// or any non-passed/non-declared state (pending / settled-outcome-unknown
-		// / failed) is observe-only — the actor never merges on unknown or unmet
-		// acceptance evidence.
-		gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
-		// #1877: an out-of-scope skip (acceptanceGateSkippedOutOfScope) is a
-		// legitimate terminal disposition equivalent to a recorded outcome for the
-		// merge gate — the orchestrator auto-terminated a degenerate acceptance
-		// stage (verification.out_of_scope, zero acceptance_criteria), so the run
-		// is merge-eligible. A read error keeps the observe-only fail-closed posture
-		// (gerr != nil admits nothing).
-		acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared ||
-			gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope)
-		switch {
-		case !mergeGateReady(runRow, stages):
+		// mergeGateReady is the delegated path's structural precondition (open
+		// PR, no stage parked at approval). It is kept here and NOT folded into
+		// the shared dispatch helper because the operator merge endpoint
+		// deliberately does not reuse it — in feature_change the implement-review
+		// stage stays parked at awaiting_approval until the merge itself settles
+		// it, so an operator merge must not block on that gate.
+		if !mergeGateReady(runRow, stages) {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but real merge state not ready; observe-only",
 				slog.String("run_id", runRow.ID.String()))
-		case !acceptanceMergeOK:
+			return observeOnly("no delegated knob met and state-matched; observe-only"), nil
+		}
+		// Acceptance-gate AND (E31.17 / #1568) + nil-merger fail-closed + the
+		// merge dispatch itself are the shared tail (#1954): the delegated arm
+		// and the operator merge endpoint both funnel through runMergeDispatch so
+		// drive_run's merge act and the one-verb operator merge converge on one
+		// code path by construction.
+		md := s.runMergeDispatch(ctx, runRow, stages, merger)
+		switch {
+		case !md.Eligible:
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but acceptance gate not passed; observe-only",
 				slog.String("run_id", runRow.ID.String()),
-				slog.String("acceptance_gate_state", gateState),
-				slog.Bool("acceptance_read_error", gerr != nil))
+				slog.String("acceptance_gate_state", md.AcceptanceState),
+				slog.Bool("acceptance_read_error", md.AcceptanceErr != nil))
 			return observeOnly("acceptance gate not passed (fail-closed); observe-only"), nil
-		case merger == nil:
+		case !md.MergerConfigured:
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but no merge client configured; observe-only",
 				slog.String("run_id", runRow.ID.String()))
 			return observeOnly("merge seam unconfigured (fail-closed); observe-only"), nil
+		case md.DispatchErr != nil:
+			return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, md.DispatchErr
 		default:
-			if merr := merger.MergePullRequest(ctx, runRow); merr != nil {
-				return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, merr
-			}
 			// may_merge ENABLES/queues GitHub auto-merge; it does NOT prove
 			// the PR has landed. The settle (pr_merged + run completion) is
 			// deliberately left to the existing pull_request-closed webhook /
@@ -560,6 +556,68 @@ func retryableFailedStage(stages []*run.Stage) *run.Stage {
 		}
 	}
 	return failed
+}
+
+// mergeDispatchResult classifies the shared merge tail's outcome (#1954) so
+// each caller maps it to its own surface: the delegated may_merge arm to an
+// observe-only AutoDriveOutcome, the operator merge endpoint to an HTTP
+// status. Exactly one terminal condition holds, read in the order Eligible →
+// MergerConfigured → DispatchErr → Dispatched.
+type mergeDispatchResult struct {
+	// AcceptanceState is the acceptanceGateState read; AcceptanceErr carries a
+	// non-nil acceptance-outcome read error (fail-closed — Eligible is false).
+	AcceptanceState string
+	AcceptanceErr   error
+	// Eligible is true when the acceptance gate admits a merge (not-declared,
+	// passed, or skipped-out-of-scope with no read error).
+	Eligible bool
+	// MergerConfigured is false when no merge seam was supplied — the merge
+	// fails closed rather than silently no-op'ing.
+	MergerConfigured bool
+	// DispatchErr carries a non-nil merger.MergePullRequest error.
+	DispatchErr error
+	// Dispatched is true only when the merge was queued through the seam.
+	Dispatched bool
+}
+
+// acceptanceMergeEligible reports whether an acceptanceGateState read admits a
+// merge. The merge-eligible set is not-declared (no acceptance stage), passed,
+// and skipped-out-of-scope (#1877 auto-terminated degenerate stage); a read
+// error or any other state (pending / outcome-unknown / failed) is NOT
+// eligible (fail-closed). Shared by runMergeDispatch and the operator merge
+// endpoint so the eligible-set literal cannot drift between them.
+func acceptanceMergeEligible(state string, readErr error) bool {
+	return readErr == nil && (state == acceptanceGateNotDeclared ||
+		state == acceptanceGatePassed || state == acceptanceGateSkippedOutOfScope)
+}
+
+// runMergeDispatch is the shared merge tail (#1954): it re-derives the
+// acceptance gate, fails closed when the gate is unreadable/unmet or the merge
+// seam is unconfigured, and otherwise dispatches the merge through the seam.
+// Both the delegated may_merge arm (AutoDriveRunGate) and the operator merge
+// endpoint (handleMergeRun) call it so the two merge paths converge by
+// construction. It does NOT record pr_merged — the pull_request-closed webhook
+// / resolveReviewStageOnMerge path settles the run when GitHub actually merges.
+func (s *Server) runMergeDispatch(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger) mergeDispatchResult {
+	state, gerr := s.acceptanceGateState(ctx, runRow, stages)
+	res := mergeDispatchResult{
+		AcceptanceState: state,
+		AcceptanceErr:   gerr,
+		Eligible:        acceptanceMergeEligible(state, gerr),
+	}
+	if !res.Eligible {
+		return res
+	}
+	if merger == nil {
+		return res // MergerConfigured stays false — fail closed.
+	}
+	res.MergerConfigured = true
+	if err := merger.MergePullRequest(ctx, runRow); err != nil {
+		res.DispatchErr = err
+		return res
+	}
+	res.Dispatched = true
+	return res
 }
 
 // mergeGateReady is the merge double-gate: the run carries an open PR and

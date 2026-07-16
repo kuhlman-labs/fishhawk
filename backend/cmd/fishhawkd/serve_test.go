@@ -6,6 +6,8 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
@@ -596,6 +598,80 @@ func TestGithubAutoMerger_FailsClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := m.MergePullRequest(ctx, tc.run); err == nil {
 				t.Fatalf("MergePullRequest(%s) = nil, want an error (fail-closed before HTTP)", tc.name)
+			}
+		})
+	}
+}
+
+// TestGithubAutoMerger_CleanStatusFallback pins the #1954 REST-merge fallback:
+// EnableAutoMerge's primary succeeds → no fallback; a "clean status"
+// (already-merge-ready) enable error → fall back to the REST squash merge; any
+// UNRELATED enable error → surface without a fallback (never laundered into a
+// synchronous merge).
+func TestGithubAutoMerger_CleanStatusFallback(t *testing.T) {
+	cases := []struct {
+		name            string
+		graphqlBody     string
+		wantMergeCalled bool
+		wantErr         bool
+	}{
+		{
+			name:            "enable success takes no fallback",
+			graphqlBody:     `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"url":"u","state":"OPEN"}}}}`,
+			wantMergeCalled: false,
+			wantErr:         false,
+		},
+		{
+			name:            "clean-status enable error falls back to REST merge",
+			graphqlBody:     `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`,
+			wantMergeCalled: true,
+			wantErr:         false,
+		},
+		{
+			name:            "unrelated enable error surfaces without fallback",
+			graphqlBody:     `{"errors":[{"message":"Auto-merge is not allowed for this repository","type":"UNPROCESSABLE"}]}`,
+			wantMergeCalled: false,
+			wantErr:         true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mergeCalled bool
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, `{"number":7,"node_id":"PR_x","state":"open","head":{"sha":"abc"}}`)
+			})
+			mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tc.graphqlBody)
+			})
+			mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge", func(w http.ResponseWriter, _ *http.Request) {
+				mergeCalled = true
+				_, _ = io.WriteString(w, `{"sha":"mergedsha","merged":true}`)
+			})
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			gh := &githubclient.Client{
+				BaseURL: srv.URL,
+				Tokens:  fakeTokenProvider{},
+				HTTP:    &http.Client{Timeout: 5 * time.Second},
+			}
+			m := githubAutoMerger{gh: gh}
+			inst := int64(42)
+			prURL := "https://github.com/x/y/pull/7"
+			err := m.MergePullRequest(context.Background(), &runpkg.Run{
+				ID:             uuid.New(),
+				InstallationID: &inst,
+				PullRequestURL: &prURL,
+			})
+			if tc.wantErr && err == nil {
+				t.Fatalf("MergePullRequest = nil, want an error (unrelated enable error must surface)")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("MergePullRequest = %v, want nil", err)
+			}
+			if mergeCalled != tc.wantMergeCalled {
+				t.Errorf("REST merge called = %v, want %v", mergeCalled, tc.wantMergeCalled)
 			}
 		})
 	}

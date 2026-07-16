@@ -101,6 +101,9 @@ type fakeGitHub struct {
 	graphqlStatus int
 	graphqlBody   string
 
+	mergePullRequestStatus int
+	mergePullRequestBody   string
+
 	getInstallationStatus int
 	getInstallationBody   string
 
@@ -155,6 +158,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		listPullsBody:             `[]`,
 		graphqlStatus:             http.StatusOK,
 		graphqlBody:               `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":42,"url":"https://github.com/x/y/pull/42","state":"OPEN"}}}}`,
+		mergePullRequestStatus:    http.StatusOK,
+		mergePullRequestBody:      `{"sha":"mergedsha","merged":true,"message":"Pull Request successfully merged"}`,
 		getInstallationStatus:     http.StatusOK,
 		getInstallationBody:       `{"id":12345,"app_id":1}`,
 		getAppStatus:              http.StatusOK,
@@ -337,6 +342,16 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			w.WriteHeader(fg.getPullRequestStatus)
 			if fg.getPullRequestBody != "" {
 				_, _ = io.WriteString(w, fg.getPullRequestBody)
+			}
+		})
+
+	mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge",
+		func(w http.ResponseWriter, r *http.Request) {
+			capture(r)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.mergePullRequestStatus)
+			if fg.mergePullRequestBody != "" {
+				_, _ = io.WriteString(w, fg.mergePullRequestBody)
 			}
 		})
 
@@ -1968,6 +1983,108 @@ func TestEnableAutoMerge_ValidationErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := c.EnableAutoMerge(context.Background(), 1, tc.repo, tc.prNumber, MergeMethodSquash)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
+				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
+			}
+		})
+	}
+}
+
+func TestMergePullRequest_HappyPath(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash); err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if fg.gotMethod != http.MethodPut {
+		t.Errorf("method = %q, want PUT", fg.gotMethod)
+	}
+	if fg.gotPath != "/repos/x/y/pulls/7/merge" {
+		t.Errorf("path = %q, want /repos/x/y/pulls/7/merge", fg.gotPath)
+	}
+	// REST merge_method is lowercase, unlike the GraphQL SQUASH enum.
+	if !strings.Contains(string(fg.gotBody), `"merge_method":"squash"`) {
+		t.Errorf("body missing merge_method:squash:\n%s", fg.gotBody)
+	}
+}
+
+func TestMergePullRequest_DefaultsMethodToSquash(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, ""); err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if !strings.Contains(string(fg.gotBody), `"merge_method":"squash"`) {
+		t.Errorf("empty method should default to squash:\n%s", fg.gotBody)
+	}
+}
+
+func TestMergePullRequest_NotMergeable405_AsValidation(t *testing.T) {
+	// GitHub answers 405 when the PR is not mergeable (checks failing,
+	// review outstanding, or already merged). Surface as an actionable,
+	// retryable validation-class error rather than an opaque 405.
+	fg, srv := newFakeGitHub(t)
+	fg.mergePullRequestStatus = http.StatusMethodNotAllowed
+	fg.mergePullRequestBody = `{"message":"Pull Request is not mergeable"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+	if !strings.Contains(err.Error(), "not mergeable") {
+		t.Errorf("err should surface the 405 marker: %v", err)
+	}
+}
+
+func TestMergePullRequest_NotFound(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.mergePullRequestStatus = http.StatusNotFound
+	fg.mergePullRequestBody = `{"message":"Not Found"}`
+	c, _ := newTestClient(t, srv, nil)
+
+	err := c.MergePullRequest(context.Background(), 42,
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestMergePullRequest_Forbidden(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			fg, srv := newFakeGitHub(t)
+			fg.mergePullRequestStatus = status
+			c, _ := newTestClient(t, srv, nil)
+			err := c.MergePullRequest(context.Background(), 42,
+				RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
+			if err == nil || !errors.Is(err, ErrForbidden) {
+				t.Errorf("err = %v, want ErrForbidden", err)
+			}
+		})
+	}
+}
+
+func TestMergePullRequest_ValidationErrors(t *testing.T) {
+	c := &Client{Tokens: &stubTokens{}}
+	cases := []struct {
+		name      string
+		repo      RepoRef
+		prNumber  int
+		wantSubst string
+	}{
+		{"missing owner", RepoRef{Name: "y"}, 1, "owner and name"},
+		{"missing name", RepoRef{Owner: "x"}, 1, "owner and name"},
+		{"zero pr", RepoRef{Owner: "x", Name: "y"}, 0, "pr number must be"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := c.MergePullRequest(context.Background(), 1, tc.repo, tc.prNumber, MergeMethodSquash)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}

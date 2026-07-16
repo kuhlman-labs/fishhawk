@@ -808,6 +808,65 @@ func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
 	return nil
 }
 
+// MergePullRequest merges a PR synchronously via the REST API (#1954).
+// It is the fallback the one-verb merge path uses when
+// enablePullRequestAutoMerge cannot be enabled because the PR is already
+// merge-ready ("Pull request is in clean status") — the common operator
+// flow where the gh approval + green checks landed before the merge call.
+//
+//	PUT /repos/{owner}/{repo}/pulls/{number}/merge
+//	{ "merge_method": "squash" }
+//
+// method maps to GitHub's lowercase REST merge_method ("squash" | "merge"
+// | "rebase"); an empty method defaults to squash (the sole method Fishhawk
+// queues). A 200 is success. GitHub answers 405 when the PR is NOT mergeable
+// (failing checks, required review outstanding, or already merged) — mapped
+// to an actionable ErrValidation-class error, never a silent success, so the
+// caller surfaces a retryable condition. 404/403/422 map like the sibling
+// methods via classifyStatus.
+func (c *Client) MergePullRequest(ctx context.Context, installationID int64,
+	repo RepoRef, number int, method MergeMethod) error {
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if number <= 0 {
+		return errors.New("githubclient: pr number must be > 0")
+	}
+	if method == "" {
+		method = MergeMethodSquash
+	}
+
+	raw, err := json.Marshal(map[string]string{"merge_method": strings.ToLower(string(method))})
+	if err != nil {
+		return fmt.Errorf("githubclient: marshal merge pr: %w", err)
+	}
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) +
+		"/pulls/" + url.PathEscape(fmt.Sprintf("%d", number)) + "/merge")
+	req, err := c.buildRequest(ctx, http.MethodPut, endpoint, bytes.NewReader(raw), installationID)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: merge pr: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusMethodNotAllowed {
+		// 405 == PR is not mergeable (checks failing, review required, or the
+		// PR is already merged). Surface as a retryable validation-class error
+		// rather than an opaque 405 so the operator verb can report it.
+		return fmt.Errorf("%w: merge pr: pull request is not mergeable (405): %s",
+			ErrValidation, readBriefBody(resp.Body))
+	}
+	return classifyStatus("merge pr", resp)
+}
+
 // PullRequest is the slice of a pull-request API response Fishhawk
 // surfaces. NodeID is the opaque base64-encoded GraphQL identifier
 // (consumed by `EnableAutoMerge` per #255). HeadSHA + State are
