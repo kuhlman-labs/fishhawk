@@ -2411,6 +2411,98 @@ func TestRunStage_AcceptanceAdmissionAuthzRejection_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestRunStage_AcceptanceAdmissionBareRoute404_FailsOpen pins the #1937 version-skew
+// carve-out: a NEW fishhawk-mcp pointed at an OLD fishhawkd that never registered the
+// acceptance-admission route answers from its stdlib http.ServeMux with the plain-text
+// "404 page not found" and NO JSON error envelope, so apiError.Code is empty. That bare
+// route-absent 404 must be reclassified into the transport fail-open path (NOT the 4xx
+// fail-closed halt) so a version skew does not wedge every acceptance dispatch: nil
+// error, exactly one spawn, and a warning naming probable version skew.
+func TestRunStage_AcceptanceAdmissionBareRoute404_FailsOpen(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.admissionStatus = http.StatusNotFound
+	fb.admissionErrBody = "404 page not found\n" // exact stdlib http.NotFound body
+	r := newResolver(srv, nil)
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("a bare route-absent 404 must fail OPEN (version skew), got: %v", err)
+	}
+	if spawned != 1 {
+		t.Errorf("a bare 404 must fall through to spawn, got %d spawns", spawned)
+	}
+	var warned bool
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "may predate the admission endpoint (version skew)") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("missing the version-skew fail-open warning; warnings: %v", out.Warnings)
+	}
+}
+
+// TestRunStage_AcceptanceAdmissionStageNotFound404_FailsClosed pins the other side of
+// the #1937 carve-out: a 404 whose body DID decode into the OpenAPI error envelope
+// (Code=="stage_not_found") is the registered handler positively saying "no such
+// stage" — the backend evaluated the request and rejected it, so it stays in the 4xx
+// fail-closed class: non-nil "rejected the dispatch" error and NO spawn.
+func TestRunStage_AcceptanceAdmissionStageNotFound404_FailsClosed(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.admissionStatus = http.StatusNotFound
+	fb.admissionErrBody = `{"error":{"code":"stage_not_found","message":"no such stage"}}`
+	r := newResolver(srv, nil)
+
+	spawned := 0
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd {
+		spawned++
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	runID := uuid.New()
+	acceptanceID := uuid.NewString()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID, RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance", GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("a body-decoded stage_not_found 404 must fail closed with a tool error, got nil")
+	}
+	if !strings.Contains(err.Error(), "rejected the dispatch") {
+		t.Errorf("error = %q, want it to name the admission rejection", err)
+	}
+	if spawned != 0 {
+		t.Errorf("a fail-closed stage_not_found 404 must spawn NO runner, got %d", spawned)
+	}
+}
+
 // TestRunStage_AcceptanceAdmissionError_StageLeftRunning_FailsClosed pins the
 // #1928 mid-walk concern: when the admission call 500s AND the failed short-circuit
 // walk left the target stage 'running', the fail-open re-check observes the

@@ -832,8 +832,11 @@ type AcceptanceAdmissionResult struct {
 // settles the acceptance stage to a passed verdict WITHOUT a runner. The dispatch
 // verbs call it for an acceptance stage before recording spawn evidence or
 // spawning; a short_circuited:true result means skip the spawn. Follows
-// RetryStage's shape — a non-2xx surfaces as *apiError so the caller can fail
-// OPEN (spawn as today) on any admission-call error.
+// RetryStage's shape — a non-2xx surfaces as *apiError so
+// maybeShortCircuitAcceptance can classify it: a 4xx rejection (401 / 403
+// cross_run_admission / 422 / a body-decoded 404 stage_not_found) fails CLOSED,
+// while a transport error (network / 5xx) and a route-absent bare 404 — an older
+// fishhawkd that predates the endpoint (version skew, #1937) — fail OPEN.
 func (c *apiClient) AcceptanceDispatchAdmission(ctx context.Context, stageID uuid.UUID) (*AcceptanceAdmissionResult, error) {
 	var res AcceptanceAdmissionResult
 	if err := c.do(ctx, http.MethodPost, "/v0/stages/"+stageID.String()+"/acceptance-admission", nil, &res); err != nil {
