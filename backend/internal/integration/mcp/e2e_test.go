@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -793,5 +794,175 @@ func TestE2E_NextActions_PlanGateParkedAndMergeRitual(t *testing.T) {
 	}
 	if _, ok := mergeAct.Params["verdict"]; !ok {
 		t.Errorf("fishhawk_merge_run params missing verdict placeholder: %v", mergeAct.Params)
+	}
+}
+
+// fakeGitHubMerger implements server.GitHubMerger for the merge E2E: it records
+// each MergePullRequest dispatch so the test can assert the endpoint queued the
+// merge through the shared seam (and re-queued on the idempotent re-POST).
+// Mutex-guarded so the -race detector is satisfied across the httptest handler
+// goroutine (which increments) and the test goroutine (which reads).
+type fakeGitHubMerger struct {
+	mu     sync.Mutex
+	called int
+}
+
+func (m *fakeGitHubMerger) MergePullRequest(_ context.Context, _ *runpkg.Run) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.called++
+	return nil
+}
+
+func (m *fakeGitHubMerger) calls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.called
+}
+
+// mergeRunView mirrors the fishhawk_merge_run MergeRunOutput wire shape so the
+// integration test can decode it off the tool's structured content.
+type mergeRunView struct {
+	Status          string  `json:"status"`
+	RunState        string  `json:"run_state"`
+	MergeQueued     bool    `json:"merge_queued"`
+	VerdictRecorded bool    `json:"verdict_recorded"`
+	AlreadyRecorded bool    `json:"already_recorded"`
+	VerdictSequence int64   `json:"verdict_sequence"`
+	PRURL           string  `json:"pr_url"`
+	WaitedSeconds   float64 `json:"waited_seconds"`
+}
+
+// mergeVerdictRowCount reads the run's merge_verdict_recorded audit rows off the
+// real backend store so the test can assert the endpoint-side idempotence (the
+// re-POST appends NO duplicate row).
+func mergeVerdictRowCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, runID uuid.UUID) int {
+	t.Helper()
+	repo := audit.NewPostgresRepository(pool)
+	entries, err := repo.ListForRunByCategory(ctx, runID, server.CategoryMergeVerdictRecorded)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(merge_verdict_recorded): %v", err)
+	}
+	return len(entries)
+}
+
+// TestE2E_MergeRun_EndpointToolWireAndIdempotence drives fishhawk_merge_run
+// end-to-end against the REAL server stack (real MCP binary → real backend HTTP
+// handleMergeRun → real Postgres), satisfying binding approval condition 2's
+// second clause and the codex integrated-test concern: the per-side unit
+// fixtures each exercise one half against a hand-rolled fake, but only this case
+// proves the endpoint↔tool wire contract against the real handleMergeRun — a
+// request/response mismatch the shared fixtures cannot catch fails HERE.
+//
+// It pins the #1954 endpoint-side idempotence (binding condition 1) end-to-end:
+//
+//   - first invoke → the endpoint appends ONE merge_verdict_recorded row,
+//     dispatches the shared merger seam, and the tool reports verdict_recorded +
+//     merge_queued;
+//   - re-invoke (the resume / 502-retry shape) → the endpoint finds the existing
+//     row, appends NO duplicate (already_recorded:true), yet STILL re-dispatches
+//     the merge — so the verdict-row count stays 1 while the merger is called
+//     twice.
+//
+// The run is left non-terminal (running) with no pr_merged entry, so the
+// client-side terminal await resolves to the resumable status=timeout under a 1s
+// bound — the merge-queued contract is what this case asserts, not the
+// webhook-settled tail (covered by the per-side units).
+func TestE2E_MergeRun_EndpointToolWireAndIdempotence(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// A second backend over the SAME pool with the merge seam wired — the
+	// fixture's own server has no GateMerger (a merge there would 503). Mirrors
+	// the binding-assertions E2E's second-server pattern.
+	merger := &fakeGitHubMerger{}
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    audit.NewPostgresRepository(fx.pool),
+		APITokenRepo: fx.apitokenRepo,
+		GateMerger:   merger,
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// Seed the run into a merge-admissible shape: a PR URL stamped and a
+	// non-terminal (running) state. The fixture run carries no WorkflowSpec, so
+	// the acceptance gate reads not-declared and admits the merge.
+	const prURL = "https://github.com/kuhlman-labs/fishhawk/pull/4848"
+	if _, err := fx.runRepo.SetRunPullRequestURL(ctx, fx.runID, prURL); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+	if _, err := fx.runRepo.TransitionRun(ctx, fx.runID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	callMerge := func() mergeRunView {
+		t.Helper()
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{
+			Name: "fishhawk_merge_run",
+			Arguments: map[string]any{
+				"run_id":  fx.runID.String(),
+				"verdict": "ship it — gates green",
+				// Bound the terminal await: a running run with no pr_merged entry
+				// never settles, so the wait resolves to the resumable timeout.
+				"timeout_seconds": 1,
+			},
+		})
+		if err != nil {
+			t.Fatalf("CallTool fishhawk_merge_run: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("merge tool returned error: %s", toolContentString(t, result))
+		}
+		var out mergeRunView
+		decodeStructured(t, result, &out)
+		return out
+	}
+
+	// First invoke: fresh verdict row, merge queued, await times out.
+	first := callMerge()
+	if !first.MergeQueued {
+		t.Error("first merge_queued = false, want true")
+	}
+	if !first.VerdictRecorded {
+		t.Error("first verdict_recorded = false, want true (fresh append)")
+	}
+	if first.AlreadyRecorded {
+		t.Error("first already_recorded = true, want false on the first POST")
+	}
+	if first.PRURL != prURL {
+		t.Errorf("first pr_url = %q, want %q", first.PRURL, prURL)
+	}
+	if first.Status != "timeout" {
+		t.Errorf("first status = %q, want timeout (running run, no pr_merged entry)", first.Status)
+	}
+	if got := merger.calls(); got != 1 {
+		t.Errorf("merger dispatched %d times after first invoke, want 1", got)
+	}
+	if n := mergeVerdictRowCount(t, ctx, fx.pool, fx.runID); n != 1 {
+		t.Fatalf("merge_verdict_recorded rows after first invoke = %d, want 1", n)
+	}
+
+	// Re-invoke (the resume / 502-retry shape): the endpoint is idempotent — no
+	// duplicate verdict row, yet it STILL re-dispatches the merge.
+	second := callMerge()
+	if !second.AlreadyRecorded {
+		t.Error("second already_recorded = false, want true (endpoint idempotence)")
+	}
+	if second.VerdictRecorded {
+		t.Error("second verdict_recorded = true, want false on the idempotent re-POST")
+	}
+	if !second.MergeQueued {
+		t.Error("second merge_queued = false, want true (re-dispatch on resume)")
+	}
+	if got := merger.calls(); got != 2 {
+		t.Errorf("merger dispatched %d times after re-invoke, want 2 (re-queued)", got)
+	}
+	if n := mergeVerdictRowCount(t, ctx, fx.pool, fx.runID); n != 1 {
+		t.Fatalf("merge_verdict_recorded rows after re-invoke = %d, want 1 (no duplicate append)", n)
 	}
 }

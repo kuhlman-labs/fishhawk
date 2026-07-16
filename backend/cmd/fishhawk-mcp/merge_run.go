@@ -132,9 +132,9 @@ Tool errors:
     refusal before the POST)
   - the backend's authoritative surfaces: validation_failed (400),
     run_token_forbidden / insufficient_scope (403), run_not_found (404),
-    merge_not_admissible (409), merge_dispatch_failed (502 — the verdict row
-    is durable and the merge is retryable; re-invoke), merge_unconfigured
-    (503)
+    run_not_mergeable / acceptance_gate_not_passed (409),
+    merge_dispatch_failed (502 — the verdict row is durable and the merge is
+    retryable; re-invoke), merge_unconfigured (503)
 `),
 	}, resolver.mergeRun)
 }

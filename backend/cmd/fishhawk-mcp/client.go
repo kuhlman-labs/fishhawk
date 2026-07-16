@@ -1280,8 +1280,9 @@ type MergeRunResult struct {
 //   - 403 run_token_forbidden (a run-bound agent token) / insufficient_scope
 //     (token lacks write:approvals)
 //   - 404 run_not_found
-//   - 409 merge_not_admissible (no PR URL; run failed/cancelled; acceptance
-//     gate not passed/declared/skipped-out-of-scope)
+//   - 409 run_not_mergeable (no PR URL; run failed/cancelled) or
+//     acceptance_gate_not_passed (the acceptance gate is not
+//     passed/not-declared/skipped-out-of-scope)
 //   - 502 merge_dispatch_failed (the verdict row is durable; the queue step
 //     is retryable — re-POST re-queues with no duplicate row)
 //   - 503 merge_unconfigured (the merger seam is not wired)
