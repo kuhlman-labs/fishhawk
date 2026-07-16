@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // TestProcgroupHelper is the Go stdlib test-helper-process pattern: when
@@ -40,8 +42,9 @@ func TestProcgroupHelper(t *testing.T) {
 		}
 		// Stay alive past any short test deadline so the deadline — not a
 		// natural exit — is what triggers the group kill that reaps us AND the
-		// in-group grandchild.
-		time.Sleep(30 * time.Second)
+		// in-group grandchild. Scaled by the shared factor so the wedge stays
+		// well above the (also-scaled) elapsed bound at any factor.
+		time.Sleep(timescale.D(30 * time.Second))
 	case "grandchild":
 		// Inherit stdout (set by the parent) and hold it open past the
 		// deadline. Record our pid first so the test can assert we were reaped
@@ -49,7 +52,7 @@ func TestProcgroupHelper(t *testing.T) {
 		if pf := os.Getenv("PROCGROUP_GC_PIDFILE"); pf != "" {
 			_ = os.WriteFile(pf, []byte(strconv.Itoa(os.Getpid())), 0o600)
 		}
-		time.Sleep(30 * time.Second)
+		time.Sleep(timescale.D(30 * time.Second))
 	}
 }
 
@@ -91,7 +94,10 @@ func parentHelperCmd(ctx context.Context, escape bool, pidfile string) *exec.Cmd
 // fails the test after a bounded wait.
 func readPidWhenReady(t *testing.T, pidfile string) int {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// A spawn-liveness wait (fork/exec + pidfile flush), NOT the kill-latency
+	// under test: raised to the shared 30s liveness base and scaled, so a loaded
+	// runner that is slow to start the grandchild does not fatal spuriously.
+	deadline := time.Now().Add(timescale.D(30 * time.Second))
 	for time.Now().Before(deadline) {
 		b, err := os.ReadFile(pidfile)
 		if err == nil {
@@ -119,13 +125,16 @@ func pidAlive(pid int) bool {
 // cmd.Output() would hang.
 func TestHarden_GroupKillReapsGrandchild(t *testing.T) {
 	pidfile := filepath.Join(t.TempDir(), "gc.pid")
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	// Every deadline-competing duration derives from timescale.D (base value ×
+	// the shared factor), so the discrimination ratios (bound/deadline,
+	// long-grace/bound) hold at any factor while CI gains headroom.
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(200*time.Millisecond))
 	defer cancel()
 
 	cmd := parentHelperCmd(ctx, false /* in-group */, pidfile)
 	// A long grace proves the group kill (not WaitDelay) is what unblocks
 	// Output: if Output returns quickly, the pipe closed via the reap.
-	Harden(cmd, 10*time.Second)
+	Harden(cmd, timescale.D(10*time.Second))
 
 	start := time.Now()
 	_, err := cmd.Output()
@@ -138,14 +147,14 @@ func TestHarden_GroupKillReapsGrandchild(t *testing.T) {
 	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		t.Fatalf("ctx.Err() = %v, want context.DeadlineExceeded (the deadline must be the trigger)", ctx.Err())
 	}
-	if elapsed > 3*time.Second {
+	if elapsed > timescale.D(3*time.Second) {
 		t.Errorf("Output took %s — the group kill should close the pipe at the deadline, not wait the 10s grace", elapsed)
 	}
 
 	// The in-group grandchild must have been reaped by the group SIGKILL.
 	gcPid := readPidWhenReady(t, pidfile)
 	gone := false
-	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(timescale.D(3 * time.Second)); time.Now().Before(deadline); {
 		if !pidAlive(gcPid) {
 			gone = true
 			break
@@ -166,11 +175,13 @@ func TestHarden_GroupKillReapsGrandchild(t *testing.T) {
 // block until the escaped grandchild's own 30s sleep ended.
 func TestHarden_WaitDelayForceClosesEscapedPipe(t *testing.T) {
 	pidfile := filepath.Join(t.TempDir(), "gc.pid")
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	// Deadline and grace both derive from timescale.D so their ratio (and the
+	// wedge/bound ratio) is preserved at any factor while CI gains headroom.
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(200*time.Millisecond))
 	defer cancel()
 
 	cmd := parentHelperCmd(ctx, true /* escape */, pidfile)
-	const grace = 300 * time.Millisecond
+	grace := timescale.D(300 * time.Millisecond)
 	Harden(cmd, grace)
 
 	// Clean up the escaped grandchild, which the group kill cannot reach.
@@ -195,7 +206,7 @@ func TestHarden_WaitDelayForceClosesEscapedPipe(t *testing.T) {
 	// Returned via WaitDelay: after the deadline + grace, but not after the
 	// escaped grandchild's 30s sleep (which is what a missing WaitDelay would
 	// force us to wait for).
-	if elapsed > 5*time.Second {
+	if elapsed > timescale.D(5*time.Second) {
 		t.Errorf("Output took %s — WaitDelay should force-close the escaped pipe near deadline+grace, not hang on the grandchild", elapsed)
 	}
 
