@@ -449,11 +449,20 @@ func TestGateView_NilStageLegacyJoin(t *testing.T) {
 
 	// (b) round-skip: a nil-stageID trigger below a CONCRETE-stage concern's
 	// origin sequence must not count toward that concern's round (gateViewRound
-	// only counts SAME-stage triggers; nil never matches a concrete stage id).
+	// only counts SAME-stage triggers; nil never matches a concrete stage id). A
+	// same-stage trigger at sequence 30 is seeded alongside it, both below the
+	// concern's origin (50), so the assertion actually distinguishes the skip:
+	// if the nil-stage trigger were wrongly counted the round would be 3 (not
+	// 2), and if the same-stage trigger were wrongly SKIPPED the round would
+	// stay 1 — either regression moves the observed value away from 2, so the
+	// nil-stageID skip path is exercised rather than trivially unreachable.
 	stageID := uuid.New()
 	roundConcern := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 50, "high", "correctness", "round note", "")
 	seedHeadEntry(au, runID, nil, CategoryStageFixupTriggered, 10, map[string]any{
 		"concern_ids": []string{}, "reason": "unrelated legacy trigger",
+	})
+	seedHeadEntry(au, runID, &stageID, CategoryStageFixupTriggered, 30, map[string]any{
+		"concern_ids": []string{}, "reason": "same-stage trigger",
 	})
 
 	resp := decodeGateView(t, getGateView(t, s, runID, ""))
@@ -467,8 +476,8 @@ func TestGateView_NilStageLegacyJoin(t *testing.T) {
 		t.Errorf("legacy nil-stage fixup did not join its nil-stage outcome: %+v", lc.Fixups[0])
 	}
 
-	if got := byID[roundConcern.ID.String()].Round; got != 1 {
-		t.Errorf("round-skip concern Round = %d, want 1 (nil-stageID trigger must not bump an unrelated concrete stage's round)", got)
+	if got := byID[roundConcern.ID.String()].Round; got != 2 {
+		t.Errorf("round-skip concern Round = %d, want 2 (the same-stage trigger at seq 30 must count but the nil-stageID trigger at seq 10 must not)", got)
 	}
 }
 

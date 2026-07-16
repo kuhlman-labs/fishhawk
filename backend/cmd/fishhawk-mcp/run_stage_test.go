@@ -2524,7 +2524,10 @@ func TestRunStage_AcceptanceAdmissionBareRoute404_StageNotDispatchable_Halts(t *
 		return exec.Command("sh", "-c", "exit 0")
 	}
 	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
-	t.Cleanup(func() { runStageCommand = origCmd })
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = exec.LookPath
+	})
 
 	runID := uuid.New()
 	acceptanceID := uuid.NewString()
