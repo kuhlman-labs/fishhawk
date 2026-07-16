@@ -900,6 +900,14 @@ per-tool contract). Internals not covered there:
   when `next_action` is `resume`.
 - The campaign-scoped operator procedure lives in the operator role spec's `conventions.campaign`
   (`docs/spec/operator-role.md`), not hard-coded here.
+- **Batch-as-campaign local drive.** The step-by-step operator procedure for driving a multi-issue batch
+  locally as one campaign — `fishhawk_start_campaign` → a `fishhawk_get_campaign_status` drive-tick loop
+  (the single status surface) → `fishhawk_start_campaign_item_run` with `runner_kind:local` per eligible
+  item → a per-item `fishhawk_drive_run` handoff, one item at a time with a per-item `scripts/dev post-merge`
+  before the next item ([#1918](https://github.com/kuhlman-labs/fishhawk/issues/1918) governs the serialize
+  rule) — is the `fishhawk://runbook` resource's **Batch-as-campaign (local campaign drive)** section
+  (E48.12 / [#1959](https://github.com/kuhlman-labs/fishhawk/issues/1959)), validated over the epic-#1940
+  campaign walk.
 
 ## Acceptance operator surface (E31.9 / #1537, ADR-049)
 
