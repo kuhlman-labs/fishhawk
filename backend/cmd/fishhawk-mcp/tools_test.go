@@ -165,8 +165,15 @@ type fakeBackend struct {
 	// succeeded so a post-short-circuit stages read reflects the settle.
 	// admissionStatus (0 -> 200) drives the fail-open error branch;
 	// admissionCalledByID counts admission POSTs per stage id.
+	// admissionErrBody, when set on a non-200 admissionStatus, is written
+	// verbatim in place of the default internal_error envelope — used to model
+	// the two 404 shapes (#1937): a route-absent bare "404 page not found\n"
+	// (empty decoded Code -> fail-open version skew) vs a body-decoded
+	// stage_not_found envelope (non-empty Code -> fail-closed). Default empty
+	// keeps every existing admission test byte-identical.
 	admissionShortCircuit bool
 	admissionStatus       int
+	admissionErrBody      string
 	admissionCalledByID   map[uuid.UUID]int
 	// #1953 fixtures: the needs_target augmentation on the short_circuited:false
 	// path. admissionNeedsTarget drives needs_target:true; admissionTargetHosts /
@@ -583,6 +590,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.admissionCalledByID[id]++
 		sc := fb.admissionShortCircuit
 		status := fb.admissionStatus
+		errBody := fb.admissionErrBody
 		needsTarget := fb.admissionNeedsTarget
 		targetHosts := fb.admissionTargetHosts
 		expectedHeadSHA := fb.admissionExpectedHeadSHA
@@ -608,7 +616,11 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Unlock()
 		if status != 0 && status != http.StatusOK {
 			w.WriteHeader(status)
-			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"boom"}}`))
+			if errBody != "" {
+				_, _ = w.Write([]byte(errBody))
+			} else {
+				_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"boom"}}`))
+			}
 			return
 		}
 		res := AcceptanceAdmissionResult{ShortCircuited: sc}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -769,12 +770,27 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 // On an admission-call error the outcome depends on the failure class:
 //
 //   - A 4xx is the backend REJECTING the admission request itself — 401
-//     authentication_required, 403 insufficient_scope / cross_run_admission, 404
-//     stage_not_found, 422 (a non-acceptance stage). Failing OPEN past one would
+//     authentication_required, 403 insufficient_scope / cross_run_admission, 422
+//     (a non-acceptance stage), and a BODY-DECODED 404 whose error envelope
+//     decoded to Code=="stage_not_found" (the registered handler positively
+//     evaluated the request and said no such stage). Failing OPEN past one would
 //     let the runner spawn (a repository command execution) AFTER the run-subject
 //     authorization boundary said no, defeating it. The reconciliation binding
-//     condition's fail-open signal is a TRANSPORT error (network / 5xx) ONLY, so a
-//     4xx returns a non-nil error and the caller HALTS, spawning nothing.
+//     condition's fail-open signal is a TRANSPORT error (network / 5xx) ONLY, so
+//     these 4xx return a non-nil error and the caller HALTS, spawning nothing.
+//   - A ROUTE-ABSENT bare 404 — StatusCode 404 with an EMPTY decoded Code, i.e. a
+//     body that never decoded into the OpenAPI error envelope — is transport-class
+//     fail-open, NOT a rejection (#1937). An older fishhawkd that predates the
+//     admission endpoint (#1928) answers the unregistered route from its stdlib
+//     http.ServeMux, whose default http.NotFound writes the plain-text "404 page
+//     not found" with no JSON envelope, so doWithStatusUsing leaves apiError.Code
+//     empty; the registered handler ALWAYS writes the envelope via writeError, so a
+//     genuine stage_not_found 404 decodes to a non-empty Code. That envelope-code
+//     discriminator lets a version-skew wedge (the new fishhawk-mcp against an old
+//     fishhawkd) fall through to the fail-open path with a skew warning instead of
+//     halting every acceptance dispatch, while a positively-evaluated
+//     stage_not_found 404 still fails closed. It joins the network / 5xx path
+//     below (including its stage-state re-check).
 //   - A network / 5xx transport error fails OPEN per the binding condition,
 //     returning the fail-open warning — but ONLY after re-checking that the target
 //     stage is still host-dispatchable: a mid-walk 500 can leave the acceptance
@@ -803,10 +819,28 @@ func (r *runResolver) maybeShortCircuitAcceptance(ctx context.Context, runID, st
 	// condition (#1928 authz concern). apiClient.do returns *apiError with the
 	// status for every non-2xx; a network failure is a non-apiError wrapped error
 	// (treated as a transport error below).
+	//
+	// Carve-out (#1937): a ROUTE-ABSENT bare 404 (StatusCode 404 with an EMPTY
+	// decoded Code — a body that never decoded into the OpenAPI error envelope) is
+	// an older fishhawkd's stdlib-mux plain-text route-absent 404, not a rejection.
+	// It falls THROUGH to the transport fail-open path below (with its own skew
+	// warning) rather than halting every acceptance dispatch on a version-skew wedge.
+	// A body-decoded 404 (Code=="stage_not_found") and every other 4xx keep failing
+	// closed here.
 	var ae *apiError
-	if errors.As(err, &ae) && ae.StatusCode >= 400 && ae.StatusCode < 500 {
+	bareRoute404 := errors.As(err, &ae) && ae.StatusCode == http.StatusNotFound && ae.Code == ""
+	if errors.As(err, &ae) && ae.StatusCode >= 400 && ae.StatusCode < 500 && !bareRoute404 {
 		return nil, "", fmt.Errorf(
 			"acceptance-admission rejected the dispatch: %w; not spawning (an authorization/validation rejection is not a fail-open condition)", err)
+	}
+	// A bare route-absent 404 gets its own fail-open warning naming probable version
+	// skew (an older fishhawkd without the admission endpoint) so an operator can
+	// tell it apart from a network blip. It shares the transport path's stage-state
+	// re-check below and then returns this warning instead of the generic one.
+	skewWarn := ""
+	if bareRoute404 {
+		skewWarn = fmt.Sprintf(
+			"acceptance-admission endpoint not found (bare 404 with no error envelope): the backend may predate the admission endpoint (version skew); proceeding to spawn as usual (fail-open). (%v)", err)
 	}
 	// Network / 5xx → fail OPEN, but first re-check the target stage. A mid-walk
 	// 500 (TryShortCircuitAcceptance failing between the sequential transitions its
@@ -819,6 +853,9 @@ func (r *runResolver) maybeShortCircuitAcceptance(ctx context.Context, runID, st
 	if state, ok := r.acceptanceStageState(ctx, runID, stageID); ok && state != "pending" && state != "dispatched" {
 		return nil, "", fmt.Errorf(
 			"acceptance-admission failed (%v) and left stage %s in state %q (no longer pending/dispatched); not spawning to avoid double-driving a partially-settled acceptance stage", err, stageID, state)
+	}
+	if skewWarn != "" {
+		return nil, skewWarn, nil
 	}
 	return nil, fmt.Sprintf(
 		"acceptance-admission pre-check failed (%v); proceeding to spawn as usual (fail-open).", err), nil
