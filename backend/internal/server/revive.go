@@ -36,6 +36,16 @@ type reviveResponse struct {
 	// landed) rather than performing fresh re-parks. On a resumed revive
 	// restored_stages is empty. Additive field (#1942).
 	Resumed bool `json:"resumed"`
+	// AuditWarning is set ONLY when the run_revived chained audit append failed
+	// AFTER the re-park/reopen transitions were already committed. The revive
+	// itself succeeded — the run is reopened and the stages re-parked — and this
+	// warning is the caller-visible signal that the chained provenance record is
+	// missing. Fail-closed is impossible here: run.ReviveRun commits every
+	// re-park and the run reopen before the audit append, and a committed revive
+	// cannot be re-run to re-attempt the append (a second revive on a now-running
+	// run refuses 422 revive_not_applicable), so a 500 would falsely tell the
+	// operator the revive did not happen. Omitted on success (#1943).
+	AuditWarning string `json:"audit_warning,omitempty"`
 }
 
 // reviveRestoredStage is one re-parked stage on the wire (and in the
@@ -143,7 +153,17 @@ func (s *Server) handleReviveRun(w http.ResponseWriter, r *http.Request) {
 	// DELIBERATELY no orchestrator.Advance and no drive retry_reopen stamp
 	// after this — revive re-parks, never dispatches (the semantic
 	// difference from /retry and /redrive).
-	s.writeReviveAudit(r, runID, restored, dec.Resumed)
+	//
+	// The re-park/reopen transitions are already committed, so an append
+	// failure does NOT unwind the revive: surface it to the caller as
+	// audit_warning on the 200 rather than 500ing on a committed state change
+	// (fail-closed is impossible — a committed revive cannot be re-run to
+	// re-attempt the append; see #1943).
+	auditWarning := ""
+	if err := s.writeReviveAudit(r, runID, restored, dec.Resumed); err != nil {
+		auditWarning = "run_revived audit append failed: " + err.Error() +
+			" — the revive is committed but no chained provenance record was written; see server logs"
+	}
 
 	// Sticky status comment (E20.4 / #330): the run flipped failed → running
 	// and stages re-parked, so the status comment should re-render.
@@ -153,14 +173,17 @@ func (s *Server) handleReviveRun(w http.ResponseWriter, r *http.Request) {
 		Run:            toRunResponse(dec.Run),
 		RestoredStages: restored,
 		Resumed:        dec.Resumed,
+		AuditWarning:   auditWarning,
 	})
 }
 
 // writeReviveAudit appends the single run_revived entry capturing every
 // re-parked stage's prior failure detail and restored state, plus the
-// actor that triggered the revive. Best-effort — the transitions are
-// already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeReviveAudit(r *http.Request, runID uuid.UUID, restored []reviveRestoredStage, resumed bool) {
+// actor that triggered the revive. The transitions are already committed,
+// so a failure here does NOT unwind: it logs the structured error AND
+// returns it so the caller can surface an audit_warning on the 200 (#1943).
+// Returns nil on a successful append.
+func (s *Server) writeReviveAudit(r *http.Request, runID uuid.UUID, restored []reviveRestoredStage, resumed bool) error {
 	id := IdentityFrom(r.Context())
 	subject := id.Subject
 	if subject == "" {
@@ -188,5 +211,7 @@ func (s *Server) writeReviveAudit(r *http.Request, runID uuid.UUID, restored []r
 			"run_id", runID,
 			"error", err.Error(),
 		)
+		return err
 	}
+	return nil
 }

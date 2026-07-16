@@ -1313,6 +1313,12 @@ type ReviveRestoredStage struct {
 type ReviveRunResult struct {
 	Run            Run                   `json:"run"`
 	RestoredStages []ReviveRestoredStage `json:"restored_stages"`
+	// AuditWarning mirrors the backend's reviveResponse.audit_warning (#1943):
+	// set ONLY when the backend committed the revive (re-parks + reopen) but
+	// then failed to append the run_revived chained provenance record. The
+	// revive succeeded; the warning is the caller-visible signal the audit
+	// record is missing. Omitted (empty) on a clean revive.
+	AuditWarning string `json:"audit_warning,omitempty"`
 }
 
 // ReviveRun re-admits a terminal-FAILED run for another operator turn via
