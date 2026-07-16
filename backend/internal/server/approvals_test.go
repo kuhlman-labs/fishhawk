@@ -1445,6 +1445,30 @@ func TestSubmitApproval_ClaimsConcernIDs_DuplicateRejected(t *testing.T) {
 	assertNoApprovalRecorded(t, ar, au)
 }
 
+// TestSubmitApproval_ClaimsConcernIDs_GetByIDsInfraError500 pins the
+// retryable-500 branch at condition_claims.go:102-109: a non-ErrNotFound
+// GetByIDs failure (a store outage, not a missing row) must surface as 500
+// internal_error and insert NO approval row — distinct from the
+// operator-corrected 400 an ErrNotFound produces (TestSubmitApproval_
+// ClaimsConcernIDs_UnknownIDRejected). Collapsing this into the 400 path would
+// misreport a transient infra failure as a bad concern id.
+func TestSubmitApproval_ClaimsConcernIDs_GetByIDsInfraError500(t *testing.T) {
+	s, ar, rr, au, cr := newApprovalServerWithConcerns(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	row := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 5, "would otherwise validate")
+	cr.getByIDsErr = errors.New("store outage")
+
+	w := submitApproval(t, s, stage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, row.ID.String()))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on a GetByIDs infra error:\n%s", w.Code, w.Body.String())
+	}
+	if !bodyHasCode(w, "internal_error") {
+		t.Errorf("want internal_error code, got %s", w.Body.String())
+	}
+	assertNoApprovalRecorded(t, ar, au)
+}
+
 // TestSubmitApproval_RemoveScopeFiles_NonRepoRelativeRejected pins the #1726
 // SHAPE fail-closed mode: a remove_scope_files path that is not repo-relative
 // (here a ".." traversal) is refused 400 validation_failed field=

@@ -1637,10 +1637,11 @@ func (a *seqAuditFake) entriesByCategory(cat string) []*audit.Entry {
 // Postgres adapter is exercised separately in
 // backend/internal/concern/postgres_test.go via testcontainers.
 type fakeConcernRepo struct {
-	mu        sync.Mutex
-	rows      []*concern.Concern
-	insertErr error
-	listErr   error
+	mu          sync.Mutex
+	rows        []*concern.Concern
+	insertErr   error
+	listErr     error
+	getByIDsErr error
 }
 
 func newFakeConcernRepo() *fakeConcernRepo { return &fakeConcernRepo{} }
@@ -1680,6 +1681,9 @@ func (f *fakeConcernRepo) InsertRaised(_ context.Context, p concern.InsertRaised
 func (f *fakeConcernRepo) GetByIDs(_ context.Context, ids []uuid.UUID) ([]*concern.Concern, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getByIDsErr != nil {
+		return nil, f.getByIDsErr
+	}
 	out := make([]*concern.Concern, 0, len(ids))
 	for _, id := range ids {
 		var found *concern.Concern

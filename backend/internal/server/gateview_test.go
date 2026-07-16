@@ -426,6 +426,52 @@ func TestGateView_FixupJoin(t *testing.T) {
 	}
 }
 
+// TestGateView_NilStageLegacyJoin covers the legacy nil-stage-id join
+// (sameStage's nil-nil match inside earliestOutcomeAfter, gateview.go:521) and
+// gateViewRound's nil-stageID trigger skip (gateview.go:488): an audit entry
+// recorded before stage ids were threaded onto fix-up audit entries carries a
+// nil StageID, and neither derivation may silently drop it (the join) or
+// silently fold it into an unrelated concrete-stage concern's round count
+// (the skip).
+func TestGateView_NilStageLegacyJoin(t *testing.T) {
+	s, repo, au, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+
+	// (a) nil-nil outcome join: a trigger and its outcome both recorded with no
+	// stage id (a legacy entry) must still pair up via sameStage's nil-nil match.
+	legacy := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 5, "high", "correctness", "legacy note", "")
+	seedHeadEntry(au, runID, nil, CategoryStageFixupTriggered, 20, map[string]any{
+		"concern_ids": []string{legacy.ID.String()}, "reason": "legacy pass",
+	})
+	seedHeadEntry(au, runID, nil, "fixup_pushed", 25, map[string]any{
+		"head_sha": "legacyhead", "apply_path": "legacyapplied",
+	})
+
+	// (b) round-skip: a nil-stageID trigger below a CONCRETE-stage concern's
+	// origin sequence must not count toward that concern's round (gateViewRound
+	// only counts SAME-stage triggers; nil never matches a concrete stage id).
+	stageID := uuid.New()
+	roundConcern := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 50, "high", "correctness", "round note", "")
+	seedHeadEntry(au, runID, nil, CategoryStageFixupTriggered, 10, map[string]any{
+		"concern_ids": []string{}, "reason": "unrelated legacy trigger",
+	})
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	byID := indexOpen(resp.Open)
+
+	lc := byID[legacy.ID.String()]
+	if len(lc.Fixups) != 1 {
+		t.Fatalf("legacy concern Fixups = %d, want 1: %+v", len(lc.Fixups), lc.Fixups)
+	}
+	if lc.Fixups[0].Outcome != "pushed" || lc.Fixups[0].HeadSHA != "legacyhead" || lc.Fixups[0].ApplyPath != "legacyapplied" {
+		t.Errorf("legacy nil-stage fixup did not join its nil-stage outcome: %+v", lc.Fixups[0])
+	}
+
+	if got := byID[roundConcern.ID.String()].Round; got != 1 {
+		t.Errorf("round-skip concern Round = %d, want 1 (nil-stageID trigger must not bump an unrelated concrete stage's round)", got)
+	}
+}
+
 // TestGateView_ResolutionJoin_StateReasonOverwrite proves the original fix-up
 // routing reason still surfaces from the audit join even though the concern's
 // state_reason was overwritten with the re-review note.
