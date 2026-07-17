@@ -1161,3 +1161,30 @@ func TestLoadConventionsOverride(t *testing.T) {
 		}
 	})
 }
+
+// TestWebhookStoreNeeded pins the delivery-store gating (E45.6 / #1860):
+// the shared webhook delivery store is created when EITHER forge's
+// webhook secret is set — including the GitLab-only case, which the
+// prior GitHub-secret-only gate would have skipped — and NOT created
+// when neither is set. The GitHub-only case stays unchanged.
+func TestWebhookStoreNeeded(t *testing.T) {
+	cases := []struct {
+		name         string
+		githubSecret string
+		gitlabSecret string
+		want         bool
+	}{
+		{"neither", "", "", false},
+		{"github-only", "gh", "", true},
+		{"gitlab-only", "", "gl", true},
+		{"both", "gh", "gl", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := webhookStoreNeeded(tc.githubSecret, tc.gitlabSecret); got != tc.want {
+				t.Errorf("webhookStoreNeeded(%q,%q) = %v, want %v",
+					tc.githubSecret, tc.gitlabSecret, got, tc.want)
+			}
+		})
+	}
+}

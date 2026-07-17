@@ -45,6 +45,7 @@ func TestCSRFExemptPath(t *testing.T) {
 		"/v0/auth/github/login",
 		"/v0/auth/github/callback",
 		"/webhooks/github",
+		"/webhooks/gitlab",
 	}
 	for _, p := range exempt {
 		if !csrfExemptPath(p) {

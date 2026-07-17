@@ -108,6 +108,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/onboarding/readiness", s.handleGetOnboardingReadiness)
 	mux.HandleFunc("POST /v0/auth/logout", s.handleLogout)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
+	mux.HandleFunc("POST /webhooks/gitlab", s.handleWebhookGitLab)
 }
 
 type healthResponse struct {

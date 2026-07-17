@@ -20,9 +20,9 @@ info:
     (post-Day 21), `/v0` and `/v1` coexist for one minor version cycle to
     let clients migrate, and `/v0` is then retired.
 
-    Webhook ingestion (`/webhooks/github`) is unversioned because GitHub
-    controls the request shape; the backend adapts as GitHub's webhook
-    schema evolves.
+    Webhook ingestion (`/webhooks/github`, `/webhooks/gitlab`) is
+    unversioned because the forge controls the request shape; the backend
+    adapts as the forge's webhook schema evolves.
 
   contact:
     name: Fishhawk
@@ -10681,6 +10681,66 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '400':
           description: Malformed event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /webhooks/gitlab:
+    post:
+      operationId: receiveGitlabWebhook
+      summary: GitLab webhook receiver
+      description: |
+        Inbound from a customer's GitLab project/group webhook. Accepts
+        merge request, note, issue, pipeline, and job events. Auth is the
+        verbatim `X-Gitlab-Token` secret (GitLab sends the configured
+        token, not an HMAC); deliveries dedup by `X-Gitlab-Event-UUID`
+        (namespaced into the shared delivery store). Issue-label and note
+        triggers route through the shared dispatcher; a merge/close drives
+        the review-stage state machine. Actual run creation from GitLab
+        triggers is the CI/dispatch phase's work (E45.8 / #1861). See
+        E45.6 (#1860).
+      tags: [webhooks]
+      security: []
+      parameters:
+        - name: X-Gitlab-Event
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-Gitlab-Event-UUID
+          in: header
+          required: true
+          schema: { type: string }
+        - name: X-Gitlab-Token
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '202':
+          description: Event accepted.
+        '401':
+          description: X-Gitlab-Token did not match the configured secret.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '400':
+          description: Malformed event or missing required header.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: Body exceeds the 10 MiB cap.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: GitLab webhook secret or delivery store unconfigured.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

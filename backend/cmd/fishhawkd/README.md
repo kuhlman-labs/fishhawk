@@ -3,6 +3,17 @@
 Fishhawk control-plane daemon binary: the backend HTTP API server plus its operational subcommands
 (`serve.go`, `migrate.go`, `token.go`, `audit_rehash.go`).
 
+## Webhook receiver secrets
+
+`FISHHAWKD_GITHUB_WEBHOOK_SECRET` (`--github-webhook-secret`) enables `POST /webhooks/github` (HMAC-verified);
+when unset the endpoint responds 503 and `serve.go` warns.
+
+`FISHHAWKD_GITLAB_WEBHOOK_SECRET` (`--gitlab-webhook-secret`) enables `POST /webhooks/gitlab` (E45.6 / #1860).
+GitLab sends this secret VERBATIM in `X-Gitlab-Token` (no HMAC); when unset the endpoint responds 503.
+Deliberately asymmetric with GitHub: an absent GitLab secret logs nothing (GitLab is optional — an absent-warn
+would nag every GitHub-only deployment). The shared webhook delivery store (`webhook_deliveries` on Postgres,
+else in-memory) is created when EITHER secret is set, so a GitLab-only deployment gets the store too.
+
 ## Work-management provider registration at startup (#1104)
 
 `workmgmt_wiring.go` — `registerWorkmgmtProviders(cfg.GitHub, jiraClient, gitlabClient)`, called from

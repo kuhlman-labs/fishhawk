@@ -191,3 +191,47 @@ func TestErrors_Distinct(t *testing.T) {
 		}
 	}
 }
+
+// TestParseEvent_LeavesForgeAndCredentialRefZero pins the GitHub-path
+// regression guard (E45.6 / #1860): the GitHub parser never sets the
+// two forge-neutral identity fields, so the GitHub webhook path is
+// byte-for-byte unchanged by the GitLab addition.
+func TestParseEvent_LeavesForgeAndCredentialRefZero(t *testing.T) {
+	ev, err := ParseEvent("issues", "deliv-1", []byte(`{"action":"labeled","installation":{"id":42}}`))
+	if err != nil {
+		t.Fatalf("ParseEvent: %v", err)
+	}
+	if ev.Forge != "" {
+		t.Errorf("Forge = %q, want empty (GitHub legacy)", ev.Forge)
+	}
+	if ev.CredentialRef != "" {
+		t.Errorf("CredentialRef = %q, want empty (GitHub uses InstallationID)", ev.CredentialRef)
+	}
+}
+
+// TestDeliveryStore_GitHubAndGitLabUUIDsDoNotCollide pins the dedup
+// namespacing: the same raw UUID arriving as a GitHub delivery and as a
+// GitLab delivery are distinct keys, because ParseGitLabEvent prefixes
+// "gitlab:" onto the delivery id. Without the prefix one forge's event
+// would silently dedup the other's.
+func TestDeliveryStore_GitHubAndGitLabUUIDsDoNotCollide(t *testing.T) {
+	const uuid = "11111111-2222-3333-4444-555555555555"
+	store := NewMemoryStore(0)
+
+	gh, err := ParseEvent("issues", uuid, []byte(`{"action":"labeled"}`))
+	if err != nil {
+		t.Fatalf("ParseEvent: %v", err)
+	}
+	gl, err := ParseGitLabEvent("Issue Hook", uuid, []byte(`{"object_kind":"issue"}`))
+	if err != nil {
+		t.Fatalf("ParseGitLabEvent: %v", err)
+	}
+	if err := store.Mark(gh.DeliveryID); err != nil {
+		t.Fatalf("mark github delivery: %v", err)
+	}
+	// The GitLab delivery shares the raw UUID but is namespaced, so it
+	// must be recorded as a fresh (non-duplicate) key.
+	if err := store.Mark(gl.DeliveryID); err != nil {
+		t.Fatalf("gitlab delivery collided with github: %v", err)
+	}
+}

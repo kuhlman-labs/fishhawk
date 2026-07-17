@@ -282,3 +282,22 @@ func TestStartCampaignItemRunRouteRegistered(t *testing.T) {
 		t.Errorf("body = %s, want campaign_repo_unconfigured (handleStartCampaignItemRun reached)", rec.Body.String())
 	}
 }
+
+// TestWebhookGitLabRouteRegistered guards the route table: POST
+// /webhooks/gitlab (E45.6 / #1860) must reach handleWebhookGitLab.
+// With no GitLabWebhookSecret configured the handler returns 503 — an
+// UNregistered route would instead 404 with the default not-found body,
+// so a 503 here proves the route is wired in handlers.go (not only
+// reachable via a direct handler call).
+func TestWebhookGitLabRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gitlab", strings.NewReader(`{}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("POST /webhooks/gitlab returned 404 — route not registered in handlers.go")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (routed but secret unconfigured)", rec.Code)
+	}
+}

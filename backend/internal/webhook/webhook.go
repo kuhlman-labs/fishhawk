@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // Errors callers may want to switch on.
@@ -165,9 +167,43 @@ type Event struct {
 	// Zero when the event isn't installation-scoped.
 	InstallationID int64
 
+	// Forge names the source forge for a parsed event. Empty is the
+	// GitHub legacy default (ParseEvent never sets it, so the GitHub
+	// path is byte-for-byte unchanged); ParseGitLabEvent sets
+	// "gitlab" (ForgeGitLab). The dispatcher routes on this field so a
+	// GitLab-sourced event never runs through the GitHub matcher.
+	Forge string
+
+	// CredentialRef is the forge-neutral installation_ref for the
+	// event (ADR-058, #2009). Empty for GitHub, where InstallationID
+	// carries the identity; for GitLab it is the "gitlab:<project_id>"
+	// scope ref forge/gitlab.projectIDFromScope parses back. When set,
+	// credentialScope() prefers forge.FromRef(CredentialRef) over the
+	// GitHub installation-id wrapper.
+	CredentialRef string
+
 	// RawBody is the original payload, kept for downstream handlers
 	// that need event-specific fields not surfaced here.
 	RawBody []byte
+}
+
+// ForgeGitLab is the Event.Forge value ParseGitLabEvent stamps. The
+// empty string is the GitHub legacy default (ParseEvent leaves it
+// zero), so callers switching on the source forge compare against
+// this constant rather than a bare literal.
+const ForgeGitLab = "gitlab"
+
+// credentialScope resolves the event's forge-neutral CredentialScope.
+// A non-empty CredentialRef (the GitLab path) wraps verbatim via
+// forge.FromRef; otherwise the GitHub installation-id convenience
+// wrapper is used (zero InstallationID → the zero scope). This keeps
+// the GitHub path byte-for-byte unchanged while letting a GitLab
+// "gitlab:<project_id>" ref flow through the shared dispatcher.
+func (ev Event) credentialScope() forge.CredentialScope {
+	if ev.CredentialRef != "" {
+		return forge.FromRef(ev.CredentialRef)
+	}
+	return forge.FromGitHubInstallationID(ev.InstallationID)
 }
 
 // minimal is the subset of fields we extract from every webhook

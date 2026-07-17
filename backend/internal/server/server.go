@@ -127,9 +127,17 @@ type Config struct {
 	// /webhooks/github endpoint (handler returns 503).
 	GitHubWebhookSecret []byte
 
-	// WebhookDeliveries dedups GitHub webhook deliveries by their
-	// X-GitHub-Delivery UUID across the GitHub retry window. nil
-	// disables the /webhooks/github endpoint.
+	// GitLabWebhookSecret is the secret token GitLab sends VERBATIM in
+	// X-Gitlab-Token (no HMAC). Empty disables the /webhooks/gitlab
+	// endpoint (handler returns 503). Deliberately independent of
+	// GitHubWebhookSecret — a deployment can run either receiver alone.
+	GitLabWebhookSecret []byte
+
+	// WebhookDeliveries dedups webhook deliveries by their per-delivery
+	// UUID across the forge retry window. Shared by BOTH receivers:
+	// GitHub keys by X-GitHub-Delivery, GitLab by "gitlab:<X-Gitlab-
+	// Event-UUID>" (namespaced so the two forges can't collide). nil
+	// disables both /webhooks/* endpoints.
 	WebhookDeliveries webhook.DeliveryStore
 
 	// WebhookDispatcher translates accepted webhook deliveries

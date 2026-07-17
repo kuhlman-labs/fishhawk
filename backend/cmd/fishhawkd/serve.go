@@ -360,6 +360,16 @@ func resolveGitLabForge(baseURL, token string) *forgegitlab.Forge {
 	return forgegitlab.New(baseURL, forgegitlab.NewStaticCredentialProvider(token))
 }
 
+// webhookStoreNeeded reports whether the shared webhook delivery store
+// must be created. The store is shared by the GitHub and GitLab
+// receivers (delivery ids are namespaced, E45.6 / #1860), so it is
+// needed when EITHER forge's webhook secret is set — a GitLab-only
+// deployment needs the store just as a GitHub-only one does. Previously
+// the store was gated on the GitHub secret alone.
+func webhookStoreNeeded(githubSecret, gitlabSecret string) bool {
+	return githubSecret != "" || gitlabSecret != ""
+}
+
 // loadConventionsOverride reads and parses the deployment-level
 // work-management conventions file at path (FISHHAWKD_WORKMGMT_CONVENTIONS),
 // returning a loader that serves the parsed conventions for every repo
@@ -499,6 +509,9 @@ func runServe(args []string, logSink io.Writer) int {
 	webhookSecret := fs.String("github-webhook-secret",
 		envOr("FISHHAWKD_GITHUB_WEBHOOK_SECRET", ""),
 		"shared secret GitHub uses to HMAC-sign webhook deliveries; when empty, /webhooks/github responds 503")
+	gitlabWebhookSecret := fs.String("gitlab-webhook-secret",
+		envOr("FISHHAWKD_GITLAB_WEBHOOK_SECRET", ""),
+		"secret token GitLab sends VERBATIM in X-Gitlab-Token (no HMAC); when empty, /webhooks/gitlab responds 503")
 	s3Bucket := fs.String("s3-bucket", envOr("FISHHAWKD_S3_BUCKET", ""),
 		"S3 bucket for trace bundle storage; when empty, /v0/runs/{id}/trace responds 503")
 	s3Region := fs.String("s3-region", envOr("FISHHAWKD_S3_REGION", "us-east-1"),
@@ -921,17 +934,28 @@ func runServe(args []string, logSink io.Writer) int {
 	var webhookEvictor *webhook.PostgresStore
 	if *webhookSecret != "" {
 		cfg.GitHubWebhookSecret = []byte(*webhookSecret)
+	} else {
+		logger.Warn("FISHHAWKD_GITHUB_WEBHOOK_SECRET not set; /webhooks/github will respond 503")
+	}
+	// GitLab is optional and deliberately asymmetric with GitHub: log
+	// when configured, but do NOT warn when absent — an absent-warn
+	// would nag every GitHub-only deployment.
+	if *gitlabWebhookSecret != "" {
+		cfg.GitLabWebhookSecret = []byte(*gitlabWebhookSecret)
+		logger.Info("gitlab webhook receiver configured")
+	}
+	// The delivery store is shared by both receivers, so create it when
+	// EITHER secret is set (previously gated on the GitHub secret alone).
+	if webhookStoreNeeded(*webhookSecret, *gitlabWebhookSecret) {
 		if pool != nil {
 			pgStore := webhook.NewPostgresStore(pool)
 			cfg.WebhookDeliveries = pgStore
 			webhookEvictor = pgStore
-			logger.Info("github webhook receiver configured (postgres dedup)")
+			logger.Info("webhook receiver configured (postgres dedup)")
 		} else {
 			cfg.WebhookDeliveries = webhook.NewMemoryStore(webhookRetention)
-			logger.Warn("github webhook receiver using memory dedup — NOT safe for multi-instance deploys; set FISHHAWKD_DATABASE_URL")
+			logger.Warn("webhook receiver using memory dedup — NOT safe for multi-instance deploys; set FISHHAWKD_DATABASE_URL")
 		}
-	} else {
-		logger.Warn("FISHHAWKD_GITHUB_WEBHOOK_SECRET not set; /webhooks/github will respond 503")
 	}
 
 	// GitHub App installation-token provider. Both ID and key file
