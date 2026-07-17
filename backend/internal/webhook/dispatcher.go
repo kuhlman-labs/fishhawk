@@ -1454,6 +1454,17 @@ func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m M
 // failure in the audit (E45.7 fix-up).
 var errCIRetryGitHubUnconfigured = errors.New("dispatcher: github client unconfigured; ci-retry workflow_dispatch skipped")
 
+// errCIRetryNoInstallation is the sibling of errCIRetryGitHubUnconfigured for
+// the second warn+skip edge: the github_actions backend also returns nil (no
+// workflow_dispatch fired) when InstallationID is 0 — e.g. a retry whose parent
+// carries runner_kind=github_actions but a nil InstallationID (a
+// trigger_source=cli parent defaults installationID to 0). Left unguarded, that
+// nil would transition a github_actions child to dispatched with no runner
+// behind it. Propagating this keeps the stage pending and records the failure,
+// restoring the pre-seam posture where the installation-0 dispatch failed at
+// the client and propagated a dispatchErr (E45.7 fix-up).
+var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-retry workflow_dispatch skipped")
+
 // handleCIFailureRetry creates a follow-up implement run when a
 // required CI check fails on a Fishhawk-managed PR (#279 / E16).
 // Best-effort throughout — every skip path emits a structured log
@@ -1652,18 +1663,24 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 			// Retry children carry no DecomposedFrom (ParentRunID threads the
 			// retry chain), so no parent_run_id input is added.
 		})
-		// An unwired GitHub client makes the github_actions backend warn+skip
-		// (TriggerStage returns nil) instead of firing a workflow_dispatch. Left
-		// unguarded, the nil below would transition this github_actions child to
-		// dispatched with no runner behind it — a silent in-flight stage. Surface
-		// it as a dispatchErr so the stage stays pending and the audit records the
-		// failure, restoring the pre-seam dispatchErr-propagation posture the plan
-		// described (minus the pre-seam nil-pointer panic). Practically unreachable
-		// — the webhook dispatcher only processes events from a wired GitHub
+		// The github_actions backend warn+skips (TriggerStage returns nil) in TWO
+		// cases instead of firing a workflow_dispatch: an unwired GitHub client
+		// (nil d.GitHub) AND a zero InstallationID (a retry whose parent carries
+		// runner_kind=github_actions but a nil InstallationID — e.g. a
+		// trigger_source=cli parent defaults installationID to 0). Left unguarded,
+		// either nil below would transition this github_actions child to dispatched
+		// with no runner behind it — a silent in-flight stage. Surface each as a
+		// dispatchErr so the stage stays pending and the audit records the failure,
+		// restoring the pre-seam dispatchErr-propagation posture the plan described
+		// (minus the pre-seam nil-pointer panic). Both are practically unreachable —
+		// the webhook dispatcher only processes events from a wired GitHub
 		// deployment — but a github_actions child must never be marked dispatched
 		// without an actual trigger (E45.7 fix-up).
 		if dispatchErr == nil && d.GitHub == nil {
 			dispatchErr = errCIRetryGitHubUnconfigured
+		}
+		if dispatchErr == nil && installationID == 0 {
+			dispatchErr = errCIRetryNoInstallation
 		}
 		if dispatchErr == nil {
 			if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,

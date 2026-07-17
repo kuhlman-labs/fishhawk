@@ -3008,6 +3008,79 @@ func TestHandle_CIFailureRetry_UnwiredGitHub_NoSilentDispatch(t *testing.T) {
 	}
 }
 
+// TestHandle_CIFailureRetry_NoInstallation_NoSilentDispatch pins the sibling
+// zero-installation edge of the runnerbackend seam (E45.7 fix-up). A wired
+// github_actions deployment whose retry PARENT carries a nil InstallationID
+// (dispatcher.go defaults installationID to 0 — e.g. a trigger_source=cli parent
+// with runner_kind=github_actions) still reaches TriggerStage, which warn+skips
+// a zero InstallationID (returns nil). Without the second dispatchErr guard the
+// child stage would land in dispatched with no runner behind it. The guard
+// surfaces a dispatch failure so the stage stays pending, the audit records
+// dispatch_failed, and the comment-back does not fire — even though d.GitHub is
+// wired.
+func TestHandle_CIFailureRetry_NoInstallation_NoSilentDispatch(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	// Parent inherits github_actions but carries NO installation_id, so the child
+	// routes through the wired github_actions backend with installationID 0.
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	parent.InstallationID = nil
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v (zero installation must not surface a transient error)", err)
+	}
+
+	// The child run + its implement stage are still created.
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (parent + child)", len(runs.created))
+	}
+	childRun := runs.created[1]
+
+	// The wired github_actions backend warn+skipped on installation 0 — no
+	// workflow_dispatch fired.
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0 (installation 0 skips)", gh.dispatchCalls)
+	}
+
+	// No stage was transitioned to dispatched — the child stays pending.
+	for _, tr := range runs.transitions {
+		if tr.To == run.StageStateDispatched {
+			t.Errorf("zero-installation github_actions dispatch must not transition a stage to dispatched; got %+v", tr)
+		}
+	}
+	for _, st := range runs.createdStages {
+		if st.RunID == childRun.ID && st.State != run.StageStatePending {
+			t.Errorf("child stage %s state = %q, want pending (dispatch failed)", st.Type, st.State)
+		}
+	}
+
+	// The dispatch audit records the failure (outcome=dispatch_failed).
+	var dispatched *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "ci_failure_retry_dispatched" {
+			dispatched = &au.appended[i]
+			break
+		}
+	}
+	if dispatched == nil {
+		t.Fatalf("expected ci_failure_retry_dispatched audit row; got %+v", au.appended)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(dispatched.Payload, &payload); err != nil {
+		t.Fatalf("audit payload unmarshal: %v", err)
+	}
+	if payload["outcome"] != "dispatch_failed" {
+		t.Errorf("audit outcome = %v, want dispatch_failed", payload["outcome"])
+	}
+
+	// Comment-back does NOT fire on a dispatch failure.
+	if len(notifier.retryCalls) != 0 {
+		t.Errorf("notifier.retryCalls = %d, want 0 (no comment-back on dispatch failure)", len(notifier.retryCalls))
+	}
+}
+
 func TestHandle_CIFailureRetry_CapHit_EmitsExhaustedAudit(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
 	d.Artifacts = &stubArtifacts{}
