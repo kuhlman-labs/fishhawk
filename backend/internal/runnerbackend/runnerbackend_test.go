@@ -77,7 +77,8 @@ func TestKindHostDispatched(t *testing.T) {
 	}{
 		{run.RunnerKindLocal, true, true},
 		{run.RunnerKindGitHubActions, false, true},
-		{"gitlab_ci", false, false},
+		{run.RunnerKindGitLabCI, false, false},
+		{"unknown_kind", false, false},
 		{"", false, false},
 	}
 	for _, c := range cases {
@@ -123,7 +124,7 @@ func TestResolver_Resolve(t *testing.T) {
 		},
 		{ // (c)
 			"resolved-unknown-kind -> trigger (fire-through)",
-			&run.Run{ID: uuid.New(), RunnerKind: "gitlab_ci", RunnerKindResolved: true},
+			&run.Run{ID: uuid.New(), RunnerKind: "circleci", RunnerKindResolved: true},
 			trigger,
 		},
 		{ // (d)
@@ -249,7 +250,7 @@ func TestResolver_ParkingWarnLogs(t *testing.T) {
 
 func TestGitHubActions_TriggerStage_NilClientSkips(t *testing.T) {
 	g := &GitHubActions{Client: nil}
-	if err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), InstallationID: 42}); err != nil {
+	if err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), Scope: forge.FromGitHubInstallationID(42)}); err != nil {
 		t.Fatalf("nil-client skip must return nil, got %v", err)
 	}
 }
@@ -257,7 +258,7 @@ func TestGitHubActions_TriggerStage_NilClientSkips(t *testing.T) {
 func TestGitHubActions_TriggerStage_ZeroInstallationSkips(t *testing.T) {
 	fc := &fakeDispatchClient{}
 	g := &GitHubActions{Client: fc}
-	if err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), Repo: "x/y", InstallationID: 0}); err != nil {
+	if err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), Repo: "x/y"}); err != nil {
 		t.Fatalf("zero-installation skip must return nil, got %v", err)
 	}
 	if len(fc.calls) != 0 {
@@ -268,7 +269,7 @@ func TestGitHubActions_TriggerStage_ZeroInstallationSkips(t *testing.T) {
 func TestGitHubActions_TriggerStage_MalformedRepoErrors(t *testing.T) {
 	fc := &fakeDispatchClient{}
 	g := &GitHubActions{Client: fc}
-	err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), Repo: "no-slash", InstallationID: 42})
+	err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), Repo: "no-slash", Scope: forge.FromGitHubInstallationID(42)})
 	if err == nil {
 		t.Fatal("malformed repo must error")
 	}
@@ -283,7 +284,7 @@ func TestGitHubActions_TriggerStage_HappyPath(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	err := g.TriggerStage(context.Background(), TriggerParams{
 		RunID: runID, StageID: stageID, WorkflowID: "feature_change",
-		StageExecutorRef: "claude-code", Repo: "kuhlman-labs/fishhawk", InstallationID: 42,
+		StageExecutorRef: "claude-code", Repo: "kuhlman-labs/fishhawk", Scope: forge.FromGitHubInstallationID(42),
 	})
 	if err != nil {
 		t.Fatalf("TriggerStage: %v", err)
@@ -327,7 +328,7 @@ func TestGitHubActions_TriggerStage_CustomRefAndFile(t *testing.T) {
 	fc := &fakeDispatchClient{}
 	g := &GitHubActions{Client: fc, DefaultRef: "release", ActionsWorkflowFile: "custom.yml"}
 	if err := g.TriggerStage(context.Background(), TriggerParams{
-		RunID: uuid.New(), StageID: uuid.New(), Repo: "x/y", InstallationID: 7,
+		RunID: uuid.New(), StageID: uuid.New(), Repo: "x/y", Scope: forge.FromGitHubInstallationID(7),
 	}); err != nil {
 		t.Fatalf("TriggerStage: %v", err)
 	}
@@ -342,7 +343,7 @@ func TestGitHubActions_TriggerStage_DecomposedChild_AddsParentRunID(t *testing.T
 	parent := uuid.New()
 	err := g.TriggerStage(context.Background(), TriggerParams{
 		RunID: uuid.New(), StageID: uuid.New(), WorkflowID: "feature_change",
-		StageExecutorRef: "claude-code", Repo: "x/y", InstallationID: 42,
+		StageExecutorRef: "claude-code", Repo: "x/y", Scope: forge.FromGitHubInstallationID(42),
 		DecomposedFrom: uuidPtr(parent), SliceIndex: intPtr(2),
 	})
 	if err != nil {
@@ -357,7 +358,7 @@ func TestGitHubActions_TriggerStage_PropagatesDispatchError(t *testing.T) {
 	sentinel := errors.New("boom")
 	fc := &fakeDispatchClient{err: sentinel}
 	g := &GitHubActions{Client: fc}
-	err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), Repo: "x/y", InstallationID: 42})
+	err := g.TriggerStage(context.Background(), TriggerParams{RunID: uuid.New(), Repo: "x/y", Scope: forge.FromGitHubInstallationID(42)})
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want sentinel propagated", err)
 	}

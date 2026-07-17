@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -809,5 +810,190 @@ func TestParseGitLabMRIID(t *testing.T) {
 		if !ok || got != want {
 			t.Errorf("parseGitLabMRIID(%q) = %d,%v want %d", in, got, ok, want)
 		}
+	}
+}
+
+// --- #1861: GitLab pipeline/job CI-failure retry ---
+
+// ciRetryWorkflowSpec is a 2-stage feature_change (plan + implement) with an
+// on_ci_failure block so the dispatcher's resolveRetryPolicy picks a cap and
+// FilterOutPlanStages leaves a non-plan stage to dispatch.
+const ciRetryWorkflowSpec = `version: "0.3"
+roles:
+  tech_lead:
+    members: ["@kuhlman-labs"]
+workflows:
+  feature_change:
+    description: Test workflow with retries
+    on_ci_failure:
+      max_retries: 1
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+            sla: 4_business_hours
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// ciRetryDispatchRuns is the dispatcher's Runs for the GitLab CI-retry tests:
+// it records the follow-up run + stages HandleGitLabCIFailure creates.
+type ciRetryDispatchRuns struct {
+	run.Repository
+	mu          sync.Mutex
+	createdRuns []*run.Run
+	stages      []*run.Stage
+}
+
+func (r *ciRetryDispatchRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rn := &run.Run{
+		ID: uuid.New(), Repo: p.Repo, WorkflowID: p.WorkflowID, WorkflowSHA: p.WorkflowSHA,
+		TriggerSource: p.TriggerSource, TriggerRef: p.TriggerRef, ParentRunID: p.ParentRunID,
+		WorkflowSpec: p.WorkflowSpec, RetryAttempt: p.RetryAttempt, RunnerKind: p.RunnerKind,
+		State: run.StatePending,
+	}
+	r.createdRuns = append(r.createdRuns, rn)
+	return rn, nil
+}
+
+func (r *ciRetryDispatchRuns) CreateStage(_ context.Context, p run.CreateStageParams) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st := &run.Stage{ID: uuid.New(), RunID: p.RunID, Sequence: p.Sequence, Type: p.Type,
+		ExecutorKind: p.ExecutorKind, ExecutorRef: p.ExecutorRef, State: run.StageStatePending}
+	r.stages = append(r.stages, st)
+	return st, nil
+}
+
+func (r *ciRetryDispatchRuns) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, _ *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, st := range r.stages {
+		if st.ID == id {
+			st.State = to
+			return st, nil
+		}
+	}
+	return nil, run.ErrNotFound
+}
+
+// ciRetryServer wires a server whose RunRepo returns parentRun and whose
+// WebhookDispatcher records the retry run it creates.
+func ciRetryServer(t *testing.T, parentRun *run.Run, listErr error) (*Server, *ciRetryDispatchRuns) {
+	t.Helper()
+	dispRuns := &ciRetryDispatchRuns{}
+	disp := &webhook.Dispatcher{Runs: dispRuns, Logger: slog.Default()}
+	rr := &prEventsRunRepo{listErr: listErr}
+	if parentRun != nil {
+		rr.listResult = []*run.Run{parentRun}
+	}
+	s, _ := newGitLabWebhookServer(t, gitlabServerOpts{runRepo: rr, dispatcher: disp})
+	return s, dispRuns
+}
+
+func gitLabCIParentRun() *run.Run {
+	ref := "issue:7"
+	return &run.Run{
+		ID: uuid.New(), Repo: "group/proj", WorkflowID: "feature_change",
+		WorkflowSHA: "abc", TriggerRef: &ref, WorkflowSpec: []byte(ciRetryWorkflowSpec),
+		RetryAttempt: 0, RunnerKind: run.RunnerKindGitLabCI, State: run.StateRunning,
+	}
+}
+
+func gitLabPipelineBody(status string) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"object_kind":       "pipeline",
+		"object_attributes": map[string]any{"id": 1, "status": status, "ref": "main", "sha": "deadbeef"},
+		"project":           map[string]any{"id": 555, "path_with_namespace": "group/proj"},
+	})
+	return body
+}
+
+func gitLabJobBody(status string) []byte {
+	body, _ := json.Marshal(map[string]any{
+		"object_kind":  "build",
+		"ref":          "main",
+		"sha":          "deadbeef",
+		"build_status": status,
+		"project_id":   555,
+		"project":      map[string]any{"id": 555, "path_with_namespace": "group/proj"},
+	})
+	return body
+}
+
+func TestHandleGitLabPipeline_FailedDrivesRetry(t *testing.T) {
+	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
+	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed")); err != nil {
+		t.Fatalf("handleGitLabPipeline err = %v, want nil", err)
+	}
+	if len(dispRuns.createdRuns) != 1 {
+		t.Fatalf("retry runs created = %d, want 1", len(dispRuns.createdRuns))
+	}
+	child := dispRuns.createdRuns[0]
+	if child.RunnerKind != run.RunnerKindGitLabCI {
+		t.Errorf("retry runner_kind = %q, want gitlab_ci", child.RunnerKind)
+	}
+	if child.RetryAttempt != 1 {
+		t.Errorf("retry attempt = %d, want 1", child.RetryAttempt)
+	}
+}
+
+func TestHandleGitLabJob_FailedDrivesRetry(t *testing.T) {
+	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
+	if err := s.handleGitLabJob(context.Background(), gitLabJobBody("failed")); err != nil {
+		t.Fatalf("handleGitLabJob err = %v, want nil", err)
+	}
+	if len(dispRuns.createdRuns) != 1 {
+		t.Fatalf("job retry runs created = %d, want 1", len(dispRuns.createdRuns))
+	}
+}
+
+func TestHandleGitLabPipeline_NonFailedStatusNoRetry(t *testing.T) {
+	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
+	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("success")); err != nil {
+		t.Fatalf("handleGitLabPipeline err = %v, want nil", err)
+	}
+	if len(dispRuns.createdRuns) != 0 {
+		t.Errorf("non-failed pipeline must drive no retry, got %d", len(dispRuns.createdRuns))
+	}
+}
+
+func TestHandleGitLabJob_NonFailedStatusNoRetry(t *testing.T) {
+	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
+	if err := s.handleGitLabJob(context.Background(), gitLabJobBody("running")); err != nil {
+		t.Fatalf("handleGitLabJob err = %v, want nil", err)
+	}
+	if len(dispRuns.createdRuns) != 0 {
+		t.Errorf("non-failed job must drive no retry, got %d", len(dispRuns.createdRuns))
+	}
+}
+
+func TestHandleGitLabPipeline_TransientRunLookupPropagates(t *testing.T) {
+	s, _ := ciRetryServer(t, nil, errors.New("db blip"))
+	err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed"))
+	if err == nil {
+		t.Fatal("transient RunRepo lookup failure must propagate (5xx), got nil")
+	}
+}
+
+func TestHandleGitLabPipeline_NoMatchIsBestEffort(t *testing.T) {
+	s, dispRuns := ciRetryServer(t, nil, nil) // empty listResult
+	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed")); err != nil {
+		t.Fatalf("no-match must be best-effort nil, got %v", err)
+	}
+	if len(dispRuns.createdRuns) != 0 {
+		t.Errorf("no matching run must drive no retry, got %d", len(dispRuns.createdRuns))
 	}
 }

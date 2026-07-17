@@ -887,3 +887,124 @@ func TestGetProjectByID_ValidatesArgs(t *testing.T) {
 		t.Error("want error for missing project id")
 	}
 }
+
+// --- CreatePipeline ---------------------------------------------------------
+
+func TestCreatePipeline_RequestShapeAndVariables(t *testing.T) {
+	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+		if rec.method != http.MethodPost {
+			t.Errorf("method = %s, want POST", rec.method)
+		}
+		if rec.path != "/api/v4/projects/42/pipeline" {
+			t.Errorf("path = %s", rec.path)
+		}
+		assertPrivateToken(t, rec.header)
+		var got struct {
+			Ref       string              `json:"ref"`
+			Variables []map[string]string `json:"variables"`
+		}
+		if err := json.Unmarshal(rec.body, &got); err != nil {
+			t.Fatalf("unmarshal body: %v (%s)", err, rec.body)
+		}
+		if got.Ref != "fishhawk/run-abcd1234" {
+			t.Errorf("ref = %q, want the run branch", got.Ref)
+		}
+		// Variables are sorted by key: run_id, stage, stage_id, workflow_id.
+		want := map[string]string{
+			"run_id":      "r1",
+			"stage_id":    "s1",
+			"workflow_id": "feature_change",
+			"stage":       "claude-code",
+		}
+		if len(got.Variables) != len(want) {
+			t.Fatalf("variables = %+v, want %d entries", got.Variables, len(want))
+		}
+		for _, v := range got.Variables {
+			if want[v["key"]] != v["value"] {
+				t.Errorf("variable %q = %q, want %q", v["key"], v["value"], want[v["key"]])
+			}
+		}
+		return jsonResponse(http.StatusCreated, `{"id":99,"status":"created"}`), nil
+	})
+	err := c.CreatePipeline(context.Background(), 42, "fishhawk/run-abcd1234", map[string]string{
+		"run_id":      "r1",
+		"stage_id":    "s1",
+		"workflow_id": "feature_change",
+		"stage":       "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreatePipeline: %v", err)
+	}
+}
+
+func TestCreatePipeline_APIError(t *testing.T) {
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusForbidden, `{"message":"403 Forbidden"}`), nil
+	})
+	err := c.CreatePipeline(context.Background(), 42, "main", nil)
+	assertAPIError(t, err, http.StatusForbidden)
+}
+
+func TestCreatePipeline_ValidatesArgs(t *testing.T) {
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		t.Fatal("transport called despite invalid args")
+		return nil, nil
+	})
+	if err := c.CreatePipeline(context.Background(), 0, "main", nil); err == nil {
+		t.Error("want error for missing project id")
+	}
+	if err := c.CreatePipeline(context.Background(), 42, " ", nil); err == nil {
+		t.Error("want error for empty ref")
+	}
+}
+
+// --- GetRawFile -------------------------------------------------------------
+
+func TestGetRawFile_RequestShapeAndResult(t *testing.T) {
+	const specBody = "version: \"0.7\"\nworkflows: {}\n"
+	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+		if rec.method != http.MethodGet {
+			t.Errorf("method = %s, want GET", rec.method)
+		}
+		// The dotted, slash-bearing path is percent-encoded into one segment.
+		if want := "/api/v4/projects/7/repository/files/.fishhawk%2Fworkflows.yaml/raw"; rec.escapedPath != want {
+			t.Errorf("escaped path = %s, want %s", rec.escapedPath, want)
+		}
+		if q := mustQuery(t, rec.rawQuery); q.Get("ref") != "main" {
+			t.Errorf("ref = %q, want main", q.Get("ref"))
+		}
+		assertPrivateToken(t, rec.header)
+		return jsonResponse(http.StatusOK, specBody), nil
+	})
+	raw, err := c.GetRawFile(context.Background(), 7, ".fishhawk/workflows.yaml", "main")
+	if err != nil {
+		t.Fatalf("GetRawFile: %v", err)
+	}
+	if string(raw) != specBody {
+		t.Errorf("raw = %q, want %q", raw, specBody)
+	}
+}
+
+func TestGetRawFile_NotFoundIsAPIError(t *testing.T) {
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusNotFound, `{"message":"404 File Not Found"}`), nil
+	})
+	_, err := c.GetRawFile(context.Background(), 7, ".fishhawk/workflows.yaml", "main")
+	assertAPIError(t, err, http.StatusNotFound)
+}
+
+func TestGetRawFile_ValidatesArgs(t *testing.T) {
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		t.Fatal("transport called despite invalid args")
+		return nil, nil
+	})
+	if _, err := c.GetRawFile(context.Background(), 0, "f", "main"); err == nil {
+		t.Error("want error for missing project id")
+	}
+	if _, err := c.GetRawFile(context.Background(), 7, " ", "main"); err == nil {
+		t.Error("want error for empty path")
+	}
+	if _, err := c.GetRawFile(context.Background(), 7, "f", " "); err == nil {
+		t.Error("want error for empty ref")
+	}
+}

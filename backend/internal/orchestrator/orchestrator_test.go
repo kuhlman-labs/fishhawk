@@ -3973,3 +3973,56 @@ func TestAdvance_ImplementStage_NoAcceptanceEmit(t *testing.T) {
 		}
 	}
 }
+
+// --- #1861: gitlab_ci dispatch ref/scope + backend registration ---
+
+func TestTriggerParams_GitLabCIRef_TopLevel(t *testing.T) {
+	o := &Orchestrator{}
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", Repo: "group/proj", RunnerKind: run.RunnerKindGitLabCI}
+	st := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+	p := o.triggerParams(r, st)
+	if want := runBranchPrefix(r.ID); p.Ref != want {
+		t.Errorf("Ref = %q, want top-level run branch %q", p.Ref, want)
+	}
+}
+
+func TestTriggerParams_GitLabCIRef_DecomposedChild(t *testing.T) {
+	o := &Orchestrator{}
+	parent := uuid.New()
+	idx := 3
+	r := &run.Run{
+		ID: uuid.New(), WorkflowID: "feature_change", Repo: "group/proj",
+		RunnerKind: run.RunnerKindGitLabCI, DecomposedFrom: &parent, SliceIndex: &idx,
+	}
+	st := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+	p := o.triggerParams(r, st)
+	if want := runBranchPrefix(parent) + "/slice-3"; p.Ref != want {
+		t.Errorf("Ref = %q, want decomposed-child slice branch %q", p.Ref, want)
+	}
+}
+
+func TestTriggerParams_GitHubActions_RefEmptyScopeSet(t *testing.T) {
+	o := &Orchestrator{}
+	inst := int64(42)
+	r := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", Repo: "o/n", RunnerKind: run.RunnerKindGitHubActions, InstallationID: &inst}
+	st := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+	p := o.triggerParams(r, st)
+	if p.Ref != "" {
+		t.Errorf("github_actions Ref = %q, want empty (falls back to DefaultRef in the backend)", p.Ref)
+	}
+	if p.Scope != forge.FromGitHubInstallationID(42) {
+		t.Errorf("Scope = %v, want scope for installation 42", p.Scope)
+	}
+}
+
+func TestBackends_RegistersGitLabCI(t *testing.T) {
+	o := &Orchestrator{}
+	rr := o.backends()
+	b, ok := rr.Registry.Backend(run.RunnerKindGitLabCI)
+	if !ok {
+		t.Fatal("gitlab_ci backend not registered")
+	}
+	if b.Kind() != run.RunnerKindGitLabCI || b.HostDispatched() {
+		t.Errorf("gitlab_ci backend kind=%q hostDispatched=%v, want gitlab_ci/false", b.Kind(), b.HostDispatched())
+	}
+}

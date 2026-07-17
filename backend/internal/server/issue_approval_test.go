@@ -1207,3 +1207,36 @@ type orchestratorRepoFailingList struct {
 func (r *orchestratorRepoFailingList) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, r.listErr
 }
+
+// --- #1861: forgeMatchesRun derives a run's forge from runner_kind ---
+
+func TestForgeMatchesRun_ForgeFromRunnerKind(t *testing.T) {
+	gitlabRun := &run.Run{RunnerKind: run.RunnerKindGitLabCI}
+	githubRun := &run.Run{RunnerKind: run.RunnerKindGitHubActions}
+	localRun := &run.Run{RunnerKind: run.RunnerKindLocal}
+
+	cases := []struct {
+		name          string
+		approvalForge string
+		r             *run.Run
+		want          bool
+	}{
+		{"gitlab approval matches gitlab_ci run", webhook.ForgeGitLab, gitlabRun, true},
+		{"github approval matches github_actions run", "github", githubRun, true},
+		{"empty (legacy github) approval matches github_actions run", "", githubRun, true},
+		{"github approval matches local run (GitHub-sourced)", "github", localRun, true},
+		// Cross-forge collisions: repo string + issue number may collide, but
+		// the forge no longer does.
+		{"gitlab approval rejects a github_actions run", webhook.ForgeGitLab, githubRun, false},
+		{"github approval rejects a gitlab_ci run", "github", gitlabRun, false},
+		{"empty (github) approval rejects a gitlab_ci run", "", gitlabRun, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := forgeMatchesRun(c.approvalForge, c.r); got != c.want {
+				t.Errorf("forgeMatchesRun(%q, runner_kind=%q) = %v, want %v",
+					c.approvalForge, c.r.RunnerKind, got, c.want)
+			}
+		})
+	}
+}

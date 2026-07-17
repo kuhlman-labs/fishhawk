@@ -292,14 +292,25 @@ func normalizeForge(f string) string {
 }
 
 // forgeMatchesRun reports whether an approval sourced from
-// approvalForge may act on run r. Runs carry no forge column yet
-// (#1861 wires GitLab run creation), so every existing run is
-// GitHub-sourced: the helper matches only when the approval's
-// normalized forge is GitHub. This is the #1861 seam — once runs
-// gain a forge discriminator, the fixed "github" here becomes
-// r's own forge.
-func forgeMatchesRun(approvalForge string, _ *run.Run) bool {
-	return normalizeForge(approvalForge) == "github"
+// approvalForge may act on run r. With GitLab run creation live (#1861),
+// a run's source forge is derived from its runner_kind: a gitlab_ci run
+// is GitLab-sourced, a github_actions/local run is GitHub-sourced. A
+// GitLab-sourced approval whose repo string + issue number collide with a
+// GitHub run (or vice versa) no longer matches — closing the cross-forge
+// approval-identity conflation this seam was reserved for (E45.19 / #2036).
+func forgeMatchesRun(approvalForge string, r *run.Run) bool {
+	return normalizeForge(approvalForge) == runForge(r)
+}
+
+// runForge derives a run's canonical source forge from its runner_kind: a
+// gitlab_ci run is GitLab-sourced ("gitlab"); every other kind
+// (github_actions, local, legacy) is GitHub-sourced ("github"). A nil run
+// defaults to GitHub — the conservative legacy posture.
+func runForge(r *run.Run) string {
+	if r != nil && r.RunnerKind == run.RunnerKindGitLabCI {
+		return webhook.ForgeGitLab
+	}
+	return "github"
 }
 
 // namespacedApproverSubject renders the approver identity used for

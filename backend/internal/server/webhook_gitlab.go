@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -122,6 +123,29 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 			s.unmarkGitLabDelivery(r.Context(), ev.DeliveryID)
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"gitlab merge_request lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
+	// A failed GitLab pipeline / job drives the CI-failure auto-retry
+	// (E45.8 / #1861 — parity with the GitHub check_run/workflow_run path).
+	// Consumed server-side like the MR lifecycle: the dispatcher's matcher
+	// skips pipeline/build, and these handlers find the parent run and route
+	// the retry through the dispatcher. A transient RunRepo lookup failure
+	// propagates as a 5xx so GitLab redelivers rather than dropping the retry.
+	if ev.Type == "pipeline" {
+		if err := s.handleGitLabPipeline(r.Context(), ev.RawBody); err != nil {
+			s.unmarkGitLabDelivery(r.Context(), ev.DeliveryID)
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"gitlab pipeline lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	if ev.Type == "build" {
+		if err := s.handleGitLabJob(r.Context(), ev.RawBody); err != nil {
+			s.unmarkGitLabDelivery(r.Context(), ev.DeliveryID)
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"gitlab job lookup failed", map[string]any{"error": err.Error()})
 			return
 		}
 	}
@@ -358,6 +382,151 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 		slog.String("project", projectPath),
 		slog.Int("iid", iid),
 		slog.String("mr_url", mrURL))
+	return nil, nil
+}
+
+// gitLabPipelinePayload is the subset of a GitLab Pipeline Hook payload the
+// CI-failure-retry consumer reads
+// (https://docs.gitlab.com/ee/user/project/integrations/webhook_events/#pipeline-events).
+// object_attributes.status is the pipeline lifecycle word (pending | running |
+// success | failed | canceled | skipped); only "failed" drives a retry.
+type gitLabPipelinePayload struct {
+	Project struct {
+		ID                int    `json:"id"`
+		PathWithNamespace string `json:"path_with_namespace"`
+	} `json:"project"`
+	ObjectAttributes struct {
+		ID     int    `json:"id"`
+		Status string `json:"status"`
+		Ref    string `json:"ref"`
+		SHA    string `json:"sha"`
+	} `json:"object_attributes"`
+}
+
+// gitLabJobPayload is the subset of a GitLab Job Hook ("build") payload the
+// CI-failure-retry consumer reads
+// (https://docs.gitlab.com/ee/user/project/integrations/webhook_events/#job-events).
+// A Job Hook is flatter than a Pipeline Hook: the status is build_status and
+// the project id is project_id at the top level. build_status "failed" drives
+// a retry — the per-JOB signal condition 3 pins independently of the
+// aggregate pipeline event.
+type gitLabJobPayload struct {
+	Ref         string `json:"ref"`
+	SHA         string `json:"sha"`
+	BuildStatus string `json:"build_status"`
+	ProjectID   int    `json:"project_id"`
+	Repository  struct {
+		Name string `json:"name"`
+	} `json:"repository"`
+	Project struct {
+		ID                int    `json:"id"`
+		PathWithNamespace string `json:"path_with_namespace"`
+	} `json:"project"`
+}
+
+// handleGitLabPipeline drives the CI-failure auto-retry on a FAILED GitLab
+// pipeline event (E45.8 / #1861). Best-effort EXCEPT for a transient
+// RunRepo lookup failure, which propagates so the receiver answers 5xx and
+// GitLab redelivers (mirroring handleGitLabMergeRequest). A parse failure, a
+// non-failed status, or a genuine no-match log and return nil (202).
+func (s *Server) handleGitLabPipeline(ctx context.Context, raw []byte) error {
+	if s.cfg.RunRepo == nil || s.cfg.WebhookDispatcher == nil {
+		return nil
+	}
+	var p gitLabPipelinePayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "gitlab pipeline: parse failed",
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if p.ObjectAttributes.Status != "failed" {
+		return nil
+	}
+	return s.driveGitLabCIRetry(ctx, p.Project.PathWithNamespace, p.Project.ID, p.ObjectAttributes.SHA)
+}
+
+// handleGitLabJob drives the CI-failure auto-retry on a FAILED GitLab job
+// ("build") event — the per-job signal (condition 3), independent of the
+// aggregate pipeline event. Same best-effort / 5xx-on-transient contract as
+// handleGitLabPipeline.
+func (s *Server) handleGitLabJob(ctx context.Context, raw []byte) error {
+	if s.cfg.RunRepo == nil || s.cfg.WebhookDispatcher == nil {
+		return nil
+	}
+	var p gitLabJobPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "gitlab job: parse failed",
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if p.BuildStatus != "failed" {
+		return nil
+	}
+	// A Job Hook carries project_id at the top level; project.id / project.path
+	// are populated on newer instances. Prefer the nested path for the run
+	// lookup, prefer the explicit project_id for the scope.
+	projectID := p.ProjectID
+	if projectID == 0 {
+		projectID = p.Project.ID
+	}
+	return s.driveGitLabCIRetry(ctx, p.Project.PathWithNamespace, projectID, p.SHA)
+}
+
+// driveGitLabCIRetry finds the gitlab_ci run backing a failed pipeline/job by
+// project path (+ head SHA) and routes the retry through the dispatcher. The
+// run lookup propagates its transient error so the caller returns 5xx; a
+// no-match logs and returns nil. The credential scope is reconstructed from
+// the project id ("gitlab:<project_id>") because a gitlab_ci run does not yet
+// persist its scope on the run row.
+func (s *Server) driveGitLabCIRetry(ctx context.Context, projectPath string, projectID int, sha string) error {
+	target, err := s.findGitLabRunForCIRetry(ctx, projectPath)
+	if err != nil {
+		return err
+	}
+	if target == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gitlab ci_failure_retry: no run matched; not retrying",
+			slog.String("project", projectPath),
+			slog.String("sha", sha))
+		return nil
+	}
+	ref := "main"
+	scope := forge.FromRef("gitlab:" + strconv.Itoa(projectID))
+	return s.cfg.WebhookDispatcher.HandleGitLabCIFailure(ctx, target, scope, ref)
+}
+
+// findGitLabRunForCIRetry resolves the Fishhawk gitlab_ci run backing a failed
+// pipeline/job: the most-recent non-terminal gitlab_ci run on the project.
+// Scoped to the project (Repo == path_with_namespace). Returns (nil, nil) on a
+// genuine no-match and (nil, err) on a transient RunRepo error so the caller
+// propagates it into a 5xx (E45.21 parity). The commit SHA is not yet used to
+// disambiguate — a gitlab_ci run does not persist its head SHA on the row, so
+// the most-recent non-terminal run is the best available anchor (the durable
+// project+SHA lookup is the ADR-057 installation_ref follow-up).
+func (s *Server) findGitLabRunForCIRetry(ctx context.Context, projectPath string) (*run.Run, error) {
+	if projectPath == "" {
+		return nil, nil
+	}
+	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		Repo:  projectPath,
+		Limit: 50,
+	})
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"gitlab ci_failure_retry: run lookup failed",
+			slog.String("project", projectPath),
+			slog.String("error", err.Error()))
+		return nil, err
+	}
+	for _, r := range runs {
+		if r.RunnerKind != run.RunnerKindGitLabCI {
+			continue
+		}
+		if r.State.IsTerminal() {
+			continue
+		}
+		return r, nil
+	}
 	return nil, nil
 }
 

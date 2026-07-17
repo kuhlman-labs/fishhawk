@@ -21,8 +21,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -667,6 +669,94 @@ func (c *Client) GetCommit(ctx context.Context, projectID int, sha string) (*Com
 		return nil, fmt.Errorf("gitlabclient: decode get commit: %w", err)
 	}
 	return &out, nil
+}
+
+// CreatePipeline creates a new pipeline for a project at ref, passing the
+// given CI/CD variables.
+//
+//	POST /api/v4/projects/:id/pipeline
+//
+// ref selects BOTH which .gitlab-ci.yml is evaluated AND which commit the
+// pipeline (and its statuses) run against — the run branch under the ADR-035
+// sole-writer lineage (https://docs.gitlab.com/ee/api/pipelines.html#create-a-new-pipeline).
+// Variables ride as the API's `variables` array of {key,value} objects. The
+// dispatch is fire-and-forget from the backend's view: the created pipeline id
+// is not read back (the runner reports its own progress), so this returns only
+// an error.
+func (c *Client) CreatePipeline(ctx context.Context, projectID int, ref string, variables map[string]string) error {
+	if projectID <= 0 {
+		return fmt.Errorf("gitlabclient: project id required")
+	}
+	if strings.TrimSpace(ref) == "" {
+		return fmt.Errorf("gitlabclient: pipeline ref required")
+	}
+
+	body := map[string]any{"ref": ref}
+	if len(variables) > 0 {
+		// Sort keys so the request body is deterministic (stable tests, stable
+		// logs). GitLab ignores variable order.
+		keys := make([]string, 0, len(variables))
+		for k := range variables {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		vars := make([]map[string]string, 0, len(variables))
+		for _, k := range keys {
+			vars = append(vars, map[string]string{"key": k, "value": variables[k]})
+		}
+		body["variables"] = vars
+	}
+
+	resp, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/api/v4/projects/%d/pipeline", projectID), body)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return errForStatus("create pipeline", resp)
+}
+
+// GetRawFile reads the raw bytes of a repository file at ref.
+//
+//	GET /api/v4/projects/:id/repository/files/:path/raw?ref=
+//
+// The file path is URL-encoded into one path segment (so the slashes in
+// ".fishhawk/workflows.yaml" become %2F as GitLab requires,
+// https://docs.gitlab.com/ee/api/repository_files.html#get-raw-file-from-repository).
+// This is the GitLab-side workflow-spec read for run creation from a GitLab
+// trigger (#1861): forge.Forge has no spec-read method, so the dispatcher
+// reads .fishhawk/workflows.yaml through this getter keyed on the
+// gitlab:<project_id> scope. A missing file is a 404 *APIError the caller can
+// distinguish via StatusCode.
+func (c *Client) GetRawFile(ctx context.Context, projectID int, filePath, ref string) ([]byte, error) {
+	if projectID <= 0 {
+		return nil, fmt.Errorf("gitlabclient: project id required")
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return nil, fmt.Errorf("gitlabclient: file path required")
+	}
+	if strings.TrimSpace(ref) == "" {
+		return nil, fmt.Errorf("gitlabclient: ref required")
+	}
+
+	q := url.Values{}
+	q.Set("ref", ref)
+	path := fmt.Sprintf("/api/v4/projects/%d/repository/files/%s/raw?%s",
+		projectID, url.PathEscape(filePath), q.Encode())
+
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := errForStatus("get raw file", resp); err != nil {
+		return nil, err
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("gitlabclient: read raw file: %w", err)
+	}
+	return raw, nil
 }
 
 // GetProjectByID reads a project by its numeric id (as opposed to GetProject,

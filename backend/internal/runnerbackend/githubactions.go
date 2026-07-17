@@ -38,10 +38,15 @@ func (*GitHubActions) Kind() string { return "github_actions" }
 func (*GitHubActions) HostDispatched() bool { return false }
 
 // TriggerStage fires the workflow_dispatch. It reproduces fireDispatch
-// byte-for-byte: warn+nil skip when the client is unwired or InstallationID is
-// 0, malformed-repo error, ref/actions-file defaults, the decomposed-child
-// slice provenance log, and the run_id/stage_id/workflow_id/stage inputs plus
-// parent_run_id iff the run is a decomposed child (#1227).
+// byte-for-byte: warn+nil skip when the client is unwired or the credential
+// scope is zero, malformed-repo error, ref/actions-file defaults, the
+// decomposed-child slice provenance log, and the run_id/stage_id/workflow_id/
+// stage inputs plus parent_run_id iff the run is a decomposed child (#1227).
+//
+// #1861: the workflow_dispatch ref is p.Ref (the run branch resolved once by
+// the caller), falling back to DefaultRef then "main" when p.Ref is empty so
+// the field stays forge-neutral — GitLab requires the branch ref, GitHub keeps
+// its legacy default.
 func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error {
 	if g.Client == nil {
 		g.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping workflow_dispatch",
@@ -49,8 +54,8 @@ func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error
 		)
 		return nil
 	}
-	if p.InstallationID == 0 {
-		g.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation_id; skipping workflow_dispatch",
+	if p.Scope.IsZero() {
+		g.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation scope; skipping workflow_dispatch",
 			slog.String("run_id", p.RunID.String()),
 		)
 		return nil
@@ -61,7 +66,10 @@ func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error
 		return fmt.Errorf("orchestrator: parse repo %q: %w", p.Repo, err)
 	}
 
-	ref := g.DefaultRef
+	ref := p.Ref
+	if ref == "" {
+		ref = g.DefaultRef
+	}
 	if ref == "" {
 		ref = "main"
 	}
@@ -95,7 +103,7 @@ func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error
 	if p.DecomposedFrom != nil {
 		inputs["parent_run_id"] = p.DecomposedFrom.String()
 	}
-	return g.Client.DispatchWorkflow(ctx, forge.FromGitHubInstallationID(p.InstallationID), repo, actionsFile, ref, inputs)
+	return g.Client.DispatchWorkflow(ctx, p.Scope, repo, actionsFile, ref, inputs)
 }
 
 func (g *GitHubActions) logger() *slog.Logger {
