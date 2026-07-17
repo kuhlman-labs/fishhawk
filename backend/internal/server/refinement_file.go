@@ -29,7 +29,6 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -136,21 +135,17 @@ func (s *Server) handleFileRefinementSession(w http.ResponseWriter, r *http.Requ
 	}
 	// Resolve the App installation for the target repo, exactly like
 	// handleFileWorkItem's run-absent operator path: an ErrNotInstalled leaves
-	// InstallationID 0 so the provider fails closed with its own actionable
-	// error; a transient resolution failure is surfaced as 502 here.
+	// a zero scope so the provider fails closed with its own actionable error;
+	// a transient resolution failure is surfaced as 502 here.
 	if s.cfg.GitHub != nil {
-		instID, rerr := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
-		switch {
-		case rerr == nil:
-			target.InstallationID = instID
-		case errors.Is(rerr, githubclient.ErrNotInstalled):
-			// Leave InstallationID 0; the provider fails closed on filing.
-		default:
+		scope, rerr := s.resolveRepoScope(r.Context(), owner, name)
+		if rerr != nil {
 			s.writeError(w, r, http.StatusBadGateway, "refinement_filing_failed",
 				"could not resolve the GitHub App installation for the target repo",
 				map[string]any{"error": rerr.Error()})
 			return
 		}
+		target.Scope = scope
 	}
 
 	// The FileItem seam: draft items ride exactly the hand-filed pipeline. The

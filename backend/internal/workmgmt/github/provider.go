@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -32,15 +33,15 @@ const statusFieldName = "Status"
 // a consumer-side interface so the provider can be unit-tested against a
 // fake. *githubclient.Client satisfies it.
 type API interface {
-	CreateIssue(ctx context.Context, installationID int64, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
-	IssueNodeID(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) (string, error)
-	ProjectFields(ctx context.Context, installationID int64, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error)
-	ProjectItemStatus(ctx context.Context, installationID int64, issueNodeID, projectID, fieldName string) (*githubclient.ProjectItemStatus, error)
-	AddProjectItem(ctx context.Context, installationID int64, projectID, contentID string) (string, error)
-	SetProjectItemSingleSelect(ctx context.Context, installationID int64, projectID, itemID, fieldID, optionID string) error
-	AddSubIssue(ctx context.Context, installationID int64, parentNodeID, childNodeID string) error
-	ListSubIssues(ctx context.Context, installationID int64, parentNodeID string) ([]githubclient.SubIssue, error)
-	SearchIssuesByTitle(ctx context.Context, installationID int64, query string) ([]githubclient.IssueTitleResult, error)
+	CreateIssueScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
+	IssueNodeIDScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (string, error)
+	ProjectFieldsScoped(ctx context.Context, scope forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error)
+	ProjectItemStatusScoped(ctx context.Context, scope forge.CredentialScope, issueNodeID, projectID, fieldName string) (*githubclient.ProjectItemStatus, error)
+	AddProjectItemScoped(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error)
+	SetProjectItemSingleSelectScoped(ctx context.Context, scope forge.CredentialScope, projectID, itemID, fieldID, optionID string) error
+	AddSubIssueScoped(ctx context.Context, scope forge.CredentialScope, parentNodeID, childNodeID string) error
+	ListSubIssuesScoped(ctx context.Context, scope forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error)
+	SearchIssuesByTitleScoped(ctx context.Context, scope forge.CredentialScope, query string) ([]githubclient.IssueTitleResult, error)
 	ProjectsTokenConfigured() bool
 }
 
@@ -82,14 +83,14 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 		return nil, errors.New("workmgmt/github: target repo owner and name required")
 	}
 	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
-	inst := req.Target.InstallationID
-	// Fail closed when no installation id is available (#1005 concern-2).
-	// On the run-absent filing path Target.InstallationID stays 0, so the
+	scope := req.Target.Scope
+	// Fail closed when no installation scope is available (#1005 concern-2).
+	// On the run-absent filing path Target.Scope stays the zero scope, so the
 	// client cannot mint an installation token; proceeding would fail
 	// opaquely deep inside the first REST call. GitHub Projects filing is
 	// run-scoped in v0 — name the missing context and the constraint here
 	// instead. A run-absent installation source is a follow-up.
-	if inst == 0 {
+	if scope.IsZero() {
 		return nil, errors.New("workmgmt/github: no installation id available; GitHub Projects filing is run-scoped in v0 — file with a run_id whose run carries an installation, or use a provider that needs no installation token")
 	}
 
@@ -101,7 +102,7 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	// already present, so re-filing a body that already carries it is a no-op.
 	body := ensureDependsOnMarker(req.Item.Body, req.Item.Relations.DependsOn)
 
-	issue, err := p.api.CreateIssue(ctx, inst, repo, githubclient.CreateIssueParams{
+	issue, err := p.api.CreateIssueScoped(ctx, scope, repo, githubclient.CreateIssueParams{
 		Title:  req.Item.Title,
 		Body:   body,
 		Labels: req.Item.Classification.Labels,
@@ -125,7 +126,7 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	// means nothing to board — leave Boarded false with no error.
 	if req.Target.Project == nil {
 		created.Boarded = false
-	} else if err := p.placeOnBoard(ctx, inst, req, issue); err != nil {
+	} else if err := p.placeOnBoard(ctx, scope, req, issue); err != nil {
 		created.BoardingError = err.Error()
 	} else {
 		created.Boarded = true
@@ -134,7 +135,7 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	// Epic linking is best-effort too; an empty parent epic means nothing
 	// to link (leave EpicLinked false with no error).
 	if epic := strings.TrimSpace(req.Item.Relations.ParentEpic); epic != "" {
-		if err := p.linkEpic(ctx, inst, repo, epic, issue.NodeID); err != nil {
+		if err := p.linkEpic(ctx, scope, repo, epic, issue.NodeID); err != nil {
 			created.EpicLinkError = err.Error()
 		} else {
 			created.EpicLinked = true
@@ -173,8 +174,8 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 	if req.IssueNumber <= 0 {
 		return nil, errors.New("workmgmt/github: transition requires a positive issue number")
 	}
-	inst := req.Target.InstallationID
-	if inst == 0 {
+	scope := req.Target.Scope
+	if scope.IsZero() {
 		return nil, errors.New("workmgmt/github: no installation id available; board transitions are run-scoped in v0")
 	}
 
@@ -204,11 +205,11 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 	}
 	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
 
-	issueNodeID, err := p.api.IssueNodeID(ctx, inst, repo, req.IssueNumber)
+	issueNodeID, err := p.api.IssueNodeIDScoped(ctx, scope, repo, req.IssueNumber)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve issue #%d: %w", req.IssueNumber, err)
 	}
-	meta, err := p.api.ProjectFields(ctx, inst, coord, statusFieldName)
+	meta, err := p.api.ProjectFieldsScoped(ctx, scope, coord, statusFieldName)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
@@ -218,7 +219,7 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 			SkipReason: fmt.Sprintf("target status %q is not a %s option on the project", toOption, statusFieldName)}, nil
 	}
 
-	item, err := p.api.ProjectItemStatus(ctx, inst, issueNodeID, meta.ProjectID, statusFieldName)
+	item, err := p.api.ProjectItemStatusScoped(ctx, scope, issueNodeID, meta.ProjectID, statusFieldName)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: read project item status: %w", err)
 	}
@@ -237,7 +238,7 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 		return &workmgmt.TransitionResult{Skipped: true, From: current, To: toOption,
 			SkipReason: "card already at target status"}, nil
 	}
-	if err := p.api.SetProjectItemSingleSelect(ctx, inst, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {
+	if err := p.api.SetProjectItemSingleSelectScoped(ctx, scope, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {
 		return nil, fmt.Errorf("workmgmt/github: set status field: %w", err)
 	}
 	return &workmgmt.TransitionResult{Moved: true, From: current, To: toOption}, nil
@@ -298,8 +299,8 @@ func (p *Provider) DiscoverNumbers(ctx context.Context, req workmgmt.DiscoverNum
 	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
 		return nil, errors.New("workmgmt/github: target repo owner and name required")
 	}
-	inst := req.Target.InstallationID
-	if inst == 0 {
+	scope := req.Target.Scope
+	if scope.IsZero() {
 		return nil, errors.New("workmgmt/github: no installation id available; number discovery is run-scoped in v0 — file with a run_id whose run carries an installation, or pass existing_numbers explicitly")
 	}
 	re, err := titleNumberRegexp(req.TitleFormat)
@@ -329,7 +330,7 @@ func (p *Provider) DiscoverNumbers(ctx context.Context, req workmgmt.DiscoverNum
 	} else {
 		query = fmt.Sprintf(`repo:%s in:title "%s"`, repoQ, titleNumberSearchPrefix(req.TitleFormat))
 	}
-	hits, err := p.api.SearchIssuesByTitle(ctx, inst, query)
+	hits, err := p.api.SearchIssuesByTitleScoped(ctx, scope, query)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: search issues by title: %w", err)
 	}
@@ -423,7 +424,7 @@ func titleNumberRegexp(format string) (*regexp.Regexp, error) {
 
 // placeOnBoard adds the created issue to the configured project and sets
 // its Status field. No-op when the conventions declare no project.
-func (p *Provider) placeOnBoard(ctx context.Context, inst int64, req workmgmt.ProviderRequest, issue *githubclient.CreatedIssue) error {
+func (p *Provider) placeOnBoard(ctx context.Context, scope forge.CredentialScope, req workmgmt.ProviderRequest, issue *githubclient.CreatedIssue) error {
 	proj := req.Target.Project
 	if proj == nil {
 		return nil
@@ -440,11 +441,11 @@ func (p *Provider) placeOnBoard(ctx context.Context, inst int64, req workmgmt.Pr
 	if proj.OwnerType == "user" {
 		ctx = githubclient.WithProjectsToken(ctx)
 	}
-	meta, err := p.api.ProjectFields(ctx, inst, coord, statusFieldName)
+	meta, err := p.api.ProjectFieldsScoped(ctx, scope, coord, statusFieldName)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
-	itemID, err := p.api.AddProjectItem(ctx, inst, meta.ProjectID, issue.NodeID)
+	itemID, err := p.api.AddProjectItemScoped(ctx, scope, meta.ProjectID, issue.NodeID)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: add project item: %w", err)
 	}
@@ -457,7 +458,7 @@ func (p *Provider) placeOnBoard(ctx context.Context, inst int64, req workmgmt.Pr
 		return fmt.Errorf("workmgmt/github: status %q is not a %s option on the project; available: %s",
 			status, statusFieldName, strings.Join(sortedKeys(meta.StatusOptions), ", "))
 	}
-	if err := p.api.SetProjectItemSingleSelect(ctx, inst, meta.ProjectID, itemID, meta.FieldID, optionID); err != nil {
+	if err := p.api.SetProjectItemSingleSelectScoped(ctx, scope, meta.ProjectID, itemID, meta.FieldID, optionID); err != nil {
 		return fmt.Errorf("workmgmt/github: set status field: %w", err)
 	}
 	return nil
@@ -465,16 +466,16 @@ func (p *Provider) placeOnBoard(ctx context.Context, inst int64, req workmgmt.Pr
 
 // linkEpic resolves the parent-epic reference (#N or N) to its node id
 // and links the new issue as its sub-issue.
-func (p *Provider) linkEpic(ctx context.Context, inst int64, repo githubclient.RepoRef, epicRef, childNodeID string) error {
+func (p *Provider) linkEpic(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, epicRef, childNodeID string) error {
 	number, err := parseIssueRef(epicRef)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: parent epic %q: %w", epicRef, err)
 	}
-	parentNodeID, err := p.api.IssueNodeID(ctx, inst, repo, number)
+	parentNodeID, err := p.api.IssueNodeIDScoped(ctx, scope, repo, number)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: resolve parent epic #%d: %w", number, err)
 	}
-	if err := p.api.AddSubIssue(ctx, inst, parentNodeID, childNodeID); err != nil {
+	if err := p.api.AddSubIssueScoped(ctx, scope, parentNodeID, childNodeID); err != nil {
 		return fmt.Errorf("workmgmt/github: link parent epic #%d: %w", number, err)
 	}
 	return nil
@@ -501,8 +502,8 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
 		return nil, errors.New("workmgmt/github: target repo owner and name required")
 	}
-	inst := req.Target.InstallationID
-	if inst == 0 {
+	scope := req.Target.Scope
+	if scope.IsZero() {
 		return nil, errors.New("workmgmt/github: no installation id available; epic-children query is run-scoped in v0 — file with a run_id whose run carries an installation")
 	}
 	number, err := parseIssueRef(req.Epic)
@@ -510,11 +511,11 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 		return nil, fmt.Errorf("workmgmt/github: epic %q: %w", req.Epic, err)
 	}
 	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
-	epicNodeID, err := p.api.IssueNodeID(ctx, inst, repo, number)
+	epicNodeID, err := p.api.IssueNodeIDScoped(ctx, scope, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve epic #%d: %w", number, err)
 	}
-	subs, err := p.api.ListSubIssues(ctx, inst, epicNodeID)
+	subs, err := p.api.ListSubIssuesScoped(ctx, scope, epicNodeID)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: list epic #%d children: %w", number, err)
 	}

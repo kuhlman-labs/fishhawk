@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -103,7 +104,7 @@ func TestFeedbackAPIAdapter_SearchOpenIssuesMapsFields(t *testing.T) {
 		`{"items":[{"number":7,"html_url":"https://github.com/o/r/issues/7","body":"marker-body"}]}`)
 	adapter := feedbackAPIAdapter{c}
 
-	got, err := adapter.SearchOpenIssues(context.Background(), 99, githubclient.RepoRef{Owner: "o", Name: "r"}, "repo:o/r is:open")
+	got, err := adapter.SearchOpenIssuesScoped(context.Background(), forge.FromGitHubInstallationID(99), githubclient.RepoRef{Owner: "o", Name: "r"}, "repo:o/r is:open")
 	if err != nil {
 		t.Fatalf("SearchOpenIssues: %v", err)
 	}

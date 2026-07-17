@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -265,18 +266,18 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		Project: conv.Project,
 		Jira:    conv.Jira,
 	}
-	// InstallationID is sourced first from a consistency-checked active run.
+	// Scope is sourced first from a consistency-checked active run.
 	// On the run-absent path (the ADR-040 operator-agent follow-up filing
 	// path) the run does not supply one, so the handler resolves the App's
 	// installation for the target repo directly (mirroring run-creation at
 	// runs.go:384) — without this the real GitHub Projects provider cannot
 	// mint an installation token and fails closed. Providers that need no
-	// installation token are unaffected (the field is GitHub-specific and
+	// installation token are unaffected (the scope is GitHub-specific and
 	// resolution only runs when a GitHub client is wired).
 	if activeRun != nil && activeRun.InstallationID != nil {
-		target.InstallationID = *activeRun.InstallationID
+		target.Scope = forge.FromGitHubInstallationID(*activeRun.InstallationID)
 	}
-	if target.InstallationID == 0 && s.cfg.GitHub != nil {
+	if target.Scope.IsZero() && s.cfg.GitHub != nil {
 		// BINDING authz gate: the run-absent installation-resolution branch
 		// is the operator-agent follow-up path ONLY. A run-bound agent token
 		// (mcp:run:<uuid> subject) MUST file through the run-scoped path —
@@ -292,22 +293,19 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 				nil)
 			return
 		}
-		instID, rerr := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
-		switch {
-		case rerr == nil:
-			target.InstallationID = instID
-		case errors.Is(rerr, githubclient.ErrNotInstalled):
-			// App genuinely not installed on the repo: leave InstallationID 0
-			// and proceed so the GitHub provider fails closed with its own
-			// actionable typed error for the unresolvable case.
-		default:
+		scope, rerr := s.resolveRepoScope(r.Context(), owner, name)
+		if rerr != nil {
 			// Transient/network failure: surface it rather than masking it as
-			// the misleading provider "no installation" message.
+			// the misleading provider "no installation" message. An
+			// ErrNotInstalled is not an error here — resolveRepoScope returns a
+			// zero scope so the GitHub provider fails closed with its own
+			// actionable typed error for the unresolvable case.
 			s.writeError(w, r, http.StatusBadGateway, "work_item_filing_failed",
 				"could not resolve the GitHub App installation for the target repo",
 				map[string]any{"error": rerr.Error()})
 			return
 		}
+		target.Scope = scope
 	}
 
 	item, created, werr := s.applyAndFileWorkItem(r.Context(), filing, conv, target, owner, name)
@@ -372,7 +370,7 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 	// {n}. Fails closed (leaves epic unset) on every failure mode, so Apply's
 	// renderTitle returns the structured missing-placeholder 422 rather than a
 	// wrong title or a crash.
-	s.deriveEpicTitleVar(ctx, &filing, conv, target.InstallationID, owner, name)
+	s.deriveEpicTitleVar(ctx, &filing, conv, target.Scope, owner, name)
 
 	// Derive the {n} child-number title placeholder from the parent epic's
 	// existing children (#1958), immediately after {epic} is resolved above
@@ -397,7 +395,7 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 	// every mode, leaving Apply to report 'area' in missing_label_namespaces.
 	// The returned labels are system-added, so they are appended to the item's
 	// DefaultedLabels after Apply for the single LOUD reporting field.
-	derivedArea := s.deriveAreaLabel(ctx, &filing, conv, target.InstallationID, owner, name)
+	derivedArea := s.deriveAreaLabel(ctx, &filing, conv, target.Scope, owner, name)
 
 	// Discover the in-use sequential numbers server-side for a numbered type
 	// that omitted existing_numbers (#1269), so the caller no longer has to
@@ -715,7 +713,7 @@ var epicTitleRE = regexp.MustCompile(`^\s*\[E(\d+)`)
 // [E<n>] token — by leaving epic unset, so Apply's renderTitle returns the
 // structured missing-placeholder 422 rather than a wrong title or a crash.
 // It mutates filing in place; the caller passes a pointer.
-func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, installID int64, owner, name string) {
+func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, scope forge.CredentialScope, owner, name string) {
 	itemType, ok := conv.Types[filing.Type]
 	if !ok || !strings.Contains(itemType.TitleFormat, "{epic}") {
 		return
@@ -726,14 +724,14 @@ func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.Filing
 	if _, set := filing.TitleVars["epic"]; set {
 		return
 	}
-	if s.cfg.GitHub == nil || installID == 0 {
+	if s.cfg.GitHub == nil || scope.IsZero() {
 		return
 	}
 	number, err := parseEpicRef(filing.Relations.ParentEpic)
 	if err != nil {
 		return
 	}
-	issue, err := s.cfg.GitHub.GetIssue(ctx, installID, githubclient.RepoRef{Owner: owner, Name: name}, number)
+	issue, err := s.cfg.GitHub.GetIssueScoped(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
 	if err != nil {
 		return
 	}
@@ -766,7 +764,7 @@ const areaNamespace = "area"
 // missing_label_namespaces rather than the filing failing. It issues its own
 // GetIssue (a second fetch alongside deriveEpicTitleVar) deliberately, to keep
 // that derivation's fail-closed {epic} contract untouched.
-func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, installID int64, owner, name string) []string {
+func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, scope forge.CredentialScope, owner, name string) []string {
 	itemType, ok := conv.Types[filing.Type]
 	if !ok || !typeWantsAreaNamespace(itemType) {
 		return nil
@@ -777,14 +775,14 @@ func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingReq
 	if hasAreaLabel(filing.Labels) || hasAreaLabel(itemType.DefaultLabels) {
 		return nil
 	}
-	if s.cfg.GitHub == nil || installID == 0 {
+	if s.cfg.GitHub == nil || scope.IsZero() {
 		return nil
 	}
 	number, err := parseEpicRef(filing.Relations.ParentEpic)
 	if err != nil {
 		return nil
 	}
-	issue, err := s.cfg.GitHub.GetIssue(ctx, installID, githubclient.RepoRef{Owner: owner, Name: name}, number)
+	issue, err := s.cfg.GitHub.GetIssueScoped(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
 	if err != nil {
 		return nil
 	}

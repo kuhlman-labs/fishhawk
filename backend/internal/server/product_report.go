@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/diagnostics"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	"github.com/kuhlman-labs/fishhawk/redaction"
@@ -220,7 +221,7 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 	// Installation: the source run supplies the installation that can act
 	// on the product repo (in dogfooding the run repo IS the product repo).
 	if runRow.InstallationID != nil {
-		target.InstallationID = *runRow.InstallationID
+		target.Scope = forge.FromGitHubInstallationID(*runRow.InstallationID)
 	}
 
 	existing, err := provider.SearchOpenByFingerprint(r.Context(), target, fingerprint)

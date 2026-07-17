@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -27,12 +28,12 @@ type fakeFeedbackAPI struct {
 	commentErr    error
 }
 
-func (f *fakeFeedbackAPI) SearchOpenIssues(_ context.Context, _ int64, _ githubclient.RepoRef, query string) ([]MatchedIssue, error) {
+func (f *fakeFeedbackAPI) SearchOpenIssuesScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, query string) ([]MatchedIssue, error) {
 	f.searchQuery = query
 	return f.searchResults, f.searchErr
 }
 
-func (f *fakeFeedbackAPI) CreateIssue(_ context.Context, _ int64, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+func (f *fakeFeedbackAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
 	f.createdBody = p.Body
 	f.createdTitle = p.Title
 	if f.createErr != nil {
@@ -41,7 +42,7 @@ func (f *fakeFeedbackAPI) CreateIssue(_ context.Context, _ int64, _ githubclient
 	return &githubclient.CreatedIssue{Number: 7, HTMLURL: "https://github.com/kuhlman-labs/fishhawk/issues/7"}, nil
 }
 
-func (f *fakeFeedbackAPI) CreateIssueComment(_ context.Context, _ int64, _ githubclient.RepoRef, number int, body string) (*githubclient.IssueComment, error) {
+func (f *fakeFeedbackAPI) CreateIssueCommentScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int, body string) (*githubclient.IssueComment, error) {
 	f.commentNumber = number
 	f.commentBody = body
 	if f.commentErr != nil {
@@ -51,7 +52,7 @@ func (f *fakeFeedbackAPI) CreateIssueComment(_ context.Context, _ int64, _ githu
 }
 
 func testTarget() workmgmt.Target {
-	return workmgmt.Target{InstallationID: 42, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}}
+	return workmgmt.Target{Scope: forge.FromGitHubInstallationID(42), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}}
 }
 
 func TestFeedback_FileEmbedsMarker_SearchFindsIt(t *testing.T) {

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // fakeProvider is a test double registered to exercise the registry.
@@ -89,7 +91,7 @@ func TestRegistry_DispatchPassesRequest(t *testing.T) {
 	req := ProviderRequest{
 		Item:   WorkItem{Type: "bug", Title: "boom"},
 		Number: 0,
-		Target: Target{InstallationID: 7, Repo: Repo{Owner: "o", Name: "r"}},
+		Target: Target{Scope: forge.FromGitHubInstallationID(7), Repo: Repo{Owner: "o", Name: "r"}},
 	}
 	created, err := p.File(context.Background(), req)
 	if err != nil {
@@ -117,7 +119,7 @@ func TestRegistry_DispatchTransition(t *testing.T) {
 	req := TransitionRequest{
 		IssueNumber:          1012,
 		Trigger:              "run_started",
-		Target:               Target{InstallationID: 7, Repo: Repo{Owner: "o", Name: "r"}},
+		Target:               Target{Scope: forge.FromGitHubInstallationID(7), Repo: Repo{Owner: "o", Name: "r"}},
 		CanonicalState:       CanonicalStateInProgress,
 		ExpectedSourceStates: []string{CanonicalStateBacklog},
 		States:               map[string]string{CanonicalStateBacklog: "Backlog", CanonicalStateInProgress: "In Progress"},
@@ -146,7 +148,7 @@ func TestRegistry_DispatchEpicChildren(t *testing.T) {
 		t.Fatalf("provider does not implement EpicChildrenQuerier")
 	}
 	res, err := q.EpicChildren(context.Background(), EpicChildrenRequest{
-		Target: Target{InstallationID: 7, Repo: Repo{Owner: "o", Name: "r"}},
+		Target: Target{Scope: forge.FromGitHubInstallationID(7), Repo: Repo{Owner: "o", Name: "r"}},
 		Epic:   "#1440",
 	})
 	if err != nil {

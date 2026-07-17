@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -816,8 +817,8 @@ func TestCreateCampaign_ResolvesInstallation(t *testing.T) {
 		t.Errorf("GetRepoInstallation RepoRef = %s/%s, want kuhlman-labs/fishhawk", rec.owner, rec.name)
 	}
 	// The resolved id reaches the provider's EpicChildren target.
-	if fp.captured.Target.InstallationID != 4242 {
-		t.Errorf("provider Target.InstallationID = %d, want 4242", fp.captured.Target.InstallationID)
+	if fp.captured.Target.Scope != forge.FromGitHubInstallationID(4242) {
+		t.Errorf("provider Target.Scope = %q, want scope for installation 4242", fp.captured.Target.Scope.Ref())
 	}
 	if fp.captured.Epic != "issue:99" {
 		t.Errorf("provider Epic = %q, want issue:99", fp.captured.Epic)
@@ -2427,8 +2428,8 @@ func TestDeriveCampaignAfterChange_CampaignStart_SweepsToUpNext_CrossBoundary(t 
 		if call.CanonicalState != workmgmt.CanonicalStateUpNext {
 			t.Errorf("canonical = %q, want up_next", call.CanonicalState)
 		}
-		if call.Target.InstallationID != 12345 {
-			t.Errorf("installation id = %d, want 12345 (resolved from repo)", call.Target.InstallationID)
+		if call.Target.Scope != forge.FromGitHubInstallationID(12345) {
+			t.Errorf("scope = %q, want scope for installation 12345 (resolved from repo)", call.Target.Scope.Ref())
 		}
 		fired[call.IssueNumber] = true
 	}

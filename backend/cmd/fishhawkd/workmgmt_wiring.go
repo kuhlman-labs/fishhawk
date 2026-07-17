@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -51,12 +52,12 @@ type feedbackAPIAdapter struct {
 
 var _ workmgmtgithub.FeedbackAPI = feedbackAPIAdapter{}
 
-func (a feedbackAPIAdapter) SearchOpenIssues(ctx context.Context, installationID int64, repo githubclient.RepoRef, query string) ([]workmgmtgithub.MatchedIssue, error) {
+func (a feedbackAPIAdapter) SearchOpenIssuesScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, query string) ([]workmgmtgithub.MatchedIssue, error) {
 	// The provider embeds repo:owner/name into the query string, so the
 	// client search method needs only the composed query — repo is unused
 	// here, kept to satisfy the consumer-side interface.
 	_ = repo
-	res, err := a.client.SearchOpenIssues(ctx, installationID, query)
+	res, err := a.client.SearchOpenIssuesScoped(ctx, scope, query)
 	if err != nil {
 		return nil, err
 	}
@@ -67,10 +68,10 @@ func (a feedbackAPIAdapter) SearchOpenIssues(ctx context.Context, installationID
 	return matches, nil
 }
 
-func (a feedbackAPIAdapter) CreateIssue(ctx context.Context, installationID int64, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
-	return a.client.CreateIssue(ctx, installationID, repo, p)
+func (a feedbackAPIAdapter) CreateIssueScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	return a.client.CreateIssueScoped(ctx, scope, repo, p)
 }
 
-func (a feedbackAPIAdapter) CreateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
-	return a.client.CreateIssueComment(ctx, installationID, repo, issueNumber, body)
+func (a feedbackAPIAdapter) CreateIssueCommentScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
+	return a.client.CreateIssueCommentScoped(ctx, scope, repo, issueNumber, body)
 }

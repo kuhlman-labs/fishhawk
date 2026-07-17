@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -151,7 +152,7 @@ func (s *Server) boardTransitionForRun(ctx context.Context, rn *run.Run, event s
 		Project: conv.Project,
 	}
 	if rn.InstallationID != nil {
-		target.InstallationID = *rn.InstallationID
+		target.Scope = forge.FromGitHubInstallationID(*rn.InstallationID)
 	}
 
 	res, err := transitioner.Transition(ctx, workmgmt.TransitionRequest{
@@ -247,9 +248,9 @@ func (s *Server) boardTransitionForCampaignItem(ctx context.Context, c *campaign
 	}
 
 	target := workmgmt.Target{
-		Repo:           workmgmt.Repo{Owner: owner, Name: name},
-		InstallationID: instID,
-		Project:        conv.Project,
+		Repo:    workmgmt.Repo{Owner: owner, Name: name},
+		Scope:   forge.FromGitHubInstallationID(instID),
+		Project: conv.Project,
 	}
 	res, err := transitioner.Transition(ctx, workmgmt.TransitionRequest{
 		IssueNumber:          issueNumber,

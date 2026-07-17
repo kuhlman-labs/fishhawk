@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -127,9 +128,9 @@ func (s *Server) handleIssueLifecycleBoardSync(ctx context.Context, ev webhook.E
 		return
 	}
 	target := workmgmt.Target{
-		Repo:           workmgmt.Repo{Owner: owner, Name: name},
-		InstallationID: ev.InstallationID,
-		Project:        conv.Project,
+		Repo:    workmgmt.Repo{Owner: owner, Name: name},
+		Scope:   forge.FromGitHubInstallationID(ev.InstallationID),
+		Project: conv.Project,
 	}
 
 	res, err := transitioner.Transition(ctx, workmgmt.TransitionRequest{
