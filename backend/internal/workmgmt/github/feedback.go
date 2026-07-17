@@ -46,9 +46,9 @@ type MatchedIssue struct {
 // run-scoped alongside the work-item provider, which is itself not yet
 // registered at startup).
 type FeedbackAPI interface {
-	SearchOpenIssues(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, query string) ([]MatchedIssue, error)
-	CreateIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
-	CreateIssueComment(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
+	SearchOpenIssues(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, query string) ([]MatchedIssue, error)
+	CreateIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
+	CreateIssueComment(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
 }
 
 // FeedbackProvider is the GitHub product-feedback provider: it files
@@ -131,15 +131,15 @@ func (p *FeedbackProvider) AppendOccurrence(ctx context.Context, target workmgmt
 // installation id every call needs. Like the work-item provider it fails
 // closed when no installation id is available: product-feedback egress is
 // run-scoped in v0, so the source run must supply the installation.
-func (p *FeedbackProvider) resolve(target workmgmt.Target) (githubclient.RepoRef, forge.CredentialScope, error) {
+func (p *FeedbackProvider) resolve(target workmgmt.Target) (forge.RepoRef, forge.CredentialScope, error) {
 	if p.api == nil {
-		return githubclient.RepoRef{}, forge.CredentialScope{}, errors.New("workmgmt/github: feedback provider missing API client")
+		return forge.RepoRef{}, forge.CredentialScope{}, errors.New("workmgmt/github: feedback provider missing API client")
 	}
 	if target.Repo.Owner == "" || target.Repo.Name == "" {
-		return githubclient.RepoRef{}, forge.CredentialScope{}, errors.New("workmgmt/github: target repo owner and name required")
+		return forge.RepoRef{}, forge.CredentialScope{}, errors.New("workmgmt/github: target repo owner and name required")
 	}
 	if target.Scope.IsZero() {
-		return githubclient.RepoRef{}, forge.CredentialScope{}, errors.New("workmgmt/github: no installation id available; product-feedback egress is run-scoped in v0 — file from a run whose installation can act on the product repo")
+		return forge.RepoRef{}, forge.CredentialScope{}, errors.New("workmgmt/github: no installation id available; product-feedback egress is run-scoped in v0 — file from a run whose installation can act on the product repo")
 	}
-	return githubclient.RepoRef{Owner: target.Repo.Owner, Name: target.Repo.Name}, target.Scope, nil
+	return forge.RepoRef{Owner: target.Repo.Owner, Name: target.Repo.Name}, target.Scope, nil
 }

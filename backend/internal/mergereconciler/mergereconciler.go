@@ -74,7 +74,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -96,7 +95,7 @@ const boardHealEvent = "pr_opened"
 // Satisfied by *githubclient.Client. Tests inject a stub returning
 // canned PR states.
 type PRGetter interface {
-	GetPullRequest(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.PullRequest, error)
+	GetPullRequest(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*forge.PullRequest, error)
 }
 
 // Resolver resolves a run's review stage from the poll's terminal PR
@@ -461,7 +460,7 @@ func (t *Ticker) healBoardTransition(ctx context.Context, runID uuid.UUID) {
 // the runner stores in runs.pull_request_url and the webhook matches on.
 // Returns an error for any other shape so the caller skips cleanly
 // rather than panicking.
-func parsePRURL(prURL string) (githubclient.RepoRef, int, error) {
+func parsePRURL(prURL string) (forge.RepoRef, int, error) {
 	s := strings.TrimSpace(prURL)
 	for _, prefix := range []string{"https://github.com/", "http://github.com/"} {
 		s = strings.TrimPrefix(s, prefix)
@@ -469,15 +468,15 @@ func parsePRURL(prURL string) (githubclient.RepoRef, int, error) {
 	parts := strings.Split(strings.Trim(s, "/"), "/")
 	// Expect: <owner>/<repo>/pull/<n>
 	if len(parts) != 4 || parts[2] != "pull" {
-		return githubclient.RepoRef{}, 0, fmt.Errorf("not a github PR html_url: %q", prURL)
+		return forge.RepoRef{}, 0, fmt.Errorf("not a github PR html_url: %q", prURL)
 	}
 	owner, name, num := parts[0], parts[1], parts[3]
 	if owner == "" || name == "" {
-		return githubclient.RepoRef{}, 0, fmt.Errorf("PR url missing owner/name: %q", prURL)
+		return forge.RepoRef{}, 0, fmt.Errorf("PR url missing owner/name: %q", prURL)
 	}
 	n, err := strconv.Atoi(num)
 	if err != nil || n <= 0 {
-		return githubclient.RepoRef{}, 0, fmt.Errorf("PR url has non-numeric number %q: %q", num, prURL)
+		return forge.RepoRef{}, 0, fmt.Errorf("PR url has non-numeric number %q: %q", num, prURL)
 	}
-	return githubclient.RepoRef{Owner: owner, Name: name}, n, nil
+	return forge.RepoRef{Owner: owner, Name: name}, n, nil
 }

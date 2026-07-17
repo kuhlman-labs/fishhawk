@@ -725,7 +725,7 @@ type stubGitHub struct {
 	specErr      error
 	dispatchErr  error
 	dispatchCall struct {
-		repo githubclient.RepoRef
+		repo forge.RepoRef
 		file string
 		ref  string
 		args githubclient.DispatchInputs
@@ -746,19 +746,19 @@ type stubGitHub struct {
 	// GetBranchProtection (#251). Default zero-value returns an
 	// empty protection — combine with rulesets to build a
 	// no-protection-anywhere refusal scenario.
-	branchProtection      *githubclient.BranchProtection
+	branchProtection      *forge.BranchProtection
 	branchProtectionErr   error
 	branchProtectionCalls int
 	// rulesets / rulesetsErr drive ListRulesetRequiredChecks
 	// (#251). Default zero-value returns an empty list.
-	rulesets       []githubclient.RulesetRequiredCheck
+	rulesets       []forge.RulesetRequiredCheck
 	rulesetsErr    error
 	rulesetsCalls  int
 	rulesetsBranch string
 }
 
 func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, _ string) (*githubclient.FileContent, error) {
+	_ forge.RepoRef, _ string) (*githubclient.FileContent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.specCalls++
@@ -769,7 +769,7 @@ func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ forge.CredentialScope,
 }
 
 func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ forge.CredentialScope,
-	repo githubclient.RepoRef, file, ref string, args githubclient.DispatchInputs) error {
+	repo forge.RepoRef, file, ref string, args githubclient.DispatchInputs) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dispatchCalls++
@@ -781,7 +781,7 @@ func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ forge.CredentialScope
 }
 
 func (s *stubGitHub) GetWorkflowRun(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error) {
+	_ forge.RepoRef, runID int64) (*githubclient.WorkflowRun, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.workflowRunCalls++
@@ -793,7 +793,7 @@ func (s *stubGitHub) GetWorkflowRun(_ context.Context, _ forge.CredentialScope,
 }
 
 func (s *stubGitHub) GetBranchProtection(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, _ string) (*githubclient.BranchProtection, error) {
+	_ forge.RepoRef, _ string) (*forge.BranchProtection, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.branchProtectionCalls++
@@ -803,11 +803,11 @@ func (s *stubGitHub) GetBranchProtection(_ context.Context, _ forge.CredentialSc
 	if s.branchProtection != nil {
 		return s.branchProtection, nil
 	}
-	return &githubclient.BranchProtection{}, nil
+	return &forge.BranchProtection{}, nil
 }
 
 func (s *stubGitHub) ListRulesetRequiredChecks(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error) {
+	_ forge.RepoRef, branch string) ([]forge.RulesetRequiredCheck, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rulesetsCalls++
@@ -1110,7 +1110,7 @@ func newDispatcherWithStubs(t *testing.T) (*Dispatcher, *stubGitHub, *stubRuns, 
 		// refuse every test run on the post-#251 protection check.
 		// Tests that exercise the no-protection refusal path zero
 		// this out explicitly.
-		branchProtection: &githubclient.BranchProtection{
+		branchProtection: &forge.BranchProtection{
 			RequiredStatusCheckContexts: []string{"ci/build"},
 		},
 	}
@@ -1727,10 +1727,10 @@ func TestHandle_SnapshotsBranchProtection(t *testing.T) {
 	// ruleset contributes another. The dispatcher unions them and
 	// snapshots the result onto the run.
 	d, gh, runs, _ := newDispatcherWithStubs(t)
-	gh.branchProtection = &githubclient.BranchProtection{
+	gh.branchProtection = &forge.BranchProtection{
 		RequiredStatusCheckContexts: []string{"ci/build"},
 	}
-	gh.rulesets = []githubclient.RulesetRequiredCheck{
+	gh.rulesets = []forge.RulesetRequiredCheck{
 		{RulesetID: 42, Contexts: []string{"audit_complete"}},
 	}
 
@@ -1766,10 +1766,10 @@ func TestHandle_SnapshotDedupsContexts(t *testing.T) {
 	// but credits both surfaces in `sources` so audits can see what
 	// contributed.
 	d, gh, runs, _ := newDispatcherWithStubs(t)
-	gh.branchProtection = &githubclient.BranchProtection{
+	gh.branchProtection = &forge.BranchProtection{
 		RequiredStatusCheckContexts: []string{"ci/build"},
 	}
-	gh.rulesets = []githubclient.RulesetRequiredCheck{
+	gh.rulesets = []forge.RulesetRequiredCheck{
 		{RulesetID: 7, Contexts: []string{"ci/build"}},
 	}
 
@@ -1791,7 +1791,7 @@ func TestHandle_NoBranchProtection_RefusesRun(t *testing.T) {
 	// WARN log line). v0 won't dispatch into an unprotected branch.
 	d, gh, runs, au := newDispatcherWithStubs(t)
 	logs := captureDispatcherLogs(d)
-	gh.branchProtection = &githubclient.BranchProtection{}
+	gh.branchProtection = &forge.BranchProtection{}
 	gh.rulesets = nil
 
 	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
@@ -1827,7 +1827,7 @@ func TestHandle_BranchProtectionForbidden_RefusesWithScopeHint(t *testing.T) {
 	// names the operator-side fix precisely.
 	d, gh, runs, _ := newDispatcherWithStubs(t)
 	logs := captureDispatcherLogs(d)
-	gh.branchProtectionErr = githubclient.ErrForbidden
+	gh.branchProtectionErr = forge.ErrForbidden
 
 	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -1846,8 +1846,8 @@ func TestHandle_BranchProtectionNotFound_FallsThroughToRulesets(t *testing.T) {
 	// and continue.
 	d, gh, runs, _ := newDispatcherWithStubs(t)
 	gh.branchProtection = nil
-	gh.branchProtectionErr = githubclient.ErrNotFound
-	gh.rulesets = []githubclient.RulesetRequiredCheck{
+	gh.branchProtectionErr = forge.ErrNotFound
+	gh.rulesets = []forge.RulesetRequiredCheck{
 		{RulesetID: 1, Contexts: []string{"e2e"}},
 	}
 
@@ -1893,7 +1893,7 @@ func TestHandle_SkipDoesntCreateRunOrAudit(t *testing.T) {
 
 func TestHandle_SpecForbidden_NoRunNoAudit(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
-	gh.specErr = githubclient.ErrForbidden
+	gh.specErr = forge.ErrForbidden
 
 	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
 		t.Fatalf("Handle returned err on Forbidden, want nil: %v", err)
@@ -1906,7 +1906,7 @@ func TestHandle_SpecForbidden_NoRunNoAudit(t *testing.T) {
 
 func TestHandle_SpecNotFound_NoRunNoAudit(t *testing.T) {
 	d, gh, runs, _ := newDispatcherWithStubs(t)
-	gh.specErr = githubclient.ErrNotFound
+	gh.specErr = forge.ErrNotFound
 
 	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
 		t.Fatalf("Handle: %v", err)
@@ -3403,14 +3403,14 @@ func TestMatchEvent_Installation_BotSenderSkips(t *testing.T) {
 // stubScaffolder records the repos it was asked to scaffold and returns a
 // configurable result/error, per-repo.
 type stubScaffolder struct {
-	calls   []githubclient.RepoRef
+	calls   []forge.RepoRef
 	result  *onboarding.Result
 	err     error
 	errRepo string // when set, only this repo's name errors
 }
 
 func (s *stubScaffolder) OpenScaffoldPR(_ context.Context, _ forge.CredentialScope,
-	repo githubclient.RepoRef) (*onboarding.Result, error) {
+	repo forge.RepoRef) (*onboarding.Result, error) {
 	s.calls = append(s.calls, repo)
 	if s.errRepo != "" && repo.Name == s.errRepo {
 		return nil, errors.New("scaffold boom")

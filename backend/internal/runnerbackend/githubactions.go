@@ -15,7 +15,7 @@ import (
 // orchestrator's and webhook's own GitHubAPI interfaces both satisfy it.
 type DispatchClient interface {
 	DispatchWorkflow(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, workflowFile, ref string,
+		repo forge.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
 }
 
@@ -109,14 +109,14 @@ func (g *GitHubActions) logger() *slog.Logger {
 // dispatch seam's only owner/name splitter); orchestrator and webhook retain
 // their own copies for their non-dispatch callers (enableAutoMerge, etc.), a
 // consolidation the orchestrator already flags as a v0.x cleanup.
-func parseRepo(s string) (githubclient.RepoRef, error) {
+func parseRepo(s string) (forge.RepoRef, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] == '/' {
 			if i == 0 || i == len(s)-1 {
-				return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+				return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 			}
-			return githubclient.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
+			return forge.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
 		}
 	}
-	return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+	return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 }

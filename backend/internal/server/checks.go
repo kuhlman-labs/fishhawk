@@ -13,7 +13,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -407,7 +406,7 @@ func (s *Server) prHeadFetcher() auditcomplete.PRHeadFetcher {
 	if s.cfg.GitHub == nil {
 		return nil
 	}
-	return func(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int) (string, error) {
+	return func(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, prNumber int) (string, error) {
 		pr, err := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
 		if err != nil {
 			return "", err

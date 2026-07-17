@@ -12,18 +12,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
-// Repository is the slice of a repository API response Fishhawk needs for
-// the App-PR onboarding path (E29.7): the default branch is the base ref
-// the scaffold commit and PR target. Other fields land here as callers
-// need them.
-type Repository struct {
-	// DefaultBranch is the repo's default branch name (e.g. "main"),
-	// decoded from `default_branch`. The onboarding scaffolder resolves
-	// it per repo because the installation webhook payload does not carry
-	// it (only repository names).
-	DefaultBranch string
-}
-
 // GetRepository fetches repository metadata.
 //
 //	GET /repos/{owner}/{repo}
@@ -70,16 +58,6 @@ func (c *Client) GetRepository(ctx context.Context, scope forge.CredentialScope,
 		return nil, fmt.Errorf("githubclient: repository response missing default_branch")
 	}
 	return &Repository{DefaultBranch: body.DefaultBranch}, nil
-}
-
-// GitCommit is the slice of a git-commit object Fishhawk needs to author a
-// follow-on commit: the commit's own SHA and the tree it points at.
-type GitCommit struct {
-	// SHA is the commit object's SHA.
-	SHA string
-	// TreeSHA is the SHA of the tree the commit points at — the base_tree
-	// for a create-tree call that adds files on top of this commit.
-	TreeSHA string
 }
 
 // GetCommit fetches a git commit object by SHA (the Git Data API, not the
@@ -136,15 +114,6 @@ func (c *Client) GetCommit(ctx context.Context, scope forge.CredentialScope, rep
 		return nil, fmt.Errorf("githubclient: commit response missing tree.sha")
 	}
 	return &GitCommit{SHA: body.SHA, TreeSHA: body.Tree.SHA}, nil
-}
-
-// TreeEntry is one file placed into a new tree by CreateTree. Content is
-// the file's full text — the Git Data API creates the underlying blob
-// implicitly from inline content, so no separate CreateBlob call is
-// needed. Path is repo-relative (no leading slash).
-type TreeEntry struct {
-	Path    string
-	Content string
 }
 
 // CreateTree creates a new git tree that layers entries on top of
