@@ -74,14 +74,14 @@ workflows:
         type: plan
         executor:
           agent: claude-code
-          # Planner runs on Fable 5 (Anthropic's most capable model) rather
-          # than the deployment default. Fable is ~2x Opus per token
-          # ($10/$50 vs $5/$25), but the plan stage is the cheapest agent
-          # stage (~$1.4/run of the ~$3.9/run implement) and higher plan
-          # quality is the lever most likely to cut downstream implement
-          # rework. executor.model is the #1013 override rung (deployment
-          # default < this < plan model_recommendation < operator gate).
-          model: claude-fable-5
+          # Planner runs on Opus 4.8 rather than the deployment default.
+          # The plan stage is the cheapest agent stage (~$1.4/run of the
+          # ~$3.9/run implement) and higher plan quality is the lever most
+          # likely to cut downstream implement rework, so it pins the most
+          # capable model. executor.model is the #1013 override rung
+          # (deployment default < this < plan model_recommendation <
+          # operator gate).
+          model: claude-opus-4-8
         # Advisory plan review (ADR-027): agent reviewers surface verdicts
         # before the human gate; effective agent count >0 + human>0 →
         # advisory, so the founder approval below stays authoritative.
@@ -152,15 +152,13 @@ workflows:
         # post-#584; verdicts land ~60-90s+ after the implement trace
         # upload (poll the audit / get_run_status). Heterogeneous
         # topology (#955): same Codex reviewer as the plan stage; the Claude
-        # reviewer runs on Fable 5 (see the plan executor note) — the
-        # implement review is the last quality gate before merge, so the
-        # most capable model reviewing the diff is the highest-leverage
-        # place to catch escaped defects. ~2x Opus per reviewer token, but
-        # implement_review is a small slice of run cost (~$0.2/review).
+        # reviewer runs on Opus 4.8 — the implement review is the last
+        # quality gate before merge, so the most capable model reviewing the
+        # diff is the highest-leverage place to catch escaped defects.
         reviewers:
           agents:
             - provider: claudecode
-              model: claude-fable-5
+              model: claude-opus-4-8
             - provider: codex
               model: gpt-5.6-terra
               reasoning_effort: high
