@@ -49,6 +49,7 @@ type Conventions struct {
 	Provider         string              `json:"provider"`
 	Project          *Project            `json:"project,omitempty"`
 	Jira             *JiraConnection     `json:"jira,omitempty"`
+	GitLab           *GitLabConnection   `json:"gitlab,omitempty"`
 	ComplexityLevels map[string]string   `json:"complexity_levels,omitempty"`
 	RequiredFields   []string            `json:"required_fields"`
 	FieldHints       map[string]string   `json:"field_hints,omitempty"`
@@ -99,6 +100,21 @@ type JiraConnection struct {
 	ProjectKey  string            `json:"project_key"`
 	IssueTypes  map[string]string `json:"issue_types,omitempty"`
 	ParentField string            `json:"parent_field,omitempty"`
+}
+
+// GitLabConnection is the GitLab connection (ADR-058 Phase 2). Project
+// optionally overrides the target GitLab project — a namespaced project path
+// (e.g. group/subgroup/project) that filed issues are created under; absent
+// means the provider resolves the filing repo's owner/name path instead. The
+// GitLab instance base URL and token are server-side env
+// (FISHHAWKD_GITLAB_BASE_URL / FISHHAWKD_GITLAB_TOKEN), never in this
+// checked-in config, so this block carries no secrets and no base URL —
+// matching the jira precedent. GitLab boards are label-driven, so the
+// canonical-state map's values are GitLab label names and the provider treats
+// applying the state label at create time as board placement; the parent-epic
+// link uses the Free-tier issue-links API rather than Premium group epics.
+type GitLabConnection struct {
+	Project string `json:"project,omitempty"`
 }
 
 // ItemType is the conventions for one work-item type.
@@ -276,10 +292,11 @@ func parse(data []byte) (Conventions, error) {
 }
 
 // validateSemantics enforces the cross-field rules the JSON Schema can't
-// express: the mandatory required-field trio, the github_projects and jira
-// connection requirements, ADR numbering, the complexity cross-reference,
-// and the transitions->states cross-reference (every configured transition
-// target must name a canonical state declared in the states map).
+// express: the mandatory required-field trio, the github_projects, jira, and
+// gitlab connection requirements, ADR numbering, the complexity
+// cross-reference, and the transitions->states cross-reference (every
+// configured transition target must name a canonical state declared in the
+// states map).
 func validateSemantics(c Conventions) error {
 	if missing := missingMandatoryFields(c.RequiredFields); len(missing) > 0 {
 		return &SemanticError{Msg: fmt.Sprintf(
@@ -293,6 +310,19 @@ func validateSemantics(c Conventions) error {
 
 	if c.Provider == "jira" && c.Jira == nil {
 		return &SemanticError{Msg: "provider jira requires a jira connection block (project_key)"}
+	}
+
+	// The gitlab block is required under provider gitlab (mirroring jira) and
+	// rejected under any other provider. The off-provider rejection is
+	// fail-closed: a gitlab block under github_projects/jira is almost
+	// certainly a misconfiguration (a copied-in connection the active
+	// provider will silently ignore), so it is surfaced rather than dropped.
+	if c.Provider == "gitlab" && c.GitLab == nil {
+		return &SemanticError{Msg: "provider gitlab requires a gitlab connection block (project optional)"}
+	}
+	if c.Provider != "gitlab" && c.GitLab != nil {
+		return &SemanticError{Msg: fmt.Sprintf(
+			"gitlab connection block is set but provider is %q, not gitlab", c.Provider)}
 	}
 
 	// Type keys are deterministically ordered so the first failure is

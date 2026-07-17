@@ -16,8 +16,8 @@
     },
     "provider": {
       "type": "string",
-      "enum": ["github_projects", "jira"],
-      "description": "Work-management backend. github_projects is the only concrete provider in v0; jira is reserved at the interface level (the model must be expressible as a Jira issue) but has no implementation yet — an unimplemented provider must fail closed at filing time, never silently."
+      "enum": ["github_projects", "jira", "gitlab"],
+      "description": "Work-management backend. github_projects and gitlab are concrete providers in v0 (ADR-058); jira is reserved at the interface level (the model must be expressible as a Jira issue) but has no implementation yet — an unimplemented provider must fail closed at filing time, never silently."
     },
     "project": {
       "type": "object",
@@ -64,6 +64,18 @@
           "minLength": 1,
           "default": "parent",
           "description": "Field used to link a created issue to its parent epic. Team-managed (next-gen) projects use the default `parent` reference ({\"parent\":{\"key\":\"EPIC-KEY\"}}); company-managed (classic) projects set the instance's epic-link custom field id (e.g. customfield_10014) to the bare epic key string. Optional; absent means the team-managed `parent` default."
+        }
+      }
+    },
+    "gitlab": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "GitLab connection (ADR-058 Phase 2). Required when provider is gitlab (semantic check); a gitlab block under any other provider is rejected (semantic check). This block carries ONLY an optional target-project override; the GitLab instance base URL and token are server-side env (FISHHAWKD_GITLAB_BASE_URL / FISHHAWKD_GITLAB_TOKEN), NOT in this checked-in config — matching the jira / FISHHAWKD_PROJECTS_TOKEN single-instance, secrets-never-in-repo precedent. GitLab boards are label-driven, so the canonical `states` map's values are GitLab label names and applying the state label at create time IS board placement; parent_epic links via the Free-tier issue-links API (relates_to), NOT Premium group epics.",
+      "properties": {
+        "project": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional namespaced GitLab project path (e.g. group/subgroup/project) that filed issues are created under. Absent means the filing repo's owner/name path is used as the project path."
         }
       }
     },

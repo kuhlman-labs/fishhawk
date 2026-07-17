@@ -322,6 +322,60 @@ types: {feature: {body_skeleton: [Summary]}}
 	}
 }
 
+// TestParseValidGitLab proves a provider:gitlab config carrying the additive
+// gitlab connection block parses cleanly and round-trips into the typed
+// *GitLabConnection, both with the optional project override and with an
+// empty block (project defaults to the filing repo path in the provider).
+// The schema↔struct seam: the GitLab struct field must land in the same
+// commit as the schema key, or the DisallowUnknownFields decode rejects the
+// gitlab key. No provider behavior is exercised here; the concrete gitlab
+// provider and its wiring land in sibling slices.
+func TestParseValidGitLab(t *testing.T) {
+	withProject := `
+spec_version: work-management-v0
+provider: gitlab
+gitlab:
+  project: group/subgroup/app
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+	c, err := Parse(strings.NewReader(withProject))
+	if err != nil {
+		t.Fatalf("Parse(gitlab with project) = %v, want nil", err)
+	}
+	if c.Provider != "gitlab" {
+		t.Errorf("Provider = %q, want gitlab", c.Provider)
+	}
+	if c.GitLab == nil {
+		t.Fatal("GitLab is nil; the gitlab block did not round-trip into the struct")
+	}
+	if c.GitLab.Project != "group/subgroup/app" {
+		t.Errorf("GitLab.Project = %q, want group/subgroup/app", c.GitLab.Project)
+	}
+
+	// An empty gitlab block is valid (project is optional): the semantic
+	// check only requires the block to be present under provider gitlab, and
+	// a present-but-empty block round-trips into a non-nil struct with an
+	// empty Project.
+	empty := `
+spec_version: work-management-v0
+provider: gitlab
+gitlab: {}
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+	c2, err := Parse(strings.NewReader(empty))
+	if err != nil {
+		t.Fatalf("Parse(gitlab empty block) = %v, want nil", err)
+	}
+	if c2.GitLab == nil {
+		t.Fatal("GitLab is nil; a present-but-empty gitlab block must round-trip into a non-nil struct")
+	}
+	if c2.GitLab.Project != "" {
+		t.Errorf("GitLab.Project = %q, want empty when the project override is absent", c2.GitLab.Project)
+	}
+}
+
 // TestParseDoneMeansSpaceVariant proves the mandatory-field check is
 // robust to "Done means" vs "Done-means".
 func TestParseDoneMeansSpaceVariant(t *testing.T) {
@@ -417,6 +471,29 @@ required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary]}}
 `,
 			want: "requires a jira connection",
+		},
+		// ADR-058: provider gitlab requires the gitlab block (fail-closed mode 1).
+		"gitlab without gitlab block": {
+			cfg: `
+spec_version: work-management-v0
+provider: gitlab
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`,
+			want: "requires a gitlab connection",
+		},
+		// ADR-058: a gitlab block under a non-gitlab provider is rejected
+		// (fail-closed mode 2 — the off-provider-block rejection).
+		"gitlab block under github_projects": {
+			cfg: `
+spec_version: work-management-v0
+provider: github_projects
+project: {owner: a, number: 1}
+gitlab: {project: group/app}
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`,
+			want: `gitlab connection block is set but provider is "github_projects", not gitlab`,
 		},
 		"adr without numbering": {
 			cfg: `

@@ -13,9 +13,10 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | Field | Required | Shape | Meaning |
 |---|---|---|---|
 | `spec_version` | yes | enum `work-management-v0` | Single-value enum per the versioning rules below. |
-| `provider` | yes | enum `github_projects` \| `jira` | Work-management backend. `github_projects` is the only concrete provider in v0; `jira` is reserved at the interface level (no implementation) and an unimplemented provider must fail closed at filing time. |
+| `provider` | yes | enum `github_projects` \| `jira` \| `gitlab` | Work-management backend. `github_projects` and `gitlab` are concrete providers in v0 (ADR-058); `jira` is reserved at the interface level (no implementation) and an unimplemented provider must fail closed at filing time. |
 | `project` | conditional | object | GitHub Projects connection (`owner`, `owner_type`, `number`). Required when `provider` is `github_projects` (semantic check). |
 | `jira` | conditional | object | Jira connection (`project_key` + optional `issue_types` map). Required when `provider` is `jira` (semantic check). Selects only the target project — the instance base URL and credentials are server-side env (see below), **not** in this checked-in config. |
+| `gitlab` | conditional | object | GitLab connection (optional `project` path override). Required when `provider` is `gitlab`, and rejected under any other provider (both semantic checks). Selects only the target project — the instance base URL and token are server-side env (see below), **not** in this checked-in config. |
 | `complexity_levels` | no | object: `low`/`medium`/`high` → prose | The complexity prior: concrete file/coupling definitions for each level. Optional in a repo config; shipped in the default. |
 | `required_fields` | yes | non-empty unique string list | Fields every filed item must carry. Must include the mandatory trio Summary, Done-means, complexity (semantic check). |
 | `field_hints` | no | object: field name → prose | Per-field authoring hints. The Done-means hint states the condition must be testable. |
@@ -51,6 +52,30 @@ The `jira` block is the connection for `provider: jira`. It carries **only non-s
 | `parent_field` | no | string (default `parent`) | Field used to link a created issue to its parent epic, applied via a best-effort post-create edit. Team-managed (next-gen) projects use the default `parent` reference; company-managed (classic) projects set the instance's epic-link custom field id (e.g. `customfield_10014`) to the bare epic key. |
 
 The Jira **instance base URL and credentials are server-side env**, never in this checked-in config: `FISHHAWKD_JIRA_BASE_URL`, `FISHHAWKD_JIRA_EMAIL`, `FISHHAWKD_JIRA_API_TOKEN`. This matches the `FISHHAWKD_PROJECTS_TOKEN` single-instance, secrets-never-in-repo precedent — the repo config selects only the project, the server holds the one instance and its creds. `provider: jira` still fails closed at filing time until the concrete provider and its server wiring land.
+
+### GitLab connection (`gitlab`)
+
+The `gitlab` block is the connection for `provider: gitlab` (ADR-058 Phase 2). It carries **only a non-secret, optional project override**:
+
+| Field | Required | Shape | Meaning |
+|---|---|---|---|
+| `project` | no | string | Namespaced GitLab project path (e.g. `group/subgroup/project`) that filed issues are created under. Absent means the filing repo's `owner/name` path is used as the project path. |
+
+The GitLab **instance base URL and token are server-side env**, never in this checked-in config: `FISHHAWKD_GITLAB_BASE_URL` (SaaS `https://gitlab.com` or a self-managed instance URL) and `FISHHAWKD_GITLAB_TOKEN` (a personal/project/group access token sent as the `PRIVATE-TOKEN` header). This mirrors the `FISHHAWKD_JIRA_*` / `FISHHAWKD_PROJECTS_TOKEN` single-instance, secrets-never-in-repo precedent.
+
+Two semantic checks (`workmgmt.Parse`) gate the block, both fail-closed:
+
+- **`provider: gitlab` requires the `gitlab` block** (mirroring the `jira` requirement). A present-but-empty `gitlab: {}` satisfies the requirement — the project override is optional.
+- **A `gitlab` block under any other provider is rejected.** A copied-in connection the active provider would silently ignore is surfaced (`gitlab connection block is set but provider is "<p>", not gitlab`) rather than dropped.
+
+#### GitLab epic and canonical-state mapping
+
+GitLab's data model differs from GitHub Projects and Jira, so the `states`/`transitions` conventions and `parent_epic` relations map onto GitLab as follows (the decision, recorded here and in the provider package README):
+
+- **Canonical states → GitLab label names.** GitLab issue boards are **label-driven**: a board column is a label, and an issue appears in a column when it carries that label. So the `states` map's values are **GitLab label names**, and the provider applies the mapped state's label at issue-create time — applying the label **is** board placement (no separate board API call). Boarded is true when the state label rode the create.
+- **`parent_epic` → Free-tier issue link (`relates_to`).** GitLab **epics are a Premium-only group entity** and are deliberately **not** used in v0. Instead a `parent_epic` relation is linked best-effort via the Free-tier **issue-links API** (`relates_to`), so the mapping works on GitLab.com Free and self-managed CE. A link failure is non-fatal (the created issue is still returned), matching the best-effort epic-link posture of the other providers.
+
+`provider: gitlab` is filed by the `backend/internal/workmgmt/gitlab` provider once its server wiring (`FISHHAWKD_GITLAB_BASE_URL` / `FISHHAWKD_GITLAB_TOKEN`) is configured; an unconfigured `provider: gitlab` fails closed at filing time like any unregistered provider.
 
 ## Required-field discipline
 
@@ -143,7 +168,7 @@ The cross-reference is a semantic rule (`workmgmt.Parse`): **every `transitions`
 `workmgmt.Parse` validates in two stages and returns a typed error:
 
 - `*SchemaError` — a structural violation (unknown key, wrong enum, malformed label, empty `body_skeleton`). Carries a JSON Pointer path.
-- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, a type named `adr` has no `numbering` rule, a type's `optional_sections` names a heading absent from its `body_skeleton`, a type's `label_defaults` value does not begin with its key's namespace prefix, or a `transitions` value names a canonical state not declared in `states`.
+- `*SemanticError` — a cross-field rule the schema can't express: the mandatory trio is incomplete, `github_projects` is missing its `project` block, `jira` is missing its `jira` block, `gitlab` is missing its `gitlab` block (or a `gitlab` block is set under another provider), a type named `adr` has no `numbering` rule, a type's `optional_sections` names a heading absent from its `body_skeleton`, a type's `label_defaults` value does not begin with its key's namespace prefix, or a `transitions` value names a canonical state not declared in `states`.
 - `*YAMLError` — unparseable, empty, or multi-document input (the config must be a single YAML document; a trailing document would bypass validation).
 
 The shipped default is validated against the schema at backend package init, so the product artifact can never drift from its own schema.
