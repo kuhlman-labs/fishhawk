@@ -3641,3 +3641,233 @@ func TestHandleInstallation_CrossBoundary(t *testing.T) {
 		}
 	}
 }
+
+// --- MatchGitLabEvent (E45.6 / #1860) ---
+
+// gitlabEvent builds a GitLab-sourced Event with the given object_kind,
+// sender, and raw body. CredentialRef defaults to a non-empty project
+// scope so the empty-CredentialRef skip only fires when a test zeroes it.
+func gitlabEvent(kind, sender, body string) Event {
+	return Event{
+		Type:          kind,
+		Sender:        sender,
+		Forge:         ForgeGitLab,
+		CredentialRef: "gitlab:1",
+		RawBody:       []byte(body),
+	}
+}
+
+func TestMatchGitLabEvent_EmptyCredentialRefSkips(t *testing.T) {
+	ev := gitlabEvent("issue", "root", `{"object_attributes":{"iid":1,"action":"open"}}`)
+	ev.CredentialRef = ""
+	m := MatchGitLabEvent(ev)
+	if !m.Skip || m.Reason != "no project id in payload" {
+		t.Errorf("got %+v, want skip 'no project id in payload'", m)
+	}
+}
+
+func TestMatchGitLabEvent_BotUsernameSkips(t *testing.T) {
+	for _, u := range []string{"project_42_bot_abc", "group_7_bot_xyz"} {
+		t.Run(u, func(t *testing.T) {
+			ev := gitlabEvent("note", u, `{"object_attributes":{"note":"/fishhawk run","noteable_type":"Issue"},"issue":{"iid":3}}`)
+			m := MatchGitLabEvent(ev)
+			if !m.Skip || !strings.Contains(m.Reason, "bot") {
+				t.Errorf("got %+v, want bot skip", m)
+			}
+		})
+	}
+}
+
+func TestMatchGitLabEvent_IssueLabelAdded_UpdateDiff(t *testing.T) {
+	body := `{"object_attributes":{"iid":23,"action":"update"},
+		"changes":{"labels":{"previous":[],"current":[{"title":"fishhawk"}]}}}`
+	m := MatchGitLabEvent(gitlabEvent("issue", "root", body))
+	if m.Skip {
+		t.Fatalf("expected a run match; got skip %q", m.Reason)
+	}
+	if m.Action != MatchActionRun {
+		t.Errorf("Action = %q, want run", m.Action)
+	}
+	if m.TriggerRef != "issue:23" {
+		t.Errorf("TriggerRef = %q, want issue:23", m.TriggerRef)
+	}
+	if m.IssueRef == nil || m.IssueRef.Number != 23 {
+		t.Errorf("IssueRef = %+v, want number 23", m.IssueRef)
+	}
+}
+
+func TestMatchGitLabEvent_IssueLabelPresentOnOpen(t *testing.T) {
+	body := `{"object_attributes":{"iid":9,"action":"open"},"labels":[{"title":"Fishhawk"}]}`
+	m := MatchGitLabEvent(gitlabEvent("issue", "root", body))
+	if m.Skip || m.Action != MatchActionRun {
+		t.Errorf("got %+v, want run match (case-insensitive label on open)", m)
+	}
+}
+
+func TestMatchGitLabEvent_IssueLabelAlreadyPresent_UpdateSkips(t *testing.T) {
+	// The fishhawk label was already present before the update (in both
+	// previous and current): not a NEW label, so it must not re-fire.
+	body := `{"object_attributes":{"iid":23,"action":"update"},
+		"changes":{"labels":{"previous":[{"title":"fishhawk"}],"current":[{"title":"fishhawk"}]}}}`
+	m := MatchGitLabEvent(gitlabEvent("issue", "root", body))
+	if !m.Skip {
+		t.Errorf("got %+v, want skip (label not newly present)", m)
+	}
+}
+
+func TestMatchGitLabEvent_IssueNonTriggerActionSkips(t *testing.T) {
+	body := `{"object_attributes":{"iid":23,"action":"close"},"labels":[{"title":"fishhawk"}]}`
+	m := MatchGitLabEvent(gitlabEvent("issue", "root", body))
+	if !m.Skip {
+		t.Errorf("got %+v, want skip (close is not a trigger action)", m)
+	}
+}
+
+func TestMatchGitLabEvent_NoteCommands(t *testing.T) {
+	cases := []struct {
+		name       string
+		note       string
+		wantAction MatchAction
+		wantSource ApprovalSource
+	}{
+		{"run", "/fishhawk run", MatchActionRun, ""},
+		{"approve", "/fishhawk approve ship it", MatchActionApprove, ApprovalSourceSlash},
+		{"reject", "/fishhawk reject not yet", MatchActionReject, ApprovalSourceSlash},
+		{"reply-pattern", "lgtm nice work", MatchActionApprove, ApprovalSourceReplyComment},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"object_attributes":{"note":%q,"noteable_type":"Issue"},"issue":{"iid":17}}`, tc.note)
+			m := MatchGitLabEvent(gitlabEvent("note", "root", body))
+			if m.Skip {
+				t.Fatalf("expected a match; got skip %q", m.Reason)
+			}
+			if m.Action != tc.wantAction {
+				t.Errorf("Action = %q, want %q", m.Action, tc.wantAction)
+			}
+			if m.ApprovalSource != tc.wantSource {
+				t.Errorf("ApprovalSource = %q, want %q", m.ApprovalSource, tc.wantSource)
+			}
+			if m.IssueRef == nil || m.IssueRef.Number != 17 {
+				t.Errorf("IssueRef = %+v, want number 17", m.IssueRef)
+			}
+		})
+	}
+}
+
+func TestMatchGitLabEvent_NoteNonIssueNoteableSkips(t *testing.T) {
+	body := `{"object_attributes":{"note":"/fishhawk run","noteable_type":"MergeRequest"},"issue":{"iid":17}}`
+	m := MatchGitLabEvent(gitlabEvent("note", "root", body))
+	if !m.Skip {
+		t.Errorf("got %+v, want skip (non-Issue noteable)", m)
+	}
+}
+
+func TestMatchGitLabEvent_NoteNonCommandSkips(t *testing.T) {
+	body := `{"object_attributes":{"note":"just a thought","noteable_type":"Issue"},"issue":{"iid":17}}`
+	m := MatchGitLabEvent(gitlabEvent("note", "root", body))
+	if !m.Skip {
+		t.Errorf("got %+v, want skip (no command)", m)
+	}
+}
+
+func TestMatchGitLabEvent_MergeRequestSkipsForServerConsumer(t *testing.T) {
+	m := MatchGitLabEvent(gitlabEvent("merge_request", "root", `{"object_attributes":{"iid":1,"action":"merge"}}`))
+	if !m.Skip || m.Reason != "MR lifecycle consumed server-side" {
+		t.Errorf("got %+v, want skip 'MR lifecycle consumed server-side'", m)
+	}
+}
+
+func TestMatchGitLabEvent_PipelineAndBuildRecognizedSkips(t *testing.T) {
+	for _, kind := range []string{"pipeline", "build"} {
+		t.Run(kind, func(t *testing.T) {
+			m := MatchGitLabEvent(gitlabEvent(kind, "root", `{"object_attributes":{"status":"success"}}`))
+			if !m.Skip || !strings.Contains(m.Reason, "#1861") {
+				t.Errorf("got %+v, want recognized skip naming #1861", m)
+			}
+		})
+	}
+}
+
+func TestMatchGitLabEvent_UnknownKindSkips(t *testing.T) {
+	m := MatchGitLabEvent(gitlabEvent("wiki_page", "root", `{}`))
+	if !m.Skip || !strings.Contains(m.Reason, "unrecognized gitlab object_kind") {
+		t.Errorf("got %+v, want unrecognized-kind skip", m)
+	}
+}
+
+// --- Dispatcher.Handle routing by forge ---
+
+func TestHandle_GitLabApprove_RoutesWithZeroInstallation(t *testing.T) {
+	d, _, _, _ := newDispatcherWithStubs(t)
+	stub := &stubApprovalHandler{}
+	d.ApprovalHandler = stub
+
+	body := `{"object_attributes":{"note":"/fishhawk approve","noteable_type":"Issue"},"issue":{"iid":42}}`
+	ev := gitlabEvent("note", "alice", body)
+	ev.DeliveryID = "gitlab:d1"
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 approval call; got %d", len(stub.calls))
+	}
+	got := stub.calls[0]
+	if got.InstallationID != 0 {
+		t.Errorf("InstallationID = %d, want 0 (GitLab carries no installation id)", got.InstallationID)
+	}
+	if got.Decision != MatchActionApprove || got.IssueNumber != 42 || got.SenderLogin != "alice" {
+		t.Errorf("unexpected approval params: %+v", got)
+	}
+}
+
+func TestHandle_GitLabRun_ParksWithoutCreatingRun(t *testing.T) {
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
+	body := `{"object_attributes":{"iid":5,"action":"open"},"labels":[{"title":"fishhawk"}]}`
+	ev := gitlabEvent("issue", "alice", body)
+	ev.DeliveryID = "gitlab:d2"
+	// A VALID Repo so the park boundary is regression-detectable: if the
+	// E45.8/#1861 park block were deleted, the fall-through would parse
+	// this repo successfully and reach the spec-fetch / CreateRun stubs,
+	// tripping the runs.created assertion below — instead of silently
+	// no-op'ing at parseRepo("") and passing identically (the vacuity
+	// the done-means pin must guard against).
+	ev.Repo = "group/project"
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("CreateRun called %d times; a parked GitLab run must create no run", len(runs.created))
+	}
+	// The park must emit its #1861-named log line (the stated done-means
+	// pin). Asserting it makes a deleted park block detectable even
+	// independent of the CreateRun stub.
+	if got := logs.String(); !strings.Contains(got, "gitlab run trigger parked") || !strings.Contains(got, "#1861") {
+		t.Errorf("expected park log naming #1861; got logs:\n%s", got)
+	}
+}
+
+func TestHandle_GitHubEvent_StillRoutesThroughMatchEvent(t *testing.T) {
+	// A GitHub event (Forge == "") that MatchEvent DISPATCHES must
+	// reach CreateRun + workflow_dispatch — positive proof the default
+	// matcher ran. This discriminates against the "route everything
+	// through MatchGitLabEvent" regression: a GitHub event carries an
+	// empty CredentialRef (only GitLab deliveries set it — see
+	// webhook.go / gitlab.go), so MatchGitLabEvent would skip this same
+	// event at its "no project id in payload" guard and create no run.
+	// A dispatched run is therefore only reachable via MatchEvent, so
+	// asserting runs.created == 1 fails if the routing regresses —
+	// unlike a skip-only assertion, which both matchers satisfy with
+	// runs.created == 0.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("CreateRun called %d times; a labeled GitHub issue must dispatch via MatchEvent (MatchGitLabEvent would skip on empty CredentialRef)", len(runs.created))
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("dispatchCalls = %d, want 1 (GitHub dispatch path)", gh.dispatchCalls)
+	}
+}

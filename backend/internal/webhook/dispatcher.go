@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -315,69 +316,77 @@ func matchIssueComment(ev Event) Match {
 	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
 		return Match{Skip: true, Reason: "issue_comment payload parse failed"}
 	}
-	body := strings.TrimSpace(payload.Comment.Body)
 	if payload.Issue.Number == 0 {
 		return Match{Skip: true, Reason: "issue_comment payload missing issue number"}
 	}
 
-	// Pick the most-specific command first so /fishhawk approve
-	// doesn't accidentally classify as /fishhawk run when the
-	// "/fishhawk" prefix coincides. Each branch leaves the trailing
-	// text (after the command) in CommentBody so approve / reject
-	// can capture an optional reason. The match is anchored at the
-	// start of the body — comments that begin with prose followed
-	// by the command are intentionally not honored (avoids quoted-
-	// reply false positives like "Should I run `/fishhawk run`?").
+	cmd, ok := classifyCommentCommand(payload.Comment.Body)
+	if !ok {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("comment does not start with a Fishhawk command (recognized: %q, %q, %q) or an approval-reply pattern",
+				CommentTrigger, CommentApprove, CommentReject)}
+	}
+	m := Match{
+		Action:         cmd.Action,
+		ApprovalSource: cmd.ApprovalSource,
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
+		IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
+		CommentBody:    cmd.CommentBody,
+	}
+	if cmd.Action == MatchActionRun {
+		m.WorkflowID = DefaultWorkflowID
+	}
+	return m
+}
+
+// commentCommand is the forge-neutral classification of a comment
+// body: which gate action it maps to, which approval matcher produced
+// it, and the trailing reviewer rationale. Shared by matchIssueComment
+// (GitHub) and matchGitLabNote (GitLab) via classifyCommentCommand so
+// the slash-command + reply-pattern semantics cannot drift between
+// the two forges.
+type commentCommand struct {
+	Action         MatchAction
+	ApprovalSource ApprovalSource
+	CommentBody    string
+}
+
+// classifyCommentCommand parses a comment body into a commentCommand,
+// or ok=false when the body matches no Fishhawk command / reply
+// pattern. The load-bearing dispatch semantics live here so both
+// forges share one classifier:
+//
+//   - Most-specific command first, so /fishhawk approve doesn't
+//     classify as /fishhawk run when the "/fishhawk" prefix coincides.
+//   - Each branch captures the trailing text (after the command word)
+//     as the optional reviewer reason on approve / reject.
+//   - The match is anchored at the start of the trimmed body — a
+//     comment that begins with prose followed by the command is NOT
+//     honored (avoids quoted-reply false positives like "Should I run
+//     `/fishhawk run`?").
+//   - Reply-comment approval (E17.3 / #338) is tried AFTER the slash
+//     matches so an explicit "/fishhawk approve lgtm" still routes
+//     through the slash path. Reject reply patterns are intentionally
+//     absent (weaker industry consensus; a typed-reply reject lacks the
+//     slash command's explicit-confirmation property).
+//
+// The caller supplies the forge-appropriate TriggerSource / TriggerRef
+// / IssueRef around this classification.
+func classifyCommentCommand(rawBody string) (commentCommand, bool) {
+	body := strings.TrimSpace(rawBody)
 	switch {
 	case isCommand(body, CommentApprove):
-		return Match{
-			Action:         MatchActionApprove,
-			ApprovalSource: ApprovalSourceSlash,
-			TriggerSource:  run.TriggerGitHubIssue,
-			TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
-			IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
-			CommentBody:    trailingComment(body, CommentApprove),
-		}
+		return commentCommand{MatchActionApprove, ApprovalSourceSlash, trailingComment(body, CommentApprove)}, true
 	case isCommand(body, CommentReject):
-		return Match{
-			Action:         MatchActionReject,
-			ApprovalSource: ApprovalSourceSlash,
-			TriggerSource:  run.TriggerGitHubIssue,
-			TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
-			IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
-			CommentBody:    trailingComment(body, CommentReject),
-		}
+		return commentCommand{MatchActionReject, ApprovalSourceSlash, trailingComment(body, CommentReject)}, true
 	case isCommand(body, CommentTrigger):
-		return Match{
-			Action:        MatchActionRun,
-			WorkflowID:    DefaultWorkflowID,
-			TriggerSource: run.TriggerGitHubIssue,
-			TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
-			IssueRef:      &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
-		}
+		return commentCommand{Action: MatchActionRun}, true
 	}
-	// Reply-comment approval (E17.3 / #338). Tried after the slash
-	// matches so an explicit "/fishhawk approve lgtm" still routes
-	// through the slash path. Patterns are anchored at the start of
-	// the body, same shape as isCommand. Reject reply patterns are
-	// intentionally absent: the rejection conventions ("-1", "👎")
-	// have weaker industry consensus and a typed-reply reject lacks
-	// the slash command's explicit-confirmation property; reviewers
-	// wanting to reject use the slash command or the dashboard.
-	if pat, trailing, ok := matchApprovalReplyPattern(body); ok {
-		_ = pat
-		return Match{
-			Action:         MatchActionApprove,
-			ApprovalSource: ApprovalSourceReplyComment,
-			TriggerSource:  run.TriggerGitHubIssue,
-			TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
-			IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
-			CommentBody:    trailing,
-		}
+	if _, trailing, ok := matchApprovalReplyPattern(body); ok {
+		return commentCommand{MatchActionApprove, ApprovalSourceReplyComment, trailing}, true
 	}
-	return Match{Skip: true,
-		Reason: fmt.Sprintf("comment does not start with a Fishhawk command (recognized: %q, %q, %q) or an approval-reply pattern",
-			CommentTrigger, CommentApprove, CommentReject)}
+	return commentCommand{}, false
 }
 
 // matchApprovalReplyPattern returns the matched pattern + trailing
@@ -687,6 +696,175 @@ func matchInstallation(ev Event) Match {
 	return Match{Action: MatchActionScaffold, Repositories: repos}
 }
 
+// gitLabBotUsername matches the generated usernames GitLab assigns to
+// project / group access-token bot users:
+// project_<project_id>_bot_<suffix> and group_<group_id>_bot_<suffix>
+// (https://docs.gitlab.com/user/project/settings/project_access_tokens/#bot-users-for-projects).
+// Skipping these prevents a feedback loop between Fishhawk's own
+// GitLab-side comments and the note/issue triggers. Residual: a plain
+// user account used as a bot is NOT skipped — the same exposure the
+// GitHub path accepts for non-Bot-typed accounts.
+var gitLabBotUsername = regexp.MustCompile(`^(project|group)_\d+_bot`)
+
+// MatchGitLabEvent classifies a GitLab-sourced Event into a Match,
+// mirroring MatchEvent into the SAME Match vocabulary + Dispatcher
+// pipeline. Pure: no I/O, no side effects. The Dispatcher selects this
+// matcher when ev.Forge == ForgeGitLab.
+//
+// Rules (E45.6 / #1860):
+//   - Empty CredentialRef (no project id in the payload) skips — a run
+//     can't be scoped to a forge credential without it.
+//   - Bot-username senders skip (feedback-loop guard, gitLabBotUsername).
+//   - object_kind "issue" triggers MatchActionRun when the fishhawk
+//     label is NEWLY present (added in the changes.labels diff on
+//     action "update", or present in labels on "open" / "reopen").
+//   - object_kind "note" on an Issue classifies the note body via the
+//     shared classifier into run / approve / reject.
+//   - object_kind "merge_request" skips — the MR lifecycle is consumed
+//     server-side (the receiver's merge/close consumer drives the
+//     review stage), not via the dispatcher.
+//   - object_kind "pipeline" / "build" skip with a reason naming the
+//     E45.8 / #1861 CI-dispatch consumer.
+//   - Everything else is acknowledged and skipped.
+func MatchGitLabEvent(ev Event) Match {
+	if ev.CredentialRef == "" {
+		return Match{Skip: true, Reason: "no project id in payload"}
+	}
+	if gitLabBotUsername.MatchString(ev.Sender) {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("sender %q is a gitlab access-token bot", ev.Sender)}
+	}
+
+	switch ev.Type {
+	case "issue":
+		return matchGitLabIssue(ev)
+	case "note":
+		return matchGitLabNote(ev)
+	case "merge_request":
+		return Match{Skip: true, Reason: "MR lifecycle consumed server-side"}
+	case "pipeline", "build":
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("%s event recognized; run creation from GitLab triggers is the E45.8/#1861 CI-dispatch consumer", ev.Type)}
+	default:
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("unrecognized gitlab object_kind %q", ev.Type)}
+	}
+}
+
+// matchGitLabIssue classifies a GitLab "issue" event. A run triggers
+// only when the fishhawk label is NEWLY present: on action "update"
+// that means present in changes.labels.current but absent from
+// changes.labels.previous (so an unrelated edit on an already-labeled
+// issue doesn't re-fire); on "open" / "reopen" it means present in the
+// issue's labels. TriggerRef / IssueRef use the per-project iid (the
+// number matching #N refs), not the global id.
+func matchGitLabIssue(ev Event) Match {
+	var payload struct {
+		ObjectAttributes struct {
+			IID    int    `json:"iid"`
+			Action string `json:"action"`
+		} `json:"object_attributes"`
+		Labels  []gitLabLabel `json:"labels"`
+		Changes struct {
+			Labels struct {
+				Previous []gitLabLabel `json:"previous"`
+				Current  []gitLabLabel `json:"current"`
+			} `json:"labels"`
+		} `json:"changes"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "gitlab issue payload parse failed"}
+	}
+	if payload.ObjectAttributes.IID == 0 {
+		return Match{Skip: true, Reason: "gitlab issue payload missing iid"}
+	}
+
+	var newlyLabeled bool
+	switch payload.ObjectAttributes.Action {
+	case "update":
+		newlyLabeled = labelPresent(payload.Changes.Labels.Current, FishhawkLabel) &&
+			!labelPresent(payload.Changes.Labels.Previous, FishhawkLabel)
+	case "open", "reopen":
+		newlyLabeled = labelPresent(payload.Labels, FishhawkLabel)
+	default:
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("gitlab issue.%s is not a trigger action", payload.ObjectAttributes.Action)}
+	}
+	if !newlyLabeled {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("fishhawk label not newly present on issue.%s", payload.ObjectAttributes.Action)}
+	}
+	return Match{
+		Action:     MatchActionRun,
+		WorkflowID: DefaultWorkflowID,
+		TriggerRef: fmt.Sprintf("issue:%d", payload.ObjectAttributes.IID),
+		IssueRef:   &IssueRef{Number: payload.ObjectAttributes.IID},
+	}
+}
+
+// matchGitLabNote classifies a GitLab "note" (comment) event. Only
+// notes on an Issue are considered (noteable_type == "Issue"); MR /
+// commit / snippet notes are out of scope for v0. The note body runs
+// through the shared classifyCommentCommand so run / approve / reject
+// + reply-pattern semantics match the GitHub path exactly. The issue
+// number is the per-project issue.iid.
+func matchGitLabNote(ev Event) Match {
+	var payload struct {
+		ObjectAttributes struct {
+			Note         string `json:"note"`
+			NoteableType string `json:"noteable_type"`
+		} `json:"object_attributes"`
+		Issue struct {
+			IID int `json:"iid"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
+		return Match{Skip: true, Reason: "gitlab note payload parse failed"}
+	}
+	if payload.ObjectAttributes.NoteableType != "Issue" {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("gitlab note on %q is not an issue note", payload.ObjectAttributes.NoteableType)}
+	}
+	if payload.Issue.IID == 0 {
+		return Match{Skip: true, Reason: "gitlab note payload missing issue iid"}
+	}
+	cmd, ok := classifyCommentCommand(payload.ObjectAttributes.Note)
+	if !ok {
+		return Match{Skip: true,
+			Reason: fmt.Sprintf("gitlab note does not start with a Fishhawk command (recognized: %q, %q, %q) or an approval-reply pattern",
+				CommentTrigger, CommentApprove, CommentReject)}
+	}
+	m := Match{
+		Action:         cmd.Action,
+		ApprovalSource: cmd.ApprovalSource,
+		TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.IID),
+		IssueRef:       &IssueRef{Number: payload.Issue.IID, Body: payload.ObjectAttributes.Note},
+		CommentBody:    cmd.CommentBody,
+	}
+	if cmd.Action == MatchActionRun {
+		m.WorkflowID = DefaultWorkflowID
+	}
+	return m
+}
+
+// gitLabLabel is the subset of a GitLab label object the matcher reads.
+// GitLab labels carry their name under "title".
+type gitLabLabel struct {
+	Title string `json:"title"`
+}
+
+// labelPresent reports whether name (case-insensitive) appears in the
+// label set. Used to detect the fishhawk trigger label in both the
+// current-labels list and the changes-diff halves.
+func labelPresent(labels []gitLabLabel, name string) bool {
+	for _, l := range labels {
+		if strings.EqualFold(l.Title, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // GitHubAPI is the slice of githubclient.Client the dispatcher
 // uses. Defining it as an interface lets tests substitute a stub
 // without standing up an httptest.Server alongside the existing
@@ -882,7 +1060,16 @@ type Dispatcher struct {
 func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	now := d.now()
 
-	m := MatchEvent(ev)
+	// Route to the forge-appropriate matcher. GitLab-sourced events
+	// (Forge == ForgeGitLab) classify through MatchGitLabEvent into
+	// the SAME Match vocabulary + pipeline below; every other event is
+	// GitHub (Forge == "") and uses the unchanged default matcher.
+	var m Match
+	if ev.Forge == ForgeGitLab {
+		m = MatchGitLabEvent(ev)
+	} else {
+		m = MatchEvent(ev)
+	}
 	if m.Skip {
 		// Skips don't write audit entries — they're noise that
 		// would dwarf real audit content. The receiver's
@@ -911,6 +1098,25 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return d.handleInstallation(ctx, ev, m)
 	}
 
+	// DELIBERATE BOUNDARY (E45.6 / #1860): a GitLab MatchActionRun
+	// parks fail-closed here, BEFORE the spec-fetch step. Actual run
+	// CREATION from a GitLab trigger is the CI/dispatch phase's work
+	// per ADR-058 (E45.8 / #1861): the forge.Forge interface has no
+	// workflow-spec read, comment-backs are GitHub-only, and no
+	// gitlab_ci runner_kind exists yet. Falling through would hand a
+	// "gitlab:<project_id>" scope to d.GitHub (the GitHub client),
+	// whose installation-id parse would fail into a 5xx retry loop, so
+	// we log the reason and return nil (202) instead.
+	if ev.Forge == ForgeGitLab {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"gitlab run trigger parked: run creation is the E45.8/#1861 CI-dispatch consumer",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("repo", ev.Repo),
+			slog.String("trigger_ref", m.TriggerRef),
+		)
+		return nil
+	}
+
 	repo, err := parseRepo(ev.Repo)
 	if err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn, "webhook repo malformed",
@@ -924,7 +1130,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	if ref == "" {
 		ref = "main"
 	}
-	scope := forge.FromGitHubInstallationID(ev.InstallationID)
+	scope := ev.credentialScope()
 
 	// Step 1: fetch the workflow spec at the ref. Failures here
 	// are typically "App lacks access" or "file not yet committed";

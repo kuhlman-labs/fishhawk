@@ -96,7 +96,7 @@ func csrfExemptPath(p string) bool {
 	// already bails when Identity has no SessionID, so these are
 	// belt-and-braces.
 	switch p {
-	case "/webhooks/github":
+	case "/webhooks/github", "/webhooks/gitlab":
 		return true
 	}
 	return false

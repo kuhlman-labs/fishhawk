@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // TestServer_FullStack drives a request through the entire middleware
@@ -753,5 +754,39 @@ func TestNew_WiresIssueNotifierWithEmptyExternalURL(t *testing.T) {
 	})
 	if s.issueNotifier == nil {
 		t.Fatal("server.New must construct the issue notifier even with an empty ExternalURL (#1787)")
+	}
+}
+
+// TestWebhookGitLab_FullStack_CSRFExempt drives POST /webhooks/gitlab
+// through the ENTIRE middleware chain (recovery → requestID → logging →
+// auth → csrf → mux), proving the GitLab receiver is both routed and
+// CSRF-exempt end to end (E45.6 / #1860): a configured server returns
+// 202 for a valid delivery rather than a 403 csrf_required or a 404.
+func TestWebhookGitLab_FullStack_CSRFExempt(t *testing.T) {
+	s := New(Config{
+		GitLabWebhookSecret: []byte("gl-token"),
+		WebhookDeliveries:   webhook.NewMemoryStore(0),
+	})
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	body := `{"object_kind":"issue","user":{"username":"root"},
+		"project":{"id":1,"path_with_namespace":"g/p"},
+		"object_attributes":{"iid":1,"action":"close"}}`
+	req, err := http.NewRequest(http.MethodPost, ts.URL+"/webhooks/gitlab", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("X-Gitlab-Token", "gl-token")
+	req.Header.Set("X-Gitlab-Event", "Issue Hook")
+	req.Header.Set("X-Gitlab-Event-UUID", "fullstack-uuid")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /webhooks/gitlab: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 202 (routed + CSRF-exempt); body=%s", resp.StatusCode, b)
 	}
 }

@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // Errors callers may want to switch on.
@@ -76,6 +78,15 @@ type DeliveryStore interface {
 	// Mark records id as processed. Returns ErrDeliveryDuplicate if
 	// id was already recorded; nil on first write.
 	Mark(id string) error
+
+	// Unmark removes id's processed-record so a later Mark(id) is a
+	// first write again. Receivers call it to undo the pre-dispatch
+	// record when a delivery's processing fails and they return a 5xx:
+	// without it the forge's retry hits the still-recorded delivery,
+	// is deduped to a 2xx, and permanently drops an event whose
+	// processing actually failed. Idempotent — unmarking an id that
+	// was never recorded is a nil no-op.
+	Unmark(id string) error
 }
 
 // MemoryStore is a process-local DeliveryStore with TTL eviction.
@@ -117,6 +128,21 @@ func (s *MemoryStore) Mark(id string) error {
 		return ErrDeliveryDuplicate
 	}
 	s.entries[id] = now
+	return nil
+}
+
+// Unmark removes id so a later Mark(id) is treated as a first write
+// again. The receiver calls it to undo a delivery record when the
+// delivery's processing failed and it returned a 5xx — otherwise the
+// retry would be deduped to a 2xx, permanently dropping the event. A
+// no-op returning nil when id was never recorded (or is empty).
+func (s *MemoryStore) Unmark(id string) error {
+	if id == "" {
+		return ErrDeliveryMissing
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, id)
 	return nil
 }
 
@@ -165,9 +191,43 @@ type Event struct {
 	// Zero when the event isn't installation-scoped.
 	InstallationID int64
 
+	// Forge names the source forge for a parsed event. Empty is the
+	// GitHub legacy default (ParseEvent never sets it, so the GitHub
+	// path is byte-for-byte unchanged); ParseGitLabEvent sets
+	// "gitlab" (ForgeGitLab). The dispatcher routes on this field so a
+	// GitLab-sourced event never runs through the GitHub matcher.
+	Forge string
+
+	// CredentialRef is the forge-neutral installation_ref for the
+	// event (ADR-058, #2009). Empty for GitHub, where InstallationID
+	// carries the identity; for GitLab it is the "gitlab:<project_id>"
+	// scope ref forge/gitlab.projectIDFromScope parses back. When set,
+	// credentialScope() prefers forge.FromRef(CredentialRef) over the
+	// GitHub installation-id wrapper.
+	CredentialRef string
+
 	// RawBody is the original payload, kept for downstream handlers
 	// that need event-specific fields not surfaced here.
 	RawBody []byte
+}
+
+// ForgeGitLab is the Event.Forge value ParseGitLabEvent stamps. The
+// empty string is the GitHub legacy default (ParseEvent leaves it
+// zero), so callers switching on the source forge compare against
+// this constant rather than a bare literal.
+const ForgeGitLab = "gitlab"
+
+// credentialScope resolves the event's forge-neutral CredentialScope.
+// A non-empty CredentialRef (the GitLab path) wraps verbatim via
+// forge.FromRef; otherwise the GitHub installation-id convenience
+// wrapper is used (zero InstallationID → the zero scope). This keeps
+// the GitHub path byte-for-byte unchanged while letting a GitLab
+// "gitlab:<project_id>" ref flow through the shared dispatcher.
+func (ev Event) credentialScope() forge.CredentialScope {
+	if ev.CredentialRef != "" {
+		return forge.FromRef(ev.CredentialRef)
+	}
+	return forge.FromGitHubInstallationID(ev.InstallationID)
 }
 
 // minimal is the subset of fields we extract from every webhook

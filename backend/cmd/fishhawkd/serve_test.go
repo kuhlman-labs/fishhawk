@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -29,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
 )
 
@@ -1160,4 +1162,79 @@ func TestLoadConventionsOverride(t *testing.T) {
 			t.Error("loader served different conventions per repo; the override must serve one document for every repo")
 		}
 	})
+}
+
+// TestWebhookStoreNeeded pins the delivery-store gating (E45.6 / #1860):
+// the shared webhook delivery store is created when EITHER forge's
+// webhook secret is set — including the GitLab-only case, which the
+// prior GitHub-secret-only gate would have skipped — and NOT created
+// when neither is set. The GitHub-only case stays unchanged.
+func TestWebhookStoreNeeded(t *testing.T) {
+	cases := []struct {
+		name         string
+		githubSecret string
+		gitlabSecret string
+		want         bool
+	}{
+		{"neither", "", "", false},
+		{"github-only", "gh", "", true},
+		{"gitlab-only", "", "gl", true},
+		{"both", "gh", "gl", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := webhookStoreNeeded(tc.githubSecret, tc.gitlabSecret); got != tc.want {
+				t.Errorf("webhookStoreNeeded(%q,%q) = %v, want %v",
+					tc.githubSecret, tc.gitlabSecret, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNewWebhookDeliveryStore pins that the delivery-store CONSTRUCTION
+// (not just the webhookStoreNeeded predicate) consults both forge secrets:
+// a GitLab-only-secret deployment gets a store just as a GitHub-only one
+// does, neither-secret gets nil, and a pool selects the Postgres store with
+// its evictor handle (E45.6 binding condition 2 / concern 4). Testing the
+// extracted constructor closes most of the "runServe re-inlines a
+// GitHub-only gate" seam the predicate test alone left open.
+func TestNewWebhookDeliveryStore(t *testing.T) {
+	const retention = time.Hour
+	// A zero-value pool is non-nil; NewPostgresStore only stores the
+	// pointer, so no DB connection is needed to exercise store selection.
+	pool := &pgxpool.Pool{}
+
+	cases := []struct {
+		name         string
+		pool         *pgxpool.Pool
+		githubSecret string
+		gitlabSecret string
+		wantStore    bool
+		wantEvictor  bool
+	}{
+		{"neither-secret-no-store", nil, "", "", false, false},
+		{"github-only-memory", nil, "gh", "", true, false},
+		{"gitlab-only-memory", nil, "", "gl", true, false},
+		{"gitlab-only-postgres", pool, "", "gl", true, true},
+		{"both-postgres", pool, "gh", "gl", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, evictor := newWebhookDeliveryStore(tc.pool, tc.githubSecret, tc.gitlabSecret, retention)
+			if (store != nil) != tc.wantStore {
+				t.Errorf("store != nil = %v, want %v", store != nil, tc.wantStore)
+			}
+			if (evictor != nil) != tc.wantEvictor {
+				t.Errorf("evictor != nil = %v, want %v", evictor != nil, tc.wantEvictor)
+			}
+			// The Postgres path must return the SAME object for both
+			// returns so the evictor is wired to the live store.
+			if tc.wantEvictor {
+				var _ webhook.DeliveryStore = evictor
+				if store != webhook.DeliveryStore(evictor) {
+					t.Errorf("postgres path: store and evictor differ; evictor must be the store")
+				}
+			}
+		})
+	}
 }

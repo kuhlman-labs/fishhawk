@@ -78,6 +78,42 @@ func TestMemoryStore_EmptyID(t *testing.T) {
 	}
 }
 
+// TestMemoryStore_UnmarkAllowsReprocess proves the retry-reprocess
+// contract the receiver relies on after a dispatch failure: once a
+// recorded delivery is Unmarked, a fresh Mark of the same id succeeds
+// again (is NOT deduped), so GitLab's redelivery re-runs the pipeline.
+func TestMemoryStore_UnmarkAllowsReprocess(t *testing.T) {
+	s := NewMemoryStore(0)
+	if err := s.Mark("d1"); err != nil {
+		t.Fatalf("first Mark: %v", err)
+	}
+	// Sanity: a duplicate is rejected while the record stands.
+	if err := s.Mark("d1"); !errors.Is(err, ErrDeliveryDuplicate) {
+		t.Fatalf("pre-unmark Mark = %v, want ErrDeliveryDuplicate", err)
+	}
+	if err := s.Unmark("d1"); err != nil {
+		t.Fatalf("Unmark: %v", err)
+	}
+	// After Unmark the retry is a first write again.
+	if err := s.Mark("d1"); err != nil {
+		t.Errorf("post-unmark Mark = %v, want nil (retry must re-process)", err)
+	}
+}
+
+func TestMemoryStore_UnmarkAbsentIsNoOp(t *testing.T) {
+	s := NewMemoryStore(0)
+	if err := s.Unmark("never-seen"); err != nil {
+		t.Errorf("Unmark of an absent id = %v, want nil no-op", err)
+	}
+}
+
+func TestMemoryStore_UnmarkEmptyID(t *testing.T) {
+	s := NewMemoryStore(0)
+	if err := s.Unmark(""); !errors.Is(err, ErrDeliveryMissing) {
+		t.Errorf("err = %v, want ErrDeliveryMissing", err)
+	}
+}
+
 func TestMemoryStore_TTLEvicts(t *testing.T) {
 	s := NewMemoryStore(time.Hour)
 	// Inject a fake clock so we can advance without sleeping.
@@ -189,5 +225,49 @@ func TestErrors_Distinct(t *testing.T) {
 		if errors.Is(p[0], p[1]) {
 			t.Errorf("errors.Is(%v, %v) = true, want false", p[0], p[1])
 		}
+	}
+}
+
+// TestParseEvent_LeavesForgeAndCredentialRefZero pins the GitHub-path
+// regression guard (E45.6 / #1860): the GitHub parser never sets the
+// two forge-neutral identity fields, so the GitHub webhook path is
+// byte-for-byte unchanged by the GitLab addition.
+func TestParseEvent_LeavesForgeAndCredentialRefZero(t *testing.T) {
+	ev, err := ParseEvent("issues", "deliv-1", []byte(`{"action":"labeled","installation":{"id":42}}`))
+	if err != nil {
+		t.Fatalf("ParseEvent: %v", err)
+	}
+	if ev.Forge != "" {
+		t.Errorf("Forge = %q, want empty (GitHub legacy)", ev.Forge)
+	}
+	if ev.CredentialRef != "" {
+		t.Errorf("CredentialRef = %q, want empty (GitHub uses InstallationID)", ev.CredentialRef)
+	}
+}
+
+// TestDeliveryStore_GitHubAndGitLabUUIDsDoNotCollide pins the dedup
+// namespacing: the same raw UUID arriving as a GitHub delivery and as a
+// GitLab delivery are distinct keys, because ParseGitLabEvent prefixes
+// "gitlab:" onto the delivery id. Without the prefix one forge's event
+// would silently dedup the other's.
+func TestDeliveryStore_GitHubAndGitLabUUIDsDoNotCollide(t *testing.T) {
+	const uuid = "11111111-2222-3333-4444-555555555555"
+	store := NewMemoryStore(0)
+
+	gh, err := ParseEvent("issues", uuid, []byte(`{"action":"labeled"}`))
+	if err != nil {
+		t.Fatalf("ParseEvent: %v", err)
+	}
+	gl, err := ParseGitLabEvent("Issue Hook", uuid, []byte(`{"object_kind":"issue"}`))
+	if err != nil {
+		t.Fatalf("ParseGitLabEvent: %v", err)
+	}
+	if err := store.Mark(gh.DeliveryID); err != nil {
+		t.Fatalf("mark github delivery: %v", err)
+	}
+	// The GitLab delivery shares the raw UUID but is namespaced, so it
+	// must be recorded as a fresh (non-duplicate) key.
+	if err := store.Mark(gl.DeliveryID); err != nil {
+		t.Fatalf("gitlab delivery collided with github: %v", err)
 	}
 }

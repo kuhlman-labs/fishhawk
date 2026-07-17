@@ -57,6 +57,30 @@ func (s *PostgresStore) Mark(id string) error {
 	return nil
 }
 
+// Unmark deletes id's delivery row so a later Mark(id) is a first write
+// again. The receiver calls it to undo the pre-dispatch record when a
+// delivery's processing fails and it returns a 5xx: the delivery is
+// recorded before dispatch (to dedup concurrent redeliveries), so without
+// removing the record GitLab's retry would hit the recorded row, Mark would
+// return ErrDeliveryDuplicate, and the receiver would answer 202 —
+// permanently dropping an event whose processing actually failed.
+//
+// A raw single-row DELETE on the delivery_id primary key rather than a
+// sqlc query, to keep this compensation confined to the store file (it has
+// no companion :one/:exec query and needs no generated model). Idempotent:
+// deleting an absent id affects zero rows and returns nil, matching
+// MemoryStore.Unmark.
+func (s *PostgresStore) Unmark(id string) error {
+	if id == "" {
+		return ErrDeliveryMissing
+	}
+	if _, err := s.pool.Exec(context.Background(),
+		"DELETE FROM webhook_deliveries WHERE delivery_id = $1", id); err != nil {
+		return fmt.Errorf("webhook: unmark delivery: %w", err)
+	}
+	return nil
+}
+
 // Evict deletes every webhook_deliveries row whose received_at is
 // strictly older than before. Returns the number of rows deleted
 // so callers can log a counter.
