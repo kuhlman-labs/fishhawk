@@ -671,24 +671,42 @@ func TestFindRunByGitLabMR_ResolvesByExactURLBeyondWindow(t *testing.T) {
 // TestFindRunByGitLabMR_AgedOutURLVariant_DeferredToProjectPersistedLookup
 // pins the residual gap deliberately deferred to #1861: an aged-out MR
 // whose stored URL differs from the webhook URL only by the /-/ infix is
-// NOT byte-equal, so the exact-URL DB filter cannot resolve it either —
-// only the windowed iid/normalized scan can, and that run has aged out of
-// the window. Until #1861 wires GitLab run creation with a durable
+// NOT byte-equal, so the exact-URL DB filter's Go-side equality re-check
+// (`*r.PullRequestURL == mrURL`, webhook_gitlab.go) rejects it — only the
+// windowed iid/normalized scan tolerates the infix, and that run has aged
+// out of the window. Until #1861 wires GitLab run creation with a durable
 // project+IID persisted lookup column (or a non-windowed normalized-URL DB
 // filter), this case returns (nil, nil) and emits the existing no-match
-// warn. This test captures that as a known, asserted-green current
-// behavior rather than an untested gap.
+// warn.
+//
+// The exactURLResult fake return is populated with the variant-URL target
+// specifically so this test exercises (and would catch a regression in)
+// the exact-match equality check itself: if that check were loosened to
+// compare via normalizeGitLabMRURL instead of raw ==, this same fixture
+// would resolve `target` and the assertion below would fail. Without
+// populating exactURLResult, the test would pass unchanged whether or not
+// URL normalization/variant-handling existed at all, since the run would
+// simply be absent from every candidate list — that vacuity is what this
+// fixture is built to avoid.
 func TestFindRunByGitLabMR_AgedOutURLVariant_DeferredToProjectPersistedLookup(t *testing.T) {
-	// The webhook uses the current /-/ form. The aged-out target's stored
-	// URL would differ only by that infix (legacy form) — but the target
-	// itself has aged out of every scan this fake models (it is absent from
-	// listResult, and exactURLResult is unset so the exact-URL filter also
-	// falls back to listResult), so there is nothing here that can resolve
-	// it — pinning the deferred gap.
+	// The webhook uses the current /-/ form.
 	mrURL := "https://gitlab.com/group/project/-/merge_requests/7"
+	// The aged-out target's stored URL differs from the webhook's only by
+	// that infix (legacy form, no /-/).
+	legacyURL := "https://gitlab.com/group/project/merge_requests/7"
+	target := &run.Run{ID: uuid.New(), Repo: "group/project", PullRequestURL: &legacyURL}
+	// The windowed project-scoped scan models the target having aged past
+	// the 50-recent-runs window: it is absent from listResult, so neither
+	// the iid nor the normalized-URL pass (both windowed) can see it.
 	urlOther := "https://gitlab.com/group/project/-/merge_requests/999"
 	rr := &prEventsRunRepo{
 		listResult: []*run.Run{{ID: uuid.New(), Repo: "group/project", PullRequestURL: &urlOther}},
+		// The exact-URL DB filter is not recency-windowed and DOES surface
+		// this row — modeling that the target still exists in the runs
+		// table — but its stored URL is the legacy variant, not byte-
+		// identical to mrURL, so findRunByGitLabMR's exact-equality
+		// re-check discards it.
+		exactURLResult: []*run.Run{target},
 	}
 	lh := &recordingLogHandler{}
 	s := New(Config{
@@ -702,7 +720,7 @@ func TestFindRunByGitLabMR_AgedOutURLVariant_DeferredToProjectPersistedLookup(t 
 		t.Fatalf("findRunByGitLabMR err = %v, want nil", err)
 	}
 	if got != nil {
-		t.Fatalf("resolved run = %+v, want nil for the deliberately-deferred aged-out /-/-infix-variant gap (#1861)", got)
+		t.Fatalf("resolved run = %+v, want nil — the /-/-infix variant must defeat the exact-URL byte match (#1861)", got)
 	}
 	if lh.find("gitlab merge_request: no run matched; review stage will not transition", nil) == nil {
 		t.Fatalf("expected the no-match warn on the deferred aged-out variant; got none")
