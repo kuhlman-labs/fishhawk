@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -1445,6 +1446,25 @@ func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m M
 	return nil
 }
 
+// errCIRetryGitHubUnconfigured is the dispatch error the CI-retry path
+// propagates when the github_actions backend's client is unwired (nil
+// d.GitHub). The github_actions backend warn+skips a nil client (returning
+// nil); propagating this as a dispatchErr keeps the retry stage out of the
+// dispatched state (no silent in-flight child with no runner) and records the
+// failure in the audit (E45.7 fix-up).
+var errCIRetryGitHubUnconfigured = errors.New("dispatcher: github client unconfigured; ci-retry workflow_dispatch skipped")
+
+// errCIRetryNoInstallation is the sibling of errCIRetryGitHubUnconfigured for
+// the second warn+skip edge: the github_actions backend also returns nil (no
+// workflow_dispatch fired) when InstallationID is 0 — e.g. a retry whose parent
+// carries runner_kind=github_actions but a nil InstallationID (a
+// trigger_source=cli parent defaults installationID to 0). Left unguarded, that
+// nil would transition a github_actions child to dispatched with no runner
+// behind it. Propagating this keeps the stage pending and records the failure,
+// restoring the pre-seam posture where the installation-0 dispatch failed at
+// the client and propagated a dispatchErr (E45.7 fix-up).
+var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-retry workflow_dispatch skipped")
+
 // handleCIFailureRetry creates a follow-up implement run when a
 // required CI check fails on a Fishhawk-managed PR (#279 / E16).
 // Best-effort throughout — every skip path emits a structured log
@@ -1613,34 +1633,55 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 	// Step 8: fire workflow_dispatch on the first retry stage, or skip
 	// for local-runner runs — they stay in pending for the agent to
 	// discover via fishhawk_list_runs / fishhawk_verify_run (ADR-022 / #445).
+	// The dispatch decision migrates onto the runnerbackend seam (E45.7): a
+	// registry lookup on the child's inherited runner_kind. A host-dispatched
+	// backend (local) leaves the first retry stage pending; a github_actions
+	// backend — and, matching the prior `default` arm, any unknown inherited
+	// kind — fires the Actions workflow_dispatch via the github_actions backend.
 	firstStage := stages[0]
 	var dispatchErr error
-	switch parent.RunnerKind {
-	case run.RunnerKindLocal:
+	reg := d.backends()
+	if b, ok := reg.Backend(parent.RunnerKind); ok && b.HostDispatched() {
 		d.logger().LogAttrs(ctx, slog.LevelInfo,
 			"ci_failure_retry: local runner — child run pending, no dispatch",
 			slog.String("delivery_id", ev.DeliveryID),
 			slog.String("run_id", child.ID.String()))
-	default:
-		repo, err := parseRepo(ev.Repo)
-		if err != nil {
+	} else {
+		// Preserve the original early-return-5xx on a malformed repo (before the
+		// audit), even though the backend re-validates it internally.
+		if _, err := parseRepo(ev.Repo); err != nil {
 			return fmt.Errorf("dispatcher: parse repo: %w", err)
 		}
-		dispatchRef := d.DefaultRef
-		if dispatchRef == "" {
-			dispatchRef = "main"
+		ghBackend, _ := reg.Backend(run.RunnerKindGitHubActions)
+		dispatchErr = ghBackend.TriggerStage(ctx, runnerbackend.TriggerParams{
+			RunID:            child.ID,
+			StageID:          firstStage.ID,
+			WorkflowID:       parent.WorkflowID,
+			StageExecutorRef: firstStage.ExecutorRef,
+			Repo:             ev.Repo,
+			InstallationID:   installationID,
+			// Retry children carry no DecomposedFrom (ParentRunID threads the
+			// retry chain), so no parent_run_id input is added.
+		})
+		// The github_actions backend warn+skips (TriggerStage returns nil) in TWO
+		// cases instead of firing a workflow_dispatch: an unwired GitHub client
+		// (nil d.GitHub) AND a zero InstallationID (a retry whose parent carries
+		// runner_kind=github_actions but a nil InstallationID — e.g. a
+		// trigger_source=cli parent defaults installationID to 0). Left unguarded,
+		// either nil below would transition this github_actions child to dispatched
+		// with no runner behind it — a silent in-flight stage. Surface each as a
+		// dispatchErr so the stage stays pending and the audit records the failure,
+		// restoring the pre-seam dispatchErr-propagation posture the plan described
+		// (minus the pre-seam nil-pointer panic). Both are practically unreachable —
+		// the webhook dispatcher only processes events from a wired GitHub
+		// deployment — but a github_actions child must never be marked dispatched
+		// without an actual trigger (E45.7 fix-up).
+		if dispatchErr == nil && d.GitHub == nil {
+			dispatchErr = errCIRetryGitHubUnconfigured
 		}
-		actionsFile := d.ActionsWorkflowFile
-		if actionsFile == "" {
-			actionsFile = DefaultActionsWorkflowFile
+		if dispatchErr == nil && installationID == 0 {
+			dispatchErr = errCIRetryNoInstallation
 		}
-		dispatchErr = d.GitHub.DispatchWorkflowScoped(ctx, forge.FromGitHubInstallationID(installationID), repo,
-			actionsFile, dispatchRef, githubclient.DispatchInputs{
-				"run_id":      child.ID.String(),
-				"stage_id":    firstStage.ID.String(),
-				"workflow_id": parent.WorkflowID,
-				"stage":       firstStage.ExecutorRef,
-			})
 		if dispatchErr == nil {
 			if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
 				run.StageStateDispatched, nil); err != nil {
@@ -1933,6 +1974,23 @@ func (d *Dispatcher) logger() *slog.Logger {
 		return d.Logger
 	}
 	return slog.Default()
+}
+
+// backends builds the runnerbackend Registry the CI-failure-retry dispatch uses
+// to route a child's inherited runner_kind (E45.7 / ADR-058). The
+// github_actions backend wraps d.GitHub with the same ref / actions-file
+// defaults ("main" / DefaultActionsWorkflowFile == "fishhawk.yml") the prior
+// inline dispatch carried. Lazily built per call (allocation-only).
+func (d *Dispatcher) backends() runnerbackend.Registry {
+	return runnerbackend.Registry{
+		run.RunnerKindGitHubActions: &runnerbackend.GitHubActions{
+			Client:              d.GitHub,
+			DefaultRef:          d.DefaultRef,
+			ActionsWorkflowFile: d.ActionsWorkflowFile,
+			Logger:              d.Logger,
+		},
+		run.RunnerKindLocal: &runnerbackend.Local{Logger: d.Logger},
+	}
 }
 
 func (d *Dispatcher) now() time.Time {

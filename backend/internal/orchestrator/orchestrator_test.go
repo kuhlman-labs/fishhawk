@@ -581,9 +581,9 @@ func TestAdvance_LocalLockedRun_ParksAwaitingHostDispatch(t *testing.T) {
 // TestAdvance_LocalUnresolvedRun_DispatchesNotParked is the negative control for
 // the #1912 park: an UN-resolved run (RunnerKindResolved == false) is NOT parked
 // even if its RunnerKind string happens to read local — the park engages only on
-// the LOCKED state, matching fireDispatch's own locked-local skip. The stage
-// takes the normal dispatched path (fireDispatch no-ops on GitHub being wired
-// but the run has no lock, so the dispatch still fires here).
+// the LOCKED state, matching the runnerbackend.Resolver's own locked-local
+// posture. The stage takes the normal dispatched path (the github_actions
+// backend's TriggerStage fires because the run has no lock).
 func TestAdvance_LocalUnresolvedRun_DispatchesNotParked(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	r, stages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
@@ -629,9 +629,9 @@ func TestAdvance_GitHubActionsLockedRun_StillFires(t *testing.T) {
 
 // seedDecomposedChild seeds a decomposition child run (DecomposedFrom set, one
 // pending implement stage) with the given inherited runner-kind fields, for the
-// per-branch runLockedLocal tests (#1980). The parent is NOT seeded here — each
-// test controls whether the parent exists / is resolved to exercise the helper's
-// fail-toward-recoverable arms.
+// per-branch resolver tests (#1980). The parent is NOT seeded here — each test
+// controls whether the parent exists / is resolved to exercise the
+// runnerbackend.Resolver's fail-toward-recoverable arms.
 func seedDecomposedChild(t *testing.T, rs *stubRuns, installationID *int64, decomposedFrom uuid.UUID, kind string, resolved bool) (*run.Run, *run.Stage) {
 	t.Helper()
 	child, stages := rs.seed(t, "x/y", installationID, []stageSeed{
@@ -644,11 +644,11 @@ func seedDecomposedChild(t *testing.T, rs *stubRuns, installationID *int64, deco
 	return child, stages[0]
 }
 
-// TestAdvance_DecomposedChild_GitHubActionsParent_StillFires pins runLockedLocal
-// branch (c): an un-resolved decomposed child whose inherited kind is NOT local
-// never enters the local-park arm — it walks pending→dispatched and fires its
-// workflow_dispatch byte-identically (the unchanged E24.5 path). runLockedLocal
-// short-circuits on the kind, so the parent is never even read.
+// TestAdvance_DecomposedChild_GitHubActionsParent_StillFires pins the resolver's
+// inherited-non-local branch: an un-resolved decomposed child whose inherited
+// kind is NOT local never enters the local-park arm — it walks pending→dispatched
+// and fires its workflow_dispatch byte-identically (the unchanged E24.5 path).
+// The resolver short-circuits on the kind, so the parent is never even read.
 func TestAdvance_DecomposedChild_GitHubActionsParent_StillFires(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
 	child, stage := seedDecomposedChild(t, rs, int64Ptr(42), uuid.New(), run.RunnerKindGitHubActions, false)
@@ -665,7 +665,7 @@ func TestAdvance_DecomposedChild_GitHubActionsParent_StillFires(t *testing.T) {
 }
 
 // TestAdvance_DecomposedChild_ParentReadError_ParksRecoverable pins
-// runLockedLocal branch (d) fail-toward-recoverable: an un-resolved local-kind
+// resolver branch (d) fail-toward-recoverable: an un-resolved local-kind
 // child whose parent GetRun fails (the parent row is absent) parks at
 // awaiting_host_dispatch and fires ZERO workflow_dispatch — a wrong park costs
 // one host-dispatch verb, a wrong fire is an unrecoverable side effect.
@@ -688,7 +688,7 @@ func TestAdvance_DecomposedChild_ParentReadError_ParksRecoverable(t *testing.T) 
 }
 
 // TestAdvance_DecomposedChild_ParentUnresolved_ParksRecoverable pins
-// runLockedLocal branch (d) parent-unresolved: an un-resolved local-kind child
+// resolver branch (d) parent-unresolved: an un-resolved local-kind child
 // whose parent is itself un-resolved parks toward the recoverable state (the
 // inherited local hint is the best signal available).
 func TestAdvance_DecomposedChild_ParentUnresolved_ParksRecoverable(t *testing.T) {
@@ -709,7 +709,7 @@ func TestAdvance_DecomposedChild_ParentUnresolved_ParksRecoverable(t *testing.T)
 	}
 }
 
-// TestAdvance_DecomposedChild_ParentResolvedLocal_Parks pins runLockedLocal
+// TestAdvance_DecomposedChild_ParentResolvedLocal_Parks pins the resolver
 // branch (d) authoritative-park: an un-resolved local-kind child whose parent is
 // RESOLVED local parks at awaiting_host_dispatch — the #1980 dogfood shape.
 func TestAdvance_DecomposedChild_ParentResolvedLocal_Parks(t *testing.T) {
@@ -730,7 +730,7 @@ func TestAdvance_DecomposedChild_ParentResolvedLocal_Parks(t *testing.T) {
 	}
 }
 
-// TestAdvance_DecomposedChild_ParentResolvedNonLocal_Fires pins runLockedLocal
+// TestAdvance_DecomposedChild_ParentResolvedNonLocal_Fires pins the resolver
 // branch (d) superseded-hint: an un-resolved child carrying a STALE local kind
 // whose parent is RESOLVED non-local (github_actions) falls through to dispatched
 // + workflow_dispatch — the parent lock is authoritative over the inherited hint.
@@ -2057,7 +2057,8 @@ func TestAdvance_NonDecomposedParent_NoConsolidatedPR(t *testing.T) {
 func TestAdvance_DecomposedParent_NoGitHub_GracefulSkip(t *testing.T) {
 	// Without a GitHub client (CLI/dev posture) the orchestrator can't
 	// open the PR — it WARN-logs, opens no PR, and still dispatches the
-	// review (the parent stays PR-less, same posture as fireDispatch).
+	// review (the parent stays PR-less, same posture as the github_actions
+	// backend's TriggerStage skip on a nil client).
 	rs := newStubRuns()
 	o := &Orchestrator{Runs: rs, DefaultRef: "main"} // GitHub nil
 

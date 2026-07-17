@@ -41,6 +41,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -2575,71 +2576,52 @@ func (o *Orchestrator) emitChildrenSettled(ctx context.Context, parentRunID, sta
 	}
 }
 
-// runLockedLocal reports whether run r is effectively locked to the local
-// runner_kind — the backend cannot host-spawn its agent stages (ADR-024), so
-// dispatchStage must park them at awaiting_host_dispatch and fireDispatch must
-// skip the github_actions workflow_dispatch. It is the single predicate wired
-// into BOTH sites so the two stay in lock-step.
-//
-// The RESOLVED lock (r.RunnerKindResolved) is authoritative: local → locked,
-// non-local → not. An un-resolved TOP-LEVEL run is NOT treated as locked — it
-// auto-resolves on its first dispatch (#1346 decision-1), so its legacy path is
-// unchanged.
-//
-// #1980: a decomposed child is the special case this helper exists for. Its row
-// is minted runner_kind-UNRESOLVED (run.CreateRunParams has no
-// RunnerKindResolved field) with RunnerKind COPIED from the parent, so the
-// resolved gate never holds for a freshly minted child even when the parent is
-// locked-local — the child then falls through to the legacy pending→dispatched
-// flip with a silent no-op fireDispatch (GitHub unwired on a local deployment),
-// deadlocking run_children whose dispatchable predicate treats 'dispatched' as
-// in-flight. So an un-resolved child that INHERITED a local kind consults the
-// parent's lock via GetRun. A github_actions child (inherited kind not local)
-// never enters this arm and fires its workflow_dispatch byte-identically.
-//
-// Fail toward the RECOVERABLE state: when the parent read errors or the parent
-// is itself un-resolved, PARK anyway. awaiting_host_dispatch is CAS-recoverable
-// with one host-dispatch verb (backend/internal/server/host_dispatch.go admits
-// {pending, awaiting_host_dispatch} → dispatched, and run_children / drive_run /
-// next_actions all route it to a dispatch verb), whereas a wrongly-fired
-// workflow_dispatch is an unrecoverable external side effect — the exact channel
-// mismatch #1355's guardrail exists to prevent.
-func (o *Orchestrator) runLockedLocal(ctx context.Context, r *run.Run) bool {
-	if r.RunnerKindResolved {
-		return r.RunnerKind == run.RunnerKindLocal
+// backends builds the default dispatcher seam (E45.7 / ADR-058) from the
+// Orchestrator's existing fields: a runnerbackend.Resolver over a Registry
+// holding the github_actions and local backends. It is lazily constructed on
+// each call (cheap, allocation-only) so direct struct construction in tests and
+// the GitHub==nil dev posture stay unchanged — the github_actions backend's
+// Client is o.GitHub, which its TriggerStage nil-checks exactly as fireDispatch
+// did. The Resolver owns the runLockedLocal lineage semantics (resolved lock
+// authoritative; un-resolved top-level -> github_actions; un-resolved
+// decomposed local-kind child -> parent lineage, failing toward the recoverable
+// local park, #1980), so no inline runner_kind comparison remains in the
+// dispatch path.
+func (o *Orchestrator) backends() *runnerbackend.Resolver {
+	reg := runnerbackend.Registry{
+		run.RunnerKindGitHubActions: &runnerbackend.GitHubActions{
+			Client:              o.GitHub,
+			DefaultRef:          o.DefaultRef,
+			ActionsWorkflowFile: o.ActionsWorkflowFile,
+			Logger:              o.Logger,
+		},
+		run.RunnerKindLocal: &runnerbackend.Local{Logger: o.Logger},
 	}
-	// Un-resolved top-level run: leave the legacy auto-resolve path unchanged.
-	if r.DecomposedFrom == nil {
-		return false
+	return &runnerbackend.Resolver{
+		Runs:     o.Runs,
+		Registry: reg,
+		Logger:   o.Logger,
 	}
-	// Un-resolved decomposed child. Only a child that inherited a local kind
-	// can be locked-local; a github_actions child fires unchanged.
-	if r.RunnerKind != run.RunnerKindLocal {
-		return false
+}
+
+// triggerParams maps a run + its next stage onto the forge-neutral
+// runnerbackend.TriggerParams the resolved backend fires. It carries the same
+// values fireDispatch built its DispatchInputs from (nil InstallationID -> 0,
+// matching fireDispatch's skip-when-unwired guard).
+func (*Orchestrator) triggerParams(r *run.Run, next *run.Stage) runnerbackend.TriggerParams {
+	p := runnerbackend.TriggerParams{
+		RunID:            r.ID,
+		StageID:          next.ID,
+		WorkflowID:       r.WorkflowID,
+		StageExecutorRef: next.ExecutorRef,
+		Repo:             r.Repo,
+		DecomposedFrom:   r.DecomposedFrom,
+		SliceIndex:       r.SliceIndex,
 	}
-	parent, err := o.Runs.GetRun(ctx, *r.DecomposedFrom)
-	if err != nil {
-		o.logger().LogAttrs(ctx, slog.LevelWarn,
-			"orchestrator: decomposed child parent-lock read failed; parking child toward the recoverable state (awaiting_host_dispatch)",
-			slog.String("run_id", r.ID.String()),
-			slog.String("decomposed_from", r.DecomposedFrom.String()),
-			slog.String("error", err.Error()),
-		)
-		return true
+	if r.InstallationID != nil {
+		p.InstallationID = *r.InstallationID
 	}
-	if parent.RunnerKindResolved {
-		// Parent lock is authoritative: local → park; non-local → the child's
-		// inherited local hint was superseded, fall through to fire.
-		return parent.RunnerKind == run.RunnerKindLocal
-	}
-	// Parent itself un-resolved: the inherited local hint is the best signal we
-	// have — park toward the recoverable state.
-	o.logger().LogAttrs(ctx, slog.LevelWarn,
-		"orchestrator: decomposed child parent runner_kind un-resolved; parking child toward the recoverable state (awaiting_host_dispatch)",
-		slog.String("run_id", r.ID.String()),
-		slog.String("decomposed_from", r.DecomposedFrom.String()),
-	)
-	return true
+	return p
 }
 
 // dispatchStage transitions the next stage to dispatched and (for
@@ -2686,14 +2668,16 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 	// dispatched at the moment of the spawn. This is the SINGLE write site for
 	// the park: every local park — plan-approved dispatch, retry_reopen, fixup
 	// re-open, revise replan, children dispatch — flows through Advance →
-	// dispatchStage, so this one branch covers every drive rule. Engages on the
-	// RESOLVED local lock and, per #1980, on a decomposed child whose inherited
-	// local kind + parent lineage make it locked-local even though the child row
-	// itself is minted runner_kind-unresolved (see runLockedLocal). An
-	// un-resolved top-level run falls through to the normal dispatched +
-	// fireDispatch path, whose own locked-local skip (see fireDispatch) remains
-	// the defensive backstop.
-	if o.runLockedLocal(ctx, r) {
+	// dispatchStage, so this one branch covers every drive rule. The resolved
+	// backend's HostDispatched() keys the park: it engages on the RESOLVED local
+	// lock and, per #1980, on a decomposed child whose inherited local kind +
+	// parent lineage make it locked-local even though the child row itself is
+	// minted runner_kind-unresolved (see runnerbackend.Resolver). An un-resolved
+	// top-level run resolves to the github_actions backend and falls through to
+	// the normal dispatched + TriggerStage path, whose own locked-local skip
+	// (runnerbackend.Local.TriggerStage) remains the defensive backstop.
+	backend := o.backends().Resolve(ctx, r)
+	if backend.HostDispatched() {
 		if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
 			return OutcomeNoOp, fmt.Errorf("orchestrator: park stage awaiting host dispatch: %w", err)
 		}
@@ -2713,12 +2697,12 @@ func (o *Orchestrator) dispatchStage(ctx context.Context, r *run.Run, next *run.
 		return OutcomeDispatched, nil
 	}
 
-	// Agent stage: transition to dispatched, then fire workflow_dispatch.
+	// Agent stage: transition to dispatched, then fire via the resolved backend.
 	if _, err := o.Runs.TransitionStage(ctx, next.ID, run.StageStateDispatched, nil); err != nil {
 		return OutcomeNoOp, fmt.Errorf("orchestrator: transition stage to dispatched: %w", err)
 	}
 
-	if err := o.fireDispatch(ctx, r, next); err != nil {
+	if err := backend.TriggerStage(ctx, o.triggerParams(r, next)); err != nil {
 		// We've already moved the stage forward; failing here
 		// leaves it in dispatched without an actual GitHub
 		// trigger. Surface the error so the caller can audit it,
@@ -2859,107 +2843,6 @@ func pullRequestNumberFromURL(u string) (int, error) {
 		return 0, fmt.Errorf("pr number must be > 0, got %d", n)
 	}
 	return n, nil
-}
-
-// fireDispatch builds a RepoRef + dispatch inputs and calls the
-// GitHub client. Skips silently when GitHub or InstallationID
-// isn't configured (e.g., trigger_source=cli runs).
-//
-// This same runner-kind-aware path OWNS Actions decomposed-child dispatch
-// (E24.5 / #1145). Each github_actions decomposed child auto-advances
-// through here via DispatchDecomposedChildren -> Advance and fires its OWN
-// workflow_dispatch carrying its own run_id/stage_id against the base ref
-// (o.DefaultRef) — so the child runner checks out its own sole-writer slice
-// branch fishhawk/run-<parent>/slice-<idx> and pushes a distinct branch
-// name, never colliding with a sibling. The runner — NOT the dispatch —
-// derives that slice branch by fetching decomposed_from + slice_index from
-// the stage-details endpoint keyed by run_id; no NEW workflow_dispatch input
-// is added because GitHub rejects inputs not declared in the customer-side
-// .github/workflows/fishhawk.yml with a 422 "Unexpected inputs provided",
-// and the existing run_id/stage_id inputs are already sufficient. For a
-// decomposed child the dispatch is annotated with structured slice_index /
-// decomposed_from log fields so the per-slice fan-out is observable.
-func (o *Orchestrator) fireDispatch(ctx context.Context, r *run.Run, next *run.Stage) error {
-	// Pre-dispatch runner_kind mismatch guardrail, Actions direction (#1355,
-	// the ADR-045 guardrail variant #1346 deferred). A workflow_dispatch fires
-	// a GitHub Actions runner; firing one against a run already LOCKED to
-	// runner_kind=local is a guaranteed channel mismatch that #1348 would only
-	// FLAG after execution. Skip the dispatch instead. Engages ONLY on the
-	// LOCKED state (RunnerKindResolved == true) so an un-resolved run still
-	// auto-resolves on its first dispatch (#1346 decision-1) and a
-	// github_actions-locked run fires unchanged. Per #1980 this also skips for a
-	// decomposed child that runLockedLocal resolves as locked-local through its
-	// parent lineage (the child row is minted runner_kind-unresolved). In
-	// practice dispatchStage's park branch — which shares the same predicate —
-	// returns before fireDispatch is reached for such a child, so this remains
-	// the defensive backstop it always was.
-	if o.runLockedLocal(ctx, r) {
-		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run locked to runner_kind=local; skipping github_actions workflow_dispatch",
-			slog.String("run_id", r.ID.String()),
-			slog.String("runner_kind", r.RunnerKind),
-		)
-		return nil
-	}
-	if o.GitHub == nil {
-		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping workflow_dispatch",
-			slog.String("run_id", r.ID.String()),
-		)
-		return nil
-	}
-	if r.InstallationID == nil || *r.InstallationID == 0 {
-		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation_id; skipping workflow_dispatch",
-			slog.String("run_id", r.ID.String()),
-		)
-		return nil
-	}
-
-	repo, err := parseRepo(r.Repo)
-	if err != nil {
-		return fmt.Errorf("orchestrator: parse repo %q: %w", r.Repo, err)
-	}
-
-	ref := o.DefaultRef
-	if ref == "" {
-		ref = "main"
-	}
-	actionsFile := o.ActionsWorkflowFile
-	if actionsFile == "" {
-		actionsFile = "fishhawk.yml"
-	}
-
-	// E24.5: annotate a decomposed child's workflow_dispatch with its slice
-	// provenance so the per-slice Actions fan-out is observable. Each child
-	// fires its OWN dispatch (own run_id/stage_id, base ref) and the runner
-	// derives the sole-writer slice branch from the stage-details endpoint —
-	// no new dispatch input is added (see the doc comment).
-	if r.DecomposedFrom != nil && r.SliceIndex != nil {
-		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator dispatching decomposed-child workflow_dispatch",
-			slog.String("run_id", r.ID.String()),
-			slog.String("stage_id", next.ID.String()),
-			slog.Int("slice_index", *r.SliceIndex),
-			slog.String("decomposed_from", r.DecomposedFrom.String()),
-			slog.String("ref", ref),
-		)
-	}
-
-	inputs := githubclient.DispatchInputs{
-		"run_id":      r.ID.String(),
-		"stage_id":    next.ID.String(),
-		"workflow_id": r.WorkflowID,
-		"stage":       next.ExecutorRef,
-	}
-	// #1227: a decomposed child carries its decomposition-parent id so the
-	// customer workflow can key an Actions `concurrency:` group on the run
-	// FAMILY and queue/serialize sibling child jobs as a runner-capacity guard
-	// (complements the backend dispatch cap, FISHHAWKD_MAX_PARALLEL_CHILDREN).
-	// DecomposedFrom (the fan-out parent), NOT ParentRunID (retry/related-run
-	// threading), is the sibling family. A non-decomposed run omits the input,
-	// so the workflow's group falls back to a per-run unique key (no
-	// serialization). Empty when DecomposedFrom is nil.
-	if r.DecomposedFrom != nil {
-		inputs["parent_run_id"] = r.DecomposedFrom.String()
-	}
-	return o.GitHub.DispatchWorkflowScoped(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, actionsFile, ref, inputs)
 }
 
 func (o *Orchestrator) logger() *slog.Logger {

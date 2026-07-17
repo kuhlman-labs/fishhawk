@@ -1142,12 +1142,12 @@ func implStageID(t *testing.T, rs *fanoutRunsRepo, runID uuid.UUID) uuid.UUID {
 	return uuid.Nil
 }
 
-// setChildInstallation stamps installationID on each child run so its
-// fireDispatch reaches the real DispatchWorkflow arm. mintPendingChildren's
-// CreateRunParams does NOT propagate the parent's InstallationID to children
-// (production fanoutIfDecomposed does), and fireDispatch reads the CHILD
-// run's InstallationID — so setting it on the seeded parent alone would skip
-// the dispatch arm and len(stub.calls)==childCount would fail (#1145).
+// setChildInstallation stamps installationID on each child run so its dispatch
+// reaches the real DispatchWorkflow arm. mintPendingChildren's CreateRunParams
+// does NOT propagate the parent's InstallationID to children (production
+// fanoutIfDecomposed does), and the github_actions backend's TriggerStage reads
+// the CHILD run's InstallationID — so setting it on the seeded parent alone
+// would skip the dispatch arm and len(stub.calls)==childCount would fail (#1145).
 func setChildInstallation(children []*run.Run, installationID int64) {
 	for _, c := range children {
 		id := installationID
@@ -1296,15 +1296,15 @@ func TestDispatchDecomposedChildren_GitHubActions_CapThrottlesDispatch(t *testin
 }
 
 // TestDispatchDecomposedChildren_GitHubActions_NilInstallationSkipsDispatch
-// asserts fireDispatch's graceful-skip arm: a github_actions child with nil
-// InstallationID records ZERO workflow_dispatch calls but still advances run
-// state (run running, implement stage dispatched).
+// asserts the github_actions backend's graceful-skip arm: a github_actions child
+// with nil InstallationID records ZERO workflow_dispatch calls but still advances
+// run state (run running, implement stage dispatched).
 func TestDispatchDecomposedChildren_GitHubActions_NilInstallationSkipsDispatch(t *testing.T) {
 	rs := newFanoutRunsRepo()
 	parent := seedAwaitingChildrenParent(t, rs)
 	children := mintPendingChildren(t, rs, parent.ID, 1, run.RunnerKindGitHubActions)
 	// Deliberately leave the child's InstallationID nil to exercise the skip
-	// arm — fireDispatch must not reach DispatchWorkflow.
+	// arm — the github_actions backend's TriggerStage must not reach DispatchWorkflow.
 
 	gh := &stubGitHub{}
 	au := &recordingAudit{}
