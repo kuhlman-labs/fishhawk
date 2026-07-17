@@ -3849,15 +3849,25 @@ func TestHandle_GitLabRun_ParksWithoutCreatingRun(t *testing.T) {
 }
 
 func TestHandle_GitHubEvent_StillRoutesThroughMatchEvent(t *testing.T) {
-	// A GitHub event (Forge == "") with a bot sender must skip via
-	// MatchEvent's bot guard — proof the default matcher is unchanged.
-	d, _, runs, _ := newDispatcherWithStubs(t)
-	body := []byte(`{"action":"labeled","sender":{"type":"Bot"}}`)
-	ev := Event{Type: "issues", Action: "labeled", InstallationID: 99, SenderType: "Bot", RawBody: body}
-	if err := d.Handle(context.Background(), ev); err != nil {
+	// A GitHub event (Forge == "") that MatchEvent DISPATCHES must
+	// reach CreateRun + workflow_dispatch — positive proof the default
+	// matcher ran. This discriminates against the "route everything
+	// through MatchGitLabEvent" regression: a GitHub event carries an
+	// empty CredentialRef (only GitLab deliveries set it — see
+	// webhook.go / gitlab.go), so MatchGitLabEvent would skip this same
+	// event at its "no project id in payload" guard and create no run.
+	// A dispatched run is therefore only reachable via MatchEvent, so
+	// asserting runs.created == 1 fails if the routing regresses —
+	// unlike a skip-only assertion, which both matchers satisfy with
+	// runs.created == 0.
+	d, gh, runs, _ := newDispatcherWithStubs(t)
+	if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
-	if len(runs.created) != 0 {
-		t.Errorf("CreateRun called %d times; bot GitHub event must skip", len(runs.created))
+	if len(runs.created) != 1 {
+		t.Fatalf("CreateRun called %d times; a labeled GitHub issue must dispatch via MatchEvent (MatchGitLabEvent would skip on empty CredentialRef)", len(runs.created))
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("dispatchCalls = %d, want 1 (GitHub dispatch path)", gh.dispatchCalls)
 	}
 }
