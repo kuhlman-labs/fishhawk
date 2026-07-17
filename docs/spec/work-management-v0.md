@@ -13,7 +13,7 @@ This is a **new canonical artifact**, NOT a block inside `.fishhawk/workflows.ya
 | Field | Required | Shape | Meaning |
 |---|---|---|---|
 | `spec_version` | yes | enum `work-management-v0` | Single-value enum per the versioning rules below. |
-| `provider` | yes | enum `github_projects` \| `jira` \| `gitlab` | Work-management backend. `github_projects` and `gitlab` are concrete providers in v0 (ADR-058); `jira` is reserved at the interface level (no implementation) and an unimplemented provider must fail closed at filing time. |
+| `provider` | yes | enum `github_projects` \| `jira` \| `gitlab` | Work-management backend. `github_projects`, `gitlab`, and `jira` are concrete providers in v0 (`gitlab` per ADR-058, `jira` per #1094); `gitlab`/`jira` are registered only when their server-side connection env is configured, and any provider not registered/configured on the server must fail closed at filing time. |
 | `project` | conditional | object | GitHub Projects connection (`owner`, `owner_type`, `number`). Required when `provider` is `github_projects` (semantic check). |
 | `jira` | conditional | object | Jira connection (`project_key` + optional `issue_types` map). Required when `provider` is `jira` (semantic check). Selects only the target project — the instance base URL and credentials are server-side env (see below), **not** in this checked-in config. |
 | `gitlab` | conditional | object | GitLab connection (optional `project` path override). Required when `provider` is `gitlab`, and rejected under any other provider (both semantic checks). Selects only the target project — the instance base URL and token are server-side env (see below), **not** in this checked-in config. |

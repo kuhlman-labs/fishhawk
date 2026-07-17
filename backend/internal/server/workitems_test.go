@@ -1473,6 +1473,51 @@ func TestFileWorkItem_RunBound_RunAbsent_Forbidden(t *testing.T) {
 	}
 }
 
+// TestFileWorkItem_RunBound_RunAbsent_GitLab_Forbidden pins the run-bound
+// rejection as PROVIDER-INDEPENDENT (ADR-058 #1856 fix-up): a run-bound agent
+// token filing run-absent against a resolved provider: gitlab MUST be rejected
+// 403 run_scoped_filing_required, exactly as it is for github_projects. The
+// forge-optional gate resolves GitHub-specific installation only for
+// github_projects, but the authz invariant — a run-scoped token may not widen
+// its authority to make unscoped filings via the run-absent door — holds for
+// every provider (gitlab/jira file with deployment-wide server-side
+// credentials, so the same widening applies). No GitHub client is configured,
+// proving the rejection does not depend on GitHub egress being wired.
+func TestFileWorkItem_RunBound_RunAbsent_GitLab_Forbidden(t *testing.T) {
+	fp := &fakeWorkProvider{name: workmgmtgitlab.ProviderName}
+	workmgmt.Register(fp)
+
+	conv := workmgmt.Default()
+	conv.Provider = workmgmtgitlab.ProviderName
+	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	s := New(Config{})
+
+	// Run-bound agent token, NO run_id supplied: the run-absent door is
+	// operator-only regardless of the resolved provider.
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "Sneak an unscoped gitlab filing through the run-absent door",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+	}, "mcp:run:"+uuid.New().String())
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "run_scoped_filing_required" {
+		t.Errorf("code = %q, want run_scoped_filing_required", env.Error.Code)
+	}
+	if fp.called {
+		t.Error("gitlab provider dispatched for a run-bound run-absent filing")
+	}
+}
+
 // newEpicGitHubClient builds a *githubclient.Client whose installation
 // endpoint answers with installID and whose single-issue endpoint answers
 // with epicTitle — the harness for the #1184 epic auto-derivation seam

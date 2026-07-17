@@ -17,7 +17,7 @@
     "provider": {
       "type": "string",
       "enum": ["github_projects", "jira", "gitlab"],
-      "description": "Work-management backend. github_projects and gitlab are concrete providers in v0 (ADR-058); jira is reserved at the interface level (the model must be expressible as a Jira issue) but has no implementation yet — an unimplemented provider must fail closed at filing time, never silently."
+      "description": "Work-management backend. github_projects, gitlab, and jira are concrete providers in v0 (gitlab per ADR-058, jira per #1094); gitlab and jira are registered only when their server-side connection env is configured, and any provider not registered/configured on the server must fail closed at filing time, never silently."
     },
     "project": {
       "type": "object",
