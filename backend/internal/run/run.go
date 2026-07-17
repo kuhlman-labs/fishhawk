@@ -481,15 +481,22 @@ type IssueComment struct {
 // RunnerKind enumerates the execution backends Fishhawk supports.
 // Closed-set; new kinds extend via a migration that updates the
 // CHECK constraint on runs.runner_kind.
+//
+// `gitlab_ci` is the second host-dispatched backend (E45.8 / #1861): a
+// run whose dispatch fires a GitLab pipeline rather than a GitHub Actions
+// workflow_dispatch. Added alongside migration 0054, which widens the
+// runs.runner_kind CHECK to admit it.
 const (
 	RunnerKindGitHubActions = "github_actions"
 	RunnerKindLocal         = "local"
+	RunnerKindGitLabCI      = "gitlab_ci"
 )
 
 // ValidRunnerKinds is the closed-set membership check.
 var ValidRunnerKinds = map[string]struct{}{
 	RunnerKindGitHubActions: {},
 	RunnerKindLocal:         {},
+	RunnerKindGitLabCI:      {},
 }
 
 // RunnerKindResolution is the outcome of reconciling a runner self-report
