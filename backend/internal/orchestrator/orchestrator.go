@@ -110,6 +110,19 @@ type Orchestrator struct {
 	GitHub GitHubAPI
 	Logger *slog.Logger
 
+	// GitLab is the narrow pipeline-trigger client the gitlab_ci backend
+	// (#1861) fires a subsequent stage's pipeline through. Nil (the GitHub-
+	// only / CLI / dev posture) warn+skips at TriggerStage exactly as a nil
+	// GitHub client does — safe to leave unset on a deployment with no GitLab
+	// wiring. NOTE: a gitlab_ci run's per-stage credential scope
+	// ("gitlab:<project_id>") is not yet persisted on the run row (the run
+	// carries only the GitHub installation_id int64; the ADR-057
+	// installation_ref column is a follow-up), so orchestrator-driven
+	// subsequent-stage gitlab_ci dispatch warn+skips until that lands. The
+	// first-stage dispatch runs through the webhook dispatcher, which has the
+	// scope directly from the trigger event.
+	GitLab runnerbackend.PipelineTriggerClient
+
 	// Artifacts is the artifact repository the fanout helper reads to
 	// load the approved plan. When nil, decomposition detection is
 	// disabled and Advance falls through to the legacy single-implement
@@ -2596,6 +2609,14 @@ func (o *Orchestrator) backends() *runnerbackend.Resolver {
 			Logger:              o.Logger,
 		},
 		run.RunnerKindLocal: &runnerbackend.Local{Logger: o.Logger},
+		// gitlab_ci (#1861): the pipeline-trigger backend. o.GitLab is the
+		// narrow PipelineTriggerClient; a nil client warn+skips at TriggerStage
+		// exactly as the github_actions backend does for a nil GitHub client
+		// (the CLI/dev posture), so registering it unconditionally is safe.
+		run.RunnerKindGitLabCI: &runnerbackend.GitLabCI{
+			Client: o.GitLab,
+			Logger: o.Logger,
+		},
 	}
 	return &runnerbackend.Resolver{
 		Runs:     o.Runs,
@@ -2619,9 +2640,31 @@ func (*Orchestrator) triggerParams(r *run.Run, next *run.Stage) runnerbackend.Tr
 		SliceIndex:       r.SliceIndex,
 	}
 	if r.InstallationID != nil {
-		p.InstallationID = *r.InstallationID
+		p.Scope = forge.FromGitHubInstallationID(*r.InstallationID)
+	}
+	// #1861: a gitlab_ci run's pipeline is created against its run branch (the
+	// ref selects BOTH the .gitlab-ci.yml evaluated AND the target commit). The
+	// github_actions/local paths leave Ref empty so the github_actions backend
+	// falls back to its DefaultRef, preserving the legacy "dispatch against
+	// main" behavior exactly. The run-branch derivation mirrors the runner's
+	// sole-writer lineage: a decomposed child's per-slice branch nests under
+	// the parent's namespace, a top-level run uses its own.
+	if r.RunnerKind == run.RunnerKindGitLabCI {
+		p.Ref = runBranchForRun(r)
 	}
 	return p
+}
+
+// runBranchForRun derives the run branch a gitlab_ci pipeline is created
+// against (#1861). A decomposed child's per-slice branch nests under its
+// decomposition parent's namespace — "fishhawk/run-<short(parent)>/slice-<n>"
+// — matching the runner's sole-writer slice branch (see shortRunID); a
+// top-level run uses its own namespace, "fishhawk/run-<short>".
+func runBranchForRun(r *run.Run) string {
+	if r.DecomposedFrom != nil && r.SliceIndex != nil {
+		return runBranchPrefix(*r.DecomposedFrom) + "/slice-" + strconv.Itoa(*r.SliceIndex)
+	}
+	return runBranchPrefix(r.ID)
 }
 
 // dispatchStage transitions the next stage to dispatched and (for

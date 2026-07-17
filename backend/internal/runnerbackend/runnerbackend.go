@@ -11,14 +11,14 @@
 // TriggerStage fires whatever wakes the runner (a github_actions
 // workflow_dispatch; a warn+no-op for the host-spawned local channel).
 //
-// Two implementations ship today: GitHubActions (githubactions.go) and Local
-// (local.go). A Registry maps runner_kind -> Backend, KindHostDispatched is the
-// package-level predicate over the two KNOWN kinds for guard sites that hold
-// only a kind string, and Resolver.Resolve ports the runLockedLocal lineage
-// rules verbatim. The gitlab_ci backend (child .8 / #1861) is the second
-// implementation this seam exists to admit. See README.md for the full
-// contract, including the deliberately-excluded companion surfaces (check-run
-// status publishing, workflow_run/check_run ingest) deferred to child .8.
+// Three implementations ship: GitHubActions (githubactions.go), GitLabCI
+// (gitlabci.go, #1861 — creates a GitLab pipeline; NOT host-dispatched, and
+// dispatch-only: it writes no commit status), and Local (local.go). A Registry
+// maps runner_kind -> Backend, KindHostDispatched is the package-level predicate
+// over the KNOWN kinds for guard sites that hold only a kind string, and
+// Resolver.Resolve ports the runLockedLocal lineage rules verbatim. See
+// README.md for the full contract, including the companion status-publish /
+// CI-ingest surfaces owned by the sibling #1861 slices.
 package runnerbackend
 
 import (
@@ -27,24 +27,41 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // TriggerParams carries everything a Backend needs to trigger a stage,
 // forge-neutrally. The github_actions backend maps these onto its
-// workflow_dispatch inputs; a future gitlab_ci backend maps them onto its own
-// trigger. Repo is the "owner/name" string as stored on the run row;
-// InstallationID is the GitHub App installation id (0 = unwired, matching the
-// pre-scope sentinel). DecomposedFrom / SliceIndex carry a decomposed child's
-// provenance so the fan-out is observable and the parent_run_id input (#1227)
-// can be attached.
+// workflow_dispatch inputs; the gitlab_ci backend maps them onto its pipeline
+// trigger. Repo is the "owner/name" string as stored on the run row.
+//
+// Scope is the forge-neutral credential scope that authenticates the trigger
+// (#1861: the InstallationID int64 seam flipped to a forge.CredentialScope so
+// a "gitlab:<project_id>" ref rides the same field a GitHub installation id
+// does). A zero Scope (Scope.IsZero()) is the unwired sentinel — the direct
+// analogue of the pre-flip InstallationID == 0 — so a backend warn+skips on it
+// exactly as it did on the zero id.
+//
+// Ref is the git ref the dispatch targets. It is resolved ONCE by the caller
+// from the run-branch derivation (orchestrator.runBranchPrefix ->
+// "fishhawk/run-<short>"; a decomposed child's per-slice branch is
+// "fishhawk/run-<short>/slice-<n>") so BOTH backends consume one source: the
+// github_actions backend maps it onto workflow_dispatch's ref (falling back to
+// its DefaultRef when empty), and the gitlab_ci backend requires it as the
+// pipeline's ref (which selects BOTH the .gitlab-ci.yml evaluated AND the
+// commit the pipeline runs against). See README.md for the run-branch contract.
+//
+// DecomposedFrom / SliceIndex carry a decomposed child's provenance so the
+// fan-out is observable and the parent_run_id input (#1227) can be attached.
 type TriggerParams struct {
 	RunID            uuid.UUID
 	StageID          uuid.UUID
 	WorkflowID       string
 	StageExecutorRef string
-	Repo             string // "owner/name"
-	InstallationID   int64  // 0 = unwired
+	Repo             string                // "owner/name"
+	Scope            forge.CredentialScope // zero = unwired
+	Ref              string                // dispatch ref (run branch); empty falls back per-backend
 	DecomposedFrom   *uuid.UUID
 	SliceIndex       *int
 }
@@ -72,13 +89,16 @@ func (r Registry) Backend(kind string) (Backend, bool) {
 	return b, ok
 }
 
-// KindHostDispatched is the package-level predicate over the two KNOWN runner
+// KindHostDispatched is the package-level predicate over the KNOWN runner
 // kinds, for guard sites that hold only a runner_kind string (no client
 // wiring). It returns (hostDispatched, known): local -> (true, true),
-// github_actions -> (false, true), any other kind -> (false, false). The
-// two-value shape lets each guard site keep its own unknown-kind posture
-// explicit — the host-dispatch endpoint rejects unknown resolved kinds while
-// the MCP guard allows them — so a future registry addition cannot silently
+// github_actions -> (false, true), any other kind -> (false, false). gitlab_ci
+// is deliberately NOT recognized here yet: the two guard sites that consume this
+// predicate (the host-dispatch endpoint and the MCP guard) each carry their own
+// unknown-kind posture, and flipping gitlab_ci to a known kind is owned by the
+// slice that updates those guards — this seam only supplies the gitlab_ci
+// Backend + Registry entry. The two-value shape lets each guard site keep its
+// unknown-kind posture explicit so a future registry addition cannot silently
 // flip either.
 func KindHostDispatched(kind string) (hostDispatched, known bool) {
 	switch kind {

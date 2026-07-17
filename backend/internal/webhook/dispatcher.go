@@ -2,11 +2,14 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -883,6 +886,18 @@ type GitHubAPI interface {
 		repo forge.RepoRef, branch string) ([]forge.RulesetRequiredCheck, error)
 }
 
+// GitLabAPI is the slice of *gitlabclient.Client the dispatcher uses to create
+// a run from a GitLab trigger (#1861): reading .fishhawk/workflows.yaml via the
+// raw-file API keyed on the gitlab:<project_id> scope, and firing the first
+// stage's pipeline. CreatePipeline satisfies runnerbackend.PipelineTriggerClient
+// so the same client backs the gitlab_ci dispatch backend. Nil leaves GitLab
+// run creation off — a GitLab MatchActionRun parks with a logged reason
+// (the pre-#1861 posture).
+type GitLabAPI interface {
+	GetRawFile(ctx context.Context, projectID int, filePath, ref string) ([]byte, error)
+	CreatePipeline(ctx context.Context, projectID int, ref string, variables map[string]string) error
+}
+
 // IssueNotifier is the slice of issuecomment.Notifier the dispatcher
 // uses for issue-thread comment-backs. Defining it as an interface
 // keeps the import boundary clean and lets tests substitute a
@@ -992,6 +1007,10 @@ type ApprovalCommandParams struct {
 // HTTP handler calls Handle once dedup has passed.
 type Dispatcher struct {
 	GitHub GitHubAPI
+	// GitLab creates runs from GitLab triggers (#1861): the raw-file spec read
+	// + the first-stage pipeline dispatch. Nil parks GitLab MatchActionRun
+	// events with a logged reason (the pre-#1861 boundary).
+	GitLab GitLabAPI
 	Runs   run.Repository
 	Audit  audit.Repository
 	// Artifacts is consulted by the CI-failure retry handler (#279
@@ -1116,23 +1135,24 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		return d.handleInstallation(ctx, ev, m)
 	}
 
-	// DELIBERATE BOUNDARY (E45.6 / #1860): a GitLab MatchActionRun
-	// parks fail-closed here, BEFORE the spec-fetch step. Actual run
-	// CREATION from a GitLab trigger is the CI/dispatch phase's work
-	// per ADR-058 (E45.8 / #1861): the forge.Forge interface has no
-	// workflow-spec read, comment-backs are GitHub-only, and no
-	// gitlab_ci runner_kind exists yet. Falling through would hand a
-	// "gitlab:<project_id>" scope to d.GitHub (the GitHub client),
-	// whose installation-id parse would fail into a 5xx retry loop, so
-	// we log the reason and return nil (202) instead.
+	// E45.8 / #1861: a GitLab MatchActionRun now CREATES a gitlab_ci run
+	// (the go-live flip). The GitLab path diverges from the GitHub create
+	// flow below — it reads .fishhawk/workflows.yaml via the GitLab raw-file
+	// API keyed on the gitlab:<project_id> scope and fires the first stage's
+	// pipeline through the gitlab_ci backend, rather than d.GitHub's
+	// contents/workflow_dispatch APIs. When GitLab is unwired the event parks
+	// with a logged reason (the pre-#1861 boundary).
 	if ev.Forge == ForgeGitLab {
-		d.logger().LogAttrs(ctx, slog.LevelInfo,
-			"gitlab run trigger parked: run creation is the E45.8/#1861 CI-dispatch consumer",
-			slog.String("delivery_id", ev.DeliveryID),
-			slog.String("repo", ev.Repo),
-			slog.String("trigger_ref", m.TriggerRef),
-		)
-		return nil
+		if d.GitLab == nil {
+			d.logger().LogAttrs(ctx, slog.LevelInfo,
+				"gitlab run trigger parked: GitLab client not configured",
+				slog.String("delivery_id", ev.DeliveryID),
+				slog.String("repo", ev.Repo),
+				slog.String("trigger_ref", m.TriggerRef),
+			)
+			return nil
+		}
+		return d.handleGitLabRunCreation(ctx, ev, m)
 	}
 
 	repo, err := parseRepo(ev.Repo)
@@ -1885,7 +1905,7 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 			WorkflowID:       parent.WorkflowID,
 			StageExecutorRef: firstStage.ExecutorRef,
 			Repo:             ev.Repo,
-			InstallationID:   installationID,
+			Scope:            forge.FromGitHubInstallationID(installationID),
 			// Retry children carry no DecomposedFrom (ParentRunID threads the
 			// retry chain), so no parent_run_id input is added.
 		})
@@ -2202,6 +2222,250 @@ func (d *Dispatcher) logger() *slog.Logger {
 	return slog.Default()
 }
 
+// handleGitLabRunCreation creates a gitlab_ci run from a GitLab issue-label /
+// note trigger (E45.8 / #1861 — the go-live flip). It mirrors the GitHub
+// create flow's SHAPE (read spec → parse/validate → create run + stages →
+// dispatch first stage → audit) but reads .fishhawk/workflows.yaml through the
+// GitLab raw-file API keyed on the gitlab:<project_id> scope and fires the
+// first stage's pipeline through the gitlab_ci backend.
+//
+// The FIRST pipeline runs against the default branch (where .gitlab-ci.yml
+// lives): the runner then creates the run branch under the ADR-035 sole-writer
+// lineage. Subsequent-stage dispatches (orchestrator) target the run branch
+// itself, which exists by then. Spec-read/parse failures are non-transient —
+// logged and swallowed (202) so GitLab does not redeliver a bad config forever;
+// a run-repo write failure propagates so the receiver returns 5xx and GitLab
+// redelivers (parity with the merge_request consumer).
+func (d *Dispatcher) handleGitLabRunCreation(ctx context.Context, ev Event, m Match) error {
+	projectID, err := parseGitLabProjectID(ev.CredentialRef)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn, "gitlab run creation: bad project scope",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("credential_ref", ev.CredentialRef),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+
+	ref := d.DefaultRef
+	if ref == "" {
+		ref = "main"
+	}
+
+	// Step 1: read + validate the workflow spec via the GitLab raw-file API.
+	// A read failure or malformed spec is non-transient — swallow (202).
+	specContent, err := d.GitLab.GetRawFile(ctx, projectID, githubclient.WorkflowSpecPath, ref)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn, "gitlab run creation: read workflow spec failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.Int("project_id", projectID),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	parsed, err := spec.ParseBytes(specContent)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn, "gitlab run creation: workflow spec parse failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.Int("project_id", projectID),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	workflow, ok := parsed.Workflows[m.WorkflowID]
+	if !ok || len(workflow.Stages) == 0 {
+		d.logger().LogAttrs(ctx, slog.LevelWarn, "gitlab run creation: workflow_id not defined or empty",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("workflow_id", m.WorkflowID),
+		)
+		return nil
+	}
+
+	// Step 2: create the run, STAMPING runner_kind=gitlab_ci — the create-path
+	// stamp condition-4 pins. The workflow_sha is the content hash of the spec
+	// bytes (GitLab's raw-file API returns no blob SHA), keeping the run's spec
+	// self-consistent. installation_id stays nil (GitLab carries no GitHub
+	// installation); the per-stage credential scope rides ev.CredentialRef.
+	triggerRef := m.TriggerRef
+	sum := sha256.Sum256(specContent)
+	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
+		Repo:          ev.Repo,
+		WorkflowID:    m.WorkflowID,
+		WorkflowSHA:   hex.EncodeToString(sum[:]),
+		TriggerSource: m.TriggerSource,
+		TriggerRef:    &triggerRef,
+		WorkflowSpec:  specContent,
+		RunnerKind:    run.RunnerKindGitLabCI,
+	})
+	if err != nil {
+		// A run-repo write failure is transient — propagate so the receiver
+		// returns 5xx and GitLab redelivers (parity with the MR consumer).
+		return fmt.Errorf("dispatcher: create gitlab run: %w", err)
+	}
+
+	// Step 3: create one stage row per stage definition.
+	stages, err := CreateStagesFromSpec(ctx, d.Runs, created.ID, workflow.Stages)
+	if err != nil {
+		return fmt.Errorf("dispatcher: create gitlab stages: %w", err)
+	}
+	firstStage := stages[0]
+
+	// Step 4: transition the first stage to dispatched and fire its pipeline
+	// through the gitlab_ci backend. The pipeline ref is the default branch —
+	// the runner creates the run branch from there.
+	if _, err := d.Runs.TransitionStage(ctx, firstStage.ID, run.StageStateDispatched, nil); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn, "gitlab run creation: transition first stage failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("stage_id", firstStage.ID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
+	backend, _ := d.backends().Backend(run.RunnerKindGitLabCI)
+	dispatchErr := backend.TriggerStage(ctx, runnerbackend.TriggerParams{
+		RunID:            created.ID,
+		StageID:          firstStage.ID,
+		WorkflowID:       m.WorkflowID,
+		StageExecutorRef: firstStage.ExecutorRef,
+		Repo:             ev.Repo,
+		Scope:            ev.credentialScope(),
+		Ref:              ref,
+	})
+
+	// Step 5: audit the create+dispatch outcome.
+	d.writeDispatchAudit(ctx, ev, m, created, created.WorkflowSHA, dispatchErr, d.now())
+
+	if dispatchErr != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn, "gitlab run creation: pipeline dispatch failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", created.ID.String()),
+			slog.String("error", dispatchErr.Error()),
+		)
+	} else {
+		d.logger().LogAttrs(ctx, slog.LevelInfo, "gitlab run created and pipeline dispatched",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("run_id", created.ID.String()),
+			slog.Int("project_id", projectID),
+		)
+	}
+	return nil
+}
+
+// HandleGitLabCIFailure creates a follow-up gitlab_ci run when a GitLab
+// pipeline or job fails on a Fishhawk-managed run (#1861 — CI-failure-retry
+// parity with the GitHub check_run/workflow_run path). The GitLab receiver
+// finds the parent run server-side (project + commit SHA) and calls this with
+// the reconstructed pipeline scope ("gitlab:<project_id>") and dispatch ref,
+// mirroring how the GitHub path routes through handleCIFailureRetry. scope is
+// passed IN because a gitlab_ci run does not yet persist its credential scope
+// on the run row (the ADR-057 installation_ref follow-up).
+//
+// Best-effort caps mirror the GitHub retry: at/over the snapshotted cap the
+// retry is refused (ci_retry_exhausted audit). A spec-resolution miss refuses
+// the retry (no runaway). A run-repo write failure propagates so the receiver
+// returns 5xx.
+func (d *Dispatcher) HandleGitLabCIFailure(ctx context.Context, parent *run.Run, scope forge.CredentialScope, ref string) error {
+	if parent == nil {
+		return nil
+	}
+
+	// Cap check: covers both the max-hit and the explicit max_retries:0 opt-out.
+	workflow, maxRetries, ok := d.resolveRetryPolicy(ctx, parent)
+	if !ok {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"gitlab ci_failure_retry: cannot resolve retry policy from cached spec",
+			slog.String("run_id", parent.ID.String()))
+		return nil
+	}
+	if parent.RetryAttempt >= maxRetries {
+		d.logger().LogAttrs(ctx, slog.LevelInfo,
+			"gitlab ci_failure_retry: retry cap reached; not retrying",
+			slog.String("run_id", parent.ID.String()),
+			slog.Int("retry_attempt", parent.RetryAttempt),
+			slog.Int("max_retries", maxRetries))
+		return nil
+	}
+
+	// Create the follow-up run, inheriting runner_kind=gitlab_ci.
+	triggerRef := ""
+	if parent.TriggerRef != nil {
+		triggerRef = *parent.TriggerRef
+	}
+	parentID := parent.ID
+	params := run.CreateRunParams{
+		Repo:                   parent.Repo,
+		WorkflowID:             parent.WorkflowID,
+		WorkflowSHA:            parent.WorkflowSHA,
+		TriggerSource:          parent.TriggerSource,
+		ParentRunID:            &parentID,
+		RequiredChecksSnapshot: parent.RequiredChecksSnapshot,
+		WorkflowSpec:           parent.WorkflowSpec,
+		RetryAttempt:           parent.RetryAttempt + 1,
+		MaxRetriesSnapshot:     parent.MaxRetriesSnapshot,
+		RunnerKind:             parent.RunnerKind,
+	}
+	if triggerRef != "" {
+		params.TriggerRef = &triggerRef
+	}
+	child, err := d.Runs.CreateRun(ctx, params)
+	if err != nil {
+		return fmt.Errorf("dispatcher: create gitlab retry run: %w", err)
+	}
+
+	// Skip plan stages — the retry's implement prompt walks ParentRunID to the
+	// original plan (parity with handleCIFailureRetry step 7).
+	retryStages := FilterOutPlanStages(workflow.Stages)
+	if len(retryStages) == 0 {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"gitlab ci_failure_retry: no non-plan stages to retry against",
+			slog.String("run_id", child.ID.String()))
+		return nil
+	}
+	stages, err := CreateStagesFromSpec(ctx, d.Runs, child.ID, retryStages)
+	if err != nil {
+		return fmt.Errorf("dispatcher: create gitlab retry stages: %w", err)
+	}
+	firstStage := stages[0]
+
+	if _, err := d.Runs.TransitionStage(ctx, firstStage.ID, run.StageStateDispatched, nil); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"gitlab ci_failure_retry: transition first retry stage failed",
+			slog.String("run_id", child.ID.String()),
+			slog.String("error", err.Error()))
+	}
+	backend, _ := d.backends().Backend(run.RunnerKindGitLabCI)
+	dispatchErr := backend.TriggerStage(ctx, runnerbackend.TriggerParams{
+		RunID:            child.ID,
+		StageID:          firstStage.ID,
+		WorkflowID:       parent.WorkflowID,
+		StageExecutorRef: firstStage.ExecutorRef,
+		Repo:             parent.Repo,
+		Scope:            scope,
+		Ref:              ref,
+	})
+	d.logger().LogAttrs(ctx, slog.LevelInfo, "gitlab ci_failure_retry dispatched",
+		slog.String("delivery_run_id", parent.ID.String()),
+		slog.String("retry_run_id", child.ID.String()),
+		slog.Int("retry_attempt", child.RetryAttempt),
+		slog.Any("dispatch_error", dispatchErr),
+	)
+	return nil
+}
+
+// parseGitLabProjectID pulls the numeric project id out of a
+// "gitlab:<project_id>" credential ref. Fails closed on a missing prefix or a
+// non-numeric / non-positive id.
+func parseGitLabProjectID(credentialRef string) (int, error) {
+	const prefix = "gitlab:"
+	if !strings.HasPrefix(credentialRef, prefix) {
+		return 0, fmt.Errorf("credential ref %q is not a gitlab project scope", credentialRef)
+	}
+	id, err := strconv.Atoi(strings.TrimPrefix(credentialRef, prefix))
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("credential ref %q has no valid gitlab project id", credentialRef)
+	}
+	return id, nil
+}
+
 // backends builds the runnerbackend Registry the CI-failure-retry dispatch uses
 // to route a child's inherited runner_kind (E45.7 / ADR-058). The
 // github_actions backend wraps d.GitHub with the same ref / actions-file
@@ -2216,7 +2480,24 @@ func (d *Dispatcher) backends() runnerbackend.Registry {
 			Logger:              d.Logger,
 		},
 		run.RunnerKindLocal: &runnerbackend.Local{Logger: d.Logger},
+		// gitlab_ci (#1861): d.GitLab satisfies PipelineTriggerClient. A nil
+		// client warn+skips at TriggerStage — the pre-#1861 posture.
+		run.RunnerKindGitLabCI: &runnerbackend.GitLabCI{
+			Client: d.gitLabPipelineClient(),
+			Logger: d.Logger,
+		},
 	}
+}
+
+// gitLabPipelineClient adapts the dispatcher's GitLabAPI to the narrower
+// runnerbackend.PipelineTriggerClient the gitlab_ci backend needs. Returns nil
+// (not a typed-nil interface) when GitLab is unwired so the backend's nil-check
+// warn+skips cleanly.
+func (d *Dispatcher) gitLabPipelineClient() runnerbackend.PipelineTriggerClient {
+	if d.GitLab == nil {
+		return nil
+	}
+	return d.GitLab
 }
 
 func (d *Dispatcher) now() time.Time {

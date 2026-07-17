@@ -3882,30 +3882,30 @@ func TestHandle_GitLabApprove_RoutesWithZeroInstallation(t *testing.T) {
 	}
 }
 
-func TestHandle_GitLabRun_ParksWithoutCreatingRun(t *testing.T) {
+func TestHandle_GitLabRun_UnwiredParksWithoutCreatingRun(t *testing.T) {
+	// With NO GitLab client wired (newDispatcherWithStubs leaves d.GitLab
+	// nil), a GitLab MatchActionRun parks with a logged reason and creates no
+	// run — the pre-#1861 boundary preserved as the unwired posture. (The
+	// wired path that DOES create a gitlab_ci run is covered by
+	// TestHandle_GitLabRunCreation_StampsGitLabCIAndDispatchesPipeline.)
 	d, _, runs, _ := newDispatcherWithStubs(t)
 	logs := captureDispatcherLogs(d)
 	body := `{"object_attributes":{"iid":5,"action":"open"},"labels":[{"title":"fishhawk"}]}`
 	ev := gitlabEvent("issue", "alice", body)
 	ev.DeliveryID = "gitlab:d2"
 	// A VALID Repo so the park boundary is regression-detectable: if the
-	// E45.8/#1861 park block were deleted, the fall-through would parse
-	// this repo successfully and reach the spec-fetch / CreateRun stubs,
-	// tripping the runs.created assertion below — instead of silently
-	// no-op'ing at parseRepo("") and passing identically (the vacuity
-	// the done-means pin must guard against).
+	// unwired-park guard were deleted, the fall-through would parse this repo
+	// successfully and reach the spec-fetch / CreateRun stubs, tripping the
+	// runs.created assertion below instead of silently no-op'ing.
 	ev.Repo = "group/project"
 	if err := d.Handle(context.Background(), ev); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if len(runs.created) != 0 {
-		t.Errorf("CreateRun called %d times; a parked GitLab run must create no run", len(runs.created))
+		t.Errorf("CreateRun called %d times; an unwired-GitLab run must create no run", len(runs.created))
 	}
-	// The park must emit its #1861-named log line (the stated done-means
-	// pin). Asserting it makes a deleted park block detectable even
-	// independent of the CreateRun stub.
-	if got := logs.String(); !strings.Contains(got, "gitlab run trigger parked") || !strings.Contains(got, "#1861") {
-		t.Errorf("expected park log naming #1861; got logs:\n%s", got)
+	if got := logs.String(); !strings.Contains(got, "gitlab run trigger parked: GitLab client not configured") {
+		t.Errorf("expected unwired-GitLab park log; got logs:\n%s", got)
 	}
 }
 
@@ -3930,5 +3930,161 @@ func TestHandle_GitHubEvent_StillRoutesThroughMatchEvent(t *testing.T) {
 	}
 	if gh.dispatchCalls != 1 {
 		t.Errorf("dispatchCalls = %d, want 1 (GitHub dispatch path)", gh.dispatchCalls)
+	}
+}
+
+// --- #1861: GitLab run creation (create → persist → dispatch) ---
+
+// stubGitLab records the GitLab raw-file spec read + pipeline dispatch the
+// gitlab_ci run-creation path drives.
+type stubGitLab struct {
+	spec          []byte
+	getErr        error
+	createErr     error
+	pipelineCalls []gitLabPipelineCall
+}
+
+type gitLabPipelineCall struct {
+	ProjectID int
+	Ref       string
+	Variables map[string]string
+}
+
+func (s *stubGitLab) GetRawFile(_ context.Context, _ int, _, _ string) ([]byte, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	return s.spec, nil
+}
+
+func (s *stubGitLab) CreatePipeline(_ context.Context, projectID int, ref string, variables map[string]string) error {
+	if s.createErr != nil {
+		return s.createErr
+	}
+	s.pipelineCalls = append(s.pipelineCalls, gitLabPipelineCall{ProjectID: projectID, Ref: ref, Variables: variables})
+	return nil
+}
+
+func gitLabIssueRunEvent() Event {
+	body, _ := json.Marshal(map[string]any{
+		"object_attributes": map[string]any{"iid": 7, "action": "open"},
+		"labels":            []map[string]any{{"title": "fishhawk"}},
+		"project":           map[string]any{"id": 555, "path_with_namespace": "group/proj"},
+	})
+	return Event{
+		Type:          "issue",
+		Forge:         ForgeGitLab,
+		Repo:          "group/proj",
+		Sender:        "alice",
+		CredentialRef: "gitlab:555",
+		DeliveryID:    "gl-deliv-1",
+		RawBody:       body,
+	}
+}
+
+func TestHandle_GitLabRunCreation_StampsGitLabCIAndDispatchesPipeline(t *testing.T) {
+	gl := &stubGitLab{spec: []byte(validSpec)}
+	runs := &stubRuns{}
+	d := &Dispatcher{
+		GitLab: gl,
+		Runs:   runs,
+		Audit:  &stubAudit{},
+		Now:    func() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) },
+	}
+	if err := d.Handle(context.Background(), gitLabIssueRunEvent()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("runs created = %d, want 1", len(runs.created))
+	}
+	created := runs.created[0]
+	if created.RunnerKind != run.RunnerKindGitLabCI {
+		t.Errorf("runner_kind = %q, want gitlab_ci (the dispatcher stamp)", created.RunnerKind)
+	}
+	if created.Repo != "group/proj" {
+		t.Errorf("repo = %q, want group/proj", created.Repo)
+	}
+	if len(gl.pipelineCalls) != 1 {
+		t.Fatalf("pipeline calls = %d, want 1", len(gl.pipelineCalls))
+	}
+	call := gl.pipelineCalls[0]
+	if call.ProjectID != 555 {
+		t.Errorf("pipeline project id = %d, want 555", call.ProjectID)
+	}
+	if call.Variables["run_id"] != created.ID.String() {
+		t.Errorf("pipeline run_id variable = %q, want %q", call.Variables["run_id"], created.ID.String())
+	}
+}
+
+func TestHandle_GitLabRunCreation_UnwiredParks(t *testing.T) {
+	runs := &stubRuns{}
+	d := &Dispatcher{Runs: runs, Audit: &stubAudit{}, Now: func() time.Time { return time.Now().UTC() }}
+	if err := d.Handle(context.Background(), gitLabIssueRunEvent()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("unwired GitLab must create no run, got %d", len(runs.created))
+	}
+}
+
+func TestHandle_GitLabRunCreation_SpecReadFailureSwallowed(t *testing.T) {
+	gl := &stubGitLab{getErr: errors.New("403 forbidden")}
+	runs := &stubRuns{}
+	d := &Dispatcher{GitLab: gl, Runs: runs, Audit: &stubAudit{}, Now: func() time.Time { return time.Now().UTC() }}
+	if err := d.Handle(context.Background(), gitLabIssueRunEvent()); err != nil {
+		t.Fatalf("spec-read failure must be swallowed (202), got %v", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("spec-read failure must create no run, got %d", len(runs.created))
+	}
+}
+
+func TestHandle_GitLabRunCreation_CreateFailurePropagates(t *testing.T) {
+	gl := &stubGitLab{spec: []byte(validSpec)}
+	runs := &stubRuns{createErr: errors.New("db blip")}
+	d := &Dispatcher{GitLab: gl, Runs: runs, Audit: &stubAudit{}, Now: func() time.Time { return time.Now().UTC() }}
+	if err := d.Handle(context.Background(), gitLabIssueRunEvent()); err == nil {
+		t.Fatal("run-repo write failure must propagate (5xx), got nil")
+	}
+}
+
+// --- #1861: HandleGitLabCIFailure defensive branches ---
+
+func TestHandleGitLabCIFailure_CapExhaustedNoRetry(t *testing.T) {
+	runs := &stubRuns{}
+	d := &Dispatcher{Runs: runs, Now: func() time.Time { return time.Now().UTC() }}
+	ref := "issue:7"
+	parent := &run.Run{
+		ID: uuid.New(), Repo: "group/proj", WorkflowID: "feature_change",
+		TriggerRef: &ref, WorkflowSpec: []byte(ciRetrySpec), RetryAttempt: 1, // == max_retries:1
+		RunnerKind: run.RunnerKindGitLabCI,
+	}
+	if err := d.HandleGitLabCIFailure(context.Background(), parent, forge.FromRef("gitlab:555"), "main"); err != nil {
+		t.Fatalf("HandleGitLabCIFailure err = %v, want nil", err)
+	}
+	if len(runs.created) != 0 {
+		t.Errorf("cap-exhausted must create no retry run, got %d", len(runs.created))
+	}
+}
+
+func TestHandleGitLabCIFailure_NilParentNoOp(t *testing.T) {
+	runs := &stubRuns{}
+	d := &Dispatcher{Runs: runs, Now: func() time.Time { return time.Now().UTC() }}
+	if err := d.HandleGitLabCIFailure(context.Background(), nil, forge.FromRef("gitlab:1"), "main"); err != nil {
+		t.Fatalf("nil parent must no-op nil, got %v", err)
+	}
+}
+
+func TestHandleGitLabCIFailure_CreateFailurePropagates(t *testing.T) {
+	runs := &stubRuns{createErr: errors.New("db blip")}
+	d := &Dispatcher{Runs: runs, Now: func() time.Time { return time.Now().UTC() }}
+	ref := "issue:7"
+	parent := &run.Run{
+		ID: uuid.New(), Repo: "group/proj", WorkflowID: "feature_change",
+		TriggerRef: &ref, WorkflowSpec: []byte(ciRetrySpec), RetryAttempt: 0,
+		RunnerKind: run.RunnerKindGitLabCI,
+	}
+	if err := d.HandleGitLabCIFailure(context.Background(), parent, forge.FromRef("gitlab:1"), "main"); err == nil {
+		t.Fatal("create failure must propagate, got nil")
 	}
 }
