@@ -50,8 +50,8 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
-	subject := p.SenderLogin
-	if subject == "" {
+	subject := namespacedApproverSubject(p.Forge, p.SenderLogin)
+	if p.SenderLogin == "" {
 		s.replyApproval(ctx, p, "Cannot approve: comment is missing sender identity (no GitHub login).")
 		return nil
 	}
@@ -64,7 +64,7 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	// reviewer typed a deliberate command.
 	silent := p.Source == webhook.ApprovalSourceReplyComment
 
-	runRow, stage, found, err := s.findAwaitingApprovalStage(ctx, p.Repo, p.IssueNumber)
+	runRow, stage, found, err := s.findAwaitingApprovalStage(ctx, p.Forge, p.Repo, p.IssueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"slash-command approval: run lookup failed",
@@ -241,7 +241,7 @@ func (s *Server) approvalCommandConfigured() bool {
 // per issue) this is faster than another sqlc query + index. If
 // repo cardinality grows past 200 active runs, swap in a focused
 // query.
-func (s *Server) findAwaitingApprovalStage(ctx context.Context, repo string, issueNumber int) (*run.Run, *run.Stage, bool, error) {
+func (s *Server) findAwaitingApprovalStage(ctx context.Context, approvalForge, repo string, issueNumber int) (*run.Run, *run.Stage, bool, error) {
 	triggerRef := fmt.Sprintf("issue:%d", issueNumber)
 	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
 		Repo:  repo,
@@ -252,6 +252,15 @@ func (s *Server) findAwaitingApprovalStage(ctx context.Context, repo string, iss
 	}
 	for _, r := range runs {
 		if r.TriggerRef == nil || *r.TriggerRef != triggerRef {
+			continue
+		}
+		if !forgeMatchesRun(approvalForge, r) {
+			// Cross-forge refusal (E45.19 / #2036): an approval sourced
+			// from a different forge than the run must not act on its
+			// gate. Runs carry no forge column yet (#1861), so every
+			// existing run is GitHub-sourced — a GitLab-sourced approval
+			// whose repo string + issue number collide with a GitHub run
+			// falls through here and matches nothing.
 			continue
 		}
 		if r.State.IsTerminal() {
@@ -268,6 +277,55 @@ func (s *Server) findAwaitingApprovalStage(ctx context.Context, repo string, iss
 		}
 	}
 	return nil, nil, false, nil
+}
+
+// normalizeForge canonicalizes an approval's source forge for
+// comparison. Empty and "github" both mean GitHub — the legacy
+// default the dispatcher leaves empty for GitHub events — so they
+// normalize to the same canonical value. Any other value (e.g.
+// webhook.ForgeGitLab) passes through verbatim.
+func normalizeForge(f string) string {
+	if f == "" || f == "github" {
+		return "github"
+	}
+	return f
+}
+
+// forgeMatchesRun reports whether an approval sourced from
+// approvalForge may act on run r. Runs carry no forge column yet
+// (#1861 wires GitLab run creation), so every existing run is
+// GitHub-sourced: the helper matches only when the approval's
+// normalized forge is GitHub. This is the #1861 seam — once runs
+// gain a forge discriminator, the fixed "github" here becomes
+// r's own forge.
+func forgeMatchesRun(approvalForge string, _ *run.Run) bool {
+	return normalizeForge(approvalForge) == "github"
+}
+
+// namespacedApproverSubject renders the approver identity used for
+// authorization, persistence, and audit. A GitHub approval (empty /
+// "github" forge) keeps the bare login so nothing about the existing
+// GitHub path changes. Any other forge prefixes the login with the
+// forge id (e.g. "gitlab:username") so a GitLab user sharing a GitHub
+// approver's login cannot string-collide in RoleResolver.CanApprove
+// (E45.19 / #2036).
+func namespacedApproverSubject(forgeID, login string) string {
+	if normalizeForge(forgeID) == "github" {
+		return login
+	}
+	return forgeID + ":" + login
+}
+
+// replyScope resolves the notifier scope for an approval reply.
+// Mirrors Event.credentialScope(): a non-empty CredentialRef (the
+// GitLab path) wraps verbatim via forge.FromRef; otherwise the GitHub
+// installation-id wrapper is used, leaving the GitHub reply path
+// byte-for-byte unchanged (E45.19 / #2036).
+func replyScope(p webhook.ApprovalCommandParams) forge.CredentialScope {
+	if p.CredentialRef != "" {
+		return forge.FromRef(p.CredentialRef)
+	}
+	return forge.FromGitHubInstallationID(p.InstallationID)
 }
 
 // authorizeSlashApprover wraps the role-resolver check into a non-
@@ -354,7 +412,7 @@ func (s *Server) replyApproval(ctx context.Context, p webhook.ApprovalCommandPar
 	}
 	if err := s.issueNotifier.NotifySlashApprovalReply(ctx, issuecomment.SlashApprovalReply{
 		Repo:        p.Repo,
-		Scope:       forge.FromGitHubInstallationID(p.InstallationID),
+		Scope:       replyScope(p),
 		IssueNumber: p.IssueNumber,
 		Body:        body,
 	}); err != nil {

@@ -966,6 +966,24 @@ type ApprovalCommandParams struct {
 	// (E17.3 / #338) skip silently (the comment may have been
 	// unrelated to a Fishhawk plan).
 	Source ApprovalSource
+
+	// Forge names the source forge for the approval, mirroring
+	// Event.Forge: empty for GitHub (the legacy default), ForgeGitLab
+	// ("gitlab") for a GitLab-sourced note (E45.19 / #2036). The handler
+	// uses it to refuse acting on a run sourced from a different forge —
+	// a GitLab project path that string-equals a GitHub repo full name
+	// plus a colliding issue number must not act on the GitHub run's
+	// gate — and to namespace the approver subject so a GitLab username
+	// cannot collide with a bare GitHub login.
+	Forge string
+
+	// CredentialRef is the forge-neutral installation_ref for the
+	// approval, mirroring Event.CredentialRef: empty for GitHub (where
+	// InstallationID carries the identity), "gitlab:<project_id>" for
+	// GitLab. When set, the reply notifier resolves its scope from this
+	// ref via forge.FromRef rather than the GitHub installation-id
+	// wrapper (E45.19 / #2036).
+	CredentialRef string
 }
 
 // Dispatcher orchestrates the I/O side: it consumes a Match,
@@ -1488,6 +1506,8 @@ func (d *Dispatcher) handleApprovalCommand(ctx context.Context, ev Event, m Matc
 		Decision:       m.Action,
 		Comment:        m.CommentBody,
 		Source:         m.ApprovalSource,
+		Forge:          ev.Forge,
+		CredentialRef:  ev.CredentialRef,
 	}); err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"slash-command approval failed",
