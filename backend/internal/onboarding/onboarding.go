@@ -74,6 +74,25 @@ Review the files, adjust the autonomy tier if needed, and merge to finish onboar
 //go:embed templates/fishhawk.yml
 var workflowTemplate []byte
 
+//go:embed templates/.gitlab-ci.yml
+var gitlabCITemplate []byte
+
+// gitlabCIPath is the repo-relative path the GitLab CI scaffold is served
+// at — GitLab evaluates a project's pipeline definition from the repo root.
+const gitlabCIPath = ".gitlab-ci.yml"
+
+// GitLabScaffoldFiles returns the customer-facing GitLab CI scaffold: the
+// single `.gitlab-ci.yml` that drives a Fishhawk run on GitLab CI/CD. It is
+// the GitLab analog of the `.github/workflows/fishhawk.yml` the GitHub App
+// scaffold (ScaffoldFiles) seeds — the backend triggers a pipeline against
+// the run branch and this file hands the run/stage trigger variables to the
+// backend-agnostic runner (which self-detects gitlab_ci). It is pure — no
+// I/O — so it is unit-testable independently of any GitLab write path. The
+// returned map is keyed by repo-relative path.
+func GitLabScaffoldFiles() map[string][]byte {
+	return map[string][]byte{gitlabCIPath: gitlabCITemplate}
+}
+
 // ScaffoldFiles assembles the scaffold file set for a preset. It is pure —
 // no I/O — so it can be unit-tested for content correctness independently
 // of the GitHub write path. The returned map is keyed by repo-relative
