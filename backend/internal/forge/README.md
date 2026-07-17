@@ -1,6 +1,6 @@
 # backend/internal/forge
 
-Forge-neutral credential-scope seam (ADR-057/ADR-058, #2009). Phase 1 of 5 of the #1855 forge-credential split: purely additive, zero behavior change.
+Forge-neutral seams (ADR-057/ADR-058): the `CredentialScope` credential seam (#2009, the #1855 split) and the `Forge` interface over a code host's operational surface (#1858 / E45.4). Both are GitHub-only today; both exist so a second forge (GitLab per ADR-058) has a place to land instead of a tree full of `*githubclient.Client` fields.
 
 ## What a credential scope is
 
@@ -39,3 +39,25 @@ The staged split is complete. The `githubclient` `Scoped`-suffixed method varian
 Detection parses each file and inspects declaration nodes; it does not match source text. This is what makes the enforcement repo-wide rather than spelling-wide: a grouped declaration (`installationID, other int64`), a comment between the identifier and its type, or a name list wrapped across lines is the same cross-forge seam, and each of them slips past a line-oriented pattern. Parsing means the gate sees the declaration the compiler sees. `TestInstallationIDDeclDetectionForms` and `TestExportedClientInt64MethodDetectionForms` pin that behavior against those forms directly, and a file that fails to parse fails the gate rather than being skipped — an unscanned file is a hole.
 
 One sanctioned entry is a deferral rather than a permanent survivor: `runnerbackend.TriggerParams.InstallationID` flips in #1861, where the `gitlab_ci` backend — the field's second consumer — gives it its forge-neutral shape.
+
+## Forge interface (#1858 / E45.4)
+
+`Forge` (`forge.go`) is the forge-neutral surface Fishhawk's flows drive a code host through: ref creation + SHA reads, git-data commit authoring (`GetRepository`/`GetCommit`/`CreateTree`/`CreateCommit`), the pull-request lifecycle (`Create`/`Get`/`Edit`/`Close`/`ListOpenByHead`/`ListForCommit`/`EnableAutoMerge`/`MergePullRequest`), commit status via `CreateCheckRun`, branch protection + ruleset required checks, `CompareCommits`/`ComparePatch`, plus `Name()` and `ResolveRepoScope`. Every method takes a `CredentialScope` first, mirroring the concrete client's scope-first shape — except `ResolveRepoScope`, which PRODUCES a scope (App-JWT auth) and so cannot take one.
+
+**Push credentials are deliberately NOT a `Forge` method.** The forge-neutral push-credential seam is the existing `CredentialProvider` (#1855): it resolves a `CredentialScope` to a bearer token, which is exactly what a git push needs. Duplicating it as a `Forge` method would give one capability two interfaces to drift between.
+
+### Vocabulary (`types.go`)
+
+The DTO types the interface speaks — `RepoRef`, `Repository`, `GitCommit`, `TreeEntry`, `PullRequest`, `PullRequestRef`, `MergeMethod`, `BranchProtection`, `RulesetRequiredCheck`, `ComparePatch{Result,File}`, `CreateCheckRun{Params,Result}`, the `CheckRunStatus`/`CheckRunConclusion` enums — plus the sentinel errors (`ErrNotFound`, `ErrForbidden`, `ErrValidation`, `ErrNotInstalled`, `ErrPullRequestExists`, `ErrMergeConflict`, `ErrPullRequestCleanStatus`, `ErrPullRequestNotMergeable`) live canonically here. They moved verbatim off `githubclient`, which now re-declares each moved name as a type ALIAS (and each moved error var as an assignment to the forge canonical). An alias is the SAME type, so the whole tree keeps compiling and every `errors.Is` across the two spellings holds — the move is behavior-preserving by construction, and `forge_test.go` (`TestMovedSentinelErrorsPreserveIdentity`, `TestMovedTypesAreIdenticalAcrossSpellings`) pins it. The types are GitHub-shaped today because GitHub is the only implementation; the shapes generalize and get their forge-neutral refinement when the second implementation lands, not from this pass guessing it.
+
+The message prefixes on the moved sentinels stay `"githubclient:"` deliberately: they are the SAME error values the concrete client has always returned and reach operators through logs/audits, so a zero-behavior-change move must not re-word them. A forge-neutral re-wording is a follow-up.
+
+### Registry (`registry.go`)
+
+A package-global `map[string]Forge` under a `sync.RWMutex`, copied verbatim from the proven `workmgmt` provider registry rather than newly designed: `Register(f)` keys on `f.Name()`, `Get(id)` returns a fail-closed `*UnknownForgeError` naming the id and the sorted known set (never a nil dispatch), `Registered()` returns the sorted ids for startup logging. `serve.go` registers the `github` adapter at startup.
+
+### github adapter (`github/`)
+
+`github.Forge` (`github/github.go`) is the registered `"github"` implementation, mirroring `workmgmt/github`: it EMBEDS `*githubclient.Client` to promote the covered methods verbatim (their signatures already take the moved `forge.*` vocabulary), and adds only `Name()` and `ResolveRepoScope` (which wraps `GetRepoInstallation` and converts via `FromGitHubInstallationID`, holding no `installationID int64` local so the #1855 credential-scope gate stays green). A `var _ forge.Forge = (*Forge)(nil)` assertion is the compile-time surface check. `New(c *githubclient.Client)` shares the same concrete client `serve.go` wires for the non-forge surfaces (issues/comments, projects, releases, contents, workflow dispatch).
+
+Consumers should prefer a NARROW local interface naming just the methods they call (Go's consumer-side convention); `*github.Forge` satisfies both that and the full `Forge`.

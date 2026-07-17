@@ -48,64 +48,100 @@ const DefaultUploadBaseURL = "https://uploads.github.com"
 const WorkflowSpecPath = ".fishhawk/workflows.yaml"
 
 // Errors callers may want to switch on.
+//
+// Each is an ASSIGNMENT to the canonical forge sentinel (ADR-058 /
+// E45.4), not a fresh errors.New: both spellings therefore bind the SAME
+// error value, so errors.Is holds across them and a caller may switch on
+// either. forge/types.go carries the per-sentinel contract.
 var (
-	// ErrNotFound means the resource (repo, file, workflow)
-	// doesn't exist OR the App's installation lacks access. GitHub
-	// returns 404 for both cases by design — we can't distinguish.
-	ErrNotFound = errors.New("githubclient: not found")
-	// ErrForbidden means the installation token was rejected (401)
-	// or the App lacks permission for the request (403).
-	ErrForbidden = errors.New("githubclient: forbidden")
-	// ErrValidation means GitHub rejected the request as malformed
-	// (422). Typical: bad ref name, missing required input.
-	ErrValidation = errors.New("githubclient: validation failed")
-	// ErrNotInstalled means the GitHub App is not installed on the
-	// target repo (GET /repos/{owner}/{repo}/installation returned
-	// 404). Distinct from ErrNotFound so callers can surface a
-	// precise user-facing error instead of a generic "not found".
-	ErrNotInstalled = errors.New("githubclient: app not installed on repo")
-	// ErrPullRequestExists means CreatePullRequest hit a 422 whose
-	// body indicates a PR already exists for the requested head/base
-	// pair. The orchestrator's consolidated-PR path treats this as a
-	// benign lost race (ADR-032 / #714) and recovers the existing PR
-	// URL via ListOpenPullRequestsByHead rather than failing the
-	// settle. Distinct from ErrValidation so the caller can switch on
-	// it without re-parsing the 422 body.
-	ErrPullRequestExists = errors.New("githubclient: pull request already exists for head/base")
-	// ErrMergeConflict means MergeBranch hit a 409 — the head branch
-	// could not be merged into the base because of a merge conflict.
-	// The fan-in integration step (ADR-041 / #1142) switches on this to
-	// fail the decomposed parent's implement stage category-B RECOVERABLE
-	// (a dedicated slice_integration_conflict audit + next_action) rather
-	// than treating it as an opaque error. Distinct from ErrValidation so
-	// the caller distinguishes a genuine conflict from a malformed request.
-	ErrMergeConflict = errors.New("githubclient: merge conflict")
-	// ErrPullRequestCleanStatus means enablePullRequestAutoMerge was rejected
-	// because the PR is ALREADY in a merge-ready ("clean") status — GitHub
-	// refuses to queue auto-merge on a PR that could be merged synchronously
-	// right now (E48.7 / #1954). This is the common operator flow: the
-	// operator's `gh pr review --approve` plus green required checks settle the
-	// PR clean before the merge verb enables auto-merge, so the enable errors.
-	// The githubAutoMerger falls back to a synchronous REST squash merge on
-	// this sentinel (serve.go). Wrapped ALONGSIDE ErrValidation (both are
-	// reported via errors.Is) so existing ErrValidation callers are unaffected.
-	ErrPullRequestCleanStatus = errors.New("githubclient: pull request already in clean status")
-	// ErrPullRequestNotMergeable means the synchronous REST merge
-	// (PUT /repos/{owner}/{repo}/pulls/{number}/merge) returned 405 — the PR
-	// is not in a mergeable state (base moved, checks not settled, draft, …).
-	// Distinct from ErrValidation so the merge caller can surface an actionable
-	// retryable error rather than an opaque 4xx (E48.7 / #1954).
-	ErrPullRequestNotMergeable = errors.New("githubclient: pull request not mergeable")
+	ErrNotFound                = forge.ErrNotFound
+	ErrForbidden               = forge.ErrForbidden
+	ErrValidation              = forge.ErrValidation
+	ErrNotInstalled            = forge.ErrNotInstalled
+	ErrPullRequestExists       = forge.ErrPullRequestExists
+	ErrMergeConflict           = forge.ErrMergeConflict
+	ErrPullRequestCleanStatus  = forge.ErrPullRequestCleanStatus
+	ErrPullRequestNotMergeable = forge.ErrPullRequestNotMergeable
 )
 
-// RepoRef identifies a GitHub repository by owner + name.
-type RepoRef struct {
-	Owner string
-	Name  string
-}
+// The Forge-surface vocabulary lives canonically in the forge package
+// now (ADR-058 / E45.4); githubclient re-declares each moved name as a
+// type ALIAS. Every existing reference — in production code and in the
+// many test fixtures that build &githubclient.Client{} literals and
+// githubclient.PullRequest{} values — keeps compiling against the same
+// type with zero behavior change: an alias is the same type, not a new
+// named type, so method sets and assignability are preserved. The
+// consumer-migration gate (forge/consumer_migration_gate_test.go)
+// enforces that migrated packages reference forge.* directly rather than
+// leaning on these aliases; the aliases exist for the unmigrated
+// non-forge surfaces (issues/comments/reactions) that still spell
+// RepoRef through githubclient.
 
-// String returns "owner/name" for use in log lines and URLs.
-func (r RepoRef) String() string { return r.Owner + "/" + r.Name }
+// RepoRef aliases forge.RepoRef.
+type RepoRef = forge.RepoRef
+
+// Repository aliases forge.Repository.
+type Repository = forge.Repository
+
+// GitCommit aliases forge.GitCommit.
+type GitCommit = forge.GitCommit
+
+// TreeEntry aliases forge.TreeEntry.
+type TreeEntry = forge.TreeEntry
+
+// PullRequest aliases forge.PullRequest.
+type PullRequest = forge.PullRequest
+
+// PullRequestRef aliases forge.PullRequestRef.
+type PullRequestRef = forge.PullRequestRef
+
+// MergeMethod aliases forge.MergeMethod.
+type MergeMethod = forge.MergeMethod
+
+// BranchProtection aliases forge.BranchProtection.
+type BranchProtection = forge.BranchProtection
+
+// RulesetRequiredCheck aliases forge.RulesetRequiredCheck.
+type RulesetRequiredCheck = forge.RulesetRequiredCheck
+
+// ComparePatchFile aliases forge.ComparePatchFile.
+type ComparePatchFile = forge.ComparePatchFile
+
+// ComparePatchResult aliases forge.ComparePatchResult.
+type ComparePatchResult = forge.ComparePatchResult
+
+// CheckRunStatus aliases forge.CheckRunStatus.
+type CheckRunStatus = forge.CheckRunStatus
+
+// CheckRunConclusion aliases forge.CheckRunConclusion.
+type CheckRunConclusion = forge.CheckRunConclusion
+
+// CreateCheckRunParams aliases forge.CreateCheckRunParams.
+type CreateCheckRunParams = forge.CreateCheckRunParams
+
+// CreateCheckRunResult aliases forge.CreateCheckRunResult.
+type CreateCheckRunResult = forge.CreateCheckRunResult
+
+// Const aliases for the moved enum values. A const declared as
+// `X = forge.X` is the same constant value, so switch arms and
+// comparisons against either spelling are identical.
+const (
+	MergeMethodSquash = forge.MergeMethodSquash
+	MergeMethodMerge  = forge.MergeMethodMerge
+	MergeMethodRebase = forge.MergeMethodRebase
+
+	CheckRunStatusQueued     = forge.CheckRunStatusQueued
+	CheckRunStatusInProgress = forge.CheckRunStatusInProgress
+	CheckRunStatusCompleted  = forge.CheckRunStatusCompleted
+
+	CheckRunConclusionSuccess        = forge.CheckRunConclusionSuccess
+	CheckRunConclusionFailure        = forge.CheckRunConclusionFailure
+	CheckRunConclusionNeutral        = forge.CheckRunConclusionNeutral
+	CheckRunConclusionCancelled      = forge.CheckRunConclusionCancelled
+	CheckRunConclusionTimedOut       = forge.CheckRunConclusionTimedOut
+	CheckRunConclusionActionRequired = forge.CheckRunConclusionActionRequired
+	CheckRunConclusionSkipped        = forge.CheckRunConclusionSkipped
+)
 
 // FileContent is the decoded result of GetFile.
 type FileContent struct {
@@ -470,20 +506,6 @@ func decodeLabelNames(raw []json.RawMessage) []string {
 	return names
 }
 
-// BranchProtection is the slice of a branch-protection API response
-// Fishhawk surfaces for the required-checks snapshot (#251 /
-// ADR-017). Only RequiredStatusCheckContexts is consumed today;
-// other fields land alongside as features need them.
-type BranchProtection struct {
-	// RequiredStatusCheckContexts is the closed list of context
-	// names a PR must report green before GitHub allows merge.
-	// Empty (nil or zero-length) means classic protection has no
-	// required-status-checks rule for the branch — rulesets may
-	// still contribute. The dispatcher derives the union per
-	// ADR-017.
-	RequiredStatusCheckContexts []string
-}
-
 // GetBranchProtection fetches classic branch protection for a
 // branch.
 //
@@ -550,19 +572,6 @@ func (c *Client) GetBranchProtection(ctx context.Context, scope forge.Credential
 		out.RequiredStatusCheckContexts = body.RequiredStatusChecks.Contexts
 	}
 	return out, nil
-}
-
-// RulesetRequiredCheck is one required-status-check context
-// contributed by a ruleset that targets the branch (#251).
-type RulesetRequiredCheck struct {
-	// RulesetID is the GitHub-side ruleset identifier — surfaced so
-	// the snapshot's `sources` field can record exactly which
-	// ruleset contributed.
-	RulesetID int64
-	// Contexts is the deduped list of context names the ruleset
-	// requires. May be empty when the ruleset doesn't include a
-	// `required_status_checks` rule.
-	Contexts []string
 }
 
 // ListRulesetRequiredChecks walks the repo-level rulesets that
@@ -748,18 +757,6 @@ func rulesetMatchesBranch(conditions *struct {
 	return false
 }
 
-// MergeMethod is the strategy GitHub uses when an auto-merge fires.
-// Mirrors the GraphQL `PullRequestMergeMethod` enum on the wire so
-// callers can pass the canonical names through.
-type MergeMethod string
-
-// Merge methods accepted by enablePullRequestAutoMerge.
-const (
-	MergeMethodSquash MergeMethod = "SQUASH"
-	MergeMethodMerge  MergeMethod = "MERGE"
-	MergeMethodRebase MergeMethod = "REBASE"
-)
-
 // EnableAutoMerge queues a PR for auto-merge once branch protection
 // clears (#255 / ADR-017). Uses the GitHub GraphQL API because the
 // REST surface does not expose auto-merge directly — only synchronous
@@ -936,40 +933,6 @@ func (c *Client) MergePullRequest(ctx context.Context, scope forge.CredentialSco
 		return fmt.Errorf("%w: merge pr #%d: %s", ErrMergeConflict, prNumber, brief)
 	}
 	return classifyStatus("merge pull request", resp)
-}
-
-// PullRequest is the slice of a pull-request API response Fishhawk
-// surfaces. NodeID is the opaque base64-encoded GraphQL identifier
-// (consumed by `EnableAutoMerge` per #255). HeadSHA + State are
-// consumed by the foreign-commit audit rule (#282) — Fishhawk
-// compares the live HEAD on GitHub against the head_shas it
-// recorded in its own pull_request artifacts.
-type PullRequest struct {
-	NodeID  string
-	HeadSHA string
-	State   string // "open" | "closed"
-	Merged  bool   // true when state=closed and the PR was merged
-	// BaseRef is the PR's target branch name (the `base.ref` field).
-	// It is the independently-trustworthy compare anchor for the run
-	// branch lineage guard (ADR-035, #858): GitHub knows what the PR
-	// targets, so a contaminated branch commit cannot launder it the
-	// way a runner-reported base_sha can.
-	BaseRef string
-	// HeadRef is the PR's source branch name (the `head.ref` field) —
-	// the run branch. The ADR-035 reset remediation (#867) force-updates
-	// THIS ref to rewind a foreign on-top commit off the run branch.
-	HeadRef string
-	// Number and HTMLURL are populated by CreatePullRequest and
-	// ListOpenPullRequestsByHead (the consolidated-PR path, #714).
-	// GetPullRequest leaves HTMLURL empty — its callers only need
-	// NodeID/HeadSHA/State/Merged/Body.
-	Number  int
-	HTMLURL string
-	// Body is the PR description. Populated by GetPullRequest so the
-	// merge-time economics stamp (#1702) can splice its delimited section
-	// into the existing body idempotently. Empty on CreatePullRequest /
-	// ListOpenPullRequestsByHead results (they don't read it back).
-	Body string
 }
 
 // GetPullRequest fetches a single PR by number.
@@ -1363,16 +1326,6 @@ func (c *Client) CompareCommits(ctx context.Context, scope forge.CredentialScope
 	return shas, nil
 }
 
-// PullRequestRef is one merged pull request associated with a commit,
-// as returned by ListPullRequestsForCommit: the number, the canonical
-// github.com URL, and the title. Only merged PRs are returned, so the
-// caller never sees an open/closed-unmerged association.
-type PullRequestRef struct {
-	Number int
-	URL    string
-	Title  string
-}
-
 // ListPullRequestsForCommit returns the MERGED pull requests associated
 // with a commit — the squash/merge commit that landed a PR carries the
 // PR in this list, which is how the release-evidence walk maps a commit
@@ -1456,42 +1409,6 @@ func (c *Client) ListPullRequestsForCommit(ctx context.Context, scope forge.Cred
 // at the cap is surfaced as a truncation rather than silently
 // under-reviewed.
 const compareFilesCap = 300
-
-// ComparePatchFile is one changed file from a ComparePatch result. Path is
-// repo-relative; Status is GitHub's word-form change kind ("added",
-// "removed", "modified", "renamed", "copied", "changed") which the
-// consolidated-review caller maps onto policy.Status.
-type ComparePatchFile struct {
-	Path   string
-	Status string
-}
-
-// ComparePatchResult carries the unified-diff text + changed-file list for
-// base...head, plus a truncation signal (#1060). It is the input the
-// consolidated decomposition review builds its policy.Diff from, since the
-// decomposed parent has no runner trace bundle of its own.
-type ComparePatchResult struct {
-	// HeadSHA is the tip commit of head (the last commit the comparison
-	// reports), reused as the implement-review dedup key. Empty when the
-	// comparison reports no commits ahead of base.
-	HeadSHA string
-	// Patch is the reconstructed unified diff: each changed file's hunks
-	// prefixed with a synthetic `diff --git` header so a downstream
-	// content reviewer reads it as an ordinary git diff. Empty when no
-	// file carried a patch body.
-	Patch string
-	// Files is every changed file the comparison reported, with its
-	// GitHub word-form status.
-	Files []ComparePatchFile
-	// Truncated is set when GitHub capped the comparison — the file list
-	// reached the documented 300-file ceiling, or a changed file's patch
-	// body was omitted (oversized diff). The review under-reviews when
-	// this is set, so the caller surfaces it loudly rather than silently.
-	Truncated bool
-	// TruncationReason names which cap tripped, for the degradation
-	// log/audit. Empty when Truncated is false.
-	TruncationReason string
-}
 
 // ComparePatch returns the unified diff + changed-file list for base...head
 // via the Compare API (#1060). It is the diff source for a decomposed
@@ -2755,55 +2672,6 @@ func (c *Client) UpdateIssueComment(ctx context.Context, scope forge.CredentialS
 		return nil, fmt.Errorf("githubclient: decode update issue comment: %w", err)
 	}
 	return &out, nil
-}
-
-// CheckRunStatus is the GitHub Checks API `status` enum.
-// Closed set; passing anything else returns ErrValidation.
-type CheckRunStatus string
-
-// Check-run status values. Documented at
-// https://docs.github.com/en/rest/checks/runs.
-const (
-	CheckRunStatusQueued     CheckRunStatus = "queued"
-	CheckRunStatusInProgress CheckRunStatus = "in_progress"
-	CheckRunStatusCompleted  CheckRunStatus = "completed"
-)
-
-// CheckRunConclusion is the Checks API `conclusion` enum.
-// Required when status=completed; must be empty otherwise.
-type CheckRunConclusion string
-
-// Check-run conclusion values.
-const (
-	CheckRunConclusionSuccess        CheckRunConclusion = "success"
-	CheckRunConclusionFailure        CheckRunConclusion = "failure"
-	CheckRunConclusionNeutral        CheckRunConclusion = "neutral"
-	CheckRunConclusionCancelled      CheckRunConclusion = "cancelled"
-	CheckRunConclusionTimedOut       CheckRunConclusion = "timed_out"
-	CheckRunConclusionActionRequired CheckRunConclusion = "action_required"
-	CheckRunConclusionSkipped        CheckRunConclusion = "skipped"
-)
-
-// CreateCheckRunParams is the typed wire body for
-// POST /repos/{owner}/{repo}/check-runs. Only the fields Fishhawk
-// uses today are surfaced; the GitHub schema is wider.
-type CreateCheckRunParams struct {
-	Name          string
-	HeadSHA       string
-	Status        CheckRunStatus
-	Conclusion    CheckRunConclusion // required when Status==completed
-	DetailsURL    string             // where the "Details" link on github.com points (typically a Fishhawk run URL)
-	OutputTitle   string
-	OutputSummary string
-}
-
-// CreateCheckRunResult carries the bits of GitHub's response we
-// care about. ID lets a caller PATCH the same row later if a
-// follow-up surface ever needs progressive updates; v0 callers
-// typically POST a fresh row per state change and ignore it.
-type CreateCheckRunResult struct {
-	ID      int64
-	HTMLURL string
 }
 
 // CreateCheckRun publishes a check run on a head commit (#231).
