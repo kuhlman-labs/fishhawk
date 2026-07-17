@@ -77,6 +77,42 @@ func TestMovedSentinelsAreDistinctFromEachOther(t *testing.T) {
 	}
 }
 
+// TestErrUnsupportedIdentity pins forge.ErrUnsupported — the fail-closed
+// sentinel for a Forge operation a forge's API cannot express (the GitLab
+// adapter's git-data trio + MergeBranch, ADR-058 / #1859). Unlike the moved
+// sentinels above it is a NEW forge-neutral value (not an alias of a
+// githubclient error), so its identity is pinned here rather than in the
+// alias-preservation table: it must be non-nil, matchable through a wrap the
+// way real callers use it, and distinct from every moved sentinel so a
+// caller switching on ErrUnsupported never collides with a not-found/
+// validation/etc. failure.
+func TestErrUnsupportedIdentity(t *testing.T) {
+	if forge.ErrUnsupported == nil {
+		t.Fatal("forge.ErrUnsupported is nil")
+	}
+	// Matchable through a wrap — the shape the GitLab adapter returns it in
+	// (errors.Join / fmt.Errorf %w around the sentinel).
+	wrapped := errors.Join(errors.New("gitlab: GetCommit"), forge.ErrUnsupported)
+	if !errors.Is(wrapped, forge.ErrUnsupported) {
+		t.Error("errors.Is(wrap(ErrUnsupported), ErrUnsupported) = false; the wrap must stay matchable")
+	}
+	// Distinct from every moved sentinel.
+	for _, other := range []error{
+		forge.ErrNotFound,
+		forge.ErrForbidden,
+		forge.ErrValidation,
+		forge.ErrNotInstalled,
+		forge.ErrPullRequestExists,
+		forge.ErrMergeConflict,
+		forge.ErrPullRequestCleanStatus,
+		forge.ErrPullRequestNotMergeable,
+	} {
+		if errors.Is(other, forge.ErrUnsupported) {
+			t.Errorf("ErrUnsupported collides with %v; it must be a distinct value", other)
+		}
+	}
+}
+
 // TestMovedTypesAreIdenticalAcrossSpellings pins the alias posture at
 // the type level: an alias is the SAME type, so a value built under one
 // spelling must be assignable to a variable of the other with no

@@ -19,6 +19,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
@@ -1028,6 +1029,49 @@ func TestResolveGitLabClient(t *testing.T) {
 		}
 		if partial {
 			t.Error("partial = true with nothing set, want false (not a misconfiguration)")
+		}
+	})
+}
+
+// TestResolveGitLabForge pins the gated registration of the gitlab
+// forge.Forge adapter (ADR-058 / E45.5, #1859): a complete config
+// (both base URL and token) yields a registerable "gitlab" adapter, and any
+// partial/empty config yields nil so the forge registry is left without a
+// gitlab entry. The both-set case also drives the adapter through
+// forge.Register / forge.Get to prove it is dispatchable under the id the
+// registry keys it on.
+func TestResolveGitLabForge(t *testing.T) {
+	t.Run("both set constructs a registerable adapter", func(t *testing.T) {
+		glForge := resolveGitLabForge("https://gitlab.com", "glpat-tok")
+		if glForge == nil {
+			t.Fatal("adapter = nil with both base URL and token set, want a constructed adapter")
+		}
+		if glForge.Name() != "gitlab" {
+			t.Errorf("Name() = %q, want gitlab", glForge.Name())
+		}
+		// Dispatchable through the registry under "gitlab".
+		forge.Register(glForge)
+		got, err := forge.Get("gitlab")
+		if err != nil {
+			t.Fatalf("forge.Get(gitlab) after register: %v", err)
+		}
+		if got.Name() != "gitlab" {
+			t.Errorf("resolved forge Name() = %q, want gitlab", got.Name())
+		}
+	})
+	t.Run("only base URL is not registered", func(t *testing.T) {
+		if glForge := resolveGitLabForge("https://gitlab.com", ""); glForge != nil {
+			t.Errorf("adapter = %v with token missing, want nil (not registered)", glForge)
+		}
+	})
+	t.Run("only token is not registered", func(t *testing.T) {
+		if glForge := resolveGitLabForge("", "glpat-tok"); glForge != nil {
+			t.Errorf("adapter = %v with base URL missing, want nil (not registered)", glForge)
+		}
+	})
+	t.Run("both empty is not registered", func(t *testing.T) {
+		if glForge := resolveGitLabForge("", ""); glForge != nil {
+			t.Errorf("adapter = %v with nothing set, want nil (not registered)", glForge)
 		}
 	})
 }

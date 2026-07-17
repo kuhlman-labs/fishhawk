@@ -73,6 +73,21 @@ var (
 	// Distinct from ErrValidation so the merge caller can surface an actionable
 	// retryable error rather than an opaque 4xx (E48.7 / #1954).
 	ErrPullRequestNotMergeable = errors.New("githubclient: pull request not mergeable")
+	// ErrUnsupported means a forge's API cannot express a Forge operation,
+	// so the implementation fails closed rather than fabricating a result.
+	// Its producers today are all in the GitLab adapter (ADR-058 / #1859):
+	// the git-data trio — GetCommit (GitLab exposes no tree SHA on a commit),
+	// CreateTree, and CreateCommit (GitLab has no git-data REST API; commit
+	// authoring is POST .../repository/commits with an actions[] array) — and
+	// MergeBranch (GitLab has no server-side branch-merge endpoint outside a
+	// merge request). Their only consumers today (the GitHub-App onboarding
+	// scaffold and the ADR-041 fan-in) are GitHub-flow-specific, so GitLab
+	// fan-in is a documented deferral. Distinct from ErrValidation: the
+	// request was well-formed; the forge simply has no surface for it. This
+	// sentinel is a NEW forge-neutral value, so its message carries the
+	// forge-neutral "forge:" prefix rather than the "githubclient:" prefix
+	// the moved sentinels preserve.
+	ErrUnsupported = errors.New("forge: operation not supported by this forge")
 )
 
 // RepoRef identifies a repository by owner + name.

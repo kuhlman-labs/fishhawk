@@ -38,6 +38,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegithub "github.com/kuhlman-labs/fishhawk/backend/internal/forge/github"
+	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -341,6 +342,22 @@ func resolveGitLabClient(baseURL, token string) (client *gitlabclient.Client, pa
 	default:
 		return nil, false
 	}
+}
+
+// resolveGitLabForge constructs the gitlab forge.Forge adapter (ADR-058 /
+// E45.5, #1859) when BOTH the instance base URL and access token are set,
+// mirroring resolveGitLabClient's both-or-neither gate. A partial or empty
+// config returns nil so the caller leaves the forge registry without a
+// gitlab entry (forge.Get("gitlab") then fails closed with an
+// *UnknownForgeError). The adapter is wired with a static-token credential
+// provider carrying token — the v0 group/project access-token path; the
+// group-scoped OAuth broker is deferred. Extracted so the gating is
+// unit-testable without booting the server.
+func resolveGitLabForge(baseURL, token string) *forgegitlab.Forge {
+	if baseURL == "" || token == "" {
+		return nil
+	}
+	return forgegitlab.New(baseURL, forgegitlab.NewStaticCredentialProvider(token))
 }
 
 // loadConventionsOverride reads and parses the deployment-level
@@ -1161,14 +1178,24 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("work-management providers not registered: fishhawk_file_issue / fishhawk_report_product_issue respond 501 until GitHub, Jira, or GitLab is configured")
 	}
 
-	// Forge providers (ADR-058 / E45.4). Register the github adapter over
-	// the same concrete cfg.GitHub client so a forge-neutral consumer can
-	// resolve "github" via forge.Get instead of holding a *githubclient.
-	// Client. Gated on cfg.GitHub like the github work-item provider above:
-	// an unconfigured client leaves the forge registry empty rather than
-	// registering a nil-backed adapter.
+	// Forge providers (ADR-058 / E45.4, E45.5). Register the github adapter
+	// over the same concrete cfg.GitHub client so a forge-neutral consumer
+	// can resolve "github" via forge.Get instead of holding a
+	// *githubclient.Client. Gated on cfg.GitHub like the github work-item
+	// provider above: an unconfigured client leaves the forge registry empty
+	// rather than registering a nil-backed adapter. The gitlab adapter (#1859)
+	// registers alongside it when BOTH --gitlab-base-url and --gitlab-token
+	// are set (the same both-or-neither guard the work-item provider uses),
+	// wired with a static-token credential provider carrying the configured
+	// group/project access token. A single startup log names every registered
+	// forge.
 	if cfg.GitHub != nil {
 		forge.Register(forgegithub.New(cfg.GitHub))
+	}
+	if glForge := resolveGitLabForge(*gitlabBaseURL, *gitlabToken); glForge != nil {
+		forge.Register(glForge)
+	}
+	if len(forge.Registered()) > 0 {
 		logger.Info("forge providers registered", slog.Any("forges", forge.Registered()))
 	}
 
