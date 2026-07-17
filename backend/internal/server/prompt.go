@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -656,8 +657,8 @@ func (s *Server) effectiveFixupScope(ctx context.Context, planScope []scopeFile,
 // fake of api.github.com — *githubclient.Client satisfies it
 // in production.
 type issueGetter interface {
-	GetIssue(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.Issue, error)
-	ListIssueComments(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
+	GetIssueScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error)
+	ListIssueCommentsScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
 }
 
 // handleGetStagePrompt implements GET /v0/stages/{stage_id}/prompt.
@@ -1838,10 +1839,11 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 
 	// Branch 2: webhook-dispatched runs — fetch via the App's
 	// installation token. Unchanged from the pre-#415 behavior.
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return
 	}
-	issue, err := github.GetIssue(ctx, *runRow.InstallationID, repo, issueNumber)
+	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
+	issue, err := github.GetIssueScoped(ctx, scope, repo, issueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: get issue failed",
 			slog.String("run_id", runRow.ID.String()),
@@ -1858,7 +1860,7 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 	// branch 1. Best-effort: a fetch error degrades to title+body
 	// rather than failing the prompt build (same WARN-and-proceed
 	// posture as the GetIssue failure above).
-	comments, err := github.ListIssueComments(ctx, *runRow.InstallationID, repo, issueNumber)
+	comments, err := github.ListIssueCommentsScoped(ctx, scope, repo, issueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list issue comments failed",
 			slog.String("run_id", runRow.ID.String()),

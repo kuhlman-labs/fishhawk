@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1161,7 +1162,7 @@ func TestLineage_ChildEnumerationErrorAsymmetry(t *testing.T) {
 	}
 
 	repo := githubclient.RepoRef{Owner: "x", Name: "y"}
-	if _, _, _, ok := s.resolveLastRunAuthoredHead(context.Background(), runRow, 99, repo, head, 42); ok {
+	if _, _, _, ok := s.resolveLastRunAuthoredHead(context.Background(), runRow, forge.FromGitHubInstallationID(99), repo, head, 42); ok {
 		t.Error("reset classifier: child enumeration error should fail closed (ok=false)")
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -453,7 +454,7 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 		)
 		return nil
 	}
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "test sweep: run has no installation id; skipping",
 			slog.String("run_id", runID.String()),
 		)
@@ -467,6 +468,7 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 		)
 		return nil
 	}
+	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 
 	// Validation already passed in handleShipPlan; a parse failure here is
 	// an internal inconsistency — log and skip rather than block.
@@ -561,7 +563,7 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 	dirListings := make(map[string][]string, len(dirs))
 	listedDirs := 0
 	for _, dir := range dirs {
-		entries, lerr := s.cfg.GitHub.ListDirectory(ctx, *runRow.InstallationID, repoRef, dir, "")
+		entries, lerr := s.cfg.GitHub.ListDirectoryScoped(ctx, scope, repoRef, dir, "")
 		if lerr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "test sweep: list directory failed; skipping",
 				slog.String("run_id", runID.String()),

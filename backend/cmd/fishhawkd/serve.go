@@ -35,6 +35,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -1483,7 +1484,7 @@ type githubTeamListerAdapter struct {
 }
 
 func (a githubTeamListerAdapter) ListTeamMembers(ctx context.Context, installationID int64, org, slug string) ([]role.TeamMember, error) {
-	got, err := a.c.ListTeamMembers(ctx, installationID, org, slug)
+	got, err := a.c.ListTeamMembersScoped(ctx, forge.FromGitHubInstallationID(installationID), org, slug)
 	if err != nil {
 		return nil, err
 	}
@@ -1736,7 +1737,7 @@ type githubAutoMerger struct {
 }
 
 func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run) error {
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return fmt.Errorf("campaign auto-merge: run %s has no installation id", runRow.ID)
 	}
 	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
@@ -1746,10 +1747,11 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	if err != nil {
 		return fmt.Errorf("campaign auto-merge: %w", err)
 	}
+	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 	// Primary: queue GitHub auto-merge so the PR lands once branch protection
 	// (required review + the fishhawk_audit_complete check) clears. The webhook
 	// / resolveReviewStageOnMerge path settles the review stage on the merge.
-	err = m.gh.EnableAutoMerge(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+	err = m.gh.EnableAutoMergeScoped(ctx, scope, repo, number, githubclient.MergeMethodSquash)
 	if err == nil {
 		return nil
 	}
@@ -1760,7 +1762,7 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	// synchronously-mergeable PR, so merge it directly via REST. Any OTHER
 	// enable error surfaces unchanged (no fallback).
 	if errors.Is(err, githubclient.ErrPullRequestCleanStatus) {
-		return m.gh.MergePullRequest(ctx, *runRow.InstallationID, repo, number, githubclient.MergeMethodSquash)
+		return m.gh.MergePullRequestScoped(ctx, scope, repo, number, githubclient.MergeMethodSquash)
 	}
 	return err
 }
