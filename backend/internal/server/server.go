@@ -776,18 +776,18 @@ func (s *Server) waitBackgroundReviews() { s.bgReviews.Wait() }
 // refinement-file resolution blocks share one conversion.
 //
 // It preserves the exact caller-visible discrimination those inline blocks had:
-// githubclient.ErrNotInstalled (the App is genuinely not installed on the repo)
+// forge.ErrNotInstalled (the App is genuinely not installed on the repo)
 // returns the ZERO scope with a nil error — the forge-optional posture, so the
 // provider fails closed downstream with its own actionable typed error — while a
 // transient/network failure returns a non-nil error the caller surfaces as a
 // 502 rather than masking it as the misleading provider "no installation"
 // message. The caller must have already checked s.cfg.GitHub != nil.
 func (s *Server) resolveRepoScope(ctx context.Context, owner, name string) (forge.CredentialScope, error) {
-	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, githubclient.RepoRef{Owner: owner, Name: name})
+	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, forge.RepoRef{Owner: owner, Name: name})
 	switch {
 	case err == nil:
 		return forge.FromGitHubInstallationID(instID), nil
-	case errors.Is(err, githubclient.ErrNotInstalled):
+	case errors.Is(err, forge.ErrNotInstalled):
 		return forge.CredentialScope{}, nil
 	default:
 		return forge.CredentialScope{}, err

@@ -33,8 +33,8 @@ const statusFieldName = "Status"
 // a consumer-side interface so the provider can be unit-tested against a
 // fake. *githubclient.Client satisfies it.
 type API interface {
-	CreateIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
-	IssueNodeID(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (string, error)
+	CreateIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
+	IssueNodeID(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (string, error)
 	ProjectFields(ctx context.Context, scope forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error)
 	ProjectItemStatus(ctx context.Context, scope forge.CredentialScope, issueNodeID, projectID, fieldName string) (*githubclient.ProjectItemStatus, error)
 	AddProjectItem(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error)
@@ -82,7 +82,7 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
 		return nil, errors.New("workmgmt/github: target repo owner and name required")
 	}
-	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
+	repo := forge.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
 	scope := req.Target.Scope
 	// Fail closed when no installation scope is available (#1005 concern-2).
 	// On the run-absent filing path Target.Scope stays the zero scope, so the
@@ -203,7 +203,7 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 		}
 		ctx = githubclient.WithProjectsToken(ctx)
 	}
-	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
+	repo := forge.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
 
 	issueNodeID, err := p.api.IssueNodeID(ctx, scope, repo, req.IssueNumber)
 	if err != nil {
@@ -466,7 +466,7 @@ func (p *Provider) placeOnBoard(ctx context.Context, scope forge.CredentialScope
 
 // linkEpic resolves the parent-epic reference (#N or N) to its node id
 // and links the new issue as its sub-issue.
-func (p *Provider) linkEpic(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, epicRef, childNodeID string) error {
+func (p *Provider) linkEpic(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, epicRef, childNodeID string) error {
 	number, err := parseIssueRef(epicRef)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: parent epic %q: %w", epicRef, err)
@@ -510,7 +510,7 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: epic %q: %w", req.Epic, err)
 	}
-	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
+	repo := forge.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
 	epicNodeID, err := p.api.IssueNodeID(ctx, scope, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve epic #%d: %w", number, err)

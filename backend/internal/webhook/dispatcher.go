@@ -693,16 +693,16 @@ func matchInstallation(ev Event) Match {
 // dispatcher tests.
 type GitHubAPI interface {
 	GetWorkflowSpec(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, ref string) (*githubclient.FileContent, error)
+		repo forge.RepoRef, ref string) (*githubclient.FileContent, error)
 	DispatchWorkflow(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, workflowFile, ref string,
+		repo forge.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
 	GetWorkflowRun(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
+		repo forge.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
 	GetBranchProtection(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, branch string) (*githubclient.BranchProtection, error)
+		repo forge.RepoRef, branch string) (*forge.BranchProtection, error)
 	ListRulesetRequiredChecks(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error)
+		repo forge.RepoRef, branch string) ([]forge.RulesetRequiredCheck, error)
 }
 
 // IssueNotifier is the slice of issuecomment.Notifier the dispatcher
@@ -752,7 +752,7 @@ type BoardSyncer interface {
 // acknowledged and skipped.
 type Scaffolder interface {
 	OpenScaffoldPR(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef) (*onboarding.Result, error)
+		repo forge.RepoRef) (*onboarding.Result, error)
 }
 
 // ApprovalCommandHandler executes a slash-command approval / reject
@@ -934,7 +934,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		// If the App can't read the file, we can't dispatch;
 		// record the outcome and return nil so GitHub doesn't
 		// retry. ErrForbidden / ErrNotFound aren't transient.
-		if errors.Is(err, githubclient.ErrForbidden) || errors.Is(err, githubclient.ErrNotFound) {
+		if errors.Is(err, forge.ErrForbidden) || errors.Is(err, forge.ErrNotFound) {
 			d.logSkipFromGitHub(ctx, ev, err)
 			return nil
 		}
@@ -2225,7 +2225,7 @@ var errProtectionScopeMissing = errors.New("app installation missing administrat
 // any other error is a transport / GitHub-side issue and surfaces
 // to the caller as-is so step 3.5 can audit and refuse.
 func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.CredentialScope,
-	repo githubclient.RepoRef, branch string) (*run.RequiredChecksSnapshot, error) {
+	repo forge.RepoRef, branch string) (*run.RequiredChecksSnapshot, error) {
 	var contexts []string
 	var sources []string
 	seen := make(map[string]struct{})
@@ -2246,10 +2246,10 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.Cred
 				add(c)
 			}
 		}
-	case errors.Is(classicErr, githubclient.ErrNotFound):
+	case errors.Is(classicErr, forge.ErrNotFound):
 		// Branch isn't protected by the classic API — fall through
 		// to rulesets.
-	case errors.Is(classicErr, githubclient.ErrForbidden):
+	case errors.Is(classicErr, forge.ErrForbidden):
 		return nil, errProtectionScopeMissing
 	default:
 		return nil, fmt.Errorf("get branch protection: %w", classicErr)
@@ -2267,13 +2267,13 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.Cred
 				add(c)
 			}
 		}
-	case errors.Is(rulesetsErr, githubclient.ErrForbidden):
+	case errors.Is(rulesetsErr, forge.ErrForbidden):
 		return nil, errProtectionScopeMissing
 	default:
 		// 404 from the rulesets endpoint is unusual but not fatal —
 		// some self-hosted GHES versions don't expose it. Fall
 		// through with whatever classic protection contributed.
-		if !errors.Is(rulesetsErr, githubclient.ErrNotFound) {
+		if !errors.Is(rulesetsErr, forge.ErrNotFound) {
 			return nil, fmt.Errorf("list rulesets: %w", rulesetsErr)
 		}
 	}
@@ -2303,16 +2303,16 @@ func (d *Dispatcher) writeProtectionRefusalAudit(ctx context.Context, ev Event, 
 	)
 }
 
-// parseRepo splits "owner/name" into a githubclient.RepoRef. Empty
+// parseRepo splits "owner/name" into a forge.RepoRef. Empty
 // or malformed inputs return an error so the caller can skip with a
 // useful reason rather than firing a request at api.github.com that
 // will 404.
-func parseRepo(s string) (githubclient.RepoRef, error) {
+func parseRepo(s string) (forge.RepoRef, error) {
 	parts := strings.SplitN(s, "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+		return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 	}
-	return githubclient.RepoRef{Owner: parts[0], Name: parts[1]}, nil
+	return forge.RepoRef{Owner: parts[0], Name: parts[1]}, nil
 }
 
 func stringPtr(s string) *string { return &s }

@@ -17,7 +17,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -511,11 +510,11 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	)
 	if s.cfg.GitHub != nil {
 		if owner, name, ok := strings.Cut(req.Repo, "/"); ok && owner != "" && name != "" {
-			id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
+			id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), forge.RepoRef{Owner: owner, Name: name})
 			switch {
 			case err == nil:
 				installationID = &id
-			case errors.Is(err, githubclient.ErrNotInstalled):
+			case errors.Is(err, forge.ErrNotInstalled):
 				installResolveErr = err
 			default:
 				installResolveErr = err
@@ -568,7 +567,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		// spec, so it hard-fails: ErrNotInstalled → 422, any other
 		// resolve error → 500.
 		if installResolveErr != nil {
-			if errors.Is(installResolveErr, githubclient.ErrNotInstalled) {
+			if errors.Is(installResolveErr, forge.ErrNotInstalled) {
 				s.writeError(w, r, http.StatusUnprocessableEntity, "repo_not_installed",
 					"GitHub App is not installed on the target repository",
 					map[string]any{"repo": req.Repo})
@@ -579,10 +578,10 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"error": installResolveErr.Error()})
 			return
 		}
-		repoRef := githubclient.RepoRef{Owner: owner, Name: name}
+		repoRef := forge.RepoRef{Owner: owner, Name: name}
 		fc, err := s.cfg.GitHub.GetWorkflowSpec(r.Context(), forge.FromGitHubInstallationID(*installationID), repoRef, req.WorkflowSHA)
 		if err != nil {
-			if errors.Is(err, githubclient.ErrNotFound) {
+			if errors.Is(err, forge.ErrNotFound) {
 				s.writeError(w, r, http.StatusUnprocessableEntity, "spec_not_found",
 					"workflow spec not found at the given sha",
 					map[string]any{"repo": req.Repo, "workflow_sha": req.WorkflowSHA})
@@ -841,7 +840,7 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, w
 	if !ok || owner == "" || name == "" {
 		return nil, fmt.Errorf("campaign repo %q is not in owner/name form", repo)
 	}
-	repoRef := githubclient.RepoRef{Owner: owner, Name: name}
+	repoRef := forge.RepoRef{Owner: owner, Name: name}
 
 	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, repoRef)
 	if err != nil {
@@ -894,7 +893,7 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, w
 // fails, so hydration never blocks a campaign run start. A comment-list fetch
 // failure degrades to title+body (the comments slice stays nil) rather than
 // discarding the whole context.
-func (s *Server) hydrateCampaignIssueContext(ctx context.Context, instID int64, repoRef githubclient.RepoRef, issueRef string) *run.IssueContext {
+func (s *Server) hydrateCampaignIssueContext(ctx context.Context, instID int64, repoRef forge.RepoRef, issueRef string) *run.IssueContext {
 	number, ok := parseIssueRef(issueRef)
 	if !ok {
 		s.cfg.Logger.Warn("campaign run start: issue ref not parseable; proceeding without issue context",

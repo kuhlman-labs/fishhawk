@@ -37,6 +37,7 @@ import (
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegithub "github.com/kuhlman-labs/fishhawk/backend/internal/forge/github"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -405,7 +406,7 @@ func resolveOperatorRepoToken(gh *githubclient.Client, tokens githubapp.TokenPro
 	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
 		return nil
 	}
-	repo := githubclient.RepoRef{Owner: owner, Name: name}
+	repo := forge.RepoRef{Owner: owner, Name: name}
 	return func(ctx context.Context) (string, error) {
 		installationID, err := gh.GetRepoInstallation(ctx, repo)
 		if err != nil {
@@ -1160,6 +1161,17 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("work-management providers not registered: fishhawk_file_issue / fishhawk_report_product_issue respond 501 until GitHub, Jira, or GitLab is configured")
 	}
 
+	// Forge providers (ADR-058 / E45.4). Register the github adapter over
+	// the same concrete cfg.GitHub client so a forge-neutral consumer can
+	// resolve "github" via forge.Get instead of holding a *githubclient.
+	// Client. Gated on cfg.GitHub like the github work-item provider above:
+	// an unconfigured client leaves the forge registry empty rather than
+	// registering a nil-backed adapter.
+	if cfg.GitHub != nil {
+		forge.Register(forgegithub.New(cfg.GitHub))
+		logger.Info("forge providers registered", slog.Any("forges", forge.Registered()))
+	}
+
 	// GitHub OAuth sign-in (E4.2). All three of client_id +
 	// client_secret + callback_url must be set; mismatched
 	// configuration logs an error and exits rather than running
@@ -1843,7 +1855,7 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	// Primary: queue GitHub auto-merge so the PR lands once branch protection
 	// (required review + the fishhawk_audit_complete check) clears. The webhook
 	// / resolveReviewStageOnMerge path settles the review stage on the merge.
-	err = m.gh.EnableAutoMerge(ctx, scope, repo, number, githubclient.MergeMethodSquash)
+	err = m.gh.EnableAutoMerge(ctx, scope, repo, number, forge.MergeMethodSquash)
 	if err == nil {
 		return nil
 	}
@@ -1853,8 +1865,8 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	// before the merge verb runs. GitHub refuses to queue auto-merge on a
 	// synchronously-mergeable PR, so merge it directly via REST. Any OTHER
 	// enable error surfaces unchanged (no fallback).
-	if errors.Is(err, githubclient.ErrPullRequestCleanStatus) {
-		return m.gh.MergePullRequest(ctx, scope, repo, number, githubclient.MergeMethodSquash)
+	if errors.Is(err, forge.ErrPullRequestCleanStatus) {
+		return m.gh.MergePullRequest(ctx, scope, repo, number, forge.MergeMethodSquash)
 	}
 	return err
 }
@@ -1862,24 +1874,24 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 // parseCampaignPRURL splits a GitHub PR html_url into its repo ref and number.
 // Mirrors mergereconciler.parsePRURL (kept local to avoid importing that
 // package for one helper).
-func parseCampaignPRURL(prURL string) (githubclient.RepoRef, int, error) {
+func parseCampaignPRURL(prURL string) (forge.RepoRef, int, error) {
 	s := strings.TrimSpace(prURL)
 	for _, prefix := range []string{"https://github.com/", "http://github.com/"} {
 		s = strings.TrimPrefix(s, prefix)
 	}
 	parts := strings.Split(strings.Trim(s, "/"), "/")
 	if len(parts) != 4 || parts[2] != "pull" {
-		return githubclient.RepoRef{}, 0, fmt.Errorf("not a github PR html_url: %q", prURL)
+		return forge.RepoRef{}, 0, fmt.Errorf("not a github PR html_url: %q", prURL)
 	}
 	owner, name, num := parts[0], parts[1], parts[3]
 	if owner == "" || name == "" {
-		return githubclient.RepoRef{}, 0, fmt.Errorf("PR url missing owner/name: %q", prURL)
+		return forge.RepoRef{}, 0, fmt.Errorf("PR url missing owner/name: %q", prURL)
 	}
 	n, err := strconv.Atoi(num)
 	if err != nil || n <= 0 {
-		return githubclient.RepoRef{}, 0, fmt.Errorf("PR url has non-numeric number %q: %q", num, prURL)
+		return forge.RepoRef{}, 0, fmt.Errorf("PR url has non-numeric number %q: %q", num, prURL)
 	}
-	return githubclient.RepoRef{Owner: owner, Name: name}, n, nil
+	return forge.RepoRef{Owner: owner, Name: name}, n, nil
 }
 
 // campaignGateActor adapts *server.Server to campaigndriver.GateActor: it drives
