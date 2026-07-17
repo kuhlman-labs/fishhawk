@@ -5,9 +5,11 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
+	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
 	workmgmtjira "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/jira"
 )
 
@@ -20,11 +22,12 @@ import (
 //
 // Each provider is gated on its own client being configured, independently:
 // an unconfigured GitHub client (no App id/key) leaves the github_projects
-// + feedback registrations off, and an unconfigured Jira client (no
-// FISHHAWKD_JIRA_* env) leaves the jira registration off — in either case
-// the affected endpoint/provider continues to return 501, the intended v0
-// not-yet-wired posture.
-func registerWorkmgmtProviders(gh *githubclient.Client, jira *jiraclient.Client) {
+// + feedback registrations off, an unconfigured Jira client (no
+// FISHHAWKD_JIRA_* env) leaves the jira registration off, and an
+// unconfigured GitLab client (no FISHHAWKD_GITLAB_* env) leaves the gitlab
+// registration off — in every case the affected endpoint/provider continues
+// to return 501, the intended v0 not-yet-wired posture.
+func registerWorkmgmtProviders(gh *githubclient.Client, jira *jiraclient.Client, gitlab *gitlabclient.Client) {
 	if gh != nil {
 		// *githubclient.Client satisfies the work-item API directly (all six
 		// methods exist with matching signatures), so no adapter is needed.
@@ -38,6 +41,11 @@ func registerWorkmgmtProviders(gh *githubclient.Client, jira *jiraclient.Client)
 		// *jiraclient.Client satisfies the jira work-item API directly
 		// (CreateIssue + Transition), so no adapter is needed.
 		workmgmt.Register(workmgmtjira.New(jira))
+	}
+	if gitlab != nil {
+		// *gitlabclient.Client satisfies the gitlab work-item API directly
+		// (GetProject + CreateIssue + LinkIssues), so no adapter is needed.
+		workmgmt.Register(workmgmtgitlab.New(gitlab))
 	}
 }
 

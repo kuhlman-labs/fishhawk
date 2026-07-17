@@ -18,10 +18,12 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
+	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
 	workmgmtjira "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/jira"
 )
 
@@ -747,6 +749,197 @@ func TestFileWorkItem_Jira_EndToEnd(t *testing.T) {
 	}
 	if _, present := linkFields["parent"]; present {
 		t.Errorf("classic link body carried a parent object: %v", linkFields)
+	}
+}
+
+// TestSetConventionsLoader covers the deployment-level override seam
+// (ADR-058 #1856): SetConventionsLoader replaces the process-wide resolver so
+// serve.go can serve a FISHHAWKD_WORKMGMT_CONVENTIONS file for every repo. It
+// asserts the installed loader is the one the handler resolves through.
+func TestSetConventionsLoader(t *testing.T) {
+	prev := conventionsLoader
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	want := workmgmt.Default()
+	want.Provider = workmgmtgitlab.ProviderName
+	want.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
+	SetConventionsLoader(func(string) (workmgmt.Conventions, error) { return want, nil })
+
+	got, err := conventionsLoader("any/repo")
+	if err != nil {
+		t.Fatalf("conventionsLoader err = %v, want nil", err)
+	}
+	if got.Provider != workmgmtgitlab.ProviderName {
+		t.Errorf("Provider = %q, want %q (the installed loader was not used)", got.Provider, workmgmtgitlab.ProviderName)
+	}
+	if got.GitLab == nil || got.GitLab.Project != "group/app" {
+		t.Errorf("GitLab = %+v, want the installed override's block", got.GitLab)
+	}
+}
+
+// TestFileWorkItem_GitLab_ForgeOptional pins the forge-optional gate
+// (ADR-058 #1856): a provider: gitlab filing must NOT enter the GitHub
+// installation-resolution branch, even when a GitHub client IS configured, so
+// it never 502s on GitHub egress. The GitHub client's installation endpoint
+// fails the test if hit; the fake gitlab provider must still be dispatched
+// with Target.GitLab populated and Target.Scope left zero (gitlab carries its
+// own server-side credentials).
+func TestFileWorkItem_GitLab_ForgeOptional(t *testing.T) {
+	fp := &fakeWorkProvider{name: workmgmtgitlab.ProviderName}
+	workmgmt.Register(fp)
+
+	// A GitHub client whose installation endpoint must NOT be hit for a gitlab
+	// filing: the provider gate skips GitHub resolution entirely.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("GetRepoInstallation called for a gitlab filing; want the GitHub branch skipped")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	gh := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+	s := New(Config{GitHub: gh})
+
+	conv := workmgmt.Default()
+	conv.Provider = workmgmtgitlab.ProviderName
+	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/subgroup/app"}
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "GitLab filing skips GitHub egress",
+		TitleVars: map[string]string{"epic": "22", "n": "5"},
+		Relations: &workItemRelations{ParentEpic: "#100"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.called {
+		t.Fatal("gitlab provider was not dispatched")
+	}
+	if !fp.captured.Target.Scope.IsZero() {
+		t.Errorf("Target.Scope = %q, want zero (no GitHub installation resolved for a gitlab filing)", fp.captured.Target.Scope.Ref())
+	}
+	if fp.captured.Target.GitLab == nil || fp.captured.Target.GitLab.Project != "group/subgroup/app" {
+		t.Errorf("Target.GitLab = %+v, want the conventions' gitlab block populated", fp.captured.Target.GitLab)
+	}
+}
+
+// TestFileWorkItem_GitLab_EndToEnd is the ADR-058 #1856 cross-boundary seam:
+// the Target.GitLab field spans conventions-parse -> filing endpoint ->
+// provider -> REST client. It injects a provider: gitlab conventions through
+// conventionsLoader and registers the REAL gitlab provider backed by a
+// *gitlabclient.Client pointed at an httptest fake GitLab API, then POSTs a
+// file-issue request and asserts (a) the created issue number/URL/labels are
+// returned and boarded, and (b) the conventions-resolved project/labels
+// reached the transport — the seam a per-layer unit (Target.GitLab left
+// unpopulated) would miss (cf. #618). No GitHub client is configured, proving
+// a gitlab filing needs no GitHub egress.
+func TestFileWorkItem_GitLab_EndToEnd(t *testing.T) {
+	var createLabels string
+	var projectLookupPath string
+	var linkHit bool
+	// A single catch-all handler routing on the ESCAPED path: the namespaced
+	// project path carries %2F, which a ServeMux `{path}` wildcard would
+	// mis-split (net/http decodes r.URL.Path). Match on EscapedPath() so the
+	// on-the-wire percent-encoding is observable, mirroring the gitlabclient
+	// stub-Doer tests.
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		esc := r.URL.EscapedPath()
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(esc, "/api/v4/projects/") &&
+			!strings.Contains(esc, "/issues"):
+			// GET /api/v4/projects/:url-encoded-path -> {id, web_url}.
+			projectLookupPath = strings.TrimPrefix(esc, "/api/v4/projects/")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"id":55,"web_url":"https://gitlab.example/group/subgroup/app"}`)
+		case r.Method == http.MethodPost && esc == "/api/v4/projects/55/issues":
+			// Issue create -> {iid, web_url}.
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			createLabels, _ = body["labels"].(string)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"iid":42,"web_url":"https://gitlab.example/group/subgroup/app/-/issues/42"}`)
+		case r.Method == http.MethodPost && esc == "/api/v4/projects/55/issues/42/links":
+			// Best-effort parent link.
+			linkHit = true
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, esc)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(handler))
+	t.Cleanup(srv.Close)
+
+	workmgmt.Register(workmgmtgitlab.New(gitlabclient.New(srv.URL, "glpat-tok")))
+
+	conv := workmgmt.Default()
+	conv.Provider = workmgmtgitlab.ProviderName
+	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/subgroup/app"}
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	// No GitHub client configured: a gitlab filing must not need one.
+	s := New(Config{})
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Add the widget endpoint",
+		TitleVars: map[string]string{"epic": "22", "n": "5"},
+		Relations: &workItemRelations{ParentEpic: "#100"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+
+	// (a) The created GitLab issue iid/URL are returned.
+	if resp.Provider != workmgmtgitlab.ProviderName {
+		t.Errorf("provider = %q, want %q", resp.Provider, workmgmtgitlab.ProviderName)
+	}
+	if resp.Number != 42 {
+		t.Errorf("number = %d, want 42 (the created issue iid)", resp.Number)
+	}
+	if resp.URL != "https://gitlab.example/group/subgroup/app/-/issues/42" {
+		t.Errorf("url = %q, want the created issue web_url", resp.URL)
+	}
+	// Board placement rode the create as the status label -> Boarded true.
+	if !resp.Boarded {
+		t.Errorf("boarded = false, want true (the Backlog status label rode the create): %+v", resp)
+	}
+	if !resp.EpicLinked {
+		t.Errorf("epic_linked = false, want true (#100 linked post-create): %+v", resp)
+	}
+
+	// (b) Transport seam: the conventions-resolved project path was
+	// URL-encoded into the lookup and the resolved labels (including the
+	// Backlog board-status label) reached the create call.
+	if projectLookupPath != "group%2Fsubgroup%2Fapp" {
+		t.Errorf("project lookup path = %q, want the URL-encoded namespaced path", projectLookupPath)
+	}
+	if !strings.Contains(createLabels, "type:feature") {
+		t.Errorf("create labels = %q, want the resolved default type:feature", createLabels)
+	}
+	if !strings.Contains(createLabels, "Backlog") {
+		t.Errorf("create labels = %q, want the Backlog board-status label (label-driven board placement)", createLabels)
+	}
+	if !linkHit {
+		t.Error("parent link transport was not hit for #100")
 	}
 }
 
