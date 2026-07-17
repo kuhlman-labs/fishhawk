@@ -5361,7 +5361,12 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch strin
 	}
 
 	title, body := prTitleAndBody(cfg, branch, logSink)
-	prRes, err := newPROpener(token).OpenPR(ctx, gitops.OpenPRArgs{
+	// Route through the forge-agnostic dispatch (ADR-058 / E45.5): a
+	// --forge=gitlab exempt resolution opens a merge request via the GitLab
+	// MR opener against cfg.gitlabBaseURL, NOT a GitHub PR against the
+	// hardcoded api.github.com base — which would transmit the minted
+	// FISHHAWK_GITLAB_TOKEN to an unintended host and fail the stage.
+	prRes, err := openImplementChangeRequest(ctx, cfg, token, gitops.OpenPRArgs{
 		Owner: owner,
 		Repo:  repoName,
 		Head:  branch,

@@ -47,18 +47,47 @@ func writeJSON(w http.ResponseWriter, status int, body string) {
 
 // --- interface seam + configurable base URL -----------------------------
 
+// muxDoer is a gitlabclient.Doer that asserts every request the adapter emits
+// targets the CONFIGURED base-URL host/scheme, then serves it against an
+// in-process mux. Because the base URL is what puts the host/scheme on the
+// request, asserting them per case genuinely pins base-URL configurability
+// with no network — a base-URL-specific regression (a hardcoded host, a
+// dropped scheme) fails here.
+type muxDoer struct {
+	t          *testing.T
+	mux        *http.ServeMux
+	wantScheme string
+	wantHost   string
+}
+
+func (d *muxDoer) Do(req *http.Request) (*http.Response, error) {
+	d.t.Helper()
+	if req.URL.Scheme != d.wantScheme || req.URL.Host != d.wantHost {
+		d.t.Errorf("request URL = %s://%s%s, want scheme %s host %s",
+			req.URL.Scheme, req.URL.Host, req.URL.Path, d.wantScheme, d.wantHost)
+	}
+	rec := httptest.NewRecorder()
+	d.mux.ServeHTTP(rec, req)
+	return rec.Result(), nil
+}
+
 // TestForgeRunShapeAcrossBaseURLs drives the adapter THROUGH the forge.Forge
 // interface (registered via forge.Register / resolved via forge.Get) across
 // the end-to-end run shape ResolveRepoScope → CreateRef → CreatePullRequest →
 // CreateCheckRun, run twice against a gitlab.com-shaped and a self-managed
-// base URL. It proves the interface seam and the configurable base URL cross
-// layers together — the same code answers both hosts.
+// base URL. Each case wires the adapter to that base URL and asserts every
+// emitted request carries the matching host/scheme (via muxDoer), so the two
+// runs are genuinely distinct — the same code answers both hosts and a
+// base-URL-specific regression is caught, not duplicated.
 func TestForgeRunShapeAcrossBaseURLs(t *testing.T) {
 	for _, tc := range []struct {
-		name string
+		name       string
+		baseURL    string
+		wantScheme string
+		wantHost   string
 	}{
-		{"saas-shaped"},
-		{"self-managed"},
+		{"saas-shaped", "https://gitlab.com", "https", "gitlab.com"},
+		{"self-managed", "https://gitlab.example.com", "https", "gitlab.example.com"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var (
@@ -104,7 +133,9 @@ func TestForgeRunShapeAcrossBaseURLs(t *testing.T) {
 				writeJSON(w, http.StatusCreated, `{"id":99,"sha":"deadbeef","status":"running","name":"fishhawk"}`)
 			})
 
-			f, _ := newForge(t, mux)
+			f := forgegitlab.New(tc.baseURL, staticToken{}, forgegitlab.WithHTTPClient(&muxDoer{
+				t: t, mux: mux, wantScheme: tc.wantScheme, wantHost: tc.wantHost,
+			}))
 			// Route through the registry to exercise the interface seam.
 			forge.Register(f)
 			resolved, err := forge.Get("gitlab")
