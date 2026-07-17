@@ -67,6 +67,7 @@ var gateEnvAllowPrefix = []string{"GO", "CGO_", "LC_"}
 // of the default-deny allow-list). These keys are dropped unconditionally.
 var gateEnvDeny = map[string]struct{}{
 	"FISHHAWK_GITHUB_TOKEN": {},
+	"FISHHAWK_GITLAB_TOKEN": {},
 	"GITHUB_TOKEN":          {},
 	"GH_TOKEN":              {},
 	"ANTHROPIC_API_KEY":     {},

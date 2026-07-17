@@ -34,6 +34,7 @@ func TestEnv_PostureTable(t *testing.T) {
 		"OPENAI_API_KEY=other-model-key",               // second model provider
 		"FISHHAWK_API_TOKEN=fhm-secret",                // MCP token: NEVER present (ADR-050: no token leg)
 		"FISHHAWK_GITHUB_TOKEN=ghs-xxx",                // repo write: denied
+		"FISHHAWK_GITLAB_TOKEN=glpat-xxx",              // repo write (gitlab): denied
 		"GITHUB_TOKEN=ghs-yyy",                         // repo write: denied
 		"GH_TOKEN=ghs-zzz",                             // repo write: denied
 		"AWS_SECRET_ACCESS_KEY=aws-shh",                // arbitrary secret: dropped by default-deny
@@ -70,7 +71,7 @@ func TestEnv_PostureTable(t *testing.T) {
 		}
 	}
 	for _, banned := range []string{
-		"FISHHAWK_API_TOKEN", "FISHHAWK_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+		"FISHHAWK_API_TOKEN", "FISHHAWK_GITHUB_TOKEN", "FISHHAWK_GITLAB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
 		"AWS_SECRET_ACCESS_KEY", "FISHHAWK_RUNNER_INTERNAL",
 		"FISHHAWK_ACCEPTANCE_ENV_APP_USER", // the prefixed form must not leak alongside the stripped one
 	} {

@@ -14,6 +14,7 @@ func TestSanitizeEnv_StripsSecretsKeepsToolchain(t *testing.T) {
 	base := []string{
 		// Secrets — must all be stripped.
 		"FISHHAWK_GITHUB_TOKEN=ghs_secret",
+		"FISHHAWK_GITLAB_TOKEN=glpat_secret",
 		"GITHUB_TOKEN=gh_secret",
 		"GH_TOKEN=gh_secret2",
 		"ANTHROPIC_API_KEY=sk-ant-secret",
@@ -29,7 +30,7 @@ func TestSanitizeEnv_StripsSecretsKeepsToolchain(t *testing.T) {
 	gotMap := envSliceToMap(t, got)
 
 	for _, secret := range []string{
-		"FISHHAWK_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
+		"FISHHAWK_GITHUB_TOKEN", "FISHHAWK_GITLAB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN",
 		"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "FISHHAWK_API_TOKEN",
 	} {
 		if _, present := gotMap[secret]; present {
