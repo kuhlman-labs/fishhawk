@@ -75,7 +75,7 @@ func newFakeGHAPI() *fakeGHAPI {
 	}
 }
 
-func (f *fakeGHAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+func (f *fakeGHAPI) CreateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
 	// Concurrency gate: hold the winner inside the filing critical section on its
 	// FIRST create so a second concurrent POST provably blocks on the per-draft
 	// advisory lock. Done before f.mu so it never blocks other API calls.
@@ -100,7 +100,7 @@ func (f *fakeGHAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope
 	return &githubclient.CreatedIssue{Number: num, NodeID: node, HTMLURL: fmt.Sprintf("https://github.com/o/r/issues/%d", num)}, nil
 }
 
-func (f *fakeGHAPI) IssueNodeIDScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (string, error) {
+func (f *fakeGHAPI) IssueNodeID(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	iss, ok := f.byNumber[number]
@@ -110,23 +110,23 @@ func (f *fakeGHAPI) IssueNodeIDScoped(_ context.Context, _ forge.CredentialScope
 	return iss.nodeID, nil
 }
 
-func (f *fakeGHAPI) ProjectFieldsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
+func (f *fakeGHAPI) ProjectFields(_ context.Context, _ forge.CredentialScope, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
 	return &githubclient.ProjectMeta{ProjectID: "proj", FieldID: "field", StatusOptions: map[string]string{"Backlog": "opt-backlog"}}, nil
 }
 
-func (f *fakeGHAPI) ProjectItemStatusScoped(_ context.Context, _ forge.CredentialScope, _, _, _ string) (*githubclient.ProjectItemStatus, error) {
+func (f *fakeGHAPI) ProjectItemStatus(_ context.Context, _ forge.CredentialScope, _, _, _ string) (*githubclient.ProjectItemStatus, error) {
 	return &githubclient.ProjectItemStatus{OnBoard: false}, nil
 }
 
-func (f *fakeGHAPI) AddProjectItemScoped(_ context.Context, _ forge.CredentialScope, _, contentID string) (string, error) {
+func (f *fakeGHAPI) AddProjectItem(_ context.Context, _ forge.CredentialScope, _, contentID string) (string, error) {
 	return "item-" + contentID, nil
 }
 
-func (f *fakeGHAPI) SetProjectItemSingleSelectScoped(_ context.Context, _ forge.CredentialScope, _, _, _, _ string) error {
+func (f *fakeGHAPI) SetProjectItemSingleSelect(_ context.Context, _ forge.CredentialScope, _, _, _, _ string) error {
 	return nil
 }
 
-func (f *fakeGHAPI) AddSubIssueScoped(_ context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
+func (f *fakeGHAPI) AddSubIssue(_ context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if child, ok := f.byNode[childNodeID]; ok && child.number == f.dropLinkFor {
@@ -138,7 +138,7 @@ func (f *fakeGHAPI) AddSubIssueScoped(_ context.Context, _ forge.CredentialScope
 	return nil
 }
 
-func (f *fakeGHAPI) ListSubIssuesScoped(_ context.Context, _ forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error) {
+func (f *fakeGHAPI) ListSubIssues(_ context.Context, _ forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []githubclient.SubIssue
@@ -149,7 +149,7 @@ func (f *fakeGHAPI) ListSubIssuesScoped(_ context.Context, _ forge.CredentialSco
 	return out, nil
 }
 
-func (f *fakeGHAPI) SearchIssuesByTitleScoped(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.IssueTitleResult, error) {
+func (f *fakeGHAPI) SearchIssuesByTitle(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.IssueTitleResult, error) {
 	// Default (nil searchResults): empty tracker, so epic number discovery
 	// allocates 1. A seeded searchResults forces a higher discovered ordinal.
 	f.mu.Lock()

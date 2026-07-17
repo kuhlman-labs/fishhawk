@@ -39,10 +39,10 @@ const releaseNotesAssetContentType = "text/markdown"
 // the path runs offline. Mirrors the releaseNotesResolverOverride seam.
 type releasePublisher interface {
 	GetRepoInstallation(ctx context.Context, repo githubclient.RepoRef) (int64, error)
-	GetReleaseByTagScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, tag string) (*githubclient.Release, error)
-	UpdateReleaseBodyScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, releaseID int64, body string) error
-	DeleteReleaseAssetScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, assetID int64) error
-	UploadReleaseAssetScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, releaseID int64, name, contentType string, data []byte) error
+	GetReleaseByTag(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, tag string) (*githubclient.Release, error)
+	UpdateReleaseBody(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, releaseID int64, body string) error
+	DeleteReleaseAsset(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, assetID int64) error
+	UploadReleaseAsset(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, releaseID int64, name, contentType string, data []byte) error
 }
 
 // releasePublishRequest is the JSON body of POST /v0/releases/publish. repo +
@@ -209,7 +209,7 @@ func (s *Server) handleReleasePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	scope := forge.FromGitHubInstallationID(instID)
-	rel, err := pub.GetReleaseByTagScoped(r.Context(), scope, repoRef, tag)
+	rel, err := pub.GetReleaseByTag(r.Context(), scope, repoRef, tag)
 	if err != nil {
 		if errors.Is(err, githubclient.ErrNotFound) {
 			s.writeError(w, r, http.StatusNotFound, "release_not_found",
@@ -242,7 +242,7 @@ func (s *Server) handleReleasePublish(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Rewrite the Release body.
-	if err := pub.UpdateReleaseBodyScoped(r.Context(), scope, repoRef, rel.ID, markdown); err != nil {
+	if err := pub.UpdateReleaseBody(r.Context(), scope, repoRef, rel.ID, markdown); err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "release_publish_failed",
 			"update GitHub Release body failed",
 			map[string]any{"error": err.Error()})
@@ -254,14 +254,14 @@ func (s *Server) handleReleasePublish(w http.ResponseWriter, r *http.Request) {
 		if a.Name != releaseNotesAssetName {
 			continue
 		}
-		if err := pub.DeleteReleaseAssetScoped(r.Context(), scope, repoRef, a.ID); err != nil {
+		if err := pub.DeleteReleaseAsset(r.Context(), scope, repoRef, a.ID); err != nil {
 			s.writeError(w, r, http.StatusBadGateway, "release_publish_failed",
 				"delete stale release asset failed",
 				map[string]any{"error": err.Error()})
 			return
 		}
 	}
-	if err := pub.UploadReleaseAssetScoped(r.Context(), scope, repoRef, rel.ID,
+	if err := pub.UploadReleaseAsset(r.Context(), scope, repoRef, rel.ID,
 		releaseNotesAssetName, releaseNotesAssetContentType, []byte(markdown)); err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "release_publish_failed",
 			"upload release-notes asset failed",

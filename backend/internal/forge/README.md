@@ -30,6 +30,12 @@ type CredentialProvider interface {
 
 The forge-neutral analogue of `githubapp.TokenProvider`. `githubapp.ScopedProvider` (`backend/internal/githubapp/scoped.go`) adapts the existing `githubapp.TokenProvider` to this interface by resolving `scope.GitHubInstallationID()` and delegating. `githubclient.NewWithCredentialProvider` (`backend/internal/githubclient/scoped.go`) constructs a `*githubclient.Client` directly from a `CredentialProvider`.
 
-## Phase boundary
+## Contract state (#1855 phase 5/5, #2013)
 
-This package and its consumers (the `githubapp.ScopedProvider` adapter and the `githubclient` `Scoped`-suffixed method variants + `NewWithCredentialProvider`) are additive: every pre-existing symbol in `githubapp`/`githubclient` is untouched, and the `int64`-taking originals remain the single tested wire implementation — the `Scoped` variants delegate to them. The `int64` originals are removed only in the contract phase (5/5) of #1855.
+The staged split is complete. The `githubclient` `Scoped`-suffixed method variants are gone: their names collapsed back onto the originals, so every exported `*githubclient.Client` method now takes a `CredentialScope` and resolves it to an installation id exactly once at entry. `githubapp.ScopedProvider` and `githubclient.NewWithCredentialProvider` remain the forge-neutral adapters.
+
+`credential_scope_gate_test.go` in this package is the enforcement: it walks every non-test `.go` file in the `backend`/`runner`/`cli` modules (skipping `*/db/` sqlc-generated packages, per the AGENTS.md coverage-gate convention) and fails, naming `file:line`, on any `installationID`/`InstallationID` `int64` declaration outside its sanctioned survivor allowlist — the GitHub App token internals, `githubclient`'s unexported wire plumbing, webhook ingest payloads, run-row persistence, and the onboarding payload mirrors. Each allowlist entry carries the reason it is forge-specific; a new cross-forge `int64` seam has to argue its way in.
+
+Detection parses each file and inspects declaration nodes; it does not match source text. This is what makes the enforcement repo-wide rather than spelling-wide: a grouped declaration (`installationID, other int64`), a comment between the identifier and its type, or a name list wrapped across lines is the same cross-forge seam, and each of them slips past a line-oriented pattern. Parsing means the gate sees the declaration the compiler sees. `TestInstallationIDDeclDetectionForms` and `TestExportedClientInt64MethodDetectionForms` pin that behavior against those forms directly, and a file that fails to parse fails the gate rather than being skipped — an unscanned file is a hole.
+
+One sanctioned entry is a deferral rather than a permanent survivor: `runnerbackend.TriggerParams.InstallationID` flips in #1861, where the `gitlab_ci` backend — the field's second consumer — gives it its forge-neutral shape.

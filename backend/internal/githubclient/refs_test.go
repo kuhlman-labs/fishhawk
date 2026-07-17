@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // forceUpdateClient wires a Client to a one-off httptest server that
@@ -54,7 +56,7 @@ func TestForceUpdateRef_HappyPath(t *testing.T) {
 	c, cap := forceUpdateClient(t, http.StatusOK,
 		`{"ref":"refs/heads/fishhawk/run/x","object":{"sha":"aaa111"}}`)
 
-	err := c.ForceUpdateRef(context.Background(), 42,
+	err := c.ForceUpdateRef(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run/x", "aaa111")
 	if err != nil {
 		t.Fatalf("ForceUpdateRef: %v", err)
@@ -78,7 +80,7 @@ func TestForceUpdateRef_HappyPath(t *testing.T) {
 func TestForceUpdateRef_ErrorPath(t *testing.T) {
 	c, _ := forceUpdateClient(t, http.StatusUnprocessableEntity,
 		`{"message":"Object does not exist"}`)
-	err := c.ForceUpdateRef(context.Background(), 42,
+	err := c.ForceUpdateRef(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run/x", "deadbeef")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
@@ -87,7 +89,7 @@ func TestForceUpdateRef_ErrorPath(t *testing.T) {
 
 func TestForceUpdateRef_NotFound(t *testing.T) {
 	c, _ := forceUpdateClient(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	err := c.ForceUpdateRef(context.Background(), 42,
+	err := c.ForceUpdateRef(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "branch", "aaa111")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -110,7 +112,7 @@ func TestForceUpdateRef_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := c.ForceUpdateRef(context.Background(), 1, tc.repo, tc.branch, tc.newSHA)
+			err := c.ForceUpdateRef(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.branch, tc.newSHA)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -120,7 +122,7 @@ func TestForceUpdateRef_ValidationErrors(t *testing.T) {
 
 func TestForceUpdateRef_MissingTokens(t *testing.T) {
 	c := &Client{} // no Tokens
-	err := c.ForceUpdateRef(context.Background(), 1,
+	err := c.ForceUpdateRef(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "b", "s")
 	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("err = %v, want TokenProvider error", err)

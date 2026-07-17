@@ -297,7 +297,7 @@ type stubIssueGetter struct {
 	commentsGotNum  int
 }
 
-func (s *stubIssueGetter) GetIssueScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+func (s *stubIssueGetter) GetIssue(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
 	s.called = true
 	s.gotInst, _ = scope.GitHubInstallationID()
 	s.gotRepo = repo
@@ -308,7 +308,7 @@ func (s *stubIssueGetter) GetIssueScoped(_ context.Context, scope forge.Credenti
 	return s.issue, nil
 }
 
-func (s *stubIssueGetter) ListIssueCommentsScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
+func (s *stubIssueGetter) ListIssueComments(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
 	s.commentsCalled = true
 	s.commentsGotInst, _ = scope.GitHubInstallationID()
 	s.commentsGotRepo = repo

@@ -384,7 +384,7 @@ type autoMergeCall struct {
 	Method   githubclient.MergeMethod
 }
 
-func (g *stubGitHub) DispatchWorkflowScoped(_ context.Context, scope forge.CredentialScope,
+func (g *stubGitHub) DispatchWorkflow(_ context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, file, ref string, inputs githubclient.DispatchInputs) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -398,7 +398,7 @@ func (g *stubGitHub) DispatchWorkflowScoped(_ context.Context, scope forge.Crede
 	return nil
 }
 
-func (g *stubGitHub) EnableAutoMergeScoped(_ context.Context, scope forge.CredentialScope,
+func (g *stubGitHub) EnableAutoMerge(_ context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, prNumber int, method githubclient.MergeMethod) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -412,7 +412,7 @@ func (g *stubGitHub) EnableAutoMergeScoped(_ context.Context, scope forge.Creden
 	return nil
 }
 
-func (g *stubGitHub) CreatePullRequestScoped(_ context.Context, scope forge.CredentialScope,
+func (g *stubGitHub) CreatePullRequest(_ context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -430,7 +430,7 @@ func (g *stubGitHub) CreatePullRequestScoped(_ context.Context, scope forge.Cred
 	return &githubclient.PullRequest{Number: 777, HTMLURL: url, State: "open"}, nil
 }
 
-func (g *stubGitHub) ListOpenPullRequestsByHeadScoped(_ context.Context, _ forge.CredentialScope,
+func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, _, _ string) ([]githubclient.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -441,7 +441,7 @@ func (g *stubGitHub) ListOpenPullRequestsByHeadScoped(_ context.Context, _ forge
 	return g.listByHeadResult, nil
 }
 
-func (g *stubGitHub) GetBranchSHAScoped(_ context.Context, _ forge.CredentialScope,
+func (g *stubGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch string) (string, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -455,7 +455,7 @@ func (g *stubGitHub) GetBranchSHAScoped(_ context.Context, _ forge.CredentialSco
 	return sha, true, nil
 }
 
-func (g *stubGitHub) CreateRefScoped(_ context.Context, _ forge.CredentialScope,
+func (g *stubGitHub) CreateRef(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch, sha string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -470,7 +470,7 @@ func (g *stubGitHub) CreateRefScoped(_ context.Context, _ forge.CredentialScope,
 	return nil
 }
 
-func (g *stubGitHub) MergeBranchScoped(_ context.Context, _ forge.CredentialScope,
+func (g *stubGitHub) MergeBranch(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, base, head, msg string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()

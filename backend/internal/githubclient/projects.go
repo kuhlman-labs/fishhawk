@@ -20,6 +20,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // CreateIssueParams is the typed body for CreateIssue. Labels are applied
@@ -77,7 +79,11 @@ type ProjectMeta struct {
 // Requires the App to hold `issues:write`. Returns ErrNotFound when the
 // repo isn't visible to the installation, ErrForbidden on auth issues,
 // ErrValidation when GitHub rejects the body.
-func (c *Client) CreateIssue(ctx context.Context, installationID int64, repo RepoRef, p CreateIssueParams) (*CreatedIssue, error) {
+func (c *Client) CreateIssue(ctx context.Context, scope forge.CredentialScope, repo RepoRef, p CreateIssueParams) (*CreatedIssue, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -138,7 +144,11 @@ func (c *Client) CreateIssue(ctx context.Context, installationID int64, repo Rep
 // dedup search uses it to find an open report already carrying a
 // fingerprint marker. Requires the App to hold `issues:read`. Returns
 // ErrForbidden on auth issues, ErrValidation when GitHub rejects the query.
-func (c *Client) SearchOpenIssues(ctx context.Context, installationID int64, query string) ([]IssueSearchResult, error) {
+func (c *Client) SearchOpenIssues(ctx context.Context, scope forge.CredentialScope, query string) ([]IssueSearchResult, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -206,7 +216,11 @@ const (
 // searchByTitleMaxPages pages (the GitHub search 1000-result ceiling).
 // Requires the App to hold `issues:read`. Returns ErrForbidden on auth
 // issues, ErrValidation when GitHub rejects the query.
-func (c *Client) SearchIssuesByTitle(ctx context.Context, installationID int64, query string) ([]IssueTitleResult, error) {
+func (c *Client) SearchIssuesByTitle(ctx context.Context, scope forge.CredentialScope, query string) ([]IssueTitleResult, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -259,7 +273,11 @@ func (c *Client) SearchIssuesByTitle(ctx context.Context, installationID int64, 
 // The work-item provider uses it to turn a parent-epic reference (#N)
 // into the node id AddSubIssue links against. Returns ErrNotFound when
 // the issue isn't visible to the installation.
-func (c *Client) IssueNodeID(ctx context.Context, installationID int64, repo RepoRef, number int) (string, error) {
+func (c *Client) IssueNodeID(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int) (string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return "", err
+	}
 	if c.Tokens == nil {
 		return "", errors.New("githubclient: client missing TokenProvider")
 	}
@@ -306,7 +324,11 @@ func (c *Client) IssueNodeID(ctx context.Context, installationID int64, repo Rep
 // Returns ErrNotFound-shaped errors via classifyStatus on transport
 // failures and ErrValidation when GraphQL reports an application error
 // (e.g. the project or field doesn't exist).
-func (c *Client) ProjectFields(ctx context.Context, installationID int64, coord ProjectCoord, fieldName string) (*ProjectMeta, error) {
+func (c *Client) ProjectFields(ctx context.Context, scope forge.CredentialScope, coord ProjectCoord, fieldName string) (*ProjectMeta, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if coord.Owner == "" || coord.Number <= 0 {
 		return nil, errors.New("githubclient: project owner and number required")
 	}
@@ -401,7 +423,11 @@ type ProjectItemStatus struct {
 // project — the not-on-board path the Transition skips on. Honors the
 // user-owned-projects token opt-in (WithProjectsToken) like the other
 // Projects (v2) calls, since it routes through doGraphQL.
-func (c *Client) ProjectItemStatus(ctx context.Context, installationID int64, issueNodeID, projectID, fieldName string) (*ProjectItemStatus, error) {
+func (c *Client) ProjectItemStatus(ctx context.Context, scope forge.CredentialScope, issueNodeID, projectID, fieldName string) (*ProjectItemStatus, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if issueNodeID == "" || projectID == "" {
 		return nil, errors.New("githubclient: issue node id and project id required")
 	}
@@ -465,7 +491,11 @@ func (c *Client) ProjectItemStatus(ctx context.Context, installationID int64, is
 // keys on.
 //
 //	mutation addProjectV2ItemById
-func (c *Client) AddProjectItem(ctx context.Context, installationID int64, projectID, contentID string) (string, error) {
+func (c *Client) AddProjectItem(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return "", err
+	}
 	if projectID == "" || contentID == "" {
 		return "", errors.New("githubclient: project id and content id required")
 	}
@@ -497,7 +527,11 @@ func (c *Client) AddProjectItem(ctx context.Context, installationID int64, proje
 // (e.g. Status) to the given option id.
 //
 //	mutation updateProjectV2ItemFieldValue
-func (c *Client) SetProjectItemSingleSelect(ctx context.Context, installationID int64, projectID, itemID, fieldID, optionID string) error {
+func (c *Client) SetProjectItemSingleSelect(ctx context.Context, scope forge.CredentialScope, projectID, itemID, fieldID, optionID string) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if projectID == "" || itemID == "" || fieldID == "" || optionID == "" {
 		return errors.New("githubclient: project id, item id, field id, and option id required")
 	}
@@ -521,7 +555,11 @@ func (c *Client) SetProjectItemSingleSelect(ctx context.Context, installationID 
 // work-item provider's parent-epic link.
 //
 //	mutation addSubIssue
-func (c *Client) AddSubIssue(ctx context.Context, installationID int64, parentNodeID, childNodeID string) error {
+func (c *Client) AddSubIssue(ctx context.Context, scope forge.CredentialScope, parentNodeID, childNodeID string) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if parentNodeID == "" || childNodeID == "" {
 		return errors.New("githubclient: parent and child node ids required")
 	}
@@ -577,7 +615,11 @@ const listSubIssuesLabelsFirst = 100
 // routes through doGraphQL; sub-issues are repo-scoped, so the installation
 // token reaches them. Returns ErrForbidden on auth issues, ErrValidation
 // when GraphQL reports an application error.
-func (c *Client) ListSubIssues(ctx context.Context, installationID int64, parentNodeID string) ([]SubIssue, error) {
+func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope, parentNodeID string) ([]SubIssue, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if parentNodeID == "" {
 		return nil, errors.New("githubclient: parent node id required")
 	}

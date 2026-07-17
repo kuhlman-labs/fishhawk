@@ -62,7 +62,7 @@ const DefaultDegradedThreshold = 5
 // needs. Defining it as an interface lets tests swap in a fake
 // without standing up a fake api.github.com.
 type CheckRunCreator interface {
-	CreateCheckRunScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error)
+	CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error)
 }
 
 // AuditReader is the slice of audit.Repository the publisher needs to prefer
@@ -222,7 +222,7 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 	}
 
 	params := buildParams(state, missing, headSHA, p.detailsURL(runID))
-	if _, err := p.github.CreateCheckRunScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, params); err != nil {
+	if _, err := p.github.CreateCheckRun(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, params); err != nil {
 		err = fmt.Errorf("auditcheckpublisher: create check run: %w", err)
 		p.recordFailure(ctx, runID, headSHA, err)
 		return false, err

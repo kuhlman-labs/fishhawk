@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
 
@@ -43,7 +44,11 @@ import (
 // repo isn't visible OR code scanning is not enabled (GitHub returns 404
 // for a repo without code scanning), and ErrForbidden on auth/permission
 // issues — callers tolerate both as "no findings recorded".
-func (c *Client) ListCodeScanningAlerts(ctx context.Context, installationID int64, repo RepoRef, ref string) ([]securityscan.Finding, error) {
+func (c *Client) ListCodeScanningAlerts(ctx context.Context, scope forge.CredentialScope, repo RepoRef, ref string) ([]securityscan.Finding, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}

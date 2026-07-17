@@ -692,16 +692,16 @@ func matchInstallation(ev Event) Match {
 // without standing up an httptest.Server alongside the existing
 // dispatcher tests.
 type GitHubAPI interface {
-	GetWorkflowSpecScoped(ctx context.Context, scope forge.CredentialScope,
+	GetWorkflowSpec(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, ref string) (*githubclient.FileContent, error)
-	DispatchWorkflowScoped(ctx context.Context, scope forge.CredentialScope,
+	DispatchWorkflow(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
-	GetWorkflowRunScoped(ctx context.Context, scope forge.CredentialScope,
+	GetWorkflowRun(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
-	GetBranchProtectionScoped(ctx context.Context, scope forge.CredentialScope,
+	GetBranchProtection(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, branch string) (*githubclient.BranchProtection, error)
-	ListRulesetRequiredChecksScoped(ctx context.Context, scope forge.CredentialScope,
+	ListRulesetRequiredChecks(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error)
 }
 
@@ -929,7 +929,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// Step 1: fetch the workflow spec at the ref. Failures here
 	// are typically "App lacks access" or "file not yet committed";
 	// neither is transient.
-	specFile, err := d.GitHub.GetWorkflowSpecScoped(ctx, scope, repo, ref)
+	specFile, err := d.GitHub.GetWorkflowSpec(ctx, scope, repo, ref)
 	if err != nil {
 		// If the App can't read the file, we can't dispatch;
 		// record the outcome and return nil so GitHub doesn't
@@ -1120,7 +1120,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		actionsFile = DefaultActionsWorkflowFile
 	}
 	firstStage := stages[0]
-	dispatchErr := d.GitHub.DispatchWorkflowScoped(ctx, scope, repo,
+	dispatchErr := d.GitHub.DispatchWorkflow(ctx, scope, repo,
 		actionsFile, ref, githubclient.DispatchInputs{
 			"run_id":      created.ID.String(),
 			"stage_id":    firstStage.ID.String(),
@@ -1387,7 +1387,7 @@ func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m M
 		return nil
 	}
 
-	wfRun, err := d.GitHub.GetWorkflowRunScoped(ctx, forge.FromGitHubInstallationID(ev.InstallationID), repo, m.WorkflowRunID)
+	wfRun, err := d.GitHub.GetWorkflowRun(ctx, forge.FromGitHubInstallationID(ev.InstallationID), repo, m.WorkflowRunID)
 	if err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"runner_action_failed: get workflow run failed",
@@ -2237,7 +2237,7 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.Cred
 		contexts = append(contexts, c)
 	}
 
-	classic, classicErr := d.GitHub.GetBranchProtectionScoped(ctx, scope, repo, branch)
+	classic, classicErr := d.GitHub.GetBranchProtection(ctx, scope, repo, branch)
 	switch {
 	case classicErr == nil:
 		if len(classic.RequiredStatusCheckContexts) > 0 {
@@ -2255,7 +2255,7 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.Cred
 		return nil, fmt.Errorf("get branch protection: %w", classicErr)
 	}
 
-	rulesets, rulesetsErr := d.GitHub.ListRulesetRequiredChecksScoped(ctx, scope, repo, branch)
+	rulesets, rulesetsErr := d.GitHub.ListRulesetRequiredChecks(ctx, scope, repo, branch)
 	switch {
 	case rulesetsErr == nil:
 		for _, r := range rulesets {

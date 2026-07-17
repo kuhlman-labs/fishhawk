@@ -1051,7 +1051,7 @@ type fakeGitHub struct {
 	err   error
 }
 
-func (f *fakeGitHub) CreateCheckRunScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
+func (f *fakeGitHub) CreateCheckRun(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, checkRunCall{scope: scope, repo: repo, params: p})

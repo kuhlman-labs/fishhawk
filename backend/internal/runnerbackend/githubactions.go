@@ -14,7 +14,7 @@ import (
 // orchestrator's local-interface convention) lets tests substitute a stub. The
 // orchestrator's and webhook's own GitHubAPI interfaces both satisfy it.
 type DispatchClient interface {
-	DispatchWorkflowScoped(ctx context.Context, scope forge.CredentialScope,
+	DispatchWorkflow(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
 }
@@ -95,7 +95,7 @@ func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error
 	if p.DecomposedFrom != nil {
 		inputs["parent_run_id"] = p.DecomposedFrom.String()
 	}
-	return g.Client.DispatchWorkflowScoped(ctx, forge.FromGitHubInstallationID(p.InstallationID), repo, actionsFile, ref, inputs)
+	return g.Client.DispatchWorkflow(ctx, forge.FromGitHubInstallationID(p.InstallationID), repo, actionsFile, ref, inputs)
 }
 
 func (g *GitHubActions) logger() *slog.Logger {

@@ -28,7 +28,7 @@ type fakeDispatchClient struct {
 	err   error
 }
 
-func (f *fakeDispatchClient) DispatchWorkflowScoped(_ context.Context, scope forge.CredentialScope,
+func (f *fakeDispatchClient) DispatchWorkflow(_ context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, file, ref string, inputs githubclient.DispatchInputs) error {
 	if f.err != nil {
 		return f.err

@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 )
 
@@ -157,6 +158,12 @@ type Client struct {
 // New returns a Client with sensible defaults. tokens is required;
 // without it every call returns an error before touching the wire.
 //
+// New is the GitHub-convenience constructor: it takes the int64-taking
+// githubapp.TokenProvider directly. NewWithCredentialProvider is the
+// forge-neutral entry point (#1855). Both yield the same scope-taking
+// method surface — the constructor chosen only decides where tokens
+// come from, never what callers pass.
+//
 // New leaves AppJWT nil, so App-level endpoints (GetRepoInstallation)
 // fail the nil guard in buildAppJWTRequest. Production must construct
 // via NewWithSigner so those endpoints authenticate; New is for
@@ -198,7 +205,11 @@ func NewWithSigner(tokens githubapp.TokenProvider, signer AppJWTSigner) *Client 
 // The response carries content base64-encoded; we decode here so
 // callers see []byte. Returns ErrNotFound if the file or repo
 // isn't visible to the installation, ErrForbidden on auth issues.
-func (c *Client) GetFile(ctx context.Context, installationID int64, repo RepoRef, path, ref string) (*FileContent, error) {
+func (c *Client) GetFile(ctx context.Context, scope forge.CredentialScope, repo RepoRef, path, ref string) (*FileContent, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -265,8 +276,8 @@ func (c *Client) GetFile(ctx context.Context, installationID int64, repo RepoRef
 // `.fishhawk/workflows.yaml`. Callers want the content + the
 // blob SHA (used as workflow_sha on Run records); having a single
 // helper eliminates the per-call risk of a path typo.
-func (c *Client) GetWorkflowSpec(ctx context.Context, installationID int64, repo RepoRef, ref string) (*FileContent, error) {
-	return c.GetFile(ctx, installationID, repo, WorkflowSpecPath, ref)
+func (c *Client) GetWorkflowSpec(ctx context.Context, scope forge.CredentialScope, repo RepoRef, ref string) (*FileContent, error) {
+	return c.GetFile(ctx, scope, repo, WorkflowSpecPath, ref)
 }
 
 // DirEntry is one entry in a Contents-API directory listing
@@ -291,7 +302,11 @@ type DirEntry struct {
 // directory or repo isn't visible to the installation, ErrForbidden on
 // auth issues, and a descriptive error (never a panic) when path names a
 // file — GitHub answers with a JSON object instead of an array there.
-func (c *Client) ListDirectory(ctx context.Context, installationID int64, repo RepoRef, path, ref string) ([]DirEntry, error) {
+func (c *Client) ListDirectory(ctx context.Context, scope forge.CredentialScope, repo RepoRef, path, ref string) ([]DirEntry, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -372,7 +387,11 @@ type Issue struct {
 // agent-facing prompt from the originating issue. Returns
 // ErrNotFound if the issue or repo isn't visible to the
 // installation.
-func (c *Client) GetIssue(ctx context.Context, installationID int64, repo RepoRef, number int) (*Issue, error) {
+func (c *Client) GetIssue(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int) (*Issue, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -478,7 +497,11 @@ type BranchProtection struct {
 // shape on GitHub repos that have migrated.
 //
 // Requires the App to hold `administration: read` (#252 / ADR-017).
-func (c *Client) GetBranchProtection(ctx context.Context, installationID int64, repo RepoRef, branch string) (*BranchProtection, error) {
+func (c *Client) GetBranchProtection(ctx context.Context, scope forge.CredentialScope, repo RepoRef, branch string) (*BranchProtection, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -559,7 +582,11 @@ type RulesetRequiredCheck struct {
 // Returns nil + nil when the repo has no matching rulesets.
 //
 // Requires the App to hold `administration: read` (#252 / ADR-017).
-func (c *Client) ListRulesetRequiredChecks(ctx context.Context, installationID int64, repo RepoRef, branch string) ([]RulesetRequiredCheck, error) {
+func (c *Client) ListRulesetRequiredChecks(ctx context.Context, scope forge.CredentialScope, repo RepoRef, branch string) ([]RulesetRequiredCheck, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -754,8 +781,12 @@ const (
 // has it queued returns success rather than failing. The dispatcher
 // can call this multiple times across retries without special-
 // casing.
-func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
+func (c *Client) EnableAutoMerge(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, prNumber int, method MergeMethod) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -769,7 +800,7 @@ func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
 		method = MergeMethodSquash
 	}
 
-	pr, err := c.GetPullRequest(ctx, installationID, repo, prNumber)
+	pr, err := c.GetPullRequest(ctx, scope, repo, prNumber)
 	if err != nil {
 		return err
 	}
@@ -851,8 +882,12 @@ func (c *Client) EnableAutoMerge(ctx context.Context, installationID int64,
 // actionable, retryable case). ErrMergeConflict on 409 (head branch moved or a
 // merge conflict). ErrNotFound (404) / ErrForbidden (401/403) / ErrValidation
 // (422) are mapped like the sibling REST methods via classifyStatus.
-func (c *Client) MergePullRequest(ctx context.Context, installationID int64,
+func (c *Client) MergePullRequest(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, prNumber int, method MergeMethod) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -948,8 +983,12 @@ type PullRequest struct {
 //     mutation can't be addressed by number).
 //   - `auditcomplete.Compute` rule 5 (#282) — for the live head_sha
 //     comparison.
-func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
+func (c *Client) GetPullRequest(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, number int) (*PullRequest, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1018,8 +1057,12 @@ func (c *Client) GetPullRequest(ctx context.Context, installationID int64,
 // already-merged PR succeeds. Mirrors the ClosePullRequest PATCH pattern.
 // Returns ErrNotFound when the repo/PR isn't visible to the installation,
 // ErrForbidden on auth issues, ErrValidation when GitHub rejects the update.
-func (c *Client) EditPullRequest(ctx context.Context, installationID int64,
+func (c *Client) EditPullRequest(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, number int, body string) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1082,7 +1125,11 @@ type Release struct {
 // visible to the installation), ErrForbidden on auth issues. The Releases
 // endpoints are covered by the App's existing contents:write grant — no new
 // permission (ADR-051 accepted-condition 3, confirmed on #1588).
-func (c *Client) GetReleaseByTag(ctx context.Context, installationID int64, repo RepoRef, tag string) (*Release, error) {
+func (c *Client) GetReleaseByTag(ctx context.Context, scope forge.CredentialScope, repo RepoRef, tag string) (*Release, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1123,7 +1170,11 @@ func (c *Client) GetReleaseByTag(ctx context.Context, installationID int64, repo
 //
 // Returns ErrNotFound when the release/repo isn't visible to the installation,
 // ErrForbidden on auth issues, ErrValidation when GitHub rejects the update.
-func (c *Client) UpdateReleaseBody(ctx context.Context, installationID int64, repo RepoRef, releaseID int64, body string) error {
+func (c *Client) UpdateReleaseBody(ctx context.Context, scope forge.CredentialScope, repo RepoRef, releaseID int64, body string) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1165,7 +1216,11 @@ func (c *Client) UpdateReleaseBody(ctx context.Context, installationID int64, re
 //
 // A 204 (no content) is success. Returns ErrNotFound when the asset/repo isn't
 // visible, ErrForbidden on auth issues.
-func (c *Client) DeleteReleaseAsset(ctx context.Context, installationID int64, repo RepoRef, assetID int64) error {
+func (c *Client) DeleteReleaseAsset(ctx context.Context, scope forge.CredentialScope, repo RepoRef, assetID int64) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1204,7 +1259,11 @@ func (c *Client) DeleteReleaseAsset(ctx context.Context, installationID int64, r
 // ErrForbidden on auth issues, ErrValidation when GitHub rejects the upload
 // (e.g. an asset with the same name already exists — the caller deletes the
 // stale asset first).
-func (c *Client) UploadReleaseAsset(ctx context.Context, installationID int64, repo RepoRef, releaseID int64, name, contentType string, data []byte) error {
+func (c *Client) UploadReleaseAsset(ctx context.Context, scope forge.CredentialScope, repo RepoRef, releaseID int64, name, contentType string, data []byte) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1258,8 +1317,12 @@ func (c *Client) UploadReleaseAsset(ctx context.Context, installationID int64, r
 // positive). Returns a typed error (ErrNotFound / ErrValidation /
 // ErrForbidden) on non-2xx so callers can fail open on a transient
 // GitHub failure.
-func (c *Client) CompareCommits(ctx context.Context, installationID int64,
+func (c *Client) CompareCommits(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, base, head string) ([]string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1330,8 +1393,12 @@ type PullRequestRef struct {
 // No pagination: the number of PRs associated with a single commit is
 // tiny (in practice one — the PR the commit landed), far below the
 // per-page default.
-func (c *Client) ListPullRequestsForCommit(ctx context.Context, installationID int64,
+func (c *Client) ListPullRequestsForCommit(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, sha string) ([]PullRequestRef, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1445,8 +1512,12 @@ type ComparePatchResult struct {
 // Returns a typed error (ErrNotFound / ErrValidation / ErrForbidden) on
 // non-2xx. Truncation is NOT an error — the partial diff is returned with
 // Truncated set so the caller can review what it has and surface the gap.
-func (c *Client) ComparePatch(ctx context.Context, installationID int64,
+func (c *Client) ComparePatch(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, base, head string) (*ComparePatchResult, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1545,8 +1616,12 @@ func (c *Client) ComparePatch(ctx context.Context, installationID int64,
 // rejects the update (422 — e.g. the SHA doesn't exist on the repo). The
 // dropped commit stays recoverable from the remote reflog / the foreign
 // pusher's own branch.
-func (c *Client) ForceUpdateRef(ctx context.Context, installationID int64,
+func (c *Client) ForceUpdateRef(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, branch, newSHA string) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1593,8 +1668,12 @@ func (c *Client) ForceUpdateRef(ctx context.Context, installationID int64,
 // 404 (the branch is absent — callers branch on absence rather than
 // treating it as a hard error), and a typed error (ErrForbidden /
 // ErrValidation) on other non-2xx responses.
-func (c *Client) GetBranchSHA(ctx context.Context, installationID int64,
+func (c *Client) GetBranchSHA(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, branch string) (string, bool, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return "", false, err
+	}
 	if c.Tokens == nil {
 		return "", false, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1654,8 +1733,12 @@ func (c *Client) GetBranchSHA(ctx context.Context, installationID int64,
 // fail because a prior fan-in pass already created the branch. Returns
 // ErrNotFound when the repo isn't visible, ErrForbidden on auth issues,
 // ErrValidation for other 422s.
-func (c *Client) CreateRef(ctx context.Context, installationID int64,
+func (c *Client) CreateRef(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, branch, sha string) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1726,8 +1809,12 @@ func (c *Client) CreateRef(ctx context.Context, installationID int64,
 // foreign. Decode is defensive: an unparseable or absent `sha` in a 201 body
 // returns ("", nil) so a body-shape quirk never wedges an otherwise clean
 // fan-in — the merge still happened; only its SHA goes unrecorded.
-func (c *Client) MergeBranch(ctx context.Context, installationID int64,
+func (c *Client) MergeBranch(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, base, head, commitMessage string) (string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return "", err
+	}
 	if c.Tokens == nil {
 		return "", errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1808,8 +1895,12 @@ func (c *Client) MergeBranch(ctx context.Context, installationID int64,
 // exhaust the 256-byte brief body). Callers recover the existing PR via
 // ListOpenPullRequestsByHead. ErrNotFound when the repo isn't visible to
 // the installation, ErrForbidden when the App lacks `pull_requests:write`.
-func (c *Client) CreatePullRequest(ctx context.Context, installationID int64,
+func (c *Client) CreatePullRequest(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, head, base, title, body string) (*PullRequest, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1902,8 +1993,12 @@ func (c *Client) CreatePullRequest(ctx context.Context, installationID int64,
 // when the repo/PR isn't visible to the installation, ErrForbidden on
 // auth issues, ErrValidation when GitHub rejects the update. Closing a PR
 // leaves its head branch intact.
-func (c *Client) ClosePullRequest(ctx context.Context, installationID int64,
+func (c *Client) ClosePullRequest(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, number int) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -1948,8 +2043,12 @@ func (c *Client) ClosePullRequest(ctx context.Context, installationID int64,
 // head is a bare branch name; this method builds the "owner:branch" head
 // filter GitHub's list endpoint expects. Returns ErrNotFound when the
 // repo isn't visible to the installation, ErrForbidden on auth issues.
-func (c *Client) ListOpenPullRequestsByHead(ctx context.Context, installationID int64,
+func (c *Client) ListOpenPullRequestsByHead(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, headBranch, base string) ([]PullRequest, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2027,7 +2126,11 @@ type TeamMember struct {
 // Pages until exhaustion via Link headers. Returns the union of
 // "maintainers" and "members" (role=all is the documented
 // equivalent on the team-members endpoint).
-func (c *Client) ListTeamMembers(ctx context.Context, installationID int64, org, slug string) ([]TeamMember, error) {
+func (c *Client) ListTeamMembers(ctx context.Context, scope forge.CredentialScope, org, slug string) ([]TeamMember, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2136,7 +2239,11 @@ type FetchedIssueComment struct {
 //
 // Returns ErrNotFound when the issue or repo isn't visible to the
 // installation, ErrForbidden on auth issues.
-func (c *Client) ListIssueComments(ctx context.Context, installationID int64, repo RepoRef, number int) ([]FetchedIssueComment, error) {
+func (c *Client) ListIssueComments(ctx context.Context, scope forge.CredentialScope, repo RepoRef, number int) ([]FetchedIssueComment, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2222,7 +2329,11 @@ type DispatchInputs map[string]string
 // picks up the event and starts the job. Returns ErrValidation
 // for bad refs / unrecognized inputs (422), ErrNotFound for an
 // unknown workflow file (404).
-func (c *Client) DispatchWorkflow(ctx context.Context, installationID int64, repo RepoRef, workflowFile, ref string, inputs DispatchInputs) error {
+func (c *Client) DispatchWorkflow(ctx context.Context, scope forge.CredentialScope, repo RepoRef, workflowFile, ref string, inputs DispatchInputs) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
 	if c.Tokens == nil {
 		return errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2298,7 +2409,11 @@ type WorkflowRun struct {
 //
 // Returns ErrNotFound if the run id doesn't exist, ErrForbidden on
 // auth issues.
-func (c *Client) GetWorkflowRun(ctx context.Context, installationID int64, repo RepoRef, runID int64) (*WorkflowRun, error) {
+func (c *Client) GetWorkflowRun(ctx context.Context, scope forge.CredentialScope, repo RepoRef, runID int64) (*WorkflowRun, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2374,8 +2489,12 @@ func (c *Client) GetWorkflowRun(ctx context.Context, installationID int64, repo 
 //
 // Returns a typed error (ErrNotFound / ErrForbidden / ErrValidation) only on a
 // hard API failure; an empty/ambiguous result is (nil, nil), not an error.
-func (c *Client) ResolveDispatchedRun(ctx context.Context, installationID int64,
+func (c *Client) ResolveDispatchedRun(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, branch string, correlation map[string]string, createdAfter time.Time) (*WorkflowRun, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2514,7 +2633,11 @@ func inputsMatchCorrelation(inputs, correlation map[string]string) bool {
 // installation, ErrForbidden when the App lacks `issues:write`.
 // Caller is responsible for any rate-limit / dedup logic — this
 // helper is the thin wrapper around the wire call.
-func (c *Client) CreateIssueComment(ctx context.Context, installationID int64, repo RepoRef, issueNumber int, body string) (*IssueComment, error) {
+func (c *Client) CreateIssueComment(ctx context.Context, scope forge.CredentialScope, repo RepoRef, issueNumber int, body string) (*IssueComment, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2585,7 +2708,11 @@ type IssueComment struct {
 // Caller is responsible for finding the comment id (typically via
 // the run's audit log — the existing `issue_commented` rows record
 // the id for sticky-comment lookups).
-func (c *Client) UpdateIssueComment(ctx context.Context, installationID int64, repo RepoRef, commentID int64, body string) (*IssueComment, error) {
+func (c *Client) UpdateIssueComment(ctx context.Context, scope forge.CredentialScope, repo RepoRef, commentID int64, body string) (*IssueComment, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2693,7 +2820,11 @@ type CreateCheckRunResult struct {
 // required fields, conclusion without status=completed),
 // ErrNotFound when the repo isn't visible to the installation,
 // ErrForbidden when the installation token lacks `checks:write`.
-func (c *Client) CreateCheckRun(ctx context.Context, installationID int64, repo RepoRef, p CreateCheckRunParams) (*CreateCheckRunResult, error) {
+func (c *Client) CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo RepoRef, p CreateCheckRunParams) (*CreateCheckRunResult, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2812,7 +2943,11 @@ type CreateReviewResult struct {
 // invalid event), ErrNotFound when the repo/PR isn't visible to the
 // installation, ErrForbidden when the installation token lacks
 // `pull_requests:write`.
-func (c *Client) CreateReview(ctx context.Context, installationID int64, repo RepoRef, prNumber int, params CreateReviewParams) (*CreateReviewResult, error) {
+func (c *Client) CreateReview(ctx context.Context, scope forge.CredentialScope, repo RepoRef, prNumber int, params CreateReviewParams) (*CreateReviewResult, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -2917,7 +3052,11 @@ const (
 // Returns ErrNotFound when the comment was deleted, ErrForbidden
 // when the installation lacks `issues:read` (covered by the
 // existing `issues:write` scope; this is a defensive check).
-func (c *Client) ListIssueCommentReactions(ctx context.Context, installationID int64, repo RepoRef, commentID int64) ([]IssueCommentReaction, error) {
+func (c *Client) ListIssueCommentReactions(ctx context.Context, scope forge.CredentialScope, repo RepoRef, commentID int64) ([]IssueCommentReaction, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}

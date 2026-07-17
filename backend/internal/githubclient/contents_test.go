@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // contentsClient wires a Client to a one-off httptest server that
@@ -45,7 +47,7 @@ func TestListDirectory_HappyPath(t *testing.T) {
 	]`
 	c, lastPath, lastQuery := contentsClient(t, http.StatusOK, body)
 
-	entries, err := c.ListDirectory(context.Background(), 42,
+	entries, err := c.ListDirectory(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "backend/internal/server", "main")
 	if err != nil {
 		t.Fatalf("ListDirectory: %v", err)
@@ -74,7 +76,7 @@ func TestListDirectory_HappyPath(t *testing.T) {
 func TestListDirectory_EmptyRefOmitsQuery(t *testing.T) {
 	c, _, lastQuery := contentsClient(t, http.StatusOK, `[]`)
 
-	entries, err := c.ListDirectory(context.Background(), 42,
+	entries, err := c.ListDirectory(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "docs", "")
 	if err != nil {
 		t.Fatalf("ListDirectory: %v", err)
@@ -89,7 +91,7 @@ func TestListDirectory_EmptyRefOmitsQuery(t *testing.T) {
 
 func TestListDirectory_NotFound(t *testing.T) {
 	c, _, _ := contentsClient(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	_, err := c.ListDirectory(context.Background(), 42,
+	_, err := c.ListDirectory(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "no/such/dir", "")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -104,7 +106,7 @@ func TestListDirectory_FilePathReturnsObject(t *testing.T) {
 	body := `{"name":"upload.go","path":"backend/internal/server/upload.go","type":"file","content":"cGtn","encoding":"base64"}`
 	c, _, _ := contentsClient(t, http.StatusOK, body)
 
-	_, err := c.ListDirectory(context.Background(), 42,
+	_, err := c.ListDirectory(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "backend/internal/server/upload.go", "")
 	if err == nil || !strings.Contains(err.Error(), "not a directory") {
 		t.Errorf("err = %v, want a 'not a directory' error", err)
@@ -125,7 +127,7 @@ func TestListDirectory_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.ListDirectory(context.Background(), 1, tc.repo, tc.path, "")
+			_, err := c.ListDirectory(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.path, "")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -135,7 +137,7 @@ func TestListDirectory_ValidationErrors(t *testing.T) {
 
 func TestListDirectory_MissingTokens(t *testing.T) {
 	c := &Client{} // no Tokens
-	_, err := c.ListDirectory(context.Background(), 1,
+	_, err := c.ListDirectory(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "docs", "")
 	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("err = %v, want TokenProvider error", err)

@@ -607,17 +607,17 @@ type recordingGitHub struct {
 	mergeErrByHead map[string]error
 }
 
-func (g *recordingGitHub) DispatchWorkflowScoped(context.Context, forge.CredentialScope,
+func (g *recordingGitHub) DispatchWorkflow(context.Context, forge.CredentialScope,
 	githubclient.RepoRef, string, string, githubclient.DispatchInputs) error {
 	return nil
 }
 
-func (g *recordingGitHub) EnableAutoMergeScoped(context.Context, forge.CredentialScope,
+func (g *recordingGitHub) EnableAutoMerge(context.Context, forge.CredentialScope,
 	githubclient.RepoRef, int, githubclient.MergeMethod) error {
 	return nil
 }
 
-func (g *recordingGitHub) CreatePullRequestScoped(_ context.Context, _ forge.CredentialScope,
+func (g *recordingGitHub) CreatePullRequest(_ context.Context, _ forge.CredentialScope,
 	repo githubclient.RepoRef, head, base, _, _ string) (*githubclient.PullRequest, error) {
 	g.createCalls = append(g.createCalls, struct {
 		Head string
@@ -630,12 +630,12 @@ func (g *recordingGitHub) CreatePullRequestScoped(_ context.Context, _ forge.Cre
 	return &githubclient.PullRequest{Number: 123, HTMLURL: url, State: "open"}, nil
 }
 
-func (g *recordingGitHub) ListOpenPullRequestsByHeadScoped(context.Context, forge.CredentialScope,
+func (g *recordingGitHub) ListOpenPullRequestsByHead(context.Context, forge.CredentialScope,
 	githubclient.RepoRef, string, string) ([]githubclient.PullRequest, error) {
 	return nil, nil
 }
 
-func (g *recordingGitHub) GetBranchSHAScoped(_ context.Context, _ forge.CredentialScope,
+func (g *recordingGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch string) (string, bool, error) {
 	sha, ok := g.branchSHAs[branch]
 	if !ok {
@@ -644,7 +644,7 @@ func (g *recordingGitHub) GetBranchSHAScoped(_ context.Context, _ forge.Credenti
 	return sha, true, nil
 }
 
-func (g *recordingGitHub) CreateRefScoped(_ context.Context, _ forge.CredentialScope,
+func (g *recordingGitHub) CreateRef(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch, sha string) error {
 	g.createRefCalls = append(g.createRefCalls, branch)
 	if g.branchSHAs == nil {
@@ -654,7 +654,7 @@ func (g *recordingGitHub) CreateRefScoped(_ context.Context, _ forge.CredentialS
 	return nil
 }
 
-func (g *recordingGitHub) MergeBranchScoped(_ context.Context, _ forge.CredentialScope,
+func (g *recordingGitHub) MergeBranch(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, base, head, _ string) (string, error) {
 	g.mergeCalls = append(g.mergeCalls, head)
 	if err, ok := g.mergeErrByHead[head]; ok {

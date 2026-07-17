@@ -31,14 +31,14 @@ func (g *GitHubResolver) MergedPRsInRange(ctx context.Context, repo, base, head 
 	if err != nil {
 		return nil, err
 	}
-	shas, err := g.Client.CompareCommitsScoped(ctx, g.Scope, ref, base, head)
+	shas, err := g.Client.CompareCommits(ctx, g.Scope, ref, base, head)
 	if err != nil {
 		return nil, err
 	}
 	seen := make(map[int]struct{})
 	var out []MergedPR
 	for _, sha := range shas {
-		prs, err := g.Client.ListPullRequestsForCommitScoped(ctx, g.Scope, ref, sha)
+		prs, err := g.Client.ListPullRequestsForCommit(ctx, g.Scope, ref, sha)
 		if err != nil {
 			return nil, err
 		}

@@ -407,11 +407,8 @@ func (s *Server) prHeadFetcher() auditcomplete.PRHeadFetcher {
 	if s.cfg.GitHub == nil {
 		return nil
 	}
-	return func(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int) (string, error) {
-		// The auditcomplete.PRHeadFetcher seam type still passes a bare int64
-		// installation id (that type is owned by the auditcomplete package, a
-		// later phase's contract); convert it to a scope at the client boundary.
-		pr, err := s.cfg.GitHub.GetPullRequestScoped(ctx, forge.FromGitHubInstallationID(installationID), repo, prNumber)
+	return func(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int) (string, error) {
+		pr, err := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
 		if err != nil {
 			return "", err
 		}

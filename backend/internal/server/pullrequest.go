@@ -1417,7 +1417,7 @@ func (s *Server) closePRAfterGatingReject(r *http.Request, runID uuid.UUID,
 	comment := fmt.Sprintf(
 		"Fishhawk closed this pull request: the implement stage was rejected by a gating agent review before the PR opened, so the change will not merge.\n\nReason: %s",
 		reason)
-	if _, cerr := s.cfg.GitHub.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, pr.PRNumber, comment); cerr != nil {
+	if _, cerr := s.cfg.GitHub.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, pr.PRNumber, comment); cerr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"gating-reject PR close: post explanatory comment failed; proceeding to close",
 			slog.String("run_id", runID.String()),
@@ -1426,7 +1426,7 @@ func (s *Server) closePRAfterGatingReject(r *http.Request, runID uuid.UUID,
 			slog.String("error", cerr.Error()))
 	}
 
-	if cerr := s.cfg.GitHub.ClosePullRequestScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, pr.PRNumber); cerr != nil {
+	if cerr := s.cfg.GitHub.ClosePullRequest(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, pr.PRNumber); cerr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"gating-reject PR close: close pull request failed",
 			slog.String("run_id", runID.String()),

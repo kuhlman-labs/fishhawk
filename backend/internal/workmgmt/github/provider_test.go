@@ -73,7 +73,7 @@ type fakeAPI struct {
 	projectsTokenConfigured bool
 }
 
-func (f *fakeAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+func (f *fakeAPI) CreateIssue(_ context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
 	f.createRepo, f.createParams = repo, p
 	if f.createErr != nil {
 		return nil, f.createErr
@@ -81,7 +81,7 @@ func (f *fakeAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope, 
 	return f.created, nil
 }
 
-func (f *fakeAPI) IssueNodeIDScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (string, error) {
+func (f *fakeAPI) IssueNodeID(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (string, error) {
 	f.nodeIDNumber = number
 	if f.nodeIDErr != nil {
 		return "", f.nodeIDErr
@@ -89,7 +89,7 @@ func (f *fakeAPI) IssueNodeIDScoped(_ context.Context, _ forge.CredentialScope, 
 	return f.parentNode, nil
 }
 
-func (f *fakeAPI) ProjectFieldsScoped(_ context.Context, _ forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error) {
+func (f *fakeAPI) ProjectFields(_ context.Context, _ forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error) {
 	f.fieldsCoord, f.fieldsName = coord, fieldName
 	if f.fieldsErr != nil {
 		return nil, f.fieldsErr
@@ -97,7 +97,7 @@ func (f *fakeAPI) ProjectFieldsScoped(_ context.Context, _ forge.CredentialScope
 	return f.meta, nil
 }
 
-func (f *fakeAPI) ProjectItemStatusScoped(_ context.Context, _ forge.CredentialScope, issueNodeID, projectID, _ string) (*githubclient.ProjectItemStatus, error) {
+func (f *fakeAPI) ProjectItemStatus(_ context.Context, _ forge.CredentialScope, issueNodeID, projectID, _ string) (*githubclient.ProjectItemStatus, error) {
 	f.itemStatusIssueNode, f.itemStatusProjectID = issueNodeID, projectID
 	if f.itemStatusErr != nil {
 		return nil, f.itemStatusErr
@@ -105,7 +105,7 @@ func (f *fakeAPI) ProjectItemStatusScoped(_ context.Context, _ forge.CredentialS
 	return f.itemStatus, nil
 }
 
-func (f *fakeAPI) AddProjectItemScoped(_ context.Context, _ forge.CredentialScope, projectID, contentID string) (string, error) {
+func (f *fakeAPI) AddProjectItem(_ context.Context, _ forge.CredentialScope, projectID, contentID string) (string, error) {
 	f.addItemContent = contentID
 	_ = projectID
 	if f.addItemErr != nil {
@@ -114,17 +114,17 @@ func (f *fakeAPI) AddProjectItemScoped(_ context.Context, _ forge.CredentialScop
 	return f.itemID, nil
 }
 
-func (f *fakeAPI) SetProjectItemSingleSelectScoped(_ context.Context, _ forge.CredentialScope, projectID, itemID, fieldID, optionID string) error {
+func (f *fakeAPI) SetProjectItemSingleSelect(_ context.Context, _ forge.CredentialScope, projectID, itemID, fieldID, optionID string) error {
 	f.setProjectID, f.setItemID, f.setFieldID, f.setOptionID = projectID, itemID, fieldID, optionID
 	return f.setErr
 }
 
-func (f *fakeAPI) AddSubIssueScoped(_ context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
+func (f *fakeAPI) AddSubIssue(_ context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
 	f.subParent, f.subChild = parentNodeID, childNodeID
 	return f.subErr
 }
 
-func (f *fakeAPI) ListSubIssuesScoped(_ context.Context, _ forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error) {
+func (f *fakeAPI) ListSubIssues(_ context.Context, _ forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error) {
 	f.listSubParent = parentNodeID
 	if f.listSubErr != nil {
 		return nil, f.listSubErr
@@ -132,7 +132,7 @@ func (f *fakeAPI) ListSubIssuesScoped(_ context.Context, _ forge.CredentialScope
 	return f.listSubResults, nil
 }
 
-func (f *fakeAPI) SearchIssuesByTitleScoped(_ context.Context, _ forge.CredentialScope, query string) ([]githubclient.IssueTitleResult, error) {
+func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ forge.CredentialScope, query string) ([]githubclient.IssueTitleResult, error) {
 	f.searchQuery = query
 	if f.searchErr != nil {
 		return nil, f.searchErr

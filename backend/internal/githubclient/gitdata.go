@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // Repository is the slice of a repository API response Fishhawk needs for
@@ -31,7 +33,11 @@ type Repository struct {
 // whose HEAD commit seeds the create-tree base_tree. Returns ErrNotFound
 // when the repo isn't visible to the installation, ErrForbidden on auth
 // issues.
-func (c *Client) GetRepository(ctx context.Context, installationID int64, repo RepoRef) (*Repository, error) {
+func (c *Client) GetRepository(ctx context.Context, scope forge.CredentialScope, repo RepoRef) (*Repository, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -86,7 +92,11 @@ type GitCommit struct {
 // sha, not a commit sha, so the repo's existing files are preserved.
 // Returns ErrNotFound when the repo/commit isn't visible, ErrForbidden on
 // auth issues.
-func (c *Client) GetCommit(ctx context.Context, installationID int64, repo RepoRef, sha string) (*GitCommit, error) {
+func (c *Client) GetCommit(ctx context.Context, scope forge.CredentialScope, repo RepoRef, sha string) (*GitCommit, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return nil, err
+	}
 	if c.Tokens == nil {
 		return nil, errors.New("githubclient: client missing TokenProvider")
 	}
@@ -149,8 +159,12 @@ type TreeEntry struct {
 // new tree's SHA. ErrNotFound when the repo isn't visible, ErrForbidden
 // on auth issues, ErrValidation when GitHub rejects the tree (422 — e.g.
 // a bad base_tree sha).
-func (c *Client) CreateTree(ctx context.Context, installationID int64, repo RepoRef,
+func (c *Client) CreateTree(ctx context.Context, scope forge.CredentialScope, repo RepoRef,
 	baseTree string, entries []TreeEntry) (string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return "", err
+	}
 	if c.Tokens == nil {
 		return "", errors.New("githubclient: client missing TokenProvider")
 	}
@@ -228,8 +242,12 @@ func (c *Client) CreateTree(ctx context.Context, installationID int64, repo Repo
 // ErrNotFound when the repo isn't visible, ErrForbidden on auth issues,
 // ErrValidation when GitHub rejects the commit (422 — e.g. a bad tree or
 // parent sha).
-func (c *Client) CreateCommit(ctx context.Context, installationID int64, repo RepoRef,
+func (c *Client) CreateCommit(ctx context.Context, scope forge.CredentialScope, repo RepoRef,
 	message, treeSHA string, parents []string) (string, error) {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return "", err
+	}
 	if c.Tokens == nil {
 		return "", errors.New("githubclient: client missing TokenProvider")
 	}

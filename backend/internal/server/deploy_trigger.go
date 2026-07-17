@@ -166,7 +166,7 @@ func (s *Server) triggerDeployGitHubActions(ctx context.Context, stage *run.Stag
 	}
 	dispatchedAt := time.Now().UTC()
 
-	if err := s.cfg.GitHub.DispatchWorkflowScoped(ctx, scope, repo,
+	if err := s.cfg.GitHub.DispatchWorkflow(ctx, scope, repo,
 		delegate.WorkflowRef, branch, githubclient.DispatchInputs(correlation)); err != nil {
 		return s.failDeployTrigger(ctx, stage,
 			"deploy trigger: workflow_dispatch failed",
@@ -178,7 +178,7 @@ func (s *Server) triggerDeployGitHubActions(ctx context.Context, stage *run.Stag
 	// the correlation token + dispatched_at window stored in the audit payload.
 	var ghaRunID int64
 	var externalURL string
-	resolved, rerr := s.cfg.GitHub.ResolveDispatchedRunScoped(ctx, scope, repo, branch, correlation, dispatchedAt.Add(-1*time.Minute))
+	resolved, rerr := s.cfg.GitHub.ResolveDispatchedRun(ctx, scope, repo, branch, correlation, dispatchedAt.Add(-1*time.Minute))
 	switch {
 	case rerr != nil:
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,

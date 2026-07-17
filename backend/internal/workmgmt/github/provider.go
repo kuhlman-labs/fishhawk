@@ -33,15 +33,15 @@ const statusFieldName = "Status"
 // a consumer-side interface so the provider can be unit-tested against a
 // fake. *githubclient.Client satisfies it.
 type API interface {
-	CreateIssueScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
-	IssueNodeIDScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (string, error)
-	ProjectFieldsScoped(ctx context.Context, scope forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error)
-	ProjectItemStatusScoped(ctx context.Context, scope forge.CredentialScope, issueNodeID, projectID, fieldName string) (*githubclient.ProjectItemStatus, error)
-	AddProjectItemScoped(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error)
-	SetProjectItemSingleSelectScoped(ctx context.Context, scope forge.CredentialScope, projectID, itemID, fieldID, optionID string) error
-	AddSubIssueScoped(ctx context.Context, scope forge.CredentialScope, parentNodeID, childNodeID string) error
-	ListSubIssuesScoped(ctx context.Context, scope forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error)
-	SearchIssuesByTitleScoped(ctx context.Context, scope forge.CredentialScope, query string) ([]githubclient.IssueTitleResult, error)
+	CreateIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
+	IssueNodeID(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (string, error)
+	ProjectFields(ctx context.Context, scope forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error)
+	ProjectItemStatus(ctx context.Context, scope forge.CredentialScope, issueNodeID, projectID, fieldName string) (*githubclient.ProjectItemStatus, error)
+	AddProjectItem(ctx context.Context, scope forge.CredentialScope, projectID, contentID string) (string, error)
+	SetProjectItemSingleSelect(ctx context.Context, scope forge.CredentialScope, projectID, itemID, fieldID, optionID string) error
+	AddSubIssue(ctx context.Context, scope forge.CredentialScope, parentNodeID, childNodeID string) error
+	ListSubIssues(ctx context.Context, scope forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error)
+	SearchIssuesByTitle(ctx context.Context, scope forge.CredentialScope, query string) ([]githubclient.IssueTitleResult, error)
 	ProjectsTokenConfigured() bool
 }
 
@@ -102,7 +102,7 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	// already present, so re-filing a body that already carries it is a no-op.
 	body := ensureDependsOnMarker(req.Item.Body, req.Item.Relations.DependsOn)
 
-	issue, err := p.api.CreateIssueScoped(ctx, scope, repo, githubclient.CreateIssueParams{
+	issue, err := p.api.CreateIssue(ctx, scope, repo, githubclient.CreateIssueParams{
 		Title:  req.Item.Title,
 		Body:   body,
 		Labels: req.Item.Classification.Labels,
@@ -205,11 +205,11 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 	}
 	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
 
-	issueNodeID, err := p.api.IssueNodeIDScoped(ctx, scope, repo, req.IssueNumber)
+	issueNodeID, err := p.api.IssueNodeID(ctx, scope, repo, req.IssueNumber)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve issue #%d: %w", req.IssueNumber, err)
 	}
-	meta, err := p.api.ProjectFieldsScoped(ctx, scope, coord, statusFieldName)
+	meta, err := p.api.ProjectFields(ctx, scope, coord, statusFieldName)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
@@ -219,7 +219,7 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 			SkipReason: fmt.Sprintf("target status %q is not a %s option on the project", toOption, statusFieldName)}, nil
 	}
 
-	item, err := p.api.ProjectItemStatusScoped(ctx, scope, issueNodeID, meta.ProjectID, statusFieldName)
+	item, err := p.api.ProjectItemStatus(ctx, scope, issueNodeID, meta.ProjectID, statusFieldName)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: read project item status: %w", err)
 	}
@@ -238,7 +238,7 @@ func (p *Provider) Transition(ctx context.Context, req workmgmt.TransitionReques
 		return &workmgmt.TransitionResult{Skipped: true, From: current, To: toOption,
 			SkipReason: "card already at target status"}, nil
 	}
-	if err := p.api.SetProjectItemSingleSelectScoped(ctx, scope, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {
+	if err := p.api.SetProjectItemSingleSelect(ctx, scope, meta.ProjectID, item.ItemID, meta.FieldID, optionID); err != nil {
 		return nil, fmt.Errorf("workmgmt/github: set status field: %w", err)
 	}
 	return &workmgmt.TransitionResult{Moved: true, From: current, To: toOption}, nil
@@ -330,7 +330,7 @@ func (p *Provider) DiscoverNumbers(ctx context.Context, req workmgmt.DiscoverNum
 	} else {
 		query = fmt.Sprintf(`repo:%s in:title "%s"`, repoQ, titleNumberSearchPrefix(req.TitleFormat))
 	}
-	hits, err := p.api.SearchIssuesByTitleScoped(ctx, scope, query)
+	hits, err := p.api.SearchIssuesByTitle(ctx, scope, query)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: search issues by title: %w", err)
 	}
@@ -441,11 +441,11 @@ func (p *Provider) placeOnBoard(ctx context.Context, scope forge.CredentialScope
 	if proj.OwnerType == "user" {
 		ctx = githubclient.WithProjectsToken(ctx)
 	}
-	meta, err := p.api.ProjectFieldsScoped(ctx, scope, coord, statusFieldName)
+	meta, err := p.api.ProjectFields(ctx, scope, coord, statusFieldName)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: resolve project fields: %w", err)
 	}
-	itemID, err := p.api.AddProjectItemScoped(ctx, scope, meta.ProjectID, issue.NodeID)
+	itemID, err := p.api.AddProjectItem(ctx, scope, meta.ProjectID, issue.NodeID)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: add project item: %w", err)
 	}
@@ -458,7 +458,7 @@ func (p *Provider) placeOnBoard(ctx context.Context, scope forge.CredentialScope
 		return fmt.Errorf("workmgmt/github: status %q is not a %s option on the project; available: %s",
 			status, statusFieldName, strings.Join(sortedKeys(meta.StatusOptions), ", "))
 	}
-	if err := p.api.SetProjectItemSingleSelectScoped(ctx, scope, meta.ProjectID, itemID, meta.FieldID, optionID); err != nil {
+	if err := p.api.SetProjectItemSingleSelect(ctx, scope, meta.ProjectID, itemID, meta.FieldID, optionID); err != nil {
 		return fmt.Errorf("workmgmt/github: set status field: %w", err)
 	}
 	return nil
@@ -471,11 +471,11 @@ func (p *Provider) linkEpic(ctx context.Context, scope forge.CredentialScope, re
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: parent epic %q: %w", epicRef, err)
 	}
-	parentNodeID, err := p.api.IssueNodeIDScoped(ctx, scope, repo, number)
+	parentNodeID, err := p.api.IssueNodeID(ctx, scope, repo, number)
 	if err != nil {
 		return fmt.Errorf("workmgmt/github: resolve parent epic #%d: %w", number, err)
 	}
-	if err := p.api.AddSubIssueScoped(ctx, scope, parentNodeID, childNodeID); err != nil {
+	if err := p.api.AddSubIssue(ctx, scope, parentNodeID, childNodeID); err != nil {
 		return fmt.Errorf("workmgmt/github: link parent epic #%d: %w", number, err)
 	}
 	return nil
@@ -511,11 +511,11 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 		return nil, fmt.Errorf("workmgmt/github: epic %q: %w", req.Epic, err)
 	}
 	repo := githubclient.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
-	epicNodeID, err := p.api.IssueNodeIDScoped(ctx, scope, repo, number)
+	epicNodeID, err := p.api.IssueNodeID(ctx, scope, repo, number)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: resolve epic #%d: %w", number, err)
 	}
-	subs, err := p.api.ListSubIssuesScoped(ctx, scope, epicNodeID)
+	subs, err := p.api.ListSubIssues(ctx, scope, epicNodeID)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: list epic #%d children: %w", number, err)
 	}

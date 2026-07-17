@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // compareClient wires a Client to a one-off httptest server that
@@ -40,7 +42,7 @@ func TestCompareCommits_HappyPath(t *testing.T) {
 	body := `{"commits":[{"sha":"aaa111"},{"sha":"bbb222"},{"sha":"ccc333"}]}`
 	c, lastPath := compareClient(t, http.StatusOK, body)
 
-	shas, err := c.CompareCommits(context.Background(), 42,
+	shas, err := c.CompareCommits(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", "ccc333")
 	if err != nil {
 		t.Fatalf("CompareCommits: %v", err)
@@ -62,7 +64,7 @@ func TestCompareCommits_HappyPath(t *testing.T) {
 
 func TestCompareCommits_EmptyCommits(t *testing.T) {
 	c, _ := compareClient(t, http.StatusOK, `{"commits":[]}`)
-	shas, err := c.CompareCommits(context.Background(), 42,
+	shas, err := c.CompareCommits(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", "abc")
 	if err != nil {
 		t.Fatalf("CompareCommits: %v", err)
@@ -74,7 +76,7 @@ func TestCompareCommits_EmptyCommits(t *testing.T) {
 
 func TestCompareCommits_NotFound(t *testing.T) {
 	c, _ := compareClient(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	_, err := c.CompareCommits(context.Background(), 42,
+	_, err := c.CompareCommits(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", "abc")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -83,7 +85,7 @@ func TestCompareCommits_NotFound(t *testing.T) {
 
 func TestCompareCommits_Unprocessable(t *testing.T) {
 	c, _ := compareClient(t, http.StatusUnprocessableEntity, `{"message":"no common ancestor"}`)
-	_, err := c.CompareCommits(context.Background(), 42,
+	_, err := c.CompareCommits(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", "abc")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
@@ -106,7 +108,7 @@ func TestCompareCommits_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.CompareCommits(context.Background(), 1, tc.repo, tc.base, tc.head)
+			_, err := c.CompareCommits(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.base, tc.head)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -116,7 +118,7 @@ func TestCompareCommits_ValidationErrors(t *testing.T) {
 
 func TestCompareCommits_MissingTokens(t *testing.T) {
 	c := &Client{} // no Tokens
-	_, err := c.CompareCommits(context.Background(), 1,
+	_, err := c.CompareCommits(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main", "h")
 	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("err = %v, want TokenProvider error", err)
@@ -156,7 +158,7 @@ func TestListPullRequestsForCommit_MergedOnlyFilter(t *testing.T) {
 	]`
 	c, lastPath := commitPullsClient(t, http.StatusOK, body)
 
-	prs, err := c.ListPullRequestsForCommit(context.Background(), 42,
+	prs, err := c.ListPullRequestsForCommit(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "abc123")
 	if err != nil {
 		t.Fatalf("ListPullRequestsForCommit: %v", err)
@@ -175,7 +177,7 @@ func TestListPullRequestsForCommit_MergedOnlyFilter(t *testing.T) {
 
 func TestListPullRequestsForCommit_NotFound(t *testing.T) {
 	c, _ := commitPullsClient(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	_, err := c.ListPullRequestsForCommit(context.Background(), 42,
+	_, err := c.ListPullRequestsForCommit(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "abc")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -184,7 +186,7 @@ func TestListPullRequestsForCommit_NotFound(t *testing.T) {
 
 func TestListPullRequestsForCommit_Forbidden(t *testing.T) {
 	c, _ := commitPullsClient(t, http.StatusForbidden, `{"message":"Forbidden"}`)
-	_, err := c.ListPullRequestsForCommit(context.Background(), 42,
+	_, err := c.ListPullRequestsForCommit(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "abc")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -205,7 +207,7 @@ func TestListPullRequestsForCommit_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.ListPullRequestsForCommit(context.Background(), 1, tc.repo, tc.sha)
+			_, err := c.ListPullRequestsForCommit(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.sha)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -215,7 +217,7 @@ func TestListPullRequestsForCommit_ValidationErrors(t *testing.T) {
 
 func TestListPullRequestsForCommit_MissingTokens(t *testing.T) {
 	c := &Client{} // no Tokens
-	_, err := c.ListPullRequestsForCommit(context.Background(), 1,
+	_, err := c.ListPullRequestsForCommit(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "abc")
 	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("err = %v, want TokenProvider error", err)

@@ -197,7 +197,7 @@ func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Ru
 		return "", false
 	}
 
-	commits, err := s.cfg.GitHub.CompareCommitsScoped(ctx, scope, repo, baseRef, compareHead)
+	commits, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, baseRef, compareHead)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage: compare commits failed; skipping check",
@@ -253,7 +253,7 @@ func (s *Server) resolveLastRunAuthoredHead(ctx context.Context, runRow *run.Run
 		return "", "", false, false
 	}
 
-	commits, err := s.cfg.GitHub.CompareCommitsScoped(ctx, scope, repo, baseRef, headSHA)
+	commits, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, baseRef, headSHA)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch reset: compare commits failed; refusing (fail-closed)",
@@ -357,7 +357,7 @@ func (s *Server) ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prN
 	if prNumber <= 0 {
 		return true
 	}
-	pr, err := s.cfg.GitHub.GetPullRequestScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage reverify: resolve PR head failed; skipping check",
@@ -443,7 +443,7 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 		// before the parent opens the consolidated PR). Fail open.
 		return ""
 	}
-	pr, err := s.cfg.GitHub.GetPullRequestScoped(ctx, scope, repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, scope, repo, prNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage: resolve PR base ref failed; skipping check",

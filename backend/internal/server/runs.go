@@ -580,7 +580,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		repoRef := githubclient.RepoRef{Owner: owner, Name: name}
-		fc, err := s.cfg.GitHub.GetWorkflowSpecScoped(r.Context(), forge.FromGitHubInstallationID(*installationID), repoRef, req.WorkflowSHA)
+		fc, err := s.cfg.GitHub.GetWorkflowSpec(r.Context(), forge.FromGitHubInstallationID(*installationID), repoRef, req.WorkflowSHA)
 		if err != nil {
 			if errors.Is(err, githubclient.ErrNotFound) {
 				s.writeError(w, r, http.StatusUnprocessableEntity, "spec_not_found",
@@ -848,7 +848,7 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, w
 		return nil, fmt.Errorf("resolve installation for %s: %w", repo, err)
 	}
 
-	fc, err := s.cfg.GitHub.GetWorkflowSpecScoped(ctx, forge.FromGitHubInstallationID(instID), repoRef, workflowRef)
+	fc, err := s.cfg.GitHub.GetWorkflowSpec(ctx, forge.FromGitHubInstallationID(instID), repoRef, workflowRef)
 	if err != nil {
 		return nil, fmt.Errorf("fetch workflow spec for %s: %w", repo, err)
 	}
@@ -901,7 +901,7 @@ func (s *Server) hydrateCampaignIssueContext(ctx context.Context, instID int64, 
 			"repo", repoRef.Owner+"/"+repoRef.Name, "issue_ref", issueRef)
 		return nil
 	}
-	issue, err := s.cfg.GitHub.GetIssueScoped(ctx, forge.FromGitHubInstallationID(instID), repoRef, number)
+	issue, err := s.cfg.GitHub.GetIssue(ctx, forge.FromGitHubInstallationID(instID), repoRef, number)
 	if err != nil {
 		s.cfg.Logger.Warn("campaign run start: hydrate issue context failed; proceeding without",
 			"repo", repoRef.Owner+"/"+repoRef.Name, "issue", number, "error", err.Error())
@@ -913,7 +913,7 @@ func (s *Server) hydrateCampaignIssueContext(ctx context.Context, instID int64, 
 		URL:    fmt.Sprintf("https://github.com/%s/%s/issues/%d", repoRef.Owner, repoRef.Name, number),
 		Number: number,
 	}
-	comments, err := s.cfg.GitHub.ListIssueCommentsScoped(ctx, forge.FromGitHubInstallationID(instID), repoRef, number)
+	comments, err := s.cfg.GitHub.ListIssueComments(ctx, forge.FromGitHubInstallationID(instID), repoRef, number)
 	if err != nil {
 		s.cfg.Logger.Warn("campaign run start: list issue comments failed; proceeding with title+body",
 			"repo", repoRef.Owner+"/"+repoRef.Name, "issue", number, "error", err.Error())

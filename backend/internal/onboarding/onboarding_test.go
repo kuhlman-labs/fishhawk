@@ -115,12 +115,12 @@ type fakeClient struct {
 	createPRURL  string
 }
 
-func (f *fakeClient) GetFileScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, _ string) (*githubclient.FileContent, error) {
+func (f *fakeClient) GetFile(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, _ string) (*githubclient.FileContent, error) {
 	f.calls = append(f.calls, "GetFile")
 	return f.getFileResult, f.getFileErr
 }
 
-func (f *fakeClient) GetRepositoryScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef) (*githubclient.Repository, error) {
+func (f *fakeClient) GetRepository(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef) (*githubclient.Repository, error) {
 	f.calls = append(f.calls, "GetRepository")
 	if f.getRepoErr != nil {
 		return nil, f.getRepoErr
@@ -128,7 +128,7 @@ func (f *fakeClient) GetRepositoryScoped(_ context.Context, _ forge.CredentialSc
 	return &githubclient.Repository{DefaultBranch: f.repoDefaultBranch}, nil
 }
 
-func (f *fakeClient) GetBranchSHAScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch string) (string, bool, error) {
+func (f *fakeClient) GetBranchSHA(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch string) (string, bool, error) {
 	f.calls = append(f.calls, "GetBranchSHA:"+branch)
 	f.getBranchCall++
 	if branch == OnboardingBranch {
@@ -138,7 +138,7 @@ func (f *fakeClient) GetBranchSHAScoped(_ context.Context, _ forge.CredentialSco
 	return f.baseBranchSHA, f.baseBranchExists, f.baseBranchErr
 }
 
-func (f *fakeClient) GetCommitScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string) (*githubclient.GitCommit, error) {
+func (f *fakeClient) GetCommit(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string) (*githubclient.GitCommit, error) {
 	f.calls = append(f.calls, "GetCommit")
 	if f.getCommitErr != nil {
 		return nil, f.getCommitErr
@@ -146,35 +146,35 @@ func (f *fakeClient) GetCommitScoped(_ context.Context, _ forge.CredentialScope,
 	return &githubclient.GitCommit{SHA: f.baseBranchSHA, TreeSHA: f.commitTreeSHA}, nil
 }
 
-func (f *fakeClient) CreateTreeScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, baseTree string, entries []githubclient.TreeEntry) (string, error) {
+func (f *fakeClient) CreateTree(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, baseTree string, entries []githubclient.TreeEntry) (string, error) {
 	f.calls = append(f.calls, "CreateTree")
 	f.baseTreeSeen = baseTree
 	f.entriesSeen = entries
 	return f.createTreeSHA, f.createTreeErr
 }
 
-func (f *fakeClient) CreateCommitScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, treeSHA string, parents []string) (string, error) {
+func (f *fakeClient) CreateCommit(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, treeSHA string, parents []string) (string, error) {
 	f.calls = append(f.calls, "CreateCommit")
 	f.commitTree = treeSHA
 	f.commitParents = parents
 	return f.createCommitSHA, f.createCommitErr
 }
 
-func (f *fakeClient) CreateRefScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch, sha string) error {
+func (f *fakeClient) CreateRef(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch, sha string) error {
 	f.calls = append(f.calls, "CreateRef")
 	f.createRefBranch = branch
 	f.createRefSHA = sha
 	return f.createRefErr
 }
 
-func (f *fakeClient) ForceUpdateRefScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch, newSHA string) error {
+func (f *fakeClient) ForceUpdateRef(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch, newSHA string) error {
 	f.calls = append(f.calls, "ForceUpdateRef")
 	f.forceUpdateBranch = branch
 	f.forceUpdateSHA = newSHA
 	return f.forceUpdateErr
 }
 
-func (f *fakeClient) CreatePullRequestScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, head, base, _, _ string) (*githubclient.PullRequest, error) {
+func (f *fakeClient) CreatePullRequest(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, head, base, _, _ string) (*githubclient.PullRequest, error) {
 	f.calls = append(f.calls, "CreatePullRequest")
 	f.createPRHead = head
 	f.createPRBase = base

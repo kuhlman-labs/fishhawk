@@ -60,12 +60,12 @@ type feedbackAPIAdapter struct {
 
 var _ workmgmtgithub.FeedbackAPI = feedbackAPIAdapter{}
 
-func (a feedbackAPIAdapter) SearchOpenIssuesScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, query string) ([]workmgmtgithub.MatchedIssue, error) {
+func (a feedbackAPIAdapter) SearchOpenIssues(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, query string) ([]workmgmtgithub.MatchedIssue, error) {
 	// The provider embeds repo:owner/name into the query string, so the
 	// client search method needs only the composed query — repo is unused
 	// here, kept to satisfy the consumer-side interface.
 	_ = repo
-	res, err := a.client.SearchOpenIssuesScoped(ctx, scope, query)
+	res, err := a.client.SearchOpenIssues(ctx, scope, query)
 	if err != nil {
 		return nil, err
 	}
@@ -76,10 +76,10 @@ func (a feedbackAPIAdapter) SearchOpenIssuesScoped(ctx context.Context, scope fo
 	return matches, nil
 }
 
-func (a feedbackAPIAdapter) CreateIssueScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
-	return a.client.CreateIssueScoped(ctx, scope, repo, p)
+func (a feedbackAPIAdapter) CreateIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	return a.client.CreateIssue(ctx, scope, repo, p)
 }
 
-func (a feedbackAPIAdapter) CreateIssueCommentScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
-	return a.client.CreateIssueCommentScoped(ctx, scope, repo, issueNumber, body)
+func (a feedbackAPIAdapter) CreateIssueComment(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
+	return a.client.CreateIssueComment(ctx, scope, repo, issueNumber, body)
 }

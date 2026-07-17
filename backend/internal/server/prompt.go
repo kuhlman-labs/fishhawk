@@ -657,8 +657,8 @@ func (s *Server) effectiveFixupScope(ctx context.Context, planScope []scopeFile,
 // fake of api.github.com — *githubclient.Client satisfies it
 // in production.
 type issueGetter interface {
-	GetIssueScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error)
-	ListIssueCommentsScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
+	GetIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error)
+	ListIssueComments(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
 }
 
 // handleGetStagePrompt implements GET /v0/stages/{stage_id}/prompt.
@@ -1843,7 +1843,7 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 		return
 	}
 	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
-	issue, err := github.GetIssueScoped(ctx, scope, repo, issueNumber)
+	issue, err := github.GetIssue(ctx, scope, repo, issueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: get issue failed",
 			slog.String("run_id", runRow.ID.String()),
@@ -1860,7 +1860,7 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 	// branch 1. Best-effort: a fetch error degrades to title+body
 	// rather than failing the prompt build (same WARN-and-proceed
 	// posture as the GetIssue failure above).
-	comments, err := github.ListIssueCommentsScoped(ctx, scope, repo, issueNumber)
+	comments, err := github.ListIssueComments(ctx, scope, repo, issueNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list issue comments failed",
 			slog.String("run_id", runRow.ID.String()),

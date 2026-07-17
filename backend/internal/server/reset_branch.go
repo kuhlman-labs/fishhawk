@@ -174,7 +174,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 		s.writeResetNotDeterminable(w, r, "run has no tracked pull request to reset")
 		return
 	}
-	pr, err := s.cfg.GitHub.GetPullRequestScoped(r.Context(), scope, repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequest(r.Context(), scope, repo, prNumber)
 	if err != nil {
 		s.writeResetNotDeterminable(w, r, "resolve live PR head failed: "+err.Error())
 		return
@@ -212,7 +212,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	// since classification, so a concurrent push between classify and
 	// patch cannot be silently clobbered. Narrows, does not eliminate,
 	// the window.
-	livePR, err := s.cfg.GitHub.GetPullRequestScoped(r.Context(), scope, repo, prNumber)
+	livePR, err := s.cfg.GitHub.GetPullRequest(r.Context(), scope, repo, prNumber)
 	if err != nil {
 		s.writeResetNotDeterminable(w, r, "lease re-check: re-read live PR head failed: "+err.Error())
 		return
@@ -224,7 +224,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Force-rewind the run branch to the last run-authored HEAD.
-	if err := s.cfg.GitHub.ForceUpdateRefScoped(r.Context(), scope, repo, branch, lastAuthoredSHA); err != nil {
+	if err := s.cfg.GitHub.ForceUpdateRef(r.Context(), scope, repo, branch, lastAuthoredSHA); err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "reset_force_update_failed",
 			"force-update of the PR head ref failed", map[string]any{"error": err.Error()})
 		return

@@ -1394,7 +1394,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			scope = forge.FromGitHubInstallationID(id)
 			instResolved = true
 		}
-		issue, err := s.cfg.GitHub.GetIssueScoped(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
+		issue, err := s.cfg.GitHub.GetIssue(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
 		if err != nil {
 			s.cfg.Logger.Warn("reconcile-on-read: get issue failed; item left unsettled",
 				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "issue_ref", it.IssueRef, "error", err.Error())
