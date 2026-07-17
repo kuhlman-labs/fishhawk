@@ -61,6 +61,63 @@ func TestScaffoldFiles_Content(t *testing.T) {
 	}
 }
 
+// --- GitLabScaffoldFiles content tests ---
+
+func TestGitLabScaffoldFiles_ServedAndParses(t *testing.T) {
+	files := GitLabScaffoldFiles()
+
+	// Served at the repo-root .gitlab-ci.yml path GitLab evaluates.
+	raw, ok := files[".gitlab-ci.yml"]
+	if !ok {
+		t.Fatalf("GitLab scaffold missing .gitlab-ci.yml; keys=%v", keysOf(files))
+	}
+	if len(raw) == 0 {
+		t.Fatal(".gitlab-ci.yml is empty")
+	}
+
+	// It parses as YAML.
+	var parsed map[string]any
+	if err := yaml.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf(".gitlab-ci.yml does not parse as YAML: %v", err)
+	}
+
+	// It invokes the backend-agnostic runner keyed on the pipeline-trigger
+	// variables the backend supplies (mirroring the GitHub workflow_dispatch
+	// inputs). Assert both the invocation and every expected variable.
+	s := string(raw)
+	if !strings.Contains(s, "fishhawk-runner") {
+		t.Errorf(".gitlab-ci.yml does not invoke the fishhawk-runner")
+	}
+	if !strings.Contains(s, "--forge gitlab") {
+		t.Errorf(".gitlab-ci.yml does not select the gitlab forge")
+	}
+	for _, v := range []string{"$run_id", "$stage_id", "$workflow_id", "$parent_run_id"} {
+		if !strings.Contains(s, v) {
+			t.Errorf(".gitlab-ci.yml does not reference trigger variable %q", v)
+		}
+	}
+	// stage feeds both --stage and --agent (executor ref), with a default.
+	if !strings.Contains(s, "${stage:-claude-code}") {
+		t.Errorf(".gitlab-ci.yml does not default the stage/agent executor ref")
+	}
+	// The concurrency guard serializes fan-out siblings on the parent run.
+	if !strings.Contains(s, "resource_group") {
+		t.Errorf(".gitlab-ci.yml does not declare a resource_group concurrency guard")
+	}
+	// It must reference the PUBLISHED runner image, not a local build path.
+	if !strings.Contains(s, "ghcr.io/kuhlman-labs/fishhawk-runner:") {
+		t.Errorf(".gitlab-ci.yml does not pin the published runner image")
+	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	return ks
+}
+
 func TestScaffoldFiles_UnknownPreset(t *testing.T) {
 	_, err := ScaffoldFiles(spec.Preset("nonsense"))
 	if err == nil {
