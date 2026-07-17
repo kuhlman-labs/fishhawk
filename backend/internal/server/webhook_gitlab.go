@@ -342,6 +342,17 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 	// reconciler poll as a backstop — the GitLab webhook is the ONLY
 	// review-gate signal, so a silent miss strands the review stage with
 	// no trace. Warn so an unmatched merge/close is diagnosable.
+	//
+	// Known, deliberately-deferred residual (E45.20, tracked at #1861): the
+	// exact-URL supplement above resolves an aged-out-of-window run ONLY
+	// when its stored URL byte-matches the webhook URL. An OLDER MR whose
+	// stored URL differs from the webhook's only by the /-/ infix variance
+	// is resolvable solely via the iid/normalized paths, both windowed to
+	// the 50 most recent project runs — so it still falls through to this
+	// warn if it merges after 50+ newer runs. This is dormant until GitLab
+	// run creation lands (#1861), which is the natural home for closing it:
+	// either a durable project+IID persisted lookup column, or a
+	// non-windowed normalized-URL DB filter alongside the exact-URL one.
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 		"gitlab merge_request: no run matched; review stage will not transition",
 		slog.String("project", projectPath),
