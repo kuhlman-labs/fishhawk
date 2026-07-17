@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -411,7 +412,7 @@ func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries [
 			continue
 		}
 		body := pingCommentBody(ev.message, runURL)
-		if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+		if _, err := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID), ctxv.repo, ctxv.issueNumber, body); err != nil {
 			return fmt.Errorf("issuecomment: create ping comment: %w", err)
 		}
 		if err := n.appendPingAudit(ctx, ctxv.run.ID, ev); err != nil {

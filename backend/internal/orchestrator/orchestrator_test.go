@@ -18,6 +18,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -360,30 +361,30 @@ type mergeBranchCall struct {
 }
 
 type createPRCall struct {
-	InstallationID int64
-	Repo           githubclient.RepoRef
-	Head           string
-	Base           string
-	Title          string
-	Body           string
+	Scope forge.CredentialScope
+	Repo  githubclient.RepoRef
+	Head  string
+	Base  string
+	Title string
+	Body  string
 }
 
 type dispatchCall struct {
-	InstallationID int64
-	Repo           githubclient.RepoRef
-	WorkflowFile   string
-	Ref            string
-	Inputs         githubclient.DispatchInputs
+	Scope        forge.CredentialScope
+	Repo         githubclient.RepoRef
+	WorkflowFile string
+	Ref          string
+	Inputs       githubclient.DispatchInputs
 }
 
 type autoMergeCall struct {
-	InstallationID int64
-	Repo           githubclient.RepoRef
-	PRNumber       int
-	Method         githubclient.MergeMethod
+	Scope    forge.CredentialScope
+	Repo     githubclient.RepoRef
+	PRNumber int
+	Method   githubclient.MergeMethod
 }
 
-func (g *stubGitHub) DispatchWorkflow(_ context.Context, installationID int64,
+func (g *stubGitHub) DispatchWorkflowScoped(_ context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, file, ref string, inputs githubclient.DispatchInputs) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -391,13 +392,13 @@ func (g *stubGitHub) DispatchWorkflow(_ context.Context, installationID int64,
 		return g.dispatchErr
 	}
 	g.calls = append(g.calls, dispatchCall{
-		InstallationID: installationID, Repo: repo,
+		Scope: scope, Repo: repo,
 		WorkflowFile: file, Ref: ref, Inputs: inputs,
 	})
 	return nil
 }
 
-func (g *stubGitHub) EnableAutoMerge(_ context.Context, installationID int64,
+func (g *stubGitHub) EnableAutoMergeScoped(_ context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, prNumber int, method githubclient.MergeMethod) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -405,18 +406,18 @@ func (g *stubGitHub) EnableAutoMerge(_ context.Context, installationID int64,
 		return g.autoMergeErr
 	}
 	g.autoMergeCalls = append(g.autoMergeCalls, autoMergeCall{
-		InstallationID: installationID, Repo: repo,
+		Scope: scope, Repo: repo,
 		PRNumber: prNumber, Method: method,
 	})
 	return nil
 }
 
-func (g *stubGitHub) CreatePullRequest(_ context.Context, installationID int64,
+func (g *stubGitHub) CreatePullRequestScoped(_ context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.createPRCalls = append(g.createPRCalls, createPRCall{
-		InstallationID: installationID, Repo: repo,
+		Scope: scope, Repo: repo,
 		Head: head, Base: base, Title: title, Body: body,
 	})
 	if g.createPRErr != nil {
@@ -429,7 +430,7 @@ func (g *stubGitHub) CreatePullRequest(_ context.Context, installationID int64,
 	return &githubclient.PullRequest{Number: 777, HTMLURL: url, State: "open"}, nil
 }
 
-func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ int64,
+func (g *stubGitHub) ListOpenPullRequestsByHeadScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, _, _ string) ([]githubclient.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -440,7 +441,7 @@ func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ int64,
 	return g.listByHeadResult, nil
 }
 
-func (g *stubGitHub) GetBranchSHA(_ context.Context, _ int64,
+func (g *stubGitHub) GetBranchSHAScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch string) (string, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -454,7 +455,7 @@ func (g *stubGitHub) GetBranchSHA(_ context.Context, _ int64,
 	return sha, true, nil
 }
 
-func (g *stubGitHub) CreateRef(_ context.Context, _ int64,
+func (g *stubGitHub) CreateRefScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch, sha string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -469,7 +470,7 @@ func (g *stubGitHub) CreateRef(_ context.Context, _ int64,
 	return nil
 }
 
-func (g *stubGitHub) MergeBranch(_ context.Context, _ int64,
+func (g *stubGitHub) MergeBranchScoped(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, base, head, msg string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -525,8 +526,8 @@ func TestAdvance_DispatchesNextAgentStage(t *testing.T) {
 		t.Fatalf("dispatch calls = %d, want 1", len(gh.calls))
 	}
 	call := gh.calls[0]
-	if call.InstallationID != 42 {
-		t.Errorf("installation_id = %d", call.InstallationID)
+	if call.Scope != forge.FromGitHubInstallationID(42) {
+		t.Errorf("installation_id scope = %v, want scope for 42", call.Scope)
 	}
 	if call.Repo.Owner != "x" || call.Repo.Name != "y" {
 		t.Errorf("repo = %+v", call.Repo)
@@ -849,7 +850,7 @@ func TestAdvance_AutoMergeStage_QueuesAndSucceeds(t *testing.T) {
 		t.Fatalf("auto-merge calls = %d, want 1", len(gh.autoMergeCalls))
 	}
 	got := gh.autoMergeCalls[0]
-	if got.PRNumber != 42 || got.InstallationID != 99 || got.Method != githubclient.MergeMethodSquash {
+	if got.PRNumber != 42 || got.Scope != forge.FromGitHubInstallationID(99) || got.Method != githubclient.MergeMethodSquash {
 		t.Errorf("auto-merge call = %+v", got)
 	}
 	if got.Repo.Owner != "kuhlman-labs" || got.Repo.Name != "example" {
@@ -1759,8 +1760,8 @@ func TestAdvance_DecomposedParent_OpensConsolidatedPR(t *testing.T) {
 	if call.Base != "main" {
 		t.Errorf("base = %q, want main (DefaultRef, not TriggerRef)", call.Base)
 	}
-	if call.InstallationID != 55 {
-		t.Errorf("installation_id = %d, want 55", call.InstallationID)
+	if call.Scope != forge.FromGitHubInstallationID(55) {
+		t.Errorf("installation_id scope = %v, want scope for 55", call.Scope)
 	}
 	// #1774: a non-conventional issue title is chore-prefixed to a
 	// Conventional Commits header.

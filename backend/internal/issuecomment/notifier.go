@@ -50,6 +50,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/cost"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/latency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -187,14 +188,14 @@ const (
 // terminal agent implement verdict (E42.2 / #1785), so the verdict lands in
 // the PR merge box, not only in the issue anchor + audit chain.
 type IssueCommenter interface {
-	CreateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
-	UpdateIssueComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error)
-	CreateReview(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error)
-	// ListIssueComments lists an issue/PR comment thread so the sticky-comment
+	CreateIssueCommentScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
+	UpdateIssueCommentScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error)
+	CreateReviewScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error)
+	// ListIssueCommentsScoped lists an issue/PR comment thread so the sticky-comment
 	// orphan-rediscovery fallback (#1793) can match a hidden marker to a comment
 	// whose id was lost from the audit chain. Production *githubclient.Client
 	// already implements it.
-	ListIssueComments(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
+	ListIssueCommentsScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error)
 }
 
 // PlanArtifactLister is the narrow slice of artifact.Repository the
@@ -622,7 +623,7 @@ func (n *Notifier) alreadyPostedAttempt(ctx context.Context, runID uuid.UUID, at
 // post() but stamps retry_attempt into the payload so dedup can
 // scope per-attempt.
 func (n *Notifier) postCIRetry(ctx context.Context, ctxv commentContext, attempt int, body string) error {
-	if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID), ctxv.repo, ctxv.issueNumber, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem
@@ -765,7 +766,7 @@ func (n *Notifier) alreadyPostedBudgetTier(ctx context.Context, runID uuid.UUID,
 // postBudgetAlert fires the comment and writes the audit row, stamping
 // period_start + budget_tier so the dedup can scope per-period/per-tier.
 func (n *Notifier) postBudgetAlert(ctx context.Context, ctxv commentContext, p BudgetAlertPayload, body string) error {
-	if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID), ctxv.repo, ctxv.issueNumber, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem
@@ -839,7 +840,7 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 		// id (#1793). Re-discover by matching the hidden anchor marker on the
 		// thread before creating a second comment; on no match / list error this
 		// returns 0 and we fall through to create, preserving today's behavior.
-		if recovered := n.rediscoverStickyComment(ctx, *ctxv.run.InstallationID,
+		if recovered := n.rediscoverStickyComment(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID),
 			ctxv.repo, ctxv.issueNumber, stickyMarker(stickyLocusAnchor, runID)); recovered > 0 {
 			existingID = recovered
 		}
@@ -848,7 +849,7 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 	if existingID > 0 {
 		// Try to edit in place. If the comment was deleted, fall
 		// through to create.
-		got, updErr := n.github.UpdateIssueComment(ctx, *ctxv.run.InstallationID,
+		got, updErr := n.github.UpdateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID),
 			ctxv.repo, existingID, body)
 		switch {
 		case updErr == nil:
@@ -862,7 +863,7 @@ func (n *Notifier) NotifyStatusUpdate(ctx context.Context, runID uuid.UUID, body
 		}
 	}
 
-	created, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID,
+	created, err := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID),
 		ctxv.repo, ctxv.issueNumber, body)
 	if err != nil {
 		return fmt.Errorf("issuecomment: create status comment: %w", err)
@@ -1312,8 +1313,8 @@ func extractGithubCommentID(payload []byte) int64 {
 // match. Fail-open: a list error (or an empty thread) returns 0, degrading to
 // today's behavior (create a fresh comment) — the extra list call is off the
 // hot path because it fires only when the audit lookup already returned 0.
-func (n *Notifier) rediscoverStickyComment(ctx context.Context, installationID int64, repo githubclient.RepoRef, number int, marker string) int64 {
-	comments, err := n.github.ListIssueComments(ctx, installationID, repo, number)
+func (n *Notifier) rediscoverStickyComment(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int, marker string) int64 {
+	comments, err := n.github.ListIssueCommentsScoped(ctx, scope, repo, number)
 	if err != nil {
 		// Fail-open: degrade to create, matching the surrounding best-effort
 		// posture. The next successful audit append re-anchors the id.
@@ -1374,7 +1375,7 @@ func (n *Notifier) maybeUpdatePRStatusComment(ctx context.Context, runRow *run.R
 		// before creating a second comment; leave lastHash empty so the recovered
 		// comment is edited in place (not dedup-skipped). No match / list error
 		// returns 0 and we fall through to create, preserving today's behavior.
-		if recovered := n.rediscoverStickyComment(ctx, *runRow.InstallationID,
+		if recovered := n.rediscoverStickyComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID),
 			repo, prNumber, stickyMarker(stickyLocusPRStatus, runRow.ID)); recovered > 0 {
 			existingID = recovered
 		}
@@ -1389,13 +1390,13 @@ func (n *Notifier) maybeUpdatePRStatusComment(ctx context.Context, runRow *run.R
 	var commentID int64
 	switch {
 	case existingID > 0:
-		got, updErr := n.github.UpdateIssueComment(ctx, *runRow.InstallationID, repo, existingID, body)
+		got, updErr := n.github.UpdateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, existingID, body)
 		switch {
 		case updErr == nil:
 			commentID = got.ID
 		case errors.Is(updErr, githubclient.ErrNotFound):
 			// Operator deleted the comment between updates — recreate it.
-			created, cerr := n.github.CreateIssueComment(ctx, *runRow.InstallationID, repo, prNumber, body)
+			created, cerr := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber, body)
 			if cerr != nil {
 				return nil
 			}
@@ -1404,7 +1405,7 @@ func (n *Notifier) maybeUpdatePRStatusComment(ctx context.Context, runRow *run.R
 			return nil
 		}
 	default:
-		created, cerr := n.github.CreateIssueComment(ctx, *runRow.InstallationID, repo, prNumber, body)
+		created, cerr := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber, body)
 		if cerr != nil {
 			return nil
 		}
@@ -1601,7 +1602,7 @@ func (n *Notifier) maybePostAgentReviewPRReviews(ctx context.Context, runRow *ru
 			// Undecodable / verdictless payload — nothing to post.
 			continue
 		}
-		result, cerr := n.github.CreateReview(ctx, *runRow.InstallationID, repo, prNumber, githubclient.CreateReviewParams{
+		result, cerr := n.github.CreateReviewScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber, githubclient.CreateReviewParams{
 			Body:  body,
 			Event: PRReviewEventComment,
 		})
@@ -1820,7 +1821,7 @@ func (n *Notifier) NotifySlashApprovalReply(ctx context.Context, p SlashApproval
 	if err != nil {
 		return nil
 	}
-	if _, err := n.github.CreateIssueComment(ctx, p.InstallationID, repo, p.IssueNumber, p.Body); err != nil {
+	if _, err := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(p.InstallationID), repo, p.IssueNumber, p.Body); err != nil {
 		return fmt.Errorf("issuecomment: create reply: %w", err)
 	}
 	return nil
@@ -1835,7 +1836,7 @@ func (n *Notifier) NotifySlashApprovalReply(ctx context.Context, p SlashApproval
 // global-chain run_rejected_misconfigured audit entry + a WARN log,
 // neither of which the customer can see.
 //
-// Flat primitive params (repo, installationID, issueNumber,
+// Flat primitive params (repo, scope, issueNumber,
 // workflowID, stageID) rather than a struct or a run UUID: the guard
 // fires before any run row is minted — there is no run UUID to pass —
 // and the signature matches the NotifyCIRetry / NotifyStatusUpdateForRun
@@ -1843,7 +1844,7 @@ func (n *Notifier) NotifySlashApprovalReply(ctx context.Context, p SlashApproval
 // the method without importing this package's concrete types.
 //
 // Skips silently when the receiver is nil, issueNumber <= 0,
-// installationID == 0, or the repo is malformed (defense in depth;
+// scope is zero, or the repo is malformed (defense in depth;
 // the dispatcher guard should only call this with valid coordinates).
 //
 // Dedup posture (deliberately none at this layer, mirroring
@@ -1859,11 +1860,11 @@ func (n *Notifier) NotifySlashApprovalReply(ctx context.Context, p SlashApproval
 //
 // Best-effort: a post failure returns a wrapped error the dispatcher
 // logs at WARN; it does not change the refusal outcome.
-func (n *Notifier) NotifyRunRejected(ctx context.Context, repo string, installationID int64, issueNumber int, workflowID, stageID string) error {
+func (n *Notifier) NotifyRunRejected(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error {
 	if n == nil {
 		return nil
 	}
-	if issueNumber <= 0 || installationID == 0 {
+	if issueNumber <= 0 || scope.IsZero() {
 		return nil
 	}
 	repoRef, err := parseRepo(repo)
@@ -1871,7 +1872,7 @@ func (n *Notifier) NotifyRunRejected(ctx context.Context, repo string, installat
 		return nil
 	}
 	body := renderRunRejectedBody(workflowID, stageID)
-	if _, err := n.github.CreateIssueComment(ctx, installationID, repoRef, issueNumber, body); err != nil {
+	if _, err := n.github.CreateIssueCommentScoped(ctx, scope, repoRef, issueNumber, body); err != nil {
 		return fmt.Errorf("issuecomment: create run-rejected comment: %w", err)
 	}
 	return nil
@@ -1978,7 +1979,7 @@ func (n *Notifier) alreadyPosted(ctx context.Context, runID uuid.UUID, kind Kind
 // the comment as posted — the next NotifyXxx call would re-post
 // (rare; the audit log is highly available).
 func (n *Notifier) post(ctx context.Context, ctxv commentContext, kind Kind, body string) error {
-	if _, err := n.github.CreateIssueComment(ctx, *ctxv.run.InstallationID, ctxv.repo, ctxv.issueNumber, body); err != nil {
+	if _, err := n.github.CreateIssueCommentScoped(ctx, forge.FromGitHubInstallationID(*ctxv.run.InstallationID), ctxv.repo, ctxv.issueNumber, body); err != nil {
 		return fmt.Errorf("issuecomment: create comment: %w", err)
 	}
 	systemKind := audit.ActorSystem

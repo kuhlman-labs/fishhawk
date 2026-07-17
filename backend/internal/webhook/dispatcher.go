@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -690,16 +691,16 @@ func matchInstallation(ev Event) Match {
 // without standing up an httptest.Server alongside the existing
 // dispatcher tests.
 type GitHubAPI interface {
-	GetWorkflowSpec(ctx context.Context, installationID int64,
+	GetWorkflowSpecScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, ref string) (*githubclient.FileContent, error)
-	DispatchWorkflow(ctx context.Context, installationID int64,
+	DispatchWorkflowScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
-	GetWorkflowRun(ctx context.Context, installationID int64,
+	GetWorkflowRunScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
-	GetBranchProtection(ctx context.Context, installationID int64,
+	GetBranchProtectionScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, branch string) (*githubclient.BranchProtection, error)
-	ListRulesetRequiredChecks(ctx context.Context, installationID int64,
+	ListRulesetRequiredChecksScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error)
 }
 
@@ -727,7 +728,7 @@ type IssueNotifier interface {
 	// CreateRun, so there is no run UUID — the issue coordinates are
 	// passed as flat primitives (matching NotifyCIRetry's convention).
 	// Best-effort: failures log but don't change the refusal outcome.
-	NotifyRunRejected(ctx context.Context, repo string, installationID int64, issueNumber int, workflowID, stageID string) error
+	NotifyRunRejected(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error
 }
 
 // BoardSyncer drives the best-effort run-lifecycle board-state transition
@@ -749,7 +750,7 @@ type BoardSyncer interface {
 // round-trips. Nil leaves the installation-scaffold path off — the event is
 // acknowledged and skipped.
 type Scaffolder interface {
-	OpenScaffoldPR(ctx context.Context, installationID int64,
+	OpenScaffoldPR(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef) (*onboarding.Result, error)
 }
 
@@ -922,11 +923,12 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	if ref == "" {
 		ref = "main"
 	}
+	scope := forge.FromGitHubInstallationID(ev.InstallationID)
 
 	// Step 1: fetch the workflow spec at the ref. Failures here
 	// are typically "App lacks access" or "file not yet committed";
 	// neither is transient.
-	specFile, err := d.GitHub.GetWorkflowSpec(ctx, ev.InstallationID, repo, ref)
+	specFile, err := d.GitHub.GetWorkflowSpecScoped(ctx, scope, repo, ref)
 	if err != nil {
 		// If the App can't read the file, we can't dispatch;
 		// record the outcome and return nil so GitHub doesn't
@@ -1013,7 +1015,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 			// labeled-issue and /fishhawk run paths are both covered.
 			if d.IssueNotifier != nil && m.TriggerSource == run.TriggerGitHubIssue &&
 				m.IssueRef != nil && m.IssueRef.Number > 0 {
-				if err := d.IssueNotifier.NotifyRunRejected(ctx, ev.Repo, ev.InstallationID,
+				if err := d.IssueNotifier.NotifyRunRejected(ctx, ev.Repo, scope,
 					m.IssueRef.Number, m.WorkflowID, st.ID); err != nil {
 					d.logger().LogAttrs(ctx, slog.LevelWarn,
 						"run-rejected comment failed",
@@ -1036,7 +1038,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// a category-B audit; v0 won't dispatch into an ungated repo
 	// because the gate-state derivation later in the flow has
 	// nothing to derive from.
-	snapshot, snapshotErr := d.resolveRequiredChecks(ctx, ev.InstallationID, repo, ref)
+	snapshot, snapshotErr := d.resolveRequiredChecks(ctx, scope, repo, ref)
 	if snapshotErr != nil {
 		d.writeProtectionRefusalAudit(ctx, ev, m, specFile.SHA, snapshotErr, now)
 		return nil
@@ -1117,7 +1119,7 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		actionsFile = DefaultActionsWorkflowFile
 	}
 	firstStage := stages[0]
-	dispatchErr := d.GitHub.DispatchWorkflow(ctx, ev.InstallationID, repo,
+	dispatchErr := d.GitHub.DispatchWorkflowScoped(ctx, scope, repo,
 		actionsFile, ref, githubclient.DispatchInputs{
 			"run_id":      created.ID.String(),
 			"stage_id":    firstStage.ID.String(),
@@ -1322,7 +1324,7 @@ func (d *Dispatcher) handleInstallation(ctx context.Context, ev Event, m Match) 
 				slog.String("repo", fullName))
 			continue
 		}
-		res, err := d.Scaffolder.OpenScaffoldPR(ctx, ev.InstallationID, repo)
+		res, err := d.Scaffolder.OpenScaffoldPR(ctx, forge.FromGitHubInstallationID(ev.InstallationID), repo)
 		if err != nil {
 			d.logger().LogAttrs(ctx, slog.LevelWarn,
 				"installation scaffold: open scaffold PR failed",
@@ -1384,7 +1386,7 @@ func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m M
 		return nil
 	}
 
-	wfRun, err := d.GitHub.GetWorkflowRun(ctx, ev.InstallationID, repo, m.WorkflowRunID)
+	wfRun, err := d.GitHub.GetWorkflowRunScoped(ctx, forge.FromGitHubInstallationID(ev.InstallationID), repo, m.WorkflowRunID)
 	if err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"runner_action_failed: get workflow run failed",
@@ -1632,7 +1634,7 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		if actionsFile == "" {
 			actionsFile = DefaultActionsWorkflowFile
 		}
-		dispatchErr = d.GitHub.DispatchWorkflow(ctx, installationID, repo,
+		dispatchErr = d.GitHub.DispatchWorkflowScoped(ctx, forge.FromGitHubInstallationID(installationID), repo,
 			actionsFile, dispatchRef, githubclient.DispatchInputs{
 				"run_id":      child.ID.String(),
 				"stage_id":    firstStage.ID.String(),
@@ -2164,7 +2166,7 @@ var errProtectionScopeMissing = errors.New("app installation missing administrat
 // errProtectionScopeMissing when the App lacks the new permission;
 // any other error is a transport / GitHub-side issue and surfaces
 // to the caller as-is so step 3.5 can audit and refuse.
-func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, installationID int64,
+func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, scope forge.CredentialScope,
 	repo githubclient.RepoRef, branch string) (*run.RequiredChecksSnapshot, error) {
 	var contexts []string
 	var sources []string
@@ -2177,7 +2179,7 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, installationID i
 		contexts = append(contexts, c)
 	}
 
-	classic, classicErr := d.GitHub.GetBranchProtection(ctx, installationID, repo, branch)
+	classic, classicErr := d.GitHub.GetBranchProtectionScoped(ctx, scope, repo, branch)
 	switch {
 	case classicErr == nil:
 		if len(classic.RequiredStatusCheckContexts) > 0 {
@@ -2195,7 +2197,7 @@ func (d *Dispatcher) resolveRequiredChecks(ctx context.Context, installationID i
 		return nil, fmt.Errorf("get branch protection: %w", classicErr)
 	}
 
-	rulesets, rulesetsErr := d.GitHub.ListRulesetRequiredChecks(ctx, installationID, repo, branch)
+	rulesets, rulesetsErr := d.GitHub.ListRulesetRequiredChecksScoped(ctx, scope, repo, branch)
 	switch {
 	case rulesetsErr == nil:
 		for _, r := range rulesets {

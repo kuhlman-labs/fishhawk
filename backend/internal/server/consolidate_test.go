@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -43,14 +44,14 @@ func newConsolidateGitHub() *consolidateGitHub {
 	}
 }
 
-func (g *consolidateGitHub) GetBranchSHA(_ context.Context, _ int64, _ githubclient.RepoRef, branch string) (string, bool, error) {
+func (g *consolidateGitHub) GetBranchSHAScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch string) (string, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	sha, ok := g.branchSHAs[branch]
 	return sha, ok, nil
 }
 
-func (g *consolidateGitHub) CreateRef(_ context.Context, _ int64, _ githubclient.RepoRef, branch, sha string) error {
+func (g *consolidateGitHub) CreateRefScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, branch, sha string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.createdRefs = append(g.createdRefs, branch)
@@ -58,7 +59,7 @@ func (g *consolidateGitHub) CreateRef(_ context.Context, _ int64, _ githubclient
 	return nil
 }
 
-func (g *consolidateGitHub) MergeBranch(_ context.Context, _ int64, _ githubclient.RepoRef, _, head, _ string) (string, error) {
+func (g *consolidateGitHub) MergeBranchScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, head, _ string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.mergeHeads = append(g.mergeHeads, head)
@@ -71,19 +72,19 @@ func (g *consolidateGitHub) MergeBranch(_ context.Context, _ int64, _ githubclie
 	return "mergesha-" + head, nil
 }
 
-func (g *consolidateGitHub) CreatePullRequest(_ context.Context, _ int64, _ githubclient.RepoRef, _, _, _, _ string) (*githubclient.PullRequest, error) {
+func (g *consolidateGitHub) CreatePullRequestScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _, _, _, _ string) (*githubclient.PullRequest, error) {
 	return &githubclient.PullRequest{HTMLURL: g.prURL}, nil
 }
 
-func (g *consolidateGitHub) ListOpenPullRequestsByHead(context.Context, int64, githubclient.RepoRef, string, string) ([]githubclient.PullRequest, error) {
+func (g *consolidateGitHub) ListOpenPullRequestsByHeadScoped(context.Context, forge.CredentialScope, githubclient.RepoRef, string, string) ([]githubclient.PullRequest, error) {
 	return nil, nil
 }
 
-func (g *consolidateGitHub) DispatchWorkflow(context.Context, int64, githubclient.RepoRef, string, string, githubclient.DispatchInputs) error {
+func (g *consolidateGitHub) DispatchWorkflowScoped(context.Context, forge.CredentialScope, githubclient.RepoRef, string, string, githubclient.DispatchInputs) error {
 	return nil
 }
 
-func (g *consolidateGitHub) EnableAutoMerge(context.Context, int64, githubclient.RepoRef, int, githubclient.MergeMethod) error {
+func (g *consolidateGitHub) EnableAutoMergeScoped(context.Context, forge.CredentialScope, githubclient.RepoRef, int, githubclient.MergeMethod) error {
 	return nil
 }
 

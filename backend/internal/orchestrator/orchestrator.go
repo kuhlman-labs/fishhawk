@@ -37,6 +37,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -46,44 +47,44 @@ import (
 // GitHubAPI is the slice of githubclient.Client the orchestrator
 // uses. Extracting an interface lets tests substitute a stub.
 type GitHubAPI interface {
-	DispatchWorkflow(ctx context.Context, installationID int64,
+	DispatchWorkflowScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
-	// EnableAutoMerge queues a PR for auto-merge once branch
+	// EnableAutoMergeScoped queues a PR for auto-merge once branch
 	// protection clears (#255 / ADR-017). Used by routine_change-
 	// style workflows whose review stage is a check-only gate.
-	EnableAutoMerge(ctx context.Context, installationID int64,
+	EnableAutoMergeScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, prNumber int,
 		method githubclient.MergeMethod) error
-	// CreatePullRequest opens the single consolidated PR for a
+	// CreatePullRequestScoped opens the single consolidated PR for a
 	// decomposed parent run (#714 / ADR-032) once all children have
 	// pushed to the shared branch. Returns ErrPullRequestExists when a
 	// PR already exists for head/base (lost double-open race).
-	CreatePullRequest(ctx context.Context, installationID int64,
+	CreatePullRequestScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error)
-	// ListOpenPullRequestsByHead recovers the existing open PR for a
+	// ListOpenPullRequestsByHeadScoped recovers the existing open PR for a
 	// head branch — used to resolve the URL after CreatePullRequest
 	// returns ErrPullRequestExists (#714).
-	ListOpenPullRequestsByHead(ctx context.Context, installationID int64,
+	ListOpenPullRequestsByHeadScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, headBranch, base string) ([]githubclient.PullRequest, error)
-	// GetBranchSHA resolves a branch ref to its tip SHA, reporting
+	// GetBranchSHAScoped resolves a branch ref to its tip SHA, reporting
 	// absence as (_, false, nil). Used by the fan-in step (ADR-041 /
 	// #1142) to read the base ref and probe the consolidated branch.
-	GetBranchSHA(ctx context.Context, installationID int64,
+	GetBranchSHAScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, branch string) (string, bool, error)
-	// CreateRef creates a branch ref at sha (idempotent on a 422
+	// CreateRefScoped creates a branch ref at sha (idempotent on a 422
 	// "already exists"). The fan-in step creates the consolidated branch
 	// from the run's base ref when it does not yet exist (ADR-041 /
 	// #1142 — under E24.1 nobody else creates it).
-	CreateRef(ctx context.Context, installationID int64,
+	CreateRefScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, branch, sha string) error
-	// MergeBranch performs a server-side merge of head into base,
+	// MergeBranchScoped performs a server-side merge of head into base,
 	// returning the resulting merge commit SHA (empty on a 204 nothing-to-
 	// merge) and ErrMergeConflict on a 409. The fan-in step merges each
 	// succeeded slice branch onto the consolidated branch in slice order
 	// (ADR-041 / #1142) and records each merge SHA in slices_integrated so
 	// the ADR-035 lineage guard attributes the integration merges (#1459).
-	MergeBranch(ctx context.Context, installationID int64,
+	MergeBranchScoped(ctx context.Context, scope forge.CredentialScope,
 		repo githubclient.RepoRef, base, head, commitMessage string) (string, error)
 }
 
@@ -615,6 +616,7 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 			slog.String("run_id", r.ID.String()))
 		return r, nil
 	}
+	scope := forge.FromGitHubInstallationID(*r.InstallationID)
 
 	repo, err := parseRepo(r.Repo)
 	if err != nil {
@@ -665,13 +667,13 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 	// (e) Open the PR; recover the existing one on a lost race.
 	var prURL string
 	var prNumber int
-	pr, err := o.GitHub.CreatePullRequest(ctx, *r.InstallationID, repo, head, base, title, body)
+	pr, err := o.GitHub.CreatePullRequestScoped(ctx, scope, repo, head, base, title, body)
 	switch {
 	case err == nil:
 		prURL = pr.HTMLURL
 		prNumber = pr.Number
 	case errors.Is(err, githubclient.ErrPullRequestExists):
-		existing, lerr := o.GitHub.ListOpenPullRequestsByHead(ctx, *r.InstallationID, repo, head, base)
+		existing, lerr := o.GitHub.ListOpenPullRequestsByHeadScoped(ctx, scope, repo, head, base)
 		if lerr != nil {
 			return r, fmt.Errorf("recover existing pr for head %q: %w", head, lerr)
 		}
@@ -786,7 +788,7 @@ func (o *Orchestrator) recordConsolidatedPRArtifact(ctx context.Context, r *run.
 	if err != nil {
 		return fmt.Errorf("parse repo %q: %w", r.Repo, err)
 	}
-	headSHA, _, err := o.GitHub.GetBranchSHA(ctx, *r.InstallationID, repo, head)
+	headSHA, _, err := o.GitHub.GetBranchSHAScoped(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, head)
 	if err != nil {
 		return fmt.Errorf("resolve consolidated head %q: %w", head, err)
 	}
@@ -794,7 +796,7 @@ func (o *Orchestrator) recordConsolidatedPRArtifact(ctx context.Context, r *run.
 	// are load-bearing for the consumers. A transient failure resolving the base
 	// branch tip must NOT unwind the artifact record (and, per the ordering, the
 	// URL stamp) — log it and leave base_sha empty rather than forcing a retry.
-	baseSHA, _, berr := o.GitHub.GetBranchSHA(ctx, *r.InstallationID, repo, base)
+	baseSHA, _, berr := o.GitHub.GetBranchSHAScoped(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, base)
 	if berr != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: best-effort consolidated base_sha resolution failed; recording artifact without it",
 			slog.String("run_id", r.ID.String()),
@@ -1531,6 +1533,7 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 			slog.String("run_id", parent.ID.String()))
 		return nil, nil
 	}
+	scope := forge.FromGitHubInstallationID(*parent.InstallationID)
 
 	children, err := o.listAllDecomposedChildren(ctx, parent.ID)
 	if err != nil {
@@ -1572,7 +1575,7 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 	if base == "" {
 		base = "main"
 	}
-	baseSHA, exists, err := o.GitHub.GetBranchSHA(ctx, *parent.InstallationID, repo, base)
+	baseSHA, exists, err := o.GitHub.GetBranchSHAScoped(ctx, scope, repo, base)
 	if err != nil {
 		return nil, fmt.Errorf("resolve base ref %q: %w", base, err)
 	}
@@ -1584,10 +1587,10 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 	// when absent. CreateRef's 422 "already exists" no-op makes a
 	// re-entrant settle (sweeper + event-driven race) safe.
 	consolidated := consolidatedBranch(parent.ID)
-	if _, cexists, err := o.GitHub.GetBranchSHA(ctx, *parent.InstallationID, repo, consolidated); err != nil {
+	if _, cexists, err := o.GitHub.GetBranchSHAScoped(ctx, scope, repo, consolidated); err != nil {
 		return nil, fmt.Errorf("resolve consolidated branch %q: %w", consolidated, err)
 	} else if !cexists {
-		if err := o.GitHub.CreateRef(ctx, *parent.InstallationID, repo, consolidated, baseSHA); err != nil {
+		if err := o.GitHub.CreateRefScoped(ctx, scope, repo, consolidated, baseSHA); err != nil {
 			return nil, fmt.Errorf("create consolidated branch %q: %w", consolidated, err)
 		}
 	}
@@ -1602,7 +1605,7 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 	for _, c := range succeeded {
 		head := sliceBranch(parent.ID, *c.SliceIndex)
 		msg := fmt.Sprintf("Integrate slice %d (run %s) into %s", *c.SliceIndex, shortRunID(c.ID), consolidated)
-		mergeSHA, err := o.GitHub.MergeBranch(ctx, *parent.InstallationID, repo, consolidated, head, msg)
+		mergeSHA, err := o.GitHub.MergeBranchScoped(ctx, scope, repo, consolidated, head, msg)
 		switch {
 		case err == nil:
 			childIDs = append(childIDs, c.ID.String())
@@ -2831,7 +2834,7 @@ func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 	// conventions on GitHub repos and is what Fishhawk's own
 	// CLAUDE.md prescribes. Spec-level merge_method is a v0.x
 	// follow-up.
-	return o.GitHub.EnableAutoMerge(ctx, *r.InstallationID, repo, prNumber, githubclient.MergeMethodSquash)
+	return o.GitHub.EnableAutoMergeScoped(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, prNumber, githubclient.MergeMethodSquash)
 }
 
 // pullRequestNumberFromURL parses the trailing /pull/<n> segment
@@ -2956,7 +2959,7 @@ func (o *Orchestrator) fireDispatch(ctx context.Context, r *run.Run, next *run.S
 	if r.DecomposedFrom != nil {
 		inputs["parent_run_id"] = r.DecomposedFrom.String()
 	}
-	return o.GitHub.DispatchWorkflow(ctx, *r.InstallationID, repo, actionsFile, ref, inputs)
+	return o.GitHub.DispatchWorkflowScoped(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, actionsFile, ref, inputs)
 }
 
 func (o *Orchestrator) logger() *slog.Logger {

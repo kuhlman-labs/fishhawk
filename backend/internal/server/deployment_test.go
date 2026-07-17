@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -1033,11 +1034,11 @@ type fakeDeployPoller struct {
 	getCalls int
 }
 
-func (f *fakeDeployPoller) GetWorkflowRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
+func (f *fakeDeployPoller) GetWorkflowRunScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
 	f.getCalls++
 	return f.get, nil
 }
 
-func (f *fakeDeployPoller) ResolveDispatchedRun(_ context.Context, _ int64, _ githubclient.RepoRef, _ string, _ map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
+func (f *fakeDeployPoller) ResolveDispatchedRunScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string, _ map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
 	return nil, nil
 }

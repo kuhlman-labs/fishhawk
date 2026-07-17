@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -50,7 +51,7 @@ type Channel interface {
 	NotifySlashApprovalReply(ctx context.Context, p SlashApprovalReply) error
 	// NotifyRunRejected posts the missing-plan-reviewer refusal comment
 	// (#577 / #599) before any run row exists.
-	NotifyRunRejected(ctx context.Context, repo string, installationID int64, issueNumber int, workflowID, stageID string) error
+	NotifyRunRejected(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error
 	// ArtifactListerWired reports whether this channel renders the living
 	// anchor's plan section (the #1069 constructor-seam introspector). It
 	// posts nothing; non-GitHub channels return false.
@@ -154,9 +155,9 @@ func (r *Router) NotifySlashApprovalReply(ctx context.Context, p SlashApprovalRe
 }
 
 // NotifyRunRejected fans the run-rejected refusal comment out to every channel.
-func (r *Router) NotifyRunRejected(ctx context.Context, repo string, installationID int64, issueNumber int, workflowID, stageID string) error {
+func (r *Router) NotifyRunRejected(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error {
 	return r.each(func(c Channel) error {
-		return c.NotifyRunRejected(ctx, repo, installationID, issueNumber, workflowID, stageID)
+		return c.NotifyRunRejected(ctx, repo, scope, issueNumber, workflowID, stageID)
 	})
 }
 
