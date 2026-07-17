@@ -6,8 +6,18 @@ import (
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 )
+
+// commitPRWalker is the narrow slice of the forge surface GitHubResolver
+// drives: enumerate the commits in a range, then map each commit to the
+// PRs that landed it. A *githubclient.Client satisfies it (both methods
+// are on the concrete client); the pgtest assembly tests fake the
+// resolver above this seam, so this interface is only exercised by the
+// real wiring.
+type commitPRWalker interface {
+	CompareCommits(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, base, head string) ([]string, error)
+	ListPullRequestsForCommit(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, sha string) ([]forge.PullRequestRef, error)
+}
 
 // GitHubResolver is the production MergedPRResolver: it enumerates the
 // commits in (base, head] via CompareCommits, then associates each
@@ -15,7 +25,7 @@ import (
 // de-duped by PR number. The pgtest assembly tests fake the resolver;
 // this is the only wiring that touches GitHub.
 type GitHubResolver struct {
-	Client *githubclient.Client
+	Client commitPRWalker
 	Scope  forge.CredentialScope
 }
 
@@ -59,12 +69,12 @@ func (g *GitHubResolver) MergedPRsInRange(ctx context.Context, repo, base, head 
 }
 
 // parseRepoRef splits an "owner/name" repo string into a
-// githubclient.RepoRef. It rejects a string that is not exactly two
+// forge.RepoRef. It rejects a string that is not exactly two
 // non-empty slash-separated segments.
-func parseRepoRef(repo string) (githubclient.RepoRef, error) {
+func parseRepoRef(repo string) (forge.RepoRef, error) {
 	owner, name, ok := strings.Cut(repo, "/")
 	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-		return githubclient.RepoRef{}, fmt.Errorf("releaseevidence: repo must be owner/name, got %q", repo)
+		return forge.RepoRef{}, fmt.Errorf("releaseevidence: repo must be owner/name, got %q", repo)
 	}
-	return githubclient.RepoRef{Owner: owner, Name: name}, nil
+	return forge.RepoRef{Owner: owner, Name: name}, nil
 }

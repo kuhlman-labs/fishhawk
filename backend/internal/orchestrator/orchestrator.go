@@ -49,36 +49,36 @@ import (
 // uses. Extracting an interface lets tests substitute a stub.
 type GitHubAPI interface {
 	DispatchWorkflow(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, workflowFile, ref string,
+		repo forge.RepoRef, workflowFile, ref string,
 		inputs githubclient.DispatchInputs) error
 	// EnableAutoMerge queues a PR for auto-merge once branch
 	// protection clears (#255 / ADR-017). Used by routine_change-
 	// style workflows whose review stage is a check-only gate.
 	EnableAutoMerge(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, prNumber int,
-		method githubclient.MergeMethod) error
+		repo forge.RepoRef, prNumber int,
+		method forge.MergeMethod) error
 	// CreatePullRequest opens the single consolidated PR for a
 	// decomposed parent run (#714 / ADR-032) once all children have
 	// pushed to the shared branch. Returns ErrPullRequestExists when a
 	// PR already exists for head/base (lost double-open race).
 	CreatePullRequest(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error)
+		repo forge.RepoRef, head, base, title, body string) (*forge.PullRequest, error)
 	// ListOpenPullRequestsByHead recovers the existing open PR for a
 	// head branch — used to resolve the URL after CreatePullRequest
 	// returns ErrPullRequestExists (#714).
 	ListOpenPullRequestsByHead(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, headBranch, base string) ([]githubclient.PullRequest, error)
+		repo forge.RepoRef, headBranch, base string) ([]forge.PullRequest, error)
 	// GetBranchSHA resolves a branch ref to its tip SHA, reporting
 	// absence as (_, false, nil). Used by the fan-in step (ADR-041 /
 	// #1142) to read the base ref and probe the consolidated branch.
 	GetBranchSHA(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, branch string) (string, bool, error)
+		repo forge.RepoRef, branch string) (string, bool, error)
 	// CreateRef creates a branch ref at sha (idempotent on a 422
 	// "already exists"). The fan-in step creates the consolidated branch
 	// from the run's base ref when it does not yet exist (ADR-041 /
 	// #1142 — under E24.1 nobody else creates it).
 	CreateRef(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, branch, sha string) error
+		repo forge.RepoRef, branch, sha string) error
 	// MergeBranch performs a server-side merge of head into base,
 	// returning the resulting merge commit SHA (empty on a 204 nothing-to-
 	// merge) and ErrMergeConflict on a 409. The fan-in step merges each
@@ -86,7 +86,7 @@ type GitHubAPI interface {
 	// (ADR-041 / #1142) and records each merge SHA in slices_integrated so
 	// the ADR-035 lineage guard attributes the integration merges (#1459).
 	MergeBranch(ctx context.Context, scope forge.CredentialScope,
-		repo githubclient.RepoRef, base, head, commitMessage string) (string, error)
+		repo forge.RepoRef, base, head, commitMessage string) (string, error)
 }
 
 // ConsolidatedReviewDispatcher dispatches the gating agent implement
@@ -673,7 +673,7 @@ func (o *Orchestrator) maybeOpenConsolidatedPR(ctx context.Context, r *run.Run, 
 	case err == nil:
 		prURL = pr.HTMLURL
 		prNumber = pr.Number
-	case errors.Is(err, githubclient.ErrPullRequestExists):
+	case errors.Is(err, forge.ErrPullRequestExists):
 		existing, lerr := o.GitHub.ListOpenPullRequestsByHead(ctx, scope, repo, head, base)
 		if lerr != nil {
 			return r, fmt.Errorf("recover existing pr for head %q: %w", head, lerr)
@@ -1620,7 +1620,7 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 				// slices_integrated.integration_commit_shas.
 				o.emitIntegrationCommitRecorded(ctx, parent.ID, mergeSHA, *c.SliceIndex, c.ID.String(), consolidated)
 			}
-		case errors.Is(err, githubclient.ErrMergeConflict):
+		case errors.Is(err, forge.ErrMergeConflict):
 			detail := fmt.Sprintf("slice integration conflict: slice %d (child run %s) could not merge onto %s",
 				*c.SliceIndex, c.ID, consolidated)
 			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator: slice integration conflict",
@@ -2818,7 +2818,7 @@ func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 	// conventions on GitHub repos and is what Fishhawk's own
 	// CLAUDE.md prescribes. Spec-level merge_method is a v0.x
 	// follow-up.
-	return o.GitHub.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, prNumber, githubclient.MergeMethodSquash)
+	return o.GitHub.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, prNumber, forge.MergeMethodSquash)
 }
 
 // pullRequestNumberFromURL parses the trailing /pull/<n> segment
@@ -2855,14 +2855,14 @@ func (o *Orchestrator) logger() *slog.Logger {
 // parseRepo splits "owner/name" — duplicated from
 // internal/webhook/dispatcher.go to keep the orchestrator package
 // dependency-light. A shared helper is a v0.x cleanup.
-func parseRepo(s string) (githubclient.RepoRef, error) {
+func parseRepo(s string) (forge.RepoRef, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] == '/' {
 			if i == 0 || i == len(s)-1 {
-				return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+				return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 			}
-			return githubclient.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
+			return forge.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
 		}
 	}
-	return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+	return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 }

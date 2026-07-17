@@ -9,7 +9,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -54,12 +53,12 @@ func (f *fakeRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 
 // stubPRGetter returns a canned PR state and counts calls.
 type stubPRGetter struct {
-	pr    *githubclient.PullRequest
+	pr    *forge.PullRequest
 	err   error
 	calls int
 }
 
-func (s *stubPRGetter) GetPullRequest(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) (*githubclient.PullRequest, error) {
+func (s *stubPRGetter) GetPullRequest(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, _ int) (*forge.PullRequest, error) {
 	s.calls++
 	if s.err != nil {
 		return nil, s.err
@@ -122,7 +121,7 @@ func newTicker(repo *fakeRepo, pg *stubPRGetter, res *stubResolver) *Ticker {
 func TestTick_Merged_ResolvesSucceeded(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -167,7 +166,7 @@ func TestTick_ReviewResolverSeam_GithubMergeResolvesMerged(t *testing.T) {
 
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	tk := &Ticker{Runs: repo, PRGetter: pg, Resolver: resolver}
 	tk.Tick(context.Background())
 
@@ -196,7 +195,7 @@ func TestTick_SLALessReviewStage_Merged_Resolves(t *testing.T) {
 		t.Fatalf("precondition: review stage should have no gate SLA, got %v", *s.GateSLA)
 	}
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -228,7 +227,7 @@ func (s *stubReverifier) ReverifyBranchLineage(_ context.Context, _ uuid.UUID, p
 func TestTick_Merged_ReverifierNotClean_SkipsResolve(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	rev := &stubReverifier{clean: false}
 	tk := newTicker(repo, pg, res)
@@ -248,7 +247,7 @@ func TestTick_Merged_ReverifierNotClean_SkipsResolve(t *testing.T) {
 func TestTick_Merged_ReverifierClean_Resolves(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	rev := &stubReverifier{clean: true}
 	tk := newTicker(repo, pg, res)
@@ -268,7 +267,7 @@ func TestTick_Merged_ReverifierClean_Resolves(t *testing.T) {
 func TestTick_Merged_NilReverifier_Resolves(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	tk := newTicker(repo, pg, res) // LineageReverifier left nil
 	tk.Tick(context.Background())
@@ -283,7 +282,7 @@ func TestTick_Merged_NilReverifier_Resolves(t *testing.T) {
 func TestTick_ClosedUnmerged_ReverifierNotConsulted(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: false}}
 	res := &stubResolver{}
 	rev := &stubReverifier{clean: false}
 	tk := newTicker(repo, pg, res)
@@ -315,7 +314,7 @@ func (s *stubRepublisher) RepublishAuditCheck(_ context.Context, runID uuid.UUID
 func TestTick_OpenPR_RepublisherInvoked(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &stubResolver{}
 	rep := &stubRepublisher{}
 	tk := newTicker(repo, pg, res)
@@ -356,7 +355,7 @@ func TestTick_GetPRError_RepublisherStillInvoked(t *testing.T) {
 func TestTick_NilRepublisher_BehaviorUnchanged(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background()) // AuditCheckRepublisher left nil
 
@@ -375,7 +374,7 @@ func TestTick_SkipCleanStages_RepublisherNotInvoked(t *testing.T) {
 		awaiting: []*run.Stage{noInstStage, noPRStage},
 		runs:     map[uuid.UUID]*run.Run{noInst.ID: noInst, noPR.ID: noPR},
 	}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &stubResolver{}
 	rep := &stubRepublisher{}
 	tk := newTicker(repo, pg, res)
@@ -393,7 +392,7 @@ func TestTick_SkipCleanStages_RepublisherNotInvoked(t *testing.T) {
 func TestTick_ClosedUnmerged_ResolvesCancelled(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: false}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -408,7 +407,7 @@ func TestTick_ClosedUnmerged_ResolvesCancelled(t *testing.T) {
 func TestTick_OpenPR_NoResolve(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -423,7 +422,7 @@ func TestTick_OpenPR_NoResolve(t *testing.T) {
 func TestTick_NilInstallation_Skips(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", nil) // no installation
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -438,7 +437,7 @@ func TestTick_NilInstallation_Skips(t *testing.T) {
 func TestTick_NoPullRequestURL_Skips(t *testing.T) {
 	r, s := reviewRun("", instID(99)) // no PR URL — pre-existing parked run
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -450,7 +449,7 @@ func TestTick_NoPullRequestURL_Skips(t *testing.T) {
 func TestTick_MalformedPRURL_Skips(t *testing.T) {
 	r, s := reviewRun("https://example.com/not/a/pr", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -467,7 +466,7 @@ func TestTick_NonReviewStage_Filtered(t *testing.T) {
 	r := &run.Run{ID: runID, Repo: "x/y", InstallationID: instID(99), PullRequestURL: strPtr("https://github.com/x/y/pull/42")}
 	planStage := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
 	repo := &fakeRepo{awaiting: []*run.Stage{planStage}, runs: map[uuid.UUID]*run.Run{runID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -493,7 +492,7 @@ func TestTick_SecondTickAfterResolution_IsNoOp(t *testing.T) {
 	// leaves awaiting_approval, so the next tick has nothing to re-poll.
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{repo: repo}
 	tk := newTicker(repo, pg, res)
 
@@ -513,7 +512,7 @@ func TestTick_ResolverError_Logged_NoPanic(t *testing.T) {
 	// re-polls the still-terminal PR and retries idempotently.
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{err: errors.New("transition rejected")}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -525,7 +524,7 @@ func TestTick_ResolverError_Logged_NoPanic(t *testing.T) {
 func TestTick_GetRunError_Skips(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, getErr: errors.New("db down"), runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -547,7 +546,7 @@ func TestTick_ListAwaitingError_NoPanic(t *testing.T) {
 func TestRun_FiresImmediatelyThenStopsOnCancel(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	// fired closes on the first resolve so the test synchronizes without
 	// racing on the call slice.
 	res := &chanResolver{fired: make(chan struct{}, 1)}
@@ -656,7 +655,7 @@ func TestTick_OpenPR_DriveRun_ObserverInvoked(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	r.Drive = true
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open"}}
 	res := &stubResolver{}
 	obs := &stubDriveObserver{}
 	tk := newTicker(repo, pg, res)
@@ -677,7 +676,7 @@ func TestTick_OpenPR_DriveRun_ObserverInvoked(t *testing.T) {
 func TestTick_OpenPR_NonDriveRun_ObserverNotInvoked(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open"}}
 	obs := &stubDriveObserver{}
 	tk := newTicker(repo, pg, &stubResolver{})
 	tk.DriveObserver = obs
@@ -694,7 +693,7 @@ func TestTick_MergedPR_DriveRun_ObserverNotInvoked(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	r.Drive = true
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	obs := &stubDriveObserver{}
 	tk := newTicker(repo, pg, res)
@@ -715,7 +714,7 @@ func TestTick_ResolverUpgrade_DefaultsDriveObserver(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	r.Drive = true
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open"}}
 	res := &resolverWithObserver{}
 	tk := &Ticker{Runs: repo, PRGetter: pg, Resolver: res}
 	tk.Tick(context.Background())
@@ -731,7 +730,7 @@ func TestTick_PlainResolver_NoObserver_NoPanic(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	r.Drive = true
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open"}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open"}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background())
 
@@ -771,7 +770,7 @@ type resolverWithBoardHealer struct {
 func TestTick_OpenPR_BoardHealerInvoked(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &stubResolver{}
 	bh := &stubBoardHealer{}
 	tk := newTicker(repo, pg, res)
@@ -796,7 +795,7 @@ func TestTick_OpenPR_BoardHealerInvoked(t *testing.T) {
 func TestTick_BoardHeal_DedupedAcrossTicks(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &stubResolver{}
 	bh := &stubBoardHealer{}
 	tk := newTicker(repo, pg, res)
@@ -818,7 +817,7 @@ func TestTick_BoardHeal_DedupedAcrossTicks(t *testing.T) {
 func TestTick_MergedPR_BoardHealerNotInvoked(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "closed", Merged: true}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "closed", Merged: true}}
 	res := &stubResolver{}
 	bh := &stubBoardHealer{}
 	tk := newTicker(repo, pg, res)
@@ -843,7 +842,7 @@ func TestTick_SkipCleanStages_BoardHealerNotInvoked(t *testing.T) {
 		awaiting: []*run.Stage{noInstStage, noPRStage},
 		runs:     map[uuid.UUID]*run.Run{noInst.ID: noInst, noPR.ID: noPR},
 	}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &stubResolver{}
 	bh := &stubBoardHealer{}
 	tk := newTicker(repo, pg, res)
@@ -861,7 +860,7 @@ func TestTick_SkipCleanStages_BoardHealerNotInvoked(t *testing.T) {
 func TestTick_NilBoardHealer_BehaviorUnchanged(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &stubResolver{}
 	newTicker(repo, pg, res).Tick(context.Background()) // BoardTransitionHealer left nil
 
@@ -876,7 +875,7 @@ func TestTick_NilBoardHealer_BehaviorUnchanged(t *testing.T) {
 func TestTick_ResolverUpgrade_DefaultsBoardHealer(t *testing.T) {
 	r, s := reviewRun("https://github.com/x/y/pull/42", instID(99))
 	repo := &fakeRepo{awaiting: []*run.Stage{s}, runs: map[uuid.UUID]*run.Run{r.ID: r}}
-	pg := &stubPRGetter{pr: &githubclient.PullRequest{State: "open", Merged: false}}
+	pg := &stubPRGetter{pr: &forge.PullRequest{State: "open", Merged: false}}
 	res := &resolverWithBoardHealer{}
 	tk := &Ticker{Runs: repo, PRGetter: pg, Resolver: res}
 	tk.Tick(context.Background())
