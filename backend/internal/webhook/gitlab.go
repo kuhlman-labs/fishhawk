@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -50,8 +51,14 @@ const gitLabScopeRefPrefix = "gitlab:"
 // GitLab sends the webhook's secret token VERBATIM in the
 // X-Gitlab-Token header — there is NO HMAC over the body (per
 // https://docs.gitlab.com/user/project/integrations/webhooks/#validate-payloads-by-using-a-secret-token).
-// The comparison is constant-time so a wrong token can't be leaked
-// byte-by-byte via timing.
+//
+// The comparison hashes both sides to fixed-length SHA-256 digests
+// before the constant-time compare. A bare subtle.ConstantTimeCompare
+// over the raw bytes returns 0 immediately when the lengths differ, so
+// its running time depends on len(secret) — leaking the configured
+// secret's length via timing. Comparing equal-length digests makes the
+// compare time independent of both inputs' lengths (the same reason
+// VerifySignature compares fixed-length HMAC sums).
 //
 // Returns ErrSecretNotConfigured when secret is empty (the receiver
 // translates that to 503), ErrGitLabTokenMissing for an empty header,
@@ -64,7 +71,9 @@ func VerifyGitLabToken(secret []byte, header string) error {
 	if header == "" {
 		return ErrGitLabTokenMissing
 	}
-	if subtle.ConstantTimeCompare([]byte(header), secret) != 1 {
+	gotSum := sha256.Sum256([]byte(header))
+	wantSum := sha256.Sum256(secret)
+	if subtle.ConstantTimeCompare(gotSum[:], wantSum[:]) != 1 {
 		return ErrGitLabTokenInvalid
 	}
 	return nil

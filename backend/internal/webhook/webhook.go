@@ -78,6 +78,15 @@ type DeliveryStore interface {
 	// Mark records id as processed. Returns ErrDeliveryDuplicate if
 	// id was already recorded; nil on first write.
 	Mark(id string) error
+
+	// Unmark removes id's processed-record so a later Mark(id) is a
+	// first write again. Receivers call it to undo the pre-dispatch
+	// record when a delivery's processing fails and they return a 5xx:
+	// without it the forge's retry hits the still-recorded delivery,
+	// is deduped to a 2xx, and permanently drops an event whose
+	// processing actually failed. Idempotent — unmarking an id that
+	// was never recorded is a nil no-op.
+	Unmark(id string) error
 }
 
 // MemoryStore is a process-local DeliveryStore with TTL eviction.
@@ -119,6 +128,21 @@ func (s *MemoryStore) Mark(id string) error {
 		return ErrDeliveryDuplicate
 	}
 	s.entries[id] = now
+	return nil
+}
+
+// Unmark removes id so a later Mark(id) is treated as a first write
+// again. The receiver calls it to undo a delivery record when the
+// delivery's processing failed and it returned a 5xx — otherwise the
+// retry would be deduped to a 2xx, permanently dropping the event. A
+// no-op returning nil when id was never recorded (or is empty).
+func (s *MemoryStore) Unmark(id string) error {
+	if id == "" {
+		return ErrDeliveryMissing
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, id)
 	return nil
 }
 

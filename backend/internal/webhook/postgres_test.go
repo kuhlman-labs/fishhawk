@@ -66,6 +66,38 @@ func TestPostgresStore_DistinctIDsBothSucceed(t *testing.T) {
 	}
 }
 
+func TestPostgresStore_UnmarkAllowsReprocess(t *testing.T) {
+	s := newStore(t)
+	if err := s.Mark("um-1"); err != nil {
+		t.Fatalf("first Mark: %v", err)
+	}
+	// Recorded → duplicate while the row stands.
+	if err := s.Mark("um-1"); !errors.Is(err, webhook.ErrDeliveryDuplicate) {
+		t.Fatalf("pre-unmark Mark = %v, want ErrDeliveryDuplicate", err)
+	}
+	if err := s.Unmark("um-1"); err != nil {
+		t.Fatalf("Unmark: %v", err)
+	}
+	// After Unmark the retry re-processes: a fresh Mark is a first write.
+	if err := s.Mark("um-1"); err != nil {
+		t.Errorf("post-unmark Mark = %v, want nil (retry must re-process)", err)
+	}
+}
+
+func TestPostgresStore_UnmarkAbsentIsNoOp(t *testing.T) {
+	s := newStore(t)
+	if err := s.Unmark("never-recorded"); err != nil {
+		t.Errorf("Unmark of an absent id = %v, want nil no-op", err)
+	}
+}
+
+func TestPostgresStore_UnmarkEmptyIDRejected(t *testing.T) {
+	s := newStore(t)
+	if err := s.Unmark(""); !errors.Is(err, webhook.ErrDeliveryMissing) {
+		t.Errorf("err = %v, want ErrDeliveryMissing", err)
+	}
+}
+
 func TestPostgresStore_Evict(t *testing.T) {
 	s := newStore(t)
 	for _, id := range []string{"old-1", "old-2", "old-3"} {

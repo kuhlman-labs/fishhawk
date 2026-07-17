@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -218,8 +219,9 @@ func TestHandleWebhookGitLab_RecognizedSkip_202(t *testing.T) {
 	// receiver responds 202. The generic 5xx dispatch-error branch is
 	// mirrored verbatim from the GitHub receiver for parity + future
 	// GitLab run creation (E45.8); no current GitLab Handle path
-	// produces a transient error, so it is exercised by the shared
-	// GitHub mapping tests (TestWebhook_*), not reachable from here.
+	// produces a transient error, so it can't be reached through the real
+	// *webhook.Dispatcher here. Its unmark-on-failure behavior is pinned
+	// directly at TestDispatchGitLabDelivery_DispatchError_Unmarks.
 	disp := &webhook.Dispatcher{}
 	s, _ := newGitLabWebhookServer(t, gitlabServerOpts{dispatcher: disp})
 	body := []byte(`{"object_kind":"pipeline","user":{"username":"alice"},
@@ -227,6 +229,98 @@ func TestHandleWebhookGitLab_RecognizedSkip_202(t *testing.T) {
 		"object_attributes":{"status":"success"}}`)
 	if w := postGitLab(t, s, gitlabHeaders("Pipeline Hook", "p1"), body); w.Code != http.StatusAccepted {
 		t.Errorf("status = %d, want 202 (recognized skip)", w.Code)
+	}
+}
+
+// stubDeliveryStore is a DeliveryStore whose Mark result is fixed by
+// markErr and whose Unmark calls are recorded, so the receiver's two 5xx
+// branches (store-record failure, dispatch failure) can be exercised
+// without a real store or dispatcher.
+type stubDeliveryStore struct {
+	markErr  error
+	unmarked []string
+}
+
+func (s *stubDeliveryStore) Mark(string) error { return s.markErr }
+func (s *stubDeliveryStore) Unmark(id string) error {
+	s.unmarked = append(s.unmarked, id)
+	return nil
+}
+
+// TestHandleWebhookGitLab_StoreMarkFailure_500 pins the reachable
+// store-record 5xx branch (E45.6 concern 3): a non-duplicate error from
+// the delivery store's Mark surfaces as 500 'failed to record delivery'.
+// Because the delivery was never recorded, GitLab's retry re-processes —
+// so this branch (unlike the dispatch branch) needs no unmark.
+func TestHandleWebhookGitLab_StoreMarkFailure_500(t *testing.T) {
+	store := &stubDeliveryStore{markErr: errors.New("delivery store unavailable")}
+	s := New(Config{
+		Addr:                "127.0.0.1:0",
+		GitLabWebhookSecret: []byte(gitlabTestToken),
+		WebhookDeliveries:   store,
+	})
+	body := []byte(`{"object_kind":"issue","user":{"username":"alice"},
+		"project":{"id":1,"path_with_namespace":"g/p"},
+		"object_attributes":{"iid":1,"action":"open"}}`)
+	w := postGitLab(t, s, gitlabHeaders("Issue Hook", "u1"), body)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on store Mark failure:\n%s", w.Code, w.Body.String())
+	}
+	if len(store.unmarked) != 0 {
+		t.Errorf("unmarked = %v, want none (nothing was recorded to undo)", store.unmarked)
+	}
+}
+
+// TestDispatchGitLabDelivery_DispatchError_Unmarks pins the high-severity
+// retry contract (E45.6 concerns 1 & 2): when dispatch of an
+// already-recorded delivery fails, the delivery is UNMARKED so GitLab's
+// retry re-records and re-processes it rather than encountering the
+// recorded delivery and being deduped to a 202 — a permanent drop. The
+// real *webhook.Dispatcher has no GitLab path that returns an error, so
+// this drives the receiver's dispatch seam directly with an erroring
+// dispatch func and asserts the delivery is releasable afterward.
+func TestDispatchGitLabDelivery_DispatchError_Unmarks(t *testing.T) {
+	store := webhook.NewMemoryStore(0)
+	const deliveryID = "gitlab:dispatch-fail"
+	if err := store.Mark(deliveryID); err != nil {
+		t.Fatalf("seed Mark: %v", err)
+	}
+	s := New(Config{Addr: "127.0.0.1:0", WebhookDeliveries: store})
+	ev := webhook.Event{DeliveryID: deliveryID, Type: "issue", Forge: webhook.ForgeGitLab}
+
+	wantErr := errors.New("transient backend failure")
+	gotErr := s.dispatchGitLabDelivery(context.Background(), ev, func(context.Context, webhook.Event) error {
+		return wantErr
+	})
+	if !errors.Is(gotErr, wantErr) {
+		t.Fatalf("dispatchGitLabDelivery err = %v, want the dispatch error surfaced (→ 500)", gotErr)
+	}
+	// The delivery must be released: a fresh Mark succeeds, proving the
+	// retry re-processes instead of being deduped to a 202.
+	if err := store.Mark(deliveryID); err != nil {
+		t.Errorf("post-dispatch-failure Mark = %v, want nil (delivery must be unmarked so the retry re-processes)", err)
+	}
+}
+
+// TestDispatchGitLabDelivery_Success_KeepsRecord confirms the happy path
+// does NOT unmark: a successful dispatch leaves the delivery recorded so a
+// redelivery (e.g. a lost 202) is correctly deduped rather than reprocessed.
+func TestDispatchGitLabDelivery_Success_KeepsRecord(t *testing.T) {
+	store := webhook.NewMemoryStore(0)
+	const deliveryID = "gitlab:dispatch-ok"
+	if err := store.Mark(deliveryID); err != nil {
+		t.Fatalf("seed Mark: %v", err)
+	}
+	s := New(Config{Addr: "127.0.0.1:0", WebhookDeliveries: store})
+	ev := webhook.Event{DeliveryID: deliveryID, Type: "issue", Forge: webhook.ForgeGitLab}
+
+	if err := s.dispatchGitLabDelivery(context.Background(), ev, func(context.Context, webhook.Event) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("dispatchGitLabDelivery err = %v, want nil on success", err)
+	}
+	if err := store.Mark(deliveryID); !errors.Is(err, webhook.ErrDeliveryDuplicate) {
+		t.Errorf("post-success Mark = %v, want ErrDeliveryDuplicate (record must stand)", err)
 	}
 }
 

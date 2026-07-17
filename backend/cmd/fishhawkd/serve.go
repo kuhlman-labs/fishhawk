@@ -370,6 +370,28 @@ func webhookStoreNeeded(githubSecret, gitlabSecret string) bool {
 	return githubSecret != "" || gitlabSecret != ""
 }
 
+// newWebhookDeliveryStore builds the shared webhook delivery store,
+// consulting webhookStoreNeeded so the gating lives in exactly one place:
+// the store is created when EITHER forge's secret is set (a GitLab-only
+// deployment needs it just as a GitHub-only one does), and nil is returned
+// when neither is — so runServe's call site cannot re-inline a GitHub-only
+// gate while leaving webhookStoreNeeded intact (E45.6 binding condition 2 /
+// fix-up). Prefers the Postgres-backed store when a pool is available
+// (dedup survives restarts, shared across instances) and falls back to an
+// in-memory store otherwise. The second return is the concrete
+// *webhook.PostgresStore for the evictor wiring — non-nil only on the
+// Postgres path, nil for the memory store and the no-store case.
+func newWebhookDeliveryStore(pool *pgxpool.Pool, githubSecret, gitlabSecret string, retention time.Duration) (webhook.DeliveryStore, *webhook.PostgresStore) {
+	if !webhookStoreNeeded(githubSecret, gitlabSecret) {
+		return nil, nil
+	}
+	if pool != nil {
+		pg := webhook.NewPostgresStore(pool)
+		return pg, pg
+	}
+	return webhook.NewMemoryStore(retention), nil
+}
+
 // loadConventionsOverride reads and parses the deployment-level
 // work-management conventions file at path (FISHHAWKD_WORKMGMT_CONVENTIONS),
 // returning a loader that serves the parsed conventions for every repo
@@ -946,14 +968,14 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 	// The delivery store is shared by both receivers, so create it when
 	// EITHER secret is set (previously gated on the GitHub secret alone).
-	if webhookStoreNeeded(*webhookSecret, *gitlabWebhookSecret) {
-		if pool != nil {
-			pgStore := webhook.NewPostgresStore(pool)
-			cfg.WebhookDeliveries = pgStore
-			webhookEvictor = pgStore
+	// newWebhookDeliveryStore owns the gating + store selection so this
+	// call site can't drift back to a GitHub-only gate.
+	if store, evictor := newWebhookDeliveryStore(pool, *webhookSecret, *gitlabWebhookSecret, webhookRetention); store != nil {
+		cfg.WebhookDeliveries = store
+		webhookEvictor = evictor
+		if evictor != nil {
 			logger.Info("webhook receiver configured (postgres dedup)")
 		} else {
-			cfg.WebhookDeliveries = webhook.NewMemoryStore(webhookRetention)
 			logger.Warn("webhook receiver using memory dedup — NOT safe for multi-instance deploys; set FISHHAWKD_DATABASE_URL")
 		}
 	}

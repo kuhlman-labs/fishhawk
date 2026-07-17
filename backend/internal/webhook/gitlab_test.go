@@ -32,6 +32,22 @@ func TestVerifyGitLabToken_Unconfigured(t *testing.T) {
 	}
 }
 
+// TestVerifyGitLabToken_WrongTokenDifferentLength exercises the
+// length-independence the SHA-256-digest comparison provides: a wrong
+// token that also DIFFERS in length must still reject as
+// ErrGitLabTokenInvalid, not leak the secret's length via an early
+// length-mismatch return. (Timing itself isn't asserted — that's not
+// observable in a unit test — but pinning the both-length branches keeps
+// a regression to a raw ConstantTimeCompare from changing the outcome.)
+func TestVerifyGitLabToken_WrongTokenDifferentLength(t *testing.T) {
+	secret := []byte("the-configured-secret")
+	for _, tok := range []string{"x", "short", "a-very-very-long-wrong-token-value"} {
+		if err := VerifyGitLabToken(secret, tok); !errors.Is(err, ErrGitLabTokenInvalid) {
+			t.Errorf("VerifyGitLabToken(secret, %q) = %v, want ErrGitLabTokenInvalid", tok, err)
+		}
+	}
+}
+
 // Fixtures transcribed from GitLab's webhook events reference
 // (https://docs.gitlab.com/user/project/integrations/webhook_events/),
 // trimmed to the fields ParseGitLabEvent / the matchers read.

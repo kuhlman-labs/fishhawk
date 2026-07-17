@@ -78,6 +78,42 @@ func TestMemoryStore_EmptyID(t *testing.T) {
 	}
 }
 
+// TestMemoryStore_UnmarkAllowsReprocess proves the retry-reprocess
+// contract the receiver relies on after a dispatch failure: once a
+// recorded delivery is Unmarked, a fresh Mark of the same id succeeds
+// again (is NOT deduped), so GitLab's redelivery re-runs the pipeline.
+func TestMemoryStore_UnmarkAllowsReprocess(t *testing.T) {
+	s := NewMemoryStore(0)
+	if err := s.Mark("d1"); err != nil {
+		t.Fatalf("first Mark: %v", err)
+	}
+	// Sanity: a duplicate is rejected while the record stands.
+	if err := s.Mark("d1"); !errors.Is(err, ErrDeliveryDuplicate) {
+		t.Fatalf("pre-unmark Mark = %v, want ErrDeliveryDuplicate", err)
+	}
+	if err := s.Unmark("d1"); err != nil {
+		t.Fatalf("Unmark: %v", err)
+	}
+	// After Unmark the retry is a first write again.
+	if err := s.Mark("d1"); err != nil {
+		t.Errorf("post-unmark Mark = %v, want nil (retry must re-process)", err)
+	}
+}
+
+func TestMemoryStore_UnmarkAbsentIsNoOp(t *testing.T) {
+	s := NewMemoryStore(0)
+	if err := s.Unmark("never-seen"); err != nil {
+		t.Errorf("Unmark of an absent id = %v, want nil no-op", err)
+	}
+}
+
+func TestMemoryStore_UnmarkEmptyID(t *testing.T) {
+	s := NewMemoryStore(0)
+	if err := s.Unmark(""); !errors.Is(err, ErrDeliveryMissing) {
+		t.Errorf("err = %v, want ErrDeliveryMissing", err)
+	}
+}
+
 func TestMemoryStore_TTLEvicts(t *testing.T) {
 	s := NewMemoryStore(time.Hour)
 	// Inject a fake clock so we can advance without sleeping.

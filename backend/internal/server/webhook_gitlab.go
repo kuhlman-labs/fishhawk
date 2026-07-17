@@ -97,9 +97,10 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 	// issue-label / note triggers and parks the deliberately-out-of-
 	// scope kinds (MR lifecycle, pipeline, build); a non-nil error is a
 	// transient infra failure the caller surfaces as 5xx so GitLab
-	// redelivers.
+	// redelivers. dispatchGitLabDelivery unmarks the delivery on that
+	// error so the redelivery actually re-processes (see its doc).
 	if s.cfg.WebhookDispatcher != nil {
-		if err := s.cfg.WebhookDispatcher.Handle(r.Context(), ev); err != nil {
+		if err := s.dispatchGitLabDelivery(r.Context(), ev, s.cfg.WebhookDispatcher.Handle); err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"webhook dispatch failed", map[string]any{"error": err.Error()})
 			return
@@ -115,6 +116,41 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// dispatchGitLabDelivery runs dispatch for an ALREADY-RECORDED delivery
+// and, on a dispatch error, UNMARKS ev.DeliveryID before returning so the
+// caller's 5xx actually causes GitLab to re-process the event.
+//
+// The delivery is recorded (Mark) BEFORE dispatch so a concurrent
+// redelivery dedups to a 202 rather than double-dispatching. The cost of
+// recording first is that a dispatch failure would otherwise leave the
+// delivery recorded: GitLab retries on the 5xx, the retry hits the recorded
+// delivery, Mark returns ErrDeliveryDuplicate, and the receiver answers 202
+// — permanently dropping an event whose processing actually failed (E45.6
+// fix-up). Unmarking undoes the record so the retry is treated as a first
+// delivery again and re-runs dispatch.
+//
+// A nil dispatch is a no-op success. The dispatch error is returned
+// unchanged for the caller to map to a 500; the unmark is best-effort — a
+// failure to unmark is logged (the retry may then still be deduped) but
+// does not mask the original dispatch error.
+func (s *Server) dispatchGitLabDelivery(ctx context.Context, ev webhook.Event, dispatch func(context.Context, webhook.Event) error) error {
+	if dispatch == nil {
+		return nil
+	}
+	err := dispatch(ctx, ev)
+	if err == nil {
+		return nil
+	}
+	if uerr := s.cfg.WebhookDeliveries.Unmark(ev.DeliveryID); uerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+			"gitlab webhook: failed to unmark delivery after dispatch error; retry may be deduped",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", uerr.Error()),
+		)
+	}
+	return err
 }
 
 // gitLabMergeRequestPayload is the subset of a GitLab Merge Request
