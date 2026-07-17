@@ -36,9 +36,41 @@ func TestDetectRunnerKind(t *testing.T) {
 		{
 			// LOAD-BEARING (binding condition #1): CI alone is NOT a
 			// github_actions signal. A local dev shell exporting CI=true
-			// must resolve local.
+			// must resolve local. It is also NOT a gitlab_ci signal.
 			name: "ci true only",
 			env:  map[string]string{"CI": "true"},
+			want: runnerKindLocal,
+		},
+		{
+			// GitLab CI/CD sets GITLAB_CI=true in every pipeline job.
+			name: "gitlab_ci true",
+			env:  map[string]string{"GITLAB_CI": "true"},
+			want: runnerKindGitLabCI,
+		},
+		{
+			name: "gitlab_ci true uppercase",
+			env:  map[string]string{"GITLAB_CI": "TRUE"},
+			want: runnerKindGitLabCI,
+		},
+		{
+			// CI_PIPELINE_ID alone (GITLAB_CI unset/empty) still resolves
+			// gitlab_ci — the pipeline id is a GitLab-specific signal.
+			name: "ci_pipeline_id set only",
+			env:  map[string]string{"CI_PIPELINE_ID": "998877", "GITLAB_CI": ""},
+			want: runnerKindGitLabCI,
+		},
+		{
+			// GitHub precedence: GITHUB_* wins even when GitLab vars are
+			// also present (a GitHub Actions job that happens to export a
+			// GitLab var must never mis-resolve gitlab_ci).
+			name: "github wins over gitlab",
+			env:  map[string]string{"GITHUB_ACTIONS": "true", "GITLAB_CI": "true", "CI_PIPELINE_ID": "1"},
+			want: runnerKindGitHubActions,
+		},
+		{
+			// GITLAB_CI explicitly false with no CI_PIPELINE_ID stays local.
+			name: "gitlab_ci false only",
+			env:  map[string]string{"GITLAB_CI": "false"},
 			want: runnerKindLocal,
 		},
 		{

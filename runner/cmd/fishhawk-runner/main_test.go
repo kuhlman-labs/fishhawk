@@ -4362,6 +4362,47 @@ func TestParseFlags_ParallelIsolate(t *testing.T) {
 	}
 }
 
+// TestParseFlags_Forge covers the --forge / --gitlab-base-url flags and their
+// validation (ADR-058 / E45.5): the default is github; gitlab requires a base
+// URL; an unknown forge is rejected.
+func TestParseFlags_Forge(t *testing.T) {
+	var out strings.Builder
+	baseArgs := func(extra ...string) []string {
+		return append([]string{
+			"--run-id", "1", "--backend-url", "https://x",
+			"--workflow", "w", "--stage", "s",
+		}, extra...)
+	}
+
+	// Default → github, empty gitlab base URL.
+	cfg, err := parseFlags(baseArgs(), &out)
+	if err != nil {
+		t.Fatalf("parseFlags (default): %v", err)
+	}
+	if cfg.forge != forgeGitHub {
+		t.Errorf("default forge = %q, want %q", cfg.forge, forgeGitHub)
+	}
+
+	// gitlab with a base URL parses.
+	cfg, err = parseFlags(baseArgs("--forge", "gitlab", "--gitlab-base-url", "https://gitlab.example.com"), &out)
+	if err != nil {
+		t.Fatalf("parseFlags (gitlab): %v", err)
+	}
+	if cfg.forge != forgeGitLab || cfg.gitlabBaseURL != "https://gitlab.example.com" {
+		t.Errorf("gitlab forge/baseURL = (%q / %q), want (gitlab / https://gitlab.example.com)", cfg.forge, cfg.gitlabBaseURL)
+	}
+
+	// gitlab WITHOUT a base URL is rejected (no gitlab.com default).
+	if _, err := parseFlags(baseArgs("--forge", "gitlab"), &out); err == nil {
+		t.Error("expected error: --forge=gitlab without --gitlab-base-url")
+	}
+
+	// An unknown forge is rejected.
+	if _, err := parseFlags(baseArgs("--forge", "bitbucket"), &out); err == nil {
+		t.Error("expected error: unknown --forge value")
+	}
+}
+
 // TestRun_FetchPrompt_ServerTimeout_Applied verifies that when --timeout is
 // not passed (default 0) and FetchPrompt returns AgentTimeoutSeconds=1800,
 // the agent invocation's Budget.Timeout equals 30 minutes.
@@ -15743,5 +15784,135 @@ func TestChildPushFilesChanged_DiffErrorReturnsZeroAndLogs(t *testing.T) {
 	}
 	if !strings.Contains(log, badBase) {
 		t.Errorf("event must name the base used (%s):\n%s", badBase, log)
+	}
+}
+
+// fakeMROpener captures OpenMR args and returns canned results — the GitLab
+// counterpart of fakePROpener.
+type fakeMROpener struct {
+	gotArgs    *gitops.OpenMRArgs
+	gotToken   string
+	gotBaseURL string
+	result     *gitops.OpenPRResult
+	err        error
+}
+
+func (f *fakeMROpener) OpenMR(_ context.Context, args gitops.OpenMRArgs) (*gitops.OpenPRResult, error) {
+	a := args
+	f.gotArgs = &a
+	if f.err != nil {
+		return nil, f.err
+	}
+	if f.result != nil {
+		return f.result, nil
+	}
+	return &gitops.OpenPRResult{
+		PRNumber: 7,
+		PRURL:    "https://gitlab.example.com/group/project/-/merge_requests/7",
+	}, nil
+}
+
+// TestOpenImplementChangeRequest_ForgeSelection pins the MR-vs-PR selection seam
+// (ADR-058 / E45.5): the default github forge routes to the PR opener with the
+// GitHub args verbatim; the gitlab forge routes to the MR opener with the base
+// URL threaded and the owner/name pair rejoined into the namespaced project path.
+func TestOpenImplementChangeRequest_ForgeSelection(t *testing.T) {
+	origPR, origMR := newPROpener, newMROpener
+	t.Cleanup(func() { newPROpener, newMROpener = origPR, origMR })
+
+	fpr := &fakePROpener{}
+	fmr := &fakeMROpener{}
+	newPROpener = func(token string) prOpener { fpr.gotToken = token; return fpr }
+	newMROpener = func(token, baseURL string) mrOpener {
+		fmr.gotToken = token
+		fmr.gotBaseURL = baseURL
+		return fmr
+	}
+
+	args := gitops.OpenPRArgs{
+		Owner: "group/subgroup", Repo: "project",
+		Head: "fishhawk/run-x/stage-y", Base: "main",
+		Title: "Add a thing", Body: "context",
+	}
+
+	// (a) github default → PR opener, MR opener untouched.
+	if _, err := openImplementChangeRequest(context.Background(), config{forge: forgeGitHub}, "ghs_tok", args); err != nil {
+		t.Fatalf("openImplementChangeRequest(github): %v", err)
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("github forge did not invoke the PR opener")
+	}
+	if fpr.gotToken != "ghs_tok" {
+		t.Errorf("PR opener token = %q, want ghs_tok", fpr.gotToken)
+	}
+	if fmr.gotArgs != nil {
+		t.Error("github forge must not invoke the MR opener")
+	}
+
+	// (b) gitlab → MR opener with base URL + rejoined project path.
+	fpr.gotArgs = nil
+	if _, err := openImplementChangeRequest(context.Background(), config{forge: forgeGitLab, gitlabBaseURL: "https://gitlab.example.com"}, "glpat_tok", args); err != nil {
+		t.Fatalf("openImplementChangeRequest(gitlab): %v", err)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("gitlab forge must not invoke the PR opener")
+	}
+	if fmr.gotArgs == nil {
+		t.Fatal("gitlab forge did not invoke the MR opener")
+	}
+	if fmr.gotToken != "glpat_tok" {
+		t.Errorf("MR opener token = %q, want glpat_tok", fmr.gotToken)
+	}
+	if fmr.gotBaseURL != "https://gitlab.example.com" {
+		t.Errorf("MR opener base URL = %q, want the configured gitlab base URL", fmr.gotBaseURL)
+	}
+	if fmr.gotArgs.ProjectPath != "group/subgroup/project" {
+		t.Errorf("MR project path = %q, want owner/name rejoined", fmr.gotArgs.ProjectPath)
+	}
+	if fmr.gotArgs.SourceBranch != "fishhawk/run-x/stage-y" || fmr.gotArgs.TargetBranch != "main" {
+		t.Errorf("MR branches = (%q -> %q), want (fishhawk/run-x/stage-y -> main)", fmr.gotArgs.SourceBranch, fmr.gotArgs.TargetBranch)
+	}
+	if fmr.gotArgs.Title != "Add a thing" || fmr.gotArgs.Description != "context" {
+		t.Errorf("MR title/description = (%q / %q), want mapped from PR title/body", fmr.gotArgs.Title, fmr.gotArgs.Description)
+	}
+}
+
+// TestMintImplementToken_GitLab_ReturnsEnvToken pins the FISHHAWK_GITLAB_TOKEN
+// broker fallback: on the gitlab forge the runner skips the GitHub App broker
+// entirely (client/issued are never consulted — passed nil here) and returns the
+// env token, logging a gitlab_env source.
+func TestMintImplementToken_GitLab_ReturnsEnvToken(t *testing.T) {
+	t.Setenv("FISHHAWK_GITLAB_TOKEN", "glpat-broker")
+	cfg := config{forge: forgeGitLab, runID: "run-1", stageID: "stage-1"}
+	var logSink strings.Builder
+	got, err := mintImplementToken(context.Background(), cfg, nil, nil, &logSink)
+	if err != nil {
+		t.Fatalf("mintImplementToken(gitlab): %v", err)
+	}
+	if got != "glpat-broker" {
+		t.Errorf("token = %q, want the FISHHAWK_GITLAB_TOKEN value", got)
+	}
+	if !strings.Contains(logSink.String(), `"source":"gitlab_env"`) {
+		t.Errorf("expected installation_token_received with source gitlab_env, got:\n%s", logSink.String())
+	}
+}
+
+// TestMintImplementToken_GitLab_MissingTokenActionable pins the fail-closed
+// branch: on the gitlab forge with FISHHAWK_GITLAB_TOKEN unset, mintImplementToken
+// returns an actionable error naming the env var and the required scope, never
+// the opaque App-broker wrap.
+func TestMintImplementToken_GitLab_MissingTokenActionable(t *testing.T) {
+	t.Setenv("FISHHAWK_GITLAB_TOKEN", "")
+	cfg := config{forge: forgeGitLab, runID: "run-1", stageID: "stage-1"}
+	var logSink strings.Builder
+	_, err := mintImplementToken(context.Background(), cfg, nil, nil, &logSink)
+	if err == nil {
+		t.Fatal("expected an error when FISHHAWK_GITLAB_TOKEN is unset")
+	}
+	if !strings.Contains(err.Error(), "FISHHAWK_GITLAB_TOKEN") {
+		t.Errorf("err = %v, want it to name FISHHAWK_GITLAB_TOKEN", err)
+	}
+	if !strings.Contains(err.Error(), "api") {
+		t.Errorf("err = %v, want it to name the required `api` scope", err)
 	}
 }
