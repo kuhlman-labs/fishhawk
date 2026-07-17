@@ -3823,14 +3823,28 @@ func TestHandle_GitLabApprove_RoutesWithZeroInstallation(t *testing.T) {
 
 func TestHandle_GitLabRun_ParksWithoutCreatingRun(t *testing.T) {
 	d, _, runs, _ := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
 	body := `{"object_attributes":{"iid":5,"action":"open"},"labels":[{"title":"fishhawk"}]}`
 	ev := gitlabEvent("issue", "alice", body)
 	ev.DeliveryID = "gitlab:d2"
+	// A VALID Repo so the park boundary is regression-detectable: if the
+	// E45.8/#1861 park block were deleted, the fall-through would parse
+	// this repo successfully and reach the spec-fetch / CreateRun stubs,
+	// tripping the runs.created assertion below — instead of silently
+	// no-op'ing at parseRepo("") and passing identically (the vacuity
+	// the done-means pin must guard against).
+	ev.Repo = "group/project"
 	if err := d.Handle(context.Background(), ev); err != nil {
 		t.Fatalf("Handle: %v", err)
 	}
 	if len(runs.created) != 0 {
 		t.Errorf("CreateRun called %d times; a parked GitLab run must create no run", len(runs.created))
+	}
+	// The park must emit its #1861-named log line (the stated done-means
+	// pin). Asserting it makes a deleted park block detectable even
+	// independent of the CreateRun stub.
+	if got := logs.String(); !strings.Contains(got, "gitlab run trigger parked") || !strings.Contains(got, "#1861") {
+		t.Errorf("expected park log naming #1861; got logs:\n%s", got)
 	}
 }
 

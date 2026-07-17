@@ -497,6 +497,33 @@ func TestFindRunByGitLabMR_ResolvesByIIDNotURL(t *testing.T) {
 	}
 }
 
+func TestFindRunByGitLabMR_NoMatch_WarnsAndReturnsNil(t *testing.T) {
+	// A run exists on the project but neither its iid nor its URL match
+	// the incoming MR — the merge/close event must NOT silently return
+	// nil (which strands the review stage); it must warn so the miss is
+	// diagnosable. The GitLab webhook is the only review-gate signal, so
+	// there is no reconciler backstop to catch this.
+	url9 := "https://gitlab.com/group/project/merge_requests/9"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: uuid.New(), Repo: "group/project", PullRequestURL: &url9}},
+	}
+	lh := &recordingLogHandler{}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   rr,
+		AuditRepo: &prEventsAuditRepo{},
+		Logger:    slog.New(lh),
+	})
+	got := s.findRunByGitLabMR(context.Background(), "group/project", 7,
+		"https://gitlab.com/group/project/-/merge_requests/7")
+	if got != nil {
+		t.Fatalf("resolved run = %+v, want nil for an unmatched MR", got)
+	}
+	if lh.find("gitlab merge_request: no run matched; review stage will not transition", nil) == nil {
+		t.Fatalf("expected a warn log on the unmatched-MR miss; got none")
+	}
+}
+
 func TestParseGitLabMRIID(t *testing.T) {
 	cases := map[string]int{
 		"https://gitlab.com/g/p/-/merge_requests/7":       7,

@@ -236,6 +236,36 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 			}
 		}
 	}
+	// Supplement: an exact PullRequestURL DB filter, mirroring the GitHub
+	// findRunByPullRequestURL lookup. Unlike the project-scoped scan above
+	// this is NOT windowed by recency — the DB filters on the indexed
+	// pull_request_url — so it resolves a run whose stored URL byte-matches
+	// the webhook URL even when 50+ newer runs exist on the project (the
+	// >window silent-miss the iid scan cannot see). Still a SUPPLEMENT, not
+	// a replacement: it runs only after the durable iid key missed, and the
+	// Go-side equality re-check keeps it exact-match-only (GitLab's /-/ infix
+	// variance is handled by the iid + normalized paths above).
+	if mrURL != "" {
+		if exact, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+			PullRequestURL: &mrURL,
+			Limit:          5,
+		}); err == nil {
+			for _, r := range exact {
+				if r.PullRequestURL != nil && *r.PullRequestURL == mrURL {
+					return r
+				}
+			}
+		}
+	}
+	// No run matched. Unlike the GitHub path — which has the merge-
+	// reconciler poll as a backstop — the GitLab webhook is the ONLY
+	// review-gate signal, so a silent miss strands the review stage with
+	// no trace. Warn so an unmatched merge/close is diagnosable.
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"gitlab merge_request: no run matched; review stage will not transition",
+		slog.String("project", projectPath),
+		slog.Int("iid", iid),
+		slog.String("mr_url", mrURL))
 	return nil
 }
 
