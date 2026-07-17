@@ -40,6 +40,28 @@ func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) 
 	}, nil
 }
 
+// TestTargetGitLab pins the additive Target.GitLab field: a zero Target
+// leaves it nil (the not-a-gitlab-filing sentinel), and a Target carrying a
+// GitLabConnection round-trips through the in-process struct so the filing
+// endpoint can hand the concrete gitlab provider its project override. Target
+// is in-process only (no serialization tags), so this asserts the struct
+// carries the field, not a JSON round-trip.
+func TestTargetGitLab(t *testing.T) {
+	if (Target{}).GitLab != nil {
+		t.Error("zero Target.GitLab should be nil (not a gitlab filing)")
+	}
+	tgt := Target{
+		Repo:   Repo{Owner: "o", Name: "r"},
+		GitLab: &GitLabConnection{Project: "group/app"},
+	}
+	if tgt.GitLab == nil {
+		t.Fatal("Target.GitLab is nil after assignment")
+	}
+	if tgt.GitLab.Project != "group/app" {
+		t.Errorf("Target.GitLab.Project = %q, want group/app", tgt.GitLab.Project)
+	}
+}
+
 func TestRegistry_RegisterAndGet(t *testing.T) {
 	fp := &fakeProvider{name: "test_provider_registered"}
 	Register(fp)
