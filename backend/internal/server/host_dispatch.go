@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 )
 
 // hostDispatchResponse is the 200 body of the host-dispatch marker endpoint
@@ -146,11 +147,18 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 			map[string]any{"run_id": runID.String(), "error": err.Error()})
 		return
 	}
-	if runRow.RunnerKindResolved && runRow.RunnerKind != run.RunnerKindLocal {
-		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
-			"run is locked to a non-local runner_kind; host-dispatch marks a LOCAL host spawn",
-			map[string]any{"run_id": runID.String(), "runner_kind": runRow.RunnerKind})
-		return
+	// Admit a host spawn only when the resolved kind is KNOWN and host-dispatched
+	// (local). This site rejects unknown resolved kinds too — a runner_kind
+	// fishhawkd doesn't recognize is never a legitimate LOCAL host spawn — the
+	// opposite unknown-kind posture from the MCP guardHostDispatch, which the
+	// KindHostDispatched (hostDispatched, known) two-value shape keeps explicit.
+	if runRow.RunnerKindResolved {
+		if hostDispatched, known := runnerbackend.KindHostDispatched(runRow.RunnerKind); !known || !hostDispatched {
+			s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+				"run is locked to a non-local runner_kind; host-dispatch marks a LOCAL host spawn",
+				map[string]any{"run_id": runID.String(), "runner_kind": runRow.RunnerKind})
+			return
+		}
 	}
 	if stage.ExecutorKind != run.ExecutorAgent || isAutoMergeReviewStage(stage) {
 		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",

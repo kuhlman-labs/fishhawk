@@ -33,17 +33,17 @@ Decomposed children are routed onto a shared branch (`fishhawk/run-<shortParentI
 
 A decomposed child of a **runner_kind-locked-local** parent must park its implement stage at `awaiting_host_dispatch` — NOT the legacy `dispatched` — so `fishhawk_run_children` (whose dispatchable predicate is `{pending, awaiting_host_dispatch}` and which treats `dispatched` as in-flight) can host-spawn it. The subtlety the fix addresses: `run.CreateRunParams` has **no `RunnerKindResolved` field**, so every child row is minted runner_kind-**UNRESOLVED** with `RunnerKind` copied from the parent. The `#1912` park branch keys on the RESOLVED lock (`RunnerKindResolved && RunnerKind == local`), which never holds for a fresh child — so pre-#1980 the child fell through to `dispatched` + a silent local no-op `fireDispatch`, deadlocking `run_children` by construction (run 780f1bb6).
 
-`runLockedLocal(ctx, r)` is the single predicate wired into BOTH `dispatchStage`'s park branch and `fireDispatch`'s skip. For an unresolved decomposed child (`DecomposedFrom != nil`) whose inherited `RunnerKind` is `local`, it consults the parent's lock via `o.Runs.GetRun(*r.DecomposedFrom)`:
+Since E45.7 (ADR-058 / #1851) this lineage decision lives in [`runnerbackend.Resolver`](../runnerbackend/README.md): `dispatchStage` calls `o.backends().Resolve(ctx, r)` once and keys the park on the resolved backend's `HostDispatched()` (local → park; github_actions → fire via `TriggerStage`), replacing the former `runLockedLocal` + `fireDispatch` pair with no behavior change. For an unresolved decomposed child (`DecomposedFrom != nil`) whose inherited `RunnerKind` is `local`, the resolver consults the parent's lock via `GetRun(*r.DecomposedFrom)`:
 
-- parent RESOLVED local → park (`awaiting_host_dispatch`);
-- parent RESOLVED non-local → the inherited local hint was superseded, fall through to `dispatched` + `fireDispatch`;
-- parent read errors OR parent itself unresolved → **fail toward the recoverable state**: park anyway and WARN. `awaiting_host_dispatch` is CAS-recoverable with one host-dispatch verb (`server/host_dispatch.go` admits `{pending, awaiting_host_dispatch} → dispatched`), whereas a wrongly-fired `workflow_dispatch` is an unrecoverable external side effect (#1355).
+- parent RESOLVED local → local backend → park (`awaiting_host_dispatch`);
+- parent RESOLVED non-local → the inherited local hint was superseded → github_actions backend → `dispatched` + `TriggerStage`;
+- parent read errors OR parent itself unresolved → **fail toward the recoverable state**: local backend (park) and WARN. `awaiting_host_dispatch` is CAS-recoverable with one host-dispatch verb (`server/host_dispatch.go` admits `{pending, awaiting_host_dispatch} → dispatched`), whereas a wrongly-fired `workflow_dispatch` is an unrecoverable external side effect (#1355).
 
-A `github_actions` child (inherited kind not `local`) never enters the arm and fires its `workflow_dispatch` byte-identically; a resolved top-level run keeps the exact `#1912`/`#1346` behavior.
+A `github_actions` child (inherited kind not `local`) resolves to the github_actions backend and fires its `workflow_dispatch` byte-identically; a resolved top-level run keeps the exact `#1912`/`#1346` behavior. `Local.TriggerStage` is the residual defensive locked-local skip the old `fireDispatch` carried.
 
 ## Actions decomposed-child dispatch (E24.5 / #1145)
 
-For the `github_actions` backend the concurrent dispatch above is realized through `fireDispatch` — each child auto-advances and fires its OWN `workflow_dispatch` carrying its own `run_id`/`stage_id` against the base ref (`o.DefaultRef`, fallback `main`), bounded by the same `DispatchDecomposedChildren` cap.
+For the `github_actions` backend the concurrent dispatch above is realized through the [`runnerbackend.GitHubActions`](../runnerbackend/README.md) backend's `TriggerStage` (formerly `fireDispatch`) — each child auto-advances and fires its OWN `workflow_dispatch` carrying its own `run_id`/`stage_id` against the base ref (`o.DefaultRef`, fallback `main`), bounded by the same `DispatchDecomposedChildren` cap.
 
 The runner — NOT the dispatch — derives the sole-writer slice branch `fishhawk/run-<parent>/slice-<idx>` by fetching `decomposed_from` + `slice_index` from the stage-details endpoint keyed by `run_id`; because each child's `run_id`/`stage_id` are distinct, the per-slice checkouts push to distinct slice-branch names that cannot collide.
 
@@ -70,7 +70,7 @@ In `Advance`, when the next pending stage is `review`, the run is a decomposed p
 - It stamps `pull_request_url` via `SetRunPullRequestURL` so the existing merge reconciler resolves the review on the consolidated PR's MERGE — ADR-031's verified-landing invariant holds (the parent reaches `succeeded` only on merge, never at PR-open).
 - Idempotency is load-bearing because the periodic sweeper and the event-driven `maybeAdvanceDecomposedParent` both finish by calling `Advance`: an empty-URL re-read shrinks the double-open window, and a `githubclient.ErrPullRequestExists` (422-duplicate) recovers the already-open PR's URL via `ListOpenPullRequestsByHead` rather than failing the settle.
 - Emits a best-effort `consolidated_pr_opened` audit (system actor).
-- Graceful-skip (parent stays PR-less, same posture as `fireDispatch`) when the run has zero children, `o.GitHub == nil`, or `installation_id` is nil — narrowing rather than regressing prior behavior.
+- Graceful-skip (parent stays PR-less, same posture as the github_actions backend's `TriggerStage` skip on a nil client / unwired installation) when the run has zero children, `o.GitHub == nil`, or `installation_id` is nil — narrowing rather than regressing prior behavior.
 
 The consolidated PR's head branch is PRODUCED by the fan-in step below (under E24.1/#1141 each child pushes only its own slice branch and nobody creates the consolidated branch).
 

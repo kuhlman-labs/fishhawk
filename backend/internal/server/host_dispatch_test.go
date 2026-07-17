@@ -290,6 +290,32 @@ func TestHostDispatch_LockedNonLocalRun_Conflict(t *testing.T) {
 	}
 }
 
+// Unknown-kind posture (E45.7): a run LOCKED to a runner_kind fishhawkd does not
+// recognize (a future gitlab_ci before its backend registers) is STILL refused
+// 409 — this endpoint rejects any resolved kind that is not known-and-
+// host-dispatched, the opposite posture from the MCP guardHostDispatch (which
+// allows unknown locked kinds). KindHostDispatched reports (false, known=false)
+// for such a kind, so the `!known || !hostDispatched` guard fires. Pins that a
+// future registry addition cannot silently flip this site to admit it.
+func TestHostDispatch_LockedUnknownKind_Conflict(t *testing.T) {
+	s, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
+	locked, _ := rr.GetRun(context.Background(), runID)
+	locked.RunnerKind = "gitlab_ci"
+	locked.RunnerKindResolved = true
+
+	w := postHostDispatch(t, s, runID, stageID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "dispatch_not_admissible") {
+		t.Errorf("body = %s, want dispatch_not_admissible", w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("state = %q, want awaiting_host_dispatch (untouched)", cur.State)
+	}
+}
+
 // Eligibility (#1912 fix-up): a locked-LOCAL run is admitted (the normal parked
 // path); an UN-resolved run is also admitted (its first host dispatch
 // auto-resolves it to local), mirroring the MCP guardHostDispatch posture — the

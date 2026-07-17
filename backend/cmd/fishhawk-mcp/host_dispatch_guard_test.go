@@ -112,6 +112,33 @@ func TestGuardHostDispatch_GetRunError_FailsOpen(t *testing.T) {
 	}
 }
 
+// Unknown-kind posture (E45.7): a run LOCKED to a kind fishhawkd does not yet
+// recognize (a future gitlab_ci before its backend registers) keeps ALLOWING
+// here — the opposite posture from the host-dispatch endpoint, which rejects
+// unknown resolved kinds. KindHostDispatched reports (false, known=false) for
+// such a kind, so the guard's `known && !hostDispatched` block does not fire.
+// This pins that a future registry addition cannot silently flip the MCP guard.
+func TestGuardHostDispatch_UnknownLockedKind_Allows(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{
+		ID:                 runID.String(),
+		State:              "running",
+		RunnerKind:         "gitlab_ci",
+		RunnerKindResolved: true,
+	}
+
+	warnings, err := r.guardHostDispatch(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("an unknown locked kind must be allowed (opposite posture from the endpoint), got %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("the allow path carries no warnings, got %v", warnings)
+	}
+}
+
 // The sibling-in-flight admission guard (#1872) has six enumerated branches;
 // each gets its own assertion driving guardSiblingStageInFlight directly through
 // the real GET /v0/runs/{run_id}/stages round-trip on the fake backend.

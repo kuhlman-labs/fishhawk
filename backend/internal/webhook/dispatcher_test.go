@@ -2889,6 +2889,57 @@ func TestHandle_CIFailureRetry_HappyPath_DispatchesChild(t *testing.T) {
 	}
 }
 
+// TestHandle_CIFailureRetry_LocalRunner_StaysPending pins the runnerbackend-seam
+// host-dispatched branch (E45.7 / ADR-022 / #445): a retry child inheriting a
+// LOCAL runner_kind mints the run + implement stage but fires NO
+// workflow_dispatch — the stage stays pending for the agent to discover. This
+// is the migrated counterpart of the happy path's github_actions fire.
+func TestHandle_CIFailureRetry_LocalRunner_StaysPending(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	// Flip the parent to the local runner so the child inherits runner_kind=local.
+	parent.RunnerKind = run.RunnerKindLocal
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	// The child run + its implement stage are still created.
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (parent + child)", len(runs.created))
+	}
+	child := runs.created[1]
+
+	// But NO workflow_dispatch fired — the local child stays pending.
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0 (local runner stays pending)", gh.dispatchCalls)
+	}
+	for _, st := range runs.createdStages {
+		if st.RunID == child.ID && st.State != run.StageStatePending {
+			t.Errorf("child stage %s state = %q, want pending (no dispatch)", st.Type, st.State)
+		}
+	}
+
+	// The dispatch audit is still chained (dispatchErr is nil — a skip, not a
+	// failure), and the retry comment-back still fires.
+	var dispatched *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "ci_failure_retry_dispatched" {
+			dispatched = &au.appended[i]
+			break
+		}
+	}
+	if dispatched == nil {
+		t.Fatalf("expected ci_failure_retry_dispatched audit row; got %+v", au.appended)
+	}
+	if len(notifier.retryCalls) != 1 {
+		t.Errorf("notifier.retryCalls = %d, want 1 (comment-back still fires)", len(notifier.retryCalls))
+	}
+}
+
 func TestHandle_CIFailureRetry_CapHit_EmitsExhaustedAudit(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
 	d.Artifacts = &stubArtifacts{}
