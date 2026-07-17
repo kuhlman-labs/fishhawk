@@ -40,7 +40,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -62,7 +61,7 @@ const DefaultDegradedThreshold = 5
 // needs. Defining it as an interface lets tests swap in a fake
 // without standing up a fake api.github.com.
 type CheckRunCreator interface {
-	CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error)
+	CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, p forge.CreateCheckRunParams) (*forge.CreateCheckRunResult, error)
 }
 
 // AuditReader is the slice of audit.Repository the publisher needs to prefer
@@ -99,7 +98,7 @@ type episode struct {
 }
 
 // Deps groups the dependencies New needs. Production wires the
-// real Postgres-backed repos and the typed githubclient.
+// real Postgres-backed repos and the typed forge.
 type Deps struct {
 	GitHub      CheckRunCreator
 	Runs        run.Repository
@@ -264,7 +263,7 @@ func (p *Publisher) recordFailure(ctx context.Context, runID uuid.UUID, headSHA 
 // (repo, head_sha) differs from `state`. Cache miss → publish
 // (the conservative default — operators expect to see the row
 // after a backend restart).
-func (p *Publisher) shouldPublish(repo githubclient.RepoRef, headSHA string, state stagecheck.State) bool {
+func (p *Publisher) shouldPublish(repo forge.RepoRef, headSHA string, state stagecheck.State) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	prev, ok := p.last[cacheKey(repo, headSHA)]
@@ -277,7 +276,7 @@ func (p *Publisher) shouldPublish(repo githubclient.RepoRef, headSHA string, sta
 // recordPublished caches the published state for dedup and clears the
 // run's failure episode, returning the streak length the success ended
 // (0 when there was none).
-func (p *Publisher) recordPublished(repo githubclient.RepoRef, runID uuid.UUID, headSHA string, state stagecheck.State) int {
+func (p *Publisher) recordPublished(repo forge.RepoRef, runID uuid.UUID, headSHA string, state stagecheck.State) int {
 	p.mu.Lock()
 	p.last[cacheKey(repo, headSHA)] = state
 	p.mu.Unlock()
@@ -301,7 +300,7 @@ func (p *Publisher) clearEpisode(runID uuid.UUID, headSHA string) int {
 	return attempts
 }
 
-func cacheKey(repo githubclient.RepoRef, headSHA string) string {
+func cacheKey(repo forge.RepoRef, headSHA string) string {
 	return repo.Owner + "/" + repo.Name + "@" + headSHA
 }
 
@@ -402,38 +401,38 @@ func decodeHeadSHA(content []byte) string {
 // parseRepo splits "owner/name" into a RepoRef. Mirrors the
 // server-package helper of the same name; duplicated here so
 // this package doesn't have to import the server.
-func parseRepo(s string) (githubclient.RepoRef, error) {
+func parseRepo(s string) (forge.RepoRef, error) {
 	parts := strings.SplitN(s, "/", 3)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return githubclient.RepoRef{}, errors.New("repo must be owner/name")
+		return forge.RepoRef{}, errors.New("repo must be owner/name")
 	}
-	return githubclient.RepoRef{Owner: parts[0], Name: parts[1]}, nil
+	return forge.RepoRef{Owner: parts[0], Name: parts[1]}, nil
 }
 
 // buildParams maps the (state, missing) tuple to GitHub's check-
 // run wire shape. Pending → in_progress; pass → success; fail →
 // failure with the missing list rendered as a markdown summary.
-func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, headSHA, detailsURL string) githubclient.CreateCheckRunParams {
-	params := githubclient.CreateCheckRunParams{
+func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, headSHA, detailsURL string) forge.CreateCheckRunParams {
+	params := forge.CreateCheckRunParams{
 		Name:       CheckName,
 		HeadSHA:    headSHA,
 		DetailsURL: detailsURL,
 	}
 	switch state {
 	case stagecheck.StatePass:
-		params.Status = githubclient.CheckRunStatusCompleted
-		params.Conclusion = githubclient.CheckRunConclusionSuccess
+		params.Status = forge.CheckRunStatusCompleted
+		params.Conclusion = forge.CheckRunConclusionSuccess
 		params.OutputSummary = "Audit chain is intact: plan, traces (raw + redacted), and pull request all present, audit chain verifies."
 	case stagecheck.StateFail:
-		params.Status = githubclient.CheckRunStatusCompleted
-		params.Conclusion = githubclient.CheckRunConclusionFailure
+		params.Status = forge.CheckRunStatusCompleted
+		params.Conclusion = forge.CheckRunConclusionFailure
 		params.OutputSummary = renderFailureSummary(missing)
 	default:
 		// Anything else (pending, not_tracked, empty) is
 		// in_progress with no conclusion. The "" -> in_progress
 		// fallback is defensive against future enum additions —
 		// publishing nothing would let a stale prior state ride.
-		params.Status = githubclient.CheckRunStatusInProgress
+		params.Status = forge.CheckRunStatusInProgress
 		params.OutputSummary = "Audit chain is still being assembled. Fishhawk will update this check when the run terminates."
 	}
 	return params

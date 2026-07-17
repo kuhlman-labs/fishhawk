@@ -321,7 +321,7 @@ type stubGitHub struct {
 
 	createPRCalls []createPRCall
 	// createPRErr, when set, is returned from CreatePullRequest. Set
-	// to githubclient.ErrPullRequestExists to exercise the lost-race
+	// to forge.ErrPullRequestExists to exercise the lost-race
 	// recovery path.
 	createPRErr error
 	// createPRURL is the html_url CreatePullRequest returns on success
@@ -329,7 +329,7 @@ type stubGitHub struct {
 	createPRURL string
 	// listByHeadResult is what ListOpenPullRequestsByHead returns (the
 	// recovery lookup). listByHeadErr forces an error from it.
-	listByHeadResult []githubclient.PullRequest
+	listByHeadResult []forge.PullRequest
 	listByHeadErr    error
 	listByHeadCalls  int
 
@@ -340,7 +340,7 @@ type stubGitHub struct {
 	createRefErr    error
 	createRefCalls  []createRefCall
 	// mergeErrByHead programs a per-head-branch MergeBranch error (e.g.
-	// githubclient.ErrMergeConflict on a specific slice branch).
+	// forge.ErrMergeConflict on a specific slice branch).
 	mergeErrByHead map[string]error
 	// mergeEmptyByHead programs a per-head-branch 204 (already-merged) no-op:
 	// MergeBranch returns ("", nil), modeling a re-entrant pass whose slices
@@ -362,7 +362,7 @@ type mergeBranchCall struct {
 
 type createPRCall struct {
 	Scope forge.CredentialScope
-	Repo  githubclient.RepoRef
+	Repo  forge.RepoRef
 	Head  string
 	Base  string
 	Title string
@@ -371,7 +371,7 @@ type createPRCall struct {
 
 type dispatchCall struct {
 	Scope        forge.CredentialScope
-	Repo         githubclient.RepoRef
+	Repo         forge.RepoRef
 	WorkflowFile string
 	Ref          string
 	Inputs       githubclient.DispatchInputs
@@ -379,13 +379,13 @@ type dispatchCall struct {
 
 type autoMergeCall struct {
 	Scope    forge.CredentialScope
-	Repo     githubclient.RepoRef
+	Repo     forge.RepoRef
 	PRNumber int
-	Method   githubclient.MergeMethod
+	Method   forge.MergeMethod
 }
 
 func (g *stubGitHub) DispatchWorkflow(_ context.Context, scope forge.CredentialScope,
-	repo githubclient.RepoRef, file, ref string, inputs githubclient.DispatchInputs) error {
+	repo forge.RepoRef, file, ref string, inputs githubclient.DispatchInputs) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.dispatchErr != nil {
@@ -399,7 +399,7 @@ func (g *stubGitHub) DispatchWorkflow(_ context.Context, scope forge.CredentialS
 }
 
 func (g *stubGitHub) EnableAutoMerge(_ context.Context, scope forge.CredentialScope,
-	repo githubclient.RepoRef, prNumber int, method githubclient.MergeMethod) error {
+	repo forge.RepoRef, prNumber int, method forge.MergeMethod) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.autoMergeErr != nil {
@@ -413,7 +413,7 @@ func (g *stubGitHub) EnableAutoMerge(_ context.Context, scope forge.CredentialSc
 }
 
 func (g *stubGitHub) CreatePullRequest(_ context.Context, scope forge.CredentialScope,
-	repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error) {
+	repo forge.RepoRef, head, base, title, body string) (*forge.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.createPRCalls = append(g.createPRCalls, createPRCall{
@@ -427,11 +427,11 @@ func (g *stubGitHub) CreatePullRequest(_ context.Context, scope forge.Credential
 	if url == "" {
 		url = "https://github.com/" + repo.Owner + "/" + repo.Name + "/pull/777"
 	}
-	return &githubclient.PullRequest{Number: 777, HTMLURL: url, State: "open"}, nil
+	return &forge.PullRequest{Number: 777, HTMLURL: url, State: "open"}, nil
 }
 
 func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, _, _ string) ([]githubclient.PullRequest, error) {
+	_ forge.RepoRef, _, _ string) ([]forge.PullRequest, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.listByHeadCalls++
@@ -442,7 +442,7 @@ func (g *stubGitHub) ListOpenPullRequestsByHead(_ context.Context, _ forge.Crede
 }
 
 func (g *stubGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, branch string) (string, bool, error) {
+	_ forge.RepoRef, branch string) (string, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.getBranchSHAErr != nil {
@@ -456,7 +456,7 @@ func (g *stubGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialScope,
 }
 
 func (g *stubGitHub) CreateRef(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, branch, sha string) error {
+	_ forge.RepoRef, branch, sha string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.createRefCalls = append(g.createRefCalls, createRefCall{Branch: branch, SHA: sha})
@@ -471,7 +471,7 @@ func (g *stubGitHub) CreateRef(_ context.Context, _ forge.CredentialScope,
 }
 
 func (g *stubGitHub) MergeBranch(_ context.Context, _ forge.CredentialScope,
-	_ githubclient.RepoRef, base, head, msg string) (string, error) {
+	_ forge.RepoRef, base, head, msg string) (string, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.mergeCalls = append(g.mergeCalls, mergeBranchCall{Base: base, Head: head, Msg: msg})
@@ -850,7 +850,7 @@ func TestAdvance_AutoMergeStage_QueuesAndSucceeds(t *testing.T) {
 		t.Fatalf("auto-merge calls = %d, want 1", len(gh.autoMergeCalls))
 	}
 	got := gh.autoMergeCalls[0]
-	if got.PRNumber != 42 || got.Scope != forge.FromGitHubInstallationID(99) || got.Method != githubclient.MergeMethodSquash {
+	if got.PRNumber != 42 || got.Scope != forge.FromGitHubInstallationID(99) || got.Method != forge.MergeMethodSquash {
 		t.Errorf("auto-merge call = %+v", got)
 	}
 	if got.Repo.Owner != "kuhlman-labs" || got.Repo.Name != "example" {
@@ -1826,8 +1826,8 @@ func TestAdvance_DecomposedParent_LostRace_RecoversURL(t *testing.T) {
 	// ListOpenPullRequestsByHead rather than failing the settle.
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
-	gh.createPRErr = githubclient.ErrPullRequestExists
-	gh.listByHeadResult = []githubclient.PullRequest{
+	gh.createPRErr = forge.ErrPullRequestExists
+	gh.listByHeadResult = []forge.PullRequest{
 		{Number: 42, HTMLURL: "https://github.com/kuhlman-labs/fishhawk/pull/42", State: "open"},
 	}
 
@@ -1853,7 +1853,7 @@ func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T
 	// the next Advance re-enters and recovers once the list catches up.
 	o, rs, gh := newOrchestrator(t)
 	o.DefaultRef = "main"
-	gh.createPRErr = githubclient.ErrPullRequestExists
+	gh.createPRErr = forge.ErrPullRequestExists
 	gh.listByHeadResult = nil // consistency gap: 422 says exists, list empty
 
 	parent, _ := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
@@ -2503,7 +2503,7 @@ func TestIntegrateSlices_Conflict_FailsParentRecoverable(t *testing.T) {
 
 	// Slice-1's branch fails to merge (a conflict).
 	gh.mergeErrByHead = map[string]error{
-		sliceBranch(parent.ID, 1): githubclient.ErrMergeConflict,
+		sliceBranch(parent.ID, 1): forge.ErrMergeConflict,
 	}
 
 	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
@@ -2605,7 +2605,7 @@ func TestIntegrateSlices_OverlappingSlice_ReturnsConflict(t *testing.T) {
 
 	// Slice-1's branch overlaps slice-0 and cannot merge.
 	gh.mergeErrByHead = map[string]error{
-		sliceBranch(parent.ID, 1): githubclient.ErrMergeConflict,
+		sliceBranch(parent.ID, 1): forge.ErrMergeConflict,
 	}
 
 	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)
@@ -2663,7 +2663,7 @@ func TestIntegrateSlices_PartialMergeThenConflict_RecordsCreatedMergeSHAs(t *tes
 	// Slice-2 conflicts, so the loop returns *SliceConflict before reaching
 	// the terminal emitSlicesIntegrated.
 	gh.mergeErrByHead = map[string]error{
-		sliceBranch(parent.ID, 2): githubclient.ErrMergeConflict,
+		sliceBranch(parent.ID, 2): forge.ErrMergeConflict,
 	}
 
 	conflict, err := o.IntegrateSlices(context.Background(), parent.ID)

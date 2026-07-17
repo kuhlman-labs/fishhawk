@@ -97,7 +97,7 @@ type stubPoller struct {
 	lastCorrelation map[string]string
 }
 
-func (s *stubPoller) GetWorkflowRun(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
+func (s *stubPoller) GetWorkflowRun(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, _ int64) (*githubclient.WorkflowRun, error) {
 	s.getCalls++
 	if s.getErr != nil {
 		return nil, s.getErr
@@ -105,7 +105,7 @@ func (s *stubPoller) GetWorkflowRun(_ context.Context, _ forge.CredentialScope, 
 	return s.get, nil
 }
 
-func (s *stubPoller) ResolveDispatchedRun(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string, correlation map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
+func (s *stubPoller) ResolveDispatchedRun(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, _ string, correlation map[string]string, _ time.Time) (*githubclient.WorkflowRun, error) {
 	s.resolveCalls++
 	s.lastCorrelation = correlation
 	if s.resolveErr != nil {

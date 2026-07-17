@@ -16,7 +16,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -69,10 +68,10 @@ func TestPublish_Pass_PostsCompletedSuccess(t *testing.T) {
 	if c.params.HeadSHA != "abc123" {
 		t.Errorf("head_sha = %q", c.params.HeadSHA)
 	}
-	if c.params.Status != githubclient.CheckRunStatusCompleted {
+	if c.params.Status != forge.CheckRunStatusCompleted {
 		t.Errorf("status = %q", c.params.Status)
 	}
-	if c.params.Conclusion != githubclient.CheckRunConclusionSuccess {
+	if c.params.Conclusion != forge.CheckRunConclusionSuccess {
 		t.Errorf("conclusion = %q", c.params.Conclusion)
 	}
 	if c.params.DetailsURL != "https://app.fishhawk.example.com/runs/"+runID.String() {
@@ -93,10 +92,10 @@ func TestPublish_Fail_RendersMissingSummary(t *testing.T) {
 		t.Fatalf("expected 1 call")
 	}
 	p := gh.calls[0].params
-	if p.Status != githubclient.CheckRunStatusCompleted {
+	if p.Status != forge.CheckRunStatusCompleted {
 		t.Errorf("status = %q want completed", p.Status)
 	}
-	if p.Conclusion != githubclient.CheckRunConclusionFailure {
+	if p.Conclusion != forge.CheckRunConclusionFailure {
 		t.Errorf("conclusion = %q want failure", p.Conclusion)
 	}
 	if !strings.Contains(p.OutputSummary, "trace_missing") || !strings.Contains(p.OutputSummary, "pr_missing") {
@@ -110,7 +109,7 @@ func TestPublish_Pending_PostsInProgress(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 	p := gh.calls[0].params
-	if p.Status != githubclient.CheckRunStatusInProgress {
+	if p.Status != forge.CheckRunStatusInProgress {
 		t.Errorf("status = %q want in_progress", p.Status)
 	}
 	if p.Conclusion != "" {
@@ -1041,8 +1040,8 @@ func prArtifact(stageID uuid.UUID, headSHA string) *artifact.Artifact {
 
 type checkRunCall struct {
 	scope  forge.CredentialScope
-	repo   githubclient.RepoRef
-	params githubclient.CreateCheckRunParams
+	repo   forge.RepoRef
+	params forge.CreateCheckRunParams
 }
 
 type fakeGitHub struct {
@@ -1051,14 +1050,14 @@ type fakeGitHub struct {
 	err   error
 }
 
-func (f *fakeGitHub) CreateCheckRun(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
+func (f *fakeGitHub) CreateCheckRun(_ context.Context, scope forge.CredentialScope, repo forge.RepoRef, p forge.CreateCheckRunParams) (*forge.CreateCheckRunResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, checkRunCall{scope: scope, repo: repo, params: p})
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &githubclient.CreateCheckRunResult{ID: 1}, nil
+	return &forge.CreateCheckRunResult{ID: 1}, nil
 }
 
 type fakeRuns struct {

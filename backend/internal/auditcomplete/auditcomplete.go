@@ -44,7 +44,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
@@ -206,7 +205,7 @@ func ReviewPresent(in ReviewPresenceInputs) (present, backstopElapsed bool) {
 // PRHeadFetcher is the signature for the live-HEAD callback. Errors
 // flow into a `head_fetch_failed` MissingItem rather than failing
 // Compute outright (GitHub flap shouldn't break the audit signal).
-type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int) (headSHA string, err error)
+type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, prNumber int) (headSHA string, err error)
 
 // HeadReportCategoriesByPrecedence lists a run's own-chain head-reporting
 // audit categories in DESCENDING precedence (#1682): the newest fixup_pushed
@@ -730,7 +729,7 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 // PRHead call + compose the missing-item detail.
 type foreignCommitInputs struct {
 	scope     forge.CredentialScope
-	repo      githubclient.RepoRef
+	repo      forge.RepoRef
 	prNumber  int
 	knownSHAs map[string]struct{}
 }
@@ -745,7 +744,7 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 	known := make(map[string]struct{})
 	var (
 		scope    forge.CredentialScope
-		repoRef  githubclient.RepoRef
+		repoRef  forge.RepoRef
 		prNumber int
 	)
 
@@ -869,12 +868,12 @@ func decodePRArtifact(content []byte) (string, int) {
 // parseRepo splits "owner/name" into a RepoRef. Mirrors the
 // helpers in other packages; duplicated here to keep auditcomplete
 // import-free of higher layers.
-func parseRepo(s string) (githubclient.RepoRef, error) {
+func parseRepo(s string) (forge.RepoRef, error) {
 	i := strings.IndexByte(s, '/')
 	if i <= 0 || i == len(s)-1 {
-		return githubclient.RepoRef{}, fmt.Errorf("auditcomplete: repo %q must be owner/name", s)
+		return forge.RepoRef{}, fmt.Errorf("auditcomplete: repo %q must be owner/name", s)
 	}
-	return githubclient.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
+	return forge.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
 }
 
 // shortSHA renders the leading 7 of a SHA for human-readable

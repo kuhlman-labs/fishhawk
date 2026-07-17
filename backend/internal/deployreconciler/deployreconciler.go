@@ -100,8 +100,8 @@ const rollbackCorrelationMarker = "fishhawk_rollback"
 // re-resolves a dispatched run from its correlation token. Satisfied by
 // *githubclient.Client. Tests inject a stub returning canned run states.
 type WorkflowRunPoller interface {
-	GetWorkflowRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
-	ResolveDispatchedRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch string, correlation map[string]string, createdAfter time.Time) (*githubclient.WorkflowRun, error)
+	GetWorkflowRun(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
+	ResolveDispatchedRun(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, branch string, correlation map[string]string, createdAfter time.Time) (*githubclient.WorkflowRun, error)
 }
 
 // AuditReader reads the deployment_dispatched handle back for a parked
@@ -485,7 +485,7 @@ func (t *Ticker) latestHandle(ctx context.Context, logger *slog.Logger, s *run.S
 // resolution was empty) it is re-resolved by the correlation token —
 // returning nil on an ambiguous fallback rather than associating a wrong
 // run (binding condition 1, #1386).
-func (t *Ticker) resolveRun(ctx context.Context, logger *slog.Logger, s *run.Stage, repo githubclient.RepoRef, scope forge.CredentialScope, handle dispatchHandle, correlation map[string]string) *githubclient.WorkflowRun {
+func (t *Ticker) resolveRun(ctx context.Context, logger *slog.Logger, s *run.Stage, repo forge.RepoRef, scope forge.CredentialScope, handle dispatchHandle, correlation map[string]string) *githubclient.WorkflowRun {
 	if handle.GHARunID > 0 {
 		wr, err := t.GH.GetWorkflowRun(ctx, scope, repo, handle.GHARunID)
 		if err != nil {
@@ -545,12 +545,12 @@ func mapConclusion(conclusion string) (run.DeployOutcome, bool) {
 	}
 }
 
-// parseRepoRef splits "owner/name" into a githubclient.RepoRef. Local to
+// parseRepoRef splits "owner/name" into a forge.RepoRef. Local to
 // this package (the server's parseRepoRef is unexported in another package).
-func parseRepoRef(s string) (githubclient.RepoRef, error) {
+func parseRepoRef(s string) (forge.RepoRef, error) {
 	owner, name, ok := strings.Cut(s, "/")
 	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
-		return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+		return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 	}
-	return githubclient.RepoRef{Owner: owner, Name: name}, nil
+	return forge.RepoRef{Owner: owner, Name: name}, nil
 }

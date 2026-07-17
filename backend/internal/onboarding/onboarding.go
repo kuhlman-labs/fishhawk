@@ -96,15 +96,15 @@ func ScaffoldFiles(preset spec.Preset) (map[string][]byte, error) {
 // drives. Declaring it as an interface lets tests substitute a fake that
 // records the call sequence without an httptest server.
 type githubClient interface {
-	GetFile(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, path, ref string) (*githubclient.FileContent, error)
-	GetRepository(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef) (*githubclient.Repository, error)
-	GetBranchSHA(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch string) (string, bool, error)
-	GetCommit(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, sha string) (*githubclient.GitCommit, error)
-	CreateTree(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, baseTree string, entries []githubclient.TreeEntry) (string, error)
-	CreateCommit(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, message, treeSHA string, parents []string) (string, error)
-	CreateRef(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch, sha string) error
-	ForceUpdateRef(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch, newSHA string) error
-	CreatePullRequest(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error)
+	GetFile(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, path, ref string) (*githubclient.FileContent, error)
+	GetRepository(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (*forge.Repository, error)
+	GetBranchSHA(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, branch string) (string, bool, error)
+	GetCommit(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, sha string) (*forge.GitCommit, error)
+	CreateTree(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, baseTree string, entries []forge.TreeEntry) (string, error)
+	CreateCommit(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, message, treeSHA string, parents []string) (string, error)
+	CreateRef(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, branch, sha string) error
+	ForceUpdateRef(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, branch, newSHA string) error
+	CreatePullRequest(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, head, base, title, body string) (*forge.PullRequest, error)
 }
 
 // Scaffolder opens the onboarding scaffold PR through a githubClient. The
@@ -164,10 +164,10 @@ type Result struct {
 // A pre-commit read failure (ErrForbidden / ErrNotFound on GetFile /
 // GetRepository / GetBranchSHA) surfaces as an error with no partial
 // branch created.
-func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef) (*Result, error) {
+func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (*Result, error) {
 	// Step 1: already-onboarded skip. ref="" reads the default branch.
 	existing, err := s.client.GetFile(ctx, scope, repo, specPath, "")
-	if err != nil && !errors.Is(err, githubclient.ErrNotFound) {
+	if err != nil && !errors.Is(err, forge.ErrNotFound) {
 		return nil, fmt.Errorf("onboarding: probe existing spec: %w", err)
 	}
 	if err == nil && existing != nil {
@@ -236,7 +236,7 @@ func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialS
 	// PR pointing at it).
 	pr, err := s.client.CreatePullRequest(ctx, scope, repo, OnboardingBranch, base, prTitle, prBody)
 	if err != nil {
-		if errors.Is(err, githubclient.ErrPullRequestExists) {
+		if errors.Is(err, forge.ErrPullRequestExists) {
 			result.PRAlreadyExisted = true
 			return result, nil
 		}
@@ -258,15 +258,15 @@ func (s *Scaffolder) presetOrDefault() spec.Preset {
 // treeEntries turns the scaffold file map into a path-sorted TreeEntry
 // slice. Sorting makes the create-tree request deterministic (stable
 // across runs and easy to assert in tests).
-func treeEntries(files map[string][]byte) []githubclient.TreeEntry {
+func treeEntries(files map[string][]byte) []forge.TreeEntry {
 	paths := make([]string, 0, len(files))
 	for p := range files {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
-	entries := make([]githubclient.TreeEntry, 0, len(paths))
+	entries := make([]forge.TreeEntry, 0, len(paths))
 	for _, p := range paths {
-		entries = append(entries, githubclient.TreeEntry{Path: p, Content: string(files[p])})
+		entries = append(entries, forge.TreeEntry{Path: p, Content: string(files[p])})
 	}
 	return entries
 }
