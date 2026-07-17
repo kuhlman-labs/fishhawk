@@ -958,31 +958,31 @@ func (g *slashGitHubRecorder) calls() []slashCommentCall {
 	return out
 }
 
-// CreateIssueCommentScoped satisfies issuecomment.IssueCommenter.
-func (g *slashGitHubRecorder) CreateIssueCommentScoped(_ context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
+// CreateIssueComment satisfies issuecomment.IssueCommenter.
+func (g *slashGitHubRecorder) CreateIssueComment(_ context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.stored = append(g.stored, slashCommentCall{repo: repo.String(), issueNumber: issueNumber, body: body})
 	return &githubclient.IssueComment{ID: int64(len(g.stored)), Body: body}, nil
 }
 
-// UpdateIssueCommentScoped satisfies the IssueCommenter interface
+// UpdateIssueComment satisfies the IssueCommenter interface
 // extended in #328. Slash-approval tests don't exercise the
 // update path; returning a happy response keeps the interface
 // satisfied.
-func (g *slashGitHubRecorder) UpdateIssueCommentScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
+func (g *slashGitHubRecorder) UpdateIssueComment(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
 	return &githubclient.IssueComment{ID: commentID, Body: body}, nil
 }
 
-// CreateReviewScoped is a no-op stub for the IssueCommenter interface extension
+// CreateReview is a no-op stub for the IssueCommenter interface extension
 // landed in #1785 (advisory COMMENT-type PR reviews). Slash-approval tests
 // don't exercise the PR-review path; a happy response keeps the interface
 // satisfied.
-func (g *slashGitHubRecorder) CreateReviewScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int, _ githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
+func (g *slashGitHubRecorder) CreateReview(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int, _ githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
 	return &githubclient.CreateReviewResult{}, nil
 }
 
-func (g *slashGitHubRecorder) ListIssueCommentsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) ([]githubclient.FetchedIssueComment, error) {
+func (g *slashGitHubRecorder) ListIssueComments(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) ([]githubclient.FetchedIssueComment, error) {
 	return nil, nil
 }
 

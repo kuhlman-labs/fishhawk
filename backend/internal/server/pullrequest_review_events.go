@@ -652,7 +652,7 @@ func (s *Server) stampEconomicsIntoPRBody(ctx context.Context, target *run.Run) 
 		return
 	}
 
-	pr, err := s.cfg.GitHub.GetPullRequestScoped(ctx, forge.FromGitHubInstallationID(*target.InstallationID), repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequest(ctx, forge.FromGitHubInstallationID(*target.InstallationID), repo, prNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"economics stamp: get pr failed",
@@ -667,7 +667,7 @@ func (s *Server) stampEconomicsIntoPRBody(ctx context.Context, target *run.Run) 
 		// Skip the PATCH so a redelivery is a true no-op.
 		return
 	}
-	if err := s.cfg.GitHub.EditPullRequestScoped(ctx, forge.FromGitHubInstallationID(*target.InstallationID), repo, prNumber, updated); err != nil {
+	if err := s.cfg.GitHub.EditPullRequest(ctx, forge.FromGitHubInstallationID(*target.InstallationID), repo, prNumber, updated); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"economics stamp: edit pr body failed",
 			slog.String("run_id", target.ID.String()),

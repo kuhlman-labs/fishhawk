@@ -1575,8 +1575,8 @@ type githubTeamListerAdapter struct {
 	c *githubclient.Client
 }
 
-func (a githubTeamListerAdapter) ListTeamMembers(ctx context.Context, installationID int64, org, slug string) ([]role.TeamMember, error) {
-	got, err := a.c.ListTeamMembersScoped(ctx, forge.FromGitHubInstallationID(installationID), org, slug)
+func (a githubTeamListerAdapter) ListTeamMembers(ctx context.Context, scope forge.CredentialScope, org, slug string) ([]role.TeamMember, error) {
+	got, err := a.c.ListTeamMembers(ctx, scope, org, slug)
 	if err != nil {
 		return nil, err
 	}
@@ -1843,7 +1843,7 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	// Primary: queue GitHub auto-merge so the PR lands once branch protection
 	// (required review + the fishhawk_audit_complete check) clears. The webhook
 	// / resolveReviewStageOnMerge path settles the review stage on the merge.
-	err = m.gh.EnableAutoMergeScoped(ctx, scope, repo, number, githubclient.MergeMethodSquash)
+	err = m.gh.EnableAutoMerge(ctx, scope, repo, number, githubclient.MergeMethodSquash)
 	if err == nil {
 		return nil
 	}
@@ -1854,7 +1854,7 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 	// synchronously-mergeable PR, so merge it directly via REST. Any OTHER
 	// enable error surfaces unchanged (no fallback).
 	if errors.Is(err, githubclient.ErrPullRequestCleanStatus) {
-		return m.gh.MergePullRequestScoped(ctx, scope, repo, number, githubclient.MergeMethodSquash)
+		return m.gh.MergePullRequest(ctx, scope, repo, number, githubclient.MergeMethodSquash)
 	}
 	return err
 }

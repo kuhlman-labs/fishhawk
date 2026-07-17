@@ -96,15 +96,15 @@ func ScaffoldFiles(preset spec.Preset) (map[string][]byte, error) {
 // drives. Declaring it as an interface lets tests substitute a fake that
 // records the call sequence without an httptest server.
 type githubClient interface {
-	GetFileScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, path, ref string) (*githubclient.FileContent, error)
-	GetRepositoryScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef) (*githubclient.Repository, error)
-	GetBranchSHAScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch string) (string, bool, error)
-	GetCommitScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, sha string) (*githubclient.GitCommit, error)
-	CreateTreeScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, baseTree string, entries []githubclient.TreeEntry) (string, error)
-	CreateCommitScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, message, treeSHA string, parents []string) (string, error)
-	CreateRefScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch, sha string) error
-	ForceUpdateRefScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch, newSHA string) error
-	CreatePullRequestScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error)
+	GetFile(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, path, ref string) (*githubclient.FileContent, error)
+	GetRepository(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef) (*githubclient.Repository, error)
+	GetBranchSHA(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch string) (string, bool, error)
+	GetCommit(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, sha string) (*githubclient.GitCommit, error)
+	CreateTree(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, baseTree string, entries []githubclient.TreeEntry) (string, error)
+	CreateCommit(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, message, treeSHA string, parents []string) (string, error)
+	CreateRef(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch, sha string) error
+	ForceUpdateRef(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch, newSHA string) error
+	CreatePullRequest(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, head, base, title, body string) (*githubclient.PullRequest, error)
 }
 
 // Scaffolder opens the onboarding scaffold PR through a githubClient. The
@@ -166,7 +166,7 @@ type Result struct {
 // branch created.
 func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef) (*Result, error) {
 	// Step 1: already-onboarded skip. ref="" reads the default branch.
-	existing, err := s.client.GetFileScoped(ctx, scope, repo, specPath, "")
+	existing, err := s.client.GetFile(ctx, scope, repo, specPath, "")
 	if err != nil && !errors.Is(err, githubclient.ErrNotFound) {
 		return nil, fmt.Errorf("onboarding: probe existing spec: %w", err)
 	}
@@ -175,13 +175,13 @@ func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialS
 	}
 
 	// Step 2: resolve default branch + its HEAD commit's tree.
-	repoInfo, err := s.client.GetRepositoryScoped(ctx, scope, repo)
+	repoInfo, err := s.client.GetRepository(ctx, scope, repo)
 	if err != nil {
 		return nil, fmt.Errorf("onboarding: get repository: %w", err)
 	}
 	base := repoInfo.DefaultBranch
 
-	baseCommitSHA, exists, err := s.client.GetBranchSHAScoped(ctx, scope, repo, base)
+	baseCommitSHA, exists, err := s.client.GetBranchSHA(ctx, scope, repo, base)
 	if err != nil {
 		return nil, fmt.Errorf("onboarding: get base branch sha: %w", err)
 	}
@@ -190,7 +190,7 @@ func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialS
 		// Skip rather than error — nothing to scaffold yet.
 		return &Result{Skipped: true, Reason: "default branch " + base + " has no commit"}, nil
 	}
-	baseCommit, err := s.client.GetCommitScoped(ctx, scope, repo, baseCommitSHA)
+	baseCommit, err := s.client.GetCommit(ctx, scope, repo, baseCommitSHA)
 	if err != nil {
 		return nil, fmt.Errorf("onboarding: get base commit: %w", err)
 	}
@@ -201,11 +201,11 @@ func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialS
 		return nil, fmt.Errorf("onboarding: scaffold files: %w", err)
 	}
 	entries := treeEntries(files)
-	treeSHA, err := s.client.CreateTreeScoped(ctx, scope, repo, baseCommit.TreeSHA, entries)
+	treeSHA, err := s.client.CreateTree(ctx, scope, repo, baseCommit.TreeSHA, entries)
 	if err != nil {
 		return nil, fmt.Errorf("onboarding: create tree: %w", err)
 	}
-	commitSHA, err := s.client.CreateCommitScoped(ctx, scope, repo, commitMessage, treeSHA, []string{baseCommitSHA})
+	commitSHA, err := s.client.CreateCommit(ctx, scope, repo, commitMessage, treeSHA, []string{baseCommitSHA})
 	if err != nil {
 		return nil, fmt.Errorf("onboarding: create commit: %w", err)
 	}
@@ -218,23 +218,23 @@ func (s *Scaffolder) OpenScaffoldPR(ctx context.Context, scope forge.CredentialS
 	// distinguishes create-vs-update up front, which the underlying
 	// CreateRef (already-exists → benign no-op) cannot.
 	result := &Result{}
-	_, branchExists, err := s.client.GetBranchSHAScoped(ctx, scope, repo, OnboardingBranch)
+	_, branchExists, err := s.client.GetBranchSHA(ctx, scope, repo, OnboardingBranch)
 	if err != nil {
 		return nil, fmt.Errorf("onboarding: probe onboarding branch: %w", err)
 	}
 	if branchExists {
-		if err := s.client.ForceUpdateRefScoped(ctx, scope, repo, OnboardingBranch, commitSHA); err != nil {
+		if err := s.client.ForceUpdateRef(ctx, scope, repo, OnboardingBranch, commitSHA); err != nil {
 			return nil, fmt.Errorf("onboarding: force-update onboarding ref: %w", err)
 		}
 		result.RefForceUpdated = true
-	} else if err := s.client.CreateRefScoped(ctx, scope, repo, OnboardingBranch, commitSHA); err != nil {
+	} else if err := s.client.CreateRef(ctx, scope, repo, OnboardingBranch, commitSHA); err != nil {
 		return nil, fmt.Errorf("onboarding: create onboarding ref: %w", err)
 	}
 
 	// Step 5: open the PR. A pre-existing PR for the same head/base is an
 	// idempotent success (the branch we just refreshed already has an open
 	// PR pointing at it).
-	pr, err := s.client.CreatePullRequestScoped(ctx, scope, repo, OnboardingBranch, base, prTitle, prBody)
+	pr, err := s.client.CreatePullRequest(ctx, scope, repo, OnboardingBranch, base, prTitle, prBody)
 	if err != nil {
 		if errors.Is(err, githubclient.ErrPullRequestExists) {
 			result.PRAlreadyExisted = true

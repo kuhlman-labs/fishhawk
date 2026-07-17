@@ -563,7 +563,7 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 	dirListings := make(map[string][]string, len(dirs))
 	listedDirs := 0
 	for _, dir := range dirs {
-		entries, lerr := s.cfg.GitHub.ListDirectoryScoped(ctx, scope, repoRef, dir, "")
+		entries, lerr := s.cfg.GitHub.ListDirectory(ctx, scope, repoRef, dir, "")
 		if lerr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "test sweep: list directory failed; skipping",
 				slog.String("run_id", runID.String()),

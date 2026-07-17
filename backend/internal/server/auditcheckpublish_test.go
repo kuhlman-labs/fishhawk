@@ -735,14 +735,14 @@ type selectiveFailGitHub struct {
 	failed     int
 }
 
-func (f *selectiveFailGitHub) CreateCheckRunScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
+func (f *selectiveFailGitHub) CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
 	if strings.Contains(p.DetailsURL, f.failSubstr) {
 		f.failMu.Lock()
 		f.failed++
 		f.failMu.Unlock()
 		return nil, errors.New("POST /repos/x/y/check-runs: 401 Bad credentials")
 	}
-	return f.publisherFakeGitHub.CreateCheckRunScoped(ctx, scope, repo, p)
+	return f.publisherFakeGitHub.CreateCheckRun(ctx, scope, repo, p)
 }
 
 // awaitingStagesRepo overrides the orchestratorRepo's no-op
@@ -762,7 +762,7 @@ func (r *awaitingStagesRepo) ListReviewStagesAwaitingApproval(context.Context) (
 // audit-check heal path from the merge-resolution path.
 type openPRGetter struct{}
 
-func (openPRGetter) GetPullRequestScoped(context.Context, forge.CredentialScope, githubclient.RepoRef, int) (*githubclient.PullRequest, error) {
+func (openPRGetter) GetPullRequest(context.Context, forge.CredentialScope, githubclient.RepoRef, int) (*githubclient.PullRequest, error) {
 	return &githubclient.PullRequest{State: "open"}, nil
 }
 
@@ -782,7 +782,7 @@ func (f *flakyCheckRunGitHub) failedCalls() int {
 	return f.failed
 }
 
-func (f *flakyCheckRunGitHub) CreateCheckRunScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
+func (f *flakyCheckRunGitHub) CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
 	f.failMu.Lock()
 	if f.failuresLeft > 0 {
 		f.failuresLeft--
@@ -791,7 +791,7 @@ func (f *flakyCheckRunGitHub) CreateCheckRunScoped(ctx context.Context, scope fo
 		return nil, errors.New("POST /repos/x/y/check-runs: 401 Bad credentials")
 	}
 	f.failMu.Unlock()
-	return f.publisherFakeGitHub.CreateCheckRunScoped(ctx, scope, repo, p)
+	return f.publisherFakeGitHub.CreateCheckRun(ctx, scope, repo, p)
 }
 
 func pullRequestArtifactBody(headSHA string) []byte {
@@ -824,7 +824,7 @@ func (f *publisherFakeGitHub) calls() []publisherFakeCall {
 	return out
 }
 
-func (f *publisherFakeGitHub) CreateCheckRunScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
+func (f *publisherFakeGitHub) CreateCheckRun(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateCheckRunParams) (*githubclient.CreateCheckRunResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stored = append(f.stored, publisherFakeCall{scope: scope, repo: repo, params: p})

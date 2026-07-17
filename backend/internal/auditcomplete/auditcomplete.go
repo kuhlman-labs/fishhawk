@@ -43,6 +43,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -205,7 +206,7 @@ func ReviewPresent(in ReviewPresenceInputs) (present, backstopElapsed bool) {
 // PRHeadFetcher is the signature for the live-HEAD callback. Errors
 // flow into a `head_fetch_failed` MissingItem rather than failing
 // Compute outright (GitHub flap shouldn't break the audit signal).
-type PRHeadFetcher func(ctx context.Context, installationID int64, repo githubclient.RepoRef, prNumber int) (headSHA string, err error)
+type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int) (headSHA string, err error)
 
 // HeadReportCategoriesByPrecedence lists a run's own-chain head-reporting
 // audit categories in DESCENDING precedence (#1682): the newest fixup_pushed
@@ -700,7 +701,7 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 		return
 	}
 
-	liveSHA, err := deps.PRHead(ctx, gather.installationID, gather.repo, gather.prNumber)
+	liveSHA, err := deps.PRHead(ctx, gather.scope, gather.repo, gather.prNumber)
 	if err != nil {
 		*out = append(*out, MissingItem{
 			Kind:   MissingHeadFetchFail,
@@ -728,10 +729,10 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 // foreignCommitInputs bundles the values rule5 needs to make the
 // PRHead call + compose the missing-item detail.
 type foreignCommitInputs struct {
-	installationID int64
-	repo           githubclient.RepoRef
-	prNumber       int
-	knownSHAs      map[string]struct{}
+	scope     forge.CredentialScope
+	repo      githubclient.RepoRef
+	prNumber  int
+	knownSHAs map[string]struct{}
 }
 
 // gatherForeignCommitInputs walks runID upward via parent_run_id
@@ -743,9 +744,9 @@ type foreignCommitInputs struct {
 func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) (foreignCommitInputs, bool, error) {
 	known := make(map[string]struct{})
 	var (
-		installationID int64
-		repoRef        githubclient.RepoRef
-		prNumber       int
+		scope    forge.CredentialScope
+		repoRef  githubclient.RepoRef
+		prNumber int
 	)
 
 	cursor := runID
@@ -763,8 +764,8 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 
 		// The original (head) run anchors installation + repo;
 		// every ancestor shares them. Capture once.
-		if installationID == 0 && r.InstallationID != nil {
-			installationID = *r.InstallationID
+		if scope.IsZero() && r.InstallationID != nil {
+			scope = forge.FromGitHubInstallationID(*r.InstallationID)
 			parsed, perr := parseRepo(r.Repo)
 			if perr == nil {
 				repoRef = parsed
@@ -834,14 +835,14 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 		cursor = *r.ParentRunID
 	}
 
-	if installationID == 0 || repoRef.Owner == "" || prNumber == 0 || len(known) == 0 {
+	if scope.IsZero() || repoRef.Owner == "" || prNumber == 0 || len(known) == 0 {
 		return foreignCommitInputs{}, false, nil
 	}
 	return foreignCommitInputs{
-		installationID: installationID,
-		repo:           repoRef,
-		prNumber:       prNumber,
-		knownSHAs:      known,
+		scope:     scope,
+		repo:      repoRef,
+		prNumber:  prNumber,
+		knownSHAs: known,
 	}, true, nil
 }
 

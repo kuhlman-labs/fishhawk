@@ -13,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1071,8 +1072,8 @@ func TestCompute_Rule7_MediumFindingDoesNotGate(t *testing.T) {
 // what was asked.
 func stubPRHead(t *testing.T, headSHA string, err error) auditcomplete.PRHeadFetcher {
 	t.Helper()
-	return func(_ context.Context, installationID int64, repo githubclient.RepoRef, prNumber int) (string, error) {
-		t.Logf("PRHead called: installationID=%d repo=%s pr=%d", installationID, repo.String(), prNumber)
+	return func(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int) (string, error) {
+		t.Logf("PRHead called: scope=%s repo=%s pr=%d", scope.Ref(), repo.String(), prNumber)
 		return headSHA, err
 	}
 }

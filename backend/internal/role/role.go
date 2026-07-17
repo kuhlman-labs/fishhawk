@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -50,7 +51,7 @@ type TeamMember struct {
 // it here as an interface lets tests substitute a stub without
 // pulling in the whole githubclient package.
 type TeamLister interface {
-	ListTeamMembers(ctx context.Context, installationID int64, org, slug string) ([]TeamMember, error)
+	ListTeamMembers(ctx context.Context, scope forge.CredentialScope, org, slug string) ([]TeamMember, error)
 }
 
 // Errors callers may want to switch on.
@@ -125,7 +126,7 @@ func NewResolver(gh TeamLister, opts ...Option) *Resolver {
 // Returns ErrUnknownRole when roleName isn't in roles. A role with
 // zero members returns an empty slice and a nil error — that's a
 // valid (if odd) configuration choice.
-func (r *Resolver) ExpandRole(ctx context.Context, installationID int64, roleName string, roles map[string]spec.Role) ([]string, error) {
+func (r *Resolver) ExpandRole(ctx context.Context, scope forge.CredentialScope, roleName string, roles map[string]spec.Role) ([]string, error) {
 	role, ok := roles[roleName]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownRole, roleName)
@@ -133,7 +134,7 @@ func (r *Resolver) ExpandRole(ctx context.Context, installationID int64, roleNam
 	seen := map[string]struct{}{}
 	out := []string{}
 	for _, ref := range role.Members {
-		members, err := r.expandMemberRef(ctx, installationID, ref)
+		members, err := r.expandMemberRef(ctx, scope, ref)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +158,7 @@ func (r *Resolver) ExpandRole(ctx context.Context, installationID int64, roleNam
 // The schema enforces exactly one of any_of/all_of is set; nil
 // approvers (gate type=check) returns (false, nil) — the caller
 // should treat that as "not an approval gate; reject."
-func (r *Resolver) CanApprove(ctx context.Context, installationID int64, approvers *spec.Approvers, roles map[string]spec.Role, subject string) (bool, error) {
+func (r *Resolver) CanApprove(ctx context.Context, scope forge.CredentialScope, approvers *spec.Approvers, roles map[string]spec.Role, subject string) (bool, error) {
 	if approvers == nil {
 		return false, nil
 	}
@@ -169,7 +170,7 @@ func (r *Resolver) CanApprove(ctx context.Context, installationID int64, approve
 	switch {
 	case len(approvers.AnyOf) > 0:
 		for _, role := range approvers.AnyOf {
-			members, err := r.ExpandRole(ctx, installationID, role, roles)
+			members, err := r.ExpandRole(ctx, scope, role, roles)
 			if err != nil {
 				return false, err
 			}
@@ -180,7 +181,7 @@ func (r *Resolver) CanApprove(ctx context.Context, installationID int64, approve
 		return false, nil
 	case len(approvers.AllOf) > 0:
 		for _, role := range approvers.AllOf {
-			members, err := r.ExpandRole(ctx, installationID, role, roles)
+			members, err := r.ExpandRole(ctx, scope, role, roles)
 			if err != nil {
 				return false, err
 			}
@@ -199,7 +200,7 @@ func (r *Resolver) CanApprove(ctx context.Context, installationID int64, approve
 // expandMemberRef handles one entry from a role's `members` list.
 // `@org/team` → ListTeamMembers (with cache); anything else →
 // passthrough as a literal login.
-func (r *Resolver) expandMemberRef(ctx context.Context, installationID int64, ref string) ([]string, error) {
+func (r *Resolver) expandMemberRef(ctx context.Context, scope forge.CredentialScope, ref string) ([]string, error) {
 	if !strings.HasPrefix(ref, "@") {
 		// Literal login. No API call.
 		return []string{strings.TrimSpace(ref)}, nil
@@ -210,14 +211,14 @@ func (r *Resolver) expandMemberRef(ctx context.Context, installationID int64, re
 		return nil, fmt.Errorf("%w: %q", ErrInvalidRef, ref)
 	}
 	org, slug := parts[0], parts[1]
-	return r.team(ctx, installationID, org, slug)
+	return r.team(ctx, scope, org, slug)
 }
 
 // team fetches an org/team's membership, returning a cached copy
 // when fresh. Concurrent callers on a cold cache may both fetch;
 // fanning that out to a single in-flight request is cheap to add
 // later if the load argues for it.
-func (r *Resolver) team(ctx context.Context, installationID int64, org, slug string) ([]string, error) {
+func (r *Resolver) team(ctx context.Context, scope forge.CredentialScope, org, slug string) ([]string, error) {
 	key := cacheKey(org, slug)
 
 	r.mu.Lock()
@@ -231,7 +232,7 @@ func (r *Resolver) team(ctx context.Context, installationID int64, org, slug str
 	if r.gh == nil {
 		return nil, errors.New("role: TeamLister not configured")
 	}
-	got, err := r.gh.ListTeamMembers(ctx, installationID, org, slug)
+	got, err := r.gh.ListTeamMembers(ctx, scope, org, slug)
 	if err != nil {
 		return nil, fmt.Errorf("role: list team %s/%s: %w", org, slug, err)
 	}

@@ -770,7 +770,7 @@ func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.Filing
 	if err != nil {
 		return
 	}
-	issue, err := s.cfg.GitHub.GetIssueScoped(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
+	issue, err := s.cfg.GitHub.GetIssue(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
 	if err != nil {
 		return
 	}
@@ -821,7 +821,7 @@ func (s *Server) deriveAreaLabel(ctx context.Context, filing *workmgmt.FilingReq
 	if err != nil {
 		return nil
 	}
-	issue, err := s.cfg.GitHub.GetIssueScoped(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
+	issue, err := s.cfg.GitHub.GetIssue(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
 	if err != nil {
 		return nil
 	}

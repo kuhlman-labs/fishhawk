@@ -757,7 +757,7 @@ type stubGitHub struct {
 	rulesetsBranch string
 }
 
-func (s *stubGitHub) GetWorkflowSpecScoped(_ context.Context, _ forge.CredentialScope,
+func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, _ string) (*githubclient.FileContent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -768,7 +768,7 @@ func (s *stubGitHub) GetWorkflowSpecScoped(_ context.Context, _ forge.Credential
 	return &githubclient.FileContent{Content: s.specContent, SHA: s.specSHA}, nil
 }
 
-func (s *stubGitHub) DispatchWorkflowScoped(_ context.Context, _ forge.CredentialScope,
+func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ forge.CredentialScope,
 	repo githubclient.RepoRef, file, ref string, args githubclient.DispatchInputs) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -780,7 +780,7 @@ func (s *stubGitHub) DispatchWorkflowScoped(_ context.Context, _ forge.Credentia
 	return s.dispatchErr
 }
 
-func (s *stubGitHub) GetWorkflowRunScoped(_ context.Context, _ forge.CredentialScope,
+func (s *stubGitHub) GetWorkflowRun(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -792,7 +792,7 @@ func (s *stubGitHub) GetWorkflowRunScoped(_ context.Context, _ forge.CredentialS
 	return s.workflowRun, nil
 }
 
-func (s *stubGitHub) GetBranchProtectionScoped(_ context.Context, _ forge.CredentialScope,
+func (s *stubGitHub) GetBranchProtection(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, _ string) (*githubclient.BranchProtection, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -806,7 +806,7 @@ func (s *stubGitHub) GetBranchProtectionScoped(_ context.Context, _ forge.Creden
 	return &githubclient.BranchProtection{}, nil
 }
 
-func (s *stubGitHub) ListRulesetRequiredChecksScoped(_ context.Context, _ forge.CredentialScope,
+func (s *stubGitHub) ListRulesetRequiredChecks(_ context.Context, _ forge.CredentialScope,
 	_ githubclient.RepoRef, branch string) ([]githubclient.RulesetRequiredCheck, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

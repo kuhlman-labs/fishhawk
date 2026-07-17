@@ -1740,40 +1740,40 @@ type fakeGithubAPI struct {
 	subIssues   []githubclient.SubIssue
 }
 
-func (f *fakeGithubAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+func (f *fakeGithubAPI) CreateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
 	f.createdBody = p.Body
 	return &githubclient.CreatedIssue{Number: 4242, NodeID: "CHILD_NODE", HTMLURL: "https://github.com/kuhlman-labs/fishhawk/issues/4242"}, nil
 }
 
-func (f *fakeGithubAPI) IssueNodeIDScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) (string, error) {
+func (f *fakeGithubAPI) IssueNodeID(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) (string, error) {
 	return "EPIC_NODE", nil
 }
 
-func (f *fakeGithubAPI) ProjectFieldsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
+func (f *fakeGithubAPI) ProjectFields(_ context.Context, _ forge.CredentialScope, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
 	return &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: map[string]string{"Backlog": "OPT"}}, nil
 }
 
-func (f *fakeGithubAPI) ProjectItemStatusScoped(_ context.Context, _ forge.CredentialScope, _, _, _ string) (*githubclient.ProjectItemStatus, error) {
+func (f *fakeGithubAPI) ProjectItemStatus(_ context.Context, _ forge.CredentialScope, _, _, _ string) (*githubclient.ProjectItemStatus, error) {
 	return &githubclient.ProjectItemStatus{OnBoard: true, ItemID: "ITEM"}, nil
 }
 
-func (f *fakeGithubAPI) AddProjectItemScoped(_ context.Context, _ forge.CredentialScope, _, _ string) (string, error) {
+func (f *fakeGithubAPI) AddProjectItem(_ context.Context, _ forge.CredentialScope, _, _ string) (string, error) {
 	return "ITEM", nil
 }
 
-func (f *fakeGithubAPI) SetProjectItemSingleSelectScoped(_ context.Context, _ forge.CredentialScope, _, _, _, _ string) error {
+func (f *fakeGithubAPI) SetProjectItemSingleSelect(_ context.Context, _ forge.CredentialScope, _, _, _, _ string) error {
 	return nil
 }
 
-func (f *fakeGithubAPI) AddSubIssueScoped(_ context.Context, _ forge.CredentialScope, _, _ string) error {
+func (f *fakeGithubAPI) AddSubIssue(_ context.Context, _ forge.CredentialScope, _, _ string) error {
 	return nil
 }
 
-func (f *fakeGithubAPI) ListSubIssuesScoped(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.SubIssue, error) {
+func (f *fakeGithubAPI) ListSubIssues(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.SubIssue, error) {
 	return f.subIssues, nil
 }
 
-func (f *fakeGithubAPI) SearchIssuesByTitleScoped(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.IssueTitleResult, error) {
+func (f *fakeGithubAPI) SearchIssuesByTitle(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.IssueTitleResult, error) {
 	return nil, nil
 }
 

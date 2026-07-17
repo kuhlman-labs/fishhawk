@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -101,7 +102,7 @@ type stubTeamLister struct {
 	teamMembers map[string][]role.TeamMember
 }
 
-func (s *stubTeamLister) ListTeamMembers(_ context.Context, _ int64, org, slug string) ([]role.TeamMember, error) {
+func (s *stubTeamLister) ListTeamMembers(_ context.Context, _ forge.CredentialScope, org, slug string) ([]role.TeamMember, error) {
 	if got, ok := s.teamMembers[org+"/"+slug]; ok {
 		return got, nil
 	}

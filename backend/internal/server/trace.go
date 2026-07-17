@@ -2677,7 +2677,7 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 	s.bgReviews.Add(1)
 	go func() {
 		defer s.bgReviews.Done()
-		cmp, cerr := s.cfg.GitHub.ComparePatchScoped(reviewCtx, scope, repo, base, head)
+		cmp, cerr := s.cfg.GitHub.ComparePatch(reviewCtx, scope, repo, base, head)
 		if cerr != nil {
 			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn, "consolidated review: compare patch failed — review not dispatched",
 				slog.String("run_id", parentRunID.String()),
@@ -2864,7 +2864,7 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 	s.bgReviews.Add(1)
 	go func() {
 		defer s.bgReviews.Done()
-		cmp, cerr := s.cfg.GitHub.ComparePatchScoped(reviewCtx, scope, repo, baseSHA, headSHA)
+		cmp, cerr := s.cfg.GitHub.ComparePatch(reviewCtx, scope, repo, baseSHA, headSHA)
 		if cerr != nil {
 			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn,
 				"fixup re-review backstop: compare patch failed — review not dispatched",
@@ -4077,7 +4077,7 @@ func (s *Server) resolveFixupDeltaDiff(ctx context.Context, runRow *run.Run, run
 		)
 		return policy.Diff{}, false
 	}
-	cmp, err := s.cfg.GitHub.ComparePatchScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, priorHead, currentHead)
+	cmp, err := s.cfg.GitHub.ComparePatch(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, priorHead, currentHead)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: compare patch for fixup delta failed — keeping full diff",
 			slog.String("run_id", runID.String()),

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // stubTokens is a minimal TokenProvider for tests that doesn't
@@ -464,7 +466,7 @@ func TestGetFile_HappyPath(t *testing.T) {
 		wrapped + `","encoding":"base64","type":"file"}`
 
 	c, stub := newTestClient(t, srv, nil)
-	got, err := c.GetFile(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	got, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		".fishhawk/workflows.yaml", "main")
 	if err != nil {
 		t.Fatalf("GetFile: %v", err)
@@ -504,7 +506,7 @@ func TestGetFile_NoRefOmitsQuery(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getFileBody = `{"path":"x","sha":"a","content":"YQ==","encoding":"base64","type":"file"}`
 	c, _ := newTestClient(t, srv, nil)
-	if _, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", ""); err != nil {
+	if _, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", ""); err != nil {
 		t.Fatal(err)
 	}
 	if fg.gotQuery != "" {
@@ -517,7 +519,7 @@ func TestGetFile_NotFound(t *testing.T) {
 	fg.getFileStatus = http.StatusNotFound
 	fg.getFileBody = `{"message":"Not Found"}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+	_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -530,7 +532,7 @@ func TestGetFile_Forbidden(t *testing.T) {
 			fg, srv := newFakeGitHub(t)
 			fg.getFileStatus = status
 			c, _ := newTestClient(t, srv, nil)
-			_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+			_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 			if !errors.Is(err, ErrForbidden) {
 				t.Errorf("err = %v, want ErrForbidden", err)
 			}
@@ -543,7 +545,7 @@ func TestGetFile_OtherStatus(t *testing.T) {
 	fg.getFileStatus = http.StatusInternalServerError
 	fg.getFileBody = `{"message":"upstream timeout"}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+	_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -556,7 +558,7 @@ func TestGetFile_NotAFile(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getFileBody = `{"path":"x","sha":"a","content":"","encoding":"none","type":"dir"}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+	_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 	if err == nil || !strings.Contains(err.Error(), `"dir"`) {
 		t.Errorf("err = %v, want dir-not-file error", err)
 	}
@@ -566,7 +568,7 @@ func TestGetFile_BadEncoding(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getFileBody = `{"path":"x","sha":"a","content":"raw","encoding":"utf-8","type":"file"}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+	_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 	if err == nil || !strings.Contains(err.Error(), "encoding") {
 		t.Errorf("err = %v, want encoding error", err)
 	}
@@ -576,7 +578,7 @@ func TestGetFile_CorruptBase64(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getFileBody = `{"path":"x","sha":"a","content":"!!!!","encoding":"base64","type":"file"}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+	_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 	if err == nil || !strings.Contains(err.Error(), "decode content") {
 		t.Errorf("err = %v, want decode error", err)
 	}
@@ -585,7 +587,7 @@ func TestGetFile_CorruptBase64(t *testing.T) {
 func TestGetFile_TokenError(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, errors.New("no installation"))
-	_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+	_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 	if err == nil || !strings.Contains(err.Error(), "no installation") {
 		t.Errorf("err = %v, want token error wrapped", err)
 	}
@@ -605,7 +607,7 @@ func TestGetFile_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.GetFile(context.Background(), 1, tc.repo, tc.path, "main")
+			_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.path, "main")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -617,7 +619,7 @@ func TestGetWorkflowSpec_DelegatesToCanonicalPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getFileBody = `{"path":".fishhawk/workflows.yaml","sha":"feedf00d","content":"YQ==","encoding":"base64","type":"file"}`
 	c, _ := newTestClient(t, srv, nil)
-	got, err := c.GetWorkflowSpec(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, "main")
+	got, err := c.GetWorkflowSpec(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +634,7 @@ func TestGetWorkflowSpec_DelegatesToCanonicalPath(t *testing.T) {
 func TestDispatchWorkflow_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
-	err := c.DispatchWorkflow(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	err := c.DispatchWorkflow(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		"fishhawk.yml", "main", DispatchInputs{"run_id": "abc-123"})
 	if err != nil {
 		t.Fatalf("DispatchWorkflow: %v", err)
@@ -665,7 +667,7 @@ func TestDispatchWorkflow_HappyPath(t *testing.T) {
 func TestDispatchWorkflow_NoInputs(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
-	if err := c.DispatchWorkflow(context.Background(), 1, RepoRef{Owner: "x", Name: "y"},
+	if err := c.DispatchWorkflow(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"},
 		"fishhawk.yml", "main", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -682,7 +684,7 @@ func TestDispatchWorkflow_Validation(t *testing.T) {
 	fg.dispatchStatus = http.StatusUnprocessableEntity
 	fg.dispatchBody = `{"message":"No ref found"}`
 	c, _ := newTestClient(t, srv, nil)
-	err := c.DispatchWorkflow(context.Background(), 1, RepoRef{Owner: "x", Name: "y"},
+	err := c.DispatchWorkflow(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"},
 		"fishhawk.yml", "no-such-branch", nil)
 	if !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
@@ -693,7 +695,7 @@ func TestDispatchWorkflow_NotFound(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.dispatchStatus = http.StatusNotFound
 	c, _ := newTestClient(t, srv, nil)
-	err := c.DispatchWorkflow(context.Background(), 1, RepoRef{Owner: "x", Name: "y"},
+	err := c.DispatchWorkflow(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"},
 		"missing.yml", "main", nil)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -715,7 +717,7 @@ func TestDispatchWorkflow_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := c.DispatchWorkflow(context.Background(), 1, tc.repo, tc.file, tc.ref, nil)
+			err := c.DispatchWorkflow(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.file, tc.ref, nil)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -726,7 +728,7 @@ func TestDispatchWorkflow_ValidationErrors(t *testing.T) {
 func TestDispatchWorkflow_TokenError(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, errors.New("install revoked"))
-	err := c.DispatchWorkflow(context.Background(), 1, RepoRef{Owner: "x", Name: "y"},
+	err := c.DispatchWorkflow(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"},
 		"f.yml", "main", nil)
 	if err == nil || !strings.Contains(err.Error(), "install revoked") {
 		t.Errorf("err = %v", err)
@@ -735,7 +737,7 @@ func TestDispatchWorkflow_TokenError(t *testing.T) {
 
 func TestDispatchWorkflow_NilTokens(t *testing.T) {
 	c := &Client{} // no Tokens
-	err := c.DispatchWorkflow(context.Background(), 1, RepoRef{Owner: "x", Name: "y"},
+	err := c.DispatchWorkflow(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"},
 		"f.yml", "main", nil)
 	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("err = %v", err)
@@ -744,7 +746,7 @@ func TestDispatchWorkflow_NilTokens(t *testing.T) {
 
 func TestGetFile_NilTokens(t *testing.T) {
 	c := &Client{}
-	_, err := c.GetFile(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, "x", "main")
+	_, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "x", "main")
 	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("err = %v", err)
 	}
@@ -799,7 +801,7 @@ func TestGetIssue_HappyPath(t *testing.T) {
 	fg.getIssueBody = `{"number":42,"title":"Add foo","body":"Body text","state":"open"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	got, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
@@ -828,7 +830,7 @@ func TestGetIssue_DecodesLabels(t *testing.T) {
 		`"labels":[{"name":"epic","color":"ededed"},{"name":"area:backend"},"autonomy:low"]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	got, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
@@ -844,7 +846,7 @@ func TestGetIssue_NoLabels(t *testing.T) {
 	fg.getIssueBody = `{"number":42,"title":"Add foo","state":"open"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	got, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
@@ -863,7 +865,7 @@ func TestGetIssue_DecodesStateReason(t *testing.T) {
 	fg.getIssueBody = `{"number":42,"title":"done","state":"closed","state_reason":"completed"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	got, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
@@ -880,7 +882,7 @@ func TestGetIssue_NoStateReason(t *testing.T) {
 	fg.getIssueBody = `{"number":42,"title":"open","state":"open"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetIssue(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	got, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
@@ -895,7 +897,7 @@ func TestGetIssue_NotFound(t *testing.T) {
 	fg.getIssueBody = `{"message":"Not Found"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	_, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 1)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -903,14 +905,14 @@ func TestGetIssue_NotFound(t *testing.T) {
 
 func TestGetIssue_ValidationErrors(t *testing.T) {
 	c := &Client{Tokens: &stubTokens{}}
-	if _, err := c.GetIssue(context.Background(), 1, RepoRef{}, 1); err == nil {
+	if _, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{}, 1); err == nil {
 		t.Errorf("expected error for empty repo")
 	}
-	if _, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 0); err == nil {
+	if _, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 0); err == nil {
 		t.Errorf("expected error for zero issue number")
 	}
 	c2 := &Client{}
-	if _, err := c2.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1); err == nil {
+	if _, err := c2.GetIssue(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 1); err == nil {
 		t.Errorf("expected error for missing TokenProvider")
 	}
 }
@@ -920,7 +922,7 @@ func TestGetIssue_DecodeError(t *testing.T) {
 	fg.getIssueBody = `not json`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.GetIssue(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	_, err := c.GetIssue(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 1)
 	if err == nil {
 		t.Fatalf("expected decode error")
 	}
@@ -936,7 +938,7 @@ func TestListIssueComments_HappyPath(t *testing.T) {
 	}
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ListIssueComments(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	got, err := c.ListIssueComments(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("ListIssueComments: %v", err)
 	}
@@ -965,7 +967,7 @@ func TestListIssueComments_Paginates(t *testing.T) {
 	}
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ListIssueComments(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 42)
+	got, err := c.ListIssueComments(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("ListIssueComments: %v", err)
 	}
@@ -986,7 +988,7 @@ func TestListIssueComments_NotFound(t *testing.T) {
 	fg.listIssueCommentsPages = []string{`{"message":"Not Found"}`}
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	_, err := c.ListIssueComments(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 1)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -997,7 +999,7 @@ func TestListIssueComments_DecodeError(t *testing.T) {
 	fg.listIssueCommentsPages = []string{`not json`}
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1)
+	_, err := c.ListIssueComments(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 1)
 	if err == nil {
 		t.Fatalf("expected decode error")
 	}
@@ -1005,14 +1007,14 @@ func TestListIssueComments_DecodeError(t *testing.T) {
 
 func TestListIssueComments_ValidationErrors(t *testing.T) {
 	c := &Client{Tokens: &stubTokens{}}
-	if _, err := c.ListIssueComments(context.Background(), 1, RepoRef{}, 1); err == nil {
+	if _, err := c.ListIssueComments(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{}, 1); err == nil {
 		t.Errorf("expected error for empty repo")
 	}
-	if _, err := c.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 0); err == nil {
+	if _, err := c.ListIssueComments(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 0); err == nil {
 		t.Errorf("expected error for zero issue number")
 	}
 	c2 := &Client{}
-	if _, err := c2.ListIssueComments(context.Background(), 1, RepoRef{Owner: "x", Name: "y"}, 1); err == nil {
+	if _, err := c2.ListIssueComments(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, 1); err == nil {
 		t.Errorf("expected error for missing TokenProvider")
 	}
 }
@@ -1023,7 +1025,7 @@ func TestCreateCheckRun_Completed_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.CreateCheckRun(context.Background(), 42,
+	got, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"},
 		CreateCheckRunParams{
 			Name:          "fishhawk_audit_complete",
@@ -1084,7 +1086,7 @@ func TestCreateCheckRun_InProgress_OmitsConclusion(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.CreateCheckRun(context.Background(), 42,
+	_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"},
 		CreateCheckRunParams{
 			Name:    "fishhawk_audit_complete",
@@ -1107,7 +1109,7 @@ func TestCreateCheckRun_RejectsCompletedWithoutConclusion(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.CreateCheckRun(context.Background(), 42,
+	_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"},
 		CreateCheckRunParams{
 			Name:    "fishhawk_audit_complete",
@@ -1123,7 +1125,7 @@ func TestCreateCheckRun_RejectsConclusionWithoutCompleted(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.CreateCheckRun(context.Background(), 42,
+	_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"},
 		CreateCheckRunParams{
 			Name:       "fishhawk_audit_complete",
@@ -1140,7 +1142,7 @@ func TestCreateReview_Comment_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.CreateReview(context.Background(), 42,
+	got, err := c.CreateReview(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 7,
 		CreateReviewParams{
 			Body:  "Advisory review by claude-opus-4-8.",
@@ -1192,7 +1194,7 @@ func TestCreateReview_StatusMapping(t *testing.T) {
 			fg.createReviewStatus = tc.status
 			fg.createReviewBody = `{"message":"nope"}`
 			c, _ := newTestClient(t, srv, nil)
-			_, err := c.CreateReview(context.Background(), 42,
+			_, err := c.CreateReview(context.Background(), forge.FromGitHubInstallationID(42),
 				RepoRef{Owner: "x", Name: "y"}, 7,
 				CreateReviewParams{Body: "b", Event: "COMMENT"})
 			if !errors.Is(err, tc.want) {
@@ -1217,7 +1219,7 @@ func TestCreateReview_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.CreateReview(context.Background(), 42, tc.repo, tc.pr, tc.params)
+			_, err := c.CreateReview(context.Background(), forge.FromGitHubInstallationID(42), tc.repo, tc.pr, tc.params)
 			if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
 				t.Errorf("err = %v, want containing %q", err, tc.wantMsg)
 			}
@@ -1240,7 +1242,7 @@ func TestCreateCheckRun_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.CreateCheckRun(context.Background(), 1, tc.repo, tc.params)
+			_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.params)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -1254,7 +1256,7 @@ func TestCreateCheckRun_GitHubError(t *testing.T) {
 	fg.createCheckRunBody = `{"message":"Resource not accessible by integration"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.CreateCheckRun(context.Background(), 1,
+	_, err := c.CreateCheckRun(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"},
 		CreateCheckRunParams{
 			Name:    "fishhawk_audit_complete",
@@ -1272,7 +1274,7 @@ func TestCreateIssueComment_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.CreateIssueComment(context.Background(), 42,
+	got, err := c.CreateIssueComment(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 17, "Fishhawk picked this up.")
 	if err != nil {
 		t.Fatalf("CreateIssueComment: %v", err)
@@ -1318,7 +1320,7 @@ func TestCreateIssueComment_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.CreateIssueComment(context.Background(), 1, tc.repo, tc.number, tc.body)
+			_, err := c.CreateIssueComment(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.number, tc.body)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -1332,7 +1334,7 @@ func TestCreateIssueComment_GitHubError(t *testing.T) {
 	fg.createIssueCommentBody = `{"message":"Resource not accessible by integration"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.CreateIssueComment(context.Background(), 1,
+	_, err := c.CreateIssueComment(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, 1, "hi")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v want ErrForbidden", err)
@@ -1345,7 +1347,7 @@ func TestUpdateIssueComment_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.UpdateIssueComment(context.Background(), 42,
+	got, err := c.UpdateIssueComment(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 11111, "edited body")
 	if err != nil {
 		t.Fatalf("UpdateIssueComment: %v", err)
@@ -1391,7 +1393,7 @@ func TestUpdateIssueComment_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.UpdateIssueComment(context.Background(), 1, tc.repo, tc.commentID, tc.body)
+			_, err := c.UpdateIssueComment(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.commentID, tc.body)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -1408,7 +1410,7 @@ func TestUpdateIssueComment_NotFound(t *testing.T) {
 	fg.updateIssueCommentBody = `{"message":"Not Found"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.UpdateIssueComment(context.Background(), 1,
+	_, err := c.UpdateIssueComment(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, 9999, "edited")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v want ErrNotFound", err)
@@ -1421,7 +1423,7 @@ func TestUpdateIssueComment_Forbidden(t *testing.T) {
 	fg.updateIssueCommentBody = `{"message":"Resource not accessible by integration"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.UpdateIssueComment(context.Background(), 1,
+	_, err := c.UpdateIssueComment(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, 1, "hi")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v want ErrForbidden", err)
@@ -1434,7 +1436,7 @@ func TestGetWorkflowRun_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetWorkflowRun(context.Background(), 42,
+	got, err := c.GetWorkflowRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 987654321)
 	if err != nil {
 		t.Fatalf("GetWorkflowRun: %v", err)
@@ -1465,7 +1467,7 @@ func TestGetWorkflowRun_NotFound(t *testing.T) {
 	fg.getWorkflowRunBody = `{"message":"Not Found"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.GetWorkflowRun(context.Background(), 42,
+	_, err := c.GetWorkflowRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 987654321)
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v want ErrNotFound", err)
@@ -1486,7 +1488,7 @@ func TestGetWorkflowRun_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.GetWorkflowRun(context.Background(), 1, tc.repo, tc.runID)
+			_, err := c.GetWorkflowRun(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.runID)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -1511,7 +1513,7 @@ func TestResolveDispatchedRun_CorrelationMatch(t *testing.T) {
 	]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+	got, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
 	if err != nil {
 		t.Fatalf("ResolveDispatchedRun: %v", err)
@@ -1534,7 +1536,7 @@ func TestResolveDispatchedRun_FallbackSingleCandidate(t *testing.T) {
 	]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+	got, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
 	if err != nil {
 		t.Fatalf("ResolveDispatchedRun: %v", err)
@@ -1556,7 +1558,7 @@ func TestResolveDispatchedRun_AmbiguousNoInputs_Indeterminate(t *testing.T) {
 	]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+	got, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
 	if err != nil {
 		t.Fatalf("ResolveDispatchedRun: %v", err)
@@ -1577,7 +1579,7 @@ func TestResolveDispatchedRun_InputsPresentNoMatch_NotFound(t *testing.T) {
 	]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+	got, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
 	if err != nil {
 		t.Fatalf("ResolveDispatchedRun: %v", err)
@@ -1591,7 +1593,7 @@ func TestResolveDispatchedRun_InputsPresentNoMatch_NotFound(t *testing.T) {
 func TestResolveDispatchedRun_EmptyList_NotFound(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
-	got, err := c.ResolveDispatchedRun(context.Background(), 42,
+	got, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Now())
 	if err != nil {
 		t.Fatalf("ResolveDispatchedRun: %v", err)
@@ -1607,7 +1609,7 @@ func TestResolveDispatchedRun_APIError(t *testing.T) {
 	fg.listWorkflowRunsStatus = http.StatusForbidden
 	fg.listWorkflowRunsBody = `{"message":"Forbidden"}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.ResolveDispatchedRun(context.Background(), 42,
+	_, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -1627,7 +1629,7 @@ func TestResolveDispatchedRun_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.ResolveDispatchedRun(context.Background(), 1, tc.repo, "main", tc.correlation, time.Time{})
+			_, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, "main", tc.correlation, time.Time{})
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -1637,7 +1639,7 @@ func TestResolveDispatchedRun_ValidationErrors(t *testing.T) {
 
 func TestResolveDispatchedRun_NilTokens(t *testing.T) {
 	c := &Client{}
-	_, err := c.ResolveDispatchedRun(context.Background(), 1,
+	_, err := c.ResolveDispatchedRun(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main", deployCorrelation(), time.Time{})
 	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("err = %v", err)
@@ -1649,7 +1651,7 @@ func TestGetBranchProtection_HappyPath(t *testing.T) {
 	fg.getBranchProtectionBody = `{"required_status_checks":{"contexts":["ci/build","lint"],"checks":[{"context":"ci/build","app_id":1}]}}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetBranchProtection(context.Background(), 42,
+	got, err := c.GetBranchProtection(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatalf("GetBranchProtection: %v", err)
@@ -1680,7 +1682,7 @@ func TestGetBranchProtection_EmptyContexts(t *testing.T) {
 	fg.getBranchProtectionBody = `{}`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.GetBranchProtection(context.Background(), 42,
+	got, err := c.GetBranchProtection(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatalf("GetBranchProtection: %v", err)
@@ -1696,7 +1698,7 @@ func TestGetBranchProtection_NotFound(t *testing.T) {
 	fg.getBranchProtectionBody = `{"message":"Branch not protected"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.GetBranchProtection(context.Background(), 42,
+	_, err := c.GetBranchProtection(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -1712,7 +1714,7 @@ func TestGetBranchProtection_Forbidden(t *testing.T) {
 	fg.getBranchProtectionStatus = http.StatusForbidden
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.GetBranchProtection(context.Background(), 42,
+	_, err := c.GetBranchProtection(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -1733,7 +1735,7 @@ func TestGetBranchProtection_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.GetBranchProtection(context.Background(), 1, tc.repo, tc.branch)
+			_, err := c.GetBranchProtection(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.branch)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -1757,7 +1759,7 @@ func TestListRulesetRequiredChecks_HappyPath(t *testing.T) {
 	}
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+	got, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatalf("ListRulesetRequiredChecks: %v", err)
@@ -1784,7 +1786,7 @@ func TestListRulesetRequiredChecks_NoneApply(t *testing.T) {
 	}
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+	got, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatalf("ListRulesetRequiredChecks: %v", err)
@@ -1800,7 +1802,7 @@ func TestListRulesetRequiredChecks_NoRulesets(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+	got, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatalf("ListRulesetRequiredChecks: %v", err)
@@ -1815,7 +1817,7 @@ func TestListRulesetRequiredChecks_Forbidden(t *testing.T) {
 	fg.listRulesetsStatus = http.StatusForbidden
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.ListRulesetRequiredChecks(context.Background(), 42,
+	_, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -1885,7 +1887,7 @@ func TestEnableAutoMerge_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.EnableAutoMerge(context.Background(), 42,
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
 	if err != nil {
 		t.Fatalf("EnableAutoMerge: %v", err)
@@ -1914,7 +1916,7 @@ func TestEnableAutoMerge_DefaultsMethodToSquash(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	if err := c.EnableAutoMerge(context.Background(), 42,
+	if err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 42, ""); err != nil {
 		t.Fatalf("EnableAutoMerge: %v", err)
 	}
@@ -1929,7 +1931,7 @@ func TestEnableAutoMerge_PRNotFound(t *testing.T) {
 	fg.getPullRequestBody = `{"message":"Not Found"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.EnableAutoMerge(context.Background(), 42,
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -1946,7 +1948,7 @@ func TestEnableAutoMerge_GraphQLError_AsValidation(t *testing.T) {
 	fg.graphqlBody = `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.EnableAutoMerge(context.Background(), 42,
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
@@ -1971,7 +1973,7 @@ func TestEnableAutoMerge_NonCleanGraphQLError_NotCleanStatus(t *testing.T) {
 	fg.graphqlBody = `{"errors":[{"message":"Auto-merge is not allowed for this repository","type":"UNPROCESSABLE"}]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.EnableAutoMerge(context.Background(), 42,
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
@@ -1985,7 +1987,7 @@ func TestMergePullRequest_HappyPath_SquashBody(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	if err := c.MergePullRequest(context.Background(), 42,
+	if err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash); err != nil {
 		t.Fatalf("MergePullRequest: %v", err)
 	}
@@ -2005,7 +2007,7 @@ func TestMergePullRequest_DefaultsMethodToSquash(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	if err := c.MergePullRequest(context.Background(), 42,
+	if err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 7, ""); err != nil {
 		t.Fatalf("MergePullRequest: %v", err)
 	}
@@ -2020,7 +2022,7 @@ func TestMergePullRequest_NotMergeable405(t *testing.T) {
 	fg.mergePullBody = `{"message":"Pull Request is not mergeable"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.MergePullRequest(context.Background(), 42,
+	err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
 	if err == nil || !errors.Is(err, ErrPullRequestNotMergeable) {
 		t.Errorf("err = %v, want ErrPullRequestNotMergeable", err)
@@ -2033,7 +2035,7 @@ func TestMergePullRequest_Conflict409(t *testing.T) {
 	fg.mergePullBody = `{"message":"Head branch was modified. Review and try the merge again."}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.MergePullRequest(context.Background(), 42,
+	err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
 	if err == nil || !errors.Is(err, ErrMergeConflict) {
 		t.Errorf("err = %v, want ErrMergeConflict", err)
@@ -2046,7 +2048,7 @@ func TestMergePullRequest_NotFound404(t *testing.T) {
 	fg.mergePullBody = `{"message":"Not Found"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.MergePullRequest(context.Background(), 42,
+	err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -2059,7 +2061,7 @@ func TestMergePullRequest_Forbidden403(t *testing.T) {
 	fg.mergePullBody = `{"message":"Resource not accessible by integration"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.MergePullRequest(context.Background(), 42,
+	err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash)
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -2080,7 +2082,7 @@ func TestMergePullRequest_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := c.MergePullRequest(context.Background(), 1, tc.repo, tc.prNumber, MergeMethodSquash)
+			err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.prNumber, MergeMethodSquash)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2093,7 +2095,7 @@ func TestEnableAutoMerge_MissingNodeID(t *testing.T) {
 	fg.getPullRequestBody = `{"number":42}` // node_id absent
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.EnableAutoMerge(context.Background(), 42,
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
 	if err == nil || !strings.Contains(err.Error(), "node_id") {
 		t.Errorf("err = %v, want missing-node_id error", err)
@@ -2114,7 +2116,7 @@ func TestEnableAutoMerge_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := c.EnableAutoMerge(context.Background(), 1, tc.repo, tc.prNumber, MergeMethodSquash)
+			err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.prNumber, MergeMethodSquash)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2125,7 +2127,7 @@ func TestEnableAutoMerge_ValidationErrors(t *testing.T) {
 func TestGetPullRequest_HappyPath(t *testing.T) {
 	_, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
-	pr, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, 42)
+	pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err != nil {
 		t.Fatalf("GetPullRequest: %v", err)
 	}
@@ -2148,7 +2150,7 @@ func TestGetPullRequest_NotFound(t *testing.T) {
 	fg.getPullRequestStatus = http.StatusNotFound
 	fg.getPullRequestBody = `{"message":"Not Found"}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, 42)
+	_, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -2158,7 +2160,7 @@ func TestGetPullRequest_MissingNodeID(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getPullRequestBody = `{"number":42,"head":{"sha":"abc"}}`
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, 42)
+	_, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, 42)
 	if err == nil || !strings.Contains(err.Error(), "node_id") {
 		t.Errorf("err = %v, want missing-node_id error", err)
 	}
@@ -2178,7 +2180,7 @@ func TestGetPullRequest_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.GetPullRequest(context.Background(), 1, tc.repo, tc.prNumber)
+			_, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.prNumber)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2192,7 +2194,7 @@ func TestCreatePullRequest_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	pr, err := c.CreatePullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	pr, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		"fishhawk/run-aaaaaaaa", "main", "Consolidated PR", "body text")
 	if err != nil {
 		t.Fatalf("CreatePullRequest: %v", err)
@@ -2228,7 +2230,7 @@ func TestCreatePullRequest_AlreadyExists(t *testing.T) {
 	fg.createPullRequestBody = `{"message":"Validation Failed","errors":[{"message":"A pull request already exists for x:fishhawk/run-aaaaaaaa."}]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.CreatePullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	_, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		"fishhawk/run-aaaaaaaa", "main", "Consolidated PR", "body")
 	if err == nil || !errors.Is(err, ErrPullRequestExists) {
 		t.Errorf("err = %v, want ErrPullRequestExists", err)
@@ -2246,7 +2248,7 @@ func TestCreatePullRequest_OtherValidation(t *testing.T) {
 	fg.createPullRequestBody = `{"message":"Validation Failed","errors":[{"message":"head branch not found"}]}`
 	c, _ := newTestClient(t, srv, nil)
 
-	_, err := c.CreatePullRequest(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	_, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		"fishhawk/run-aaaaaaaa", "main", "Consolidated PR", "body")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
@@ -2272,7 +2274,7 @@ func TestCreatePullRequest_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.CreatePullRequest(context.Background(), 1, tc.repo, tc.head, tc.base, tc.title, "b")
+			_, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.head, tc.base, tc.title, "b")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2284,7 +2286,7 @@ func TestClosePullRequest_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	if err := c.ClosePullRequest(context.Background(), 42,
+	if err := c.ClosePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "o", Name: "r"}, 7); err != nil {
 		t.Fatalf("ClosePullRequest: %v", err)
 	}
@@ -2320,7 +2322,7 @@ func TestClosePullRequest_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := c.ClosePullRequest(context.Background(), 1, tc.repo, tc.number)
+			err := c.ClosePullRequest(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.number)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2334,7 +2336,7 @@ func TestClosePullRequest_GitHubError(t *testing.T) {
 	fg.closePullRequestBody = `{"message":"Resource not accessible by integration"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.ClosePullRequest(context.Background(), 1,
+	err := c.ClosePullRequest(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "o", Name: "r"}, 7)
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -2345,7 +2347,7 @@ func TestEditPullRequest_HappyPath(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	c, _ := newTestClient(t, srv, nil)
 
-	if err := c.EditPullRequest(context.Background(), 42,
+	if err := c.EditPullRequest(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "o", Name: "r"}, 7, "new body with economics"); err != nil {
 		t.Fatalf("EditPullRequest: %v", err)
 	}
@@ -2385,7 +2387,7 @@ func TestEditPullRequest_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := c.EditPullRequest(context.Background(), 1, tc.repo, tc.number, "b")
+			err := c.EditPullRequest(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.number, "b")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2399,7 +2401,7 @@ func TestEditPullRequest_GitHubError(t *testing.T) {
 	fg.closePullRequestBody = `{"message":"Resource not accessible by integration"}`
 	c, _ := newTestClient(t, srv, nil)
 
-	err := c.EditPullRequest(context.Background(), 1,
+	err := c.EditPullRequest(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "o", Name: "r"}, 7, "b")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -2414,7 +2416,7 @@ func TestGetPullRequest_DecodesBody(t *testing.T) {
 	fg.getPullRequestBody = `{"number":7,"node_id":"PR_kw7","state":"closed","merged":true,"body":"Existing description.","head":{"sha":"abc"},"base":{"ref":"main"}}`
 	c, _ := newTestClient(t, srv, nil)
 
-	pr, err := c.GetPullRequest(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 7)
+	pr, err := c.GetPullRequest(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 7)
 	if err != nil {
 		t.Fatalf("GetPullRequest: %v", err)
 	}
@@ -2428,7 +2430,7 @@ func TestListOpenPullRequestsByHead_HappyPath(t *testing.T) {
 	fg.listPullsBody = `[{"number":99,"node_id":"PR_kw99","state":"open","html_url":"https://github.com/x/y/pull/99","head":{"sha":"def456"}}]`
 	c, _ := newTestClient(t, srv, nil)
 
-	got, err := c.ListOpenPullRequestsByHead(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	got, err := c.ListOpenPullRequestsByHead(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		"fishhawk/run-aaaaaaaa", "main")
 	if err != nil {
 		t.Fatalf("ListOpenPullRequestsByHead: %v", err)
@@ -2461,7 +2463,7 @@ func TestListOpenPullRequestsByHead_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.ListOpenPullRequestsByHead(context.Background(), 1, tc.repo, tc.head, "main")
+			_, err := c.ListOpenPullRequestsByHead(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.head, "main")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2477,7 +2479,7 @@ func TestListIssueCommentReactions_HappyPath(t *testing.T) {
 	]`
 
 	c, _ := newTestClient(t, srv, nil)
-	got, err := c.ListIssueCommentReactions(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 4242)
+	got, err := c.ListIssueCommentReactions(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 4242)
 	if err != nil {
 		t.Fatalf("ListIssueCommentReactions: %v", err)
 	}
@@ -2507,7 +2509,7 @@ func TestListIssueCommentReactions_NotFound(t *testing.T) {
 	fg.listReactionsBody = `{"message":"Not Found"}`
 
 	c, _ := newTestClient(t, srv, nil)
-	_, err := c.ListIssueCommentReactions(context.Background(), 99, RepoRef{Owner: "x", Name: "y"}, 4242)
+	_, err := c.ListIssueCommentReactions(context.Background(), forge.FromGitHubInstallationID(99), RepoRef{Owner: "x", Name: "y"}, 4242)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -2527,7 +2529,7 @@ func TestListIssueCommentReactions_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.ListIssueCommentReactions(context.Background(), 1, tc.repo, tc.commentID)
+			_, err := c.ListIssueCommentReactions(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, tc.commentID)
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
@@ -2884,7 +2886,7 @@ func TestComparePatch_HappyPath(t *testing.T) {
 		]
 	}`
 	c, rec := comparePatchServer(t, http.StatusOK, body)
-	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "fishhawk/run-abcd1234")
+	got, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, "main", "fishhawk/run-abcd1234")
 	if err != nil {
 		t.Fatalf("ComparePatch: %v", err)
 	}
@@ -2926,7 +2928,7 @@ func TestComparePatch_TruncatedFileCap(t *testing.T) {
 	}
 	body := `{"total_commits":1,"commits":[{"sha":"head"}],"files":[` + strings.Join(files, ",") + `]}`
 	c, _ := comparePatchServer(t, http.StatusOK, body)
-	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "head")
+	got, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, "main", "head")
 	if err != nil {
 		t.Fatalf("ComparePatch: %v", err)
 	}
@@ -2949,7 +2951,7 @@ func TestComparePatch_TruncatedOmittedPatch(t *testing.T) {
 		]
 	}`
 	c, _ := comparePatchServer(t, http.StatusOK, body)
-	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "head")
+	got, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, "main", "head")
 	if err != nil {
 		t.Fatalf("ComparePatch: %v", err)
 	}
@@ -2969,7 +2971,7 @@ func TestComparePatch_TruncatedOmittedPatch(t *testing.T) {
 func TestComparePatch_BinaryOnlyNotTruncated(t *testing.T) {
 	body := `{"total_commits":1,"commits":[{"sha":"h"}],"files":[{"filename":"img.png","status":"added","changes":0,"patch":""}]}`
 	c, _ := comparePatchServer(t, http.StatusOK, body)
-	got, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "h")
+	got, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, "main", "h")
 	if err != nil {
 		t.Fatalf("ComparePatch: %v", err)
 	}
@@ -2980,7 +2982,7 @@ func TestComparePatch_BinaryOnlyNotTruncated(t *testing.T) {
 
 func TestComparePatch_NotFound(t *testing.T) {
 	c, _ := comparePatchServer(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	_, err := c.ComparePatch(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, "main", "head")
+	_, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, "main", "head")
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -2988,10 +2990,10 @@ func TestComparePatch_NotFound(t *testing.T) {
 
 func TestComparePatch_Validation(t *testing.T) {
 	c := New(&stubTokens{})
-	if _, err := c.ComparePatch(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, "", "head"); err == nil {
+	if _, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "o", Name: "r"}, "", "head"); err == nil {
 		t.Error("empty base: want error")
 	}
-	if _, err := c.ComparePatch(context.Background(), 1, RepoRef{}, "main", "head"); err == nil {
+	if _, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{}, "main", "head"); err == nil {
 		t.Error("empty repo: want error")
 	}
 }
@@ -3072,7 +3074,7 @@ func TestGetBranchSHA_Found(t *testing.T) {
 	cap.getRefStatus = http.StatusOK
 	cap.getRefBody = `{"ref":"refs/heads/fishhawk/run-abc","object":{"sha":"sha123"}}`
 
-	sha, exists, err := c.GetBranchSHA(context.Background(), 42,
+	sha, exists, err := c.GetBranchSHA(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc")
 	if err != nil {
 		t.Fatalf("GetBranchSHA: %v", err)
@@ -3093,7 +3095,7 @@ func TestGetBranchSHA_Absent(t *testing.T) {
 	cap.getRefStatus = http.StatusNotFound
 	cap.getRefBody = `{"message":"Not Found"}`
 
-	sha, exists, err := c.GetBranchSHA(context.Background(), 42,
+	sha, exists, err := c.GetBranchSHA(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "missing")
 	if err != nil {
 		t.Fatalf("GetBranchSHA on 404 should not error, got %v", err)
@@ -3111,7 +3113,7 @@ func TestGetBranchSHA_Forbidden(t *testing.T) {
 	cap.getRefStatus = http.StatusForbidden
 	cap.getRefBody = `{"message":"Forbidden"}`
 
-	_, _, err := c.GetBranchSHA(context.Background(), 42,
+	_, _, err := c.GetBranchSHA(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "b")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -3123,7 +3125,7 @@ func TestCreateRef_Created(t *testing.T) {
 	cap.createStatus = http.StatusCreated
 	cap.createRespBody = `{"ref":"refs/heads/fishhawk/run-abc"}`
 
-	err := c.CreateRef(context.Background(), 42,
+	err := c.CreateRef(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "basesha")
 	if err != nil {
 		t.Fatalf("CreateRef: %v", err)
@@ -3143,7 +3145,7 @@ func TestCreateRef_AlreadyExistsIsNoOp(t *testing.T) {
 
 	// A re-entrant fan-in pass that finds the consolidated branch already
 	// created must treat the 422 as a benign no-op, not a failure.
-	err := c.CreateRef(context.Background(), 42,
+	err := c.CreateRef(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "basesha")
 	if err != nil {
 		t.Fatalf("CreateRef on 'already exists' should be a no-op, got %v", err)
@@ -3155,7 +3157,7 @@ func TestCreateRef_OtherValidationError(t *testing.T) {
 	cap.createStatus = http.StatusUnprocessableEntity
 	cap.createRespBody = `{"message":"Invalid request: sha is not a valid object"}`
 
-	err := c.CreateRef(context.Background(), 42,
+	err := c.CreateRef(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "bad")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation for a non-duplicate 422", err)
@@ -3167,7 +3169,7 @@ func TestMergeBranch_Merged(t *testing.T) {
 	cap.mergeStatus = http.StatusCreated
 	cap.mergeRespBody = `{"sha":"mergecommit"}`
 
-	sha, err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "fishhawk/run-abc", "fishhawk/run-abc/slice-0", "Integrate slice 0")
 	if err != nil {
 		t.Fatalf("MergeBranch: %v", err)
@@ -3192,7 +3194,7 @@ func TestMergeBranch_MergedMissingSHAIsBenign(t *testing.T) {
 	// merge already happened — decode defensively to ("", nil) (#1459).
 	cap.mergeRespBody = `{"not_a_sha":true}`
 
-	sha, err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
 	if err != nil {
 		t.Fatalf("MergeBranch 201 with absent sha should be nil error, got %v", err)
@@ -3209,7 +3211,7 @@ func TestMergeBranch_NothingToMerge(t *testing.T) {
 	// 204 = base already contains head — idempotent success for a
 	// re-entrant fan-in pass over an already-integrated slice; no merge
 	// commit was created, so the SHA is empty.
-	sha, err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
 	if err != nil {
 		t.Fatalf("MergeBranch 204 should be nil, got %v", err)
@@ -3224,7 +3226,7 @@ func TestMergeBranch_Conflict(t *testing.T) {
 	cap.mergeStatus = http.StatusConflict
 	cap.mergeRespBody = `{"message":"Merge conflict"}`
 
-	sha, err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
 	if err == nil || !errors.Is(err, ErrMergeConflict) {
 		t.Errorf("err = %v, want ErrMergeConflict on 409", err)
@@ -3239,7 +3241,7 @@ func TestMergeBranch_NotFound(t *testing.T) {
 	cap.mergeStatus = http.StatusNotFound
 	cap.mergeRespBody = `{"message":"Not Found"}`
 
-	sha, err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "base", "missing", "msg")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound on 404", err)
@@ -3254,7 +3256,7 @@ func TestMergeBranch_Validation(t *testing.T) {
 	cap.mergeStatus = http.StatusUnprocessableEntity
 	cap.mergeRespBody = `{"message":"Validation Failed"}`
 
-	sha, err := c.MergeBranch(context.Background(), 42,
+	sha, err := c.MergeBranch(context.Background(), forge.FromGitHubInstallationID(42),
 		RepoRef{Owner: "x", Name: "y"}, "base", "head", "msg")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation on 422", err)
@@ -3301,7 +3303,7 @@ func releaseServer(t *testing.T, status int, body string) (*Client, *struct {
 func TestGetReleaseByTag_HappyPath(t *testing.T) {
 	body := `{"id":555,"tag_name":"v1.2.3","body":"old notes","html_url":"https://github.com/o/r/releases/tag/v1.2.3","assets":[{"id":9001,"name":"release-notes.md"},{"id":9002,"name":"binary.tar.gz"}]}`
 	c, rec := releaseServer(t, http.StatusOK, body)
-	rel, err := c.GetReleaseByTag(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, "v1.2.3")
+	rel, err := c.GetReleaseByTag(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, "v1.2.3")
 	if err != nil {
 		t.Fatalf("GetReleaseByTag: %v", err)
 	}
@@ -3321,7 +3323,7 @@ func TestGetReleaseByTag_HappyPath(t *testing.T) {
 
 func TestGetReleaseByTag_NotFound(t *testing.T) {
 	c, _ := releaseServer(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	_, err := c.GetReleaseByTag(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, "v9.9.9")
+	_, err := c.GetReleaseByTag(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, "v9.9.9")
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
@@ -3329,11 +3331,11 @@ func TestGetReleaseByTag_NotFound(t *testing.T) {
 
 func TestGetReleaseByTag_Validation(t *testing.T) {
 	c := &Client{Tokens: &stubTokens{}}
-	if _, err := c.GetReleaseByTag(context.Background(), 1, RepoRef{Name: "r"}, "v1"); err == nil ||
+	if _, err := c.GetReleaseByTag(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Name: "r"}, "v1"); err == nil ||
 		!strings.Contains(err.Error(), "owner and name") {
 		t.Errorf("missing owner err = %v", err)
 	}
-	if _, err := c.GetReleaseByTag(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, ""); err == nil ||
+	if _, err := c.GetReleaseByTag(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "o", Name: "r"}, ""); err == nil ||
 		!strings.Contains(err.Error(), "tag is required") {
 		t.Errorf("missing tag err = %v", err)
 	}
@@ -3341,7 +3343,7 @@ func TestGetReleaseByTag_Validation(t *testing.T) {
 
 func TestUpdateReleaseBody_HappyPath(t *testing.T) {
 	c, rec := releaseServer(t, http.StatusOK, `{"id":555}`)
-	if err := c.UpdateReleaseBody(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555, "new release notes"); err != nil {
+	if err := c.UpdateReleaseBody(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 555, "new release notes"); err != nil {
 		t.Fatalf("UpdateReleaseBody: %v", err)
 	}
 	if rec.method != http.MethodPatch || rec.path != "/repos/o/r/releases/555" {
@@ -3372,7 +3374,7 @@ func TestUpdateReleaseBody_Errors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _ := releaseServer(t, tc.status, `{"message":"boom"}`)
-			err := c.UpdateReleaseBody(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555, "b")
+			err := c.UpdateReleaseBody(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 555, "b")
 			if err == nil || !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
 			}
@@ -3382,7 +3384,7 @@ func TestUpdateReleaseBody_Errors(t *testing.T) {
 
 func TestUpdateReleaseBody_Validation(t *testing.T) {
 	c := &Client{Tokens: &stubTokens{}}
-	if err := c.UpdateReleaseBody(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, 0, "b"); err == nil ||
+	if err := c.UpdateReleaseBody(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "o", Name: "r"}, 0, "b"); err == nil ||
 		!strings.Contains(err.Error(), "release id must be") {
 		t.Errorf("zero release id err = %v", err)
 	}
@@ -3390,7 +3392,7 @@ func TestUpdateReleaseBody_Validation(t *testing.T) {
 
 func TestDeleteReleaseAsset_HappyPath(t *testing.T) {
 	c, rec := releaseServer(t, http.StatusNoContent, "")
-	if err := c.DeleteReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 9001); err != nil {
+	if err := c.DeleteReleaseAsset(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 9001); err != nil {
 		t.Fatalf("DeleteReleaseAsset: %v", err)
 	}
 	if rec.method != http.MethodDelete || rec.path != "/repos/o/r/releases/assets/9001" {
@@ -3400,12 +3402,12 @@ func TestDeleteReleaseAsset_HappyPath(t *testing.T) {
 
 func TestDeleteReleaseAsset_Errors(t *testing.T) {
 	c, _ := releaseServer(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	err := c.DeleteReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 9001)
+	err := c.DeleteReleaseAsset(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 9001)
 	if err == nil || !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 	cc := &Client{Tokens: &stubTokens{}}
-	if err := cc.DeleteReleaseAsset(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, 0); err == nil ||
+	if err := cc.DeleteReleaseAsset(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "o", Name: "r"}, 0); err == nil ||
 		!strings.Contains(err.Error(), "asset id must be") {
 		t.Errorf("zero asset id err = %v", err)
 	}
@@ -3445,7 +3447,7 @@ func TestUploadReleaseAsset_TargetsUploadHost(t *testing.T) {
 	c.UploadBaseURL = uploadSrv.URL
 
 	data := []byte("# Release notes\n\nbody")
-	if err := c.UploadReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555,
+	if err := c.UploadReleaseAsset(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 555,
 		"release-notes.md", "text/markdown", data); err != nil {
 		t.Fatalf("UploadReleaseAsset: %v", err)
 	}
@@ -3475,14 +3477,14 @@ func TestUploadReleaseAsset_Errors(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c, _ := newTestClient(t, srv, nil)
 	c.UploadBaseURL = srv.URL
-	err := c.UploadReleaseAsset(context.Background(), 42, RepoRef{Owner: "o", Name: "r"}, 555,
+	err := c.UploadReleaseAsset(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "o", Name: "r"}, 555,
 		"release-notes.md", "text/markdown", []byte("x"))
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Errorf("err = %v, want ErrValidation", err)
 	}
 
 	cc := &Client{Tokens: &stubTokens{}}
-	if err := cc.UploadReleaseAsset(context.Background(), 1, RepoRef{Owner: "o", Name: "r"}, 555, "", "text/markdown", nil); err == nil ||
+	if err := cc.UploadReleaseAsset(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "o", Name: "r"}, 555, "", "text/markdown", nil); err == nil ||
 		!strings.Contains(err.Error(), "asset name is required") {
 		t.Errorf("missing name err = %v", err)
 	}

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // projectsFake is a focused fake for the work-management surfaces: REST
@@ -98,7 +100,7 @@ func TestCreateIssue_AppliesLabelsAndReturnsNodeID(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.createIssueBody = `{"number":1234,"node_id":"ISSUE_NODE","html_url":"https://github.com/o/r/issues/1234"}`
 
-	got, err := c.CreateIssue(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, CreateIssueParams{
+	got, err := c.CreateIssue(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, CreateIssueParams{
 		Title: "boom", Body: "body", Labels: []string{"type:bug", "area:server"},
 	})
 	if err != nil {
@@ -123,7 +125,7 @@ func TestCreateIssue_AppliesLabelsAndReturnsNodeID(t *testing.T) {
 func TestCreateIssue_MissingNodeID(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.createIssueBody = `{"number":1,"html_url":"u"}`
-	_, err := c.CreateIssue(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, CreateIssueParams{Title: "x"})
+	_, err := c.CreateIssue(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, CreateIssueParams{Title: "x"})
 	if err == nil || !strings.Contains(err.Error(), "missing node_id") {
 		t.Fatalf("want missing-node_id error, got %v", err)
 	}
@@ -132,7 +134,7 @@ func TestCreateIssue_MissingNodeID(t *testing.T) {
 func TestIssueNodeID(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.getIssueBody = `{"node_id":"EPIC_NODE"}`
-	got, err := c.IssueNodeID(context.Background(), 7, RepoRef{Owner: "o", Name: "r"}, 1005)
+	got, err := c.IssueNodeID(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, 1005)
 	if err != nil {
 		t.Fatalf("IssueNodeID: %v", err)
 	}
@@ -145,7 +147,7 @@ func TestProjectFields_UserOwnerResolvesIDsAndOptions(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ProjectFields"] = `{"data":{"user":{"projectV2":{"id":"PROJ","field":{"id":"FIELD","options":[{"id":"o1","name":"Backlog"},{"id":"o2","name":"Done"}]}}}}}`
 
-	meta, err := c.ProjectFields(context.Background(), 7, ProjectCoord{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}, "Status")
+	meta, err := c.ProjectFields(context.Background(), forge.FromGitHubInstallationID(7), ProjectCoord{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}, "Status")
 	if err != nil {
 		t.Fatalf("ProjectFields: %v", err)
 	}
@@ -164,7 +166,7 @@ func TestProjectFields_UserOwnerResolvesIDsAndOptions(t *testing.T) {
 func TestProjectFields_OrgOwnerRootsAtOrganization(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ProjectFields"] = `{"data":{"organization":{"projectV2":{"id":"P","field":{"id":"F","options":[{"id":"x","name":"Todo"}]}}}}}`
-	meta, err := c.ProjectFields(context.Background(), 7, ProjectCoord{Owner: "acme", OwnerType: "organization", Number: 3}, "Status")
+	meta, err := c.ProjectFields(context.Background(), forge.FromGitHubInstallationID(7), ProjectCoord{Owner: "acme", OwnerType: "organization", Number: 3}, "Status")
 	if err != nil {
 		t.Fatalf("ProjectFields: %v", err)
 	}
@@ -176,7 +178,7 @@ func TestProjectFields_OrgOwnerRootsAtOrganization(t *testing.T) {
 func TestProjectFields_NotFoundWhenProjectNil(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ProjectFields"] = `{"data":{"user":{"projectV2":null}}}`
-	_, err := c.ProjectFields(context.Background(), 7, ProjectCoord{Owner: "x", Number: 9}, "Status")
+	_, err := c.ProjectFields(context.Background(), forge.FromGitHubInstallationID(7), ProjectCoord{Owner: "x", Number: 9}, "Status")
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("want not-found error, got %v", err)
 	}
@@ -185,7 +187,7 @@ func TestProjectFields_NotFoundWhenProjectNil(t *testing.T) {
 func TestProjectFields_GraphQLErrorIsValidation(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ProjectFields"] = `{"errors":[{"message":"Could not resolve to a ProjectV2"}]}`
-	_, err := c.ProjectFields(context.Background(), 7, ProjectCoord{Owner: "x", Number: 9}, "Status")
+	_, err := c.ProjectFields(context.Background(), forge.FromGitHubInstallationID(7), ProjectCoord{Owner: "x", Number: 9}, "Status")
 	if err == nil || !strings.Contains(err.Error(), "Could not resolve") {
 		t.Fatalf("want graphql validation error, got %v", err)
 	}
@@ -199,7 +201,7 @@ func TestProjectItemStatus_OnBoardMatchesProjectAndReadsStatus(t *testing.T) {
 	  {"id":"ITEM_OTHER","project":{"id":"OTHER"},"fieldValueByName":{"name":"Done"}},
 	  {"id":"ITEM_OURS","project":{"id":"PROJ"},"fieldValueByName":{"name":"In Progress"}}
 	]}}}}`
-	got, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", "Status")
+	got, err := c.ProjectItemStatus(context.Background(), forge.FromGitHubInstallationID(7), "ISSUE_NODE", "PROJ", "Status")
 	if err != nil {
 		t.Fatalf("ProjectItemStatus: %v", err)
 	}
@@ -217,7 +219,7 @@ func TestProjectItemStatus_UnsetStatusReadsEmpty(t *testing.T) {
 	pf.graphqlByOp["ProjectItemStatus"] = `{"data":{"node":{"projectItems":{"nodes":[
 	  {"id":"ITEM_OURS","project":{"id":"PROJ"},"fieldValueByName":null}
 	]}}}}`
-	got, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", "Status")
+	got, err := c.ProjectItemStatus(context.Background(), forge.FromGitHubInstallationID(7), "ISSUE_NODE", "PROJ", "Status")
 	if err != nil {
 		t.Fatalf("ProjectItemStatus: %v", err)
 	}
@@ -232,7 +234,7 @@ func TestProjectItemStatus_NotOnBoard(t *testing.T) {
 	pf.graphqlByOp["ProjectItemStatus"] = `{"data":{"node":{"projectItems":{"nodes":[
 	  {"id":"ITEM_OTHER","project":{"id":"OTHER"},"fieldValueByName":{"name":"Done"}}
 	]}}}}`
-	got, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", "Status")
+	got, err := c.ProjectItemStatus(context.Background(), forge.FromGitHubInstallationID(7), "ISSUE_NODE", "PROJ", "Status")
 	if err != nil {
 		t.Fatalf("ProjectItemStatus: %v", err)
 	}
@@ -248,7 +250,7 @@ func TestProjectItemStatus_ProjectsTokenOptIn(t *testing.T) {
 	  {"id":"ITEM_OURS","project":{"id":"PROJ"},"fieldValueByName":{"name":"Backlog"}}
 	]}}}}`
 	ctx := WithProjectsToken(context.Background())
-	if _, err := c.ProjectItemStatus(ctx, 7, "ISSUE_NODE", "PROJ", "Status"); err != nil {
+	if _, err := c.ProjectItemStatus(ctx, forge.FromGitHubInstallationID(7), "ISSUE_NODE", "PROJ", "Status"); err != nil {
 		t.Fatalf("ProjectItemStatus: %v", err)
 	}
 	if pf.gotGraphQLAuth != "Bearer pat_projects" {
@@ -258,10 +260,10 @@ func TestProjectItemStatus_ProjectsTokenOptIn(t *testing.T) {
 
 func TestProjectItemStatus_MissingArgs(t *testing.T) {
 	_, c := newProjectsFake(t)
-	if _, err := c.ProjectItemStatus(context.Background(), 7, "", "PROJ", "Status"); err == nil {
+	if _, err := c.ProjectItemStatus(context.Background(), forge.FromGitHubInstallationID(7), "", "PROJ", "Status"); err == nil {
 		t.Errorf("want error when issue node id is empty")
 	}
-	if _, err := c.ProjectItemStatus(context.Background(), 7, "ISSUE_NODE", "PROJ", ""); err == nil {
+	if _, err := c.ProjectItemStatus(context.Background(), forge.FromGitHubInstallationID(7), "ISSUE_NODE", "PROJ", ""); err == nil {
 		t.Errorf("want error when field name is empty")
 	}
 }
@@ -269,7 +271,7 @@ func TestProjectItemStatus_MissingArgs(t *testing.T) {
 func TestAddProjectItem(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["AddItem"] = `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`
-	id, err := c.AddProjectItem(context.Background(), 7, "PROJ", "ISSUE_NODE")
+	id, err := c.AddProjectItem(context.Background(), forge.FromGitHubInstallationID(7), "PROJ", "ISSUE_NODE")
 	if err != nil {
 		t.Fatalf("AddProjectItem: %v", err)
 	}
@@ -284,7 +286,7 @@ func TestAddProjectItem(t *testing.T) {
 func TestSetProjectItemSingleSelect(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["SetField"] = `{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"ITEM"}}}}`
-	if err := c.SetProjectItemSingleSelect(context.Background(), 7, "PROJ", "ITEM", "FIELD", "OPT"); err != nil {
+	if err := c.SetProjectItemSingleSelect(context.Background(), forge.FromGitHubInstallationID(7), "PROJ", "ITEM", "FIELD", "OPT"); err != nil {
 		t.Fatalf("SetProjectItemSingleSelect: %v", err)
 	}
 	if vars := pf.gotGraphQLVars["SetField"]; vars["optionId"] != "OPT" || vars["fieldId"] != "FIELD" {
@@ -295,7 +297,7 @@ func TestSetProjectItemSingleSelect(t *testing.T) {
 func TestAddSubIssue(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["AddSubIssue"] = `{"data":{"addSubIssue":{"issue":{"id":"X"}}}}`
-	if err := c.AddSubIssue(context.Background(), 7, "PARENT", "CHILD"); err != nil {
+	if err := c.AddSubIssue(context.Background(), forge.FromGitHubInstallationID(7), "PARENT", "CHILD"); err != nil {
 		t.Fatalf("AddSubIssue: %v", err)
 	}
 	if vars := pf.gotGraphQLVars["AddSubIssue"]; vars["issueId"] != "PARENT" || vars["subIssueId"] != "CHILD" {
@@ -309,7 +311,7 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 		{"number":41,"title":"slice A","body":"## Summary","id":"N41","labels":{"nodes":[{"name":"type:feature"},{"name":"autonomy:low"}]}},
 		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","labels":{"nodes":[]}}
 	]}}}}`
-	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
+	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
 	if err != nil {
 		t.Fatalf("ListSubIssues: %v", err)
 	}
@@ -356,7 +358,7 @@ func TestListSubIssues_AutonomyLabelBeyondFirst20(t *testing.T) {
 	pf.graphqlByOp["ListSubIssues"] = fmt.Sprintf(
 		`{"data":{"node":{"subIssues":{"nodes":[{"number":41,"title":"slice A","body":"b","id":"N41","labels":{"nodes":[%s]}}]}}}}`,
 		strings.Join(nodes, ","))
-	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
+	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
 	if err != nil {
 		t.Fatalf("ListSubIssues: %v", err)
 	}
@@ -384,7 +386,7 @@ func TestListSubIssues_AutonomyLabelBeyondFirst20(t *testing.T) {
 func TestListSubIssues_EmptyReturnsNil(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[]}}}}`
-	subs, err := c.ListSubIssues(context.Background(), 7, "EPIC_NODE")
+	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
 	if err != nil {
 		t.Fatalf("ListSubIssues: %v", err)
 	}
@@ -395,7 +397,7 @@ func TestListSubIssues_EmptyReturnsNil(t *testing.T) {
 
 func TestListSubIssues_MissingParentRejected(t *testing.T) {
 	_, c := newProjectsFake(t)
-	if _, err := c.ListSubIssues(context.Background(), 7, ""); err == nil || !strings.Contains(err.Error(), "parent node id required") {
+	if _, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), ""); err == nil || !strings.Contains(err.Error(), "parent node id required") {
 		t.Fatalf("want parent-required error, got %v", err)
 	}
 }
@@ -403,7 +405,7 @@ func TestListSubIssues_MissingParentRejected(t *testing.T) {
 func TestAddProjectItem_MissingItemID(t *testing.T) {
 	pf, c := newProjectsFake(t)
 	pf.graphqlByOp["AddItem"] = `{"data":{"addProjectV2ItemById":{"item":{"id":""}}}}`
-	_, err := c.AddProjectItem(context.Background(), 7, "P", "C")
+	_, err := c.AddProjectItem(context.Background(), forge.FromGitHubInstallationID(7), "P", "C")
 	if err == nil || !strings.Contains(err.Error(), "missing item id") {
 		t.Fatalf("want missing-item-id error, got %v", err)
 	}
@@ -435,7 +437,7 @@ func TestSearchOpenIssues_HitMapsFields(t *testing.T) {
 	gotQuery, c := newSearchFake(t, http.StatusOK,
 		`{"total_count":1,"items":[{"number":42,"html_url":"https://github.com/o/r/issues/42","body":"boom <!-- fishhawk-fingerprint:abc -->"}]}`)
 	const q = `repo:o/r is:issue is:open in:body "<!-- fishhawk-fingerprint:abc -->"`
-	got, err := c.SearchOpenIssues(context.Background(), 7, q)
+	got, err := c.SearchOpenIssues(context.Background(), forge.FromGitHubInstallationID(7), q)
 	if err != nil {
 		t.Fatalf("SearchOpenIssues: %v", err)
 	}
@@ -453,7 +455,7 @@ func TestSearchOpenIssues_HitMapsFields(t *testing.T) {
 
 func TestSearchOpenIssues_EmptyMiss(t *testing.T) {
 	_, c := newSearchFake(t, http.StatusOK, `{"total_count":0,"items":[]}`)
-	got, err := c.SearchOpenIssues(context.Background(), 7, "repo:o/r is:issue is:open")
+	got, err := c.SearchOpenIssues(context.Background(), forge.FromGitHubInstallationID(7), "repo:o/r is:issue is:open")
 	if err != nil {
 		t.Fatalf("SearchOpenIssues: %v", err)
 	}
@@ -464,7 +466,7 @@ func TestSearchOpenIssues_EmptyMiss(t *testing.T) {
 
 func TestSearchOpenIssues_ErrorStatus(t *testing.T) {
 	_, c := newSearchFake(t, http.StatusUnprocessableEntity, `{"message":"Validation Failed"}`)
-	_, err := c.SearchOpenIssues(context.Background(), 7, "repo:o/r bad")
+	_, err := c.SearchOpenIssues(context.Background(), forge.FromGitHubInstallationID(7), "repo:o/r bad")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
 	}
@@ -525,7 +527,7 @@ func TestSearchIssuesByTitle_SinglePageMapsNumberAndTitle(t *testing.T) {
 	gotQuery, c := newSearchFake(t, http.StatusOK,
 		`{"items":[{"number":865,"title":"[ADR-035] run branch ownership"},{"number":900,"title":"[ADR-040] operator role"}]}`)
 	const q = `repo:o/r in:title "[ADR-"`
-	got, err := c.SearchIssuesByTitle(context.Background(), 7, q)
+	got, err := c.SearchIssuesByTitle(context.Background(), forge.FromGitHubInstallationID(7), q)
 	if err != nil {
 		t.Fatalf("SearchIssuesByTitle: %v", err)
 	}
@@ -550,7 +552,7 @@ func TestSearchIssuesByTitle_PaginatesAcrossPages(t *testing.T) {
 		1: titleItemsPage(1, 100),
 		2: titleItemsPage(101, 5),
 	})
-	got, err := c.SearchIssuesByTitle(context.Background(), 7, `repo:o/r in:title "[ADR-"`)
+	got, err := c.SearchIssuesByTitle(context.Background(), forge.FromGitHubInstallationID(7), `repo:o/r in:title "[ADR-"`)
 	if err != nil {
 		t.Fatalf("SearchIssuesByTitle: %v", err)
 	}
@@ -571,7 +573,7 @@ func TestSearchIssuesByTitle_StopsAtPageCap(t *testing.T) {
 		bodies[p] = titleItemsPage((p-1)*100+1, 100)
 	}
 	pages, c := newPagedSearchFake(t, http.StatusOK, bodies)
-	got, err := c.SearchIssuesByTitle(context.Background(), 7, `repo:o/r in:title "[ADR-"`)
+	got, err := c.SearchIssuesByTitle(context.Background(), forge.FromGitHubInstallationID(7), `repo:o/r in:title "[ADR-"`)
 	if err != nil {
 		t.Fatalf("SearchIssuesByTitle: %v", err)
 	}
@@ -585,7 +587,7 @@ func TestSearchIssuesByTitle_StopsAtPageCap(t *testing.T) {
 
 func TestSearchIssuesByTitle_EmptyMiss(t *testing.T) {
 	_, c := newSearchFake(t, http.StatusOK, `{"items":[]}`)
-	got, err := c.SearchIssuesByTitle(context.Background(), 7, `repo:o/r in:title "[ADR-"`)
+	got, err := c.SearchIssuesByTitle(context.Background(), forge.FromGitHubInstallationID(7), `repo:o/r in:title "[ADR-"`)
 	if err != nil {
 		t.Fatalf("SearchIssuesByTitle: %v", err)
 	}
@@ -596,7 +598,7 @@ func TestSearchIssuesByTitle_EmptyMiss(t *testing.T) {
 
 func TestSearchIssuesByTitle_ErrorStatus(t *testing.T) {
 	_, c := newSearchFake(t, http.StatusUnprocessableEntity, `{"message":"Validation Failed"}`)
-	_, err := c.SearchIssuesByTitle(context.Background(), 7, "repo:o/r bad")
+	_, err := c.SearchIssuesByTitle(context.Background(), forge.FromGitHubInstallationID(7), "repo:o/r bad")
 	if err == nil || !errors.Is(err, ErrValidation) {
 		t.Fatalf("want ErrValidation, got %v", err)
 	}
@@ -612,7 +614,7 @@ func TestDoGraphQL_ProjectsTokenSelected(t *testing.T) {
 	// With the opt-in flag AND a non-empty ProjectsToken, the request must
 	// carry the projects PAT, not the installation token.
 	ctx := WithProjectsToken(context.Background())
-	if _, err := c.AddProjectItem(ctx, 7, "PROJ", "ISSUE_NODE"); err != nil {
+	if _, err := c.AddProjectItem(ctx, forge.FromGitHubInstallationID(7), "PROJ", "ISSUE_NODE"); err != nil {
 		t.Fatalf("AddProjectItem: %v", err)
 	}
 	if pf.gotGraphQLAuth != "Bearer pat_projects" {
@@ -627,7 +629,7 @@ func TestDoGraphQL_FallsBackToInstallationToken(t *testing.T) {
 	// Flag set but ProjectsToken empty → installation-token fallback,
 	// preserving the #1107 best-effort path when unconfigured.
 	ctx := WithProjectsToken(context.Background())
-	if _, err := c.AddProjectItem(ctx, 7, "PROJ", "ISSUE_NODE"); err != nil {
+	if _, err := c.AddProjectItem(ctx, forge.FromGitHubInstallationID(7), "PROJ", "ISSUE_NODE"); err != nil {
 		t.Fatalf("AddProjectItem: %v", err)
 	}
 	if pf.gotGraphQLAuth != "Bearer ghs_canned" {
@@ -637,7 +639,7 @@ func TestDoGraphQL_FallsBackToInstallationToken(t *testing.T) {
 	// No flag, even with a projects token set → installation token (the
 	// flag is the explicit opt-in seam).
 	c.ProjectsToken = "pat_projects"
-	if _, err := c.AddProjectItem(context.Background(), 7, "PROJ", "ISSUE_NODE"); err != nil {
+	if _, err := c.AddProjectItem(context.Background(), forge.FromGitHubInstallationID(7), "PROJ", "ISSUE_NODE"); err != nil {
 		t.Fatalf("AddProjectItem (no flag): %v", err)
 	}
 	if pf.gotGraphQLAuth != "Bearer ghs_canned" {

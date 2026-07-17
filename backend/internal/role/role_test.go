@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -19,7 +20,7 @@ type stubLister struct {
 	calls atomic.Int64
 }
 
-func (s *stubLister) ListTeamMembers(_ context.Context, _ int64, org, slug string) ([]TeamMember, error) {
+func (s *stubLister) ListTeamMembers(_ context.Context, _ forge.CredentialScope, org, slug string) ([]TeamMember, error) {
 	s.calls.Add(1)
 	if s.err != nil {
 		return nil, s.err
@@ -39,7 +40,7 @@ func TestExpandRole_LiteralLoginPassthrough(t *testing.T) {
 	roles := map[string]spec.Role{
 		"single": {Members: []string{"octocat"}},
 	}
-	got, err := r.ExpandRole(context.Background(), 1, "single", roles)
+	got, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "single", roles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +57,7 @@ func TestExpandRole_TeamRefExpands(t *testing.T) {
 	roles := map[string]spec.Role{
 		"eng_team": {Members: []string{"@acme/eng"}},
 	}
-	got, err := r.ExpandRole(context.Background(), 99, "eng_team", roles)
+	got, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(99), "eng_team", roles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +75,7 @@ func TestExpandRole_MultipleRefsUnioned(t *testing.T) {
 	roles := map[string]spec.Role{
 		"any": {Members: []string{"@acme/eng", "@acme/leads", "extern_doe"}},
 	}
-	got, err := r.ExpandRole(context.Background(), 99, "any", roles)
+	got, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(99), "any", roles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +92,7 @@ func TestExpandRole_MultipleRefsUnioned(t *testing.T) {
 
 func TestExpandRole_UnknownRole(t *testing.T) {
 	r := NewResolver(newRoleStub(nil))
-	_, err := r.ExpandRole(context.Background(), 1, "nonexistent", map[string]spec.Role{})
+	_, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "nonexistent", map[string]spec.Role{})
 	if !errors.Is(err, ErrUnknownRole) {
 		t.Errorf("err = %v, want ErrUnknownRole", err)
 	}
@@ -102,7 +103,7 @@ func TestExpandRole_InvalidRef(t *testing.T) {
 	roles := map[string]spec.Role{
 		"bad": {Members: []string{"@no-slash"}},
 	}
-	_, err := r.ExpandRole(context.Background(), 1, "bad", roles)
+	_, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "bad", roles)
 	if !errors.Is(err, ErrInvalidRef) {
 		t.Errorf("err = %v, want ErrInvalidRef", err)
 	}
@@ -116,7 +117,7 @@ func TestExpandRole_CaseInsensitive(t *testing.T) {
 	roles := map[string]spec.Role{
 		"eng": {Members: []string{"@acme/eng"}},
 	}
-	got, _ := r.ExpandRole(context.Background(), 1, "eng", roles)
+	got, _ := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles)
 	if len(got) != 1 || got[0] != "octocat" {
 		t.Errorf("got %v, want [octocat] (case-folded)", got)
 	}
@@ -132,7 +133,7 @@ func TestCanApprove_AnyOf_Allowed(t *testing.T) {
 	}
 	approvers := &spec.Approvers{AnyOf: []string{"eng"}}
 
-	ok, err := r.CanApprove(context.Background(), 1, approvers, roles, "alice")
+	ok, err := r.CanApprove(context.Background(), forge.FromGitHubInstallationID(1), approvers, roles, "alice")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +151,7 @@ func TestCanApprove_AnyOf_Denied(t *testing.T) {
 		"eng": {Members: []string{"@acme/eng"}},
 	}
 	approvers := &spec.Approvers{AnyOf: []string{"eng"}}
-	ok, _ := r.CanApprove(context.Background(), 1, approvers, roles, "mallory")
+	ok, _ := r.CanApprove(context.Background(), forge.FromGitHubInstallationID(1), approvers, roles, "mallory")
 	if ok {
 		t.Errorf("CanApprove = true, want false (mallory not in eng)")
 	}
@@ -169,12 +170,12 @@ func TestCanApprove_AllOf_AllRequired(t *testing.T) {
 	approvers := &spec.Approvers{AllOf: []string{"eng", "leads"}}
 
 	// Alice is in both → allowed.
-	ok, _ := r.CanApprove(context.Background(), 1, approvers, roles, "alice")
+	ok, _ := r.CanApprove(context.Background(), forge.FromGitHubInstallationID(1), approvers, roles, "alice")
 	if !ok {
 		t.Errorf("expected alice (in both) to be allowed")
 	}
 	// Bob is only in eng → denied.
-	ok, _ = r.CanApprove(context.Background(), 1, approvers, roles, "bob")
+	ok, _ = r.CanApprove(context.Background(), forge.FromGitHubInstallationID(1), approvers, roles, "bob")
 	if ok {
 		t.Errorf("expected bob (only in eng) to be denied")
 	}
@@ -182,7 +183,7 @@ func TestCanApprove_AllOf_AllRequired(t *testing.T) {
 
 func TestCanApprove_NilApprovers(t *testing.T) {
 	r := NewResolver(newRoleStub(nil))
-	ok, err := r.CanApprove(context.Background(), 1, nil, nil, "alice")
+	ok, err := r.CanApprove(context.Background(), forge.FromGitHubInstallationID(1), nil, nil, "alice")
 	if err != nil {
 		t.Errorf("err = %v, want nil", err)
 	}
@@ -194,7 +195,7 @@ func TestCanApprove_NilApprovers(t *testing.T) {
 func TestCanApprove_EmptySubject(t *testing.T) {
 	r := NewResolver(newRoleStub(nil))
 	approvers := &spec.Approvers{AnyOf: []string{"eng"}}
-	ok, _ := r.CanApprove(context.Background(), 1, approvers, nil, "")
+	ok, _ := r.CanApprove(context.Background(), forge.FromGitHubInstallationID(1), approvers, nil, "")
 	if ok {
 		t.Errorf("empty subject should never approve")
 	}
@@ -209,7 +210,7 @@ func TestCanApprove_CaseInsensitiveSubject(t *testing.T) {
 		"eng": {Members: []string{"@acme/eng"}},
 	}
 	approvers := &spec.Approvers{AnyOf: []string{"eng"}}
-	ok, _ := r.CanApprove(context.Background(), 1, approvers, roles, "Alice")
+	ok, _ := r.CanApprove(context.Background(), forge.FromGitHubInstallationID(1), approvers, roles, "Alice")
 	if !ok {
 		t.Errorf("subject 'Alice' should match member 'alice' (case-fold)")
 	}
@@ -225,7 +226,7 @@ func TestExpandRole_CacheHitsSkipUpstream(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		if _, err := r.ExpandRole(context.Background(), 1, "eng", roles); err != nil {
+		if _, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -243,12 +244,12 @@ func TestExpandRole_CacheExpires(t *testing.T) {
 	roles := map[string]spec.Role{
 		"eng": {Members: []string{"@acme/eng"}},
 	}
-	if _, err := r.ExpandRole(context.Background(), 1, "eng", roles); err != nil {
+	if _, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles); err != nil {
 		t.Fatal(err)
 	}
 	// Move clock 2 minutes ahead — past TTL.
 	clock = clock.Add(2 * time.Minute)
-	if _, err := r.ExpandRole(context.Background(), 1, "eng", roles); err != nil {
+	if _, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles); err != nil {
 		t.Fatal(err)
 	}
 	if got := gh.calls.Load(); got != 2 {
@@ -265,9 +266,9 @@ func TestInvalidate_BypassesCache(t *testing.T) {
 		"eng": {Members: []string{"@acme/eng"}},
 	}
 
-	_, _ = r.ExpandRole(context.Background(), 1, "eng", roles)
+	_, _ = r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles)
 	r.Invalidate("acme", "eng")
-	_, _ = r.ExpandRole(context.Background(), 1, "eng", roles)
+	_, _ = r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles)
 	if got := gh.calls.Load(); got != 2 {
 		t.Errorf("upstream calls = %d, want 2 (invalidate should force refetch)", got)
 	}
@@ -279,7 +280,7 @@ func TestExpandRole_GitHubError(t *testing.T) {
 	roles := map[string]spec.Role{
 		"eng": {Members: []string{"@acme/eng"}},
 	}
-	_, err := r.ExpandRole(context.Background(), 1, "eng", roles)
+	_, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles)
 	if err == nil {
 		t.Fatal("expected error from upstream failure")
 	}
@@ -290,7 +291,7 @@ func TestNewResolver_NilListerErrorsOnFetch(t *testing.T) {
 	roles := map[string]spec.Role{
 		"eng": {Members: []string{"@acme/eng"}},
 	}
-	_, err := r.ExpandRole(context.Background(), 1, "eng", roles)
+	_, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "eng", roles)
 	if err == nil || err.Error() == "" {
 		t.Errorf("expected non-nil error when TeamLister missing")
 	}
@@ -301,7 +302,7 @@ func TestExpandRole_EmptyRoleMembers(t *testing.T) {
 	roles := map[string]spec.Role{
 		"empty": {Members: []string{}},
 	}
-	got, err := r.ExpandRole(context.Background(), 1, "empty", roles)
+	got, err := r.ExpandRole(context.Background(), forge.FromGitHubInstallationID(1), "empty", roles)
 	if err != nil {
 		t.Errorf("err = %v, want nil", err)
 	}

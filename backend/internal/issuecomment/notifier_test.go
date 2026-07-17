@@ -1239,7 +1239,7 @@ func TestNotifySlashApprovalReply_PostsAndDoesNotDedup(t *testing.T) {
 	_ = n // unused; happyDeps constructs one we don't need here
 
 	if err := n2.NotifySlashApprovalReply(context.Background(), issuecomment.SlashApprovalReply{
-		Repo: "x/y", InstallationID: 99, IssueNumber: 42, Body: "Approved by @alice.",
+		Repo: "x/y", Scope: forge.FromGitHubInstallationID(99), IssueNumber: 42, Body: "Approved by @alice.",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1252,7 +1252,7 @@ func TestNotifySlashApprovalReply_PostsAndDoesNotDedup(t *testing.T) {
 
 	// Second call — replies are not deduped.
 	if err := n2.NotifySlashApprovalReply(context.Background(), issuecomment.SlashApprovalReply{
-		Repo: "x/y", InstallationID: 99, IssueNumber: 42, Body: "Cannot approve: ci_pass failing.",
+		Repo: "x/y", Scope: forge.FromGitHubInstallationID(99), IssueNumber: 42, Body: "Cannot approve: ci_pass failing.",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1273,10 +1273,10 @@ func TestNotifySlashApprovalReply_SkipsBadParams(t *testing.T) {
 		name string
 		p    issuecomment.SlashApprovalReply
 	}{
-		{"zero issue", issuecomment.SlashApprovalReply{Repo: "x/y", InstallationID: 99, Body: "x"}},
-		{"zero installation", issuecomment.SlashApprovalReply{Repo: "x/y", IssueNumber: 1, Body: "x"}},
-		{"empty body", issuecomment.SlashApprovalReply{Repo: "x/y", InstallationID: 99, IssueNumber: 1}},
-		{"malformed repo", issuecomment.SlashApprovalReply{Repo: "no-slash", InstallationID: 99, IssueNumber: 1, Body: "x"}},
+		{"zero issue", issuecomment.SlashApprovalReply{Repo: "x/y", Scope: forge.FromGitHubInstallationID(99), Body: "x"}},
+		{"zero scope", issuecomment.SlashApprovalReply{Repo: "x/y", IssueNumber: 1, Body: "x"}},
+		{"empty body", issuecomment.SlashApprovalReply{Repo: "x/y", Scope: forge.FromGitHubInstallationID(99), IssueNumber: 1}},
+		{"malformed repo", issuecomment.SlashApprovalReply{Repo: "no-slash", Scope: forge.FromGitHubInstallationID(99), IssueNumber: 1, Body: "x"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1297,7 +1297,7 @@ func TestNotify_NilReceiver_NoOp(t *testing.T) {
 		t.Errorf("nil plan should be a no-op; got %v", err)
 	}
 	if err := n.NotifySlashApprovalReply(context.Background(), issuecomment.SlashApprovalReply{
-		Repo: "x/y", InstallationID: 1, IssueNumber: 1, Body: "x",
+		Repo: "x/y", Scope: forge.FromGitHubInstallationID(1), IssueNumber: 1, Body: "x",
 	}); err != nil {
 		t.Errorf("nil reply should be a no-op; got %v", err)
 	}
@@ -1473,16 +1473,16 @@ type fakeGitHub struct {
 	listCalls []ghListCommentsCall
 }
 
-// ghListCommentsCall records one ListIssueCommentsScoped invocation.
+// ghListCommentsCall records one ListIssueComments invocation.
 type ghListCommentsCall struct {
 	scope  forge.CredentialScope
 	repo   githubclient.RepoRef
 	number int
 }
 
-// ListIssueCommentsScoped returns the seeded comment thread (or listErr), recording
+// ListIssueComments returns the seeded comment thread (or listErr), recording
 // the call. Backs the orphan-rediscovery fallback (#1793).
-func (f *fakeGitHub) ListIssueCommentsScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
+func (f *fakeGitHub) ListIssueComments(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.listCalls = append(f.listCalls, ghListCommentsCall{scope: scope, repo: repo, number: number})
@@ -1492,7 +1492,7 @@ func (f *fakeGitHub) ListIssueCommentsScoped(_ context.Context, scope forge.Cred
 	return f.listComments, nil
 }
 
-func (f *fakeGitHub) CreateIssueCommentScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
+func (f *fakeGitHub) CreateIssueComment(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, ghCommentCall{scope: scope, repo: repo, issueNumber: issueNumber, body: body})
@@ -1513,9 +1513,9 @@ func (f *fakeGitHub) CreateIssueCommentScoped(_ context.Context, scope forge.Cre
 	}, nil
 }
 
-// UpdateIssueCommentScoped records the edit call alongside the existing
+// UpdateIssueComment records the edit call alongside the existing
 // create-call log. Status-comment tests assert on both surfaces.
-func (f *fakeGitHub) UpdateIssueCommentScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
+func (f *fakeGitHub) UpdateIssueComment(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, commentID int64, body string) (*githubclient.IssueComment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.updateCalls = append(f.updateCalls, ghUpdateCommentCall{scope: scope, repo: repo, commentID: commentID, body: body})
@@ -1529,9 +1529,9 @@ func (f *fakeGitHub) UpdateIssueCommentScoped(_ context.Context, scope forge.Cre
 	}, nil
 }
 
-// CreateReviewScoped records the advisory PR-review call. Returns a deterministic
+// CreateReview records the advisory PR-review call. Returns a deterministic
 // review id from the call index so tests can predict it.
-func (f *fakeGitHub) CreateReviewScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
+func (f *fakeGitHub) CreateReview(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int, params githubclient.CreateReviewParams) (*githubclient.CreateReviewResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reviewCalls = append(f.reviewCalls, ghReviewCall{

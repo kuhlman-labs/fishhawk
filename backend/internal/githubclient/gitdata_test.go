@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // gitDataClient wires a Client to a one-off httptest server covering the
@@ -107,7 +109,7 @@ func TestGetRepository_HappyPath(t *testing.T) {
 	c, cap := gitDataClient(t)
 	cap.getRepoBody = `{"default_branch":"trunk","name":"y"}`
 
-	got, err := c.GetRepository(context.Background(), 42, RepoRef{Owner: "x", Name: "y"})
+	got, err := c.GetRepository(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"})
 	if err != nil {
 		t.Fatalf("GetRepository: %v", err)
 	}
@@ -122,7 +124,7 @@ func TestGetRepository_HappyPath(t *testing.T) {
 func TestGetRepository_MissingDefaultBranch(t *testing.T) {
 	c, cap := gitDataClient(t)
 	cap.getRepoBody = `{"name":"y"}`
-	_, err := c.GetRepository(context.Background(), 42, RepoRef{Owner: "x", Name: "y"})
+	_, err := c.GetRepository(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"})
 	if err == nil || !strings.Contains(err.Error(), "default_branch") {
 		t.Errorf("err = %v, want missing default_branch", err)
 	}
@@ -143,7 +145,7 @@ func TestGetRepository_ErrorMapping(t *testing.T) {
 			c, cap := gitDataClient(t)
 			cap.getRepoStatus = tc.status
 			cap.getRepoBody = `{"message":"nope"}`
-			_, err := c.GetRepository(context.Background(), 42, RepoRef{Owner: "x", Name: "y"})
+			_, err := c.GetRepository(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"})
 			if err == nil || !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
 			}
@@ -155,7 +157,7 @@ func TestGetCommit_HappyPath(t *testing.T) {
 	c, cap := gitDataClient(t)
 	cap.getCommitBody = `{"sha":"commit123","tree":{"sha":"tree456"}}`
 
-	got, err := c.GetCommit(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, "commit123")
+	got, err := c.GetCommit(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, "commit123")
 	if err != nil {
 		t.Fatalf("GetCommit: %v", err)
 	}
@@ -170,7 +172,7 @@ func TestGetCommit_HappyPath(t *testing.T) {
 func TestGetCommit_MissingTreeSHA(t *testing.T) {
 	c, cap := gitDataClient(t)
 	cap.getCommitBody = `{"sha":"commit123"}`
-	_, err := c.GetCommit(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, "commit123")
+	_, err := c.GetCommit(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, "commit123")
 	if err == nil || !strings.Contains(err.Error(), "tree.sha") {
 		t.Errorf("err = %v, want missing tree.sha", err)
 	}
@@ -191,7 +193,7 @@ func TestGetCommit_ErrorMapping(t *testing.T) {
 			c, cap := gitDataClient(t)
 			cap.getCommitStatus = tc.status
 			cap.getCommitBody = `{"message":"nope"}`
-			_, err := c.GetCommit(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, "s")
+			_, err := c.GetCommit(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, "s")
 			if err == nil || !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
 			}
@@ -203,7 +205,7 @@ func TestCreateTree_HappyPath(t *testing.T) {
 	c, cap := gitDataClient(t)
 	cap.createTreeResp = `{"sha":"newtree789"}`
 
-	sha, err := c.CreateTree(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	sha, err := c.CreateTree(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		"basetree000", []TreeEntry{
 			{Path: ".fishhawk/workflows.yaml", Content: "version: 1.0\n"},
 			{Path: "AGENTS.md", Content: "# agents\n"},
@@ -239,7 +241,7 @@ func TestCreateTree_HappyPath(t *testing.T) {
 
 func TestCreateTree_NoEntries(t *testing.T) {
 	c, _ := gitDataClient(t)
-	_, err := c.CreateTree(context.Background(), 42, RepoRef{Owner: "x", Name: "y"}, "b", nil)
+	_, err := c.CreateTree(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, "b", nil)
 	if err == nil || !strings.Contains(err.Error(), "at least one tree entry") {
 		t.Errorf("err = %v, want at-least-one-entry error", err)
 	}
@@ -260,7 +262,7 @@ func TestCreateTree_ErrorMapping(t *testing.T) {
 			c, cap := gitDataClient(t)
 			cap.createTreeStatus = tc.status
 			cap.createTreeResp = `{"message":"nope"}`
-			_, err := c.CreateTree(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+			_, err := c.CreateTree(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 				"b", []TreeEntry{{Path: "f", Content: "c"}})
 			if err == nil || !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
@@ -273,7 +275,7 @@ func TestCreateCommit_HappyPath(t *testing.T) {
 	c, cap := gitDataClient(t)
 	cap.createCommitResp = `{"sha":"commitABC"}`
 
-	sha, err := c.CreateCommit(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+	sha, err := c.CreateCommit(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 		"scaffold onboarding", "newtree789", []string{"parentSHA"})
 	if err != nil {
 		t.Fatalf("CreateCommit: %v", err)
@@ -310,7 +312,7 @@ func TestCreateCommit_ErrorMapping(t *testing.T) {
 			c, cap := gitDataClient(t)
 			cap.createCommitState = tc.status
 			cap.createCommitResp = `{"message":"nope"}`
-			_, err := c.CreateCommit(context.Background(), 42, RepoRef{Owner: "x", Name: "y"},
+			_, err := c.CreateCommit(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"},
 				"m", "t", []string{"p"})
 			if err == nil || !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
@@ -324,19 +326,19 @@ func TestGitData_ValidationErrors(t *testing.T) {
 	ctx := context.Background()
 	repo := RepoRef{Owner: "x", Name: "y"}
 
-	if _, err := c.GetRepository(ctx, 1, RepoRef{Name: "y"}); err == nil ||
+	if _, err := c.GetRepository(ctx, forge.FromGitHubInstallationID(1), RepoRef{Name: "y"}); err == nil ||
 		!strings.Contains(err.Error(), "owner and name") {
 		t.Errorf("GetRepository missing owner: %v", err)
 	}
-	if _, err := c.GetCommit(ctx, 1, repo, ""); err == nil ||
+	if _, err := c.GetCommit(ctx, forge.FromGitHubInstallationID(1), repo, ""); err == nil ||
 		!strings.Contains(err.Error(), "commit sha is required") {
 		t.Errorf("GetCommit missing sha: %v", err)
 	}
-	if _, err := c.CreateCommit(ctx, 1, repo, "", "t", nil); err == nil ||
+	if _, err := c.CreateCommit(ctx, forge.FromGitHubInstallationID(1), repo, "", "t", nil); err == nil ||
 		!strings.Contains(err.Error(), "commit message is required") {
 		t.Errorf("CreateCommit missing message: %v", err)
 	}
-	if _, err := c.CreateCommit(ctx, 1, repo, "m", "", nil); err == nil ||
+	if _, err := c.CreateCommit(ctx, forge.FromGitHubInstallationID(1), repo, "m", "", nil); err == nil ||
 		!strings.Contains(err.Error(), "tree sha is required") {
 		t.Errorf("CreateCommit missing tree: %v", err)
 	}
@@ -346,11 +348,11 @@ func TestGitData_MissingTokens(t *testing.T) {
 	c := &Client{} // no Tokens
 	ctx := context.Background()
 	repo := RepoRef{Owner: "x", Name: "y"}
-	if _, err := c.GetRepository(ctx, 1, repo); err == nil ||
+	if _, err := c.GetRepository(ctx, forge.FromGitHubInstallationID(1), repo); err == nil ||
 		!strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("GetRepository: %v", err)
 	}
-	if _, err := c.CreateTree(ctx, 1, repo, "b", []TreeEntry{{Path: "f", Content: "c"}}); err == nil ||
+	if _, err := c.CreateTree(ctx, forge.FromGitHubInstallationID(1), repo, "b", []TreeEntry{{Path: "f", Content: "c"}}); err == nil ||
 		!strings.Contains(err.Error(), "TokenProvider") {
 		t.Errorf("CreateTree: %v", err)
 	}

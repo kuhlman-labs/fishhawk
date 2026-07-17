@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -292,7 +293,7 @@ func (s *Server) authorizeSlashApprover(ctx context.Context, stage *run.Stage, s
 		// an explicit approvers block.
 		return "", true
 	}
-	allowed, err := s.cfg.RoleResolver.CanApprove(ctx, gate.installationID, gate.approvers, gate.roles, subject)
+	allowed, err := s.cfg.RoleResolver.CanApprove(ctx, gate.scope, gate.approvers, gate.roles, subject)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"slash-command approval: role resolution failed",
@@ -352,10 +353,10 @@ func (s *Server) replyApproval(ctx context.Context, p webhook.ApprovalCommandPar
 		return
 	}
 	if err := s.issueNotifier.NotifySlashApprovalReply(ctx, issuecomment.SlashApprovalReply{
-		Repo:           p.Repo,
-		InstallationID: p.InstallationID,
-		IssueNumber:    p.IssueNumber,
-		Body:           body,
+		Repo:        p.Repo,
+		Scope:       forge.FromGitHubInstallationID(p.InstallationID),
+		IssueNumber: p.IssueNumber,
+		Body:        body,
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"slash-command approval: reply comment failed",

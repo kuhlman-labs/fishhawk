@@ -100,8 +100,8 @@ const rollbackCorrelationMarker = "fishhawk_rollback"
 // re-resolves a dispatched run from its correlation token. Satisfied by
 // *githubclient.Client. Tests inject a stub returning canned run states.
 type WorkflowRunPoller interface {
-	GetWorkflowRunScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
-	ResolveDispatchedRunScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch string, correlation map[string]string, createdAfter time.Time) (*githubclient.WorkflowRun, error)
+	GetWorkflowRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, runID int64) (*githubclient.WorkflowRun, error)
+	ResolveDispatchedRun(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, branch string, correlation map[string]string, createdAfter time.Time) (*githubclient.WorkflowRun, error)
 }
 
 // AuditReader reads the deployment_dispatched handle back for a parked
@@ -487,7 +487,7 @@ func (t *Ticker) latestHandle(ctx context.Context, logger *slog.Logger, s *run.S
 // run (binding condition 1, #1386).
 func (t *Ticker) resolveRun(ctx context.Context, logger *slog.Logger, s *run.Stage, repo githubclient.RepoRef, scope forge.CredentialScope, handle dispatchHandle, correlation map[string]string) *githubclient.WorkflowRun {
 	if handle.GHARunID > 0 {
-		wr, err := t.GH.GetWorkflowRunScoped(ctx, scope, repo, handle.GHARunID)
+		wr, err := t.GH.GetWorkflowRun(ctx, scope, repo, handle.GHARunID)
 		if err != nil {
 			logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: get workflow run failed; retry next tick",
 				slog.String("run_id", s.RunID.String()),
@@ -511,7 +511,7 @@ func (t *Ticker) resolveRun(ctx context.Context, logger *slog.Logger, s *run.Sta
 			createdAfter = ts.Add(-1 * time.Minute)
 		}
 	}
-	wr, err := t.GH.ResolveDispatchedRunScoped(ctx, scope, repo, handle.GitRef, correlation, createdAfter)
+	wr, err := t.GH.ResolveDispatchedRun(ctx, scope, repo, handle.GitRef, correlation, createdAfter)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "deployreconciler: re-resolve dispatched run failed; retry next tick",
 			slog.String("run_id", s.RunID.String()),

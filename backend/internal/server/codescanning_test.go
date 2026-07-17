@@ -132,7 +132,7 @@ type fakeCodeScanningLister struct {
 	calls    int
 }
 
-func (l *fakeCodeScanningLister) ListCodeScanningAlertsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string) ([]securityscan.Finding, error) {
+func (l *fakeCodeScanningLister) ListCodeScanningAlerts(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string) ([]securityscan.Finding, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.calls++

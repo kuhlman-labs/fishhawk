@@ -59,7 +59,7 @@ type stubPRGetter struct {
 	calls int
 }
 
-func (s *stubPRGetter) GetPullRequestScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) (*githubclient.PullRequest, error) {
+func (s *stubPRGetter) GetPullRequest(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) (*githubclient.PullRequest, error) {
 	s.calls++
 	if s.err != nil {
 		return nil, s.err

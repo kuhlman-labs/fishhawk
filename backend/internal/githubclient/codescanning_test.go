@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // codeScanningClient wires a Client to an httptest server serving the
@@ -55,7 +57,7 @@ func TestListCodeScanningAlerts_HappyPath(t *testing.T) {
 	]`
 	c, lastURL := codeScanningClient(t, http.StatusOK, body)
 
-	got, err := c.ListCodeScanningAlerts(context.Background(), 99,
+	got, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(99),
 		RepoRef{Owner: "x", Name: "y"}, "refs/pull/12/merge")
 	if err != nil {
 		t.Fatalf("ListCodeScanningAlerts: %v", err)
@@ -100,7 +102,7 @@ func TestListCodeScanningAlerts_DescriptionFallback(t *testing.T) {
 	body := `[{"number":1,"state":"open","rule":{"name":"Hardcoded credential",
 	  "security_severity_level":"critical"},"most_recent_instance":{}}]`
 	c, _ := codeScanningClient(t, http.StatusOK, body)
-	got, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	got, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "")
 	if err != nil {
 		t.Fatalf("ListCodeScanningAlerts: %v", err)
@@ -114,7 +116,7 @@ func TestListCodeScanningAlerts_DescriptionFallback(t *testing.T) {
 // branch is read.
 func TestListCodeScanningAlerts_NoRef(t *testing.T) {
 	c, lastURL := codeScanningClient(t, http.StatusOK, `[]`)
-	if _, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	if _, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, ""); err != nil {
 		t.Fatalf("ListCodeScanningAlerts: %v", err)
 	}
@@ -125,7 +127,7 @@ func TestListCodeScanningAlerts_NoRef(t *testing.T) {
 
 func TestListCodeScanningAlerts_EmptyList(t *testing.T) {
 	c, _ := codeScanningClient(t, http.StatusOK, `[]`)
-	got, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	got, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatalf("ListCodeScanningAlerts: %v", err)
@@ -155,7 +157,7 @@ func TestListCodeScanningAlerts_Pagination(t *testing.T) {
 	t.Cleanup(srv.Close)
 	c := &Client{BaseURL: srv.URL, Tokens: &stubTokens{token: "t"}, HTTP: &http.Client{Timeout: 5 * time.Second}}
 
-	got, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	got, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err != nil {
 		t.Fatalf("ListCodeScanningAlerts: %v", err)
@@ -168,7 +170,7 @@ func TestListCodeScanningAlerts_Pagination(t *testing.T) {
 func TestListCodeScanningAlerts_NotFound(t *testing.T) {
 	// 404 — repo invisible OR code scanning not enabled. Caller tolerates.
 	c, _ := codeScanningClient(t, http.StatusNotFound, `{"message":"Not Found"}`)
-	_, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	_, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("err = %v, want ErrNotFound", err)
@@ -177,7 +179,7 @@ func TestListCodeScanningAlerts_NotFound(t *testing.T) {
 
 func TestListCodeScanningAlerts_Forbidden(t *testing.T) {
 	c, _ := codeScanningClient(t, http.StatusForbidden, `{"message":"Resource not accessible"}`)
-	_, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	_, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
@@ -186,7 +188,7 @@ func TestListCodeScanningAlerts_Forbidden(t *testing.T) {
 
 func TestListCodeScanningAlerts_ServerError(t *testing.T) {
 	c, _ := codeScanningClient(t, http.StatusInternalServerError, `boom`)
-	_, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	_, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err == nil || !strings.Contains(err.Error(), "500") {
 		t.Errorf("err = %v, want a 500 error", err)
@@ -195,7 +197,7 @@ func TestListCodeScanningAlerts_ServerError(t *testing.T) {
 
 func TestListCodeScanningAlerts_DecodeError(t *testing.T) {
 	c, _ := codeScanningClient(t, http.StatusOK, `not json`)
-	_, err := c.ListCodeScanningAlerts(context.Background(), 1,
+	_, err := c.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1),
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err == nil || !strings.Contains(err.Error(), "decode") {
 		t.Errorf("err = %v, want a decode error", err)
@@ -215,7 +217,7 @@ func TestListCodeScanningAlerts_ValidationErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := tc.client.ListCodeScanningAlerts(context.Background(), 1, tc.repo, "main")
+			_, err := tc.client.ListCodeScanningAlerts(context.Background(), forge.FromGitHubInstallationID(1), tc.repo, "main")
 			if err == nil || !strings.Contains(err.Error(), tc.wantSubst) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}

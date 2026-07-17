@@ -46,9 +46,9 @@ type MatchedIssue struct {
 // run-scoped alongside the work-item provider, which is itself not yet
 // registered at startup).
 type FeedbackAPI interface {
-	SearchOpenIssuesScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, query string) ([]MatchedIssue, error)
-	CreateIssueScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
-	CreateIssueCommentScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
+	SearchOpenIssues(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, query string) ([]MatchedIssue, error)
+	CreateIssue(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error)
+	CreateIssueComment(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error)
 }
 
 // FeedbackProvider is the GitHub product-feedback provider: it files
@@ -76,7 +76,7 @@ func (p *FeedbackProvider) SearchOpenByFingerprint(ctx context.Context, target w
 	}
 	mk := marker(fingerprint)
 	query := fmt.Sprintf(`repo:%s/%s is:issue is:open in:body %q`, repo.Owner, repo.Name, mk)
-	matches, err := p.api.SearchOpenIssuesScoped(ctx, scope, repo, query)
+	matches, err := p.api.SearchOpenIssues(ctx, scope, repo, query)
 	if err != nil {
 		return nil, fmt.Errorf("workmgmt/github: search open reports: %w", err)
 	}
@@ -98,7 +98,7 @@ func (p *FeedbackProvider) File(ctx context.Context, target workmgmt.Target, rep
 		return nil, err
 	}
 	body := strings.TrimRight(report.Body, "\n") + "\n\n" + marker(report.Fingerprint)
-	issue, err := p.api.CreateIssueScoped(ctx, scope, repo, githubclient.CreateIssueParams{
+	issue, err := p.api.CreateIssue(ctx, scope, repo, githubclient.CreateIssueParams{
 		Title:  report.Title,
 		Body:   body,
 		Labels: report.Labels,
@@ -121,7 +121,7 @@ func (p *FeedbackProvider) AppendOccurrence(ctx context.Context, target workmgmt
 	if err != nil {
 		return err
 	}
-	if _, err := p.api.CreateIssueCommentScoped(ctx, scope, repo, number, note); err != nil {
+	if _, err := p.api.CreateIssueComment(ctx, scope, repo, number, note); err != nil {
 		return fmt.Errorf("workmgmt/github: append occurrence to #%d: %w", number, err)
 	}
 	return nil

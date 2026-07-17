@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1155,7 +1156,7 @@ func (s *Server) checkApproverAuthorization(w http.ResponseWriter, r *http.Reque
 		return true
 	}
 
-	allowed, err := s.cfg.RoleResolver.CanApprove(r.Context(), gate.installationID, gate.approvers, gate.roles, subject)
+	allowed, err := s.cfg.RoleResolver.CanApprove(r.Context(), gate.scope, gate.approvers, gate.roles, subject)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"approval: role resolution failed",
@@ -1178,11 +1179,11 @@ func (s *Server) checkApproverAuthorization(w http.ResponseWriter, r *http.Reque
 
 // gateContext carries the bits of the workflow spec the role
 // check needs: the gate's approvers, the spec's roles map, and
-// the run's installation_id (so the resolver can reach GitHub).
+// the run's credential scope (so the resolver can reach the forge).
 type gateContext struct {
-	approvers      *spec.Approvers
-	roles          map[string]spec.Role
-	installationID int64
+	approvers *spec.Approvers
+	roles     map[string]spec.Role
+	scope     forge.CredentialScope
 }
 
 // fetchGateForStage loads the workflow spec from the run row's
@@ -1222,14 +1223,14 @@ func (s *Server) fetchGateForStage(ctx context.Context, stage *run.Stage) (*gate
 		for _, gate := range stg.Gates {
 			if gate.Type == spec.GateTypeApproval && gate.Approvers != nil {
 				return &gateContext{
-					approvers:      gate.Approvers,
-					roles:          parsed.Roles,
-					installationID: *runRow.InstallationID,
+					approvers: gate.Approvers,
+					roles:     parsed.Roles,
+					scope:     forge.FromGitHubInstallationID(*runRow.InstallationID),
 				}, nil
 			}
 		}
 		// Stage exists but has no approval gate.
-		return &gateContext{roles: parsed.Roles, installationID: *runRow.InstallationID}, nil
+		return &gateContext{roles: parsed.Roles, scope: forge.FromGitHubInstallationID(*runRow.InstallationID)}, nil
 	}
 	return nil, fmt.Errorf("stage_type %q not in workflow %q", stage.Type, runRow.WorkflowID)
 }
