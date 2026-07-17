@@ -454,7 +454,7 @@ func (s *Server) runTestSweep(ctx context.Context, runID, stageID uuid.UUID, pla
 		)
 		return nil
 	}
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "test sweep: run has no installation id; skipping",
 			slog.String("run_id", runID.String()),
 		)

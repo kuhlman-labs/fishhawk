@@ -118,7 +118,7 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 			slog.String("error", err.Error()))
 		return true
 	}
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		// No installation to call GitHub with. Fail open.
 		return true
 	}
@@ -338,7 +338,7 @@ func (s *Server) ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prN
 			slog.String("error", err.Error()))
 		return true
 	}
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return true
 	}
 	repo, err := parseRepoOwnerName(runRow.Repo)

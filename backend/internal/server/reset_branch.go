@@ -159,7 +159,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	// Resolve the PR, its live head, and the run branch. Every
 	// unresolvable input is a fail-CLOSED refusal (reset_not_determinable)
 	// — never a force-update on an uncertain anchor.
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		s.writeResetNotDeterminable(w, r, "run has no installation to authorize a GitHub force-update")
 		return
 	}

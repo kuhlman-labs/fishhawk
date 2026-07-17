@@ -1839,7 +1839,7 @@ func (s *Server) fillIssueContext(ctx context.Context, github issueGetter, runRo
 
 	// Branch 2: webhook-dispatched runs — fetch via the App's
 	// installation token. Unchanged from the pre-#415 behavior.
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return
 	}
 	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)

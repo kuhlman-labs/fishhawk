@@ -1737,7 +1737,7 @@ type githubAutoMerger struct {
 }
 
 func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run) error {
-	if runRow.InstallationID == nil {
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return fmt.Errorf("campaign auto-merge: run %s has no installation id", runRow.ID)
 	}
 	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
