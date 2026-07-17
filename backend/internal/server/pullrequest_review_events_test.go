@@ -38,6 +38,15 @@ type prEventsRunRepo struct {
 	transErr    error
 	curState    map[uuid.UUID]run.StageState // models the same-state no-op
 	runStates   map[uuid.UUID]run.State      // terminal run state recorded by TransitionRun
+
+	// exactURLResult, when non-nil, models the indexed, non-recency-windowed
+	// PullRequestURL DB filter: a ListRuns call carrying f.PullRequestURL
+	// returns this slice instead of listResult, so a test can distinguish
+	// the project-scoped windowed scan (which truncates at Limit) from the
+	// exact-URL supplement (which is not windowed). Left nil, ListRuns
+	// returns listResult for every filter — every existing consumer of this
+	// fake is unaffected.
+	exactURLResult []*run.Run
 }
 
 type prEventsTransition struct {
@@ -50,6 +59,9 @@ func (r *prEventsRunRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*
 	defer r.mu.Unlock()
 	if f.PullRequestURL != nil {
 		r.listURLs = append(r.listURLs, *f.PullRequestURL)
+		if r.exactURLResult != nil {
+			return r.exactURLResult, r.listErr
+		}
 	}
 	return r.listResult, r.listErr
 }

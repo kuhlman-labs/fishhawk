@@ -630,6 +630,85 @@ func TestFindRunByGitLabMR_NoMatch_WarnsAndReturnsNil(t *testing.T) {
 	}
 }
 
+// TestFindRunByGitLabMR_ResolvesByExactURLBeyondWindow pins the E45.20/
+// E45.21 done-means: a run whose backing MR has aged past the 50-recent-
+// runs project window (so it's absent from the windowed iid/normalized
+// scan) is still resolved when its stored PullRequestURL byte-matches the
+// webhook URL exactly, via the non-windowed exact-URL DB filter supplement.
+func TestFindRunByGitLabMR_ResolvesByExactURLBeyondWindow(t *testing.T) {
+	mrURL := "https://gitlab.com/group/project/-/merge_requests/7"
+	// The windowed project-scoped scan sees only newer runs whose stored
+	// URLs neither iid-match nor normalize-match the incoming MR — modeling
+	// the target having aged out of the 50-run window.
+	urlOther := "https://gitlab.com/group/project/-/merge_requests/999"
+	windowed := []*run.Run{{ID: uuid.New(), Repo: "group/project", PullRequestURL: &urlOther}}
+	// The exact-URL DB filter is not recency-windowed and resolves the
+	// aged-out target because its stored URL byte-matches the webhook URL.
+	target := &run.Run{ID: uuid.New(), Repo: "group/project", PullRequestURL: &mrURL}
+	rr := &prEventsRunRepo{
+		listResult:     windowed,
+		exactURLResult: []*run.Run{target},
+	}
+	s := prEventsTestServer(t, rr, &prEventsAuditRepo{})
+	got, err := s.findRunByGitLabMR(context.Background(), "group/project", 7, mrURL)
+	if err != nil {
+		t.Fatalf("findRunByGitLabMR err = %v, want nil", err)
+	}
+	if got != target {
+		t.Fatalf("resolved run = %+v, want the exact-URL-matched aged-out target %+v", got, target)
+	}
+	found := false
+	for _, u := range rr.listURLs {
+		if u == mrURL {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("listURLs = %v, want the exact-URL filter to have run with mrURL %q", rr.listURLs, mrURL)
+	}
+}
+
+// TestFindRunByGitLabMR_AgedOutURLVariant_DeferredToProjectPersistedLookup
+// pins the residual gap deliberately deferred to #1861: an aged-out MR
+// whose stored URL differs from the webhook URL only by the /-/ infix is
+// NOT byte-equal, so the exact-URL DB filter cannot resolve it either —
+// only the windowed iid/normalized scan can, and that run has aged out of
+// the window. Until #1861 wires GitLab run creation with a durable
+// project+IID persisted lookup column (or a non-windowed normalized-URL DB
+// filter), this case returns (nil, nil) and emits the existing no-match
+// warn. This test captures that as a known, asserted-green current
+// behavior rather than an untested gap.
+func TestFindRunByGitLabMR_AgedOutURLVariant_DeferredToProjectPersistedLookup(t *testing.T) {
+	// The webhook uses the current /-/ form. The aged-out target's stored
+	// URL would differ only by that infix (legacy form) — but the target
+	// itself has aged out of every scan this fake models (it is absent from
+	// listResult, and exactURLResult is unset so the exact-URL filter also
+	// falls back to listResult), so there is nothing here that can resolve
+	// it — pinning the deferred gap.
+	mrURL := "https://gitlab.com/group/project/-/merge_requests/7"
+	urlOther := "https://gitlab.com/group/project/-/merge_requests/999"
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{{ID: uuid.New(), Repo: "group/project", PullRequestURL: &urlOther}},
+	}
+	lh := &recordingLogHandler{}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   rr,
+		AuditRepo: &prEventsAuditRepo{},
+		Logger:    slog.New(lh),
+	})
+	got, err := s.findRunByGitLabMR(context.Background(), "group/project", 7, mrURL)
+	if err != nil {
+		t.Fatalf("findRunByGitLabMR err = %v, want nil", err)
+	}
+	if got != nil {
+		t.Fatalf("resolved run = %+v, want nil for the deliberately-deferred aged-out /-/-infix-variant gap (#1861)", got)
+	}
+	if lh.find("gitlab merge_request: no run matched; review stage will not transition", nil) == nil {
+		t.Fatalf("expected the no-match warn on the deferred aged-out variant; got none")
+	}
+}
+
 // TestFindRunByGitLabMR_LookupError_ReturnsError pins the transient-
 // failure branch (E45.21): a RunRepo ListRuns error must propagate as
 // (nil, err) — NOT be swallowed to (nil, nil) — so the caller can 5xx and
