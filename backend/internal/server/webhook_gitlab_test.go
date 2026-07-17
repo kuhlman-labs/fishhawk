@@ -520,7 +520,9 @@ func TestHandleWebhookGitLab_MergeRequestMerged_TransitionsReview(t *testing.T) 
 	s := prEventsTestServer(t, rr, ar)
 
 	body := gitLabMRBody("merge", "https://gitlab.com/group/project/-/merge_requests/7", 7)
-	s.handleGitLabMergeRequest(context.Background(), body)
+	if err := s.handleGitLabMergeRequest(context.Background(), body); err != nil {
+		t.Fatalf("handleGitLabMergeRequest err = %v, want nil on a resolved merge", err)
+	}
 
 	if len(rr.transitions) != 1 {
 		t.Fatalf("transitions = %d, want 1", len(rr.transitions))
@@ -551,7 +553,9 @@ func TestHandleWebhookGitLab_MergeRequestClosed_CancelsReview(t *testing.T) {
 	s := prEventsTestServer(t, rr, ar)
 
 	body := gitLabMRBody("close", "https://gitlab.com/group/project/-/merge_requests/7", 7)
-	s.handleGitLabMergeRequest(context.Background(), body)
+	if err := s.handleGitLabMergeRequest(context.Background(), body); err != nil {
+		t.Fatalf("handleGitLabMergeRequest err = %v, want nil on a resolved close", err)
+	}
 
 	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateCancelled {
 		t.Fatalf("transitions = %+v, want review→cancelled", rr.transitions)
@@ -566,7 +570,9 @@ func TestHandleWebhookGitLab_MergeRequest_NonTerminalActionIgnored(t *testing.T)
 	ar := &prEventsAuditRepo{}
 	s := prEventsTestServer(t, rr, ar)
 	// action "update" is not a review-gate signal — no lookup, no audit.
-	s.handleGitLabMergeRequest(context.Background(), gitLabMRBody("update", "https://gitlab.com/group/project/-/merge_requests/7", 7))
+	if err := s.handleGitLabMergeRequest(context.Background(), gitLabMRBody("update", "https://gitlab.com/group/project/-/merge_requests/7", 7)); err != nil {
+		t.Fatalf("handleGitLabMergeRequest err = %v, want nil on a non-terminal action", err)
+	}
 	if len(rr.transitions) != 0 || len(ar.appended) != 0 {
 		t.Errorf("update action must be ignored; transitions=%d audits=%d", len(rr.transitions), len(ar.appended))
 	}
@@ -585,7 +591,10 @@ func TestFindRunByGitLabMR_ResolvesByIIDNotURL(t *testing.T) {
 		},
 	}
 	s := prEventsTestServer(t, rr, &prEventsAuditRepo{})
-	got := s.findRunByGitLabMR(context.Background(), "group/project", 7, "https://gitlab.com/group/project/-/merge_requests/7")
+	got, err := s.findRunByGitLabMR(context.Background(), "group/project", 7, "https://gitlab.com/group/project/-/merge_requests/7")
+	if err != nil {
+		t.Fatalf("findRunByGitLabMR err = %v, want nil", err)
+	}
 	if got == nil || got.PullRequestURL == nil || *got.PullRequestURL != url7 {
 		t.Fatalf("resolved run = %+v, want the iid-7 run", got)
 	}
@@ -608,13 +617,79 @@ func TestFindRunByGitLabMR_NoMatch_WarnsAndReturnsNil(t *testing.T) {
 		AuditRepo: &prEventsAuditRepo{},
 		Logger:    slog.New(lh),
 	})
-	got := s.findRunByGitLabMR(context.Background(), "group/project", 7,
+	got, err := s.findRunByGitLabMR(context.Background(), "group/project", 7,
 		"https://gitlab.com/group/project/-/merge_requests/7")
+	if err != nil {
+		t.Fatalf("findRunByGitLabMR err = %v, want nil for a genuine no-match", err)
+	}
 	if got != nil {
 		t.Fatalf("resolved run = %+v, want nil for an unmatched MR", got)
 	}
 	if lh.find("gitlab merge_request: no run matched; review stage will not transition", nil) == nil {
 		t.Fatalf("expected a warn log on the unmatched-MR miss; got none")
+	}
+}
+
+// TestFindRunByGitLabMR_LookupError_ReturnsError pins the transient-
+// failure branch (E45.21): a RunRepo ListRuns error must propagate as
+// (nil, err) — NOT be swallowed to (nil, nil) — so the caller can 5xx and
+// let GitLab redeliver rather than permanently dropping the transition.
+func TestFindRunByGitLabMR_LookupError_ReturnsError(t *testing.T) {
+	listErr := errors.New("transient db failure")
+	rr := &prEventsRunRepo{listErr: listErr}
+	s := prEventsTestServer(t, rr, &prEventsAuditRepo{})
+	got, err := s.findRunByGitLabMR(context.Background(), "group/project", 7,
+		"https://gitlab.com/group/project/-/merge_requests/7")
+	if got != nil {
+		t.Fatalf("resolved run = %+v, want nil on a lookup error", got)
+	}
+	if !errors.Is(err, listErr) {
+		t.Fatalf("err = %v, want the ListRuns error propagated", err)
+	}
+}
+
+// TestHandleGitLabMergeRequest_LookupError_PropagatesError confirms the
+// consumer surfaces the transient lookup error to its caller and performs
+// NO transition and NO audit side effect on that path (E45.21).
+func TestHandleGitLabMergeRequest_LookupError_PropagatesError(t *testing.T) {
+	listErr := errors.New("transient db failure")
+	rr := &prEventsRunRepo{listErr: listErr}
+	ar := &prEventsAuditRepo{}
+	s := prEventsTestServer(t, rr, ar)
+	err := s.handleGitLabMergeRequest(context.Background(),
+		gitLabMRBody("merge", "https://gitlab.com/group/project/-/merge_requests/7", 7))
+	if !errors.Is(err, listErr) {
+		t.Fatalf("err = %v, want the lookup error propagated (→ 5xx)", err)
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (no transition on a lookup failure)", len(rr.transitions))
+	}
+	if len(ar.appended) != 0 {
+		t.Errorf("audits = %d, want 0 (no audit side effects on a lookup failure)", len(ar.appended))
+	}
+}
+
+// TestHandleWebhookGitLab_MergeRequestLookupError_500_Unmarks is the
+// cross-layer end-to-end assertion (E45.21): a transient MR run-lookup
+// failure at the HTTP receiver yields a 500 AND unmarks the already-recorded
+// delivery so GitLab's retry re-records and re-drives the transition rather
+// than being deduped to a 202. The fresh-Mark-succeeds technique mirrors
+// TestDispatchGitLabDelivery_DispatchError_Unmarks.
+func TestHandleWebhookGitLab_MergeRequestLookupError_500_Unmarks(t *testing.T) {
+	rr := &prEventsRunRepo{listErr: errors.New("transient db failure")}
+	s, store := newGitLabWebhookServer(t, gitlabServerOpts{
+		runRepo:   rr,
+		auditRepo: &prEventsAuditRepo{},
+	})
+	body := gitLabMRBody("merge", "https://gitlab.com/group/project/-/merge_requests/7", 7)
+	w := postGitLab(t, s, gitlabHeaders("Merge Request Hook", "mr-lookup-err"), body)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 on MR lookup failure:\n%s", w.Code, w.Body.String())
+	}
+	// The delivery must be released: a fresh Mark on the same id succeeds,
+	// proving the retry re-processes instead of being deduped to a 202.
+	if err := store.Mark("gitlab:mr-lookup-err"); err != nil {
+		t.Errorf("post-failure Mark = %v, want nil (delivery must be unmarked so the retry re-drives the transition)", err)
 	}
 }
 
