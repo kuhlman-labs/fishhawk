@@ -2940,6 +2940,74 @@ func TestHandle_CIFailureRetry_LocalRunner_StaysPending(t *testing.T) {
 	}
 }
 
+// TestHandle_CIFailureRetry_UnwiredGitHub_NoSilentDispatch pins the
+// unwired-GitHub edge of the runnerbackend seam (E45.7 fix-up). A github_actions
+// retry child whose backend client is nil must NOT be silently transitioned to
+// dispatched: the github_actions backend warn+skips a nil client (TriggerStage
+// returns nil), and without the dispatchErr guard the child stage would land in
+// dispatched with no runner behind it. The guard surfaces a dispatch failure so
+// the stage stays pending, the audit records dispatch_failed, and the
+// comment-back does not fire. Handle still returns nil (a dispatch failure here
+// is not a transient 5xx).
+func TestHandle_CIFailureRetry_UnwiredGitHub_NoSilentDispatch(t *testing.T) {
+	d, _, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	// Parent inherits github_actions (seedParentRunForRetry default), so the child
+	// routes through the github_actions backend — but the client is unwired.
+	child := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	_ = child
+	d.GitHub = nil // unwired GitHub deployment
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v (unwired GitHub must not surface a transient error)", err)
+	}
+
+	// The child run + its implement stage are still created.
+	if len(runs.created) != 2 {
+		t.Fatalf("runs.created = %d, want 2 (parent + child)", len(runs.created))
+	}
+	childRun := runs.created[1]
+
+	// No stage was transitioned to dispatched — the child stays pending so a
+	// later delivery (or a wired retry) can pick it up.
+	for _, tr := range runs.transitions {
+		if tr.To == run.StageStateDispatched {
+			t.Errorf("unwired github_actions dispatch must not transition a stage to dispatched; got %+v", tr)
+		}
+	}
+	for _, st := range runs.createdStages {
+		if st.RunID == childRun.ID && st.State != run.StageStatePending {
+			t.Errorf("child stage %s state = %q, want pending (dispatch failed)", st.Type, st.State)
+		}
+	}
+
+	// The dispatch audit records the failure (outcome=dispatch_failed).
+	var dispatched *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "ci_failure_retry_dispatched" {
+			dispatched = &au.appended[i]
+			break
+		}
+	}
+	if dispatched == nil {
+		t.Fatalf("expected ci_failure_retry_dispatched audit row; got %+v", au.appended)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(dispatched.Payload, &payload); err != nil {
+		t.Fatalf("audit payload unmarshal: %v", err)
+	}
+	if payload["outcome"] != "dispatch_failed" {
+		t.Errorf("audit outcome = %v, want dispatch_failed", payload["outcome"])
+	}
+
+	// Comment-back does NOT fire on a dispatch failure.
+	if len(notifier.retryCalls) != 0 {
+		t.Errorf("notifier.retryCalls = %d, want 0 (no comment-back on dispatch failure)", len(notifier.retryCalls))
+	}
+}
+
 func TestHandle_CIFailureRetry_CapHit_EmitsExhaustedAudit(t *testing.T) {
 	d, gh, runs, au := newDispatcherWithStubs(t)
 	d.Artifacts = &stubArtifacts{}

@@ -3,6 +3,7 @@ package runnerbackend
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/google/uuid"
@@ -163,6 +164,82 @@ func TestResolver_Resolve(t *testing.T) {
 			got := rr.Resolve(context.Background(), c.run)
 			if got.Kind() != c.wantKind {
 				t.Errorf("Resolve() backend kind = %q, want %q", got.Kind(), c.wantKind)
+			}
+		})
+	}
+}
+
+// --- Resolver parking-warn-log pinning (branches (h)/(i)) ---
+
+// logRecord captures the level + message of one slog record.
+type logRecord struct {
+	Level slog.Level
+	Msg   string
+}
+
+// recordingHandler is a minimal slog.Handler that appends each record's level
+// and message. It pins the two resolver parking WARN logs (branches (h)/(i))
+// against drift: the seam's zero-behavior-change claim leans on these two
+// structured warn strings staying byte-identical, so a rename here fails the
+// test rather than silently changing operator-visible output.
+type recordingHandler struct{ records *[]logRecord }
+
+func (h recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	*h.records = append(*h.records, logRecord{Level: r.Level, Msg: r.Message})
+	return nil
+}
+func (h recordingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h recordingHandler) WithGroup(string) slog.Handler      { return h }
+
+func TestResolver_ParkingWarnLogs(t *testing.T) {
+	local := run.RunnerKindLocal
+
+	parentUnresolved := uuid.New()
+	parentMissing := uuid.New() // absent from the fake -> GetRun errors
+
+	runs := &fakeRuns{byID: map[uuid.UUID]*run.Run{
+		parentUnresolved: {ID: parentUnresolved, RunnerKind: local, RunnerKindResolved: false},
+	}}
+
+	cases := []struct {
+		name    string
+		child   *run.Run
+		wantMsg string
+	}{
+		{ // (h) parent read error
+			"parent-lock read failed",
+			&run.Run{ID: uuid.New(), RunnerKind: local, RunnerKindResolved: false, DecomposedFrom: uuidPtr(parentMissing)},
+			"orchestrator: decomposed child parent-lock read failed; parking child toward the recoverable state (awaiting_host_dispatch)",
+		},
+		{ // (i) parent un-resolved
+			"parent runner_kind un-resolved",
+			&run.Run{ID: uuid.New(), RunnerKind: local, RunnerKindResolved: false, DecomposedFrom: uuidPtr(parentUnresolved)},
+			"orchestrator: decomposed child parent runner_kind un-resolved; parking child toward the recoverable state (awaiting_host_dispatch)",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var recs []logRecord
+			rr := newResolver(runs, &fakeDispatchClient{})
+			rr.Logger = slog.New(recordingHandler{records: &recs})
+
+			if got := rr.Resolve(context.Background(), c.child); got.Kind() != local {
+				t.Errorf("Resolve() backend kind = %q, want %q (parks local)", got.Kind(), local)
+			}
+
+			var found bool
+			for _, r := range recs {
+				if r.Msg == c.wantMsg {
+					found = true
+					if r.Level != slog.LevelWarn {
+						t.Errorf("parking log level = %v, want WARN", r.Level)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("expected parking WARN log %q; got %+v", c.wantMsg, recs)
 			}
 		})
 	}

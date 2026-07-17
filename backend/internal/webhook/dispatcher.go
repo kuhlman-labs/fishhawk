@@ -1446,6 +1446,14 @@ func (d *Dispatcher) handleRunnerActionFailed(ctx context.Context, ev Event, m M
 	return nil
 }
 
+// errCIRetryGitHubUnconfigured is the dispatch error the CI-retry path
+// propagates when the github_actions backend's client is unwired (nil
+// d.GitHub). The github_actions backend warn+skips a nil client (returning
+// nil); propagating this as a dispatchErr keeps the retry stage out of the
+// dispatched state (no silent in-flight child with no runner) and records the
+// failure in the audit (E45.7 fix-up).
+var errCIRetryGitHubUnconfigured = errors.New("dispatcher: github client unconfigured; ci-retry workflow_dispatch skipped")
+
 // handleCIFailureRetry creates a follow-up implement run when a
 // required CI check fails on a Fishhawk-managed PR (#279 / E16).
 // Best-effort throughout — every skip path emits a structured log
@@ -1644,6 +1652,19 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 			// Retry children carry no DecomposedFrom (ParentRunID threads the
 			// retry chain), so no parent_run_id input is added.
 		})
+		// An unwired GitHub client makes the github_actions backend warn+skip
+		// (TriggerStage returns nil) instead of firing a workflow_dispatch. Left
+		// unguarded, the nil below would transition this github_actions child to
+		// dispatched with no runner behind it — a silent in-flight stage. Surface
+		// it as a dispatchErr so the stage stays pending and the audit records the
+		// failure, restoring the pre-seam dispatchErr-propagation posture the plan
+		// described (minus the pre-seam nil-pointer panic). Practically unreachable
+		// — the webhook dispatcher only processes events from a wired GitHub
+		// deployment — but a github_actions child must never be marked dispatched
+		// without an actual trigger (E45.7 fix-up).
+		if dispatchErr == nil && d.GitHub == nil {
+			dispatchErr = errCIRetryGitHubUnconfigured
+		}
 		if dispatchErr == nil {
 			if _, err := d.Runs.TransitionStage(ctx, firstStage.ID,
 				run.StageStateDispatched, nil); err != nil {
