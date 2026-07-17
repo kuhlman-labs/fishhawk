@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -135,7 +136,7 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 	// reported head (first-report bootstrap) and compares the same head.
 	// On a confirmed foreign commit, fail the stage category-B.
 	offendingSHA, checked := s.detectForeignCommitOnBranch(ctx, runRow,
-		*runRow.InstallationID, repo, headSHA, headSHA, prNumber)
+		forge.FromGitHubInstallationID(*runRow.InstallationID), repo, headSHA, headSHA, prNumber)
 	if checked && offendingSHA != "" {
 		s.recordForeignCommitViolation(ctx, runID, stage, offendingSHA, headSHA)
 		return false
@@ -167,12 +168,12 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 // current head; the merge-resolution caller seeds with "" so the live
 // branch tip is not auto-whitelisted into the set it is checked against.
 func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Run,
-	installationID int64, repo githubclient.RepoRef, compareHead, ledgerSeedSHA string,
+	scope forge.CredentialScope, repo githubclient.RepoRef, compareHead, ledgerSeedSHA string,
 	prNumber int) (offendingSHA string, checked bool) {
 	// Resolve the compare anchor defensively (ADR-035 binding condition):
 	// the run's real PR base ref, never a hardcoded branch name and never
 	// the laundering-prone reported base_sha. Unconfirmed → fail open.
-	baseRef := s.resolveLineageBaseRef(ctx, runRow, installationID, repo, prNumber)
+	baseRef := s.resolveLineageBaseRef(ctx, runRow, scope, repo, prNumber)
 	if baseRef == "" {
 		return "", false
 	}
@@ -196,7 +197,7 @@ func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Ru
 		return "", false
 	}
 
-	commits, err := s.cfg.GitHub.CompareCommits(ctx, installationID, repo, baseRef, compareHead)
+	commits, err := s.cfg.GitHub.CompareCommitsScoped(ctx, scope, repo, baseRef, compareHead)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage: compare commits failed; skipping check",
@@ -237,8 +238,8 @@ func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Ru
 // run-authored HEAD — so an uncertain classification can never drive a
 // force-update. The handler maps ok=false to reset_not_determinable.
 func (s *Server) resolveLastRunAuthoredHead(ctx context.Context, runRow *run.Run,
-	installationID int64, repo githubclient.RepoRef, headSHA string, prNumber int) (lastAuthoredSHA, offendingSHA string, isOnTop, ok bool) {
-	baseRef := s.resolveLineageBaseRef(ctx, runRow, installationID, repo, prNumber)
+	scope forge.CredentialScope, repo githubclient.RepoRef, headSHA string, prNumber int) (lastAuthoredSHA, offendingSHA string, isOnTop, ok bool) {
+	baseRef := s.resolveLineageBaseRef(ctx, runRow, scope, repo, prNumber)
 	if baseRef == "" {
 		return "", "", false, false
 	}
@@ -252,7 +253,7 @@ func (s *Server) resolveLastRunAuthoredHead(ctx context.Context, runRow *run.Run
 		return "", "", false, false
 	}
 
-	commits, err := s.cfg.GitHub.CompareCommits(ctx, installationID, repo, baseRef, headSHA)
+	commits, err := s.cfg.GitHub.CompareCommitsScoped(ctx, scope, repo, baseRef, headSHA)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch reset: compare commits failed; refusing (fail-closed)",
@@ -356,7 +357,7 @@ func (s *Server) ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prN
 	if prNumber <= 0 {
 		return true
 	}
-	pr, err := s.cfg.GitHub.GetPullRequest(ctx, *runRow.InstallationID, repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequestScoped(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, prNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage reverify: resolve PR head failed; skipping check",
@@ -371,7 +372,7 @@ func (s *Server) ReverifyBranchLineage(ctx context.Context, runID uuid.UUID, prN
 	}
 
 	offendingSHA, checked := s.detectForeignCommitOnBranch(ctx, runRow,
-		*runRow.InstallationID, repo, headSHA, "", prNumber)
+		forge.FromGitHubInstallationID(*runRow.InstallationID), repo, headSHA, "", prNumber)
 	if !checked || offendingSHA == "" {
 		// Fail open or clean — either way the merge may resolve.
 		return true
@@ -433,7 +434,7 @@ func (s *Server) foreignCommitAlreadyRecorded(ctx context.Context, runID uuid.UU
 // otherwise the number is parsed from the run's tracked
 // pull_request_url.
 func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
-	installationID int64, repo githubclient.RepoRef, prNumber int) string {
+	scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int) string {
 	if prNumber <= 0 {
 		prNumber = parsePRNumberFromURL(runRow.PullRequestURL)
 	}
@@ -442,7 +443,7 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 		// before the parent opens the consolidated PR). Fail open.
 		return ""
 	}
-	pr, err := s.cfg.GitHub.GetPullRequest(ctx, installationID, repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequestScoped(ctx, scope, repo, prNumber)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"branch lineage: resolve PR base ref failed; skipping check",

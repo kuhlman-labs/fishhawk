@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -296,9 +297,9 @@ type stubIssueGetter struct {
 	commentsGotNum  int
 }
 
-func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+func (s *stubIssueGetter) GetIssueScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) (*githubclient.Issue, error) {
 	s.called = true
-	s.gotInst = installationID
+	s.gotInst, _ = scope.GitHubInstallationID()
 	s.gotRepo = repo
 	s.gotNum = number
 	if s.getErr != nil {
@@ -307,9 +308,9 @@ func (s *stubIssueGetter) GetIssue(_ context.Context, installationID int64, repo
 	return s.issue, nil
 }
 
-func (s *stubIssueGetter) ListIssueComments(_ context.Context, installationID int64, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
+func (s *stubIssueGetter) ListIssueCommentsScoped(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, number int) ([]githubclient.FetchedIssueComment, error) {
 	s.commentsCalled = true
-	s.commentsGotInst = installationID
+	s.commentsGotInst, _ = scope.GitHubInstallationID()
 	s.commentsGotRepo = repo
 	s.commentsGotNum = number
 	if s.commentsErr != nil {

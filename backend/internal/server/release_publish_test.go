@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 )
 
@@ -60,7 +61,7 @@ func (f *fakeReleasePublisher) GetRepoInstallation(_ context.Context, _ githubcl
 	return f.instID, nil
 }
 
-func (f *fakeReleasePublisher) GetReleaseByTag(_ context.Context, _ int64, _ githubclient.RepoRef, tag string) (*githubclient.Release, error) {
+func (f *fakeReleasePublisher) GetReleaseByTagScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, tag string) (*githubclient.Release, error) {
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
@@ -76,7 +77,7 @@ func (f *fakeReleasePublisher) GetReleaseByTag(_ context.Context, _ int64, _ git
 	return &githubclient.Release{ID: f.releaseID, TagName: tag, Body: f.body, HTMLURL: f.htmlURL, Assets: assets}, nil
 }
 
-func (f *fakeReleasePublisher) UpdateReleaseBody(_ context.Context, _ int64, _ githubclient.RepoRef, _ int64, body string) error {
+func (f *fakeReleasePublisher) UpdateReleaseBodyScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int64, body string) error {
 	if f.updateErr != nil {
 		return f.updateErr
 	}
@@ -87,7 +88,7 @@ func (f *fakeReleasePublisher) UpdateReleaseBody(_ context.Context, _ int64, _ g
 	return nil
 }
 
-func (f *fakeReleasePublisher) DeleteReleaseAsset(_ context.Context, _ int64, _ githubclient.RepoRef, assetID int64) error {
+func (f *fakeReleasePublisher) DeleteReleaseAssetScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, assetID int64) error {
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}
@@ -104,7 +105,7 @@ func (f *fakeReleasePublisher) DeleteReleaseAsset(_ context.Context, _ int64, _ 
 	return nil
 }
 
-func (f *fakeReleasePublisher) UploadReleaseAsset(_ context.Context, _ int64, _ githubclient.RepoRef, _ int64, name, _ string, data []byte) error {
+func (f *fakeReleasePublisher) UploadReleaseAssetScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int64, name, _ string, data []byte) error {
 	if f.uploadErr != nil {
 		return f.uploadErr
 	}

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -147,7 +148,7 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 		resp.Spec.Source = "unavailable"
 		resp.Spec.Note = "GitHub App is not installed on the target repository; cannot fetch the workflow spec"
 	default:
-		fc, err := s.cfg.GitHub.GetWorkflowSpec(r.Context(), installationID, repoRef, "")
+		fc, err := s.cfg.GitHub.GetWorkflowSpecScoped(r.Context(), forge.FromGitHubInstallationID(installationID), repoRef, "")
 		switch {
 		case err == nil:
 			resp.Spec.Source = "fetched"

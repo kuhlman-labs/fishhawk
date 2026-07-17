@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -162,6 +163,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 		s.writeResetNotDeterminable(w, r, "run has no installation to authorize a GitHub force-update")
 		return
 	}
+	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 	repo, err := parseRepoOwnerName(runRow.Repo)
 	if err != nil {
 		s.writeResetNotDeterminable(w, r, "run repo is unparseable: "+err.Error())
@@ -172,7 +174,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 		s.writeResetNotDeterminable(w, r, "run has no tracked pull request to reset")
 		return
 	}
-	pr, err := s.cfg.GitHub.GetPullRequest(r.Context(), *runRow.InstallationID, repo, prNumber)
+	pr, err := s.cfg.GitHub.GetPullRequestScoped(r.Context(), scope, repo, prNumber)
 	if err != nil {
 		s.writeResetNotDeterminable(w, r, "resolve live PR head failed: "+err.Error())
 		return
@@ -186,7 +188,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	// Classify: find the last run-authored HEAD, the offending on-top
 	// commit, and whether the foreign commit sits strictly on top.
 	lastAuthoredSHA, offendingSHA, isOnTop, ok := s.resolveLastRunAuthoredHead(
-		r.Context(), runRow, *runRow.InstallationID, repo, headSHA, prNumber)
+		r.Context(), runRow, scope, repo, headSHA, prNumber)
 	if !ok {
 		s.writeResetNotDeterminable(w, r,
 			"could not classify the run branch's lineage with certainty")
@@ -210,7 +212,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	// since classification, so a concurrent push between classify and
 	// patch cannot be silently clobbered. Narrows, does not eliminate,
 	// the window.
-	livePR, err := s.cfg.GitHub.GetPullRequest(r.Context(), *runRow.InstallationID, repo, prNumber)
+	livePR, err := s.cfg.GitHub.GetPullRequestScoped(r.Context(), scope, repo, prNumber)
 	if err != nil {
 		s.writeResetNotDeterminable(w, r, "lease re-check: re-read live PR head failed: "+err.Error())
 		return
@@ -222,7 +224,7 @@ func (s *Server) handleResetRunBranch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Force-rewind the run branch to the last run-authored HEAD.
-	if err := s.cfg.GitHub.ForceUpdateRef(r.Context(), *runRow.InstallationID, repo, branch, lastAuthoredSHA); err != nil {
+	if err := s.cfg.GitHub.ForceUpdateRefScoped(r.Context(), scope, repo, branch, lastAuthoredSHA); err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "reset_force_update_failed",
 			"force-update of the PR head ref failed", map[string]any{"error": err.Error()})
 		return
