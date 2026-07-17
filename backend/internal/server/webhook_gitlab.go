@@ -110,12 +110,40 @@ func (s *Server) handleWebhookGitLab(w http.ResponseWriter, r *http.Request) {
 	// The MR lifecycle is consumed server-side (the dispatcher skips
 	// object_kind merge_request): a merge/close drives the review-stage
 	// state machine via the ADR-018 resolver shared with the GitHub
-	// pull_request.closed path. Best-effort — never influences the 202.
+	// pull_request.closed path. A transient RunRepo lookup failure is the
+	// GitLab receiver's ONLY review-gate signal (the GitHub path has the
+	// merge-reconciler poll as a backstop; GitLab has none), so — unlike a
+	// parse failure or a genuine no-match, which stay best-effort 202 — it
+	// propagates as a non-nil error here. We unmark the already-recorded
+	// delivery and surface a 5xx so GitLab redelivers and re-drives the
+	// transition (E45.21; mirrors the dispatch-drop fix above).
 	if ev.Type == "merge_request" {
-		s.handleGitLabMergeRequest(r.Context(), ev.RawBody)
+		if err := s.handleGitLabMergeRequest(r.Context(), ev.RawBody); err != nil {
+			s.unmarkGitLabDelivery(r.Context(), ev.DeliveryID)
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"gitlab merge_request lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// unmarkGitLabDelivery releases an ALREADY-RECORDED delivery so a GitLab
+// redelivery is treated as a first delivery again and re-processes rather
+// than deduping to a 202. It is best-effort: a failure to unmark is logged
+// (the retry may then still be deduped) and does not abort the caller. Shared
+// by dispatchGitLabDelivery and the MR review-gate consumer, both of which
+// return a 5xx on a transient failure after Mark has already recorded the
+// delivery.
+func (s *Server) unmarkGitLabDelivery(ctx context.Context, deliveryID string) {
+	if uerr := s.cfg.WebhookDeliveries.Unmark(deliveryID); uerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+			"gitlab webhook: failed to unmark delivery after error; retry may be deduped",
+			slog.String("delivery_id", deliveryID),
+			slog.String("error", uerr.Error()),
+		)
+	}
 }
 
 // dispatchGitLabDelivery runs dispatch for an ALREADY-RECORDED delivery
@@ -143,13 +171,7 @@ func (s *Server) dispatchGitLabDelivery(ctx context.Context, ev webhook.Event, d
 	if err == nil {
 		return nil
 	}
-	if uerr := s.cfg.WebhookDeliveries.Unmark(ev.DeliveryID); uerr != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
-			"gitlab webhook: failed to unmark delivery after dispatch error; retry may be deduped",
-			slog.String("delivery_id", ev.DeliveryID),
-			slog.String("error", uerr.Error()),
-		)
-	}
+	s.unmarkGitLabDelivery(ctx, ev.DeliveryID)
 	return err
 }
 
@@ -182,28 +204,36 @@ type gitLabMergeRequestPayload struct {
 // "close" to cancelled (merged=false, closed-without-merge). Every
 // other MR action is ignored — they aren't review-gate signals.
 //
-// Best-effort throughout: a parse failure, a missing run, or a
-// non-Fishhawk-managed MR all log and return without surfacing as a
-// 5xx. Idempotent on redeliveries: TransitionStage is a no-op on an
+// Best-effort EXCEPT for a transient run-lookup failure: a nil
+// RunRepo/AuditRepo, a parse failure, a non-terminal MR action, or a
+// genuine no-match all log and return nil (the receiver answers 202).
+// A transient RunRepo error from findRunByGitLabMR, by contrast, is
+// returned so the receiver unmarks the delivery and answers 5xx — the
+// GitLab webhook is the only review-gate signal, so a dropped merge/close
+// on a DB blip would strand the review stage permanently (E45.21).
+// Idempotent on redeliveries: TransitionStage is a no-op on an
 // already-terminal stage.
-func (s *Server) handleGitLabMergeRequest(ctx context.Context, raw []byte) {
+func (s *Server) handleGitLabMergeRequest(ctx context.Context, raw []byte) error {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
-		return
+		return nil
 	}
 	var p gitLabMergeRequestPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"gitlab merge_request: parse failed",
 			slog.String("error", err.Error()))
-		return
+		return nil
 	}
 	action := p.ObjectAttributes.Action
 	if action != "merge" && action != "close" {
-		return
+		return nil
 	}
-	target := s.findRunByGitLabMR(ctx, p.Project.PathWithNamespace, p.ObjectAttributes.IID, p.ObjectAttributes.URL)
+	target, err := s.findRunByGitLabMR(ctx, p.Project.PathWithNamespace, p.ObjectAttributes.IID, p.ObjectAttributes.URL)
+	if err != nil {
+		return err
+	}
 	if target == nil {
-		return
+		return nil
 	}
 
 	// prURL for the audit/log uses the Fishhawk-stored URL when present
@@ -219,6 +249,7 @@ func (s *Server) handleGitLabMergeRequest(ctx context.Context, raw []byte) {
 		actorKind:  audit.ActorKind("user"),
 	}
 	s.resolveReviewStageOnMerge(ctx, target, action == "merge", meta)
+	return nil
 }
 
 // findRunByGitLabMR resolves the Fishhawk run backing a GitLab MR by
@@ -236,9 +267,14 @@ func (s *Server) handleGitLabMergeRequest(ctx context.Context, raw []byte) {
 // SUPPLEMENTS — never replaces — the iid-keyed lookup: it catches a run
 // whose stored URL differs from the webhook's only by the /-/ infix
 // when the iid could not be parsed.
-func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid int, mrURL string) *run.Run {
+//
+// Returns (nil, nil) on a genuine no-match (warn logged, best-effort) and
+// (nil, err) on a transient RunRepo error from either ListRuns call — the
+// caller propagates that error into a 5xx so GitLab redelivers rather than
+// permanently dropping the merge/close transition (E45.21).
+func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid int, mrURL string) (*run.Run, error) {
 	if projectPath == "" || iid <= 0 {
-		return nil
+		return nil, nil
 	}
 	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
 		Repo:  projectPath,
@@ -250,7 +286,7 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 			slog.String("project", projectPath),
 			slog.Int("iid", iid),
 			slog.String("error", err.Error()))
-		return nil
+		return nil, err
 	}
 	// Primary: match on the iid parsed out of the stored MR URL.
 	for _, r := range runs {
@@ -258,7 +294,7 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 			continue
 		}
 		if storedIID, ok := parseGitLabMRIID(*r.PullRequestURL); ok && storedIID == iid {
-			return r
+			return r, nil
 		}
 	}
 	// Fallback: normalized-URL equality, for a run whose stored URL
@@ -268,7 +304,7 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 		want := normalizeGitLabMRURL(mrURL)
 		for _, r := range runs {
 			if r.PullRequestURL != nil && normalizeGitLabMRURL(*r.PullRequestURL) == want {
-				return r
+				return r, nil
 			}
 		}
 	}
@@ -282,14 +318,23 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 	// Go-side equality re-check keeps it exact-match-only (GitLab's /-/ infix
 	// variance is handled by the iid + normalized paths above).
 	if mrURL != "" {
-		if exact, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		exact, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
 			PullRequestURL: &mrURL,
 			Limit:          5,
-		}); err == nil {
-			for _, r := range exact {
-				if r.PullRequestURL != nil && *r.PullRequestURL == mrURL {
-					return r
-				}
+		})
+		if err != nil {
+			// Same transient-failure class as the primary lookup: propagate
+			// so the caller redelivers rather than dropping the transition.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"gitlab merge_request: exact-url run lookup failed",
+				slog.String("project", projectPath),
+				slog.Int("iid", iid),
+				slog.String("error", err.Error()))
+			return nil, err
+		}
+		for _, r := range exact {
+			if r.PullRequestURL != nil && *r.PullRequestURL == mrURL {
+				return r, nil
 			}
 		}
 	}
@@ -302,7 +347,7 @@ func (s *Server) findRunByGitLabMR(ctx context.Context, projectPath string, iid 
 		slog.String("project", projectPath),
 		slog.Int("iid", iid),
 		slog.String("mr_url", mrURL))
-	return nil
+	return nil, nil
 }
 
 // parseGitLabMRIID extracts the merge-request iid from a GitLab MR web
