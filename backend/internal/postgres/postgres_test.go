@@ -271,6 +271,28 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Errorf("stages_state_check after MigrateUp does not admit 'awaiting_host_dispatch': %s", stageStateCheckDef)
 	}
 
+	// 0054 (#1861) widened runs_runner_kind_check to admit the second
+	// host-dispatched backend 'gitlab_ci' (E45.8). Confirm the CHECK names it
+	// after a full MigrateUp — without this widening a run stamped
+	// runner_kind='gitlab_ci' is uninsertable (SQLSTATE 23514). The two prior
+	// backends stay admitted (the widening is additive).
+	var runnerKindCheckDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		 WHERE conname = 'runs_runner_kind_check'`,
+	).Scan(&runnerKindCheckDef); err != nil {
+		t.Fatalf("query runs_runner_kind_check constraint def: %v", err)
+	}
+	if !strings.Contains(runnerKindCheckDef, "gitlab_ci") {
+		t.Errorf("runs_runner_kind_check after MigrateUp does not admit 'gitlab_ci': %s", runnerKindCheckDef)
+	}
+	if !strings.Contains(runnerKindCheckDef, "github_actions") {
+		t.Errorf("runs_runner_kind_check after MigrateUp dropped 'github_actions': %s", runnerKindCheckDef)
+	}
+	if !strings.Contains(runnerKindCheckDef, "local") {
+		t.Errorf("runs_runner_kind_check after MigrateUp dropped 'local': %s", runnerKindCheckDef)
+	}
+
 	// 0039 (#1437) added the campaigns + campaign_items tables (the
 	// campaign keystone). Confirm both exist after a full MigrateUp.
 	var campaignsTable, campaignItemsTable int
@@ -704,14 +726,14 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0053 (#1912) is now the latest
-	// migration: it WIDENED stages_state_check to admit 'awaiting_host_dispatch'
-	// and backfilled the parked local rows (the #1912 split of the conflated
-	// local 'dispatched' state). It adds no table and no column, so its one-step
-	// rollback narrows the CHECK back (dropping 'awaiting_host_dispatch') and
-	// reverses the backfill, touching nothing else — 0052's (#1854, ADR-057 /
-	// ADR-058) accounts + installations tenancy tables now SURVIVE, as does
-	// every prior migration's effect: 0051's (#1587) artifacts_kind_check
+	// MigrateDown rolls back one step. 0054 (#1861) is now the latest
+	// migration: it WIDENED runs_runner_kind_check to admit the second
+	// host-dispatched backend 'gitlab_ci' (E45.8). It adds no table and no
+	// column and does no backfill, so its one-step rollback narrows the CHECK
+	// back (dropping 'gitlab_ci'), touching nothing else — 0053's (#1912)
+	// stages_state_check 'awaiting_host_dispatch' member now SURVIVES, as does
+	// every prior migration's effect: 0052's (#1854, ADR-057 / ADR-058)
+	// accounts + installations tenancy tables, 0051's (#1587) artifacts_kind_check
 	// 'release_notes' member, 0050's (#1708) api_tokens.auth_method/provider
 	// columns, 0044's (#1519) stages_type_check 'acceptance' member, 0043's
 	// (#1417) runs.upstream_run_id column + partial index, 0042's (#1455)
@@ -723,10 +745,10 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// 0037's (#1385) artifacts_kind_check 'deployment', 0036's (#1346)
 	// runs.runner_kind_resolved column, etc.
 	//
-	// This is the binding TestMigrateDown flip for 0053: 'awaiting_host_dispatch'
-	// must be ABSENT from stages_state_check after the one-step down (asserted
-	// alongside the surviving deploy states below), while 0052's accounts +
-	// installations tables (now a prior migration) SURVIVE.
+	// This is the binding TestMigrateDown flip for 0054: 'gitlab_ci' must be
+	// ABSENT from runs_runner_kind_check after the one-step down (asserted below),
+	// while 0053's 'awaiting_host_dispatch' (now a prior migration) SURVIVES, as
+	// do 0052's accounts + installations tables.
 	var accountsTableDown, installationsTableDown int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'`,
@@ -1018,12 +1040,31 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if !strings.Contains(stageStateCheckDef, "awaiting_children") {
 		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_children': %s", stageStateCheckDef)
 	}
-	// 0053 (#1912) is the migration rolled back by this one-step down, so its
+	// 0053 (#1912) is now a PRIOR migration (only 0054 rolled back), so its
 	// widening — the parked-for-host-dispatch state 'awaiting_host_dispatch' —
-	// must be GONE from stages_state_check (the binding TestMigrateDown flip for
-	// 0053). Every prior state above survives.
-	if strings.Contains(stageStateCheckDef, "awaiting_host_dispatch") {
-		t.Errorf("stages_state_check after MigrateDown still admits 'awaiting_host_dispatch' (0053 should have narrowed it): %s", stageStateCheckDef)
+	// SURVIVES in stages_state_check.
+	if !strings.Contains(stageStateCheckDef, "awaiting_host_dispatch") {
+		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_host_dispatch' (0053 still applied; only 0054 rolled back): %s", stageStateCheckDef)
+	}
+	// 0054 (#1861) is the migration rolled back by this one-step down, so its
+	// widening — the second host-dispatched backend 'gitlab_ci' — must be GONE
+	// from runs_runner_kind_check (the binding TestMigrateDown flip for 0054),
+	// while the two prior backends survive.
+	var runnerKindCheckDefDown string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+		 WHERE conname = 'runs_runner_kind_check'`,
+	).Scan(&runnerKindCheckDefDown); err != nil {
+		t.Fatalf("query runs_runner_kind_check constraint def after MigrateDown: %v", err)
+	}
+	if strings.Contains(runnerKindCheckDefDown, "gitlab_ci") {
+		t.Errorf("runs_runner_kind_check after MigrateDown still admits 'gitlab_ci' (0054 should have narrowed it): %s", runnerKindCheckDefDown)
+	}
+	if !strings.Contains(runnerKindCheckDefDown, "github_actions") {
+		t.Errorf("runs_runner_kind_check after MigrateDown dropped 'github_actions' (0024 still applied): %s", runnerKindCheckDefDown)
+	}
+	if !strings.Contains(runnerKindCheckDefDown, "local") {
+		t.Errorf("runs_runner_kind_check after MigrateDown dropped 'local' (0024 still applied): %s", runnerKindCheckDefDown)
 	}
 	var driveCol int
 	if err := pool.QueryRow(context.Background(),
@@ -1348,7 +1389,8 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0053 (narrow stages_state_check + reverse the
+	// Step down past 0054 (narrow runs_runner_kind_check — inert re: campaigns)
+	// then 0053 (narrow stages_state_check + reverse the
 	// awaiting_host_dispatch backfill — inert re: campaigns; no paused row holds
 	// that state) then 0052 (drop the accounts + installations tenancy tables —
 	// inert re: campaigns) then 0051 (narrow artifacts_kind_check — inert re:
@@ -1363,6 +1405,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0054) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0053) failed: %v", err)
 	}
@@ -1438,10 +1483,14 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0053 back so we can seed 'dispatched' rows
-	// under the pre-0053 narrow CHECK before re-applying the backfill.
+	// Apply everything, then roll 0054 (widen runs_runner_kind_check — inert re:
+	// this backfill) and 0053 back so we can seed 'dispatched' rows under the
+	// pre-0053 narrow CHECK before re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0054 above 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0053 to seed pre-backfill rows): %v", err)
@@ -1535,12 +1584,89 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 		t.Errorf("re-opened local stage (started_at set) state after backfill = %q, want dispatched (conservatively skipped)", got)
 	}
 
-	// Down reverses the backfill: the flipped row returns to dispatched.
+	// Down reverses the backfill: roll back 0054 (narrow runs_runner_kind_check —
+	// inert re: this backfill) then 0053, and the flipped row returns to
+	// dispatched.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0054 above 0053): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (reverse 0053 backfill): %v", err)
 	}
 	if got := stageState(parkedStageID); got != "dispatched" {
 		t.Errorf("parked-local stage state after down = %q, want dispatched (backfill reversed)", got)
+	}
+}
+
+// TestMigration0054_AdmitsGitLabCIRunnerKind is the #1861 / E45.8 CHECK-widening
+// round-trip guard. After a full MigrateUp a run stamped runner_kind='gitlab_ci'
+// INSERTs successfully (it violated the pre-0054 CHECK), a bogus runner_kind is
+// still rejected (the set stays closed), and after rolling 0054 back the
+// gitlab_ci INSERT is once more rejected (the CHECK narrowed). This is a
+// behavioral done-means assertion: a comment-only touch of the migration cannot
+// pass it.
+func TestMigration0054_AdmitsGitLabCIRunnerKind(t *testing.T) {
+	url := startContainer(t)
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// A gitlab_ci run is now insertable — the widened CHECK admits it.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'gitlab_ci')`,
+		uuid.New(),
+	); err != nil {
+		t.Fatalf("INSERT runner_kind='gitlab_ci' after MigrateUp failed, want success (0054 widened the CHECK): %v", err)
+	}
+
+	// A bogus runner_kind is still rejected — the set stays closed.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'bogus_backend')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("INSERT runner_kind='bogus_backend' succeeded, want CHECK violation (closed set)")
+	}
+	// The down migration's re-add validates against existing rows: a lingering
+	// gitlab_ci row makes it raise SQLSTATE 23514 (the documented rollback
+	// caveat). Clear the gitlab_ci rows first, mirroring the PR's rollback plan.
+	if _, err := pool.Exec(context.Background(),
+		`DELETE FROM runs WHERE runner_kind = 'gitlab_ci'`,
+	); err != nil {
+		t.Fatalf("clear gitlab_ci rows before rollback: %v", err)
+	}
+	pool.Close()
+
+	// Roll 0054 back: the CHECK narrows and a gitlab_ci INSERT is rejected again.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0054): %v", err)
+	}
+	pool2, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("re-Connect: %v", err)
+	}
+	defer pool2.Close()
+	if _, err := pool2.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'gitlab_ci')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("INSERT runner_kind='gitlab_ci' succeeded after MigrateDown, want CHECK violation (0054 narrowed the CHECK back)")
+	}
+	// github_actions still inserts — 0024's CHECK survives the one-step down.
+	if _, err := pool2.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'github_actions')`,
+		uuid.New(),
+	); err != nil {
+		t.Errorf("INSERT runner_kind='github_actions' after MigrateDown failed, want success (0024 CHECK survives): %v", err)
 	}
 }
 
