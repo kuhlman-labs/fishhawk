@@ -8,7 +8,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +28,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
 )
 
 // resolveMaxParallelChildren mirrors runServe's --max-parallel-children
@@ -982,4 +986,134 @@ func TestResolveOperatorRepoToken(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResolveGitLabClient covers the FISHHAWKD_GITLAB_BASE_URL /
+// FISHHAWKD_GITLAB_TOKEN all-or-warn gate (ADR-058 #1856), mirroring the jira
+// gating: both set constructs the client (no warn); exactly one set leaves the
+// provider disabled with partial=true so the caller warns naming both vars;
+// both empty is simply-unconfigured (nil client, no warn).
+func TestResolveGitLabClient(t *testing.T) {
+	t.Run("both set constructs the client", func(t *testing.T) {
+		client, partial := resolveGitLabClient("https://gitlab.com", "glpat-tok")
+		if client == nil {
+			t.Fatal("client = nil with both base URL and token set, want a constructed client")
+		}
+		if partial {
+			t.Error("partial = true with a complete config, want false")
+		}
+	})
+	t.Run("only base URL is a partial config (disabled + warn)", func(t *testing.T) {
+		client, partial := resolveGitLabClient("https://gitlab.com", "")
+		if client != nil {
+			t.Errorf("client = %v with token missing, want nil (disabled)", client)
+		}
+		if !partial {
+			t.Error("partial = false with only the base URL set, want true so the caller warns")
+		}
+	})
+	t.Run("only token is a partial config (disabled + warn)", func(t *testing.T) {
+		client, partial := resolveGitLabClient("", "glpat-tok")
+		if client != nil {
+			t.Errorf("client = %v with base URL missing, want nil (disabled)", client)
+		}
+		if !partial {
+			t.Error("partial = false with only the token set, want true so the caller warns")
+		}
+	})
+	t.Run("both empty is unconfigured (no client, no warn)", func(t *testing.T) {
+		client, partial := resolveGitLabClient("", "")
+		if client != nil {
+			t.Errorf("client = %v with nothing set, want nil", client)
+		}
+		if partial {
+			t.Error("partial = true with nothing set, want false (not a misconfiguration)")
+		}
+	})
+}
+
+// TestLoadConventionsOverride covers the FISHHAWKD_WORKMGMT_CONVENTIONS
+// startup override (ADR-058 #1856): an empty path is a no-op (nil loader, nil
+// error, the Default() stub stands); an unreadable path fails fast with an
+// error naming the path; an invalid document fails fast with an error naming
+// the path + parse cause; a valid file returns a loader serving the parsed
+// conventions for every repo.
+func TestLoadConventionsOverride(t *testing.T) {
+	t.Run("empty path is a no-op", func(t *testing.T) {
+		loader, err := loadConventionsOverride("")
+		if err != nil {
+			t.Fatalf("loadConventionsOverride(\"\") err = %v, want nil", err)
+		}
+		if loader != nil {
+			t.Error("loader != nil for an empty path, want nil (no override)")
+		}
+	})
+
+	t.Run("unreadable path fails fast naming the path", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "does-not-exist.yaml")
+		loader, err := loadConventionsOverride(missing)
+		if err == nil {
+			t.Fatal("err = nil for a missing file, want a read failure")
+		}
+		if loader != nil {
+			t.Error("loader != nil on a read failure, want nil")
+		}
+		if !strings.Contains(err.Error(), missing) {
+			t.Errorf("err = %v, want it to name the path %q", err, missing)
+		}
+	})
+
+	t.Run("invalid document fails fast naming path and parse cause", func(t *testing.T) {
+		bad := filepath.Join(t.TempDir(), "bad.yaml")
+		// A structurally-invalid conventions doc: missing the required
+		// spec_version/types, so workmgmt.Parse returns a typed error.
+		if werr := os.WriteFile(bad, []byte("provider: gitlab\n"), 0o600); werr != nil {
+			t.Fatalf("write bad file: %v", werr)
+		}
+		loader, err := loadConventionsOverride(bad)
+		if err == nil {
+			t.Fatal("err = nil for an invalid document, want a parse failure")
+		}
+		if loader != nil {
+			t.Error("loader != nil on a parse failure, want nil")
+		}
+		if !strings.Contains(err.Error(), bad) {
+			t.Errorf("err = %v, want it to name the path %q", err, bad)
+		}
+	})
+
+	t.Run("valid file serves the parsed conventions for every repo", func(t *testing.T) {
+		good := filepath.Join(t.TempDir(), "work-management.yaml")
+		doc := "spec_version: work-management-v0\n" +
+			"provider: gitlab\n" +
+			"gitlab:\n" +
+			"  project: group/subgroup/app\n" +
+			"required_fields: [Summary, Done-means, complexity]\n" +
+			"types: {feature: {body_skeleton: [Summary]}}\n"
+		if werr := os.WriteFile(good, []byte(doc), 0o600); werr != nil {
+			t.Fatalf("write good file: %v", werr)
+		}
+		loader, err := loadConventionsOverride(good)
+		if err != nil {
+			t.Fatalf("loadConventionsOverride(valid) err = %v, want nil", err)
+		}
+		if loader == nil {
+			t.Fatal("loader = nil for a valid file, want a loader")
+		}
+		// The loader serves the SAME parsed conventions regardless of repo.
+		conv, lerr := loader("any/repo")
+		if lerr != nil {
+			t.Fatalf("loader err = %v, want nil", lerr)
+		}
+		if conv.Provider != workmgmtgitlab.ProviderName {
+			t.Errorf("Provider = %q, want %q (parsed from the override file)", conv.Provider, workmgmtgitlab.ProviderName)
+		}
+		if conv.GitLab == nil || conv.GitLab.Project != "group/subgroup/app" {
+			t.Errorf("GitLab = %+v, want the parsed project override", conv.GitLab)
+		}
+		conv2, _ := loader("another/repo")
+		if conv2.Provider != conv.Provider {
+			t.Error("loader served different conventions per repo; the override must serve one document for every repo")
+		}
+	})
 }

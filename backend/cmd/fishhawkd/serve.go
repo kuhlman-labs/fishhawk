@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -39,6 +40,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -322,6 +324,47 @@ func resolveRefinementRepo(pool *pgxpool.Pool) refinement.Repository {
 	return refinement.NewPostgresRepository(pool)
 }
 
+// resolveGitLabClient constructs the gitlab work-item client when BOTH the
+// instance base URL and access token are set (ADR-058 Phase 2, #1856),
+// mirroring the jira all-or-warn gate. A partial config — exactly one of the
+// two set — returns a nil client and partial=true so the caller warns and
+// leaves the provider disabled (the endpoint stays 501 for provider: gitlab).
+// Both empty returns nil, false (the provider is simply not configured).
+// Extracted so the gating is unit-testable without booting the server.
+func resolveGitLabClient(baseURL, token string) (client *gitlabclient.Client, partial bool) {
+	switch {
+	case baseURL != "" && token != "":
+		return gitlabclient.New(baseURL, token), false
+	case baseURL != "" || token != "":
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+// loadConventionsOverride reads and parses the deployment-level
+// work-management conventions file at path (FISHHAWKD_WORKMGMT_CONVENTIONS),
+// returning a loader that serves the parsed conventions for every repo
+// (ADR-058 Phase 2, #1856). An empty path returns a nil loader and nil error
+// (no override — the Default()-only stub stands). A read or parse failure
+// returns a precise error naming the path + cause so runServe fails startup
+// fast rather than serving a half-configured provider. Extracted so the
+// read/parse/fail-fast branches are unit-testable without booting the server.
+func loadConventionsOverride(path string) (func(repo string) (workmgmt.Conventions, error), error) {
+	if path == "" {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read work-management conventions %q: %w", path, err)
+	}
+	conv, err := workmgmt.Parse(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("parse work-management conventions %q: %w", path, err)
+	}
+	return func(string) (workmgmt.Conventions, error) { return conv, nil }, nil
+}
+
 // resolveIdentityProvider is the OAuth-config gate for the forge-neutral
 // identity provider (E39.1 / #1706): with an OAuth client_id present it
 // constructs the GitHub device-flow + REST implementation; absent it
@@ -461,6 +504,15 @@ func runServe(args []string, logSink io.Writer) int {
 	jiraAPIToken := fs.String("jira-api-token",
 		envOr("FISHHAWKD_JIRA_API_TOKEN", ""),
 		"Jira API token for HTTP Basic auth (secret: never logged); required with --jira-base-url + --jira-email to enable the jira provider")
+	gitlabBaseURL := fs.String("gitlab-base-url",
+		envOr("FISHHAWKD_GITLAB_BASE_URL", ""),
+		"GitLab instance base URL (e.g. https://gitlab.com or a self-managed host); with --gitlab-token, enables the gitlab work-item provider")
+	gitlabToken := fs.String("gitlab-token",
+		envOr("FISHHAWKD_GITLAB_TOKEN", ""),
+		"GitLab access token for PRIVATE-TOKEN auth (secret: never logged); required with --gitlab-base-url to enable the gitlab provider")
+	workmgmtConventions := fs.String("workmgmt-conventions",
+		envOr("FISHHAWKD_WORKMGMT_CONVENTIONS", ""),
+		"path to a YAML work-management conventions file served for every repo; parsed fail-fast at startup. Empty uses the shipped default. A per-repo in-repo loader is a follow-up (#2022)")
 	enableSLATimer := fs.Bool("enable-sla-timer",
 		envOr("FISHHAWKD_ENABLE_SLA_TIMER", "false") == "true",
 		"start the approval SLA timeout ticker; off by default to keep dev runs from racing with the timer")
@@ -1053,19 +1105,59 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("jira partially configured; all of FISHHAWKD_JIRA_BASE_URL, FISHHAWKD_JIRA_EMAIL, FISHHAWKD_JIRA_API_TOKEN are required to enable the jira provider — leaving it disabled (provider: jira responds 501)")
 	}
 
-	// Work-management providers (#1104, #1094). Register the github_projects
-	// work-item + product-feedback providers and the jira work-item provider
-	// so fishhawk_file_issue and fishhawk_report_product_issue resolve a
-	// provider instead of 501. Each provider is gated on its own client being
+	// GitLab work-item provider (ADR-058 Phase 2, #1856). The instance base
+	// URL + token are server-side env (secrets cannot live in a checked-in
+	// repo config); the per-repo conventions block selects only an optional
+	// project override. Both must be set to enable the provider — a partial
+	// config is a misconfiguration, warned and left disabled (the endpoint
+	// stays 501 for provider: gitlab). The token is a secret: presence-only
+	// logging, never the value (the base URL is an instance address, not a
+	// secret). A configurable base URL covers GitLab.com SaaS and
+	// self-managed instances alike.
+	gitlabClient, gitlabPartial := resolveGitLabClient(*gitlabBaseURL, *gitlabToken)
+	switch {
+	case gitlabClient != nil:
+		logger.Info("gitlab client configured",
+			slog.String("base_url", *gitlabBaseURL),
+			slog.Bool("token_configured", true))
+	case gitlabPartial:
+		logger.Warn("gitlab partially configured; both of FISHHAWKD_GITLAB_BASE_URL and FISHHAWKD_GITLAB_TOKEN are required to enable the gitlab provider — leaving it disabled (provider: gitlab responds 501)")
+	}
+
+	// Deployment-level conventions override (ADR-058 Phase 2, #1856). When
+	// FISHHAWKD_WORKMGMT_CONVENTIONS names a YAML file, parse it fail-fast at
+	// startup and serve the parsed conventions for every repo — enough to run
+	// a non-github_projects provider (e.g. provider: gitlab) end-to-end
+	// against a single-tenant deployment. The true in-repo per-repo loader is
+	// deferred (#2022): the server cannot know which forge to fetch
+	// .fishhawk/work-management.yaml from before the conventions themselves
+	// declare the provider (the chicken-and-egg the override sidesteps).
+	conventionsOverride, cerr := loadConventionsOverride(*workmgmtConventions)
+	if cerr != nil {
+		logger.Error("invalid work-management conventions file",
+			slog.String("path", *workmgmtConventions), slog.String("error", cerr.Error()))
+		return exitFailure
+	}
+	if conventionsOverride != nil {
+		server.SetConventionsLoader(conventionsOverride)
+		logger.Info("work-management conventions override loaded",
+			slog.String("path", *workmgmtConventions))
+	}
+
+	// Work-management providers (#1104, #1094, #1856). Register the
+	// github_projects work-item + product-feedback providers, the jira
+	// work-item provider, and the gitlab work-item provider so
+	// fishhawk_file_issue and fishhawk_report_product_issue resolve a provider
+	// instead of 501. Each provider is gated on its own client being
 	// configured — an unconfigured client leaves that provider unregistered
 	// and the endpoint continues to 501 (the v0 not-yet-wired posture).
-	registerWorkmgmtProviders(cfg.GitHub, jiraClient)
+	registerWorkmgmtProviders(cfg.GitHub, jiraClient, gitlabClient)
 	if len(workmgmt.Registered()) > 0 || len(workmgmt.RegisteredFeedback()) > 0 {
 		logger.Info("work-management providers registered",
 			slog.Any("work_item", workmgmt.Registered()),
 			slog.Any("feedback", workmgmt.RegisteredFeedback()))
 	} else {
-		logger.Warn("work-management providers not registered: fishhawk_file_issue / fishhawk_report_product_issue respond 501 until GitHub or Jira is configured")
+		logger.Warn("work-management providers not registered: fishhawk_file_issue / fishhawk_report_product_issue respond 501 until GitHub, Jira, or GitLab is configured")
 	}
 
 	// GitHub OAuth sign-in (E4.2). All three of client_id +

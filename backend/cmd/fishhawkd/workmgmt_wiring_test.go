@@ -11,9 +11,11 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
+	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
 	workmgmtjira "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/jira"
 )
 
@@ -53,7 +55,7 @@ var _ workmgmtgithub.FeedbackAPI = feedbackAPIAdapter{}
 // BOTH registries carry github_projects, directly pinning the registration
 // production lacked (#1104).
 func TestRegisterWorkmgmtProviders_RegistersGitHubProjects(t *testing.T) {
-	registerWorkmgmtProviders(&githubclient.Client{}, nil)
+	registerWorkmgmtProviders(&githubclient.Client{}, nil, nil)
 
 	if !slices.Contains(workmgmt.Registered(), workmgmtgithub.ProviderName) {
 		t.Errorf("work-item registry = %v, want it to contain %q", workmgmt.Registered(), workmgmtgithub.ProviderName)
@@ -67,15 +69,26 @@ func TestRegisterWorkmgmtProviders_RegistersGitHubProjects(t *testing.T) {
 // client registers the jira work-item provider, independently of GitHub:
 // passing a nil GitHub client must still register jira (#1094).
 func TestRegisterWorkmgmtProviders_RegistersJira(t *testing.T) {
-	registerWorkmgmtProviders(nil, jiraclient.New("https://acme.atlassian.net", "e@x.com", "tok"))
+	registerWorkmgmtProviders(nil, jiraclient.New("https://acme.atlassian.net", "e@x.com", "tok"), nil)
 
 	if !slices.Contains(workmgmt.Registered(), workmgmtjira.ProviderName) {
 		t.Errorf("work-item registry = %v, want it to contain %q", workmgmt.Registered(), workmgmtjira.ProviderName)
 	}
 }
 
-// TestRegisterWorkmgmtProviders_NilClientNoOp asserts an unconfigured
-// GitHub client leaves both registries unchanged (no panic, no
+// TestRegisterWorkmgmtProviders_RegistersGitLab asserts a configured GitLab
+// client registers the gitlab work-item provider, independently of GitHub
+// and Jira: passing nil for both must still register gitlab (ADR-058 #1856).
+func TestRegisterWorkmgmtProviders_RegistersGitLab(t *testing.T) {
+	registerWorkmgmtProviders(nil, nil, gitlabclient.New("https://gitlab.com", "glpat-tok"))
+
+	if !slices.Contains(workmgmt.Registered(), workmgmtgitlab.ProviderName) {
+		t.Errorf("work-item registry = %v, want it to contain %q", workmgmt.Registered(), workmgmtgitlab.ProviderName)
+	}
+}
+
+// TestRegisterWorkmgmtProviders_NilClientNoOp asserts unconfigured GitHub,
+// Jira, and GitLab clients leave both registries unchanged (no panic, no
 // registration) — the v0 not-yet-wired posture where the endpoints keep
 // returning 501. Snapshot-equality is order-independent: a sibling test may
 // already have registered github_projects, so we assert the nil call adds
@@ -84,7 +97,7 @@ func TestRegisterWorkmgmtProviders_NilClientNoOp(t *testing.T) {
 	beforeWork := slices.Clone(workmgmt.Registered())
 	beforeFeedback := slices.Clone(workmgmt.RegisteredFeedback())
 
-	registerWorkmgmtProviders(nil, nil)
+	registerWorkmgmtProviders(nil, nil, nil)
 
 	if got := workmgmt.Registered(); !slices.Equal(got, beforeWork) {
 		t.Errorf("work-item registry changed on nil client: before=%v after=%v", beforeWork, got)

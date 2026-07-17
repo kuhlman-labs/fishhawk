@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
 
 // maxWorkItemRequestBytes caps the filing request body. Bodies carry a
@@ -36,13 +37,30 @@ const categoryWorkItemFiled = "work_item_filed"
 
 // conventionsLoader resolves the work-management conventions for a repo.
 // v0 returns the shipped default (the conventions are the value, and the
-// default seeds the kuhlman-labs/fishhawk Project #7 conventions); a
-// per-repo override loader that fetches `.fishhawk/work-management.yaml`
-// from the repo is a follow-up. Declared as a package var so tests can
+// default seeds the kuhlman-labs/fishhawk Project #7 conventions), unless a
+// deployment-level override is installed via SetConventionsLoader (from
+// FISHHAWKD_WORKMGMT_CONVENTIONS) — the honest minimum that unblocks a
+// non-github_projects provider (e.g. provider: gitlab) end-to-end for a
+// single-tenant deployment. The true in-repo per-repo loader that fetches
+// `.fishhawk/work-management.yaml` from the repo is a follow-up (#2022): the
+// server cannot know which forge to fetch that file from before the
+// conventions themselves declare the provider (the chicken-and-egg the
+// deployment override sidesteps). Declared as a package var so tests can
 // inject conventions (e.g. an unimplemented-provider config) without a
 // GitHub round-trip.
 var conventionsLoader = func(_ string) (workmgmt.Conventions, error) {
 	return workmgmt.Default(), nil
+}
+
+// SetConventionsLoader installs the process-wide work-management conventions
+// resolver, replacing the Default()-only stub. It is the seam serve.go uses
+// to serve a deployment-level FISHHAWKD_WORKMGMT_CONVENTIONS file (parsed
+// fail-fast at startup) for every repo, so a non-github_projects provider is
+// reachable end-to-end before the per-repo in-repo loader (#2022) lands. It
+// is not concurrency-safe with in-flight filings and is intended to be
+// called once at startup.
+func SetConventionsLoader(loader func(repo string) (workmgmt.Conventions, error)) {
+	conventionsLoader = loader
 }
 
 // workItemRequest is the POST /v0/work-items body: the provider-neutral
@@ -265,6 +283,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
 		Project: conv.Project,
 		Jira:    conv.Jira,
+		GitLab:  conv.GitLab,
 	}
 	// Scope is sourced first from a consistency-checked active run.
 	// On the run-absent path (the ADR-040 operator-agent follow-up filing
@@ -277,22 +296,42 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 	if activeRun != nil && activeRun.InstallationID != nil {
 		target.Scope = forge.FromGitHubInstallationID(*activeRun.InstallationID)
 	}
-	if target.Scope.IsZero() && s.cfg.GitHub != nil {
-		// BINDING authz gate: the run-absent installation-resolution branch
-		// is the operator-agent follow-up path ONLY. A run-bound agent token
-		// (mcp:run:<uuid> subject) MUST file through the run-scoped path —
-		// supply its own run_id, which is repo-consistency-checked above — so
-		// it cannot use the run-absent door to resolve an installation for an
-		// arbitrary App-installed repo (the confused-deputy egress #1005
-		// closed). Reject before any GetRepoInstallation call or provider
-		// dispatch. Non-run-bound operator/session callers proceed (operators
-		// are trusted for App-installed repos in v0).
+	// BINDING authz gate (provider-independent, ADR-058 #1856): the run-absent
+	// filing path is the operator-agent follow-up path ONLY. A run-bound agent
+	// token (mcp:run:<uuid> subject) MUST file through the run-scoped path —
+	// supply its own run_id, repo-consistency-checked above — so it can neither
+	// resolve a GitHub App installation for an arbitrary App-installed repo (the
+	// confused-deputy egress #1005 closed) NOR file gitlab/jira issues with the
+	// deployment-wide server-side credentials; both widen a run-scoped token's
+	// authority to make unscoped filings. This gate is provider-INDEPENDENT and
+	// fires before any provider-specific resolution, so gitlab/jira get the same
+	// run-scoped-only posture github does (a run-bound token filing a resolved
+	// provider:gitlab no longer slips past this rejection). Keyed on the
+	// run-ABSENT condition (activeRun nil), NOT on Target.Scope being zero, so a
+	// legitimate run-scoped filing whose run carries no GitHub installation
+	// (every gitlab run) is unaffected: it set activeRun by supplying a
+	// repo-consistency-checked run_id. Non-run-bound operator/session callers
+	// proceed (operators are trusted in v0). Reject before any
+	// GetRepoInstallation call or provider dispatch.
+	if activeRun == nil {
 		if _, runBound := runBoundTokenRunID(id); runBound {
 			s.writeError(w, r, http.StatusForbidden, "run_scoped_filing_required",
-				"a run-bound agent token must file through the run-scoped path (supply its own run_id); the run-absent installation-resolution path is operator-only",
+				"a run-bound agent token must file through the run-scoped path (supply its own run_id); the run-absent filing path is operator-only",
 				nil)
 			return
 		}
+	}
+	// The GitHub installation-resolution branch is forge-optional: it runs ONLY
+	// when the resolved provider is github_projects (ADR-058 #1856).
+	// Installation resolution and its scope are GitHub-specific, so a gitlab (or
+	// jira) filing must not attempt GitHub App resolution — it would otherwise
+	// 502 on GitHub egress and cannot proceed with s.cfg.GitHub nil. Those
+	// providers carry their own server-side credentials and leave Target.Scope
+	// zero (the #1855 credential-scope seam is out of scope here). The
+	// provider-independent run-bound rejection above has already run, so this
+	// branch is reached only by operator/session callers (or a run-scoped
+	// filing) — its github_projects security posture is unchanged.
+	if target.Scope.IsZero() && s.cfg.GitHub != nil && conv.Provider == workmgmtgithub.ProviderName {
 		scope, rerr := s.resolveRepoScope(r.Context(), owner, name)
 		if rerr != nil {
 			// Transient/network failure: surface it rather than masking it as

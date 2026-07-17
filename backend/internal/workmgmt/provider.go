@@ -183,6 +183,11 @@ type Target struct {
 	// server-side env (FISHHAWKD_JIRA_*), not carried here — this block
 	// selects only the target Jira project.
 	Jira *JiraConnection
+	// GitLab is the GitLab connection from the conventions (nil for
+	// providers that don't use it). The instance base URL and token are
+	// server-side env (FISHHAWKD_GITLAB_*), not carried here — this block
+	// selects only an optional target-project override.
+	GitLab *GitLabConnection
 }
 
 // ProviderRequest is the fully-resolved filing handed to a Provider: the
