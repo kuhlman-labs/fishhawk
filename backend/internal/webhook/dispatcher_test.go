@@ -4088,3 +4088,84 @@ func TestHandleGitLabCIFailure_CreateFailurePropagates(t *testing.T) {
 		t.Fatal("create failure must propagate, got nil")
 	}
 }
+
+// gitLabAuditCount returns how many captured audit entries carry category cat.
+func gitLabAuditCount(au *stubAudit, cat string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for _, p := range au.appended {
+		if p.Category == cat {
+			n++
+		}
+	}
+	return n
+}
+
+// gitLabAuditEntry returns the first captured audit entry with category cat.
+func gitLabAuditEntry(au *stubAudit, cat string) (audit.ChainAppendParams, bool) {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, p := range au.appended {
+		if p.Category == cat {
+			return p, true
+		}
+	}
+	return audit.ChainAppendParams{}, false
+}
+
+// TestHandleGitLabCIFailure_CapExhaustedWritesAudit pins concern 1: the
+// cap-exhausted path must emit a ci_retry_exhausted audit chained to the parent
+// (GitHub parity — the doc comment promises it), not silently no-op.
+func TestHandleGitLabCIFailure_CapExhaustedWritesAudit(t *testing.T) {
+	runs := &stubRuns{}
+	au := &stubAudit{}
+	d := &Dispatcher{Runs: runs, Audit: au, Now: func() time.Time { return time.Now().UTC() }}
+	ref := "issue:7"
+	parent := &run.Run{
+		ID: uuid.New(), Repo: "group/proj", WorkflowID: "feature_change",
+		TriggerRef: &ref, WorkflowSpec: []byte(ciRetrySpec), RetryAttempt: 1, // == max_retries:1
+		RunnerKind: run.RunnerKindGitLabCI,
+	}
+	if err := d.HandleGitLabCIFailure(context.Background(), parent, forge.FromRef("gitlab:555"), "fishhawk/run-x"); err != nil {
+		t.Fatalf("HandleGitLabCIFailure err = %v, want nil", err)
+	}
+	if got := gitLabAuditCount(au, "ci_retry_exhausted"); got != 1 {
+		t.Fatalf("ci_retry_exhausted audits = %d, want 1", got)
+	}
+	entry, _ := gitLabAuditEntry(au, "ci_retry_exhausted")
+	if entry.RunID != parent.ID {
+		t.Errorf("exhausted audit chained to %s, want parent %s", entry.RunID, parent.ID)
+	}
+}
+
+// TestHandleGitLabCIFailure_DispatchWritesAudit pins concern 1: a dispatched
+// retry must emit a ci_failure_retry_dispatched audit chained to the CHILD run
+// (the SAME category the GitHub path emits) so the retry is visible in the
+// audit trail. A nil GitLab client warn+skips the pipeline create (no
+// dispatchErr), but the child run + audit are still produced.
+func TestHandleGitLabCIFailure_DispatchWritesAudit(t *testing.T) {
+	runs := &stubRuns{}
+	au := &stubAudit{}
+	d := &Dispatcher{Runs: runs, Audit: au, Now: func() time.Time { return time.Now().UTC() }}
+	ref := "issue:7"
+	parent := &run.Run{
+		ID: uuid.New(), Repo: "group/proj", WorkflowID: "feature_change",
+		TriggerRef: &ref, WorkflowSpec: []byte(ciRetrySpec), RetryAttempt: 0,
+		RunnerKind: run.RunnerKindGitLabCI,
+	}
+	if err := d.HandleGitLabCIFailure(context.Background(), parent, forge.FromRef("gitlab:555"), "fishhawk/run-x"); err != nil {
+		t.Fatalf("HandleGitLabCIFailure err = %v, want nil", err)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("retry runs created = %d, want 1", len(runs.created))
+	}
+	child := runs.created[0]
+	if got := gitLabAuditCount(au, "ci_failure_retry_dispatched"); got != 1 {
+		t.Fatalf("ci_failure_retry_dispatched audits = %d, want 1", got)
+	}
+	entry, _ := gitLabAuditEntry(au, "ci_failure_retry_dispatched")
+	if entry.RunID != child.ID {
+		t.Errorf("dispatched audit chained to %s, want child %s", entry.RunID, child.ID)
+	}
+}

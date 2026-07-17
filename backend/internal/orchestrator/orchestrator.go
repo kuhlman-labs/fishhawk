@@ -2667,6 +2667,17 @@ func runBranchForRun(r *run.Run) string {
 	return runBranchPrefix(r.ID)
 }
 
+// RunBranch is the exported derivation of the run branch a gitlab_ci pipeline
+// is created against for run r (#1861). It delegates to the single unexported
+// runBranchForRun formula so an out-of-package consumer — the server's GitLab
+// CI-failure-retry lookup, which must correlate a failed pipeline/job to the
+// specific Fishhawk run whose pipeline ran on this branch rather than retrying
+// the most-recent run on the project — matches the dispatch ref byte-for-byte
+// instead of re-hardcoding the "fishhawk/run-<short>" literal (#1245 discipline).
+func RunBranch(r *run.Run) string {
+	return runBranchForRun(r)
+}
+
 // dispatchStage transitions the next stage to dispatched and (for
 // agent stages) fires workflow_dispatch. Human stages transition
 // to awaiting_approval directly — there's no runner to wake up.

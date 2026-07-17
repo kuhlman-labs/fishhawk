@@ -2360,9 +2360,12 @@ func (d *Dispatcher) handleGitLabRunCreation(ctx context.Context, ev Event, m Ma
 // on the run row (the ADR-057 installation_ref follow-up).
 //
 // Best-effort caps mirror the GitHub retry: at/over the snapshotted cap the
-// retry is refused (ci_retry_exhausted audit). A spec-resolution miss refuses
-// the retry (no runaway). A run-repo write failure propagates so the receiver
-// returns 5xx.
+// retry is refused (ci_retry_exhausted audit, chained to the parent). A
+// spec-resolution miss refuses the retry (no runaway). A run-repo write failure
+// propagates so the receiver returns 5xx. A dispatched retry writes a
+// ci_failure_retry_dispatched audit (chained to the child, the SAME category
+// the GitHub path emits — distinguished by the payload's runner_kind) so the
+// retry is visible in the audit trail exactly as the GitHub retry is.
 func (d *Dispatcher) HandleGitLabCIFailure(ctx context.Context, parent *run.Run, scope forge.CredentialScope, ref string) error {
 	if parent == nil {
 		return nil
@@ -2382,6 +2385,7 @@ func (d *Dispatcher) HandleGitLabCIFailure(ctx context.Context, parent *run.Run,
 			slog.String("run_id", parent.ID.String()),
 			slog.Int("retry_attempt", parent.RetryAttempt),
 			slog.Int("max_retries", maxRetries))
+		d.writeGitLabCIRetryExhaustedAudit(ctx, parent, maxRetries, d.now())
 		return nil
 	}
 
@@ -2442,6 +2446,7 @@ func (d *Dispatcher) HandleGitLabCIFailure(ctx context.Context, parent *run.Run,
 		Scope:            scope,
 		Ref:              ref,
 	})
+	d.writeGitLabCIRetryDispatchedAudit(ctx, parent, child, maxRetries, dispatchErr, d.now())
 	d.logger().LogAttrs(ctx, slog.LevelInfo, "gitlab ci_failure_retry dispatched",
 		slog.String("delivery_run_id", parent.ID.String()),
 		slog.String("retry_run_id", child.ID.String()),
@@ -2449,6 +2454,82 @@ func (d *Dispatcher) HandleGitLabCIFailure(ctx context.Context, parent *run.Run,
 		slog.Any("dispatch_error", dispatchErr),
 	)
 	return nil
+}
+
+// writeGitLabCIRetryDispatchedAudit records the GitLab CI-failure retry
+// dispatch, chained to the child run — the GitLab counterpart to
+// writeCIRetryDispatchedAudit, reusing the SAME ci_failure_retry_dispatched
+// category (a consumer tells the forges apart by the payload's runner_kind).
+// Best-effort + nil-safe: an unwired Audit (the dev/CLI posture) or an append
+// error logs but never unwinds the dispatch. The leaner payload (no
+// check_run/PR coordinates) reflects that a GitLab retry is keyed by run +
+// project, not a PR head_sha.
+func (d *Dispatcher) writeGitLabCIRetryDispatchedAudit(ctx context.Context, parent, child *run.Run,
+	maxRetries int, dispatchErr error, now time.Time) {
+	if d.Audit == nil {
+		return
+	}
+	systemKind := audit.ActorKind("system")
+	outcome := "dispatched"
+	if dispatchErr != nil {
+		outcome = "dispatch_failed"
+	}
+	payload := map[string]any{
+		"repo":          parent.Repo,
+		"parent_run_id": parent.ID.String(),
+		"child_run_id":  child.ID.String(),
+		"retry_attempt": child.RetryAttempt,
+		"max_retries":   maxRetries,
+		"outcome":       outcome,
+		"runner_kind":   parent.RunnerKind,
+	}
+	if dispatchErr != nil {
+		payload["error"] = dispatchErr.Error()
+	}
+	body, _ := json.Marshal(payload)
+	if _, err := d.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        child.ID,
+		Timestamp:    now,
+		Category:     "ci_failure_retry_dispatched",
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("gitlab-webhook"),
+		Payload:      body,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelError, "gitlab ci_failure_retry: audit append failed",
+			slog.String("run_id", child.ID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// writeGitLabCIRetryExhaustedAudit records the cap-hit case so an operator can
+// see "we tried, this is why we stopped" — the GitLab counterpart to
+// writeCIRetryExhaustedAudit, chained to the parent run (there is no child).
+// Best-effort + nil-safe.
+func (d *Dispatcher) writeGitLabCIRetryExhaustedAudit(ctx context.Context, parent *run.Run,
+	maxRetries int, now time.Time) {
+	if d.Audit == nil {
+		return
+	}
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(map[string]any{
+		"repo":          parent.Repo,
+		"run_id":        parent.ID.String(),
+		"retry_attempt": parent.RetryAttempt,
+		"max_retries":   maxRetries,
+		"runner_kind":   parent.RunnerKind,
+	})
+	if _, err := d.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        parent.ID,
+		Timestamp:    now,
+		Category:     "ci_retry_exhausted",
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("gitlab-webhook"),
+		Payload:      payload,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelError, "gitlab ci_failure_retry: exhausted audit failed",
+			slog.String("run_id", parent.ID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // parseGitLabProjectID pulls the numeric project id out of a

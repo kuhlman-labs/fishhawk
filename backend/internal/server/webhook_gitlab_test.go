@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -912,19 +913,19 @@ func gitLabCIParentRun() *run.Run {
 	}
 }
 
-func gitLabPipelineBody(status string) []byte {
+func gitLabPipelineBody(status, ref string) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"object_kind":       "pipeline",
-		"object_attributes": map[string]any{"id": 1, "status": status, "ref": "main", "sha": "deadbeef"},
+		"object_attributes": map[string]any{"id": 1, "status": status, "ref": ref, "sha": "deadbeef"},
 		"project":           map[string]any{"id": 555, "path_with_namespace": "group/proj"},
 	})
 	return body
 }
 
-func gitLabJobBody(status string) []byte {
+func gitLabJobBody(status, ref string) []byte {
 	body, _ := json.Marshal(map[string]any{
 		"object_kind":  "build",
-		"ref":          "main",
+		"ref":          ref,
 		"sha":          "deadbeef",
 		"build_status": status,
 		"project_id":   555,
@@ -934,8 +935,9 @@ func gitLabJobBody(status string) []byte {
 }
 
 func TestHandleGitLabPipeline_FailedDrivesRetry(t *testing.T) {
-	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
-	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed")); err != nil {
+	parent := gitLabCIParentRun()
+	s, dispRuns := ciRetryServer(t, parent, nil)
+	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed", orchestrator.RunBranch(parent))); err != nil {
 		t.Fatalf("handleGitLabPipeline err = %v, want nil", err)
 	}
 	if len(dispRuns.createdRuns) != 1 {
@@ -951,8 +953,9 @@ func TestHandleGitLabPipeline_FailedDrivesRetry(t *testing.T) {
 }
 
 func TestHandleGitLabJob_FailedDrivesRetry(t *testing.T) {
-	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
-	if err := s.handleGitLabJob(context.Background(), gitLabJobBody("failed")); err != nil {
+	parent := gitLabCIParentRun()
+	s, dispRuns := ciRetryServer(t, parent, nil)
+	if err := s.handleGitLabJob(context.Background(), gitLabJobBody("failed", orchestrator.RunBranch(parent))); err != nil {
 		t.Fatalf("handleGitLabJob err = %v, want nil", err)
 	}
 	if len(dispRuns.createdRuns) != 1 {
@@ -960,9 +963,88 @@ func TestHandleGitLabJob_FailedDrivesRetry(t *testing.T) {
 	}
 }
 
+// capturingGitLab is a webhook.GitLabAPI that records the project id
+// CreatePipeline is addressed with, so a test can assert the SCOPE the retry
+// reconstructs (not merely that a run was created).
+type capturingGitLab struct {
+	spec        []byte
+	mu          sync.Mutex
+	calls       int
+	lastProject int
+}
+
+func (g *capturingGitLab) GetRawFile(context.Context, int, string, string) ([]byte, error) {
+	return g.spec, nil
+}
+
+func (g *capturingGitLab) CreatePipeline(_ context.Context, projectID int, _ string, _ map[string]string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.calls++
+	g.lastProject = projectID
+	return nil
+}
+
+// TestHandleGitLabJob_FailedDrivesRetry_ProjectIDFallback pins the top-level-
+// project_id-absent branch of handleGitLabJob: an older GitLab instance's Job
+// Hook that populates only the nested project.id (not the flat project_id). The
+// retry's pipeline must be created against project 555 — the value the
+// `if projectID == 0` fallback supplies from project.id. Asserting the CAPTURED
+// CreatePipeline project id (not just that a run row was created) is what makes
+// an inverted fallback fail: reading the zero top-level value would reconstruct
+// a "gitlab:0" scope that errors before CreatePipeline, so the capture would be
+// empty.
+func TestHandleGitLabJob_FailedDrivesRetry_ProjectIDFallback(t *testing.T) {
+	parent := gitLabCIParentRun()
+	gl := &capturingGitLab{spec: []byte(ciRetryWorkflowSpec)}
+	dispRuns := &ciRetryDispatchRuns{}
+	disp := &webhook.Dispatcher{Runs: dispRuns, GitLab: gl, Logger: slog.Default()}
+	rr := &prEventsRunRepo{listResult: []*run.Run{parent}}
+	s, _ := newGitLabWebhookServer(t, gitlabServerOpts{runRepo: rr, dispatcher: disp})
+
+	body, _ := json.Marshal(map[string]any{
+		"object_kind":  "build",
+		"ref":          orchestrator.RunBranch(parent),
+		"sha":          "deadbeef",
+		"build_status": "failed",
+		// project_id deliberately ABSENT (0) — only the nested project.id is set.
+		"project": map[string]any{"id": 555, "path_with_namespace": "group/proj"},
+	})
+	if err := s.handleGitLabJob(context.Background(), body); err != nil {
+		t.Fatalf("handleGitLabJob err = %v, want nil", err)
+	}
+	if len(dispRuns.createdRuns) != 1 {
+		t.Fatalf("job retry runs created = %d, want 1 (project_id fallback path)", len(dispRuns.createdRuns))
+	}
+	if gl.calls != 1 {
+		t.Fatalf("CreatePipeline calls = %d, want 1 (fallback must reconstruct a valid scope)", gl.calls)
+	}
+	if gl.lastProject != 555 {
+		t.Errorf("retry pipeline project id = %d, want 555 (from project.id fallback)", gl.lastProject)
+	}
+}
+
+// TestHandleGitLabPipeline_RefMismatchNoRetry pins the correlation guard: a
+// FAILED pipeline whose ref does NOT match any active gitlab_ci run's branch
+// (an unrelated branch, or a second concurrent run's pipeline) must drive NO
+// retry. Without the ref correlation this failure would spuriously retry the
+// most-recent non-terminal run on the project — the security exposure #1861's
+// review flagged.
+func TestHandleGitLabPipeline_RefMismatchNoRetry(t *testing.T) {
+	parent := gitLabCIParentRun()
+	s, dispRuns := ciRetryServer(t, parent, nil)
+	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed", "some/unrelated-branch")); err != nil {
+		t.Fatalf("handleGitLabPipeline err = %v, want nil", err)
+	}
+	if len(dispRuns.createdRuns) != 0 {
+		t.Errorf("ref not matching the run branch must drive no retry, got %d", len(dispRuns.createdRuns))
+	}
+}
+
 func TestHandleGitLabPipeline_NonFailedStatusNoRetry(t *testing.T) {
-	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
-	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("success")); err != nil {
+	parent := gitLabCIParentRun()
+	s, dispRuns := ciRetryServer(t, parent, nil)
+	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("success", orchestrator.RunBranch(parent))); err != nil {
 		t.Fatalf("handleGitLabPipeline err = %v, want nil", err)
 	}
 	if len(dispRuns.createdRuns) != 0 {
@@ -971,8 +1053,9 @@ func TestHandleGitLabPipeline_NonFailedStatusNoRetry(t *testing.T) {
 }
 
 func TestHandleGitLabJob_NonFailedStatusNoRetry(t *testing.T) {
-	s, dispRuns := ciRetryServer(t, gitLabCIParentRun(), nil)
-	if err := s.handleGitLabJob(context.Background(), gitLabJobBody("running")); err != nil {
+	parent := gitLabCIParentRun()
+	s, dispRuns := ciRetryServer(t, parent, nil)
+	if err := s.handleGitLabJob(context.Background(), gitLabJobBody("running", orchestrator.RunBranch(parent))); err != nil {
 		t.Fatalf("handleGitLabJob err = %v, want nil", err)
 	}
 	if len(dispRuns.createdRuns) != 0 {
@@ -982,7 +1065,7 @@ func TestHandleGitLabJob_NonFailedStatusNoRetry(t *testing.T) {
 
 func TestHandleGitLabPipeline_TransientRunLookupPropagates(t *testing.T) {
 	s, _ := ciRetryServer(t, nil, errors.New("db blip"))
-	err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed"))
+	err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed", "fishhawk/run-deadbeef"))
 	if err == nil {
 		t.Fatal("transient RunRepo lookup failure must propagate (5xx), got nil")
 	}
@@ -990,7 +1073,7 @@ func TestHandleGitLabPipeline_TransientRunLookupPropagates(t *testing.T) {
 
 func TestHandleGitLabPipeline_NoMatchIsBestEffort(t *testing.T) {
 	s, dispRuns := ciRetryServer(t, nil, nil) // empty listResult
-	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed")); err != nil {
+	if err := s.handleGitLabPipeline(context.Background(), gitLabPipelineBody("failed", "fishhawk/run-deadbeef")); err != nil {
 		t.Fatalf("no-match must be best-effort nil, got %v", err)
 	}
 	if len(dispRuns.createdRuns) != 0 {

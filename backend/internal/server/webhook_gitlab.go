@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
@@ -442,7 +443,7 @@ func (s *Server) handleGitLabPipeline(ctx context.Context, raw []byte) error {
 	if p.ObjectAttributes.Status != "failed" {
 		return nil
 	}
-	return s.driveGitLabCIRetry(ctx, p.Project.PathWithNamespace, p.Project.ID, p.ObjectAttributes.SHA)
+	return s.driveGitLabCIRetry(ctx, p.Project.PathWithNamespace, p.Project.ID, p.ObjectAttributes.Ref, p.ObjectAttributes.SHA)
 }
 
 // handleGitLabJob drives the CI-failure auto-retry on a FAILED GitLab job
@@ -469,17 +470,19 @@ func (s *Server) handleGitLabJob(ctx context.Context, raw []byte) error {
 	if projectID == 0 {
 		projectID = p.Project.ID
 	}
-	return s.driveGitLabCIRetry(ctx, p.Project.PathWithNamespace, projectID, p.SHA)
+	return s.driveGitLabCIRetry(ctx, p.Project.PathWithNamespace, projectID, p.Ref, p.SHA)
 }
 
 // driveGitLabCIRetry finds the gitlab_ci run backing a failed pipeline/job by
-// project path (+ head SHA) and routes the retry through the dispatcher. The
-// run lookup propagates its transient error so the caller returns 5xx; a
-// no-match logs and returns nil. The credential scope is reconstructed from
-// the project id ("gitlab:<project_id>") because a gitlab_ci run does not yet
-// persist its scope on the run row.
-func (s *Server) driveGitLabCIRetry(ctx context.Context, projectPath string, projectID int, sha string) error {
-	target, err := s.findGitLabRunForCIRetry(ctx, projectPath)
+// project path + the pipeline's ref (the run branch it ran on) and routes the
+// retry through the dispatcher. The run lookup propagates its transient error
+// so the caller returns 5xx; a no-match logs and returns nil. The credential
+// scope is reconstructed from the project id ("gitlab:<project_id>") because a
+// gitlab_ci run does not yet persist its scope on the run row. The dispatch ref
+// is the same run branch the failing pipeline ran on — so the retry's pipeline
+// targets the run's own branch, not main.
+func (s *Server) driveGitLabCIRetry(ctx context.Context, projectPath string, projectID int, ref, sha string) error {
+	target, err := s.findGitLabRunForCIRetry(ctx, projectPath, ref)
 	if err != nil {
 		return err
 	}
@@ -487,24 +490,33 @@ func (s *Server) driveGitLabCIRetry(ctx context.Context, projectPath string, pro
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"gitlab ci_failure_retry: no run matched; not retrying",
 			slog.String("project", projectPath),
+			slog.String("ref", ref),
 			slog.String("sha", sha))
 		return nil
 	}
-	ref := "main"
 	scope := forge.FromRef("gitlab:" + strconv.Itoa(projectID))
 	return s.cfg.WebhookDispatcher.HandleGitLabCIFailure(ctx, target, scope, ref)
 }
 
 // findGitLabRunForCIRetry resolves the Fishhawk gitlab_ci run backing a failed
-// pipeline/job: the most-recent non-terminal gitlab_ci run on the project.
-// Scoped to the project (Repo == path_with_namespace). Returns (nil, nil) on a
-// genuine no-match and (nil, err) on a transient RunRepo error so the caller
-// propagates it into a 5xx (E45.21 parity). The commit SHA is not yet used to
-// disambiguate — a gitlab_ci run does not persist its head SHA on the row, so
-// the most-recent non-terminal run is the best available anchor (the durable
-// project+SHA lookup is the ADR-057 installation_ref follow-up).
-func (s *Server) findGitLabRunForCIRetry(ctx context.Context, projectPath string) (*run.Run, error) {
-	if projectPath == "" {
+// pipeline/job by CORRELATING the pipeline's ref to the run branch a Fishhawk
+// gitlab_ci run's pipeline is created against (orchestrator.RunBranch). This
+// limits a retry to the run whose OWN pipeline failed instead of retrying the
+// most-recent non-terminal run on the project — closing the exposure where any
+// uncorrelated, project-controlled pipeline failure (an unrelated branch, or a
+// second concurrent gitlab_ci run) would drive agent execution against the
+// wrong run. Scoped to the project (Repo == path_with_namespace). Returns
+// (nil, nil) on a genuine no-match — including an empty ref, or a ref that
+// matches no active run branch (e.g. the FIRST pipeline running on the default
+// branch before the run branch exists) — and (nil, err) on a transient RunRepo
+// error so the caller propagates it into a 5xx (E45.21 parity).
+//
+// Correlating on the commit SHA in addition to the branch is the durable
+// ADR-057 installation_ref follow-up (a gitlab_ci run does not persist its head
+// SHA on the row); the run branch is the strongest correlation key available
+// without that column and is exact per run.
+func (s *Server) findGitLabRunForCIRetry(ctx context.Context, projectPath, ref string) (*run.Run, error) {
+	if projectPath == "" || ref == "" {
 		return nil, nil
 	}
 	runs, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
@@ -523,6 +535,9 @@ func (s *Server) findGitLabRunForCIRetry(ctx context.Context, projectPath string
 			continue
 		}
 		if r.State.IsTerminal() {
+			continue
+		}
+		if orchestrator.RunBranch(r) != ref {
 			continue
 		}
 		return r, nil
