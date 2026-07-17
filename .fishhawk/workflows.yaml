@@ -175,7 +175,12 @@ workflows:
           # category-B at 32 files on a plan the gate had approved with a
           # 32-file scope — the cap lagged real feature sizes. Plan-gate
           # coherence pre-check (scope.files vs this cap) tracked separately.
-          - max_files_changed: 45
+          # TEMPORARY 45 -> 80 (2026-07-16, #2018): governed cap exception
+          # for the E45.13 contract rename (#2013) — 52 single-identifier
+          # FooScoped->Foo renames, provably atomic (structural interfaces),
+          # per #2008's unsplittable-exception rule. #2019 restores 45
+          # immediately after #2013 merges.
+          - max_files_changed: 80
           - forbidden_paths:
               - ".github/workflows/**"
               - ".fishhawk/**"
