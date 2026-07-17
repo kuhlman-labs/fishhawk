@@ -386,6 +386,257 @@ func TestCheckRunPublisher_DoesNotRepublishParentOnRetry(t *testing.T) {
 	}
 }
 
+// --- gitlab_ci runner_kind guard (#1861) ---
+
+// TestPublish_GitLabCI_PostsCommitStatus proves the runner_kind guard's GitLab
+// branch: a gitlab_ci run (no installation_id) routes to the injected GitLab
+// forge, resolves the repo's "gitlab:<project_id>" scope, and posts the commit
+// status against the findHeadSHA-resolved head — NOT the GitHub check-run path.
+func TestPublish_GitLabCI_PostsCommitStatus(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "grp/proj", InstallationID: nil,
+			RunnerKind: run.RunnerKindGitLabCI,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	gh := &fakeGitHub{}
+	gl := &fakeGitLab{scope: forge.FromRef("gitlab:42")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, GitLab: gl, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	if pub == nil {
+		t.Fatal("publisher nil")
+	}
+
+	ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected published=true")
+	}
+	// GitHub path must NOT have been touched — routing is by runner_kind.
+	if len(gh.calls) != 0 {
+		t.Fatalf("GitHub CreateCheckRun called %d times; want 0 for a gitlab_ci run", len(gh.calls))
+	}
+	if len(gl.resolveCalls) != 1 {
+		t.Fatalf("ResolveRepoScope calls = %d, want 1", len(gl.resolveCalls))
+	}
+	if gl.resolveCalls[0].Owner != "grp" || gl.resolveCalls[0].Name != "proj" {
+		t.Errorf("ResolveRepoScope repo = %+v", gl.resolveCalls[0])
+	}
+	if len(gl.calls) != 1 {
+		t.Fatalf("GitLab CreateCheckRun calls = %d, want 1", len(gl.calls))
+	}
+	c := gl.calls[0]
+	if c.scope != forge.FromRef("gitlab:42") {
+		t.Errorf("scope = %v, want the resolved gitlab:42 scope", c.scope)
+	}
+	if c.repo.Owner != "grp" || c.repo.Name != "proj" {
+		t.Errorf("repo = %+v", c.repo)
+	}
+	if c.params.HeadSHA != "abc123" {
+		t.Errorf("head_sha = %q, want the resolved head abc123", c.params.HeadSHA)
+	}
+	if c.params.Name != auditcheckpublisher.CheckName {
+		t.Errorf("name = %q, want the shared check identity", c.params.Name)
+	}
+	if c.params.Status != forge.CheckRunStatusCompleted || c.params.Conclusion != forge.CheckRunConclusionSuccess {
+		t.Errorf("status/conclusion = %q/%q, want completed/success", c.params.Status, c.params.Conclusion)
+	}
+}
+
+// TestPublish_GitHubActions_UsesGitHubPath is the routing counterpart: even
+// with a GitLab forge wired, a github_actions run publishes through the GitHub
+// check-run path and never touches the GitLab forge.
+func TestPublish_GitHubActions_UsesGitHubPath(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "x/y", InstallationID: int64Ptr(42),
+			RunnerKind: run.RunnerKindGitHubActions,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	gh := &fakeGitHub{}
+	gl := &fakeGitLab{scope: forge.FromRef("gitlab:42")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, GitLab: gl, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("GitHub CreateCheckRun calls = %d, want 1", len(gh.calls))
+	}
+	if len(gl.calls) != 0 || len(gl.resolveCalls) != 0 {
+		t.Errorf("GitLab forge touched for a github_actions run: create=%d resolve=%d", len(gl.calls), len(gl.resolveCalls))
+	}
+	if gh.calls[0].scope != forge.FromGitHubInstallationID(42) {
+		t.Errorf("scope = %v, want installation 42", gh.calls[0].scope)
+	}
+}
+
+// TestPublish_GitLabCI_EmptyHead_Skips proves the empty-head no-op holds for
+// the gitlab_ci branch: with no PR artifact (and no audit head), findHeadSHA
+// returns not-ready and the publisher skips — no scope resolution, no status.
+func TestPublish_GitLabCI_EmptyHead_Skips(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "grp/proj", InstallationID: nil,
+			RunnerKind: run.RunnerKindGitLabCI,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	gl := &fakeGitLab{scope: forge.FromRef("gitlab:42")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: &fakeGitHub{}, GitLab: gl, Runs: repoRuns,
+		Artifacts:   &fakeArtifacts{}, // no PR artifact -> no head
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	ok, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if ok {
+		t.Errorf("expected skip (ok=false) when the gitlab_ci run has no head")
+	}
+	if len(gl.calls) != 0 || len(gl.resolveCalls) != 0 {
+		t.Errorf("no forge work expected on an empty head: create=%d resolve=%d", len(gl.calls), len(gl.resolveCalls))
+	}
+}
+
+// TestPublish_GitLabCI_ResolveScopeError_Propagates proves the scope-resolution
+// defensive branch: a ResolveRepoScope failure surfaces as a Publish error and
+// no commit status is posted (never a publish to a wrong/zero scope).
+func TestPublish_GitLabCI_ResolveScopeError_Propagates(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "grp/proj", InstallationID: nil,
+			RunnerKind: run.RunnerKindGitLabCI,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	gl := &fakeGitLab{scopeErr: errors.New("404 project not visible")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: &fakeGitHub{}, GitLab: gl, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	_, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	if err == nil {
+		t.Fatal("expected a Publish error from the scope-resolution failure")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Errorf("err should wrap the ResolveRepoScope error: %v", err)
+	}
+	if len(gl.calls) != 0 {
+		t.Errorf("no commit status should be posted on a scope-resolution error, got %d", len(gl.calls))
+	}
+}
+
+// TestPublish_GitLabCI_CreateError_Returned proves the create-error branch for
+// the gitlab_ci path: a CreateCheckRun failure is wrapped and returned, and the
+// dedup cache is not poisoned (a retry re-attempts).
+func TestPublish_GitLabCI_CreateError_Returned(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "grp/proj", InstallationID: nil,
+			RunnerKind: run.RunnerKindGitLabCI,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	gl := &fakeGitLab{scope: forge.FromRef("gitlab:42"), err: errors.New("403 forbidden")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: &fakeGitHub{}, GitLab: gl, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err == nil {
+		t.Fatal("expected error")
+	} else if !strings.Contains(err.Error(), "403") {
+		t.Errorf("err should wrap the GitLab error: %v", err)
+	}
+	// A failure must NOT record the state — the next compute retries.
+	if _, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil); err == nil {
+		t.Error("expected retry after failure to also call the forge")
+	}
+	if len(gl.calls) != 2 {
+		t.Errorf("expected 2 attempts (both errored); got %d", len(gl.calls))
+	}
+}
+
+// TestPublish_GitLabCI_ForgeUnregistered_Errors proves the registry-fallback
+// defensive branch: with no injected GitLab dep AND no "gitlab" forge in the
+// process registry, a gitlab_ci run surfaces the mis-wire as an error rather
+// than silently skipping its merge-gate status. This test deliberately injects
+// no GitLab dep and never registers a forge, so forge.Get fails deterministically.
+func TestPublish_GitLabCI_ForgeUnregistered_Errors(t *testing.T) {
+	runID := uuid.New()
+	implID := uuid.New()
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{runID: {
+			ID: runID, Repo: "grp/proj", InstallationID: nil,
+			RunnerKind: run.RunnerKindGitLabCI,
+		}},
+		stages: map[uuid.UUID][]*run.Stage{runID: {
+			{ID: implID, Type: run.StageTypeImplement, RunID: runID},
+		}},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		implID: {prArtifact(implID, "abc123")},
+	}}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: &fakeGitHub{}, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+		// GitLab intentionally unset -> falls back to forge.Get("gitlab").
+	})
+
+	_, err := pub.Publish(context.Background(), runID, stagecheck.StatePass, nil)
+	if err == nil {
+		t.Fatal("expected an error when the gitlab forge is neither injected nor registered")
+	}
+	if !strings.Contains(err.Error(), "gitlab") {
+		t.Errorf("err should name the missing gitlab forge: %v", err)
+	}
+}
+
 func TestNew_NilDepsReturnsNilPublisher(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1058,6 +1309,38 @@ func (f *fakeGitHub) CreateCheckRun(_ context.Context, scope forge.CredentialSco
 		return nil, f.err
 	}
 	return &forge.CreateCheckRunResult{ID: 1}, nil
+}
+
+// fakeGitLab is a minimal auditcheckpublisher.GitLabForge: it records the
+// ResolveRepoScope repos and the CreateCheckRun calls, returns a canned scope,
+// and can be made to fail either method to drive the defensive branches.
+type fakeGitLab struct {
+	mu           sync.Mutex
+	scope        forge.CredentialScope
+	scopeErr     error
+	err          error
+	resolveCalls []forge.RepoRef
+	calls        []checkRunCall
+}
+
+func (f *fakeGitLab) ResolveRepoScope(_ context.Context, repo forge.RepoRef) (forge.CredentialScope, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resolveCalls = append(f.resolveCalls, repo)
+	if f.scopeErr != nil {
+		return forge.CredentialScope{}, f.scopeErr
+	}
+	return f.scope, nil
+}
+
+func (f *fakeGitLab) CreateCheckRun(_ context.Context, scope forge.CredentialScope, repo forge.RepoRef, p forge.CreateCheckRunParams) (*forge.CreateCheckRunResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, checkRunCall{scope: scope, repo: repo, params: p})
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &forge.CreateCheckRunResult{ID: 7}, nil
 }
 
 type fakeRuns struct {
