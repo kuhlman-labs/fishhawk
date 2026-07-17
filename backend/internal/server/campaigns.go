@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -370,12 +371,12 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// Resolve the App installation for the target repo (#713 / runs.go:498).
 	// A runless create has no run row to carry the id, so resolve it directly:
 	// the real GitHub provider needs it to query the epic's children.
-	var instID int64
+	var scope forge.CredentialScope
 	if s.cfg.GitHub != nil {
 		id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
 		switch {
 		case err == nil:
-			instID = id
+			scope = forge.FromGitHubInstallationID(id)
 		case errors.Is(err, githubclient.ErrNotInstalled):
 			s.writeError(w, r, http.StatusUnprocessableEntity, "repo_not_installed",
 				"GitHub App is not installed on the target repository",
@@ -419,10 +420,10 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 
 	result, err := querier.EpicChildren(r.Context(), workmgmt.EpicChildrenRequest{
 		Target: workmgmt.Target{
-			Repo:           workmgmt.Repo{Owner: owner, Name: name},
-			InstallationID: instID,
-			Project:        conv.Project,
-			Jira:           conv.Jira,
+			Repo:    workmgmt.Repo{Owner: owner, Name: name},
+			Scope:   scope,
+			Project: conv.Project,
+			Jira:    conv.Jira,
 		},
 		Epic: req.EpicRef,
 	})
@@ -1366,7 +1367,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 	// in-memory so the closed-status read happens exactly once per item and the
 	// fixpoint never re-reads GitHub.
 	var candidates []*campaign.Item
-	var instID int64
+	var scope forge.CredentialScope
 	instResolved := false
 	for _, it := range items {
 		// Only a run-less item in a settleable pending/blocked state is a
@@ -1390,10 +1391,10 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 					"campaign_id", c.ID.String(), "repo", c.Repo, "error", err.Error())
 				return false
 			}
-			instID = id
+			scope = forge.FromGitHubInstallationID(id)
 			instResolved = true
 		}
-		issue, err := s.cfg.GitHub.GetIssue(ctx, instID, githubclient.RepoRef{Owner: owner, Name: name}, number)
+		issue, err := s.cfg.GitHub.GetIssueScoped(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
 		if err != nil {
 			s.cfg.Logger.Warn("reconcile-on-read: get issue failed; item left unsettled",
 				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "issue_ref", it.IssueRef, "error", err.Error())

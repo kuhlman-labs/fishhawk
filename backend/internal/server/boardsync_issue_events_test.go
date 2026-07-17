@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -56,8 +57,8 @@ func TestHandleIssueLifecycle_ClosedCompleted_Moves(t *testing.T) {
 	if got.Trigger != lifecycleIssueClosed || got.CanonicalState != workmgmt.CanonicalStateDone {
 		t.Errorf("call = trigger %q canonical %q, want issue_closed/done", got.Trigger, got.CanonicalState)
 	}
-	if got.IssueNumber != 1817 || got.Target.InstallationID != 4242 {
-		t.Errorf("call issue=%d install=%d, want 1817/4242", got.IssueNumber, got.Target.InstallationID)
+	if got.IssueNumber != 1817 || got.Target.Scope != forge.FromGitHubInstallationID(4242) {
+		t.Errorf("call issue=%d scope=%q, want 1817/scope-for-4242", got.IssueNumber, got.Target.Scope.Ref())
 	}
 	// The handler must pass the derived issue_closed expected-source set (all
 	// configured states minus the target) — a wiring bug that passed nil would

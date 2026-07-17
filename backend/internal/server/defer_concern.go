@@ -13,7 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -259,28 +259,26 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		Project: conv.Project,
 		Jira:    conv.Jira,
 	}
-	// InstallationID comes from the concern's resolved run; fall back to
-	// resolving the App installation for the target repo when the run
-	// carries none (mirroring workitems.go). No run-bound rejection here:
-	// the installation belongs to the concern's own run, not an arbitrary
+	// Scope comes from the concern's resolved run; fall back to resolving
+	// the App installation for the target repo when the run carries none
+	// (mirroring workitems.go). No run-bound rejection here: the
+	// installation belongs to the concern's own run, not an arbitrary
 	// caller-named repo.
 	if rn.InstallationID != nil {
-		target.InstallationID = *rn.InstallationID
+		target.Scope = forge.FromGitHubInstallationID(*rn.InstallationID)
 	}
-	if target.InstallationID == 0 && s.cfg.GitHub != nil {
-		instID, rerr := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
-		switch {
-		case rerr == nil:
-			target.InstallationID = instID
-		case errors.Is(rerr, githubclient.ErrNotInstalled):
-			// App genuinely not installed: leave 0 so the provider fails
-			// closed with its own actionable typed error.
-		default:
+	if target.Scope.IsZero() && s.cfg.GitHub != nil {
+		scope, rerr := s.resolveRepoScope(r.Context(), owner, name)
+		if rerr != nil {
+			// Transient/network failure surfaces as 502; an ErrNotInstalled
+			// is not an error (resolveRepoScope returns a zero scope) so the
+			// provider fails closed with its own actionable typed error.
 			s.writeError(w, r, http.StatusBadGateway, "work_item_filing_failed",
 				"could not resolve the GitHub App installation for the concern's repo",
 				map[string]any{"error": rerr.Error()})
 			return
 		}
+		target.Scope = scope
 	}
 
 	// Snapshot the prior state before any transition: ApplyResolution

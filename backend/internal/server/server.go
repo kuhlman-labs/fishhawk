@@ -28,6 +28,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githuboidc"
@@ -765,6 +766,33 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // blocking reviewer, then call this, then assert. Production code never
 // calls it (Shutdown drains the same group, bounded by its context).
 func (s *Server) waitBackgroundReviews() { s.bgReviews.Wait() }
+
+// resolveRepoScope resolves the GitHub App installation for owner/name into a
+// forge.CredentialScope (ADR-058 / #1855), the input the scope-taking
+// githubclient surface and workmgmt.Target now take instead of a bare int64.
+// GetRepoInstallation stays the unscoped resolution primitive — it PRODUCES a
+// scope, so there is no scoped variant of it — and this helper wraps it plus
+// forge.FromGitHubInstallationID so the workitems / defer-concern /
+// refinement-file resolution blocks share one conversion.
+//
+// It preserves the exact caller-visible discrimination those inline blocks had:
+// githubclient.ErrNotInstalled (the App is genuinely not installed on the repo)
+// returns the ZERO scope with a nil error — the forge-optional posture, so the
+// provider fails closed downstream with its own actionable typed error — while a
+// transient/network failure returns a non-nil error the caller surfaces as a
+// 502 rather than masking it as the misleading provider "no installation"
+// message. The caller must have already checked s.cfg.GitHub != nil.
+func (s *Server) resolveRepoScope(ctx context.Context, owner, name string) (forge.CredentialScope, error) {
+	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, githubclient.RepoRef{Owner: owner, Name: name})
+	switch {
+	case err == nil:
+		return forge.FromGitHubInstallationID(instID), nil
+	case errors.Is(err, githubclient.ErrNotInstalled):
+		return forge.CredentialScope{}, nil
+	default:
+		return forge.CredentialScope{}, err
+	}
+}
 
 // buildHandler wires the route mux and the middleware chain.
 //

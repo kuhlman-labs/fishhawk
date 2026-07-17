@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
 // Provider files a resolved work item against a concrete backend (GitHub
@@ -164,8 +166,15 @@ type Repo struct {
 // project connection). Apply leaves Target zero; the filing endpoint
 // populates it from the request + conventions before dispatch.
 type Target struct {
-	InstallationID int64
-	Repo           Repo
+	// Scope is the opaque forge credential-scope key naming which
+	// installation to authenticate as when the filing lands (ADR-058 /
+	// #1855). It carries the same installation identity the pre-scope
+	// int64 InstallationID did — its zero value (IsZero) is the
+	// unresolved-installation sentinel the old InstallationID==0 was —
+	// but as a forge-neutral key rather than a bare GitHub id. Target is
+	// in-process only, so this field carries no serialization tags.
+	Scope forge.CredentialScope
+	Repo  Repo
 	// Project is the GitHub Projects connection from the conventions
 	// (nil for providers that don't use it).
 	Project *Project

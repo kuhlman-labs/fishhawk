@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -130,8 +131,8 @@ func TestNotifyBoardTransition_LifecycleSeam(t *testing.T) {
 			if got.Trigger != tc.event {
 				t.Errorf("trigger = %q, want %q", got.Trigger, tc.event)
 			}
-			if got.Target.InstallationID != 99 {
-				t.Errorf("installation id = %d, want 99", got.Target.InstallationID)
+			if got.Target.Scope != forge.FromGitHubInstallationID(99) {
+				t.Errorf("scope = %q, want scope for installation 99", got.Target.Scope.Ref())
 			}
 			if !sameSet(got.ExpectedSourceStates, tc.wantExpectSrc) {
 				t.Errorf("expected sources = %v, want %v", got.ExpectedSourceStates, tc.wantExpectSrc)
@@ -269,8 +270,8 @@ func TestBoardTransitionForCampaignItem_MovesBacklogToUpNext(t *testing.T) {
 	if got.IssueNumber != 1816 {
 		t.Errorf("issue number = %d, want 1816", got.IssueNumber)
 	}
-	if got.Target.InstallationID != 12345 {
-		t.Errorf("installation id = %d, want 12345 (resolved from repo)", got.Target.InstallationID)
+	if got.Target.Scope != forge.FromGitHubInstallationID(12345) {
+		t.Errorf("scope = %q, want scope for installation 12345 (resolved from repo)", got.Target.Scope.Ref())
 	}
 	if !sameSet(got.ExpectedSourceStates, []string{workmgmt.CanonicalStateBacklog}) {
 		t.Errorf("expected sources = %v, want [backlog] only", got.ExpectedSourceStates)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -131,7 +132,7 @@ type fakeCodeScanningLister struct {
 	calls    int
 }
 
-func (l *fakeCodeScanningLister) ListCodeScanningAlerts(_ context.Context, _ int64, _ githubclient.RepoRef, _ string) ([]securityscan.Finding, error) {
+func (l *fakeCodeScanningLister) ListCodeScanningAlertsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ string) ([]securityscan.Finding, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.calls++

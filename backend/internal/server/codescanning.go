@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 )
@@ -23,7 +24,7 @@ import (
 // (codescanning_test.go) without standing up a real REST client +
 // token provider; production passes s.cfg.GitHub, which satisfies it.
 type codeScanningLister interface {
-	ListCodeScanningAlerts(ctx context.Context, installationID int64, repo githubclient.RepoRef, ref string) ([]securityscan.Finding, error)
+	ListCodeScanningAlertsScoped(ctx context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, ref string) ([]securityscan.Finding, error)
 }
 
 // codeScanningAlertPayload is the slice of GitHub's code_scanning_alert
@@ -159,7 +160,7 @@ func (s *Server) ingestCodeScanningAlertWith(ctx context.Context, raw []byte, li
 		return
 	}
 
-	alerts, err := lister.ListCodeScanningAlerts(ctx, installID, repoRefFromPayload(p), ref)
+	alerts, err := lister.ListCodeScanningAlertsScoped(ctx, forge.FromGitHubInstallationID(installID), repoRefFromPayload(p), ref)
 	if err != nil {
 		// Best-effort: a fetch error records no entry this delivery; a
 		// later delivery re-fetches. (The gate's fail-OPEN on a

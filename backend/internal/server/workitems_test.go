@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -35,7 +36,7 @@ type fakeWorkProvider struct {
 	fileErr  error
 	// failIfNoInstallation mirrors the real github.Provider fail-closed
 	// (#1092's installation_unavailable guard): File errors when the
-	// resolved Target.InstallationID is still 0.
+	// resolved Target.Scope is still the zero scope.
 	failIfNoInstallation bool
 	// boardingError, when set, mirrors the github.Provider best-effort
 	// boarding failure (#1107): File returns the created item with a nil
@@ -48,7 +49,7 @@ func (f *fakeWorkProvider) Name() string { return f.name }
 func (f *fakeWorkProvider) File(_ context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
 	f.called = true
 	f.captured = req
-	if f.failIfNoInstallation && req.Target.InstallationID == 0 {
+	if f.failIfNoInstallation && req.Target.Scope.IsZero() {
 		return nil, errors.New("installation_unavailable: provider needs an installation token")
 	}
 	if f.fileErr != nil {
@@ -170,8 +171,8 @@ func TestFileWorkItem_RunInFlight_AuditsAndApplies(t *testing.T) {
 	if len(got.Item.Classification.Labels) == 0 || got.Item.Classification.Labels[0] != "type:feature" {
 		t.Errorf("provider Item.Labels = %v, want default type:feature", got.Item.Classification.Labels)
 	}
-	if got.Target.InstallationID != inst {
-		t.Errorf("provider Target.InstallationID = %d, want %d", got.Target.InstallationID, inst)
+	if got.Target.Scope != forge.FromGitHubInstallationID(inst) {
+		t.Errorf("provider Target.Scope = %q, want scope for installation %d", got.Target.Scope.Ref(), inst)
 	}
 	if got.Target.Repo.Owner != "kuhlman-labs" || got.Target.Repo.Name != "fishhawk" {
 		t.Errorf("provider Target.Repo = %+v", got.Target.Repo)
@@ -1113,7 +1114,7 @@ func newInstallationGitHubClient(t *testing.T, installID int64, notInstalled boo
 // TestFileWorkItem_NoRun_ResolvesInstallation is the cross-boundary test
 // for #1095: a run-absent operator filing must resolve the App's
 // installation for the target repo so the provider receives a non-zero
-// Target.InstallationID. It drives a real POST through handleFileWorkItem
+// Target.Scope. It drives a real POST through handleFileWorkItem
 // with a stub installation endpoint and asserts the fakeWorkProvider
 // captured the resolved id — the handler -> GitHub-resolver -> provider
 // seam a per-layer unit would miss.
@@ -1140,9 +1141,9 @@ func TestFileWorkItem_NoRun_ResolvesInstallation(t *testing.T) {
 	if !fp.called {
 		t.Fatal("provider was not called")
 	}
-	if fp.captured.Target.InstallationID != wantInst {
-		t.Errorf("provider Target.InstallationID = %d, want %d (resolved from the stub installation endpoint)",
-			fp.captured.Target.InstallationID, wantInst)
+	if fp.captured.Target.Scope != forge.FromGitHubInstallationID(wantInst) {
+		t.Errorf("provider Target.Scope = %q, want scope for installation %d (resolved from the stub installation endpoint)",
+			fp.captured.Target.Scope.Ref(), wantInst)
 	}
 }
 
@@ -1173,8 +1174,8 @@ func TestFileWorkItem_NoRun_NoInstallation_FailsClosed(t *testing.T) {
 	if env.Error.Code != "work_item_filing_failed" {
 		t.Errorf("code = %q, want work_item_filing_failed", env.Error.Code)
 	}
-	if fp.captured.Target.InstallationID != 0 {
-		t.Errorf("Target.InstallationID = %d, want 0 (left unresolved on ErrNotInstalled)", fp.captured.Target.InstallationID)
+	if !fp.captured.Target.Scope.IsZero() {
+		t.Errorf("Target.Scope = %q, want zero scope (left unresolved on ErrNotInstalled)", fp.captured.Target.Scope.Ref())
 	}
 }
 
@@ -1501,38 +1502,40 @@ type fakeGithubAPI struct {
 	subIssues   []githubclient.SubIssue
 }
 
-func (f *fakeGithubAPI) CreateIssue(_ context.Context, _ int64, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+func (f *fakeGithubAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
 	f.createdBody = p.Body
 	return &githubclient.CreatedIssue{Number: 4242, NodeID: "CHILD_NODE", HTMLURL: "https://github.com/kuhlman-labs/fishhawk/issues/4242"}, nil
 }
 
-func (f *fakeGithubAPI) IssueNodeID(_ context.Context, _ int64, _ githubclient.RepoRef, _ int) (string, error) {
+func (f *fakeGithubAPI) IssueNodeIDScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, _ int) (string, error) {
 	return "EPIC_NODE", nil
 }
 
-func (f *fakeGithubAPI) ProjectFields(_ context.Context, _ int64, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
+func (f *fakeGithubAPI) ProjectFieldsScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
 	return &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: map[string]string{"Backlog": "OPT"}}, nil
 }
 
-func (f *fakeGithubAPI) ProjectItemStatus(_ context.Context, _ int64, _, _, _ string) (*githubclient.ProjectItemStatus, error) {
+func (f *fakeGithubAPI) ProjectItemStatusScoped(_ context.Context, _ forge.CredentialScope, _, _, _ string) (*githubclient.ProjectItemStatus, error) {
 	return &githubclient.ProjectItemStatus{OnBoard: true, ItemID: "ITEM"}, nil
 }
 
-func (f *fakeGithubAPI) AddProjectItem(_ context.Context, _ int64, _, _ string) (string, error) {
+func (f *fakeGithubAPI) AddProjectItemScoped(_ context.Context, _ forge.CredentialScope, _, _ string) (string, error) {
 	return "ITEM", nil
 }
 
-func (f *fakeGithubAPI) SetProjectItemSingleSelect(_ context.Context, _ int64, _, _, _, _ string) error {
+func (f *fakeGithubAPI) SetProjectItemSingleSelectScoped(_ context.Context, _ forge.CredentialScope, _, _, _, _ string) error {
 	return nil
 }
 
-func (f *fakeGithubAPI) AddSubIssue(_ context.Context, _ int64, _, _ string) error { return nil }
+func (f *fakeGithubAPI) AddSubIssueScoped(_ context.Context, _ forge.CredentialScope, _, _ string) error {
+	return nil
+}
 
-func (f *fakeGithubAPI) ListSubIssues(_ context.Context, _ int64, _ string) ([]githubclient.SubIssue, error) {
+func (f *fakeGithubAPI) ListSubIssuesScoped(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.SubIssue, error) {
 	return f.subIssues, nil
 }
 
-func (f *fakeGithubAPI) SearchIssuesByTitle(_ context.Context, _ int64, _ string) ([]githubclient.IssueTitleResult, error) {
+func (f *fakeGithubAPI) SearchIssuesByTitleScoped(_ context.Context, _ forge.CredentialScope, _ string) ([]githubclient.IssueTitleResult, error) {
 	return nil, nil
 }
 
@@ -1592,7 +1595,7 @@ func TestFileWorkItem_DependsOn_EndToEnd(t *testing.T) {
 		{Number: 4242, NodeID: "CHILD_NODE", Title: "slice C", Body: api.createdBody},
 	}
 	res, err := provider.EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
-		Target: workmgmt.Target{InstallationID: inst, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(inst), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
 		Epic:   "#1005",
 	})
 	if err != nil {

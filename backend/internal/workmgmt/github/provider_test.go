@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -72,7 +73,7 @@ type fakeAPI struct {
 	projectsTokenConfigured bool
 }
 
-func (f *fakeAPI) CreateIssue(_ context.Context, _ int64, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+func (f *fakeAPI) CreateIssueScoped(_ context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
 	f.createRepo, f.createParams = repo, p
 	if f.createErr != nil {
 		return nil, f.createErr
@@ -80,7 +81,7 @@ func (f *fakeAPI) CreateIssue(_ context.Context, _ int64, repo githubclient.Repo
 	return f.created, nil
 }
 
-func (f *fakeAPI) IssueNodeID(_ context.Context, _ int64, _ githubclient.RepoRef, number int) (string, error) {
+func (f *fakeAPI) IssueNodeIDScoped(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (string, error) {
 	f.nodeIDNumber = number
 	if f.nodeIDErr != nil {
 		return "", f.nodeIDErr
@@ -88,7 +89,7 @@ func (f *fakeAPI) IssueNodeID(_ context.Context, _ int64, _ githubclient.RepoRef
 	return f.parentNode, nil
 }
 
-func (f *fakeAPI) ProjectFields(_ context.Context, _ int64, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error) {
+func (f *fakeAPI) ProjectFieldsScoped(_ context.Context, _ forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error) {
 	f.fieldsCoord, f.fieldsName = coord, fieldName
 	if f.fieldsErr != nil {
 		return nil, f.fieldsErr
@@ -96,7 +97,7 @@ func (f *fakeAPI) ProjectFields(_ context.Context, _ int64, coord githubclient.P
 	return f.meta, nil
 }
 
-func (f *fakeAPI) ProjectItemStatus(_ context.Context, _ int64, issueNodeID, projectID, _ string) (*githubclient.ProjectItemStatus, error) {
+func (f *fakeAPI) ProjectItemStatusScoped(_ context.Context, _ forge.CredentialScope, issueNodeID, projectID, _ string) (*githubclient.ProjectItemStatus, error) {
 	f.itemStatusIssueNode, f.itemStatusProjectID = issueNodeID, projectID
 	if f.itemStatusErr != nil {
 		return nil, f.itemStatusErr
@@ -104,7 +105,7 @@ func (f *fakeAPI) ProjectItemStatus(_ context.Context, _ int64, issueNodeID, pro
 	return f.itemStatus, nil
 }
 
-func (f *fakeAPI) AddProjectItem(_ context.Context, _ int64, projectID, contentID string) (string, error) {
+func (f *fakeAPI) AddProjectItemScoped(_ context.Context, _ forge.CredentialScope, projectID, contentID string) (string, error) {
 	f.addItemContent = contentID
 	_ = projectID
 	if f.addItemErr != nil {
@@ -113,17 +114,17 @@ func (f *fakeAPI) AddProjectItem(_ context.Context, _ int64, projectID, contentI
 	return f.itemID, nil
 }
 
-func (f *fakeAPI) SetProjectItemSingleSelect(_ context.Context, _ int64, projectID, itemID, fieldID, optionID string) error {
+func (f *fakeAPI) SetProjectItemSingleSelectScoped(_ context.Context, _ forge.CredentialScope, projectID, itemID, fieldID, optionID string) error {
 	f.setProjectID, f.setItemID, f.setFieldID, f.setOptionID = projectID, itemID, fieldID, optionID
 	return f.setErr
 }
 
-func (f *fakeAPI) AddSubIssue(_ context.Context, _ int64, parentNodeID, childNodeID string) error {
+func (f *fakeAPI) AddSubIssueScoped(_ context.Context, _ forge.CredentialScope, parentNodeID, childNodeID string) error {
 	f.subParent, f.subChild = parentNodeID, childNodeID
 	return f.subErr
 }
 
-func (f *fakeAPI) ListSubIssues(_ context.Context, _ int64, parentNodeID string) ([]githubclient.SubIssue, error) {
+func (f *fakeAPI) ListSubIssuesScoped(_ context.Context, _ forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error) {
 	f.listSubParent = parentNodeID
 	if f.listSubErr != nil {
 		return nil, f.listSubErr
@@ -131,7 +132,7 @@ func (f *fakeAPI) ListSubIssues(_ context.Context, _ int64, parentNodeID string)
 	return f.listSubResults, nil
 }
 
-func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ int64, query string) ([]githubclient.IssueTitleResult, error) {
+func (f *fakeAPI) SearchIssuesByTitleScoped(_ context.Context, _ forge.CredentialScope, query string) ([]githubclient.IssueTitleResult, error) {
 	f.searchQuery = query
 	if f.searchErr != nil {
 		return nil, f.searchErr
@@ -154,9 +155,9 @@ func baseRequest() workmgmt.ProviderRequest {
 			BoardPlacement: workmgmt.BoardPlacement{Status: "Backlog"},
 		},
 		Target: workmgmt.Target{
-			InstallationID: 99,
-			Repo:           workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
-			Project:        &workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7},
+			Scope:   forge.FromGitHubInstallationID(99),
+			Repo:    workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+			Project: &workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7},
 		},
 	}
 }
@@ -359,7 +360,7 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 		},
 	}
 	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
-		Target: workmgmt.Target{InstallationID: 99, Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
 		Epic:   "#1005",
 	})
 	if err != nil {
@@ -448,7 +449,7 @@ func TestParseAutonomyLabel(t *testing.T) {
 // ListSubIssues error each return an error rather than a partial result.
 func TestProvider_EpicChildren_FailClosed(t *testing.T) {
 	good := workmgmt.EpicChildrenRequest{
-		Target: workmgmt.Target{InstallationID: 99, Repo: workmgmt.Repo{Owner: "o", Name: "r"}},
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "o", Name: "r"}},
 		Epic:   "#1005",
 	}
 	t.Run("nil api", func(t *testing.T) {
@@ -465,7 +466,7 @@ func TestProvider_EpicChildren_FailClosed(t *testing.T) {
 	})
 	t.Run("zero installation", func(t *testing.T) {
 		req := good
-		req.Target.InstallationID = 0
+		req.Target.Scope = forge.CredentialScope{}
 		if _, err := New(&fakeAPI{}).EpicChildren(context.Background(), req); err == nil || !strings.Contains(err.Error(), "no installation id available") {
 			t.Fatalf("want missing-installation error, got %v", err)
 		}
@@ -526,7 +527,7 @@ func TestProvider_File_MissingInstallationRejected(t *testing.T) {
 	// run-scoped constraint rather than dispatching an untokened REST call.
 	api := &fakeAPI{created: &githubclient.CreatedIssue{Number: 1, NodeID: "N", HTMLURL: "u"}}
 	req := baseRequest()
-	req.Target.InstallationID = 0
+	req.Target.Scope = forge.CredentialScope{}
 	_, err := New(api).File(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "no installation id available") {
 		t.Fatalf("want missing-installation error, got %v", err)
@@ -882,7 +883,7 @@ func TestProvider_Transition_ResolveErrorsPropagate(t *testing.T) {
 
 func TestProvider_Transition_MissingInstallationRejected(t *testing.T) {
 	req := runStartedRequest()
-	req.Target.InstallationID = 0
+	req.Target.Scope = forge.CredentialScope{}
 	_, err := New(transitionAPI("Backlog", true)).Transition(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "no installation id available") {
 		t.Fatalf("want missing-installation error, got %v", err)
@@ -1175,7 +1176,7 @@ func TestProvider_DiscoverNumbers_MissingInstallationRejected(t *testing.T) {
 	// Fail closed: a run-absent target leaves InstallationID 0; discovery must
 	// error rather than dispatch an untokened search.
 	req := discoverRequest()
-	req.Target.InstallationID = 0
+	req.Target.Scope = forge.CredentialScope{}
 	api := &fakeAPI{}
 	_, err := New(api).DiscoverNumbers(context.Background(), req)
 	if err == nil || !strings.Contains(err.Error(), "no installation id available") {

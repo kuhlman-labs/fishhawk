@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -274,8 +275,8 @@ func TestWebhook_IssueClosedBoardSync(t *testing.T) {
 	if got.IssueNumber != 1817 {
 		t.Errorf("issue number = %d, want 1817", got.IssueNumber)
 	}
-	if got.Target.InstallationID != 4242 {
-		t.Errorf("installation id = %d, want 4242 (from the payload)", got.Target.InstallationID)
+	if got.Target.Scope != forge.FromGitHubInstallationID(4242) {
+		t.Errorf("scope = %q, want scope for installation 4242 (from the payload)", got.Target.Scope.Ref())
 	}
 
 	audits := campaignTransitionAudits(au)
