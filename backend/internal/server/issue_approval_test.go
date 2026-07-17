@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -909,6 +910,213 @@ func TestHandleApprovalCommand_ReplyComment_DuplicateIdempotent(t *testing.T) {
 	}
 }
 
+// --- cross-forge identity conflation (E45.19 / #2036) ---
+
+// gitLabNoteEvent builds a webhook.Event shaped like a GitLab note on
+// an Issue with the given body, carrying the source-forge + credential
+// discriminator ParseGitLabEvent stamps. Drives the real dispatcher
+// classifier (MatchGitLabEvent → matchGitLabNote) rather than a
+// hand-built Match.
+func gitLabNoteEvent(repo, credRef, sender, noteBody string, issueIID int) webhook.Event {
+	raw := fmt.Sprintf(`{"object_attributes":{"note":%q,"noteable_type":"Issue"},"issue":{"iid":%d}}`, noteBody, issueIID)
+	return webhook.Event{
+		Type:          "note",
+		Forge:         webhook.ForgeGitLab,
+		CredentialRef: credRef,
+		Sender:        sender,
+		Repo:          repo,
+		RawBody:       []byte(raw),
+	}
+}
+
+// TestGitLabApproval_CrossForge_DoesNotAdvanceCollidingGitHubRun is the
+// binding-condition-1 continuous cross-boundary test: a GitLab-sourced
+// approval note flows through the REAL webhook.Dispatcher path
+// (Dispatcher.Handle → handleApprovalCommand) into
+// server.HandleApprovalCommand, and MUST NOT act on a seeded GitHub run
+// whose (Repo, issue:N) collide. The GitHub run's stage is left
+// untouched (no ApprovalRepo.Submit, state unchanged); the slash
+// variant fires the loud no-awaiting-stage reply resolved to the GitLab
+// credential scope, the reply-comment variant skips silently. This is
+// the seam the whole fix defends, exercised end-to-end in one test.
+func TestGitLabApproval_CrossForge_DoesNotAdvanceCollidingGitHubRun(t *testing.T) {
+	cases := []struct {
+		name        string
+		noteBody    string // slash → loud; "+1" → reply-comment silent
+		wantReplies int
+	}{
+		{"slash approval fires loud no-awaiting reply", "/fishhawk approve", 1},
+		{"reply-comment approval skips silently", "+1", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newOrchestratorRepo()
+			// Seed a GitHub run whose Repo string + issue number
+			// string-collide with the GitLab project path + note iid.
+			r := rr.seedRun()
+			r.TriggerSource = run.TriggerGitHubIssue
+			triggerRef := "issue:42"
+			r.TriggerRef = &triggerRef
+			r.InstallationID = ptrInt64(99)
+			r.Repo = "gitlab-org/gitlab-test"
+
+			stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+			stage.Type = run.StageTypePlan
+
+			ar := newFakeApprovalRepo()
+			au := newAuditCompleteAuditFake()
+			gh := newSlashGitHubRecorder()
+			o := &orchestrator.Orchestrator{Runs: rr}
+
+			s := New(Config{
+				Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+				Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
+			})
+			s.issueNotifier = issuecomment.New(issuecomment.Deps{
+				GitHub: gh, Runs: rr, Audit: au,
+				ExternalURL: "https://app.fishhawk.example.com",
+			})
+
+			// Drive the REAL dispatcher with the server as its
+			// approval handler — one continuous path, no shortcut.
+			d := &webhook.Dispatcher{ApprovalHandler: s}
+			ev := gitLabNoteEvent("gitlab-org/gitlab-test", "gitlab:5", "root", tc.noteBody, 42)
+			if err := d.Handle(context.Background(), ev); err != nil {
+				t.Fatalf("Dispatcher.Handle: %v", err)
+			}
+
+			// The colliding GitHub run is untouched.
+			if len(ar.all) != 0 {
+				t.Errorf("GitHub run must not be advanced by a GitLab approval; got approvals %+v", ar.all)
+			}
+			if stage.State != run.StageStateAwaitingApproval {
+				t.Errorf("GitHub stage state = %q, want awaiting_approval (unchanged)", stage.State)
+			}
+
+			calls := gh.calls()
+			if len(calls) != tc.wantReplies {
+				t.Fatalf("want %d replies; got %d: %v", tc.wantReplies, len(calls), commentBodies(calls))
+			}
+			if tc.wantReplies == 1 {
+				if !strings.Contains(calls[0].body, "No stage on this issue's run is awaiting approval") {
+					t.Errorf("slash reply should be the no-awaiting-stage help: %q", calls[0].body)
+				}
+				// Reply scope resolves from the GitLab CredentialRef
+				// (forge.FromRef), NOT the GitHub installation wrapper.
+				if got, want := calls[0].scope, forge.FromRef("gitlab:5"); got != want {
+					t.Errorf("reply scope = %+v, want FromRef(gitlab:5) %+v", got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestNamespacedApproverSubject pins the subject-namespacing helper:
+// GitHub (empty / "github" forge) keeps the bare login so the existing
+// path is unchanged; any other forge prefixes with the forge id so a
+// GitLab username cannot string-collide with a bare GitHub login.
+func TestNamespacedApproverSubject(t *testing.T) {
+	cases := []struct {
+		name  string
+		forge string
+		login string
+		want  string
+	}{
+		{"empty forge is bare GitHub login", "", "alice", "alice"},
+		{"explicit github is bare login", "github", "alice", "alice"},
+		{"gitlab is namespaced", "gitlab", "alice", "gitlab:alice"},
+		{"gitlab distinct from colliding github login", webhook.ForgeGitLab, "root", "gitlab:root"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := namespacedApproverSubject(tc.forge, tc.login); got != tc.want {
+				t.Errorf("namespacedApproverSubject(%q, %q) = %q, want %q", tc.forge, tc.login, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleApprovalCommand_GitHubPreservation is the binding-condition-2
+// regression: for a GitHub approval event (empty Forge / CredentialRef,
+// as the dispatcher forwards) the reply notifier scope stays
+// InstallationID-derived (forge.FromGitHubInstallationID, NOT FromRef)
+// and the persisted ApproverSubject / audit ActorSubject stay the bare
+// login. A regression that GitLab-shaped the GitHub path fails here.
+func TestHandleApprovalCommand_GitHubPreservation(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypePlan
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: rr, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo: "x/y", IssueNumber: 42, InstallationID: 99, SenderLogin: "alice",
+		Decision: webhook.MatchActionApprove,
+		Source:   webhook.ApprovalSourceSlash,
+		// Forge + CredentialRef deliberately empty — the GitHub shape.
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+
+	// Persisted approver stays the bare login (no forge namespace).
+	if len(ar.all) != 1 {
+		t.Fatalf("expected 1 approval row; got %d", len(ar.all))
+	}
+	if ar.all[0].ApproverSubject != "alice" {
+		t.Errorf("ApproverSubject = %q, want bare login alice", ar.all[0].ApproverSubject)
+	}
+
+	// Audit ActorSubject stays the bare login.
+	var found bool
+	for _, e := range au.entries {
+		if e.Category == "approval_submitted" {
+			found = true
+			if e.ActorSubject == nil || *e.ActorSubject != "alice" {
+				t.Errorf("audit ActorSubject = %v, want bare login alice", e.ActorSubject)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected an approval_submitted audit entry")
+	}
+
+	// The slash success reply resolves to the GitHub installation
+	// scope, NOT a forge ref.
+	var replyScopeSeen forge.CredentialScope
+	var sawReply bool
+	for _, c := range gh.calls() {
+		if strings.HasPrefix(c.body, "Approved by ") {
+			sawReply = true
+			replyScopeSeen = c.scope
+		}
+	}
+	if !sawReply {
+		t.Fatalf("expected an 'Approved by' slash reply; got bodies %v", commentBodies(gh.calls()))
+	}
+	if want := forge.FromGitHubInstallationID(99); replyScopeSeen != want {
+		t.Errorf("reply scope = %+v, want FromGitHubInstallationID(99) %+v", replyScopeSeen, want)
+	}
+}
+
 // --- helpers ---
 
 // splitBroadcastAndStatus picks the plan-approved broadcast (the
@@ -941,6 +1149,7 @@ type slashCommentCall struct {
 	repo        string
 	issueNumber int
 	body        string
+	scope       forge.CredentialScope
 }
 
 type slashGitHubRecorder struct {
@@ -959,10 +1168,10 @@ func (g *slashGitHubRecorder) calls() []slashCommentCall {
 }
 
 // CreateIssueComment satisfies issuecomment.IssueCommenter.
-func (g *slashGitHubRecorder) CreateIssueComment(_ context.Context, _ forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
+func (g *slashGitHubRecorder) CreateIssueComment(_ context.Context, scope forge.CredentialScope, repo githubclient.RepoRef, issueNumber int, body string) (*githubclient.IssueComment, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.stored = append(g.stored, slashCommentCall{repo: repo.String(), issueNumber: issueNumber, body: body})
+	g.stored = append(g.stored, slashCommentCall{repo: repo.String(), issueNumber: issueNumber, body: body, scope: scope})
 	return &githubclient.IssueComment{ID: int64(len(g.stored)), Body: body}, nil
 }
 

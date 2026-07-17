@@ -383,6 +383,67 @@ func TestHandle_ReplyPatternApprove_RoutesWithSource(t *testing.T) {
 	}
 }
 
+// TestHandle_ApprovalForwardsForgeAndCredentialRef pins that
+// handleApprovalCommand threads ev.Forge + ev.CredentialRef into the
+// ApprovalCommandParams for a GitLab-sourced note (E45.19 / #2036),
+// and leaves BOTH empty for a GitHub event so the GitHub path stays
+// byte-for-byte unchanged.
+func TestHandle_ApprovalForwardsForgeAndCredentialRef(t *testing.T) {
+	t.Run("gitlab note forwards forge + credential ref", func(t *testing.T) {
+		d, _, _, _ := newDispatcherWithStubs(t)
+		stub := &stubApprovalHandler{}
+		d.ApprovalHandler = stub
+
+		if err := d.Handle(context.Background(), Event{
+			Type:          "note",
+			Forge:         ForgeGitLab,
+			CredentialRef: "gitlab:5",
+			Sender:        "root",
+			Repo:          "gitlab-org/gitlab-test",
+			RawBody:       []byte(glNoteFixture),
+		}); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if len(stub.calls) != 1 {
+			t.Fatalf("expected 1 approval call; got %d", len(stub.calls))
+		}
+		got := stub.calls[0]
+		if got.Forge != ForgeGitLab {
+			t.Errorf("Forge = %q, want %q", got.Forge, ForgeGitLab)
+		}
+		if got.CredentialRef != "gitlab:5" {
+			t.Errorf("CredentialRef = %q, want gitlab:5", got.CredentialRef)
+		}
+		if got.Decision != MatchActionApprove {
+			t.Errorf("Decision = %q, want approve", got.Decision)
+		}
+	})
+
+	t.Run("github comment leaves forge + credential ref empty", func(t *testing.T) {
+		d, _, _, _ := newDispatcherWithStubs(t)
+		stub := &stubApprovalHandler{}
+		d.ApprovalHandler = stub
+
+		body := []byte(`{"comment":{"body":"/fishhawk approve"},"issue":{"number":42}}`)
+		if err := d.Handle(context.Background(), Event{
+			Type: "issue_comment", Action: "created", InstallationID: 99, Sender: "alice",
+			Repo: "x/y", RawBody: body,
+		}); err != nil {
+			t.Fatalf("Handle: %v", err)
+		}
+		if len(stub.calls) != 1 {
+			t.Fatalf("expected 1 approval call; got %d", len(stub.calls))
+		}
+		got := stub.calls[0]
+		if got.Forge != "" {
+			t.Errorf("Forge = %q, want empty for GitHub", got.Forge)
+		}
+		if got.CredentialRef != "" {
+			t.Errorf("CredentialRef = %q, want empty for GitHub", got.CredentialRef)
+		}
+	})
+}
+
 // --- MatchEvent: workflow_run ---
 
 func workflowRunBody(t *testing.T, fields map[string]any) []byte {
