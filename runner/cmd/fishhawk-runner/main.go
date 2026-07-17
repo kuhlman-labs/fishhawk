@@ -4535,6 +4535,13 @@ type prOpener interface {
 	OpenPR(ctx context.Context, args gitops.OpenPRArgs) (*gitops.OpenPRResult, error)
 }
 
+// mrOpener abstracts gitops.OpenMRClient for tests — the GitLab-forge parallel
+// of prOpener (ADR-058 / E45.5). openImplementChangeRequest selects it when
+// cfg.forge=="gitlab".
+type mrOpener interface {
+	OpenMR(ctx context.Context, args gitops.OpenMRArgs) (*gitops.OpenPRResult, error)
+}
+
 // newPusher / newPROpener are test seams. Production code
 // returns the real gitops types; tests substitute fakes via
 // withFakeGitOps().
@@ -4551,6 +4558,13 @@ var (
 
 	newPROpener = func(token string) prOpener {
 		return &gitops.OpenPRClient{Token: token}
+	}
+
+	// newMROpener is the GitLab merge-request counterpart of newPROpener
+	// (ADR-058 / E45.5). baseURL is the configured GitLab instance root
+	// (--gitlab-base-url); tests substitute a fake mrOpener.
+	newMROpener = func(token, baseURL string) mrOpener {
+		return &gitops.OpenMRClient{Token: token, BaseURL: baseURL}
 	}
 
 	// remoteBranchExists reports whether the named branch exists on the
@@ -5107,6 +5121,26 @@ func resolveImplementBaseRef(cfg config) string {
 	return baseRef
 }
 
+// openImplementChangeRequest opens the implement-stage change request on the
+// configured forge (ADR-058 / E45.5): a GitHub pull request by default, or a
+// GitLab merge request when cfg.forge=="gitlab". Both return the unified
+// OpenPRResult (number/iid + web URL) the artifact upload consumes, so the seam
+// is fully contained here and every downstream call stays forge-agnostic. The
+// GitHub OpenPRArgs.Owner/Repo pair is the same "owner/name" slug GitLab needs
+// as its namespaced project path, so the MR path just rejoins them.
+func openImplementChangeRequest(ctx context.Context, cfg config, token string, args gitops.OpenPRArgs) (*gitops.OpenPRResult, error) {
+	if cfg.forge == forgeGitLab {
+		return newMROpener(token, cfg.gitlabBaseURL).OpenMR(ctx, gitops.OpenMRArgs{
+			ProjectPath:  args.Owner + "/" + args.Repo,
+			SourceBranch: args.Head,
+			TargetBranch: args.Base,
+			Title:        args.Title,
+			Description:  args.Body,
+		})
+	}
+	return newPROpener(token).OpenPR(ctx, args)
+}
+
 // implementBranchRouting is the resolved branch routing for an implement
 // push: which branch the stage commits to and which of the three mutually
 // exclusive paths (fix-up / decomposed child / standalone) it is on.
@@ -5191,6 +5225,23 @@ func resolveImplementBranchRouting(_ context.Context, cfg config, _, baseRef str
 // and the zero-re-run exempt resolution (openHeldCommitPR, #1231) so both
 // resolve the credential identically.
 func mintImplementToken(ctx context.Context, cfg config, client uploadClient, issued *upload.IssuedKey, logSink io.Writer) (string, error) {
+	// GitLab forge (ADR-058 / E45.5): there is no GitHub App broker to mint
+	// against. The push + MR-create credential is the operator-supplied
+	// FISHHAWK_GITLAB_TOKEN (a group/project access token with api scope);
+	// fail with an actionable error naming the env var when it is absent.
+	if cfg.forge == forgeGitLab {
+		tok := os.Getenv("FISHHAWK_GITLAB_TOKEN")
+		if tok == "" {
+			return "", errors.New("this run targets the gitlab forge (--forge=gitlab) but FISHHAWK_GITLAB_TOKEN is not set; " +
+				"export a GitLab access token with `api` scope so the runner can push the run branch and open the merge request")
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"gitlab_env"}`+"\n",
+			cfg.runID, cfg.stageID,
+		)
+		return tok, nil
+	}
+
 	tokenRes, err := client.FetchInstallationToken(ctx, upload.FetchInstallationTokenArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
@@ -5310,7 +5361,12 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch strin
 	}
 
 	title, body := prTitleAndBody(cfg, branch, logSink)
-	prRes, err := newPROpener(token).OpenPR(ctx, gitops.OpenPRArgs{
+	// Route through the forge-agnostic dispatch (ADR-058 / E45.5): a
+	// --forge=gitlab exempt resolution opens a merge request via the GitLab
+	// MR opener against cfg.gitlabBaseURL, NOT a GitHub PR against the
+	// hardcoded api.github.com base — which would transmit the minted
+	// FISHHAWK_GITLAB_TOKEN to an unintended host and fail the stage.
+	prRes, err := openImplementChangeRequest(ctx, cfg, token, gitops.OpenPRArgs{
 		Owner: owner,
 		Repo:  repoName,
 		Head:  branch,
@@ -6136,7 +6192,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return nil
 	}
 
-	prRes, err := newPROpener(token).OpenPR(ctx, gitops.OpenPRArgs{
+	prRes, err := openImplementChangeRequest(ctx, cfg, token, gitops.OpenPRArgs{
 		Owner: owner,
 		Repo:  repoName,
 		Head:  branch,

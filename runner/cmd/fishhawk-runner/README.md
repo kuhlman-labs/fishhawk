@@ -89,3 +89,18 @@ Fail-open ladder (each rung is byte-identical to the prior behavior it degrades 
 3. **tip baseRef** — `merge-base(<local base>, HEAD)` itself unresolvable (unrelated histories, shallow clone, ref not fetched) → logs `merge_base_unresolved` and returns the original tip baseRef (today's 2-dot behavior), never blocking the diff.
 
 The `git_diff` event's `base_ref` label stays the human-meaningful fork-point label (`main`), and the recorded `base_sha` (the lineage/audit fork point — ADR-035) is UNTOUCHED: only the commit-ish the diff is measured against re-anchors. The event payload shape is unchanged, so backend decoders stay untouched.
+
+## Forge selection: GitHub PR vs GitLab MR (ADR-058 / E45.5, #1859)
+
+The implement-stage push + open path targets a **change-request forge** selected by `--forge` (default `github`):
+
+- `--forge github` (default) — opens a GitHub **pull request** via the `prOpener` seam (`gitops.OpenPRClient`, `Authorization: Bearer`). Historical behavior; unchanged when the flag is omitted.
+- `--forge gitlab` — opens a GitLab **merge request** via the `mrOpener` seam (`gitops.OpenMRClient`, `PRIVATE-TOKEN`). Requires `--gitlab-base-url` (e.g. `https://gitlab.com` or a self-managed `https://gitlab.example.com`) — there is **no gitlab.com default**, so a self-managed instance is a first-class target and `parseFlags` rejects `--forge=gitlab` without it. An unknown `--forge` value is rejected at parse time.
+
+`openImplementChangeRequest` (main.go) is the single MR-vs-PR dispatch point: it maps the shared `gitops.OpenPRArgs` onto `gitops.OpenMRArgs` for GitLab — the `--github-repo`/`GITHUB_REPOSITORY` `owner/name` slug becomes the namespaced project path (`url.PathEscape`d into one `%2F`-encoded segment by `OpenMR`), `Head`→`source_branch`, `Base` (`resolveImplementBaseRef`)→`target_branch`, `Title`/`Body`→`title`/`description`. Both openers return the unified `gitops.OpenPRResult` (PR number / MR iid + web URL), so every downstream artifact-upload path stays forge-agnostic.
+
+**Credential (`FISHHAWK_GITLAB_TOKEN`).** On the gitlab forge, `mintImplementToken` skips the GitHub App broker entirely and reads `FISHHAWK_GITLAB_TOKEN` — a GitLab access token with `api` scope (a group/project access token in v0). It authenticates both the run-branch push (via `PushToken` → `http.<host>.extraheader`) and the MR-create REST call. When unset, the stage fails with an actionable error naming the env var and scope. The secret is on the gate (`gateenv.go`) and acceptance (`acceptenv` package) **denylists**, so agent-authored gate code and the acceptance agent never see it.
+
+**Runner-kind self-report.** `detectRunnerKind` reports `gitlab_ci` when `GITLAB_CI=true` or `CI_PIPELINE_ID` is non-empty (GitHub signals win when both are present; a bare `CI=true` still resolves `local`). The backend ignores the unrecognized value until #1861 adds the enum member, so shipping the detection first is additive-safe.
+
+ADR-035 lineage/tree-ownership is git-level and remote-shape independent — the push machinery never parses the forge host — pinned by `gitops.TestCommitAndPush_ShapedRemote_LineageIsRemoteShapeIndependent`. The live GitLab walk with real credentials is tracked in #2032 (E45.18).

@@ -12,6 +12,7 @@ import "strings"
 // ignores an unrecognized self-report rather than persisting it.
 const (
 	runnerKindGitHubActions = "github_actions"
+	runnerKindGitLabCI      = "gitlab_ci"
 	runnerKindLocal         = "local"
 )
 
@@ -35,9 +36,24 @@ const (
 // that never dispatches. So CI=true ALONE (with no GITHUB_* var present)
 // MUST resolve to local. The github_actions decision keys ONLY off the
 // GITHUB_* signals.
+// The gitlab_ci branch mirrors the github_actions one for GitLab CI/CD
+// (ADR-058 / E45.5): GitLab sets GITLAB_CI=true and a non-empty CI_PIPELINE_ID
+// in every pipeline job; a host-side local spawn inherits NEITHER. The GITHUB_*
+// checks come FIRST so a GitHub Actions job that also exports the generic CI=true
+// (or, pathologically, a GitLab var) still resolves github_actions. As with the
+// github_actions decision, the generic CI=true is DELIBERATELY NOT a gitlab_ci
+// signal on its own — only the GitLab-specific vars are.
+//
+// The backend's run.ValidRunnerKinds membership check drops an unrecognized
+// self-report rather than persisting it (ResolveRunnerKind), so shipping this
+// detection before #1861 adds the enum member is additive-safe: a gitlab_ci
+// self-report is simply ignored until the backend learns the value.
 func detectRunnerKind(getenv func(string) string) string {
 	if strings.EqualFold(getenv("GITHUB_ACTIONS"), "true") || getenv("GITHUB_RUN_ID") != "" {
 		return runnerKindGitHubActions
+	}
+	if strings.EqualFold(getenv("GITLAB_CI"), "true") || getenv("CI_PIPELINE_ID") != "" {
+		return runnerKindGitLabCI
 	}
 	return runnerKindLocal
 }

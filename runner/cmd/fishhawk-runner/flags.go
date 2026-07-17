@@ -10,6 +10,13 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/version"
 )
 
+// forge literals for the --forge flag. GitHub is the historical default;
+// gitlab selects the GitLab merge-request path (ADR-058 / E45.5).
+const (
+	forgeGitHub = "github"
+	forgeGitLab = "gitlab"
+)
+
 // config is the parsed CLI input. Every field has a corresponding
 // flag; the action.yml inputs map 1:1 onto the required flags.
 //
@@ -69,6 +76,20 @@ type config struct {
 	githubRepo string
 	baseBranch string
 	noPR       bool
+
+	// forge selects the change-request forge the implement-stage push +
+	// open-PR path targets (ADR-058 / E45.5): "github" (default) opens a
+	// GitHub pull request; "gitlab" opens a GitLab merge request via the
+	// mrOpener seam. The default preserves the historical GitHub-only
+	// behavior for invocations that omit the flag.
+	forge string
+
+	// gitlabBaseURL is the GitLab instance root (e.g. https://gitlab.com or
+	// a self-managed https://gitlab.example.com) the merge-request opener and
+	// the FISHHAWK_GITLAB_TOKEN push path target. Required when --forge=gitlab
+	// — there is NO gitlab.com default, so a self-managed instance is a
+	// first-class target.
+	gitlabBaseURL string
 
 	// verifyCmd is the shell command run as the in-band test gate
 	// after the agent exits cleanly. Empty (default) skips the gate.
@@ -181,6 +202,10 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 		"base branch for the implement-stage PR; falls back to GITHUB_REF_NAME env then to 'main' when both empty")
 	fs.BoolVar(&cfg.noPR, "no-pr", false,
 		"skip the implement-stage git push + PR open; the working tree stays dirty for the operator to commit themselves. Default posture for local-runner dev loops")
+	fs.StringVar(&cfg.forge, "forge", forgeGitHub,
+		"change-request forge for the implement-stage push + open path (github|gitlab); github (default) opens a pull request, gitlab opens a merge request (ADR-058 / E45.5)")
+	fs.StringVar(&cfg.gitlabBaseURL, "gitlab-base-url", "",
+		"GitLab instance root (e.g. https://gitlab.com or a self-managed https://gitlab.example.com); required when --forge=gitlab (no gitlab.com default)")
 	fs.StringVar(&cfg.verifyCmd, "verify-cmd", "",
 		"shell command run as the in-band test gate after the agent exits cleanly (executed via sh -c); empty means skip. Corresponds to executor.verify.command in the workflow spec.")
 	fs.DurationVar(&cfg.verifyTimeout, "verify-timeout", 0,
@@ -205,6 +230,15 @@ func parseFlags(args []string, w io.Writer) (config, error) {
 	}
 	if cfg.stage == "" {
 		return cfg, fmt.Errorf("missing required --stage")
+	}
+	switch cfg.forge {
+	case forgeGitHub:
+	case forgeGitLab:
+		if cfg.gitlabBaseURL == "" {
+			return cfg, fmt.Errorf("--forge=gitlab requires --gitlab-base-url (no gitlab.com default)")
+		}
+	default:
+		return cfg, fmt.Errorf("invalid --forge %q: must be %q or %q", cfg.forge, forgeGitHub, forgeGitLab)
 	}
 	return cfg, nil
 }

@@ -21,7 +21,8 @@
 //   - Explicitly denied, never present: FISHHAWK_API_TOKEN (the acceptance
 //     agent gets NO MCP/Fishhawk token — its verdict ships via the
 //     signature-authed evidence upload), FISHHAWK_GITHUB_TOKEN /
-//     GITHUB_TOKEN / GH_TOKEN (repo write), and anything deploy-shaped.
+//     FISHHAWK_GITLAB_TOKEN / GITHUB_TOKEN / GH_TOKEN (repo write), and
+//     anything deploy-shaped.
 //   - HTTP_PROXY / HTTPS_PROXY / ALL_PROXY (upper and lower case) are set
 //     to the egress proxy and NO_PROXY is cleared, so every cooperating
 //     HTTP client in the invocation routes through the ADR-050 proxy.
@@ -72,6 +73,7 @@ var modelKeys = map[string]struct{}{
 var deny = map[string]struct{}{
 	"FISHHAWK_API_TOKEN":    {},
 	"FISHHAWK_GITHUB_TOKEN": {},
+	"FISHHAWK_GITLAB_TOKEN": {},
 	"GITHUB_TOKEN":          {},
 	"GH_TOKEN":              {},
 }
