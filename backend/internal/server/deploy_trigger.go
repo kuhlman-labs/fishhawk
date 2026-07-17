@@ -330,17 +330,17 @@ func (s *Server) failDeployTrigger(ctx context.Context, stage *run.Stage, reason
 	return failed, nil
 }
 
-// parseRepoRef splits "owner/name" into a githubclient.RepoRef. Local to the
+// parseRepoRef splits "owner/name" into a forge.RepoRef. Local to the
 // server package (orchestrator.parseRepo is unexported); a shared helper is a
 // v0.x cleanup.
-func parseRepoRef(s string) (githubclient.RepoRef, error) {
+func parseRepoRef(s string) (forge.RepoRef, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] == '/' {
 			if i == 0 || i == len(s)-1 {
-				return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+				return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 			}
-			return githubclient.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
+			return forge.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
 		}
 	}
-	return githubclient.RepoRef{}, fmt.Errorf("malformed repo %q", s)
+	return forge.RepoRef{}, fmt.Errorf("malformed repo %q", s)
 }

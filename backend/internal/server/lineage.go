@@ -13,7 +13,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -168,7 +167,7 @@ func (s *Server) verifyBranchLineage(ctx context.Context, runID uuid.UUID,
 // current head; the merge-resolution caller seeds with "" so the live
 // branch tip is not auto-whitelisted into the set it is checked against.
 func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Run,
-	scope forge.CredentialScope, repo githubclient.RepoRef, compareHead, ledgerSeedSHA string,
+	scope forge.CredentialScope, repo forge.RepoRef, compareHead, ledgerSeedSHA string,
 	prNumber int) (offendingSHA string, checked bool) {
 	// Resolve the compare anchor defensively (ADR-035 binding condition):
 	// the run's real PR base ref, never a hardcoded branch name and never
@@ -238,7 +237,7 @@ func (s *Server) detectForeignCommitOnBranch(ctx context.Context, runRow *run.Ru
 // run-authored HEAD — so an uncertain classification can never drive a
 // force-update. The handler maps ok=false to reset_not_determinable.
 func (s *Server) resolveLastRunAuthoredHead(ctx context.Context, runRow *run.Run,
-	scope forge.CredentialScope, repo githubclient.RepoRef, headSHA string, prNumber int) (lastAuthoredSHA, offendingSHA string, isOnTop, ok bool) {
+	scope forge.CredentialScope, repo forge.RepoRef, headSHA string, prNumber int) (lastAuthoredSHA, offendingSHA string, isOnTop, ok bool) {
 	baseRef := s.resolveLineageBaseRef(ctx, runRow, scope, repo, prNumber)
 	if baseRef == "" {
 		return "", "", false, false
@@ -434,7 +433,7 @@ func (s *Server) foreignCommitAlreadyRecorded(ctx context.Context, runID uuid.UU
 // otherwise the number is parsed from the run's tracked
 // pull_request_url.
 func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
-	scope forge.CredentialScope, repo githubclient.RepoRef, prNumber int) string {
+	scope forge.CredentialScope, repo forge.RepoRef, prNumber int) string {
 	if prNumber <= 0 {
 		prNumber = parsePRNumberFromURL(runRow.PullRequestURL)
 	}

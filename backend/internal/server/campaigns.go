@@ -14,7 +14,6 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
-	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -373,11 +372,11 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// the real GitHub provider needs it to query the epic's children.
 	var scope forge.CredentialScope
 	if s.cfg.GitHub != nil {
-		id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), githubclient.RepoRef{Owner: owner, Name: name})
+		id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), forge.RepoRef{Owner: owner, Name: name})
 		switch {
 		case err == nil:
 			scope = forge.FromGitHubInstallationID(id)
-		case errors.Is(err, githubclient.ErrNotInstalled):
+		case errors.Is(err, forge.ErrNotInstalled):
 			s.writeError(w, r, http.StatusUnprocessableEntity, "repo_not_installed",
 				"GitHub App is not installed on the target repository",
 				map[string]any{"repo": req.Repo})
@@ -1385,7 +1384,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		}
 		// Resolve the installation lazily on the first candidate, then reuse it.
 		if !instResolved {
-			id, err := s.cfg.GitHub.GetRepoInstallation(ctx, githubclient.RepoRef{Owner: owner, Name: name})
+			id, err := s.cfg.GitHub.GetRepoInstallation(ctx, forge.RepoRef{Owner: owner, Name: name})
 			if err != nil {
 				s.cfg.Logger.Warn("reconcile-on-read: resolve installation failed; run-less settle pass skipped",
 					"campaign_id", c.ID.String(), "repo", c.Repo, "error", err.Error())
@@ -1394,7 +1393,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			scope = forge.FromGitHubInstallationID(id)
 			instResolved = true
 		}
-		issue, err := s.cfg.GitHub.GetIssue(ctx, scope, githubclient.RepoRef{Owner: owner, Name: name}, number)
+		issue, err := s.cfg.GitHub.GetIssue(ctx, scope, forge.RepoRef{Owner: owner, Name: name}, number)
 		if err != nil {
 			s.cfg.Logger.Warn("reconcile-on-read: get issue failed; item left unsettled",
 				"campaign_id", c.ID.String(), "item_id", it.ID.String(), "issue_ref", it.IssueRef, "error", err.Error())
