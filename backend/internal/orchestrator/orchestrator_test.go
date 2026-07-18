@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"reflect"
 	"sort"
 	"strconv"
@@ -19,9 +21,11 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
@@ -3971,5 +3975,111 @@ func TestAdvance_ImplementStage_NoAcceptanceEmit(t *testing.T) {
 		if p.Category == "acceptance_dispatched" {
 			t.Errorf("implement dispatch wrongly emitted acceptance_dispatched: %s", p.Payload)
 		}
+	}
+}
+
+// --- gitlab_ci dispatch seam (E45.8 / #1861) ------------------------------
+
+// pipelineCaptureDoer records the POST /pipeline request the real gitlab forge
+// emits so the ref-seam test can assert the exact ref that threaded through.
+type pipelineCaptureDoer struct {
+	method string
+	path   string
+	body   map[string]any
+}
+
+func (d *pipelineCaptureDoer) Do(req *http.Request) (*http.Response, error) {
+	d.method = req.Method
+	d.path = req.URL.Path
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		_ = json.Unmarshal(b, &d.body)
+	}
+	return &http.Response{
+		StatusCode: http.StatusCreated,
+		Body:       io.NopCloser(strings.NewReader(`{"id":1,"status":"created"}`)),
+		Header:     make(http.Header),
+	}, nil
+}
+
+// TestTriggerParams_RefSeam_ThroughToCreatePipeline is the binding ref-seam E2E
+// (approval condition 1): it drives a DERIVED run-branch ref through the REAL
+// path — orchestrator.triggerParams resolves the ref, the GitLabCI backend
+// consumes it, the real *gitlab.Forge.TriggerPipeline issues the POST, and the
+// observed CreatePipeline request body carries that EXACT ref — for both a
+// top-level run (fishhawk/run-<short>) and a decomposed child (its
+// fishhawk/run-<short>/slice-<n> branch).
+//
+// GitLab credential-scope threading onto the run row is deferred to enablement
+// (#2043), so the test substitutes a gitlab-shaped scope after triggerParams;
+// the REF (the seam the dispatch design turns on) is what flows unmodified from
+// the run-branch derivation all the way to the wire.
+func TestTriggerParams_RefSeam_ThroughToCreatePipeline(t *testing.T) {
+	o := &Orchestrator{}
+	next := &run.Stage{ID: uuid.New(), ExecutorRef: "claude-code"}
+
+	parent := uuid.New()
+	sliceIdx := 2
+	topLevel := &run.Run{ID: uuid.New(), Repo: "x/y", WorkflowID: "feature_change"}
+	child := &run.Run{
+		ID: uuid.New(), Repo: "x/y", WorkflowID: "feature_change",
+		DecomposedFrom: &parent, SliceIndex: &sliceIdx,
+	}
+
+	cases := []struct {
+		name    string
+		run     *run.Run
+		wantRef string
+	}{
+		{"top-level run", topLevel, runBranchPrefix(topLevel.ID)},
+		{"decomposed child", child, sliceBranch(parent, sliceIdx)},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := o.triggerParams(c.run, next)
+			if p.Ref != c.wantRef {
+				t.Fatalf("triggerParams Ref = %q, want %q", p.Ref, c.wantRef)
+			}
+			if !strings.HasPrefix(p.Ref, "fishhawk/run-") {
+				t.Errorf("ref %q must be a fishhawk run branch", p.Ref)
+			}
+			// gitlab scope threading deferred to #2043; the ref is the seam here.
+			p.Scope = forge.FromRef("gitlab:77")
+
+			doer := &pipelineCaptureDoer{}
+			glForge := forgegitlab.New("https://gitlab.example",
+				forgegitlab.NewStaticCredentialProvider("glpat-test"),
+				forgegitlab.WithHTTPClient(doer))
+			backend := &runnerbackend.GitLabCI{Trigger: glForge}
+
+			if err := backend.TriggerStage(context.Background(), p); err != nil {
+				t.Fatalf("TriggerStage: %v", err)
+			}
+			if doer.method != http.MethodPost || doer.path != "/api/v4/projects/77/pipeline" {
+				t.Fatalf("request = %s %s, want POST /api/v4/projects/77/pipeline", doer.method, doer.path)
+			}
+			if doer.body["ref"] != c.wantRef {
+				t.Errorf("observed CreatePipeline ref = %v, want %q", doer.body["ref"], c.wantRef)
+			}
+		})
+	}
+}
+
+// TestBackends_ResolvesGitLabCIRun asserts the orchestrator's default Registry
+// routes a resolved runner_kind=gitlab_ci run to the GitLabCI backend (Kind()
+// == "gitlab_ci"), not the github_actions fire-through, while a resolved
+// github_actions run still resolves to the github_actions backend.
+func TestBackends_ResolvesGitLabCIRun(t *testing.T) {
+	o := &Orchestrator{Runs: newStubRuns()}
+
+	glRun := &run.Run{ID: uuid.New(), RunnerKind: run.RunnerKindGitLabCI, RunnerKindResolved: true}
+	if got := o.backends().Resolve(context.Background(), glRun); got.Kind() != run.RunnerKindGitLabCI {
+		t.Errorf("resolved gitlab_ci run backend = %q, want gitlab_ci", got.Kind())
+	}
+
+	ghRun := &run.Run{ID: uuid.New(), RunnerKind: run.RunnerKindGitHubActions, RunnerKindResolved: true}
+	if got := o.backends().Resolve(context.Background(), ghRun); got.Kind() != run.RunnerKindGitHubActions {
+		t.Errorf("resolved github_actions run backend = %q, want github_actions", got.Kind())
 	}
 }

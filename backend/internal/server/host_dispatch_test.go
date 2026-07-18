@@ -290,14 +290,14 @@ func TestHostDispatch_LockedNonLocalRun_Conflict(t *testing.T) {
 	}
 }
 
-// Unknown-kind posture (E45.7): a run LOCKED to a runner_kind fishhawkd does not
-// recognize (a future gitlab_ci before its backend registers) is STILL refused
-// 409 — this endpoint rejects any resolved kind that is not known-and-
-// host-dispatched, the opposite posture from the MCP guardHostDispatch (which
-// allows unknown locked kinds). KindHostDispatched reports (false, known=false)
-// for such a kind, so the `!known || !hostDispatched` guard fires. Pins that a
-// future registry addition cannot silently flip this site to admit it.
-func TestHostDispatch_LockedUnknownKind_Conflict(t *testing.T) {
+// Non-host kind (E45.8 / #1861): a run LOCKED to gitlab_ci — now a KNOWN
+// non-host-dispatched kind (KindHostDispatched reports (false, known=true)) — is
+// STILL refused 409. This endpoint rejects any resolved kind that is not
+// known-AND-host-dispatched, so both the former unknown gitlab_ci and the now-
+// known non-host gitlab_ci resolve to the same `!known || !hostDispatched` block
+// (fishhawkd fires gitlab_ci's pipeline, never a LOCAL host spawn). Pins that the
+// classification flip did not change this site's 409 posture.
+func TestHostDispatch_LockedGitLabCI_Conflict(t *testing.T) {
 	s, rr, runID, stageID := hostDispatchServer(t, run.StageStateAwaitingHostDispatch)
 	locked, _ := rr.GetRun(context.Background(), runID)
 	locked.RunnerKind = "gitlab_ci"

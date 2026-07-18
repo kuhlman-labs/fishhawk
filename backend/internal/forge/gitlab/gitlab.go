@@ -539,6 +539,27 @@ func checkState(status forge.CheckRunStatus, conclusion forge.CheckRunConclusion
 	}
 }
 
+// --- pipelines ----------------------------------------------------------
+
+// TriggerPipeline creates a GitLab CI/CD pipeline on ref, carrying vars as
+// CI/CD variables. It is the thin wrapper the runnerbackend.GitLabCI dispatch
+// backend (#1861) resolves through forge.Get("gitlab"): f.resolve parses the
+// project id back out of the "gitlab:<id>" scope and authenticates, then
+// gitlabclient.CreatePipeline issues the POST. This method is NOT part of the
+// forge.Forge interface — it is a gitlab-specific extension the narrow
+// runnerbackend.PipelineTrigger interface is satisfied by. It is dispatch-only:
+// it never publishes a commit status (that stays auditcheckpublisher's job).
+func (f *Forge) TriggerPipeline(ctx context.Context, scope forge.CredentialScope, ref string, vars []gitlabclient.PipelineVariable) error {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return err
+	}
+	if _, err := c.CreatePipeline(ctx, pid, gitlabclient.CreatePipelineParams{Ref: ref, Variables: vars}); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
 // --- protection ---------------------------------------------------------
 
 // GetBranchProtection reads a branch's classic protection. GitLab protection

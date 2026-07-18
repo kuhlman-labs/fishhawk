@@ -46,16 +46,17 @@ func (r *runResolver) guardHostDispatch(ctx context.Context, runUUID uuid.UUID) 
 	if !got.RunnerKindResolved {
 		return nil, nil
 	}
-	// (3) Locked to a KNOWN, non-host-dispatched kind (github_actions): a host
-	// dispatch (always local) conflicts. This site blocks ONLY a known
-	// non-host-dispatched kind — an unknown non-actions locked kind keeps
-	// ALLOWING (the opposite unknown-kind posture from the host-dispatch
-	// endpoint), which the KindHostDispatched (hostDispatched, known) two-value
-	// shape keeps explicit.
+	// (3) Locked to a KNOWN, non-host-dispatched kind (github_actions, gitlab_ci):
+	// a host dispatch (always local) conflicts. This site blocks ONLY a known
+	// non-host-dispatched kind — an unknown locked kind keeps ALLOWING (the
+	// opposite unknown-kind posture from the host-dispatch endpoint), which the
+	// KindHostDispatched (hostDispatched, known) two-value shape keeps explicit.
+	// The error names the locked kind so it stays accurate as new non-host kinds
+	// (gitlab_ci, #1861) join the known set.
 	if hostDispatched, known := runnerbackend.KindHostDispatched(got.RunnerKind); known && !hostDispatched {
 		return nil, fmt.Errorf(
-			"run %s is locked to runner_kind=github_actions, but fishhawk_dispatch_stage / fishhawk_run_stage spawn a LOCAL runner — dispatching here would conflict with the run's resolved execution channel. To run this stage on GitHub Actions, dispatch it through the Actions workflow channel; to drive it locally, start a NEW run with runner_kind=local",
-			runUUID)
+			"run %s is locked to runner_kind=%s, but fishhawk_dispatch_stage / fishhawk_run_stage spawn a LOCAL runner — dispatching here would conflict with the run's resolved execution channel. To run this stage on its own CI channel, dispatch it there; to drive it locally, start a NEW run with runner_kind=local",
+			runUUID, got.RunnerKind)
 	}
 	// Locked to local (or any unknown non-actions kind): allow — the host
 	// dispatch matches the run's resolved local channel.
