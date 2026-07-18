@@ -89,14 +89,9 @@ var sanctioned = map[string]string{
 	"backend/cmd/fishhawk-mcp/client.go":    "onboarding payload mirror of the GitHub installations API",
 	"cli/cmd/fishhawk/doctor_onboarding.go": "onboarding payload mirror of the GitHub installations API",
 
-	// DEFERRED, NOT SANCTIONED-FOREVER (#1861). runnerbackend.TriggerParams
-	// .InstallationID is the one known remaining cross-forge int64 seam.
-	// Migrating it here was adjudicated as deferred at the #2013 plan gate:
-	// the gitlab_ci backend is the field's second consumer and is what
-	// gives it its correct forge-neutral shape, so #1861 owns the flip
-	// rather than this pass guessing it. Delete this entry when #1861
-	// lands — the gate then holds the field to a scope.
-	"backend/internal/runnerbackend/runnerbackend.go": "TriggerParams.InstallationID — deferred to #1861 (gitlab_ci backend shapes the flip)",
+	// (The #1861 runnerbackend.TriggerParams.InstallationID entry was removed
+	// once E45.8 flipped that field to a forge.CredentialScope — it was the last
+	// known cross-forge int64 seam. The gate now holds it to a scope.)
 }
 
 // isInstallationIDName reports whether an identifier IS the installation

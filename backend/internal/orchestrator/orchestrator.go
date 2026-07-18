@@ -2596,6 +2596,14 @@ func (o *Orchestrator) backends() *runnerbackend.Resolver {
 			Logger:              o.Logger,
 		},
 		run.RunnerKindLocal: &runnerbackend.Local{Logger: o.Logger},
+		// gitlab_ci (#1861): DORMANT — no gitlab_ci run is created until go-live
+		// enablement (#2043), so this backend fires only under test. Its pipeline
+		// trigger resolves through forge.Get("gitlab") (nil-safe when GitLab is
+		// unconfigured), so no authenticated GitLab client is wired here.
+		run.RunnerKindGitLabCI: &runnerbackend.GitLabCI{
+			Trigger: runnerbackend.GitLabPipelineTrigger(),
+			Logger:  o.Logger,
+		},
 	}
 	return &runnerbackend.Resolver{
 		Runs:     o.Runs,
@@ -2606,8 +2614,12 @@ func (o *Orchestrator) backends() *runnerbackend.Resolver {
 
 // triggerParams maps a run + its next stage onto the forge-neutral
 // runnerbackend.TriggerParams the resolved backend fires. It carries the same
-// values fireDispatch built its DispatchInputs from (nil InstallationID -> 0,
-// matching fireDispatch's skip-when-unwired guard).
+// values fireDispatch built its DispatchInputs from: Scope is the zero
+// (unwired) scope when InstallationID is nil, matching fireDispatch's
+// skip-when-unwired guard (Scope.IsZero() is the direct analogue of the
+// pre-flip InstallationID == 0 sentinel, #2013). Ref is the run's ADR-035
+// sole-writer branch (runBranchRef) — the branch the gitlab_ci backend creates
+// its pipeline against; the github_actions backend ignores it.
 func (*Orchestrator) triggerParams(r *run.Run, next *run.Stage) runnerbackend.TriggerParams {
 	p := runnerbackend.TriggerParams{
 		RunID:            r.ID,
@@ -2615,13 +2627,26 @@ func (*Orchestrator) triggerParams(r *run.Run, next *run.Stage) runnerbackend.Tr
 		WorkflowID:       r.WorkflowID,
 		StageExecutorRef: next.ExecutorRef,
 		Repo:             r.Repo,
+		Ref:              runBranchRef(r),
 		DecomposedFrom:   r.DecomposedFrom,
 		SliceIndex:       r.SliceIndex,
 	}
 	if r.InstallationID != nil {
-		p.InstallationID = *r.InstallationID
+		p.Scope = forge.FromGitHubInstallationID(*r.InstallationID)
 	}
 	return p
+}
+
+// runBranchRef derives the ADR-035 sole-writer branch a run's stages execute on
+// — the ref a pipeline/dispatch trigger targets. A decomposed child executes on
+// its per-slice branch fishhawk/run-<shortParent>/slice-<n> (sliceBranch); every
+// other run executes on its own fishhawk/run-<short> namespace (runBranchPrefix).
+// It is the single derivation the gitlab_ci backend's p.Ref flows from.
+func runBranchRef(r *run.Run) string {
+	if r.DecomposedFrom != nil && r.SliceIndex != nil {
+		return sliceBranch(*r.DecomposedFrom, *r.SliceIndex)
+	}
+	return runBranchPrefix(r.ID)
 }
 
 // dispatchStage transitions the next stage to dispatched and (for

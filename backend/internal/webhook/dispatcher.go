@@ -1885,7 +1885,7 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 			WorkflowID:       parent.WorkflowID,
 			StageExecutorRef: firstStage.ExecutorRef,
 			Repo:             ev.Repo,
-			InstallationID:   installationID,
+			Scope:            forge.FromGitHubInstallationID(installationID),
 			// Retry children carry no DecomposedFrom (ParentRunID threads the
 			// retry chain), so no parent_run_id input is added.
 		})
@@ -2216,6 +2216,15 @@ func (d *Dispatcher) backends() runnerbackend.Registry {
 			Logger:              d.Logger,
 		},
 		run.RunnerKindLocal: &runnerbackend.Local{Logger: d.Logger},
+		// gitlab_ci (#1861): DORMANT — registered so the seam is complete, but no
+		// gitlab_ci run is created until enablement (#2043). The CI-retry path only
+		// dispatches through the github_actions backend; this entry keeps the
+		// dispatcher's Registry consistent with the orchestrator's. Nil-safe when
+		// GitLab is unconfigured (forge.Get("gitlab") returns no PipelineTrigger).
+		run.RunnerKindGitLabCI: &runnerbackend.GitLabCI{
+			Trigger: runnerbackend.GitLabPipelineTrigger(),
+			Logger:  d.Logger,
+		},
 	}
 }
 

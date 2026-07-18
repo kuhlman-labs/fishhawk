@@ -38,10 +38,12 @@ func (*GitHubActions) Kind() string { return "github_actions" }
 func (*GitHubActions) HostDispatched() bool { return false }
 
 // TriggerStage fires the workflow_dispatch. It reproduces fireDispatch
-// byte-for-byte: warn+nil skip when the client is unwired or InstallationID is
-// 0, malformed-repo error, ref/actions-file defaults, the decomposed-child
-// slice provenance log, and the run_id/stage_id/workflow_id/stage inputs plus
-// parent_run_id iff the run is a decomposed child (#1227).
+// byte-for-byte: warn+nil skip when the client is unwired or the credential
+// scope is the zero (unwired) scope, malformed-repo error, ref/actions-file
+// defaults, the decomposed-child slice provenance log, and the
+// run_id/stage_id/workflow_id/stage inputs plus parent_run_id iff the run is a
+// decomposed child (#1227). p.Ref is ignored: the workflow file lives on the
+// default branch, so github_actions always dispatches on DefaultRef ("main").
 func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error {
 	if g.Client == nil {
 		g.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping workflow_dispatch",
@@ -49,7 +51,7 @@ func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error
 		)
 		return nil
 	}
-	if p.InstallationID == 0 {
+	if p.Scope.IsZero() {
 		g.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: run has no installation_id; skipping workflow_dispatch",
 			slog.String("run_id", p.RunID.String()),
 		)
@@ -95,7 +97,7 @@ func (g *GitHubActions) TriggerStage(ctx context.Context, p TriggerParams) error
 	if p.DecomposedFrom != nil {
 		inputs["parent_run_id"] = p.DecomposedFrom.String()
 	}
-	return g.Client.DispatchWorkflow(ctx, forge.FromGitHubInstallationID(p.InstallationID), repo, actionsFile, ref, inputs)
+	return g.Client.DispatchWorkflow(ctx, p.Scope, repo, actionsFile, ref, inputs)
 }
 
 func (g *GitHubActions) logger() *slog.Logger {
