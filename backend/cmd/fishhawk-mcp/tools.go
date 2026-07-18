@@ -410,6 +410,53 @@ type GetPlanOutput struct {
 	// (the shape that wedged #1551's first attempt), plus the sub-plan
 	// runtime-sum and expensive-gate-vs-budget advisories.
 	PlanWarnings []string `json:"plan_warnings,omitempty" jsonschema:"plan-gate soft advisories (#1684): notably flags a multi-slice decomposition where every sub_plan omits depends_on — if any slice forms a producer->consumer chain, all slices run in parallel in wave 0 and the consumer can fail typecheck against the not-yet-integrated symbol (the shape that wedged #1551's first attempt). Also flags a sub-plan predicted_runtime_minutes sum less than the parent's (possible scope compression) and an expensive test_strategy gate paired with an under-budgeted predicted_runtime_minutes. Advisory, never blocks approval. Absent when no advisory fired or on older runs predating this pass"`
+	// Reachability surfaces the runner-side symbol-reachability sweep (#2056):
+	// the plan's split_proposal phase partition validated against the compiler's
+	// view of the working tree, with per-phase declared-vs-derived file counts
+	// and cross-boundary compile-breaking violations.
+	Reachability *PlanReachability `json:"reachability,omitempty" jsonschema:"plan-gate symbol-reachability sweep (#2056): validates a split_proposal's phase partition against the compiler's view of the working tree (go/packages+go/types, runner-side — only the runner holds the checkout). Per phase it reports declared_count (files the phase declares) vs derived_count (declared plus any sibling-phase file that references a symbol this phase defines through a construction site, interface implementer, or test-fake field reader); a phase whose counts disagree carries mismatch=true and sets the top-level discrepancy flag — that phase's symbols leak across the partition boundary, so shipping the phase alone would produce a non-compiling intermediate. violations names each offending symbol + def/use file + phase. Advisory + fail-open: absent when the plan carries no split_proposal, the sweep skipped (available=false with skip_reason), or on older runs predating the pass. Never blocks approval"`
+}
+
+// PlanReachabilityPhase is one split-proposal phase's declared-vs-derived file
+// counts decoded from a plan_reachability_sweep audit entry (#2056). Mismatch
+// is the distinct indicator get_plan computes when DeclaredCount != DerivedCount
+// — the phase's symbols leak into a sibling phase, so the partition would ship a
+// non-compiling intermediate. Mirrors the runner reachability.PhaseResult wire
+// shape (the mismatch field is computed here, not carried on the wire).
+type PlanReachabilityPhase struct {
+	Index         int    `json:"index" jsonschema:"0-based phase index in split_proposal order"`
+	Title         string `json:"title" jsonschema:"the phase title"`
+	DeclaredCount int    `json:"declared_count" jsonschema:"number of files the phase declares"`
+	DerivedCount  int    `json:"derived_count" jsonschema:"declared files plus any sibling-phase file referencing a symbol this phase defines through a cross-boundary compile-breaking use site"`
+	Mismatch      bool   `json:"mismatch,omitempty" jsonschema:"true when declared_count != derived_count — the distinct indicator that this phase's symbols leak across the partition boundary; a clean partition leaves it false/absent"`
+}
+
+// PlanReachabilityViolation is one cross-boundary compile-breaking use site
+// decoded from a plan_reachability_sweep audit entry (#2056): Symbol defined in
+// DefFile (phase DefPhase) referenced from UseFile (the different phase
+// UsePhase), classified by Kind (construction_site | interface_implementer |
+// test_fake_field_reader). Mirrors the runner reachability.Violation wire shape.
+type PlanReachabilityViolation struct {
+	Kind     string `json:"kind" jsonschema:"the cross-boundary use-site kind: construction_site, interface_implementer, or test_fake_field_reader"`
+	Symbol   string `json:"symbol" jsonschema:"the offending symbol name"`
+	DefFile  string `json:"def_file" jsonschema:"repo-relative file that defines the symbol"`
+	DefPhase int    `json:"def_phase" jsonschema:"0-based phase index the defining file belongs to"`
+	UseFile  string `json:"use_file" jsonschema:"repo-relative file that references the symbol from a different phase"`
+	UsePhase int    `json:"use_phase" jsonschema:"0-based phase index the use site belongs to"`
+}
+
+// PlanReachability is the plan-gate reachability sweep result decoded from the
+// newest plan_reachability_sweep audit entry (#2056). Available=false marks a
+// fail-open skip (SkipReason explains why; Phases/Violations empty).
+// Discrepancy is get_plan's computed top-level flag: true when any phase's
+// declared and derived counts disagree, so the operator can branch on the
+// disagreement without scanning every phase.
+type PlanReachability struct {
+	Available   bool                        `json:"available" jsonschema:"true when the sweep ran to completion; false when it fail-open skipped (see skip_reason)"`
+	SkipReason  string                      `json:"skip_reason,omitempty" jsonschema:"why the sweep was skipped when available=false — a load failure, a package that failed to type-check, or an absent/degenerate split_proposal"`
+	Discrepancy bool                        `json:"discrepancy,omitempty" jsonschema:"the distinct indicator: true when any phase's declared_count != derived_count, i.e. the split_proposal partition would produce a non-compiling intermediate. False/absent for a clean partition"`
+	Phases      []PlanReachabilityPhase     `json:"phases,omitempty" jsonschema:"per-phase declared-vs-derived file counts"`
+	Violations  []PlanReachabilityViolation `json:"violations,omitempty" jsonschema:"cross-boundary compile-breaking use sites; empty for a clean partition"`
 }
 
 // TestSweepFinding is one test-sweep result decoded from a plan_test_sweep
@@ -586,6 +633,10 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("load plan warnings: %w", err)
 			}
+			reach, err := r.loadReachability(ctx, current)
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("load reachability: %w", err)
+			}
 			return nil, GetPlanOutput{
 				Status:           "available",
 				Plan:             p,
@@ -596,6 +647,7 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 				SurfaceSweep:     surfaceSweep,
 				TestSweep:        testSweep,
 				PlanWarnings:     planWarnings,
+				Reachability:     reach,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -914,6 +966,58 @@ func (r *runResolver) loadPlanWarnings(ctx context.Context, runID uuid.UUID) ([]
 		return nil, nil
 	}
 	return payload.Warnings, nil
+}
+
+// loadReachability fetches the NEWEST plan_reachability_sweep audit entry
+// (#2056) for the run and decodes its payload into a PlanReachability. As with
+// the sibling sweep loaders the backend's per-run audit endpoint returns entries
+// sequence-ascending, so the authoritative entry is the last one — a schema-retry
+// or revise re-uploads the plan and writes a second sweep, and the latest
+// reflects the plan the human actually approves. Returns nil when no entry exists
+// (a plan with no split_proposal, an older run predating the pass, or a fail-open
+// no-op) so the field is omitted. A corrupt payload is treated as "not checked"
+// rather than failing the whole plan fetch, mirroring the sibling loaders.
+//
+// The per-phase Mismatch flag and the top-level Discrepancy flag are COMPUTED
+// here from the declared-vs-derived counts, not trusted from the wire, so the
+// distinct disagreement indicator is authoritative regardless of the runner's
+// payload shape.
+func (r *runResolver) loadReachability(ctx context.Context, runID uuid.UUID) (*PlanReachability, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "plan_reachability_sweep",
+		Limit:    reviewAuditQueryLimit,
+		// plan_reachability_sweep is not yet in audit.KnownCategories (its
+		// registration is a follow-up outside this slice's scope), so the
+		// registry-validating GET /audit endpoint would 400 on the bare
+		// category filter. allow_unknown bypasses that check so the advisory
+		// read path stays functional until the category is registered.
+		AllowUnknown: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil, nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil, nil
+	}
+	var pr PlanReachability
+	if uerr := json.Unmarshal(raw, &pr); uerr != nil {
+		return nil, nil
+	}
+	for i := range pr.Phases {
+		if pr.Phases[i].DeclaredCount != pr.Phases[i].DerivedCount {
+			pr.Phases[i].Mismatch = true
+			pr.Discrepancy = true
+		}
+	}
+	return &pr, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status

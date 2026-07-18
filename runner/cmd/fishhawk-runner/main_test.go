@@ -15916,3 +15916,141 @@ func TestMintImplementToken_GitLab_MissingTokenActionable(t *testing.T) {
 		t.Errorf("err = %v, want it to name the required `api` scope", err)
 	}
 }
+
+// --- Plan-reachability sweep wiring (#2056, E50.4) ---
+
+// splitProposalPlanJSON is a minimal standard_v1-shaped plan carrying a
+// two-phase split_proposal, used by the reachability-sweep wiring tests. Only
+// the fields splitProposalPhases reads need be present.
+func splitProposalPlanJSON() string {
+	return `{
+		"plan_version": "standard_v1",
+		"split_proposal": {
+			"rationale": "over cap by count",
+			"phases": [
+				{"title": "expand", "scope": {"files": [
+					{"path": "pkg/a/widget.go", "operation": "modify"},
+					{"path": "pkg/a/widget_new.go", "operation": "create"}
+				]}},
+				{"title": "migrate", "scope": {"files": [
+					{"path": "pkg/b/use.go", "operation": "modify"}
+				]}}
+			]
+		}
+	}`
+}
+
+func TestSplitProposalPhases_ParsesPhasesAndFiles(t *testing.T) {
+	phases := splitProposalPhases([]byte(splitProposalPlanJSON()))
+	if len(phases) != 2 {
+		t.Fatalf("phases = %d, want 2", len(phases))
+	}
+	if phases[0].Title != "expand" || phases[1].Title != "migrate" {
+		t.Errorf("titles = %q, %q", phases[0].Title, phases[1].Title)
+	}
+	if len(phases[0].Files) != 2 {
+		t.Fatalf("phase 0 files = %d, want 2", len(phases[0].Files))
+	}
+	if phases[0].Files[0].Path != "pkg/a/widget.go" || phases[0].Files[0].Operation != "modify" {
+		t.Errorf("phase 0 file 0 = %+v", phases[0].Files[0])
+	}
+	if phases[0].Files[1].Operation != "create" {
+		t.Errorf("phase 0 file 1 operation = %q, want create", phases[0].Files[1].Operation)
+	}
+	if len(phases[1].Files) != 1 || phases[1].Files[0].Path != "pkg/b/use.go" {
+		t.Errorf("phase 1 files = %+v", phases[1].Files)
+	}
+}
+
+func TestSplitProposalPhases_NilWhenNoSplitProposal(t *testing.T) {
+	if got := splitProposalPhases([]byte(`{"plan_version":"standard_v1"}`)); got != nil {
+		t.Errorf("expected nil for a plan with no split_proposal, got %+v", got)
+	}
+}
+
+func TestSplitProposalPhases_NilOnMalformed(t *testing.T) {
+	if got := splitProposalPhases([]byte(`not json`)); got != nil {
+		t.Errorf("expected nil on malformed plan bytes, got %+v", got)
+	}
+}
+
+func TestAnalyzePlanReachability_NilWhenNoSplitProposal(t *testing.T) {
+	cfg := config{runID: "r", workingDir: t.TempDir()}
+	if got := analyzePlanReachability(cfg, []byte(`{"plan_version":"standard_v1"}`), io.Discard); got != nil {
+		t.Errorf("expected nil (no sweep) for a plan without split_proposal, got %+v", got)
+	}
+}
+
+func TestAnalyzePlanReachability_FailOpenSkipOnUnbuildableTree(t *testing.T) {
+	// An empty temp dir has no loadable Go packages, so Analyze fail-open skips.
+	cfg := config{runID: "r", workingDir: t.TempDir()}
+	got := analyzePlanReachability(cfg, []byte(splitProposalPlanJSON()), io.Discard)
+	if got == nil {
+		t.Fatal("expected a non-nil result for a split_proposal plan")
+	}
+	if got.Available {
+		t.Errorf("expected fail-open skip (Available=false) on an unbuildable tree, got %+v", got)
+	}
+}
+
+// TestUploadPlan_ShipsReachability_FailOpenDoesNotFailStage is the main-wiring
+// fail-open test the plan requires: a split_proposal plan whose reachability
+// sweep skips (Available=false, an unbuildable tree) is still shipped, and
+// uploadPlan returns no error — the advisory never fails the plan stage.
+func TestUploadPlan_ShipsReachability_FailOpenDoesNotFailStage(t *testing.T) {
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(planPath, []byte(splitProposalPlanJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fu := newFakeUploader(t)
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		planOut:    planPath,
+		backendURL: "https://api.fishhawk.test",
+		workingDir: dir, // no Go source → Analyze fail-open skip
+	}
+	var stderr strings.Builder
+	if err := uploadPlan(context.Background(), cfg, &stderr, fu, nil); err != nil {
+		t.Fatalf("uploadPlan must not fail on a reachability skip: %v", err)
+	}
+	if fu.gotPlanArgs == nil {
+		t.Fatal("ShipPlan not called")
+	}
+	if fu.gotPlanArgs.Reachability == nil {
+		t.Fatal("reachability payload not attached for a split_proposal plan")
+	}
+	if fu.gotPlanArgs.Reachability.Available {
+		t.Errorf("expected fail-open skip (Available=false), got %+v", fu.gotPlanArgs.Reachability)
+	}
+}
+
+// TestUploadPlan_NoReachabilityWhenNoSplitProposal asserts a plan without a
+// split_proposal attaches no reachability payload — byte-identical to a
+// pre-#2056 runner.
+func TestUploadPlan_NoReachabilityWhenNoSplitProposal(t *testing.T) {
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(planPath, []byte(validPlanJSON()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fu := newFakeUploader(t)
+	cfg := config{
+		runID:      "11111111-2222-3333-4444-555555555555",
+		stageID:    "22222222-3333-4444-5555-666666666666",
+		planOut:    planPath,
+		backendURL: "https://api.fishhawk.test",
+		workingDir: dir,
+	}
+	var stderr strings.Builder
+	if err := uploadPlan(context.Background(), cfg, &stderr, fu, nil); err != nil {
+		t.Fatalf("uploadPlan: %v", err)
+	}
+	if fu.gotPlanArgs == nil {
+		t.Fatal("ShipPlan not called")
+	}
+	if fu.gotPlanArgs.Reachability != nil {
+		t.Errorf("expected no reachability payload for a non-split plan, got %+v", fu.gotPlanArgs.Reachability)
+	}
+}

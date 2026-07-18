@@ -1219,6 +1219,93 @@ func shipPlanRequest(t *testing.T, s *Server, runID, stageID uuid.UUID, priv ed2
 	return w
 }
 
+// shipPlanRequestWithReach is shipPlanRequest with the advisory
+// X-Fishhawk-Plan-Reachability header attached (#2056). The header rides
+// alongside the signed body (it is not covered by the signature).
+func shipPlanRequestWithReach(t *testing.T, s *Server, runID, stageID uuid.UUID, priv ed25519.PrivateKey, body []byte, reachHeader string) *httptest.ResponseRecorder {
+	t.Helper()
+	url := fmt.Sprintf("/v0/runs/%s/plan?stage_id=%s", runID, stageID)
+	req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	sig := ed25519.Sign(priv, signing.ComputeMessage(body))
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(sig))
+	if reachHeader != "" {
+		req.Header.Set(reachabilityHeader, reachHeader)
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+// countPlanAudit counts appended audit entries of the given category.
+func countPlanAudit(appended []audit.ChainAppendParams, category string) int {
+	n := 0
+	for _, e := range appended {
+		if e.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// TestShipPlan_Reachability_HeaderRecorded is the handleShipPlan decode-path
+// test: a valid plan carrying the reachability header records a
+// plan_reachability_sweep advisory entry alongside plan_generated, and the
+// upload succeeds (201).
+func TestShipPlan_Reachability_HeaderRecorded(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	body := validPlanBytes(t)
+	reach := `{"available":true,"phases":[{"index":0,"title":"expand","declared_count":2,"derived_count":3}],` +
+		`"violations":[{"kind":"construction_site","symbol":"Widget","def_file":"a.go","def_phase":0,"use_file":"b.go","use_phase":1}]}`
+
+	w := shipPlanRequestWithReach(t, s, runID, stageID, priv, body, reach)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := countPlanAudit(au.appended, reachabilitySweepAuditKind); got != 1 {
+		t.Errorf("plan_reachability_sweep entries = %d, want 1", got)
+	}
+	if got := countPlanAudit(au.appended, "plan_generated"); got != 1 {
+		t.Errorf("plan_generated entries = %d, want 1", got)
+	}
+}
+
+// TestShipPlan_Reachability_AbsentHeader_NoEntry asserts a plan upload with no
+// reachability header records no plan_reachability_sweep entry — the non-split
+// happy path is unaffected.
+func TestShipPlan_Reachability_AbsentHeader_NoEntry(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if got := countPlanAudit(au.appended, reachabilitySweepAuditKind); got != 0 {
+		t.Errorf("plan_reachability_sweep entries = %d, want 0", got)
+	}
+}
+
+// TestShipPlan_Reachability_MalformedHeader_Skipped asserts a malformed
+// reachability header is logged and skipped — the plan upload still succeeds and
+// records no sweep entry (fail-open, never blocks the stage).
+func TestShipPlan_Reachability_MalformedHeader_Skipped(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newPlanServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	w := shipPlanRequestWithReach(t, s, runID, stageID, priv, validPlanBytes(t), "not json")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (malformed advisory must not fail the upload):\n%s", w.Code, w.Body.String())
+	}
+	if got := countPlanAudit(au.appended, reachabilitySweepAuditKind); got != 0 {
+		t.Errorf("plan_reachability_sweep entries = %d, want 0 on malformed header", got)
+	}
+}
+
 func TestShipPlan_HappyPath(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, ar, au, _ := newPlanServer(t, runID, stageID)
