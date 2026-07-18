@@ -139,6 +139,20 @@ func TestKnownCategoriesRegistersIssueNamedCategories(t *testing.T) {
 	}
 }
 
+// TestKnownCategoriesRegistersSplitChildrenFiled pins, independent of the AST
+// sweep, that the split_children_filed completion marker (#2057, E50.5) is
+// registered. The server approval hook emits it via
+// audit.ChainAppendParams{Category: splitChildrenFiledCategory}; fishhawk_await_audit
+// and GET /audit reject an unregistered category, so an operator (or the sibling
+// fishhawk_get_plan loadSplitFiling read) awaiting/reading it would 400 without
+// this registration.
+func TestKnownCategoriesRegistersSplitChildrenFiled(t *testing.T) {
+	if !audit.IsKnownCategory("split_children_filed") {
+		t.Error("IsKnownCategory(\"split_children_filed\") = false; the E50.5 on-approval " +
+			"split-child filing completion marker must be registered so it is readable via GET /audit")
+	}
+}
+
 // collected is one audit-category string literal the sweep found, tagged with
 // the syntactic shape it was collected from (used by the fixture self-test to
 // prove every shape is exercised).

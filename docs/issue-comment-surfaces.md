@@ -16,6 +16,7 @@ it.
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
+| Split parent acceptance-carrier (#2057) | _(none at the comment; the sibling `split_children_filed` completion marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` (plan-gate approve of a `split_proposal`-bearing plan) | on completion of split-child filing (all N children durably filed) | No (one comment per completed split filing; the completion-marker dedup makes the whole hook idempotent, so a re-approval never re-posts) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 
 Notes:
@@ -514,6 +515,25 @@ Notes:
   Read back by the MCP surface (`fishhawk_get_plan` `plan_warnings`, newest
   entry wins). Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The on-approval split-child-filing completion audit kind —
+  `split_children_filed` (#2057, E50.5), written by the approval hook
+  (`server/split_filing.go::fileSplitProposalChildren` via
+  `finishApprovalAdvance`) — is an **internal, system-actor audit kind, not an
+  issue-comment surface** (the parent acceptance-carrier COMMENT it posts IS a
+  surface — the table row above — but this audit entry is a read/dedup record).
+  Nothing in `issuecomment` posts it. It is emitted ONCE per run, only when EVERY
+  phased child of an approved `split_proposal` is durably filed (a partial run
+  leaves per-phase `work_item_filed` resume markers and NO completion marker, so
+  a re-approval resumes at the first un-filed ordinal), with a `system` actor and
+  payload `{contract_classification (delete-only|governed-exception), children:
+  [{phase_index, title, number, url, is_contract}], contract_child_number,
+  deferral_issue (#2062), cap_exception?: {spec_diff, pr_body}}`. The
+  `cap_exception` draft (present only for a governed-exception contract phase) is
+  operator-authored + admin-merged and rides this payload ONLY — it is never
+  written to `.fishhawk/**` (agent-forbidden). Read back by the MCP surface
+  (`fishhawk_get_plan` `split_filing`, newest entry wins) and the completion
+  marker doubles as the hook's idempotency dedup. Listed here so a future reader
+  grepping the audit categories doesn't mistake it for a comment surface.
 - The operator-scope-undelivered audit kind — `operator_scope_path_undelivered`
   (#1407), written by the implement-review assembly path
   (`trace.go::runImplementReviews`) before any reviewer verdict — is an
