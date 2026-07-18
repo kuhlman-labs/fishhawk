@@ -74,6 +74,28 @@ Review the files, adjust the autonomy tier if needed, and merge to finish onboar
 //go:embed templates/fishhawk.yml
 var workflowTemplate []byte
 
+// gitlabCITemplate is the customer-side GitLab CI/CD pipeline — the
+// .gitlab-ci.yml analog of templates/fishhawk.yml — the backend triggers via
+// the GitLab pipelines API to run a stage on the GitLab forge. It is embedded
+// additively and deliberately NOT part of ScaffoldFiles: the App-PR scaffold
+// seeds a GitHub repository, so adding a .gitlab-ci.yml there would be dead
+// config. GitLab onboarding (ADR-058 / #1861) surfaces it through
+// GitLabCITemplate() instead. Run creation on the gitlab_ci runner stays
+// parked; enablement is #2043.
+//
+//go:embed templates/.gitlab-ci.yml
+var gitlabCITemplate []byte
+
+// GitLabCITemplate returns the customer-side .gitlab-ci.yml pipeline (a copy,
+// so callers cannot mutate the embedded bytes). It invokes the published,
+// backend-agnostic runner against the GitLab forge; see the file header for
+// the CI/CD variables the backend supplies and the operator configures.
+func GitLabCITemplate() []byte {
+	out := make([]byte, len(gitlabCITemplate))
+	copy(out, gitlabCITemplate)
+	return out
+}
+
 // ScaffoldFiles assembles the scaffold file set for a preset. It is pure —
 // no I/O — so it can be unit-tested for content correctness independently
 // of the GitHub write path. The returned map is keyed by repo-relative

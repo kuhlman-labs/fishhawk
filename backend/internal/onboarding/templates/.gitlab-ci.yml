@@ -1,0 +1,78 @@
+# Fishhawk self-execution pipeline (GitLab CI/CD).
+#
+# This is the customer-side .gitlab-ci.yml the Fishhawk backend triggers via
+# the GitLab pipelines API (POST /projects/:id/pipeline). When a
+# Fishhawk-labeled issue lands or a merge request drives a stage, the backend
+# creates a run + stages and triggers a pipeline on the run branch
+# (fishhawk/run-<short>, or fishhawk/run-<short>/slice-<n> for a decomposition
+# child), passing the run/stage identifiers as CI/CD variables:
+#
+#   - FISHHAWK_RUN_ID       — workflow run UUID (supplied by the dispatcher)
+#   - FISHHAWK_STAGE_ID     — stage UUID for this dispatch
+#   - FISHHAWK_WORKFLOW_ID  — workflow ID from .fishhawk/workflows.yaml
+#   - FISHHAWK_STAGE        — stage executor ref / agent provider
+#                             (claude-code|codex); defaults to claude-code
+#   - FISHHAWK_PARENT_RUN_ID — decomposition-parent run UUID, set ONLY for
+#                             fan-out children; keys the resource_group guard
+#
+# This is the GitLab analog of the App-onboarded GitHub Actions workflow
+# (.github/workflows/fishhawk.yml). Like that template, it invokes the
+# PUBLISHED, versioned runner image rather than a local checkout, so it works
+# in any project onboarded onto Fishhawk. Bump the pinned tag when you adopt a
+# newer runner release.
+#
+# Operator-configured CI/CD variables (Settings → CI/CD → Variables):
+#   - FISHHAWK_BACKEND_URL   — the Fishhawk backend base URL
+#   - FISHHAWK_GITLAB_TOKEN  — a project/group access token the runner pushes
+#                             the run branch + opens the merge request with
+#                             (masked; the --forge=gitlab push-path credential)
+#   - ANTHROPIC_API_KEY      — forwarded to Claude Code (agent=claude-code)
+#   - OPENAI_API_KEY         — forwarded to the Codex CLI (agent=codex)
+
+stages:
+  - fishhawk
+
+fishhawk:
+  stage: fishhawk
+  # PUBLISHED runner image — the GitLab analog of the GitHub composite action
+  # `kuhlman-labs/fishhawk/runner@runner/v1`. Never a local ./runner path.
+  image: ghcr.io/kuhlman-labs/fishhawk-runner:v1
+  # Run only when the backend triggered a pipeline with the Fishhawk stage
+  # inputs set. An ordinary branch/MR pipeline has no FISHHAWK_RUN_ID and is
+  # skipped, so this file never runs a stage on routine commits.
+  rules:
+    - if: '$FISHHAWK_RUN_ID && $FISHHAWK_STAGE_ID'
+      when: always
+    - when: never
+  variables:
+    # Default the parent-run key to the unique pipeline id so each top-level
+    # run gets its own resource_group. The backend OVERRIDES this (higher
+    # precedence than a .gitlab-ci.yml default) only for a decomposition
+    # child, so a fan-out's siblings share one key and serialize — the GitLab
+    # analog of the GitHub concurrency `parent_run_id || github.run_id`.
+    FISHHAWK_PARENT_RUN_ID: $CI_PIPELINE_ID
+    # The runner performs its own checkout + push against the run branch, so
+    # the job clone only needs the pipeline ref.
+    GIT_STRATEGY: fetch
+  # Serialize decomposition-fan-out siblings (they share FISHHAWK_PARENT_RUN_ID);
+  # a normal run falls back to the unique pipeline id above, so it never waits.
+  resource_group: fishhawk-run-$FISHHAWK_PARENT_RUN_ID
+  script:
+    # Invoke the backend-agnostic runner against the GitLab forge. --fetch-prompt
+    # resolves the real stage work from FISHHAWK_STAGE_ID, so run/stage identity
+    # is what is load-bearing; --forge=gitlab routes the push + open-MR path
+    # through FISHHAWK_GITLAB_TOKEN against this instance ($CI_SERVER_URL).
+    - >
+      fishhawk-runner
+      --forge gitlab
+      --gitlab-base-url "$CI_SERVER_URL"
+      --backend-url "$FISHHAWK_BACKEND_URL"
+      --run-id "$FISHHAWK_RUN_ID"
+      --stage-id "$FISHHAWK_STAGE_ID"
+      --workflow "$FISHHAWK_WORKFLOW_ID"
+      --stage "${FISHHAWK_STAGE:-claude-code}"
+      --agent "${FISHHAWK_STAGE:-claude-code}"
+      --fetch-prompt
+      --upload-trace
+      --plan-out /tmp/fishhawk-plan.json
+      --check-base-ref "origin/$CI_DEFAULT_BRANCH"
