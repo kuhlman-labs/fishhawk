@@ -1015,6 +1015,120 @@ func TestPostgres_RestartCampaignItem(t *testing.T) {
 	}
 }
 
+// TestPostgres_SettleCampaignItemOutOfBand pins the #2029 guard-bypassing
+// terminal→succeeded settle: a cancelled or failed item is settled succeeded
+// with its run link RETAINED (provenance to the dead run), while every other
+// from-state is rejected InvalidTransitionError and a missing item is
+// ErrNotFound. Modeled on TestPostgres_RestartCampaignItem's per-mode round
+// trip, differing in the target (succeeded, not pending) and the retained link.
+func TestPostgres_SettleCampaignItemOutOfBand(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	// mkLinkedItem creates an item linked to a fresh run and drives it to the
+	// requested state through the valid running-first path, returning the item
+	// and the run id it was linked to.
+	mkLinkedItem := func(t *testing.T, ref string, to campaign.ItemState) (*campaign.Item, uuid.UUID) {
+		t.Helper()
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+			Repo:          "kuhlman-labs/fishhawk",
+			WorkflowID:    "feature_change",
+			WorkflowSHA:   "deadbeef",
+			TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+			CampaignID: c.ID,
+			IssueRef:   ref,
+		})
+		if err != nil {
+			t.Fatalf("create item: %v", err)
+		}
+		if _, err := repo.SetCampaignItemRun(ctx, it.ID, &r.ID); err != nil {
+			t.Fatalf("link run: %v", err)
+		}
+		if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
+			t.Fatalf("→running: %v", err)
+		}
+		if to != campaign.ItemStateRunning {
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, to); err != nil {
+				t.Fatalf("→%s: %v", to, err)
+			}
+		}
+		return it, r.ID
+	}
+
+	// cancelled → succeeded, run link RETAINED (unlike restart, which clears it).
+	cancelled, cancelledRun := mkLinkedItem(t, "issue:cancelled", campaign.ItemStateCancelled)
+	settled, err := repo.SettleCampaignItemOutOfBand(ctx, cancelled.ID)
+	if err != nil {
+		t.Fatalf("settle(cancelled): %v", err)
+	}
+	if settled.State != campaign.ItemStateSucceeded {
+		t.Errorf("settle(cancelled) state = %q, want succeeded", settled.State)
+	}
+	if settled.RunID == nil || *settled.RunID != cancelledRun {
+		t.Errorf("settle(cancelled) run_id = %v, want %s retained", settled.RunID, cancelledRun)
+	}
+	// Persisted, not just returned — state succeeded AND run link intact.
+	if got, _ := repo.GetCampaignItem(ctx, cancelled.ID); got.State != campaign.ItemStateSucceeded ||
+		got.RunID == nil || *got.RunID != cancelledRun {
+		t.Errorf("persisted cancelled settle = state %q run_id %v, want succeeded/%s", got.State, got.RunID, cancelledRun)
+	}
+
+	// failed → succeeded, run link retained.
+	failed, failedRun := mkLinkedItem(t, "issue:failed", campaign.ItemStateFailed)
+	sf, err := repo.SettleCampaignItemOutOfBand(ctx, failed.ID)
+	if err != nil {
+		t.Fatalf("settle(failed): %v", err)
+	}
+	if sf.State != campaign.ItemStateSucceeded {
+		t.Errorf("settle(failed) state = %q, want succeeded", sf.State)
+	}
+	if sf.RunID == nil || *sf.RunID != failedRun {
+		t.Errorf("settle(failed) run_id = %v, want %s retained", sf.RunID, failedRun)
+	}
+
+	// succeeded → InvalidTransitionError (not a settleable terminal-non-succeeded
+	// state; also guards against a concurrent double-settle).
+	succeeded, _ := mkLinkedItem(t, "issue:succeeded", campaign.ItemStateSucceeded)
+	var ite campaign.InvalidTransitionError
+	if _, err := repo.SettleCampaignItemOutOfBand(ctx, succeeded.ID); !errors.As(err, &ite) {
+		t.Errorf("settle(succeeded) err = %v, want InvalidTransitionError", err)
+	} else if ite.Kind != "campaign_item" || ite.From != "succeeded" || ite.To != "succeeded" {
+		t.Errorf("settle(succeeded) err = %+v, want campaign_item succeeded→succeeded", ite)
+	}
+
+	// running → InvalidTransitionError (not a terminal state).
+	running, _ := mkLinkedItem(t, "issue:running", campaign.ItemStateRunning)
+	if _, err := repo.SettleCampaignItemOutOfBand(ctx, running.ID); !errors.As(err, &ite) {
+		t.Errorf("settle(running) err = %v, want InvalidTransitionError", err)
+	}
+
+	// pending → InvalidTransitionError (a run-less pending item is class A's
+	// guarded path, never this bypass).
+	pending, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID,
+		IssueRef:   "issue:pending",
+	})
+	if err != nil {
+		t.Fatalf("create pending item: %v", err)
+	}
+	if _, err := repo.SettleCampaignItemOutOfBand(ctx, pending.ID); !errors.As(err, &ite) {
+		t.Errorf("settle(pending) err = %v, want InvalidTransitionError", err)
+	}
+
+	// missing → ErrNotFound.
+	if _, err := repo.SettleCampaignItemOutOfBand(ctx, uuid.New()); !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("settle(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
 // TestPostgres_RunLinkage_EndToEnd spans domain → persistence → run linkage:
 // it inserts a REAL runs row (via the run repo, exercising the cross-package
 // boundary), attaches it to a campaign item, and asserts both forward

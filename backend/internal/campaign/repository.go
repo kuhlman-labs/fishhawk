@@ -150,6 +150,28 @@ type Repository interface {
 	// BEFORE item admission — so a failed item never reaches this reset through
 	// the verb today. The broader repo contract is intentional; the layering
 	// asymmetry is documented here at the definition site (operator arbitration,
-	// #1729).
+	// #1729). See also SettleCampaignItemOutOfBand — the sibling guard-bypassing
+	// terminal transition that settles (rather than restarts) a delivered item.
 	RestartCampaignItem(ctx context.Context, id uuid.UUID) (*Item, error)
+
+	// SettleCampaignItemOutOfBand settles a TERMINAL item (cancelled or failed)
+	// to succeeded WITHOUT clearing the run link, atomically under the same
+	// SELECT … FOR UPDATE lock as the other transitions — the out-of-band-delivery
+	// settle behind reconcile-on-read pass 2 (#2029). It is the counterpart to
+	// RestartCampaignItem: a re-shaped-then-delivered item whose linked run went
+	// terminal-non-succeeded (cancelled/failed) but whose GitHub issue is now
+	// closed-as-completed is settled succeeded so its rollup stops blocking
+	// dependents and next_actions stops advising a restart of the closed,
+	// delivered issue. Like RestartCampaignItem it lives OUTSIDE the
+	// campaignItemTransitions table (transition.go), which refuses every terminal
+	// `from` (ValidCampaignItemTransition returns false for any terminal state):
+	// this is an operator/out-of-band settle, not a lifecycle transition, so it
+	// enforces its OWN guard — `from` must be in {cancelled, failed} — and returns
+	// InvalidTransitionError for any other state (including running/succeeded/
+	// pending/blocked/paused) and ErrNotFound for a missing item. UNLIKE
+	// RestartCampaignItem it deliberately RETAINS the run link (the dead run is
+	// preserved as provenance to the run that was re-shaped and delivered
+	// out-of-band). A concurrent second call re-reads the now-succeeded row under
+	// the lock and is rejected.
+	SettleCampaignItemOutOfBand(ctx context.Context, id uuid.UUID) (*Item, error)
 }

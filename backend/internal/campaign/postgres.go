@@ -339,6 +339,51 @@ func (r *postgresRepo) RestartCampaignItem(ctx context.Context, id uuid.UUID) (*
 	return result, nil
 }
 
+// SettleCampaignItemOutOfBand settles a restartable-terminal item (cancelled or
+// failed) to succeeded WITHOUT clearing its run link, atomically under
+// SELECT … FOR UPDATE. It mirrors RestartCampaignItem's lock posture and its
+// own-guard bypass of the campaignItemTransitions terminal check (see the
+// Repository doc), but differs in two ways: the target is succeeded (not
+// pending) and the run link is RETAINED (no SetCampaignItemRun{nil}) so the dead
+// run stays as provenance for the out-of-band delivery. Any `from` other than
+// {cancelled, failed} — running/succeeded/pending/blocked/paused — is rejected
+// InvalidTransitionError; a missing item is ErrNotFound.
+func (r *postgresRepo) SettleCampaignItemOutOfBand(ctx context.Context, id uuid.UUID) (*Item, error) {
+	var result *Item
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+		current, err := q.LockCampaignItemForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign item: %w", err)
+		}
+		from := ItemState(current.State)
+		// Out-of-band settle is only defined from a restartable terminal state.
+		// This guard stands in for the transition table, which refuses every
+		// terminal from.
+		if from != ItemStateCancelled && from != ItemStateFailed {
+			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(ItemStateSucceeded)}
+		}
+		// Settle to succeeded, RETAINING the run link (unlike RestartCampaignItem,
+		// which clears it): the dead run is preserved as provenance.
+		updated, err := q.UpdateCampaignItemState(ctx, campaigndb.UpdateCampaignItemStateParams{
+			ID:    id,
+			State: string(ItemStateSucceeded),
+		})
+		if err != nil {
+			return fmt.Errorf("settle campaign item state: %w", err)
+		}
+		result = rowToCampaignItem(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // --- Conversions between DB and domain types ---
 
 // marshalDependsOn renders the depends_on edge slice as a JSONB array. A nil
