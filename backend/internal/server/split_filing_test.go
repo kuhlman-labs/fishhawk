@@ -560,6 +560,48 @@ func TestFileSplitProposalChildren_PartialFailureResumes(t *testing.T) {
 	}
 }
 
+// TestFileSplitProposalChildren_MarkerAppendFailure_AbortsNoCompletion is the
+// marker-append-failure interleaving operator binding condition 1 targets and
+// the implement review flagged as untested (the partial-failure test injects a
+// provider File error, not a marker append failure). The per-ordinal
+// work_item_filed resume marker is the hook's SOLE durable filing record, so if
+// its append fails the run must ABORT with no completion marker — never a false
+// completion on a durable state it can no longer resume — rather than filing the
+// remaining children on top of a lost record. This mirrors
+// refinement.ExecuteFiling's abort-on-record-failure discipline; the one child
+// that did File re-files once on a later re-approval is the documented
+// at-least-once residual, not a widening of the window.
+func TestFileSplitProposalChildren_MarkerAppendFailure_AbortsNoCompletion(t *testing.T) {
+	inst := int64(91)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+	})
+	// The per-ordinal resume-marker append is the failing operation.
+	h.au.appendErrCategory = categoryWorkItemFiled
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	// Exactly ONE child filed with the provider; the lost marker then aborted the
+	// loop before filing the rest.
+	if len(h.provider.reqs) != 1 {
+		t.Fatalf("filed %d children, want 1 (abort on the first lost marker)", len(h.provider.reqs))
+	}
+	// No durable marker persisted (the append itself failed).
+	if got := h.childMarkerCount(t); got != 0 {
+		t.Errorf("recorded %d resume markers, want 0 (the append failed)", got)
+	}
+	// The abort wrote NO completion marker: never a false completion.
+	if _, n := h.completionEntry(t); n != 0 {
+		t.Errorf("marker-append failure must write NO completion marker, wrote %d", n)
+	}
+	// And posted NO parent acceptance-carrier comment (that follows completion).
+	if len(rec.comments) != 0 {
+		t.Errorf("marker-append failure must post no parent comment, posted %d", len(rec.comments))
+	}
+}
+
 // TestFileSplitProposalChildren_ParentCommentFailure_BestEffort: a failing
 // parent comment does not block filing or the completion marker.
 func TestFileSplitProposalChildren_ParentCommentFailure_BestEffort(t *testing.T) {

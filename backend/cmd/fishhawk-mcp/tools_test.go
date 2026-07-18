@@ -8361,53 +8361,28 @@ func TestLoadSplitFiling_CorruptPayload_DecodesNil(t *testing.T) {
 	}
 }
 
-// splitFilingWireChild mirrors the server split_filing.go splitFilingChild wire
-// shape (its json tags), so the cross-layer test below builds the audit payload
-// in the exact serialized form the approval hook persists. Kept in lockstep with
-// backend/internal/server/split_filing.go: splitFilingChild.
-type splitFilingWireChild struct {
-	PhaseIndex int    `json:"phase_index"`
-	Title      string `json:"title"`
-	Number     int    `json:"number"`
-	URL        string `json:"url"`
-	IsContract bool   `json:"is_contract"`
-}
-
-// splitFilingWireCapException mirrors the server splitCapExceptionDraft wire shape.
-type splitFilingWireCapException struct {
-	SpecDiff string `json:"spec_diff"`
-	PRBody   string `json:"pr_body"`
-}
-
-// splitFilingWirePayload mirrors the server splitChildrenFiledPayload wire shape:
-// the exact bytes writeSplitChildrenFiledAudit marshals. Kept in lockstep with
-// backend/internal/server/split_filing.go: splitChildrenFiledPayload.
-type splitFilingWirePayload struct {
-	ContractClassification string                       `json:"contract_classification"`
-	Children               []splitFilingWireChild       `json:"children"`
-	ContractChildNumber    int                          `json:"contract_child_number"`
-	DeferralIssue          int                          `json:"deferral_issue"`
-	CapException           *splitFilingWireCapException `json:"cap_exception,omitempty"`
-}
-
 // TestGetPlan_SplitFiling_EndToEndRoundTrip is the CONDITION 2 cross-layer
 // assertion: it locks the approval-to-MCP-read contract by driving the REAL
 // shared split-classification logic the approval hook itself runs
 // (splitfiling.Classify + splitfiling.DraftCapException over a plan.SplitProposal
 // and reachability evidence) — NOT a hand-fabricated payload of magic strings —
-// then serializing the result in the server's exact wire shape
-// (splitFilingWirePayload mirrors split_filing.go's splitChildrenFiledPayload
-// tags) and reading it back through the ACTUAL getPlan/loadSplitFiling resolver.
-// So the classification string, the #2062 deferral constant, and the drafted
-// cap-exception that cross the audit boundary are the REAL values the hook emits,
-// and a divergence in the MCP selection/decode resolver fails HERE.
+// then serializing the result through the server's OWN payload type
+// (server.SplitChildrenFiledPayload, the exact struct writeSplitChildrenFiledAudit
+// marshals — no hand-copied wire mirror that can drift from its tags) and reading
+// it back through the ACTUAL getPlan/loadSplitFiling resolver. So the audit
+// payload that crosses the boundary is byte-for-byte what the hook persists, and
+// a divergence between the hook's write shape and the MCP read surface (a
+// renamed/dropped json tag on either side) now fails to compile or fails the
+// round-trip HERE — closing the integration-mismatch gap the two separate legs
+// left open.
 //
-// The remaining leg — the server hook PRODUCING this wire shape from those same
-// splitfiling outputs — is locked in the sibling
-// backend/internal/server/split_filing_test.go (the hook method + its unexported
-// payload struct are not importable from package main; exporting the payload type
-// for a single-process compile-locked test was requested via scope amendment,
-// which timed out — see the PR Notes and the filed follow-up).
+// The remaining leg — the server hook PRODUCING this payload from those same
+// splitfiling outputs at run time — is locked in the sibling
+// backend/internal/server/split_filing_test.go (its hook method + fakes are
+// unexported package-internal, so a single in-process test that both drives the
+// real hook AND calls this package-main resolver remains blocked by the
+// package-main import boundary; the payload-type export above pins the shared
+// wire contract these two legs meet on).
 func TestGetPlan_SplitFiling_EndToEndRoundTrip(t *testing.T) {
 	// The over-cap contract phase the hook classifies: a 3-phase rename whose
 	// terminal (contract) phase's reachability DerivedCount (9) exceeds the
@@ -8439,18 +8414,19 @@ func TestGetPlan_SplitFiling_EndToEndRoundTrip(t *testing.T) {
 		t.Fatal("precondition: DraftCapException returned nil for a governed-exception")
 	}
 
-	// Serialize in the server's exact wire shape — the bytes
-	// writeSplitChildrenFiledAudit persists.
-	wire := splitFilingWirePayload{
+	// Serialize through the server's OWN payload type — the exact struct (and json
+	// tags) writeSplitChildrenFiledAudit marshals, so a tag drift on either side
+	// of the audit boundary is caught here at compile/round-trip time.
+	wire := server.SplitChildrenFiledPayload{
 		ContractClassification: string(classification),
-		Children: []splitFilingWireChild{
+		Children: []server.SplitFilingChild{
 			{PhaseIndex: 0, Title: "expand: add NewFoo", Number: 3001, URL: "https://github.com/o/r/issues/3001"},
 			{PhaseIndex: 1, Title: "migrate consumers", Number: 3002, URL: "https://github.com/o/r/issues/3002"},
 			{PhaseIndex: 2, Title: "contract: delete Foo", Number: 3003, URL: "https://github.com/o/r/issues/3003", IsContract: true},
 		},
 		ContractChildNumber: 3003,
 		DeferralIssue:       splitfiling.DeferralIssue,
-		CapException:        &splitFilingWireCapException{SpecDiff: draft.SpecDiff, PRBody: draft.PRBody},
+		CapException:        &server.SplitCapExceptionDraft{SpecDiff: draft.SpecDiff, PRBody: draft.PRBody},
 	}
 	recorded, err := json.Marshal(wire)
 	if err != nil {

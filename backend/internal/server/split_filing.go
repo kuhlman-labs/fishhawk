@@ -58,6 +58,22 @@ type splitChildrenFiledPayload struct {
 	CapException           *splitCapExceptionDraft `json:"cap_exception,omitempty"`
 }
 
+// SplitChildrenFiledPayload is an exported alias of the completion-marker payload
+// type. It exists so the sibling fishhawk-mcp getPlan round-trip test decodes the
+// hook's ACTUAL payload type — compile-locking the approval-hook-write ↔ MCP-read
+// audit-boundary contract — instead of a hand-copied wire mirror that can
+// silently drift from these struct tags (#2057 fix-up, resolving the
+// E2E-verification concern).
+type SplitChildrenFiledPayload = splitChildrenFiledPayload
+
+// SplitFilingChild is an exported alias of the per-child completion-marker entry
+// type (see [SplitChildrenFiledPayload]).
+type SplitFilingChild = splitFilingChild
+
+// SplitCapExceptionDraft is an exported alias of the cap-exception draft carried
+// on the completion marker (see [SplitChildrenFiledPayload]).
+type SplitCapExceptionDraft = splitCapExceptionDraft
+
 // splitChildFiledMarker is the per-phase durable resume marker
 // fileSplitProposalChildren records — via the existing work_item_filed category
 // so it needs no new registry entry — immediately after each child is filed. On
@@ -92,9 +108,16 @@ type filedChild struct {
 // Idempotency (operator binding condition 1): a prior split_children_filed
 // completion marker means every child is already filed → no-op. A partial run
 // (some children filed, then an error) writes NO completion marker, so a
-// re-approval re-enters here, reads the per-phase work_item_filed markers, skips
-// the already-filed ordinals, and fills only the un-filed ones — no duplicates,
-// resumable to full completion.
+// re-approval re-enters here, reads the per-phase work_item_filed resume markers
+// — the durable per-ordinal filing record — skips the already-recorded ordinals,
+// and fills only the un-recorded ones. The per-ordinal marker append is a HARD
+// prerequisite, not a best-effort side effect: if it fails the run aborts (no
+// completion marker, no parent comment) rather than proceeding on a durable
+// state it can no longer resume from — mirroring refinement.ExecuteFiling's
+// abort-on-record-failure discipline. The one irreducible residual — a child
+// whose provider File succeeded but whose marker never persisted re-files once
+// on a re-approval — is the same at-least-once seam ExecuteFiling documents
+// (GitHub's issue-create API offers no idempotency key to close it).
 func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage) {
 	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil {
 		return
@@ -231,7 +254,17 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 			break // no completion marker; run stays resumable
 		}
 		filed[idx] = filedChild{number: created.Number, url: created.URL}
-		s.writeSplitChildFiledMarker(ctx, runRow, spec, created)
+		if err := s.writeSplitChildFiledMarker(ctx, runRow, spec, created); err != nil {
+			// The durable per-ordinal record is a HARD prerequisite: a lost
+			// marker aborts the run with NO completion marker (and no parent
+			// comment) rather than filing more children on top of a durable
+			// state we can no longer resume from — the same abort-on-record-
+			// failure discipline refinement.ExecuteFiling uses. The just-filed
+			// ordinal re-files once on a re-approval (its record never
+			// persisted): the documented at-least-once residual, not a widening
+			// of it.
+			break
+		}
 	}
 
 	// Completion only when EVERY phase is durably filed (operator binding
@@ -257,9 +290,14 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 		}
 	}
 
-	// Best-effort parent acceptance-carrier comment, then the completion marker.
-	s.postSplitParentComment(ctx, runRow, owner, name, parentIssue, contractChildNumber)
+	// Persist the completion marker (the durable dedup record) BEFORE posting the
+	// best-effort parent comment: once the marker is durable a re-approval no-ops
+	// at the priorCompletion gate above and never re-enters, so the acceptance-
+	// carrier comment is posted at most once for a completed filing. (If the
+	// completion append itself fails, a re-approval re-enters and may re-post — a
+	// narrow best-effort residual on that one interleaving, not a guarantee.)
 	s.writeSplitChildrenFiledAudit(ctx, runRow, classification, children, contractChildNumber, capDraft)
+	s.postSplitParentComment(ctx, runRow, owner, name, parentIssue, contractChildNumber)
 }
 
 // splitPhaseOrder returns the split proposal's phase indices in a
@@ -356,9 +394,16 @@ func (s *Server) loadReachabilityEvidence(ctx context.Context, runID uuid.UUID) 
 
 // loadFiledSplitChildren reads the per-phase work_item_filed resume markers for
 // the run (those carrying a split_phase_index) into a map keyed by phase index.
-// Fail-open to an empty map (a read error resumes as if nothing filed — the
-// per-ordinal completion check plus applyAndFileWorkItem's own durable
-// idempotency still bound duplicates in the worst case).
+// These markers ARE the durable per-ordinal filing record the hook consults on
+// resume — appended immediately after each child files and treated as a hard
+// prerequisite (writeSplitChildFiledMarker's failure aborts filing), so a
+// re-approval skips every durably-recorded ordinal and re-files none of them.
+// applyAndFileWorkItem itself provides NO durable idempotency (it calls
+// provider.File unconditionally), so the marker is the sole resume record: a
+// read error here fails open to an empty map and a resume then re-files (the
+// same at-least-once residual refinement.ExecuteFiling documents), and the
+// completion-marker dedup at the top of the hook prevents re-entry once the full
+// set is recorded.
 func (s *Server) loadFiledSplitChildren(ctx context.Context, runID uuid.UUID) map[int]filedChild {
 	filed := map[int]filedChild{}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryWorkItemFiled)
@@ -377,8 +422,12 @@ func (s *Server) loadFiledSplitChildren(ctx context.Context, runID uuid.UUID) ma
 
 // writeSplitChildFiledMarker records the durable per-phase resume marker
 // immediately after a child is filed, so a partial-failure re-approval skips it.
-// Best-effort: a marker append failure logs but never unwinds the filing.
-func (s *Server) writeSplitChildFiledMarker(ctx context.Context, runRow *run.Run, spec splitfiling.ChildSpec, created *workmgmt.CreatedItem) {
+// It returns the append error (also WARN-logged): because this marker is the
+// hook's sole durable per-ordinal record, its append is a HARD prerequisite —
+// the caller aborts the run (no completion marker) on failure rather than filing
+// further children on a durable state it can no longer resume, mirroring
+// refinement.ExecuteFiling's abort-on-RecordFiledItem-failure discipline.
+func (s *Server) writeSplitChildFiledMarker(ctx context.Context, runRow *run.Run, spec splitfiling.ChildSpec, created *workmgmt.CreatedItem) error {
 	idx := spec.PhaseIndex
 	payload, _ := json.Marshal(map[string]any{
 		"type":              "feature",
@@ -397,8 +446,10 @@ func (s *Server) writeSplitChildFiledMarker(ctx context.Context, runRow *run.Run
 		ActorKind: &systemKind,
 		Payload:   payload,
 	}); err != nil {
-		s.logSplitFilingWarn(ctx, runRow.ID, "append split-child work_item_filed marker failed", err.Error())
+		s.logSplitFilingWarn(ctx, runRow.ID, "append split-child resume marker failed; aborting split filing for resume", err.Error())
+		return err
 	}
+	return nil
 }
 
 // writeSplitChildrenFiledAudit emits the ONE completion marker after every child
