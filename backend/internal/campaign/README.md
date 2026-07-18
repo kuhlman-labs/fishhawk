@@ -30,6 +30,13 @@ No driving yet in the E25.2 keystone (that lands E25.3+): the keystone delivers 
 - Reuses `plan.Waves` for the topological sort, and maps the `[][]int` waves back to `[][]string` `issue:N` refs — REUSING the wave engine rather than reimplementing Kahn.
 - **Fails closed**: any `DroppedEdges` (a mis-targeted/dangling dependency the provider surfaced) yields `ErrDanglingDependency` (the body-authoritative "a missing dependency fails assembly closed" choice, reconciling the E25.1 forward-note); a cycle/out-of-range edge from `plan.Waves` yields `ErrCycle`.
 
+**Subset filter** (`subset.go::FilterToSubset(*workmgmt.EpicChildrenResult, items)`, #2003): an OPTIONAL pre-assembly narrowing that lets an operator scope a campaign to a named subset of an epic's children in one `POST /v0/campaigns` call, instead of filing a shadow epic and re-parenting issues. Pure and fail-closed:
+
+- `items` are issue refs (bare number or `issue:N`); every ref MUST resolve to a child in the result. The FIRST ref that is not a child (or is unparseable) yields `ErrItemNotChild`, which the handler maps to `422 campaign_item_not_child`.
+- Children are narrowed to the requested set, preserving ascending order.
+- Edges are re-partitioned against the included set: both-endpoints-included edges are kept; an included item whose `depends_on` targets an EXCLUDED item is appended to `DroppedEdges` (a dangling dependency — `Assemble` then fails it closed as `ErrDanglingDependency` → `422 campaign_dangling_dependency`, the same guarantee a cross-epic edge gives); an edge whose depending item (`From`) is excluded is dropped silently (that item is not in the campaign). Pre-existing `DroppedEdges` carry through unchanged.
+- Empty/nil `items` returns the result unchanged — the backward-compatible no-op that sweeps every child.
+
 `Persist(ctx, Repository, repo, *Assembly)` is a thin sequencing helper (CreateCampaign then CreateCampaignItem per item) so Track C / E25.4 can assemble-and-store.
 
 **Engine** (`engine.go`):

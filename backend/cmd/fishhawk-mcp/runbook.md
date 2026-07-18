@@ -265,8 +265,14 @@ campaign against that epic.
 required; optional `pause_policy` of `pause_campaign` (default) / `pause_item`,
 fixed at create time). It resolves the epic's children + their `depends_on`
 edges, wave-orders the DAG, and persists the campaign — the batch counterpart to
-`fishhawk_start_run`. A dependency targeting a non-child fails
-`campaign_dangling_dependency`; an un-installed repo fails `repo_not_installed`.
+`fishhawk_start_run`. Pass optional `items` (issue refs — bare number or
+`issue:N`) to scope the campaign to a subset of the epic's children instead of
+all of them (#2003): `epic_ref` stays required and every item must be a child of
+it, the DAG is built over just those items, and an included item whose
+`depends_on` points at an EXCLUDED item fails `campaign_dangling_dependency`
+(omit `items` to sweep every child). A dependency targeting a non-child fails
+`campaign_dangling_dependency`; an `items` ref that is not a child of the epic
+fails `campaign_item_not_child`; an un-installed repo fails `repo_not_installed`.
 
 **2. The drive-tick loop — `fishhawk_get_campaign_status` is the single status
 surface.** It is reconcile-on-read: each poll settles every terminal item run and

@@ -29,6 +29,9 @@ type StartCampaignInput struct {
 	// wholesale override with no delegated knobs — page on every action. Omit
 	// (nil map) to leave every issue-run on its workflow default.
 	OperatorAgent map[string]any `json:"operator_agent,omitempty" jsonschema:"OPTIONAL campaign-level operator_agent delegation override. A JSON object with the operator_agent knobs (may_approve, may_route_fixup, may_waive, may_retry, may_merge, must_page_human, model_policy). When set it REPLACES (wins wholesale over) every issue-run's per-workflow operator_agent contract for the whole campaign — it is never merged. An explicit empty {} is a valid wholesale override with no delegated knobs (page on every action). Omit to leave each issue-run on its workflow default"`
+	// Items is the OPTIONAL subset filter (#2003): scope the campaign to a named
+	// subset of the epic's children instead of all of them.
+	Items []string `json:"items,omitempty" jsonschema:"OPTIONAL subset of the epic's child issues to scope the campaign to, as issue refs (a bare number like '101' or 'issue:101'). epic_ref is still required — every item must be a child of it. The campaign DAG is built over just these items; an included item whose depends_on points at an EXCLUDED item fails campaign_dangling_dependency (that dependency must run within the batch). A ref that is not a child of the epic fails campaign_item_not_child. Omit to sweep every child (the default)"`
 }
 
 // StartCampaignOutput carries the created campaign row.
@@ -82,7 +85,12 @@ fishhawk_resume_campaign.
 
 repo (owner/name) and epic_ref are required. pause_policy is optional —
 pause_campaign (the default, block the whole campaign at a gate hand-off) or
-pause_item (continue the other items). operator_agent is optional — a
+pause_item (continue the other items). items is optional — a subset of the
+epic's child issue refs (bare number or issue:N) to scope the campaign to
+instead of all children; epic_ref stays required and every item must be a child
+of it, the DAG is built over just those items, and an included item whose
+depends_on points at an excluded item fails campaign_dangling_dependency (omit
+items to sweep every child). operator_agent is optional — a
 campaign-level operator_agent delegation block that REPLACES (wins wholesale
 over) every issue-run's per-workflow operator_agent contract for the whole
 campaign; an explicit empty {} is a valid wholesale override with no delegated
@@ -90,7 +98,8 @@ knobs (page on every action); omit to leave each issue-run on its workflow
 default. A write tool:
 needs an operator token with write:campaigns scope (a runner-bound token is
 rejected 403). An epic whose dependency edges point outside its own children
-fails campaign_dangling_dependency; a repo without the GitHub App installed
+fails campaign_dangling_dependency; a requested item that is not a child of the
+epic fails campaign_item_not_child; a repo without the GitHub App installed
 fails repo_not_installed; a malformed or unknown-field operator_agent fails
 validation_failed.
 `),
@@ -128,7 +137,7 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 		operatorAgent = b
 	}
 
-	created, err := r.api.CreateCampaign(ctx, repo, in.EpicRef, in.PausePolicy, operatorAgent)
+	created, err := r.api.CreateCampaign(ctx, repo, in.EpicRef, in.PausePolicy, operatorAgent, in.Items)
 	if err != nil {
 		// Map the backend's gate codes onto operator-actionable tool errors.
 		var ae *apiError
@@ -137,6 +146,9 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 			case "repo_not_installed":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"repo_not_installed: %s — install the Fishhawk GitHub App on %s before starting a campaign", ae.Message, repo)
+			case "campaign_item_not_child":
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"campaign_item_not_child: %s — an items ref is not a child of epic %s; pass only issue refs that are children of the epic, or omit items to sweep every child", ae.Message, in.EpicRef)
 			case "campaign_dangling_dependency":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_dangling_dependency: %s — an epic child declares a depends_on that is not a fellow child of %s; fix the epic's dependency edges and retry", ae.Message, in.EpicRef)

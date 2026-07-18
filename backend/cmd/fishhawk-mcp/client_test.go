@@ -65,7 +65,7 @@ func TestCreateCampaign_OperatorAgentBytes_OmittedWhenNil(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
-	_, err := r.api.CreateCampaign(context.Background(), "x/y", "#1", "", nil)
+	_, err := r.api.CreateCampaign(context.Background(), "x/y", "#1", "", nil, nil)
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestCreateCampaign_OperatorAgentBytes_CarriedVerbatim(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "",
-		json.RawMessage(`{"may_waive":"solo_low"}`))
+		json.RawMessage(`{"may_waive":"solo_low"}`), nil)
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
