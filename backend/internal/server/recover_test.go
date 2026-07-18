@@ -704,19 +704,64 @@ func TestRecoverRun_PlanStagelessIneligibleSurfacesPlanResolved(t *testing.T) {
 		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
 	}
 	assertErrorCode(t, w, "recovery_not_eligible")
+	// Decode plan_resolved as a *bool, not a bool: unmarshaling an ABSENT JSON
+	// field into a plain bool yields false, so a plain-bool assertion would pass
+	// even if the handler omitted plan_resolved from the error details entirely —
+	// leaving the case-2 error-detail behavior unpinned. A *bool distinguishes
+	// "field absent" (nil) from "surfaced as false", so this test now establishes
+	// that plan_resolved IS surfaced AND is false.
 	var body struct {
 		Error struct {
 			Details struct {
-				PlanResolved bool `json:"plan_resolved"`
+				PlanResolved *bool `json:"plan_resolved"`
 			} `json:"details"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode error body: %v", err)
 	}
-	if body.Error.Details.PlanResolved {
+	if body.Error.Details.PlanResolved == nil {
+		t.Fatalf("plan_resolved absent from error details; want it surfaced as false:\n%s", w.Body.String())
+	}
+	if *body.Error.Details.PlanResolved {
 		t.Errorf("plan_resolved = true, want false for an unresolvable plan")
 	}
+}
+
+// TestRecoverRun_NewChildPlanResolveError covers the new-child mint branch's
+// loadApprovedPlanForRun IO-error leg (recover.go's 500 "resolve approved plan
+// failed"): when the parent-walk plan resolve fails with a repo error, the
+// handler fails loud with 500 internal_error and mints no run rather than
+// silently refusing recovery. A recoverable non-decomposition parent (its own
+// plan stage succeeded) reaches the resolve, and an ArtifactRepo whose
+// ListForStage errors drives the failure. The decomposition-child branch's
+// analogous leg is pinned by TestRecoverRun_DecompositionChildErrorMappings'
+// "plan resolve error" case; this pins the new-child branch's own leg.
+func TestRecoverRun_NewChildPlanResolveError(t *testing.T) {
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	art := newFakeArtifactRepo()
+	// ArtifactRepo present (so loadApprovedPlanForRun does not short-circuit to
+	// nil,nil) but ListForStage errors → tryLoadPlanForRun → loadApprovedPlanForRun
+	// returns an error on the parent's own plan stage.
+	art.listErr = errors.New("artifact list boom")
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          &recoverAuditRepo{},
+		ArtifactRepo:       art,
+	})
+
+	parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "internal_error")
+	// The resolve fails before CreateRun, so no half-formed child was minted.
+	assertNoRunMinted(t, rr)
 }
 
 // seedRecoverableDecompositionChild seeds a parent run carrying an
