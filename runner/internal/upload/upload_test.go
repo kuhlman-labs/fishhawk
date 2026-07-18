@@ -2019,19 +2019,28 @@ func TestShipPlan_ReachabilityHeader_AbsentWhenNil(t *testing.T) {
 	}
 }
 
-// TestShipPlan_ReachabilityHeader_DroppedWhenOversized asserts the
-// maxReachabilityHeaderBytes guard: a pathologically large payload is dropped
-// (no header) so the ADVISORY never breaks the plan upload — the plan still
-// ships successfully.
-func TestShipPlan_ReachabilityHeader_DroppedWhenOversized(t *testing.T) {
+// TestShipPlan_ReachabilityHeader_ReducedWhenOversized asserts the
+// maxReachabilityHeaderBytes handling (#2056 fixup): a VALID sweep whose
+// violation list overflows the header budget is NOT discarded wholesale.
+// Instead a REDUCED payload ships — the full per-phase counts plus the largest
+// violation prefix that fits — so the operator still gets the per-phase counts
+// and named cross-boundary violations for exactly the leaky partitions the
+// advisory exists to flag. The plan upload still succeeds regardless.
+func TestShipPlan_ReachabilityHeader_ReducedWhenOversized(t *testing.T) {
 	var got string
 	srv := reachCaptureServer(t, &got)
 	c := quickPlanClient(srv)
 	priv, _ := makePlanKey(t)
 
 	// Build a result whose JSON exceeds maxReachabilityHeaderBytes via many
-	// violations.
-	big := &reachability.Result{Available: true}
+	// violations, but with real per-phase counts that MUST survive the trim.
+	big := &reachability.Result{
+		Available: true,
+		Phases: []reachability.PhaseResult{
+			{Index: 0, Title: "slice 1", DeclaredCount: 3, DerivedCount: 5},
+			{Index: 1, Title: "slice 2", DeclaredCount: 4, DerivedCount: 4},
+		},
+	}
 	for i := 0; i < 2000; i++ {
 		big.Violations = append(big.Violations, reachability.Violation{
 			Kind:    reachability.KindConstructionSite,
@@ -2040,8 +2049,34 @@ func TestShipPlan_ReachabilityHeader_DroppedWhenOversized(t *testing.T) {
 			UseFile: "another/long/path/to/a/use/site/file.go",
 		})
 	}
-	if reachabilityHeaderValue(big) != "" {
-		t.Fatalf("test setup: payload not large enough to exceed cap")
+
+	wire := reachabilityHeaderValue(big)
+	if wire == "" {
+		t.Fatal("oversized result must ship a reduced header, not be discarded")
+	}
+	if len(wire) > maxReachabilityHeaderBytes {
+		t.Fatalf("reduced header exceeds cap: %d > %d", len(wire), maxReachabilityHeaderBytes)
+	}
+	var decoded reachability.Result
+	if err := json.Unmarshal([]byte(wire), &decoded); err != nil {
+		t.Fatalf("reduced header is not valid JSON: %v", err)
+	}
+	if !decoded.Available {
+		t.Error("reduced header dropped Available")
+	}
+	if len(decoded.Phases) != len(big.Phases) {
+		t.Errorf("reduced header dropped per-phase counts: got %d phases, want %d",
+			len(decoded.Phases), len(big.Phases))
+	}
+	if got, want := decoded.Phases[0].DerivedCount, big.Phases[0].DerivedCount; got != want {
+		t.Errorf("reduced header altered a per-phase count: DerivedCount = %d, want %d", got, want)
+	}
+	if len(decoded.Violations) == 0 {
+		t.Error("reduced header must retain at least one named violation")
+	}
+	if len(decoded.Violations) >= len(big.Violations) {
+		t.Errorf("reduced header did not trim violations: got %d, want < %d",
+			len(decoded.Violations), len(big.Violations))
 	}
 
 	res, err := c.ShipPlan(context.Background(), ShipPlanArgs{
@@ -2057,7 +2092,7 @@ func TestShipPlan_ReachabilityHeader_DroppedWhenOversized(t *testing.T) {
 	if res == nil {
 		t.Fatal("expected a successful plan ship")
 	}
-	if got != "" {
-		t.Errorf("oversized reachability header must be dropped, got %d bytes", len(got))
+	if got != wire {
+		t.Errorf("shipped header = %q, want the reduced value %q", got, wire)
 	}
 }

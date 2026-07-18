@@ -825,19 +825,55 @@ type ShipPlanArgs struct {
 }
 
 // reachabilityHeaderValue serializes args.Reachability to the compact JSON the
-// ReachabilityHeader carries, or "" when there is nothing to send (nil result,
-// a marshal failure, or a payload exceeding maxReachabilityHeaderBytes). It is
-// FAIL-OPEN by construction: every non-happy branch returns "" so the plan
-// upload proceeds header-less rather than failing.
+// ReachabilityHeader carries, or "" when there is nothing to send (nil result
+// or a marshal failure). It is FAIL-OPEN by construction: it never lets the
+// advisory break the plan upload.
+//
+// When the full result exceeds maxReachabilityHeaderBytes it is NOT discarded
+// wholesale (#2056 fixup). Dropping a VALID sweep whose violation list is large
+// enough to overflow the header budget would deny the operator the per-phase
+// counts AND every named cross-boundary violation for exactly the leaky
+// partitions the advisory exists to surface. Instead a REDUCED payload ships:
+// the per-phase counts (bounded by phase count) plus the largest prefix of
+// violations that still fits under the cap. The per-phase DerivedCount already
+// reflects the FULL leak, so the counts stay accurate even when the
+// named-violation list is trimmed. Only a pathological payload that overflows
+// even with zero violations falls back to "" (header-less, upload proceeds).
 func reachabilityHeaderValue(res *reachability.Result) string {
 	if res == nil {
 		return ""
 	}
 	b, err := json.Marshal(res)
-	if err != nil || len(b) > maxReachabilityHeaderBytes {
+	if err != nil {
 		return ""
 	}
-	return string(b)
+	if len(b) <= maxReachabilityHeaderBytes {
+		return string(b)
+	}
+
+	// Oversized: keep the phases and binary-search the largest violation prefix
+	// that still fits. Re-slicing res.Violations never mutates the caller's
+	// slice contents, and `reduced` is a shallow struct copy so the search
+	// leaves the original Result untouched.
+	reduced := *res
+	lo, hi := 0, len(res.Violations)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		reduced.Violations = res.Violations[:mid]
+		rb, rerr := json.Marshal(&reduced)
+		if rerr == nil && len(rb) <= maxReachabilityHeaderBytes {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	reduced.Violations = res.Violations[:lo]
+	rb, rerr := json.Marshal(&reduced)
+	if rerr != nil || len(rb) > maxReachabilityHeaderBytes {
+		// Even the phases-only payload overflows — fail open, header-less.
+		return ""
+	}
+	return string(rb)
 }
 
 // ShipPlanResult is the (run, stage, content_hash, idempotent) tuple
