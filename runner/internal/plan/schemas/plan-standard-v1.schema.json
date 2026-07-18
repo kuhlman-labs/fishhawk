@@ -82,6 +82,25 @@
     "over_cap": {
       "type": "boolean",
       "description": "Optional (#2053). A planner SELF-DECLARATION HINT that scope.files exceeds the resolved implement-stage max_files_changed cap. Advisory only: the plan-gate over-cap advisory is derived SERVER-SIDE from len(scope.files) vs the resolved cap and does NOT depend on this flag — no enforcement or detection path may branch on over_cap to decide whether a plan is over-cap. Set it true as a courtesy when you must emit a single plan whose scope genuinely exceeds the cap; omitting it (or setting it false) never suppresses the server's count-derived advisory."
+    },
+    "split_proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rationale", "phases"],
+      "description": "Optional (#2055, E50.3). The ordered-phase split a plan carries when scope.files exceeds the resolved implement-stage max_files_changed cap BY COUNT. A plan over the cap by count MUST carry split_proposal or it is REJECTED server-side (plan_review_failed / category-B) REGARDLESS of the over_cap hint — the AUTHORITATIVE over-cap signal is the server-derived len(scope.files) vs the resolved cap, never over_cap (which remains an advisory courtesy). Each phase carries its own scope.files (intended at or under the cap) and depends_on edges, shaped expand->migrate->contract for compile-atomic changes. Additive-optional within standard_v1 (no major bump).",
+      "properties": {
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the work is split into these phases and how they relate."
+        },
+        "phases": {
+          "type": "array",
+          "minItems": 2,
+          "items": { "$ref": "#/$defs/split-phase" },
+          "description": "Ordered list of phases. At least two required; the canonical shape is expand->migrate->contract."
+        }
+      }
     }
   },
 
@@ -333,6 +352,34 @@
         "model_recommendation": {
           "$ref": "#/$defs/model-recommendation",
           "description": "Optional. The model recommendation for THIS sub-plan's decomposition child. Resolved through the same chokepoint as the top-level model_recommendation, so a decomposed child ratifies its own slice's recommendation at its plan gate. Omitted means the child has no per-slice recommendation."
+        }
+      }
+    },
+
+    "split-phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "scope"],
+      "description": "One phase within split_proposal.phases (#2055). Carries its own scope.files (intended at or under the resolved implement-stage max_files_changed cap so each phase ships as its own within-cap plan) and depends_on edges; phases are shaped expand->migrate->contract for compile-atomic changes.",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Short title for this phase. Must be unique within split_proposal.phases."
+        },
+        "scope_hint": {
+          "type": "string",
+          "description": "Brief description of what this phase covers. Helps the reviewer understand the split."
+        },
+        "scope": {
+          "$ref": "#/$defs/scope",
+          "description": "The files THIS phase will touch. Intended at or under the resolved implement-stage max_files_changed cap so each phase ships as its own within-cap plan."
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "description": "0-based indices of sibling phases this phase depends on; mirrors decomposition.sub_plans depends_on. Shaped expand(0) <- migrate(1) <- contract(2) for the canonical compile-atomic split."
         }
       }
     },

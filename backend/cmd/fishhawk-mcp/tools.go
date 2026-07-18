@@ -261,6 +261,13 @@ type PlanContent struct {
 	PredictedRuntimeMinutes    int                `json:"predicted_runtime_minutes"`
 	PredictedRuntimeConfidence string             `json:"predicted_runtime_confidence"`
 	Decomposition              *PlanDecomposition `json:"decomposition,omitempty"`
+	// SplitProposal surfaces the plan's optional over-cap split (#2055,
+	// E50.3): the expand->migrate->contract phase sequence a plan carries when
+	// scope.files exceeds the resolved implement-stage cap by count. Nil when
+	// the plan declares no split (a single-phase plan). FileCount on each phase
+	// is derived at decode time (see tryGetPlanForRun) so the operator gate view
+	// can show a per-phase file count without recomputing it.
+	SplitProposal *PlanSplitProposal `json:"split_proposal,omitempty"`
 }
 
 // PlanDecomposition carries the agent's proposal to split the plan
@@ -268,6 +275,27 @@ type PlanContent struct {
 type PlanDecomposition struct {
 	Rationale string        `json:"rationale"`
 	SubPlans  []PlanSubPlan `json:"sub_plans"`
+}
+
+// PlanSplitProposal renders the plan's over-cap split (#2055, E50.3) in the
+// operator gate view: the Rationale for splitting and the ordered Phases
+// (shaped expand->migrate->contract). Visually distinct from a single-phase
+// plan via the per-phase file list, count, and depends_on edges below.
+type PlanSplitProposal struct {
+	Rationale string           `json:"rationale"`
+	Phases    []PlanSplitPhase `json:"phases"`
+}
+
+// PlanSplitPhase describes one phase within a PlanSplitProposal for the gate
+// view. Files is the phase's own scope.files; FileCount is derived from
+// len(Files) at decode time; DependsOn carries the 0-based indices of sibling
+// phases this phase depends on.
+type PlanSplitPhase struct {
+	Title     string          `json:"title"`
+	ScopeHint string          `json:"scope_hint,omitempty"`
+	Files     []PlanScopeFile `json:"files"`
+	FileCount int             `json:"file_count"`
+	DependsOn []int           `json:"depends_on,omitempty"`
 }
 
 // PlanSubPlan describes one sub-plan within a decomposed plan.
@@ -659,7 +687,53 @@ func (r *runResolver) tryGetPlanForRun(ctx context.Context, runID uuid.UUID) (*P
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, false, fmt.Errorf("decode plan artifact: %w", err)
 	}
+	// split_proposal (#2055): the wire shape nests files under scope.files per
+	// phase; the gate-view PlanSplitPhase flattens that to Files + a derived
+	// FileCount. Decode the wire shape explicitly and overwrite the (flat, so
+	// mis-decoded) SplitProposal the top-level Unmarshal produced.
+	p.SplitProposal = mapSplitProposal(raw)
 	return &p, true, nil
+}
+
+// mapSplitProposal decodes the plan artifact's optional split_proposal (#2055,
+// E50.3) from its wire shape — each phase nests its file list under scope.files
+// — into the flattened gate-view PlanSplitProposal, deriving FileCount from
+// len(files) per phase so the operator sees a per-phase file count without
+// recomputing it. Returns nil when the plan carries no split_proposal or the
+// split JSON is malformed (a corrupt split is not a reason to fail the whole
+// plan fetch — the rest of the plan still renders).
+func mapSplitProposal(raw []byte) *PlanSplitProposal {
+	var wire struct {
+		SplitProposal *struct {
+			Rationale string `json:"rationale"`
+			Phases    []struct {
+				Title     string `json:"title"`
+				ScopeHint string `json:"scope_hint"`
+				Scope     *struct {
+					Files []PlanScopeFile `json:"files"`
+				} `json:"scope"`
+				DependsOn []int `json:"depends_on"`
+			} `json:"phases"`
+		} `json:"split_proposal"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil || wire.SplitProposal == nil {
+		return nil
+	}
+	out := &PlanSplitProposal{Rationale: wire.SplitProposal.Rationale}
+	for _, ph := range wire.SplitProposal.Phases {
+		var files []PlanScopeFile
+		if ph.Scope != nil {
+			files = ph.Scope.Files
+		}
+		out.Phases = append(out.Phases, PlanSplitPhase{
+			Title:     ph.Title,
+			ScopeHint: ph.ScopeHint,
+			Files:     files,
+			FileCount: len(files),
+			DependsOn: ph.DependsOn,
+		})
+	}
+	return out
 }
 
 // loadPlanReviews queries plan_reviewed audit entries for the given

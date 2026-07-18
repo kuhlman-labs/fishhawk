@@ -65,7 +65,8 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "decomposition": { "rationale": "...", "sub_plans": [...] },
   "model_recommendation": { "implement_model": "...", "rationale": "...", "complexity_assessed": "low|medium|high" },
   "surface_sweep_exemptions": [ { "pattern": "...", "sibling": "...", "reason": "..." } ],
-  "over_cap": false
+  "over_cap": false,
+  "split_proposal": { "rationale": "...", "phases": [ { "title": "...", "scope": { "files": [...] }, "depends_on": [] }, ... ] }
 }
 ```
 
@@ -354,6 +355,27 @@ An optional planner **self-declaration hint** that `scope.files` exceeds the res
 
 **Advisory only — the gate signal is server-authoritative.** The plan-gate over-cap advisory is derived **server-side** from `len(scope.files)` versus the resolved cap (`runPlanWarnings`), and it fires regardless of whether `over_cap` is omitted, `false`, or `true`. No enforcement or detection path may branch on `over_cap` to decide whether a plan is over cap — the flag never suppresses (nor is required to trigger) the deterministic count-derived advisory. It exists so an honest planner can flag its own over-cap plan explicitly, not as the mechanism that surfaces the condition. Additive-optional within `standard_v1.x`; a plan that omits it validates and gates exactly as before.
 
+### `split_proposal`
+
+The optional ordered-phase split a plan carries when `scope.files` exceeds the resolved implement-stage `max_files_changed` cap **by count** (#2055, E50.3). It is an object with a `rationale` and an ordered `phases` array (at least two). Each phase declares its own `scope.files` (intended at or under the cap so the phase ships as its own within-cap plan), an optional `scope_hint`, and optional `depends_on` edges. The canonical shape is `expand -> migrate -> contract` for compile-atomic changes, with `depends_on` edges `expand(0) <- migrate(1) <- contract(2)`.
+
+```json
+{
+  "split_proposal": {
+    "rationale": "rename spans more files than the cap; split expand->migrate->contract",
+    "phases": [
+      { "title": "Expand",   "scope": { "files": [ { "path": "a.go", "operation": "modify" } ] } },
+      { "title": "Migrate",  "depends_on": [0], "scope": { "files": [ { "path": "b.go", "operation": "modify" } ] } },
+      { "title": "Contract", "depends_on": [1], "scope": { "files": [ { "path": "c.go", "operation": "modify" } ] } }
+    ]
+  }
+}
+```
+
+**Server-authoritative, count-derived reject — regardless of `over_cap`.** A plan over the cap **by count** that carries no `split_proposal` is **REJECTED** server-side at the plan gate (a terminal `plan_review_failed` audit entry, plan stage failed category-B, no advancement). The authoritative over-cap signal is the server-derived `len(scope.files)` versus the resolved cap (`overCapSplitRejection`, reusing the same `overCapByCount` count as the advisory) — it **never reads `over_cap`**, so an over-cap-by-count monolith without a split is rejected whether `over_cap` is omitted, `false`, or `true`. An over-cap plan carrying a valid `split_proposal` is accepted; an under-cap plan is unaffected. `over_cap` remains an advisory courtesy only. See a full worked example in [`examples/split-proposal-example.yaml`](examples/split-proposal-example.yaml). Additive-optional within `standard_v1.x`; a plan that omits it validates as before.
+
+There is deliberately **no** `over_cap: true ⇒ split_proposal present` coupling in the plan-package semantic validator. Because that validator has no view of the resolved cap, such a check was count-blind — it rejected an **under-cap** plan that merely set the `over_cap` hint, turning the advisory into a server rejection across every `plan.Parse` caller (the plan reviewers plus the fail-open scope/surface/test gate checks) and breaking the under-cap-unaffected guarantee (#2055 fixup). The count-derived server reject above is the sole authoritative over-cap enforcement; the semantic validator only checks the **structure** of a `split_proposal` that is present (see below).
+
 ## Validation rules beyond the schema
 
 JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
@@ -365,6 +387,8 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - Every sub-plan in a decomposition must declare a non-empty `scope.files`. A decomposition in which any slice omits its scope returns `*SemanticError` naming the offending slice(s) (semantic check `checkSubPlanScopesDeclared` in the plan package, #1669). An unscoped slice used to inherit the parent's full `scope.files`, which made every fan-out child implement the whole plan and produced disjoint slice branches that conflicted wholesale at fan-in and could never consolidate. This is enforced by the semantic validator, NOT the JSON Schema (no schema-major bump).
 - A file path may appear in at most one sub-plan's `scope.files` within a decomposition. A path scoped by two or more slices returns `*SemanticError` (semantic check in the plan package), because the orchestrator partitions per-slice `scope.files` for commit bounding and scope-drift detection — the non-owning slice's edit to a shared file would be drift-excluded and silently shipped inert (#1062). The planner must re-slice so all edits to one file live in a single slice. (With per-slice scope now mandatory, every sub-plan is checked; the single-owner rule partitions the parent scope across disjoint slices.)
 - `decomposition.sub_plans[*].depends_on` must form a valid DAG: every index in `[0, len(sub_plans))`, never self-referential, and free of cycles. `plan.Waves` validates this and returns `*SemanticError` on violation (#1258). The waves it derives are not yet consumed by dispatch (slice B, #1278).
+- `over_cap` is hint-only: the plan-package semantic validator enforces **no** `over_cap ⇒ split_proposal` coupling. A plan self-declaring `over_cap: true` without a `split_proposal` parses cleanly — the count-blind coupling that once rejected it also rejected under-cap plans that merely set the hint, so it was removed (#2055 fixup). The authoritative over-cap enforcement is the server-side count-derived reject (`overCapSplitRejection`), which never reads `over_cap`.
+- `split_proposal.phases[*].title` must be unique within the array, every phase must declare a non-empty `scope.files`, and `split_proposal.phases[*].depends_on` must form a valid DAG (every index in `[0, len(phases))`, never self-referential, free of cycles — reusing the same Kahn sort as `plan.Waves`). Each returns `*SemanticError` on violation (semantic check `checkSplitProposal` in the plan package, #2055).
 
 These cross-references aren't expressible in JSON Schema cleanly.
 

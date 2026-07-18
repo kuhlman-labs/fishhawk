@@ -268,6 +268,26 @@ func semanticCheck(p *Plan) error {
 		}
 		seenCriteria[c.ID] = struct{}{}
 	}
+	// split_proposal STRUCTURAL invariants (#2055, E50.3). These run on a
+	// non-decomposed plan too, so they precede the decomposition early return.
+	//
+	// There is deliberately NO over_cap ⇒ split_proposal coupling here. over_cap
+	// is a HINT-ONLY self-declaration (see Plan.OverCap): no detection or
+	// enforcement path may branch on it. An earlier revision rejected a plan
+	// self-declaring over_cap:true without a split_proposal as a defensive layer,
+	// but because semanticCheck has no view of the resolved cap that check was
+	// count-blind — it fired for an UNDER-cap plan that merely set the hint,
+	// turning the advisory hint into a server rejection across every plan.Parse
+	// caller (runPlanReviews plus the fail-open scope/surface/test gate checks)
+	// and breaking the under-cap-unaffected guarantee (#2055 fixup). The
+	// AUTHORITATIVE over-cap enforcement is the server-side count-derived
+	// overCapSplitRejection gate in handleShipPlan (len(scope.files) > resolved
+	// cap, which never reads over_cap); a genuinely over-cap plan missing a split
+	// is rejected there regardless of the hint. checkSplitProposal below still
+	// validates the STRUCTURE of any split_proposal that IS present.
+	if err := checkSplitProposal(p.SplitProposal); err != nil {
+		return err
+	}
 	if p.Decomposition == nil {
 		return nil
 	}
@@ -375,6 +395,44 @@ func checkCrossSliceSharedFiles(d *Decomposition) error {
 			strings.Join(parts, "; "),
 		),
 	}
+}
+
+// checkSplitProposal validates a plan's optional split_proposal (#2055): phase
+// titles must be unique, every phase must declare a non-empty scope.files (each
+// phase ships as its own within-cap plan, so an empty phase scope is
+// meaningless), and the phase depends_on edges must form a valid DAG (in-range,
+// non-negative, non-self, acyclic — reusing the Kahn sort behind Waves). A nil
+// SplitProposal is a no-op (the field is additive-optional). These are the
+// structural invariants JSON Schema cannot express. There is deliberately no
+// over_cap ⇒ split_proposal coupling anywhere in the plan package — over_cap is
+// hint-only; the authoritative over-cap reject is the server's count-derived
+// overCapSplitRejection gate (#2055 fixup).
+func checkSplitProposal(sp *SplitProposal) error {
+	if sp == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(sp.Phases))
+	dependsOn := make([][]int, len(sp.Phases))
+	for i, ph := range sp.Phases {
+		if _, dup := seen[ph.Title]; dup {
+			return &SemanticError{
+				Message: fmt.Sprintf("split_proposal.phases: duplicate title %q", ph.Title),
+			}
+		}
+		seen[ph.Title] = struct{}{}
+		if ph.Scope == nil || len(ph.Scope.Files) == 0 {
+			return &SemanticError{
+				Message: fmt.Sprintf("split_proposal.phases: phase %q declares no scope.files; every phase must declare the files it owns so it ships as its own within-cap plan", ph.Title),
+			}
+		}
+		dependsOn[i] = ph.DependsOn
+	}
+	if _, err := wavesFromDependsOn(dependsOn, "phase"); err != nil {
+		return &SemanticError{
+			Message: fmt.Sprintf("split_proposal.phases: invalid depends_on: %v", err),
+		}
+	}
+	return nil
 }
 
 // Warnings returns advisory strings for a successfully-parsed Plan.

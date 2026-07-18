@@ -3652,3 +3652,151 @@ func TestPlanGateEvidence_SurfaceSweepExemptionSeam(t *testing.T) {
 		t.Errorf("applied exemption evidence = %+v, want %+v", got, want)
 	}
 }
+
+// stageTransitionSummary reports whether rr recorded a transition of stageID to
+// failed carrying FailureCategory B, and whether any advancement transition
+// (awaiting_approval or succeeded) was recorded for it.
+func stageTransitionSummary(rr *promptRunRepo, stageID uuid.UUID) (failedB, advanced bool) {
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID != stageID {
+			continue
+		}
+		switch call.To {
+		case run.StageStateFailed:
+			if call.Completion != nil && call.Completion.FailureCategory != nil &&
+				*call.Completion.FailureCategory == run.FailureB {
+				failedB = true
+			}
+		case run.StageStateAwaitingApproval, run.StageStateSucceeded:
+			advanced = true
+		}
+	}
+	return failedB, advanced
+}
+
+// TestShipPlan_OverCapSplitReject_EndToEnd is the E50 keystone end-to-end matrix
+// (#2055 constraint #1): a POST of an over-cap-BY-COUNT monolith (4 scope files
+// vs the implement-stage cap of 3) that carries NO split_proposal settles the
+// plan stage failed category-B with a plan_review_failed audit entry and NO
+// advancement — in ALL THREE over_cap states (omitted, false, true). An
+// over-cap plan carrying a valid split_proposal advances; an under-cap plan is
+// unaffected. specGatingReviewersWithConstraints declares max_files_changed: 3
+// and a gating reviewer that APPROVES, so any advancement in a reject cell would
+// prove the count reject failed to fire.
+func TestShipPlan_OverCapSplitReject_EndToEnd(t *testing.T) {
+	approve := func() *fakePlanReviewer {
+		return &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+			model:   "claude-sonnet-4-6",
+		}
+	}
+
+	t.Run("over-cap-by-count monolith rejects flag-independently", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			overCap *bool
+		}{
+			{name: "over_cap omitted", overCap: nil},
+			{name: "over_cap false", overCap: boolPtr(false)},
+			{name: "over_cap true", overCap: boolPtr(true)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				runID, stageID := uuid.New(), uuid.New()
+				s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, approve(), specGatingReviewersWithConstraints)
+				priv, _ := sf.issue(t, runID)
+				body := overCapPlanBodyWithSplit(t, 4, tc.overCap, false) // 4 > cap 3, no split.
+
+				w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+				if w.Code != http.StatusCreated {
+					t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+				}
+
+				if n := countAuditCategory(au, "plan_review_failed"); n != 1 {
+					t.Errorf("plan_review_failed entries = %d, want 1", n)
+				}
+				if n := countAuditCategory(au, "plan_reviewed"); n != 0 {
+					t.Errorf("plan_reviewed entries = %d, want 0 (the reviewer must be skipped on a server reject)", n)
+				}
+				failedB, advanced := stageTransitionSummary(rr, stageID)
+				if !failedB {
+					t.Error("stage was not transitioned to failed category-B")
+				}
+				if advanced {
+					t.Error("stage advanced despite the over-cap reject (must be suppressed)")
+				}
+			})
+		}
+	})
+
+	t.Run("over-cap with valid split_proposal advances", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, approve(), specGatingReviewersWithConstraints)
+		priv, _ := sf.issue(t, runID)
+		body := overCapPlanBodyWithSplit(t, 4, nil, true) // 4 > cap 3, WITH split.
+
+		w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+
+		if n := countAuditCategory(au, "plan_review_failed"); n != 0 {
+			t.Errorf("plan_review_failed entries = %d, want 0 (a valid split must not be rejected)", n)
+		}
+		if n := countAuditCategory(au, "plan_reviewed"); n != 1 {
+			t.Errorf("plan_reviewed entries = %d, want 1 (the reviewer runs on an accepted plan)", n)
+		}
+		failedB, advanced := stageTransitionSummary(rr, stageID)
+		if failedB {
+			t.Error("stage was failed-B despite carrying a valid split_proposal")
+		}
+		if !advanced {
+			t.Error("stage did not advance to awaiting_approval despite carrying a valid split_proposal")
+		}
+	})
+
+	t.Run("under-cap plan unaffected in every over_cap state", func(t *testing.T) {
+		// The over_cap:true cell is the #2055-fixup regression guard: an under-cap
+		// plan that merely sets the over_cap hint must NOT be rejected by the
+		// plan.Parse semanticCheck inside runPlanReviews. Before the fixup, the
+		// count-blind over_cap ⇒ split_proposal coupling fired here, emitting a
+		// plan_review_failed and skipping the reviewer entirely for a plan the
+		// authoritative count gate had already accepted. Asserting the reviewer
+		// RAN (plan_reviewed == 1) alongside the no-reject/advance checks pins the
+		// regression: with the coupling present the over_cap:true cell would show
+		// plan_reviewed == 0 and plan_review_failed == 1.
+		for _, tc := range []struct {
+			name    string
+			overCap *bool
+		}{
+			{name: "over_cap omitted", overCap: nil},
+			{name: "over_cap false", overCap: boolPtr(false)},
+			{name: "over_cap true", overCap: boolPtr(true)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				runID, stageID := uuid.New(), uuid.New()
+				s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, approve(), specGatingReviewersWithConstraints)
+				priv, _ := sf.issue(t, runID)
+				body := overCapPlanBodyWithSplit(t, 1, tc.overCap, false) // 1 <= cap 3, no split.
+
+				w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+				if w.Code != http.StatusCreated {
+					t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+				}
+
+				if n := countAuditCategory(au, "plan_review_failed"); n != 0 {
+					t.Errorf("plan_review_failed entries = %d, want 0 for an under-cap plan", n)
+				}
+				if n := countAuditCategory(au, "plan_reviewed"); n != 1 {
+					t.Errorf("plan_reviewed entries = %d, want 1 (the reviewer must run on an accepted under-cap plan)", n)
+				}
+				failedB, advanced := stageTransitionSummary(rr, stageID)
+				if failedB {
+					t.Error("under-cap plan must not be failed-B")
+				}
+				if !advanced {
+					t.Error("under-cap plan must advance to awaiting_approval")
+				}
+			})
+		}
+	})
+}
