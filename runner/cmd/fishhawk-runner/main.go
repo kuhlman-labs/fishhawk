@@ -46,6 +46,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/otelemit"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -2511,10 +2512,11 @@ func uploadPlan(ctx context.Context, cfg config, logSink io.Writer, client uploa
 	}
 
 	res, err := client.ShipPlan(ctx, upload.ShipPlanArgs{
-		RunID:      cfg.runID,
-		StageID:    cfg.stageID,
-		Plan:       planBytes,
-		PrivateKey: issued.PrivateKey,
+		RunID:        cfg.runID,
+		StageID:      cfg.stageID,
+		Plan:         planBytes,
+		PrivateKey:   issued.PrivateKey,
+		Reachability: analyzePlanReachability(cfg, planBytes, logSink),
 	})
 	if err != nil {
 		return fmt.Errorf("ship plan: %w", err)
@@ -2524,6 +2526,70 @@ func uploadPlan(ctx context.Context, cfg config, logSink io.Writer, client uploa
 		cfg.runID, res.StageID, res.ID, res.ContentHash, res.Idempotent,
 	)
 	return nil
+}
+
+// splitProposalPhases parses split_proposal.phases out of a plan artifact's
+// JSON into reachability phases (#2056, E50.4). It decodes a MINIMAL local shape
+// — the runner's plan package has no typed Plan struct — reading only the fields
+// the sweep needs, so an unrelated plan-shape change never breaks this parse.
+// Returns nil when the plan carries no split_proposal (the common
+// non-decomposition case) or on any decode failure: the caller then ships no
+// reachability payload.
+func splitProposalPhases(planBytes []byte) []reachability.Phase {
+	var doc struct {
+		SplitProposal *struct {
+			Phases []struct {
+				Title string `json:"title"`
+				Scope *struct {
+					Files []struct {
+						Path      string `json:"path"`
+						Operation string `json:"operation"`
+					} `json:"files"`
+				} `json:"scope"`
+			} `json:"phases"`
+		} `json:"split_proposal"`
+	}
+	if err := json.Unmarshal(planBytes, &doc); err != nil || doc.SplitProposal == nil {
+		return nil
+	}
+	phases := make([]reachability.Phase, 0, len(doc.SplitProposal.Phases))
+	for _, ph := range doc.SplitProposal.Phases {
+		rp := reachability.Phase{Title: ph.Title}
+		if ph.Scope != nil {
+			for _, f := range ph.Scope.Files {
+				rp.Files = append(rp.Files, reachability.File{Path: f.Path, Operation: f.Operation})
+			}
+		}
+		phases = append(phases, rp)
+	}
+	return phases
+}
+
+// analyzePlanReachability runs the symbol-reachability sweep (#2056, E50.4)
+// against the plan's split_proposal during the plan stage. The sweep runs
+// RUNNER-side because only the runner holds the checked-out Go source (the
+// server has no checkout). It is ADVISORY and FAIL-OPEN throughout: it returns
+// nil when the plan carries no split_proposal (no sweep to run), and otherwise
+// returns reachability.Analyze's Result — which may itself be a fail-open skip
+// (Available:false, e.g. a tree that doesn't type-check). It NEVER returns an
+// error and NEVER fails the plan stage; the result rides to the server in
+// ShipPlanArgs.Reachability, where a skip/empty result simply carries no
+// annotation.
+func analyzePlanReachability(cfg config, planBytes []byte, logSink io.Writer) *reachability.Result {
+	phases := splitProposalPhases(planBytes)
+	if len(phases) == 0 {
+		return nil
+	}
+	repoDir := cfg.workingDir
+	if repoDir == "" {
+		repoDir = "."
+	}
+	res := reachability.Analyze(phases, repoDir)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"plan_reachability_swept","run_id":%q,"available":%t,"phases":%d,"violations":%d,"skip_reason":%q}`+"\n",
+		cfg.runID, res.Available, len(res.Phases), len(res.Violations), res.SkipReason,
+	)
+	return &res
 }
 
 // issueSigningKey issues a per-run Ed25519 keypair via the backend.

@@ -7911,3 +7911,229 @@ func TestGetPlan_WithoutSplitProposal_FieldNil(t *testing.T) {
 		t.Errorf("Plan.SplitProposal should be nil for a plan without a split_proposal; got %+v", out.Plan.SplitProposal)
 	}
 }
+
+// --- get_plan reachability field (#2056, E50.4) ---
+
+// seedReachabilityAudit adds a plan_reachability_sweep audit entry to the fake's
+// per-run audit map, round-tripping the payload through JSON so the handler's
+// re-marshal + unmarshal decodes to the same value (mirroring
+// seedPlanReviewAudit).
+func seedReachabilityAudit(fb *fakeBackend, runID uuid.UUID, payload any) {
+	body, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(body, &decoded)
+	entry := AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "plan_reachability_sweep",
+		Payload:  decoded,
+	}
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
+}
+
+func seedReachabilityRun(t *testing.T, fb *fakeBackend, runID uuid.UUID) {
+	t.Helper()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+}
+
+// TestGetPlan_Reachability_DiscrepancyIndicatorOnMismatch asserts the distinct
+// indicator: a phase whose declared/derived counts disagree carries mismatch=true
+// and sets the top-level discrepancy flag, and the violations survive the render.
+func TestGetPlan_Reachability_DiscrepancyIndicatorOnMismatch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedReachabilityRun(t, fb, runID)
+	seedReachabilityAudit(fb, runID, map[string]any{
+		"available": true,
+		"phases": []map[string]any{
+			{"index": 0, "title": "expand", "declared_count": 2, "derived_count": 3},
+			{"index": 1, "title": "migrate", "declared_count": 1, "derived_count": 1},
+		},
+		"violations": []map[string]any{
+			{"kind": "construction_site", "symbol": "Widget", "def_file": "a.go", "def_phase": 0, "use_file": "b.go", "use_phase": 1},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Reachability == nil {
+		t.Fatal("Reachability should be populated")
+	}
+	if !out.Reachability.Available {
+		t.Error("Available should be true")
+	}
+	if !out.Reachability.Discrepancy {
+		t.Error("Discrepancy should be true when a phase's declared != derived")
+	}
+	if len(out.Reachability.Phases) != 2 {
+		t.Fatalf("phases = %d, want 2", len(out.Reachability.Phases))
+	}
+	if !out.Reachability.Phases[0].Mismatch {
+		t.Error("phase 0 (2 vs 3) should carry mismatch=true")
+	}
+	if out.Reachability.Phases[1].Mismatch {
+		t.Error("phase 1 (1 vs 1) should NOT carry mismatch")
+	}
+	if len(out.Reachability.Violations) != 1 || out.Reachability.Violations[0].Symbol != "Widget" {
+		t.Errorf("violations = %+v", out.Reachability.Violations)
+	}
+}
+
+// TestGetPlan_Reachability_NoDiscrepancyOnCleanPartition asserts a clean
+// partition (every phase declared==derived) leaves discrepancy false and no
+// per-phase mismatch.
+func TestGetPlan_Reachability_NoDiscrepancyOnCleanPartition(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedReachabilityRun(t, fb, runID)
+	seedReachabilityAudit(fb, runID, map[string]any{
+		"available": true,
+		"phases": []map[string]any{
+			{"index": 0, "title": "expand", "declared_count": 2, "derived_count": 2},
+			{"index": 1, "title": "migrate", "declared_count": 1, "derived_count": 1},
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Reachability == nil {
+		t.Fatal("Reachability should be populated")
+	}
+	if out.Reachability.Discrepancy {
+		t.Error("Discrepancy should be false for a clean partition")
+	}
+	for i, ph := range out.Reachability.Phases {
+		if ph.Mismatch {
+			t.Errorf("phase %d should not carry mismatch on a clean partition", i)
+		}
+	}
+}
+
+// TestGetPlan_Reachability_SkipRendersAvailableFalse asserts a fail-open skip
+// (available=false with a skip_reason) surfaces without a discrepancy.
+func TestGetPlan_Reachability_SkipRendersAvailableFalse(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedReachabilityRun(t, fb, runID)
+	seedReachabilityAudit(fb, runID, map[string]any{
+		"available":   false,
+		"skip_reason": "loaded package has errors: broken.go:1: undefined X",
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Reachability == nil {
+		t.Fatal("Reachability should be populated")
+	}
+	if out.Reachability.Available {
+		t.Error("Available should be false on a skip")
+	}
+	if out.Reachability.SkipReason == "" {
+		t.Error("SkipReason should be surfaced")
+	}
+	if out.Reachability.Discrepancy {
+		t.Error("Discrepancy should be false on a skip (no phases)")
+	}
+}
+
+// TestGetPlan_Reachability_AbsentWhenNoEntry asserts the field is omitted when
+// no plan_reachability_sweep entry exists (a non-split plan or older run).
+func TestGetPlan_Reachability_AbsentWhenNoEntry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedReachabilityRun(t, fb, runID)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Reachability != nil {
+		t.Errorf("Reachability should be nil when no sweep entry exists, got %+v", out.Reachability)
+	}
+}
+
+// TestGetPlan_Reachability_EndToEndRoundTrip is the cross-layer transport test
+// the operator required (SLICE 2): a RUNNER-produced JSON payload (exactly what
+// reachability.Result marshals) is decoded by the SERVER's PlanReachabilityPayload
+// (the server decode leg, imported here), re-marshaled as the audit payload the
+// recorder stores, then rendered by get_plan — asserting per-phase counts AND
+// violations survive every hop. A tag drift on any of the three structs breaks
+// this test rather than silently failing the advisory open.
+func TestGetPlan_Reachability_EndToEndRoundTrip(t *testing.T) {
+	// The exact bytes a runner reachability.Result marshals to on the wire.
+	runnerJSON := `{"available":true,` +
+		`"phases":[{"index":0,"title":"expand","declared_count":2,"derived_count":3},` +
+		`{"index":1,"title":"migrate","declared_count":1,"derived_count":1}],` +
+		`"violations":[{"kind":"interface_implementer","symbol":"Store",` +
+		`"def_file":"pkg/a/store.go","def_phase":0,"use_file":"pkg/b/impl.go","use_phase":1}]}`
+
+	// Server decode leg: the backend owns a mirroring struct across the module
+	// boundary. Decode the runner bytes into it, then re-marshal exactly as the
+	// recorder stores the audit payload.
+	var decoded server.PlanReachabilityPayload
+	if err := json.Unmarshal([]byte(runnerJSON), &decoded); err != nil {
+		t.Fatalf("server decode of runner payload failed: %v", err)
+	}
+	if decoded.Phases[0].DerivedCount != 3 || decoded.Violations[0].Kind != "interface_implementer" {
+		t.Fatalf("server decode dropped a field: %+v", decoded)
+	}
+	recorded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("re-marshal recorded payload: %v", err)
+	}
+
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedReachabilityRun(t, fb, runID)
+
+	// Seed the audit entry with the exact bytes the server recorder would store.
+	var asAny any
+	if err := json.Unmarshal(recorded, &asAny); err != nil {
+		t.Fatal(err)
+	}
+	seedReachabilityAudit(fb, runID, asAny)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Reachability == nil {
+		t.Fatal("Reachability should survive the round-trip")
+	}
+	if len(out.Reachability.Phases) != 2 {
+		t.Fatalf("phases = %d, want 2 after round-trip", len(out.Reachability.Phases))
+	}
+	if out.Reachability.Phases[0].DeclaredCount != 2 || out.Reachability.Phases[0].DerivedCount != 3 {
+		t.Errorf("phase 0 counts did not survive: %+v", out.Reachability.Phases[0])
+	}
+	if !out.Reachability.Phases[0].Mismatch || !out.Reachability.Discrepancy {
+		t.Error("mismatch/discrepancy indicator lost after round-trip")
+	}
+	if len(out.Reachability.Violations) != 1 ||
+		out.Reachability.Violations[0].Kind != "interface_implementer" ||
+		out.Reachability.Violations[0].Symbol != "Store" ||
+		out.Reachability.Violations[0].UseFile != "pkg/b/impl.go" {
+		t.Errorf("violation did not survive the round-trip: %+v", out.Reachability.Violations)
+	}
+}

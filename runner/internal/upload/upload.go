@@ -34,6 +34,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
 )
 
 // Default backoff parameters for ShipTrace. Public so tests can
@@ -778,6 +780,25 @@ func statusError(op string, resp *http.Response) error {
 		op, strconv.Itoa(resp.StatusCode), body)
 }
 
+// ReachabilityHeader is the request header ShipPlan carries the advisory
+// symbol-reachability sweep result in (#2056, E50.4). The result CANNOT ride
+// inside the POST body: the body is the standard_v1 plan artifact, verified
+// against the Ed25519 signature and stored verbatim, so any extra bytes would
+// corrupt the plan. It rides in this header instead — an advisory side channel
+// the server reads fail-open. The header name MUST stay byte-identical to the
+// backend's reachabilityHeader constant (backend/internal/server/
+// plan_reachability.go); a drift silently disables the advisory.
+const ReachabilityHeader = "X-Fishhawk-Plan-Reachability"
+
+// maxReachabilityHeaderBytes caps the serialized reachability header ShipPlan
+// will attach (#2056). The advisory MUST NEVER break the plan upload: a
+// pathologically large violation list that would overflow the server's header
+// limit and fail the whole request is dropped here instead, so the plan still
+// ships without its advisory. 16 KiB is ample for a real decomposition's
+// per-phase counts + violations while staying well under the server's header
+// budget.
+const maxReachabilityHeaderBytes = 16 * 1024
+
 // ShipPlanArgs collects everything ShipPlan needs.
 type ShipPlanArgs struct {
 	RunID   string
@@ -787,6 +808,72 @@ type ShipPlanArgs struct {
 	// and validating it locally before shipping.
 	Plan       []byte
 	PrivateKey ed25519.PrivateKey
+
+	// Reachability is the optional symbol-reachability sweep result (#2056,
+	// E50.4) the runner computed against the plan's split_proposal. When
+	// non-nil ShipPlan serializes it to compact JSON and sends it in the
+	// ReachabilityHeader header — an ADVISORY side channel that never touches
+	// the signed plan body. nil (the common case: a plan with no
+	// split_proposal, or a fail-open Analyze skip) sends no header.
+	//
+	// CROSS-MODULE WIRE CONTRACT: reachability.Result's json tags are the
+	// runner→server wire contract; the backend owns a mirroring decode struct
+	// (backend/internal/server.PlanReachabilityPayload) it cannot import across
+	// the module boundary, so a tag drift silently fails the advisory open.
+	// Locked by the exact-wire-key serialization test in upload_test.go.
+	Reachability *reachability.Result
+}
+
+// reachabilityHeaderValue serializes args.Reachability to the compact JSON the
+// ReachabilityHeader carries, or "" when there is nothing to send (nil result
+// or a marshal failure). It is FAIL-OPEN by construction: it never lets the
+// advisory break the plan upload.
+//
+// When the full result exceeds maxReachabilityHeaderBytes it is NOT discarded
+// wholesale (#2056 fixup). Dropping a VALID sweep whose violation list is large
+// enough to overflow the header budget would deny the operator the per-phase
+// counts AND every named cross-boundary violation for exactly the leaky
+// partitions the advisory exists to surface. Instead a REDUCED payload ships:
+// the per-phase counts (bounded by phase count) plus the largest prefix of
+// violations that still fits under the cap. The per-phase DerivedCount already
+// reflects the FULL leak, so the counts stay accurate even when the
+// named-violation list is trimmed. Only a pathological payload that overflows
+// even with zero violations falls back to "" (header-less, upload proceeds).
+func reachabilityHeaderValue(res *reachability.Result) string {
+	if res == nil {
+		return ""
+	}
+	b, err := json.Marshal(res)
+	if err != nil {
+		return ""
+	}
+	if len(b) <= maxReachabilityHeaderBytes {
+		return string(b)
+	}
+
+	// Oversized: keep the phases and binary-search the largest violation prefix
+	// that still fits. Re-slicing res.Violations never mutates the caller's
+	// slice contents, and `reduced` is a shallow struct copy so the search
+	// leaves the original Result untouched.
+	reduced := *res
+	lo, hi := 0, len(res.Violations)
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		reduced.Violations = res.Violations[:mid]
+		rb, rerr := json.Marshal(&reduced)
+		if rerr == nil && len(rb) <= maxReachabilityHeaderBytes {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	reduced.Violations = res.Violations[:lo]
+	rb, rerr := json.Marshal(&reduced)
+	if rerr != nil || len(rb) > maxReachabilityHeaderBytes {
+		// Even the phases-only payload overflows — fail open, header-less.
+		return ""
+	}
+	return string(rb)
 }
 
 // ShipPlanResult is the (run, stage, content_hash, idempotent) tuple
@@ -823,6 +910,12 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 	signature := ed25519.Sign(args.PrivateKey, digest[:])
 	sigHex := hex.EncodeToString(signature)
 
+	// Serialize the advisory reachability sweep once (fail-open: "" when there
+	// is nothing to send or the payload is oversized). It rides in a header, not
+	// the signed body, so it is not covered by sigHex — the server treats it as
+	// advisory and never authenticates it.
+	reachHeader := reachabilityHeaderValue(args.Reachability)
+
 	endpoint := fmt.Sprintf("%s/v0/runs/%s/plan?stage_id=%s",
 		c.BaseURL,
 		url.PathEscape(args.RunID),
@@ -856,6 +949,9 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Fishhawk-Signature", sigHex)
 		req.Header.Set("Accept", "application/json")
+		if reachHeader != "" {
+			req.Header.Set(ReachabilityHeader, reachHeader)
+		}
 		req.ContentLength = int64(len(args.Plan))
 
 		resp, err := c.HTTP.Do(req)
