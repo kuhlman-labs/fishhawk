@@ -243,6 +243,75 @@ func worktreeProvisionFailureReason(err error) string {
 	return "worktree_provision"
 }
 
+const (
+	// worktreeAdminGitMaxAttempts bounds how many times worktreeAdminGit re-runs
+	// a worktree-admin git op on the transient enumeration signature before
+	// surfacing the failure. Four attempts (one initial + three retries) over the
+	// short backoff comfortably outlast a sibling git process's millisecond-scale
+	// commondir create/remove.
+	worktreeAdminGitMaxAttempts = 4
+	// worktreeAdminGitBackoff is the pause between retries — short, because the
+	// racing sibling git process finishes its commondir create/remove in
+	// milliseconds, so a brief yield clears the transient.
+	worktreeAdminGitBackoff = 25 * time.Millisecond
+)
+
+// worktreeAdminGitRun executes `git -C repoDir <args...>` and returns its
+// combined stdout+stderr. It is a package-level seam so a test can inject a
+// first-attempt transient (the git-internal commondir enumeration race) then
+// delegate to real git, exercising worktreeAdminGit's retry deterministically
+// without needing a real concurrent git process to reproduce the race.
+var worktreeAdminGitRun = func(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "git", append([]string{"-C", repoDir}, args...)...).CombinedOutput()
+}
+
+// isTransientWorktreeAdminErr reports whether a failed worktree-admin git op's
+// combined output carries the git-INTERNAL worktree-enumeration transient: git's
+// worktree add/list scan of .git/worktrees/* transiently fails reading a
+// `commondir` file that a SIBLING git process (another run's post-provision
+// stage checkout/commit, which runs OUTSIDE the worktree-admin lock and so
+// cannot be serialized) is mid-creating/removing. The signature observed on CI
+// is the errno-0 `failed to read '.git/worktrees/run-XXX/commondir': Success`;
+// the match is the general `failed to read` + `commondir` shape, case-insensitive
+// substring. It is deliberately conservative — a real add failure (name
+// collision, missing base SHA) never carries both tokens, so it does NOT match
+// and surfaces immediately rather than being retried.
+func isTransientWorktreeAdminErr(combinedOutput string) bool {
+	s := strings.ToLower(combinedOutput)
+	return strings.Contains(s, "failed to read") && strings.Contains(s, "commondir")
+}
+
+// worktreeAdminGit runs a worktree-admin git op through the worktreeAdminGitRun
+// seam, retrying on the isTransientWorktreeAdminErr signature with a short
+// backoff up to worktreeAdminGitMaxAttempts. Each retry emits exactly one
+// worktree_admin_git_retry event (mirroring the runner's verify_infra_flake_retry
+// diagnostic). A non-transient error returns immediately on the first attempt —
+// unretried and unmasked — as does a transient once the attempt cap is reached or
+// the context is done; in every terminal case the captured combined output is
+// returned alongside the error so the caller's error wrapping stays actionable.
+func worktreeAdminGit(ctx context.Context, repoDir string, logSink io.Writer, args ...string) ([]byte, error) {
+	var out []byte
+	var err error
+	for attempt := 1; attempt <= worktreeAdminGitMaxAttempts; attempt++ {
+		out, err = worktreeAdminGitRun(ctx, repoDir, args...)
+		if err == nil {
+			return out, nil
+		}
+		if attempt >= worktreeAdminGitMaxAttempts || !isTransientWorktreeAdminErr(string(out)) || ctx.Err() != nil {
+			return out, err
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"worktree_admin_git_retry","attempt":%d,"op":%q,"detail":%q}`+"\n",
+			attempt, strings.Join(args, " "), strings.TrimSpace(string(out)))
+		select {
+		case <-ctx.Done():
+			return out, err
+		case <-time.After(worktreeAdminGitBackoff):
+		}
+	}
+	return out, err
+}
+
 // provisionLineageWorktree returns the absolute path to the lineage's
 // worktree, creating it on first use and reusing it for every subsequent
 // run that keys on the same root (decomposed-child sharing). The worktree
@@ -307,8 +376,8 @@ func provisionLineageWorktree(ctx context.Context, repoDir, root, baseRef string
 	// above. --detach avoids claiming a branch; the run's own branch/commit
 	// work happens via the downstream FreshFetchBase / checkoutChildBase /
 	// commit sequences in the worktree.
-	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
-		"worktree", "add", "--detach", target, headSHA).CombinedOutput(); err != nil {
+	if out, err := worktreeAdminGit(ctx, repoDir, logSink,
+		"worktree", "add", "--detach", target, headSHA); err != nil {
 		return "", fmt.Errorf("provisionLineageWorktree: worktree add: %v: %s",
 			err, strings.TrimSpace(string(out)))
 	}
@@ -321,10 +390,16 @@ func provisionLineageWorktree(ctx context.Context, repoDir, root, baseRef string
 // registered against repoDir's shared gitdir via
 // `git worktree list --porcelain` (the `worktree <path>` records).
 func listWorktreePaths(ctx context.Context, repoDir string) ([]string, error) {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
-		"worktree", "list", "--porcelain").Output()
+	// Routed through the transient-retry wrapper (the enumeration race the add
+	// path hits also afflicts this scan). logSink is io.Discard because
+	// listWorktreePaths's signature is shared with out-of-package callers; the
+	// retry itself — the load-bearing behavior — still fires, only its diagnostic
+	// line is suppressed here. worktreeAdminGit uses CombinedOutput, so on failure
+	// the captured output (stderr included) is carried in out rather than the
+	// ExitError.Stderr gitErr reads — surface it directly instead.
+	out, err := worktreeAdminGit(ctx, repoDir, io.Discard, "worktree", "list", "--porcelain")
 	if err != nil {
-		return nil, fmt.Errorf("worktree list: %w", gitErr(err))
+		return nil, fmt.Errorf("worktree list: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	var paths []string
 	for _, line := range strings.Split(string(out), "\n") {
@@ -596,8 +671,8 @@ func looksLikeRunID(s string) bool {
 // line and leaves the entry; on success it removes the run-id sidecar and
 // the run-<root>.lock and logs exactly one lineage_worktree_pruned line.
 func pruneStaleWorktree(ctx context.Context, repoDir, wtDir, root, path, reason string, logSink io.Writer) {
-	if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
-		"worktree", "remove", "--force", path).CombinedOutput(); err != nil {
+	if out, err := worktreeAdminGit(ctx, repoDir, logSink,
+		"worktree", "remove", "--force", path); err != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"worktree_sweep_degraded","root":%q,"reason":%q,"detail":%q}`+"\n",
 			root, reason, strings.TrimSpace(string(out)))
@@ -683,8 +758,8 @@ func sweepTerminalWorktrees(ctx context.Context, repoDir string, client lineageS
 		if !complete {
 			continue
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", repoDir,
-			"worktree", "remove", "--force", p).CombinedOutput(); err != nil {
+		if out, err := worktreeAdminGit(ctx, repoDir, logSink,
+			"worktree", "remove", "--force", p); err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"worktree_sweep_degraded","root":%q,"detail":%q}`+"\n",
 				root, strings.TrimSpace(string(out)))

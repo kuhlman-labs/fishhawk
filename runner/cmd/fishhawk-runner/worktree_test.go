@@ -927,6 +927,117 @@ func TestWorktreeProvisionFailureReason(t *testing.T) {
 	}
 }
 
+// TestIsTransientWorktreeAdminErr pins the transient detector: the exact
+// errno-0 CI signature AND the generic `failed to read ...commondir` shape match
+// (case-insensitively), while a genuine add failure ('already exists'), an
+// unrelated git error, and empty output do NOT — so a real failure is never
+// misclassified as retryable and surfaces immediately.
+func TestIsTransientWorktreeAdminErr(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"ci_errno0_signature", "fatal: failed to read '.git/worktrees/run-abc123/commondir': Success", true},
+		{"generic_commondir_read", "error: failed to read commondir for worktree", true},
+		{"mixed_case", "Fatal: Failed To Read '.git/worktrees/run-x/COMMONDIR': Success", true},
+		{"real_add_collision", "fatal: '/path/run-x' already exists", false},
+		{"unrelated_git_error", "fatal: not a valid object name HEAD", false},
+		{"missing_base_sha", "fatal: invalid reference: deadbeef", false},
+		{"failed_to_read_no_commondir", "fatal: failed to read object", false},
+		{"empty", "", false},
+	}
+	for _, c := range cases {
+		if got := isTransientWorktreeAdminErr(c.in); got != c.want {
+			t.Errorf("isTransientWorktreeAdminErr(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
+// TestProvisionLineageWorktree_RetriesTransientCommondir is the load-bearing
+// done-means test: it injects the git-internal commondir transient on the FIRST
+// `git worktree add` via the worktreeAdminGitRun seam, then delegates to real
+// git, and asserts provision retries and succeeds, the worktree ends registered,
+// and exactly one worktree_admin_git_retry event is emitted — proving the retry
+// resolves the enumeration race deterministically, without needing the flaky
+// 2-core CI race to reproduce.
+func TestProvisionLineageWorktree_RetriesTransientCommondir(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+
+	orig := worktreeAdminGitRun
+	t.Cleanup(func() { worktreeAdminGitRun = orig })
+	var addAttempts int
+	worktreeAdminGitRun = func(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "add" {
+			addAttempts++
+			if addAttempts == 1 {
+				// The observed errno-0 CI transient on the first add attempt.
+				return []byte("fatal: failed to read '.git/worktrees/run-retry000/commondir': Success"),
+					errProbe("exit status 128")
+			}
+		}
+		return orig(ctx, repoDir, args...)
+	}
+
+	var log bytes.Buffer
+	wt, err := provisionLineageWorktree(ctx, repo, "retry000", "main", &log)
+	if err != nil {
+		t.Fatalf("provision failed despite a retryable transient: %v", err)
+	}
+	if addAttempts < 2 {
+		t.Errorf("worktree add was not retried: attempts = %d, want >= 2", addAttempts)
+	}
+	if st, err := os.Stat(wt); err != nil || !st.IsDir() {
+		t.Fatalf("worktree not created after retry: %v", err)
+	}
+	registered, err := listWorktreePaths(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isRegisteredWorktree(wt, registered) {
+		t.Errorf("worktree not registered after a retried add: %v", registered)
+	}
+	if got := strings.Count(log.String(), `"event":"worktree_admin_git_retry"`); got != 1 {
+		t.Errorf("worktree_admin_git_retry events = %d, want exactly 1:\n%s", got, log.String())
+	}
+}
+
+// TestProvisionLineageWorktree_NonTransientAddErrorNotRetried is the fail-closed
+// companion: a NON-transient add error every attempt must surface on the FIRST
+// attempt — unretried and unmasked — so a real failure (a name collision, a
+// missing base SHA) is never hidden behind the retry loop.
+func TestProvisionLineageWorktree_NonTransientAddErrorNotRetried(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+
+	orig := worktreeAdminGitRun
+	t.Cleanup(func() { worktreeAdminGitRun = orig })
+	var addAttempts int
+	worktreeAdminGitRun = func(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "add" {
+			addAttempts++
+			return []byte("fatal: '/some/run-nonxient' already exists"), errProbe("exit status 128")
+		}
+		return orig(ctx, repoDir, args...)
+	}
+
+	var log bytes.Buffer
+	_, err := provisionLineageWorktree(ctx, repo, "nonxient", "main", &log)
+	if err == nil {
+		t.Fatal("provision succeeded despite a non-transient add failure; want the error surfaced")
+	}
+	if addAttempts != 1 {
+		t.Errorf("non-transient add was retried: attempts = %d, want exactly 1", addAttempts)
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("error masked the underlying failure detail: %v", err)
+	}
+	if strings.Contains(log.String(), `"event":"worktree_admin_git_retry"`) {
+		t.Errorf("emitted a retry event for a non-transient failure:\n%s", log.String())
+	}
+}
+
 // gitPorcelain returns `git status --porcelain` output for dir.
 func gitPorcelain(t *testing.T, dir string) string {
 	t.Helper()
