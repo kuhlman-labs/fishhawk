@@ -1,0 +1,105 @@
+# Sample standard_v1 plan carrying a split_proposal (#2055, E50.3).
+#
+# A monolithic change whose scope.files exceeds the resolved implement-stage
+# max_files_changed cap BY COUNT must carry split_proposal or be rejected
+# server-side (plan_review_failed / category-B) regardless of the over_cap
+# hint. This fixture is the committed artifact the round-trip test and the
+# sample-validates criterion both anchor on:
+#
+#   check-jsonschema --schemafile docs/spec/plan-standard-v1.schema.json \
+#     docs/spec/examples/split-proposal-example.yaml
+#
+# The three phases are shaped expand -> migrate -> contract with depends_on
+# edges expand(0) <- migrate(1) <- contract(2); each phase's scope.files stays
+# at or under a representative cap so every phase ships as its own within-cap
+# plan.
+plan_version: standard_v1
+ticket_reference:
+  type: github_issue
+  url: https://github.com/kuhlman-labs/fishhawk/issues/2055
+  id: kuhlman-labs/fishhawk#2055
+generated_by:
+  agent: claude-code
+  model: claude-opus-4-8
+  timestamp: "2026-07-18T12:00:00Z"
+summary: >-
+  Rename the RunState column across the storage, server, and CLI layers. The
+  change touches more files than the implement-stage cap allows, so it is split
+  into an expand->migrate->contract sequence: add the new column, migrate every
+  reader/writer to it, then drop the old column.
+scope:
+  files:
+    - path: backend/internal/db/migrations/0042_add_run_state.sql
+      operation: create
+    - path: backend/internal/storage/run.go
+      operation: modify
+    - path: backend/internal/server/reads.go
+      operation: modify
+    - path: backend/internal/server/runs.go
+      operation: modify
+    - path: cli/internal/runs/render.go
+      operation: modify
+    - path: backend/internal/db/migrations/0043_drop_legacy_state.sql
+      operation: create
+  estimated_lines_changed: 320
+approach:
+  - step: 1
+    description: >-
+      Expand: add the new run_state column alongside the legacy column so both
+      exist and every existing reader keeps working.
+  - step: 2
+    description: >-
+      Migrate: point every storage/server/CLI reader and writer at the new
+      column, backfilling from the legacy column.
+  - step: 3
+    description: >-
+      Contract: drop the now-unused legacy column once no code references it.
+verification:
+  test_strategy: >-
+    Each phase ships as its own within-cap plan with its own tests: the expand
+    phase asserts the migration applies and both columns exist; the migrate
+    phase asserts every reader/writer round-trips through the new column; the
+    contract phase asserts the legacy column is gone and no reference remains.
+  rollback_plan: >-
+    Revert per phase. The expand phase is additive (drop the new column); the
+    contract phase is the only destructive step and runs last, so a regression
+    caught in migrate is undone without data loss.
+predicted_runtime_minutes: 90
+predicted_runtime_confidence: medium
+split_proposal:
+  rationale: >-
+    The rename spans a schema column plus every reader/writer across storage,
+    server, and CLI — more files than the implement-stage cap. An
+    expand->migrate->contract split keeps each phase compile-atomic and at or
+    under the cap: expand adds the new column, migrate moves all callers, and
+    contract drops the legacy column only after nothing references it.
+  phases:
+    - title: Expand — add the new run_state column
+      scope_hint: additive schema change, no reader changes
+      scope:
+        files:
+          - path: backend/internal/db/migrations/0042_add_run_state.sql
+            operation: create
+          - path: backend/internal/storage/run.go
+            operation: modify
+      depends_on: []
+    - title: Migrate — move every reader and writer to the new column
+      scope_hint: repoint storage/server/CLI at the new column
+      scope:
+        files:
+          - path: backend/internal/server/reads.go
+            operation: modify
+          - path: backend/internal/server/runs.go
+            operation: modify
+          - path: cli/internal/runs/render.go
+            operation: modify
+      depends_on:
+        - 0
+    - title: Contract — drop the legacy column
+      scope_hint: destructive cleanup, runs last
+      scope:
+        files:
+          - path: backend/internal/db/migrations/0043_drop_legacy_state.sql
+            operation: create
+      depends_on:
+        - 1

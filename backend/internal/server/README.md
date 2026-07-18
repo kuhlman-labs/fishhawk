@@ -650,6 +650,17 @@ Gives `backend/internal/plan/validate.go::Warnings(p *Plan) []string` (unit-test
 - Advisory + fail-open: a `plan.Parse` failure or an audit-append failure WARN-logs and returns nil/continues; it never transitions or fails the plan stage.
 - The returned payload is NOT YET threaded into the plan-review prompt's gate-evidence section (deferred; the operator-facing surface for this slice is `fishhawk_get_plan`).
 - MCP surface: `fishhawk_get_plan` adds `plan_warnings` (`[]string`) decoded from the **newest** `plan_warnings` entry (`loadPlanWarnings` in `tools.go`); absent/omitted when no entry exists (warning-free plan or an older run predating this pass).
+- **Over-cap advisory (#2053)**: `runPlanWarnings` also appends a deterministic, count-derived over-cap advisory when the resolved implement-stage `max_files_changed` cap is `> 0` and `len(scope.files) > cap`, via `overCapWarning`. The decode is `json.Unmarshal` (NOT `plan.Parse`) so the advisory stays independent of the `over_cap ⇒ split_proposal` semantic coupling — a `plan.Parse` there would suppress the advisory for exactly the `over_cap:true` flag state #2053 requires it to fire in.
+
+### Plan-gate over-cap split reject (`plan_warnings.go` / `plan.go`, #2055, E50.3)
+
+`backend/internal/server/plan_warnings.go::overCapSplitRejection` — called from `handleShipPlan` (`plan.go`) right before `runPlanReviews`. This is the **SERVER-AUTHORITATIVE, count-derived HARD reject** for an over-cap monolith — the E50 keystone, distinct from the advisory above.
+
+- **Count-derived, flag-independent.** `overCapByCount` factors the #2053 count determination (`resolveImplementConstraints` → `len(scope.files)` vs `MaxFilesChanged`) into a shared helper that `overCapWarning` (advisory) and `overCapSplitRejection` (reject) both call; it **never reads `over_cap`**. `overCapSplitRejection` returns a reject reason when the plan is over cap **by count** AND carries no `split_proposal`, and `""` otherwise — so an over-cap-by-count monolith without a split is rejected whether `over_cap` is omitted, `false`, or `true`; an over-cap plan carrying a valid `split_proposal` is accepted; an under-cap plan is unaffected.
+- **Decodes with `json.Unmarshal`, not `plan.Parse`** (in `handleShipPlan`): the `over_cap ⇒ split_proposal` semanticCheck coupling would reject an `over_cap:true` monolith before this gate could see it, letting that flag cell escape the authoritative count reject. Decoding without semanticCheck keeps the gate flag- AND parse-independent.
+- On a non-empty reason: emit a terminal `plan_review_failed` audit entry (`emitReviewFailed`), fail the plan stage category-B (`run.FailStage` + `advanceAfterFailure`, the same terminal path the plan-invalid/decomposition reject uses), and set `gatingRejected` so `advancePlanStageTerminal`/`notifyPlanReadyIfReady` are suppressed — the rejected plan never advances, and the artifact is still stored so the operator can inspect it via `fishhawk_get_plan`.
+- **Fail-open** on every leg exactly like the advisory (nil `RunRepo`, `GetRun` error, no spec/implement stage, unresolved/zero cap → `overCapByCount` returns `ok=false` → `""`), so an unresolved cap can never spuriously block a plan.
+- The `plan.Parse` semanticCheck `over_cap ⇒ split_proposal` coupling (`backend/internal/plan/validate.go`) is kept as an **additional in-artifact defensive layer**, NOT the authoritative gate.
 
 ### Plan-gate scope-regression sweep (`scope_regression.go`, #1257)
 

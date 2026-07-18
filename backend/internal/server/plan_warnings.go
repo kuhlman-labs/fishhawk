@@ -64,24 +64,32 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		return nil
 	}
 
-	// Validation already passed in handleShipPlan; a parse failure here is
-	// an internal inconsistency — log and skip rather than block.
-	parsedPlan, err := plan.Parse(planBody)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan warnings: parse plan failed",
+	// Validation already passed in handleShipPlan; decode with json.Unmarshal
+	// (schema-only bytes, NOT plan.Parse) so the advisories stay independent of
+	// the semanticCheck over_cap ⇒ split_proposal coupling (#2055): an over-cap
+	// over_cap:true plan that omits split_proposal would fail plan.Parse, which
+	// would SUPPRESS the count-derived over-cap advisory for exactly the flag
+	// state #2053 requires it to fire in — reversing #2053's flag-independence
+	// guarantee. Decoding here never runs semanticCheck; the authoritative gate
+	// (handleShipPlan overCapSplitRejection) owns the reject. A json.Unmarshal
+	// failure on schema-valid bytes is an internal inconsistency — log and skip
+	// rather than block (fail-open, unchanged).
+	var parsedPlan plan.Plan
+	if err := json.Unmarshal(planBody, &parsedPlan); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan warnings: decode plan failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
 		return nil
 	}
 
-	warnings := plan.Warnings(parsedPlan)
+	warnings := plan.Warnings(&parsedPlan)
 
 	// SERVER-AUTHORITATIVE over-cap advisory (#2053): count-derived, computed
 	// independently of the planner's over_cap self-declaration. Appended before
 	// the emptiness check so an otherwise warning-free over-cap plan still
 	// records a plan_warnings entry that surfaces through fishhawk_get_plan.
-	if w := s.overCapWarning(ctx, runID, parsedPlan); w != "" {
+	if w := s.overCapWarning(ctx, runID, &parsedPlan); w != "" {
 		warnings = append(warnings, w)
 	}
 
@@ -124,8 +132,36 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 // resolveImplementConstraints, the same helper runScopePrecheck uses, so the
 // plan-gate advisory and the scope pre-check agree on the resolved cap.
 func (s *Server) overCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
-	if s.cfg.RunRepo == nil {
+	count, capLimit, over, ok := s.overCapByCount(ctx, runID, parsedPlan)
+	if !ok || !over {
 		return ""
+	}
+	return fmt.Sprintf(
+		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d — "+
+			"narrow the scope or split the work into a decomposition before approving.",
+		count, capLimit,
+	)
+}
+
+// overCapByCount is the shared #2053 count determination (E50.3 refactor). It
+// resolves the implement-stage max_files_changed cap and compares it against
+// len(parsedPlan.Scope.Files), NEVER reading parsedPlan.OverCap — the planner's
+// self-declaration hint plays no part in whether a plan is over cap. It returns
+// count (scanned scope.files), capLimit (the resolved cap), over (count >
+// capLimit against a positive cap), and ok (the cap resolved to a positive
+// value).
+//
+// Fail-open on every leg (nil RunRepo, GetRun error, no spec/implement stage,
+// or a zero/unresolved cap): ok=false and over=false, so an unresolved cap can
+// never be treated as over-cap. Both overCapWarning (advisory) and
+// overCapSplitRejection (authoritative reject) route through this one function,
+// so the plan-gate advisory and the count-derived reject agree on the resolved
+// cap by construction — no duplicated cap logic. The cap resolution reuses
+// resolveImplementConstraints, the same helper runScopePrecheck uses.
+func (s *Server) overCapByCount(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) (count, capLimit int, over, ok bool) {
+	count = len(parsedPlan.Scope.Files)
+	if s.cfg.RunRepo == nil {
+		return count, 0, false, false
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if err != nil {
@@ -133,19 +169,43 @@ func (s *Server) overCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
+		return count, 0, false, false
+	}
+	constraints, _, resolved := s.resolveImplementConstraints(ctx, runRow)
+	if !resolved || constraints.MaxFilesChanged <= 0 {
+		return count, 0, false, false
+	}
+	return count, constraints.MaxFilesChanged, count > constraints.MaxFilesChanged, true
+}
+
+// overCapSplitRejection is the SERVER-AUTHORITATIVE, count-derived over-cap
+// REJECT reason (#2055, E50.3) — the E50 keystone. It returns a clear,
+// actionable reason when the plan is over cap BY COUNT (len(scope.files) >
+// resolved cap) AND carries no split_proposal, and "" otherwise. Like the
+// sibling advisory it reads ONLY the file count and the resolved cap via
+// overCapByCount and MUST NOT consult parsedPlan.OverCap — so an over-cap-by-
+// count monolith lacking a split is rejected whether over_cap is omitted,
+// false, or true, and an over-cap plan that carries a split_proposal is
+// accepted (structural validity of that split is the plan.Parse semanticCheck's
+// job, an additional in-artifact defensive layer).
+//
+// Fail-open on every leg exactly like overCapWarning: overCapByCount returns
+// ok=false (nil RunRepo, GetRun error, no spec/implement stage, unresolved/zero
+// cap) → "" so an unresolved cap never spuriously blocks a plan. It reuses
+// overCapByCount (and thus resolveImplementConstraints) so the reject and the
+// advisory share one cap resolution with no duplicated logic.
+func (s *Server) overCapSplitRejection(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
+	count, capLimit, over, ok := s.overCapByCount(ctx, runID, parsedPlan)
+	if !ok || !over {
 		return ""
 	}
-	constraints, _, ok := s.resolveImplementConstraints(ctx, runRow)
-	if !ok || constraints.MaxFilesChanged <= 0 {
-		return ""
-	}
-	count := len(parsedPlan.Scope.Files)
-	if count <= constraints.MaxFilesChanged {
+	if parsedPlan.SplitProposal != nil {
 		return ""
 	}
 	return fmt.Sprintf(
-		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d — "+
-			"narrow the scope or split the work into a decomposition before approving.",
-		count, constraints.MaxFilesChanged,
+		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d, "+
+			"and carries no split_proposal — split the work into an expand->migrate->contract split_proposal "+
+			"(each phase at or under the cap) before approving.",
+		count, capLimit,
 	)
 }

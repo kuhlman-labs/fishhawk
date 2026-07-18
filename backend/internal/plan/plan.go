@@ -63,11 +63,53 @@ type Plan struct {
 	// because plan.Parse strict-decodes with DisallowUnknownFields, so an
 	// over_cap artifact would otherwise fail to decode. HINT-ONLY: NO
 	// enforcement or detection path may branch on this flag to decide whether a
-	// plan is over-cap. The authoritative over-cap signal is the server-side
-	// count-derived advisory in runPlanWarnings (len(scope.files) > resolved
-	// cap), which never reads this field. Omitted (false) for a plan that
-	// declares nothing.
+	// plan is over-cap. The AUTHORITATIVE over-cap signal is the server-side
+	// count-derived reject/advisory (len(scope.files) > resolved cap), which
+	// never reads this field: the plan.Parse semanticCheck's
+	// over_cap ⇒ split_proposal coupling is only an ADDITIONAL in-artifact
+	// DEFENSIVE layer, while the authoritative enforcement is the server
+	// overCapSplitRejection gate in handleShipPlan (overCapByCount, which does
+	// NOT read OverCap). Omitted (false) for a plan that declares nothing.
 	OverCap bool `json:"over_cap,omitempty"`
+	// SplitProposal is the plan's optional ordered-phase split (#2055, E50.3):
+	// the expand->migrate->contract phase sequence a plan carries when
+	// scope.files exceeds the resolved implement-stage max_files_changed cap BY
+	// COUNT. A plan over the cap by count MUST carry it or the server rejects it
+	// (plan_review_failed / category-B) REGARDLESS of the OverCap hint — the
+	// authoritative over-cap signal is the server-derived count, not OverCap.
+	// Each phase carries its own scope.files (intended at or under the cap) and
+	// depends_on edges. Additive-optional within standard_v1; nil means the plan
+	// declares no split. JSON tags mirror the split_proposal / split-phase $defs
+	// in the schema.
+	SplitProposal *SplitProposal `json:"split_proposal,omitempty"`
+}
+
+// SplitProposal is the plan's optional ordered-phase split (#2055, E50.3): the
+// Rationale for splitting and the ordered Phases (shaped expand->migrate->
+// contract for compile-atomic changes). Carried when scope.files exceeds the
+// resolved implement-stage cap by count. JSON tags mirror the split_proposal
+// $def in the schema.
+type SplitProposal struct {
+	Rationale string       `json:"rationale"`
+	Phases    []SplitPhase `json:"phases"`
+}
+
+// SplitPhase is one phase within a SplitProposal. Each phase declares its own
+// non-empty Scope.Files (intended at or under the resolved implement-stage cap
+// so the phase ships as its own within-cap plan) and DependsOn edges (0-based
+// indices of sibling phases it depends on, mirroring SubPlanSummary.DependsOn).
+// JSON tags mirror the split-phase $def in the schema.
+type SplitPhase struct {
+	Title     string `json:"title"`
+	ScopeHint string `json:"scope_hint,omitempty"`
+	// Scope is the phase's own file list. Non-nil and non-empty is enforced by
+	// semanticCheck when a SplitProposal is present.
+	Scope *Scope `json:"scope,omitempty"`
+	// DependsOn lists the 0-based indices of sibling phases this phase depends
+	// on within the same SplitProposal. Validated by semanticCheck (in-range,
+	// non-negative, non-self, acyclic) reusing the Waves Kahn sort. Omitted/
+	// empty means no dependency.
+	DependsOn []int `json:"depends_on,omitempty"`
 }
 
 // SurfaceSweepExemption is one entry in Plan.SurfaceSweepExemptions (#1544):
@@ -211,17 +253,37 @@ func Waves(d *Decomposition) ([][]int, error) {
 	if d == nil || len(d.SubPlans) == 0 {
 		return nil, nil
 	}
-	n := len(d.SubPlans)
+	dependsOn := make([][]int, len(d.SubPlans))
+	for i, sp := range d.SubPlans {
+		dependsOn[i] = sp.DependsOn
+	}
+	return wavesFromDependsOn(dependsOn, "sub_plan")
+}
+
+// wavesFromDependsOn is the shared Kahn topological sort behind Waves (#1258)
+// and the split_proposal phase DAG check (#2055). dependsOn[i] holds node i's
+// 0-based dependency indices; label names the node kind in error messages
+// ("sub_plan" / "phase"). It validates every edge (in-range, non-negative,
+// non-self) before layering so a malformed index is reported as such rather
+// than masquerading as a cycle, then returns ordered waves of node indices
+// (wave 0 = every node with no unsatisfied dependency; within a wave indices
+// are ascending for deterministic output). A dependency cycle that leaves some
+// nodes unplaceable is a hard error. A zero-length input returns (nil, nil).
+func wavesFromDependsOn(dependsOn [][]int, label string) ([][]int, error) {
+	n := len(dependsOn)
+	if n == 0 {
+		return nil, nil
+	}
 
 	// Validate every edge before layering so a malformed index is reported
 	// as such rather than masquerading as a cycle.
-	for i, sp := range d.SubPlans {
-		for _, dep := range sp.DependsOn {
+	for i, deps := range dependsOn {
+		for _, dep := range deps {
 			if dep < 0 || dep >= n {
-				return nil, fmt.Errorf("sub_plan %d depends_on index %d out of range [0,%d)", i, dep, n)
+				return nil, fmt.Errorf("%s %d depends_on index %d out of range [0,%d)", label, i, dep, n)
 			}
 			if dep == i {
-				return nil, fmt.Errorf("sub_plan %d depends_on itself (index %d)", i, dep)
+				return nil, fmt.Errorf("%s %d depends_on itself (index %d)", label, i, dep)
 			}
 		}
 	}
@@ -239,7 +301,7 @@ func Waves(d *Decomposition) ([][]int, error) {
 				continue
 			}
 			ready := true
-			for _, dep := range d.SubPlans[i].DependsOn {
+			for _, dep := range dependsOn[i] {
 				if !placed[dep] {
 					ready = false
 					break
@@ -258,7 +320,7 @@ func Waves(d *Decomposition) ([][]int, error) {
 					stuck = append(stuck, i)
 				}
 			}
-			return nil, fmt.Errorf("dependency cycle among sub_plans %v", stuck)
+			return nil, fmt.Errorf("dependency cycle among %ss %v", label, stuck)
 		}
 		for _, i := range wave {
 			placed[i] = true

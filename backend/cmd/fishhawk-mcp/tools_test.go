@@ -7776,3 +7776,138 @@ func TestReleaseNotesTool_Handler(t *testing.T) {
 		})
 	}
 }
+
+// seedRawPlanArtifact attaches a plan artifact whose Content is a caller-built
+// wire-shaped value (a map, not a typed PlanContent), so a test can exercise a
+// wire shape the typed struct cannot express — e.g. split_proposal.phases[]
+// nesting files under scope.files (#2055), which the resolver flattens.
+func seedRawPlanArtifact(fb *fakeBackend, stageID uuid.UUID, content any, createdAge time.Duration) Artifact {
+	v := "standard_v1"
+	body, _ := json.Marshal(content)
+	var decoded any
+	_ = json.Unmarshal(body, &decoded)
+	art := Artifact{
+		ID:            uuid.New().String(),
+		StageID:       stageID.String(),
+		Kind:          "plan",
+		SchemaVersion: &v,
+		ContentHash:   "h",
+		Content:       decoded,
+		CreatedAt:     time.Now().UTC().Add(-createdAge),
+	}
+	fb.mu.Lock()
+	fb.artifactsByStage[stageID] = append(fb.artifactsByStage[stageID], art)
+	fb.mu.Unlock()
+	return art
+}
+
+// TestGetPlan_WithSplitProposal_FieldsSurfaced covers the over-cap split render
+// seam (#2055, E50.3): a plan artifact carrying a split_proposal (wire shape:
+// each phase nests files under scope.files) is surfaced in the gate view as a
+// PlanSplitProposal whose phases carry a flattened per-phase Files list, a
+// derived FileCount, and the depends_on edges — visually distinct from a
+// single-phase plan.
+func TestGetPlan_WithSplitProposal_FieldsSurfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+
+	// Build the artifact in WIRE shape so mapSplitProposal's flatten + FileCount
+	// derivation is exercised exactly as in production.
+	base, _ := json.Marshal(samplePlanContent())
+	var content map[string]any
+	if err := json.Unmarshal(base, &content); err != nil {
+		t.Fatalf("unmarshal sample content: %v", err)
+	}
+	content["split_proposal"] = map[string]any{
+		"rationale": "rename spans more files than the cap; split expand->migrate->contract",
+		"phases": []any{
+			map[string]any{
+				"title":      "Expand",
+				"scope_hint": "additive schema change",
+				"scope": map[string]any{"files": []any{
+					map[string]any{"path": "backend/internal/storage/run.go", "operation": "modify"},
+				}},
+			},
+			map[string]any{
+				"title":      "Migrate",
+				"depends_on": []any{0},
+				"scope": map[string]any{"files": []any{
+					map[string]any{"path": "backend/internal/server/reads.go", "operation": "modify"},
+					map[string]any{"path": "backend/internal/server/runs.go", "operation": "modify"},
+				}},
+			},
+		},
+	}
+	seedRawPlanArtifact(fb, planStageID, content, time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Plan == nil {
+		t.Fatal("Plan should be non-nil")
+	}
+	sp := out.Plan.SplitProposal
+	if sp == nil {
+		t.Fatal("Plan.SplitProposal should be non-nil for a plan carrying a split_proposal")
+	}
+	if sp.Rationale == "" {
+		t.Error("SplitProposal.Rationale should be non-empty")
+	}
+	if got := len(sp.Phases); got != 2 {
+		t.Fatalf("len(SplitProposal.Phases) = %d, want 2", got)
+	}
+	// Phase 0 (Expand): one file, derived count 1, no depends_on.
+	if sp.Phases[0].Title != "Expand" {
+		t.Errorf("Phases[0].Title = %q, want Expand", sp.Phases[0].Title)
+	}
+	if got := len(sp.Phases[0].Files); got != 1 {
+		t.Errorf("Phases[0] Files len = %d, want 1", got)
+	}
+	if sp.Phases[0].FileCount != 1 {
+		t.Errorf("Phases[0].FileCount = %d, want 1 (derived from len(Files))", sp.Phases[0].FileCount)
+	}
+	if len(sp.Phases[0].DependsOn) != 0 {
+		t.Errorf("Phases[0].DependsOn = %v, want empty", sp.Phases[0].DependsOn)
+	}
+	// Phase 1 (Migrate): two files, derived count 2, depends_on [0].
+	if sp.Phases[1].FileCount != 2 {
+		t.Errorf("Phases[1].FileCount = %d, want 2", sp.Phases[1].FileCount)
+	}
+	if got := len(sp.Phases[1].Files); got != 2 {
+		t.Errorf("Phases[1] Files len = %d, want 2", got)
+	}
+	if len(sp.Phases[1].DependsOn) != 1 || sp.Phases[1].DependsOn[0] != 0 {
+		t.Errorf("Phases[1].DependsOn = %v, want [0]", sp.Phases[1].DependsOn)
+	}
+}
+
+// TestGetPlan_WithoutSplitProposal_FieldNil confirms a plan with no
+// split_proposal surfaces a nil SplitProposal (omitted from the JSON response),
+// so single-phase rendering is unchanged (#2055).
+func TestGetPlan_WithoutSplitProposal_FieldNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Plan == nil {
+		t.Fatal("Plan should be non-nil")
+	}
+	if out.Plan.SplitProposal != nil {
+		t.Errorf("Plan.SplitProposal should be nil for a plan without a split_proposal; got %+v", out.Plan.SplitProposal)
+	}
+}

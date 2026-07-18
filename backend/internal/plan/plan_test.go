@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 )
@@ -360,9 +362,11 @@ func TestParse_DecompositionTwoSubPlans_Succeeds(t *testing.T) {
 // over-cap advisory — that advisory is count-derived in the server's
 // runPlanWarnings (len(scope.files) > resolved cap) and never reads OverCap.
 // This test pins the decode/round-trip contract only, not the detection
-// contract; a future editor must not mistake it for the latter.
+// contract; a future editor must not mistake it for the latter. It now also
+// carries a split_proposal because over_cap:true without one is rejected by the
+// in-artifact semanticCheck defensive layer (#2055).
 func TestParse_OverCap_RoundTrips(t *testing.T) {
-	m := planfixture.Valid(func(m map[string]any) {
+	m := planfixture.Valid(threePhaseSplitOption(), func(m map[string]any) {
 		m["over_cap"] = true
 	})
 	p, err := plan.Parse(marshalFixture(t, m))
@@ -1436,8 +1440,9 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // as a drift guard: any byte change (an unintended edit, or a docs/spec
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
-// standard_v1.x — most recently the #2053 top-level over_cap planner
-// self-declaration hint (before that, the #1748 acceptance-criterion
+// standard_v1.x — most recently the #2055 top-level split_proposal over-cap
+// phase-split field (before that, the #2053 top-level over_cap planner
+// self-declaration hint, the #1748 acceptance-criterion
 // skip_expected / expectation_basis marker, the #1544 top-level
 // surface_sweep_exemptions field, and the #1529
 // verification.acceptance_criteria / out_of_scope fields). A standard_v1 plan
@@ -1445,7 +1450,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "42543f6365d423d2d27eed9d1b3337f0e0dd63e4c6cabeb335a222eae0214d25"
+	const wantHash = "d637dff36b34f684477d647ea4f8870d958bd439b3db9f479cc0712c986ca7d3"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -1631,5 +1636,241 @@ func TestParse_AcceptanceCriteria_MisspelledProperty_IsSchemaError(t *testing.T)
 	var se *plan.SchemaError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *SchemaError (a misspelled criterion property is rejected)", err)
+	}
+}
+
+// --- split_proposal (#2055, E50.3) ---
+
+// splitPhase builds one split_proposal phase map with the given title, its own
+// scope.files, and optional depends_on indices — the shape the split_proposal
+// schema and semanticCheck validate.
+func splitPhase(title string, dependsOn []int, paths ...string) map[string]any {
+	files := make([]any, len(paths))
+	for i, p := range paths {
+		files[i] = map[string]any{"path": p, "operation": "modify"}
+	}
+	ph := map[string]any{
+		"title":      title,
+		"scope_hint": title + " phase",
+		"scope":      map[string]any{"files": files},
+	}
+	if dependsOn != nil {
+		deps := make([]any, len(dependsOn))
+		for i, d := range dependsOn {
+			deps[i] = d
+		}
+		ph["depends_on"] = deps
+	}
+	return ph
+}
+
+// threePhaseSplitOption sets a valid expand->migrate->contract split_proposal
+// with depends_on edges expand(0) <- migrate(1) <- contract(2), each phase
+// carrying its own disjoint scope.files.
+func threePhaseSplitOption() planfixture.Option {
+	return func(m map[string]any) {
+		m["split_proposal"] = map[string]any{
+			"rationale": "rename spans more files than the implement-stage cap; split expand->migrate->contract",
+			"phases": []any{
+				splitPhase("Expand", nil, "backend/internal/storage/run.go"),
+				splitPhase("Migrate", []int{0}, "backend/internal/server/reads.go", "backend/internal/server/runs.go"),
+				splitPhase("Contract", []int{1}, "backend/internal/db/migrations/0043_drop.sql"),
+			},
+		}
+	}
+}
+
+// TestParse_SplitProposal_RoundTrips covers the additive optional
+// split_proposal (#2055): a three-phase expand/migrate/contract proposal
+// validates against the schema and decodes into the typed Plan.SplitProposal,
+// preserving phase titles, per-phase scope.files, and depends_on edges. It also
+// re-marshals cleanly (the round-trip the operator-facing surfaces rely on).
+func TestParse_SplitProposal_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(threePhaseSplitOption())
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.SplitProposal == nil {
+		t.Fatal("SplitProposal should be non-nil")
+	}
+	if p.SplitProposal.Rationale == "" {
+		t.Error("SplitProposal.Rationale should be non-empty")
+	}
+	if got, want := len(p.SplitProposal.Phases), 3; got != want {
+		t.Fatalf("phases len = %d, want %d", got, want)
+	}
+	ph := p.SplitProposal.Phases
+	if ph[0].Title != "Expand" || ph[1].Title != "Migrate" || ph[2].Title != "Contract" {
+		t.Errorf("phase titles = %q/%q/%q, want Expand/Migrate/Contract", ph[0].Title, ph[1].Title, ph[2].Title)
+	}
+	if ph[1].Scope == nil || len(ph[1].Scope.Files) != 2 {
+		t.Errorf("migrate phase should carry 2 scope files, got %+v", ph[1].Scope)
+	}
+	if len(ph[1].DependsOn) != 1 || ph[1].DependsOn[0] != 0 {
+		t.Errorf("migrate depends_on = %v, want [0]", ph[1].DependsOn)
+	}
+	if len(ph[2].DependsOn) != 1 || ph[2].DependsOn[0] != 1 {
+		t.Errorf("contract depends_on = %v, want [1]", ph[2].DependsOn)
+	}
+	// Re-marshal must not error (the JSON round-trip operator surfaces use).
+	if _, err := json.Marshal(p); err != nil {
+		t.Fatalf("re-marshal plan: %v", err)
+	}
+}
+
+// TestParse_WithoutSplitProposal_StillValidates confirms split_proposal is
+// optional: a plan omitting it validates and decodes to a nil SplitProposal.
+func TestParse_WithoutSplitProposal_StillValidates(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.SplitProposal != nil {
+		t.Errorf("SplitProposal = %+v, want nil when split_proposal is omitted", p.SplitProposal)
+	}
+}
+
+// TestParse_OverCapWithoutSplitProposal_IsSemanticError pins the in-artifact
+// DEFENSIVE layer (#2055 constraint #1): a plan self-declaring over_cap:true but
+// omitting split_proposal is rejected by semanticCheck. This is NOT the
+// authoritative gate (that is the server count-derived reject) — it only catches
+// a planner that set the hint but forgot the split.
+func TestParse_OverCapWithoutSplitProposal_IsSemanticError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["over_cap"] = true
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "split_proposal") {
+		t.Errorf("SemanticError should name split_proposal, got %q", se.Error())
+	}
+}
+
+// TestParse_OverCapWithSplitProposal_Succeeds confirms the coupling is
+// satisfied: over_cap:true WITH a valid split_proposal parses cleanly.
+func TestParse_OverCapWithSplitProposal_Succeeds(t *testing.T) {
+	m := planfixture.Valid(threePhaseSplitOption(), func(m map[string]any) {
+		m["over_cap"] = true
+	})
+	if _, err := plan.Parse(marshalFixture(t, m)); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+}
+
+// TestParse_SplitProposalEmptyPhaseScope_IsSemanticError covers the
+// non-empty-scope invariant: a phase declaring an empty scope.files is rejected
+// (schema minItems:1 on scope.files makes this a *SchemaError, the fail-closed
+// outcome we assert regardless of layer).
+func TestParse_SplitProposalEmptyPhaseScope_IsSemanticError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["split_proposal"] = map[string]any{
+			"rationale": "split",
+			"phases": []any{
+				splitPhase("Expand", nil, "a.go"),
+				map[string]any{
+					"title": "Empty",
+					"scope": map[string]any{"files": []any{}},
+				},
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	if err == nil {
+		t.Fatal("want an error for a phase with empty scope.files")
+	}
+	var se *plan.SchemaError
+	var sem *plan.SemanticError
+	if !errors.As(err, &se) && !errors.As(err, &sem) {
+		t.Fatalf("err = %v, want *SchemaError or *SemanticError", err)
+	}
+}
+
+// TestParse_SplitProposalDuplicatePhaseTitle_IsSemanticError covers the
+// unique-title invariant: two phases sharing a title are rejected by
+// semanticCheck.
+func TestParse_SplitProposalDuplicatePhaseTitle_IsSemanticError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["split_proposal"] = map[string]any{
+			"rationale": "split",
+			"phases": []any{
+				splitPhase("Same", nil, "a.go"),
+				splitPhase("Same", nil, "b.go"),
+			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SemanticError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "duplicate title") {
+		t.Errorf("SemanticError should name the duplicate title, got %q", se.Error())
+	}
+}
+
+// TestParse_SplitProposalBadDependsOn_IsSemanticError covers the depends_on DAG
+// invariant across its three malformed shapes: out-of-range, self, and cyclic
+// indices are each rejected by semanticCheck (reusing the Waves Kahn sort).
+func TestParse_SplitProposalBadDependsOn_IsSemanticError(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		deps0 []int
+		deps1 []int
+	}{
+		{name: "out-of-range", deps0: nil, deps1: []int{9}},
+		{name: "self", deps0: nil, deps1: []int{1}},
+		{name: "cycle", deps0: []int{1}, deps1: []int{0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := planfixture.Valid(func(m map[string]any) {
+				m["split_proposal"] = map[string]any{
+					"rationale": "split",
+					"phases": []any{
+						splitPhase("Alpha", tc.deps0, "a.go"),
+						splitPhase("Beta", tc.deps1, "b.go"),
+					},
+				}
+			})
+			_, err := plan.Parse(marshalFixture(t, m))
+			var se *plan.SemanticError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SemanticError", err)
+			}
+			if !strings.Contains(se.Error(), "depends_on") {
+				t.Errorf("SemanticError should name depends_on, got %q", se.Error())
+			}
+		})
+	}
+}
+
+// TestParse_SplitProposalExampleFixture_Validates pins the committed sample
+// fixture (operator constraint #2) as parseable through the full Parse path
+// (schema + semanticCheck), so the round-trip test and the check-jsonschema
+// sample-validates criterion anchor on the same artifact.
+func TestParse_SplitProposalExampleFixture_Validates(t *testing.T) {
+	raw, err := os.ReadFile("../../../docs/spec/examples/split-proposal-example.yaml")
+	if err != nil {
+		t.Fatalf("read example fixture: %v", err)
+	}
+	// yaml.v3 decodes maps with string keys, so a re-marshal to JSON yields the
+	// wire form plan.Parse consumes.
+	var doc any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode example fixture YAML: %v", err)
+	}
+	jsonBytes, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("re-encode example fixture as JSON: %v", err)
+	}
+	p, err := plan.Parse(jsonBytes)
+	if err != nil {
+		t.Fatalf("Parse example fixture: %v", err)
+	}
+	if p.SplitProposal == nil || len(p.SplitProposal.Phases) != 3 {
+		t.Fatalf("example fixture should carry a 3-phase split_proposal, got %+v", p.SplitProposal)
 	}
 }

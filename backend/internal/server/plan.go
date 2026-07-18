@@ -549,14 +549,60 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// the plan-review prompt's gate-evidence section like the gates above.
 	acceptance := s.runAcceptancePrecheck(r.Context(), runID, stageID, body)
 
+	// Plan-gate over-cap split rejection (E50.3 / #2055): the
+	// SERVER-AUTHORITATIVE, count-derived HARD reject — the E50 keystone. When
+	// scope.files exceeds the resolved implement-stage max_files_changed cap BY
+	// COUNT and the plan carries no split_proposal, reject it here
+	// (plan_review_failed + category-B via the same run.FailStage +
+	// advanceAfterFailure terminal path the plan-invalid/decomposition reject
+	// uses) REGARDLESS of the over_cap hint. overCapSplitRejection is
+	// count-derived (it never reads over_cap) and fails OPEN on an unresolved
+	// cap exactly like the sibling advisory. Setting gatingRejected reuses the
+	// existing advancement-suppression below, so the rejected stage never walks
+	// to awaiting_approval and no plan-ready ping fires; the plan artifact is
+	// already stored and audited, so the operator can inspect the rejected plan
+	// (and the count-derived plan_warnings advisory) via fishhawk_get_plan.
+	//
+	// The plan is decoded with json.Unmarshal, NOT plan.Parse, on purpose: the
+	// body already passed plan.Validate (schema) above, and Parse additionally
+	// runs the semanticCheck over_cap ⇒ split_proposal coupling — which would
+	// REJECT an over_cap:true monolith before this gate could see it, letting the
+	// over_cap:true cell of the flag-independence matrix escape the authoritative
+	// count reject. Decoding without semanticCheck keeps this gate flag- AND
+	// parse-independent: it fires on the server-derived count alone for over_cap
+	// {omitted, false, true} alike. The semanticCheck coupling remains an
+	// ADDITIONAL in-artifact defensive layer (surfaced via runPlanReviews'
+	// plan.Parse path), NOT this authoritative gate. A json.Unmarshal failure on
+	// schema-valid bytes is an internal inconsistency: skip the gate (fail open).
+	gatingRejected := false
+	var parsedForCap plan.Plan
+	if uerr := json.Unmarshal(body, &parsedForCap); uerr == nil {
+		if reason := s.overCapSplitRejection(r.Context(), runID, &parsedForCap); reason != "" {
+			s.emitReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
+			cat := run.FailureB
+			if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, "plan_review_failed: "+reason); ferr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"plan upload: transition to failed-B after over-cap split reject failed",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", ferr.Error()))
+			}
+			s.advanceAfterFailure(r, runID, stageID)
+			gatingRejected = true
+		}
+	}
+
 	// Plan review: invoke configured review agents after the artifact
 	// is stored and audited, before advancing the stage. The gate
 	// results computed above ride along so the review prompt carries
 	// the machine-verified evidence (#963). Returns true when authority
 	// is gating and at least one verdict is reject; in that case the
 	// stage has been transitioned to failed-B and stage advancement is
-	// blocked.
-	gatingRejected := s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep, regression, acceptance)
+	// blocked. Skipped when the over-cap split reject above already failed
+	// the stage — the reviewers have nothing to add to a server-rejected plan.
+	if !gatingRejected {
+		gatingRejected = s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep, regression, acceptance)
+	}
 
 	// Plan-stage terminal advancement (#603). With a valid plan artifact
 	// now stored, this handler is the authoritative driver of the plan

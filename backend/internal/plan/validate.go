@@ -268,6 +268,23 @@ func semanticCheck(p *Plan) error {
 		}
 		seenCriteria[c.ID] = struct{}{}
 	}
+	// split_proposal invariants (#2055, E50.3). These run on a non-decomposed
+	// plan too, so they precede the decomposition early return.
+	//
+	// The over_cap ⇒ split_proposal coupling here is an ADDITIONAL in-artifact
+	// DEFENSIVE layer, NOT the authoritative over-cap gate: the AUTHORITATIVE
+	// enforcement is the server-side count-derived overCapSplitRejection gate
+	// (len(scope.files) > resolved cap, which never reads over_cap). This branch
+	// only catches a self-declaring planner that set over_cap:true but forgot
+	// the split.
+	if p.OverCap && p.SplitProposal == nil {
+		return &SemanticError{
+			Message: "over_cap is true but split_proposal is absent; a plan over the implement-stage max_files_changed cap must carry a split_proposal shaped expand->migrate->contract",
+		}
+	}
+	if err := checkSplitProposal(p.SplitProposal); err != nil {
+		return err
+	}
 	if p.Decomposition == nil {
 		return nil
 	}
@@ -375,6 +392,42 @@ func checkCrossSliceSharedFiles(d *Decomposition) error {
 			strings.Join(parts, "; "),
 		),
 	}
+}
+
+// checkSplitProposal validates a plan's optional split_proposal (#2055): phase
+// titles must be unique, every phase must declare a non-empty scope.files (each
+// phase ships as its own within-cap plan, so an empty phase scope is
+// meaningless), and the phase depends_on edges must form a valid DAG (in-range,
+// non-negative, non-self, acyclic — reusing the Kahn sort behind Waves). A nil
+// SplitProposal is a no-op (the field is additive-optional). These are the
+// structural invariants JSON Schema cannot express; the over_cap ⇒
+// split_proposal coupling is enforced by the caller.
+func checkSplitProposal(sp *SplitProposal) error {
+	if sp == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(sp.Phases))
+	dependsOn := make([][]int, len(sp.Phases))
+	for i, ph := range sp.Phases {
+		if _, dup := seen[ph.Title]; dup {
+			return &SemanticError{
+				Message: fmt.Sprintf("split_proposal.phases: duplicate title %q", ph.Title),
+			}
+		}
+		seen[ph.Title] = struct{}{}
+		if ph.Scope == nil || len(ph.Scope.Files) == 0 {
+			return &SemanticError{
+				Message: fmt.Sprintf("split_proposal.phases: phase %q declares no scope.files; every phase must declare the files it owns so it ships as its own within-cap plan", ph.Title),
+			}
+		}
+		dependsOn[i] = ph.DependsOn
+	}
+	if _, err := wavesFromDependsOn(dependsOn, "phase"); err != nil {
+		return &SemanticError{
+			Message: fmt.Sprintf("split_proposal.phases: invalid depends_on: %v", err),
+		}
+	}
+	return nil
 }
 
 // Warnings returns advisory strings for a successfully-parsed Plan.

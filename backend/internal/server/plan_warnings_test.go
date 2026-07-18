@@ -557,3 +557,161 @@ func getPlanWarningsField(t *testing.T, au *auditFake, _ uuid.UUID) []string {
 	}
 	return entries[len(entries)-1].Warnings
 }
+
+// splitProposalMap returns a valid two-phase expand->contract split_proposal
+// map (each phase carrying its own disjoint scope.files, depends_on edge
+// expand(0) <- contract(1)) for the over-cap reject accept-path tests (#2055).
+func splitProposalMap() map[string]any {
+	return map[string]any{
+		"rationale": "split expand->migrate->contract; each phase at or under the cap",
+		"phases": []any{
+			map[string]any{
+				"title": "Expand",
+				"scope": map[string]any{"files": []any{
+					map[string]any{"path": "backend/internal/foo/expand.go", "operation": "modify"},
+				}},
+			},
+			map[string]any{
+				"title":      "Contract",
+				"depends_on": []any{0},
+				"scope": map[string]any{"files": []any{
+					map[string]any{"path": "backend/internal/foo/contract.go", "operation": "modify"},
+				}},
+			},
+		},
+	}
+}
+
+// overCapPlanBodyWithSplit builds a schema-valid standard_v1 plan whose
+// scope.files has numFiles entries, sets over_cap per overCap (nil = omit), and
+// attaches a valid split_proposal when withSplit is true — the shapes the
+// count-derived overCapSplitRejection matrix (#2055) exercises.
+func overCapPlanBodyWithSplit(t *testing.T, numFiles int, overCap *bool, withSplit bool) []byte {
+	t.Helper()
+	fileMaps := make([]any, 0, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fileMaps = append(fileMaps, map[string]any{
+			"path":      fmt.Sprintf("backend/internal/bar/f%d.go", i),
+			"operation": "modify",
+		})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": fileMaps}
+	})
+	if overCap != nil {
+		m["over_cap"] = *overCap
+	}
+	if withSplit {
+		m["split_proposal"] = splitProposalMap()
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	// Schema-valid regardless of the over_cap ⇒ split_proposal semantic coupling
+	// (Validate is schema-only); the authoritative gate decodes with
+	// json.Unmarshal exactly like handleShipPlan, never running semanticCheck.
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return body
+}
+
+// unmarshalPlan decodes a plan body WITHOUT semanticCheck, mirroring the
+// json.Unmarshal handleShipPlan uses for the authoritative over-cap gate — so
+// an over_cap:true + no-split body (which plan.Parse would reject) still decodes
+// here, which is the whole point of the flag-independence keystone.
+func unmarshalPlan(t *testing.T, body []byte) *plan.Plan {
+	t.Helper()
+	var p plan.Plan
+	if err := json.Unmarshal(body, &p); err != nil {
+		t.Fatalf("unmarshal plan body: %v", err)
+	}
+	return &p
+}
+
+// TestOverCapSplitRejection_FlagMatrix is the E50 keystone (#2055 constraint
+// #1): the count-derived server reject fires for an over-cap-BY-COUNT monolith
+// lacking a split_proposal in ALL THREE over_cap states (omitted, false, true),
+// accepts an over-cap plan carrying a valid split_proposal, and leaves an
+// under-cap plan untouched. The over_cap:true + no-split cell is what catches a
+// flag-reading regression like `if plan.OverCap && count > cap` — the reject
+// must be derived from the file count ALONE and never read over_cap.
+func TestOverCapSplitRejection_FlagMatrix(t *testing.T) {
+	const capLimit = 2
+	for _, tc := range []struct {
+		name       string
+		numFiles   int
+		overCap    *bool
+		withSplit  bool
+		wantReject bool
+	}{
+		{name: "over-cap, flag omitted, no split -> reject", numFiles: 3, overCap: nil, withSplit: false, wantReject: true},
+		{name: "over-cap, flag false, no split -> reject", numFiles: 3, overCap: boolPtr(false), withSplit: false, wantReject: true},
+		{name: "over-cap, flag true, no split -> reject", numFiles: 3, overCap: boolPtr(true), withSplit: false, wantReject: true},
+		{name: "over-cap, flag omitted, WITH split -> accept", numFiles: 3, overCap: nil, withSplit: true, wantReject: false},
+		{name: "over-cap, flag true, WITH split -> accept", numFiles: 3, overCap: boolPtr(true), withSplit: true, wantReject: false},
+		{name: "under-cap, flag true, no split -> accept", numFiles: 1, overCap: boolPtr(true), withSplit: false, wantReject: false},
+		{name: "under-cap, flag omitted -> accept", numFiles: 1, overCap: nil, withSplit: false, wantReject: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+			p := unmarshalPlan(t, overCapPlanBodyWithSplit(t, tc.numFiles, tc.overCap, tc.withSplit))
+
+			reason := s.overCapSplitRejection(context.Background(), runRow.ID, p)
+
+			if tc.wantReject {
+				if reason == "" {
+					t.Fatal("want a non-empty reject reason for an over-cap-by-count plan without split_proposal")
+				}
+				if !strings.Contains(reason, fmt.Sprintf("declares %d files", tc.numFiles)) ||
+					!strings.Contains(reason, fmt.Sprintf("cap of %d", capLimit)) {
+					t.Errorf("reason = %q, want it to name count=%d and cap=%d", reason, tc.numFiles, capLimit)
+				}
+				if !strings.Contains(reason, "split_proposal") {
+					t.Errorf("reason = %q, want it to name split_proposal as the remedy", reason)
+				}
+			} else if reason != "" {
+				t.Errorf("want no reject reason; got %q", reason)
+			}
+		})
+	}
+}
+
+// TestOverCapSplitRejection_NilRunRepo_FailsOpen pins the fail-open leg for a
+// nil RunRepo (#2055): the cap cannot be resolved, so overCapByCount returns
+// ok=false and the reject is skipped — an over-cap-by-count monolith is NOT
+// blocked when the cap is unresolvable.
+func TestOverCapSplitRejection_NilRunRepo_FailsOpen(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"}) // RunRepo intentionally nil.
+	p := unmarshalPlan(t, overCapPlanBodyWithSplit(t, 3, nil, false))
+
+	if reason := s.overCapSplitRejection(context.Background(), uuid.New(), p); reason != "" {
+		t.Errorf("want no reject with a nil RunRepo (cap unresolvable, fail-open); got %q", reason)
+	}
+}
+
+// TestOverCapSplitRejection_UnresolvedCap_FailsOpen pins the fail-open leg when
+// the workflow has no implement stage (#2055): resolveImplementConstraints
+// returns ok=false, so there is no cap to exceed and the reject is skipped even
+// for an over-cap-by-count monolith without a split.
+func TestOverCapSplitRejection_UnresolvedCap_FailsOpen(t *testing.T) {
+	specNoImplement := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+	s, _, runRow := newScopePrecheckServer(t, specNoImplement)
+	p := unmarshalPlan(t, overCapPlanBodyWithSplit(t, 3, nil, false))
+
+	if reason := s.overCapSplitRejection(context.Background(), runRow.ID, p); reason != "" {
+		t.Errorf("want no reject when the workflow has no implement stage (fail-open); got %q", reason)
+	}
+}
