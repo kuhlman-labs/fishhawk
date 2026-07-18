@@ -843,6 +843,13 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 	// attempted.
 	if p.Decision == approval.DecisionApprove && advanced.Type == run.StageTypePlan {
 		s.recordDrivePlanApproved(ctx, advanced)
+		// On-approval split-proposal child filing (#2057, E50.5): when the
+		// approved plan carries a split_proposal, file the phased children,
+		// classify the contract phase, and emit the split_children_filed
+		// completion marker. Best-effort like recordDrivePlanApproved above — a
+		// failure logs and never unwinds the approval the gate already recorded;
+		// a plan without a split_proposal no-ops.
+		s.fileSplitProposalChildren(ctx, advanced)
 	}
 
 	// Plan-comment re-render (#377): a plan-stage approve or reject re-fires

@@ -169,6 +169,7 @@ var KnownCategories = map[string]struct{}{
 	"slice_integration_conflict":              {},
 	"slice_integration_failed":                {},
 	"slices_integrated":                       {},
+	"split_children_filed":                    {},
 	"spend_alert":                             {},
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_triggered":                   {},
