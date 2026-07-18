@@ -3673,6 +3673,53 @@ func TestGetPlan_PlanWarnings_CrossBoundarySeam(t *testing.T) {
 	}
 }
 
+// TestGetPlan_OverCapAdvisory_ReachesPlanWarningsField is the condition-2
+// end-to-end assertion (#2053) exercising the REAL cross-boundary resolver.
+// The sibling TestShipPlan_OverCapAdvisory_ReachesGetPlanField in
+// backend/internal/server proves handleShipPlan -> runPlanWarnings PRODUCES
+// the count-derived over-cap advisory payload, but it can only REPLICATE the
+// get_plan selection contract (the resolver loadPlanWarnings lives here in
+// package main, unimportable from the server package). This test closes that
+// vacuity: a server-side PlanWarningsPayload carrying the over-cap advisory
+// (the exact string overCapWarning emits, naming the scanned count and the
+// resolved cap) round-trips through the audit log and surfaces via the actual
+// getPlan/loadPlanWarnings path in GetPlanOutput.PlanWarnings — so a divergence
+// in the real selection/serialization resolver would fail HERE.
+func TestGetPlan_OverCapAdvisory_ReachesPlanWarningsField(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// The over-cap advisory string, byte-for-byte as
+	// server.(*Server).overCapWarning emits it (plan_warnings.go): scanned
+	// count 4 exceeding the resolved cap of 3.
+	const count, capLimit = 4, 3
+	overCapAdvisory := fmt.Sprintf(
+		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d — "+
+			"narrow the scope or split the work into a decomposition before approving.",
+		count, capLimit,
+	)
+	seedPlanWarningsAudit(fb, runID, server.PlanWarningsPayload{Warnings: []string{overCapAdvisory}})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if len(out.PlanWarnings) != 1 {
+		t.Fatalf("len(PlanWarnings) = %d, want 1: %v", len(out.PlanWarnings), out.PlanWarnings)
+	}
+	got := out.PlanWarnings[0]
+	if !strings.Contains(got, fmt.Sprintf("declares %d files", count)) ||
+		!strings.Contains(got, fmt.Sprintf("cap of %d", capLimit)) {
+		t.Errorf("PlanWarnings[0] = %q, want it to name count=%d and cap=%d", got, count, capLimit)
+	}
+}
+
 // TestGetPlan_PlanWarnings_NewestEntryWins mirrors the sibling sweeps: a
 // schema-retry run writes two plan_warnings entries; the authoritative one
 // is the newest (last, sequence-ascending).

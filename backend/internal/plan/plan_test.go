@@ -354,6 +354,38 @@ func TestParse_DecompositionTwoSubPlans_Succeeds(t *testing.T) {
 	}
 }
 
+// TestParse_OverCap_RoundTrips covers the additive optional over_cap hint
+// (#2053): a plan with over_cap:true decodes and round-trips into the typed
+// Plan.OverCap. NOTE: decoding this flag is NOT what triggers the plan-gate
+// over-cap advisory — that advisory is count-derived in the server's
+// runPlanWarnings (len(scope.files) > resolved cap) and never reads OverCap.
+// This test pins the decode/round-trip contract only, not the detection
+// contract; a future editor must not mistake it for the latter.
+func TestParse_OverCap_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["over_cap"] = true
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !p.OverCap {
+		t.Error("OverCap = false, want true after decoding over_cap:true")
+	}
+}
+
+// TestParse_WithoutOverCap_StillValidates confirms the field is optional: a
+// plan that omits over_cap validates and decodes to the zero value (#2053).
+func TestParse_WithoutOverCap_StillValidates(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.OverCap {
+		t.Error("OverCap = true, want false when over_cap is omitted")
+	}
+}
+
 // TestParse_SubPlanScope_RoundTrips covers the additive per-sub-plan
 // scope field (#676): a decomposition whose sub_plans carry their own
 // scope.files validates against the schema and decodes into the typed
@@ -1404,15 +1436,16 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // as a drift guard: any byte change (an unintended edit, or a docs/spec
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
-// standard_v1.x — most recently the #1748 acceptance-criterion skip_expected /
-// expectation_basis marker (before that, the #1544 top-level
+// standard_v1.x — most recently the #2053 top-level over_cap planner
+// self-declaration hint (before that, the #1748 acceptance-criterion
+// skip_expected / expectation_basis marker, the #1544 top-level
 // surface_sweep_exemptions field, and the #1529
 // verification.acceptance_criteria / out_of_scope fields). A standard_v1 plan
 // that omits the new optional fields must still
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "ab98a6bf5c47adb7cb8e1980756511bfda9c67683de685313f4eec3364491b14"
+	const wantHash = "42543f6365d423d2d27eed9d1b3337f0e0dd63e4c6cabeb335a222eae0214d25"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)

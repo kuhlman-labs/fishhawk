@@ -1154,6 +1154,17 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if trigger.RevisionConstraint != nil {
 			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
 		}
+		// File-count constraint (#2053): resolve the implement-stage
+		// max_files_changed cap from the workflow spec and inject it into the
+		// plan prompt as a hard planning constraint. resolveImplementConstraints
+		// fails open (ok=false, zero Constraints) when the spec is absent,
+		// unparseable, or has no implement stage, so MaxFilesChanged stays 0 and
+		// buildPlan omits the block — keeping the prompt byte-unchanged for
+		// uncapped workflows. Set on BOTH prompt handlers so the signed prompt
+		// and the render preview stay byte-identical.
+		if constraints, _, ok := s.resolveImplementConstraints(r.Context(), runRow); ok {
+			trigger.MaxFilesChanged = constraints.MaxFilesChanged
+		}
 	}
 
 	trigger.PlanStageTimeout = time.Duration(s.resolveAgentTimeout(r.Context(), runRow, run.StageTypePlan)) * time.Second
@@ -1621,6 +1632,17 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		trigger.RevisionConstraint = s.loadRevisionConstraint(r.Context(), runRow.ID)
 		if trigger.RevisionConstraint != nil {
 			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
+		}
+		// File-count constraint (#2053): resolve the implement-stage
+		// max_files_changed cap from the workflow spec and inject it into the
+		// plan prompt as a hard planning constraint. resolveImplementConstraints
+		// fails open (ok=false, zero Constraints) when the spec is absent,
+		// unparseable, or has no implement stage, so MaxFilesChanged stays 0 and
+		// buildPlan omits the block — keeping the prompt byte-unchanged for
+		// uncapped workflows. Set on BOTH prompt handlers so the signed prompt
+		// and the render preview stay byte-identical.
+		if constraints, _, ok := s.resolveImplementConstraints(r.Context(), runRow); ok {
+			trigger.MaxFilesChanged = constraints.MaxFilesChanged
 		}
 	}
 

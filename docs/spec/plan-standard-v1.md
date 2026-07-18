@@ -64,7 +64,8 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "risks_and_assumptions": ["..."],
   "decomposition": { "rationale": "...", "sub_plans": [...] },
   "model_recommendation": { "implement_model": "...", "rationale": "...", "complexity_assessed": "low|medium|high" },
-  "surface_sweep_exemptions": [ { "pattern": "...", "sibling": "...", "reason": "..." } ]
+  "surface_sweep_exemptions": [ { "pattern": "...", "sibling": "...", "reason": "..." } ],
+  "over_cap": false
 }
 ```
 
@@ -340,6 +341,18 @@ The plan's optional, machine-readable declarations that a surface-sweep **lockst
 **When to use.** Only when you scope a lockstep pattern's trigger but a listed sibling genuinely needs no change — most commonly a purely data-driven addition to a shared render file that adds no new coupling. Do not use it to skip a sibling that actually must move in lockstep.
 
 **How the sweep honors it.** The sweep suppresses a missing-sibling finding only when the pattern's entire missing set is covered by matching `(pattern, sibling)` exemptions; a partial exemption still fires a finding for the remaining uncovered siblings (the true positive is preserved). A declared top-level exemption also applies to every decomposition sub-plan's own scope. Each **applied** exemption is recorded in the `plan_surface_sweep` audit payload (`applied_exemptions`) and rendered into the plan-review prompt's gate evidence, so a reviewer can challenge a bogus reason — the reviewer-visibility guardrail. A non-matching, non-firing, or already-scoped-sibling exemption is a harmless no-op and is not recorded as applied. The whole array is additive-optional within `standard_v1.x`; a plan that omits it validates and sweeps exactly as before.
+
+### `over_cap`
+
+An optional planner **self-declaration hint** that `scope.files` exceeds the resolved implement-stage `max_files_changed` cap (#2053). The plan-stage prompt injects the resolved cap as a hard planning constraint and asks the planner to keep `scope.files` at or under it; when the work genuinely cannot fit, the planner sets `over_cap: true` as a courtesy so the flag round-trips.
+
+```json
+{
+  "over_cap": true
+}
+```
+
+**Advisory only — the gate signal is server-authoritative.** The plan-gate over-cap advisory is derived **server-side** from `len(scope.files)` versus the resolved cap (`runPlanWarnings`), and it fires regardless of whether `over_cap` is omitted, `false`, or `true`. No enforcement or detection path may branch on `over_cap` to decide whether a plan is over cap — the flag never suppresses (nor is required to trigger) the deterministic count-derived advisory. It exists so an honest planner can flag its own over-cap plan explicitly, not as the mechanism that surfaces the condition. Additive-optional within `standard_v1.x`; a plan that omits it validates and gates exactly as before.
 
 ## Validation rules beyond the schema
 

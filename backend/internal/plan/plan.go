@@ -57,6 +57,17 @@ type Plan struct {
 	// plan declares none (the sweep reduces to its prior behavior). JSON tags
 	// mirror the surface-sweep-exemption $def in the schema.
 	SurfaceSweepExemptions []SurfaceSweepExemption `json:"surface_sweep_exemptions,omitempty"`
+	// OverCap is the planner's optional SELF-DECLARATION HINT that scope.files
+	// exceeds the resolved implement-stage max_files_changed cap (#2053).
+	// Additive-optional within standard_v1; the field must exist on the struct
+	// because plan.Parse strict-decodes with DisallowUnknownFields, so an
+	// over_cap artifact would otherwise fail to decode. HINT-ONLY: NO
+	// enforcement or detection path may branch on this flag to decide whether a
+	// plan is over-cap. The authoritative over-cap signal is the server-side
+	// count-derived advisory in runPlanWarnings (len(scope.files) > resolved
+	// cap), which never reads this field. Omitted (false) for a plan that
+	// declares nothing.
+	OverCap bool `json:"over_cap,omitempty"`
 }
 
 // SurfaceSweepExemption is one entry in Plan.SurfaceSweepExemptions (#1544):

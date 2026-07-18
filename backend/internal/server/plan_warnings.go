@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -35,15 +36,29 @@ type PlanWarningsPayload struct {
 // its first production caller, closing the gap where the decomposition
 // safety net computed a result nobody ever read.
 //
-// Advisory-only and fail-open: it guards only on AuditRepo (unlike the
-// sibling gates it needs no RunRepo/workflow spec/GitHub client — Warnings
-// depends only on the parsed plan itself), and a plan.Parse error or an
-// audit-append failure WARN-logs and continues rather than blocking or
-// unwinding the upload. It never transitions or fails the plan stage.
+// Advisory-only and fail-open: it guards only on AuditRepo for the
+// plan.Warnings() advisories (which depend only on the parsed plan itself),
+// and a plan.Parse error or an audit-append failure WARN-logs and continues
+// rather than blocking or unwinding the upload. It never transitions or fails
+// the plan stage.
+//
+// SERVER-AUTHORITATIVE over-cap advisory (#2053): it ALSO appends a
+// deterministic over-cap advisory when the resolved implement-stage
+// max_files_changed cap is > 0 and len(scope.files) > cap. This computation is
+// the SINGLE SOURCE OF TRUTH for the over-cap condition — it reads ONLY the
+// scanned file count and the resolved cap and MUST NOT read parsedPlan.OverCap
+// (the planner's self-declaration hint). It is the guarantee that no monolithic
+// over-cap plan silently passes the plan gate; downstream E50 slices key on it.
+// Resolving the cap adds a RunRepo dependency the plan.Warnings() advisories do
+// not need; that leg fails open independently (nil RunRepo, GetRun error, no
+// spec/implement stage, or cap unresolvable → over-cap advisory skipped, plan
+// settle never blocked), so the plan.Warnings() advisories still fire even when
+// the cap cannot be resolved.
 //
 // Returns the computed payload so a future caller can thread it into the
-// plan-review prompt's gate-evidence section (not wired in this slice);
-// nil when Warnings() found nothing to report or on any fail-open path.
+// plan-review prompt's gate-evidence section (not wired in this slice); nil when
+// neither plan.Warnings() nor the over-cap check found anything to report, or on
+// any fail-open path.
 func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, planBody []byte) *PlanWarningsPayload {
 	if s.cfg.AuditRepo == nil {
 		return nil
@@ -61,6 +76,15 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 	}
 
 	warnings := plan.Warnings(parsedPlan)
+
+	// SERVER-AUTHORITATIVE over-cap advisory (#2053): count-derived, computed
+	// independently of the planner's over_cap self-declaration. Appended before
+	// the emptiness check so an otherwise warning-free over-cap plan still
+	// records a plan_warnings entry that surfaces through fishhawk_get_plan.
+	if w := s.overCapWarning(ctx, runID, parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
+
 	if len(warnings) == 0 {
 		return nil
 	}
@@ -83,4 +107,45 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		)
 	}
 	return result
+}
+
+// overCapWarning computes the SERVER-AUTHORITATIVE, count-derived over-cap
+// advisory string for a parsed plan (#2053), or "" when the plan is not over
+// cap or the cap cannot be resolved. It is the single source of truth for the
+// over-cap condition: the over-cap decision reads ONLY len(scope.files) and the
+// resolved implement-stage max_files_changed cap and MUST NOT consult
+// parsedPlan.OverCap (the planner's self-declaration hint) — so an over-cap plan
+// fires the advisory whether over_cap is omitted, false, or true, and an
+// under-cap plan never fires it even when over_cap is true.
+//
+// Fail-open on every leg (nil RunRepo, GetRun error, no spec/implement stage, or
+// an unresolved / zero cap): return "" so the over-cap advisory is skipped and
+// the plan settle is never blocked. The cap resolution reuses
+// resolveImplementConstraints, the same helper runScopePrecheck uses, so the
+// plan-gate advisory and the scope pre-check agree on the resolved cap.
+func (s *Server) overCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
+	if s.cfg.RunRepo == nil {
+		return ""
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan warnings: get run for over-cap check failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return ""
+	}
+	constraints, _, ok := s.resolveImplementConstraints(ctx, runRow)
+	if !ok || constraints.MaxFilesChanged <= 0 {
+		return ""
+	}
+	count := len(parsedPlan.Scope.Files)
+	if count <= constraints.MaxFilesChanged {
+		return ""
+	}
+	return fmt.Sprintf(
+		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d — "+
+			"narrow the scope or split the work into a decomposition before approving.",
+		count, constraints.MaxFilesChanged,
+	)
 }
