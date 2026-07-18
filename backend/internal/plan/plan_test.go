@@ -362,11 +362,11 @@ func TestParse_DecompositionTwoSubPlans_Succeeds(t *testing.T) {
 // over-cap advisory — that advisory is count-derived in the server's
 // runPlanWarnings (len(scope.files) > resolved cap) and never reads OverCap.
 // This test pins the decode/round-trip contract only, not the detection
-// contract; a future editor must not mistake it for the latter. It now also
-// carries a split_proposal because over_cap:true without one is rejected by the
-// in-artifact semanticCheck defensive layer (#2055).
+// contract; a future editor must not mistake it for the latter. over_cap:true
+// parses cleanly WITHOUT a split_proposal: over_cap is hint-only and
+// semanticCheck enforces no over_cap ⇒ split_proposal coupling (#2055 fixup).
 func TestParse_OverCap_RoundTrips(t *testing.T) {
-	m := planfixture.Valid(threePhaseSplitOption(), func(m map[string]any) {
+	m := planfixture.Valid(func(m map[string]any) {
 		m["over_cap"] = true
 	})
 	p, err := plan.Parse(marshalFixture(t, m))
@@ -1731,27 +1731,25 @@ func TestParse_WithoutSplitProposal_StillValidates(t *testing.T) {
 	}
 }
 
-// TestParse_OverCapWithoutSplitProposal_IsSemanticError pins the in-artifact
-// DEFENSIVE layer (#2055 constraint #1): a plan self-declaring over_cap:true but
-// omitting split_proposal is rejected by semanticCheck. This is NOT the
-// authoritative gate (that is the server count-derived reject) — it only catches
-// a planner that set the hint but forgot the split.
-func TestParse_OverCapWithoutSplitProposal_IsSemanticError(t *testing.T) {
+// TestParse_OverCapWithoutSplitProposal_ParsesCleanly pins the hint-only
+// contract (#2055 fixup): a plan self-declaring over_cap:true but omitting
+// split_proposal parses WITHOUT error. semanticCheck deliberately enforces no
+// over_cap ⇒ split_proposal coupling — that count-blind check rejected under-cap
+// plans that merely set the hint, turning the advisory into a server rejection
+// across every plan.Parse caller. The authoritative over-cap reject is the
+// server-side count-derived overCapSplitRejection gate, which never reads
+// over_cap.
+func TestParse_OverCapWithoutSplitProposal_ParsesCleanly(t *testing.T) {
 	m := planfixture.Valid(func(m map[string]any) {
 		m["over_cap"] = true
 	})
-	_, err := plan.Parse(marshalFixture(t, m))
-	var se *plan.SemanticError
-	if !errors.As(err, &se) {
-		t.Fatalf("err = %v, want *SemanticError", err)
-	}
-	if !strings.Contains(se.Error(), "split_proposal") {
-		t.Errorf("SemanticError should name split_proposal, got %q", se.Error())
+	if _, err := plan.Parse(marshalFixture(t, m)); err != nil {
+		t.Fatalf("Parse: over_cap:true without split_proposal must parse cleanly (hint-only), got %v", err)
 	}
 }
 
-// TestParse_OverCapWithSplitProposal_Succeeds confirms the coupling is
-// satisfied: over_cap:true WITH a valid split_proposal parses cleanly.
+// TestParse_OverCapWithSplitProposal_Succeeds confirms over_cap:true WITH a
+// valid split_proposal also parses cleanly (the structural split checks pass).
 func TestParse_OverCapWithSplitProposal_Succeeds(t *testing.T) {
 	m := planfixture.Valid(threePhaseSplitOption(), func(m map[string]any) {
 		m["over_cap"] = true

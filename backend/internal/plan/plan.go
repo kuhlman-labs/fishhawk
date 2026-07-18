@@ -65,11 +65,13 @@ type Plan struct {
 	// enforcement or detection path may branch on this flag to decide whether a
 	// plan is over-cap. The AUTHORITATIVE over-cap signal is the server-side
 	// count-derived reject/advisory (len(scope.files) > resolved cap), which
-	// never reads this field: the plan.Parse semanticCheck's
-	// over_cap ⇒ split_proposal coupling is only an ADDITIONAL in-artifact
-	// DEFENSIVE layer, while the authoritative enforcement is the server
+	// never reads this field: the authoritative enforcement is the server
 	// overCapSplitRejection gate in handleShipPlan (overCapByCount, which does
-	// NOT read OverCap). Omitted (false) for a plan that declares nothing.
+	// NOT read OverCap). semanticCheck deliberately enforces NO
+	// over_cap ⇒ split_proposal coupling — a count-blind rejection branched on
+	// this hint made plan.Parse reject an under-cap plan that merely set
+	// over_cap:true, contradicting the hint-only contract (#2055 fixup). Omitted
+	// (false) for a plan that declares nothing.
 	OverCap bool `json:"over_cap,omitempty"`
 	// SplitProposal is the plan's optional ordered-phase split (#2055, E50.3):
 	// the expand->migrate->contract phase sequence a plan carries when

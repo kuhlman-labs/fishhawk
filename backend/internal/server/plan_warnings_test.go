@@ -608,9 +608,9 @@ func overCapPlanBodyWithSplit(t *testing.T, numFiles int, overCap *bool, withSpl
 	if err != nil {
 		t.Fatalf("marshal plan: %v", err)
 	}
-	// Schema-valid regardless of the over_cap ⇒ split_proposal semantic coupling
-	// (Validate is schema-only); the authoritative gate decodes with
-	// json.Unmarshal exactly like handleShipPlan, never running semanticCheck.
+	// Validate is schema-only (no semanticCheck); the authoritative over-cap gate
+	// decodes with json.Unmarshal exactly like handleShipPlan, so an over_cap:true
+	// + no-split body is admitted for the count-derived reject to judge.
 	if err := plan.Validate(body); err != nil {
 		t.Fatalf("fixture plan does not validate: %v", err)
 	}
@@ -618,9 +618,10 @@ func overCapPlanBodyWithSplit(t *testing.T, numFiles int, overCap *bool, withSpl
 }
 
 // unmarshalPlan decodes a plan body WITHOUT semanticCheck, mirroring the
-// json.Unmarshal handleShipPlan uses for the authoritative over-cap gate — so
-// an over_cap:true + no-split body (which plan.Parse would reject) still decodes
-// here, which is the whole point of the flag-independence keystone.
+// json.Unmarshal handleShipPlan uses for the authoritative over-cap gate — the
+// gate judges an over-cap-by-count monolith on the file count alone, never on
+// over_cap or any in-artifact semantic coupling, which is the whole point of the
+// flag-independence keystone.
 func unmarshalPlan(t *testing.T, body []byte) *plan.Plan {
 	t.Helper()
 	var p plan.Plan
