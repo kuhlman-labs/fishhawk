@@ -5591,6 +5591,233 @@ func TestSubtractScopePaths_RefusesEmptyingNonEmptyScope(t *testing.T) {
 	}
 }
 
+// TestScopeFilesFromApprovedPlanFull pins the #2027 case-1 inclusion helper:
+// the top-level scope.files unioned with every decomposition sub_plan slice,
+// operations preserved, deduped by path (first-seen op wins), nil for an
+// empty/nil plan.
+func TestScopeFilesFromApprovedPlanFull(t *testing.T) {
+	t.Run("nil plan -> nil", func(t *testing.T) {
+		if got := scopeFilesFromApprovedPlanFull(nil); got != nil {
+			t.Errorf("nil plan = %#v, want nil", got)
+		}
+	})
+
+	t.Run("empty scope no decomposition -> nil", func(t *testing.T) {
+		if got := scopeFilesFromApprovedPlanFull(&plan.Plan{}); got != nil {
+			t.Errorf("empty plan = %#v, want nil", got)
+		}
+	})
+
+	t.Run("top-level only when no decomposition", func(t *testing.T) {
+		p := &plan.Plan{Scope: plan.Scope{Files: []plan.ScopeFile{
+			{Path: "a.go", Operation: plan.FileOpModify},
+		}}}
+		got := scopeFilesFromApprovedPlanFull(p)
+		if len(got) != 1 || got[0].Path != "a.go" || got[0].Operation != "modify" {
+			t.Fatalf("got %#v, want [{a.go modify}]", got)
+		}
+	})
+
+	t.Run("union preserves slice operations and dedups first-seen", func(t *testing.T) {
+		p := &plan.Plan{
+			Scope: plan.Scope{Files: []plan.ScopeFile{
+				{Path: "top.go", Operation: plan.FileOpModify},
+				{Path: "shared.go", Operation: plan.FileOpModify},
+			}},
+			Decomposition: &plan.Decomposition{SubPlans: []plan.SubPlanSummary{
+				{Scope: &plan.Scope{Files: []plan.ScopeFile{
+					{Path: "slice_new.go", Operation: plan.FileOpCreate},
+					// Duplicate of a top-level path with a DIFFERENT op — the
+					// first-seen (top-level modify) must win.
+					{Path: "shared.go", Operation: plan.FileOpCreate},
+				}}},
+				{Scope: nil}, // nil sub-plan scope is skipped, not a panic.
+				{Scope: &plan.Scope{Files: []plan.ScopeFile{
+					{Path: "slice_del.go", Operation: plan.FileOpDelete},
+				}}},
+			}},
+		}
+		got := scopeFilesFromApprovedPlanFull(p)
+		byPath := make(map[string]string, len(got))
+		for _, f := range got {
+			if _, dup := byPath[f.Path]; dup {
+				t.Fatalf("duplicate path %q in %#v", f.Path, got)
+			}
+			byPath[f.Path] = f.Operation
+		}
+		want := map[string]string{
+			"top.go":       "modify",
+			"shared.go":    "modify", // first-seen top-level op wins over slice create
+			"slice_new.go": "create",
+			"slice_del.go": "delete",
+		}
+		if len(byPath) != len(want) {
+			t.Fatalf("got %#v, want %v", got, want)
+		}
+		for path, op := range want {
+			if byPath[path] != op {
+				t.Errorf("%q operation = %q, want %q", path, byPath[path], op)
+			}
+		}
+	})
+}
+
+// TestFoldScopeEntries_PreservesOperation pins the #2027 operation-preserving
+// fold: a create entry folds as create, an empty operation defaults to modify,
+// an already-present path is not duplicated, and #824/#1314's []string
+// foldScopePaths stays modify-defaulting for its other callers.
+func TestFoldScopeEntries_PreservesOperation(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	in := []scopeFile{{Path: "existing.go", Operation: "modify"}}
+	entries := []scopeamendment.PathEntry{
+		{Path: "new_create.go", Operation: scopeamendment.OperationCreate},
+		{Path: "no_op.go", Operation: ""},          // empty -> modify
+		{Path: "existing.go", Operation: "create"}, // already present -> not re-added / not mutated
+	}
+	got := s.foldScopeEntries(context.Background(), in, entries, "test")
+	byPath := make(map[string]string, len(got))
+	for _, f := range got {
+		byPath[f.Path] = f.Operation
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d entries %#v, want 3 (no duplicate for existing.go)", len(got), got)
+	}
+	if byPath["new_create.go"] != "create" {
+		t.Errorf("new_create.go op = %q, want create", byPath["new_create.go"])
+	}
+	if byPath["no_op.go"] != "modify" {
+		t.Errorf("no_op.go op = %q, want modify (empty default)", byPath["no_op.go"])
+	}
+	if byPath["existing.go"] != "modify" {
+		t.Errorf("existing.go op = %q, want the original modify (unchanged)", byPath["existing.go"])
+	}
+
+	// Empty entries is a no-op; #824/#1314 foldScopePaths still defaults modify.
+	if got := s.foldScopeEntries(context.Background(), in, nil, "test"); len(got) != 1 {
+		t.Errorf("empty entries mutated scope: %#v", got)
+	}
+	pathsGot := s.foldScopePaths(context.Background(), in, []string{"str_add.go"}, "test")
+	var op string
+	for _, f := range pathsGot {
+		if f.Path == "str_add.go" {
+			op = f.Operation
+		}
+	}
+	if op != "modify" {
+		t.Errorf("foldScopePaths op = %q, want modify (byte-identical for #824/#1314 callers)", op)
+	}
+}
+
+// TestResolveApprovedScopeAmendmentEntries pins the operation-carrying resolver:
+// only APPROVED rows for the given stage are returned (operation preserved), a
+// ListByRun error degrades to nil, and a nil repo returns nil.
+func TestResolveApprovedScopeAmendmentEntries(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	otherStage := uuid.New()
+
+	sa := newFakeScopeAmendmentRepo()
+	seed := func(stage uuid.UUID, status scopeamendment.Status, path, op string) {
+		id := uuid.New()
+		sa.rows[id] = &scopeamendment.Amendment{
+			ID: id, RunID: runID, StageID: stage,
+			Paths:  []scopeamendment.PathEntry{{Path: path, Operation: op}},
+			Status: status,
+		}
+		sa.order = append(sa.order, id)
+	}
+	seed(stageID, scopeamendment.StatusApproved, "approved_create.go", scopeamendment.OperationCreate)
+	seed(stageID, scopeamendment.StatusPending, "pending.go", scopeamendment.OperationModify)
+	seed(stageID, scopeamendment.StatusDenied, "denied.go", scopeamendment.OperationModify)
+	seed(otherStage, scopeamendment.StatusApproved, "other_stage.go", scopeamendment.OperationCreate)
+
+	s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
+	got := s.resolveApprovedScopeAmendmentEntries(context.Background(), runID, stageID)
+	if len(got) != 1 || got[0].Path != "approved_create.go" || got[0].Operation != scopeamendment.OperationCreate {
+		t.Fatalf("got %#v, want only [{approved_create.go create}]", got)
+	}
+
+	// ListByRun error -> nil (best-effort).
+	saErr := newFakeScopeAmendmentRepo()
+	saErr.failListOn = 1
+	sErr := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: saErr})
+	if got := sErr.resolveApprovedScopeAmendmentEntries(context.Background(), runID, stageID); got != nil {
+		t.Errorf("ListByRun error = %#v, want nil", got)
+	}
+
+	// Nil repo -> nil.
+	sNil := New(Config{Addr: "127.0.0.1:0"})
+	if got := sNil.resolveApprovedScopeAmendmentEntries(context.Background(), runID, stageID); got != nil {
+		t.Errorf("nil repo = %#v, want nil", got)
+	}
+}
+
+// TestIsPlanStagelessRecoveryChild pins the #2027 case-1 predicate and each of
+// its false branches: no ParentRunID, a decomposition slice (DecomposedFrom
+// set), a run with its own plan stage, and a ListStagesForRun error.
+func TestIsPlanStagelessRecoveryChild(t *testing.T) {
+	newServer := func(rr run.Repository) *Server {
+		return New(Config{Addr: "127.0.0.1:0", RunRepo: rr})
+	}
+
+	t.Run("plan-stage-less recovery child -> true", func(t *testing.T) {
+		rr := newRecoverRepo()
+		parent := rr.seedRun()
+		child := rr.seedRun()
+		pid := parent.ID
+		child.ParentRunID = &pid
+		impl := rr.seedStage(child.ID, 0, run.StageStateFailed)
+		impl.Type = run.StageTypeImplement
+		if !newServer(rr).isPlanStagelessRecoveryChild(context.Background(), child) {
+			t.Error("plan-stage-less recovery child = false, want true")
+		}
+	})
+
+	t.Run("no ParentRunID -> false", func(t *testing.T) {
+		rr := newRecoverRepo()
+		runRow := rr.seedRun()
+		if newServer(rr).isPlanStagelessRecoveryChild(context.Background(), runRow) {
+			t.Error("run without ParentRunID = true, want false")
+		}
+	})
+
+	t.Run("decomposition slice (DecomposedFrom set) -> false", func(t *testing.T) {
+		rr := newRecoverRepo()
+		parent := rr.seedRun()
+		child := rr.seedRun()
+		pid := parent.ID
+		child.ParentRunID = &pid
+		child.DecomposedFrom = &pid
+		if newServer(rr).isPlanStagelessRecoveryChild(context.Background(), child) {
+			t.Error("decomposition slice = true, want false")
+		}
+	})
+
+	t.Run("has own plan stage -> false", func(t *testing.T) {
+		rr := newRecoverRepo()
+		parent := rr.seedRun()
+		child := rr.seedRun()
+		pid := parent.ID
+		child.ParentRunID = &pid
+		rr.seedStage(child.ID, 0, run.StageStateSucceeded) // default Type is plan
+		if newServer(rr).isPlanStagelessRecoveryChild(context.Background(), child) {
+			t.Error("run with own plan stage = true, want false")
+		}
+	})
+
+	t.Run("ListStagesForRun error -> false", func(t *testing.T) {
+		rr := newRecoverRepo()
+		parent := rr.seedRun()
+		child := rr.seedRun()
+		pid := parent.ID
+		child.ParentRunID = &pid
+		rr.listStagesErr = errors.New("boom")
+		if newServer(rr).isPlanStagelessRecoveryChild(context.Background(), child) {
+			t.Error("ListStagesForRun error = true, want false (best-effort degrade)")
+		}
+	})
+}
+
 // TestGetStagePrompt_Implement_RemoveScopeFilesSubtractedFromScope crosses the
 // full #1726 subtraction seam: persisted approval_submitted.remove_scope_files
 // -> resolveApprovalRemoveScopeFiles -> subtractScopePaths ->

@@ -482,6 +482,243 @@ func TestRecoverRun_PromptRenderCrossesAllSeams(t *testing.T) {
 	}
 }
 
+// TestRecoverRun_ParentPlanCreateEntryReachesRecoveryChild is the binding
+// fail-on-HEAD reproduction for #2027 case 1: a plan-stage-less recovery child
+// re-executing a parent's APPROVED plan must receive EVERY declared scope.files
+// path in its effective implement scope — INCLUDING a create declared only in a
+// decomposition sub_plan's slice. On the pre-fix tree scopeFilesFromPlan
+// enumerates only the top-level scope.files and the requireDecomposedScope
+// per-slice narrowing never runs for a child with no DecomposedFrom, so the
+// slice-only create is dropped: this test must be observed RED on HEAD and
+// GREEN after the scopeFilesFromApprovedPlanFull fix.
+func TestRecoverRun_ParentPlanCreateEntryReachesRecoveryChild(t *testing.T) {
+	const topLevelFile = "backend/internal/server/handlers.go"
+	const sliceCreateFile = "backend/internal/server/credential_scope_gate_test.go"
+
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	art := newFakeArtifactRepo()
+
+	parent, planStage, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+
+	// The parent's approved plan is a DECOMPOSED plan whose top-level scope
+	// declares only topLevelFile, with sliceCreateFile declared ONLY inside a
+	// decomposition sub_plan's scope as operation:create.
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "decomposed recoverable plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: topLevelFile, Operation: plan.FileOpModify}},
+		},
+		Decomposition: &plan.Decomposition{
+			Rationale: "split contract and implementation phases",
+			SubPlans: []plan.SubPlanSummary{{
+				Title:     "contract phase",
+				ScopeHint: "credential scope gate contract",
+				Scope: &plan.Scope{
+					Files: []plan.ScopeFile{{Path: sliceCreateFile, Operation: plan.FileOpCreate}},
+				},
+			}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          &recoverAuditRepo{},
+		ArtifactRepo:       art,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := postRecover(t, s, parent.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode recover response: %v", err)
+	}
+	childStages, err := rr.ListStagesForRun(context.Background(), created.ID)
+	if err != nil || len(childStages) != 1 {
+		t.Fatalf("child stages = %v (err %v), want exactly one", childStages, err)
+	}
+	childImplement := childStages[0]
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/stages/"+childImplement.ID.String()+"/prompt-render", nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("prompt-render status = %d, want 200:\n%s", rec.Code, rec.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt-render: %v", err)
+	}
+
+	var gotOp string
+	found := false
+	for _, f := range resp.ScopeFiles {
+		if f.Path == sliceCreateFile {
+			found = true
+			gotOp = f.Operation
+		}
+	}
+	if !found {
+		t.Fatalf("recovery child ScopeFiles missing slice-declared create %q (inclusion gap); got %#v",
+			sliceCreateFile, resp.ScopeFiles)
+	}
+	if gotOp != "create" {
+		t.Errorf("slice-declared %q operation = %q, want create", sliceCreateFile, gotOp)
+	}
+}
+
+// seedPlanBearingParent seeds an original parent run carrying a succeeded plan
+// stage with an approved standard_v1 plan artifact (top-level scope only) plus a
+// category-B-failed implement stage. Returns the parent run.
+func seedPlanBearingParent(t *testing.T, rr *recoverRepo, art *fakeArtifactRepo) *run.Run {
+	t.Helper()
+	parent, planStage, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "original recoverable plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: "backend/internal/server/handlers.go", Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+	return parent
+}
+
+// TestRecoverRun_RecoveryOfRecoveryEligible covers #2027 case 2: a
+// plan-stage-less recovery child (its own implement failed category-B, no plan
+// stage of its own) is itself recoverable when its approved plan resolves via
+// the loadApprovedPlanForRun ParentRunID parent-walk — minting a fresh child
+// with an implement stage two hops from the plan-bearing original.
+func TestRecoverRun_RecoveryOfRecoveryEligible(t *testing.T) {
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	art := newFakeArtifactRepo()
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          &recoverAuditRepo{},
+		ArtifactRepo:       art,
+	})
+
+	original := seedPlanBearingParent(t, rr, art)
+
+	// The first recovery child: chains to the original via ParentRunID, carries
+	// NO plan stage of its own, and its own implement stage failed category-B.
+	child := rr.seedRun()
+	child.WorkflowID = "feature_change"
+	child.WorkflowSpec = []byte(gatedSpecYAML)
+	child.State = run.StateFailed
+	oid := original.ID
+	child.ParentRunID = &oid
+	childImpl := rr.seedStage(child.ID, 0, run.StageStateFailed)
+	childImpl.Type = run.StageTypeImplement
+	childImpl.FailureCategory = failureCat(run.FailureB)
+
+	w := postRecover(t, s, child.ID.String(), `{}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("recover-of-recovery status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode recover response: %v", err)
+	}
+	if created.ID == child.ID {
+		t.Fatalf("recovery-of-recovery re-used the child id %s instead of minting a new run", child.ID)
+	}
+	grandchild, err := rr.GetRun(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("get minted grandchild: %v", err)
+	}
+	if grandchild.ParentRunID == nil || *grandchild.ParentRunID != child.ID {
+		t.Errorf("grandchild ParentRunID = %v, want %s", grandchild.ParentRunID, child.ID)
+	}
+	stages, err := rr.ListStagesForRun(context.Background(), created.ID)
+	if err != nil || len(stages) != 1 || stages[0].Type != run.StageTypeImplement {
+		t.Fatalf("grandchild stages = %v (err %v), want exactly one implement stage", stages, err)
+	}
+}
+
+// TestRecoverRun_PlanStagelessIneligibleSurfacesPlanResolved covers the case-2
+// ineligibility branch: a plan-stage-less target whose approved plan does NOT
+// resolve via the parent walk (no ParentRunID) is refused with
+// recovery_not_eligible and plan_resolved:false in the details.
+func TestRecoverRun_PlanStagelessIneligibleSurfacesPlanResolved(t *testing.T) {
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	art := newFakeArtifactRepo()
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          &recoverAuditRepo{},
+		ArtifactRepo:       art,
+	})
+
+	// A target with a cached spec, an implement stage failed category-B, NO plan
+	// stage, and NO ParentRunID — so the parent walk resolves no plan.
+	target := rr.seedRun()
+	target.WorkflowID = "feature_change"
+	target.WorkflowSpec = []byte(gatedSpecYAML)
+	target.State = run.StateFailed
+	impl := rr.seedStage(target.ID, 0, run.StageStateFailed)
+	impl.Type = run.StageTypeImplement
+	impl.FailureCategory = failureCat(run.FailureB)
+
+	w := postRecover(t, s, target.ID.String(), `{}`, nil)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "recovery_not_eligible")
+	var body struct {
+		Error struct {
+			Details struct {
+				PlanResolved bool `json:"plan_resolved"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body.Error.Details.PlanResolved {
+		t.Errorf("plan_resolved = true, want false for an unresolvable plan")
+	}
+}
+
 // seedRecoverableDecompositionChild seeds a parent run carrying an
 // approved plan artifact on its plan stage, plus a decomposition child
 // (DecomposedFrom + ParentRunID = parent) whose own implement stage

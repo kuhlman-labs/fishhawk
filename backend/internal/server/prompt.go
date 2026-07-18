@@ -382,6 +382,85 @@ func scopeFilesFromScope(sc *plan.Scope) []scopeFile {
 	return out
 }
 
+// scopeFilesFromApprovedPlanFull returns an approved plan's FULL declared
+// scope.files: the top-level p.Scope.Files UNIONED with every
+// p.Decomposition.SubPlans[i].Scope.Files, operations preserved verbatim and
+// deduped by Path (first-seen operation wins; the top-level entries come
+// first). It is the inclusion counterpart of scopeFilesFromPlan, which reads
+// ONLY the top-level scope: a file declared ONLY in a decomposition sub_plan
+// slice is invisible to scopeFilesFromPlan, so a plan-stage-less recovery child
+// re-executing a decomposed parent's approved plan — a child that carries no
+// DecomposedFrom and therefore never resolves the requireDecomposedScope
+// per-slice narrowing — would drop that path entirely from its implement scope
+// (#2027 case 1). Returns nil when the plan is nil or declares no files at all,
+// so the field stays omitted and the runner keeps its `git add -A` fallback.
+func scopeFilesFromApprovedPlanFull(p *plan.Plan) []scopeFile {
+	if p == nil {
+		return nil
+	}
+	out := scopeFilesFromScope(&p.Scope)
+	if p.Decomposition == nil {
+		return out
+	}
+	seen := make(map[string]struct{}, len(out))
+	for _, f := range out {
+		seen[f.Path] = struct{}{}
+	}
+	for i := range p.Decomposition.SubPlans {
+		sub := p.Decomposition.SubPlans[i]
+		if sub.Scope == nil {
+			continue
+		}
+		for _, f := range scopeFilesFromScope(sub.Scope) {
+			if _, ok := seen[f.Path]; ok {
+				continue
+			}
+			seen[f.Path] = struct{}{}
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// isPlanStagelessRecoveryChild reports whether the run is a plan-stage-less
+// recovery/retry child that re-executes a PARENT's approved plan via the
+// loadApprovedPlanForRun parent-walk: it chains to a parent (ParentRunID !=
+// nil), is NOT a decomposition fan-out slice (DecomposedFrom == nil), and
+// carries no plan stage of its own. For exactly that shape the caller resolves
+// the implement scope from scopeFilesFromApprovedPlanFull instead of
+// scopeFilesFromPlan (#2027 case 1), so a file declared only in the parent
+// plan's decomposition sub_plans is not silently dropped — the
+// requireDecomposedScope per-slice narrowing never runs without a DecomposedFrom
+// to key it. The predicate is strictly gated to this shape so normal implements
+// (no ParentRunID), genuine decomposition slices (DecomposedFrom set, narrowed),
+// and fix-ups stay byte-identical.
+//
+// Best-effort, matching the surrounding prompt resolvers: a nil RunRepo or a
+// ListStagesForRun error logs and returns false, degrading to today's
+// scopeFilesFromPlan behavior rather than failing the prompt fetch.
+func (s *Server) isPlanStagelessRecoveryChild(ctx context.Context, runRow *run.Run) bool {
+	if runRow.ParentRunID == nil || runRow.DecomposedFrom != nil {
+		return false
+	}
+	if s.cfg.RunRepo == nil {
+		return false
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: list stages for recovery-child detection failed",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	for _, st := range stages {
+		if st.Type == run.StageTypePlan {
+			return false
+		}
+	}
+	return true
+}
+
 // isRepoRelativePath reports whether p is a clean repo-relative path: not
 // absolute (no leading '/') and free of any '..' parent-traversal segment. It
 // mirrors validateAllowCreate's repo-relative contract (backend/internal/server/
@@ -422,8 +501,42 @@ func (s *Server) mergeApprovedScopeAmendments(ctx context.Context, scopeFiles []
 	if len(scopeFiles) == 0 || s.cfg.ScopeAmendmentRepo == nil {
 		return scopeFiles
 	}
-	paths := s.resolveApprovedScopeAmendments(ctx, runID, stageID)
-	return s.foldScopePaths(ctx, scopeFiles, paths, "scope-amendment")
+	// Operation-preserving fold (#2027): route through the {path, operation}
+	// entries so an inherited/approved `create` amendment folds as create rather
+	// than being flattened to modify by the []string path fold. resolveApproved-
+	// ScopeAmendments/foldScopePaths stay []string for their other callers
+	// (effectiveFixupScope #1162/#1314, the review-prompt derivation #824).
+	entries := s.resolveApprovedScopeAmendmentEntries(ctx, runID, stageID)
+	return s.foldScopeEntries(ctx, scopeFiles, entries, "scope-amendment")
+}
+
+// resolveApprovedScopeAmendmentEntries returns the {path, operation} entries of
+// every APPROVED scope amendment filed by the given stage, operation preserved
+// (#2027) — the operation-carrying counterpart of resolveApprovedScopeAmendments'
+// []string result. Pending/denied rows are excluded (a pending amendment confers
+// nothing until decided). Best-effort, matching resolveApprovedScopeAmendments'
+// posture: an unconfigured repo or a ListByRun error logs and returns nil so the
+// original scope stays authoritative.
+func (s *Server) resolveApprovedScopeAmendmentEntries(ctx context.Context, runID, stageID uuid.UUID) []scopeamendment.PathEntry {
+	if s.cfg.ScopeAmendmentRepo == nil {
+		return nil
+	}
+	items, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: list scope amendments failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	var out []scopeamendment.PathEntry
+	for _, a := range items {
+		if a.StageID != stageID || a.Status != scopeamendment.StatusApproved {
+			continue
+		}
+		out = append(out, a.Paths...)
+	}
+	return out
 }
 
 // resolveApprovedScopeAmendments returns the paths of every APPROVED scope
@@ -515,6 +628,45 @@ func (s *Server) foldScopePaths(ctx context.Context, scopeFiles []scopeFile, pat
 		existing[p] = struct{}{}
 		scopeFiles = append(scopeFiles, scopeFile{Path: p, Operation: "modify"})
 		added = append(added, p)
+	}
+	if len(added) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: folded files into implement scope",
+			slog.String("source", source),
+			slog.Int("count", len(added)),
+			slog.String("paths", strings.Join(added, ",")),
+		)
+	}
+	return scopeFiles
+}
+
+// foldScopeEntries is the operation-preserving counterpart of foldScopePaths
+// (#2027): it appends amendment entries not already present (compared by .Path)
+// to the scope set, preserving each entry's declared operation and defaulting to
+// modify ONLY when Operation is empty; it dedups and info-logs the additions.
+// An inherited/approved `create` amendment therefore folds as create instead of
+// being flattened to modify. Callers own the empty-scope and empty-entries
+// guards. foldScopePaths stays byte-identical for its #824/#1314 callers.
+func (s *Server) foldScopeEntries(ctx context.Context, scopeFiles []scopeFile, entries []scopeamendment.PathEntry, source string) []scopeFile {
+	if len(entries) == 0 {
+		return scopeFiles
+	}
+	existing := make(map[string]struct{}, len(scopeFiles))
+	for _, f := range scopeFiles {
+		existing[f.Path] = struct{}{}
+	}
+	added := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if _, ok := existing[e.Path]; ok {
+			continue
+		}
+		existing[e.Path] = struct{}{}
+		op := e.Operation
+		if op == "" {
+			op = scopeamendment.OperationModify
+		}
+		scopeFiles = append(scopeFiles, scopeFile{Path: e.Path, Operation: op})
+		added = append(added, e.Path)
 	}
 	if len(added) > 0 {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
@@ -787,6 +939,18 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
+		// Recovery/retry child re-executing a parent's APPROVED plan (#2027 case
+		// 1): scopeFilesFromPlan enumerates ONLY the top-level scope.files, so a
+		// path declared only in the parent plan's decomposition sub_plans is
+		// dropped. A plan-stage-less recovery child carries no DecomposedFrom, so
+		// the requireDecomposedScope per-slice narrowing below never resolves it —
+		// the slice-only path would never reach the child's implement prompt.
+		// Resolve the FULL declared scope (top-level unioned with every sub_plan
+		// slice, operations preserved) for that shape only, so normal implements,
+		// genuine decomposition slices, and fix-ups stay byte-identical.
+		if approvedPlan != nil && s.isPlanStagelessRecoveryChild(r.Context(), runRow) {
+			scopeFiles = scopeFilesFromApprovedPlanFull(approvedPlan)
+		}
 		// Decomposition fan-out (#676, fail-loud #1721): a genuine fan-out slice
 		// child carries DecomposedFrom and narrows its scope to its own sub-plan
 		// slice, linked by the SliceIndex the orchestrator stamps on every
@@ -1268,6 +1432,18 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			}
 		}
 		scopeFiles = scopeFilesFromPlan(approvedPlan)
+		// Recovery/retry child re-executing a parent's APPROVED plan (#2027 case
+		// 1): scopeFilesFromPlan enumerates ONLY the top-level scope.files, so a
+		// path declared only in the parent plan's decomposition sub_plans is
+		// dropped. A plan-stage-less recovery child carries no DecomposedFrom, so
+		// the requireDecomposedScope per-slice narrowing below never resolves it —
+		// the slice-only path would never reach the child's implement prompt.
+		// Resolve the FULL declared scope (top-level unioned with every sub_plan
+		// slice, operations preserved) for that shape only, so normal implements,
+		// genuine decomposition slices, and fix-ups stay byte-identical.
+		if approvedPlan != nil && s.isPlanStagelessRecoveryChild(r.Context(), runRow) {
+			scopeFiles = scopeFilesFromApprovedPlanFull(approvedPlan)
+		}
 		// Decomposition fan-out (#676, fail-loud #1721): a genuine fan-out slice
 		// child carries DecomposedFrom and narrows its scope to its own sub-plan
 		// slice, linked by the SliceIndex the orchestrator stamps on every
