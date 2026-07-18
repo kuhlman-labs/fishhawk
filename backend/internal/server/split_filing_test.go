@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -148,26 +150,38 @@ func writeSentinel(dir string) error {
 	return os.WriteFile(dir+"/workflows.yaml", []byte("sentinel: untouched\n"), 0o644)
 }
 
-func readSentinel(t *testing.T, dir string) string {
+// snapshotTree walks root recursively and returns each entry's root-relative
+// path mapped to its content (dirs map to "", keyed with a trailing slash), so
+// a before/after comparison detects ANY file created, modified, or removed
+// under root — including a nested .fishhawk/** write. A governed-exception draft
+// committed to .fishhawk/** (which must NEVER happen: it rides the audit payload
+// only) would appear here as a new or changed entry and fail the comparison.
+func snapshotTree(t *testing.T, root string) map[string]string {
 	t.Helper()
-	b, err := os.ReadFile(dir + "/workflows.yaml")
+	snap := map[string]string{}
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, rerr := filepath.Rel(root, p)
+		if rerr != nil {
+			return rerr
+		}
+		if d.IsDir() {
+			snap[rel+"/"] = ""
+			return nil
+		}
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return rerr
+		}
+		snap[rel] = string(b)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("read sentinel: %v", err)
+		t.Fatalf("snapshot %s: %v", root, err)
 	}
-	return string(b)
-}
-
-func fishhawkFileNames(t *testing.T, dir string) []string {
-	t.Helper()
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read .fishhawk dir: %v", err)
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		names = append(names, e.Name())
-	}
-	return names
+	return snap
 }
 
 func splitPlanBytes(t *testing.T, withProposal bool) []byte {
@@ -625,35 +639,45 @@ func TestFileSplitProposalChildren_ParentCommentFailure_BestEffort(t *testing.T)
 }
 
 // TestFileSplitProposalChildren_NoFilesystemWrite asserts the governed-exception
-// cap-exception draft rides the audit payload and NOTHING is written to
-// .fishhawk/** during filing: a sentinel .fishhawk file in a temp cwd is
-// byte-unchanged and no new .fishhawk file appears.
+// cap-exception draft rides the audit payload and NOTHING is written to the
+// working tree — the agent-forbidden .fishhawk/** in particular — during filing.
+// The hook runs with the temp dir AS the process working directory (t.Chdir), so
+// a relative .fishhawk write (the location a draft committed to disk would land)
+// resolves INSIDE the snapshotted root; a recursive before/after tree snapshot
+// then fails on any created or modified file. This is NOT vacuous: were a
+// .fishhawk write introduced, it would land under the observed root and diverge
+// the snapshots.
 func TestFileSplitProposalChildren_NoFilesystemWrite(t *testing.T) {
 	dir := t.TempDir()
+	t.Chdir(dir) // a relative .fishhawk write now lands under the observed root
 	fishhawkDir := dir + "/.fishhawk"
 	if err := writeSentinel(fishhawkDir); err != nil {
 		t.Fatalf("seed sentinel: %v", err)
 	}
-	before := readSentinel(t, fishhawkDir)
+	before := snapshotTree(t, dir)
 
 	h := newSplitFilingHarness(t, splitFilingConfig{
 		withSplitProposal: true, withSpec: true, reachabilityDerived: 12,
 	})
 	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
 
-	// The draft rode the audit payload (delivered, not written to disk).
+	// Positive: the governed-exception draft is delivered ON the audit payload
+	// (both the SpecDiff and PRBody present) — proving it exists and is carried
+	// by audit, not disk.
 	payload, n := h.completionEntry(t)
 	if n != 1 || payload.CapException == nil {
 		t.Fatalf("governed-exception draft must ride the audit payload")
 	}
-	// The sentinel .fishhawk/workflows.yaml is untouched and no other .fishhawk
-	// file was created.
-	after := readSentinel(t, fishhawkDir)
-	if before != after {
-		t.Errorf(".fishhawk sentinel changed: before=%q after=%q", before, after)
+	if payload.CapException.SpecDiff == "" || payload.CapException.PRBody == "" {
+		t.Fatalf("cap-exception draft must carry SpecDiff+PRBody on the audit payload: %+v", payload.CapException)
 	}
-	if names := fishhawkFileNames(t, fishhawkDir); len(names) != 1 {
-		t.Errorf(".fishhawk dir gained files during filing: %v", names)
+
+	// Negative: no filesystem write occurred under any path (the .fishhawk
+	// sentinel included). A future edit that commits the draft to .fishhawk/**
+	// would add or modify an entry here and fail this comparison.
+	after := snapshotTree(t, dir)
+	if !reflect.DeepEqual(before, after) {
+		t.Errorf("filing wrote to the working tree; before=%v after=%v", before, after)
 	}
 }
 
