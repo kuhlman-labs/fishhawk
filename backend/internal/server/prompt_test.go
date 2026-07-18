@@ -3141,6 +3141,140 @@ func TestResolveAcceptanceExpectedHeadSHA_ReadErrorOmitsField(t *testing.T) {
 	}
 }
 
+// TestResolveAcceptanceExpectedHeadSHA_RecoveryChild_ResolvesEmpty is the #2028
+// empirical CHARACTERIZATION test (NOT a RED test — it PASSES on the pre-fix
+// tree). It pins that the own-run-scoped resolveAcceptanceExpectedHeadSHA reads
+// the ledger under the run's OWN runID (resolveNewestReportedHeadSHA ->
+// ListForRunByCategory(ctx, runID, cat)), so a plan-stageless recovery child
+// whose implement lineage was recorded under the PARENT runID resolves "".
+// This documents and JUSTIFIES the gap the walking resolver closes: the
+// recovery-child needs_target payload would ship expected_head_sha="" and the
+// #1953 dispatch verb would degrade from a hard-block to proceed-with-warning.
+func TestResolveAcceptanceExpectedHeadSHA_RecoveryChild_ResolvesEmpty(t *testing.T) {
+	parentRunID := uuid.New()
+	parentImplStageID := uuid.New()
+	childRunID := uuid.New()
+	childAcceptanceStageID := uuid.New()
+	headSHA := "abc1234def567890abc1234def567890abc12345"
+
+	// The reported-head ledger entry is scoped to the PARENT runID only; the
+	// child's own ledger is empty.
+	auditByRun := map[uuid.UUID][]*audit.Entry{
+		parentRunID: {makeReportedHeadEntry(parentRunID, parentImplStageID, "pull_request_opened", headSHA, time.Now().UTC())},
+	}
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		AuditRepo: &feedbackAuditRepo{byRunID: auditByRun},
+	})
+
+	// CURRENT (pre-fix) behavior: reading the child's OWN runID resolves empty —
+	// the head lives under the parent. This assertion holds on the pre-step-5 tree.
+	if got := s.resolveAcceptanceExpectedHeadSHA(context.Background(), childRunID, childAcceptanceStageID); got != "" {
+		t.Errorf("resolveAcceptanceExpectedHeadSHA(child) = %q, want empty (child ledger is empty; head is on the parent)", got)
+	}
+}
+
+// TestResolveAcceptanceExpectedHeadSHAWalkingParents pins the four resolution
+// branches of the #2028 ParentRunID head fallback plus its defensive branches:
+// own-run-non-empty (no walk, byte-identical), empty-own+ancestor-non-empty (walk
+// resolves), empty-own+ancestor-empty (exhausts to ""), nil-ParentRunID (top-level
+// no-op), a GetRun error (fail-closed to ""), and a parent cycle (bounded by
+// retryPlanChainDepth, no infinite loop).
+func TestResolveAcceptanceExpectedHeadSHAWalkingParents(t *testing.T) {
+	headSHA := "abc1234def567890abc1234def567890abc12345"
+	ancestorSHA := "def4567890abc1234def567890abc1234def56789"
+	newServer := func(auditByRun map[uuid.UUID][]*audit.Entry, rr *promptRunRepo) *Server {
+		return New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: &feedbackAuditRepo{byRunID: auditByRun}})
+	}
+
+	// (1) own-run non-empty -> returned verbatim, NO walk (the parent carries a
+	// DIFFERENT head that must never be consulted).
+	t.Run("own-run non-empty -> no walk", func(t *testing.T) {
+		parent := uuid.New()
+		childID := uuid.New()
+		stageID := uuid.New()
+		rr := newPromptRunRepo()
+		rr.getRuns[parent] = &run.Run{ID: parent}
+		child := &run.Run{ID: childID, ParentRunID: &parent}
+		auditByRun := map[uuid.UUID][]*audit.Entry{
+			childID: {makeReportedHeadEntry(childID, stageID, "pull_request_opened", headSHA, time.Now().UTC())},
+			parent:  {makeReportedHeadEntry(parent, stageID, "pull_request_opened", ancestorSHA, time.Now().UTC())},
+		}
+		if got := newServer(auditByRun, rr).resolveAcceptanceExpectedHeadSHAWalkingParents(context.Background(), child, stageID); got != headSHA {
+			t.Errorf("= %q, want %q (own-run head, no walk)", got, headSHA)
+		}
+	})
+
+	// (2) empty own + ancestor non-empty (2-hop) -> the walk advances via GetRun
+	// and resolves the grandparent head.
+	t.Run("empty own + ancestor non-empty -> walk resolves", func(t *testing.T) {
+		grandparent := uuid.New()
+		parent := uuid.New()
+		childID := uuid.New()
+		stageID := uuid.New()
+		rr := newPromptRunRepo()
+		rr.getRuns[parent] = &run.Run{ID: parent, ParentRunID: &grandparent}
+		rr.getRuns[grandparent] = &run.Run{ID: grandparent}
+		child := &run.Run{ID: childID, ParentRunID: &parent}
+		auditByRun := map[uuid.UUID][]*audit.Entry{
+			grandparent: {makeReportedHeadEntry(grandparent, stageID, "pull_request_opened", ancestorSHA, time.Now().UTC())},
+		}
+		if got := newServer(auditByRun, rr).resolveAcceptanceExpectedHeadSHAWalkingParents(context.Background(), child, stageID); got != ancestorSHA {
+			t.Errorf("= %q, want %q (grandparent head via the walk)", got, ancestorSHA)
+		}
+	})
+
+	// (3) empty own + empty ancestor chain -> exhausts to "".
+	t.Run("empty own + empty ancestor -> exhausts to empty", func(t *testing.T) {
+		parent := uuid.New()
+		childID := uuid.New()
+		stageID := uuid.New()
+		rr := newPromptRunRepo()
+		rr.getRuns[parent] = &run.Run{ID: parent} // ParentRunID nil -> chain ends
+		child := &run.Run{ID: childID, ParentRunID: &parent}
+		if got := newServer(map[uuid.UUID][]*audit.Entry{}, rr).resolveAcceptanceExpectedHeadSHAWalkingParents(context.Background(), child, stageID); got != "" {
+			t.Errorf("= %q, want empty (no head anywhere in the chain)", got)
+		}
+	})
+
+	// (4) nil ParentRunID (top-level) -> pure own-run resolution, never walks.
+	t.Run("nil ParentRunID -> top-level no-op", func(t *testing.T) {
+		childID := uuid.New()
+		stageID := uuid.New()
+		top := &run.Run{ID: childID} // ParentRunID nil
+		if got := newServer(map[uuid.UUID][]*audit.Entry{}, newPromptRunRepo()).resolveAcceptanceExpectedHeadSHAWalkingParents(context.Background(), top, stageID); got != "" {
+			t.Errorf("= %q, want empty (top-level, no walk)", got)
+		}
+	})
+
+	// (5) a GetRun error mid-walk -> fail-closed to "" (WARN-and-omit).
+	t.Run("GetRun error -> fail-closed empty", func(t *testing.T) {
+		parent := uuid.New()
+		childID := uuid.New()
+		stageID := uuid.New()
+		rr := newPromptRunRepo()
+		rr.runErr = errors.New("run-repo transport failure")
+		child := &run.Run{ID: childID, ParentRunID: &parent}
+		if got := newServer(map[uuid.UUID][]*audit.Entry{}, rr).resolveAcceptanceExpectedHeadSHAWalkingParents(context.Background(), child, stageID); got != "" {
+			t.Errorf("= %q, want empty (GetRun error drops the field)", got)
+		}
+	})
+
+	// (6) a parent cycle -> bounded by retryPlanChainDepth; returns "" without
+	// looping forever.
+	t.Run("parent cycle -> bounded exhaust", func(t *testing.T) {
+		parent := uuid.New()
+		childID := uuid.New()
+		stageID := uuid.New()
+		rr := newPromptRunRepo()
+		rr.getRuns[parent] = &run.Run{ID: parent, ParentRunID: &parent} // self-cycle
+		child := &run.Run{ID: childID, ParentRunID: &parent}
+		if got := newServer(map[uuid.UUID][]*audit.Entry{}, rr).resolveAcceptanceExpectedHeadSHAWalkingParents(context.Background(), child, stageID); got != "" {
+			t.Errorf("= %q, want empty (cycle bounded by the depth cap)", got)
+		}
+	})
+}
+
 // TestGetStagePrompt_Implement_FixupDecomposedChild_SliceBranch covers the
 // decomposed-child fix-up branch form after ADR-041 (#1246): a child's work
 // lives on its per-slice sole-writer branch

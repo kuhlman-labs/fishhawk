@@ -1272,6 +1272,11 @@ func (o *Orchestrator) walkAcceptanceToSucceededFrom(ctx context.Context, stageI
 // and a non-nil approved plan reach the predicates, mirroring the pre-refactor
 // guard.
 //
+// The approved plan is resolved via loadApprovedPlanWalkingParents (#2028): a
+// plan-stageless recovery child resolves its ancestor's plan by walking
+// ParentRunID, so BOTH the predicates AND liveValidationRequired evaluate
+// against the ancestor plan rather than falling through to nil.
+//
 // liveValidationRequired (E48.6 / #1953) is true ONLY when the target is an
 // admissible acceptance stage, the approved plan loaded, and NONE of the three
 // short-circuit predicates matched — i.e. at least one acceptance criterion
@@ -1285,7 +1290,14 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 	if target.Type != run.StageTypeAcceptance || o.Artifacts == nil {
 		return nil, false, nil
 	}
-	approvedPlan, _, err := o.loadApprovedPlan(ctx, stages)
+	// Walk ParentRunID as a fallback when the run's OWN stages carry no plan
+	// stage: a plan-stageless recovery child (#2028) must resolve its ancestor's
+	// approved plan here so BOTH the three short-circuit predicates AND
+	// liveValidationRequired evaluate against it — otherwise the child falls
+	// through to approvedPlan==nil -> liveValidationRequired=false and its
+	// acceptance dispatch spawns a doomed category-C runner. A run whose own
+	// stages carry a plan resolves byte-identically (the walk never engages).
+	approvedPlan, _, err := o.loadApprovedPlanWalkingParents(ctx, r, stages)
 	if err != nil {
 		return nil, false, fmt.Errorf("orchestrator: load approved plan for acceptance skip: %w", err)
 	}
@@ -2206,6 +2218,69 @@ func (o *Orchestrator) loadApprovedPlan(ctx context.Context, stages []*run.Stage
 		return nil, planStageID, fmt.Errorf("decode plan artifact %s: %w", picked.ID, err)
 	}
 	return &p, planStageID, nil
+}
+
+// acceptancePlanChainDepth caps the ParentRunID walk in
+// loadApprovedPlanWalkingParents. It echoes server.retryPlanChainDepth (8): an
+// auto-retry / recovery chain is at most a handful of links, so 8 is generous
+// and bounds a corrupt parent_run_id cycle without imposing on legitimate
+// workflows.
+const acceptancePlanChainDepth = 8
+
+// loadApprovedPlanWalkingParents resolves the approved standard_v1 plan for a
+// run, falling back to its ParentRunID ancestry when the run's OWN stages carry
+// no plan stage. It first tries loadApprovedPlan against the given stages; on a
+// nil plan with no error it walks r.ParentRunID upward — fetching each parent's
+// stages via o.Runs.ListStagesForRun and re-running loadApprovedPlan — until a
+// plan resolves, ParentRunID is nil, or acceptancePlanChainDepth is hit.
+//
+// It mirrors server.loadApprovedPlanForRun (prompt.go) so a plan-stageless
+// recovery child (e.g. a #279 CI-retry or a #2013 recovery run) sees its
+// ancestor's approved plan for acceptance admission. Without the walk
+// loadApprovedPlan yields nil for such a child, liveValidationRequired stays
+// false, and the admission never reports needs_target — a dispatch verb then
+// spawns a runner straight into category-C acceptance_target_unreachable
+// (#2028).
+//
+// Returns (nil, uuid.Nil, nil) when no ancestor carries a plan; propagates repo
+// IO errors. The returned plan stage ID is discarded by the acceptance caller.
+func (o *Orchestrator) loadApprovedPlanWalkingParents(ctx context.Context, r *run.Run, stages []*run.Stage) (*plan.Plan, uuid.UUID, error) {
+	p, planStageID, err := o.loadApprovedPlan(ctx, stages)
+	if err != nil {
+		return nil, uuid.Nil, err
+	}
+	if p != nil {
+		return p, planStageID, nil
+	}
+	if r == nil || r.ParentRunID == nil {
+		return nil, uuid.Nil, nil
+	}
+	current := *r.ParentRunID
+	for depth := 0; depth < acceptancePlanChainDepth; depth++ {
+		parentStages, err := o.Runs.ListStagesForRun(ctx, current)
+		if err != nil {
+			return nil, uuid.Nil, fmt.Errorf("orchestrator: list stages for acceptance plan parent-walk: %w", err)
+		}
+		p, planStageID, err := o.loadApprovedPlan(ctx, parentStages)
+		if err != nil {
+			return nil, uuid.Nil, err
+		}
+		if p != nil {
+			return p, planStageID, nil
+		}
+		parent, err := o.Runs.GetRun(ctx, current)
+		if err != nil {
+			return nil, uuid.Nil, fmt.Errorf("orchestrator: get run for acceptance plan parent-walk: %w", err)
+		}
+		if parent.ParentRunID == nil {
+			return nil, uuid.Nil, nil
+		}
+		current = *parent.ParentRunID
+	}
+	o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: acceptance plan parent-walk hit depth cap",
+		slog.String("run_id", r.ID.String()),
+		slog.Int("max_depth", acceptancePlanChainDepth))
+	return nil, uuid.Nil, nil
 }
 
 // childIssueContextFromSubPlan derives a child run's issue context

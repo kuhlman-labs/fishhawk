@@ -194,9 +194,14 @@ func (s *Server) handleAcceptanceAdmission(w http.ResponseWriter, r *http.Reques
 				if hosts := s.resolveAcceptanceEgressTargetHosts(r.Context(), runRow); len(hosts) > 0 {
 					resp.NeedsTarget = true
 					resp.TargetHosts = hosts
-					// May be empty when the ledger resolution fails — still emit
+					// Resolve the merge-candidate head, walking ParentRunID as a
+					// fallback (#2028) so a plan-stageless recovery child — whose
+					// implement lineage was recorded under the PARENT runID — carries
+					// its ancestor's non-empty head rather than an empty one that
+					// degrades the #1953 verb from a hard-block to proceed-with-warning.
+					// May STILL be empty when the walk exhausts — still emit
 					// needs_target; the verb degrades to a proceed-with-warning.
-					resp.ExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHA(r.Context(), stage.RunID, stage.ID)
+					resp.ExpectedHeadSHA = s.resolveAcceptanceExpectedHeadSHAWalkingParents(r.Context(), runRow, stage.ID)
 				}
 			}
 		}

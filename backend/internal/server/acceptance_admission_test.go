@@ -327,6 +327,136 @@ func TestAcceptanceAdmission_NeedsTarget(t *testing.T) {
 	})
 }
 
+// TestAcceptanceAdmission_RecoveryChild_NeedsTargetWithAncestorHead is the #2028
+// cross-layer regression proof: a plan-stageless recovery child (ParentRunID set,
+// own ledger EMPTY) whose ancestor carries a mixed-criteria plan + a reported-head
+// ledger entry must produce the SAME needs_target refusal as its plan-bearing
+// parent — NON-EMPTY expected_head_sha resolved via the parent walk — not a weaker
+// one. The shared orchestratorRepo backs BOTH the server RunRepo and the
+// orchestrator Runs, so a single seeded parent+child exercises BOTH parent walks:
+// the orchestrator plan walk (liveValidationRequired) AND the server head walk
+// (expected_head_sha). On the pre-fix tree the head walk is absent and
+// expected_head_sha resolves "", so the NON-EMPTY assertion is the RED regression
+// proof. A ledger-empty companion pins that needs_target stays true with an empty
+// SHA (the walk exhausts).
+func TestAcceptanceAdmission_RecoveryChild_NeedsTargetWithAncestorHead(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	mixed := []map[string]any{
+		allSkipWithBasisCriteria[0],
+		{"id": "get-returns-200", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1", "blocking": true},
+	}
+	const headSHA = "abc1234def567890abc1234def567890abc12345"
+
+	// newRecoveryChildSeam seeds a PARENT run (plan+implement+review, plan artifact
+	// on its plan stage) and a plan-stageless recovery CHILD (ParentRunID=parent.ID,
+	// declared egress hosts, admissible pending acceptance stage). When seedHead is
+	// true the reported-head ledger entry is scoped to the PARENT runID only (the
+	// child's own ledger stays empty). Returns the server, the audit fake, and the
+	// child's run+acceptance ids.
+	newRecoveryChildSeam := func(t *testing.T, seedHead bool) (*Server, *auditFake, *orchestratorRepo, uuid.UUID, uuid.UUID) {
+		t.Helper()
+		rr := newOrchestratorRepo()
+		au := newAuditFake()
+
+		parent := rr.seedRun()
+		parent.WorkflowID = "feature_change"
+		parentPlan := rr.seedStage(parent.ID, 0, run.StageStateSucceeded)
+		parentPlan.Type = run.StageTypePlan
+		parentImpl := rr.seedStage(parent.ID, 1, run.StageStateSucceeded)
+		parentImpl.Type = run.StageTypeImplement
+		parentRev := rr.seedStage(parent.ID, 2, run.StageStateSucceeded)
+		parentRev.Type = run.StageTypeReview
+
+		child := rr.seedRun()
+		child.WorkflowID = "feature_change"
+		child.ParentRunID = &parent.ID
+		child.WorkflowSpec = exampleBytes
+		childImpl := rr.seedStage(child.ID, 0, run.StageStateSucceeded)
+		childImpl.Type = run.StageTypeImplement
+		childRev := rr.seedStage(child.ID, 1, run.StageStateSucceeded)
+		childRev.Type = run.StageTypeReview
+		childAcc := rr.seedStage(child.ID, 2, run.StageStatePending)
+		childAcc.Type = run.StageTypeAcceptance
+
+		ar := newFakeArtifactRepo()
+		v := "standard_v1"
+		ar.all = append(ar.all, &artifact.Artifact{
+			ID: uuid.New(), StageID: parentPlan.ID, Kind: artifact.KindPlan,
+			SchemaVersion: &v, Content: admissionPlanBytes(t, nil, mixed), CreatedAt: time.Now().UTC(),
+		})
+		if seedHead {
+			au.seeded = append(au.seeded,
+				makeReportedHeadEntry(parent.ID, parentImpl.ID, "pull_request_opened", headSHA, time.Now().UTC()))
+		}
+
+		o := &orchestrator.Orchestrator{Runs: rr, Audit: au, Artifacts: ar}
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: ar, Orchestrator: o})
+		return s, au, rr, child.ID, childAcc.ID
+	}
+
+	t.Run("ancestor head -> needs_target with the walked non-empty sha", func(t *testing.T) {
+		s, au, rr, _, childAccID := newRecoveryChildSeam(t, true)
+
+		w := postAdmission(t, s, childAccID, testOperatorIdentity())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp acceptanceAdmissionResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if resp.ShortCircuited {
+			t.Fatalf("short_circuited = true, want false (mixed-criteria ancestor plan)")
+		}
+		if !resp.NeedsTarget {
+			t.Errorf("needs_target = false, want true (live validation via the ancestor plan walk)")
+		}
+		if len(resp.TargetHosts) != 1 || resp.TargetHosts[0] != "localhost:8080" {
+			t.Errorf("target_hosts = %v, want [localhost:8080] verbatim", resp.TargetHosts)
+		}
+		// THE RED REGRESSION PROOF: the head resolves NON-EMPTY via the parent walk.
+		// On the pre-step-5 tree the own-run-scoped resolver reads the child's empty
+		// ledger and this fails.
+		if resp.ExpectedHeadSHA != headSHA {
+			t.Errorf("expected_head_sha = %q, want %q (ancestor head via the parent walk)", resp.ExpectedHeadSHA, headSHA)
+		}
+		body := w.Body.String()
+		if !strings.Contains(body, `"expected_head_sha":"`+headSHA+`"`) {
+			t.Errorf("response missing wire key expected_head_sha=%s:\n%s", headSHA, body)
+		}
+		// No-spawn pin: no runner dispatched, no verdict recorded, stage still pending.
+		if n := countByCategory(au, CategoryAcceptanceDispatched); n != 0 {
+			t.Errorf("acceptance_dispatched = %d, want 0 (no runner spawned)", n)
+		}
+		if n := countByCategory(au, CategoryAcceptanceOutcomeRecorded); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0 (no verdict)", n)
+		}
+		if got := rr.stagesByID[childAccID].State; got != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending (untouched)", got)
+		}
+	})
+
+	t.Run("no ancestor head -> needs_target, empty sha", func(t *testing.T) {
+		s, _, _, _, childAccID := newRecoveryChildSeam(t, false)
+
+		w := postAdmission(t, s, childAccID, testOperatorIdentity())
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp acceptanceAdmissionResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if !resp.NeedsTarget {
+			t.Errorf("needs_target = false, want true even with no resolvable ancestor head")
+		}
+		if len(resp.TargetHosts) != 1 || resp.TargetHosts[0] != "localhost:8080" {
+			t.Errorf("target_hosts = %v, want [localhost:8080]", resp.TargetHosts)
+		}
+		if resp.ExpectedHeadSHA != "" {
+			t.Errorf("expected_head_sha = %q, want empty (walk exhausts with no ledger entry)", resp.ExpectedHeadSHA)
+		}
+	})
+}
+
 // getRunErrRepo wraps an orchestratorRepo and forces GetRun to fail while every
 // other method (GetStage, transitions, …) still works, so the handler's GetRun
 // call in the needs_target augmentation can be driven into its fail-open branch
