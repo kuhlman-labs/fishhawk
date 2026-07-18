@@ -524,6 +524,16 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// plan_warnings field.
 	_ = s.runPlanWarnings(r.Context(), runID, stageID, body)
 
+	// Plan-gate reachability sweep (#2056, E50.4): decode the advisory
+	// symbol-reachability sweep result the runner shipped in the
+	// reachabilityHeader header (the runner holds the checked-out Go source; the
+	// server has no checkout, so the sweep runs runner-side and crosses here) and
+	// record a fail-open plan_reachability_sweep audit entry. Absent header (a
+	// plan with no split_proposal, or an older runner) records nothing. Advisory
+	// + fail-open like the sibling gates above; never blocks or transitions the
+	// plan stage. The operator surface is fishhawk_get_plan's reachability field.
+	_ = s.runPlanReachability(r.Context(), runID, stageID, r.Header.Get(reachabilityHeader))
+
 	// Plan-gate scope-regression sweep (#1257): on a revise pass, diff the
 	// new plan's scoped paths (top-level scope.files UNION every
 	// decomposition sub-plan's scope.files) against the revision-base plan

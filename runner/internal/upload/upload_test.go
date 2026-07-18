@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/reachability"
 )
 
 // fakeBackend builds a httptest.Server with handlers that mimic the
@@ -1855,5 +1857,207 @@ func TestFetchPrompt_AcceptanceFieldsAbsentByDefault(t *testing.T) {
 	if got.AcceptanceExpectedHeadSHA != "" {
 		t.Errorf("AcceptanceExpectedHeadSHA must default empty (older backend), got %q",
 			got.AcceptanceExpectedHeadSHA)
+	}
+}
+
+// --- Plan-reachability transport contract (#2056, E50.4) ---
+
+// reachCaptureServer mounts a POST /v0/runs/{run_id}/plan handler that captures
+// the advisory reachability header and returns a plausible 201, so the tests
+// below can assert exactly what ShipPlan put on the wire. It is local to these
+// tests so it does not perturb the shared planFakeBackend.
+func reachCaptureServer(t *testing.T, gotHeader *string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/plan", func(w http.ResponseWriter, r *http.Request) {
+		*gotHeader = r.Header.Get(ReachabilityHeader)
+		raw, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ShipPlanResult{
+			ID:            "00000000-0000-0000-0000-000000000abc",
+			StageID:       r.URL.Query().Get("stage_id"),
+			ContentHash:   hex.EncodeToString(func() []byte { d := sha256.Sum256(raw); return d[:] }()),
+			SchemaVersion: "standard_v1",
+			Idempotent:    false,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestShipPlan_ReachabilityWireKeys_ExactTags is the exact-wire-key
+// serialization test the operator required (SLICE 2): it pins the runner→server
+// JSON transport contract against silent tag drift. It marshals a fully
+// populated reachability.Result exactly as ShipPlan serializes it for the header
+// and asserts the presence of EVERY wire key the server's mirroring decode
+// struct depends on. A rename on either side that isn't mirrored breaks this
+// test rather than silently failing the advisory open.
+func TestShipPlan_ReachabilityWireKeys_ExactTags(t *testing.T) {
+	res := &reachability.Result{
+		Available:  true,
+		SkipReason: "",
+		Phases: []reachability.PhaseResult{
+			{Index: 0, Title: "expand", DeclaredCount: 2, DerivedCount: 3},
+		},
+		Violations: []reachability.Violation{
+			{
+				Kind:     reachability.KindConstructionSite,
+				Symbol:   "Widget",
+				DefFile:  "pkg/a/widget.go",
+				DefPhase: 0,
+				UseFile:  "pkg/b/use.go",
+				UsePhase: 1,
+			},
+		},
+	}
+	// reachabilityHeaderValue is exactly what ShipPlan puts on the wire.
+	wire := reachabilityHeaderValue(res)
+	if wire == "" {
+		t.Fatal("reachabilityHeaderValue returned empty for a populated result")
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(wire), &m); err != nil {
+		t.Fatalf("unmarshal wire: %v", err)
+	}
+	for _, k := range []string{"available", "phases", "violations"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("top-level wire key %q missing", k)
+		}
+	}
+	// skip_reason is omitempty — absent here (Available:true), which is itself
+	// part of the contract.
+	if _, ok := m["skip_reason"]; ok {
+		t.Errorf("skip_reason must be omitted when empty")
+	}
+
+	var phase map[string]json.RawMessage
+	if err := json.Unmarshal(mustFirstElem(t, m["phases"]), &phase); err != nil {
+		t.Fatalf("unmarshal phase: %v", err)
+	}
+	for _, k := range []string{"index", "title", "declared_count", "derived_count"} {
+		if _, ok := phase[k]; !ok {
+			t.Errorf("phase wire key %q missing", k)
+		}
+	}
+
+	var viol map[string]json.RawMessage
+	if err := json.Unmarshal(mustFirstElem(t, m["violations"]), &viol); err != nil {
+		t.Fatalf("unmarshal violation: %v", err)
+	}
+	for _, k := range []string{"kind", "symbol", "def_file", "def_phase", "use_file", "use_phase"} {
+		if _, ok := viol[k]; !ok {
+			t.Errorf("violation wire key %q missing", k)
+		}
+	}
+}
+
+// mustFirstElem returns the first element of a JSON array RawMessage.
+func mustFirstElem(t *testing.T, arr json.RawMessage) json.RawMessage {
+	t.Helper()
+	var elems []json.RawMessage
+	if err := json.Unmarshal(arr, &elems); err != nil {
+		t.Fatalf("unmarshal array: %v", err)
+	}
+	if len(elems) == 0 {
+		t.Fatal("expected at least one array element")
+	}
+	return elems[0]
+}
+
+// TestShipPlan_ReachabilityHeader_SentWhenPresent asserts ShipPlan attaches the
+// serialized reachability result in the ReachabilityHeader header, and that the
+// header round-trips to a value equal to reachabilityHeaderValue.
+func TestShipPlan_ReachabilityHeader_SentWhenPresent(t *testing.T) {
+	var got string
+	srv := reachCaptureServer(t, &got)
+	c := quickPlanClient(srv)
+	priv, _ := makePlanKey(t)
+
+	res := &reachability.Result{
+		Available: true,
+		Phases:    []reachability.PhaseResult{{Index: 0, Title: "p", DeclaredCount: 1, DerivedCount: 1}},
+	}
+	if _, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+		RunID:        "r",
+		StageID:      "s",
+		Plan:         []byte(`{"plan_version":"standard_v1"}`),
+		PrivateKey:   priv,
+		Reachability: res,
+	}); err != nil {
+		t.Fatalf("ShipPlan: %v", err)
+	}
+	if got == "" {
+		t.Fatal("reachability header not sent")
+	}
+	if got != reachabilityHeaderValue(res) {
+		t.Errorf("header value = %q, want %q", got, reachabilityHeaderValue(res))
+	}
+}
+
+// TestShipPlan_ReachabilityHeader_AbsentWhenNil asserts a nil Reachability (the
+// common non-decomposition case) sends NO header — the plan upload is
+// byte-identical to a pre-#2056 runner.
+func TestShipPlan_ReachabilityHeader_AbsentWhenNil(t *testing.T) {
+	var got string
+	srv := reachCaptureServer(t, &got)
+	c := quickPlanClient(srv)
+	priv, _ := makePlanKey(t)
+
+	if _, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+		RunID:      "r",
+		StageID:    "s",
+		Plan:       []byte(`{"plan_version":"standard_v1"}`),
+		PrivateKey: priv,
+	}); err != nil {
+		t.Fatalf("ShipPlan: %v", err)
+	}
+	if got != "" {
+		t.Errorf("expected no reachability header, got %q", got)
+	}
+}
+
+// TestShipPlan_ReachabilityHeader_DroppedWhenOversized asserts the
+// maxReachabilityHeaderBytes guard: a pathologically large payload is dropped
+// (no header) so the ADVISORY never breaks the plan upload — the plan still
+// ships successfully.
+func TestShipPlan_ReachabilityHeader_DroppedWhenOversized(t *testing.T) {
+	var got string
+	srv := reachCaptureServer(t, &got)
+	c := quickPlanClient(srv)
+	priv, _ := makePlanKey(t)
+
+	// Build a result whose JSON exceeds maxReachabilityHeaderBytes via many
+	// violations.
+	big := &reachability.Result{Available: true}
+	for i := 0; i < 2000; i++ {
+		big.Violations = append(big.Violations, reachability.Violation{
+			Kind:    reachability.KindConstructionSite,
+			Symbol:  strings.Repeat("S", 32),
+			DefFile: "some/long/path/to/a/definition/file.go",
+			UseFile: "another/long/path/to/a/use/site/file.go",
+		})
+	}
+	if reachabilityHeaderValue(big) != "" {
+		t.Fatalf("test setup: payload not large enough to exceed cap")
+	}
+
+	res, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+		RunID:        "r",
+		StageID:      "s",
+		Plan:         []byte(`{"plan_version":"standard_v1"}`),
+		PrivateKey:   priv,
+		Reachability: big,
+	})
+	if err != nil {
+		t.Fatalf("ShipPlan must still succeed with an oversized advisory: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected a successful plan ship")
+	}
+	if got != "" {
+		t.Errorf("oversized reachability header must be dropped, got %d bytes", len(got))
 	}
 }
