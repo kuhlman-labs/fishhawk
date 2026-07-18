@@ -20,9 +20,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 )
 
 // fakeBackend is a thin httptest server that records the last
@@ -8135,5 +8137,372 @@ func TestGetPlan_Reachability_EndToEndRoundTrip(t *testing.T) {
 		out.Reachability.Violations[0].Symbol != "Store" ||
 		out.Reachability.Violations[0].UseFile != "pkg/b/impl.go" {
 		t.Errorf("violation did not survive the round-trip: %+v", out.Reachability.Violations)
+	}
+}
+
+// --- get_plan split_filing field (#2057, E50.5) ---
+
+// seedSplitFilingAudit adds a split_children_filed audit entry to the fake's
+// per-run audit map, round-tripping the payload through JSON so the handler's
+// re-marshal + unmarshal decodes to the same value (mirroring
+// seedReachabilityAudit).
+func seedSplitFilingAudit(fb *fakeBackend, runID uuid.UUID, payload any) {
+	body, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(body, &decoded)
+	entry := AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "split_children_filed",
+		Payload:  decoded,
+	}
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
+}
+
+func seedSplitFilingRun(t *testing.T, fb *fakeBackend, runID uuid.UUID) {
+	t.Helper()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+}
+
+// TestGetPlan_SplitFiling_DeleteOnly asserts the delete-only completion marker
+// surfaces the classification, the filed children (with the contract child
+// flagged), the contract-child number and the #2062 deferral, and carries NO
+// drafted cap-exception.
+func TestGetPlan_SplitFiling_DeleteOnly(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+	seedSplitFilingAudit(fb, runID, map[string]any{
+		"contract_classification": "delete-only",
+		"children": []map[string]any{
+			{"phase_index": 0, "title": "expand: add NewFoo", "number": 3001, "url": "https://github.com/o/r/issues/3001"},
+			{"phase_index": 1, "title": "migrate consumers", "number": 3002, "url": "https://github.com/o/r/issues/3002"},
+			{"phase_index": 2, "title": "contract: delete Foo", "number": 3003, "url": "https://github.com/o/r/issues/3003", "is_contract": true},
+		},
+		"contract_child_number": 3003,
+		"deferral_issue":        2062,
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling == nil {
+		t.Fatal("SplitFiling should be populated")
+	}
+	if out.SplitFiling.ContractClassification != "delete-only" {
+		t.Errorf("classification = %q, want delete-only", out.SplitFiling.ContractClassification)
+	}
+	if len(out.SplitFiling.Children) != 3 {
+		t.Fatalf("children = %d, want 3", len(out.SplitFiling.Children))
+	}
+	if !out.SplitFiling.Children[2].IsContract {
+		t.Error("child 2 (contract phase) should carry is_contract=true")
+	}
+	if out.SplitFiling.Children[0].IsContract {
+		t.Error("child 0 (expand phase) should NOT carry is_contract")
+	}
+	if out.SplitFiling.Children[1].Number != 3002 {
+		t.Errorf("child 1 number = %d, want 3002 (sibling #N resolution)", out.SplitFiling.Children[1].Number)
+	}
+	if out.SplitFiling.ContractChildNumber != 3003 {
+		t.Errorf("contract_child_number = %d, want 3003", out.SplitFiling.ContractChildNumber)
+	}
+	if out.SplitFiling.DeferralIssue != 2062 {
+		t.Errorf("deferral_issue = %d, want 2062", out.SplitFiling.DeferralIssue)
+	}
+	if out.SplitFiling.CapException != nil {
+		t.Errorf("delete-only should carry no cap_exception; got %+v", out.SplitFiling.CapException)
+	}
+}
+
+// TestGetPlan_SplitFiling_GovernedException asserts a governed-exception marker
+// surfaces the drafted cap-exception (spec_diff raising the cap + pr_body
+// stating operator-authored + admin-merged) alongside the classification.
+func TestGetPlan_SplitFiling_GovernedException(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+	seedSplitFilingAudit(fb, runID, map[string]any{
+		"contract_classification": "governed-exception",
+		"children": []map[string]any{
+			{"phase_index": 0, "title": "expand", "number": 3001, "url": "https://github.com/o/r/issues/3001"},
+			{"phase_index": 1, "title": "contract", "number": 3002, "url": "https://github.com/o/r/issues/3002", "is_contract": true},
+		},
+		"contract_child_number": 3002,
+		"deferral_issue":        2062,
+		"cap_exception": map[string]any{
+			"spec_diff": "-  max_files_changed: 3\n+  max_files_changed: 9",
+			"pr_body":   "Atomic rename overflows the cap. This change must be operator-authored and admin-merged: .fishhawk/** is agent-forbidden.",
+		},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling == nil {
+		t.Fatal("SplitFiling should be populated")
+	}
+	if out.SplitFiling.ContractClassification != "governed-exception" {
+		t.Errorf("classification = %q, want governed-exception", out.SplitFiling.ContractClassification)
+	}
+	if out.SplitFiling.CapException == nil {
+		t.Fatal("governed-exception should carry a cap_exception draft")
+	}
+	if !strings.Contains(out.SplitFiling.CapException.SpecDiff, "max_files_changed: 9") {
+		t.Errorf("spec_diff should raise the cap; got %q", out.SplitFiling.CapException.SpecDiff)
+	}
+	if !strings.Contains(out.SplitFiling.CapException.PRBody, "operator-authored") ||
+		!strings.Contains(out.SplitFiling.CapException.PRBody, "admin-merged") {
+		t.Errorf("pr_body should state operator-authored + admin-merged; got %q", out.SplitFiling.CapException.PRBody)
+	}
+}
+
+// TestGetPlan_SplitFiling_AbsentWhenNoEntry asserts the field is omitted when
+// no split_children_filed entry exists (a non-split plan, a hook that has not
+// completed filing, or an older run).
+func TestGetPlan_SplitFiling_AbsentWhenNoEntry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling != nil {
+		t.Errorf("SplitFiling should be nil when no completion marker exists, got %+v", out.SplitFiling)
+	}
+}
+
+// TestGetPlan_SplitFiling_NewestEntryWins mirrors the sibling sweeps: a
+// re-approval after a partial-then-completed filing can write a second
+// completion marker; the authoritative one is the newest (last,
+// sequence-ascending) — reflecting the FULL child set (operator binding
+// condition 1: the marker reflects the completed set).
+func TestGetPlan_SplitFiling_NewestEntryWins(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+	// A stale marker with a partial child set (the shape a superseded read
+	// must not win with).
+	seedSplitFilingAudit(fb, runID, map[string]any{
+		"contract_classification": "delete-only",
+		"children": []map[string]any{
+			{"phase_index": 0, "title": "expand", "number": 3001, "url": "u1"},
+		},
+		"contract_child_number": 0,
+		"deferral_issue":        2062,
+	})
+	// The authoritative completion marker: the full set.
+	seedSplitFilingAudit(fb, runID, map[string]any{
+		"contract_classification": "delete-only",
+		"children": []map[string]any{
+			{"phase_index": 0, "title": "expand", "number": 3001, "url": "u1"},
+			{"phase_index": 1, "title": "migrate", "number": 3002, "url": "u2"},
+			{"phase_index": 2, "title": "contract", "number": 3003, "url": "u3", "is_contract": true},
+		},
+		"contract_child_number": 3003,
+		"deferral_issue":        2062,
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling == nil {
+		t.Fatal("SplitFiling should be populated")
+	}
+	if len(out.SplitFiling.Children) != 3 || out.SplitFiling.ContractChildNumber != 3003 {
+		t.Errorf("newest (full-set) marker should win; got children=%d contract=%d",
+			len(out.SplitFiling.Children), out.SplitFiling.ContractChildNumber)
+	}
+}
+
+// TestLoadSplitFiling_CorruptPayload_DecodesNil pins the corrupt-decode
+// degradation: a split_children_filed entry whose payload doesn't decode to the
+// completion-marker shape is treated as "not present" rather than an error, so
+// a corrupt marker never fails the whole plan fetch.
+func TestLoadSplitFiling_CorruptPayload_DecodesNil(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+	// Corrupt entry: payload is a bare string, not the completion-marker object.
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: "split_children_filed",
+		Payload:  "not-an-object",
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan should not error on a corrupt split_children_filed payload: %v", err)
+	}
+	if out.SplitFiling != nil {
+		t.Errorf("corrupt payload should decode to nil SplitFiling, got %+v", out.SplitFiling)
+	}
+}
+
+// splitFilingWireChild mirrors the server split_filing.go splitFilingChild wire
+// shape (its json tags), so the cross-layer test below builds the audit payload
+// in the exact serialized form the approval hook persists. Kept in lockstep with
+// backend/internal/server/split_filing.go: splitFilingChild.
+type splitFilingWireChild struct {
+	PhaseIndex int    `json:"phase_index"`
+	Title      string `json:"title"`
+	Number     int    `json:"number"`
+	URL        string `json:"url"`
+	IsContract bool   `json:"is_contract"`
+}
+
+// splitFilingWireCapException mirrors the server splitCapExceptionDraft wire shape.
+type splitFilingWireCapException struct {
+	SpecDiff string `json:"spec_diff"`
+	PRBody   string `json:"pr_body"`
+}
+
+// splitFilingWirePayload mirrors the server splitChildrenFiledPayload wire shape:
+// the exact bytes writeSplitChildrenFiledAudit marshals. Kept in lockstep with
+// backend/internal/server/split_filing.go: splitChildrenFiledPayload.
+type splitFilingWirePayload struct {
+	ContractClassification string                       `json:"contract_classification"`
+	Children               []splitFilingWireChild       `json:"children"`
+	ContractChildNumber    int                          `json:"contract_child_number"`
+	DeferralIssue          int                          `json:"deferral_issue"`
+	CapException           *splitFilingWireCapException `json:"cap_exception,omitempty"`
+}
+
+// TestGetPlan_SplitFiling_EndToEndRoundTrip is the CONDITION 2 cross-layer
+// assertion: it locks the approval-to-MCP-read contract by driving the REAL
+// shared split-classification logic the approval hook itself runs
+// (splitfiling.Classify + splitfiling.DraftCapException over a plan.SplitProposal
+// and reachability evidence) — NOT a hand-fabricated payload of magic strings —
+// then serializing the result in the server's exact wire shape
+// (splitFilingWirePayload mirrors split_filing.go's splitChildrenFiledPayload
+// tags) and reading it back through the ACTUAL getPlan/loadSplitFiling resolver.
+// So the classification string, the #2062 deferral constant, and the drafted
+// cap-exception that cross the audit boundary are the REAL values the hook emits,
+// and a divergence in the MCP selection/decode resolver fails HERE.
+//
+// The remaining leg — the server hook PRODUCING this wire shape from those same
+// splitfiling outputs — is locked in the sibling
+// backend/internal/server/split_filing_test.go (the hook method + its unexported
+// payload struct are not importable from package main; exporting the payload type
+// for a single-process compile-locked test was requested via scope amendment,
+// which timed out — see the PR Notes and the filed follow-up).
+func TestGetPlan_SplitFiling_EndToEndRoundTrip(t *testing.T) {
+	// The over-cap contract phase the hook classifies: a 3-phase rename whose
+	// terminal (contract) phase's reachability DerivedCount (9) exceeds the
+	// resolved implement cap (3), so an atomic rename cannot ship in one in-cap
+	// PR — governed-exception.
+	const cap, contractDerived = 3, 9
+	proposal := plan.SplitProposal{
+		Rationale: "over-cap rename",
+		Phases: []plan.SplitPhase{
+			{Title: "expand: add NewFoo", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "a.go", Operation: plan.FileOpModify}}}},
+			{Title: "migrate consumers", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "b.go", Operation: plan.FileOpModify}}}, DependsOn: []int{0}},
+			{Title: "contract: delete Foo", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "a.go", Operation: plan.FileOpDelete}}}, DependsOn: []int{1}},
+		},
+	}
+	evidence := []splitfiling.PhaseEvidence{
+		{Index: 0, Title: "expand", DeclaredCount: 1, DerivedCount: 1},
+		{Index: 1, Title: "migrate", DeclaredCount: 1, DerivedCount: 1},
+		{Index: 2, Title: "contract", DeclaredCount: 1, DerivedCount: contractDerived},
+	}
+
+	// The REAL shared logic the approval hook runs — its outputs are what cross
+	// the audit boundary.
+	classification := splitfiling.Classify(proposal, evidence, cap)
+	if classification != splitfiling.ClassificationGovernedException {
+		t.Fatalf("precondition: Classify = %q, want governed-exception", classification)
+	}
+	draft := splitfiling.DraftCapException(proposal, evidence, cap)
+	if draft == nil {
+		t.Fatal("precondition: DraftCapException returned nil for a governed-exception")
+	}
+
+	// Serialize in the server's exact wire shape — the bytes
+	// writeSplitChildrenFiledAudit persists.
+	wire := splitFilingWirePayload{
+		ContractClassification: string(classification),
+		Children: []splitFilingWireChild{
+			{PhaseIndex: 0, Title: "expand: add NewFoo", Number: 3001, URL: "https://github.com/o/r/issues/3001"},
+			{PhaseIndex: 1, Title: "migrate consumers", Number: 3002, URL: "https://github.com/o/r/issues/3002"},
+			{PhaseIndex: 2, Title: "contract: delete Foo", Number: 3003, URL: "https://github.com/o/r/issues/3003", IsContract: true},
+		},
+		ContractChildNumber: 3003,
+		DeferralIssue:       splitfiling.DeferralIssue,
+		CapException:        &splitFilingWireCapException{SpecDiff: draft.SpecDiff, PRBody: draft.PRBody},
+	}
+	recorded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal wire payload: %v", err)
+	}
+	var asAny any
+	if err := json.Unmarshal(recorded, &asAny); err != nil {
+		t.Fatal(err)
+	}
+
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+	seedSplitFilingAudit(fb, runID, asAny)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling == nil {
+		t.Fatal("SplitFiling should survive the round-trip")
+	}
+	// The classification + deferral that crossed the boundary are the REAL
+	// splitfiling values.
+	if out.SplitFiling.ContractClassification != string(splitfiling.ClassificationGovernedException) {
+		t.Errorf("classification did not survive: %q", out.SplitFiling.ContractClassification)
+	}
+	if out.SplitFiling.DeferralIssue != splitfiling.DeferralIssue {
+		t.Errorf("deferral_issue = %d, want the shared splitfiling.DeferralIssue (%d)",
+			out.SplitFiling.DeferralIssue, splitfiling.DeferralIssue)
+	}
+	// The drafted cap-exception decodes to the REAL DraftCapException output.
+	if out.SplitFiling.CapException == nil {
+		t.Fatal("cap_exception should survive the round-trip for a governed-exception")
+	}
+	if out.SplitFiling.CapException.SpecDiff != draft.SpecDiff {
+		t.Errorf("spec_diff did not survive:\n got %q\nwant %q", out.SplitFiling.CapException.SpecDiff, draft.SpecDiff)
+	}
+	if out.SplitFiling.CapException.PRBody != draft.PRBody {
+		t.Errorf("pr_body did not survive:\n got %q\nwant %q", out.SplitFiling.CapException.PRBody, draft.PRBody)
+	}
+	// The filed children + contract carrier survive with the contract flagged.
+	if len(out.SplitFiling.Children) != 3 || !out.SplitFiling.Children[2].IsContract {
+		t.Errorf("children did not survive with the contract child flagged: %+v", out.SplitFiling.Children)
+	}
+	if out.SplitFiling.ContractChildNumber != 3003 {
+		t.Errorf("contract_child_number = %d, want 3003", out.SplitFiling.ContractChildNumber)
+	}
+	// The drafted spec diff literally raises the cap to the derived count.
+	if !strings.Contains(out.SplitFiling.CapException.SpecDiff, strconv.Itoa(contractDerived)) {
+		t.Errorf("spec_diff should raise the cap to the derived count %d; got %q", contractDerived, out.SplitFiling.CapException.SpecDiff)
 	}
 }
