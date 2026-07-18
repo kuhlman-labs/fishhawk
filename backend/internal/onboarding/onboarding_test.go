@@ -61,6 +61,87 @@ func TestScaffoldFiles_Content(t *testing.T) {
 	}
 }
 
+// --- GitLab CI template tests ---
+
+// TestGitLabCITemplate_ParsesAndInvokesRunner locks the customer-side
+// .gitlab-ci.yml: it must parse as YAML and invoke the PUBLISHED runner image
+// (never a local ./runner path), the GitLab analog of fishhawk.yml.
+func TestGitLabCITemplate_ParsesAndInvokesRunner(t *testing.T) {
+	tmpl := GitLabCITemplate()
+	if len(tmpl) == 0 {
+		t.Fatal("GitLabCITemplate() returned no bytes")
+	}
+
+	// Valid GitLab CI YAML.
+	var parsed map[string]any
+	if err := yaml.Unmarshal(tmpl, &parsed); err != nil {
+		t.Fatalf(".gitlab-ci.yml does not parse as YAML: %v", err)
+	}
+	if _, ok := parsed["fishhawk"]; !ok {
+		t.Errorf(".gitlab-ci.yml missing the fishhawk job")
+	}
+
+	s := string(tmpl)
+	// It invokes the backend-agnostic runner against the GitLab forge.
+	if !strings.Contains(s, "fishhawk-runner") {
+		t.Errorf(".gitlab-ci.yml does not invoke fishhawk-runner")
+	}
+	if !strings.Contains(s, "--forge gitlab") {
+		t.Errorf(".gitlab-ci.yml does not select the gitlab forge")
+	}
+	// It pins the PUBLISHED runner image, not a local ./runner path.
+	if !strings.Contains(s, "image: ghcr.io/kuhlman-labs/fishhawk-runner:") {
+		t.Errorf(".gitlab-ci.yml does not pin the published runner image")
+	}
+	if strings.Contains(s, "uses: ./runner") || strings.Contains(s, "./cmd/fishhawk-runner") {
+		t.Errorf(".gitlab-ci.yml references a local runner path, not the published image")
+	}
+	// The backend-supplied run/stage identifiers are wired through.
+	for _, v := range []string{
+		"$FISHHAWK_RUN_ID", "$FISHHAWK_STAGE_ID", "$FISHHAWK_WORKFLOW_ID", "$FISHHAWK_STAGE",
+	} {
+		if !strings.Contains(s, v) {
+			t.Errorf(".gitlab-ci.yml does not reference %s", v)
+		}
+	}
+}
+
+// TestGitLabCITemplate_NotInGitHubScaffold locks the additive-embed invariant:
+// the GitLab pipeline must NOT leak into the GitHub App-PR scaffold, whose
+// four files seed a GitHub repository (a stray .gitlab-ci.yml would be dead
+// config there).
+func TestGitLabCITemplate_NotInGitHubScaffold(t *testing.T) {
+	files, err := ScaffoldFiles(spec.PresetMedium)
+	if err != nil {
+		t.Fatalf("ScaffoldFiles: %v", err)
+	}
+	if _, ok := files[".gitlab-ci.yml"]; ok {
+		t.Errorf("ScaffoldFiles must not include .gitlab-ci.yml")
+	}
+	for p := range files {
+		if strings.HasSuffix(p, ".gitlab-ci.yml") {
+			t.Errorf("ScaffoldFiles leaked a GitLab CI file at %q", p)
+		}
+	}
+	if len(files) != 4 {
+		t.Errorf("ScaffoldFiles has %d entries, want 4 (GitHub scaffold unchanged)", len(files))
+	}
+}
+
+// TestGitLabCITemplate_ReturnsCopy verifies the accessor hands back a copy so a
+// caller cannot mutate the embedded bytes.
+func TestGitLabCITemplate_ReturnsCopy(t *testing.T) {
+	a := GitLabCITemplate()
+	if len(a) == 0 {
+		t.Fatal("GitLabCITemplate() returned no bytes")
+	}
+	a[0] ^= 0xff
+	b := GitLabCITemplate()
+	if b[0] == a[0] {
+		t.Errorf("GitLabCITemplate() returned a shared slice; mutation leaked into the embed")
+	}
+}
+
 func TestScaffoldFiles_UnknownPreset(t *testing.T) {
 	_, err := ScaffoldFiles(spec.Preset("nonsense"))
 	if err == nil {
