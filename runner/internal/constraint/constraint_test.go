@@ -111,6 +111,70 @@ func TestMaxFilesChanged_Over(t *testing.T) {
 	}
 }
 
+// TestIsGeneratedPath pins the generated/vendored allowlist (#2054):
+// sqlc db packages (a .go file under a db/ directory) and vendored deps
+// (vendor/) are exempt; hand-written non-db source is not. Mirrors the
+// backend policy copy so the two verdicts stay in lockstep.
+func TestIsGeneratedPath(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		// Matching: sqlc db packages.
+		{"backend/internal/audit/db/queries.sql.go", true},
+		{"backend/internal/audit/db/models.go", true},
+		{"db/queries.sql.go", true}, // db/ at repo root
+		// Matching: vendored deps.
+		{"vendor/github.com/foo/bar/baz.go", true},
+		{"backend/vendor/github.com/x/y.go", true},
+		// Non-matching: hand-written source that merely mentions "db".
+		{"backend/internal/db_helpers.go", false}, // db in filename, not a db/ dir
+		{"backend/internal/server/handlers.go", false},
+		{"backend/internal/db/notes.md", false}, // under db/ but not a .go file
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			if got := IsGeneratedPath(tc.path); got != tc.want {
+				t.Errorf("IsGeneratedPath(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMaxFilesChanged_GeneratedExempt covers the #2054 exemption at the
+// max_files_changed gate in both named branches (sqlc db, vendored): a
+// diff of only generated files never trips the cap, and a mixed diff
+// counts only the non-generated files (reported in the Detail) and fires
+// only when THAT count exceeds the cap.
+func TestMaxFilesChanged_GeneratedExempt(t *testing.T) {
+	// db-only diff under a tiny cap: zero counted files, no violation.
+	dbOnly := diff("svc/db/queries.sql.go", "svc/db/models.go", "svc/db/db.go")
+	if v := Evaluate(dbOnly, Constraints{MaxFilesChanged: 1}); len(v) != 0 {
+		t.Errorf("db-only diff must be exempt under cap 1, got %+v", v)
+	}
+	// vendor-only diff under a tiny cap: zero counted files, no violation.
+	vendorOnly := diff("vendor/a/a.go", "vendor/b/b.go", "vendor/c/c.go")
+	if v := Evaluate(vendorOnly, Constraints{MaxFilesChanged: 1}); len(v) != 0 {
+		t.Errorf("vendor-only diff must be exempt under cap 1, got %+v", v)
+	}
+	// N=3 non-generated + M=2 generated under cap 3: counted==3, no violation.
+	mixed := diff(
+		"backend/a.go", "backend/b.go", "backend/c.go", // 3 counted
+		"backend/x/db/queries.sql.go", "vendor/lib/lib.go", // exempt
+	)
+	if v := Evaluate(mixed, Constraints{MaxFilesChanged: 3}); len(v) != 0 {
+		t.Errorf("3 counted under cap 3 must pass despite 2 generated files, got %+v", v)
+	}
+	// Same mixed diff under cap 2: counted==3 > 2, fires; Detail reports 3.
+	v := Evaluate(mixed, Constraints{MaxFilesChanged: 2})
+	if len(v) != 1 || v[0].Constraint != "max_files_changed" {
+		t.Fatalf("expected one max_files_changed violation, got %+v", v)
+	}
+	if !strings.Contains(v[0].Detail, "changed 3 files") {
+		t.Errorf("Detail must report the exempted count 3, got %q", v[0].Detail)
+	}
+}
+
 func TestRequiredOutcomes_TestsAddedOrUpdated_Pass(t *testing.T) {
 	cases := []string{
 		"backend/internal/server/handlers_test.go",

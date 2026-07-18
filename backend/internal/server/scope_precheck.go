@@ -29,7 +29,11 @@ const categoryPlanScopePrecheck = "plan_scope_precheck"
 // so the plan-gate pre-check payload matches the post-implement
 // policy_evaluated gate's shape exactly — the MCP read side decodes the
 // same JSON contract. ScannedFiles is the count of scope.files the
-// pre-check evaluated. MaxFilesChanged is the resolved implement-stage
+// pre-check evaluated toward the max_files_changed cap — the exempted
+// count from policy.CountedFileCount, so generated/vendored paths
+// (sqlc */db/*.go, vendor/) are excluded exactly as they are at the
+// post-implement policy gate (a db-only scope reports scanned_files ==
+// 0). MaxFilesChanged is the resolved implement-stage
 // cap (#983; 0 = no cap configured) so downstream surfaces can render
 // headroom (scanned_files vs cap) even when violations is empty — the
 // 29/30 near-miss a violations-only payload makes invisible.
@@ -123,7 +127,7 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 		WorkflowID:       runRow.WorkflowID,
 		ImplementStageID: implStageID,
 		Violations:       violations,
-		ScannedFiles:     len(diff.ChangedFiles),
+		ScannedFiles:     policy.CountedFileCount(diff),
 		MaxFilesChanged:  constraints.MaxFilesChanged,
 	}
 	payload, _ := json.Marshal(result)

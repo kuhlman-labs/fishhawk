@@ -183,6 +183,70 @@ func TestScopePrecheck_MaxFilesOverCapFlagged(t *testing.T) {
 	}
 }
 
+// TestScopePrecheck_GeneratedPathsExemptFromScannedCount is the #2054
+// approval-time assertion, symmetric across BOTH allowlist branches
+// (sqlc db, vendored): generated/vendored scope.files are exempt from
+// ScannedFiles (the max_files_changed count) at the plan gate, exactly
+// as they are at the post-implement policy gate. Every path stays under
+// the spec's allowed_paths (backend/**) so the exemption — which only
+// affects max_files_changed, not allowed_paths — is the sole variable.
+// Assertions read the genuine serialized plan_scope_precheck payload
+// (lastScopePrecheckEntry decodes ap.Payload) so a serialization
+// divergence would be caught server-side.
+func TestScopePrecheck_GeneratedPathsExemptFromScannedCount(t *testing.T) {
+	cases := []struct {
+		name  string
+		files []plan.ScopeFile
+		want  int
+	}{
+		{
+			// db-only scope: every file exempt -> ScannedFiles == 0.
+			name: "db-only",
+			files: []plan.ScopeFile{
+				{Path: "backend/internal/audit/db/queries.sql.go", Operation: plan.FileOpModify},
+				{Path: "backend/internal/audit/db/models.go", Operation: plan.FileOpModify},
+			},
+			want: 0,
+		},
+		{
+			// vendor-only scope: every file exempt -> ScannedFiles == 0.
+			name: "vendor-only",
+			files: []plan.ScopeFile{
+				{Path: "backend/vendor/github.com/foo/bar.go", Operation: plan.FileOpModify},
+				{Path: "backend/vendor/github.com/foo/baz.go", Operation: plan.FileOpModify},
+			},
+			want: 0,
+		},
+		{
+			// N=2 non-generated + M db + M vendor -> ScannedFiles == 2.
+			name: "mixed non-generated + db + vendor",
+			files: []plan.ScopeFile{
+				{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify},
+				{Path: "backend/internal/foo/bar.go", Operation: plan.FileOpModify},
+				{Path: "backend/internal/foo/db/queries.sql.go", Operation: plan.FileOpModify},
+				{Path: "backend/vendor/github.com/x/y.go", Operation: plan.FileOpModify},
+			},
+			want: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+			body := scopePlanBody(t, tc.files)
+
+			s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+
+			got := lastScopePrecheckEntry(t, au)
+			if got.ScannedFiles != tc.want {
+				t.Errorf("ScannedFiles = %d, want %d", got.ScannedFiles, tc.want)
+			}
+			if len(got.Violations) != 0 {
+				t.Fatalf("exempt/in-allowlist scope must produce no violation; got %+v", got.Violations)
+			}
+		})
+	}
+}
+
 func TestScopePrecheck_CleanScopeWritesEmptyViolations(t *testing.T) {
 	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
 	body := scopePlanBody(t, []plan.ScopeFile{
