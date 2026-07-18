@@ -126,6 +126,14 @@ type createCampaignRequest struct {
 	// handler before it is stored opaquely. Omit it for no override (each
 	// issue-run inherits its workflow's contract — the unchanged default).
 	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
+	// Items is the OPTIONAL subset filter (#2003): issue refs (bare number or
+	// issue:N) naming the subset of the epic's children the campaign should
+	// scope to. Every ref must be a child of epic_ref (a non-child fails
+	// campaign_item_not_child, 422); the DAG is built over just these items and
+	// an included item whose depends_on targets an EXCLUDED item fails
+	// campaign_dangling_dependency, exactly as a cross-epic dangling edge does.
+	// Empty/omitted sweeps every child — the backward-compatible default.
+	Items []string `json:"items,omitempty"`
 }
 
 func toCampaignResponse(c *campaign.Campaign) campaignResponse {
@@ -430,6 +438,23 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadGateway, "epic_children_query_failed",
 			"could not query the epic's children",
 			map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Narrow the children to the OPTIONAL requested subset (#2003) before
+	// assembly. FilterToSubset fails closed on a ref that is not a child of the
+	// epic (campaign_item_not_child) and re-classifies an included->excluded
+	// depends_on into a dropped edge, which Assemble then surfaces as a dangling
+	// dependency. Empty/omitted items is a no-op that sweeps every child.
+	result, err = campaign.FilterToSubset(result, req.Items)
+	if err != nil {
+		if errors.Is(err, campaign.ErrItemNotChild) {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_not_child",
+				err.Error(), map[string]any{"epic_ref": req.EpicRef, "items": req.Items})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"filter campaign items to subset failed", map[string]any{"error": err.Error()})
 		return
 	}
 

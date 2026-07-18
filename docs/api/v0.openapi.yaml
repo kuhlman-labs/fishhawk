@@ -6486,6 +6486,21 @@ paths:
                     (unknown fields rejected) at create. Omit (or send `null`)
                     for no override — each issue-run inherits its workflow's
                     contract.
+                items:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    OPTIONAL subset filter (#2003): issue refs (bare number or
+                    `issue:N`) naming the subset of the epic's children to scope
+                    the campaign to. `epic_ref` stays required and every entry
+                    must be a child of it; the DAG is built over just these
+                    items. An included item whose `depends_on` targets an
+                    EXCLUDED item fails `campaign_dangling_dependency` (the same
+                    fail-closed guarantee a cross-epic edge gives). A ref that is
+                    not a child of the epic fails `campaign_item_not_child`. Omit
+                    (or send an empty array) to sweep every child — the
+                    backward-compatible default.
+                  example: ["issue:1440", "issue:1441"]
       responses:
         '200':
           description: |
@@ -6515,7 +6530,10 @@ paths:
             `repo_not_installed` — the GitHub App is not installed on the
             target repo; `campaign_dangling_dependency` — a child's
             `depends_on` targets an issue that is not a fellow child of the
-            epic (assembly fails closed rather than dropping the edge).
+            epic (assembly fails closed rather than dropping the edge), which
+            also covers an `items` subset that includes an item whose
+            `depends_on` points at an EXCLUDED item; `campaign_item_not_child` —
+            an `items` entry is not a child of the epic.
         '501':
           description: |
             `provider_unimplemented` — the conventions name an unregistered

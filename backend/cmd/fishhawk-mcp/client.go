@@ -1898,6 +1898,10 @@ type campaignCreateRequest struct {
 	// body, not an MCP tool schema — omitempty drops a nil/empty value so a
 	// campaign without an override sends no operator_agent key.
 	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
+	// Items is the OPTIONAL subset filter (#2003): issue refs naming the subset
+	// of the epic's children to scope the campaign to. Empty/nil omits the field
+	// so the backend sweeps every child (the backward-compatible default).
+	Items []string `json:"items,omitempty"`
 }
 
 // CreateCampaign assembles a campaign from an epic ref via
@@ -1914,9 +1918,13 @@ type campaignCreateRequest struct {
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 422 repo_not_installed (the GitHub App is not on the target repo)
 //   - 422 campaign_dangling_dependency (a depends_on target is not a fellow child)
+//   - 422 campaign_item_not_child (a requested items ref is not a child of the epic)
 //   - 503 campaign_repo_unconfigured (no campaign repository wired on the deploy)
-func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage) (*Campaign, error) {
-	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent})
+//
+// items is the OPTIONAL subset filter (#2003): issue refs naming the subset of
+// the epic's children to scope the campaign to; empty/nil sweeps every child.
+func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage, items []string) (*Campaign, error) {
+	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent, Items: items})
 	if err != nil {
 		return nil, fmt.Errorf("marshal create campaign: %w", err)
 	}

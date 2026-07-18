@@ -539,6 +539,131 @@ func TestCreateCampaign_CrossBoundary_E2E(t *testing.T) {
 	}
 }
 
+// threeChildDAG is a three-item fixture for the subset tests: 100 has no deps
+// (wave 0), 101 and 102 each depend on 100 (wave 1).
+func threeChildDAG() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 100, Title: "first"},
+			{Number: 101, Title: "second"},
+			{Number: 102, Title: "third"},
+		},
+		Edges: []workmgmt.DependsEdge{
+			{From: 101, To: 100},
+			{From: 102, To: 100},
+		},
+	}
+}
+
+// TestCreateCampaign_ItemsSubset_CrossBoundary_E2E drives the subset filter
+// (#2003) end-to-end: a POST naming a subset of the epic's children assembles
+// the DAG over ONLY those items (request payload -> FilterToSubset -> Assemble
+// -> Postgres -> GET /status render).
+func TestCreateCampaign_ItemsSubset_CrossBoundary_E2E(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+
+	gh := recordingInstallGitHubClient(t, 7788, &installRecorder{})
+	s := New(Config{CampaignRepo: repo, GitHub: gh})
+
+	// Scope to {100, 101}, dropping 102 and its edge.
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:100","issue:101"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+created.ID.String()+"/status", nil)
+	statusReq.SetPathValue("campaign_id", created.ID.String())
+	sw := httptest.NewRecorder()
+	s.handleGetCampaignStatus(sw, withAuth(statusReq))
+	if sw.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200 (body=%s)", sw.Code, sw.Body.String())
+	}
+	var status struct {
+		Items []campaignItemResponse `json:"items"`
+	}
+	if err := json.Unmarshal(sw.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v (body=%s)", err, sw.Body.String())
+	}
+	if len(status.Items) != 2 {
+		t.Fatalf("items = %d, want 2 (subset {100,101})", len(status.Items))
+	}
+	refs := map[string]bool{}
+	for _, it := range status.Items {
+		refs[it.IssueRef] = true
+	}
+	if !refs["issue:100"] || !refs["issue:101"] || refs["issue:102"] {
+		t.Errorf("item refs = %v, want exactly {issue:100, issue:101}", refs)
+	}
+}
+
+// TestCreateCampaign_ItemNotChild_422 is the fail-closed branch: a requested
+// item that is not a child of the epic returns 422 campaign_item_not_child.
+func TestCreateCampaign_ItemNotChild_422(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:100","issue:999"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_item_not_child" {
+		t.Errorf("error code = %q, want campaign_item_not_child", code)
+	}
+}
+
+// TestCreateCampaign_SubsetIncludedDependsOnExcluded_422 is the re-classified
+// DroppedEdges path: including 101 (depends on 100) while excluding 100 makes
+// 101's dependency dangling, surfaced as 422 campaign_dangling_dependency —
+// reusing the existing mapping with no handler change.
+func TestCreateCampaign_SubsetIncludedDependsOnExcluded_422(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:101"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "campaign_dangling_dependency" {
+		t.Errorf("error code = %q, want campaign_dangling_dependency", code)
+	}
+}
+
+// TestCreateCampaign_OmittedItems_SweepsAllChildren is the backward-compat
+// regression guard: omitting items assembles the campaign over EVERY child,
+// unchanged from the pre-subset behavior.
+func TestCreateCampaign_OmittedItems_SweepsAllChildren(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	if len(items) != 3 {
+		t.Errorf("persisted items = %d, want 3 (all children swept)", len(items))
+	}
+}
+
 // TestCreateCampaign_OperatorAgent_CrossBoundary_E2E is the slice-A cross-layer
 // done-means for the campaign-level operator_agent override (E25.12): a POST
 // carrying an operator_agent block flows payload -> domain -> JSONB persistence

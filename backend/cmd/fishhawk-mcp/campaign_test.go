@@ -44,6 +44,67 @@ func TestStartCampaign_HappyPath_PostsBodyReturnsCampaign(t *testing.T) {
 	}
 }
 
+// TestStartCampaign_ItemsSubset_PostsItemsInBody pins the optional subset
+// filter (#2003): a non-empty items list travels in the POST body verbatim so
+// the backend scopes the campaign to just the named children.
+func TestStartCampaign_ItemsSubset_PostsItemsInBody(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:    "kuhlman-labs/fishhawk",
+		EpicRef: "#25",
+		Items:   []string{"issue:101", "issue:102"},
+	})
+	if err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	if got := fb.createCampaignBody.Items; len(got) != 2 || got[0] != "issue:101" || got[1] != "issue:102" {
+		t.Errorf("backend got items = %v, want [issue:101 issue:102]", got)
+	}
+}
+
+// TestStartCampaign_OmittedItems_LeavesBodyEmpty pins the backward-compatible
+// default: omitting items sends no items field (nil), so the backend sweeps
+// every child.
+func TestStartCampaign_OmittedItems_LeavesBodyEmpty(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:    "x/y",
+		EpicRef: "#1",
+	})
+	if err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	if len(fb.createCampaignBody.Items) != 0 {
+		t.Errorf("items = %v, want empty (omit sweeps every child)", fb.createCampaignBody.Items)
+	}
+}
+
+// TestStartCampaign_ItemNotChild_MapsActionableError covers the new
+// campaign_item_not_child wire code: a requested item that is not a child of
+// the epic maps to an actionable client-side message naming the code and epic.
+func TestStartCampaign_ItemNotChild_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_item_not_child","message":"issue:999 is not a child of the epic"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo: "x/y", EpicRef: "#25", Items: []string{"issue:999"},
+	})
+	if err == nil {
+		t.Fatal("err = nil, want campaign_item_not_child mapping")
+	}
+	for _, want := range []string{"campaign_item_not_child", "child", "#25"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
 // TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty pins the optional
 // pause_policy: omitting it sends an empty value (the backend normalizes it).
 func TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty(t *testing.T) {
