@@ -564,6 +564,71 @@ func (c *Client) SetCommitStatus(ctx context.Context, projectID int, sha string,
 	return &out, nil
 }
 
+// PipelineVariable is one CI/CD variable passed to a pipeline trigger. GitLab's
+// create-pipeline API takes variables as an ARRAY of {key, value} objects (not a
+// flat map), so this is a slice element, keeping the on-wire order deterministic.
+type PipelineVariable struct {
+	Key   string
+	Value string
+}
+
+// CreatePipelineParams describes a pipeline to create. Ref (a branch name or
+// tag) is required by GitLab; Variables may be empty.
+type CreatePipelineParams struct {
+	Ref       string
+	Variables []PipelineVariable
+}
+
+// Pipeline is the subset of a GitLab pipeline the forge adapter reads back after
+// creating one.
+type Pipeline struct {
+	ID     int    `json:"id"`
+	SHA    string `json:"sha"`
+	Ref    string `json:"ref"`
+	Status string `json:"status"`
+	WebURL string `json:"web_url"`
+}
+
+// CreatePipeline creates a CI/CD pipeline for a project on a ref.
+//
+//	POST /api/v4/projects/:id/pipeline
+//
+// The body is {ref, variables:[{key,value}]}: ref is required; variables is
+// GitLab's array-of-objects shape (NOT a flat map), sent only when non-empty
+// (https://docs.gitlab.com/ee/api/pipelines.html#create-a-new-pipeline).
+func (c *Client) CreatePipeline(ctx context.Context, projectID int, p CreatePipelineParams) (*Pipeline, error) {
+	if projectID <= 0 {
+		return nil, fmt.Errorf("gitlabclient: project id required")
+	}
+	if strings.TrimSpace(p.Ref) == "" {
+		return nil, fmt.Errorf("gitlabclient: pipeline ref required")
+	}
+
+	body := map[string]any{"ref": p.Ref}
+	if len(p.Variables) > 0 {
+		vars := make([]map[string]any, 0, len(p.Variables))
+		for _, v := range p.Variables {
+			vars = append(vars, map[string]any{"key": v.Key, "value": v.Value})
+		}
+		body["variables"] = vars
+	}
+
+	resp, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/api/v4/projects/%d/pipeline", projectID), body)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := errForStatus("create pipeline", resp); err != nil {
+		return nil, err
+	}
+
+	var out Pipeline
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("gitlabclient: decode create pipeline: %w", err)
+	}
+	return &out, nil
+}
+
 // GetProtectedBranch reads a branch's protection entry.
 //
 //	GET /api/v4/projects/:id/protected_branches/:branch

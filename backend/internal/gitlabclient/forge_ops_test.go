@@ -887,3 +887,93 @@ func TestGetProjectByID_ValidatesArgs(t *testing.T) {
 		t.Error("want error for missing project id")
 	}
 }
+
+// --- CreatePipeline ---------------------------------------------------------
+
+func TestCreatePipeline_RequestShapeAndResult(t *testing.T) {
+	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+		if rec.method != http.MethodPost {
+			t.Errorf("method = %s, want POST", rec.method)
+		}
+		if rec.path != "/api/v4/projects/42/pipeline" {
+			t.Errorf("path = %s", rec.path)
+		}
+		assertPrivateToken(t, rec.header)
+		var got map[string]any
+		if err := json.Unmarshal(rec.body, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got["ref"] != "fishhawk/run-abc12345/slice-2" {
+			t.Errorf("ref = %v, want the slice branch", got["ref"])
+		}
+		// variables is an ARRAY of {key,value} objects (not a flat map), in
+		// insertion order.
+		rawVars, ok := got["variables"].([]any)
+		if !ok {
+			t.Fatalf("variables not an array: %T", got["variables"])
+		}
+		if len(rawVars) != 2 {
+			t.Fatalf("variables len = %d, want 2", len(rawVars))
+		}
+		first, _ := rawVars[0].(map[string]any)
+		if first["key"] != "run_id" || first["value"] != "r1" {
+			t.Errorf("variables[0] = %v, want {run_id,r1}", first)
+		}
+		second, _ := rawVars[1].(map[string]any)
+		if second["key"] != "stage" || second["value"] != "claude-code" {
+			t.Errorf("variables[1] = %v, want {stage,claude-code}", second)
+		}
+		return jsonResponse(http.StatusCreated,
+			`{"id":900,"sha":"headsha","ref":"fishhawk/run-abc12345/slice-2","status":"created","web_url":"https://gl/pipe/900"}`), nil
+	})
+	pipe, err := c.CreatePipeline(context.Background(), 42, CreatePipelineParams{
+		Ref: "fishhawk/run-abc12345/slice-2",
+		Variables: []PipelineVariable{
+			{Key: "run_id", Value: "r1"},
+			{Key: "stage", Value: "claude-code"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreatePipeline: %v", err)
+	}
+	if pipe.ID != 900 || pipe.SHA != "headsha" || pipe.Status != "created" || pipe.WebURL != "https://gl/pipe/900" {
+		t.Errorf("pipeline = %+v", pipe)
+	}
+}
+
+func TestCreatePipeline_OmitsEmptyVariables(t *testing.T) {
+	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+		var got map[string]any
+		if err := json.Unmarshal(rec.body, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, ok := got["variables"]; ok {
+			t.Error("variables present though empty")
+		}
+		return jsonResponse(http.StatusCreated, `{"id":1,"ref":"main"}`), nil
+	})
+	if _, err := c.CreatePipeline(context.Background(), 42, CreatePipelineParams{Ref: "main"}); err != nil {
+		t.Fatalf("CreatePipeline: %v", err)
+	}
+}
+
+func TestCreatePipeline_APIError(t *testing.T) {
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusBadRequest, `{"message":"Reference not found"}`), nil
+	})
+	_, err := c.CreatePipeline(context.Background(), 42, CreatePipelineParams{Ref: "nope"})
+	assertAPIError(t, err, http.StatusBadRequest)
+}
+
+func TestCreatePipeline_ValidatesArgs(t *testing.T) {
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		t.Fatal("transport called despite invalid args")
+		return nil, nil
+	})
+	if _, err := c.CreatePipeline(context.Background(), 0, CreatePipelineParams{Ref: "main"}); err == nil {
+		t.Error("want error for missing project id")
+	}
+	if _, err := c.CreatePipeline(context.Background(), 42, CreatePipelineParams{Ref: " "}); err == nil {
+		t.Error("want error for empty ref")
+	}
+}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 )
 
 // staticToken is the credential provider the adapter is wired with in tests —
@@ -475,6 +476,55 @@ func TestUnsupportedOperations(t *testing.T) {
 	}
 	if _, err := f.MergeBranch(ctx, scope, repo, "base", "head", "msg"); !errors.Is(err, forge.ErrUnsupported) {
 		t.Errorf("MergeBranch err = %v, want ErrUnsupported", err)
+	}
+}
+
+// --- pipelines ----------------------------------------------------------
+
+// TestTriggerPipeline pins the resolve → CreatePipeline wrapper the gitlab_ci
+// dispatch backend (#1861) drives: the scope's project id is parsed back out,
+// and the POST /pipeline carries the ref and the ordered CI/CD variables.
+func TestTriggerPipeline(t *testing.T) {
+	var gotRef string
+	var gotVars []map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v4/projects/5/pipeline", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotRef, _ = body["ref"].(string)
+		if raw, ok := body["variables"].([]any); ok {
+			for _, v := range raw {
+				if m, ok := v.(map[string]any); ok {
+					gotVars = append(gotVars, m)
+				}
+			}
+		}
+		writeJSON(w, http.StatusCreated, `{"id":900,"ref":"fishhawk/run-abc12345","status":"created"}`)
+	})
+	f, _ := newForge(t, mux)
+
+	err := f.TriggerPipeline(context.Background(), gitlabScope("5"), "fishhawk/run-abc12345",
+		[]gitlabclient.PipelineVariable{
+			{Key: "run_id", Value: "r1"},
+			{Key: "stage", Value: "claude-code"},
+		})
+	if err != nil {
+		t.Fatalf("TriggerPipeline: %v", err)
+	}
+	if gotRef != "fishhawk/run-abc12345" {
+		t.Errorf("ref = %q, want fishhawk/run-abc12345", gotRef)
+	}
+	if len(gotVars) != 2 || gotVars[0]["key"] != "run_id" || gotVars[1]["key"] != "stage" {
+		t.Errorf("variables = %v", gotVars)
+	}
+}
+
+// A non-gitlab-shaped scope fails closed in resolve before any HTTP call.
+func TestTriggerPipeline_NonGitLabScopeRejected(t *testing.T) {
+	f, _ := newForge(t, http.NewServeMux())
+	err := f.TriggerPipeline(context.Background(), forge.FromRef("12345"), "main", nil)
+	if err == nil {
+		t.Fatal("want error for a non-gitlab-shaped scope")
 	}
 }
 

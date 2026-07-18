@@ -786,10 +786,11 @@ type stubGitHub struct {
 	specErr      error
 	dispatchErr  error
 	dispatchCall struct {
-		repo forge.RepoRef
-		file string
-		ref  string
-		args githubclient.DispatchInputs
+		scope forge.CredentialScope
+		repo  forge.RepoRef
+		file  string
+		ref   string
+		args  githubclient.DispatchInputs
 	}
 	specCalls     int
 	dispatchCalls int
@@ -829,11 +830,12 @@ func (s *stubGitHub) GetWorkflowSpec(_ context.Context, _ forge.CredentialScope,
 	return &githubclient.FileContent{Content: s.specContent, SHA: s.specSHA}, nil
 }
 
-func (s *stubGitHub) DispatchWorkflow(_ context.Context, _ forge.CredentialScope,
+func (s *stubGitHub) DispatchWorkflow(_ context.Context, scope forge.CredentialScope,
 	repo forge.RepoRef, file, ref string, args githubclient.DispatchInputs) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.dispatchCalls++
+	s.dispatchCall.scope = scope
 	s.dispatchCall.repo = repo
 	s.dispatchCall.file = file
 	s.dispatchCall.ref = ref
@@ -2921,6 +2923,12 @@ func TestHandle_CIFailureRetry_HappyPath_DispatchesChild(t *testing.T) {
 	// workflow_dispatch was fired.
 	if gh.dispatchCalls != 1 {
 		t.Errorf("DispatchWorkflow calls = %d, want 1", gh.dispatchCalls)
+	}
+	// E45.8 flip: the CI-retry caller now passes the parent's installation as a
+	// forge.CredentialScope (was a bare int64), so the github_actions backend
+	// authenticates as the parent's installation (42) rather than skipping.
+	if gh.dispatchCall.scope != forge.FromGitHubInstallationID(42) {
+		t.Errorf("dispatch scope = %v, want scope for installation 42", gh.dispatchCall.scope)
 	}
 
 	// One ci_failure_retry_dispatched audit row chained against the
