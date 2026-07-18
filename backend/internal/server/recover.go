@@ -212,16 +212,32 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 			failureCategory = string(*implementStage.FailureCategory)
 		}
 	}
-	eligible := planStage != nil && planStage.State == run.StageStateSucceeded &&
-		implementStage != nil && implementStage.State == run.StageStateFailed &&
+	// Recovery-of-a-recovery (#2027 case 2): a plan-stage-less recovery/retry
+	// target (its own plan stage is absent) is eligible when its APPROVED plan
+	// resolves via the loadApprovedPlanForRun ParentRunID parent-walk — the same
+	// walk the child's implement prompt uses. Resolve it here so the eligibility
+	// gate accepts that shape (plan-stage-less + plan resolvable) alongside the
+	// original succeeded-own-plan-stage shape, keeping the implement-failed-
+	// category-B leg unchanged. A repo IO failure fails loud rather than silently
+	// refusing recovery.
+	approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), parentID)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"resolve approved plan failed", map[string]any{"error": err.Error()})
+		return
+	}
+	planOK := (planStage != nil && planStage.State == run.StageStateSucceeded) ||
+		(planStage == nil && approvedPlan != nil)
+	implementB := implementStage != nil && implementStage.State == run.StageStateFailed &&
 		implementStage.FailureCategory != nil && *implementStage.FailureCategory == run.FailureB
-	if !eligible {
+	if !planOK || !implementB {
 		s.writeError(w, r, http.StatusConflict, "recovery_not_eligible",
-			"recovery requires a succeeded plan stage and an implement stage failed category-B",
+			"recovery requires a succeeded plan stage (or a plan resolvable via the parent walk) and an implement stage failed category-B",
 			map[string]any{
 				"plan_state":       planState,
 				"implement_state":  implementState,
 				"failure_category": failureCategory,
+				"plan_resolved":    approvedPlan != nil,
 			})
 		return
 	}
