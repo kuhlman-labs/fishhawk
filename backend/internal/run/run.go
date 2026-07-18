@@ -481,15 +481,24 @@ type IssueComment struct {
 // RunnerKind enumerates the execution backends Fishhawk supports.
 // Closed-set; new kinds extend via a migration that updates the
 // CHECK constraint on runs.runner_kind.
+//
+// `gitlab_ci` (ADR-058 / E45.8, #1861) is the GitLab pipeline dispatch
+// backend added as additive, DORMANT surface: the enum member + the
+// migration 0054 CHECK widening land so the value is representable and
+// persistable, but no gitlab_ci run is ever created in this change (go-live
+// enablement is carved to #2043). It parallels `github_actions` as a
+// non-host-dispatched backend that triggers a customer-side CI pipeline.
 const (
 	RunnerKindGitHubActions = "github_actions"
 	RunnerKindLocal         = "local"
+	RunnerKindGitLabCI      = "gitlab_ci"
 )
 
 // ValidRunnerKinds is the closed-set membership check.
 var ValidRunnerKinds = map[string]struct{}{
 	RunnerKindGitHubActions: {},
 	RunnerKindLocal:         {},
+	RunnerKindGitLabCI:      {},
 }
 
 // RunnerKindResolution is the outcome of reconciling a runner self-report
