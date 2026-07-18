@@ -375,6 +375,18 @@ type Trigger struct {
 	// ImplementStageTimeout is the max runtime budget for the implement stage.
 	// Zero resolves to defaultStageTimeoutMinutes in buildPlan.
 	ImplementStageTimeout time.Duration
+	// MaxFilesChanged is the spec-resolved implement-stage max_files_changed
+	// cap injected into the plan-stage prompt as a HARD planning constraint
+	// (#2053). When > 0, buildPlan renders a "File-count constraint" block
+	// telling the planner to keep scope.files at or under the cap and — only
+	// when it genuinely cannot — to set over_cap:true as a COURTESY
+	// self-declaration. The prompt frames over_cap as an advisory hint, NOT as
+	// the mechanism that surfaces the over-cap condition: the plan gate detects
+	// over-cap server-side from len(scope.files) vs this cap regardless of the
+	// flag (runPlanWarnings). Zero means no cap configured (block omitted,
+	// prompt byte-unchanged) — the fail-open value the server assigns when the
+	// spec has no implement stage or no max_files_changed constraint.
+	MaxFilesChanged int
 	// DecomposeRequired signals that the previous plan for this run
 	// was rejected because its predicted runtime exceeded the
 	// implement-stage budget without a decomposition block. When true,
@@ -2140,6 +2152,30 @@ func buildPlan(t Trigger) string {
 			"so the reviewer can split the work into multiple runs.\n\n",
 		planMins, implMins,
 	)
+
+	// File-count constraint (#2053): inject the spec-resolved implement-stage
+	// max_files_changed cap as a HARD planning constraint so the planner scopes
+	// within it at first emission. over_cap is framed as a COURTESY
+	// self-declaration hint — NOT the mechanism that surfaces the over-cap
+	// condition. The plan gate detects over-cap deterministically server-side
+	// from len(scope.files) vs the resolved cap (runPlanWarnings), independent
+	// of this flag. Omitted entirely when no cap is configured (t.MaxFilesChanged
+	// == 0), keeping the prompt byte-unchanged for uncapped workflows.
+	if t.MaxFilesChanged > 0 {
+		fmt.Fprintf(&b,
+			"File-count constraint (HARD): the implement stage that executes this plan enforces "+
+				"max_files_changed = %d. Keep scope.files AT OR UNDER %d files — a plan whose scope "+
+				"exceeds the cap will be flagged at the plan gate and is at risk of category-B failure "+
+				"in the implement stage. Treat exceeding the cap as a scope problem: narrow the change, "+
+				"or if the work genuinely cannot be done within the cap, populate decomposition.sub_plans "+
+				"to split it across multiple runs. Only if you must emit a single plan whose scope.files "+
+				"exceeds %d, set over_cap:true in the plan artifact as a COURTESY self-declaration and "+
+				"flag the over-cap scope explicitly — over_cap is an advisory hint, not the thing that "+
+				"surfaces the over-cap condition (the gate detects it from your scope.files count "+
+				"regardless of the flag). Do NOT silently emit an over-cap monolith.\n\n",
+			t.MaxFilesChanged, t.MaxFilesChanged, t.MaxFilesChanged,
+		)
+	}
 
 	// Step zero (#1057): the plannability / needs-direction gate. The planner
 	// must run this BEFORE drafting a plan; a genuinely unplannable issue

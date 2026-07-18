@@ -78,6 +78,10 @@
       "type": "array",
       "items": { "$ref": "#/$defs/surface-sweep-exemption" },
       "description": "Optional (#1544). Machine-readable declarations that a surface-sweep lockstep pattern's named sibling correctly needs no change in this plan — the structured form of the prose 'justify why a sibling needs no change' escape hatch. The plan-gate surface sweep honors a matching (pattern, sibling) entry to suppress the would-be missing-sibling finding, and records the applied exemption in the audit payload + plan-review evidence so a bogus reason stays reviewer-challengeable (never silent). A non-matching or non-firing entry is a harmless no-op."
+    },
+    "over_cap": {
+      "type": "boolean",
+      "description": "Optional (#2053). A planner SELF-DECLARATION HINT that scope.files exceeds the resolved implement-stage max_files_changed cap. Advisory only: the plan-gate over-cap advisory is derived SERVER-SIDE from len(scope.files) vs the resolved cap and does NOT depend on this flag — no enforcement or detection path may branch on over_cap to decide whether a plan is over-cap. Set it true as a courtesy when you must emit a single plan whose scope genuinely exceeds the cap; omitting it (or setting it false) never suppresses the server's count-derived advisory."
     }
   },
 

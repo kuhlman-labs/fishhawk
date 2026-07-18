@@ -585,6 +585,75 @@ func TestPlanPrompt_SurfaceCouplingSiblingMap_NamesLockstepSibling(t *testing.T)
 	}
 }
 
+// planStageSpecYAMLWithCap builds a feature_change workflow whose implement
+// stage declares max_files_changed = cap, for the plan-prompt file-count
+// constraint integration test (#2053).
+func planStageSpecYAMLWithCap(cap int) []byte {
+	return []byte(fmt.Sprintf(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: %d
+        produces:
+          - artifact: pull_request
+`, cap))
+}
+
+// TestPlanPrompt_FileCountConstraint_ResolvedFromSpec is the #2053 cross-
+// boundary integration test: it drives GET /v0/stages/{id}/prompt-render for a
+// feature_change plan stage and asserts the rendered plan prompt (the prompt
+// trace) contains the spec-resolved max_files_changed cap. The two sub-cases use
+// DIFFERENT cap values so a passing test proves the injected value tracks the
+// spec's implement-stage constraint rather than a hardcoded constant
+// (done-means #1169).
+func TestPlanPrompt_FileCountConstraint_ResolvedFromSpec(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cap  int
+	}{
+		{name: "default-ish cap", cap: 25},
+		{name: "non-default cap", cap: 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, _, _, sf, gh := newImplementPromptServer(t)
+			runID, planStageID, _, rn := seedRunWithStages(rr)
+			rn.WorkflowSpec = planStageSpecYAMLWithCap(tc.cap)
+			gh.issue = &githubclient.Issue{Number: 42, Title: "Cap test", Body: "ctx"}
+
+			priv, _ := sf.issue(t, runID)
+			w := promptRequestForStage(t, s, runID, planStageID, priv)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				"File-count constraint",
+				fmt.Sprintf("max_files_changed = %d", tc.cap),
+				fmt.Sprintf("AT OR UNDER %d", tc.cap),
+			} {
+				if !strings.Contains(resp.Prompt, want) {
+					t.Errorf("plan-stage prompt missing %q\n---\n%s", want, resp.Prompt)
+				}
+			}
+		})
+	}
+}
+
 func TestHandleGetStagePromptRender_BudgetContext(t *testing.T) {
 	// Seed a run with a 30m workflow policy and a plan artifact where
 	// predicted_runtime_minutes=9. Assert the implement-stage prompt

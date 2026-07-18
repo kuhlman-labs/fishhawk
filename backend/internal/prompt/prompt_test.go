@@ -899,6 +899,75 @@ func TestBuild_Plan_BudgetHintWithTimeouts(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_FileCountConstraint_Rendered asserts buildPlan renders the
+// File-count constraint block naming the resolved max_files_changed cap when
+// Trigger.MaxFilesChanged > 0 (#2053). It also asserts the copy frames over_cap
+// as an advisory self-declaration ("courtesy"), not the mechanism that surfaces
+// the over-cap condition.
+func TestBuild_Plan_FileCountConstraint_Rendered(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber:     7,
+		IssueTitle:      "Plan a refactor",
+		Repo:            "x/y",
+		MaxFilesChanged: 12,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{
+		"File-count constraint",
+		"max_files_changed = 12",
+		"AT OR UNDER 12",
+		"over_cap:true",
+		"COURTESY self-declaration",
+		"regardless of the flag",
+	} {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_FileCountConstraint_OmittedWhenZero asserts the File-count
+// constraint block is omitted entirely when no cap is configured (#2053), so
+// the prompt is byte-unchanged for uncapped workflows.
+func TestBuild_Plan_FileCountConstraint_OmittedWhenZero(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+		// MaxFilesChanged intentionally zero.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "File-count constraint") {
+		t.Errorf("plan prompt should omit the File-count constraint block when the cap is 0\n---\n%s", got)
+	}
+}
+
+// TestBuild_Plan_FileCountConstraint_Deterministic pins the pure/deterministic
+// renderer contract (#2053): two Build calls with the same cap are byte-identical.
+func TestBuild_Plan_FileCountConstraint_Deterministic(t *testing.T) {
+	trig := Trigger{
+		IssueNumber:     7,
+		IssueTitle:      "Plan a refactor",
+		Repo:            "x/y",
+		MaxFilesChanged: 5,
+	}
+	a, err := Build("plan", trig)
+	if err != nil {
+		t.Fatalf("Build a: %v", err)
+	}
+	b, err := Build("plan", trig)
+	if err != nil {
+		t.Fatalf("Build b: %v", err)
+	}
+	if a != b {
+		t.Error("two Build calls with the same cap are not byte-identical")
+	}
+}
+
 func TestBuild_Plan_BudgetHintDefaultFallback(t *testing.T) {
 	// Zero durations should resolve to the default (15 minutes).
 	got, err := Build("plan", Trigger{
