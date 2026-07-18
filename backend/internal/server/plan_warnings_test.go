@@ -507,11 +507,17 @@ workflows:
 // over-cap advisory text (naming the scanned count and the cap) reaches the
 // serialized-out form the fishhawk_get_plan PlanWarnings field is built from.
 //
-// The get_plan resolver (backend/cmd/fishhawk-mcp/tools.go::loadPlanWarnings)
-// selects the NEWEST plan_warnings entry and decodes its payload's `warnings`
-// array — the exact contract replicated here via getPlanWarningsField — so this
-// asserts the operator-visible cross-boundary contract, not merely the internal
-// warnings slice.
+// This half proves the PRODUCTION leg: the real handleShipPlan ->
+// runPlanWarnings writes an audit payload carrying the over-cap advisory. The
+// SELECTION leg — the real get_plan resolver
+// (backend/cmd/fishhawk-mcp/tools.go::loadPlanWarnings) picking that payload out
+// of the audit log and decoding its `warnings` array — is asserted against the
+// GENUINE resolver by TestGetPlan_OverCapAdvisory_ReachesPlanWarningsField in
+// the fishhawk-mcp package (loadPlanWarnings lives in package main and is
+// unimportable here). getPlanWarningsField below only REPLICATES that selection
+// so this server-package test can assert the payload text without the
+// cross-module hop; the fishhawk-mcp seam test is what catches a resolver
+// divergence.
 func TestShipPlan_OverCapAdvisory_ReachesGetPlanField(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	reviewer := &fakePlanReviewer{
@@ -539,7 +545,10 @@ func TestShipPlan_OverCapAdvisory_ReachesGetPlanField(t *testing.T) {
 // (backend/cmd/fishhawk-mcp/tools.go::loadPlanWarnings), which cannot be imported
 // across the module boundary: it selects the NEWEST plan_warnings audit entry for
 // the run and returns its payload's decoded `warnings` array. Returns nil when no
-// entry exists — the field-omitted case the get_plan resolver produces.
+// entry exists — the field-omitted case the get_plan resolver produces. Because
+// this REPLICATES rather than invokes the resolver, the genuine selection path is
+// pinned separately by TestGetPlan_OverCapAdvisory_ReachesPlanWarningsField in the
+// fishhawk-mcp package, which exercises the real loadPlanWarnings.
 func getPlanWarningsField(t *testing.T, au *auditFake, _ uuid.UUID) []string {
 	t.Helper()
 	entries := planWarningsEntries(t, au)
