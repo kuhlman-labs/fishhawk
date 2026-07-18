@@ -205,11 +205,14 @@ func New(d Deps) *Publisher {
 //     skipped for its absence.
 //   - A gitlab_ci run's GitLab forge is unconfigured (best-effort
 //     skip, mirroring the GitHub nil-client posture).
-//   - The most-recent published state for this (repo, head_sha)
-//     already matches — don't spam GitHub on every read. This path
-//     still clears the run's failure episode and fires OnRecovered:
-//     the state being live on GitHub ends the episode even when
-//     another run sharing the head commit published it.
+//   - The most-recent published state for this (forge, repo,
+//     head_sha) already matches — don't spam the forge on every
+//     read. The cache is keyed per-forge (#1861), so a github_actions
+//     run never dedup-suppresses a gitlab_ci run's status (or vice
+//     versa) for the same owner/name@sha. This path still clears the
+//     run's failure episode and fires OnRecovered: the state being
+//     live on the forge ends the episode even when another run
+//     sharing the head commit published it.
 //
 // The bool return is "did we actually publish to GitHub on this
 // call." Useful for tests; production callers usually ignore it.
@@ -273,7 +276,16 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 		scope = forge.FromGitHubInstallationID(*runRow.InstallationID)
 	}
 
-	if !p.shouldPublish(repo, headSHA, state) {
+	// The dedup cache is keyed per-FORGE (#1861): a GitHub Check Run and a
+	// GitLab commit status for the same owner/name@sha are independent
+	// surfaces, so a github_actions run must never suppress a gitlab_ci run's
+	// status (or vice versa) — each forge tracks its own last-published state.
+	forgeKind := "github"
+	if isGitLab {
+		forgeKind = "gitlab"
+	}
+
+	if !p.shouldPublish(repo, headSHA, forgeKind, state) {
 		// The dedup cache records only successful publishes, so a hit
 		// means this (repo, head_sha) already carries `state` on GitHub
 		// — posted by this run or by another run sharing the head
@@ -296,7 +308,7 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 		p.recordFailure(ctx, runID, headSHA, err)
 		return false, err
 	}
-	attempts := p.recordPublished(repo, runID, headSHA, state)
+	attempts := p.recordPublished(repo, runID, headSHA, forgeKind, state)
 	if p.onRecovered != nil {
 		p.onRecovered(ctx, runID, headSHA, attempts)
 	}
@@ -346,13 +358,13 @@ func (p *Publisher) recordFailure(ctx context.Context, runID uuid.UUID, headSHA 
 }
 
 // shouldPublish returns true when the cached state for this
-// (repo, head_sha) differs from `state`. Cache miss → publish
+// (forge, repo, head_sha) differs from `state`. Cache miss → publish
 // (the conservative default — operators expect to see the row
 // after a backend restart).
-func (p *Publisher) shouldPublish(repo forge.RepoRef, headSHA string, state stagecheck.State) bool {
+func (p *Publisher) shouldPublish(repo forge.RepoRef, headSHA, forgeKind string, state stagecheck.State) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	prev, ok := p.last[cacheKey(repo, headSHA)]
+	prev, ok := p.last[cacheKey(repo, headSHA, forgeKind)]
 	if !ok {
 		return true
 	}
@@ -362,9 +374,9 @@ func (p *Publisher) shouldPublish(repo forge.RepoRef, headSHA string, state stag
 // recordPublished caches the published state for dedup and clears the
 // run's failure episode, returning the streak length the success ended
 // (0 when there was none).
-func (p *Publisher) recordPublished(repo forge.RepoRef, runID uuid.UUID, headSHA string, state stagecheck.State) int {
+func (p *Publisher) recordPublished(repo forge.RepoRef, runID uuid.UUID, headSHA, forgeKind string, state stagecheck.State) int {
 	p.mu.Lock()
-	p.last[cacheKey(repo, headSHA)] = state
+	p.last[cacheKey(repo, headSHA, forgeKind)] = state
 	p.mu.Unlock()
 	return p.clearEpisode(runID, headSHA)
 }
@@ -386,8 +398,12 @@ func (p *Publisher) clearEpisode(runID uuid.UUID, headSHA string) int {
 	return attempts
 }
 
-func cacheKey(repo forge.RepoRef, headSHA string) string {
-	return repo.Owner + "/" + repo.Name + "@" + headSHA
+// cacheKey keys the dedup cache by (forge, repo, head_sha). The forge prefix
+// (#1861) keeps a GitHub Check Run and a GitLab commit status for the same
+// owner/name@sha independent — publishing one must not dedup-suppress the
+// other, which has no status on its forge.
+func cacheKey(repo forge.RepoRef, headSHA, forgeKind string) string {
+	return forgeKind + ":" + repo.Owner + "/" + repo.Name + "@" + headSHA
 }
 
 // episodeKey keys failure episodes by (run_id, head_sha) — NOT the

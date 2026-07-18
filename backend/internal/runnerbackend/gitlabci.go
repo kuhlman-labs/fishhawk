@@ -71,8 +71,10 @@ func (*GitLabCI) HostDispatched() bool { return false }
 // (Trigger == nil) or the credential scope is the zero/unwired scope
 // (p.Scope.IsZero()) — the fail-closed guards mirroring github_actions. On the
 // happy path it creates a pipeline against p.Ref (the run branch) carrying
-// run_id/stage_id/workflow_id/stage as CI/CD variables, plus parent_run_id iff
-// the run is a decomposed child (#1227). It NEVER writes a commit status.
+// FISHHAWK_RUN_ID/FISHHAWK_STAGE_ID/FISHHAWK_WORKFLOW_ID/FISHHAWK_STAGE as CI/CD
+// variables (the keys templates/.gitlab-ci.yml gates on), plus
+// FISHHAWK_PARENT_RUN_ID iff the run is a decomposed child (#1227). It NEVER
+// writes a commit status.
 func (g *GitLabCI) TriggerStage(ctx context.Context, p TriggerParams) error {
 	if g.Trigger == nil {
 		g.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitLab not configured; skipping pipeline trigger",
@@ -88,19 +90,25 @@ func (g *GitLabCI) TriggerStage(ctx context.Context, p TriggerParams) error {
 	}
 
 	// Ordered slice (not a map) so the CI/CD variable order is deterministic —
-	// the run-provenance keys the customer pipeline reads. run_id/stage_id/
-	// workflow_id/stage mirror the github_actions workflow_dispatch inputs.
+	// the run-provenance keys the customer pipeline reads. A GitLab
+	// pipeline-trigger variable becomes a job environment variable under its
+	// EXACT key, with no inputs→env remap layer (unlike the github_actions
+	// workflow file, which maps inputs.run_id → env FISHHAWK_RUN_ID). So the
+	// keys are emitted FISHHAWK_*-prefixed to match what templates/.gitlab-ci.yml
+	// gates its `rules` on and passes to the runner (--run-id "$FISHHAWK_RUN_ID"
+	// …); a lowercase key would leave the template's gate false and the runner's
+	// --run-id empty at go-live.
 	vars := []gitlabclient.PipelineVariable{
-		{Key: "run_id", Value: p.RunID.String()},
-		{Key: "stage_id", Value: p.StageID.String()},
-		{Key: "workflow_id", Value: p.WorkflowID},
-		{Key: "stage", Value: p.StageExecutorRef},
+		{Key: "FISHHAWK_RUN_ID", Value: p.RunID.String()},
+		{Key: "FISHHAWK_STAGE_ID", Value: p.StageID.String()},
+		{Key: "FISHHAWK_WORKFLOW_ID", Value: p.WorkflowID},
+		{Key: "FISHHAWK_STAGE", Value: p.StageExecutorRef},
 	}
 	// #1227: a decomposed child carries its decomposition-parent id so the
 	// customer pipeline can key a resource group on the run FAMILY. DecomposedFrom
 	// (the fan-out parent), NOT ParentRunID, is the sibling family.
 	if p.DecomposedFrom != nil {
-		vars = append(vars, gitlabclient.PipelineVariable{Key: "parent_run_id", Value: p.DecomposedFrom.String()})
+		vars = append(vars, gitlabclient.PipelineVariable{Key: "FISHHAWK_PARENT_RUN_ID", Value: p.DecomposedFrom.String()})
 	}
 
 	// E24.5: annotate a decomposed child's pipeline trigger with its slice

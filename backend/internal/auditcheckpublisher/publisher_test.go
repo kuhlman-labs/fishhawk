@@ -340,6 +340,70 @@ func TestPublish_GitLabCI_PublishesGitLabCommitStatus(t *testing.T) {
 	}
 }
 
+// TestPublish_CrossForge_NoDedupSuppression proves the dedup cache is keyed
+// per-forge (#1861): a github_actions run publishing a Check Run for a given
+// owner/name@sha and state must NOT dedup-suppress a gitlab_ci run publishing a
+// commit status for the SAME owner/name@sha and state — the two forges are
+// independent surfaces, and GitLab has no status until its own run publishes.
+// Before the per-forge key this shared (repo, head_sha, state) tuple made the
+// GitLab publish a false dedup hit, silently skipping the GitLab status.
+func TestPublish_CrossForge_NoDedupSuppression(t *testing.T) {
+	ghRunID, glRunID := uuid.New(), uuid.New()
+	ghImplID, glImplID := uuid.New(), uuid.New()
+	const sharedSHA = "shared9sha" // same head commit on both forges
+
+	repoRuns := &fakeRuns{
+		runs: map[uuid.UUID]*run.Run{
+			ghRunID: {
+				ID: ghRunID, Repo: "grp/proj", InstallationID: int64Ptr(42),
+				RunnerKind: run.RunnerKindGitHubActions,
+			},
+			glRunID: {
+				ID: glRunID, Repo: "grp/proj", InstallationID: nil,
+				RunnerKind: run.RunnerKindGitLabCI,
+			},
+		},
+		stages: map[uuid.UUID][]*run.Stage{
+			ghRunID: {{ID: ghImplID, Type: run.StageTypeImplement, RunID: ghRunID}},
+			glRunID: {{ID: glImplID, Type: run.StageTypeImplement, RunID: glRunID}},
+		},
+	}
+	repoArts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+		ghImplID: {prArtifact(ghImplID, sharedSHA)},
+		glImplID: {prArtifact(glImplID, sharedSHA)},
+	}}
+	gh := &fakeGitHub{}
+	gl := &fakeGitLab{scope: forge.FromRef("gitlab:77")}
+	pub := auditcheckpublisher.New(auditcheckpublisher.Deps{
+		GitHub: gh, GitLab: gl, Runs: repoRuns, Artifacts: repoArts,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	// GitHub run publishes first, filling the dedup cache for grp/proj@sha.
+	ghOK, err := pub.Publish(context.Background(), ghRunID, stagecheck.StatePass, nil)
+	if err != nil {
+		t.Fatalf("GitHub Publish: %v", err)
+	}
+	if !ghOK {
+		t.Fatal("GitHub run should publish")
+	}
+
+	// GitLab run, same repo/sha/state, must STILL publish — a different forge.
+	glOK, err := pub.Publish(context.Background(), glRunID, stagecheck.StatePass, nil)
+	if err != nil {
+		t.Fatalf("GitLab Publish: %v", err)
+	}
+	if !glOK {
+		t.Fatal("GitLab run must publish despite the GitHub run's identical (repo, sha, state) — cross-forge dedup suppression")
+	}
+	if len(gh.calls) != 1 {
+		t.Errorf("GitHub calls = %d, want 1", len(gh.calls))
+	}
+	if len(gl.calls) != 1 {
+		t.Errorf("GitLab calls = %d, want 1 (the GitLab status was suppressed if this is 0)", len(gl.calls))
+	}
+}
+
 // TestPublish_GitLabCI_Unconfigured_Skips proves the unwired-GitLab
 // best-effort skip: a gitlab_ci run whose GitLab forge is neither injected
 // nor registered publishes nothing and returns (false, nil) — the

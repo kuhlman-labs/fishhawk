@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -125,11 +127,11 @@ func TestGitLabCI_TriggerStage_ForwardsRef(t *testing.T) {
 				t.Errorf("scope = %v, want %v", call.scope, c.p.Scope)
 			}
 			got := varsMap(call.vars)
-			if got["run_id"] != runID.String() || got["stage_id"] != stageID.String() ||
-				got["workflow_id"] != "feature_change" || got["stage"] != "claude-code" {
+			if got["FISHHAWK_RUN_ID"] != runID.String() || got["FISHHAWK_STAGE_ID"] != stageID.String() ||
+				got["FISHHAWK_WORKFLOW_ID"] != "feature_change" || got["FISHHAWK_STAGE"] != "claude-code" {
 				t.Errorf("variables = %+v", got)
 			}
-			pv, ok := got["parent_run_id"]
+			pv, ok := got["FISHHAWK_PARENT_RUN_ID"]
 			if c.wantParentVar {
 				if !ok || pv != c.wantParentRef {
 					t.Errorf("parent_run_id = %q (present=%v), want %q", pv, ok, c.wantParentRef)
@@ -139,6 +141,81 @@ func TestGitLabCI_TriggerStage_ForwardsRef(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGitLabCI_DispatchVarsMatchTemplateGate reconciles the two halves of the
+// GitLab dispatch contract that the separate backend and onboarding tests each
+// pass on in isolation: the CI/CD variable KEYS this backend supplies vs. the
+// $FISHHAWK_* variable names the customer-side templates/.gitlab-ci.yml gates
+// its `rules` on and forwards to the runner. A GitLab pipeline-trigger variable
+// becomes a job env var under its EXACT key, so a mismatch (e.g. the backend
+// emitting `run_id` while the template gates on `$FISHHAWK_RUN_ID`) would leave
+// the gate false → `when: never` → the pipeline runs no stage, invisibly to
+// either package's own tests. This test fails on any such drift.
+func TestGitLabCI_DispatchVarsMatchTemplateGate(t *testing.T) {
+	// Drive a decomposed child so ALL provenance keys — including the
+	// parent-run key — are emitted and reconciled.
+	ft := &fakePipelineTrigger{}
+	g := &GitLabCI{Trigger: ft}
+	parent := uuid.New()
+	if err := g.TriggerStage(context.Background(), TriggerParams{
+		RunID: uuid.New(), StageID: uuid.New(), WorkflowID: "feature_change",
+		StageExecutorRef: "claude-code", Scope: gitlabScope("77"),
+		Ref:            "fishhawk/run-abc12345/slice-2",
+		DecomposedFrom: &parent, SliceIndex: intPtr(2),
+	}); err != nil {
+		t.Fatalf("TriggerStage: %v", err)
+	}
+	if len(ft.calls) != 1 {
+		t.Fatalf("pipeline calls = %d, want 1", len(ft.calls))
+	}
+	backendKeys := map[string]bool{}
+	for _, v := range ft.calls[0].vars {
+		backendKeys[v.Key] = true
+	}
+
+	tmpl := string(onboarding.GitLabCITemplate())
+
+	// (1) Every provenance key the backend supplies must be referenced as
+	// $KEY somewhere in the template — otherwise the runner would receive an
+	// empty flag (--run-id "$FISHHAWK_RUN_ID" with no such var) at go-live.
+	for k := range backendKeys {
+		if !strings.Contains(tmpl, "$"+k) {
+			t.Errorf("backend supplies CI/CD var %q but the template never references $%s", k, k)
+		}
+	}
+
+	// (2) The template's `rules` gate fires the fishhawk job only when its
+	// required $FISHHAWK_* vars are truthy; every var the gate names MUST be
+	// one the backend supplies, or the gate evaluates false, falls through to
+	// `when: never`, and the dispatched pipeline runs no stage.
+	gateVars := fishhawkVarsInRulesGate(tmpl)
+	if len(gateVars) == 0 {
+		t.Fatal("no $FISHHAWK_* vars found in the template rules gate")
+	}
+	for _, gv := range gateVars {
+		if !backendKeys[gv] {
+			t.Errorf("template rules gate requires %s but the backend never supplies that key — "+
+				"the dispatched pipeline would match `when: never` and run no stage", gv)
+		}
+	}
+}
+
+// fishhawkVarsInRulesGate returns the FISHHAWK_* variable names (no leading $)
+// referenced in the template's `rules:` gate conditions.
+func fishhawkVarsInRulesGate(tmpl string) []string {
+	varRe := regexp.MustCompile(`\$FISHHAWK_[A-Z_]+`)
+	var out []string
+	for _, line := range strings.Split(tmpl, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "- if:") && !strings.HasPrefix(trimmed, "if:") {
+			continue
+		}
+		for _, m := range varRe.FindAllString(line, -1) {
+			out = append(out, strings.TrimPrefix(m, "$"))
+		}
+	}
+	return out
 }
 
 func varsMap(vars []gitlabclient.PipelineVariable) map[string]string {
