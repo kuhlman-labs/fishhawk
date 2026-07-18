@@ -81,3 +81,8 @@ func (BaseFake) PauseCampaignItem(_ context.Context, _ uuid.UUID, _ PauseReason)
 func (BaseFake) RestartCampaignItem(_ context.Context, _ uuid.UUID) (*Item, error) {
 	return nil, ErrNotFound
 }
+
+// SettleCampaignItemOutOfBand returns nil, ErrNotFound.
+func (BaseFake) SettleCampaignItemOutOfBand(_ context.Context, _ uuid.UUID) (*Item, error) {
+	return nil, ErrNotFound
+}

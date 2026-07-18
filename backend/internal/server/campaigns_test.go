@@ -66,6 +66,7 @@ type fakeCampaignRepo struct {
 	transCmpCalls  int
 	setRunCalls    int
 	restartCalls   int
+	settleOOBCalls int
 }
 
 func newFakeCampaignRepo() *fakeCampaignRepo {
@@ -206,6 +207,33 @@ func (f *fakeCampaignRepo) RestartCampaignItem(_ context.Context, id uuid.UUID) 
 			}
 			it.State = campaign.ItemStatePending
 			it.RunID = nil
+			it.UpdatedAt = time.Now().UTC()
+			return it, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
+}
+
+// SettleCampaignItemOutOfBand settles a terminal-non-succeeded item (cancelled
+// or failed) to succeeded while RETAINING its run link, mirroring the Postgres
+// adapter's guard-bypassing contract (#2029) so reconcile-on-read's class-B
+// (out-of-band terminal) settle path is exercised. Any other from-state is
+// rejected InvalidTransitionError; settleOOBCalls counts invocations for the
+// mutation asserts.
+func (f *fakeCampaignRepo) SettleCampaignItemOutOfBand(_ context.Context, id uuid.UUID) (*campaign.Item, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settleOOBCalls++
+	for _, items := range f.itemsByCmp {
+		for _, it := range items {
+			if it.ID != id {
+				continue
+			}
+			if it.State != campaign.ItemStateCancelled && it.State != campaign.ItemStateFailed {
+				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(campaign.ItemStateSucceeded)}
+			}
+			it.State = campaign.ItemStateSucceeded
+			// Run link RETAINED (unlike RestartCampaignItem, which clears it).
 			it.UpdatedAt = time.Now().UTC()
 			return it, nil
 		}
@@ -4008,6 +4036,248 @@ func TestReconcileOnRead_RunlessNonIssueRef_Skipped(t *testing.T) {
 	}
 	if ghState.issueCalls != 0 || ghState.installCalls != 0 {
 		t.Errorf("GitHub calls = issue:%d install:%d, want 0/0 (skipped before any call)", ghState.issueCalls, ghState.installCalls)
+	}
+}
+
+// seedTerminalRun inserts a run in the given terminal state into rrepo and
+// returns its id, so a class-B (out-of-band terminal) item can carry a faithful
+// run link. The settle path never reads the run (the item's terminal state
+// already reflects it), but the link is real so the retained-provenance
+// assertion is meaningful.
+func seedTerminalRun(t *testing.T, rrepo *fakeRepo, state run.State) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	now := time.Now().UTC()
+	rrepo.mu.Lock()
+	rrepo.runs[id] = &run.Run{
+		ID:            id,
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		TriggerSource: run.TriggerCLI,
+		State:         state,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}
+	rrepo.mu.Unlock()
+	return id
+}
+
+// cItemWithRun builds a campaign item fixture linked to runID (a class-B
+// out-of-band-terminal item carries a run link even in its terminal state).
+func cItemWithRun(ref string, deps []string, state campaign.ItemState, runID uuid.UUID) *campaign.Item {
+	it := cItem(ref, deps, state)
+	it.RunID = &runID
+	return it
+}
+
+// TestReconcileOnRead_OutOfBandTerminal_CancelledDelivered_SettlesAndUnblocks_E2E
+// is the #2029 headline cross-boundary path (class B): a CANCELLED item whose
+// linked run went terminal-non-succeeded but whose GitHub issue is now
+// closed-as-completed (delivered out-of-band) settles succeeded on a status read
+// via SettleCampaignItemOutOfBand, its dependent unblocks in the SAME response,
+// and the campaign_issue_settled audit carries settled_via=issue_closed AND the
+// retained run_id (the field that distinguishes this arm from the run-less arm).
+// Directly pins the binding condition's user-visible regression: after the
+// settle, next_action targets the DEPENDENT, never a start_run/restart of the
+// closed, delivered item.
+func TestReconcileOnRead_OutOfBandTerminal_CancelledDelivered_SettlesAndUnblocks_E2E(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	rrepo := newFakeRepo()
+	runID := seedTerminalRun(t, rrepo, run.StateCancelled)
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"}, // delivered out-of-band
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: gh})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateCancelled, runID),
+		cItem("issue:101", []string{"issue:100"}, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	// issue:100 settled succeeded (Done), run link RETAINED (provenance).
+	byRef := map[string]campaignItemResponse{}
+	for _, it := range st.Items {
+		byRef[it.IssueRef] = it
+	}
+	if got := byRef["issue:100"]; got.State != string(campaign.ItemStateSucceeded) {
+		t.Errorf("item issue:100 state = %q, want succeeded (out-of-band settle)", got.State)
+	}
+	if got := byRef["issue:100"]; got.RunID == nil || *got.RunID != runID {
+		t.Errorf("item issue:100 run_id = %v, want %s retained (provenance)", got.RunID, runID)
+	}
+	if len(st.Rollup.Done) != 1 || st.Rollup.Done[0] != "issue:100" {
+		t.Errorf("rollup.Done = %v, want [issue:100] after out-of-band settle", st.Rollup.Done)
+	}
+	// The wedge cleared: the settled item is no longer offered for restart, and
+	// its dependent unblocked.
+	if containsRef(st.Rollup.Cancelled, "issue:100") {
+		t.Errorf("rollup.Cancelled = %v, must NOT contain the settled issue:100", st.Rollup.Cancelled)
+	}
+	if len(st.Rollup.Eligible) != 1 || st.Rollup.Eligible[0] != "issue:101" {
+		t.Errorf("rollup.Eligible = %v, want [issue:101] (dependent unblocked)", st.Rollup.Eligible)
+	}
+	// Binding condition: next_action targets the DEPENDENT, never a
+	// start_run/restart of the closed, delivered issue:100.
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:101" {
+		t.Errorf("next_action = %+v, want start_run issue:101 (dependent)", st.NextAction)
+	}
+	if st.NextAction.IssueRef == "issue:100" {
+		t.Errorf("next_action targets the settled issue:100 = %+v, want it NEVER offered for start_run/restart", st.NextAction)
+	}
+
+	// Exactly one settle audit, class B: settled_via=issue_closed AND run_id present.
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Fatalf("campaign_issue_settled = %d, want 1", n)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["settled_via"] != "issue_closed" {
+		t.Errorf("settled_via = %v, want issue_closed", p["settled_via"])
+	}
+	if p["state_reason"] != "completed" {
+		t.Errorf("state_reason = %v, want completed", p["state_reason"])
+	}
+	if p["outcome"] != "succeeded" {
+		t.Errorf("outcome = %v, want succeeded", p["outcome"])
+	}
+	if got, ok := p["run_id"].(string); !ok || got != runID.String() {
+		t.Errorf("payload run_id = %v (ok=%v), want %s present (out-of-band-terminal marker)", p["run_id"], ok, runID)
+	}
+	// The class-B settle went through the guard-bypassing repo method exactly once.
+	if crepo.settleOOBCalls != 1 {
+		t.Errorf("settleOOBCalls = %d, want 1 (class-B bypass method)", crepo.settleOOBCalls)
+	}
+}
+
+// TestReconcileOnRead_OutOfBandTerminal_SingleItem_NextActionComplete_E2E is the
+// purest form of the binding condition (#2029): a SINGLE delivered-out-of-band
+// cancelled item, no dependents. BEFORE the fix the campaign wedges — the item
+// stays cancelled, its rollup keeps it Restartable, and next_action wrongly
+// advises start_run (restart) on the closed issue. AFTER the fix the status read
+// settles it succeeded and next_action for the settled item is COMPLETE — the
+// item is no longer offered start_run and no restart is advised.
+func TestReconcileOnRead_OutOfBandTerminal_SingleItem_NextActionComplete_E2E(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	rrepo := newFakeRepo()
+	runID := seedTerminalRun(t, rrepo, run.StateCancelled)
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateCancelled, runID),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	// The settled item: succeeded, in Done, NOT offered for restart.
+	if len(st.Rollup.Done) != 1 || st.Rollup.Done[0] != "issue:100" {
+		t.Errorf("rollup.Done = %v, want [issue:100]", st.Rollup.Done)
+	}
+	if containsRef(st.Rollup.Cancelled, "issue:100") {
+		t.Errorf("rollup.Cancelled = %v, must NOT contain the settled item", st.Rollup.Cancelled)
+	}
+	// Binding condition, pinned directly: next_action is complete (not
+	// start_run/restart of the closed issue).
+	if st.NextAction.Action != "complete" {
+		t.Errorf("next_action = %+v, want complete (settled item never restarted)", st.NextAction)
+	}
+	if st.NextAction.Action == "start_run" {
+		t.Errorf("next_action = %+v, must NOT advise start_run/restart of the delivered issue", st.NextAction)
+	}
+	// Whole campaign settled → succeeded.
+	if st.Campaign.State != string(campaign.StateSucceeded) {
+		t.Errorf("campaign state = %q, want succeeded once the sole item settles", st.Campaign.State)
+	}
+	if crepo.settleOOBCalls != 1 {
+		t.Errorf("settleOOBCalls = %d, want 1", crepo.settleOOBCalls)
+	}
+}
+
+// TestReconcileOnRead_OutOfBandTerminal_NotPlanned_NotSettled is the class-B
+// not_planned guard: a cancelled, run-linked item whose issue is closed as
+// NOT_PLANNED is an abandonment, not a delivery — it must stay cancelled, emit no
+// settle audit, and never invoke the bypass method (the closed-as-completed-only
+// guard is unchanged for class B).
+func TestReconcileOnRead_OutOfBandTerminal_NotPlanned_NotSettled(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	rrepo := newFakeRepo()
+	runID := seedTerminalRun(t, rrepo, run.StateCancelled)
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "not_planned"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateCancelled, runID),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	if len(st.Rollup.Done) != 0 {
+		t.Errorf("rollup.Done = %v, want empty (not_planned not settled)", st.Rollup.Done)
+	}
+	for _, it := range st.Items {
+		if it.IssueRef == "issue:100" && it.State != string(campaign.ItemStateCancelled) {
+			t.Errorf("item issue:100 state = %q, want cancelled (not_planned left unsettled)", it.State)
+		}
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0 (not_planned closure)", n)
+	}
+	if crepo.settleOOBCalls != 0 {
+		t.Errorf("settleOOBCalls = %d, want 0 (bypass method never invoked for not_planned)", crepo.settleOOBCalls)
+	}
+}
+
+// TestReconcileOnRead_OutOfBandTerminal_FailedDelivered_Settles is the class-B
+// failed-run variant: a FAILED (not cancelled) item whose issue is
+// closed-as-completed settles succeeded the same way — the bypass admits both
+// terminal-non-succeeded from-states, with run_id retained.
+func TestReconcileOnRead_OutOfBandTerminal_FailedDelivered_Settles(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	rrepo := newFakeRepo()
+	runID := seedTerminalRun(t, rrepo, run.StateFailed)
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateFailed, runID),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	byRef := map[string]campaignItemResponse{}
+	for _, it := range st.Items {
+		byRef[it.IssueRef] = it
+	}
+	if got := byRef["issue:100"]; got.State != string(campaign.ItemStateSucceeded) {
+		t.Errorf("item issue:100 state = %q, want succeeded (failed→succeeded out-of-band)", got.State)
+	}
+	if got := byRef["issue:100"]; got.RunID == nil || *got.RunID != runID {
+		t.Errorf("item issue:100 run_id = %v, want %s retained", got.RunID, runID)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Fatalf("campaign_issue_settled = %d, want 1", n)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["settled_via"] != "issue_closed" {
+		t.Errorf("settled_via = %v, want issue_closed", p["settled_via"])
+	}
+	if got, ok := p["run_id"].(string); !ok || got != runID.String() {
+		t.Errorf("payload run_id = %v (ok=%v), want %s present", p["run_id"], ok, runID)
+	}
+	if crepo.settleOOBCalls != 1 {
+		t.Errorf("settleOOBCalls = %d, want 1", crepo.settleOOBCalls)
 	}
 }
 

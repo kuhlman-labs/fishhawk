@@ -1195,10 +1195,14 @@ func firstUnmetDependency(item *campaign.Item, items []*campaign.Item) (string, 
 //  1. RUN-LINKED terminal settle: a running item whose linked run reached a
 //     terminal run state settles to the mapped item-terminal state. No-ops when
 //     no run repository is wired (the local-native trigger needs run state).
-//  2. RUN-LESS issue-closed settle (#1558): a run-less, deps-satisfied item whose
-//     GitHub issue is closed-as-completed settles succeeded — a human-led item
-//     that merged and closed OUTSIDE the run lifecycle, which pass 1 can never
-//     see because it has no linked run. See settleIssueClosedItems.
+//  2. ISSUE-CLOSED settle (#1558, extended #2029): a deps-satisfied item whose
+//     GitHub issue is closed-as-completed settles succeeded, in two classes — a
+//     RUN-LESS pending/blocked item (a human-led item that merged and closed
+//     OUTSIDE the run lifecycle, which pass 1 can never see) AND a run-LINKED
+//     item whose linked run went terminal-non-succeeded (cancelled/failed) but
+//     was delivered out-of-band (the re-shaped-then-delivered case). Only a
+//     closed-as-completed issue settles either class; an open or not_planned
+//     closure never does. See settleIssueClosedItems.
 //
 // It is BEST-EFFORT and NEVER fails the read: every error is logged and
 // swallowed. It is IDEMPOTENT: the item/campaign transitions go through the
@@ -1304,14 +1308,26 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 	return true
 }
 
-// settleIssueClosedItems is reconcile-on-read pass 2 (#1558): the run-less,
-// out-of-band settle for a campaign item completed OUTSIDE the run lifecycle —
-// a human-led (autonomy:low) issue merged and closed by a maintainer PR. For a
-// run-less item whose dependencies are satisfied, it reads the item's GitHub
-// issue and settles the item succeeded ONLY when the issue is CLOSED as
-// completed (state_reason=completed), emitting a campaign_issue_settled marker
-// tagged settled_via=issue_closed and carrying NO run_id. Returns whether it
-// settled anything so the caller re-derives and re-reads.
+// settleIssueClosedItems is reconcile-on-read pass 2 (#1558, extended #2029):
+// the issue-closed settle for a campaign item delivered OUTSIDE the run
+// lifecycle. It reads the item's GitHub issue and settles the item succeeded
+// ONLY when the issue is CLOSED as completed (state_reason=completed), for two
+// deps-satisfied candidate classes:
+//
+//	A (run-less): a run-less pending/blocked item — a human-led (autonomy:low)
+//	  issue merged and closed by a maintainer PR OUTSIDE any run. Settled via the
+//	  guarded TransitionCampaignItem(->succeeded); its campaign_issue_settled
+//	  marker carries settled_via=issue_closed and NO run_id.
+//	B (out-of-band terminal, #2029): a run-LINKED item whose linked run went
+//	  terminal-non-succeeded (cancelled/failed) — a re-shaped-then-delivered item
+//	  whose dead run left it terminal but whose issue is now closed-as-completed.
+//	  A terminal item cannot go succeeded through the transition table (it refuses
+//	  every terminal from), so it is settled via the guard-bypassing
+//	  SettleCampaignItemOutOfBand, which RETAINS the run link; its marker carries
+//	  settled_via=issue_closed AND the retained run_id (the distinguishing field).
+//
+// Returns whether it settled anything so the caller re-derives and re-reads. An
+// open issue or a not_planned closure settles NEITHER class.
 //
 // SOLE SETTLE SITE: reconcileCampaignItemsOnRead (this pass's only caller) is
 // the ONLY place a run-less issue-closed item is settled. The create path
@@ -1369,12 +1385,20 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 	var scope forge.CredentialScope
 	instResolved := false
 	for _, it := range items {
-		// Only a run-less item in a settleable pending/blocked state is a
-		// candidate — a linked or terminal item is pass 1's or already settled.
-		if it.RunID != nil {
-			continue
-		}
-		if it.State != campaign.ItemStatePending && it.State != campaign.ItemStateBlocked {
+		// Two candidate classes settle here (both gated on closed-as-completed):
+		//   A (run-less delivery): a run-less item in a settleable pending/blocked
+		//     state — a human-led issue merged and closed OUTSIDE any run.
+		//   B (out-of-band delivery, #2029): a run-LINKED item whose linked run
+		//     went terminal-non-succeeded (cancelled/failed) — a re-shaped-then-
+		//     delivered item whose dead run left it terminal but whose issue is now
+		//     closed-as-completed. Pass 1 already mapped the terminal run onto the
+		//     item state, so no RunRepo read is needed here.
+		// A running item is pass 1's; a succeeded item is already settled.
+		isClassA := it.RunID == nil &&
+			(it.State == campaign.ItemStatePending || it.State == campaign.ItemStateBlocked)
+		isClassB := it.RunID != nil &&
+			(it.State == campaign.ItemStateCancelled || it.State == campaign.ItemStateFailed)
+		if !isClassA && !isClassB {
 			continue
 		}
 		number, ok := parseIssueTriggerRef(it.IssueRef)
@@ -1431,24 +1455,45 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 			// candidate is never revisited by the fixpoint (bounds iteration and
 			// avoids a duplicate transition attempt this read).
 			settled[it.ID] = true
-			if !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStateSucceeded) {
-				continue
-			}
-			if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateSucceeded); err != nil {
-				s.cfg.Logger.Warn("reconcile-on-read: run-less settle transition failed; left for next read",
-					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
-				continue
-			}
-			done[it.IssueRef] = true
-			progressed = true
-			settledAny = true
-			s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, map[string]any{
+			// The audit payload for either class; class B additionally carries the
+			// retained run_id (the distinguishing marker of the out-of-band-terminal
+			// arm — a run-less class-A settle has none).
+			payload := map[string]any{
 				"campaign_id":  c.ID.String(),
 				"issue_ref":    it.IssueRef,
 				"outcome":      string(campaign.ItemStateSucceeded),
 				"settled_via":  "issue_closed",
 				"state_reason": "completed",
-			})
+			}
+			if it.RunID != nil {
+				// Class B (out-of-band terminal delivery, #2029): a cancelled/failed
+				// item cannot go succeeded through the transition table (it refuses
+				// every terminal from), so bypass the gate via
+				// SettleCampaignItemOutOfBand, which retains the run link for
+				// provenance. run_id present is what distinguishes this arm's audit.
+				if _, err := s.cfg.CampaignRepo.SettleCampaignItemOutOfBand(ctx, it.ID); err != nil {
+					s.cfg.Logger.Warn("reconcile-on-read: out-of-band terminal settle failed; left for next read",
+						"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
+					continue
+				}
+				payload["run_id"] = it.RunID.String()
+			} else {
+				// Class A (run-less delivery): the item is pending/blocked, so the
+				// guarded transition applies. A defensive re-check keeps the run-less
+				// arm untouched.
+				if !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStateSucceeded) {
+					continue
+				}
+				if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateSucceeded); err != nil {
+					s.cfg.Logger.Warn("reconcile-on-read: run-less settle transition failed; left for next read",
+						"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
+					continue
+				}
+			}
+			done[it.IssueRef] = true
+			progressed = true
+			settledAny = true
+			s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, payload)
 		}
 		if !progressed {
 			break
