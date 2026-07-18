@@ -2819,6 +2819,56 @@ func (s *Server) resolveAcceptanceExpectedHeadSHA(ctx context.Context, runID, st
 	return s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "acceptance_expected_head_sha")
 }
 
+// resolveAcceptanceExpectedHeadSHAWalkingParents resolves the acceptance
+// merge-candidate head SHA with a ParentRunID fallback (#2028): it calls the
+// own-run resolveAcceptanceExpectedHeadSHA FIRST and returns its result verbatim
+// when non-empty (BYTE-IDENTICAL to the top-level path). Only when the own-run
+// ledger resolves "" AND r.ParentRunID != nil does it walk ParentRunID upward,
+// re-running resolveNewestReportedHeadSHA against each ancestor's runID until a
+// non-empty head resolves, ParentRunID is nil, or retryPlanChainDepth is hit.
+//
+// It mirrors loadApprovedPlanForRun's parent walk so a plan-stageless recovery
+// child — whose implement lineage was recorded under the PARENT runID — carries
+// its ancestor's non-empty merge-candidate head instead of shipping an empty
+// expected_head_sha (which degrades the #1953 dispatch verb from a hard-block to
+// proceed-with-warning). The walk is a PURE fallback: a top-level run
+// (ParentRunID==nil) never enters it, so every own-plan / top-level path is
+// unchanged. Preserves the WARN-and-omit "" posture — an exhausted walk returns
+// "" exactly as the own-run resolver would.
+func (s *Server) resolveAcceptanceExpectedHeadSHAWalkingParents(ctx context.Context, r *run.Run, stageID uuid.UUID) string {
+	if r == nil {
+		return ""
+	}
+	if sha := s.resolveAcceptanceExpectedHeadSHA(ctx, r.ID, stageID); sha != "" {
+		return sha
+	}
+	if r.ParentRunID == nil || s.cfg.RunRepo == nil {
+		return ""
+	}
+	current := *r.ParentRunID
+	for depth := 0; depth < retryPlanChainDepth; depth++ {
+		if sha := s.resolveNewestReportedHeadSHA(ctx, current, stageID, "acceptance_expected_head_sha"); sha != "" {
+			return sha
+		}
+		runRow, err := s.cfg.RunRepo.GetRun(ctx, current)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: acceptance head parent-walk get run failed; omitting field",
+				slog.String("run_id", current.String()),
+				slog.String("error", err.Error()))
+			return ""
+		}
+		if runRow.ParentRunID == nil {
+			return ""
+		}
+		current = *runRow.ParentRunID
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: acceptance head parent-walk hit depth cap; omitting field",
+		slog.String("run_id", r.ID.String()),
+		slog.Int("max_depth", retryPlanChainDepth))
+	return ""
+}
+
 // resolveNewestReportedHeadSHA is the shared reported-head ledger walk behind
 // resolveFixupExpectedHeadSHA and resolveAcceptanceExpectedHeadSHA: the newest
 // head_sha across lineageLedgerCategories, "" (WARN-and-omit, logging forField

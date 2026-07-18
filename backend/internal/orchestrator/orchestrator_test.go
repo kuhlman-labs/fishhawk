@@ -3852,6 +3852,216 @@ func TestTryShortCircuitAcceptance(t *testing.T) {
 	})
 }
 
+// seedRecoveryChildAcceptanceRun seeds a PARENT run carrying a plan stage +
+// standard_v1 plan artifact and a plan-stageless recovery CHILD (ParentRunID =
+// parent.ID) whose only stages are implement(succeeded)+review(succeeded)+
+// acceptance(acceptanceState). The child has NO plan stage of its own, so the
+// approved plan resolves ONLY via the ParentRunID walk (#2028). When
+// seedParentPlan is false the parent carries no plan stage either, so the walk
+// exhausts to no ancestor plan (the no-ancestor-plan guard fixture). Returns the
+// child run, the child's stages, the shared stub, the audit fake, and the wired
+// orchestrator.
+func seedRecoveryChildAcceptanceRun(t *testing.T, planBytes []byte, acceptanceState run.StageState, seedParentPlan bool) (*run.Run, []*run.Stage, *stubRuns, *recordingAudit, *Orchestrator) {
+	t.Helper()
+	rs := newStubRuns()
+	ra := &recordingAudit{}
+	parentStageSeeds := []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStateSucceeded},
+	}
+	if seedParentPlan {
+		parentStageSeeds = append([]stageSeed{
+			{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		}, parentStageSeeds...)
+	}
+	parent, parentStages := rs.seed(t, "x/y", int64Ptr(42), parentStageSeeds)
+	child, childStages := rs.seed(t, "x/y", int64Ptr(42), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, ExecutorRef: "human", State: run.StageStateSucceeded},
+		{Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: acceptanceState},
+	})
+	child.ParentRunID = &parent.ID
+	byStage := map[uuid.UUID][]*artifact.Artifact{}
+	if seedParentPlan {
+		schemaV := "standard_v1"
+		byStage[parentStages[0].ID] = []*artifact.Artifact{{
+			ID:            uuid.New(),
+			StageID:       parentStages[0].ID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &schemaV,
+			Content:       planBytes,
+			CreatedAt:     time.Now().UTC(),
+		}}
+	}
+	o := &Orchestrator{Runs: rs, GitHub: &stubGitHub{}, Audit: ra, Artifacts: &fakeArtifacts{byStage: byStage}}
+	return child, childStages, rs, ra, o
+}
+
+// TestTryShortCircuitAcceptance_RecoveryChildParentWalk pins the #2028
+// load-bearing fix: a plan-stageless recovery child resolves its ancestor's
+// approved plan via loadApprovedPlanWalkingParents, so BOTH liveValidationRequired
+// AND the short-circuit predicates evaluate against the walked ancestor plan
+// rather than falling through to approvedPlan==nil -> liveValidationRequired=false.
+func TestTryShortCircuitAcceptance_RecoveryChildParentWalk(t *testing.T) {
+	allSkip := []map[string]any{
+		{"id": "webhook-fires", "statement": "webhook fires on close", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in webhook_integration_test.go with a fake"},
+		{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
+	}
+
+	// (a) mixed-criteria ancestor plan -> the recovery child needs a live target:
+	// nil short-circuit, liveValidationRequired TRUE (resolved via the parent
+	// walk), the acceptance stage untouched. The load-bearing distinction: the
+	// child's OWN stages (loadApprovedPlan) resolve NO plan, so without the walk
+	// liveValidationRequired would be false.
+	t.Run("mixed-criteria ancestor -> live-validation via parent walk", func(t *testing.T) {
+		mixed := []map[string]any{
+			allSkip[0],
+			{"id": "get-returns-200", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1", "blocking": true},
+		}
+		planBytes := acceptanceSkipPlanBytes(t, nil, mixed)
+		child, childStages, _, ra, o := seedRecoveryChildAcceptanceRun(t, planBytes, run.StageStatePending, true)
+
+		// Load-bearing pin: the child's OWN stages carry no plan, so the pre-fix
+		// loadApprovedPlan path resolves nil (liveValidationRequired would be false);
+		// only the parent walk resolves the ancestor plan.
+		ownPlan, _, err := o.loadApprovedPlan(context.Background(), childStages)
+		if err != nil {
+			t.Fatalf("loadApprovedPlan(own): %v", err)
+		}
+		if ownPlan != nil {
+			t.Fatalf("loadApprovedPlan(own child stages) = non-nil, want nil (child has no plan stage)")
+		}
+
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), child.ID, childStages[2].ID)
+		if err != nil {
+			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if sc != nil {
+			t.Errorf("short-circuit = %+v, want nil (mixed criteria needs a live target)", sc)
+		}
+		if !liveReq {
+			t.Error("liveValidationRequired = false, want true (ancestor plan resolved via the parent walk)")
+		}
+		if childStages[2].State != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending (untouched)", childStages[2].State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0 (no state change)", n)
+		}
+	})
+
+	// (b) all-skip-with-basis ancestor plan -> the recovery child short-circuits to
+	// succeeded through the walked ancestor plan, exactly as a plan-bearing run.
+	t.Run("all-skip ancestor -> short-circuits via parent walk", func(t *testing.T) {
+		planBytes := acceptanceSkipPlanBytes(t, nil, allSkip)
+		child, childStages, _, ra, o := seedRecoveryChildAcceptanceRun(t, planBytes, run.StageStatePending, true)
+
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), child.ID, childStages[2].ID)
+		if err != nil {
+			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false on an all-skip short-circuit hit")
+		}
+		if sc == nil || sc.Kind != AcceptanceShortCircuitAllSkipWithBasis || sc.CriteriaTotal != 2 {
+			t.Fatalf("short-circuit = %+v, want an all-skip-with-basis hit (total=2)", sc)
+		}
+		if childStages[2].State != run.StageStateSucceeded {
+			t.Errorf("acceptance stage = %q, want succeeded", childStages[2].State)
+		}
+		if child.State != run.StateSucceeded {
+			t.Errorf("child run state = %q, want succeeded (Advance re-entered)", child.State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 1 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 1", n)
+		}
+	})
+
+	// (c) no-ancestor-plan guard: a recovery child whose ancestor chain carries no
+	// resolvable plan (parent has no plan stage either) -> (nil, false, nil), no
+	// error, no state change — the depth-bounded walk exhausts to nil.
+	t.Run("no ancestor plan -> nil no-op", func(t *testing.T) {
+		child, childStages, _, ra, o := seedRecoveryChildAcceptanceRun(t, nil, run.StageStatePending, false)
+
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), child.ID, childStages[2].ID)
+		if err != nil {
+			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if sc != nil {
+			t.Errorf("short-circuit = %+v, want nil (no ancestor plan)", sc)
+		}
+		if liveReq {
+			t.Error("liveValidationRequired = true, want false when no ancestor carries a plan")
+		}
+		if childStages[2].State != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending (untouched)", childStages[2].State)
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0", n)
+		}
+	})
+}
+
+// TestLoadApprovedPlanWalkingParents_ErrorBranches pins the three error/edge
+// branches of the orchestrator-side parent walk (#2028) that the
+// short-circuit subtests above do not reach: the ListStagesForRun IO error, the
+// GetRun IO error, and the corrupt-parent cycle bounded by acceptancePlanChainDepth.
+// It mirrors the coverage the analogous server-side walk
+// (resolveAcceptanceExpectedHeadSHAWalkingParents) carries for its GetRun-error
+// and cycle/depth-cap branches, closing the pre-fix asymmetry.
+func TestLoadApprovedPlanWalkingParents_ErrorBranches(t *testing.T) {
+	// (a) a parent-walk ListStagesForRun IO error propagates (the child's OWN
+	// stages resolve no plan, so the walk fetches the parent's stages and that
+	// read fails).
+	t.Run("ListStagesForRun error in parent walk propagates", func(t *testing.T) {
+		child, childStages, rs, _, o := seedRecoveryChildAcceptanceRun(t, nil, run.StageStatePending, false)
+		boom := errors.New("boom: list stages")
+		rs.listStagesErrIDs = map[uuid.UUID]error{*child.ParentRunID: boom}
+
+		p, id, err := o.loadApprovedPlanWalkingParents(context.Background(), child, childStages)
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want wrapped %v", err, boom)
+		}
+		if p != nil || id != uuid.Nil {
+			t.Errorf("plan/id = %v/%v, want nil/Nil on IO error", p, id)
+		}
+	})
+
+	// (b) a parent-walk GetRun IO error propagates (parent stages list fine and
+	// carry no plan, so the walk reaches the GetRun that resolves the next hop).
+	t.Run("GetRun error in parent walk propagates", func(t *testing.T) {
+		child, childStages, rs, _, o := seedRecoveryChildAcceptanceRun(t, nil, run.StageStatePending, false)
+		boom := errors.New("boom: get run")
+		rs.getRunErr = boom
+
+		p, id, err := o.loadApprovedPlanWalkingParents(context.Background(), child, childStages)
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want wrapped %v", err, boom)
+		}
+		if p != nil || id != uuid.Nil {
+			t.Errorf("plan/id = %v/%v, want nil/Nil on IO error", p, id)
+		}
+	})
+
+	// (c) a corrupt parent cycle (parent.ParentRunID points back at itself, no
+	// plan anywhere) is bounded by acceptancePlanChainDepth: the walk exhausts to
+	// (nil, Nil, nil) via the depth-cap warn-and-return path rather than looping
+	// forever.
+	t.Run("corrupt parent cycle bounded by depth cap", func(t *testing.T) {
+		child, childStages, rs, _, o := seedRecoveryChildAcceptanceRun(t, nil, run.StageStatePending, false)
+		parent := rs.runs[*child.ParentRunID]
+		parent.ParentRunID = &parent.ID // self-cycle: every hop returns to the parent
+
+		p, id, err := o.loadApprovedPlanWalkingParents(context.Background(), child, childStages)
+		if err != nil {
+			t.Fatalf("loadApprovedPlanWalkingParents: %v", err)
+		}
+		if p != nil || id != uuid.Nil {
+			t.Errorf("plan/id = %v/%v, want nil/Nil (depth-cap exhaustion)", p, id)
+		}
+	})
+}
+
 // TestTryShortCircuitAcceptance_AdmissionLock pins the per-stage admission fence
 // (#1936): the short-circuit walk serializes behind LockStageAdmission, and the
 // admissibility read happens UNDER the lock so a marker that wins the CAS while
