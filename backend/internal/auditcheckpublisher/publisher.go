@@ -64,6 +64,18 @@ type CheckRunCreator interface {
 	CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, p forge.CreateCheckRunParams) (*forge.CreateCheckRunResult, error)
 }
 
+// GitLabStatusForge is the slice of forge.Forge the publisher needs to route
+// a gitlab_ci run's audit-complete status to GitLab (#1861): resolve the
+// repo's "gitlab:<project-id>" credential scope, then publish the commit
+// status via CreateCheckRun (which the GitLab forge maps to
+// POST /projects/:id/statuses/:sha, #1859). *gitlab.Forge satisfies it, so
+// forge.Get("gitlab") resolves it with no extra Deps/serve wiring; a nil
+// (unconfigured) GitLab forge is a best-effort skip.
+type GitLabStatusForge interface {
+	ResolveRepoScope(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error)
+	CreateCheckRun(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, p forge.CreateCheckRunParams) (*forge.CreateCheckRunResult, error)
+}
+
 // AuditReader is the slice of audit.Repository the publisher needs to prefer
 // the run's newest fixup_pushed head over the stale PR-open artifact head
 // (#1682). A narrow interface (not the full audit.Repository) keeps the test
@@ -76,6 +88,7 @@ type AuditReader interface {
 // once with New and share — concurrent calls to Publish are safe.
 type Publisher struct {
 	github      CheckRunCreator
+	gitlab      GitLabStatusForge // Deps.GitLab override; nil falls back to forge.Get("gitlab")
 	runs        run.Repository
 	artifacts   artifact.Repository
 	audit       AuditReader
@@ -100,7 +113,16 @@ type episode struct {
 // Deps groups the dependencies New needs. Production wires the
 // real Postgres-backed repos and the typed forge.
 type Deps struct {
-	GitHub      CheckRunCreator
+	GitHub CheckRunCreator
+
+	// GitLab, when set, overrides the registered GitLab forge the
+	// publisher routes a gitlab_ci run's commit status through (#1861).
+	// Nil (production) defers to forge.Get("gitlab") — resolved lazily per
+	// Publish and nil-safe: a gitlab_ci run skips best-effort when GitLab
+	// is unconfigured, mirroring the GitHub nil-installation skip. Tests
+	// inject a fake here to avoid touching the global forge registry.
+	GitLab GitLabStatusForge
+
 	Runs        run.Repository
 	Artifacts   artifact.Repository
 	ExternalURL string
@@ -149,6 +171,7 @@ func New(d Deps) *Publisher {
 	}
 	return &Publisher{
 		github:      d.GitHub,
+		gitlab:      d.GitLab,
 		runs:        d.Runs,
 		artifacts:   d.Artifacts,
 		audit:       d.Audit,
@@ -165,12 +188,23 @@ func New(d Deps) *Publisher {
 // effort: returns errors so callers can log them, but a publish
 // failure should not unwind whatever computed the state.
 //
+// The forge is chosen by runner_kind (#1861): a gitlab_ci run
+// publishes a GitLab commit status through the registered GitLab
+// forge (resolved via forge.Get("gitlab"), nil-safe); every other
+// kind (github_actions, local, and legacy/unknown) keeps the GitHub
+// Check Run path.
+//
 // Skips silently and returns (false, nil) when:
 //   - The receiver is nil (Publisher disabled).
 //   - The run has no implement-stage pull_request artifact yet
 //     (no head_sha to publish against).
-//   - The run lacks installation_id or a parseable repo (non-
-//     GitHub-triggered runs, e.g. CLI ad-hoc).
+//   - A github_actions/local run lacks installation_id, or any run
+//     lacks a parseable repo (non-GitHub-triggered runs, e.g. CLI
+//     ad-hoc). The installation_id guard is GitHub-only — a
+//     gitlab_ci run carries no GitHub installation and is not
+//     skipped for its absence.
+//   - A gitlab_ci run's GitLab forge is unconfigured (best-effort
+//     skip, mirroring the GitHub nil-client posture).
 //   - The most-recent published state for this (repo, head_sha)
 //     already matches — don't spam GitHub on every read. This path
 //     still clears the run's failure episode and fires OnRecovered:
@@ -188,19 +222,55 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 	if err != nil {
 		return false, fmt.Errorf("auditcheckpublisher: get run: %w", err)
 	}
-	if runRow.InstallationID == nil {
-		return false, nil
-	}
 	repo, err := parseRepo(runRow.Repo)
 	if err != nil {
 		return false, nil
 	}
+
+	// Route by runner_kind (#1861). A gitlab_ci run publishes a GitLab
+	// commit status through the registered GitLab forge; github_actions and
+	// local (and any legacy/unknown kind) keep the GitHub Check Run path.
+	// The InstallationID guard lives under the GitHub branch so a gitlab_ci
+	// run — which carries no GitHub installation id — is not wrongly
+	// skipped.
+	isGitLab := runRow.RunnerKind == run.RunnerKindGitLabCI
+	var gitlabForge GitLabStatusForge
+	if isGitLab {
+		gitlabForge = p.resolveGitLab()
+		if gitlabForge == nil {
+			// GitLab forge unconfigured — best-effort skip, mirroring the
+			// GitHub nil-client posture for non-GitHub-triggered runs.
+			return false, nil
+		}
+	} else if runRow.InstallationID == nil {
+		return false, nil
+	}
+
 	headSHA, ok, err := p.findHeadSHA(ctx, runID)
 	if err != nil {
 		return false, fmt.Errorf("auditcheckpublisher: find head_sha: %w", err)
 	}
 	if !ok {
 		return false, nil
+	}
+
+	// Resolve the check-run creator + credential scope now that a head
+	// exists to publish against — deferring the GitLab scope round-trip past
+	// the cheap skips above. github_actions/local authenticate against the
+	// run's installation; gitlab_ci resolves the repo's "gitlab:<id>" scope.
+	var (
+		creator CheckRunCreator
+		scope   forge.CredentialScope
+	)
+	if isGitLab {
+		creator = gitlabForge
+		scope, err = gitlabForge.ResolveRepoScope(ctx, repo)
+		if err != nil {
+			return false, fmt.Errorf("auditcheckpublisher: resolve gitlab scope: %w", err)
+		}
+	} else {
+		creator = p.github
+		scope = forge.FromGitHubInstallationID(*runRow.InstallationID)
 	}
 
 	if !p.shouldPublish(repo, headSHA, state) {
@@ -221,7 +291,7 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 	}
 
 	params := buildParams(state, missing, headSHA, p.detailsURL(runID))
-	if _, err := p.github.CreateCheckRun(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, params); err != nil {
+	if _, err := creator.CreateCheckRun(ctx, scope, repo, params); err != nil {
 		err = fmt.Errorf("auditcheckpublisher: create check run: %w", err)
 		p.recordFailure(ctx, runID, headSHA, err)
 		return false, err
@@ -231,6 +301,22 @@ func (p *Publisher) Publish(ctx context.Context, runID uuid.UUID, state stageche
 		p.onRecovered(ctx, runID, headSHA, attempts)
 	}
 	return true, nil
+}
+
+// resolveGitLab returns the GitLab forge the publisher routes a gitlab_ci
+// run's commit status through (#1861). The Deps.GitLab override wins (tests
+// inject a fake here); otherwise it resolves the registered forge lazily via
+// forge.Get("gitlab") — robust to registration ordering and nil-safe: an
+// unconfigured GitLab (UnknownForgeError) returns nil, and the caller skips
+// best-effort.
+func (p *Publisher) resolveGitLab() GitLabStatusForge {
+	if p.gitlab != nil {
+		return p.gitlab
+	}
+	if f, err := forge.Get("gitlab"); err == nil && f != nil {
+		return f
+	}
+	return nil
 }
 
 // recordFailure advances the (run, head_sha) consecutive-failure
