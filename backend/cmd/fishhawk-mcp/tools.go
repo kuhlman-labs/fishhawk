@@ -415,6 +415,54 @@ type GetPlanOutput struct {
 	// view of the working tree, with per-phase declared-vs-derived file counts
 	// and cross-boundary compile-breaking violations.
 	Reachability *PlanReachability `json:"reachability,omitempty" jsonschema:"plan-gate symbol-reachability sweep (#2056): validates a split_proposal's phase partition against the compiler's view of the working tree (go/packages+go/types, runner-side — only the runner holds the checkout). Per phase it reports declared_count (files the phase declares) vs derived_count (declared plus any sibling-phase file that references a symbol this phase defines through a construction site, interface implementer, or test-fake field reader); a phase whose counts disagree carries mismatch=true and sets the top-level discrepancy flag — that phase's symbols leak across the partition boundary, so shipping the phase alone would produce a non-compiling intermediate. violations names each offending symbol + def/use file + phase. Advisory + fail-open: absent when the plan carries no split_proposal, the sweep skipped (available=false with skip_reason), or on older runs predating the pass. Never blocks approval"`
+	// SplitFiling surfaces the on-approval split-child filing outcome (#2057,
+	// E50.5): decoded from the newest split_children_filed completion marker
+	// the approval hook emits after filing every phased child of an approved
+	// split_proposal. Carries the contract-phase classification, the filed
+	// children, the #2062 close-parent-watcher deferral, and the drafted
+	// cap-exception when the contract phase is a governed exception.
+	SplitFiling *PlanSplitFiling `json:"split_filing,omitempty" jsonschema:"on-approval split-child filing outcome (#2057, E50.5): present once the approval hook has filed every phased child of an approved split_proposal and emitted the split_children_filed completion marker. contract_classification is delete-only (the transitional name is kept permanently; the contract phase deletes only) or governed-exception (the contract phase's reachability-derived file count exceeds the implement max_files_changed cap, so an atomic rename cannot fit one in-cap PR). children[] lists each filed phased child (phase_index, title, number, url, is_contract) with depends_on edges resolved to sibling #N; contract_child_number is the acceptance-carrier child; deferral_issue is the #2062 close-parent-watcher follow-up (this slice ships no live parent-close — a child issue body carries no functionless Closes line). cap_exception, present only for governed-exception, carries the in-memory-only operator-authored + admin-merged draft (spec_diff raising the cap + pr_body from the atomicity evidence) that rides the audit payload and is NEVER written to .fishhawk/**. Absent when the plan carries no split_proposal, the hook has not yet completed filing, or on older runs predating the pass"`
+}
+
+// PlanSplitFilingChild is one filed phased child decoded from a
+// split_children_filed completion marker (#2057, E50.5): the child issue the
+// approval hook filed for one split_proposal phase, with its resolved tracker
+// Number and URL. IsContract marks the terminal (contract) phase's child — the
+// acceptance carrier. Mirrors the server splitFilingChild wire shape.
+type PlanSplitFilingChild struct {
+	PhaseIndex int    `json:"phase_index" jsonschema:"0-based split_proposal phase index this child was filed for"`
+	Title      string `json:"title" jsonschema:"the child issue title"`
+	Number     int    `json:"number" jsonschema:"the filed child's tracker issue number"`
+	URL        string `json:"url" jsonschema:"the filed child's issue URL"`
+	IsContract bool   `json:"is_contract,omitempty" jsonschema:"true for the terminal contract-phase child — the acceptance carrier the parent should be closed against once it lands"`
+}
+
+// PlanSplitCapException is the drafted, in-memory-only cap exception decoded
+// from a split_children_filed completion marker (#2057, E50.5): present only
+// when the contract phase is a governed exception. SpecDiff raises the
+// implement max_files_changed cap to the contract phase's derived file count;
+// PRBody is derived from the reachability atomicity evidence and states the
+// change must be operator-authored + admin-merged (the .fishhawk/** constraint).
+// Both ride the audit payload only and are never written to disk. Mirrors the
+// server splitCapExceptionDraft wire shape.
+type PlanSplitCapException struct {
+	SpecDiff string `json:"spec_diff" jsonschema:"a unified-diff-style spec change raising the implement max_files_changed cap to the contract phase's reachability-derived file count; in-memory only, never committed"`
+	PRBody   string `json:"pr_body" jsonschema:"the drafted PR body derived from the atomicity evidence; explicitly states the change must be operator-authored and admin-merged because .fishhawk/** is agent-forbidden"`
+}
+
+// PlanSplitFiling is the on-approval split-child filing outcome decoded from the
+// newest split_children_filed completion marker (#2057, E50.5). The marker is
+// written ONCE, only after every phased child of an approved split_proposal is
+// durably filed, so its presence means filing completed. ContractClassification
+// is delete-only or governed-exception; CapException is populated only for the
+// latter. DeferralIssue is the #2062 close-parent-watcher follow-up. Mirrors the
+// server splitChildrenFiledPayload wire shape.
+type PlanSplitFiling struct {
+	ContractClassification string                 `json:"contract_classification" jsonschema:"delete-only (transitional name kept permanently; contract phase deletes only) or governed-exception (contract phase overflows the implement max_files_changed cap, so an atomic rename cannot ship as one in-cap PR)"`
+	Children               []PlanSplitFilingChild `json:"children,omitempty" jsonschema:"the filed phased children with resolved tracker numbers + URLs and depends_on edges to sibling #N"`
+	ContractChildNumber    int                    `json:"contract_child_number,omitempty" jsonschema:"the terminal contract-phase child's tracker number — the acceptance carrier the parent should be closed against once it lands"`
+	DeferralIssue          int                    `json:"deferral_issue,omitempty" jsonschema:"the #2062 close-parent-watcher follow-up: this slice ships no live parent-close, so the parent is commented to be closed when the contract child lands, automated by #2062 once it ships"`
+	CapException           *PlanSplitCapException `json:"cap_exception,omitempty" jsonschema:"the drafted, in-memory-only cap exception; present only for a governed-exception contract classification"`
 }
 
 // PlanReachabilityPhase is one split-proposal phase's declared-vs-derived file
@@ -637,6 +685,10 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 			if err != nil {
 				return nil, GetPlanOutput{}, fmt.Errorf("load reachability: %w", err)
 			}
+			splitFiling, err := r.loadSplitFiling(ctx, current)
+			if err != nil {
+				return nil, GetPlanOutput{}, fmt.Errorf("load split filing: %w", err)
+			}
 			return nil, GetPlanOutput{
 				Status:           "available",
 				Plan:             p,
@@ -648,6 +700,7 @@ func (r *runResolver) getPlan(ctx context.Context, _ *mcp.CallToolRequest, in Ge
 				TestSweep:        testSweep,
 				PlanWarnings:     planWarnings,
 				Reachability:     reach,
+				SplitFiling:      splitFiling,
 			}, nil
 		}
 		runRow, err := r.api.GetRun(ctx, current)
@@ -1018,6 +1071,47 @@ func (r *runResolver) loadReachability(ctx context.Context, runID uuid.UUID) (*P
 		}
 	}
 	return &pr, nil
+}
+
+// loadSplitFiling fetches the NEWEST split_children_filed audit entry (#2057,
+// E50.5) for the run and decodes its payload into a PlanSplitFiling. As with the
+// sibling sweep loaders the backend's per-run audit endpoint returns entries
+// sequence-ascending, so the authoritative entry is the last one — a re-approval
+// after a partial filing failure resumes the un-filed ordinals and re-emits the
+// completion marker only once every child is durably filed, and the latest
+// reflects the completed set. Returns nil when no entry exists (a plan with no
+// split_proposal, a hook that has not yet completed filing, or an older run
+// predating the pass) so the field is omitted. A corrupt payload is treated as
+// "not present" rather than failing the whole plan fetch, mirroring the sibling
+// loaders' degradation contract.
+//
+// Unlike loadReachability this needs no allow_unknown: split_children_filed is a
+// registered audit.KnownCategory, so the registry-validating GET /audit endpoint
+// accepts the bare category filter.
+func (r *runResolver) loadSplitFiling(ctx context.Context, runID uuid.UUID) (*PlanSplitFiling, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "split_children_filed",
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return nil, nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return nil, nil
+	}
+	var sf PlanSplitFiling
+	if uerr := json.Unmarshal(raw, &sf); uerr != nil {
+		return nil, nil
+	}
+	return &sf, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status
