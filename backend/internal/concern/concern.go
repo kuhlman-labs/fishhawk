@@ -23,16 +23,21 @@ import (
 )
 
 // State is one concern's lifecycle position. The full enum ships now —
-// waived and superseded have no production writer until the deferred
-// operator waive verb lands, but defining them here means that
-// follow-up needs no schema or enum change.
+// waived's production writer is the operator waive verb; superseded's is
+// the plan-gate revise handler (fishhawk_revise_plan, #2065), which
+// supersedes a plan stage's open plan-review concerns when a revise
+// re-plans in place. Defining the full enum up front means each such
+// writer needs no schema or enum change.
 type State string
 
 // States. Raised is the creation state. The open states (raised,
 // addressed_pending, reopened) are the ones the run-status surface
 // lists and fix-up routing accepts. waived, superseded, deferred, and
 // addressed_by_condition are terminal: waived is the operator "this does
-// not block" judgment, superseded the re-review supersession, deferred
+// not block" judgment, superseded the re-review supersession — a
+// prior-revision plan-review concern superseded when the plan-gate revise
+// handler (fishhawk_revise_plan, #2065) re-plans a plan stage in place —
+// deferred
 // the operator "file a follow-up and resolve" verb (E22.X / #1202) — a
 // concern converted into a tracked work item, its state_reason naming the
 // filed issue — and addressed_by_condition the condition-claim resolution

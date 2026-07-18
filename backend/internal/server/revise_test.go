@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -503,6 +504,205 @@ func TestRevisePlan_NonDrive_RecordsNoDriveEntry(t *testing.T) {
 	}
 	if advances := reviseDriveAdvances(t, au); len(advances) != 0 {
 		t.Errorf("run_auto_advanced entries = %+v, want none on a non-drive run", advances)
+	}
+}
+
+// newReviseServerWithConcerns wires RunRepo + AuditRepo + a ConcernRepo
+// for the plan-revise handler and seeds a plan stage parked at
+// awaiting_approval, so the #2065 supersession path (superseding the
+// discarded revision's open plan-review concerns on a successful revise)
+// can be exercised end to end through the real handler.
+func newReviseServerWithConcerns(t *testing.T, runID, stageID uuid.UUID) (*Server, *promptRunRepo, *fakeConcernRepo) {
+	t.Helper()
+	rr := newPromptRunRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change"}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+	return s, rr, cr
+}
+
+// concernState reads back one concern's current state from the fake repo.
+func concernState(t *testing.T, cr *fakeConcernRepo, id uuid.UUID) concern.State {
+	t.Helper()
+	rows, err := cr.GetByIDs(context.Background(), []uuid.UUID{id})
+	if err != nil {
+		t.Fatalf("get concern %s: %v", id, err)
+	}
+	return rows[0].State
+}
+
+// TestRevisePlan_Supersede_HappyPath is #2065 mode (1): a plan stage with
+// an OPEN (raised) plan concern is revised; the concern is transitioned to
+// terminal superseded — with a state_reason naming the revise pass — so it
+// drops out of ListOpenByRun / the merge gate, and the revise returns 200.
+func TestRevisePlan_Supersede_HappyPath(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, cr := newReviseServerWithConcerns(t, runID, stageID)
+	c := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 101, "the plan omits a migration")
+
+	w := revisePlan(t, s, stageID, `{"constraint":"add the migration step"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	if got := concernState(t, cr, c.ID); got != concern.StateSuperseded {
+		t.Errorf("concern state = %q, want superseded", got)
+	} else if got.IsOpen() {
+		t.Errorf("superseded concern still reports IsOpen()==true")
+	}
+	// Done-means: the superseded concern no longer counts as open, so the
+	// merge gate's ListOpenByRun would not surface it.
+	open, err := cr.ListOpenByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list open: %v", err)
+	}
+	if len(open) != 0 {
+		t.Errorf("open concerns = %d, want 0 (superseded is terminal)", len(open))
+	}
+	// The state_reason names the revise pass.
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{c.ID})
+	if !strings.Contains(rows[0].StateReason, "plan revise (pass 1)") {
+		t.Errorf("state_reason = %q, want it to name the revise pass", rows[0].StateReason)
+	}
+}
+
+// TestRevisePlan_Supersede_OpenVariants is #2065 mode (2): both
+// addressed_pending and reopened plan concerns are OPEN, so both are
+// superseded (the open->superseded edges), proving no open state is missed.
+func TestRevisePlan_Supersede_OpenVariants(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, cr := newReviseServerWithConcerns(t, runID, stageID)
+	ap := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 101, "addressed_pending concern")
+	ap.State = concern.StateAddressedPending
+	re := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 102, "reopened concern")
+	re.State = concern.StateReopened
+
+	w := revisePlan(t, s, stageID, `{"constraint":"revise it"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := concernState(t, cr, ap.ID); got != concern.StateSuperseded {
+		t.Errorf("addressed_pending concern state = %q, want superseded", got)
+	}
+	if got := concernState(t, cr, re.ID); got != concern.StateSuperseded {
+		t.Errorf("reopened concern state = %q, want superseded", got)
+	}
+}
+
+// TestRevisePlan_Supersede_TerminalUntouched is #2065 mode (3): an
+// already-terminal plan concern (addressed) is left unchanged — the helper
+// filters on IsOpen() so it never attempts an invalid terminal->superseded
+// transition.
+func TestRevisePlan_Supersede_TerminalUntouched(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, cr := newReviseServerWithConcerns(t, runID, stageID)
+	done := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 101, "already addressed")
+	done.State = concern.StateAddressed
+	waived := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 102, "already waived")
+	waived.State = concern.StateWaived
+
+	w := revisePlan(t, s, stageID, `{"constraint":"revise it"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := concernState(t, cr, done.ID); got != concern.StateAddressed {
+		t.Errorf("addressed concern state = %q, want addressed (untouched)", got)
+	}
+	if got := concernState(t, cr, waived.ID); got != concern.StateWaived {
+		t.Errorf("waived concern state = %q, want waived (untouched)", got)
+	}
+}
+
+// TestRevisePlan_Supersede_NonPlanUntouched is #2065 mode (4): an OPEN
+// implement-stage concern on the same stage_id is left open — only
+// plan-stage concerns are superseded.
+func TestRevisePlan_Supersede_NonPlanUntouched(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, cr := newReviseServerWithConcerns(t, runID, stageID)
+	impl := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 101, "implement concern")
+
+	w := revisePlan(t, s, stageID, `{"constraint":"revise it"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := concernState(t, cr, impl.ID); got != concern.StateRaised {
+		t.Errorf("implement concern state = %q, want raised (untouched)", got)
+	}
+}
+
+// TestRevisePlan_Supersede_OtherStageUntouched is #2065 mode (5): an OPEN
+// plan concern on a DIFFERENT stage_id is untouched — the filter is scoped
+// to the revised stage.
+func TestRevisePlan_Supersede_OtherStageUntouched(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, cr := newReviseServerWithConcerns(t, runID, stageID)
+	otherStage := uuid.New()
+	other := seedConcernRow(t, cr, runID, otherStage, concern.StageKindPlan, 101, "other stage's plan concern")
+
+	w := revisePlan(t, s, stageID, `{"constraint":"revise it"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := concernState(t, cr, other.ID); got != concern.StateRaised {
+		t.Errorf("other-stage concern state = %q, want raised (untouched)", got)
+	}
+}
+
+// TestRevisePlan_Supersede_NilRepo is #2065 mode (6): with no ConcernRepo
+// wired the revise still returns 200 and does not panic (the helper
+// no-ops on a nil store).
+func TestRevisePlan_Supersede_NilRepo(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _ := newReviseServer(t, runID, stageID, run.StageStateAwaitingApproval, run.StageTypePlan)
+
+	w := revisePlan(t, s, stageID, `{"constraint":"revise it"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestRevisePlan_Supersede_BestEffortOnError is #2065 mode (7): a
+// ConcernRepo whose ApplyResolution fails (getByIDsErr makes the internal
+// GetByIDs error) does NOT block the revise — the failure is warn-only, so
+// the revise still returns 200 and the concern is left open.
+func TestRevisePlan_Supersede_BestEffortOnError(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, cr := newReviseServerWithConcerns(t, runID, stageID)
+	c := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 101, "the plan omits a migration")
+	// ListByRun still succeeds (listErr nil), but ApplyResolution's internal
+	// GetByIDs errors, so the per-concern write fails and is skipped.
+	cr.getByIDsErr = errors.New("db down")
+
+	w := revisePlan(t, s, stageID, `{"constraint":"revise it"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (supersession failure is warn-only):\n%s", w.Code, w.Body.String())
+	}
+	// The concern was NOT superseded (the write failed) — but crucially the
+	// revise still succeeded.
+	cr.getByIDsErr = nil
+	if got := concernState(t, cr, c.ID); got != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (supersession failed, left open)", got)
+	}
+}
+
+// TestRevisePlan_Supersede_ListError is #2065's other best-effort branch:
+// when the ListByRun read fails the helper logs and returns without
+// attempting any transition — the revise still returns 200.
+func TestRevisePlan_Supersede_ListError(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, cr := newReviseServerWithConcerns(t, runID, stageID)
+	c := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 101, "the plan omits a migration")
+	cr.listErr = errors.New("db down")
+
+	w := revisePlan(t, s, stageID, `{"constraint":"revise it"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (list failure is warn-only):\n%s", w.Code, w.Body.String())
+	}
+	cr.listErr = nil
+	if got := concernState(t, cr, c.ID); got != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (list failed, nothing superseded)", got)
 	}
 }
 

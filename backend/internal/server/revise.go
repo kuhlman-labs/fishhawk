@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -245,6 +246,13 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The revise genuinely re-opened the plan stage in place (same
+	// stage_id). Supersede the discarded revision's OPEN plan-review
+	// concerns BEFORE the re-plan mints fresh ones, so the operator no
+	// longer hand-waives dead concerns from a discarded revision at the
+	// merge gate (#2065). Best-effort — never fails the revise.
+	s.supersedeReplanConcerns(r.Context(), dec.Stage, priorPasses)
+
 	// The revise re-open lands the stage in pending; hand off to the
 	// orchestrator to walk pending → dispatched and fire workflow_dispatch.
 	// Orchestrator failures are logged but don't fail the request: the
@@ -281,6 +289,55 @@ func (s *Server) handleRevisePlan(w http.ResponseWriter, r *http.Request) {
 	s.notifyStatusUpdate(r.Context(), dec.Stage.RunID, "plan_revised")
 
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(dec.Stage))
+}
+
+// supersedeReplanConcerns transitions every OPEN plan-review concern of
+// the just-re-opened plan stage to the terminal superseded state (#2065).
+// A revise re-plans IN PLACE — the re-opened stage keeps its stage_id, so
+// the concern store (keyed by run_id + stage_id + stage_kind +
+// origin_review_sequence, no revision column) cannot otherwise distinguish
+// the discarded revision's concerns from the new ones. Superseding the
+// open ones here — AFTER the awaiting_approval → pending transition has
+// committed but BEFORE the re-dispatched review's persistReviewConcerns
+// mints fresh raised rows — drops them out of every open-concern surface
+// (the gate view, ListOpenByRun, the merge gate's len(open)==0 check) so
+// the operator no longer hand-waives dead concerns from a discarded
+// revision.
+//
+// It is best-effort / warn-only, matching the concern package's posture
+// around lifecycle writes: a nil store no-ops, a ListByRun read error logs
+// and returns, and a per-concern ApplyResolution failure (an
+// InvalidTransitionError or a concurrent-state-change error) is logged and
+// skipped. The revise's HTTP success is never gated on the supersession.
+func (s *Server) supersedeReplanConcerns(ctx context.Context, stage *run.Stage, priorPasses int) {
+	if s.cfg.ConcernRepo == nil {
+		return
+	}
+	rows, err := s.cfg.ConcernRepo.ListByRun(ctx, stage.RunID)
+	if err != nil {
+		s.cfg.Logger.Warn("supersede replan concerns: list concerns failed",
+			"run_id", stage.RunID,
+			"stage_id", stage.ID,
+			"error", err.Error(),
+		)
+		return
+	}
+	reason := fmt.Sprintf(
+		"superseded by plan revise (pass %d): prior-revision plan-review concern discarded on in-place re-plan",
+		priorPasses+1)
+	for _, c := range rows {
+		if c.StageID != stage.ID || c.StageKind != concern.StageKindPlan || !c.State.IsOpen() {
+			continue
+		}
+		if _, err := s.cfg.ConcernRepo.ApplyResolution(ctx, c.ID, concern.StateSuperseded, reason); err != nil {
+			s.cfg.Logger.Warn("supersede replan concern failed",
+				"run_id", stage.RunID,
+				"stage_id", stage.ID,
+				"concern_id", c.ID,
+				"error", err.Error(),
+			)
+		}
+	}
 }
 
 // recordDriveReviseReplan stamps the drive engine's revise_replan rule
