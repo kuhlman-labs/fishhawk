@@ -4002,6 +4002,66 @@ func TestTryShortCircuitAcceptance_RecoveryChildParentWalk(t *testing.T) {
 	})
 }
 
+// TestLoadApprovedPlanWalkingParents_ErrorBranches pins the three error/edge
+// branches of the orchestrator-side parent walk (#2028) that the
+// short-circuit subtests above do not reach: the ListStagesForRun IO error, the
+// GetRun IO error, and the corrupt-parent cycle bounded by acceptancePlanChainDepth.
+// It mirrors the coverage the analogous server-side walk
+// (resolveAcceptanceExpectedHeadSHAWalkingParents) carries for its GetRun-error
+// and cycle/depth-cap branches, closing the pre-fix asymmetry.
+func TestLoadApprovedPlanWalkingParents_ErrorBranches(t *testing.T) {
+	// (a) a parent-walk ListStagesForRun IO error propagates (the child's OWN
+	// stages resolve no plan, so the walk fetches the parent's stages and that
+	// read fails).
+	t.Run("ListStagesForRun error in parent walk propagates", func(t *testing.T) {
+		child, childStages, rs, _, o := seedRecoveryChildAcceptanceRun(t, nil, run.StageStatePending, false)
+		boom := errors.New("boom: list stages")
+		rs.listStagesErrIDs = map[uuid.UUID]error{*child.ParentRunID: boom}
+
+		p, id, err := o.loadApprovedPlanWalkingParents(context.Background(), child, childStages)
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want wrapped %v", err, boom)
+		}
+		if p != nil || id != uuid.Nil {
+			t.Errorf("plan/id = %v/%v, want nil/Nil on IO error", p, id)
+		}
+	})
+
+	// (b) a parent-walk GetRun IO error propagates (parent stages list fine and
+	// carry no plan, so the walk reaches the GetRun that resolves the next hop).
+	t.Run("GetRun error in parent walk propagates", func(t *testing.T) {
+		child, childStages, rs, _, o := seedRecoveryChildAcceptanceRun(t, nil, run.StageStatePending, false)
+		boom := errors.New("boom: get run")
+		rs.getRunErr = boom
+
+		p, id, err := o.loadApprovedPlanWalkingParents(context.Background(), child, childStages)
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want wrapped %v", err, boom)
+		}
+		if p != nil || id != uuid.Nil {
+			t.Errorf("plan/id = %v/%v, want nil/Nil on IO error", p, id)
+		}
+	})
+
+	// (c) a corrupt parent cycle (parent.ParentRunID points back at itself, no
+	// plan anywhere) is bounded by acceptancePlanChainDepth: the walk exhausts to
+	// (nil, Nil, nil) via the depth-cap warn-and-return path rather than looping
+	// forever.
+	t.Run("corrupt parent cycle bounded by depth cap", func(t *testing.T) {
+		child, childStages, rs, _, o := seedRecoveryChildAcceptanceRun(t, nil, run.StageStatePending, false)
+		parent := rs.runs[*child.ParentRunID]
+		parent.ParentRunID = &parent.ID // self-cycle: every hop returns to the parent
+
+		p, id, err := o.loadApprovedPlanWalkingParents(context.Background(), child, childStages)
+		if err != nil {
+			t.Fatalf("loadApprovedPlanWalkingParents: %v", err)
+		}
+		if p != nil || id != uuid.Nil {
+			t.Errorf("plan/id = %v/%v, want nil/Nil (depth-cap exhaustion)", p, id)
+		}
+	})
+}
+
 // TestTryShortCircuitAcceptance_AdmissionLock pins the per-stage admission fence
 // (#1936): the short-circuit walk serializes behind LockStageAdmission, and the
 // admissibility read happens UNDER the lock so a marker that wins the CAS while
