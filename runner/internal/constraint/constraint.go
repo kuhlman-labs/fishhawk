@@ -185,13 +185,60 @@ func checkAllowed(diff Diff, patterns []string) []Violation {
 }
 
 func checkMaxFiles(diff Diff, max int) []Violation {
-	if len(diff.ChangedFiles) <= max {
+	counted := CountedFileCount(diff)
+	if counted <= max {
 		return nil
 	}
 	return []Violation{{
 		Constraint: "max_files_changed",
-		Detail:     fmt.Sprintf("changed %d files; limit %d", len(diff.ChangedFiles), max),
+		Detail:     fmt.Sprintf("changed %d files; limit %d", counted, max),
 	}}
+}
+
+// CountedFileCount returns the number of changed files that count
+// toward the max_files_changed constraint: every ChangedFile whose
+// Path is NOT a generated path (see IsGeneratedPath). Only
+// max_files_changed uses this exempted count — checkForbidden and
+// checkAllowed still operate on the full file set, so a generated file
+// under a forbidden glob is still a violation. Mirrors
+// backend/internal/policy.CountedFileCount so the runner's in-line
+// verdict equals the backend re-verify.
+func CountedFileCount(diff Diff) int {
+	n := 0
+	for _, f := range diff.ChangedFiles {
+		if !IsGeneratedPath(f.Path) {
+			n++
+		}
+	}
+	return n
+}
+
+// IsGeneratedPath reports whether p is a generated or vendored path
+// exempt from the max_files_changed file count. Two classes are
+// exempt:
+//
+//   - sqlc-generated db packages — a `.go` file under a `db/`
+//     directory. This mirrors CI's coverage exclusion, which drops
+//     any path containing the substring `/db/` (scripts/check-coverage.py
+//     `--exclude '/db/'`), narrowed to `.go` files per #2054's
+//     `*/db/*.go` phrasing. A hand-written package under a `db/`
+//     directory is exempted too, exactly as CI's coverage exclusion
+//     already treats it.
+//   - vendored dependencies — anything under a `vendor/` directory.
+//
+// Plain string matching (like isTestPath), not doublestar: these are
+// fixed structural conventions, not author-supplied globs. Mirrors
+// backend/internal/policy.IsGeneratedPath — change them together.
+func IsGeneratedPath(p string) bool {
+	// sqlc db packages: a .go file under a db/ directory.
+	if strings.HasSuffix(p, ".go") && (strings.Contains(p, "/db/") || strings.HasPrefix(p, "db/")) {
+		return true
+	}
+	// Vendored dependencies.
+	if strings.HasPrefix(p, "vendor/") || strings.Contains(p, "/vendor/") {
+		return true
+	}
+	return false
 }
 
 func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violation {

@@ -3227,6 +3227,55 @@ func TestGetPlan_ScopePrecheck_CrossBoundarySeam(t *testing.T) {
 	}
 }
 
+// TestGetPlan_ScopePrecheck_ExemptedCountReachesSurface is the #2054
+// binding-condition-2 seam assertion (resolves f828ec9c): the
+// post-exemption ScannedFiles — generated/vendored paths dropped by
+// policy.CountedFileCount — must reach the operator-visible surface
+// (getPlan -> ScopePrecheck.scanned_files) intact. The seeded value is
+// derived by the REAL exemption function over a mixed diff, marshaled as
+// a genuine server.ScopePrecheckPayload, and read back through the REAL
+// resolver, so a serialization OR selection divergence across the
+// backend-write -> mcp-read boundary fails here rather than in
+// production.
+func TestGetPlan_ScopePrecheck_ExemptedCountReachesSurface(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// 2 non-generated + 2 generated (sqlc db + vendored): the exempted
+	// count is 2. Derive it via the real matcher so the seam genuinely
+	// couples CountedFileCount to the surface.
+	mixed := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/a.go"},
+		{Path: "backend/b.go"},
+		{Path: "backend/internal/audit/db/queries.sql.go"},
+		{Path: "backend/vendor/github.com/x/y.go"},
+	}}
+	seedScopePrecheckAudit(fb, runID, server.ScopePrecheckPayload{
+		WorkflowID:       "feature_change",
+		ImplementStageID: "implement",
+		ScannedFiles:     policy.CountedFileCount(mixed),
+		MaxFilesChanged:  30,
+		Violations:       []policy.Violation{},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ScopePrecheck == nil {
+		t.Fatal("ScopePrecheck is nil; want populated")
+	}
+	if out.ScopePrecheck.ScannedFiles != 2 {
+		t.Errorf("ScannedFiles = %d, want 2 (2 non-generated, 2 exempt)", out.ScopePrecheck.ScannedFiles)
+	}
+}
+
 func TestGetPlan_ScopePrecheck_NewestEntryWins(t *testing.T) {
 	// A schema-retry run writes two plan_scope_precheck entries; the
 	// authoritative one is the newest (last, sequence-ascending). The

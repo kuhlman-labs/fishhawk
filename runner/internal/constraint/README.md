@@ -48,6 +48,12 @@ The outcome is also **scoped**: a non-empty diff that touches no unit-testable s
 
 The allowlist fails open: an unrecognized source language reads as no-testable-code and passes, never a new false-fail.
 
+## Generated-path allowlist for `max_files_changed` (#2054)
+
+`max_files_changed` counts only files that are NOT generated or vendored: `IsGeneratedPath` exempts sqlc-generated db packages (a `.go` file under a `db/` directory) and vendored dependencies (anything under `vendor/`). `CountedFileCount` returns the un-exempted count, and `checkMaxFiles` compares that (and reports it in the violation `Detail`) against the cap — so a diff of 5 hand-written files plus a regenerated `db/queries.sql.go` counts as 5, not 6.
+
+The db exemption mirrors CI's coverage exclusion (`scripts/check-coverage.py --exclude '/db/'`), narrowed to `.go` files. Only `max_files_changed` is affected — `forbidden_paths`/`allowed_paths` still match the full file set, so a generated file under a forbidden glob is still a violation. No `vendor/` directory exists in the repo today; that branch is forward-looking and exercised only by unit tests.
+
 ## Lockstep with the backend copy
 
-Both copies (runner `constraint.go` + backend `policy.go`) carry identical `isTestPath`/`diffTouchesTestableCode`/`checkRequiredOutcomes` logic so the runner's in-line verdict and the backend re-eval agree. Change them together.
+Both copies (runner `constraint.go` + backend `policy.go`) carry identical `isTestPath`/`diffTouchesTestableCode`/`checkRequiredOutcomes`/`IsGeneratedPath`/`CountedFileCount` logic so the runner's in-line verdict and the backend re-eval agree. Change them together.
