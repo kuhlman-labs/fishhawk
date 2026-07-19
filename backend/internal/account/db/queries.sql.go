@@ -117,6 +117,104 @@ func (q *Queries) ListAccountMembers(ctx context.Context, accountID uuid.UUID) (
 	return items, nil
 }
 
+const listAutoJoinAccountsByKeys = `-- name: ListAutoJoinAccountsByKeys :many
+SELECT id, account_key, auto_join_role
+  FROM accounts
+ WHERE provider = $1
+   AND granularity = 'organization'
+   AND auto_join_role IS NOT NULL
+   AND account_key = ANY($2::text[])
+ ORDER BY account_key ASC
+`
+
+type ListAutoJoinAccountsByKeysParams struct {
+	Provider    string   `json:"provider"`
+	AccountKeys []string `json:"account_keys"`
+}
+
+type ListAutoJoinAccountsByKeysRow struct {
+	ID           uuid.UUID `json:"id"`
+	AccountKey   string    `json:"account_key"`
+	AutoJoinRole *string   `json:"auto_join_role"`
+}
+
+// Auto-join bootstrap intersection (E44.3): organization-granularity accounts
+// whose auto_join_role policy is set and whose org key appears in the user's
+// LIVE forge org list. Stable account_key order keeps the callback's
+// deterministic-first pick reproducible.
+func (q *Queries) ListAutoJoinAccountsByKeys(ctx context.Context, arg ListAutoJoinAccountsByKeysParams) ([]ListAutoJoinAccountsByKeysRow, error) {
+	rows, err := q.db.Query(ctx, listAutoJoinAccountsByKeys, arg.Provider, arg.AccountKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListAutoJoinAccountsByKeysRow
+	for rows.Next() {
+		var i ListAutoJoinAccountsByKeysRow
+		if err := rows.Scan(&i.ID, &i.AccountKey, &i.AutoJoinRole); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMemberGrantsByRef = `-- name: ListMemberGrantsByRef :many
+SELECT m.account_id, m.origin, a.account_key, a.granularity, a.auto_join_role
+  FROM account_members m
+  JOIN accounts a ON a.id = m.account_id
+ WHERE m.provider = $1
+   AND m.member_ref = $2
+ ORDER BY m.created_at ASC, m.id ASC
+`
+
+type ListMemberGrantsByRefParams struct {
+	Provider  string `json:"provider"`
+	MemberRef string `json:"member_ref"`
+}
+
+type ListMemberGrantsByRefRow struct {
+	AccountID    uuid.UUID `json:"account_id"`
+	Origin       string    `json:"origin"`
+	AccountKey   string    `json:"account_key"`
+	Granularity  string    `json:"granularity"`
+	AutoJoinRole *string   `json:"auto_join_role"`
+}
+
+// The login-gate admission read (E44.3 / ADR-057 Amendment A2): every grant for
+// a forge member joined with its account's admission fields, so the resolver
+// can admit invited rows DB-only and re-verify auto_join rows against their
+// policy predicate. Explicit columns (a per-query Row struct) — the resolver
+// needs only the admission slice, not the whole roster row.
+func (q *Queries) ListMemberGrantsByRef(ctx context.Context, arg ListMemberGrantsByRefParams) ([]ListMemberGrantsByRefRow, error) {
+	rows, err := q.db.Query(ctx, listMemberGrantsByRef, arg.Provider, arg.MemberRef)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListMemberGrantsByRefRow
+	for rows.Next() {
+		var i ListMemberGrantsByRefRow
+		if err := rows.Scan(
+			&i.AccountID,
+			&i.Origin,
+			&i.AccountKey,
+			&i.Granularity,
+			&i.AutoJoinRole,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertAccount = `-- name: UpsertAccount :one
 
 INSERT INTO accounts (id, provider, account_key, display_name, granularity, home_region)
@@ -199,6 +297,38 @@ func (q *Queries) UpsertAccountMember(ctx context.Context, arg UpsertAccountMemb
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const upsertAccountMemberWithOrigin = `-- name: UpsertAccountMemberWithOrigin :exec
+INSERT INTO account_members (id, account_id, provider, member_ref, role, origin)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (account_id, provider, member_ref) DO UPDATE
+   SET role   = EXCLUDED.role,
+       origin = EXCLUDED.origin
+`
+
+type UpsertAccountMemberWithOriginParams struct {
+	ID        uuid.UUID `json:"id"`
+	AccountID uuid.UUID `json:"account_id"`
+	Provider  string    `json:"provider"`
+	MemberRef string    `json:"member_ref"`
+	Role      *string   `json:"role"`
+	Origin    string    `json:"origin"`
+}
+
+// Mint (or refresh) a grant with an explicit origin — the auto-join bootstrap's
+// audited origin='auto_join' write. UpsertAccountMember above keeps its
+// pre-0056 shape (origin defaults to 'invited').
+func (q *Queries) UpsertAccountMemberWithOrigin(ctx context.Context, arg UpsertAccountMemberWithOriginParams) error {
+	_, err := q.db.Exec(ctx, upsertAccountMemberWithOrigin,
+		arg.ID,
+		arg.AccountID,
+		arg.Provider,
+		arg.MemberRef,
+		arg.Role,
+		arg.Origin,
+	)
+	return err
 }
 
 const upsertInstallation = `-- name: UpsertInstallation :one

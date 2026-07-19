@@ -12,8 +12,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 )
 
 // fakeAuthRepo is the in-memory auth.Repository for handler tests.
@@ -36,7 +40,7 @@ func newFakeAuthRepo() *fakeAuthRepo {
 	}
 }
 
-func (f *fakeAuthRepo) SignIn(_ context.Context, p auth.GitHubProfile) (*auth.User, *auth.Session, error) {
+func (f *fakeAuthRepo) SignIn(_ context.Context, p auth.GitHubProfile, accountID uuid.UUID) (*auth.User, *auth.Session, error) {
 	if f.signInErr != nil {
 		return nil, nil, f.signInErr
 	}
@@ -55,6 +59,10 @@ func (f *fakeAuthRepo) SignIn(_ context.Context, p auth.GitHubProfile) (*auth.Us
 	}
 	f.users[user.ID] = user
 
+	boundAccount := ""
+	if accountID != uuid.Nil {
+		boundAccount = accountID.String()
+	}
 	plain := auth.SessionTokenPrefix + uuid.New().String() + uuid.New().String()
 	hash, _ := auth.HashPlaintext(plain)
 	sess := &auth.Session{
@@ -64,6 +72,7 @@ func (f *fakeAuthRepo) SignIn(_ context.Context, p auth.GitHubProfile) (*auth.Us
 		LastUsedAt:        now,
 		SlidingExpiresAt:  now.Add(auth.SessionSlidingTTL),
 		AbsoluteExpiresAt: now.Add(auth.SessionAbsoluteTTL),
+		AccountID:         boundAccount,
 		PlainText:         plain,
 	}
 	stored := *sess
@@ -151,7 +160,35 @@ func stubGitHubOAuthServer(t *testing.T) (*httptest.Server, *auth.GitHubOAuth) {
 	return srv, gh
 }
 
+// fakeMembershipResolver is the injectable membership gate for
+// handler tests. Zero value denies (empty result).
+type fakeMembershipResolver struct {
+	ids         []uuid.UUID
+	err         error
+	calls       int
+	gotProvider string
+	gotToken    string
+	gotLogin    string
+}
+
+func (f *fakeMembershipResolver) ResolveAccounts(_ context.Context, provider, accessToken string, profile auth.GitHubProfile) ([]uuid.UUID, error) {
+	f.calls++
+	f.gotProvider = provider
+	f.gotToken = accessToken
+	f.gotLogin = profile.Login
+	return f.ids, f.err
+}
+
+// testAccountID is the account the default test resolver admits.
+var testAccountID = uuid.MustParse("11111111-2222-3333-4444-555555555555")
+
 func newAuthServer(t *testing.T) (*Server, *fakeAuthRepo) {
+	t.Helper()
+	s, repo, _ := newAuthServerWithResolver(t, &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}})
+	return s, repo
+}
+
+func newAuthServerWithResolver(t *testing.T, resolver auth.MembershipResolver) (*Server, *fakeAuthRepo, *auth.GitHubOAuth) {
 	t.Helper()
 	repo := newFakeAuthRepo()
 	_, gh := stubGitHubOAuthServer(t)
@@ -159,9 +196,10 @@ func newAuthServer(t *testing.T) (*Server, *fakeAuthRepo) {
 		Addr:                   "127.0.0.1:0",
 		AuthRepo:               repo,
 		GitHubOAuth:            gh,
+		AuthMembership:         resolver,
 		AuthRedirectAfterLogin: "/app",
 	})
-	return s, repo
+	return s, repo, gh
 }
 
 func TestGitHubLogin_RedirectsAndSetsStateCookie(t *testing.T) {
@@ -386,6 +424,7 @@ func TestGitHubCallback_RejectsUnsafeRedirect(t *testing.T) {
 		Addr:                   "127.0.0.1:0",
 		AuthRepo:               repo,
 		GitHubOAuth:            gh,
+		AuthMembership:         &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}},
 		AuthRedirectAfterLogin: "//evil.example.com/", // open-redirect
 	})
 
@@ -409,7 +448,7 @@ func TestGetMe_HappyPath(t *testing.T) {
 	// Sign in once via the repo to get a user + session.
 	user, sess, err := repo.SignIn(context.Background(), auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "The Octo Cat",
-	})
+	}, testAccountID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +485,7 @@ func TestLogout_HappyPath(t *testing.T) {
 	s, repo := newAuthServer(t)
 	_, sess, _ := repo.SignIn(context.Background(), auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "Octocat",
-	})
+	}, testAccountID)
 
 	req := httptest.NewRequest(http.MethodPost, "/v0/auth/logout", nil)
 	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: sess.PlainText})
@@ -537,7 +576,7 @@ func TestBearerAuth_SessionCookieResolvesIdentity(t *testing.T) {
 	repo := newFakeAuthRepo()
 	user, sess, _ := repo.SignIn(context.Background(), auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "x",
-	})
+	}, testAccountID)
 
 	var captured Identity
 	h := newServer(t, newFakeRepo()).bearerAuth(nil, nil, repo)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -562,7 +601,7 @@ func TestBearerAuth_RevokedSessionFallsBackToAnonymous(t *testing.T) {
 	repo := newFakeAuthRepo()
 	_, sess, _ := repo.SignIn(context.Background(), auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "x",
-	})
+	}, testAccountID)
 	sid, _ := uuid.Parse(sess.ID)
 	if err := repo.Revoke(context.Background(), sid); err != nil {
 		t.Fatal(err)
@@ -599,8 +638,358 @@ func TestBearerAuth_AuthRepoNil_AnonymousOnCookie(t *testing.T) {
 func TestFakeAuthRepo_SignInError(t *testing.T) {
 	r := newFakeAuthRepo()
 	r.signInErr = errors.New("boom")
-	_, _, err := r.SignIn(context.Background(), auth.GitHubProfile{ID: 1, Login: "x"})
+	_, _, err := r.SignIn(context.Background(), auth.GitHubProfile{ID: 1, Login: "x"}, uuid.Nil)
 	if err == nil {
 		t.Error("expected propagated error")
 	}
+}
+
+// --- E44.3 membership-gate tests (ADR-057 Amendment A2) ---
+
+// Named fail-closed branch 1: a nil resolver denies EVERY sign-in —
+// access-denied redirect, no session cookie, no CSRF cookie, no user.
+func TestGitHubCallback_NilResolver_DeniesFailClosed(t *testing.T) {
+	repo := newFakeAuthRepo()
+	_, gh := stubGitHubOAuthServer(t)
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		AuthRepo:    repo,
+		GitHubOAuth: gh,
+		// AuthMembership deliberately nil.
+	})
+
+	w := callbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "/access-denied" {
+		t.Errorf("Location = %q, want /access-denied", loc)
+	}
+	assertNoAuthCookies(t, w)
+	if len(repo.users) != 0 {
+		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
+	}
+}
+
+// Named fail-closed branch 2: a resolver ERROR (forge down with no
+// invited grant) fails closed with a non-2xx and no session.
+func TestGitHubCallback_ResolverError_FailsClosed(t *testing.T) {
+	resolver := &fakeMembershipResolver{err: errors.New("github is down")}
+	s, repo, _ := newAuthServerWithResolver(t, resolver)
+
+	w := callbackRequest(t, s)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "membership_resolution_failed") {
+		t.Errorf("body missing membership_resolution_failed:\n%s", w.Body.String())
+	}
+	assertNoAuthCookies(t, w)
+	if len(repo.users) != 0 {
+		t.Errorf("users = %d, want 0 (no SignIn on resolver error)", len(repo.users))
+	}
+}
+
+// Named fail-closed branch 3: no admitting account -> access-denied
+// redirect with NO session cookie and NO CSRF cookie.
+func TestGitHubCallback_NoAdmittingAccount_RedirectsAccessDenied(t *testing.T) {
+	resolver := &fakeMembershipResolver{} // empty result = deny
+	s, repo, _ := newAuthServerWithResolver(t, resolver)
+
+	w := callbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "/access-denied" {
+		t.Errorf("Location = %q, want /access-denied", loc)
+	}
+	assertNoAuthCookies(t, w)
+	if len(repo.users) != 0 {
+		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
+	}
+}
+
+// The configured deny target is honored when safe and replaced by the
+// default when it is an open-redirect vector.
+func TestGitHubCallback_AccessDeniedRedirectConfig(t *testing.T) {
+	for _, tc := range []struct{ configured, want string }{
+		{"/no-entry", "/no-entry"},
+		{"//evil.example.com/", "/access-denied"},
+		{"", "/access-denied"},
+	} {
+		t.Run(tc.configured, func(t *testing.T) {
+			repo := newFakeAuthRepo()
+			_, gh := stubGitHubOAuthServer(t)
+			s := New(Config{
+				Addr:                     "127.0.0.1:0",
+				AuthRepo:                 repo,
+				GitHubOAuth:              gh,
+				AuthMembership:           &fakeMembershipResolver{},
+				AuthAccessDeniedRedirect: tc.configured,
+			})
+			w := callbackRequest(t, s)
+			if loc := w.Header().Get("Location"); loc != tc.want {
+				t.Errorf("Location = %q, want %q", loc, tc.want)
+			}
+		})
+	}
+}
+
+// Admission threads through: the resolver sees the provider + the
+// exchanged token + profile, and the admitted account binds the
+// session, surfacing on /v0/auth/me as account_id.
+func TestGitHubCallback_AdmittedAccountBindsSession(t *testing.T) {
+	resolver := &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}}
+	s, _, _ := newAuthServerWithResolver(t, resolver)
+
+	w := callbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	if resolver.calls != 1 || resolver.gotProvider != "github" ||
+		resolver.gotToken != "gho_xxx" || resolver.gotLogin != "octocat" {
+		t.Errorf("resolver saw %+v, want github/gho_xxx/octocat once", resolver)
+	}
+	var sessCookie *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == auth.SessionCookieName {
+			sessCookie = c
+		}
+	}
+	if sessCookie == nil {
+		t.Fatal("session cookie not set on admitted sign-in")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/me", nil)
+	req.AddCookie(sessCookie)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/v0/auth/me status = %d, want 200:\n%s", rec.Code, rec.Body.String())
+	}
+	var resp userResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp.AccountID == nil || *resp.AccountID != testAccountID.String() {
+		t.Errorf("account_id = %v, want %s", resp.AccountID, testAccountID)
+	}
+}
+
+// Defense in depth: a session whose account binding is gone (account
+// deleted after sign-in, or a pre-gate session) gets 403
+// account_unresolved from /v0/auth/me, not another tenant's data.
+func TestGetMe_SessionWithoutAccount_403AccountUnresolved(t *testing.T) {
+	s, repo := newAuthServer(t)
+	_, sess, err := repo.SignIn(context.Background(), auth.GitHubProfile{
+		ID: 42, Login: "octocat", Name: "x",
+	}, uuid.Nil) // unbound session
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/me", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: sess.PlainText})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "account_unresolved") {
+		t.Errorf("body missing account_unresolved:\n%s", w.Body.String())
+	}
+}
+
+// callbackRequest drives a state-valid GET /v0/auth/github/callback.
+func callbackRequest(t *testing.T, s *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	state := "state-gate"
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/github/callback?code=abc&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+// assertNoAuthCookies fails if the response set a session or CSRF
+// cookie — a denied sign-in must leave the browser credential-free.
+func assertNoAuthCookies(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	for _, c := range w.Result().Cookies() {
+		if (c.Name == auth.SessionCookieName || c.Name == CSRFCookieName) && c.MaxAge >= 0 && c.Value != "" {
+			t.Errorf("denied sign-in set cookie %s=%q", c.Name, c.Value)
+		}
+	}
+}
+
+// TestGitHubCallback_MembershipGate_PostgresE2E drives the FULL
+// callback against a real migrated database: real auth repo, real
+// membership resolver + account/db store, fake GitHub OAuth endpoints,
+// fake forge lister. The admission source is real account_members /
+// accounts rows — the cross-boundary seam the per-layer units can't
+// cover (sessions.account_id persisted end-to-end).
+func TestGitHubCallback_MembershipGate_PostgresE2E(t *testing.T) {
+	newPGAuthServer := func(t *testing.T, lister *e2eOrgLister) (*Server, *pgxpool.Pool) {
+		t.Helper()
+		url := pgtest.NewURL(t)
+		if err := postgres.MigrateUp(url); err != nil {
+			t.Fatalf("MigrateUp: %v", err)
+		}
+		pool, err := pgxpool.New(context.Background(), url)
+		if err != nil {
+			t.Fatalf("pool: %v", err)
+		}
+		t.Cleanup(pool.Close)
+		_, gh := stubGitHubOAuthServer(t)
+		s := New(Config{
+			Addr:        "127.0.0.1:0",
+			AuthRepo:    auth.NewPostgresRepository(pool),
+			GitHubOAuth: gh,
+			AuthMembership: auth.NewMembershipResolver(
+				auth.NewAccountMembershipStore(accountdb.New(pool)), lister),
+			AuthRedirectAfterLogin: "/app",
+		})
+		return s, pool
+	}
+	seedAccount := func(t *testing.T, pool *pgxpool.Pool, key string, autoJoinRole *string) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO accounts (id, provider, account_key, granularity, auto_join_role)
+			 VALUES ($1, 'github', $2, 'organization', $3)`,
+			id, key, autoJoinRole,
+		); err != nil {
+			t.Fatalf("seed account: %v", err)
+		}
+		return id
+	}
+
+	t.Run("auto-join admits and binds the session", func(t *testing.T) {
+		lister := &e2eOrgLister{keys: []string{"acme-corp"}}
+		s, pool := newPGAuthServer(t, lister)
+		role := "member"
+		accountID := seedAccount(t, pool, "acme-corp", &role)
+
+		w := callbackRequest(t, s)
+		if w.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+		}
+		var sessCookie *http.Cookie
+		for _, c := range w.Result().Cookies() {
+			if c.Name == auth.SessionCookieName {
+				sessCookie = c
+			}
+		}
+		if sessCookie == nil {
+			t.Fatal("session cookie not set")
+		}
+		// The persisted sessions row carries the resolved account.
+		var persisted *uuid.UUID
+		if err := pool.QueryRow(context.Background(),
+			`SELECT account_id FROM sessions`).Scan(&persisted); err != nil {
+			t.Fatalf("read sessions.account_id: %v", err)
+		}
+		if persisted == nil || *persisted != accountID {
+			t.Errorf("sessions.account_id = %v, want %s", persisted, accountID)
+		}
+		// The minted grant is audited as auto_join.
+		var origin string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT origin FROM account_members WHERE account_id = $1 AND member_ref = 'octocat'`,
+			accountID).Scan(&origin); err != nil {
+			t.Fatalf("read minted grant: %v", err)
+		}
+		if origin != "auto_join" {
+			t.Errorf("origin = %q, want auto_join", origin)
+		}
+		// /v0/auth/me surfaces the account context.
+		req := httptest.NewRequest(http.MethodGet, "/v0/auth/me", nil)
+		req.AddCookie(sessCookie)
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/v0/auth/me status = %d:\n%s", rec.Code, rec.Body.String())
+		}
+		var resp userResponse
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		if resp.AccountID == nil || *resp.AccountID != accountID.String() {
+			t.Errorf("account_id = %v, want %s", resp.AccountID, accountID)
+		}
+	})
+
+	t.Run("invited row admits with the forge erroring", func(t *testing.T) {
+		lister := &e2eOrgLister{err: errors.New("github is down")}
+		s, pool := newPGAuthServer(t, lister)
+		accountID := seedAccount(t, pool, "acme-corp", nil)
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO account_members (id, account_id, provider, member_ref, origin)
+			 VALUES ($1, $2, 'github', 'octocat', 'invited')`,
+			uuid.New(), accountID); err != nil {
+			t.Fatalf("seed invited grant: %v", err)
+		}
+
+		w := callbackRequest(t, s)
+		if w.Code != http.StatusFound || w.Header().Get("Location") != "/app" {
+			t.Fatalf("status/Location = %d %q, want 302 /app:\n%s",
+				w.Code, w.Header().Get("Location"), w.Body.String())
+		}
+	})
+
+	t.Run("no admitting row denies with no session row", func(t *testing.T) {
+		lister := &e2eOrgLister{keys: []string{"some-other-org"}}
+		s, pool := newPGAuthServer(t, lister)
+		seedAccount(t, pool, "acme-corp", nil)
+
+		w := callbackRequest(t, s)
+		if w.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+		}
+		if loc := w.Header().Get("Location"); loc != "/access-denied" {
+			t.Errorf("Location = %q, want /access-denied", loc)
+		}
+		assertNoAuthCookies(t, w)
+		var sessions int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM sessions`).Scan(&sessions); err != nil {
+			t.Fatalf("count sessions: %v", err)
+		}
+		if sessions != 0 {
+			t.Errorf("sessions rows = %d, want 0 on deny", sessions)
+		}
+	})
+
+	t.Run("forge error with no invited row fails closed", func(t *testing.T) {
+		lister := &e2eOrgLister{err: errors.New("github is down")}
+		s, pool := newPGAuthServer(t, lister)
+		role := "member"
+		seedAccount(t, pool, "acme-corp", &role)
+
+		w := callbackRequest(t, s)
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502:\n%s", w.Code, w.Body.String())
+		}
+		assertNoAuthCookies(t, w)
+		var sessions int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM sessions`).Scan(&sessions); err != nil {
+			t.Fatalf("count sessions: %v", err)
+		}
+		if sessions != 0 {
+			t.Errorf("sessions rows = %d, want 0 on fail-closed", sessions)
+		}
+	})
+}
+
+// e2eOrgLister is the fake ForgeMembershipLister for the postgres
+// end-to-end callback tests.
+type e2eOrgLister struct {
+	keys []string
+	err  error
+}
+
+func (f *e2eOrgLister) ListUserOrgKeys(context.Context, string) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.keys, nil
 }

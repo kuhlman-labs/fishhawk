@@ -2973,6 +2973,15 @@ components:
           example: Brett Kuhlman
         email:
           type: [string, "null"]
+        account_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            The workspace account the session's membership gate resolved at
+            sign-in (E44.3 / ADR-057 Amendment A2). The SPA scopes its rendering
+            to this account. `null` for bearer-token identities (their account
+            enforcement is E44.5); a cookie session with no resolvable account
+            is refused with 403 `account_unresolved` instead of returning null.
 
     OnboardingReadiness:
       type: object
@@ -3263,8 +3272,15 @@ paths:
       summary: GitHub OAuth callback
       description: |
         Verifies the state, exchanges the code for a GitHub access token,
-        looks up or creates the user, and sets the `fishhawk_session`
-        cookie. Redirects to the SPA on success.
+        fetches the GitHub profile, then runs the workspace-membership gate
+        (E44.3 / ADR-057 Amendment A2) BEFORE any session exists: an
+        `invited` `account_members` row admits DB-only; otherwise the user's
+        live org list is intersected with org-granularity accounts whose
+        `auto_join_role` policy is set (minting an audited `auto_join` row on
+        first match). Only an admitted user gets a `fishhawk_session` cookie,
+        bound to the resolved account. A user no account admits is redirected
+        to the access-denied page with NO session cookie; a forge error
+        during auto-join evaluation (with no invited row) fails closed.
       security: []
       tags: [auth]
       parameters:
@@ -3278,8 +3294,20 @@ paths:
           schema: { type: string }
       responses:
         '302':
-          description: Redirect to the SPA root with session cookie set.
+          description: |
+            Admitted: redirect to the SPA root with the session cookie set,
+            bound to the resolved account. Denied (no admitting account, or
+            no membership resolver configured): redirect to the access-denied
+            page (default `/access-denied`) with NO session cookie.
         '400': { $ref: '#/components/responses/BadRequest' }
+        '502':
+          description: |
+            Membership resolution failed closed — the forge membership API
+            errored during auto-join evaluation and no invited grant admits
+            (`membership_resolution_failed`). No session is created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/auth/github/manifest-flow-start:
     get:
@@ -3384,15 +3412,28 @@ paths:
     get:
       operationId: getMe
       summary: Current user
-      description: Returns the authenticated user, or 401 if unauthenticated.
+      description: |
+        Returns the authenticated user, or 401 if unauthenticated. A cookie
+        session includes its `account_id` (the workspace account resolved at
+        sign-in); a session whose account can no longer be resolved — the
+        account was deleted after sign-in, or the session predates the
+        membership gate — is refused with 403 `account_unresolved` (the SPA
+        routes this to the access-denied page).
       tags: [auth]
       responses:
         '200':
-          description: The authenticated user.
+          description: The authenticated user, with the session's account context.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/User' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            The session carries no resolvable workspace account
+            (`account_unresolved`). Sign in again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/auth/logout:
     post:

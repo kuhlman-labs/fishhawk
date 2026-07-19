@@ -54,3 +54,39 @@ RETURNING *;
 SELECT * FROM account_members
  WHERE account_id = $1
  ORDER BY created_at ASC, id ASC;
+
+-- name: ListMemberGrantsByRef :many
+-- The login-gate admission read (E44.3 / ADR-057 Amendment A2): every grant for
+-- a forge member joined with its account's admission fields, so the resolver
+-- can admit invited rows DB-only and re-verify auto_join rows against their
+-- policy predicate. Explicit columns (a per-query Row struct) — the resolver
+-- needs only the admission slice, not the whole roster row.
+SELECT m.account_id, m.origin, a.account_key, a.granularity, a.auto_join_role
+  FROM account_members m
+  JOIN accounts a ON a.id = m.account_id
+ WHERE m.provider = $1
+   AND m.member_ref = $2
+ ORDER BY m.created_at ASC, m.id ASC;
+
+-- name: ListAutoJoinAccountsByKeys :many
+-- Auto-join bootstrap intersection (E44.3): organization-granularity accounts
+-- whose auto_join_role policy is set and whose org key appears in the user's
+-- LIVE forge org list. Stable account_key order keeps the callback's
+-- deterministic-first pick reproducible.
+SELECT id, account_key, auto_join_role
+  FROM accounts
+ WHERE provider = $1
+   AND granularity = 'organization'
+   AND auto_join_role IS NOT NULL
+   AND account_key = ANY(sqlc.arg(account_keys)::text[])
+ ORDER BY account_key ASC;
+
+-- name: UpsertAccountMemberWithOrigin :exec
+-- Mint (or refresh) a grant with an explicit origin — the auto-join bootstrap's
+-- audited origin='auto_join' write. UpsertAccountMember above keeps its
+-- pre-0056 shape (origin defaults to 'invited').
+INSERT INTO account_members (id, account_id, provider, member_ref, role, origin)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (account_id, provider, member_ref) DO UPDATE
+   SET role   = EXCLUDED.role,
+       origin = EXCLUDED.origin;
