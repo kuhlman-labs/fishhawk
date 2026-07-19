@@ -13,22 +13,27 @@ import (
 // fakeGitHub stands in for github.com / api.github.com. Tests
 // configure responses via fields and assert on captured input.
 type fakeGitHub struct {
-	tokenResp  string // JSON for the /access_token endpoint
-	tokenCode  int
-	userResp   string
-	userCode   int
-	gotCode    string
-	gotToken   string
-	gotRedir   string
-	gotClient  string
-	gotSecret  string
-	tokenCalls int
-	userCalls  int
+	tokenResp    string // JSON for the /access_token endpoint
+	tokenCode    int
+	userResp     string
+	userCode     int
+	orgsResp     string
+	orgsCode     int
+	gotCode      string
+	gotToken     string
+	gotOrgsToken string
+	gotOrgsQuery string
+	gotRedir     string
+	gotClient    string
+	gotSecret    string
+	tokenCalls   int
+	userCalls    int
+	orgsCalls    int
 }
 
 func newFakeGitHub(t *testing.T) (*fakeGitHub, OAuthURLs) {
 	t.Helper()
-	fg := &fakeGitHub{tokenCode: 200, userCode: 200}
+	fg := &fakeGitHub{tokenCode: 200, userCode: 200, orgsCode: 200, orgsResp: `[]`}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, r *http.Request) {
 		fg.tokenCalls++
@@ -48,12 +53,21 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, OAuthURLs) {
 		w.WriteHeader(fg.userCode)
 		_, _ = w.Write([]byte(fg.userResp))
 	})
+	mux.HandleFunc("/user/orgs", func(w http.ResponseWriter, r *http.Request) {
+		fg.orgsCalls++
+		fg.gotOrgsToken = r.Header.Get("Authorization")
+		fg.gotOrgsQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(fg.orgsCode)
+		_, _ = w.Write([]byte(fg.orgsResp))
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	urls := OAuthURLs{
 		AuthorizeURL: srv.URL + "/login/oauth/authorize",
 		TokenURL:     srv.URL + "/login/oauth/access_token",
 		UserURL:      srv.URL + "/user",
+		OrgsURL:      srv.URL + "/user/orgs",
 	}
 	return fg, urls
 }
@@ -75,8 +89,8 @@ func TestAuthorizeURL_BuildsExpectedShape(t *testing.T) {
 	if q.Get("redirect_uri") != "https://example.com/callback" {
 		t.Errorf("redirect_uri = %q", q.Get("redirect_uri"))
 	}
-	if q.Get("scope") != "read:user user:email" {
-		t.Errorf("scope = %q", q.Get("scope"))
+	if q.Get("scope") != "read:user user:email read:org" {
+		t.Errorf("scope = %q (read:org is required so the auto-join /user/orgs read sees private org memberships)", q.Get("scope"))
 	}
 	if q.Get("allow_signup") != "false" {
 		t.Errorf("allow_signup = %q (want 'false' to keep org-only installs from prompting account creation)", q.Get("allow_signup"))
@@ -209,5 +223,57 @@ func TestFetchProfile_RejectsEmptyToken(t *testing.T) {
 	_, err := o.FetchProfile(context.Background(), "")
 	if err == nil {
 		t.Error("expected error on empty token")
+	}
+}
+
+func TestListUserOrgKeys_HappyPath(t *testing.T) {
+	fg, urls := newFakeGitHub(t)
+	fg.orgsResp = `[{"login":"acme-corp","id":1},{"login":"other-org","id":2}]`
+	o := NewGitHubOAuth("c", "s", "x", urls)
+
+	keys, err := o.ListUserOrgKeys(context.Background(), "gho_xxx")
+	if err != nil {
+		t.Fatalf("ListUserOrgKeys: %v", err)
+	}
+	if len(keys) != 2 || keys[0] != "acme-corp" || keys[1] != "other-org" {
+		t.Errorf("keys = %v", keys)
+	}
+	// The USER's OAuth token, never an App token.
+	if fg.gotOrgsToken != "Bearer gho_xxx" {
+		t.Errorf("auth header = %q", fg.gotOrgsToken)
+	}
+	if !strings.Contains(fg.gotOrgsQuery, "per_page=100") {
+		t.Errorf("query = %q, want per_page=100", fg.gotOrgsQuery)
+	}
+}
+
+func TestListUserOrgKeys_HTTPError(t *testing.T) {
+	fg, urls := newFakeGitHub(t)
+	fg.orgsCode = 403 // e.g. token missing read:org
+	o := NewGitHubOAuth("c", "s", "x", urls)
+	_, err := o.ListUserOrgKeys(context.Background(), "tok")
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Errorf("err = %v, want 403", err)
+	}
+}
+
+func TestListUserOrgKeys_RejectsEmptyToken(t *testing.T) {
+	o := NewGitHubOAuth("c", "s", "x", OAuthURLs{})
+	_, err := o.ListUserOrgKeys(context.Background(), "")
+	if err == nil {
+		t.Error("expected error on empty token")
+	}
+}
+
+func TestListUserOrgKeys_EmptyList(t *testing.T) {
+	fg, urls := newFakeGitHub(t)
+	fg.orgsResp = `[]`
+	o := NewGitHubOAuth("c", "s", "x", urls)
+	keys, err := o.ListUserOrgKeys(context.Background(), "tok")
+	if err != nil {
+		t.Fatalf("ListUserOrgKeys: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Errorf("keys = %v, want empty", keys)
 	}
 }

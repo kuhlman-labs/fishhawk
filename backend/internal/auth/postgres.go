@@ -28,7 +28,7 @@ func NewPostgresRepository(pool *pgxpool.Pool) Repository {
 	}
 }
 
-func (r *postgresRepo) SignIn(ctx context.Context, p GitHubProfile) (*User, *Session, error) {
+func (r *postgresRepo) SignIn(ctx context.Context, p GitHubProfile, accountID uuid.UUID) (*User, *Session, error) {
 	if p.ID == 0 || p.Login == "" {
 		return nil, nil, errors.New("auth: GitHub profile id + login required")
 	}
@@ -54,6 +54,13 @@ func (r *postgresRepo) SignIn(ctx context.Context, p GitHubProfile) (*User, *Ses
 		return nil, nil, err
 	}
 
+	// uuid.Nil maps to a NULL account_id — a session with no gate
+	// binding, which /v0/auth/me refuses with account_unresolved.
+	var boundAccount *uuid.UUID
+	if accountID != uuid.Nil {
+		boundAccount = &accountID
+	}
+
 	now := r.now()
 	sessionRow, err := q.CreateSession(ctx, authdb.CreateSessionParams{
 		ID:                uuid.New(),
@@ -61,6 +68,7 @@ func (r *postgresRepo) SignIn(ctx context.Context, p GitHubProfile) (*User, *Ses
 		TokenHash:         hash,
 		SlidingExpiresAt:  pgtype.Timestamptz{Time: now.Add(SessionSlidingTTL), Valid: true},
 		AbsoluteExpiresAt: pgtype.Timestamptz{Time: now.Add(SessionAbsoluteTTL), Valid: true},
+		AccountID:         boundAccount,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("auth: create session: %w", err)
@@ -165,6 +173,9 @@ func rowToSession(r authdb.Session) *Session {
 	if r.RevokedAt.Valid {
 		t := r.RevokedAt.Time
 		out.RevokedAt = &t
+	}
+	if r.AccountID != nil {
+		out.AccountID = r.AccountID.String()
 	}
 	return out
 }

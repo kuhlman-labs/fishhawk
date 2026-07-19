@@ -34,6 +34,14 @@ export function RequireAuth({ children }: Props) {
     );
   }
 
+  if (status === 'denied') {
+    // Signed in but no workspace account resolves for the session
+    // (E44.3 #1827). /login would loop; /access-denied explains the
+    // situation and offers sign-out. No ?next= — there is nowhere to
+    // resume until an admin grants membership.
+    return <Navigate to="/access-denied" replace />;
+  }
+
   if (status === 'unauthenticated') {
     const intent = location.pathname + location.search;
     const target =

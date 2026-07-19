@@ -18,6 +18,7 @@ const (
 	defaultAuthorizeURL = "https://github.com/login/oauth/authorize"
 	defaultTokenURL     = "https://github.com/login/oauth/access_token"
 	defaultUserURL      = "https://api.github.com/user"
+	defaultOrgsURL      = "https://api.github.com/user/orgs"
 )
 
 // OAuthURLs lets tests substitute httptest.Server URLs for the
@@ -26,6 +27,7 @@ type OAuthURLs struct {
 	AuthorizeURL string
 	TokenURL     string
 	UserURL      string
+	OrgsURL      string
 }
 
 // GitHubOAuth wraps the OAuth web-app flow against GitHub.
@@ -58,6 +60,9 @@ func NewGitHubOAuth(clientID, clientSecret, callbackURL string, urls OAuthURLs) 
 	if urls.UserURL == "" {
 		urls.UserURL = defaultUserURL
 	}
+	if urls.OrgsURL == "" {
+		urls.OrgsURL = defaultOrgsURL
+	}
 	return &GitHubOAuth{
 		clientID:     clientID,
 		clientSecret: clientSecret,
@@ -68,13 +73,15 @@ func NewGitHubOAuth(clientID, clientSecret, callbackURL string, urls OAuthURLs) 
 }
 
 // AuthorizeURL builds the URL the login handler redirects the
-// browser to. Includes state + redirect_uri + the requested scopes
-// (read:user is enough — we only need the public profile).
+// browser to. Includes state + redirect_uri + the requested scopes:
+// read:user + user:email for the profile, and read:org so the
+// auto-join bootstrap's /user/orgs read (E44.3) sees private org
+// memberships, not just public ones.
 func (g *GitHubOAuth) AuthorizeURL(state string) string {
 	q := url.Values{}
 	q.Set("client_id", g.clientID)
 	q.Set("redirect_uri", g.callbackURL)
-	q.Set("scope", "read:user user:email")
+	q.Set("scope", "read:user user:email read:org")
 	q.Set("state", state)
 	q.Set("allow_signup", "false")
 	return g.urls.AuthorizeURL + "?" + q.Encode()
@@ -173,6 +180,50 @@ func (g *GitHubOAuth) FetchProfile(ctx context.Context, accessToken string) (*Gi
 		Name:  body.Name,
 		Email: body.Email,
 	}, nil
+}
+
+// ListUserOrgKeys lists the org logins of the authenticated user via
+// GET /user/orgs, using the USER's OAuth access token (never an App
+// token) — the sole live-forge read of the E44.3 membership gate,
+// consumed only by the auto-join bootstrap. Single page, per_page=100:
+// a membership beyond the first page fails auto-join CLOSED and the
+// remedy is an invited account_members row, which admits DB-only.
+// Note the same caveat applies to GitHub's third-party-application
+// restrictions, which can silently omit an org from this listing.
+func (g *GitHubOAuth) ListUserOrgKeys(ctx context.Context, accessToken string) ([]string, error) {
+	if accessToken == "" {
+		return nil, errors.New("auth: empty access token")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, g.urls.OrgsURL+"?per_page=100", nil)
+	if err != nil {
+		return nil, fmt.Errorf("auth: build orgs request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := g.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("auth: list user orgs: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("auth: orgs endpoint returned %d", resp.StatusCode)
+	}
+
+	var body []struct {
+		Login string `json:"login"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("auth: decode orgs: %w", err)
+	}
+	keys := make([]string, 0, len(body))
+	for _, org := range body {
+		if org.Login != "" {
+			keys = append(keys, org.Login)
+		}
+	}
+	return keys, nil
 }
 
 func readBriefBody(r io.Reader) string {

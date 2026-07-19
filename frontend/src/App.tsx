@@ -3,6 +3,7 @@ import { AuthProvider } from './auth/auth-provider';
 import { RequireAuth } from './auth/require-auth';
 import { Root } from './routes/root';
 import { Login } from './routes/login';
+import { AccessDenied } from './routes/access-denied';
 import { Runs } from './routes/runs';
 import { RunDetail } from './routes/run-detail';
 import { StageDetail } from './routes/stage-detail';
@@ -16,6 +17,7 @@ export function App() {
     <AuthProvider>
       <Routes>
         <Route path="/login" element={<Login />} />
+        <Route path="/access-denied" element={<AccessDenied />} />
         <Route
           path="/"
           element={

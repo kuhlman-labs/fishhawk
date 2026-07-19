@@ -94,6 +94,7 @@ type Session struct {
 	SlidingExpiresAt  pgtype.Timestamptz `json:"sliding_expires_at"`
 	AbsoluteExpiresAt pgtype.Timestamptz `json:"absolute_expires_at"`
 	RevokedAt         pgtype.Timestamptz `json:"revoked_at"`
+	AccountID         *uuid.UUID         `json:"account_id"`
 }
 
 type SigningKey struct {

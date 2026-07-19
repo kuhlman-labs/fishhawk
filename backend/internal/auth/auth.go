@@ -105,6 +105,13 @@ type Session struct {
 	AbsoluteExpiresAt time.Time
 	RevokedAt         *time.Time
 
+	// AccountID is the workspace account the membership gate resolved
+	// at sign-in (E44.3 / ADR-057 Amendment A2). Empty when the
+	// session carries no binding — a pre-gate row, or an account
+	// deleted after sign-in (the FK is ON DELETE SET NULL); handlers
+	// treat that as account_unresolved rather than admitting.
+	AccountID string
+
 	PlainText string
 }
 

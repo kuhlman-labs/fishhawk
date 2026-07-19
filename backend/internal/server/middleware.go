@@ -66,6 +66,13 @@ type Identity struct {
 	UserID    string
 	SessionID string
 
+	// AccountID is the workspace account the session's membership
+	// gate resolved at sign-in (E44.3). Set only on the cookie path,
+	// from the sessions row; empty for bearer-token identities (their
+	// account enforcement is E44.5) and for sessions whose account
+	// binding is gone (deleted account → /v0/auth/me denies).
+	AccountID string
+
 	// AuthMethod records how a bearer api_token was authenticated at
 	// issue time: "static" for operator-minted tokens, "oauth" for tokens
 	// minted through the OAuth device flow (E39.3 / #1708). Populated only
@@ -254,6 +261,7 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 							Subject:   "github:" + user.GitHubLogin,
 							UserID:    user.ID,
 							SessionID: sess.ID,
+							AccountID: sess.AccountID,
 						}
 					}
 				}

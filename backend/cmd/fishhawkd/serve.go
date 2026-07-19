@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
@@ -1272,6 +1273,18 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Warn("identity-provider REST reads stay anonymous: token-mint authz gate (fishhawk token login) will fail HTTP 500 until FISHHAWKD_GITHUB_APP_ID + key are configured")
 		}
 		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken)
+		// Workspace-membership login gate (E44.3 / ADR-057 Amendment
+		// A2): invited account_members rows admit DB-only; the
+		// GitHubOAuth client doubles as the ForgeMembershipLister for
+		// the auto-join bootstrap. Without a database the resolver
+		// stays nil and the callback denies every sign-in (fail
+		// closed).
+		if pool != nil {
+			cfg.AuthMembership = authpkg.NewMembershipResolver(
+				authpkg.NewAccountMembershipStore(accountdb.New(pool)), cfg.GitHubOAuth)
+		} else {
+			logger.Warn("membership resolver unconfigured (no database); every OAuth sign-in will be denied")
+		}
 		logger.Info("github oauth sign-in configured",
 			slog.String("callback_url", *oauthCallbackURL),
 			slog.String("redirect_after_login", *oauthRedirectAfterLogin),

@@ -15,10 +15,10 @@ import (
 const createSession = `-- name: CreateSession :one
 INSERT INTO sessions (
     id, user_id, token_hash,
-    sliding_expires_at, absolute_expires_at
+    sliding_expires_at, absolute_expires_at, account_id
 )
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, token_hash, issued_at, last_used_at, sliding_expires_at, absolute_expires_at, revoked_at
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, user_id, token_hash, issued_at, last_used_at, sliding_expires_at, absolute_expires_at, revoked_at, account_id
 `
 
 type CreateSessionParams struct {
@@ -27,8 +27,11 @@ type CreateSessionParams struct {
 	TokenHash         string             `json:"token_hash"`
 	SlidingExpiresAt  pgtype.Timestamptz `json:"sliding_expires_at"`
 	AbsoluteExpiresAt pgtype.Timestamptz `json:"absolute_expires_at"`
+	AccountID         *uuid.UUID         `json:"account_id"`
 }
 
+// account_id is the workspace account the membership gate resolved at
+// sign-in (E44.3); NULL only where no gate ran.
 func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error) {
 	row := q.db.QueryRow(ctx, createSession,
 		arg.ID,
@@ -36,6 +39,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		arg.TokenHash,
 		arg.SlidingExpiresAt,
 		arg.AbsoluteExpiresAt,
+		arg.AccountID,
 	)
 	var i Session
 	err := row.Scan(
@@ -47,6 +51,7 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.SlidingExpiresAt,
 		&i.AbsoluteExpiresAt,
 		&i.RevokedAt,
+		&i.AccountID,
 	)
 	return i, err
 }
@@ -68,7 +73,7 @@ func (q *Queries) EvictExpiredSessions(ctx context.Context, absoluteExpiresAt pg
 }
 
 const getSessionByHash = `-- name: GetSessionByHash :one
-SELECT id, user_id, token_hash, issued_at, last_used_at, sliding_expires_at, absolute_expires_at, revoked_at FROM sessions
+SELECT id, user_id, token_hash, issued_at, last_used_at, sliding_expires_at, absolute_expires_at, revoked_at, account_id FROM sessions
  WHERE token_hash = $1
    AND revoked_at IS NULL
    AND absolute_expires_at > now()
@@ -89,6 +94,7 @@ func (q *Queries) GetSessionByHash(ctx context.Context, tokenHash string) (Sessi
 		&i.SlidingExpiresAt,
 		&i.AbsoluteExpiresAt,
 		&i.RevokedAt,
+		&i.AccountID,
 	)
 	return i, err
 }

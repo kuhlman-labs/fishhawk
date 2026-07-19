@@ -11,12 +11,15 @@ import (
 )
 
 // userResponse mirrors the OpenAPI `User` schema. Surfaces only
-// what the SPA / CLI needs.
+// what the SPA / CLI needs. AccountID is the workspace account the
+// session's membership gate resolved (E44.3); null for bearer-token
+// identities.
 type userResponse struct {
 	ID          string  `json:"id"`
 	GitHubLogin string  `json:"github_login"`
 	Name        string  `json:"name"`
 	Email       *string `json:"email"`
+	AccountID   *string `json:"account_id"`
 }
 
 // handleGitHubLogin implements GET /v0/auth/github/login. Mints a
@@ -136,7 +139,36 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, sess, err := s.cfg.AuthRepo.SignIn(r.Context(), *profile)
+	// Workspace-membership gate (E44.3 / ADR-057 Amendment A2): the
+	// profile fetch succeeding is NOT admission. Resolve which
+	// account(s) admit this user — invited account_members rows
+	// DB-only, auto-join via the live org-list bootstrap — BEFORE any
+	// session exists. Fail closed on every branch: no resolver and no
+	// match both deny with no session cookie.
+	if s.cfg.AuthMembership == nil {
+		s.cfg.Logger.Warn("oauth sign-in denied: no membership resolver configured",
+			"github_login", profile.Login)
+		http.Redirect(w, r, s.accessDeniedRedirect(), http.StatusFound)
+		return
+	}
+	accountIDs, err := s.cfg.AuthMembership.ResolveAccounts(r.Context(), "github", accessToken, *profile)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadGateway, "membership_resolution_failed",
+			"could not resolve workspace membership; sign-in denied",
+			map[string]any{"error": err.Error()})
+		return
+	}
+	if len(accountIDs) == 0 {
+		s.cfg.Logger.Info("oauth sign-in denied: no admitting account",
+			"github_login", profile.Login)
+		http.Redirect(w, r, s.accessDeniedRedirect(), http.StatusFound)
+		return
+	}
+	// Deterministic-first: the resolver returns a sorted set; a
+	// multi-account picker is out of scope for v0.
+	accountID := accountIDs[0]
+
+	user, sess, err := s.cfg.AuthRepo.SignIn(r.Context(), *profile, accountID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"sign-in failed", map[string]any{"error": err.Error()})
@@ -189,6 +221,7 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		"user_id", user.ID,
 		"github_login", user.GitHubLogin,
 		"session_id", sess.ID,
+		"account_id", accountID.String(),
 	)
 	http.Redirect(w, r, redirect, http.StatusFound)
 }
@@ -220,7 +253,18 @@ func (s *Server) handleGetMe(w http.ResponseWriter, r *http.Request) {
 			"user not found", nil)
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, toUserResponse(user))
+	// A session identity must carry a resolvable account (E44.3).
+	// Defense in depth: an account deleted after sign-in nulls
+	// sessions.account_id (ON DELETE SET NULL), and pre-gate sessions
+	// never had one — both deny rather than render another tenant's
+	// data. Bearer-token identities (no SessionID) pass with a null
+	// account_id; their enforcement is E44.5.
+	if id.SessionID != "" && id.AccountID == "" {
+		s.writeError(w, r, http.StatusForbidden, "account_unresolved",
+			"session is not bound to a workspace account; sign in again", nil)
+		return
+	}
+	s.writeJSON(w, r, http.StatusOK, toUserResponse(user, id.AccountID))
 }
 
 // handleLogout implements POST /v0/auth/logout. Revokes the
@@ -265,13 +309,29 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func toUserResponse(u *auth.User) userResponse {
-	return userResponse{
+func toUserResponse(u *auth.User, accountID string) userResponse {
+	resp := userResponse{
 		ID:          u.ID,
 		GitHubLogin: u.GitHubLogin,
 		Name:        u.Name,
 		Email:       u.Email,
 	}
+	if accountID != "" {
+		resp.AccountID = &accountID
+	}
+	return resp
+}
+
+// accessDeniedRedirect is the safe relative target the callback sends
+// membership-denied users to. Falls back to /access-denied on an
+// empty or unsafe configured value (same defense-in-depth as the
+// post-login redirect).
+func (s *Server) accessDeniedRedirect() string {
+	target := s.cfg.AuthAccessDeniedRedirect
+	if target == "" || !isSafeRelativeRedirect(target) {
+		return "/access-denied"
+	}
+	return target
 }
 
 // isSafeRelativeRedirect rejects URLs that look like open-redirect
