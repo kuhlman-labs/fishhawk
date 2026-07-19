@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1814,6 +1815,115 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	}
 	if got := stageState(parkedStageID); got != "dispatched" {
 		t.Errorf("parked-local stage state after down = %q, want dispatched (backfill reversed)", got)
+	}
+}
+
+// TestMigration0055_BackfillsRunsAccountID is the #1825 backfill round-trip
+// guard. 0055's up migration ends with an UPDATE that associates pre-existing
+// runs with their account via the installations mapping:
+//
+//	UPDATE runs SET account_id = i.account_id FROM installations i
+//	 WHERE runs.installation_id IS NOT NULL
+//	   AND i.installation_ref = runs.installation_id::text;
+//
+// The schema-shape/provider/rollback assertions in TestMigrateUp/TestMigrateDown
+// all pass even if this UPDATE (or its ::text cast) is removed — they never seed
+// a run+installation pair, so the backfill silently updates nothing and the
+// column-level assertions can't tell. This test seeds the pair BEFORE 0055 (at
+// 0054) and asserts the UPDATE actually fires: a run whose installation_id::text
+// matches an installation_ref gets that installation's account_id, while a run
+// with NULL installation_id stays NULL (the `installation_id IS NOT NULL`
+// guard). Removing the UPDATE, dropping the ::text cast, or breaking the join
+// makes this FAIL. Follows the partial-migrate + seed + migrate + assert shape
+// of TestMigration0053_BackfillsParkedLocalStages, seeding via raw SQL against
+// the migrated-to-0054 DB (not the sqlc package).
+func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
+	url := startContainer(t)
+
+	// Apply everything, then roll 0055 back so we can seed a run+installation
+	// pair under the pre-0055 schema (accounts + installations exist at 0052;
+	// runs.installation_id exists at 0005; runs.account_id does NOT yet exist).
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0055 to reach 0054): %v", err)
+	}
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	// An account and an installation whose installation_ref is the string form of
+	// a BIGINT installation id — so installation_id::text = installation_ref joins.
+	const installationBigint = int64(987654321)
+	accountID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, account_key) VALUES ($1, 'backfill-acct')`,
+		accountID,
+	); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO installations (id, account_id, installation_ref) VALUES ($1, $2, $3)`,
+		uuid.New(), accountID, strconv.FormatInt(installationBigint, 10),
+	); err != nil {
+		t.Fatalf("seed installation: %v", err)
+	}
+
+	// A run whose installation_id (BIGINT) equals the installation's ref — the
+	// backfill must associate it with the account.
+	matchedRunID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind, installation_id)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'github_actions', $2)`,
+		matchedRunID, installationBigint,
+	); err != nil {
+		t.Fatalf("seed run with installation_id: %v", err)
+	}
+	// A run with NULL installation_id — the `installation_id IS NOT NULL` guard
+	// must leave its account_id NULL.
+	nullRunID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind, installation_id)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'local', NULL)`,
+		nullRunID,
+	); err != nil {
+		t.Fatalf("seed run with NULL installation_id: %v", err)
+	}
+	pool.Close()
+
+	// Re-apply 0055: adds runs.account_id then runs the backfill UPDATE.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply 0055 backfill): %v", err)
+	}
+
+	pool2, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("re-Connect: %v", err)
+	}
+	defer pool2.Close()
+
+	runAccountID := func(id uuid.UUID) *uuid.UUID {
+		t.Helper()
+		var acct *uuid.UUID
+		if err := pool2.QueryRow(context.Background(),
+			`SELECT account_id FROM runs WHERE id = $1`, id,
+		).Scan(&acct); err != nil {
+			t.Fatalf("read run %s account_id: %v", id, err)
+		}
+		return acct
+	}
+
+	if got := runAccountID(matchedRunID); got == nil {
+		t.Error("matched run account_id after backfill = NULL, want the seeded account (backfill UPDATE did not fire)")
+	} else if *got != accountID {
+		t.Errorf("matched run account_id after backfill = %s, want %s", *got, accountID)
+	}
+	if got := runAccountID(nullRunID); got != nil {
+		t.Errorf("NULL-installation run account_id after backfill = %s, want NULL (installation_id IS NOT NULL guard)", *got)
 	}
 }
 
