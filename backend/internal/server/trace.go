@@ -3664,7 +3664,7 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// stamped with the sequence the append returned — the audit
 			// chain stays the sole sequence authority, so a failed append
 			// (no sequence) skips persistence for this verdict.
-			s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, entry.Sequence, verdict.Concerns)
+			freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, entry.Sequence, verdict.Concerns)
 			// Apply the delta-verification resolutions to the concern
 			// store (#984) — same append-gated, best-effort posture.
 			s.applyConcernResolutions(ctx, runID, stageID, verdict.ConcernResolutions)
@@ -3678,7 +3678,20 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// children no-op. Fires at most once per loop; idempotent across
 			// later re-review rounds via the already-terminal silent skip.
 			if !conditionClaimsResolved && verdict.Verdict != planreview.VerdictReject {
-				s.resolveConditionClaimedPlanConcerns(ctx, runID, entry.Sequence, model, string(verdict.Verdict))
+				// Cross-link this confirming review's OWN fresh implement
+				// concerns (#2066): persistReviewConcerns ran earlier in this
+				// same iteration for this same verdict, so freshRows are the
+				// concerns THIS confirming review minted. A non-empty set
+				// qualifies the resolution's state_reason + audit payload so
+				// the settled ledger no longer asserts an unqualified
+				// "confirmed delivered" when the same review re-raised concerns.
+				freshIDs := make([]uuid.UUID, 0, len(freshRows))
+				for _, fr := range freshRows {
+					if fr != nil {
+						freshIDs = append(freshIDs, fr.ID)
+					}
+				}
+				s.resolveConditionClaimedPlanConcerns(ctx, runID, entry.Sequence, model, string(verdict.Verdict), freshIDs)
 				conditionClaimsResolved = true
 			}
 		}
@@ -4282,9 +4295,18 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 // Best-effort like the append itself: a nil repo or an insert failure
 // warn-logs and never fails the review loop — the audit payload remains
 // the authoritative record and this store is a derived index over it.
-func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel string, originSequence int64, concerns []planreview.Concern) {
+//
+// It RETURNS the minted concern rows (#2066) so the implement-review loop
+// can cross-link a confirming review's OWN fresh concerns into the
+// condition-claim resolution. The returned set is the concerns that
+// actually minted an open row — suppressRelitigation (below) drops
+// relitigation-suppressed concerns from the batch BEFORE InsertRaised, so
+// this can be a strict subset of `concerns`, which is exactly why it (not
+// the raw verdict.Concerns) is the correct fresh-concern source. Every
+// early-return / error path returns nil.
+func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel string, originSequence int64, concerns []planreview.Concern) []*concern.Concern {
 	if s.cfg.ConcernRepo == nil || len(concerns) == 0 {
-		return
+		return nil
 	}
 	raised := make([]concern.RaisedConcern, 0, len(concerns))
 	for _, c := range concerns {
@@ -4309,23 +4331,26 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 		})
 	}
 	if len(raised) == 0 {
-		return
+		return nil
 	}
-	if _, err := s.cfg.ConcernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+	minted, err := s.cfg.ConcernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
 		RunID:                runID,
 		StageID:              stageID,
 		StageKind:            stageKind,
 		ReviewerModel:        reviewerModel,
 		OriginReviewSequence: originSequence,
 		Concerns:             raised,
-	}); err != nil {
+	})
+	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review concerns: persist failed — audit payload remains authoritative",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("stage_kind", stageKind),
 			slog.String("error", err.Error()),
 		)
+		return nil
 	}
+	return minted
 }
 
 // suppressRelitigation reports whether the concern c is a no-evidence re-raise of

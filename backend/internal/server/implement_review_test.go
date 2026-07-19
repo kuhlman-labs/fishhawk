@@ -1769,6 +1769,103 @@ func TestImplementReview_ConditionClaim_ResolvesOnConfirmingVerdict(t *testing.T
 	}
 }
 
+// TestImplementReview_ConditionClaim_QualifiedWhenConfirmingReviewRaisesFreshConcerns
+// is the #2066 cross-boundary wiring test: it drives the real
+// runImplementReviewInvocations loop with a confirming approve_with_concerns
+// reviewer that mints its OWN fresh implement concerns, and asserts the trace.go
+// seam (persistReviewConcerns return -> fresh-ids capture ->
+// resolveConditionClaimedPlanConcerns) qualifies the resolution. The claimed
+// plan concern still resolves to addressed_by_condition, but the state_reason
+// drops the unqualified "confirmed delivered" wording and the lineage payload
+// cross-links the fresh implement concern ids minted in the SAME review. The
+// direct-call unit tests bypass this seam by calling the resolver directly.
+func TestImplementReview_ConditionClaim_QualifiedWhenConfirmingReviewRaisesFreshConcerns(t *testing.T) {
+	ar := newFakeApprovalRepo()
+	rr := newApprovalRunRepo()
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: ar,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		ConcernRepo:  cr,
+	})
+
+	planStage := rr.seedStage(run.StageStateAwaitingApproval)
+	runID := planStage.RunID
+	claimed := seedConcernRow(t, cr, runID, planStage.ID, concern.StageKindPlan, 5, "the retry cap is not enforced")
+
+	w := submitApproval(t, s, planStage.ID,
+		fmt.Sprintf(`{"decision":"approve","claims_concern_ids":[%q]}`, claimed.ID.String()))
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// The confirming review is non-reject BUT raises its own fresh implement
+	// concerns re-litigating the same substance (the run cae3666a shape).
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictApproveWithConcerns,
+			Concerns: []planreview.Concern{
+				{Severity: planreview.SeverityHigh, Category: "correctness", Note: "the retry cap is STILL not enforced"},
+			},
+		},
+		model: "claude-opus-4-8",
+	}
+	implStageID := uuid.New()
+	s.runImplementReviewInvocations(context.Background(), runID, implStageID,
+		[]reviewerInvocation{{reviewer: reviewer}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget)
+
+	// The claim still resolves — the operator's binding condition is the authority.
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{claimed.ID})
+	if rows[0].State != concern.StateAddressedByCondition {
+		t.Fatalf("claimed concern state = %q, want addressed_by_condition", rows[0].State)
+	}
+	if strings.Contains(rows[0].StateReason, "confirmed delivered") {
+		t.Errorf("state_reason = %q, must NOT assert unqualified \"confirmed delivered\" when the confirming review raised fresh concerns", rows[0].StateReason)
+	}
+	if !strings.Contains(rows[0].StateReason, "1 fresh implement concern") {
+		t.Errorf("state_reason = %q, want it to name the fresh-concern count (1)", rows[0].StateReason)
+	}
+
+	// The fresh implement concern the review minted in the same pass.
+	all, _ := cr.ListByRun(context.Background(), runID)
+	var freshImplIDs []string
+	for _, row := range all {
+		if row.StageKind == concern.StageKindImplement {
+			freshImplIDs = append(freshImplIDs, row.ID.String())
+		}
+	}
+	if len(freshImplIDs) != 1 {
+		t.Fatalf("minted implement concerns = %d, want 1", len(freshImplIDs))
+	}
+
+	entries := au.entriesByCategory(CategoryConcernAddressedByCondition)
+	if len(entries) != 1 {
+		t.Fatalf("concern_addressed_by_condition entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode lineage payload: %v", err)
+	}
+	if payload["confirming_review_qualified"] != true {
+		t.Errorf("confirming_review_qualified = %v, want true", payload["confirming_review_qualified"])
+	}
+	raw, ok := payload["confirming_review_fresh_concern_ids"].([]any)
+	if !ok {
+		t.Fatalf("confirming_review_fresh_concern_ids = %v, want a []string cross-linking the fresh concern", payload["confirming_review_fresh_concern_ids"])
+	}
+	got := make([]string, 0, len(raw))
+	for _, v := range raw {
+		got = append(got, v.(string))
+	}
+	if len(got) != 1 || got[0] != freshImplIDs[0] {
+		t.Errorf("confirming_review_fresh_concern_ids = %v, want the minted implement concern %v", got, freshImplIDs)
+	}
+}
+
 // TestImplementReview_ConditionClaim_RejectLeavesConcernOpen is the #1956
 // reject control: an all-reject review round resolves nothing — the claimed
 // concern stays open (the ONE-confirming-review contract).

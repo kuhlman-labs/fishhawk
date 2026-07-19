@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -125,7 +126,7 @@ func TestResolveConditionClaimedPlanConcerns_HappyPath(t *testing.T) {
 	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 5, "the retry cap is not enforced")
 	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
 
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve_with_concerns")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve_with_concerns", nil)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateAddressedByCondition {
@@ -169,6 +170,94 @@ func TestResolveConditionClaimedPlanConcerns_HappyPath(t *testing.T) {
 	}
 }
 
+func TestResolveConditionClaimedPlanConcerns_QualifiedWhenConfirmingReviewRaisedFreshConcerns(t *testing.T) {
+	s, au, cr := conditionClaimsServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 5, "the gap is not met")
+	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
+
+	// The confirming review minted two fresh implement concerns of its own.
+	fresh := []uuid.UUID{uuid.New(), uuid.New()}
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve_with_concerns", fresh)
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
+	// The claim STILL resolves — the operator's binding condition is the
+	// authority; only the LABEL is qualified.
+	if rows[0].State != concern.StateAddressedByCondition {
+		t.Fatalf("state = %q, want addressed_by_condition (the claim still resolves when qualified)", rows[0].State)
+	}
+	if strings.Contains(rows[0].StateReason, "confirmed delivered") {
+		t.Errorf("state_reason = %q, must NOT assert unqualified \"confirmed delivered\" when the confirming review raised fresh concerns", rows[0].StateReason)
+	}
+	if !strings.Contains(rows[0].StateReason, "2 fresh implement concern") {
+		t.Errorf("state_reason = %q, want it to name the fresh-concern count (2)", rows[0].StateReason)
+	}
+
+	idx := auditEntriesByCategory(au, CategoryConcernAddressedByCondition)
+	if len(idx) != 1 {
+		t.Fatalf("concern_addressed_by_condition entries = %d, want 1", len(idx))
+	}
+	au.mu.Lock()
+	entry := au.appended[idx[0]]
+	au.mu.Unlock()
+	var payload map[string]any
+	if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload["confirming_review_qualified"] != true {
+		t.Errorf("confirming_review_qualified = %v, want true", payload["confirming_review_qualified"])
+	}
+	raw, ok := payload["confirming_review_fresh_concern_ids"].([]any)
+	if !ok {
+		t.Fatalf("confirming_review_fresh_concern_ids = %v, want a []string", payload["confirming_review_fresh_concern_ids"])
+	}
+	got := make([]string, 0, len(raw))
+	for _, v := range raw {
+		got = append(got, v.(string))
+	}
+	want := []string{fresh[0].String(), fresh[1].String()}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("confirming_review_fresh_concern_ids = %v, want %v", got, want)
+	}
+}
+
+func TestResolveConditionClaimedPlanConcerns_UnqualifiedOnCleanApprove(t *testing.T) {
+	s, au, cr := conditionClaimsServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 5, "the retry cap is not enforced")
+	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
+
+	// A clean approve with zero fresh minted concerns keeps the verbatim wording.
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
+
+	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
+	if rows[0].State != concern.StateAddressedByCondition {
+		t.Fatalf("state = %q, want addressed_by_condition", rows[0].State)
+	}
+	wantReason := "binding approval condition (approval sequence 42) confirmed delivered by implement review sequence 200"
+	if rows[0].StateReason != wantReason {
+		t.Errorf("state_reason = %q, want the verbatim unqualified wording %q", rows[0].StateReason, wantReason)
+	}
+
+	idx := auditEntriesByCategory(au, CategoryConcernAddressedByCondition)
+	if len(idx) != 1 {
+		t.Fatalf("concern_addressed_by_condition entries = %d, want 1", len(idx))
+	}
+	au.mu.Lock()
+	entry := au.appended[idx[0]]
+	au.mu.Unlock()
+	var payload map[string]any
+	if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload["confirming_review_qualified"] != false {
+		t.Errorf("confirming_review_qualified = %v, want false on a clean approve", payload["confirming_review_qualified"])
+	}
+	if _, present := payload["confirming_review_fresh_concern_ids"]; present {
+		t.Errorf("confirming_review_fresh_concern_ids present = %v, want omitted when unqualified", payload["confirming_review_fresh_concern_ids"])
+	}
+}
+
 func TestResolveConditionClaimedPlanConcerns_AppendFailureNoTransition(t *testing.T) {
 	s, au, cr := conditionClaimsServer(t)
 	runID, stageID := uuid.New(), uuid.New()
@@ -178,7 +267,7 @@ func TestResolveConditionClaimedPlanConcerns_AppendFailureNoTransition(t *testin
 	// NOT run (durable-record-first).
 	au.appendErrCategory = CategoryConcernAddressedByCondition
 
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateRaised {
@@ -196,7 +285,7 @@ func TestResolveConditionClaimedPlanConcerns_AlreadyWaivedSilentSkip(t *testing.
 	}
 	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
 
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateWaived {
@@ -215,7 +304,7 @@ func TestResolveConditionClaimedPlanConcerns_ImplementStageRowSkipped(t *testing
 	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 5, "implement concern")
 	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
 
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateRaised {
@@ -241,7 +330,7 @@ func TestResolveConditionClaimedPlanConcerns_ApplyResolutionFailureAfterAppend(t
 	row := seedConcernRow(t, base, runID, stageID, concern.StageKindPlan, 5, "condition")
 	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
 
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateRaised {
@@ -255,7 +344,7 @@ func TestResolveConditionClaimedPlanConcerns_ApplyResolutionFailureAfterAppend(t
 	if n := len(auditEntriesByCategory(au, CategoryConcernAddressedByCondition)); n != 1 {
 		t.Fatalf("concern_addressed_by_condition entries = %d, want 1 after the first failed transition", n)
 	}
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 300, "gpt-5.5", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 300, "gpt-5.5", "approve", nil)
 	if n := len(auditEntriesByCategory(au, CategoryConcernAddressedByCondition)); n != 2 {
 		t.Errorf("concern_addressed_by_condition entries = %d, want 2 (a still-open row re-appends on the next round)", n)
 	}
@@ -271,7 +360,7 @@ func TestResolveConditionClaimedPlanConcerns_CrossRunRowSkipped(t *testing.T) {
 	row := seedConcernRow(t, cr, otherRunID, stageID, concern.StageKindPlan, 5, "another run's plan concern")
 	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
 
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateRaised {
@@ -289,9 +378,9 @@ func TestResolveConditionClaimedPlanConcerns_SecondRoundIdempotent(t *testing.T)
 	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
 
 	// Round 1 resolves it.
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
 	// Round 2 (a post-fixup re-review) must be a no-op on the already-terminal row.
-	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 300, "gpt-5.5", "approve")
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 300, "gpt-5.5", "approve", nil)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateAddressedByCondition {
