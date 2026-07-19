@@ -301,22 +301,27 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 							// (ADR-057 / E44.5): an mcp:run token acts within
 							// its run's tenant account, so the ownership
 							// middleware bounds it exactly as a bearer token
-							// bound to that account. Best-effort via the
-							// optional AccountGetter capability — a fake
-							// repo that doesn't implement it leaves AccountID
-							// empty (untenanted, allowed). A DB-unavailable
-							// lookup short-circuits 503 per the writeDBUnavailable
-							// contract rather than masking an outage as a
-							// per-handler denial.
+							// bound to that account. Resolved via the optional
+							// AccountGetter capability — a fake repo that
+							// doesn't implement it leaves AccountID empty. The
+							// untenanted-run happy path is GetRunAccountID
+							// returning "" with NO error → empty AccountID
+							// (allowed). Any lookup ERROR fails CLOSED with 503:
+							// a run-scoped token that cannot resolve its own
+							// run's account must never fall through to a
+							// resolved accountless identity, which
+							// accountVisiblePage/handleListRuns would promote to
+							// the global operator view (a run-scoped token
+							// escalated to global read). A DB-unavailable error
+							// is the same 503; an ordinary error mirrors it via
+							// writeDBUnavailable rather than proceeding.
 							if getter, gok := s.cfg.RunRepo.(run.AccountGetter); gok {
 								acct, aerr := getter.GetRunAccountID(r.Context(), rec.RunID)
-								if dberr.IsUnavailable(aerr) {
+								if aerr != nil {
 									s.writeDBUnavailable(w, r)
 									return
 								}
-								if aerr == nil {
-									id.AccountID = acct
-								}
+								id.AccountID = acct
 							}
 						}
 					case tokens != nil:

@@ -359,16 +359,19 @@ func TestBearerAuth_MCPToken_StampsAccountIDFromRun(t *testing.T) {
 // TestBearerAuth_MCPToken_AccountLookupError_FallsThrough covers the
 // non-unavailable error branch of the mcp:run AccountID-population path: when
 // GetRunAccountID returns an ordinary (not DB-unavailable) error, the lookup
-// is best-effort — id.AccountID stays empty and the middleware still resolves a
-// non-anonymous mcp identity and calls the handler. The empty account is
-// fail-safe (a tenanted run then denies via ownership; an untenanted run
-// allows).
+// must FAIL CLOSED with 503 rather than fall through to a resolved accountless
+// identity. An accountless-but-resolved mcp identity would gain
+// accountless-operator GLOBAL visibility on the unwrapped collection/export
+// endpoints (accountVisiblePage's `if acct == "" { return page }`
+// short-circuit) — a run-scoped token promoted to the global operator tier. A
+// token that cannot resolve its own run's account must never reach a handler.
 func TestBearerAuth_MCPToken_AccountLookupError_FallsThrough(t *testing.T) {
 	fr := newFakeRepo()
 	runID := uuid.New()
 	fr.runs[runID] = &run.Run{ID: runID, AccountID: "44444444-5555-6666-7777-888888888888"}
-	// A plain error is NOT dberr.IsUnavailable, so GetRunAccountID's failure
-	// must fall through (empty AccountID) rather than short-circuit 503.
+	// A plain error is NOT dberr.IsUnavailable, but GetRunAccountID's failure
+	// must still fail closed with 503, not fall through to a global-visibility
+	// accountless identity.
 	fr.getErr = fmt.Errorf("account lookup failed")
 	s := newServer(t, fr)
 
@@ -379,26 +382,23 @@ func TestBearerAuth_MCPToken_AccountLookupError_FallsThrough(t *testing.T) {
 		Scopes:    []string{"mcp:read"},
 	}}
 
-	var captured Identity
-	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		captured = IdentityFrom(r.Context())
+	var handlerRan bool
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerRan = true
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("Authorization", "Bearer "+mcptoken.TokenPrefix+"matchingplaintext")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (handler ran despite the account lookup error)", rec.Code)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (fail closed on an account lookup error)", rec.Code)
 	}
-	if captured.IsAnonymous() {
-		t.Fatalf("expected a resolved mcp identity, got %+v", captured)
+	if !strings.Contains(rec.Body.String(), "service_unavailable") {
+		t.Errorf("body missing service_unavailable code:\n%s", rec.Body.String())
 	}
-	if captured.Subject != "mcp:run:"+runID.String() {
-		t.Errorf("Subject = %q, want mcp:run:%s", captured.Subject, runID)
-	}
-	if captured.AccountID != "" {
-		t.Errorf("Identity.AccountID = %q, want empty on a best-effort lookup failure", captured.AccountID)
+	if handlerRan {
+		t.Error("handler should not run when the run-scoped token cannot resolve its account")
 	}
 }
 
