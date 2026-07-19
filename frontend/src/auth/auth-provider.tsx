@@ -32,6 +32,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setState({ status: 'authenticated', user });
         return;
       }
+      if (res.status === 403) {
+        // Valid session, but no workspace account resolves for it
+        // (account_unresolved, E44.3 #1827). Bouncing to /login would
+        // loop — the OAuth flow succeeds and lands right back here —
+        // so this is a distinct terminal state.
+        setState({ status: 'denied', user: null });
+        return;
+      }
       setState({ status: 'unauthenticated', user: null });
     } catch {
       setState({ status: 'unauthenticated', user: null });
