@@ -1608,6 +1608,13 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		runnerKindFilter = &v
 	}
 
+	// Account-scoped listing (ADR-057 / E44.5): bound the page to the
+	// caller's tenant account. An empty caller account (bearer/operator token
+	// with no account, or anonymous) is no constraint — the pre-tenancy view.
+	// A tenanted caller sees its own runs plus untenanted (NULL account_id)
+	// rows, per ListRunsFilter.AccountID's contract.
+	accountFilter := IdentityFrom(r.Context()).AccountID
+
 	// Fetch one extra row so we can tell whether there's a next
 	// page without a separate COUNT query. The trick: ask for
 	// limit+1, drop the extra in the response if present.
@@ -1618,6 +1625,7 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		PullRequestURL: prURLFilter,
 		TriggerRef:     triggerRefFilter,
 		RunnerKind:     runnerKindFilter,
+		AccountID:      accountFilter,
 		Limit:          limit + 1,
 		Offset:         offset,
 	})

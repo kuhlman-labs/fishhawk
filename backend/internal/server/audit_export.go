@@ -263,6 +263,10 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		// resolveExportPage already wrote the error response.
 		return
 	}
+	// Account-scope the page (ADR-057 / E44.5): a tenant can only export its
+	// own (and untenanted) run evidence. The global chain partition below is
+	// run-less and stays unfiltered.
+	ep.page = accountVisiblePage(r, ep.page)
 
 	resp := exportResponse{
 		Schema:     exportSchemaV1,
@@ -302,6 +306,29 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Fishhawk-Export-Next-Cursor", ep.nextCursor)
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// accountVisiblePage filters a resolved export page to the caller's tenant
+// account (ADR-057 / E44.5): runs whose account_id equals the caller's
+// Identity.AccountID, plus untenanted (empty AccountID) runs, which stay
+// visible. An empty caller account (bearer/operator token with no account, or
+// anonymous) is no constraint — the whole page is returned, the pre-tenancy
+// view. Every bulk-export surface (JSON, CSV, agent-changes report) routes its
+// page through this so a tenant can never export another account's run
+// evidence. The run-less global chain partition is NOT account-scoped (it has
+// no owning run) and is emitted unfiltered by each handler.
+func accountVisiblePage(r *http.Request, page []*run.Run) []*run.Run {
+	acct := IdentityFrom(r.Context()).AccountID
+	if acct == "" {
+		return page
+	}
+	out := make([]*run.Run, 0, len(page))
+	for _, rn := range page {
+		if rn.AccountID == "" || rn.AccountID == acct {
+			out = append(out, rn)
+		}
+	}
+	return out
 }
 
 // selectExplicitRuns resolves an explicit run-id set. A compliance

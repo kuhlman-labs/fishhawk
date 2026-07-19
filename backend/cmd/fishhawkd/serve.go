@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
@@ -912,7 +913,11 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.ConcernRepo = concern.NewPostgresRepository(pool)
 		cfg.RefinementRepo = resolveRefinementRepo(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
-		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth)", slog.String("driver", "postgres"))
+		// Account-role reader for the handler-authz write tiers (ADR-057 /
+		// E44.5, #1829). Nil pool leaves cfg.AccountRoles nil (untenanted-allow
+		// — role-bounding skipped), mirroring AuthMembership's nil-pool posture.
+		cfg.AccountRoles = account.NewStore(accountdb.New(pool))
+		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth + account-roles)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
 	}

@@ -29,6 +29,60 @@ func newRepo(t *testing.T) apitoken.Repository {
 	return apitoken.NewPostgresRepository(pool)
 }
 
+// TestPostgres_GetTokenByHash_ScansAccountID exercises migration 0055's
+// nullable api_tokens.account_id (ADR-057 / E44.5): Authenticate (which reads
+// via GetTokenByHash) surfaces "" for an untenanted token and the bound
+// account UUID for a tenanted one. Issue does not set account_id, so the
+// binding is a raw UPDATE — the writer/backfill lands in a later child.
+func TestPostgres_GetTokenByHash_ScansAccountID(t *testing.T) {
+	url := pgtest.NewURL(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	r := apitoken.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	// Untenanted token: NULL account_id maps to "".
+	untenanted, err := r.Issue(ctx, "github:acctless", []string{"read:runs"})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	authU, err := r.Authenticate(ctx, untenanted.PlainText)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if authU.AccountID != "" {
+		t.Errorf("untenanted AccountID = %q, want empty", authU.AccountID)
+	}
+
+	// Tenanted token: bind an account, re-authenticate, assert it round-trips.
+	acctID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+		acctID, "acct-"+acctID.String()[:8]); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	tenanted, err := r.Issue(ctx, "github:acctful", nil)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE api_tokens SET account_id = $1 WHERE id = $2`,
+		acctID, tenanted.ID); err != nil {
+		t.Fatalf("bind account: %v", err)
+	}
+	authT, err := r.Authenticate(ctx, tenanted.PlainText)
+	if err != nil {
+		t.Fatalf("Authenticate (tenanted): %v", err)
+	}
+	if authT.AccountID != acctID.String() {
+		t.Errorf("tenanted AccountID = %q, want %q", authT.AccountID, acctID.String())
+	}
+}
+
 func TestPostgres_Issue_ReturnsPlaintextOnce(t *testing.T) {
 	r := newRepo(t)
 	tok, err := r.Issue(context.Background(), "github:42", []string{"runs:read"})

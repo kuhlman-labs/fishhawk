@@ -19,7 +19,9 @@ RETURNING *;
 -- name: GetTokenByHash :one
 -- Active-only: revoked tokens never authenticate. Used on every
 -- bearer-auth request, so the partial index on (token_hash) WHERE
--- revoked_at IS NULL is the hot path.
+-- revoked_at IS NULL is the hot path. Selects account_id (ADR-057 / E44.5)
+-- so the bearer-auth path can thread the token's tenant account onto the
+-- resolved Identity.
 SELECT * FROM api_tokens
  WHERE token_hash = $1
    AND revoked_at IS NULL;

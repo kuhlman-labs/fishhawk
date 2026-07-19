@@ -299,6 +299,18 @@ type Config struct {
 	// "/access-denied"; validated by isSafeRelativeRedirect.
 	AuthAccessDeniedRedirect string
 
+	// AccountRoles resolves a cookie-session caller's role within its
+	// tenant workspace account (ADR-057 / E44.5, #1829). The account-
+	// ownership middleware's write tiers consult it to bound a resolved
+	// OAuth cookie: an admin role clears the destructive/admin tier, a
+	// member (or NULL/unknown role) clears only the operator-decision tier.
+	// Nil is the untenanted-allow posture — a deployment without a database
+	// wires no reader, so the role check is skipped and only the ownership
+	// check applies. Wired from account.NewStore(accountdb.New(pool)) in
+	// serve.go; bearer/mcp identities never reach it (role-bounding is
+	// cookie-only).
+	AccountRoles AccountRoles
+
 	// ExternalURL is the operator-facing root URL for the SPA, e.g.
 	// `https://app.fishhawk.example.com`. Used to build links in
 	// surfaces that escape the backend (today: GitHub Check Runs,

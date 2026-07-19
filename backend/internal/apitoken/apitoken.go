@@ -80,6 +80,16 @@ type Token struct {
 	// token (e.g. "github"). Empty for static tokens.
 	Provider string
 
+	// AccountID is the tenant workspace account this token acts within
+	// (ADR-057 / E44.5, migration 0055's nullable api_tokens.account_id).
+	// Empty string when the token is untenanted (NULL account_id — every
+	// operator/static token and every legacy row until a later child
+	// backfills). Populated by Authenticate (GetTokenByHash selects the
+	// column); the bearer-auth path threads it onto Identity.AccountID so
+	// the account-ownership middleware can bound a bearer request to its
+	// account.
+	AccountID string
+
 	// PlainText is the bearer string the caller stores. Set only
 	// on Issue's return value; empty for tokens loaded from the
 	// repository.

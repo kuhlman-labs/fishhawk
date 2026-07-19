@@ -56,6 +56,31 @@ func (q *Queries) GetAccountByKey(ctx context.Context, arg GetAccountByKeyParams
 	return i, err
 }
 
+const getAccountMemberRole = `-- name: GetAccountMemberRole :one
+SELECT role FROM account_members
+ WHERE account_id = $1
+   AND provider = $2
+   AND member_ref = $3
+`
+
+type GetAccountMemberRoleParams struct {
+	AccountID uuid.UUID `json:"account_id"`
+	Provider  string    `json:"provider"`
+	MemberRef string    `json:"member_ref"`
+}
+
+// The handler-authz role lookup (E44.5 / #1829): the caller's role in an
+// account, keyed on the forge-neutral (account_id, provider, member_ref).
+// role is nullable — a grant with no explicit role scans as NULL, which the
+// Go layer interprets as member-tier (least privilege). No row (no membership)
+// surfaces as pgx.ErrNoRows, also member-tier at the caller.
+func (q *Queries) GetAccountMemberRole(ctx context.Context, arg GetAccountMemberRoleParams) (*string, error) {
+	row := q.db.QueryRow(ctx, getAccountMemberRole, arg.AccountID, arg.Provider, arg.MemberRef)
+	var role *string
+	err := row.Scan(&role)
+	return role, err
+}
+
 const getInstallationByRef = `-- name: GetInstallationByRef :one
 SELECT id, account_id, provider, installation_ref, created_at, updated_at, forge_base_url, oauth_base_url FROM installations WHERE provider = $1 AND installation_ref = $2
 `

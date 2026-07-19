@@ -156,6 +156,12 @@ type ListRunsFilter struct {
 	// DecomposedFrom filters to runs minted as children of the
 	// given parent run (#455). Nil = no constraint.
 	DecomposedFrom *uuid.UUID
+	// AccountID scopes the listing to a tenant workspace account
+	// (ADR-057 / E44.5). Empty = no constraint. When set, the query
+	// keeps rows whose account_id equals it OR whose account_id is NULL
+	// (untenanted rows stay visible) — the account-scoped list contract
+	// the /v0/runs handler enforces against the caller's Identity.AccountID.
+	AccountID string
 	// ParentRunID filters to recovery children minted with this
 	// parent_run_id — the resume/retry lineage loadApprovedPlanForRun
 	// walks upward (#216). Nil = no constraint. DISTINCT from
@@ -303,4 +309,19 @@ type Repository interface {
 // race window; production always has the capability.
 type StageCASTransitioner interface {
 	TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error)
+}
+
+// AccountGetter is an OPTIONAL capability on the concrete postgres repo —
+// the cheap tenant-account lookup (ADR-057 / E44.5) that returns just a run's
+// account_id ("" for an untenanted NULL row, the account UUID string
+// otherwise) without materializing the whole run. It is kept OFF the
+// Repository interface — mirroring StageCASTransitioner / AddRunCost /
+// ResolveRunnerKind — because adding a method to Repository would break the
+// ~20 hand-rolled full-interface test fakes across the backend. The
+// bearer-auth mcp:run path type-asserts it to populate Identity.AccountID;
+// when a fake doesn't implement it the mcp identity's AccountID stays empty
+// (untenanted), which the ownership check treats as allow. BaseFake provides a
+// no-op so a fake embedding it satisfies the capability for free.
+type AccountGetter interface {
+	GetRunAccountID(ctx context.Context, id uuid.UUID) (string, error)
 }

@@ -10,11 +10,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 func TestRequestID_GeneratesWhenAbsent(t *testing.T) {
@@ -296,6 +300,144 @@ func TestBearerAuth_StaticToken_ThreadsAuthMethod(t *testing.T) {
 	}
 	if captured.AuthMethod != "static" {
 		t.Errorf("AuthMethod = %q, want static", captured.AuthMethod)
+	}
+}
+
+// TestBearerAuth_APIToken_StampsAccountID pins the E44.5 identity stamping on
+// the api_token bearer path: the resolved token's AccountID is threaded onto
+// Identity.AccountID so the account-ownership middleware can bound the request.
+func TestBearerAuth_APIToken_StampsAccountID(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	const acct = "22222222-3333-4444-5555-666666666666"
+	tok := &apitoken.Token{Subject: "github:42", Scopes: []string{"read:runs"}, AccountID: acct}
+	auth := stubAPITokenAuth{tok: tok}
+
+	var captured Identity
+	h := s.bearerAuth(auth, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer fhk_token_with_account")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured.AccountID != acct {
+		t.Errorf("Identity.AccountID = %q, want %q", captured.AccountID, acct)
+	}
+}
+
+// TestBearerAuth_MCPToken_StampsAccountIDFromRun pins the E44.5 identity
+// stamping on the mcp:run path: the token's AccountID is loaded from its OWN
+// run via the AccountGetter capability, so an mcp:run token is bounded to
+// its run's tenant account exactly as a bearer token bound to that account.
+func TestBearerAuth_MCPToken_StampsAccountIDFromRun(t *testing.T) {
+	fr := newFakeRepo()
+	runID := uuid.New()
+	const acct = "33333333-4444-5555-6666-777777777777"
+	fr.runs[runID] = &run.Run{ID: runID, AccountID: acct}
+	s := newServer(t, fr)
+
+	mcpAuth := &stubMCPAuthenticator{token: &mcptoken.Token{
+		ID:        uuid.New(),
+		RunID:     runID,
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Scopes:    []string{"mcp:read"},
+	}}
+
+	var captured Identity
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+mcptoken.TokenPrefix+"matchingplaintext")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured.AccountID != acct {
+		t.Errorf("mcp Identity.AccountID = %q, want %q (loaded from its run)", captured.AccountID, acct)
+	}
+}
+
+// TestBearerAuth_MCPToken_AccountLookupError_FallsThrough covers the
+// non-unavailable error branch of the mcp:run AccountID-population path: when
+// GetRunAccountID returns an ordinary (not DB-unavailable) error, the lookup
+// must FAIL CLOSED with 503 rather than fall through to a resolved accountless
+// identity. An accountless-but-resolved mcp identity would gain
+// accountless-operator GLOBAL visibility on the unwrapped collection/export
+// endpoints (accountVisiblePage's `if acct == "" { return page }`
+// short-circuit) — a run-scoped token promoted to the global operator tier. A
+// token that cannot resolve its own run's account must never reach a handler.
+func TestBearerAuth_MCPToken_AccountLookupError_FallsThrough(t *testing.T) {
+	fr := newFakeRepo()
+	runID := uuid.New()
+	fr.runs[runID] = &run.Run{ID: runID, AccountID: "44444444-5555-6666-7777-888888888888"}
+	// A plain error is NOT dberr.IsUnavailable, but GetRunAccountID's failure
+	// must still fail closed with 503, not fall through to a global-visibility
+	// accountless identity.
+	fr.getErr = fmt.Errorf("account lookup failed")
+	s := newServer(t, fr)
+
+	mcpAuth := &stubMCPAuthenticator{token: &mcptoken.Token{
+		ID:        uuid.New(),
+		RunID:     runID,
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Scopes:    []string{"mcp:read"},
+	}}
+
+	var handlerRan bool
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerRan = true
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+mcptoken.TokenPrefix+"matchingplaintext")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (fail closed on an account lookup error)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service_unavailable") {
+		t.Errorf("body missing service_unavailable code:\n%s", rec.Body.String())
+	}
+	if handlerRan {
+		t.Error("handler should not run when the run-scoped token cannot resolve its account")
+	}
+}
+
+// TestBearerAuth_MCPToken_AccountLookupDBUnavailable_Returns503 covers the
+// DB-unavailable branch of the mcp:run AccountID-population path: when
+// GetRunAccountID fails because the database is unreachable, the middleware
+// short-circuits with 503 rather than masking the outage as an untenanted
+// (empty-account) identity that would then be denied on its own tenanted run.
+func TestBearerAuth_MCPToken_AccountLookupDBUnavailable_Returns503(t *testing.T) {
+	fr := newFakeRepo()
+	runID := uuid.New()
+	fr.runs[runID] = &run.Run{ID: runID, AccountID: "44444444-5555-6666-7777-888888888888"}
+	fr.getErr = fmt.Errorf("run: account lookup: %w", &pgconn.ConnectError{})
+	s := newServer(t, fr)
+
+	mcpAuth := &stubMCPAuthenticator{token: &mcptoken.Token{
+		ID:        uuid.New(),
+		RunID:     runID,
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Scopes:    []string{"mcp:read"},
+	}}
+
+	var handlerRan bool
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerRan = true
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+mcptoken.TokenPrefix+"matchingplaintext")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "service_unavailable") {
+		t.Errorf("body missing service_unavailable code:\n%s", rec.Body.String())
+	}
+	if handlerRan {
+		t.Error("handler should not run on a 503 short-circuit")
 	}
 }
 

@@ -446,9 +446,19 @@ type Run struct {
 	// back off the prompt-fetch response to route the child onto its
 	// own sole-writer slice branch fishhawk/run-<parent>/slice-<n>.
 	SliceIndex *int
-	State      State
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// AccountID is the tenant workspace account that owns this run
+	// (ADR-057 / E44.5, migration 0055's nullable runs.account_id). Empty
+	// string when the run is untenanted (NULL account_id — CLI/local runs,
+	// and every legacy row until a later child backfills + tightens to NOT
+	// NULL). Populated by construction: GetRun / ListRuns SELECT the column
+	// and rowToRun maps NULL → "". The account-ownership authorization
+	// middleware (internal/server) reads it to bound a run-scoped request to
+	// the caller's account; an untenanted run is allowed through (#1830 will
+	// close the NULL-allow window once every row is populated).
+	AccountID string
+	State     State
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

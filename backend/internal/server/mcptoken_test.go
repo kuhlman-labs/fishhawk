@@ -411,8 +411,15 @@ func TestBearerAuth_MCPTokenRoutesToMCPAuthenticator(t *testing.T) {
 		},
 	}
 
+	// Register the token's run (untenanted) so the mcp:run account lookup
+	// returns ("", nil): bearerAuth fails closed on ANY GetRunAccountID error
+	// (incl. ErrNotFound), and an mcp:run token is always run-bound in
+	// production, so a registered run is the realistic fixture for routing.
+	fr := newFakeRepo()
+	fr.runs[runID] = &run.Run{ID: runID}
+
 	var captured Identity
-	h := newServer(t, newFakeRepo()).bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+	h := newServer(t, fr).bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		captured = IdentityFrom(r.Context())
 	}))
 	req := httptest.NewRequest(http.MethodGet, "/v0/runs", http.NoBody)

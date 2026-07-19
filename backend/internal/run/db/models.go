@@ -132,6 +132,7 @@ type Run struct {
 	SliceIndex             *int32             `json:"slice_index"`
 	RunnerKindResolved     bool               `json:"runner_kind_resolved"`
 	UpstreamRunID          *uuid.UUID         `json:"upstream_run_id"`
+	AccountID              *uuid.UUID         `json:"account_id"`
 }
 
 type ScopeAmendment struct {

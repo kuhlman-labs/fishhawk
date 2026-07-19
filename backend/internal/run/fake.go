@@ -30,6 +30,11 @@ func (BaseFake) GetRun(_ context.Context, _ uuid.UUID) (*Run, error) {
 	return nil, ErrNotFound
 }
 
+// GetRunAccountID returns "", ErrNotFound.
+func (BaseFake) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", ErrNotFound
+}
+
 // GetRunByIdempotencyKey returns nil, ErrNotFound.
 func (BaseFake) GetRunByIdempotencyKey(_ context.Context, _, _ string) (*Run, error) {
 	return nil, ErrNotFound
