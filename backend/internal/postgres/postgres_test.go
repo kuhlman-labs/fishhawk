@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"os"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -794,13 +796,21 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Errorf("insert account_member with provider='gitlab' FK'd to gitlab account failed (narrower CHECK?): %v", err)
 	}
 	// CHECK fail-closed: an out-of-set provider is rejected by
-	// account_members_provider_check.
-	if _, err := pool.Exec(context.Background(),
+	// account_members_provider_check. Assert the specific constraint name, not
+	// merely that some error fired — a bitbucket member FK'd to the github
+	// account ALSO violates the composite FK (no (id, 'bitbucket') accounts row),
+	// so a non-nil error alone would pass even if the provider CHECK were dropped.
+	// Pinning the constraint name proves the CHECK, not the FK, is the rejector.
+	_, err = pool.Exec(context.Background(),
 		`INSERT INTO account_members (id, account_id, provider, member_ref)
 		 VALUES ($1, $2, 'bitbucket', 'bb-user')`,
 		uuid.New(), githubAccountID,
-	); err == nil {
-		t.Error("insert account_member with provider='bitbucket' succeeded, want account_members_provider_check rejection")
+	)
+	var bitbucketErr *pgconn.PgError
+	if !errors.As(err, &bitbucketErr) {
+		t.Errorf("insert account_member with provider='bitbucket' returned %v, want *pgconn.PgError from account_members_provider_check", err)
+	} else if bitbucketErr.ConstraintName != "account_members_provider_check" {
+		t.Errorf("insert account_member with provider='bitbucket' rejected by constraint %q, want account_members_provider_check (the CHECK, not the composite FK)", bitbucketErr.ConstraintName)
 	}
 	// Composite FK fail-closed: a member whose provider ('gitlab') differs from
 	// its account's ('github') is rejected — the github account has no
