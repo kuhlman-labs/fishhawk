@@ -101,6 +101,29 @@ func TestMembership_InvitedRowAdmits_ForgeErroring(t *testing.T) {
 	}
 }
 
+// An invited row admits WITHOUT the forge lister being called at all —
+// the stronger 'not called' assertion (mirrors the GitLab-deny check)
+// proving invited admission is forge-INDEPENDENT, not merely
+// forge-error-tolerant (ADR-057 Amendment A2). The lister here would
+// SUCCEED; admission must still make no forge call.
+func TestMembership_InvitedRowAdmits_ForgeNeverCalled(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	accountID := seedGitHubAccount(t, pool, "acme-corp", "organization", nil)
+	seedMember(t, pool, accountID, "octocat", auth.MemberOriginInvited)
+	lister.keys = []string{"acme-corp"} // a healthy forge would return this
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Errorf("admitted = %v, want [%s]", got, accountID)
+	}
+	if lister.calls != 0 {
+		t.Errorf("forge lister called %d times on the invited-admit path, want 0", lister.calls)
+	}
+}
+
 // (b) No row + a matching auto-join policy: admits AND mints an
 // audited origin='auto_join' row bound to the right account with the
 // policy role.
@@ -224,21 +247,18 @@ func TestMembership_ForgeError_NoInvitedRow_FailsClosed(t *testing.T) {
 }
 
 // (f) invited vs auto_join origins persist distinctly on their rows.
+// (b) already covers minting an auto_join row; here both origins coexist
+// for one user across different accounts and read back distinctly. They
+// are seeded directly because the invited short-circuit (A2) means a
+// single login with an invited grant never also mints an auto_join row.
 func TestMembership_OriginsPersistDistinctly(t *testing.T) {
-	pool, lister, r := newMembershipFixture(t)
+	pool, _, _ := newMembershipFixture(t)
 	invitedID := seedGitHubAccount(t, pool, "invited-org", "organization", nil)
 	seedMember(t, pool, invitedID, "octocat", auth.MemberOriginInvited)
 	role := "admin"
 	autoID := seedGitHubAccount(t, pool, "auto-org", "organization", &role)
-	lister.keys = []string{"auto-org"}
+	seedMember(t, pool, autoID, "octocat", auth.MemberOriginAutoJoin)
 
-	got, err := resolve(t, r, "github")
-	if err != nil {
-		t.Fatalf("ResolveAccounts: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("admitted = %v, want both accounts", got)
-	}
 	for _, tc := range []struct {
 		accountID  uuid.UUID
 		wantOrigin string

@@ -15,20 +15,23 @@ import (
 //
 // The admission SOURCE is account_members rows, not a live forge match:
 //
-//   - origin='invited' rows admit DB-ONLY — no forge call on that path,
-//     so forge-API availability can never lock out an invited member.
+//   - origin='invited' rows admit DB-ONLY — the resolver checks for an
+//     invited grant FIRST and, if one exists, admits its account(s) and
+//     returns WITHOUT making any forge call at all. Invited admission is
+//     forge-independent: immune to forge latency, hang, availability, or
+//     egress, not merely tolerant of a forge error.
 //   - origin='auto_join' rows are minted at login by the auto-join
 //     bootstrap and RE-VERIFIED against their policy predicate at every
 //     subsequent login; a row whose predicate no longer holds stops
 //     admitting but is kept for audit.
 //
-// The auto-join bootstrap is the ONLY live-forge read: the user's org
-// list (GET /user/orgs with the user's OAuth token) is intersected with
-// organization-granularity accounts whose auto_join_role policy is set;
-// a match with no existing grant mints an origin='auto_join' row and
-// admits. A forge error fails auto-join eval CLOSED without touching
-// invited admission. Providers with no lister implementation (gitlab
-// today) deny.
+// The live forge read (GET /user/orgs with the user's OAuth token) is
+// reached ONLY on the auto_join path — when no invited grant admits. It
+// is intersected with organization-granularity accounts whose
+// auto_join_role policy is set; a match with no existing grant mints an
+// origin='auto_join' row and admits. A forge error there fails the
+// auto_join eval CLOSED (and, with no invited grant, the whole sign-in).
+// Providers with no lister implementation (gitlab today) deny.
 
 // Member-grant origins (account_members.origin, migration 0056).
 const (
@@ -131,30 +134,36 @@ func (r *forgeMembershipResolver) ResolveAccounts(ctx context.Context, provider,
 		return nil, fmt.Errorf("auth: list member grants: %w", err)
 	}
 
-	admitted := map[uuid.UUID]bool{}
+	// Invited rows admit DB-ONLY. Check for an invited grant FIRST and,
+	// if any exists, admit its account(s) and return WITHOUT any forge
+	// call — invited admission must be immune to forge latency, hang,
+	// availability, and egress, not merely tolerant of a forge error
+	// (ADR-057 Amendment A2). The live-forge read below is reached only
+	// when no invited grant admits, scoping it to the auto_join path.
+	invited := map[uuid.UUID]bool{}
 	for _, g := range grants {
 		if g.Origin == MemberOriginInvited {
-			// Invited rows admit DB-only — deliberately decided before
-			// any forge call so forge availability can't affect them.
-			admitted[g.AccountID] = true
+			invited[g.AccountID] = true
 		}
 	}
+	if len(invited) > 0 {
+		return sortedAccountIDs(invited), nil
+	}
 
-	// Auto-join evaluation — the ONLY live-forge read. An error here
-	// fails auto-join eval closed: invited admissions above stand,
-	// and if none exist the whole sign-in fails closed.
+	// No invited grant: the auto_join path, the ONLY live-forge read. An
+	// error here fails the auto_join eval — and, since no invited grant
+	// admits, the whole sign-in — CLOSED.
 	keys, forgeErr := r.lister.ListUserOrgKeys(ctx, accessToken)
 	if forgeErr != nil {
-		if len(admitted) == 0 {
-			return nil, fmt.Errorf("auth: forge membership list failed and no invited grant admits: %w", forgeErr)
-		}
-		return sortedAccountIDs(admitted), nil
+		return nil, fmt.Errorf("auth: forge membership list failed and no invited grant admits: %w", forgeErr)
 	}
 
 	keySet := make(map[string]bool, len(keys))
 	for _, k := range keys {
 		keySet[k] = true
 	}
+
+	admitted := map[uuid.UUID]bool{}
 
 	// Re-verify existing auto_join grants against their predicate: the
 	// account's policy must still be set and the user's live org list
