@@ -197,7 +197,19 @@ func (s *Server) loadApprovalConcernClaims(ctx context.Context, runID uuid.UUID)
 // with a lineage state_reason. An InvalidTransitionError WARN-skips (never
 // wedges the review loop). The whole function is best-effort/warn-only,
 // matching applyConcernResolutions.
-func (s *Server) resolveConditionClaimedPlanConcerns(ctx context.Context, runID uuid.UUID, reviewSequence int64, reviewerModel, verdict string) {
+//
+// confirmingReviewFreshConcernIDs (#2066) are the fresh implement-stage
+// concern ids the SAME confirming review minted in this loop iteration. When
+// non-empty, the resolution is QUALIFIED: the state_reason drops the
+// unqualified "confirmed delivered" phrasing (that review re-raised its own
+// implement concerns, so a bare "delivered" ledger label would be misleading)
+// and the concern_addressed_by_condition audit payload cross-links those fresh
+// ids + a qualified flag. When empty, the historical unqualified wording and
+// byte-identical clean-approve behavior are preserved. Qualification keys on
+// the MINTED-fresh count (not verdict==approve_with_concerns) so a review whose
+// concerns were all relitigation-suppressed correctly stays unqualified and a
+// bare approve that still carried a fresh concern is correctly qualified.
+func (s *Server) resolveConditionClaimedPlanConcerns(ctx context.Context, runID uuid.UUID, reviewSequence int64, reviewerModel, verdict string, confirmingReviewFreshConcernIDs []uuid.UUID) {
 	if s.cfg.ConcernRepo == nil || s.cfg.AuditRepo == nil {
 		return
 	}
@@ -238,19 +250,45 @@ func (s *Server) resolveConditionClaimedPlanConcerns(ctx context.Context, runID 
 		}
 
 		priorState := string(row.State)
-		reason := fmt.Sprintf(
-			"binding approval condition (approval sequence %d) confirmed delivered by implement review sequence %d",
-			claims.ApprovalSeq, reviewSequence)
+		// QUALIFIED (#2066): when the confirming review minted its own fresh
+		// implement concerns, drop the unqualified "confirmed delivered"
+		// phrasing — a bare "delivered" ledger label would mislead when the
+		// same review re-raised concerns. The concern still resolves (the
+		// operator's binding condition is the authority); only the LABEL is
+		// honest about the fresh concerns to review before treating as
+		// delivered. UNQUALIFIED keeps the historical wording verbatim so the
+		// clean-approve path and its gateview settled-ledger rendering are
+		// byte-identical.
+		qualified := len(confirmingReviewFreshConcernIDs) > 0
+		var reason string
+		if qualified {
+			reason = fmt.Sprintf(
+				"binding approval condition (approval sequence %d) claimed by implement review sequence %d, which itself raised %d fresh implement concern(s) (verdict %s) — review the cross-linked concerns before treating as delivered",
+				claims.ApprovalSeq, reviewSequence, len(confirmingReviewFreshConcernIDs), verdict)
+		} else {
+			reason = fmt.Sprintf(
+				"binding approval condition (approval sequence %d) confirmed delivered by implement review sequence %d",
+				claims.ApprovalSeq, reviewSequence)
+		}
 
-		payload, _ := json.Marshal(map[string]any{
-			"concern_id":                 row.ID.String(),
-			"prior_state":                priorState,
-			"approval_sequence":          claims.ApprovalSeq,
-			"approver_subject":           claims.ApproverSubject,
-			"confirming_review_sequence": reviewSequence,
-			"reviewer_model":             reviewerModel,
-			"verdict":                    verdict,
-		})
+		auditPayload := map[string]any{
+			"concern_id":                  row.ID.String(),
+			"prior_state":                 priorState,
+			"approval_sequence":           claims.ApprovalSeq,
+			"approver_subject":            claims.ApproverSubject,
+			"confirming_review_sequence":  reviewSequence,
+			"reviewer_model":              reviewerModel,
+			"verdict":                     verdict,
+			"confirming_review_qualified": qualified,
+		}
+		if qualified {
+			freshIDStrings := make([]string, 0, len(confirmingReviewFreshConcernIDs))
+			for _, id := range confirmingReviewFreshConcernIDs {
+				freshIDStrings = append(freshIDStrings, id.String())
+			}
+			auditPayload["confirming_review_fresh_concern_ids"] = freshIDStrings
+		}
+		payload, _ := json.Marshal(auditPayload)
 		systemKind := audit.ActorSystem
 		if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 			RunID:     row.RunID,
