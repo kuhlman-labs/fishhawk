@@ -578,35 +578,69 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 	); err != nil {
 		t.Errorf("insert (gitlab, acme-corp) account failed, want success (account_key is provider-scoped): %v", err)
 	}
-	// Forge-neutral-naming mode: the endpoint-config columns exist AND no
-	// accounts column is provider-named (pins acceptance criterion 2 as a test).
-	var forgeBaseURLCol, oauthBaseURLCol, githubNamedCols int
+	// Forge-neutral-naming mode (Amendment A1 relocation, 0055): the endpoint-
+	// config columns forge_base_url/oauth_base_url now live on INSTALLATIONS,
+	// not accounts — a forge-agnostic workspace spanning a github.com install and
+	// a gitlab.com group cannot share one per-account base URL. Assert they are
+	// PRESENT on installations and ABSENT from accounts, and that NEITHER table
+	// carries a provider-named endpoint column (pins acceptance criterion 2 as a
+	// test on both tables).
+	var forgeBaseURLOnInstallations, oauthBaseURLOnInstallations int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'installations' AND column_name = 'forge_base_url'`,
+	).Scan(&forgeBaseURLOnInstallations); err != nil {
+		t.Fatalf("query installations.forge_base_url column: %v", err)
+	}
+	if forgeBaseURLOnInstallations != 1 {
+		t.Errorf("installations.forge_base_url count after MigrateUp = %d, want 1 (Amendment A1 relocation)", forgeBaseURLOnInstallations)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'installations' AND column_name = 'oauth_base_url'`,
+	).Scan(&oauthBaseURLOnInstallations); err != nil {
+		t.Fatalf("query installations.oauth_base_url column: %v", err)
+	}
+	if oauthBaseURLOnInstallations != 1 {
+		t.Errorf("installations.oauth_base_url count after MigrateUp = %d, want 1 (Amendment A1 relocation)", oauthBaseURLOnInstallations)
+	}
+	var forgeBaseURLOnAccounts, oauthBaseURLOnAccounts int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'accounts' AND column_name = 'forge_base_url'`,
-	).Scan(&forgeBaseURLCol); err != nil {
+	).Scan(&forgeBaseURLOnAccounts); err != nil {
 		t.Fatalf("query accounts.forge_base_url column: %v", err)
 	}
-	if forgeBaseURLCol != 1 {
-		t.Errorf("accounts.forge_base_url count after MigrateUp = %d, want 1", forgeBaseURLCol)
+	if forgeBaseURLOnAccounts != 0 {
+		t.Errorf("accounts.forge_base_url count after MigrateUp = %d, want 0 (0055 dropped it from accounts, Amendment A1)", forgeBaseURLOnAccounts)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'accounts' AND column_name = 'oauth_base_url'`,
-	).Scan(&oauthBaseURLCol); err != nil {
+	).Scan(&oauthBaseURLOnAccounts); err != nil {
 		t.Fatalf("query accounts.oauth_base_url column: %v", err)
 	}
-	if oauthBaseURLCol != 1 {
-		t.Errorf("accounts.oauth_base_url count after MigrateUp = %d, want 1", oauthBaseURLCol)
+	if oauthBaseURLOnAccounts != 0 {
+		t.Errorf("accounts.oauth_base_url count after MigrateUp = %d, want 0 (0055 dropped it from accounts, Amendment A1)", oauthBaseURLOnAccounts)
 	}
+	var githubNamedAccountCols, githubNamedInstallationCols int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.columns
 		 WHERE table_name = 'accounts' AND column_name LIKE 'github_%'`,
-	).Scan(&githubNamedCols); err != nil {
+	).Scan(&githubNamedAccountCols); err != nil {
 		t.Fatalf("query accounts github_%% columns: %v", err)
 	}
-	if githubNamedCols != 0 {
-		t.Errorf("accounts has %d column(s) named 'github_%%', want 0 (endpoint columns must be forge-neutral)", githubNamedCols)
+	if githubNamedAccountCols != 0 {
+		t.Errorf("accounts has %d column(s) named 'github_%%', want 0 (endpoint columns must be forge-neutral)", githubNamedAccountCols)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'installations' AND column_name LIKE 'github_%'`,
+	).Scan(&githubNamedInstallationCols); err != nil {
+		t.Fatalf("query installations github_%% columns: %v", err)
+	}
+	if githubNamedInstallationCols != 0 {
+		t.Errorf("installations has %d column(s) named 'github_%%', want 0 (endpoint columns must be forge-neutral)", githubNamedInstallationCols)
 	}
 	// An installations row FK'd to the github account inserts and reads back its
 	// TEXT credential-scope key.
@@ -697,6 +731,88 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Error("insert run with runner_kind='gitlab_pipeline' succeeded, want runs_runner_kind_check rejection")
 	}
 
+	// 0055 (#1825, E44.1, ADR-057 / ADR-058) threads a nullable account_id FK
+	// through every root entity and adds the account_members membership table.
+	// These are behavioral done-means assertions (a comment-only touch cannot
+	// pass): account_id must exist, be NULLABLE, and carry a <t>_account_id_fkey
+	// FK to accounts on ALL EIGHT threaded root tables.
+	for _, tbl := range []string{
+		"runs", "campaigns", "refinement_drafts", "refinement_decisions",
+		"refinement_filing_sessions", "refinement_filed_items", "api_tokens", "audit_entries",
+	} {
+		var isNullable string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT is_nullable FROM information_schema.columns
+			 WHERE table_name = $1 AND column_name = 'account_id'`, tbl,
+		).Scan(&isNullable); err != nil {
+			t.Fatalf("query %s.account_id column (missing?): %v", tbl, err)
+		}
+		if isNullable != "YES" {
+			t.Errorf("%s.account_id is_nullable after MigrateUp = %q, want YES (nullable throughout E44.1)", tbl, isNullable)
+		}
+		var fkCount int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM information_schema.table_constraints
+			 WHERE table_name = $1 AND constraint_name = $2 AND constraint_type = 'FOREIGN KEY'`,
+			tbl, tbl+"_account_id_fkey",
+		).Scan(&fkCount); err != nil {
+			t.Fatalf("query %s_account_id_fkey: %v", tbl, err)
+		}
+		if fkCount != 1 {
+			t.Errorf("%s_account_id_fkey count after MigrateUp = %d, want 1", tbl, fkCount)
+		}
+	}
+
+	// account_members: the forge-neutral membership table. Assert it exists, its
+	// provider CHECK admits 'gitlab' (FK'd to the gitlab account) but rejects
+	// 'bitbucket', and its composite FK rejects a member whose (account_id,
+	// provider) has no matching account.
+	var accountMembersTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'account_members'`,
+	).Scan(&accountMembersTable); err != nil {
+		t.Fatalf("query account_members table: %v", err)
+	}
+	if accountMembersTable != 1 {
+		t.Errorf("'account_members' table count after MigrateUp = %d, want 1", accountMembersTable)
+	}
+	// Happy path: a member FK'd to the github account inserts (provider defaults
+	// to 'github').
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO account_members (id, account_id, member_ref) VALUES ($1, $2, 'octocat')`,
+		uuid.New(), githubAccountID,
+	); err != nil {
+		t.Errorf("insert account_member FK'd to github account after MigrateUp failed: %v", err)
+	}
+	// CHECK admits 'gitlab' (FK'd to the gitlab account — the additive-provider
+	// guarantee; a narrower CHECK would fail this).
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO account_members (id, account_id, provider, member_ref)
+		 VALUES ($1, $2, 'gitlab', 'gl-user')`,
+		uuid.New(), gitlabAccountID,
+	); err != nil {
+		t.Errorf("insert account_member with provider='gitlab' FK'd to gitlab account failed (narrower CHECK?): %v", err)
+	}
+	// CHECK fail-closed: an out-of-set provider is rejected by
+	// account_members_provider_check.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO account_members (id, account_id, provider, member_ref)
+		 VALUES ($1, $2, 'bitbucket', 'bb-user')`,
+		uuid.New(), githubAccountID,
+	); err == nil {
+		t.Error("insert account_member with provider='bitbucket' succeeded, want account_members_provider_check rejection")
+	}
+	// Composite FK fail-closed: a member whose provider ('gitlab') differs from
+	// its account's ('github') is rejected — the github account has no
+	// (id, 'gitlab') row to reference.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO account_members (id, account_id, provider, member_ref)
+		 VALUES ($1, $2, 'gitlab', 'mismatch-user')`,
+		uuid.New(), githubAccountID,
+	); err == nil {
+		t.Error("insert account_member whose provider ('gitlab') differs from its account's ('github') succeeded, want composite-FK rejection")
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -725,29 +841,32 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0054 (#1861, ADR-058 / E45.8) is now the
-	// latest migration: it WIDENED runs_runner_kind_check to admit 'gitlab_ci'
-	// (the additive, dormant GitLab pipeline dispatch backend). It adds no table
-	// and no column, so its one-step rollback narrows the CHECK back (dropping
-	// 'gitlab_ci'), touching nothing else — 0053's (#1912) stages_state_check
-	// 'awaiting_host_dispatch' member now SURVIVES, as does 0052's (#1854,
-	// ADR-057 / ADR-058) accounts + installations tenancy tables and every prior
-	// migration's effect: 0051's (#1587) artifacts_kind_check 'release_notes'
-	// member, 0050's (#1708) api_tokens.auth_method/provider columns, 0044's
-	// (#1519) stages_type_check 'acceptance' member, 0043's (#1417)
-	// runs.upstream_run_id column + partial index, 0042's (#1455)
-	// campaigns.idempotency_key column + unique index, 0041's (#1451)
-	// operator_agent column, and 0040's (#1446) pause_policy + pause_reason
-	// columns + widened 'paused' state CHECK. 0039's (#1437) campaigns +
-	// campaign_items tables likewise still EXIST, as does every earlier
-	// migration's effect — 0038's (#1400) widened stages_type_check ('deploy'),
-	// 0037's (#1385) artifacts_kind_check 'deployment', 0036's (#1346)
-	// runs.runner_kind_resolved column, etc.
+	// MigrateDown rolls back one step. 0055 (#1825, E44.1, ADR-057 / ADR-058) is
+	// now the latest migration: it added the account_members table, threaded a
+	// nullable account_id FK through the eight root entities, and RELOCATED the
+	// per-forge endpoint columns from accounts to installations (Amendment A1).
+	// So its one-step rollback DROPs account_members, DROPs all eight account_id
+	// columns, and reverses the endpoint relocation (forge_base_url/oauth_base_url
+	// back on accounts, gone from installations) — touching nothing else. 0054's
+	// (#1861, ADR-058 / E45.8) runs_runner_kind_check 'gitlab_ci' member now
+	// SURVIVES, as do 0053's (#1912) stages_state_check 'awaiting_host_dispatch'
+	// member and 0052's (#1854, ADR-057 / ADR-058) accounts + installations
+	// tenancy tables, and every prior migration's effect: 0051's (#1587)
+	// artifacts_kind_check 'release_notes' member, 0050's (#1708)
+	// api_tokens.auth_method/provider columns, 0044's (#1519) stages_type_check
+	// 'acceptance' member, 0043's (#1417) runs.upstream_run_id column + partial
+	// index, 0042's (#1455) campaigns.idempotency_key column + unique index,
+	// 0041's (#1451) operator_agent column, and 0040's (#1446) pause_policy +
+	// pause_reason columns + widened 'paused' state CHECK. 0039's (#1437)
+	// campaigns + campaign_items tables likewise still EXIST, as does every
+	// earlier migration's effect — 0038's (#1400) widened stages_type_check
+	// ('deploy'), 0037's (#1385) artifacts_kind_check 'deployment', 0036's
+	// (#1346) runs.runner_kind_resolved column, etc.
 	//
-	// This is the binding TestMigrateDown flip for 0054: 'gitlab_ci' must be
-	// ABSENT from runs_runner_kind_check after the one-step down (asserted
-	// below), while 0053's 'awaiting_host_dispatch' state (now a prior migration)
-	// SURVIVES.
+	// This is the binding TestMigrateDown flip for 0055: account_members and the
+	// eight account_id columns must be ABSENT, the endpoint columns must be back
+	// on accounts and GONE from installations, and 0054's 'gitlab_ci' runner_kind
+	// (now a prior migration) SURVIVES (asserted below).
 	var accountsTableDown, installationsTableDown int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'`,
@@ -755,7 +874,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query accounts table: %v", err)
 	}
 	if accountsTableDown != 1 {
-		t.Errorf("'accounts' table count after MigrateDown = %d, want 1 (0052 still applied; only 0053 rolled back)", accountsTableDown)
+		t.Errorf("'accounts' table count after MigrateDown = %d, want 1 (0052 still applied; only 0055 rolled back)", accountsTableDown)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`,
@@ -763,7 +882,72 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query installations table: %v", err)
 	}
 	if installationsTableDown != 1 {
-		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0052 still applied; only 0053 rolled back)", installationsTableDown)
+		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0052 still applied; only 0055 rolled back)", installationsTableDown)
+	}
+	// 0055 rolled back: account_members is GONE and NONE of the eight root tables
+	// carries account_id anymore (the binding TestMigrateDown flip for 0055).
+	var accountMembersTableDown int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'account_members'`,
+	).Scan(&accountMembersTableDown); err != nil {
+		t.Fatalf("query account_members table: %v", err)
+	}
+	if accountMembersTableDown != 0 {
+		t.Errorf("'account_members' table count after MigrateDown = %d, want 0 (0055 rolled back)", accountMembersTableDown)
+	}
+	for _, tbl := range []string{
+		"runs", "campaigns", "refinement_drafts", "refinement_decisions",
+		"refinement_filing_sessions", "refinement_filed_items", "api_tokens", "audit_entries",
+	} {
+		var accountIDCol int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM information_schema.columns
+			 WHERE table_name = $1 AND column_name = 'account_id'`, tbl,
+		).Scan(&accountIDCol); err != nil {
+			t.Fatalf("query %s.account_id column: %v", tbl, err)
+		}
+		if accountIDCol != 0 {
+			t.Errorf("%s.account_id count after MigrateDown = %d, want 0 (0055 rolled back)", tbl, accountIDCol)
+		}
+	}
+	// Amendment A1 relocation reversed: the endpoint columns are back on accounts
+	// and GONE from installations.
+	var forgeOnAccountsDown, oauthOnAccountsDown, forgeOnInstallationsDown, oauthOnInstallationsDown int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'accounts' AND column_name = 'forge_base_url'`,
+	).Scan(&forgeOnAccountsDown); err != nil {
+		t.Fatalf("query accounts.forge_base_url column: %v", err)
+	}
+	if forgeOnAccountsDown != 1 {
+		t.Errorf("accounts.forge_base_url count after MigrateDown = %d, want 1 (0055 restored it to accounts)", forgeOnAccountsDown)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'accounts' AND column_name = 'oauth_base_url'`,
+	).Scan(&oauthOnAccountsDown); err != nil {
+		t.Fatalf("query accounts.oauth_base_url column: %v", err)
+	}
+	if oauthOnAccountsDown != 1 {
+		t.Errorf("accounts.oauth_base_url count after MigrateDown = %d, want 1 (0055 restored it to accounts)", oauthOnAccountsDown)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'installations' AND column_name = 'forge_base_url'`,
+	).Scan(&forgeOnInstallationsDown); err != nil {
+		t.Fatalf("query installations.forge_base_url column: %v", err)
+	}
+	if forgeOnInstallationsDown != 0 {
+		t.Errorf("installations.forge_base_url count after MigrateDown = %d, want 0 (0055 relocation reversed)", forgeOnInstallationsDown)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'installations' AND column_name = 'oauth_base_url'`,
+	).Scan(&oauthOnInstallationsDown); err != nil {
+		t.Fatalf("query installations.oauth_base_url column: %v", err)
+	}
+	if oauthOnInstallationsDown != 0 {
+		t.Errorf("installations.oauth_base_url count after MigrateDown = %d, want 0 (0055 relocation reversed)", oauthOnInstallationsDown)
 	}
 	var campaignsTable, campaignItemsTable int
 	if err := pool.QueryRow(context.Background(),
@@ -1047,12 +1231,13 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if !strings.Contains(stageStateCheckDef, "awaiting_host_dispatch") {
 		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_host_dispatch' (0053 still applied; only 0054 rolled back): %s", stageStateCheckDef)
 	}
-	// 0054 (#1861, ADR-058 / E45.8) is the migration rolled back by this
-	// one-step down, so its widening — the 'gitlab_ci' runner_kind — must be
-	// GONE from runs_runner_kind_check (the binding TestMigrateDown flip for
-	// 0054). This is a behavioral done-means assertion: a run row with
-	// runner_kind='gitlab_ci' must now be UNINSERTABLE (the narrowed CHECK
-	// rejects it), while a 'github_actions' run still inserts.
+	// 0054 (#1861, ADR-058 / E45.8) is now a PRIOR migration (only 0055 rolled
+	// back), so its widening — the 'gitlab_ci' runner_kind — SURVIVES the
+	// one-step down. Before 0055 shipped, 0054 was the migration a one-step down
+	// rolled back and 'gitlab_ci' had to be GONE here — 0055 flips that assertion
+	// (the binding TestMigrateDown flip for 0054). This is a behavioral done-means
+	// assertion: a run row with runner_kind='gitlab_ci' now INSERTs, while a
+	// 'github_actions' run still inserts too.
 	var runnerKindCheckDef string
 	if err := pool.QueryRow(context.Background(),
 		`SELECT pg_get_constraintdef(oid) FROM pg_constraint
@@ -1060,15 +1245,15 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	).Scan(&runnerKindCheckDef); err != nil {
 		t.Fatalf("query runs_runner_kind_check constraint def: %v", err)
 	}
-	if strings.Contains(runnerKindCheckDef, "gitlab_ci") {
-		t.Errorf("runs_runner_kind_check after MigrateDown still admits 'gitlab_ci' (0054 should have narrowed it): %s", runnerKindCheckDef)
+	if !strings.Contains(runnerKindCheckDef, "gitlab_ci") {
+		t.Errorf("runs_runner_kind_check after MigrateDown dropped 'gitlab_ci' (0054 still applied; only 0055 rolled back): %s", runnerKindCheckDef)
 	}
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
 		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'gitlab_ci')`,
 		uuid.New(),
-	); err == nil {
-		t.Error("insert runner_kind='gitlab_ci' run after MigrateDown succeeded, want narrowed-CHECK rejection (0054 rolled back)")
+	); err != nil {
+		t.Errorf("insert runner_kind='gitlab_ci' run after MigrateDown failed, want success (0054 survives; only 0055 rolled back): %v", err)
 	}
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
@@ -1400,8 +1585,10 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0054 (narrow runs_runner_kind_check — inert re: campaigns;
-	// no paused row is a run) then 0053 (narrow stages_state_check + reverse the
+	// Step down past 0055 (drop account_members + the eight account_id columns +
+	// reverse the endpoint relocation — inert re: campaigns; no paused row holds
+	// an account_id) then 0054 (narrow runs_runner_kind_check — inert re:
+	// campaigns; no paused row is a run) then 0053 (narrow stages_state_check + reverse the
 	// awaiting_host_dispatch backfill — inert re: campaigns; no paused row holds
 	// that state) then 0052 (drop the accounts + installations tenancy tables —
 	// inert re: campaigns) then 0051 (narrow artifacts_kind_check — inert re:
@@ -1416,6 +1603,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0055) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0054) failed: %v", err)
 	}
@@ -1494,11 +1684,15 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0054 (the runner_kind CHECK widening, inert re:
-	// stages) and 0053 back so we can seed 'dispatched' rows under the pre-0053
-	// narrow CHECK before re-applying the backfill.
+	// Apply everything, then roll 0055 (account_members + account_id + endpoint
+	// relocation, inert re: stages), 0054 (the runner_kind CHECK widening, inert
+	// re: stages) and 0053 back so we can seed 'dispatched' rows under the
+	// pre-0053 narrow CHECK before re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0055 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0054 to reach 0053): %v", err)
@@ -1595,8 +1789,13 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 		t.Errorf("re-opened local stage (started_at set) state after backfill = %q, want dispatched (conservatively skipped)", got)
 	}
 
-	// Down reverses the backfill: roll back 0054 (the runner_kind CHECK widening,
-	// inert re: stages) then 0053, and the flipped row returns to dispatched.
+	// Down reverses the backfill: roll back 0055 (account_members + account_id +
+	// endpoint relocation, inert re: stages) then 0054 (the runner_kind CHECK
+	// widening, inert re: stages) then 0053, and the flipped row returns to
+	// dispatched.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0055 to reach 0053): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0054 to reach 0053): %v", err)
 	}
