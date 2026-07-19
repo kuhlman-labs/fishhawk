@@ -230,6 +230,10 @@ func (s *Server) handleAgentChangesReport(w http.ResponseWriter, r *http.Request
 		// resolveExportPage already wrote the error response.
 		return
 	}
+	// Account-scope the page (ADR-057 / E44.5): the report is a projection of
+	// the same run evidence, so it carries the same tenant isolation — another
+	// account's rows are excluded, untenanted rows stay visible.
+	ep.page = accountVisiblePage(r, ep.page)
 
 	report, aerr := s.buildAgentChangesReport(r.Context(), r, ep)
 	if aerr != nil {
@@ -263,6 +267,8 @@ func (s *Server) handleAgentChangesReportMarkdown(w http.ResponseWriter, r *http
 	if !ok {
 		return
 	}
+	// Account-scope the page (ADR-057 / E44.5), mirroring the JSON report path.
+	ep.page = accountVisiblePage(r, ep.page)
 
 	report, aerr := s.buildAgentChangesReport(r.Context(), r, ep)
 	if aerr != nil {

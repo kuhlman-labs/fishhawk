@@ -10,11 +10,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 func TestRequestID_GeneratesWhenAbsent(t *testing.T) {
@@ -296,6 +300,59 @@ func TestBearerAuth_StaticToken_ThreadsAuthMethod(t *testing.T) {
 	}
 	if captured.AuthMethod != "static" {
 		t.Errorf("AuthMethod = %q, want static", captured.AuthMethod)
+	}
+}
+
+// TestBearerAuth_APIToken_StampsAccountID pins the E44.5 identity stamping on
+// the api_token bearer path: the resolved token's AccountID is threaded onto
+// Identity.AccountID so the account-ownership middleware can bound the request.
+func TestBearerAuth_APIToken_StampsAccountID(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	const acct = "22222222-3333-4444-5555-666666666666"
+	tok := &apitoken.Token{Subject: "github:42", Scopes: []string{"read:runs"}, AccountID: acct}
+	auth := stubAPITokenAuth{tok: tok}
+
+	var captured Identity
+	h := s.bearerAuth(auth, nil, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer fhk_token_with_account")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured.AccountID != acct {
+		t.Errorf("Identity.AccountID = %q, want %q", captured.AccountID, acct)
+	}
+}
+
+// TestBearerAuth_MCPToken_StampsAccountIDFromRun pins the E44.5 identity
+// stamping on the mcp:run path: the token's AccountID is loaded from its OWN
+// run via the AccountGetter capability, so an mcp:run token is bounded to
+// its run's tenant account exactly as a bearer token bound to that account.
+func TestBearerAuth_MCPToken_StampsAccountIDFromRun(t *testing.T) {
+	fr := newFakeRepo()
+	runID := uuid.New()
+	const acct = "33333333-4444-5555-6666-777777777777"
+	fr.runs[runID] = &run.Run{ID: runID, AccountID: acct}
+	s := newServer(t, fr)
+
+	mcpAuth := &stubMCPAuthenticator{token: &mcptoken.Token{
+		ID:        uuid.New(),
+		RunID:     runID,
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Scopes:    []string{"mcp:read"},
+	}}
+
+	var captured Identity
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+mcptoken.TokenPrefix+"matchingplaintext")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured.AccountID != acct {
+		t.Errorf("mcp Identity.AccountID = %q, want %q (loaded from its run)", captured.AccountID, acct)
 	}
 }
 

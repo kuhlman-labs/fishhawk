@@ -10,6 +10,12 @@ RETURNING *;
 -- name: GetRun :one
 SELECT * FROM runs WHERE id = $1;
 
+-- name: GetRunAccountID :one
+-- The cheap tenant-account lookup for the bearer-auth mcp:run path
+-- (ADR-057 / E44.5): returns just account_id (nullable) so Identity.AccountID
+-- can be populated without materializing the whole run row.
+SELECT account_id FROM runs WHERE id = $1;
+
 -- name: GetRunByIdempotencyKey :one
 -- Used by POST /v0/runs to resolve an Idempotency-Key header to
 -- a previously-created run. Active scope is (repo, idempotency_key);
@@ -36,6 +42,7 @@ SELECT * FROM runs
    AND (sqlc.narg('runner_kind')::text IS NULL OR runner_kind = sqlc.narg('runner_kind'))
    AND (sqlc.narg('decomposed_from')::uuid IS NULL OR decomposed_from = sqlc.narg('decomposed_from'))
    AND (sqlc.narg('parent_run_id')::uuid IS NULL OR parent_run_id = sqlc.narg('parent_run_id'))
+   AND (sqlc.narg('account_id')::uuid IS NULL OR account_id = sqlc.narg('account_id') OR account_id IS NULL)
  ORDER BY created_at DESC, id DESC
  LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
 

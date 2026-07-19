@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -115,6 +116,22 @@ func (f *fakeRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
 	return r, nil
 }
 
+// GetRunAccountID satisfies run.AccountGetter (ADR-057 / E44.5): the cheap
+// tenant-account lookup the bearer-auth mcp:run path uses. Returns the run's
+// AccountID ("" for untenanted) or ErrNotFound.
+func (f *fakeRepo) GetRunAccountID(_ context.Context, id uuid.UUID) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return "", f.getErr
+	}
+	r, ok := f.runs[id]
+	if !ok {
+		return "", run.ErrNotFound
+	}
+	return r.AccountID, nil
+}
+
 // transitionErr lets tests inject specific errors out of TransitionRun
 // so the cancel handler's branches (404, 409, 500) are reachable.
 // listErr does the same for ListRuns.
@@ -206,6 +223,12 @@ func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.R
 			if r.ParentRunID == nil || *r.ParentRunID != *fil.ParentRunID {
 				continue
 			}
+		}
+		// Account scoping (ADR-057 / E44.5): a set filter keeps same-account
+		// rows plus untenanted (empty AccountID) rows, mirroring the SQL
+		// (account_id = $ OR account_id IS NULL).
+		if fil.AccountID != "" && r.AccountID != "" && r.AccountID != fil.AccountID {
+			continue
 		}
 		matched = append(matched, r)
 	}
@@ -312,23 +335,48 @@ func (f *fakeRepo) TransitionStage(_ context.Context, _ uuid.UUID, _ run.StageSt
 	return nil, errors.New("fakeRepo: TransitionStage not implemented")
 }
 
+// testOperatorAccountID is the resolved workspace account the shared
+// cookie-session operator identity carries (ADR-057 / E44.5). Fixed so
+// account-scoped list/export fixtures over untenanted (empty-account) runs
+// stay visible and full-chain write-tier fixtures resolve as admin.
+const testOperatorAccountID = "00000000-0000-0000-0000-0000000000ac"
+
+// fakeAccountRoles is the server.AccountRoles stub. It returns a fixed role
+// for every lookup (admin by default) so cookie write-tier enforcement resolves
+// deterministically; err lets a test exercise the 503 role-resolution branch.
+type fakeAccountRoles struct {
+	role string
+	err  error
+}
+
+func (f fakeAccountRoles) MemberRole(_ context.Context, _, _, _ string) (string, error) {
+	return f.role, f.err
+}
+
 // newServer builds a Server wired to repo, with the Handler() exposed
-// so tests can call it via httptest.NewRecorder.
+// so tests can call it via httptest.NewRecorder. It wires a default
+// admin AccountRoles so the shared testOperatorIdentity resolves as admin on
+// the write-tier account middleware when a test drives the full mux.
 func newServer(t *testing.T, repo run.Repository) *Server {
 	t.Helper()
-	return New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+	return New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AccountRoles: fakeAccountRoles{role: account.RoleAdmin}})
 }
 
 // testOperatorIdentity returns an Identity that represents a
 // cookie-session operator (no TokenID, no Scopes). The requireWriteScope
 // guard lets cookie-session callers through unconditionally, so this
 // is the correct fixture for tests that exercise handler logic past
-// the auth gate.
+// the auth gate. It carries a resolved AccountID (ADR-057 / E44.5) so the
+// account-ownership middleware's write-tier role-bounding — when a test drives
+// the full mux — resolves against the newServer admin AccountRoles rather than
+// 403 account_unresolved. Handler-direct tests (the common case) bypass the
+// route-registration wrapper, so the field is inert for them.
 func testOperatorIdentity() Identity {
 	return Identity{
 		Subject:   "github:test-operator",
 		UserID:    "00000000-0000-0000-0000-000000000001",
 		SessionID: "00000000-0000-0000-0000-000000000002",
+		AccountID: testOperatorAccountID,
 	}
 }
 

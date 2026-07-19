@@ -48,6 +48,17 @@ ON CONFLICT (account_id, provider, member_ref) DO UPDATE
    SET role = EXCLUDED.role
 RETURNING *;
 
+-- name: GetAccountMemberRole :one
+-- The handler-authz role lookup (E44.5 / #1829): the caller's role in an
+-- account, keyed on the forge-neutral (account_id, provider, member_ref).
+-- role is nullable — a grant with no explicit role scans as NULL, which the
+-- Go layer interprets as member-tier (least privilege). No row (no membership)
+-- surfaces as pgx.ErrNoRows, also member-tier at the caller.
+SELECT role FROM account_members
+ WHERE account_id = $1
+   AND provider = $2
+   AND member_ref = $3;
+
 -- name: ListAccountMembers :many
 -- Insertion order (created_at ASC + id tiebreak) so a membership roster renders
 -- stably.

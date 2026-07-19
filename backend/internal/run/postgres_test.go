@@ -44,6 +44,114 @@ func makeStage(t *testing.T, repo run.Repository, runID uuid.UUID, seq int) *run
 	return s
 }
 
+// TestPostgres_AccountID_RoundTrip exercises migration 0055's nullable
+// runs.account_id (ADR-057 / E44.5): a run bound to a tenant account reads its
+// account back through GetRun AND the GetRunAccountID capability, while an
+// untenanted (NULL) run surfaces "". CreateRun does not set account_id (the
+// backfill/writer lands in a later child), so the binding is a raw UPDATE.
+func TestPostgres_AccountID_RoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	plain := makeRun(t, repo)
+	if plain.AccountID != "" {
+		t.Errorf("untenanted AccountID = %q, want empty", plain.AccountID)
+	}
+
+	acctID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+		acctID, "acct-"+acctID.String()[:8]); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	tenanted := makeRun(t, repo)
+	if _, err := pool.Exec(ctx, `UPDATE runs SET account_id = $1 WHERE id = $2`, acctID, tenanted.ID); err != nil {
+		t.Fatalf("bind account: %v", err)
+	}
+
+	got, err := repo.GetRun(ctx, tenanted.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.AccountID != acctID.String() {
+		t.Errorf("GetRun AccountID = %q, want %q", got.AccountID, acctID.String())
+	}
+
+	getter, ok := repo.(run.AccountGetter)
+	if !ok {
+		t.Fatal("postgres repo must implement run.AccountGetter")
+	}
+	acct, err := getter.GetRunAccountID(ctx, tenanted.ID)
+	if err != nil {
+		t.Fatalf("get run account id: %v", err)
+	}
+	if acct != acctID.String() {
+		t.Errorf("GetRunAccountID = %q, want %q", acct, acctID.String())
+	}
+	acctPlain, err := getter.GetRunAccountID(ctx, plain.ID)
+	if err != nil {
+		t.Fatalf("get run account id (untenanted): %v", err)
+	}
+	if acctPlain != "" {
+		t.Errorf("untenanted GetRunAccountID = %q, want empty", acctPlain)
+	}
+	if _, err := getter.GetRunAccountID(ctx, uuid.New()); !errors.Is(err, run.ErrNotFound) {
+		t.Errorf("GetRunAccountID(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestPostgres_ListRuns_AccountFilter exercises ListRunsFilter.AccountID
+// (ADR-057 / E44.5): a set filter keeps same-account runs PLUS untenanted
+// (NULL account_id) runs, and excludes other accounts' runs.
+func TestPostgres_ListRuns_AccountFilter(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	acctA, acctB := uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{acctA, acctB} {
+		if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+			id, "acct-"+id.String()[:8]); err != nil {
+			t.Fatalf("insert account: %v", err)
+		}
+	}
+	runA, runB, runU := makeRun(t, repo), makeRun(t, repo), makeRun(t, repo)
+	if _, err := pool.Exec(ctx, `UPDATE runs SET account_id=$1 WHERE id=$2`, acctA, runA.ID); err != nil {
+		t.Fatalf("bind A: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE runs SET account_id=$1 WHERE id=$2`, acctB, runB.ID); err != nil {
+		t.Fatalf("bind B: %v", err)
+	}
+
+	ids := func(rs []*run.Run) map[uuid.UUID]bool {
+		m := map[uuid.UUID]bool{}
+		for _, r := range rs {
+			m[r.ID] = true
+		}
+		return m
+	}
+
+	// Account A: A + untenanted visible, B excluded.
+	rs, err := repo.ListRuns(ctx, run.ListRunsFilter{AccountID: acctA.String(), Limit: 100})
+	if err != nil {
+		t.Fatalf("list A: %v", err)
+	}
+	got := ids(rs)
+	if !got[runA.ID] || !got[runU.ID] || got[runB.ID] {
+		t.Errorf("account A listing = %v; want runA+runU, not runB", got)
+	}
+
+	// No filter: all three visible.
+	rs, err = repo.ListRuns(ctx, run.ListRunsFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	got = ids(rs)
+	if !got[runA.ID] || !got[runB.ID] || !got[runU.ID] {
+		t.Errorf("unfiltered listing = %v; want all three", got)
+	}
+}
+
 func TestPostgres_CreateAndGetRun(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)

@@ -222,7 +222,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id FROM runs WHERE id = $1
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -255,8 +255,23 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.SliceIndex,
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
+		&i.AccountID,
 	)
 	return i, err
+}
+
+const getRunAccountID = `-- name: GetRunAccountID :one
+SELECT account_id FROM runs WHERE id = $1
+`
+
+// The cheap tenant-account lookup for the bearer-auth mcp:run path
+// (ADR-057 / E44.5): returns just account_id (nullable) so Identity.AccountID
+// can be populated without materializing the whole run row.
+func (q *Queries) GetRunAccountID(ctx context.Context, id uuid.UUID) (*uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getRunAccountID, id)
+	var account_id *uuid.UUID
+	err := row.Scan(&account_id)
+	return account_id, err
 }
 
 const getRunByIdempotencyKey = `-- name: GetRunByIdempotencyKey :one
@@ -508,7 +523,7 @@ func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage
 }
 
 const listRuns = `-- name: ListRuns :many
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id FROM runs
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR workflow_id = $2)
    AND ($3::text = '' OR state = $3)
@@ -517,8 +532,9 @@ SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, 
    AND ($6::text IS NULL OR runner_kind = $6)
    AND ($7::uuid IS NULL OR decomposed_from = $7)
    AND ($8::uuid IS NULL OR parent_run_id = $8)
+   AND ($9::uuid IS NULL OR account_id = $9 OR account_id IS NULL)
  ORDER BY created_at DESC, id DESC
- LIMIT $10 OFFSET $9
+ LIMIT $11 OFFSET $10
 `
 
 type ListRunsParams struct {
@@ -530,6 +546,7 @@ type ListRunsParams struct {
 	RunnerKind     *string    `json:"runner_kind"`
 	DecomposedFrom *uuid.UUID `json:"decomposed_from"`
 	ParentRunID    *uuid.UUID `json:"parent_run_id"`
+	AccountID      *uuid.UUID `json:"account_id"`
 	Off            int32      `json:"off"`
 	Lim            int32      `json:"lim"`
 }
@@ -552,6 +569,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 		arg.RunnerKind,
 		arg.DecomposedFrom,
 		arg.ParentRunID,
+		arg.AccountID,
 		arg.Off,
 		arg.Lim,
 	)
@@ -589,6 +607,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 			&i.SliceIndex,
 			&i.RunnerKindResolved,
 			&i.UpstreamRunID,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}

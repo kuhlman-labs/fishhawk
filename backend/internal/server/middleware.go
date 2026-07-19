@@ -9,10 +9,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // apitokenAuthenticator is the slice of apitoken.Repository
@@ -293,6 +297,27 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 								TokenID: rec.ID.String(),
 								Scopes:  append([]string(nil), rec.Scopes...),
 							}
+							// Populate AccountID from the token's own run
+							// (ADR-057 / E44.5): an mcp:run token acts within
+							// its run's tenant account, so the ownership
+							// middleware bounds it exactly as a bearer token
+							// bound to that account. Best-effort via the
+							// optional AccountGetter capability — a fake
+							// repo that doesn't implement it leaves AccountID
+							// empty (untenanted, allowed). A DB-unavailable
+							// lookup short-circuits 503 per the writeDBUnavailable
+							// contract rather than masking an outage as a
+							// per-handler denial.
+							if getter, gok := s.cfg.RunRepo.(run.AccountGetter); gok {
+								acct, aerr := getter.GetRunAccountID(r.Context(), rec.RunID)
+								if dberr.IsUnavailable(aerr) {
+									s.writeDBUnavailable(w, r)
+									return
+								}
+								if aerr == nil {
+									id.AccountID = acct
+								}
+							}
 						}
 					case tokens != nil:
 						rec, err := tokens.Authenticate(r.Context(), tok)
@@ -306,6 +331,11 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 								TokenID:    rec.ID.String(),
 								Scopes:     append([]string(nil), rec.Scopes...),
 								AuthMethod: rec.AuthMethod,
+								// The token's own tenant account (ADR-057 /
+								// E44.5): the ownership middleware bounds a
+								// bearer request to it. Empty for untenanted /
+								// operator tokens (NULL account_id).
+								AccountID: rec.AccountID,
 							}
 						}
 					}
@@ -325,6 +355,202 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 func (s *Server) writeDBUnavailable(w http.ResponseWriter, r *http.Request) {
 	s.writeError(w, r, http.StatusServiceUnavailable, "service_unavailable",
 		"database unavailable; retry shortly", nil)
+}
+
+// --- Account-ownership authorization (ADR-057 / E44.5, #1829) ---
+
+// AccountRoles resolves a cookie-session caller's role within its tenant
+// account. Satisfied by *account.Store (accountdb-backed) in production and a
+// fake in tests. Kept as an interface here so the middleware never imports the
+// account package directly.
+type AccountRoles interface {
+	MemberRole(ctx context.Context, accountID, provider, subject string) (string, error)
+}
+
+// accountTier classifies a run-scoped route for centralized account
+// enforcement. Every tier carries the OWNERSHIP check (a tenanted run may be
+// touched only by its own account); the two write tiers additionally carry
+// cookie ROLE-BOUNDING. adminWrite is the destructive/admin surface (an admin
+// role is required); memberWrite is the operator-decision surface (member or
+// admin); readAccess carries ownership only, so a resolved cookie reading an
+// untenanted run stays allowed.
+type accountTier int
+
+const (
+	readAccess accountTier = iota
+	memberWrite
+	adminWrite
+)
+
+// providerFromSubject extracts the forge discriminator from an identity
+// subject: "github:<login>" → "github", "gitlab:<user>" → "gitlab". A subject
+// with no ":" is returned verbatim.
+func providerFromSubject(subject string) string {
+	if i := strings.IndexByte(subject, ':'); i >= 0 {
+		return subject[:i]
+	}
+	return subject
+}
+
+// enforceAccount applies the ownership + (write-tier) cookie role-bounding
+// checks for an already-resolved run. Returns true when the request may
+// proceed; on denial it writes the error envelope and returns false.
+//
+// (a) OWNERSHIP (all tiers): a tenanted run (AccountID != "") whose account
+// disagrees with the caller's Identity.AccountID → 403 account_forbidden. An
+// untenanted run (AccountID == "") is allowed — the NULL-allow window #1830
+// closes once every row is populated.
+//
+// (b) COOKIE ROLE-BOUNDING (write tiers only, resolved OAuth cookie only —
+// SessionID != "" && TokenID == ""): an empty AccountID on a write is 403
+// account_unresolved (a pre-gate / de-tenanted session must not write). With a
+// role provider wired, an adminWrite tier requires the admin role (else 403
+// insufficient_role); memberWrite admits member/admin/NULL-role. Bearer and mcp
+// identities carry a TokenID, so role-bounding never fires for them — they are
+// bounded by ownership alone. A nil AccountRoles is the untenanted-allow
+// posture: role-bounding is skipped (ownership still applies).
+func (s *Server) enforceAccount(w http.ResponseWriter, r *http.Request, tier accountTier, runRow *run.Run) bool {
+	id := IdentityFrom(r.Context())
+
+	// (a) Ownership.
+	if runRow.AccountID != "" && id.AccountID != runRow.AccountID {
+		s.writeError(w, r, http.StatusForbidden, "account_forbidden",
+			"this run belongs to a different workspace account", nil)
+		return false
+	}
+
+	// (b) Cookie role-bounding, write tiers only.
+	if tier == readAccess {
+		return true
+	}
+	if id.SessionID == "" || id.TokenID != "" {
+		// Not a resolved OAuth cookie (bearer / mcp / anonymous): ownership
+		// alone governs.
+		return true
+	}
+	if id.AccountID == "" {
+		s.writeError(w, r, http.StatusForbidden, "account_unresolved",
+			"session is not bound to a workspace account; sign in again", nil)
+		return false
+	}
+	if s.cfg.AccountRoles == nil {
+		// No role provider wired (untenanted-allow): skip role-bounding.
+		return true
+	}
+	role, err := s.cfg.AccountRoles.MemberRole(r.Context(), id.AccountID,
+		providerFromSubject(id.Subject), id.Subject)
+	if err != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "service_unavailable",
+			"could not resolve workspace account role; retry shortly", nil)
+		return false
+	}
+	if tier == adminWrite && role != account.RoleAdmin {
+		s.writeError(w, r, http.StatusForbidden, "insufficient_role",
+			"this action requires the admin role in the workspace account", nil)
+		return false
+	}
+	return true
+}
+
+// requireRunAccount wraps a run-scoped handler ({run_id} in the path) with the
+// tiered account enforcement. It resolves the run WITH its account and enforces
+// before calling next. When the run can't be resolved (no repo, bad UUID, not
+// found, load error) it FALLS THROUGH to next unchanged, so the handler
+// produces its own 503/400/404 — the wrapper never alters a request's
+// non-authz error surface.
+func (s *Server) requireRunAccount(tier accountTier, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		runRow, ok := s.resolveRunForAuthz(r, r.PathValue("run_id"))
+		if ok && !s.enforceAccount(w, r, tier, runRow) {
+			return
+		}
+		next(w, r)
+	}
+}
+
+// requireStageAccount wraps a stage-scoped handler ({stage_id}): stage_id ->
+// stage.RunID -> run -> account. Same fall-through-on-unresolvable contract as
+// requireRunAccount.
+func (s *Server) requireStageAccount(tier accountTier, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		runRow, ok := s.resolveRunForStage(r, r.PathValue("stage_id"))
+		if ok && !s.enforceAccount(w, r, tier, runRow) {
+			return
+		}
+		next(w, r)
+	}
+}
+
+// requireConcernAccount wraps a concern-scoped handler ({concern_id}):
+// concern_id -> concern.RunID -> run -> account. Same fall-through contract.
+func (s *Server) requireConcernAccount(tier accountTier, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		runRow, ok := s.resolveRunForConcern(r, r.PathValue("concern_id"))
+		if ok && !s.enforceAccount(w, r, tier, runRow) {
+			return
+		}
+		next(w, r)
+	}
+}
+
+// resolveRunForAuthz loads the run named by rawRunID WITH its account. ok=false
+// (fall through to the handler) when no run repo is wired, the id is not a
+// UUID, or the load fails/404s — the wrapper must not change those surfaces.
+func (s *Server) resolveRunForAuthz(r *http.Request, rawRunID string) (*run.Run, bool) {
+	if s.cfg.RunRepo == nil {
+		return nil, false
+	}
+	id, err := uuid.Parse(rawRunID)
+	if err != nil {
+		return nil, false
+	}
+	rn, err := s.cfg.RunRepo.GetRun(r.Context(), id)
+	if err != nil {
+		return nil, false
+	}
+	return rn, true
+}
+
+// resolveRunForStage resolves stage_id -> stage.RunID -> run. ok=false on any
+// unresolvable step (fall through).
+func (s *Server) resolveRunForStage(r *http.Request, rawStageID string) (*run.Run, bool) {
+	if s.cfg.RunRepo == nil {
+		return nil, false
+	}
+	sid, err := uuid.Parse(rawStageID)
+	if err != nil {
+		return nil, false
+	}
+	st, err := s.cfg.RunRepo.GetStage(r.Context(), sid)
+	if err != nil {
+		return nil, false
+	}
+	rn, err := s.cfg.RunRepo.GetRun(r.Context(), st.RunID)
+	if err != nil {
+		return nil, false
+	}
+	return rn, true
+}
+
+// resolveRunForConcern resolves concern_id -> concern.RunID -> run. ok=false on
+// any unresolvable step (no concern/run repo, bad UUID, not found).
+func (s *Server) resolveRunForConcern(r *http.Request, rawConcernID string) (*run.Run, bool) {
+	if s.cfg.ConcernRepo == nil || s.cfg.RunRepo == nil {
+		return nil, false
+	}
+	cid, err := uuid.Parse(rawConcernID)
+	if err != nil {
+		return nil, false
+	}
+	cs, err := s.cfg.ConcernRepo.GetByIDs(r.Context(), []uuid.UUID{cid})
+	if err != nil || len(cs) == 0 {
+		return nil, false
+	}
+	rn, err := s.cfg.RunRepo.GetRun(r.Context(), cs[0].RunID)
+	if err != nil {
+		return nil, false
+	}
+	return rn, true
 }
 
 // tokenFromHeader extracts a Fishhawk bearer token from the

@@ -91,7 +91,7 @@ func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (ApiTo
 }
 
 const getTokenByHash = `-- name: GetTokenByHash :one
-SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider FROM api_tokens
+SELECT id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider, account_id FROM api_tokens
  WHERE token_hash = $1
    AND revoked_at IS NULL
 `
@@ -112,6 +112,7 @@ func (q *Queries) GetTokenByHash(ctx context.Context, tokenHash string) (ApiToke
 		&i.RevokedAt,
 		&i.AuthMethod,
 		&i.Provider,
+		&i.AccountID,
 	)
 	return i, err
 }

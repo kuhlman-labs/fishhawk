@@ -177,6 +177,12 @@ func rowToToken(r tokendb.ApiToken) *Token {
 	if r.Provider.Valid {
 		out.Provider = r.Provider.String
 	}
+	// NULL account_id → "" (untenanted, ADR-057 / E44.5). Only GetTokenByHash
+	// selects the column; the other ApiToken-returning queries leave it nil,
+	// which maps to "" here — those paths don't consume the account.
+	if r.AccountID != nil {
+		out.AccountID = r.AccountID.String()
+	}
 	if r.LastUsedAt.Valid {
 		t := r.LastUsedAt.Time
 		out.LastUsedAt = &t

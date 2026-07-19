@@ -133,6 +133,21 @@ func (r *postgresRepo) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return rowToRun(row), nil
 }
 
+func (r *postgresRepo) GetRunAccountID(ctx context.Context, id uuid.UUID) (string, error) {
+	q := rundb.New(r.pool)
+	acct, err := q.GetRunAccountID(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("get run account_id: %w", err)
+	}
+	if acct == nil {
+		return "", nil
+	}
+	return acct.String(), nil
+}
+
 func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, error) {
 	if f.Limit <= 0 {
 		return nil, fmt.Errorf("list runs: limit must be > 0")
@@ -150,6 +165,7 @@ func (r *postgresRepo) ListRuns(ctx context.Context, f ListRunsFilter) ([]*Run, 
 		RunnerKind:     f.RunnerKind,
 		DecomposedFrom: f.DecomposedFrom,
 		ParentRunID:    f.ParentRunID,
+		AccountID:      accountIDArg(f.AccountID),
 		Lim:            int32(f.Limit),
 		Off:            int32(f.Offset),
 	})
@@ -862,6 +878,13 @@ func rowToRun(r rundb.Run) *Run {
 	}
 	out.DecomposedFrom = r.DecomposedFrom
 	out.UpstreamRunID = r.UpstreamRunID
+	// NULL account_id → "" (untenanted); a set value → its UUID string
+	// (ADR-057 / E44.5). GetRun / ListRuns select the column; the other
+	// Run-returning queries leave rundb.Run.AccountID nil, which maps to ""
+	// here — those paths don't consume the account so the zero value is safe.
+	if r.AccountID != nil {
+		out.AccountID = r.AccountID.String()
+	}
 	out.CostUSDTotal = r.CostUsdTotal
 	out.ResolvedModel = r.ResolvedModel
 	out.Drive = r.Drive
@@ -874,6 +897,22 @@ func rowToRun(r rundb.Run) *Run {
 // (non-decomposed run) round-trips to nil; a value round-trips
 // unchanged — a slice index never approaches int32 range, so the
 // narrowing conversion is lossless in practice.
+// accountIDArg maps a ListRunsFilter.AccountID (empty = no constraint,
+// else an account UUID string) to the nullable *uuid.UUID the sqlc filter
+// takes (ADR-057 / E44.5). A malformed non-empty value maps to nil (no
+// constraint) rather than erroring — the handler validates the account
+// source (the caller's resolved Identity.AccountID), so this is defensive.
+func accountIDArg(s string) *uuid.UUID {
+	if s == "" {
+		return nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+
 func intPtrToInt32Ptr(v *int) *int32 {
 	if v == nil {
 		return nil

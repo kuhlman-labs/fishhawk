@@ -3,6 +3,60 @@
 fishhawkd's HTTP surface: route handlers for the v0 REST API and the
 cross-component seams they anchor.
 
+## Account-ownership authorization (ADR-057 / E44.5, #1829)
+
+Handler authorization is tenant-scoped through ONE centralized middleware layer
+(`middleware.go`), applied at route registration (`handlers.go`) — never
+scattered per-handler. `Identity.AccountID` is the caller's tenant workspace
+account, populated on every auth path in `bearerAuth`: the cookie path from the
+session row's `account_id` (#1827); the api_token bearer path from the resolved
+token's `AccountID` (selected by `apitoken` `GetTokenByHash`); the `mcp:run`
+path from the token's OWN run via the optional `run.AccountGetter`
+capability (`GetRunAccountID`), so an mcp token is bounded to its run's account
+exactly like a bearer token bound to it.
+
+**The tiered wrappers.** `require{Run,Stage,Concern}Account(tier, next)` resolve
+the route's run WITH its `account_id` (`run_id` directly; `stage_id →
+stage.RunID → run`; `concern_id → concern.RunID → run`) and enforce before
+calling the handler. When the run can't be resolved (no repo, bad UUID, not
+found, load error) the wrapper **falls through** to the handler unchanged, so
+`503`/`400`/`404` surfaces are never altered by the authz layer. Three tiers,
+each visible in `handlers.go`'s route table (the tier of every write route
+encodes the operator's admin-vs-member founder decision, reviewable there):
+`readAccess` (GET run/stage/gate views — ownership only), `memberWrite`
+(operator-decision writes + the runner `ship-*` uploads), `adminWrite`
+(destructive/admin sub-actions: cancel, recover, revive, reset-branch, redrive,
+reap-failure, deployment rollback, signing-key, installation-token, mcp-token).
+
+**`enforceAccount` — two checks.** (1) OWNERSHIP (all tiers): a tenanted run
+(`AccountID != ""`) whose account disagrees with the caller's → `403
+account_forbidden`; an untenanted run (`AccountID == ""`, every row today) is
+allowed — the NULL-allow window #1830 closes once every row is populated. (2)
+COOKIE ROLE-BOUNDING (write tiers only, resolved OAuth cookie only:
+`SessionID != "" && TokenID == ""`): an empty `AccountID` on a write → `403
+account_unresolved`; with a role provider wired (`Config.AccountRoles`,
+`account.Store.MemberRole`), an `adminWrite` tier requires the `admin` role
+(else `403 insufficient_role`) while `memberWrite` admits `member`/`admin`/
+NULL-role (least privilege). Bearer and mcp identities carry a `TokenID`, so
+role-bounding never fires for them — ownership alone bounds them. A nil
+`AccountRoles` (no database wired) is the untenanted-allow posture:
+role-bounding is skipped, ownership still applies. The role lookup is
+**forge-agnostic** — it strips the `<provider>:` prefix from the identity
+subject generically (`github:`, `gitlab:`, any future forge), never a hard-coded
+literal.
+
+**List / export account scoping (filter, not 403).** `GET /v0/runs` bounds its
+page to the caller's account via `ListRunsFilter.AccountID` (SQL `account_id = $
+OR account_id IS NULL`). The bulk-export surfaces (`GET /v0/audit/export`,
+`.../export.csv`, `GET /v0/reports/agent-changes(.md)`) route their resolved
+page through `accountVisiblePage` (`audit_export.go`). Both keep untenanted
+(NULL-account) rows visible, and an empty caller account (operator/bearer token
+with no account) sees everything (the pre-tenancy view). The run-less global
+audit-chain partition is never account-scoped (it has no owning run).
+
+**403 codes:** `account_forbidden`, `account_unresolved`, `insufficient_role`.
+The cross-boundary integration matrix is `authz_account_test.go`.
+
 ## Acceptance stage seam (E31, ADR-049 / ADR-050)
 
 The acceptance surface spans spec → plan pre-check → dispatch →

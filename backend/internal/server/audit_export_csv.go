@@ -99,6 +99,10 @@ func (s *Server) handleAuditExportCSV(w http.ResponseWriter, r *http.Request) {
 		// resolveExportPage already wrote the error response.
 		return
 	}
+	// Account-scope the page (ADR-057 / E44.5): the CSV projection carries the
+	// same tenant-isolation as the JSON export. The run-less global partition
+	// below is unfiltered (it has no owning run).
+	ep.page = accountVisiblePage(r, ep.page)
 
 	// Render the WHOLE page to a buffer first, so any per-run assembly
 	// error becomes a clean JSON writeError with no partial CSV bytes
