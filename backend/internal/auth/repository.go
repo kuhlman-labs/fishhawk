@@ -20,9 +20,12 @@ type GitHubProfile struct {
 // Postgres implementation; tests substitute a fake.
 type Repository interface {
 	// SignIn upserts the user (keyed by GitHub id) and creates a
-	// fresh session. Returns the populated Session including its
-	// PlainText (set exactly once at issue time).
-	SignIn(ctx context.Context, p GitHubProfile) (*User, *Session, error)
+	// fresh session bound to the account the membership gate
+	// resolved (E44.3 / ADR-057 Amendment A2). accountID may be
+	// uuid.Nil only where no gate ran (tests); the callback always
+	// passes a resolved account. Returns the populated Session
+	// including its PlainText (set exactly once at issue time).
+	SignIn(ctx context.Context, p GitHubProfile, accountID uuid.UUID) (*User, *Session, error)
 
 	// Authenticate hashes plaintext, looks up an active session,
 	// validates sliding + absolute TTLs against the current

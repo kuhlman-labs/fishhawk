@@ -19,11 +19,13 @@ SELECT * FROM users WHERE id = $1;
 SELECT * FROM users WHERE github_user_id = $1;
 
 -- name: CreateSession :one
+-- account_id is the workspace account the membership gate resolved at
+-- sign-in (E44.3); NULL only where no gate ran.
 INSERT INTO sessions (
     id, user_id, token_hash,
-    sliding_expires_at, absolute_expires_at
+    sliding_expires_at, absolute_expires_at, account_id
 )
-VALUES ($1, $2, $3, $4, $5)
+VALUES ($1, $2, $3, $4, $5, $6)
 RETURNING *;
 
 -- name: GetSessionByHash :one

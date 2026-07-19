@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 )
 
@@ -73,7 +75,7 @@ func signInWithSession(t *testing.T) (s *Server, sessCookie, csrfCookie *http.Co
 	srv, repo := newAuthServer(t)
 	_, sess, err := repo.SignIn(context.Background(), auth.GitHubProfile{
 		ID: 99, Login: "csrf-tester", Name: "Tester",
-	})
+	}, uuid.New())
 	if err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}

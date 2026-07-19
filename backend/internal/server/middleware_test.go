@@ -189,6 +189,31 @@ func TestBearerAuth_SessionDBUnavailable_Returns503(t *testing.T) {
 	}
 }
 
+// TestBearerAuth_CookiePathStampsAccountID pins the E44.3 identity
+// stamping: the cookie path copies the session row's account binding
+// onto Identity.AccountID (and leaves it empty for unbound sessions,
+// which /v0/auth/me then refuses).
+func TestBearerAuth_CookiePathStampsAccountID(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	const boundAccount = "11111111-2222-3333-4444-555555555555"
+	sessions := stubSessionAuth{
+		user: &auth.User{ID: "u-1", GitHubLogin: "octocat"},
+		sess: &auth.Session{ID: "s-1", UserID: "u-1", AccountID: boundAccount},
+	}
+
+	var captured Identity
+	h := s.bearerAuth(nil, nil, sessions)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: "fhs_deadbeef"})
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if captured.AccountID != boundAccount {
+		t.Errorf("Identity.AccountID = %q, want %q", captured.AccountID, boundAccount)
+	}
+}
+
 // TestBearerAuth_MCPTokenDBUnavailable_Returns503 mirrors the apitoken
 // 503 seam for the MCP-token (fhm_) path (#764): the MCP authenticator
 // fails because the database is unreachable. Guards the third dberr

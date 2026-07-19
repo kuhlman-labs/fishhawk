@@ -288,6 +288,17 @@ type Config struct {
 	// root). Defaults to "/" when empty.
 	AuthRedirectAfterLogin string
 
+	// AuthMembership resolves which workspace account(s) admit a
+	// logging-in forge user (E44.3 / ADR-057 Amendment A2). Consulted
+	// by the OAuth callback BEFORE SignIn; a nil resolver denies
+	// EVERY sign-in (fail closed — no session, no cookie).
+	AuthMembership auth.MembershipResolver
+
+	// AuthAccessDeniedRedirect is where the callback sends a user the
+	// membership gate denied (no session is created). Defaults to
+	// "/access-denied"; validated by isSafeRelativeRedirect.
+	AuthAccessDeniedRedirect string
+
 	// ExternalURL is the operator-facing root URL for the SPA, e.g.
 	// `https://app.fishhawk.example.com`. Used to build links in
 	// surfaces that escape the backend (today: GitHub Check Runs,
