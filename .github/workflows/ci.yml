@@ -146,7 +146,7 @@ jobs:
       # thrashing the exact key on every push.
       - name: Cache golangci-lint analysis cache
         if: steps.have-modules.outputs.yes == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/golangci-lint
           key: golangci-${{ runner.os }}-${{ hashFiles('.golangci.yml') }}-${{ github.sha }}
