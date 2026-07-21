@@ -92,9 +92,9 @@ workflows:
         reviewers:
           agents:
             - provider: claudecode
-              model: claude-opus-4-8
+              model: claude-fable-5
             - provider: codex
-              model: gpt-5.6-terra
+              model: gpt-5.6-sol
               reasoning_effort: high
           human: 1
         inputs:
@@ -152,15 +152,15 @@ workflows:
         # post-#584; verdicts land ~60-90s+ after the implement trace
         # upload (poll the audit / get_run_status). Heterogeneous
         # topology (#955): same Codex reviewer as the plan stage; the Claude
-        # reviewer runs on Opus 4.8 — the implement review is the last
+        # reviewer runs on Fable 5 — the implement review is the last
         # quality gate before merge, so the most capable model reviewing the
         # diff is the highest-leverage place to catch escaped defects.
         reviewers:
           agents:
             - provider: claudecode
-              model: claude-opus-4-8
+              model: claude-fable-5
             - provider: codex
-              model: gpt-5.6-terra
+              model: gpt-5.6-sol
               reasoning_effort: high
           human: 1
         inputs:
