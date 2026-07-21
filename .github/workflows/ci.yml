@@ -86,7 +86,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           # Some transitive deps (pgx, testcontainers, golang-migrate) declare
           # `go 1.25` directives, so the toolchain on the runner must be >= 1.25
@@ -172,7 +172,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.25'
           cache: true
