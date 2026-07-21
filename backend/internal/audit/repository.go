@@ -96,4 +96,14 @@ type Repository interface {
 type ListAllParams struct {
 	Category *string
 	RunID    *uuid.UUID
+	// AccountID scopes the listing to a tenant workspace account
+	// (ADR-057 / #1830). Empty = no constraint, mirroring
+	// run.ListRunsFilter.AccountID — the internal system readers
+	// (calibration, cost/alert scans, prompt + acceptance stats) leave it
+	// empty so their cross-account reads are unnarrowed. When set, the
+	// query keeps rows whose account_id equals it OR whose account_id is
+	// NULL (untenanted rows stay universally visible — the #1829
+	// NULL-allow window); the user-facing audit-list handler passes the
+	// caller's Identity.AccountID.
+	AccountID string
 }

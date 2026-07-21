@@ -60,6 +60,15 @@ type fakeCampaignRepo struct {
 	itemsErrOnCall int
 	itemsCalls     int
 
+	// lastListFilter records the most recent ListCampaigns filter so handler
+	// tests can assert the account-scope wire-up (ADR-057 / #1830).
+	lastListFilter campaign.ListCampaignsFilter
+
+	// accounts maps campaign id -> workspace account for the AccountGetter
+	// capability override below; a campaign absent from the map is
+	// untenanted ("").
+	accounts map[uuid.UUID]string
+
 	// call counters so idempotency tests can assert a no-op re-poll performs no
 	// further mutation.
 	transItemCalls int
@@ -73,6 +82,7 @@ func newFakeCampaignRepo() *fakeCampaignRepo {
 	return &fakeCampaignRepo{
 		campaigns:  map[uuid.UUID]*campaign.Campaign{},
 		itemsByCmp: map[uuid.UUID][]*campaign.Item{},
+		accounts:   map[uuid.UUID]string{},
 	}
 }
 
@@ -258,6 +268,19 @@ func (f *fakeCampaignRepo) CreateCampaignItem(_ context.Context, p campaign.Crea
 	return it, nil
 }
 
+// GetCampaignAccountID overrides BaseFake's ErrNotFound no-op so handler
+// tests can exercise the GET /v0/campaigns/{id} ownership check
+// (ADR-057 / #1830): a campaign seeded into the accounts map is tenanted;
+// everything else is untenanted ("").
+func (f *fakeCampaignRepo) GetCampaignAccountID(_ context.Context, id uuid.UUID) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.campaigns[id]; !ok {
+		return "", campaign.ErrNotFound
+	}
+	return f.accounts[id], nil
+}
+
 func (f *fakeCampaignRepo) GetCampaign(_ context.Context, id uuid.UUID) (*campaign.Campaign, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -274,6 +297,7 @@ func (f *fakeCampaignRepo) GetCampaign(_ context.Context, id uuid.UUID) (*campai
 func (f *fakeCampaignRepo) ListCampaigns(_ context.Context, fil campaign.ListCampaignsFilter) ([]*campaign.Campaign, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastListFilter = fil
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
@@ -1530,6 +1554,87 @@ func TestListCampaignItems_BadUUID_400(t *testing.T) {
 	}
 }
 
+// TestGetCampaign_AccountOwnership pins the GET /v0/campaigns/{id}
+// ownership check (ADR-057 / #1830), mirroring enforceAccount for runs:
+// a cross-account campaign is 403 account_forbidden, a same-account one is
+// allowed, and an untenanted campaign is allowed under any caller (the
+// NULL-allow window).
+func TestGetCampaign_AccountOwnership(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	tenanted := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", nil)
+	untenanted := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:100", nil)
+	acctA, acctB := uuid.NewString(), uuid.NewString()
+	repo.accounts[tenanted.ID] = acctA
+	s := New(Config{CampaignRepo: repo})
+
+	get := func(campaignID uuid.UUID, callerAcct string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+campaignID.String(), nil)
+		req.SetPathValue("campaign_id", campaignID.String())
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+			Identity{Subject: "github:op", TokenID: "tok-1", AccountID: callerAcct}))
+		w := httptest.NewRecorder()
+		s.handleGetCampaign(w, req)
+		return w
+	}
+
+	// Cross-account: refused 403 account_forbidden.
+	if w := get(tenanted.ID, acctB); w.Code != http.StatusForbidden {
+		t.Errorf("cross-account status = %d, want 403 (body=%s)", w.Code, w.Body.String())
+	} else if code := decodeCampaignError(t, w); code != "account_forbidden" {
+		t.Errorf("cross-account code = %q, want account_forbidden", code)
+	}
+
+	// Same account: allowed.
+	if w := get(tenanted.ID, acctA); w.Code != http.StatusOK {
+		t.Errorf("same-account status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+
+	// Untenanted campaign: allowed under any (even cross-tenant) caller.
+	if w := get(untenanted.ID, acctB); w.Code != http.StatusOK {
+		t.Errorf("untenanted status = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// erroringAccountCampaignRepo fails the AccountGetter lookup so the
+// degrade-to-untenanted-allow posture is testable.
+type erroringAccountCampaignRepo struct{ *fakeCampaignRepo }
+
+func (e erroringAccountCampaignRepo) GetCampaignAccountID(context.Context, uuid.UUID) (string, error) {
+	return "", errInjected
+}
+
+// noCapabilityCampaignRepo narrows a fake to the plain Repository method
+// set (interface embedding drops GetCampaignAccountID), so the
+// capability-absent branch is testable.
+type noCapabilityCampaignRepo struct{ campaign.Repository }
+
+// TestGetCampaign_AccountOwnership_Degrades pins enforceCampaignAccount's
+// two fall-open branches (ADR-057 / #1830): an AccountGetter lookup error
+// and a repo without the capability both degrade to untenanted-allow (the
+// best-effort posture bearerAuth's mcp:run account resolution uses) rather
+// than failing the read.
+func TestGetCampaign_AccountOwnership_Degrades(t *testing.T) {
+	inner := newFakeCampaignRepo()
+	c := inner.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", nil)
+	inner.accounts[c.ID] = uuid.NewString() // tenanted, but the lookup won't see it
+
+	for name, repo := range map[string]campaign.Repository{
+		"lookup_error":      erroringAccountCampaignRepo{inner},
+		"capability_absent": noCapabilityCampaignRepo{inner},
+	} {
+		s := New(Config{CampaignRepo: repo})
+		req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String(), nil)
+		req.SetPathValue("campaign_id", c.ID.String())
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+			Identity{Subject: "github:op", TokenID: "tok-1", AccountID: uuid.NewString()}))
+		w := httptest.NewRecorder()
+		s.handleGetCampaign(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200 (degrade to allow; body=%s)", name, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestGetCampaignStatus_RollupAndNextAction(t *testing.T) {
 	repo := newFakeCampaignRepo()
 	// A GENUINELY-STUCK failed item (its dependency is unsatisfied, so it stays in
@@ -1645,6 +1750,42 @@ func TestListCampaigns_PaginationAndEmpty(t *testing.T) {
 	}
 	if page2.NextCursor != "" {
 		t.Errorf("page2 next_cursor = %q, want empty (end of list)", page2.NextCursor)
+	}
+}
+
+// TestListCampaigns_AccountScope_PassesThrough pins the account-scope
+// wire-up (ADR-057 / #1830): the handler hands the caller's
+// Identity.AccountID to the repo via ListCampaignsFilter, and an
+// untenanted caller passes "" (no constraint — the unchanged view).
+func TestListCampaigns_AccountScope_PassesThrough(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo})
+
+	acct := uuid.NewString()
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+		Identity{Subject: "github:op", TokenID: "tok-1", AccountID: acct}))
+	w := httptest.NewRecorder()
+	s.handleListCampaigns(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if repo.lastListFilter.AccountID != acct {
+		t.Errorf("filter AccountID = %q, want %q", repo.lastListFilter.AccountID, acct)
+	}
+
+	// Untenanted caller (no AccountID on the identity): empty filter —
+	// unnarrowed, per ListCampaignsFilter.AccountID's contract.
+	req = httptest.NewRequest(http.MethodGet, "/v0/campaigns", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+		Identity{Subject: "github:op", TokenID: "tok-1"}))
+	w = httptest.NewRecorder()
+	s.handleListCampaigns(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if repo.lastListFilter.AccountID != "" {
+		t.Errorf("untenanted filter AccountID = %q, want empty", repo.lastListFilter.AccountID)
 	}
 }
 

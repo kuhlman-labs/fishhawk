@@ -115,6 +115,124 @@ func TestPostgres_ListCampaigns(t *testing.T) {
 	}
 }
 
+// TestPostgres_GetCampaignAccountID exercises the AccountGetter capability
+// (ADR-057 / #1830): a tenanted campaign yields its account UUID string, an
+// untenanted (NULL account_id) one yields "", and a missing id yields
+// ErrNotFound. Also pins that GetCampaign still round-trips a tenanted row
+// (the added account_id scan handles non-NULL values).
+func TestPostgres_GetCampaignAccountID(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	acct := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+		acct, "acct-"+acct.String()[:8]); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	tenanted, plain := makeCampaign(t, repo), makeCampaign(t, repo)
+	if _, err := pool.Exec(ctx, `UPDATE campaigns SET account_id=$1 WHERE id=$2`, acct, tenanted.ID); err != nil {
+		t.Fatalf("bind account: %v", err)
+	}
+
+	getter, ok := repo.(campaign.AccountGetter)
+	if !ok {
+		t.Fatal("postgres repo does not implement campaign.AccountGetter")
+	}
+	got, err := getter.GetCampaignAccountID(ctx, tenanted.ID)
+	if err != nil {
+		t.Fatalf("GetCampaignAccountID: %v", err)
+	}
+	if got != acct.String() {
+		t.Errorf("GetCampaignAccountID = %q, want %q", got, acct.String())
+	}
+	gotPlain, err := getter.GetCampaignAccountID(ctx, plain.ID)
+	if err != nil {
+		t.Fatalf("GetCampaignAccountID(untenanted): %v", err)
+	}
+	if gotPlain != "" {
+		t.Errorf("untenanted GetCampaignAccountID = %q, want empty", gotPlain)
+	}
+	if _, err := getter.GetCampaignAccountID(ctx, uuid.New()); !errors.Is(err, campaign.ErrNotFound) {
+		t.Errorf("GetCampaignAccountID(missing) err = %v, want ErrNotFound", err)
+	}
+
+	// The tenanted row still round-trips through GetCampaign (non-NULL
+	// account_id scan).
+	rt, err := repo.GetCampaign(ctx, tenanted.ID)
+	if err != nil {
+		t.Fatalf("get tenanted campaign: %v", err)
+	}
+	if rt.ID != tenanted.ID {
+		t.Errorf("round-trip mismatch: %+v", rt)
+	}
+}
+
+// TestPostgres_ListCampaigns_AccountFilter exercises
+// ListCampaignsFilter.AccountID (ADR-057 / #1830): a set filter keeps
+// same-account campaigns PLUS untenanted (NULL account_id) campaigns and
+// excludes other accounts' campaigns; an empty filter is no constraint; a
+// malformed non-empty value degrades to no constraint (accountIDArg's
+// defensive nil mapping — the handler validates the account source).
+func TestPostgres_ListCampaigns_AccountFilter(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	acctA, acctB := uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{acctA, acctB} {
+		if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+			id, "acct-"+id.String()[:8]); err != nil {
+			t.Fatalf("insert account: %v", err)
+		}
+	}
+	campA, campB, campU := makeCampaign(t, repo), makeCampaign(t, repo), makeCampaign(t, repo)
+	if _, err := pool.Exec(ctx, `UPDATE campaigns SET account_id=$1 WHERE id=$2`, acctA, campA.ID); err != nil {
+		t.Fatalf("bind A: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE campaigns SET account_id=$1 WHERE id=$2`, acctB, campB.ID); err != nil {
+		t.Fatalf("bind B: %v", err)
+	}
+
+	ids := func(cs []*campaign.Campaign) map[uuid.UUID]bool {
+		m := map[uuid.UUID]bool{}
+		for _, c := range cs {
+			m[c.ID] = true
+		}
+		return m
+	}
+
+	// Account A: A's campaign + the untenanted one visible, B's excluded.
+	got, err := repo.ListCampaigns(ctx, campaign.ListCampaignsFilter{AccountID: acctA.String(), Limit: 100})
+	if err != nil {
+		t.Fatalf("list A: %v", err)
+	}
+	m := ids(got)
+	if !m[campA.ID] || !m[campU.ID] || m[campB.ID] {
+		t.Errorf("account A listing = %v; want campA+campU, not campB", m)
+	}
+
+	// Empty filter: no constraint — all three visible.
+	got, err = repo.ListCampaigns(ctx, campaign.ListCampaignsFilter{Limit: 100})
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	m = ids(got)
+	if !m[campA.ID] || !m[campB.ID] || !m[campU.ID] {
+		t.Errorf("unfiltered listing = %v; want all three campaigns", m)
+	}
+
+	// Malformed non-empty filter: degrades to no constraint rather than
+	// erroring (defensive — the handler owns validating the source).
+	got, err = repo.ListCampaigns(ctx, campaign.ListCampaignsFilter{AccountID: "not-a-uuid", Limit: 100})
+	if err != nil {
+		t.Fatalf("list malformed: %v", err)
+	}
+	if m = ids(got); !m[campA.ID] || !m[campB.ID] || !m[campU.ID] {
+		t.Errorf("malformed-filter listing = %v; want all three campaigns (no constraint)", m)
+	}
+}
+
 func TestPostgres_ListCampaigns_BadPagination(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := campaign.NewPostgresRepository(pool)

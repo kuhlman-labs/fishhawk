@@ -72,7 +72,12 @@ ORDER BY ae.sequence ASC;
 -- governance event is at the top; secondary sort on (id) keeps ordering
 -- deterministic when entries share a millisecond. Optional category +
 -- run_id filters; sqlc.narg makes them omittable from the WHERE.
+-- account_id (ADR-057 / #1830) scopes to a tenant workspace account: a
+-- set filter keeps the account's rows PLUS untenanted (NULL account_id)
+-- rows — the same contract as run.ListRuns — while NULL (unset) keeps
+-- the internal system readers' cross-account scans unconstrained.
 SELECT * FROM audit_entries
  WHERE (sqlc.narg(category)::text IS NULL OR category = sqlc.narg(category)::text)
    AND (sqlc.narg(run_id)::uuid  IS NULL OR run_id   = sqlc.narg(run_id)::uuid)
+   AND (sqlc.narg(account_id)::uuid IS NULL OR account_id = sqlc.narg(account_id)::uuid OR account_id IS NULL)
  ORDER BY ts DESC, id DESC;

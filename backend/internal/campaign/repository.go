@@ -57,10 +57,18 @@ type CreateCampaignItemParams struct {
 // constraint" — same convention as run.ListRunsFilter and the underlying
 // SQL. Limit must be > 0; Offset must be >= 0.
 type ListCampaignsFilter struct {
-	Repo   string
-	State  string
-	Limit  int
-	Offset int
+	Repo  string
+	State string
+	// AccountID scopes the listing to a tenant workspace account
+	// (ADR-057 / #1830). Empty = no constraint, mirroring
+	// run.ListRunsFilter.AccountID. When set, the query keeps rows whose
+	// account_id equals it OR whose account_id is NULL (untenanted
+	// campaigns stay visible — the #1829 NULL-allow window) — the
+	// account-scoped list contract the /v0/campaigns handler enforces
+	// against the caller's Identity.AccountID.
+	AccountID string
+	Limit     int
+	Offset    int
 }
 
 // Repository persists campaigns and campaign items and applies
@@ -174,4 +182,19 @@ type Repository interface {
 	// out-of-band). A concurrent second call re-reads the now-succeeded row under
 	// the lock and is rejected.
 	SettleCampaignItemOutOfBand(ctx context.Context, id uuid.UUID) (*Item, error)
+}
+
+// AccountGetter is an OPTIONAL capability on the concrete postgres repo —
+// the cheap tenant-account lookup (ADR-057 / #1830) that returns just a
+// campaign's account_id ("" for an untenanted NULL row, the account UUID
+// string otherwise) without the domain Campaign type carrying the column. It
+// is kept OFF the Repository interface — mirroring run.AccountGetter —
+// so adding it breaks no existing Repository implementation. The
+// GET /v0/campaigns/{id} handler type-asserts it for the ownership check
+// (caller's Identity.AccountID vs the campaign's account; untenanted =
+// allowed); a repo without the capability degrades to untenanted-allow.
+// BaseFake provides a no-op so a fake embedding it satisfies the capability
+// for free.
+type AccountGetter interface {
+	GetCampaignAccountID(ctx context.Context, id uuid.UUID) (string, error)
 }
