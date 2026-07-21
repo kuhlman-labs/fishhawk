@@ -1608,30 +1608,53 @@ func (e erroringAccountCampaignRepo) GetCampaignAccountID(context.Context, uuid.
 // capability-absent branch is testable.
 type noCapabilityCampaignRepo struct{ campaign.Repository }
 
-// TestGetCampaign_AccountOwnership_Degrades pins enforceCampaignAccount's
-// two fall-open branches (ADR-057 / #1830): an AccountGetter lookup error
-// and a repo without the capability both degrade to untenanted-allow (the
-// best-effort posture bearerAuth's mcp:run account resolution uses) rather
-// than failing the read.
-func TestGetCampaign_AccountOwnership_Degrades(t *testing.T) {
+// TestGetCampaign_AccountOwnership_LookupError_FailsClosed pins the
+// security-critical fail-CLOSED posture (ADR-057 / #1830): an AccountGetter
+// lookup ERROR must NOT disclose the already-resolved tenanted campaign to a
+// cross-account caller. A transient DB failure on the account probe surfaces
+// 503 service_unavailable (mirroring bearerAuth's mcp:run account resolution,
+// "any lookup ERROR fails CLOSED with 503"), never a fall-open 200.
+func TestGetCampaign_AccountOwnership_LookupError_FailsClosed(t *testing.T) {
 	inner := newFakeCampaignRepo()
 	c := inner.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", nil)
-	inner.accounts[c.ID] = uuid.NewString() // tenanted, but the lookup won't see it
+	inner.accounts[c.ID] = uuid.NewString() // tenanted, but the lookup errors before it's read
 
-	for name, repo := range map[string]campaign.Repository{
-		"lookup_error":      erroringAccountCampaignRepo{inner},
-		"capability_absent": noCapabilityCampaignRepo{inner},
-	} {
-		s := New(Config{CampaignRepo: repo})
-		req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String(), nil)
-		req.SetPathValue("campaign_id", c.ID.String())
-		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
-			Identity{Subject: "github:op", TokenID: "tok-1", AccountID: uuid.NewString()}))
-		w := httptest.NewRecorder()
-		s.handleGetCampaign(w, req)
-		if w.Code != http.StatusOK {
-			t.Errorf("%s: status = %d, want 200 (degrade to allow; body=%s)", name, w.Code, w.Body.String())
-		}
+	s := New(Config{CampaignRepo: erroringAccountCampaignRepo{inner}})
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String(), nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+		Identity{Subject: "github:op", TokenID: "tok-1", AccountID: uuid.NewString()}))
+	w := httptest.NewRecorder()
+	s.handleGetCampaign(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lookup_error: status = %d, want 503 (fail closed; body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "service_unavailable" {
+		t.Errorf("lookup_error: code = %q, want service_unavailable", code)
+	}
+}
+
+// TestGetCampaign_AccountOwnership_CapabilityAbsent pins the remaining
+// degrade-to-allow branch (ADR-057 / #1830): a repo WITHOUT the optional
+// AccountGetter capability degrades to untenanted-allow, matching the
+// run.AccountGetter posture bearerAuth uses when the capability is absent.
+// This branch is unreachable in production — the concrete postgres repo
+// carries AccountGetter (a compile-time assertion) — so only a
+// capability-narrowed test fake lands here.
+func TestGetCampaign_AccountOwnership_CapabilityAbsent(t *testing.T) {
+	inner := newFakeCampaignRepo()
+	c := inner.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", nil)
+	inner.accounts[c.ID] = uuid.NewString() // tenanted, but the capability-narrowed repo can't see it
+
+	s := New(Config{CampaignRepo: noCapabilityCampaignRepo{inner}})
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String(), nil)
+	req.SetPathValue("campaign_id", c.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+		Identity{Subject: "github:op", TokenID: "tok-1", AccountID: uuid.NewString()}))
+	w := httptest.NewRecorder()
+	s.handleGetCampaign(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("capability_absent: status = %d, want 200 (degrade to allow; body=%s)", w.Code, w.Body.String())
 	}
 }
 

@@ -155,11 +155,19 @@ func newRLSFixture(t *testing.T) *rlsFixture {
 // WithTenant transaction on pool.
 func visibleIDs(t *testing.T, pool *pgxpool.Pool, account, table string) map[uuid.UUID]bool {
 	t.Helper()
+	return visibleKeys(t, pool, account, table, "id")
+}
+
+// visibleKeys is visibleIDs generalized over the key column, for tables whose
+// primary key isn't named "id" (e.g. refinement_filing_sessions keys on
+// draft_id). table + keyCol are test-controlled literals, not request input.
+func visibleKeys(t *testing.T, pool *pgxpool.Pool, account, table, keyCol string) map[uuid.UUID]bool {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	got := map[uuid.UUID]bool{}
 	if err := postgres.WithTenant(ctx, pool, account, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, "SELECT id FROM "+table)
+		rows, err := tx.Query(ctx, "SELECT "+keyCol+" FROM "+table)
 		if err != nil {
 			return err
 		}
@@ -322,4 +330,100 @@ func TestRLS_CrossAccountIsolation(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestRLS_CrossAccountReadIsolation_AllAccountTables extends the headline proof
+// to EVERY remaining account_id-carrying root table (#1830): campaigns, the
+// four refinement_* tables, api_tokens, and audit_entries. runs/stages/sessions
+// are covered by TestRLS_CrossAccountIsolation above. Without this a policy
+// could be present yet behaviorally ineffective for one of these tables (a
+// wrong predicate, a missing FORCE) and go undetected. Each table is seeded
+// with an account-A row, an account-B row, and an untenanted (NULL) row via the
+// superuser admin (which bypasses RLS), then read under the non-superuser probe
+// role: the cross-account row must be hidden while the own + NULL rows remain
+// visible.
+func TestRLS_CrossAccountReadIsolation_AllAccountTables(t *testing.T) {
+	f := newRLSFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	accountA := f.accountA.String()
+	accountB := f.accountB.String()
+
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := f.admin.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("seed %q: %v", sql, err)
+		}
+	}
+
+	campA, campB, campN := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO campaigns (id, repo, epic_ref, account_id)
+	      VALUES ($1,'r','issue:1',$2),($3,'r','issue:1',$4),($5,'r','issue:1',NULL)`,
+		campA, f.accountA, campB, f.accountB, campN)
+
+	// The four refinement_* tables chain FK: decisions + filing_sessions ->
+	// drafts, filed_items -> filing_sessions. Reuse one draft id per account as
+	// the shared FK anchor (filing_sessions keys on draft_id).
+	draftA, draftB, draftN := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO refinement_drafts (id, session_id, brief, draft, account_id)
+	      VALUES ($1,$2,'b','{}'::jsonb,$3),($4,$5,'b','{}'::jsonb,$6),($7,$8,'b','{}'::jsonb,NULL)`,
+		draftA, uuid.New(), f.accountA, draftB, uuid.New(), f.accountB, draftN, uuid.New())
+
+	decA, decB, decN := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO refinement_decisions (id, session_id, draft_id, decision, reason, draft_content_hash, account_id)
+	      VALUES ($1,$2,$3,'approved','r','h',$4),($5,$6,$7,'approved','r','h',$8),($9,$10,$11,'approved','r','h',NULL)`,
+		decA, uuid.New(), draftA, f.accountA, decB, uuid.New(), draftB, f.accountB, decN, uuid.New(), draftN)
+
+	exec(`INSERT INTO refinement_filing_sessions (draft_id, session_id, repo, account_id)
+	      VALUES ($1,$2,'r',$3),($4,$5,'r',$6),($7,$8,'r',NULL)`,
+		draftA, uuid.New(), f.accountA, draftB, uuid.New(), f.accountB, draftN, uuid.New())
+
+	itemA, itemB, itemN := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO refinement_filed_items (id, draft_id, ordinal, issue_number, issue_url, account_id)
+	      VALUES ($1,$2,0,1,'u',$3),($4,$5,0,1,'u',$6),($7,$8,0,1,'u',NULL)`,
+		itemA, draftA, f.accountA, itemB, draftB, f.accountB, itemN, draftN)
+
+	tokA, tokB, tokN := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO api_tokens (id, subject, token_hash, account_id)
+	      VALUES ($1,'s',$2,$3),($4,'s',$5,$6),($7,'s',$8,NULL)`,
+		tokA, "th-"+tokA.String(), f.accountA, tokB, "th-"+tokB.String(), f.accountB, tokN, "th-"+tokN.String())
+
+	// audit_entries.run_id -> runs (fixture-seeded). RLS scopes via
+	// audit_entries.account_id, independent of the run's own account.
+	audA, audB, audN := uuid.New(), uuid.New(), uuid.New()
+	exec(`INSERT INTO audit_entries (id, run_id, category, payload, entry_hash, account_id)
+	      VALUES ($1,$2,'c','{}'::jsonb,'h1',$3),($4,$5,'c','{}'::jsonb,'h2',$6),($7,$8,'c','{}'::jsonb,'h3',NULL)`,
+		audA, f.runA, f.accountA, audB, f.runB, f.accountB, audN, f.runNull)
+
+	cases := []struct {
+		table            string
+		keyCol           string
+		a, b, untenanted uuid.UUID
+	}{
+		{"campaigns", "id", campA, campB, campN},
+		{"refinement_drafts", "id", draftA, draftB, draftN},
+		{"refinement_decisions", "id", decA, decB, decN},
+		{"refinement_filing_sessions", "draft_id", draftA, draftB, draftN},
+		{"refinement_filed_items", "id", itemA, itemB, itemN},
+		{"api_tokens", "id", tokA, tokB, tokN},
+		{"audit_entries", "id", audA, audB, audN},
+	}
+	for _, c := range cases {
+		t.Run(c.table, func(t *testing.T) {
+			underA := visibleKeys(t, f.probe, accountA, c.table, c.keyCol)
+			if underA[c.b] {
+				t.Errorf("account B's %s row visible under account A, want RLS-hidden", c.table)
+			}
+			if !underA[c.a] || !underA[c.untenanted] {
+				t.Errorf("%s under account A = %v, want own %s and untenanted %s", c.table, underA, c.a, c.untenanted)
+			}
+			underB := visibleKeys(t, f.probe, accountB, c.table, c.keyCol)
+			if underB[c.a] {
+				t.Errorf("account A's %s row visible under account B, want RLS-hidden", c.table)
+			}
+			if !underB[c.b] || !underB[c.untenanted] {
+				t.Errorf("%s under account B = %v, want own %s and untenanted %s", c.table, underB, c.b, c.untenanted)
+			}
+		})
+	}
 }

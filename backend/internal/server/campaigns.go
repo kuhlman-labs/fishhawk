@@ -656,19 +656,33 @@ func (s *Server) handleGetCampaign(w http.ResponseWriter, r *http.Request) {
 // campaign (NULL account_id → "") is allowed — the NULL-allow window a
 // later E44 child closes. The account is read via the OPTIONAL
 // campaign.AccountGetter capability (the domain Campaign type doesn't
-// carry the column); a repo without the capability, or a lookup error
-// (e.g. an embedding BaseFake's ErrNotFound), degrades to
-// untenanted-allow — the same best-effort posture as the mcp:run
-// identity's account resolution in bearerAuth. Returns true when the
-// request may proceed; on denial it writes the error envelope and
-// returns false.
+// carry the column).
+//
+// A lookup ERROR fails CLOSED (503), never open: a transient DB failure on
+// the account probe must NOT fall through to untenanted-allow and disclose
+// the already-resolved tenanted campaign to a caller from another account.
+// This mirrors the mcp:run identity's account resolution in bearerAuth,
+// whose written contract is "any lookup ERROR fails CLOSED with 503". A repo
+// WITHOUT the capability still degrades to untenanted-allow — but that branch
+// is unreachable in production, where the concrete postgres repo carries
+// AccountGetter (a compile-time assertion pins it) and only a
+// capability-narrowed test fake lands there; it matches the run.AccountGetter
+// posture bearerAuth uses when the capability is absent. Returns true when the
+// request may proceed; on denial it writes the error envelope and returns
+// false.
 func (s *Server) enforceCampaignAccount(w http.ResponseWriter, r *http.Request, id uuid.UUID) bool {
 	getter, ok := s.cfg.CampaignRepo.(campaign.AccountGetter)
 	if !ok {
 		return true
 	}
 	acct, err := getter.GetCampaignAccountID(r.Context(), id)
-	if err != nil || acct == "" {
+	if err != nil {
+		// Fail CLOSED: a probe error must never fall through to allow.
+		s.writeDBUnavailable(w, r)
+		return false
+	}
+	if acct == "" {
+		// Untenanted (NULL account_id): allowed under any caller.
 		return true
 	}
 	if IdentityFrom(r.Context()).AccountID != acct {
