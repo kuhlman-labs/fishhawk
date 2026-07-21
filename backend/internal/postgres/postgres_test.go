@@ -892,6 +892,40 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Errorf("accounts.auto_join_role is_nullable after MigrateUp = %q, want YES (NULL = no auto-join policy)", autoJoinRoleNullable)
 	}
 
+	// 0057 (#1830, E44.6, ADR-057) enabled + FORCED row-level security with a
+	// <table>_tenant_isolation policy on every account-scoped table: the eight
+	// 0055 root tables, 0056's sessions, and stages (scoped via its parent
+	// run). Done-means shape pin — an empty/no-op migration fails these. The
+	// assertions are shape-only by necessity: this test connects as the
+	// superuser owner, which bypasses RLS even under FORCE; the behavioral
+	// isolation proof under a purpose-created non-superuser NOBYPASSRLS role
+	// is rls_test.go.
+	for _, tbl := range []string{
+		"runs", "campaigns", "refinement_drafts", "refinement_decisions",
+		"refinement_filing_sessions", "refinement_filed_items", "api_tokens",
+		"audit_entries", "sessions", "stages",
+	} {
+		var rowSec, forceSec bool
+		if err := pool.QueryRow(context.Background(),
+			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, tbl,
+		).Scan(&rowSec, &forceSec); err != nil {
+			t.Fatalf("query %s pg_class RLS flags: %v", tbl, err)
+		}
+		if !rowSec || !forceSec {
+			t.Errorf("%s relrowsecurity=%v relforcerowsecurity=%v after MigrateUp, want true/true (0057 ENABLE + FORCE)", tbl, rowSec, forceSec)
+		}
+		var polCount int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM pg_policies WHERE tablename = $1 AND policyname = $2`,
+			tbl, tbl+"_tenant_isolation",
+		).Scan(&polCount); err != nil {
+			t.Fatalf("query %s_tenant_isolation policy: %v", tbl, err)
+		}
+		if polCount != 1 {
+			t.Errorf("%s_tenant_isolation policy count after MigrateUp = %d, want 1", tbl, polCount)
+		}
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -920,13 +954,15 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0056 (#1827, E44.3, ADR-057 Amendment A2)
-	// is now the latest migration: it added sessions.account_id (+ FK + index),
-	// account_members.origin (+ CHECK), and accounts.auto_join_role. So its
-	// one-step rollback DROPs exactly those three columns — touching nothing
-	// else. 0055's (#1825, E44.1) account_members table, its eight root-table
-	// account_id columns, and its Amendment A1 endpoint relocation now SURVIVE,
-	// as do 0054's (#1861, ADR-058 / E45.8) runs_runner_kind_check 'gitlab_ci'
+	// MigrateDown rolls back one step. 0057 (#1830, E44.6, ADR-057) is now the
+	// latest migration: it enabled + FORCEd row-level security with a
+	// <table>_tenant_isolation policy on every account-scoped table. So its
+	// one-step rollback DROPs exactly those policies and disables RLS —
+	// touching nothing else. 0056's (#1827, E44.3) sessions.account_id,
+	// account_members.origin, and accounts.auto_join_role columns now SURVIVE,
+	// as do 0055's (#1825, E44.1) account_members table, its eight root-table
+	// account_id columns, and its Amendment A1 endpoint relocation, 0054's
+	// (#1861, ADR-058 / E45.8) runs_runner_kind_check 'gitlab_ci'
 	// member, 0053's (#1912) stages_state_check 'awaiting_host_dispatch' member,
 	// 0052's (#1854, ADR-057 / ADR-058) accounts + installations tenancy tables,
 	// and every prior migration's effect: 0051's (#1587) artifacts_kind_check
@@ -941,10 +977,10 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// 0037's (#1385) artifacts_kind_check 'deployment', 0036's (#1346)
 	// runs.runner_kind_resolved column, etc.
 	//
-	// This is the binding TestMigrateDown flip for 0056: sessions.account_id,
-	// account_members.origin, and accounts.auto_join_role must be ABSENT, while
-	// 0055's account_members table and eight account_id columns (now a prior
-	// migration) SURVIVE.
+	// This is the binding TestMigrateDown flip for 0057: RLS and every
+	// tenant-isolation policy must be ABSENT, while 0056's three columns (now a
+	// prior migration) SURVIVE alongside 0055's account_members table and eight
+	// account_id columns.
 	var accountsTableDown, installationsTableDown int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'`,
@@ -952,7 +988,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query accounts table: %v", err)
 	}
 	if accountsTableDown != 1 {
-		t.Errorf("'accounts' table count after MigrateDown = %d, want 1 (0052 still applied; only 0056 rolled back)", accountsTableDown)
+		t.Errorf("'accounts' table count after MigrateDown = %d, want 1 (0052 still applied; only 0057 rolled back)", accountsTableDown)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`,
@@ -960,10 +996,36 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query installations table: %v", err)
 	}
 	if installationsTableDown != 1 {
-		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0052 still applied; only 0056 rolled back)", installationsTableDown)
+		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0052 still applied; only 0057 rolled back)", installationsTableDown)
 	}
-	// 0056 rolled back: sessions.account_id, account_members.origin, and
-	// accounts.auto_join_role are GONE.
+	// 0057 rolled back: RLS is disabled (and un-FORCEd) and every
+	// <table>_tenant_isolation policy is GONE on all ten tables.
+	for _, tbl := range []string{
+		"runs", "campaigns", "refinement_drafts", "refinement_decisions",
+		"refinement_filing_sessions", "refinement_filed_items", "api_tokens",
+		"audit_entries", "sessions", "stages",
+	} {
+		var rowSec, forceSec bool
+		if err := pool.QueryRow(context.Background(),
+			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, tbl,
+		).Scan(&rowSec, &forceSec); err != nil {
+			t.Fatalf("query %s pg_class RLS flags: %v", tbl, err)
+		}
+		if rowSec || forceSec {
+			t.Errorf("%s relrowsecurity=%v relforcerowsecurity=%v after MigrateDown, want false/false (0057 rolled back)", tbl, rowSec, forceSec)
+		}
+		var polCount int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM pg_policies WHERE tablename = $1`, tbl,
+		).Scan(&polCount); err != nil {
+			t.Fatalf("query %s policies: %v", tbl, err)
+		}
+		if polCount != 0 {
+			t.Errorf("%s policy count after MigrateDown = %d, want 0 (0057 rolled back)", tbl, polCount)
+		}
+	}
+	// 0056 (now a prior migration) SURVIVES: sessions.account_id,
+	// account_members.origin, and accounts.auto_join_role remain.
 	for _, col := range []struct{ table, column string }{
 		{"sessions", "account_id"},
 		{"account_members", "origin"},
@@ -976,8 +1038,8 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		).Scan(&n); err != nil {
 			t.Fatalf("query %s.%s column: %v", col.table, col.column, err)
 		}
-		if n != 0 {
-			t.Errorf("%s.%s count after MigrateDown = %d, want 0 (0056 rolled back)", col.table, col.column, n)
+		if n != 1 {
+			t.Errorf("%s.%s count after MigrateDown = %d, want 1 (0056 still applied; only 0057 rolled back)", col.table, col.column, n)
 		}
 	}
 	// 0055 (now a prior migration) SURVIVES: account_members exists and every
@@ -989,7 +1051,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query account_members table: %v", err)
 	}
 	if accountMembersTableDown != 1 {
-		t.Errorf("'account_members' table count after MigrateDown = %d, want 1 (0055 still applied; only 0056 rolled back)", accountMembersTableDown)
+		t.Errorf("'account_members' table count after MigrateDown = %d, want 1 (0055 still applied; only 0057 rolled back)", accountMembersTableDown)
 	}
 	for _, tbl := range []string{
 		"runs", "campaigns", "refinement_drafts", "refinement_decisions",
@@ -1327,7 +1389,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if !strings.Contains(stageStateCheckDef, "awaiting_host_dispatch") {
 		t.Errorf("stages_state_check after MigrateDown dropped 'awaiting_host_dispatch' (0053 still applied; only 0054 rolled back): %s", stageStateCheckDef)
 	}
-	// 0054 (#1861, ADR-058 / E45.8) is now a PRIOR migration (only 0056 rolled
+	// 0054 (#1861, ADR-058 / E45.8) is now a PRIOR migration (only 0057 rolled
 	// back), so its widening — the 'gitlab_ci' runner_kind — SURVIVES the
 	// one-step down. Before 0055 shipped, 0054 was the migration a one-step down
 	// rolled back and 'gitlab_ci' had to be GONE here — 0055 flips that assertion
@@ -1342,14 +1404,14 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query runs_runner_kind_check constraint def: %v", err)
 	}
 	if !strings.Contains(runnerKindCheckDef, "gitlab_ci") {
-		t.Errorf("runs_runner_kind_check after MigrateDown dropped 'gitlab_ci' (0054 still applied; only 0056 rolled back): %s", runnerKindCheckDef)
+		t.Errorf("runs_runner_kind_check after MigrateDown dropped 'gitlab_ci' (0054 still applied; only 0057 rolled back): %s", runnerKindCheckDef)
 	}
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
 		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'gitlab_ci')`,
 		uuid.New(),
 	); err != nil {
-		t.Errorf("insert runner_kind='gitlab_ci' run after MigrateDown failed, want success (0054 survives; only 0056 rolled back): %v", err)
+		t.Errorf("insert runner_kind='gitlab_ci' run after MigrateDown failed, want success (0054 survives; only 0057 rolled back): %v", err)
 	}
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
@@ -1681,7 +1743,8 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0056 (drop sessions.account_id + account_members.origin +
+	// Step down past 0057 (drop the RLS policies + disable RLS — purely
+	// declarative, inert re: campaigns) then 0056 (drop sessions.account_id + account_members.origin +
 	// accounts.auto_join_role — inert re: campaigns) then 0055 (drop account_members + the eight account_id columns +
 	// reverse the endpoint relocation — inert re: campaigns; no paused row holds
 	// an account_id) then 0054 (narrow runs_runner_kind_check — inert re:
@@ -1700,6 +1763,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0057) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0056) failed: %v", err)
 	}
@@ -1784,13 +1850,18 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0056 (sessions.account_id + origin +
-	// auto_join_role, inert re: stages), 0055 (account_members + account_id +
-	// endpoint relocation, inert re: stages), 0054 (the runner_kind CHECK widening, inert
-	// re: stages) and 0053 back so we can seed 'dispatched' rows under the
-	// pre-0053 narrow CHECK before re-applying the backfill.
+	// Apply everything, then roll 0057 (the RLS policies, inert re: stages —
+	// this test connects as the superuser owner anyway), 0056
+	// (sessions.account_id + origin + auto_join_role, inert re: stages), 0055
+	// (account_members + account_id + endpoint relocation, inert re: stages),
+	// 0054 (the runner_kind CHECK widening, inert re: stages) and 0053 back so
+	// we can seed 'dispatched' rows under the pre-0053 narrow CHECK before
+	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0057 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0056 to reach 0053): %v", err)
@@ -1893,11 +1964,14 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 		t.Errorf("re-opened local stage (started_at set) state after backfill = %q, want dispatched (conservatively skipped)", got)
 	}
 
-	// Down reverses the backfill: roll back 0056 (sessions.account_id + origin +
-	// auto_join_role, inert re: stages) then 0055 (account_members + account_id +
-	// endpoint relocation, inert re: stages) then 0054 (the runner_kind CHECK
-	// widening, inert re: stages) then 0053, and the flipped row returns to
-	// dispatched.
+	// Down reverses the backfill: roll back 0057 (the RLS policies, inert re:
+	// stages) then 0056 (sessions.account_id + origin + auto_join_role, inert
+	// re: stages) then 0055 (account_members + account_id + endpoint
+	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
+	// inert re: stages) then 0053, and the flipped row returns to dispatched.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0057 to reach 0053): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0056 to reach 0053): %v", err)
 	}
@@ -1937,12 +2011,15 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0056 and 0055 back so we can seed a
+	// Apply everything, then roll 0057, 0056 and 0055 back so we can seed a
 	// run+installation pair under the pre-0055 schema (accounts + installations
 	// exist at 0052; runs.installation_id exists at 0005; runs.account_id does
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0057 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0056 to reach 0054): %v", err)
