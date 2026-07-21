@@ -533,13 +533,21 @@ func (s *Server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Scope the listing to the caller's workspace account (ADR-057 /
+	// #1830), mirroring handleListRuns: a tenanted caller sees their
+	// account's campaigns plus untenanted (NULL account_id) ones; an
+	// untenanted caller (empty AccountID) is unconstrained, per
+	// ListCampaignsFilter.AccountID's contract.
+	accountFilter := IdentityFrom(r.Context()).AccountID
+
 	// Fetch one extra row to compute the next cursor without a COUNT, the
 	// same limit+1 trick handleListRuns uses.
 	rows, err := s.cfg.CampaignRepo.ListCampaigns(r.Context(), campaign.ListCampaignsFilter{
-		Repo:   q.Get("repo"),
-		State:  stateFilter,
-		Limit:  limit + 1,
-		Offset: offset,
+		Repo:      q.Get("repo"),
+		State:     stateFilter,
+		AccountID: accountFilter,
+		Limit:     limit + 1,
+		Offset:    offset,
 	})
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -635,7 +643,54 @@ func (s *Server) handleGetCampaign(w http.ResponseWriter, r *http.Request) {
 			"get campaign failed", map[string]any{"error": err.Error()})
 		return
 	}
+	if !s.enforceCampaignAccount(w, r, id) {
+		return
+	}
 	s.writeJSON(w, r, http.StatusOK, toCampaignResponse(c))
+}
+
+// enforceCampaignAccount applies the ownership check for an
+// already-resolved campaign (ADR-057 / #1830), mirroring enforceAccount's
+// posture for runs: a tenanted campaign whose account disagrees with the
+// caller's Identity.AccountID → 403 account_forbidden; an untenanted
+// campaign (NULL account_id → "") is allowed — the NULL-allow window a
+// later E44 child closes. The account is read via the OPTIONAL
+// campaign.AccountGetter capability (the domain Campaign type doesn't
+// carry the column).
+//
+// A lookup ERROR fails CLOSED (503), never open: a transient DB failure on
+// the account probe must NOT fall through to untenanted-allow and disclose
+// the already-resolved tenanted campaign to a caller from another account.
+// This mirrors the mcp:run identity's account resolution in bearerAuth,
+// whose written contract is "any lookup ERROR fails CLOSED with 503". A repo
+// WITHOUT the capability still degrades to untenanted-allow — but that branch
+// is unreachable in production, where the concrete postgres repo carries
+// AccountGetter (a compile-time assertion pins it) and only a
+// capability-narrowed test fake lands there; it matches the run.AccountGetter
+// posture bearerAuth uses when the capability is absent. Returns true when the
+// request may proceed; on denial it writes the error envelope and returns
+// false.
+func (s *Server) enforceCampaignAccount(w http.ResponseWriter, r *http.Request, id uuid.UUID) bool {
+	getter, ok := s.cfg.CampaignRepo.(campaign.AccountGetter)
+	if !ok {
+		return true
+	}
+	acct, err := getter.GetCampaignAccountID(r.Context(), id)
+	if err != nil {
+		// Fail CLOSED: a probe error must never fall through to allow.
+		s.writeDBUnavailable(w, r)
+		return false
+	}
+	if acct == "" {
+		// Untenanted (NULL account_id): allowed under any caller.
+		return true
+	}
+	if IdentityFrom(r.Context()).AccountID != acct {
+		s.writeError(w, r, http.StatusForbidden, "account_forbidden",
+			"this campaign belongs to a different workspace account", nil)
+		return false
+	}
+	return true
 }
 
 // handleListCampaignItems implements GET /v0/campaigns/{campaign_id}/items.

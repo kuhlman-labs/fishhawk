@@ -288,8 +288,9 @@ func (r *postgresRepo) ListGlobal(ctx context.Context) ([]*Entry, error) {
 func (r *postgresRepo) ListAll(ctx context.Context, p ListAllParams) ([]*Entry, error) {
 	q := auditdb.New(r.pool)
 	rows, err := q.ListAuditEntriesAll(ctx, auditdb.ListAuditEntriesAllParams{
-		Category: p.Category,
-		RunID:    p.RunID,
+		Category:  p.Category,
+		RunID:     p.RunID,
+		AccountID: accountIDArg(p.AccountID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list audit entries: %w", err)
@@ -315,6 +316,23 @@ func (r *postgresRepo) ChainsByParent(ctx context.Context, parentRunID uuid.UUID
 		out = append(out, rowToEntry(row))
 	}
 	return out, nil
+}
+
+// accountIDArg maps a ListAllParams.AccountID (empty = no constraint,
+// else an account UUID string) to the nullable *uuid.UUID the sqlc filter
+// takes (ADR-057 / #1830). A malformed non-empty value maps to nil (no
+// constraint) rather than erroring — the handler validates the account
+// source (the caller's resolved Identity.AccountID), so this is defensive.
+// Same shape as run's accountIDArg (unexported there, so mirrored here).
+func accountIDArg(s string) *uuid.UUID {
+	if s == "" {
+		return nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return nil
+	}
+	return &id
 }
 
 func rowToEntry(r auditdb.AuditEntry) *Entry {

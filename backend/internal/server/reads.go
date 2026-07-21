@@ -504,7 +504,13 @@ func (s *Server) handleListGlobalAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	params := audit.ListAllParams{}
+	// Scope the user-facing feed to the caller's workspace account
+	// (ADR-057 / #1830): a tenanted caller sees their account's entries plus
+	// untenanted (NULL account_id) entries; an untenanted caller (empty
+	// AccountID) is unconstrained, per ListAllParams.AccountID's contract.
+	// The internal ListAll consumers (calibration, cost/alert scans,
+	// prompt + acceptance stats) deliberately leave this empty.
+	params := audit.ListAllParams{AccountID: IdentityFrom(r.Context()).AccountID}
 	if cat := q.Get("category"); cat != "" {
 		params.Category = &cat
 	}

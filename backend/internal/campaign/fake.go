@@ -27,6 +27,13 @@ func (BaseFake) GetCampaign(_ context.Context, _ uuid.UUID) (*Campaign, error) {
 	return nil, ErrNotFound
 }
 
+// GetCampaignAccountID returns "", ErrNotFound. It satisfies the OPTIONAL
+// AccountGetter capability (ADR-057 / #1830) so an embedding fake carries it
+// for free; the get-campaign handler treats the error as untenanted-allow.
+func (BaseFake) GetCampaignAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", ErrNotFound
+}
+
 // GetCampaignByIdempotencyKey returns nil, ErrNotFound.
 func (BaseFake) GetCampaignByIdempotencyKey(_ context.Context, _, _ string) (*Campaign, error) {
 	return nil, ErrNotFound

@@ -66,6 +66,25 @@ func (r *postgresRepo) GetCampaign(ctx context.Context, id uuid.UUID) (*Campaign
 	return rowToCampaign(row), nil
 }
 
+// GetCampaignAccountID implements the OPTIONAL AccountGetter capability
+// (ADR-057 / #1830): just the campaign's account_id, "" for an untenanted
+// NULL row, ErrNotFound for a missing campaign. Mirrors run's
+// GetRunAccountID.
+func (r *postgresRepo) GetCampaignAccountID(ctx context.Context, id uuid.UUID) (string, error) {
+	q := campaigndb.New(r.pool)
+	acct, err := q.GetCampaignAccountID(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("get campaign account_id: %w", err)
+	}
+	if acct == nil {
+		return "", nil
+	}
+	return acct.String(), nil
+}
+
 func (r *postgresRepo) GetCampaignByIdempotencyKey(ctx context.Context, repo, key string) (*Campaign, error) {
 	q := campaigndb.New(r.pool)
 	row, err := q.GetCampaignByIdempotencyKey(ctx, campaigndb.GetCampaignByIdempotencyKeyParams{
@@ -90,10 +109,11 @@ func (r *postgresRepo) ListCampaigns(ctx context.Context, f ListCampaignsFilter)
 	}
 	q := campaigndb.New(r.pool)
 	rows, err := q.ListCampaigns(ctx, campaigndb.ListCampaignsParams{
-		Repo:  f.Repo,
-		State: f.State,
-		Lim:   int32(f.Limit),
-		Off:   int32(f.Offset),
+		Repo:      f.Repo,
+		State:     f.State,
+		AccountID: accountIDArg(f.AccountID),
+		Lim:       int32(f.Limit),
+		Off:       int32(f.Offset),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("list campaigns: %w", err)
@@ -400,6 +420,23 @@ func marshalDependsOn(deps []string) ([]byte, error) {
 	return b, nil
 }
 
+// accountIDArg maps a ListCampaignsFilter.AccountID (empty = no constraint,
+// else an account UUID string) to the nullable *uuid.UUID the sqlc filter
+// takes (ADR-057 / #1830). A malformed non-empty value maps to nil (no
+// constraint) rather than erroring — the handler validates the account
+// source (the caller's resolved Identity.AccountID), so this is defensive.
+// Same shape as run's accountIDArg (unexported there, so mirrored here).
+func accountIDArg(s string) *uuid.UUID {
+	if s == "" {
+		return nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return nil
+	}
+	return &id
+}
+
 func rowToCampaign(c campaigndb.Campaign) *Campaign {
 	out := &Campaign{
 		ID:          c.ID,
@@ -460,3 +497,6 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 
 // Compile-time check that postgresRepo implements Repository.
 var _ Repository = (*postgresRepo)(nil)
+
+// Compile-time check that postgresRepo carries the AccountGetter capability.
+var _ AccountGetter = (*postgresRepo)(nil)
