@@ -63,6 +63,7 @@ type Campaign struct {
 	PausePolicy    string             `json:"pause_policy"`
 	OperatorAgent  []byte             `json:"operator_agent"`
 	IdempotencyKey *string            `json:"idempotency_key"`
+	AccountID      *uuid.UUID         `json:"account_id"`
 }
 
 type CampaignItem struct {

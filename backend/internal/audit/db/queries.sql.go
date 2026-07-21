@@ -204,12 +204,14 @@ const listAuditEntriesAll = `-- name: ListAuditEntriesAll :many
 SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
  WHERE ($1::text IS NULL OR category = $1::text)
    AND ($2::uuid  IS NULL OR run_id   = $2::uuid)
+   AND ($3::uuid IS NULL OR account_id = $3::uuid OR account_id IS NULL)
  ORDER BY ts DESC, id DESC
 `
 
 type ListAuditEntriesAllParams struct {
-	Category *string    `json:"category"`
-	RunID    *uuid.UUID `json:"run_id"`
+	Category  *string    `json:"category"`
+	RunID     *uuid.UUID `json:"run_id"`
+	AccountID *uuid.UUID `json:"account_id"`
 }
 
 // Cross-chain feed (per-run rows + global-chain rows) used by the
@@ -217,8 +219,12 @@ type ListAuditEntriesAllParams struct {
 // governance event is at the top; secondary sort on (id) keeps ordering
 // deterministic when entries share a millisecond. Optional category +
 // run_id filters; sqlc.narg makes them omittable from the WHERE.
+// account_id (ADR-057 / #1830) scopes to a tenant workspace account: a
+// set filter keeps the account's rows PLUS untenanted (NULL account_id)
+// rows — the same contract as run.ListRuns — while NULL (unset) keeps
+// the internal system readers' cross-account scans unconstrained.
 func (q *Queries) ListAuditEntriesAll(ctx context.Context, arg ListAuditEntriesAllParams) ([]AuditEntry, error) {
-	rows, err := q.db.Query(ctx, listAuditEntriesAll, arg.Category, arg.RunID)
+	rows, err := q.db.Query(ctx, listAuditEntriesAll, arg.Category, arg.RunID, arg.AccountID)
 	if err != nil {
 		return nil, err
 	}

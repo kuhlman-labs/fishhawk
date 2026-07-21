@@ -98,7 +98,7 @@ func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItem
 }
 
 const getCampaign = `-- name: GetCampaign :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key FROM campaigns WHERE id = $1
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id FROM campaigns WHERE id = $1
 `
 
 func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -114,8 +114,24 @@ func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, erro
 		&i.PausePolicy,
 		&i.OperatorAgent,
 		&i.IdempotencyKey,
+		&i.AccountID,
 	)
 	return i, err
+}
+
+const getCampaignAccountID = `-- name: GetCampaignAccountID :one
+SELECT account_id FROM campaigns WHERE id = $1
+`
+
+// The cheap tenant-account lookup for the campaign ownership check
+// (ADR-057 / #1830): returns just account_id (nullable) so the handler can
+// bound GET /v0/campaigns/{id} to the caller's account. Mirrors
+// internal/run/queries.sql GetRunAccountID.
+func (q *Queries) GetCampaignAccountID(ctx context.Context, id uuid.UUID) (*uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getCampaignAccountID, id)
+	var account_id *uuid.UUID
+	err := row.Scan(&account_id)
+	return account_id, err
 }
 
 const getCampaignByIdempotencyKey = `-- name: GetCampaignByIdempotencyKey :one
@@ -252,27 +268,32 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 }
 
 const listCampaigns = `-- name: ListCampaigns :many
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key FROM campaigns
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id FROM campaigns
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR state = $2)
+   AND ($3::uuid IS NULL OR account_id = $3 OR account_id IS NULL)
  ORDER BY created_at DESC, id DESC
- LIMIT $4 OFFSET $3
+ LIMIT $5 OFFSET $4
 `
 
 type ListCampaignsParams struct {
-	Repo  string `json:"repo"`
-	State string `json:"state"`
-	Off   int32  `json:"off"`
-	Lim   int32  `json:"lim"`
+	Repo      string     `json:"repo"`
+	State     string     `json:"state"`
+	AccountID *uuid.UUID `json:"account_id"`
+	Off       int32      `json:"off"`
+	Lim       int32      `json:"lim"`
 }
 
 // Empty string in any filter means "no constraint." created_at DESC + id
 // DESC tiebreak so paginations are stable across concurrent inserts at the
-// same created_at microsecond.
+// same created_at microsecond. account_id (ADR-057 / #1830) scopes to a
+// tenant workspace account: a set filter keeps the account's rows PLUS
+// untenanted (NULL account_id) rows, same contract as run.ListRuns.
 func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([]Campaign, error) {
 	rows, err := q.db.Query(ctx, listCampaigns,
 		arg.Repo,
 		arg.State,
+		arg.AccountID,
 		arg.Off,
 		arg.Lim,
 	)
@@ -293,6 +314,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 			&i.PausePolicy,
 			&i.OperatorAgent,
 			&i.IdempotencyKey,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}

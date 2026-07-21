@@ -787,3 +787,75 @@ func TestPostgres_ListAll_FiltersByRunID(t *testing.T) {
 		t.Errorf("filter leaked: got RunID %v", got[0].RunID)
 	}
 }
+
+// TestPostgres_ListAll_AccountFilter exercises ListAllParams.AccountID
+// (ADR-057 / #1830): a set filter keeps same-account entries PLUS untenanted
+// (NULL account_id) entries and excludes other accounts' entries; an empty
+// filter is no constraint (the internal system readers' unnarrowed view);
+// and a malformed non-empty value degrades to no constraint (accountIDArg's
+// defensive nil mapping — the handler validates the account source).
+func TestPostgres_ListAll_AccountFilter(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+	runID := makeRun(t, pool)
+
+	acctA, acctB := uuid.New(), uuid.New()
+	for _, id := range []uuid.UUID{acctA, acctB} {
+		if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+			id, "acct-"+id.String()[:8]); err != nil {
+			t.Fatalf("insert account: %v", err)
+		}
+	}
+
+	// audit_entries is append-only (UPDATE is trigger-forbidden), so the
+	// tenanted fixtures are INSERTed directly with account_id set — no write
+	// path populates the column yet (a later E44 child threads it).
+	entryA, entryB, entryU := uuid.New(), uuid.New(), uuid.New()
+	for id, acct := range map[uuid.UUID]*uuid.UUID{entryA: &acctA, entryB: &acctB, entryU: nil} {
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO audit_entries (id, run_id, ts, category, payload, entry_hash, account_id)
+			 VALUES ($1, $2, now(), 'account_filter_fixture', '{}', $3, $4)`,
+			id, runID, "hash-"+id.String()[:8], acct); err != nil {
+			t.Fatalf("insert entry: %v", err)
+		}
+	}
+
+	ids := func(es []*audit.Entry) map[uuid.UUID]bool {
+		m := map[uuid.UUID]bool{}
+		for _, e := range es {
+			m[e.ID] = true
+		}
+		return m
+	}
+
+	// Account A: A's entry + the untenanted entry visible, B's excluded.
+	got, err := repo.ListAll(ctx, audit.ListAllParams{AccountID: acctA.String()})
+	if err != nil {
+		t.Fatalf("list A: %v", err)
+	}
+	m := ids(got)
+	if !m[entryA] || !m[entryU] || m[entryB] {
+		t.Errorf("account A listing = %v; want entryA+entryU, not entryB", m)
+	}
+
+	// Empty filter: no constraint — all three visible (system reads unnarrowed).
+	got, err = repo.ListAll(ctx, audit.ListAllParams{})
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	m = ids(got)
+	if !m[entryA] || !m[entryB] || !m[entryU] {
+		t.Errorf("unfiltered listing = %v; want all three entries", m)
+	}
+
+	// Malformed non-empty filter: degrades to no constraint rather than
+	// erroring (defensive — the handler owns validating the source).
+	got, err = repo.ListAll(ctx, audit.ListAllParams{AccountID: "not-a-uuid"})
+	if err != nil {
+		t.Fatalf("list malformed: %v", err)
+	}
+	if m = ids(got); !m[entryA] || !m[entryB] || !m[entryU] {
+		t.Errorf("malformed-filter listing = %v; want all three entries (no constraint)", m)
+	}
+}

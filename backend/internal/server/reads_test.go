@@ -1390,6 +1390,44 @@ func TestListGlobalAudit_RunIDFilter_PassesThrough(t *testing.T) {
 	}
 }
 
+// TestListGlobalAudit_AccountScope_PassesThrough pins the user-facing feed's
+// account scoping (ADR-057 / #1830): the handler hands the caller's
+// Identity.AccountID to the repo via ListAllParams, and an anonymous /
+// untenanted caller passes "" (no constraint — the unchanged view).
+func TestListGlobalAudit_AccountScope_PassesThrough(t *testing.T) {
+	a := newAuditReadFake()
+	var captured audit.ListAllParams
+	a.listAllFn = func(p audit.ListAllParams) ([]*audit.Entry, error) {
+		captured = p
+		return nil, nil
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a})
+
+	acct := uuid.NewString()
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+		Identity{Subject: "github:op", TokenID: "tok-1", AccountID: acct}))
+	w := httptest.NewRecorder()
+	s.handleListGlobalAudit(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if captured.AccountID != acct {
+		t.Errorf("AccountID = %q, want %q", captured.AccountID, acct)
+	}
+
+	// Untenanted caller (no identity): empty AccountID — unnarrowed.
+	req = httptest.NewRequest(http.MethodGet, "/v0/audit", nil)
+	w = httptest.NewRecorder()
+	s.handleListGlobalAudit(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if captured.AccountID != "" {
+		t.Errorf("anonymous AccountID = %q, want empty (no constraint)", captured.AccountID)
+	}
+}
+
 func TestListGlobalAudit_RepoError_500(t *testing.T) {
 	a := newAuditReadFake()
 	a.listErr = errors.New("db down")

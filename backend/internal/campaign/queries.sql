@@ -11,6 +11,13 @@ RETURNING *;
 -- name: GetCampaign :one
 SELECT * FROM campaigns WHERE id = $1;
 
+-- name: GetCampaignAccountID :one
+-- The cheap tenant-account lookup for the campaign ownership check
+-- (ADR-057 / #1830): returns just account_id (nullable) so the handler can
+-- bound GET /v0/campaigns/{id} to the caller's account. Mirrors
+-- internal/run/queries.sql GetRunAccountID.
+SELECT account_id FROM campaigns WHERE id = $1;
+
 -- name: GetCampaignByIdempotencyKey :one
 -- Used by POST /v0/campaigns to resolve an Idempotency-Key header to a
 -- previously-created campaign. Active scope is (repo, idempotency_key);
@@ -23,10 +30,13 @@ SELECT * FROM campaigns
 -- name: ListCampaigns :many
 -- Empty string in any filter means "no constraint." created_at DESC + id
 -- DESC tiebreak so paginations are stable across concurrent inserts at the
--- same created_at microsecond.
+-- same created_at microsecond. account_id (ADR-057 / #1830) scopes to a
+-- tenant workspace account: a set filter keeps the account's rows PLUS
+-- untenanted (NULL account_id) rows, same contract as run.ListRuns.
 SELECT * FROM campaigns
  WHERE (sqlc.arg('repo')::text = '' OR repo = sqlc.arg('repo'))
    AND (sqlc.arg('state')::text = '' OR state = sqlc.arg('state'))
+   AND (sqlc.narg('account_id')::uuid IS NULL OR account_id = sqlc.narg('account_id') OR account_id IS NULL)
  ORDER BY created_at DESC, id DESC
  LIMIT sqlc.arg('lim') OFFSET sqlc.arg('off');
 
