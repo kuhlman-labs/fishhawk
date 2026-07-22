@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,13 @@ const gitLabGroupsPerPage = 100
 // account (or a server that never stops advertising a next page) cannot
 // loop unbounded. 50 pages x 100 = 5000 groups.
 const gitLabMaxGroupPages = 50
+
+// gitLabMaxPageBytes caps how much of ONE page body is read. The page
+// cap bounds the number of requests but not the size of any single
+// response, so an oversized or endlessly-streaming body from a
+// compromised GitLab endpoint could otherwise consume memory during an
+// authentication request. 4 MiB is ~100x a full 100-group page.
+const gitLabMaxPageBytes = 4 << 20
 
 // GitLabMembershipLister reads the authenticated user's GitLab group
 // memberships (GET /api/v4/groups) with the USER's OAuth access token —
@@ -58,9 +66,9 @@ func NewGitLabMembershipLister(baseURL string) *GitLabMembershipLister {
 // belongs to. full_path — not name — is the stable addressable key an
 // accounts.account_key records for a group-granularity account.
 //
-// Every failure (empty token, transport error, non-200, undecodable
-// body, pagination cap exceeded) returns an error so the caller fails
-// CLOSED rather than admitting on a partial listing.
+// Every failure (empty token, transport error, non-200, oversized body,
+// undecodable body, pagination cap exceeded) returns an error so the
+// caller fails CLOSED rather than admitting on a partial listing.
 func (l *GitLabMembershipLister) ListUserOrgKeys(ctx context.Context, accessToken string) ([]string, error) {
 	if accessToken == "" {
 		return nil, errors.New("auth: empty access token")
@@ -104,10 +112,24 @@ func (l *GitLabMembershipLister) listGroupPage(ctx context.Context, accessToken 
 		return nil, false, fmt.Errorf("auth: gitlab groups endpoint returned %d", resp.StatusCode)
 	}
 
+	// Read at most gitLabMaxPageBytes (+1 byte, purely to distinguish
+	// "exactly at the cap" from "over it"). The forge response is
+	// semi-trusted input on an authentication path, so an oversized body
+	// is REJECTED rather than truncated-and-parsed: a truncated listing
+	// would be a partial membership set, and admitting on one is exactly
+	// what this client's fail-closed contract forbids.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, gitLabMaxPageBytes+1))
+	if err != nil {
+		return nil, false, fmt.Errorf("auth: read gitlab groups: %w", err)
+	}
+	if len(raw) > gitLabMaxPageBytes {
+		return nil, false, fmt.Errorf("auth: gitlab groups response exceeded %d bytes", gitLabMaxPageBytes)
+	}
+
 	var body []struct {
 		FullPath string `json:"full_path"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, false, fmt.Errorf("auth: decode gitlab groups: %w", err)
 	}
 	keys := make([]string, 0, len(body))

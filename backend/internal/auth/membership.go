@@ -30,7 +30,9 @@ import (
 // auto_join_role policy is set; a match with no existing grant mints an
 // origin='auto_join' row and admits. A forge error there fails the
 // auto_join eval CLOSED (and, with no invited grant, the whole sign-in).
-// A provider with NO registered lister denies.
+// A provider with NO registered lister denies the AUTO_JOIN path only —
+// the lister lookup happens AFTER the invited check, so an invited grant
+// still admits for a provider whose forge is unconfigured.
 //
 // E44.8 (#1832) generalizes the auto_join sources from one to three,
 // all behind this same seam:
@@ -178,12 +180,6 @@ func NewMembershipResolver(store MembershipStore, listers map[string]ForgeMember
 // returned IDs are sorted (deterministic-first: the callback binds the
 // session to index 0). Empty result = deny; error = fail closed.
 func (r *forgeMembershipResolver) ResolveAccounts(ctx context.Context, provider, accessToken string, profile GitHubProfile) ([]uuid.UUID, error) {
-	lister := r.listers[provider]
-	if lister == nil {
-		// No lister registered for this provider (an unconfigured
-		// forge): deny, without touching the store.
-		return nil, nil
-	}
 	if profile.Login == "" {
 		return nil, errors.New("auth: membership resolution requires a login")
 	}
@@ -209,9 +205,19 @@ func (r *forgeMembershipResolver) ResolveAccounts(ctx context.Context, provider,
 		return sortedAccountIDs(invited), nil
 	}
 
-	// No invited grant: the auto_join path, the ONLY live-forge read. An
-	// error here fails the auto_join eval — and, since no invited grant
-	// admits, the whole sign-in — CLOSED.
+	// No invited grant: the auto_join path, the ONLY live-forge read —
+	// and the ONLY path that needs a registered lister. The lookup is
+	// deliberately AFTER the invited check: an invited grant is a
+	// DB-only, forge-INDEPENDENT admission, so an unregistered provider
+	// must not deny it. A provider with no lister can only mean "no
+	// auto_join can be evaluated", which denies on its own.
+	lister := r.listers[provider]
+	if lister == nil {
+		return nil, nil
+	}
+
+	// An error here fails the auto_join eval — and, since no invited
+	// grant admits, the whole sign-in — CLOSED.
 	liveKeys, forgeErr := lister.ListUserOrgKeys(ctx, accessToken)
 	if forgeErr != nil {
 		return nil, fmt.Errorf("auth: forge membership list failed and no invited grant admits: %w", forgeErr)

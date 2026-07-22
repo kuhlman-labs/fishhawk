@@ -322,8 +322,9 @@ func TestMembership_OriginsPersistDistinctly(t *testing.T) {
 }
 
 // A provider with NO registered lister (gitlab when
-// FISHHAWKD_GITLAB_BASE_URL is unset) denies — the walk never runs and
-// the github lister is never called.
+// FISHHAWKD_GITLAB_BASE_URL is unset) denies when no grant admits: the
+// auto_join eval cannot run, and the github lister is never called for
+// another provider's login.
 func TestMembership_UnregisteredProvider_Denies(t *testing.T) {
 	_, lister, r := newMembershipFixture(t)
 	got, err := r.ResolveAccounts(context.Background(), "gitlab", "glpat-tok",
@@ -568,6 +569,47 @@ func TestMembership_GitLabInvitedRow_ListerNeverCalled(t *testing.T) {
 	}
 	if lister.calls != 0 {
 		t.Errorf("gitlab lister called %d times on the invited-admit path, want 0", lister.calls)
+	}
+}
+
+// An invited grant admits for a provider with NO registered lister.
+// Invited admission is DB-only and forge-INDEPENDENT, so it cannot be
+// conditioned on the forge being configured at all: here only github
+// has a lister, yet a gitlab invited grant still admits. (The lister
+// lookup is on the auto_join path only.)
+func TestMembership_InvitedRow_UnregisteredProviderLister_StillAdmits(t *testing.T) {
+	// The github-only fixture: no gitlab lister is registered.
+	pool, ghLister, r := newMembershipFixture(t)
+	accountID := seedProviderAccount(t, pool, "gitlab", "acme/platform", "group", nil)
+	seedMemberFor(t, pool, "gitlab", accountID, "gl-user", auth.MemberOriginInvited)
+
+	got, err := r.ResolveAccounts(context.Background(), "gitlab", "gl-tok",
+		auth.GitHubProfile{ID: 7, Login: "gl-user"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want [%s] (invited grants are forge-independent)", got, accountID)
+	}
+	if ghLister.calls != 0 {
+		t.Errorf("github lister called %d times resolving a gitlab login, want 0", ghLister.calls)
+	}
+}
+
+// The same provider with no lister and NO invited grant still denies:
+// an auto_join evaluation is impossible without a live membership read.
+func TestMembership_UnregisteredProviderLister_NoInvitedRow_Denies(t *testing.T) {
+	pool, _, r := newMembershipFixture(t)
+	role := "member"
+	seedProviderAccount(t, pool, "gitlab", "acme/platform", "group", &role)
+
+	got, err := r.ResolveAccounts(context.Background(), "gitlab", "gl-tok",
+		auth.GitHubProfile{ID: 7, Login: "gl-user"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("admitted = %v, want deny (no gitlab lister ⇒ no auto_join eval)", got)
 	}
 }
 

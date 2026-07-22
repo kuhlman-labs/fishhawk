@@ -145,6 +145,47 @@ func TestGitLabMembershipLister_PaginationCap_FailsClosed(t *testing.T) {
 	}
 }
 
+// An oversized page body is REJECTED, not truncated-and-parsed. The
+// page cap bounds the number of requests but not the size of any one
+// response, so without a byte cap a compromised GitLab endpoint could
+// stream unbounded data into memory during an authentication request.
+// The handler keeps writing whitespace padding inside an otherwise
+// valid JSON array; it stops as soon as the client hangs up, which is
+// itself the evidence the read is bounded.
+func TestGitLabMembershipLister_OversizedBody_FailsClosed(t *testing.T) {
+	const maxBytes = 4 << 20 // must track gitLabMaxPageBytes
+	var wrote int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`[{"full_path":"g/x"}`)); err != nil {
+			return
+		}
+		wrote += 20
+		pad := strings.Repeat(" ", 64<<10)
+		for wrote < 2*maxBytes {
+			n, err := w.Write([]byte(pad))
+			wrote += n
+			if err != nil {
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`]`))
+	}))
+	defer srv.Close()
+
+	keys, err := auth.NewGitLabMembershipLister(srv.URL).
+		ListUserOrgKeys(context.Background(), "gl-user-token")
+	if err == nil {
+		t.Fatalf("ListUserOrgKeys = %v, want an error on an oversized body", keys)
+	}
+	if keys != nil {
+		t.Errorf("keys = %v on the oversized-body path, want nil (fail closed)", keys)
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Errorf("error = %v, want it to name the byte cap", err)
+	}
+}
+
 func TestGitLabMembershipLister_FailClosedModes(t *testing.T) {
 	t.Run("empty access token", func(t *testing.T) {
 		called := false

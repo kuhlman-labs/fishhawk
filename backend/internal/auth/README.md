@@ -15,13 +15,13 @@ The OAuth callback consults `Config.AuthMembership` (a `MembershipResolver`) AFT
 - **`invited`** — operator-granted. Admits **DB-only**: no forge call on this path, so forge-API availability can never lock out an invited member. This is the reliable grant.
 - **`auto_join`** — minted at login by the bootstrap below, and **re-verified against its policy predicate at every login**: the account must still carry `auto_join_role` and its `(account_key, granularity)` pair must still be one the user's memberships derive. A failed predicate stops admitting; the row is kept for audit.
 
-**Auto-join bootstrap** is the ONLY live-forge read. E44.8 (#1832) generalized it from one membership source to three, all behind the SAME `ForgeMembershipLister` seam, dispatched through a **provider-keyed lister map** (`NewMembershipResolver(store, listers, opts...)`). A provider absent from the map denies without touching the store.
+**Auto-join bootstrap** is the ONLY live-forge read. E44.8 (#1832) generalized it from one membership source to three, all behind the SAME `ForgeMembershipLister` seam, dispatched through a **provider-keyed lister map** (`NewMembershipResolver(store, listers, opts...)`). A provider absent from the map denies **the auto-join path only** — the lister lookup happens AFTER the invited-grant check, so an invited grant for a provider whose forge is unconfigured still admits. Conditioning invited admission on lister registration would break the DB-only, forge-independent contract above.
 
 | Granularity | Provider | Source | Live forge call |
 |---|---|---|---|
 | `organization` | github | `GitHubOAuth.ListUserOrgKeys` — GET `/user/orgs` with the USER's OAuth token, never an App token | yes |
 | `enterprise` | github, **EMU posture only** | the enterprise short code split off the EMU login itself (`emu.go`) | **no** |
-| `group` | gitlab | `GitLabMembershipLister.ListUserOrgKeys` — GET `/api/v4/groups` with the USER's OAuth token, never `FISHHAWKD_GITLAB_TOKEN`; **paginated** to exhaustion (Link `rel="next"`, else a full page implies another) under a 50-page cap | yes |
+| `group` | gitlab | `GitLabMembershipLister.ListUserOrgKeys` — GET `/api/v4/groups` with the USER's OAuth token, never `FISHHAWKD_GITLAB_TOKEN`; **paginated** to exhaustion (Link `rel="next"`, else a full page implies another) under a 50-page cap, each page body read under a 4 MiB byte cap | yes |
 
 A match with no existing grant upserts an audited `origin='auto_join'` row (role = the policy's `auto_join_role`, `member_ref` = the forge login) and admits.
 
@@ -41,10 +41,11 @@ A match with no existing grant upserts an audited `origin='auto_join'` row (role
 | Forge error during auto-join eval, no invited grant | resolver error → callback 502 `membership_resolution_failed`, no session |
 | Forge error during auto-join eval, invited grant present | invited admission stands (DB-only); auto-join eval degrades closed |
 | No admitting account | 302 to `Config.AuthAccessDeniedRedirect` (default `/access-denied`, validated by `isSafeRelativeRedirect`), no session, no cookie |
-| Provider with NO registered lister (gitlab with `FISHHAWKD_GITLAB_BASE_URL` unset) | deny, without touching the store |
+| Provider with NO registered lister (gitlab with `FISHHAWKD_GITLAB_BASE_URL` unset), no invited grant | deny — no auto-join eval is possible without a live membership read |
+| Provider with NO registered lister, invited grant present | **admits** — invited grants are DB-only and forge-independent, so they cannot be gated on forge configuration |
 | Underscore-bearing login on github.com posture | no enterprise key derived at all → no enterprise admission (spoofing guard) |
 | EMU posture, login with no underscore / empty half (`alice_`, `_acme`) | no enterprise key contributed; org auto-join unaffected |
-| GitLab group listing errors, non-200, undecodable, or exceeds the page cap | error → auto-join eval fails closed (whole sign-in, absent an invited grant) |
+| GitLab group listing errors, non-200, undecodable, exceeds the 50-page cap, or returns a page body over the 4 MiB read cap | error → auto-join eval fails closed (whole sign-in, absent an invited grant). The forge body is semi-trusted input on an auth path, so an oversized page is rejected outright rather than truncated-and-parsed — a truncated listing is a partial membership set, and admitting on one is what this contract forbids |
 | `UpsertAutoJoinGrant` write fails | error, no admission — the minted row IS the audit record |
 | Session with no resolvable account (deleted account → FK SET NULL, or a pre-gate session) | `/v0/auth/me` 403 `account_unresolved` |
 
