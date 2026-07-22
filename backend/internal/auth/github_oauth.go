@@ -166,6 +166,7 @@ func (g *GitHubOAuth) FetchProfile(ctx context.Context, accessToken string) (*Gi
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("auth: decode user: %w", err)
 	}
+	body.Login = canonicalGitHubLogin(body.Login)
 	if body.ID == 0 || body.Login == "" {
 		return nil, errors.New("auth: user response missing id or login")
 	}
@@ -230,4 +231,16 @@ func readBriefBody(r io.Reader) string {
 	limited := io.LimitReader(r, 256)
 	b, _ := io.ReadAll(limited)
 	return strings.TrimSpace(string(b))
+}
+
+// canonicalGitHubLogin returns the canonical Fishhawk login for a raw GitHub
+// login value. Enterprise Managed User (EMU) logins carry a
+// "<username>_<shortcode>" enterprise short-code suffix (e.g. "alice_acme");
+// Fishhawk keys identity on the FULL login (short code included), so the
+// suffix is preserved verbatim — never stripped or split — and only
+// surrounding whitespace is trimmed. A plain github.com login (no underscore)
+// passes through unchanged. Mirrors identity.canonicalGitHubLogin so the
+// OAuth web flow and the device flow agree on the subject/profile login.
+func canonicalGitHubLogin(login string) string {
+	return strings.TrimSpace(login)
 }

@@ -99,6 +99,45 @@ func TestVerifyAccessToken_Success(t *testing.T) {
 	}
 }
 
+// TestVerifyAccessToken_EMULogin pins EMU handling (E44.2 / #1826): an
+// Enterprise Managed User login carries a "<username>_<shortcode>" enterprise
+// short-code suffix. It must parse without error and resolve to a subject that
+// preserves the FULL login (short code included) — never stripped or split, so
+// two EMU users on different enterprises stay distinct subjects.
+func TestVerifyAccessToken_EMULogin(t *testing.T) {
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"login":"alice_acme"}`))
+	})
+
+	p := newTestProvider(f)
+	subject, err := p.VerifyAccessToken(context.Background(), "gho_emu")
+	if err != nil {
+		t.Fatalf("VerifyAccessToken with an EMU login: %v", err)
+	}
+	if subject != "github:alice_acme" {
+		t.Errorf("subject = %q, want github:alice_acme (full EMU login preserved)", subject)
+	}
+}
+
+// TestCanonicalGitHubLogin pins the shared normalization: EMU short-code
+// suffix preserved verbatim, plain login unchanged, surrounding whitespace
+// trimmed, and the short code NEVER stripped.
+func TestCanonicalGitHubLogin(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"octocat", "octocat"},
+		{"alice_acme", "alice_acme"},
+		{"  alice_acme  ", "alice_acme"},
+		{"a_b_c", "a_b_c"},
+	}
+	for _, c := range cases {
+		if got := canonicalGitHubLogin(c.in); got != c.want {
+			t.Errorf("canonicalGitHubLogin(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 // TestVerifyAccessToken_EmptyToken rejects an empty token before any HTTP
 // call — the mint endpoint must never treat a blank credential as a
 // verified subject.

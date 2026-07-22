@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -34,6 +35,31 @@ type Client struct {
 	BaseURL string // empty → DefaultGitHubAPIBase
 	Signer  *Signer
 	HTTP    *http.Client
+
+	// ResolveBaseURL, when non-nil, resolves the per-installation API base
+	// URL for an installation (Mode 2, data-resident installs on
+	// <slug>.ghe.com). IssueInstallationToken consults it per mint, passing
+	// the stringified installation id (the forge-neutral installation_ref the
+	// account resolver keys on — the int64 stays inside this GitHub-specific
+	// package):
+	//
+	//   - a non-empty return OVERRIDES BaseURL/DefaultGitHubAPIBase — the
+	//     request targets the per-installation host. It is validated as a
+	//     well-formed absolute https URL before it becomes the target host
+	//     (see validateResolvedBaseURL): the mint ships a live App JWT, so an
+	//     override that is not https-with-a-host FAILS the mint rather than
+	//     transmitting the credential to an unvalidated (or non-TLS) host.
+	//   - an empty return falls back to BaseURL then DefaultGitHubAPIBase:
+	//     the intentional absence of an override (NULL column / unknown
+	//     installation) keeps the deployment default.
+	//   - a NON-NIL error FAILS the mint (surfaced to the caller). A real
+	//     endpoint-resolution fault must never silently target the default
+	//     host for a data-resident install — failing closed is the only safe
+	//     posture (E44.2 / #1826).
+	//
+	// Nil (the default) preserves the pre-#1826 behavior: BaseURL, else the
+	// GitHub default.
+	ResolveBaseURL func(ctx context.Context, installationRef string) (string, error)
 }
 
 // NewClient returns a Client with a 30s default timeout. signer
@@ -61,6 +87,24 @@ func (c *Client) IssueInstallationToken(ctx context.Context, installationID int6
 	base := c.BaseURL
 	if base == "" {
 		base = DefaultGitHubAPIBase
+	}
+	// Mode 2 (E44.2 / #1826): a per-installation resolver overrides the
+	// deployment default for data-resident installs. A real resolution error
+	// FAILS the mint — never a silent fallback to the default host.
+	if c.ResolveBaseURL != nil {
+		resolved, err := c.ResolveBaseURL(ctx, formatInt64(installationID))
+		if err != nil {
+			return nil, fmt.Errorf("githubapp: resolve installation base url: %w", err)
+		}
+		if resolved != "" {
+			// Validate BEFORE the JWT ships: an override host that is not a
+			// well-formed https URL fails the mint (never a live App JWT to an
+			// unvalidated or non-TLS host).
+			if err := validateResolvedBaseURL(resolved); err != nil {
+				return nil, err
+			}
+			base = resolved
+		}
 	}
 	url := fmt.Sprintf("%s/app/installations/%s/access_tokens", base, formatInt64(installationID))
 
@@ -98,6 +142,30 @@ func (c *Client) IssueInstallationToken(ctx context.Context, installationID int6
 		return nil, errors.New("githubapp: response missing required fields")
 	}
 	return &out, nil
+}
+
+// validateResolvedBaseURL rejects a per-installation override host that is not
+// a well-formed absolute https URL. IssueInstallationToken ships a live App JWT
+// in the Authorization header, so an override resolved from the installations
+// row must pass a scheme/parse sanity check before it can become the target
+// host: an http:// value would transmit the JWT without TLS, and a malformed or
+// hostless value could send it somewhere unintended (E44.2 / #1826). This is a
+// scheme/parse check, NOT a host allowlist — per-installation host pinning is
+// deferred to the follow-up that introduces a production (tenant / forge-sync)
+// writer for forge_base_url; today the sole writer is the operator-side
+// UpsertInstallation path.
+func validateResolvedBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("githubapp: malformed installation base url %q: %w", raw, err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("githubapp: installation base url %q must use https, got scheme %q", raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("githubapp: installation base url %q missing host", raw)
+	}
+	return nil
 }
 
 // readBriefBody reads up to 256 bytes for use in error messages.

@@ -56,6 +56,34 @@ ADR-057 Amendment A1: the per-forge endpoint columns `forge_base_url` /
 github.com today) were relocated by `0055` **from `accounts` to
 `installations`**. A forge-agnostic workspace spanning both a github.com install
 and a gitlab.com group cannot share one per-account base URL, so the endpoints
-belong per-installation. This child owns only column **location**; endpoint
-**resolution** (reading `installations.forge_base_url`, threading it through the
-OAuth/App clients + GitLab endpoints) is deferred to E44.2 (#1826).
+belong per-installation. `0055` owns only column **location**; endpoint
+**resolution** lands in E44.2 (#1826, `endpoints.go`).
+
+## EndpointResolver — the per-installation endpoint reader (E44.2 / #1826)
+
+`endpoints.go` is the first production reader of the Amendment A1 columns.
+`EndpointResolver.ResolveInstallationEndpoints(ctx, provider, installationRef)`
+looks up the installation via `GetInstallationByRef` and returns its recorded
+`(forge_base_url, oauth_base_url)`:
+
+- **both columns SET** → `(forgeBaseURL, oauthBaseURL, nil)` — the data-resident
+  override the caller routes its per-installation client to. NULL columns are
+  honored independently (a set forge with a NULL oauth returns `("...", "")`).
+- **NULL column / not-found row (`pgx.ErrNoRows`)** → the empty string with a
+  `nil` error: the intentional absence of an override, so the caller keeps its
+  deployment default. A `nil` resolver / `nil` getter reports the same
+  no-override default without a query (the no-database posture).
+- **a REAL DB error** → propagated (`("", "", err)`) so the caller **FAILS
+  CLOSED**. An endpoint-resolution fault must never silently fall back to the
+  default host for a data-resident install — only an intentional absence
+  (NULL/not-found) falls back.
+
+The GitHub App token-mint consumer lives in `serve.go`: it late-binds
+`githubapp.Client.ResolveBaseURL` (after the DB pool exists) to a closure that
+calls this resolver with `provider="github"` and the `installationRef` the
+githubapp client hands it — the stringified numeric GitHub App installation id,
+which is exactly `installations.installation_ref`. The int64 stays inside the
+GitHub-specific githubapp package (which owns the id → ref stringification); the
+serve.go closure is a thin forge-neutral passthrough. Per-installation
+REST-client routing and per-installation GitLab-client construction (both
+needing a per-installation client factory) build on this resolver as follow-ups.
