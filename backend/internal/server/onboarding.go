@@ -349,7 +349,7 @@ func (s *Server) handleOnboardingRegionPin(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	pin, err := handoff.Verify(deps.secret, r.URL.Query(), time.Now())
+	pin, err := handoff.Verify(r.URL.Query(), string(deps.secret), time.Now())
 	if err != nil {
 		status, code := http.StatusForbidden, "region_pin_rejected"
 		switch {

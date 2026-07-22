@@ -623,19 +623,30 @@ func newRegionPinServer(t *testing.T, q account.RegionQuerier, cellRegion string
 
 // regionPinURL builds the redirect target the REAL directory codec would emit,
 // then returns just its path+query so a test can drive the cell handler with
-// exactly the bytes that crossed the wire. This deliberately goes through
-// handoff.AppendTo rather than hand-assembling parameters: the serialization
-// boundary between the two sides is the thing under test.
+// exactly the bytes that crossed the wire. The signed parameters come from
+// handoff.Sign rather than being hand-assembled: the serialization boundary
+// between the two sides is the thing under test. The merge below mirrors the
+// directory router's buildLocation — the signed fh_* parameters overwrite any
+// caller-supplied ones instead of appending alongside them.
 func regionPinURL(t *testing.T, secret []byte, p handoff.Params, extra url.Values) string {
 	t.Helper()
-	loc, err := handoff.AppendTo("https://cell.example.com", "/v0/onboarding/region-pin", extra, secret, p)
+	pin, err := handoff.Sign(p, string(secret))
 	if err != nil {
-		t.Fatalf("handoff.AppendTo: %v", err)
+		t.Fatalf("handoff.Sign: %v", err)
 	}
-	u, err := url.Parse(loc)
-	if err != nil {
-		t.Fatalf("parse redirect location: %v", err)
+	q := url.Values{}
+	for k, vals := range extra {
+		for _, v := range vals {
+			q.Add(k, v)
+		}
 	}
+	for k, vals := range pin {
+		q.Del(k)
+		for _, v := range vals {
+			q.Add(k, v)
+		}
+	}
+	u := &url.URL{Path: "/v0/onboarding/region-pin", RawQuery: q.Encode()}
 	return u.RequestURI()
 }
 
@@ -798,9 +809,12 @@ func TestRegionPin_HandoffRejections(t *testing.T) {
 			status: http.StatusBadRequest, code: "validation_failed",
 		},
 		{
+			// A pin stripped of its signature is MISSING a required parameter,
+			// not a bad one, so it lands on the same branch as "absent" above:
+			// 400, and — the invariant that matters — nothing is written.
 			name:   "unsigned",
 			target: func(t *testing.T) string { return mutate(t, func(v url.Values) { v.Del(handoff.ParamSignature) }) },
-			status: http.StatusForbidden, code: "region_pin_rejected",
+			status: http.StatusBadRequest, code: "validation_failed",
 		},
 		{
 			name: "forged_signature",
@@ -836,11 +850,16 @@ func TestRegionPin_HandoffRejections(t *testing.T) {
 			status: http.StatusForbidden, code: "region_pin_rejected",
 		},
 		{
+			// mutate() rewrites an ALREADY-SIGNED pin, so a garbled expiry is
+			// first and foremost tampering. The codec authenticates before it
+			// parses, so this is reported as a signature mismatch rather than a
+			// field-format complaint — the stronger answer, since it never
+			// admits that an unauthenticated value was even inspected.
 			name: "malformed_expiry",
 			target: func(t *testing.T) string {
 				return mutate(t, func(v url.Values) { v.Set(handoff.ParamExpiresAt, "soon") })
 			},
-			status: http.StatusBadRequest, code: "validation_failed",
+			status: http.StatusForbidden, code: "region_pin_rejected",
 		},
 		{
 			name: "blank_nonce",
