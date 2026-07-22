@@ -1067,6 +1067,26 @@ type Dispatcher struct {
 	// admission seams bucket spend into the same window. Nil is
 	// treated as UTC by CheckBlockingBudget.
 	BudgetLocation *time.Location
+
+	// Accounts resolves the event's App installation to its owning tenant
+	// workspace account so the dispatcher's run-less audit entries
+	// (run_rejected_misconfigured / run_rejected_budget — no run row exists
+	// at either guard) land on that account's chain partition (ADR-057 /
+	// #1828). OPTIONAL: nil (not yet wired), a miss (""), or a lookup error
+	// all degrade to the untenanted NULL partition — the #1829 NULL-allow
+	// window — with the error case WARN-logged; the audit writes it feeds
+	// are already best-effort.
+	Accounts InstallationAccountLookup
+}
+
+// InstallationAccountLookup resolves the tenant workspace account that owns a
+// forge App installation (ADR-057 / #1828): the account UUID string, or ""
+// when the installation is not mapped to an account. Backed in production by
+// the installations table's (provider, installation_ref) natural key
+// (E44.1 / #1825); defined here as a narrow seam so the webhook package
+// doesn't import the account persistence layer.
+type InstallationAccountLookup interface {
+	AccountIDForInstallation(ctx context.Context, installationID int64) (string, error)
 }
 
 // Handle takes a webhook event after receipt + dedup and runs the
@@ -2301,6 +2321,7 @@ func (d *Dispatcher) writeReviewerMisconfiguredAudit(ctx context.Context, ev Eve
 		ActorKind:    &systemKind,
 		ActorSubject: stringPtr("github-webhook"),
 		Payload:      payload,
+		AccountID:    d.eventAccountID(ctx, ev),
 	}); err != nil {
 		d.logger().LogAttrs(ctx, slog.LevelWarn,
 			"append run_rejected_misconfigured audit entry failed",
@@ -2382,6 +2403,7 @@ func (d *Dispatcher) refusedByBlockingBudget(ctx context.Context, ev Event, m Ma
 			ActorKind:    &systemKind,
 			ActorSubject: stringPtr("github-webhook"),
 			Payload:      payload,
+			AccountID:    d.eventAccountID(ctx, ev),
 		}); err != nil {
 			d.logger().LogAttrs(ctx, slog.LevelWarn,
 				"append run_rejected_budget audit entry failed",
@@ -2551,3 +2573,32 @@ func parseRepo(s string) (forge.RepoRef, error) {
 }
 
 func stringPtr(s string) *string { return &s }
+
+// eventAccountID resolves the run-less audit chain partition for an event's
+// installation (ADR-057 / #1828) via the OPTIONAL Accounts seam. Best-effort
+// like the audit writes it feeds: a nil seam, a zero InstallationID (the
+// event isn't installation-scoped), a miss (""), or an unparsable value
+// degrade silently to nil — the untenanted NULL partition — and a lookup
+// error degrades to nil with a WARN log rather than failing the caller.
+func (d *Dispatcher) eventAccountID(ctx context.Context, ev Event) *uuid.UUID {
+	if d.Accounts == nil || ev.InstallationID == 0 {
+		return nil
+	}
+	acct, err := d.Accounts.AccountIDForInstallation(ctx, ev.InstallationID)
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"resolve installation account failed; stamping audit entry untenanted",
+			slog.Int64("installation_id", ev.InstallationID),
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if acct == "" {
+		return nil
+	}
+	u, err := uuid.Parse(acct)
+	if err != nil {
+		return nil
+	}
+	return &u
+}

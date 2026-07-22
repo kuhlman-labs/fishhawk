@@ -299,12 +299,47 @@ func (s *Server) auditCampaignBoardTransition(ctx context.Context, c *campaign.C
 		Category:  categoryWorkItemTransitioned,
 		ActorKind: &kind,
 		Payload:   payload,
+		// Background caller: no request Identity here (webhook/driver
+		// contexts), so the campaign entity in hand supplies the run-less
+		// chain partition (ADR-057 / #1828).
+		AccountID: s.campaignAccountIDForAudit(ctx, c.ID),
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "append campaign work_item_transitioned audit",
 			slog.String("event", event),
 			slog.String("campaign_id", c.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// campaignAccountIDForAudit resolves a campaign's owning tenant account for
+// stamping the run-less audit chain partition (ADR-057 / #1828), read via the
+// OPTIONAL campaign.AccountGetter capability (the domain Campaign type doesn't
+// carry the column). Best-effort like the audit writes it feeds — this is a
+// write-side partition stamp, not an authz gate, so unlike
+// enforceCampaignAccount it never fails the caller: a repo without the
+// capability, an untenanted ("") row, or an unparsable value degrade silently
+// to nil (the untenanted NULL partition), and a lookup error degrades to nil
+// with a WARN log.
+func (s *Server) campaignAccountIDForAudit(ctx context.Context, campaignID uuid.UUID) *uuid.UUID {
+	getter, ok := s.cfg.CampaignRepo.(campaign.AccountGetter)
+	if !ok {
+		return nil
+	}
+	acct, err := getter.GetCampaignAccountID(ctx, campaignID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign audit: resolve account failed; stamping untenanted",
+			slog.String("campaign_id", campaignID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if acct == "" {
+		return nil
+	}
+	u, err := uuid.Parse(acct)
+	if err != nil {
+		return nil
+	}
+	return &u
 }
 
 // auditBoardTransition appends a work_item_transitioned entry recording what the
