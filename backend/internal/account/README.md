@@ -87,3 +87,55 @@ GitHub-specific githubapp package (which owns the id → ref stringification); t
 serve.go closure is a thin forge-neutral passthrough. Per-installation
 REST-client routing and per-installation GitLab-client construction (both
 needing a per-installation client factory) build on this resolver as follow-ups.
+
+## RegionPinner — the cell-side region pin (E44.7 / #1831, ADR-062)
+
+`region.go` records which region owns an account, from a signed handoff the
+regional directory issued. The directory plane owns `(provider, account_key) ->
+region`; this type is the cell's local record of that assignment, so the cell's
+own reads can answer "is this account mine?" without a directory round-trip.
+
+`Pin(ctx, provider, accountKey, region)` refuses in this order, each with a
+typed error the HTTP layer maps onto a status:
+
+- **`ErrRegionDisabled`** — the cell has no configured home region (or no query
+  surface). The pin surface is then disabled ENTIRELY (ADR-062 A2.4): a cell
+  that does not know which region it is cannot honor a residency claim, so it
+  refuses rather than stamping an unverifiable value. A **nil** `*RegionPinner`
+  reports the same thing rather than panicking, which is why the fail-closed
+  decision lives here and not in every caller.
+- **`ErrInvalidPin`** — empty provider, account key, or region.
+- **`ErrRegionMismatch`** — the handoff names a region OTHER than this cell's
+  own. The residency self-check: a valid signature is not authority to record
+  another region's account here.
+- **`ErrUnknownAccount`** / **`ErrAlreadyPinned`** — the conditional UPDATE
+  matched no row, disambiguated by a follow-up read.
+
+**First-write-wins lives in SQL, not in Go.** `PinAccountHomeRegion` is
+
+```sql
+UPDATE accounts SET home_region = $3, updated_at = now()
+ WHERE provider = $1 AND account_key = $2
+   AND (home_region IS NULL OR home_region = $3)
+RETURNING *;
+```
+
+The guard clause matches only a row that is unpinned or already pinned to the
+SAME region, so two concurrent pins proposing different regions serialize on the
+row lock and exactly one can match — there is no check-then-act window to race
+(ADR-062 A2.3). `region_test.go` pins this with a four-goroutine concurrent test
+under `-race` against real Postgres: exactly one winner, and the stored value
+never moves afterwards.
+
+The statement is **UPDATE-only on purpose**: it must never create an account. A
+handoff naming an account this cell has never heard of matches no row and is
+refused (`ErrUnknownAccount`), not silently materialized — otherwise a signed
+handoff would be an account-creation primitive (ADR-062 A2.5).
+
+Re-pinning an account to the region it already holds MATCHES the row and is a
+no-op. That idempotence is what makes replay safe: the handoff's nonce and
+expiry bind one issuance but are not consumed against a store, so replaying an
+unexpired handoff verbatim changes nothing. See
+`backend/internal/server/regionpin.go` for the HTTP middleware that verifies the
+handoff before calling this, and `docs/deploy/regional-cells.md` for the
+two-plane topology.

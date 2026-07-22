@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
@@ -506,6 +507,21 @@ type Config struct {
 	// process legitimately still has in flight. Zero uses time.Now(); tests
 	// inject a fixed instant to exercise the boot-marker gate deterministically.
 	ProcessStart time.Time
+
+	// HandoffSecret is the HMAC key this cell shares with the directory
+	// plane (ADR-062, E44.7 / #1831). EMPTY disables the region-pin surface:
+	// a routed request that carries a handoff is then REFUSED with 503, not
+	// served as though the handoff were absent. Requests carrying no fh_*
+	// parameters are unaffected either way, so a single-cell deployment
+	// behaves identically before and after.
+	HandoffSecret string
+
+	// RegionPinner stamps accounts.home_region from a verified handoff. Nil,
+	// or a pinner whose cell region is unset, disables the pin surface on the
+	// same fail-closed terms as an empty HandoffSecret. Constructed by
+	// serve.go only when BOTH FISHHAWKD_HOME_REGION and FISHHAWKD_HANDOFF_
+	// SECRET are set.
+	RegionPinner *account.RegionPinner
 }
 
 // Server wraps an http.Server with the routes and middleware stack

@@ -37,6 +37,28 @@ SELECT * FROM accounts
  WHERE account_key = $1
  ORDER BY provider ASC;
 
+-- name: PinAccountHomeRegion :one
+-- The cell-side region pin (ADR-062 A2.3, E44.7 / #1831). First-write-wins is
+-- enforced HERE, in SQL, rather than as a check-then-act read/write pair in Go:
+-- the WHERE clause matches only a row that is unpinned or ALREADY pinned to the
+-- same region, so two concurrent pins proposing different regions serialize on
+-- the row lock and exactly one can match.
+--
+-- The statement is UPDATE-only ON PURPOSE — it must never create an account. A
+-- handoff naming an account this cell has never heard of matches no row and is
+-- refused, not silently materialized (ADR-062 A2.5).
+--
+-- Zero rows is therefore ambiguous by design and the Go layer disambiguates:
+-- either the account does not exist here, or it is already pinned to a
+-- DIFFERENT region. Both are refusals; neither is an overwrite.
+UPDATE accounts
+   SET home_region = $3,
+       updated_at  = now()
+ WHERE provider = $1
+   AND account_key = $2
+   AND (home_region IS NULL OR home_region = $3)
+RETURNING *;
+
 -- name: UpsertInstallation :one
 -- Idempotent create-or-update keyed on (provider, installation_ref). Carries
 -- the relocated forge_base_url / oauth_base_url endpoint columns (Amendment A1).

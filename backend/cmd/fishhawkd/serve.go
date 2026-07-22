@@ -112,6 +112,60 @@ type planReviewerOptions struct {
 	planReviewMaxTokens       int
 	planReviewMaxRetries      int
 	planReviewTimeout         time.Duration
+	// modelBaseURL / modelAPIKey are the region-scoped inference endpoint and
+	// credential (ADR-062, E44.7 / #1831). They govern the Anthropic SDK
+	// adapter only — the claudecode and codex adapters are subprocesses whose
+	// endpoint is the CLI's own configuration, not ours. Both empty is the
+	// single-cell posture: the SDK default endpoint, the anthropic API key.
+	modelBaseURL string
+	modelAPIKey  string
+}
+
+// inferenceAPIKey resolves the credential the Anthropic SDK adapter presents.
+// The region-scoped key wins when set; otherwise the deployment's
+// FISHHAWKD_ANTHROPIC_API_KEY is used unchanged. It is deliberately NOT part of
+// the adapter-selection precedence in Default(): a region key alone does not
+// turn the anthropic reviewer on, it only redirects the credential of a
+// reviewer that FISHHAWKD_ANTHROPIC_API_KEY already selected.
+//
+// The fallback is confined to the DEFAULT endpoint. A configured
+// FISHHAWKD_MODEL_BASE_URL with no FISHHAWKD_MODEL_API_KEY is half-configured,
+// and falling back there would send the deployment's Anthropic credential —
+// along with plan and review text — to an operator-supplied host. That is
+// secret exfiltration via configurable egress, so it fails closed with an empty
+// credential (the endpoint refuses the call) and a startup warning naming the
+// missing key.
+func (p *planReviewerOptions) inferenceAPIKey() string {
+	if p.regionKeyWithoutEndpoint() {
+		return ""
+	}
+	if p.modelAPIKey != "" {
+		return p.modelAPIKey
+	}
+	if p.modelBaseURL != "" {
+		return ""
+	}
+	return p.anthropicAPIKey
+}
+
+// regionKeyWithoutEndpoint reports the MIRROR half-configured posture:
+// FISHHAWKD_MODEL_API_KEY set with no FISHHAWKD_MODEL_BASE_URL. The SDK then
+// falls back to its global default endpoint, so the region-scoped credential
+// AND the plan/implement-review text it authenticates — the residency-sensitive
+// payload the region endpoint exists to contain — would egress outside the
+// region. Withholding the credential alone is not enough here: the request
+// body still travels. So this posture withholds the anthropic SDK adapter
+// ENTIRELY (Default skips it, For refuses it by name), which is the only way
+// the cell sends nothing at all.
+func (p *planReviewerOptions) regionKeyWithoutEndpoint() bool {
+	return p.modelAPIKey != "" && p.modelBaseURL == ""
+}
+
+// anthropicConfigured reports whether the Anthropic SDK adapter may serve:
+// selected by FISHHAWKD_ANTHROPIC_API_KEY and not withheld by the
+// half-configured region posture above.
+func (p *planReviewerOptions) anthropicConfigured() bool {
+	return p.anthropicAPIKey != "" && !p.regionKeyWithoutEndpoint()
 }
 
 // planReviewerSet implements server.ReviewerSet over the deployment's
@@ -128,7 +182,13 @@ type planReviewerSet struct {
 
 func (p *planReviewerSet) newAnthropic(model string) server.PlanReviewer {
 	reviewer := anthropic.NewReviewer(anthropic.Config{
-		APIKey:    p.opts.anthropicAPIKey,
+		// Region-scoped inference (ADR-062, E44.7 / #1831): both the endpoint
+		// and the credential come from the cell's own config, so plan- and
+		// implement-review text for this cell's accounts never leaves the
+		// region. Both empty is the single-cell posture (SDK default endpoint,
+		// deployment anthropic key) — byte-identical to before.
+		APIKey:    p.opts.inferenceAPIKey(),
+		BaseURL:   p.opts.modelBaseURL,
 		Model:     model,
 		MaxTokens: p.opts.planReviewMaxTokens,
 		Timeout:   p.opts.planReviewTimeout,
@@ -179,7 +239,7 @@ func (p *planReviewerSet) newCodex(model, reasoningEffort string) server.PlanRev
 // correct.
 func (p *planReviewerSet) Default() server.PlanReviewer {
 	switch {
-	case p.opts.anthropicAPIKey != "":
+	case p.opts.anthropicConfigured():
 		return p.newAnthropic(p.opts.planReviewModel)
 	case p.opts.enableLocalClaudeReviewer:
 		return p.newClaudeCode(p.opts.localClaudeModel)
@@ -220,6 +280,11 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 	}
 	switch provider {
 	case "anthropic":
+		if p.opts.regionKeyWithoutEndpoint() {
+			return nil, fmt.Errorf("reviewer provider %q is withheld: FISHHAWKD_MODEL_API_KEY is set without FISHHAWKD_MODEL_BASE_URL, "+
+				"which would send the region-scoped credential and the review text to the SDK's global default endpoint; "+
+				"set FISHHAWKD_MODEL_BASE_URL to the region endpoint, or unset FISHHAWKD_MODEL_API_KEY", provider)
+		}
 		if p.opts.anthropicAPIKey == "" {
 			return nil, fmt.Errorf("reviewer provider %q is not configured: set FISHHAWKD_ANTHROPIC_API_KEY", provider)
 		}
@@ -256,7 +321,7 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.ReviewerSet {
 	set := &planReviewerSet{opts: opts}
 	configured := 0
-	if opts.anthropicAPIKey != "" {
+	if opts.anthropicConfigured() {
 		configured++
 		logger.Info("plan review adapter configured",
 			slog.String("adapter", "anthropic"),
@@ -293,7 +358,73 @@ func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.
 		// mode, skip with an audit trail in advisory mode.
 		logger.Warn("plan-review agent not configured (set FISHHAWKD_ANTHROPIC_API_KEY, or FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER for local mode, to enable); any workflow declaring reviewers.agent > 0 will fail dispatch in gating mode and skip with a plan_review_skipped audit entry in advisory mode")
 	}
+	if opts.modelBaseURL != "" {
+		// Log the endpoint, never the key. Both review paths (plan and
+		// implement) share this adapter, so one line covers both.
+		logger.Info("region-scoped inference endpoint configured",
+			slog.String("base_url", opts.modelBaseURL),
+			slog.Bool("region_scoped_key", opts.modelAPIKey != ""),
+			slog.String("ref", "#1831"))
+		if opts.modelAPIKey == "" {
+			logger.Warn("FISHHAWKD_MODEL_BASE_URL is set without FISHHAWKD_MODEL_API_KEY; the anthropic reviewer will present NO credential to that endpoint and its calls will fail. FISHHAWKD_ANTHROPIC_API_KEY is deliberately not sent to a non-default endpoint — set FISHHAWKD_MODEL_API_KEY to the region-scoped key",
+				slog.String("base_url", opts.modelBaseURL),
+				slog.String("ref", "#1831"))
+		}
+	}
+	if opts.regionKeyWithoutEndpoint() {
+		// The mirror half-configuration, and the louder of the two: here the
+		// failure mode is egress, not a refused call.
+		logger.Warn("FISHHAWKD_MODEL_API_KEY is set without FISHHAWKD_MODEL_BASE_URL; the anthropic reviewer is WITHHELD rather than pointed at the SDK's global default endpoint, which would send the region-scoped credential and the plan/implement-review text outside this region. Set FISHHAWKD_MODEL_BASE_URL to the region-scoped inference endpoint, or unset FISHHAWKD_MODEL_API_KEY to run on the default endpoint with FISHHAWKD_ANTHROPIC_API_KEY",
+			slog.String("ref", "#1831"))
+	}
 	return set
+}
+
+// regionPinOptions carries the two env values that decide whether this cell
+// participates in regional handoffs (ADR-062, E44.7 / #1831).
+type regionPinOptions struct {
+	homeRegion    string
+	handoffSecret string
+}
+
+// resolveRegionPin returns the (server.Config.HandoffSecret,
+// server.Config.RegionPinner) pair for this deployment.
+//
+// The surface is constructed ONLY when all three inputs are present: the cell's
+// own region, the shared handoff secret, and an account query surface (i.e. a
+// configured database). Any one missing returns ("", nil) — the DISABLED
+// posture, in which server.withRegionPin refuses a routed request carrying a
+// handoff with 503 rather than serving it as though the handoff were absent.
+// Disabling is logged once at startup naming what is missing, because a cell
+// that silently declines to pin is indistinguishable from a healthy one until
+// an account lands in the wrong region.
+//
+// Returning "" for the secret even when a secret WAS supplied is deliberate:
+// half-configured is not a distinct posture, and carrying the secret into a
+// Config with no pinner would make the fail-closed guard depend on two
+// conditions instead of one.
+func resolveRegionPin(opts regionPinOptions, q account.RegionPinnerQueries, logger *slog.Logger) (string, *account.RegionPinner) {
+	var missing []string
+	if opts.homeRegion == "" {
+		missing = append(missing, "FISHHAWKD_HOME_REGION")
+	}
+	if opts.handoffSecret == "" {
+		missing = append(missing, "FISHHAWKD_HANDOFF_SECRET")
+	}
+	if q == nil {
+		missing = append(missing, "FISHHAWKD_DATABASE_URL")
+	}
+	if len(missing) > 0 {
+		logger.Info("region-pin surface disabled; a routed request carrying a directory handoff will be refused with 503 (requests without fh_* parameters are unaffected)",
+			slog.String("missing", strings.Join(missing, ", ")),
+			slog.String("ref", "#1831"))
+		return "", nil
+	}
+	logger.Info("region-pin surface enabled",
+		slog.String("home_region", opts.homeRegion),
+		slog.String("routed_path", server.RoutedOnboardingPath),
+		slog.String("ref", "#1831"))
+	return opts.handoffSecret, account.NewRegionPinner(q, opts.homeRegion)
 }
 
 // resolveRefinementDrafter builds the E34.2 refinement drafting agent
@@ -783,6 +914,17 @@ func runServe(args []string, logSink io.Writer) int {
 		"minimum repository permission (none|read|triage|write|maintain|admin) a verified subject must hold "+
 			"on --oauth-operator-repo to mint an OAuth token (E39.3 / #1708); default write. An unrecognized "+
 			"value fails startup (fail closed) rather than silently under-gating")
+	homeRegion := fs.String("home-region",
+		envOr("FISHHAWKD_HOME_REGION", ""),
+		"the region THIS cell serves (ADR-062, E44.7 / #1831), e.g. us or eu. Empty disables the "+
+			"region-pin surface entirely: a routed request carrying a directory handoff is then REFUSED "+
+			"(503), never served as though the handoff were absent. Requests carrying no fh_* parameters "+
+			"are unaffected, so a single-cell deployment behaves identically with or without this flag")
+	handoffSecret := fs.String("handoff-secret",
+		envOr("FISHHAWKD_HANDOFF_SECRET", ""),
+		"HMAC-SHA256 key this cell shares with the directory plane to verify signed handoffs "+
+			"(ADR-062, E44.7 / #1831). Empty disables the region-pin surface on the same fail-closed "+
+			"terms as an empty --home-region; BOTH must be set for the surface to be constructed")
 	externalURL := fs.String("external-url",
 		envOr("FISHHAWKD_EXTERNAL_URL", ""),
 		"operator-facing root URL for the SPA, e.g. https://app.fishhawk.example.com; used to build links in surfaces that escape the backend (today: GitHub Check Runs). Empty disables the publish-to-GitHub paths cleanly.")
@@ -816,6 +958,18 @@ func runServe(args []string, logSink io.Writer) int {
 	openAIAPIKey := fs.String("openai-api-key",
 		envOr("FISHHAWKD_OPENAI_API_KEY", ""),
 		"OpenAI API key forwarded as OPENAI_API_KEY to the Codex reviewer subprocess; empty is fine when Codex is authenticated via a ChatGPT login on the host")
+	modelBaseURL := fs.String("model-base-url",
+		envOr("FISHHAWKD_MODEL_BASE_URL", ""),
+		"region-scoped inference endpoint for the Anthropic SDK reviewer (ADR-062, E44.7 / #1831). "+
+			"Empty uses the SDK default (api.anthropic.com), which is the single-cell posture. "+
+			"Selection is process-level: every plan- and implement-review call this cell makes targets this endpoint")
+	modelAPIKey := fs.String("model-api-key",
+		envOr("FISHHAWKD_MODEL_API_KEY", ""),
+		"API key presented to --model-base-url. Empty falls back to --anthropic-api-key ONLY when "+
+			"--model-base-url is also empty (the single-cell posture, which needs neither flag); with a "+
+			"custom endpoint configured and this key unset the adapter presents no credential rather than "+
+			"sending the deployment key to that endpoint. It does NOT enable the anthropic reviewer on its own — "+
+			"--anthropic-api-key still selects the adapter; this key only overrides the credential sent")
 	planReviewMaxTokens := fs.Int("plan-review-max-tokens",
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_TOKENS", 4096),
 		"maximum tokens for plan-review agent responses")
@@ -993,6 +1147,8 @@ func runServe(args []string, logSink io.Writer) int {
 		planReviewMaxTokens:       *planReviewMaxTokens,
 		planReviewMaxRetries:      *planReviewMaxRetries,
 		planReviewTimeout:         *planReviewTimeout,
+		modelBaseURL:              *modelBaseURL,
+		modelAPIKey:               *modelAPIKey,
 	}, logger)
 
 	// Refinement drafting agent (E34.2 / #1593). Reuses the local-claude
@@ -1013,6 +1169,10 @@ func runServe(args []string, logSink io.Writer) int {
 	// repository-dependent handler returns 503 — so operators can
 	// smoke-test a deploy before pointing it at production data.
 	var pool *pgxpool.Pool
+	// accountQueries stays a literal nil interface without a pool (never a
+	// typed-nil *accountdb.Queries, which would read as "configured" to
+	// resolveRegionPin's q == nil check).
+	var accountQueries account.RegionPinnerQueries
 	if *dbURL != "" {
 		var err error
 		pool, err = pgxpool.New(context.Background(), *dbURL)
@@ -1038,10 +1198,19 @@ func runServe(args []string, logSink io.Writer) int {
 		// E44.5, #1829). Nil pool leaves cfg.AccountRoles nil (untenanted-allow
 		// — role-bounding skipped), mirroring AuthMembership's nil-pool posture.
 		cfg.AccountRoles = account.NewStore(accountdb.New(pool))
+		accountQueries = accountdb.New(pool)
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth + account-roles)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
 	}
+
+	// Regional handoff surface (ADR-062, E44.7 / #1831). Constructed only when
+	// the cell's own region, the shared secret, AND a database are all present;
+	// anything less leaves the pair zero, which is the fail-closed posture.
+	cfg.HandoffSecret, cfg.RegionPinner = resolveRegionPin(regionPinOptions{
+		homeRegion:    *homeRegion,
+		handoffSecret: *handoffSecret,
+	}, accountQueries, logger)
 
 	// Trace storage wiring. The S3 client uses path-style requests
 	// so the same code works against AWS S3 and MinIO. An empty

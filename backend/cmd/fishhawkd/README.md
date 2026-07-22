@@ -46,6 +46,60 @@ install; a NULL column or unknown installation falls back to the deployment
 default; a **real DB error FAILS the mint** (fail-closed) rather than silently
 targeting the default host. See `backend/internal/account/README.md`.
 
+## Regional cells: handoff surface + region-scoped inference (ADR-062, E44.7 / #1831)
+
+Four optional env vars turn this process into a *regional cell*. All four default empty, and an
+all-empty deployment is byte-identical to a single-cell one.
+
+| Env var | Flag | Effect | Empty means |
+|---|---|---|---|
+| `FISHHAWKD_HOME_REGION` | `--home-region` | the region THIS cell serves (`us`, `eu`, …) | region-pin surface **disabled** |
+| `FISHHAWKD_HANDOFF_SECRET` | `--handoff-secret` | HMAC-SHA256 key shared with the directory plane | region-pin surface **disabled** |
+| `FISHHAWKD_MODEL_BASE_URL` | `--model-base-url` | region-scoped inference endpoint for the Anthropic SDK reviewer | SDK default (`api.anthropic.com`) |
+| `FISHHAWKD_MODEL_API_KEY` | `--model-api-key` | credential presented to that endpoint | falls back to `FISHHAWKD_ANTHROPIC_API_KEY` **only when `FISHHAWKD_MODEL_BASE_URL` is also empty** |
+
+The two region-inference knobs are set **together or not at all**: either half alone is refused,
+in the direction each half fails (see below).
+
+**Pin surface construction is all-or-nothing.** `resolveRegionPin` (in `serve.go`) returns the
+`(server.Config.HandoffSecret, server.Config.RegionPinner)` pair only when the region, the secret
+**and** an account query surface (i.e. `FISHHAWKD_DATABASE_URL`) are all present; any one missing
+returns `("", nil)` and logs once naming what is missing. Returning an empty secret even when a
+secret *was* supplied is deliberate — half-configured is not a distinct posture, and it keeps the
+downstream fail-closed guard depending on one condition instead of two.
+
+Disabled is **fail closed, not permissive**: a request to the routed surface
+(`server.RoutedOnboardingPath` = `GET /v0/onboarding/start`) that carries directory handoff
+parameters is refused with 503 `region_pin_disabled`. Requests carrying no `fh_*` parameters pass
+through untouched, which is what makes the flags a no-op for a single-cell deployment. Only that one
+path is routed; the OAuth login/callback pair is deliberately not (see
+`docs/deploy/regional-cells.md`).
+
+**Region-scoped inference is process-level** (ADR-062 Q3(a)) — there is no per-account endpoint
+registry. `FISHHAWKD_MODEL_BASE_URL` + `FISHHAWKD_MODEL_API_KEY` are threaded into
+`anthropic.Config{BaseURL, APIKey}` by `planReviewerSet.newAnthropic`, so **both** the plan-review
+and implement-review calls (one adapter, two prompt shapes) target the cell's in-region endpoint and
+the review text never leaves the region. It governs the Anthropic **SDK** adapter only — the
+`claudecode` and `codex` adapters are subprocesses whose endpoint is the CLI's own configuration.
+`FISHHAWKD_MODEL_API_KEY` redirects a credential; it does **not** select the anthropic adapter,
+which `FISHHAWKD_ANTHROPIC_API_KEY` still does.
+
+The credential fallback is confined to the **default** endpoint. With `FISHHAWKD_MODEL_BASE_URL`
+set and `FISHHAWKD_MODEL_API_KEY` unset, `inferenceAPIKey` resolves to the empty string rather than
+the deployment's `FISHHAWKD_ANTHROPIC_API_KEY`: falling back there would send a production
+credential — and the plan/review text it authenticates — to an operator-supplied host, which is
+secret exfiltration via configurable egress. That half-configured posture fails closed (the endpoint
+refuses an uncredentialed call) and logs a startup warning naming the missing key.
+
+The **mirror** half-configuration fails closed harder. With `FISHHAWKD_MODEL_API_KEY` set and
+`FISHHAWKD_MODEL_BASE_URL` unset, the SDK would fall back to its **global default** endpoint and
+send both the region-scoped credential and the plan/implement-review text out of the region.
+Withholding the credential is not sufficient there — the request body still travels — so the
+Anthropic SDK adapter is withheld **entirely**: `planReviewerSet.Default()` skips it (falling
+through to `claudecode`/`codex` if either is configured) and `For("anthropic")` refuses by name,
+with a startup warning naming `FISHHAWKD_MODEL_BASE_URL`. Set the endpoint, or unset the region key
+to run on the default endpoint with `FISHHAWKD_ANTHROPIC_API_KEY`.
+
 ## Work-management provider registration at startup (#1104)
 
 `workmgmt_wiring.go` — `registerWorkmgmtProviders(cfg.GitHub, jiraClient, gitlabClient)`, called from

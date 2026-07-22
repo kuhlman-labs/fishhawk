@@ -18,9 +18,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
+	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -34,6 +37,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
+	"github.com/kuhlman-labs/fishhawk/directory/pkg/handoff"
 )
 
 // resolveMaxParallelChildren mirrors runServe's --max-parallel-children
@@ -1352,5 +1356,383 @@ func TestNewWebhookDeliveryStore(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// --- Regional cells: serve wiring (ADR-062, E44.7 / #1831) ------------------
+
+// stubAccountQueries is a minimal account.RegionPinnerQueries so
+// resolveRegionPin's "a database is configured" input can be supplied without
+// a pool. It records the pin it was asked for.
+type stubAccountQueries struct {
+	calls []accountdb.PinAccountHomeRegionParams
+}
+
+func (s *stubAccountQueries) PinAccountHomeRegion(_ context.Context, arg accountdb.PinAccountHomeRegionParams) (accountdb.Account, error) {
+	s.calls = append(s.calls, arg)
+	return accountdb.Account{Provider: arg.Provider, AccountKey: arg.AccountKey, HomeRegion: arg.HomeRegion}, nil
+}
+
+func (s *stubAccountQueries) GetAccountByKey(_ context.Context, arg accountdb.GetAccountByKeyParams) (accountdb.Account, error) {
+	return accountdb.Account{Provider: arg.Provider, AccountKey: arg.AccountKey}, nil
+}
+
+// TestResolveRegionPin_Postures covers every branch of the construction gate:
+// the surface is built only when the region, the secret AND a query surface are
+// all present, and each individual absence disables it.
+func TestResolveRegionPin_Postures(t *testing.T) {
+	q := &stubAccountQueries{}
+	for _, tc := range []struct {
+		name        string
+		region      string
+		secret      string
+		queries     account.RegionPinnerQueries
+		wantSecret  string
+		wantEnabled bool
+		wantLog     string
+	}{
+		{"all three set", "eu", "s3cret", q, "s3cret", true, "region-pin surface enabled"},
+		{"region unset", "", "s3cret", q, "", false, "FISHHAWKD_HOME_REGION"},
+		{"secret unset", "eu", "", q, "", false, "FISHHAWKD_HANDOFF_SECRET"},
+		{"no database", "eu", "s3cret", nil, "", false, "FISHHAWKD_DATABASE_URL"},
+		{"nothing set", "", "", nil, "", false, "FISHHAWKD_HOME_REGION"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf strings.Builder
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			secret, pinner := resolveRegionPin(regionPinOptions{
+				homeRegion:    tc.region,
+				handoffSecret: tc.secret,
+			}, tc.queries, logger)
+
+			if secret != tc.wantSecret {
+				t.Errorf("secret = %q, want %q", secret, tc.wantSecret)
+			}
+			if pinner.Enabled() != tc.wantEnabled {
+				t.Errorf("pinner.Enabled() = %v, want %v", pinner.Enabled(), tc.wantEnabled)
+			}
+			if !tc.wantEnabled && pinner != nil {
+				t.Errorf("pinner = %v, want nil when the surface is disabled", pinner)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Errorf("startup log = %q, want it to mention %q", buf.String(), tc.wantLog)
+			}
+		})
+	}
+}
+
+// signedOnboardingRequest returns the routed onboarding GET carrying a handoff
+// actually signed with secret — not a hand-built parameter set.
+func signedOnboardingRequest(t *testing.T, secret, region string) *http.Request {
+	t.Helper()
+	signed, err := handoff.Sign(secret, handoff.Params{
+		Provider:   "github",
+		AccountKey: "acme",
+		HomeRegion: region,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Nonce:      "nonce-abcdef0123456789",
+	})
+	if err != nil {
+		t.Fatalf("sign handoff: %v", err)
+	}
+	return httptest.NewRequest(http.MethodGet,
+		server.RoutedOnboardingPath+"?"+signed.Encode(), nil)
+}
+
+// serveRegionPinResponse runs a signed routed request through a server whose
+// region-pin config came from resolveRegionPin, i.e. exactly the wiring
+// runServe performs.
+func serveRegionPinResponse(t *testing.T, opts regionPinOptions, q account.RegionPinnerQueries, signSecret, signRegion string) *httptest.ResponseRecorder {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := server.Config{Logger: logger}
+	cfg.HandoffSecret, cfg.RegionPinner = resolveRegionPin(opts, q, logger)
+
+	rec := httptest.NewRecorder()
+	server.New(cfg).Handler().ServeHTTP(rec, signedOnboardingRequest(t, signSecret, signRegion))
+	return rec
+}
+
+// TestServeWiring_SecretSetRegionUnsetRefusesSignedRequest is the fail-closed
+// behavioral assertion (binding condition 8). Asserting only that the pinner
+// was not constructed would not prove the surface REFUSES rather than bypasses,
+// so this sends a genuinely-signed handoff — one the configured secret would
+// verify if the region were set — and asserts it is turned away.
+func TestServeWiring_SecretSetRegionUnsetRefusesSignedRequest(t *testing.T) {
+	const secret = "shared-cell-directory-secret"
+	q := &stubAccountQueries{}
+
+	rec := serveRegionPinResponse(t, regionPinOptions{
+		homeRegion:    "", // the fail-closed input under test
+		handoffSecret: secret,
+	}, q, secret, "eu")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (a signed handoff must be REFUSED, not bypassed, when the cell region is unset); body: %s",
+			rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "region_pin_disabled") {
+		t.Errorf("body = %s, want the region_pin_disabled error code", rec.Body.String())
+	}
+	if len(q.calls) != 0 {
+		t.Errorf("PinAccountHomeRegion called %d times, want 0 — a disabled cell must not write", len(q.calls))
+	}
+}
+
+// TestServeWiring_RegionSetSecretUnsetRefusesSignedRequest is the mirror
+// fail-closed case: the cell knows its region but shares no secret, so it
+// cannot verify a residency claim and must refuse rather than serve.
+func TestServeWiring_RegionSetSecretUnsetRefusesSignedRequest(t *testing.T) {
+	q := &stubAccountQueries{}
+
+	rec := serveRegionPinResponse(t, regionPinOptions{
+		homeRegion:    "eu",
+		handoffSecret: "", // the fail-closed input under test
+	}, q, "some-other-secret", "eu")
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d; body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if len(q.calls) != 0 {
+		t.Errorf("PinAccountHomeRegion called %d times, want 0", len(q.calls))
+	}
+}
+
+// TestServeWiring_BothSetHonoursSignedRequest is the positive control: with
+// both env values set the wiring really does construct a working surface, so
+// the two refusals above are fail-closed behavior and not a dead route.
+func TestServeWiring_BothSetHonoursSignedRequest(t *testing.T) {
+	const secret = "shared-cell-directory-secret"
+	q := &stubAccountQueries{}
+
+	rec := serveRegionPinResponse(t, regionPinOptions{
+		homeRegion:    "eu",
+		handoffSecret: secret,
+	}, q, secret, "eu")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+	if len(q.calls) != 1 {
+		t.Fatalf("PinAccountHomeRegion called %d times, want exactly 1", len(q.calls))
+	}
+	got := q.calls[0]
+	if got.Provider != "github" || got.AccountKey != "acme" || got.HomeRegion == nil || *got.HomeRegion != "eu" {
+		t.Errorf("pin = %+v, want the identity carried by the signed handoff (github/acme/eu)", got)
+	}
+}
+
+// TestInferenceAPIKey_RegionKeyWinsElseAnthropicKey pins the credential
+// precedence for the region-scoped inference endpoint.
+func TestInferenceAPIKey_RegionKeyWinsElseAnthropicKey(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		anthropic string
+		region    string
+		baseURL   string
+		want      string
+	}{
+		// A region-scoped key with NO region endpoint is half-configured in the
+		// direction that EGRESSES: the SDK would present it — and the review
+		// text — to its global default endpoint. Fail closed.
+		{"region key without a region endpoint", "deployment-key", "region-key", "", ""},
+		{"falls back to the anthropic key on the default endpoint", "deployment-key", "", "", "deployment-key"},
+		{"both empty", "", "", "", ""},
+		// A custom endpoint with no region key must NOT receive the
+		// deployment credential — that would ship a production secret (and
+		// the review text it authenticates) to an operator-supplied host.
+		{"no fallback to a custom endpoint", "deployment-key", "", "https://eu.inference.example.com", ""},
+		{"region key still wins on a custom endpoint", "deployment-key", "region-key", "https://eu.inference.example.com", "region-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := planReviewerOptions{anthropicAPIKey: tc.anthropic, modelAPIKey: tc.region, modelBaseURL: tc.baseURL}
+			if got := opts.inferenceAPIKey(); got != tc.want {
+				t.Errorf("inferenceAPIKey() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint is the
+// behavioral half of the no-fallback rule: with a custom endpoint configured
+// and NO region-scoped key, the reviewer must not present
+// FISHHAWKD_ANTHROPIC_API_KEY to that endpoint. Asserting the resolved string
+// alone would not prove what the adapter puts on the wire, so this drives a
+// real Review through an httptest endpoint and inspects the observed headers.
+func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing.T) {
+	// Hermetic: the SDK falls back to its own ambient credential sources when
+	// the client carries none, and an operator shell commonly exports these.
+	// Blank them so this asserts OUR resolution, not the host's.
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+
+	const deploymentKey = "deployment-anthropic-key"
+	var gotAPIKey, gotAuth string
+	var observed int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed++
+		gotAPIKey, gotAuth = r.Header.Get("x-api-key"), r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant",` +
+			`"content":[{"type":"text","text":"{\"verdict\":\"approve\"}"}],` +
+			`"model":"claude-sonnet-4-6","stop_reason":"end_turn",` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	set := resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey:     deploymentKey,
+		planReviewModel:     "claude-sonnet-4-6",
+		planReviewMaxTokens: 1024,
+		planReviewTimeout:   10 * time.Second,
+		modelBaseURL:        srv.URL,
+		modelAPIKey:         "", // the half-configured input under test
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	reviewer := set.Default()
+	if reviewer == nil {
+		t.Fatal("Default() = nil, want the anthropic adapter (the deployment key still selects it)")
+	}
+	// The call fails by design — no credential is presented.
+	_, _, err := reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
+	if err == nil {
+		t.Fatal("Review succeeded with no credential configured; some credential must have been presented")
+	}
+
+	// A bare "the key is absent from the observed headers" assertion would pass
+	// vacuously if nothing ever reached the endpoint, so assert the stronger
+	// fact that actually holds: with an empty credential the SDK refuses before
+	// it opens a connection, so NOTHING travels — not the deployment key, and
+	// not the plan text either. (The sibling positive test proves this same
+	// wiring does emit a request when a region key IS configured, so the zero
+	// here is the credential rule biting, not a dead endpoint.)
+	if observed != 0 {
+		t.Errorf("%d request(s) reached the custom endpoint with no region key configured; want none", observed)
+	}
+	if strings.Contains(gotAPIKey, deploymentKey) || strings.Contains(gotAuth, deploymentKey) {
+		t.Errorf("the deployment anthropic key reached the custom endpoint (x-api-key=%q Authorization=%q); "+
+			"FISHHAWKD_ANTHROPIC_API_KEY must never be sent to FISHHAWKD_MODEL_BASE_URL", gotAPIKey, gotAuth)
+	}
+}
+
+// TestResolvePlanReviewers_WarnsOnBaseURLWithoutRegionKey pins the operator
+// signal for that half-configured posture: it fails closed, and says so.
+func TestResolvePlanReviewers_WarnsOnBaseURLWithoutRegionKey(t *testing.T) {
+	var buf strings.Builder
+	resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey: "deployment-key",
+		modelBaseURL:    "https://eu.inference.example.com",
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if !strings.Contains(buf.String(), "FISHHAWKD_MODEL_API_KEY") {
+		t.Errorf("startup log = %q, want a warning naming FISHHAWKD_MODEL_API_KEY", buf.String())
+	}
+}
+
+// TestResolvePlanReviewers_RegionKeyWithoutEndpointWithholdsAnthropic is the
+// mirror fail-closed posture: FISHHAWKD_MODEL_API_KEY set with no
+// FISHHAWKD_MODEL_BASE_URL would point the SDK at its GLOBAL default endpoint,
+// sending both the region-scoped credential and the review text out of region.
+// Withholding the credential alone would not help — the request body still
+// travels — so the adapter itself must be withheld, on both resolution paths.
+func TestResolvePlanReviewers_RegionKeyWithoutEndpointWithholdsAnthropic(t *testing.T) {
+	var buf strings.Builder
+	set := resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey:     "deployment-key",
+		planReviewModel:     "claude-sonnet-4-6",
+		planReviewMaxTokens: 1024,
+		planReviewTimeout:   10 * time.Second,
+		modelAPIKey:         "eu-region-scoped-key",
+		modelBaseURL:        "", // the half-configured input under test
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if got := set.Default(); got != nil {
+		t.Errorf("Default() = %T, want nil — the anthropic adapter must not be constructed against the global default endpoint with a region key", got)
+	}
+	if _, err := set.For("anthropic", ""); err == nil {
+		t.Error("For(\"anthropic\") = nil error, want a refusal naming FISHHAWKD_MODEL_BASE_URL")
+	} else if !strings.Contains(err.Error(), "FISHHAWKD_MODEL_BASE_URL") {
+		t.Errorf("For(\"anthropic\") error = %v, want it to name FISHHAWKD_MODEL_BASE_URL", err)
+	}
+	if !strings.Contains(buf.String(), "FISHHAWKD_MODEL_BASE_URL") {
+		t.Errorf("startup log = %q, want a warning naming FISHHAWKD_MODEL_BASE_URL", buf.String())
+	}
+}
+
+// TestResolvePlanReviewers_RegionKeyWithoutEndpointFallsThroughToOtherAdapters
+// pins the blast radius of that withholding: only the SDK adapter egresses to
+// the global endpoint, so a deployment that also configured a subprocess
+// adapter still has a reviewer.
+func TestResolvePlanReviewers_RegionKeyWithoutEndpointFallsThroughToOtherAdapters(t *testing.T) {
+	set := resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey:           "deployment-key",
+		enableLocalClaudeReviewer: true,
+		localClaudeBinary:         "claude",
+		localClaudeModel:          "claude-sonnet-4-6",
+		modelAPIKey:               "eu-region-scoped-key",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if _, ok := set.Default().(*claudecode.Reviewer); !ok {
+		t.Errorf("Default() = %T, want the claudecode adapter", set.Default())
+	}
+}
+
+// TestResolvePlanReviewers_RegionKeyAloneDoesNotSelectAnthropic guards the
+// documented non-effect: FISHHAWKD_MODEL_API_KEY redirects a credential, it
+// does not enable an adapter FISHHAWKD_ANTHROPIC_API_KEY did not select.
+func TestResolvePlanReviewers_RegionKeyAloneDoesNotSelectAnthropic(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	set := resolvePlanReviewers(planReviewerOptions{
+		modelAPIKey:  "region-key",
+		modelBaseURL: "https://eu.inference.example.com",
+	}, logger)
+	if set.Default() != nil {
+		t.Errorf("Default() = %T, want nil — a region key alone must not select the anthropic adapter", set.Default())
+	}
+}
+
+// TestResolvePlanReviewers_AnthropicReviewerUsesRegionEndpoint is the
+// serve-side half of binding condition 7: the reviewer this wiring actually
+// hands the server calls the region endpoint with the region key. The
+// per-review-path coverage lives in
+// backend/internal/anthropic/client_test.go's
+// TestRegionScopedInference_BothReviewPaths, which drives both the plan and the
+// implement-review prompt shape through the same adapter.
+func TestResolvePlanReviewers_AnthropicReviewerUsesRegionEndpoint(t *testing.T) {
+	const regionKey = "eu-region-scoped-key"
+	var gotHost, gotAPIKey, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost, gotAPIKey, gotAuth = r.Host, r.Header.Get("x-api-key"), r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant",` +
+			`"content":[{"type":"text","text":"{\"verdict\":\"approve\"}"}],` +
+			`"model":"claude-sonnet-4-6","stop_reason":"end_turn",` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	set := resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey:     "deployment-key",
+		planReviewModel:     "claude-sonnet-4-6",
+		planReviewMaxTokens: 1024,
+		planReviewTimeout:   10 * time.Second,
+		modelBaseURL:        srv.URL,
+		modelAPIKey:         regionKey,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	reviewer := set.Default()
+	if reviewer == nil {
+		t.Fatal("Default() = nil, want the anthropic adapter")
+	}
+	if _, _, err := reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan"); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	if want := strings.TrimPrefix(srv.URL, "http://"); gotHost != want {
+		t.Errorf("request reached host %q, want the region endpoint %q", gotHost, want)
+	}
+	if gotAPIKey != regionKey && gotAuth != "Bearer "+regionKey {
+		t.Errorf("credential = x-api-key:%q Authorization:%q, want the region-scoped key %q",
+			gotAPIKey, gotAuth, regionKey)
 	}
 }
