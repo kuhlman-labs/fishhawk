@@ -2,6 +2,7 @@ package gitlabclient
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -22,10 +23,13 @@ type stubDoer struct {
 // recordedRequest is a snapshot of a request with its body already read.
 // escapedPath preserves the on-the-wire percent-encoding (so a %2F in a
 // namespaced project path is observable), which req.URL.Path decodes away.
+// rawQuery preserves the query string so a required parameter (GetFile's
+// ref) is assertable on the wire.
 type recordedRequest struct {
 	method      string
 	path        string
 	escapedPath string
+	rawQuery    string
 	header      http.Header
 	body        []byte
 }
@@ -43,6 +47,7 @@ func (s *stubDoer) Do(req *http.Request) (*http.Response, error) {
 		method:      req.Method,
 		path:        req.URL.Path,
 		escapedPath: req.URL.EscapedPath(),
+		rawQuery:    req.URL.RawQuery,
 		header:      req.Header.Clone(),
 		body:        body,
 	}
@@ -137,6 +142,114 @@ func TestGetProject_ValidatesArgs(t *testing.T) {
 	}))
 	if _, err := c.GetProject(context.Background(), "  "); err == nil {
 		t.Error("expected error for empty project path")
+	}
+}
+
+func TestGetFile_RequestShapeAndResult(t *testing.T) {
+	content := base64.StdEncoding.EncodeToString([]byte("version: 1\nprovider: gitlab\n"))
+	stub := &stubDoer{t: t}
+	stub.handler = func(rec *recordedRequest) (*http.Response, error) {
+		if rec.method != http.MethodGet {
+			t.Errorf("method = %s, want GET", rec.method)
+		}
+		assertPrivateToken(t, rec.header)
+		// Both the namespaced project path and the file path are
+		// percent-encoded into single segments: every slash becomes %2F
+		// on the wire.
+		if want := "/api/v4/projects/group%2Fsub%2Fproj/repository/files/.fishhawk%2Fwork-management.yaml"; rec.escapedPath != want {
+			t.Errorf("escaped path = %s, want %s", rec.escapedPath, want)
+		}
+		// The Repository Files API requires an explicit ref; pin it on
+		// the wire.
+		if rec.rawQuery != "ref=HEAD" {
+			t.Errorf("query = %q, want ref=HEAD", rec.rawQuery)
+		}
+		if len(rec.body) != 0 {
+			t.Errorf("GET carried a body: %s", rec.body)
+		}
+		return jsonResponse(http.StatusOK,
+			`{"file_path":".fishhawk/work-management.yaml","blob_id":"abc123","encoding":"base64","content":"`+content+`"}`), nil
+	}
+
+	c := New(testBaseURL, testToken, WithHTTPClient(stub))
+	file, err := c.GetFile(context.Background(), "group/sub/proj", ".fishhawk/work-management.yaml", "HEAD")
+	if err != nil {
+		t.Fatalf("GetFile: %v", err)
+	}
+	if file.FilePath != ".fishhawk/work-management.yaml" {
+		t.Errorf("file_path = %q", file.FilePath)
+	}
+	if got := string(file.Content); got != "version: 1\nprovider: gitlab\n" {
+		t.Errorf("content = %q, want the decoded file body", got)
+	}
+	if file.BlobID != "abc123" {
+		t.Errorf("blob_id = %q, want abc123", file.BlobID)
+	}
+}
+
+func TestGetFile_APIError(t *testing.T) {
+	stub := &stubDoer{t: t}
+	stub.handler = func(*recordedRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusNotFound, `{"message":"404 File Not Found"}`), nil
+	}
+	c := New(testBaseURL, testToken, WithHTTPClient(stub))
+	_, err := c.GetFile(context.Background(), "group/proj", "missing.yaml", "HEAD")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error = %v, want *APIError", err)
+	}
+	if apiErr.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", apiErr.StatusCode)
+	}
+}
+
+func TestGetFile_ValidatesArgs(t *testing.T) {
+	c := New(testBaseURL, testToken, WithHTTPClient(&stubDoer{
+		t: t,
+		handler: func(*recordedRequest) (*http.Response, error) {
+			t.Fatal("transport called despite invalid args")
+			return nil, nil
+		},
+	}))
+	for _, tc := range []struct {
+		name                       string
+		projectPath, filePath, ref string
+	}{
+		{"empty project path", "  ", "f.yaml", "HEAD"},
+		{"empty file path", "group/proj", "  ", "HEAD"},
+		// ref is required by the Repository Files API — an empty ref
+		// fails closed before the wire.
+		{"empty ref", "group/proj", "f.yaml", "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := c.GetFile(context.Background(), tc.projectPath, tc.filePath, tc.ref); err == nil {
+				t.Errorf("expected error for %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestGetFile_BadEncoding(t *testing.T) {
+	stub := &stubDoer{t: t}
+	stub.handler = func(*recordedRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"file_path":"f.yaml","blob_id":"x","encoding":"text","content":"hi"}`), nil
+	}
+	c := New(testBaseURL, testToken, WithHTTPClient(stub))
+	_, err := c.GetFile(context.Background(), "group/proj", "f.yaml", "HEAD")
+	if err == nil || !strings.Contains(err.Error(), "encoding") {
+		t.Errorf("err = %v, want an unexpected-encoding error", err)
+	}
+}
+
+func TestGetFile_CorruptBase64(t *testing.T) {
+	stub := &stubDoer{t: t}
+	stub.handler = func(*recordedRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusOK, `{"file_path":"f.yaml","blob_id":"x","encoding":"base64","content":"!!!not-base64!!!"}`), nil
+	}
+	c := New(testBaseURL, testToken, WithHTTPClient(stub))
+	_, err := c.GetFile(context.Background(), "group/proj", "f.yaml", "HEAD")
+	if err == nil || !strings.Contains(err.Error(), "decode content") {
+		t.Errorf("err = %v, want a base64 decode error", err)
 	}
 }
 

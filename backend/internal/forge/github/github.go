@@ -40,6 +40,10 @@ type Forge struct {
 // that the client does not promote, this line fails the build.
 var _ forge.Forge = (*Forge)(nil)
 
+// Compile-time assertion that the adapter also provides the standalone
+// file-read capability the per-repo conventions loader consumes (#2022).
+var _ forge.FileFetcher = (*Forge)(nil)
+
 // New wraps c as the registered "github" forge. c is the same concrete
 // client serve.go wires for the non-forge surfaces (issues, comments,
 // projects, releases, contents, workflow dispatch); the adapter shares
@@ -67,4 +71,18 @@ func (f *Forge) ResolveRepoScope(ctx context.Context, repo forge.RepoRef) (forge
 		return forge.CredentialScope{}, err
 	}
 	return forge.FromGitHubInstallationID(id), nil
+}
+
+// FetchFile implements forge.FileFetcher by delegating to the embedded
+// client's GetFile — which already issues
+// GET /repos/{owner}/{repo}/contents/{path}?ref={ref}, base64-decodes the
+// content, and returns forge.ErrNotFound / ErrForbidden — and mapping its
+// *githubclient.FileContent onto the forge-neutral *forge.FileContent.
+// Errors propagate unmodified.
+func (f *Forge) FetchFile(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, path, ref string) (*forge.FileContent, error) {
+	fc, err := f.GetFile(ctx, scope, repo, path, ref)
+	if err != nil {
+		return nil, err
+	}
+	return &forge.FileContent{Path: fc.Path, Content: fc.Content, SHA: fc.SHA}, nil
 }

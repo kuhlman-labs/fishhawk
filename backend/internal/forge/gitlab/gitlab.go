@@ -72,6 +72,10 @@ type Forge struct {
 // Compile-time assertion that *Forge satisfies the full Forge surface.
 var _ forge.Forge = (*Forge)(nil)
 
+// Compile-time assertion that the adapter also provides the standalone
+// file-read capability the per-repo conventions loader consumes (#2022).
+var _ forge.FileFetcher = (*Forge)(nil)
+
 // Option customises a Forge at construction.
 type Option func(*Forge)
 
@@ -648,6 +652,32 @@ func (f *Forge) ComparePatch(ctx context.Context, scope forge.CredentialScope, _
 		res.TruncationReason = "gitlab compare_timeout: the diff was capped server-side"
 	}
 	return res, nil
+}
+
+// --- files --------------------------------------------------------------
+
+// FetchFile implements forge.FileFetcher: it reads one file from repo at
+// ref via the Repository Files API. Unlike the scope-parsing Forge methods
+// it addresses the project by repo's namespaced path — its consumer (the
+// per-repo conventions loader, #2022) holds a deployment-level credential
+// scope that need not carry a "gitlab:<id>" project ref, and GitLab
+// accepts the URL-encoded path wherever it accepts the numeric id. The
+// scope still selects the credential via the provider. An empty ref
+// becomes HEAD — the explicit ref the Repository Files API requires — and
+// a 404 maps to forge.ErrNotFound.
+func (f *Forge) FetchFile(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, path, ref string) (*forge.FileContent, error) {
+	token, err := f.provider.Token(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	if ref == "" {
+		ref = "HEAD"
+	}
+	file, err := f.client(token).GetFile(ctx, repo.String(), path, ref)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	return &forge.FileContent{Path: file.FilePath, Content: file.Content, SHA: file.BlobID}, nil
 }
 
 // changedPath returns the path a compare diff entry reports as changed — the

@@ -2,6 +2,7 @@ package github_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -108,6 +109,80 @@ func TestResolveRepoScopeNotInstalled(t *testing.T) {
 	}
 	if !scope.IsZero() {
 		t.Errorf("scope = %v on error, want the zero scope", scope)
+	}
+}
+
+// newContentsAdapter builds a *forgegithub.Forge whose embedded client
+// points at an httptest server serving the given handler for the
+// Contents API file read.
+func newContentsAdapter(t *testing.T, handler http.HandlerFunc) *forgegithub.Forge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/contents/{path...}", handler)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  stubTokens{},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+	return forgegithub.New(c)
+}
+
+// TestFetchFileMapsContent pins the forge.FileFetcher mapping: the
+// embedded client's GetFile result lands field-for-field on
+// *forge.FileContent (path, decoded content, blob SHA), the requested ref
+// rides the query, and the call is dispatchable through the standalone
+// capability interface.
+func TestFetchFileMapsContent(t *testing.T) {
+	content := base64.StdEncoding.EncodeToString([]byte("version: 1\n"))
+	f := newContentsAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.PathValue("path"); got != ".fishhawk/work-management.yaml" {
+			t.Errorf("contents path = %q, want .fishhawk/work-management.yaml", got)
+		}
+		if got := r.URL.Query().Get("ref"); got != "main" {
+			t.Errorf("ref = %q, want main", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w,
+			`{"path":".fishhawk/work-management.yaml","sha":"blob123","content":"`+content+`","encoding":"base64","type":"file"}`)
+	})
+
+	var fetcher forge.FileFetcher = f
+	fc, err := fetcher.FetchFile(context.Background(), forge.FromGitHubInstallationID(42),
+		forge.RepoRef{Owner: "o", Name: "n"}, ".fishhawk/work-management.yaml", "main")
+	if err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	if fc.Path != ".fishhawk/work-management.yaml" {
+		t.Errorf("Path = %q", fc.Path)
+	}
+	if got := string(fc.Content); got != "version: 1\n" {
+		t.Errorf("Content = %q, want the decoded file body", got)
+	}
+	if fc.SHA != "blob123" {
+		t.Errorf("SHA = %q, want blob123", fc.SHA)
+	}
+}
+
+// TestFetchFileNotFound pins the ErrNotFound passthrough: a 404 from the
+// Contents API surfaces as forge.ErrNotFound UNMODIFIED — the sentinel
+// the conventions loader's fall-through branch switches on.
+func TestFetchFileNotFound(t *testing.T) {
+	f := newContentsAdapter(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+	})
+
+	fc, err := f.FetchFile(context.Background(), forge.FromGitHubInstallationID(42),
+		forge.RepoRef{Owner: "o", Name: "n"}, "missing.yaml", "main")
+	if !errors.Is(err, forge.ErrNotFound) {
+		t.Errorf("err = %v, want forge.ErrNotFound", err)
+	}
+	if fc != nil {
+		t.Errorf("FileContent = %+v on error, want nil", fc)
 	}
 }
 
