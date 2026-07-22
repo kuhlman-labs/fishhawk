@@ -33,14 +33,23 @@ An unconfigured client leaves that provider unregistered, and the affected endpo
 **501** — the v0 not-yet-wired posture. This is the wiring behind #1104: `fishhawk_file_issue` /
 `fishhawk_report_product_issue` answer 501 unless the providers are registered.
 
-## Deployment-level work-management conventions override (ADR-058 Phase 2, #1856)
+## Per-repo work-management conventions loader + break-glass override (E45.16 / #2022)
 
-`FISHHAWKD_WORKMGMT_CONVENTIONS` names a YAML conventions file that `serve.go` reads and parses
-(`loadConventionsOverride`) fail-fast at startup — an unreadable or invalid file aborts serve with a
-precise error naming the path + cause. The parsed document is installed for **every** repo via
-`server.SetConventionsLoader`, replacing the `Default()`-only stub. This is enough to run a
-non-`github_projects` provider (e.g. `provider: gitlab`) end-to-end against a single-tenant
-deployment; the true in-repo per-repo loader is deferred to #2022 (the server can't know which forge
-to fetch `.fishhawk/work-management.yaml` from before the conventions declare the provider). The
-run-absent GitHub installation-resolution branch in `workitems.go` is gated on
+`serve.go` installs the per-repo conventions loader after `server.New`:
+`buildRepoConventionsLoader` assembles `server.RepoConventionsLoader` from the forge registry
+(`registeredFileFetcher("github")` / `("gitlab")` — an absent forge yields a nil fetcher and that
+provider falls through), the server's GitHub repo-scope resolution
+(`srv.GitHubRepoScopeResolver()`), the deployment gitlab credential scope (non-zero exactly when
+the gitlab forge is registered; the E45.5 static-token provider ignores the ref), and the
+accounts provider discriminator (`account.NewResolver` over the pool — nil without a database, so
+every filing then falls through to override/Default, the pre-#2022 posture). The loader fetches
+`.fishhawk/work-management.yaml` from the filing repo's **own** forge, resolved via
+`accounts.provider`; full contract in `backend/internal/server/README.md`.
+
+`FISHHAWKD_WORKMGMT_CONVENTIONS` (ADR-058 Phase 2, #1856) is retained as the loader's
+**break-glass fallback**, no longer THE loader: `loadConventionsOverride` still reads and parses
+it fail-fast at startup — an unreadable or invalid file aborts serve with a precise error naming
+the path + cause — but the parsed document is now served only when the per-repo resolution falls
+through (provider not found/ambiguous, unregistered forge, no credential scope, or no committed
+file). The run-absent GitHub installation-resolution branch in `workitems.go` remains gated on
 `provider == github_projects`, so a gitlab filing never attempts GitHub egress.

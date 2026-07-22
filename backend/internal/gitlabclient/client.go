@@ -2,8 +2,10 @@
 // GitLab REST API v4 for the small set of operations the Fishhawk
 // work-management gitlab provider (ADR-058, #1856) needs: resolving a
 // namespaced project path to its numeric id, creating an issue with
-// labels applied at create time, and best-effort linking that issue to a
-// parent via the Free-tier issue-links API.
+// labels applied at create time, best-effort linking that issue to a
+// parent via the Free-tier issue-links API, and reading a single
+// repository file (the per-repo conventions loader's
+// `.fishhawk/work-management.yaml` fetch, #2022).
 //
 // Auth is the PRIVATE-TOKEN header carrying a personal, project, or group
 // access token (the documented GitLab server-to-server scheme — see
@@ -15,14 +17,15 @@
 // instances. The token is unexported and never logged.
 //
 // What's NOT in scope: a comprehensive GitLab SDK. We cover exactly the
-// three calls the provider maps a resolved work item onto. The HTTP
-// transport is injectable (Doer) so tests drive every method against a
-// stub without touching the network.
+// small set of calls Fishhawk's flows map onto. The HTTP transport is
+// injectable (Doer) so tests drive every method against a stub without
+// touching the network.
 package gitlabclient
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -138,6 +141,83 @@ func (c *Client) GetProject(ctx context.Context, path string) (*Project, error) 
 		return nil, fmt.Errorf("gitlabclient: decode project: %w", err)
 	}
 	return &Project{ID: out.ID, WebURL: out.WebURL}, nil
+}
+
+// RepositoryFile is the decoded result of GetFile.
+type RepositoryFile struct {
+	// FilePath is the repo-relative path GitLab reported back.
+	FilePath string
+	// Content is the file's decoded bytes.
+	Content []byte
+	// BlobID is GitLab's blob SHA for the file's content at the ref.
+	// Stable per content — the same dedup property GitHub's blob SHA
+	// carries — so an unchanged file yields the same BlobID across
+	// refetches.
+	BlobID string
+}
+
+// repositoryFileResponse is the subset of GET .../repository/files/:path's
+// success body Fishhawk reads.
+type repositoryFileResponse struct {
+	FilePath string `json:"file_path"`
+	BlobID   string `json:"blob_id"`
+	Encoding string `json:"encoding"`
+	Content  string `json:"content"`
+}
+
+// GetFile fetches a single file from a project at ref.
+//
+//	GET /api/v4/projects/:path/repository/files/:file_path?ref=
+//
+// projectPath is the namespaced project path (e.g. "group/sub/proj"),
+// percent-encoded into a single path segment exactly like GetProject;
+// filePath is repo-relative and likewise encoded into one segment. ref is
+// REQUIRED — the Repository Files API rejects a read without one
+// (https://docs.gitlab.com/ee/api/repository_files.html) — so an empty
+// ref fails closed here rather than on the wire; callers wanting the
+// default branch pass "HEAD". The response carries content
+// base64-encoded; we decode so callers see []byte. A missing file or
+// project is a 404 *APIError, which the forge adapter maps to
+// forge.ErrNotFound.
+func (c *Client) GetFile(ctx context.Context, projectPath, filePath, ref string) (*RepositoryFile, error) {
+	if strings.TrimSpace(projectPath) == "" {
+		return nil, fmt.Errorf("gitlabclient: project path required")
+	}
+	if strings.TrimSpace(filePath) == "" {
+		return nil, fmt.Errorf("gitlabclient: file path required")
+	}
+	if strings.TrimSpace(ref) == "" {
+		return nil, fmt.Errorf("gitlabclient: ref required")
+	}
+
+	q := url.Values{}
+	q.Set("ref", ref)
+	path := "/api/v4/projects/" + url.PathEscape(projectPath) +
+		"/repository/files/" + url.PathEscape(filePath) + "?" + q.Encode()
+	resp, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := errForStatus("get file", resp); err != nil {
+		return nil, err
+	}
+
+	var out repositoryFileResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("gitlabclient: decode get file: %w", err)
+	}
+	if out.Encoding != "base64" {
+		return nil, fmt.Errorf("gitlabclient: get file: unexpected content encoding %q", out.Encoding)
+	}
+	// GitLab may wrap the base64 payload; strip newlines before decoding,
+	// mirroring the GitHub client's contents read.
+	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(out.Content, "\n", ""))
+	if err != nil {
+		return nil, fmt.Errorf("gitlabclient: get file: decode content: %w", err)
+	}
+	return &RepositoryFile{FilePath: out.FilePath, Content: decoded, BlobID: out.BlobID}, nil
 }
 
 // CreateIssueParams describes a single issue to create. Title is

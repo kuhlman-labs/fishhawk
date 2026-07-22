@@ -1037,7 +1037,7 @@ func TestResolveReviewOnMerge_ClosedWithoutMerge_NoPostMergeObserved(t *testing.
 // it fails: neither the Transition call nor the audit row is emitted.
 func TestResolveReviewOnMerge_NoReviewStage_EmitsRunMergedBoardTransition(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{}

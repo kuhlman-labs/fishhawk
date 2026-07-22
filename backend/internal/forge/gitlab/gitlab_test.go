@@ -2,6 +2,7 @@ package gitlab_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -756,5 +757,106 @@ func TestListPullRequestsForCommit(t *testing.T) {
 	}
 	if len(refs) != 1 || refs[0].Number != 7 || refs[0].Title != "t" {
 		t.Errorf("refs = %+v, want one ref iid 7", refs)
+	}
+}
+
+// --- file fetch ---------------------------------------------------------
+
+// fileFetchMux is the Repository Files handler the FetchFile tests share:
+// it asserts the project and file paths each ride the URL as one
+// percent-encoded segment and the REQUIRED ref=HEAD rides the query, then
+// serves the base64 body.
+func fileFetchMux(t *testing.T, content string) *http.ServeMux {
+	t.Helper()
+	encoded := base64.StdEncoding.EncodeToString([]byte(content))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/{proj}/repository/files/{file}", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.EscapedPath(); !strings.Contains(got, "grp%2Fsub%2Fproj") ||
+			!strings.Contains(got, ".fishhawk%2Fwork-management.yaml") {
+			t.Errorf("escaped path = %q, want percent-encoded project and file segments", got)
+		}
+		if got := r.URL.Query().Get("ref"); got != "HEAD" {
+			t.Errorf("ref = %q, want HEAD", got)
+		}
+		writeJSON(w, http.StatusOK,
+			`{"file_path":".fishhawk/work-management.yaml","blob_id":"blob123","encoding":"base64","content":"`+encoded+`"}`)
+	})
+	return mux
+}
+
+// TestFetchFileRoundTrip pins the forge.FileFetcher round-trip through
+// gitlabclient.GetFile: the namespaced repo addresses the project, the
+// explicit ref=HEAD rides the query, and the decoded body + blob id land
+// on *forge.FileContent, dispatchable through the capability interface.
+func TestFetchFileRoundTrip(t *testing.T) {
+	f, _ := newForge(t, fileFetchMux(t, "provider: gitlab\n"))
+	var fetcher forge.FileFetcher = f
+	fc, err := fetcher.FetchFile(context.Background(), forge.CredentialScope{},
+		forge.RepoRef{Owner: "grp/sub", Name: "proj"}, ".fishhawk/work-management.yaml", "HEAD")
+	if err != nil {
+		t.Fatalf("FetchFile: %v", err)
+	}
+	if fc.Path != ".fishhawk/work-management.yaml" {
+		t.Errorf("Path = %q", fc.Path)
+	}
+	if got := string(fc.Content); got != "provider: gitlab\n" {
+		t.Errorf("Content = %q, want the decoded file body", got)
+	}
+	if fc.SHA != "blob123" {
+		t.Errorf("SHA = %q, want blob123", fc.SHA)
+	}
+}
+
+// TestFetchFileDefaultsRefToHEAD pins the empty-ref default: the
+// Repository Files API requires an explicit ref, so the adapter
+// substitutes HEAD (asserted on the wire by fileFetchMux) rather than
+// emitting a request GitLab would reject.
+func TestFetchFileDefaultsRefToHEAD(t *testing.T) {
+	f, _ := newForge(t, fileFetchMux(t, "provider: gitlab\n"))
+	if _, err := f.FetchFile(context.Background(), forge.CredentialScope{},
+		forge.RepoRef{Owner: "grp/sub", Name: "proj"}, ".fishhawk/work-management.yaml", ""); err != nil {
+		t.Fatalf("FetchFile with empty ref: %v", err)
+	}
+}
+
+// failingToken is a credential provider whose resolution always fails —
+// the FetchFile token-error leg.
+type failingToken struct{}
+
+func (failingToken) Token(context.Context, forge.CredentialScope) (string, error) {
+	return "", errors.New("token boom")
+}
+
+// TestFetchFileTokenError pins the fail-closed token-resolution leg: a
+// provider failure propagates before any HTTP call. No Doer is injected,
+// so a leaked request would hit the real network host, not a stub — the
+// error content proves the call never got that far.
+func TestFetchFileTokenError(t *testing.T) {
+	f := forgegitlab.New("https://gitlab.invalid", failingToken{})
+	fc, err := f.FetchFile(context.Background(), forge.CredentialScope{},
+		forge.RepoRef{Owner: "grp", Name: "proj"}, "f.yaml", "HEAD")
+	if err == nil || !strings.Contains(err.Error(), "token boom") {
+		t.Errorf("err = %v, want the provider's token error", err)
+	}
+	if fc != nil {
+		t.Errorf("FileContent = %+v on error, want nil", fc)
+	}
+}
+
+// TestFetchFileNotFound pins the 404 → forge.ErrNotFound mapping — the
+// sentinel the conventions loader's fall-through branch switches on.
+func TestFetchFileNotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/{proj}/repository/files/{file}", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, `{"message":"404 File Not Found"}`)
+	})
+	f, _ := newForge(t, mux)
+	fc, err := f.FetchFile(context.Background(), forge.CredentialScope{},
+		forge.RepoRef{Owner: "grp/sub", Name: "proj"}, "missing.yaml", "HEAD")
+	if !errors.Is(err, forge.ErrNotFound) {
+		t.Errorf("err = %v, want forge.ErrNotFound", err)
+	}
+	if fc != nil {
+		t.Errorf("FileContent = %+v on error, want nil", fc)
 	}
 }

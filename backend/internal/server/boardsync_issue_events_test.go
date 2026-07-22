@@ -16,7 +16,7 @@ import (
 func issueEventServer(t *testing.T) (*Server, *campaignAuditRecorder) {
 	t.Helper()
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	au := &campaignAuditRecorder{}
@@ -253,7 +253,7 @@ func TestHandleIssueLifecycle_UnmappedTransition_NoOp(t *testing.T) {
 	prev := conventionsLoader
 	conv := workmgmt.Default()
 	conv.Transitions = map[string]string{} // states present, but no issue_closed edge
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{}
@@ -277,7 +277,7 @@ func TestHandleIssueLifecycle_EmptyStates_NoOp(t *testing.T) {
 	prev := conventionsLoader
 	conv := workmgmt.Default()
 	conv.States = nil
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{}
@@ -337,7 +337,7 @@ func TestHandleIssueLifecycle_NonTransitioner_NoOp(t *testing.T) {
 	t.Cleanup(func() { registerTransitionProvider(t, &fakeTransitionProvider{}) })
 	au := &campaignAuditRecorder{}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 	s := New(Config{AuditRepo: au})
 
@@ -353,7 +353,7 @@ func TestHandleIssueLifecycle_NonTransitioner_NoOp(t *testing.T) {
 // failed conventions load.
 func TestHandleIssueLifecycle_ConventionsError_NoOp(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) {
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
 		return workmgmt.Conventions{}, context.DeadlineExceeded
 	}
 	t.Cleanup(func() { conventionsLoader = prev })

@@ -585,7 +585,7 @@ func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 	conv := workmgmt.Default()
 	conv.Provider = "gitlab" // never registered
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	s := New(Config{})
@@ -651,7 +651,7 @@ func TestFileWorkItem_Jira_EndToEnd(t *testing.T) {
 	conv.Provider = workmgmtjira.ProviderName
 	conv.Jira = &workmgmt.JiraConnection{ProjectKey: "FISH"}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	// file runs one filing flow with the conventions' current jira block and
@@ -763,9 +763,9 @@ func TestSetConventionsLoader(t *testing.T) {
 	want := workmgmt.Default()
 	want.Provider = workmgmtgitlab.ProviderName
 	want.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
-	SetConventionsLoader(func(string) (workmgmt.Conventions, error) { return want, nil })
+	SetConventionsLoader(func(context.Context, string) (workmgmt.Conventions, error) { return want, nil })
 
-	got, err := conventionsLoader("any/repo")
+	got, err := conventionsLoader(context.Background(), "any/repo")
 	if err != nil {
 		t.Fatalf("conventionsLoader err = %v, want nil", err)
 	}
@@ -810,7 +810,7 @@ func TestFileWorkItem_GitLab_ForgeOptional(t *testing.T) {
 	conv.Provider = workmgmtgitlab.ProviderName
 	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/subgroup/app"}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	rec := fileWorkItem(t, s, workItemRequest{
@@ -890,7 +890,7 @@ func TestFileWorkItem_GitLab_EndToEnd(t *testing.T) {
 	conv.Provider = workmgmtgitlab.ProviderName
 	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/subgroup/app"}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	// No GitHub client configured: a gitlab filing must not need one.
@@ -1491,7 +1491,7 @@ func TestFileWorkItem_RunBound_RunAbsent_GitLab_Forbidden(t *testing.T) {
 	conv.Provider = workmgmtgitlab.ProviderName
 	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	s := New(Config{})
@@ -1536,7 +1536,7 @@ func TestFileWorkItem_RunBound_RunScoped_GitLab_Dispatches(t *testing.T) {
 	conv.Provider = workmgmtgitlab.ProviderName
 	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	au := newAuditFake()
@@ -1725,7 +1725,7 @@ func TestFileWorkItem_EpicDerived_TitleVarsOmitted(t *testing.T) {
 		},
 	}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	gh := newEpicGitHubClient(t, 7788, "[E22] The parent epic")
@@ -2151,7 +2151,7 @@ func TestFileWorkItem_AreaDerivation_FailsOpen(t *testing.T) {
 		},
 	}
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	gh := newLabeledEpicGitHubClient(t, 7788, nil, true) // GetIssue 500s

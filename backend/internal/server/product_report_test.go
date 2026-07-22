@@ -211,7 +211,7 @@ func TestProductReport_KillSwitch_Returns403(t *testing.T) {
 	s, runID := productReportFixture(t, fp, af)
 
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) {
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
 		c := workmgmt.Default()
 		c.ProductFeedback = &workmgmt.ProductFeedback{Enabled: false}
 		return c, nil

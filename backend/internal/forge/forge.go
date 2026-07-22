@@ -126,3 +126,20 @@ type Forge interface {
 	// error.
 	ComparePatch(ctx context.Context, scope CredentialScope, repo RepoRef, base, head string) (*ComparePatchResult, error)
 }
+
+// FileFetcher is the forge-neutral single-file read capability (#2022).
+// It is deliberately a STANDALONE capability interface rather than a new
+// method on Forge: widening Forge would churn every existing
+// implementation and test fake for a capability only the per-repo
+// conventions loader consumes. Both registered forges implement it
+// (compile-asserted in forge/github and forge/gitlab); consumers name it
+// directly, per the narrow-interface convention above.
+type FileFetcher interface {
+	// FetchFile reads one file from repo at ref and returns its decoded
+	// content. path is repo-relative (no leading slash). An empty ref
+	// means the repo's default branch: the GitHub implementation omits
+	// the ref parameter, and the GitLab implementation substitutes HEAD
+	// because the Repository Files API requires an explicit ref. A
+	// missing file — or a repo the scope cannot see — is ErrNotFound.
+	FetchFile(ctx context.Context, scope CredentialScope, repo RepoRef, path, ref string) (*FileContent, error)
+}

@@ -121,7 +121,7 @@ func (s *Server) handleFileRefinementSession(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	conv, err := conventionsLoader(req.Repo)
+	conv, err := conventionsLoader(r.Context(), req.Repo)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not load work-management conventions", map[string]any{"error": err.Error()})

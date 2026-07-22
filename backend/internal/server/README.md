@@ -57,6 +57,52 @@ audit-chain partition is never account-scoped (it has no owning run).
 **403 codes:** `account_forbidden`, `account_unresolved`, `insufficient_role`.
 The cross-boundary integration matrix is `authz_account_test.go`.
 
+## Per-repo work-management conventions loader (`conventions_loader.go`, E45.16 / #2022)
+
+`RepoConventionsLoader.Load` is what serve.go installs as the process-wide `conventionsLoader`
+seam (`workitems.go`, signature `func(ctx, repo)`): it fetches `.fishhawk/work-management.yaml`
+from the filing repo's **own** forge, breaking the chicken-and-egg the deployment override
+sidestepped — the fetch-forge is resolved from **outside** the conventions file.
+
+**Resolution chain per filing** (each fall-through is deliberate; each error is fail-closed):
+
+1. **Provider discriminator** (the SOLE out-of-file hint in this pass; run-bound forge-context
+   corroboration is explicitly out of scope): `account.Resolver.ResolveProvider` looks up
+   `accounts.provider` by the repo owner as `account_key`. Exactly one row selects the forge;
+   zero rows **or an ambiguous key** (legal under `accounts.UNIQUE(provider, account_key)`, the
+   same key under both providers) fall through cleanly — never an arbitrary first row. A query
+   error **fails closed** (propagated) rather than silently selecting a different provider on a
+   transient DB fault.
+2. **Self-resolved CredentialScope**: github routes through the server's existing
+   `resolveRepoScope` (exposed as `Server.GitHubRepoScopeResolver`; zero scope = App not
+   installed → fall through; a transient resolution *error* fails closed); gitlab uses the
+   deployment-level scope serve.go wires when the gitlab forge is registered. No resolvable
+   scope, a nil fetcher (forge absent from the registry), or an unknown provider are all treated
+   exactly like an unregistered forge → fall through.
+3. **Fetch + parse**: the provider's `forge.FileFetcher` reads the file (gitlab with the explicit
+   `ref=HEAD` the Repository Files API requires). `forge.ErrNotFound` (no committed file) falls
+   through; **any other fetch error and any parse error fail closed** — an auth/transport/server
+   fault must not silently switch providers.
+4. **Break-glass override** (`FISHHAWKD_WORKMGMT_CONVENTIONS`, retained from ADR-058 Phase 2
+   #1856): served whenever the chain falls through, else `workmgmt.Default()`.
+
+**Cache**: parsed conventions are cached per **`(provider, repo)`** key, TTL-gated (5 min default;
+clock/TTL/parse injectable so `conventions_loader_test.go` asserts the counters): within TTL the
+cached parse is served with **no fetch**; after TTL a refetch **reuses the cached parse when the
+blob SHA is unchanged**. The key is **forge-qualified** so a repo reassigned to a different
+provider never serves the prior forge's cached parse. A **per-key mutex** is held across the fetch
+so concurrent same-repo filings do one fetch, not a thundering herd — but it is **per repo**, not
+process-global, so a slow or hung forge round-trip for one repo does **not** stall filings for any
+other repo (the short map-guarding `mu` is never held across the fetch). The per-key lock map, like
+the cache, never evicts — bounded in practice by distinct authenticated filing targets.
+
+**Operator-accepted E44 posture**: the E44 `accounts` tables are not yet populated in
+production, so the discriminator path resolves `found=false` and live filings degrade to the
+break-glass override / `Default()` — production effect begins when E44 wires repo→account rows.
+Until then the discriminator-driven end-to-end selection is exercised by
+`conventions_loader_test.go` (per-failure-mode + the mixed-forge test driving one loader across
+a github repo and a gitlab repo).
+
 ## Acceptance stage seam (E31, ADR-049 / ADR-050)
 
 The acceptance surface spans spec → plan pre-check → dispatch →
