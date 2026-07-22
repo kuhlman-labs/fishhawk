@@ -4717,3 +4717,30 @@ func TestCampaignDecomposedParent_ChildrenBindOwnSlice_E2E(t *testing.T) {
 		}
 	}
 }
+
+// --- per-account audit stamping (ADR-057 / #1828) ---
+
+// TestEmitCampaignAudit_StampsIdentityAccount pins the campaign handlers'
+// account source: every emitCampaignAudit site is request-triggered, so the
+// caller Identity's account selects the run-less chain partition; a caller
+// with no account binding lands on the untenanted NULL partition.
+func TestEmitCampaignAudit_StampsIdentityAccount(t *testing.T) {
+	acct := uuid.New()
+	rec := &campaignAuditRecorder{}
+	s := New(Config{AuditRepo: rec})
+
+	bound := context.WithValue(context.Background(), ctxKeyIdentity,
+		Identity{Subject: "github:alice", AccountID: acct.String()})
+	s.emitCampaignAudit(bound, categoryCampaignAdvanced, map[string]any{"campaign_id": "c1"})
+	s.emitCampaignAudit(context.Background(), categoryCampaignAdvanced, map[string]any{"campaign_id": "c2"})
+
+	if len(rec.entries) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(rec.entries))
+	}
+	if rec.entries[0].AccountID == nil || *rec.entries[0].AccountID != acct {
+		t.Fatalf("bound-identity entry AccountID = %v, want %s", rec.entries[0].AccountID, acct)
+	}
+	if rec.entries[1].AccountID != nil {
+		t.Fatalf("identityless entry AccountID = %s, want nil (untenanted)", *rec.entries[1].AccountID)
+	}
+}

@@ -593,3 +593,29 @@ func TestStartRunForCampaignIssue_HydrationDegradesOnCommentError(t *testing.T) 
 		t.Errorf("IssueContext.Comments = %+v, want empty after the comment-fetch failure", ic.Comments)
 	}
 }
+
+// TestEmitReviewerCapabilityUnavailable_StampsIdentityAccount pins the
+// run-create audit emissions' account source (ADR-057 / #1828): the entry
+// carries the creating caller Identity's account so the degradation lands on
+// that tenant's run-less chain partition.
+func TestEmitReviewerCapabilityUnavailable_StampsIdentityAccount(t *testing.T) {
+	acct := uuid.New()
+	rec := &campaignAuditRecorder{}
+	s := New(Config{AuditRepo: rec})
+
+	ctx := context.WithValue(context.Background(), ctxKeyIdentity,
+		Identity{Subject: "github:alice", AccountID: acct.String()})
+	s.emitReviewerCapabilityUnavailable(ctx, "acme/widgets", "feature_change", "plan", 1,
+		unavailableReviewer{provider: "anthropic", optional: true, err: errors.New("no api key")})
+
+	if len(rec.entries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(rec.entries))
+	}
+	got := rec.entries[0]
+	if got.Category != "reviewer_capability_unavailable" {
+		t.Fatalf("category = %q, want reviewer_capability_unavailable", got.Category)
+	}
+	if got.AccountID == nil || *got.AccountID != acct {
+		t.Fatalf("AccountID = %v, want %s", got.AccountID, acct)
+	}
+}

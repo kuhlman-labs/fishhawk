@@ -25,6 +25,26 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
+// identityAccountID maps the caller's resolved Identity.AccountID onto the
+// run-less audit chain's tenant partition pointer (ADR-057 / #1828): the
+// parsed account UUID, or nil — the untenanted NULL partition — when the
+// identity carries no account binding (anonymous callers, bearer tokens
+// before E44.5, sessions whose account is gone). An unparsable value (never
+// produced by the auth middleware, which stores UUID strings from the
+// sessions/accounts rows) also degrades to nil rather than failing the
+// audit write it feeds.
+func identityAccountID(ctx context.Context) *uuid.UUID {
+	acct := IdentityFrom(ctx).AccountID
+	if acct == "" {
+		return nil
+	}
+	u, err := uuid.Parse(acct)
+	if err != nil {
+		return nil
+	}
+	return &u
+}
+
 // runResponse is the JSON shape POST /v0/runs and GET /v0/runs/{id}
 // return. Field names + types match docs/api/v0.openapi.yaml's
 // `Run` schema exactly so there's never a translation step between
@@ -690,6 +710,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 						Category:  "run_rejected_misconfigured",
 						ActorKind: &systemKind,
 						Payload:   payload,
+						AccountID: identityAccountID(r.Context()),
 					}); aerr != nil {
 						s.cfg.Logger.Warn("append run_rejected_misconfigured audit entry failed",
 							"repo", req.Repo, "workflow_id", req.WorkflowID, "error", aerr.Error())
@@ -1881,6 +1902,7 @@ func (s *Server) emitReviewerCapabilityUnavailable(ctx context.Context, repo, wo
 		Category:  "reviewer_capability_unavailable",
 		ActorKind: &systemKind,
 		Payload:   payload,
+		AccountID: identityAccountID(ctx),
 	}); aerr != nil {
 		s.cfg.Logger.Warn("append reviewer_capability_unavailable audit entry failed",
 			"repo", repo, "workflow_id", workflowID, "error", aerr.Error())
