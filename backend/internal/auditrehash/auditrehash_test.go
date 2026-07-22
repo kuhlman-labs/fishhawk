@@ -495,14 +495,28 @@ func (t *failAfterTx) Exec(ctx context.Context, sql string, args ...any) (pgconn
 func TestRehashAllChains_InjectedFailureRestoresTriggersAndWritesNothing(t *testing.T) {
 	pool := pgtest.NewPool(t)
 
-	// One non-canonical run-less row, so the walk attempts an UPDATE.
+	// THREE non-canonical run-less rows in the same (untenanted)
+	// partition, so the walk attempts three UPDATEs in sequence. A
+	// single-row corpus cannot test rollback-after-partial-mutation:
+	// if we fail on the first UPDATE, no write ever lands, so the
+	// unchanged-row assertion would still pass even if a committed
+	// earlier update escaped rollback. Here we let the FIRST UPDATE
+	// succeed inside the tx and fail on the SECOND, then assert every
+	// row — including the mutated-then-rolled-back first — retains its
+	// original hash.
 	loc := time.FixedZone("EDT", -4*3600)
-	ts := time.Date(2026, 5, 13, 8, 52, 53, 665435123, loc)
-	id, oldHash := insertNonCanonicalEntry(t, pool, nil, nil, ts, "api_token_issued", []byte(`{}`), nil)
+	ts1 := time.Date(2026, 5, 13, 8, 52, 53, 665435123, loc)
+	ts2 := ts1.Add(time.Second)
+	ts3 := ts2.Add(time.Second)
+	id1, oldHash1 := insertNonCanonicalEntry(t, pool, nil, nil, ts1, "api_token_issued", []byte(`{}`), nil)
+	id2, oldHash2 := insertNonCanonicalEntry(t, pool, nil, nil, ts2, "api_token_issued", []byte(`{}`), &oldHash1)
+	id3, oldHash3 := insertNonCanonicalEntry(t, pool, nil, nil, ts3, "api_token_revoked", []byte(`{}`), &oldHash2)
 
-	// Allow exactly one Exec (the trigger disable), then fail on the
-	// first UPDATE.
-	db := &failAfterDB{pool: pool, execsLeft: 1}
+	// Allow two Execs — the trigger disable and the first row's UPDATE
+	// — then fail on the second row's UPDATE. This drives a genuine
+	// partial mutation: row 1 is rewritten inside the tx before the
+	// abort.
+	db := &failAfterDB{pool: pool, execsLeft: 2}
 	if _, err := auditrehash.RehashAllChains(context.Background(), db, false); err == nil {
 		t.Fatal("RehashAllChains succeeded, want injected failure")
 	}
@@ -510,18 +524,26 @@ func TestRehashAllChains_InjectedFailureRestoresTriggersAndWritesNothing(t *test
 	// The abort rolled back the trigger disable: audit_entries is
 	// still append-only.
 	if _, err := pool.Exec(context.Background(),
-		`UPDATE audit_entries SET category = category WHERE id = $1`, id); err == nil {
+		`UPDATE audit_entries SET category = category WHERE id = $1`, id1); err == nil {
 		t.Error("UPDATE succeeded after failed rehash — append-only trigger not restored")
 	}
 
-	// And no row was mutated.
-	var stored string
-	if err := pool.QueryRow(context.Background(),
-		`SELECT entry_hash FROM audit_entries WHERE id = $1`, id).Scan(&stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored != oldHash {
-		t.Errorf("failed rehash mutated the row: stored %q, want unchanged %q", stored, oldHash)
+	// And NO row was left mutated — including id1, whose UPDATE landed
+	// inside the tx before the injected failure. If the earlier update
+	// escaped rollback, id1's stored hash would be the recomputed
+	// canonical value, not oldHash1.
+	for _, want := range []struct {
+		id   uuid.UUID
+		hash string
+	}{{id1, oldHash1}, {id2, oldHash2}, {id3, oldHash3}} {
+		var stored string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT entry_hash FROM audit_entries WHERE id = $1`, want.id).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != want.hash {
+			t.Errorf("failed rehash mutated row %s: stored %q, want unchanged %q", want.id, stored, want.hash)
+		}
 	}
 }
 
