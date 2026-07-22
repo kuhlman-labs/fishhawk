@@ -399,7 +399,7 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve the work-management provider and its optional epic-children
 	// query capability, exactly as POST /v0/work-items does (workitems.go).
-	conv, err := conventionsLoader(req.Repo)
+	conv, err := conventionsLoader(r.Context(), req.Repo)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not load work-management conventions", map[string]any{"error": err.Error()})

@@ -1239,7 +1239,7 @@ func TestCreateCampaign_ProviderNotQuerier_501(t *testing.T) {
 // provider id fails closed with provider_unimplemented.
 func TestCreateCampaign_UnknownProvider_501(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) {
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
 		return workmgmt.Conventions{Provider: "never_registered_provider"}, nil
 	}
 	t.Cleanup(func() { conventionsLoader = prev })
@@ -1258,7 +1258,7 @@ func TestCreateCampaign_UnknownProvider_501(t *testing.T) {
 // surfaces a 500.
 func TestCreateCampaign_ConventionsError_500(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) {
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
 		return workmgmt.Conventions{}, fmt.Errorf("conventions boom")
 	}
 	t.Cleanup(func() { conventionsLoader = prev })
@@ -2701,7 +2701,7 @@ func TestStartCampaignItemRun_ReconcileOnRead_FailedRun_Quarantine_E2E(t *testin
 // Up Next card to In Progress (up_next is in run_started's expected source).
 func TestDeriveCampaignAfterChange_CampaignStart_SweepsToUpNext_CrossBoundary(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "Backlog", To: "Up Next"}}

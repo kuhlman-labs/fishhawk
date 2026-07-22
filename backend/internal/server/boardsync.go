@@ -116,7 +116,7 @@ func (s *Server) boardTransitionForRun(ctx context.Context, rn *run.Run, event s
 		return
 	}
 
-	conv, err := conventionsLoader(rn.Repo)
+	conv, err := conventionsLoader(ctx, rn.Repo)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "board transition: load conventions failed",
 			slog.String("event", event),
@@ -196,7 +196,7 @@ func (s *Server) boardTransitionForCampaignItem(ctx context.Context, c *campaign
 	if c == nil || issueNumber <= 0 {
 		return
 	}
-	conv, err := conventionsLoader(c.Repo)
+	conv, err := conventionsLoader(ctx, c.Repo)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign board transition: load conventions failed",
 			slog.String("event", event),

@@ -186,7 +186,7 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 	classification := splitfiling.Classify(proposal, evidence, capFiles)
 	capDraft := splitfiling.DraftCapException(proposal, evidence, capFiles)
 
-	conv, err := conventionsLoader(runRow.Repo)
+	conv, err := conventionsLoader(ctx, runRow.Repo)
 	if err != nil {
 		s.logSplitFilingWarn(ctx, runID, "load work-management conventions failed", err.Error())
 		return

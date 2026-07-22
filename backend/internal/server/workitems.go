@@ -36,30 +36,25 @@ const maxWorkItemRequestBytes = 64 * 1024
 const categoryWorkItemFiled = "work_item_filed"
 
 // conventionsLoader resolves the work-management conventions for a repo.
-// v0 returns the shipped default (the conventions are the value, and the
-// default seeds the kuhlman-labs/fishhawk Project #7 conventions), unless a
-// deployment-level override is installed via SetConventionsLoader (from
-// FISHHAWKD_WORKMGMT_CONVENTIONS) — the honest minimum that unblocks a
-// non-github_projects provider (e.g. provider: gitlab) end-to-end for a
-// single-tenant deployment. The true in-repo per-repo loader that fetches
-// `.fishhawk/work-management.yaml` from the repo is a follow-up (#2022): the
-// server cannot know which forge to fetch that file from before the
-// conventions themselves declare the provider (the chicken-and-egg the
-// deployment override sidesteps). Declared as a package var so tests can
-// inject conventions (e.g. an unimplemented-provider config) without a
-// GitHub round-trip.
-var conventionsLoader = func(_ string) (workmgmt.Conventions, error) {
+// The default stub returns the shipped Default() (which seeds the
+// kuhlman-labs/fishhawk Project #7 conventions); serve.go replaces it at
+// startup with RepoConventionsLoader.Load (conventions_loader.go, #2022),
+// which fetches `.fishhawk/work-management.yaml` from the filing repo's OWN
+// forge — resolved via the ADR-057/ADR-058 provider discriminator, with the
+// FISHHAWKD_WORKMGMT_CONVENTIONS override retained as the break-glass
+// fallback. Declared as a package var so tests can inject conventions (e.g.
+// an unimplemented-provider config) without a forge round-trip.
+var conventionsLoader = func(_ context.Context, _ string) (workmgmt.Conventions, error) {
 	return workmgmt.Default(), nil
 }
 
 // SetConventionsLoader installs the process-wide work-management conventions
 // resolver, replacing the Default()-only stub. It is the seam serve.go uses
-// to serve a deployment-level FISHHAWKD_WORKMGMT_CONVENTIONS file (parsed
-// fail-fast at startup) for every repo, so a non-github_projects provider is
-// reachable end-to-end before the per-repo in-repo loader (#2022) lands. It
-// is not concurrency-safe with in-flight filings and is intended to be
-// called once at startup.
-func SetConventionsLoader(loader func(repo string) (workmgmt.Conventions, error)) {
+// to install the per-repo RepoConventionsLoader (#2022) — carrying the
+// deployment-level FISHHAWKD_WORKMGMT_CONVENTIONS file as its break-glass
+// fallback. It is not concurrency-safe with in-flight filings and is
+// intended to be called once at startup.
+func SetConventionsLoader(loader func(ctx context.Context, repo string) (workmgmt.Conventions, error)) {
 	conventionsLoader = loader
 }
 
@@ -191,7 +186,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conv, err := conventionsLoader(req.Repo)
+	conv, err := conventionsLoader(r.Context(), req.Repo)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not load work-management conventions", map[string]any{"error": err.Error()})
