@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go/option"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // captureSchemaServer returns an httptest server that records the request body
@@ -238,5 +240,146 @@ func TestClient_Messages_NoTextBlockReturnsError(t *testing.T) {
 	}
 	if text != "" {
 		t.Errorf("responseText = %q, want empty string on no-text-block error", text)
+	}
+}
+
+// observedRequest is what the region-scoped inference endpoint saw.
+type observedRequest struct {
+	host   string
+	apiKey string
+	auth   string
+	system string
+	user   string
+}
+
+// regionEndpoint stands in for a cell's in-region inference endpoint. It
+// records the host, the credential headers, and the system/user split of every
+// Messages call, and replies with a valid approve verdict so Reviewer.Review
+// completes.
+func regionEndpoint(t *testing.T) (*httptest.Server, *[]observedRequest) {
+	t.Helper()
+	var seen []observedRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			System []struct {
+				Text string `json:"text"`
+			} `json:"system"`
+			Messages []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		_ = json.Unmarshal(body, &req)
+		obs := observedRequest{
+			host:   r.Host,
+			apiKey: r.Header.Get("x-api-key"),
+			auth:   r.Header.Get("Authorization"),
+		}
+		if len(req.System) > 0 {
+			obs.system = req.System[0].Text
+		}
+		if len(req.Messages) > 0 && len(req.Messages[0].Content) > 0 {
+			obs.user = req.Messages[0].Content[0].Text
+		}
+		seen = append(seen, obs)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(okResp(`{"verdict":"approve"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &seen
+}
+
+// TestRegionScopedInference_BothReviewPaths is the done-means behavioral
+// assertion for the region-scoped inference config (ADR-062, E44.7 / #1831).
+// It does NOT check that a field is populated: it drives the real Reviewer with
+// a plan-review prompt AND an implement-review prompt and asserts that the
+// endpoint the requests actually reached is the configured region base URL, and
+// that the credential they carried is the region-scoped API key.
+//
+// Both review paths share one Reviewer (they differ only in prompt shape), so
+// asserting only one would leave the other unproven against a future
+// per-path client.
+func TestRegionScopedInference_BothReviewPaths(t *testing.T) {
+	srv, seen := regionEndpoint(t)
+
+	const regionKey = "eu-region-scoped-key"
+	cfg := testConfig()
+	cfg.APIKey = regionKey
+	cfg.BaseURL = srv.URL
+
+	// No option.WithBaseURL override here — the point is that cfg.BaseURL
+	// alone routes the call.
+	reviewer := NewReviewer(cfg)
+
+	planPrompt := "review criteria" + prompt.PlanReviewSplitMarker + "the plan artifact"
+	implementPrompt := "review criteria" + prompt.PlanReviewSplitMarker + "the approved plan" +
+		prompt.ImplementReviewSplitMarker + "the diff"
+
+	for _, tc := range []struct {
+		name   string
+		prompt string
+	}{
+		{"plan review", planPrompt},
+		{"implement review", implementPrompt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := reviewer.Review(context.Background(), tc.prompt); err != nil {
+				t.Fatalf("Review: %v", err)
+			}
+		})
+	}
+
+	if len(*seen) != 2 {
+		t.Fatalf("region endpoint saw %d requests, want 2 (one per review path)", len(*seen))
+	}
+	wantHost := strings.TrimPrefix(srv.URL, "http://")
+	for i, obs := range *seen {
+		if obs.host != wantHost {
+			t.Errorf("request %d reached host %q, want the region base URL host %q", i, obs.host, wantHost)
+		}
+		if obs.apiKey != regionKey && obs.auth != "Bearer "+regionKey {
+			t.Errorf("request %d credential = x-api-key:%q Authorization:%q, want the region-scoped key %q in one of them",
+				i, obs.apiKey, obs.auth, regionKey)
+		}
+	}
+	// Sanity: the two requests really were the two different review shapes,
+	// so this is not the same path asserted twice.
+	if (*seen)[0].user == (*seen)[1].user {
+		t.Errorf("both requests carried the same user block %q; the plan and implement paths must differ", (*seen)[0].user)
+	}
+}
+
+// TestNewClient_EmptyBaseURLKeepsSDKDefault asserts the single-cell posture:
+// an unset BaseURL adds no override, so an explicit option.WithBaseURL (what
+// every other test here relies on) still governs.
+func TestNewClient_EmptyBaseURLKeepsSDKDefault(t *testing.T) {
+	srv, captured := captureSchemaServer(t)
+
+	cfg := testConfig() // BaseURL left empty
+	c := NewClient(cfg, option.WithBaseURL(srv.URL))
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(*captured) == 0 {
+		t.Error("no request reached the test server; an empty cfg.BaseURL must not redirect the call")
+	}
+}
+
+// TestNewClient_ExplicitOptionOverridesConfigBaseURL asserts the precedence
+// documented on NewClient: cfg.BaseURL is a DEFAULT, so a caller-supplied
+// option.WithBaseURL wins.
+func TestNewClient_ExplicitOptionOverridesConfigBaseURL(t *testing.T) {
+	srv, captured := captureSchemaServer(t)
+
+	cfg := testConfig()
+	cfg.BaseURL = "http://unreachable.invalid"
+	c := NewClient(cfg, option.WithBaseURL(srv.URL))
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(*captured) == 0 {
+		t.Error("no request reached the test server; the explicit option must override cfg.BaseURL")
 	}
 }
