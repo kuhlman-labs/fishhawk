@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -282,6 +283,12 @@ func TestWithRegionPin_PinFailurePropagates(t *testing.T) {
 	}
 	if w.Code != http.StatusInternalServerError || errorCode(t, w) != "region_pin_failed" {
 		t.Fatalf("status/code = %d/%s, want 500/region_pin_failed:\n%s", w.Code, errorCode(t, w), w.Body.String())
+	}
+	// The unclassified fault must NOT echo the underlying store error: this
+	// surface answers before any auth decision, so a driver message (host,
+	// query, connection detail) would leak to an unauthenticated caller.
+	if strings.Contains(w.Body.String(), "connection reset") {
+		t.Errorf("body leaks the underlying store error:\n%s", w.Body.String())
 	}
 }
 

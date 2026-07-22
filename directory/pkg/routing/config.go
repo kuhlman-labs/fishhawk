@@ -43,6 +43,21 @@ const DefaultHandoffTTL = 5 * time.Minute
 // rather than guessed at.
 const DefaultRoutedPath = "/v0/onboarding/start"
 
+// supportedRoutedPaths is the set of cell surfaces a routed redirect may
+// name. It is a CLOSED set on purpose, and it must stay in lockstep with the
+// paths the cell mounts its handoff-verifying middleware on
+// (backend/internal/server.RoutedOnboardingPath, one entry today).
+//
+// Routing a path the cell does not verify is worse than not routing it: the
+// caller arrives at that surface with a signed redirect that nothing checks,
+// so no handoff is verified and no account is pinned, while the redirect
+// still looks authoritative. Accepting an arbitrary path from env would make
+// that a one-line configuration mistake, so an unsupported path is a startup
+// error instead.
+var supportedRoutedPaths = map[string]bool{
+	DefaultRoutedPath: true,
+}
+
 // ErrInvalidConfig is the typed startup failure. Every validation branch
 // wraps it, so a caller can match the whole class with errors.Is.
 var ErrInvalidConfig = errors.New("routing: invalid directory configuration")
@@ -132,6 +147,11 @@ func (c Config) Validate() error {
 		if seen[p] {
 			return fmt.Errorf("%w: routed path %q is listed twice", ErrInvalidConfig, p)
 		}
+		if !supportedRoutedPaths[p] {
+			return fmt.Errorf("%w: routed path %q is not a cell surface that verifies a handoff (supported: %s); "+
+				"routing it would deliver a signed redirect to an endpoint that pins nothing",
+				ErrInvalidConfig, p, strings.Join(sortedSet(supportedRoutedPaths), ", "))
+		}
 		seen[p] = true
 	}
 	return nil
@@ -202,6 +222,17 @@ func validateCellURL(region, raw string) error {
 		return fmt.Errorf("%w: region %q cell URL %q must not carry a query or fragment", ErrInvalidConfig, region, raw)
 	}
 	return nil
+}
+
+// sortedSet renders a set's members in a stable order, so an error message
+// naming the supported surfaces reads the same on every run.
+func sortedSet(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func sortedKeys(m map[string]string) []string {

@@ -1528,18 +1528,80 @@ func TestInferenceAPIKey_RegionKeyWinsElseAnthropicKey(t *testing.T) {
 		name      string
 		anthropic string
 		region    string
+		baseURL   string
 		want      string
 	}{
-		{"region key wins", "deployment-key", "region-key", "region-key"},
-		{"falls back to the anthropic key", "deployment-key", "", "deployment-key"},
-		{"both empty", "", "", ""},
+		{"region key wins", "deployment-key", "region-key", "", "region-key"},
+		{"falls back to the anthropic key on the default endpoint", "deployment-key", "", "", "deployment-key"},
+		{"both empty", "", "", "", ""},
+		// A custom endpoint with no region key must NOT receive the
+		// deployment credential — that would ship a production secret (and
+		// the review text it authenticates) to an operator-supplied host.
+		{"no fallback to a custom endpoint", "deployment-key", "", "https://eu.inference.example.com", ""},
+		{"region key still wins on a custom endpoint", "deployment-key", "region-key", "https://eu.inference.example.com", "region-key"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := planReviewerOptions{anthropicAPIKey: tc.anthropic, modelAPIKey: tc.region}
+			opts := planReviewerOptions{anthropicAPIKey: tc.anthropic, modelAPIKey: tc.region, modelBaseURL: tc.baseURL}
 			if got := opts.inferenceAPIKey(); got != tc.want {
 				t.Errorf("inferenceAPIKey() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint is the
+// behavioral half of the no-fallback rule: with a custom endpoint configured
+// and NO region-scoped key, the reviewer must not present
+// FISHHAWKD_ANTHROPIC_API_KEY to that endpoint. Asserting the resolved string
+// alone would not prove what the adapter puts on the wire, so this drives a
+// real Review through an httptest endpoint and inspects the observed headers.
+func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing.T) {
+	const deploymentKey = "deployment-anthropic-key"
+	var gotAPIKey, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKey, gotAuth = r.Header.Get("x-api-key"), r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant",` +
+			`"content":[{"type":"text","text":"{\"verdict\":\"approve\"}"}],` +
+			`"model":"claude-sonnet-4-6","stop_reason":"end_turn",` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	set := resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey:     deploymentKey,
+		planReviewModel:     "claude-sonnet-4-6",
+		planReviewMaxTokens: 1024,
+		planReviewTimeout:   10 * time.Second,
+		modelBaseURL:        srv.URL,
+		modelAPIKey:         "", // the half-configured input under test
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	reviewer := set.Default()
+	if reviewer == nil {
+		t.Fatal("Default() = nil, want the anthropic adapter (the deployment key still selects it)")
+	}
+	// The call may fail (no credential is presented, by design); what matters
+	// is what did NOT travel.
+	_, _, _ = reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
+
+	if strings.Contains(gotAPIKey, deploymentKey) || strings.Contains(gotAuth, deploymentKey) {
+		t.Errorf("the deployment anthropic key reached the custom endpoint (x-api-key=%q Authorization=%q); "+
+			"FISHHAWKD_ANTHROPIC_API_KEY must never be sent to FISHHAWKD_MODEL_BASE_URL", gotAPIKey, gotAuth)
+	}
+}
+
+// TestResolvePlanReviewers_WarnsOnBaseURLWithoutRegionKey pins the operator
+// signal for that half-configured posture: it fails closed, and says so.
+func TestResolvePlanReviewers_WarnsOnBaseURLWithoutRegionKey(t *testing.T) {
+	var buf strings.Builder
+	resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey: "deployment-key",
+		modelBaseURL:    "https://eu.inference.example.com",
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if !strings.Contains(buf.String(), "FISHHAWKD_MODEL_API_KEY") {
+		t.Errorf("startup log = %q, want a warning naming FISHHAWKD_MODEL_API_KEY", buf.String())
 	}
 }
 

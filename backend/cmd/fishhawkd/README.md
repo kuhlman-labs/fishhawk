@@ -56,7 +56,7 @@ all-empty deployment is byte-identical to a single-cell one.
 | `FISHHAWKD_HOME_REGION` | `--home-region` | the region THIS cell serves (`us`, `eu`, …) | region-pin surface **disabled** |
 | `FISHHAWKD_HANDOFF_SECRET` | `--handoff-secret` | HMAC-SHA256 key shared with the directory plane | region-pin surface **disabled** |
 | `FISHHAWKD_MODEL_BASE_URL` | `--model-base-url` | region-scoped inference endpoint for the Anthropic SDK reviewer | SDK default (`api.anthropic.com`) |
-| `FISHHAWKD_MODEL_API_KEY` | `--model-api-key` | credential presented to that endpoint | falls back to `FISHHAWKD_ANTHROPIC_API_KEY` |
+| `FISHHAWKD_MODEL_API_KEY` | `--model-api-key` | credential presented to that endpoint | falls back to `FISHHAWKD_ANTHROPIC_API_KEY` **only when `FISHHAWKD_MODEL_BASE_URL` is also empty** |
 
 **Pin surface construction is all-or-nothing.** `resolveRegionPin` (in `serve.go`) returns the
 `(server.Config.HandoffSecret, server.Config.RegionPinner)` pair only when the region, the secret
@@ -80,6 +80,13 @@ the review text never leaves the region. It governs the Anthropic **SDK** adapte
 `claudecode` and `codex` adapters are subprocesses whose endpoint is the CLI's own configuration.
 `FISHHAWKD_MODEL_API_KEY` redirects a credential; it does **not** select the anthropic adapter,
 which `FISHHAWKD_ANTHROPIC_API_KEY` still does.
+
+The credential fallback is confined to the **default** endpoint. With `FISHHAWKD_MODEL_BASE_URL`
+set and `FISHHAWKD_MODEL_API_KEY` unset, `inferenceAPIKey` resolves to the empty string rather than
+the deployment's `FISHHAWKD_ANTHROPIC_API_KEY`: falling back there would send a production
+credential — and the plan/review text it authenticates — to an operator-supplied host, which is
+secret exfiltration via configurable egress. That half-configured posture fails closed (the endpoint
+refuses an uncredentialed call) and logs a startup warning naming the missing key.
 
 ## Work-management provider registration at startup (#1104)
 

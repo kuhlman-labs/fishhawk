@@ -127,9 +127,20 @@ type planReviewerOptions struct {
 // the adapter-selection precedence in Default(): a region key alone does not
 // turn the anthropic reviewer on, it only redirects the credential of a
 // reviewer that FISHHAWKD_ANTHROPIC_API_KEY already selected.
+//
+// The fallback is confined to the DEFAULT endpoint. A configured
+// FISHHAWKD_MODEL_BASE_URL with no FISHHAWKD_MODEL_API_KEY is half-configured,
+// and falling back there would send the deployment's Anthropic credential —
+// along with plan and review text — to an operator-supplied host. That is
+// secret exfiltration via configurable egress, so it fails closed with an empty
+// credential (the endpoint refuses the call) and a startup warning naming the
+// missing key.
 func (p *planReviewerOptions) inferenceAPIKey() string {
 	if p.modelAPIKey != "" {
 		return p.modelAPIKey
+	}
+	if p.modelBaseURL != "" {
+		return ""
 	}
 	return p.anthropicAPIKey
 }
@@ -326,6 +337,11 @@ func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.
 			slog.String("base_url", opts.modelBaseURL),
 			slog.Bool("region_scoped_key", opts.modelAPIKey != ""),
 			slog.String("ref", "#1831"))
+		if opts.modelAPIKey == "" {
+			logger.Warn("FISHHAWKD_MODEL_BASE_URL is set without FISHHAWKD_MODEL_API_KEY; the anthropic reviewer will present NO credential to that endpoint and its calls will fail. FISHHAWKD_ANTHROPIC_API_KEY is deliberately not sent to a non-default endpoint — set FISHHAWKD_MODEL_API_KEY to the region-scoped key",
+				slog.String("base_url", opts.modelBaseURL),
+				slog.String("ref", "#1831"))
+		}
 	}
 	return set
 }
@@ -915,8 +931,10 @@ func runServe(args []string, logSink io.Writer) int {
 			"Selection is process-level: every plan- and implement-review call this cell makes targets this endpoint")
 	modelAPIKey := fs.String("model-api-key",
 		envOr("FISHHAWKD_MODEL_API_KEY", ""),
-		"API key presented to --model-base-url. Empty falls back to --anthropic-api-key, so a single-cell "+
-			"deployment needs neither flag. It does NOT enable the anthropic reviewer on its own — "+
+		"API key presented to --model-base-url. Empty falls back to --anthropic-api-key ONLY when "+
+			"--model-base-url is also empty (the single-cell posture, which needs neither flag); with a "+
+			"custom endpoint configured and this key unset the adapter presents no credential rather than "+
+			"sending the deployment key to that endpoint. It does NOT enable the anthropic reviewer on its own — "+
 			"--anthropic-api-key still selects the adapter; this key only overrides the credential sent")
 	planReviewMaxTokens := fs.Int("plan-review-max-tokens",
 		envOrInt("FISHHAWKD_PLAN_REVIEW_MAX_TOKENS", 4096),

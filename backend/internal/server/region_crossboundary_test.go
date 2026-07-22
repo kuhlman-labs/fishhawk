@@ -387,3 +387,41 @@ func TestCrossBoundary_RoutedSurfaceRequiresOperatorCredential(t *testing.T) {
 		t.Fatalf("refused request still emitted a Location: %q", loc)
 	}
 }
+
+// TestCrossBoundary_DirectoryRefusesUnmountedRoutedPath closes the
+// configuration gap the two planes could otherwise open between them:
+// FISHHAWK_DIRECTORY_ROUTED_PATHS is operator input, while withRegionPin is
+// mounted on ONE fixed cell path. A path in the first set but not the second
+// would receive a signed redirect that verifies no handoff and pins no
+// account.
+//
+// /v0/onboarding/readiness is the sharpest case — a REAL cell route, mounted
+// bare — so this asserts the directory's own config validation refuses to
+// route it, and that the cell serves it without ever consulting a handoff.
+func TestCrossBoundary_DirectoryRefusesUnmountedRoutedPath(t *testing.T) {
+	const unmounted = "/v0/onboarding/readiness"
+
+	cfg := routing.Config{
+		Regions:       map[string]string{crossRegion: "https://cell.example"},
+		RoutedPaths:   []string{RoutedOnboardingPath, unmounted},
+		HandoffSecret: crossSecret,
+		HandoffTTL:    5 * time.Minute,
+		AdminToken:    crossAdminToken,
+	}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatalf("directory accepted routed path %q, which no cell surface verifies", unmounted)
+	}
+	if !strings.Contains(err.Error(), unmounted) {
+		t.Errorf("validation error = %v, want it to name the offending path %q", err, unmounted)
+	}
+
+	// The premise: that path really is served bare by the cell — reaching it
+	// with a handoff would neither verify nor pin, which is why routing it is
+	// refused rather than tolerated.
+	rec := httptest.NewRecorder()
+	New(Config{}).Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, unmounted, nil))
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("cell returned 404 for %q; this test's premise (a real cell route with no handoff verification) no longer holds", unmounted)
+	}
+}

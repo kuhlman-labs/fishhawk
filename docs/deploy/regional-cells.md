@@ -48,7 +48,7 @@ length-prefixed canonical serialization. Both planes call the one owning codec
 | `FISHHAWK_DIRECTORY_REGIONS` | yes | `region=url,…`, e.g. `us=https://us.example.com,eu=https://eu.example.com` |
 | `FISHHAWK_DIRECTORY_HANDOFF_SECRET` | yes | HMAC key shared with every cell |
 | `FISHHAWK_DIRECTORY_ADMIN_TOKEN` | yes | operator credential; **unset refuses every surface** |
-| `FISHHAWK_DIRECTORY_ROUTED_PATHS` | no | default `/v0/onboarding/start` |
+| `FISHHAWK_DIRECTORY_ROUTED_PATHS` | no | default `/v0/onboarding/start`; a path outside the supported set (today that one surface) is a **startup error** — see below |
 | `FISHHAWK_DIRECTORY_HANDOFF_TTL` | no | default 5m |
 | `FISHHAWK_DIRECTORY_ADDR` | no | default `:8081` |
 
@@ -59,7 +59,7 @@ length-prefixed canonical serialization. Both planes call the one owning codec
 | `FISHHAWKD_HOME_REGION` | `--home-region` | the region this cell serves | pin surface **disabled** |
 | `FISHHAWKD_HANDOFF_SECRET` | `--handoff-secret` | must equal the directory's `FISHHAWK_DIRECTORY_HANDOFF_SECRET` | pin surface **disabled** |
 | `FISHHAWKD_MODEL_BASE_URL` | `--model-base-url` | in-region inference endpoint | SDK default (`api.anthropic.com`) |
-| `FISHHAWKD_MODEL_API_KEY` | `--model-api-key` | credential for that endpoint | falls back to `FISHHAWKD_ANTHROPIC_API_KEY` |
+| `FISHHAWKD_MODEL_API_KEY` | `--model-api-key` | credential for that endpoint | falls back to `FISHHAWKD_ANTHROPIC_API_KEY` **only when `FISHHAWKD_MODEL_BASE_URL` is also empty** |
 
 `FISHHAWKD_DATABASE_URL` is also a precondition for the pin surface — without a
 database there is no `accounts` row to stamp.
@@ -80,6 +80,9 @@ Every one of these is a refusal, never a degrade-to-permissive.
 | Account already homed in a different region | 409 `region_conflict`. The pin is a first-write-wins conditional UPDATE, so this holds in SQL rather than check-then-act in Go. |
 | Handoff for an account this cell does not have | 404. The pin is **UPDATE-only**: it never inserts an account row. |
 | Request carries no `fh_*` parameters | passes through untouched. A single-cell deployment behaves identically with or without any of these env vars. |
+| `FISHHAWK_DIRECTORY_ROUTED_PATHS` names a path the cell does not verify | startup fails naming the supported set. The routed-path list is a **closed set** kept in lockstep with the cell surfaces `withRegionPin` is mounted on; routing anything else would deliver a signed redirect to an endpoint that verifies no handoff and pins no account. |
+| Cell `MODEL_BASE_URL` set, `MODEL_API_KEY` unset | the anthropic reviewer presents **no** credential (its calls fail) and startup warns. `FISHHAWKD_ANTHROPIC_API_KEY` is deliberately never sent to a non-default endpoint — that would ship a production secret, and the review text it authenticates, to an operator-supplied host. |
+| Cell pin fails for an unclassified reason | 500 `region_pin_failed` with a **generic** message. The routed surface answers before any auth decision (the handoff is itself the credential), so a driver/query/host detail is logged, never returned. |
 
 ### Replay
 
@@ -102,6 +105,12 @@ correlation does not work either, since the cell mints the OAuth `state` only
 *after* the redirect. Routing that pair needs a correlation design that does not
 exist yet; it is tracked as a follow-up.
 
+`FISHHAWK_DIRECTORY_ROUTED_PATHS` cannot be used to route them anyway: the
+directory validates each configured path against a closed set of cell surfaces
+that mount `withRegionPin` (one entry today), and refuses to start otherwise.
+Adding a routed surface is therefore a two-sided change — the cell mounts the
+middleware, and the directory's supported set gains the path.
+
 ## Region-scoped inference
 
 Inference stays per-cell and **process-level** (ADR-062 Q3(a)) — there is no
@@ -110,6 +119,13 @@ per-account endpoint registry. `FISHHAWKD_MODEL_BASE_URL` +
 the plan-review and the implement-review call (one adapter, two prompt shapes)
 target the cell's in-region endpoint with the region's own credential and the
 review text never leaves the region.
+
+Setting `FISHHAWKD_MODEL_BASE_URL` **without** `FISHHAWKD_MODEL_API_KEY` fails
+closed: the adapter presents an empty credential rather than the deployment's
+`FISHHAWKD_ANTHROPIC_API_KEY`, and startup warns. Sending the deployment key to
+an operator-configured endpoint would combine a production secret with
+configurable network egress; the endpoint refusing an uncredentialed call is the
+safer failure.
 
 This governs the Anthropic SDK adapter only. The `claudecode` and `codex`
 reviewers are subprocesses whose endpoint is the CLI's own configuration; a

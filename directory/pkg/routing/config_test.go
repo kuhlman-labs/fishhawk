@@ -47,7 +47,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 
 func TestLoadConfigOverrides(t *testing.T) {
 	e := validEnv()
-	e[EnvRoutedPaths] = "/v0/onboarding/start, /v0/onboarding/resume"
+	// An explicit list is honoured, but only over surfaces the cell actually
+	// verifies — see TestLoadConfigFailsClosed's unsupported-path case.
+	e[EnvRoutedPaths] = " /v0/onboarding/start "
 	e[EnvHandoffTTL] = "90s"
 
 	cfg, err := LoadConfig(env(e))
@@ -57,8 +59,25 @@ func TestLoadConfigOverrides(t *testing.T) {
 	if cfg.HandoffTTL != 90*time.Second {
 		t.Fatalf("HandoffTTL = %s, want 90s", cfg.HandoffTTL)
 	}
-	if len(cfg.RoutedPaths) != 2 || cfg.RoutedPaths[1] != "/v0/onboarding/resume" {
+	if len(cfg.RoutedPaths) != 1 || cfg.RoutedPaths[0] != DefaultRoutedPath {
 		t.Fatalf("RoutedPaths = %v", cfg.RoutedPaths)
+	}
+}
+
+// TestSupportedRoutedPathsMatchCellMiddleware is the lockstep guard: the
+// directory may only route a path the cell mounts its handoff-verifying
+// middleware on. The cell's constant is server.RoutedOnboardingPath; the
+// directory module cannot import backend (the dependency is one-way), so the
+// literal is asserted here and named in both files' comments.
+func TestSupportedRoutedPathsMatchCellMiddleware(t *testing.T) {
+	want := map[string]bool{"/v0/onboarding/start": true}
+	if len(supportedRoutedPaths) != len(want) {
+		t.Fatalf("supportedRoutedPaths = %v, want %v — a new entry needs a matching cell mount", supportedRoutedPaths, want)
+	}
+	for p := range want {
+		if !supportedRoutedPaths[p] {
+			t.Errorf("supportedRoutedPaths is missing %q", p)
+		}
 	}
 }
 
@@ -122,9 +141,23 @@ func TestLoadConfigFailsClosed(t *testing.T) {
 			wantSub: "must be absolute",
 		},
 		{
-			name:    "duplicate routed path",
-			mutate:  func(e map[string]string) { e[EnvRoutedPaths] = "/a,/a" },
+			name: "duplicate routed path",
+			mutate: func(e map[string]string) {
+				e[EnvRoutedPaths] = DefaultRoutedPath + "," + DefaultRoutedPath
+			},
 			wantSub: "listed twice",
+		},
+		{
+			// A path the cell does not mount withRegionPin on would receive a
+			// signed redirect that verifies nothing and pins nothing.
+			name:    "unsupported routed path",
+			mutate:  func(e map[string]string) { e[EnvRoutedPaths] = "/v0/onboarding/start,/v0/onboarding/resume" },
+			wantSub: "is not a cell surface that verifies a handoff",
+		},
+		{
+			name:    "unsupported routed path alone",
+			mutate:  func(e map[string]string) { e[EnvRoutedPaths] = "/v0/auth/github/callback" },
+			wantSub: "is not a cell surface that verifies a handoff",
 		},
 	}
 

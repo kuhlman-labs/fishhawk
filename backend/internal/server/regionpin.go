@@ -81,14 +81,22 @@ func (s *Server) withRegionPin(next http.HandlerFunc) http.HandlerFunc {
 
 		if err := s.cfg.RegionPinner.Pin(r.Context(), params.Provider, params.AccountKey, params.HomeRegion); err != nil {
 			status, code := pinErrorStatus(err)
+			// The typed refusals (409/404/400) describe the CALLER's request
+			// and are safe to echo. An unclassified fault is a server-side
+			// error whose text can carry driver, query or host detail, and
+			// this surface answers before any auth decision — the handoff is
+			// itself the credential — so it is genericized, matching the
+			// directory router's own posture (TestAssignStoreFailureIsInternalError).
+			message := err.Error()
 			if status == http.StatusInternalServerError {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError, "region pin failed",
 					slog.String("provider", params.Provider),
 					slog.String("account_key", params.AccountKey),
 					slog.String("error", err.Error()),
 				)
+				message = "the account's home region could not be recorded"
 			}
-			s.writeError(w, r, status, code, err.Error(), map[string]any{
+			s.writeError(w, r, status, code, message, map[string]any{
 				"provider":    params.Provider,
 				"account_key": params.AccountKey,
 				"region":      params.HomeRegion,
