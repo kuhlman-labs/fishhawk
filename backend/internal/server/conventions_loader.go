@@ -94,17 +94,25 @@ type conventionsCacheEntry struct {
 // resolvable scope is treated exactly like an unregistered forge. Fetch and
 // parse failures other than forge.ErrNotFound FAIL CLOSED — an
 // auth/transport/server fault must not silently select a different provider.
-// Parses are cached per repo behind a mutex, TTL-gated: within TTL the
-// cached parse is served with NO fetch; after TTL a refetch reuses the
-// cached parse when the blob SHA is unchanged.
+// Parses are cached per (provider, repo), TTL-gated: within TTL the cached
+// parse is served with NO fetch; after TTL a refetch reuses the cached parse
+// when the blob SHA is unchanged. The cache key is forge-qualified so a repo
+// reassigned to a different provider never serves the prior forge's parse.
 type RepoConventionsLoader struct {
 	cfg RepoConventionsLoaderConfig
 
-	// mu guards cache. It is deliberately held across the fetch: the filing
-	// paths are low-QPS, and serializing loads means concurrent filings for
-	// one repo do one fetch, not a thundering herd.
+	// mu guards cache and locks. It is held only for the short map
+	// operations, NEVER across the forge fetch — a slow/hung round-trip for
+	// one repo must not stall filings for every other repo.
 	mu    sync.Mutex
 	cache map[string]conventionsCacheEntry
+	// locks holds one fetch-serialization mutex per forge-qualified cache
+	// key. Held across the fetch, it confines the "concurrent same-repo
+	// filings do one fetch, not a thundering herd" serialization to that one
+	// repo while leaving other repos free to fetch concurrently. Like cache,
+	// it never evicts — bounded in practice by distinct authenticated filing
+	// targets.
+	locks map[string]*sync.Mutex
 }
 
 // NewRepoConventionsLoader builds a loader over cfg, defaulting Parse, Now,
@@ -119,13 +127,17 @@ func NewRepoConventionsLoader(cfg RepoConventionsLoaderConfig) *RepoConventionsL
 	if cfg.TTL <= 0 {
 		cfg.TTL = defaultConventionsTTL
 	}
-	return &RepoConventionsLoader{cfg: cfg, cache: make(map[string]conventionsCacheEntry)}
+	return &RepoConventionsLoader{
+		cfg:   cfg,
+		cache: make(map[string]conventionsCacheEntry),
+		locks: make(map[string]*sync.Mutex),
+	}
 }
 
 // Load resolves the work-management conventions for repo ("owner/name"). It
 // is the func installed as the process-wide conventionsLoader seam.
 func (l *RepoConventionsLoader) Load(ctx context.Context, repo string) (workmgmt.Conventions, error) {
-	fetcher, scope, ref, ok, err := l.resolveFetch(ctx, repo)
+	fetcher, scope, provider, ref, ok, err := l.resolveFetch(ctx, repo)
 	if err != nil {
 		return workmgmt.Conventions{}, err
 	}
@@ -133,7 +145,7 @@ func (l *RepoConventionsLoader) Load(ctx context.Context, repo string) (workmgmt
 		return l.fallback(), nil
 	}
 	owner, name, _ := strings.Cut(repo, "/")
-	return l.loadCached(ctx, repo, fetcher, scope, forge.RepoRef{Owner: owner, Name: name}, ref)
+	return l.loadCached(ctx, provider, repo, fetcher, scope, forge.RepoRef{Owner: owner, Name: name}, ref)
 }
 
 // resolveFetch runs the out-of-file resolution chain: the provider
@@ -141,58 +153,65 @@ func (l *RepoConventionsLoader) Load(ctx context.Context, repo string) (workmgmt
 // scope. ok=false means "fall through to override/Default" (provider
 // not-found/ambiguous, unregistered forge, or no resolvable credential
 // scope). A resolver or scope-resolution ERROR fails closed instead.
-func (l *RepoConventionsLoader) resolveFetch(ctx context.Context, repo string) (forge.FileFetcher, forge.CredentialScope, string, bool, error) {
+func (l *RepoConventionsLoader) resolveFetch(ctx context.Context, repo string) (forge.FileFetcher, forge.CredentialScope, string, string, bool, error) {
 	if l.cfg.Resolver == nil {
-		return nil, forge.CredentialScope{}, "", false, nil
+		return nil, forge.CredentialScope{}, "", "", false, nil
 	}
 	provider, found, err := l.cfg.Resolver.ResolveProvider(ctx, repo)
 	if err != nil {
-		return nil, forge.CredentialScope{}, "", false, fmt.Errorf("resolve conventions provider for %q: %w", repo, err)
+		return nil, forge.CredentialScope{}, "", "", false, fmt.Errorf("resolve conventions provider for %q: %w", repo, err)
 	}
 	if !found {
-		return nil, forge.CredentialScope{}, "", false, nil
+		return nil, forge.CredentialScope{}, "", "", false, nil
 	}
 	owner, name, cut := strings.Cut(repo, "/")
 	if !cut || owner == "" || name == "" {
-		return nil, forge.CredentialScope{}, "", false, nil
+		return nil, forge.CredentialScope{}, "", "", false, nil
 	}
 	switch provider {
 	case "github":
 		if l.cfg.GitHubFetcher == nil || l.cfg.GitHubScope == nil {
-			return nil, forge.CredentialScope{}, "", false, nil
+			return nil, forge.CredentialScope{}, "", "", false, nil
 		}
 		scope, err := l.cfg.GitHubScope(ctx, owner, name)
 		if err != nil {
-			return nil, forge.CredentialScope{}, "", false, fmt.Errorf("resolve github credential scope for %q: %w", repo, err)
+			return nil, forge.CredentialScope{}, "", "", false, fmt.Errorf("resolve github credential scope for %q: %w", repo, err)
 		}
 		if scope.IsZero() {
 			// App not installed on the repo — no credential to fetch
 			// with, exactly like an unregistered forge.
-			return nil, forge.CredentialScope{}, "", false, nil
+			return nil, forge.CredentialScope{}, "", "", false, nil
 		}
-		return l.cfg.GitHubFetcher, scope, "", true, nil
+		return l.cfg.GitHubFetcher, scope, provider, "", true, nil
 	case "gitlab":
 		if l.cfg.GitLabFetcher == nil || l.cfg.GitLabScope.IsZero() {
-			return nil, forge.CredentialScope{}, "", false, nil
+			return nil, forge.CredentialScope{}, "", "", false, nil
 		}
 		// The Repository Files API requires an explicit ref; HEAD is the
 		// repo's default branch.
-		return l.cfg.GitLabFetcher, l.cfg.GitLabScope, "HEAD", true, nil
+		return l.cfg.GitLabFetcher, l.cfg.GitLabScope, provider, "HEAD", true, nil
 	default:
 		// A provider the loader has no fetch path for behaves like an
 		// unregistered forge.
-		return nil, forge.CredentialScope{}, "", false, nil
+		return nil, forge.CredentialScope{}, "", "", false, nil
 	}
 }
 
 // loadCached serves repo's conventions from the TTL-gated cache, fetching
-// and (when the blob SHA changed) re-parsing on miss or expiry.
-func (l *RepoConventionsLoader) loadCached(ctx context.Context, repo string, fetcher forge.FileFetcher, scope forge.CredentialScope, ref forge.RepoRef, fetchRef string) (workmgmt.Conventions, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// and (when the blob SHA changed) re-parsing on miss or expiry. The cache is
+// keyed by (provider, repo) so a repo reassigned to a different provider
+// never serves the prior forge's parse. A per-key mutex serializes concurrent
+// loads for the SAME key (one fetch, no thundering herd) without blocking
+// loads for any OTHER repo across the forge round-trip.
+func (l *RepoConventionsLoader) loadCached(ctx context.Context, provider, repo string, fetcher forge.FileFetcher, scope forge.CredentialScope, ref forge.RepoRef, fetchRef string) (workmgmt.Conventions, error) {
+	key := provider + "\x00" + repo
+
+	keyLock := l.keyLock(key)
+	keyLock.Lock()
+	defer keyLock.Unlock()
 
 	now := l.cfg.Now()
-	entry, cached := l.cache[repo]
+	entry, cached := l.readCache(key)
 	if cached && now.Sub(entry.fetchedAt) < l.cfg.TTL {
 		return entry.conv, nil
 	}
@@ -209,7 +228,7 @@ func (l *RepoConventionsLoader) loadCached(ctx context.Context, repo string, fet
 	}
 	if cached && entry.sha == fc.SHA {
 		entry.fetchedAt = now
-		l.cache[repo] = entry
+		l.writeCache(key, entry)
 		return entry.conv, nil
 	}
 	conv, err := l.cfg.Parse(bytes.NewReader(fc.Content))
@@ -218,8 +237,36 @@ func (l *RepoConventionsLoader) loadCached(ctx context.Context, repo string, fet
 		// surface, not a reason to serve some other repo's conventions.
 		return workmgmt.Conventions{}, fmt.Errorf("parse %s from %s: %w", conventionsFilePath, repo, err)
 	}
-	l.cache[repo] = conventionsCacheEntry{sha: fc.SHA, conv: conv, fetchedAt: now}
+	l.writeCache(key, conventionsCacheEntry{sha: fc.SHA, conv: conv, fetchedAt: now})
 	return conv, nil
+}
+
+// keyLock returns the per-key fetch-serialization mutex, creating it on first
+// use. The short l.mu critical section here is the only place the map lock is
+// taken during a load — never across the fetch itself.
+func (l *RepoConventionsLoader) keyLock(key string) *sync.Mutex {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lk := l.locks[key]
+	if lk == nil {
+		lk = &sync.Mutex{}
+		l.locks[key] = lk
+	}
+	return lk
+}
+
+// readCache / writeCache access the cache map under the short l.mu lock.
+func (l *RepoConventionsLoader) readCache(key string) (conventionsCacheEntry, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, ok := l.cache[key]
+	return entry, ok
+}
+
+func (l *RepoConventionsLoader) writeCache(key string, entry conventionsCacheEntry) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.cache[key] = entry
 }
 
 // fallback is the tail of the resolution chain: the break-glass

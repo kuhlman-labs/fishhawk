@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -417,6 +418,196 @@ func TestConventionsLoader_Cache(t *testing.T) {
 	if conv.Provider != "gitlab" {
 		t.Errorf("changed-SHA Provider = %q, want gitlab from the re-parsed content", conv.Provider)
 	}
+}
+
+// TestConventionsLoader_ProviderReassignment_ForgeQualifiedKey pins the
+// forge-qualified cache key: a repo cached under one provider and later
+// reassigned to another (ADR-057/ADR-058) must refetch from the NEW forge and
+// serve its conventions, never the prior forge's cached parse — even within
+// the TTL window. With a repo-only key the second (within-TTL) Load would
+// serve the stale github parse; the (provider, repo) key makes it a miss.
+func TestConventionsLoader_ProviderReassignment_ForgeQualifiedKey(t *testing.T) {
+	gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "gh-sha"}}
+	gl := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitLabConventionsYAML), SHA: "gl-sha"}}
+	resolver := mapProviderResolver{"acme/widgets": "github"}
+	now := time.Unix(1_700_000_000, 0)
+	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+		Resolver:      resolver,
+		GitHubFetcher: gh,
+		GitLabFetcher: gl,
+		GitHubScope:   githubScopeFixed("42"),
+		GitLabScope:   forge.FromRef("gitlab:deployment"),
+		Now:           func() time.Time { return now },
+		TTL:           time.Hour,
+	})
+
+	conv, err := l.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load (github) err = %v, want nil", err)
+	}
+	if conv.Provider != "github_projects" {
+		t.Fatalf("Provider = %q, want github_projects from the github forge", conv.Provider)
+	}
+
+	// Reassign the repo to gitlab WITHIN the TTL: a repo-only cache key would
+	// serve the stale github parse with no fetch; the forge-qualified key
+	// makes this a fresh miss on the gitlab forge.
+	resolver["acme/widgets"] = "gitlab"
+	conv, err = l.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load (gitlab) err = %v, want nil", err)
+	}
+	if conv.Provider != "gitlab" {
+		t.Errorf("Provider = %q, want gitlab after provider reassignment — the github parse must not be served cross-forge", conv.Provider)
+	}
+	if gl.calls != 1 {
+		t.Errorf("gitlab fetch calls = %d, want 1 (the reassignment forced a fetch from the new forge)", gl.calls)
+	}
+}
+
+// TestConventionsLoader_NotFoundAfterExpiry: a repo whose conventions file was
+// cached and is later deleted takes fetch→ErrNotFound→fallback on the
+// post-TTL refetch, and the now-expired cache entry is NEVER served again.
+func TestConventionsLoader_NotFoundAfterExpiry(t *testing.T) {
+	gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "sha-1"}}
+	now := time.Unix(1_700_000_000, 0)
+	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+		Resolver:      &fakeProviderResolver{provider: "github", found: true},
+		GitHubFetcher: gh,
+		GitHubScope:   githubScopeFixed("42"),
+		Override:      breakGlass,
+		Now:           func() time.Time { return now },
+		TTL:           time.Minute,
+	})
+
+	conv, err := l.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load (cold) err = %v, want nil", err)
+	}
+	if conv.Provider != "github_projects" {
+		t.Fatalf("cold Provider = %q, want github_projects", conv.Provider)
+	}
+
+	// The file is deleted; the next refetch (after TTL) returns ErrNotFound.
+	gh.fc, gh.err = nil, forge.ErrNotFound
+	now = now.Add(2 * time.Minute)
+	conv, err = l.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load (after delete) err = %v, want nil (ErrNotFound falls through)", err)
+	}
+	if conv.Provider != "break-glass" {
+		t.Errorf("Provider = %q, want the break-glass fallback — the deleted file's stale parse must not be served", conv.Provider)
+	}
+	if gh.calls != 2 {
+		t.Errorf("fetch calls = %d, want 2 (the expiry forced a refetch that 404'd)", gh.calls)
+	}
+}
+
+// TestConventionsLoader_ConcurrentLoads asserts the mutex contract: concurrent
+// loads for the SAME repo collapse to one fetch (no thundering herd), and a
+// slow/hung fetch for ONE repo does not block a concurrent load for ANOTHER
+// repo (the per-key lock, not a process-global one).
+func TestConventionsLoader_ConcurrentLoads(t *testing.T) {
+	t.Run("same repo does one fetch", func(t *testing.T) {
+		gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "sha-1"}}
+		now := time.Unix(1_700_000_000, 0)
+		l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+			Resolver:      &fakeProviderResolver{provider: "github", found: true},
+			GitHubFetcher: gh,
+			GitHubScope:   githubScopeFixed("42"),
+			Now:           func() time.Time { return now },
+			TTL:           time.Hour,
+		})
+
+		const n = 8
+		var wg sync.WaitGroup
+		wg.Add(n)
+		for i := 0; i < n; i++ {
+			go func() {
+				defer wg.Done()
+				conv, err := l.Load(context.Background(), "acme/widgets")
+				if err != nil {
+					t.Errorf("concurrent Load err = %v, want nil", err)
+					return
+				}
+				if conv.Provider != "github_projects" {
+					t.Errorf("concurrent Load Provider = %q, want github_projects", conv.Provider)
+				}
+			}()
+		}
+		wg.Wait()
+		if gh.calls != 1 {
+			t.Errorf("fetch calls = %d, want 1 — concurrent same-repo loads must collapse to one fetch", gh.calls)
+		}
+	})
+
+	t.Run("a slow repo does not block another repo", func(t *testing.T) {
+		// gatedGitHub blocks inside FetchFile until released, holding the
+		// acme/widgets key lock across the fetch. A process-global lock would
+		// then wedge the concurrent group/lib load below.
+		started := make(chan struct{})
+		release := make(chan struct{})
+		gated := &gatedFetcher{
+			started: started,
+			release: release,
+			fc:      &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "gh-sha"},
+		}
+		gl := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitLabConventionsYAML), SHA: "gl-sha"}}
+		l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+			Resolver:      mapProviderResolver{"acme/widgets": "github", "group/lib": "gitlab"},
+			GitHubFetcher: gated,
+			GitLabFetcher: gl,
+			GitHubScope:   githubScopeFixed("42"),
+			GitLabScope:   forge.FromRef("gitlab:deployment"),
+		})
+
+		slowDone := make(chan struct{})
+		go func() {
+			defer close(slowDone)
+			_, _ = l.Load(context.Background(), "acme/widgets")
+		}()
+		<-started // acme/widgets is now inside FetchFile, holding its key lock
+
+		fast := make(chan workmgmt.Conventions, 1)
+		go func() {
+			conv, err := l.Load(context.Background(), "group/lib")
+			if err != nil {
+				t.Errorf("Load(group/lib) err = %v, want nil", err)
+			}
+			fast <- conv
+		}()
+
+		// The deadlock guard: group/lib must complete while acme/widgets is
+		// still blocked in its fetch. This is a generous liveness bound, not a
+		// timing assertion — the fake gitlab fetch returns in microseconds.
+		select {
+		case conv := <-fast:
+			if conv.Provider != "gitlab" {
+				t.Errorf("group/lib Provider = %q, want gitlab", conv.Provider)
+			}
+		case <-time.After(5 * time.Second):
+			close(release) // unblock the parked goroutine before failing
+			t.Fatal("Load(group/lib) blocked behind acme/widgets' held fetch lock — loads are serialized cross-repo")
+		}
+
+		close(release)
+		<-slowDone
+	})
+}
+
+// gatedFetcher blocks inside FetchFile until release is closed, signaling entry
+// by closing started — so a test can hold one repo's fetch open across a
+// concurrent load for another repo.
+type gatedFetcher struct {
+	started chan struct{}
+	release chan struct{}
+	fc      *forge.FileContent
+}
+
+func (g *gatedFetcher) FetchFile(context.Context, forge.CredentialScope, forge.RepoRef, string, string) (*forge.FileContent, error) {
+	close(g.started)
+	<-g.release
+	return g.fc, nil
 }
 
 // TestConventionsLoader_OverrideAbsent_Default: with no break-glass override

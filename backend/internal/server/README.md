@@ -86,11 +86,15 @@ sidestepped — the fetch-forge is resolved from **outside** the conventions fil
 4. **Break-glass override** (`FISHHAWKD_WORKMGMT_CONVENTIONS`, retained from ADR-058 Phase 2
    #1856): served whenever the chain falls through, else `workmgmt.Default()`.
 
-**Cache**: parsed conventions are cached per repo behind a mutex, TTL-gated (5 min default;
+**Cache**: parsed conventions are cached per **`(provider, repo)`** key, TTL-gated (5 min default;
 clock/TTL/parse injectable so `conventions_loader_test.go` asserts the counters): within TTL the
 cached parse is served with **no fetch**; after TTL a refetch **reuses the cached parse when the
-blob SHA is unchanged**. The mutex is deliberately held across the fetch — the filing paths are
-low-QPS and serialized loads keep concurrent same-repo filings to one fetch.
+blob SHA is unchanged**. The key is **forge-qualified** so a repo reassigned to a different
+provider never serves the prior forge's cached parse. A **per-key mutex** is held across the fetch
+so concurrent same-repo filings do one fetch, not a thundering herd — but it is **per repo**, not
+process-global, so a slow or hung forge round-trip for one repo does **not** stall filings for any
+other repo (the short map-guarding `mu` is never held across the fetch). The per-key lock map, like
+the cache, never evicts — bounded in practice by distinct authenticated filing targets.
 
 **Operator-accepted E44 posture**: the E44 `accounts` tables are not yet populated in
 production, so the discriminator path resolves `found=false` and live filings degrade to the
