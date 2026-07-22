@@ -116,6 +116,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/auth/github/manifest-callback", s.handleGitHubManifestCallback)
 	mux.HandleFunc("GET /v0/auth/me", s.handleGetMe)
 	mux.HandleFunc("GET /v0/onboarding/readiness", s.handleGetOnboardingReadiness)
+	// The one directory-routed surface (ADR-062 A2.1, E44.7 / #1831). The
+	// handoff-verifying middleware is mounted on the routed path ITSELF, and
+	// UNCONDITIONALLY: on a cell with no region configured it refuses a signed
+	// request with 503 rather than being absent and silently serving it.
+	mux.HandleFunc("GET "+RoutedOnboardingPath, s.withRegionPin(s.handleOnboardingStart))
 	mux.HandleFunc("POST /v0/auth/logout", s.handleLogout)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
 	mux.HandleFunc("POST /webhooks/gitlab", s.handleWebhookGitLab)

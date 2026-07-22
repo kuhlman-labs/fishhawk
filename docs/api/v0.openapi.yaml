@@ -2986,6 +2986,43 @@ components:
             enforcement is E44.5); a cookie session with no resolvable account
             is refused with 403 `account_unresolved` instead of returning null.
 
+    OnboardingStart:
+      type: object
+      description: |
+        The cell entry point's answer for a directory-routed caller (ADR-062,
+        E44.7). `cell_region` is what THIS cell serves; `home_region` is the
+        account's recorded region, equal to `cell_region` once a handoff has
+        been honored.
+      required: [provider, account_key, cell_region, home_region, pinned, readiness_path]
+      properties:
+        provider:
+          type: string
+          example: github
+        account_key:
+          type: string
+          example: kuhlman-labs
+        cell_region:
+          type: string
+          description: |
+            The region this cell serves. Empty on a single-cell deployment with
+            no configured region.
+          example: us
+        home_region:
+          type: string
+          description: |
+            The account's home region as recorded by this request's handoff.
+            Empty on a pass-through (handoff-less) request.
+          example: us
+        pinned:
+          type: boolean
+          description: |
+            Whether this request carried a VERIFIED handoff that stamped the
+            account. False on a pass-through request.
+        readiness_path:
+          type: string
+          description: Where the caller continues the onboarding walk.
+          example: /v0/onboarding/readiness
+
     OnboardingReadiness:
       type: object
       description: |
@@ -3482,6 +3519,136 @@ paths:
               schema: { $ref: '#/components/schemas/OnboardingReadiness' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v0/onboarding/start:
+    get:
+      operationId: getOnboardingStart
+      summary: Cell entry point for a directory-routed caller
+      description: |
+        The ONE cell surface the regional directory routes to (ADR-062, E44.7).
+        It reports which region this cell serves and the account's recorded home
+        region, and points at `/v0/onboarding/readiness` for the rest of the
+        walk.
+
+        Two ways to arrive, and the response is the same shape either way:
+
+        - **Carrying a handoff.** The directory appends the signed `fh_*`
+          parameter set below to the redirect. This endpoint's middleware
+          verifies the signature and expiry, checks the named region is THIS
+          cell's own, and stamps `accounts.home_region` with a conditional,
+          first-write-wins UPDATE before the handler runs. The HMAC over the
+          account identity is itself the credential, so no session is required.
+          The pin is UPDATE-only: a handoff for an account this cell has no row
+          for is refused `404`, never silently created.
+        - **Without a handoff.** A single-cell deployment sees no `fh_*`
+          parameters and the request passes through untouched; the caller must
+          then be authenticated and name the account explicitly.
+
+        Fail-closed: on a cell with no configured home region or no shared
+        handoff secret, a request that DOES carry `fh_sig` is refused `503`. It
+        is never served as though the handoff were absent.
+
+        Replay safety comes from the conditional UPDATE, not from a consumed
+        nonce: replaying an unexpired handoff verbatim is a harmless no-op,
+        while a handoff naming a different region than the account already
+        holds is refused `409`.
+      tags: [onboarding]
+      parameters:
+        - name: provider
+          in: query
+          required: false
+          description: |
+            Forge discriminator (`github`, `gitlab`). Required WITHOUT a
+            handoff; ignored with one (the signed `fh_provider` wins).
+          schema: { type: string }
+        - name: account_key
+          in: query
+          required: false
+          description: |
+            Forge-neutral account key. Required WITHOUT a handoff; ignored with
+            one (the signed `fh_account_key` wins).
+          schema: { type: string }
+        - name: fh_provider
+          in: query
+          required: false
+          description: Handoff — the provider the directory authenticated.
+          schema: { type: string }
+        - name: fh_account_key
+          in: query
+          required: false
+          description: Handoff — the account key the directory authenticated.
+          schema: { type: string }
+        - name: fh_region
+          in: query
+          required: false
+          description: |
+            Handoff — the region that owns the account. Must equal this cell's
+            own region; anything else is refused `409` (the residency
+            self-check).
+          schema: { type: string }
+        - name: fh_expires_at
+          in: query
+          required: false
+          description: Handoff — RFC3339 expiry. At or past it, `403`.
+          schema: { type: string, format: date-time }
+        - name: fh_nonce
+          in: query
+          required: false
+          description: |
+            Handoff — per-issuance nonce. It BINDS one issuance; it is not
+            consumed against a store. Distinct from an OAuth `state`, which the
+            directory preserves untouched.
+          schema: { type: string }
+        - name: fh_sig
+          in: query
+          required: false
+          description: |
+            Handoff — hex HMAC-SHA256 over a canonical, length-prefixed
+            serialization of the other `fh_*` fields. Its PRESENCE is what
+            switches this endpoint from pass-through to verify-and-pin.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The cell's region and the account's home region.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OnboardingStart' }
+        '400':
+          description: |
+            A malformed handoff (missing or unusable `fh_*` parameter), or a
+            handoff-less request that named no account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: The handoff signature did not verify, or it has expired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            The handoff names an account this cell has no row for. The pin is
+            UPDATE-only, so the account is NOT created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `region_mismatch` — the handoff names another region than this
+            cell — or `region_conflict` — the account is already homed
+            elsewhere and first-write-wins keeps that assignment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `region_pin_disabled` — this cell has no configured home region or
+            no shared handoff secret, so it refuses a handoff-bearing request
+            rather than serving it unverified.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/tokens:
     get:
