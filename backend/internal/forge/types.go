@@ -111,6 +111,20 @@ type Repository struct {
 	DefaultBranch string
 }
 
+// FileContent is the decoded result of FileFetcher.FetchFile.
+type FileContent struct {
+	// Path is the repo-relative path of the fetched file, as the forge
+	// reported it back.
+	Path string
+	// Content is the file's decoded bytes.
+	Content []byte
+	// SHA is the forge's blob id for the file's content at the ref
+	// (GitHub: the blob SHA, GitLab: blob_id). Stable per content, so an
+	// unchanged file yields the same SHA across refetches — the key the
+	// per-repo conventions loader (#2022) reuses a cached parse on.
+	SHA string
+}
+
 // GitCommit is the slice of a git-commit object Fishhawk needs to author a
 // follow-on commit: the commit's own SHA and the tree it points at.
 type GitCommit struct {
