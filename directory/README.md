@@ -13,11 +13,10 @@ in a cell (`backend/`).
 | Path | Contract |
 |---|---|
 | `pkg/handoff/` | The **single owning** codec for the signed handoff parameter set. Public because both planes import it. |
+| `pkg/routing/` | Config (`FISHHAWK_DIRECTORY_*`) plus the `http.Handler` serving both surfaces: `POST /v0/directory/assign` and the routed 302 redirect. Public so the cell's cross-boundary test can drive the real router. |
 | `internal/store/` | The directory's whole persistent state: `(provider, account_key) -> home_region`. |
 | `internal/store/migrations/` | Embedded golang-migrate SQL, applied by `MigrateUp`. |
-
-`pkg/routing/` and `cmd/fishhawk-directory/` land in sibling slices of the
-same plan; this module currently ships the codec and the store.
+| `cmd/fishhawk-directory/` | The binary: `serve` validates config, opens the directory database, migrates, and mounts `pkg/routing`. |
 
 ## `pkg/handoff` — the signed handoff
 
