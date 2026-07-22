@@ -56,6 +56,10 @@ func (f *calibrationAuditFake) ListForRun(_ context.Context, _ uuid.UUID) ([]*au
 func (f *calibrationAuditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
+func (f *calibrationAuditFake) ListGlobalByAccount(_ context.Context, _ *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (f *calibrationAuditFake) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, nil
 }

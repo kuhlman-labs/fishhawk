@@ -204,6 +204,10 @@ func (a *auditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("auditFake: ListGlobal not used")
 }
 
+func (a *auditFake) ListGlobalByAccount(_ context.Context, _ *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, errors.New("auditFake: ListGlobalByAccount not used")
+}
+
 // ListAll returns the seeded history plus any entries appended during
 // the test, filtered by p.Category when set. This backs the
 // spend-alert check's cost-history read (#649); the trace handler is

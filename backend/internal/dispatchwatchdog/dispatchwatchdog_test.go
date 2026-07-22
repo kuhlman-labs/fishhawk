@@ -152,6 +152,9 @@ func (a *fakeAudit) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, erro
 func (a *fakeAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+func (a *fakeAudit) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *fakeAudit) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
 }

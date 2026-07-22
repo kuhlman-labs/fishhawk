@@ -184,6 +184,10 @@ func (r *recordingAudit) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry,
 func (r *recordingAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
+func (r *recordingAudit) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (r *recordingAudit) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, audit.ErrNotFound
 }

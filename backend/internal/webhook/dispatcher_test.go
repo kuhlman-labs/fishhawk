@@ -1121,6 +1121,10 @@ func (s *stubAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAp
 func (s *stubAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (s *stubAudit) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
 func (s *stubAudit) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }

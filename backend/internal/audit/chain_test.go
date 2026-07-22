@@ -240,6 +240,69 @@ func TestPostgres_AppendChained_AllOptionalFields(t *testing.T) {
 	}
 }
 
+// TestPostgres_AppendChained_StampsRunAccountID pins the per-run half of
+// ADR-057 / #1828: a per-run append carries the LOCKED run row's
+// account_id (read under the SELECT FOR UPDATE inside the same tx), and a
+// run with no account stamps nil. The per-run chain key is unchanged
+// (still run_id), and the canonical hash recomputes through the UNCHANGED
+// HashInputs shape — account_id is a stamp, not a hash input.
+func TestPostgres_AppendChained_StampsRunAccountID(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	acct := makeAccount(t, pool)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE runs SET account_id = $1 WHERE id = $2`, acct, runID); err != nil {
+		t.Fatalf("set run account: %v", err)
+	}
+
+	e, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "run_dispatched",
+		Payload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("AppendChained: %v", err)
+	}
+	if e.AccountID == nil || *e.AccountID != acct {
+		t.Errorf("per-run entry AccountID = %v, want the run's account %s", e.AccountID, acct)
+	}
+
+	recomputed, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID:        e.RunID,
+		StageID:      e.StageID,
+		Timestamp:    e.Timestamp,
+		Category:     e.Category,
+		ActorKind:    e.ActorKind,
+		ActorSubject: e.ActorSubject,
+		Payload:      e.Payload,
+		PrevHash:     e.PrevHash,
+	})
+	if err != nil {
+		t.Fatalf("ComputeEntryHash: %v", err)
+	}
+	if recomputed != e.EntryHash {
+		t.Errorf("hash mismatch: account stamping must not change the canonical hash\n  stored:     %s\n  recomputed: %s",
+			e.EntryHash, recomputed)
+	}
+
+	// A run with no account (CLI/local, pre-backfill) stamps nil.
+	bareRun := makeRun(t, pool)
+	bare, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     bareRun,
+		Timestamp: time.Now().UTC(),
+		Category:  "run_dispatched",
+		Payload:   json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("AppendChained (no-account run): %v", err)
+	}
+	if bare.AccountID != nil {
+		t.Errorf("no-account run entry AccountID = %v, want nil", bare.AccountID)
+	}
+}
+
 func TestPostgres_AppendChained_RunNotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := audit.NewPostgresRepository(pool)
