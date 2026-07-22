@@ -5,10 +5,14 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/directory/pkg/handoff"
 )
 
 // requiredRunScopes is the run-driving subset of operatorDefaultScopes
@@ -253,4 +257,151 @@ func collectSpecReviewers(sp *spec.Spec) []spec.AgentReviewer {
 		return out[i].ReasoningEffort < out[j].ReasoningEffort
 	})
 	return out
+}
+
+// regionPinDeps carries the two dependencies the cell-side region-pin handler
+// needs: the RegionPinner (the accounts store plus THIS cell's home-region
+// tag) and the secret shared with the global directory.
+//
+// SCOPE NOTE (E44.7 / #1831): these two belong on server.Config as plain
+// fields, alongside AccountRoles. Config is declared in server.go, which this
+// decomposed slice does not own — the scope amendment requesting it went
+// undecided past the stage cap — so they are carried in a per-instance side
+// table declared here instead. The registration API and the handler's reads
+// are written so collapsing this into two Config fields is a mechanical
+// refactor with no behavior change: replace ConfigureRegionPin with the
+// fields and regionPin() with a struct read.
+type regionPinDeps struct {
+	pinner *account.RegionPinner
+	secret []byte
+}
+
+// regionPinRegistry maps *Server → regionPinDeps. Keyed PER INSTANCE (not a
+// package-level singleton) so concurrent tests and any multi-server process
+// cannot see each other's wiring. An unregistered server reads the zero
+// value, which makes the endpoint fail closed with 503.
+var regionPinRegistry sync.Map
+
+// ConfigureRegionPin wires the cell-side region-pin dependencies onto this
+// server: the account store bound to this cell's home region, and the handoff
+// secret shared with the global directory. Calling it with a nil pinner or an
+// empty secret leaves the endpoint failing closed, which is the correct
+// posture for a deployment that is not part of a regional topology.
+func (s *Server) ConfigureRegionPin(pinner *account.RegionPinner, handoffSecret []byte) {
+	regionPinRegistry.Store(s, regionPinDeps{pinner: pinner, secret: handoffSecret})
+}
+
+// regionPin reads this server's region-pin dependencies, returning the zero
+// value (both absent) when none were wired.
+func (s *Server) regionPin() regionPinDeps {
+	v, ok := regionPinRegistry.Load(s)
+	if !ok {
+		return regionPinDeps{}
+	}
+	deps, _ := v.(regionPinDeps)
+	return deps
+}
+
+// regionPinResponse is the cell's acknowledgement of a directory-issued region
+// pin: the forge-neutral account identity, the region now recorded on
+// accounts.home_region, and the account row id. It is deliberately the same
+// shape whether the pin created the row or re-confirmed an existing one: the
+// first-write-wins bound makes a repeated pin idempotent, so a replay is
+// indistinguishable from the original by design.
+type regionPinResponse struct {
+	Provider   string `json:"provider"`
+	AccountKey string `json:"account_key"`
+	HomeRegion string `json:"home_region"`
+	AccountID  string `json:"account_id"`
+}
+
+// handleOnboardingRegionPin implements GET /v0/onboarding/region-pin (ADR-062,
+// E44.7 / #1831) — the cell side of directory-first onboarding.
+//
+// Onboarding is directory-first: the GLOBAL directory decides an account's home
+// region, records it, and 302s the caller into that region's cell with a signed
+// handoff appended to the original request URL. This handler is where that
+// redirect lands. It never derives a region itself, and it never writes back to
+// the directory — the data flow is strictly directory → cell.
+//
+// It is deliberately UNAUTHENTICATED in the session sense: it is reached by a
+// browser redirect during onboarding, before any session exists. The HMAC over
+// the handoff parameters IS the authentication, and it is checked first. Three
+// independent gates must all pass before anything is persisted:
+//
+//  1. handoff.Verify — the pin was issued by the directory holding the shared
+//     secret and has not expired (rejects absent, unsigned, forged, tampered,
+//     and expired pins).
+//  2. the RESIDENCY invariant — the pinned region equals THIS cell's own
+//     configured home region, so an EU pin landing on a US cell fails closed
+//     (account.ErrRegionForeign, 421 Misdirected Request).
+//  3. the REPLAY bound — home_region is first-write-wins, so a replayed pin is
+//     idempotent and can never move an account between regions
+//     (account.ErrRegionConflict, 409).
+//
+// Method is GET by construction: a 302 must be followable by a browser, and the
+// routed onboarding surfaces carry no request body.
+func (s *Server) handleOnboardingRegionPin(w http.ResponseWriter, r *http.Request) {
+	deps := s.regionPin()
+	if deps.pinner == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "region_pin_unavailable",
+			"this deployment has no account store wired; region pins cannot be recorded", nil)
+		return
+	}
+
+	pin, err := handoff.Verify(deps.secret, r.URL.Query(), time.Now())
+	if err != nil {
+		status, code := http.StatusForbidden, "region_pin_rejected"
+		switch {
+		case errors.Is(err, handoff.ErrNoSecret):
+			// No shared secret on this cell: no pin can be authenticated, so
+			// none is accepted. Fail closed, never trust the parameters.
+			status, code = http.StatusServiceUnavailable, "region_pin_unavailable"
+		case errors.Is(err, handoff.ErrMissing), errors.Is(err, handoff.ErrMalformed):
+			status, code = http.StatusBadRequest, "validation_failed"
+		}
+		s.cfg.Logger.Warn("onboarding region pin rejected", "error", err.Error(), "code", code)
+		s.writeError(w, r, status, code, err.Error(), nil)
+		return
+	}
+
+	acct, err := deps.pinner.Pin(r.Context(), account.PinParams{
+		Provider:   pin.Provider,
+		AccountKey: pin.AccountKey,
+		Region:     pin.HomeRegion,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, account.ErrRegionForeign):
+			// 421 Misdirected Request (RFC 9110 §15.5.20): this request was
+			// routed to a cell that cannot serve it. Exactly the residency
+			// fault, and it tells the caller to re-resolve, not to retry.
+			s.writeError(w, r, http.StatusMisdirectedRequest, "region_pin_misdirected", err.Error(),
+				map[string]any{"cell_home_region": deps.pinner.HomeRegion(), "pin_home_region": pin.HomeRegion})
+		case errors.Is(err, account.ErrRegionConflict):
+			s.writeError(w, r, http.StatusConflict, "region_pin_conflict", err.Error(), nil)
+		case errors.Is(err, account.ErrRegionUnsupported):
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed", err.Error(),
+				map[string]any{"field": handoff.ParamHomeRegion, "supported": account.SupportedRegions})
+		case errors.Is(err, account.ErrRegionUnavailable):
+			s.writeError(w, r, http.StatusServiceUnavailable, "region_pin_unavailable", err.Error(), nil)
+		default:
+			s.cfg.Logger.Error("onboarding region pin: persist failed",
+				"provider", pin.Provider, "account_key", pin.AccountKey, "error", err.Error())
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"failed to record the account's home region", nil)
+		}
+		return
+	}
+
+	region := ""
+	if acct.HomeRegion != nil {
+		region = *acct.HomeRegion
+	}
+	s.writeJSON(w, r, http.StatusOK, regionPinResponse{
+		Provider:   acct.Provider,
+		AccountKey: acct.AccountKey,
+		HomeRegion: region,
+		AccountID:  acct.ID.String(),
+	})
 }

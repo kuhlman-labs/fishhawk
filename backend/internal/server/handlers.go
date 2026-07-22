@@ -116,6 +116,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/auth/github/manifest-callback", s.handleGitHubManifestCallback)
 	mux.HandleFunc("GET /v0/auth/me", s.handleGetMe)
 	mux.HandleFunc("GET /v0/onboarding/readiness", s.handleGetOnboardingReadiness)
+	// The cell side of directory-first onboarding (ADR-062 / E44.7, #1831):
+	// where the global directory's 302 lands. GET by construction (a redirect
+	// must be browser-followable and the routed surfaces carry no body) and
+	// deliberately NOT session-gated — it is reached before any session
+	// exists, and the HMAC over the handoff parameters is its authentication.
+	mux.HandleFunc("GET /v0/onboarding/region-pin", s.handleOnboardingRegionPin)
 	mux.HandleFunc("POST /v0/auth/logout", s.handleLogout)
 	mux.HandleFunc("POST /webhooks/github", s.handleWebhook)
 	mux.HandleFunc("POST /webhooks/gitlab", s.handleWebhookGitLab)

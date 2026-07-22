@@ -15,6 +15,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jackc/puddle/v2 v2.2.2
+	github.com/kuhlman-labs/fishhawk/directory v0.0.0
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20260606222916-3bdc667bf430
 	github.com/kuhlman-labs/fishhawk/redaction v0.0.0-20260622095901-47e0c4255798
 	github.com/modelcontextprotocol/go-sdk v1.6.1
@@ -107,3 +108,12 @@ require (
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 )
+
+// The region-handoff codec (directory/pkg/handoff) is the ONE encode/verify
+// implementation shared by the global directory and the regional cells
+// (ADR-062, E44.7 / #1831). The directory module is not published, so the
+// require above resolves through this local replace; `use ./directory` in
+// go.work (added by the directory-module slice) supersedes it in workspace
+// mode. directory/pkg/handoff is stdlib-only, so this adds no transitive
+// dependency to the backend.
+replace github.com/kuhlman-labs/fishhawk/directory => ../directory

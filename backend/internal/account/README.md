@@ -87,3 +87,46 @@ GitHub-specific githubapp package (which owns the id → ref stringification); t
 serve.go closure is a thin forge-neutral passthrough. Per-installation
 REST-client routing and per-installation GitLab-client construction (both
 needing a per-installation client factory) build on this resolver as follow-ups.
+
+## RegionPinner — the directory-decided home-region write path (E44.7 / #1831)
+
+`region.go` is the cell-side write path for ADR-062 data residency. Onboarding
+is **directory-first**: a global directory decides an account's home region,
+records it, and 302s the caller into that region's cell with an HMAC-signed
+handoff (`directory/pkg/handoff` — the one codec, imported by both sides). The
+cell stamps `accounts.home_region` from that decision and does nothing else:
+
+- it **never derives** the region in-cell, and
+- it **never writes back** to the directory. The data flow is strictly
+  directory → cell.
+
+The write reuses the existing `UpsertAccount` query — `home_region` has existed
+on `accounts` since migration `0052`, so **no migration is added**. Because that
+query's `ON CONFLICT` clause overwrites `home_region` unconditionally, the
+ordering guarantees live in Go, ahead of the statement.
+
+`RegionPinner.Pin` enforces three gates, each fail-closed with no partial write:
+
+- **Supported-region check** (`ErrRegionUnsupported`) — the region string
+  crosses a trust boundary, so only the closed `SupportedRegions` set
+  (`au`, `eu`, `us`; case-insensitive) is accepted. An unrecognized value is
+  never persisted verbatim, where it would later resolve to no cell at all.
+- **The residency invariant** (`ErrRegionForeign`) — the pin must name the
+  region THIS cell serves (`FISHHAWKD_HOME_REGION`, passed to
+  `NewRegionPinner`). A valid EU pin arriving at a US cell is a routing fault:
+  honoring it would place EU data in the US. An **empty** cell tag disables the
+  check — the single-region deployment where every cell is the only cell.
+- **The replay bound** (`ErrRegionConflict`) — `home_region` is
+  **first-write-wins**. A pin is accepted only when the column is currently
+  `NULL` or already equals the incoming value, so replaying an old signed pin
+  is idempotent and can never move an account between regions.
+
+A real DB read fault propagates rather than falling through to a write (which
+would create a duplicate account row on a transient error), and a nil querier
+reports `ErrRegionUnavailable` — the no-database posture, not a panic. On the
+existing-row path the account's `display_name` and `granularity` are carried
+through unchanged, so a pin never clobbers them.
+
+The HTTP surface is `GET /v0/onboarding/region-pin`
+(`internal/server/onboarding.go`), which verifies the handoff signature and
+expiry before calling `Pin`.
