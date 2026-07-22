@@ -142,6 +142,47 @@ func (q *Queries) ListAccountMembers(ctx context.Context, accountID uuid.UUID) (
 	return items, nil
 }
 
+const listAccountsByAccountKey = `-- name: ListAccountsByAccountKey :many
+SELECT id, provider, account_key, display_name, granularity, home_region, created_at, updated_at FROM accounts
+ WHERE account_key = $1
+ ORDER BY provider ASC
+`
+
+// The provider-discriminator lookup for the per-repo conventions loader
+// (E45.16 / #2022): keyed by account_key ALONE — the provider is exactly what
+// the caller is resolving. UNIQUE(provider, account_key) permits the same key
+// under both providers, so this can return more than one row; the resolver
+// treats that as ambiguous (found=false), never an arbitrary first row. Stable
+// provider order keeps the multi-row result deterministic anyway.
+func (q *Queries) ListAccountsByAccountKey(ctx context.Context, accountKey string) ([]Account, error) {
+	rows, err := q.db.Query(ctx, listAccountsByAccountKey, accountKey)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Account
+	for rows.Next() {
+		var i Account
+		if err := rows.Scan(
+			&i.ID,
+			&i.Provider,
+			&i.AccountKey,
+			&i.DisplayName,
+			&i.Granularity,
+			&i.HomeRegion,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listAutoJoinAccountsByKeys = `-- name: ListAutoJoinAccountsByKeys :many
 SELECT id, account_key, auto_join_role
   FROM accounts

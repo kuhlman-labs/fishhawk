@@ -26,6 +26,17 @@ SELECT * FROM accounts WHERE id = $1;
 -- name: GetAccountByKey :one
 SELECT * FROM accounts WHERE provider = $1 AND account_key = $2;
 
+-- name: ListAccountsByAccountKey :many
+-- The provider-discriminator lookup for the per-repo conventions loader
+-- (E45.16 / #2022): keyed by account_key ALONE — the provider is exactly what
+-- the caller is resolving. UNIQUE(provider, account_key) permits the same key
+-- under both providers, so this can return more than one row; the resolver
+-- treats that as ambiguous (found=false), never an arbitrary first row. Stable
+-- provider order keeps the multi-row result deterministic anyway.
+SELECT * FROM accounts
+ WHERE account_key = $1
+ ORDER BY provider ASC;
+
 -- name: UpsertInstallation :one
 -- Idempotent create-or-update keyed on (provider, installation_ref). Carries
 -- the relocated forge_base_url / oauth_base_url endpoint columns (Amendment A1).
