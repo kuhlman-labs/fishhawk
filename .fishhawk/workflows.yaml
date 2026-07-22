@@ -60,7 +60,7 @@ workflows:
     # dogfood admission-time refusal once the period limit is exhausted.
     budgets:
       - period: weekly
-        limit_usd: 50
+        limit_usd: 1000
         warn_at: 0.8
         enforcement: advisory
     # Auto-retry once on CI failure (#276). The human approves the
