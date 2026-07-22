@@ -142,6 +142,10 @@ func (a *auditCapture) ListForRunByCategory(_ context.Context, _ uuid.UUID, _ st
 func (a *auditCapture) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
+func (a *auditCapture) ListGlobalByAccount(_ context.Context, _ *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *auditCapture) ListAll(_ context.Context, _ audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
 }

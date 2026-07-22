@@ -368,6 +368,10 @@ func (f *planReadyAuditFake) AppendGlobalChained(context.Context, audit.GlobalCh
 func (f *planReadyAuditFake) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
+func (f *planReadyAuditFake) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (f *planReadyAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
 }

@@ -6,9 +6,9 @@
 -- name: AppendAuditEntry :one
 INSERT INTO audit_entries (
     id, run_id, stage_id, ts, category, actor_kind, actor_subject,
-    payload, prev_hash, entry_hash
+    payload, prev_hash, entry_hash, account_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 RETURNING *;
 
 -- name: GetAuditEntry :one
@@ -31,20 +31,42 @@ SELECT * FROM audit_entries
 WHERE run_id = $1 AND category = $2
 ORDER BY sequence ASC;
 
--- name: GetLastGlobalAuditEntry :one
--- Mirror of GetLastAuditEntryForRun for the global chain partition
--- (E2.7 / #138). Used by AppendGlobalChained to fetch prev_hash for
--- the next non-run event (token issue/revoke, OAuth sign-in, etc.).
+-- name: GetLastGlobalAuditEntryForAccount :one
+-- Mirror of GetLastAuditEntryForRun for one tenant account's run-less
+-- chain partition (ADR-057 / #1828, was the single-partition
+-- GetLastGlobalAuditEntry, E2.7 / #138). Used by AppendGlobalChained
+-- to fetch prev_hash for the next non-run event (token issue/revoke,
+-- OAuth sign-in, etc.) within the account's chain. Served by the 0058
+-- partial index audit_entries_global_account_seq_idx.
 SELECT * FROM audit_entries
- WHERE run_id IS NULL
+ WHERE run_id IS NULL AND account_id = $1
+ ORDER BY sequence DESC
+ LIMIT 1;
+
+-- name: GetLastGlobalAuditEntryUntenanted :one
+-- The account_id IS NULL variant of GetLastGlobalAuditEntryForAccount:
+-- the untenanted legacy partition (historical rows plus writers with no
+-- resolvable account — the #1829 NULL-allow window) stays one chain of
+-- its own.
+SELECT * FROM audit_entries
+ WHERE run_id IS NULL AND account_id IS NULL
  ORDER BY sequence DESC
  LIMIT 1;
 
 -- name: ListGlobalAuditEntries :many
--- Used by compliance exports + the verifier to walk the global
--- chain in append order.
+-- Used by compliance exports + the verifier to walk the run-less
+-- partition (all accounts) in append order.
 SELECT * FROM audit_entries
  WHERE run_id IS NULL
+ ORDER BY sequence ASC;
+
+-- name: ListGlobalAuditEntriesByAccount :many
+-- One account's run-less chain partition in append order (ADR-057 /
+-- #1828); IS NOT DISTINCT FROM folds the untenanted partition in — a
+-- NULL $1 selects the account_id IS NULL rows. Feeds the per-account
+-- compliance-export groups and per-partition verification.
+SELECT * FROM audit_entries
+ WHERE run_id IS NULL AND account_id IS NOT DISTINCT FROM $1
  ORDER BY sequence ASC;
 
 -- name: ListAuditEntriesForRunChain :many
@@ -61,7 +83,8 @@ WITH RECURSIVE run_chain AS (
     WHERE ($2::boolean OR r.decomposed_from IS NULL)
 )
 SELECT ae.id, ae.sequence, ae.run_id, ae.stage_id, ae.ts, ae.category,
-       ae.actor_kind, ae.actor_subject, ae.payload, ae.prev_hash, ae.entry_hash
+       ae.actor_kind, ae.actor_subject, ae.payload, ae.prev_hash, ae.entry_hash,
+       ae.account_id
 FROM audit_entries ae
 JOIN run_chain rc ON ae.run_id = rc.id
 ORDER BY ae.sequence ASC;

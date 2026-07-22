@@ -16,10 +16,10 @@ const appendAuditEntry = `-- name: AppendAuditEntry :one
 
 INSERT INTO audit_entries (
     id, run_id, stage_id, ts, category, actor_kind, actor_subject,
-    payload, prev_hash, entry_hash
+    payload, prev_hash, entry_hash, account_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-RETURNING id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+RETURNING id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id
 `
 
 type AppendAuditEntryParams struct {
@@ -33,6 +33,7 @@ type AppendAuditEntryParams struct {
 	Payload      []byte             `json:"payload"`
 	PrevHash     *string            `json:"prev_hash"`
 	EntryHash    string             `json:"entry_hash"`
+	AccountID    *uuid.UUID         `json:"account_id"`
 }
 
 // Audit-entry queries consumed by the postgres adapter for the
@@ -51,6 +52,7 @@ func (q *Queries) AppendAuditEntry(ctx context.Context, arg AppendAuditEntryPara
 		arg.Payload,
 		arg.PrevHash,
 		arg.EntryHash,
+		arg.AccountID,
 	)
 	var i AuditEntry
 	err := row.Scan(
@@ -65,12 +67,13 @@ func (q *Queries) AppendAuditEntry(ctx context.Context, arg AppendAuditEntryPara
 		&i.Payload,
 		&i.PrevHash,
 		&i.EntryHash,
+		&i.AccountID,
 	)
 	return i, err
 }
 
 const getAuditEntry = `-- name: GetAuditEntry :one
-SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries WHERE id = $1
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries WHERE id = $1
 `
 
 func (q *Queries) GetAuditEntry(ctx context.Context, id uuid.UUID) (AuditEntry, error) {
@@ -88,12 +91,13 @@ func (q *Queries) GetAuditEntry(ctx context.Context, id uuid.UUID) (AuditEntry, 
 		&i.Payload,
 		&i.PrevHash,
 		&i.EntryHash,
+		&i.AccountID,
 	)
 	return i, err
 }
 
 const getLastAuditEntryForRun = `-- name: GetLastAuditEntryForRun :one
-SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
 WHERE run_id = $1
 ORDER BY sequence DESC
 LIMIT 1
@@ -115,22 +119,26 @@ func (q *Queries) GetLastAuditEntryForRun(ctx context.Context, runID *uuid.UUID)
 		&i.Payload,
 		&i.PrevHash,
 		&i.EntryHash,
+		&i.AccountID,
 	)
 	return i, err
 }
 
-const getLastGlobalAuditEntry = `-- name: GetLastGlobalAuditEntry :one
-SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
- WHERE run_id IS NULL
+const getLastGlobalAuditEntryForAccount = `-- name: GetLastGlobalAuditEntryForAccount :one
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
+ WHERE run_id IS NULL AND account_id = $1
  ORDER BY sequence DESC
  LIMIT 1
 `
 
-// Mirror of GetLastAuditEntryForRun for the global chain partition
-// (E2.7 / #138). Used by AppendGlobalChained to fetch prev_hash for
-// the next non-run event (token issue/revoke, OAuth sign-in, etc.).
-func (q *Queries) GetLastGlobalAuditEntry(ctx context.Context) (AuditEntry, error) {
-	row := q.db.QueryRow(ctx, getLastGlobalAuditEntry)
+// Mirror of GetLastAuditEntryForRun for one tenant account's run-less
+// chain partition (ADR-057 / #1828, was the single-partition
+// GetLastGlobalAuditEntry, E2.7 / #138). Used by AppendGlobalChained
+// to fetch prev_hash for the next non-run event (token issue/revoke,
+// OAuth sign-in, etc.) within the account's chain. Served by the 0058
+// partial index audit_entries_global_account_seq_idx.
+func (q *Queries) GetLastGlobalAuditEntryForAccount(ctx context.Context, accountID *uuid.UUID) (AuditEntry, error) {
+	row := q.db.QueryRow(ctx, getLastGlobalAuditEntryForAccount, accountID)
 	var i AuditEntry
 	err := row.Scan(
 		&i.ID,
@@ -144,6 +152,38 @@ func (q *Queries) GetLastGlobalAuditEntry(ctx context.Context) (AuditEntry, erro
 		&i.Payload,
 		&i.PrevHash,
 		&i.EntryHash,
+		&i.AccountID,
+	)
+	return i, err
+}
+
+const getLastGlobalAuditEntryUntenanted = `-- name: GetLastGlobalAuditEntryUntenanted :one
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
+ WHERE run_id IS NULL AND account_id IS NULL
+ ORDER BY sequence DESC
+ LIMIT 1
+`
+
+// The account_id IS NULL variant of GetLastGlobalAuditEntryForAccount:
+// the untenanted legacy partition (historical rows plus writers with no
+// resolvable account — the #1829 NULL-allow window) stays one chain of
+// its own.
+func (q *Queries) GetLastGlobalAuditEntryUntenanted(ctx context.Context) (AuditEntry, error) {
+	row := q.db.QueryRow(ctx, getLastGlobalAuditEntryUntenanted)
+	var i AuditEntry
+	err := row.Scan(
+		&i.ID,
+		&i.Sequence,
+		&i.RunID,
+		&i.StageID,
+		&i.Ts,
+		&i.Category,
+		&i.ActorKind,
+		&i.ActorSubject,
+		&i.Payload,
+		&i.PrevHash,
+		&i.EntryHash,
+		&i.AccountID,
 	)
 	return i, err
 }
@@ -157,7 +197,8 @@ WITH RECURSIVE run_chain AS (
     WHERE ($2::boolean OR r.decomposed_from IS NULL)
 )
 SELECT ae.id, ae.sequence, ae.run_id, ae.stage_id, ae.ts, ae.category,
-       ae.actor_kind, ae.actor_subject, ae.payload, ae.prev_hash, ae.entry_hash
+       ae.actor_kind, ae.actor_subject, ae.payload, ae.prev_hash, ae.entry_hash,
+       ae.account_id
 FROM audit_entries ae
 JOIN run_chain rc ON ae.run_id = rc.id
 ORDER BY ae.sequence ASC
@@ -189,6 +230,7 @@ func (q *Queries) ListAuditEntriesForRunChain(ctx context.Context, arg ListAudit
 			&i.Payload,
 			&i.PrevHash,
 			&i.EntryHash,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}
@@ -201,7 +243,7 @@ func (q *Queries) ListAuditEntriesForRunChain(ctx context.Context, arg ListAudit
 }
 
 const listAuditEntriesAll = `-- name: ListAuditEntriesAll :many
-SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
  WHERE ($1::text IS NULL OR category = $1::text)
    AND ($2::uuid  IS NULL OR run_id   = $2::uuid)
    AND ($3::uuid IS NULL OR account_id = $3::uuid OR account_id IS NULL)
@@ -244,6 +286,7 @@ func (q *Queries) ListAuditEntriesAll(ctx context.Context, arg ListAuditEntriesA
 			&i.Payload,
 			&i.PrevHash,
 			&i.EntryHash,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}
@@ -256,7 +299,7 @@ func (q *Queries) ListAuditEntriesAll(ctx context.Context, arg ListAuditEntriesA
 }
 
 const listAuditEntriesByCategory = `-- name: ListAuditEntriesByCategory :many
-SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
 WHERE run_id = $1 AND category = $2
 ORDER BY sequence ASC
 `
@@ -287,6 +330,7 @@ func (q *Queries) ListAuditEntriesByCategory(ctx context.Context, arg ListAuditE
 			&i.Payload,
 			&i.PrevHash,
 			&i.EntryHash,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}
@@ -299,7 +343,7 @@ func (q *Queries) ListAuditEntriesByCategory(ctx context.Context, arg ListAuditE
 }
 
 const listAuditEntriesForRun = `-- name: ListAuditEntriesForRun :many
-SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
 WHERE run_id = $1
 ORDER BY sequence ASC
 `
@@ -325,6 +369,7 @@ func (q *Queries) ListAuditEntriesForRun(ctx context.Context, runID *uuid.UUID) 
 			&i.Payload,
 			&i.PrevHash,
 			&i.EntryHash,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}
@@ -337,13 +382,13 @@ func (q *Queries) ListAuditEntriesForRun(ctx context.Context, runID *uuid.UUID) 
 }
 
 const listGlobalAuditEntries = `-- name: ListGlobalAuditEntries :many
-SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash FROM audit_entries
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
  WHERE run_id IS NULL
  ORDER BY sequence ASC
 `
 
-// Used by compliance exports + the verifier to walk the global
-// chain in append order.
+// Used by compliance exports + the verifier to walk the run-less
+// partition (all accounts) in append order.
 func (q *Queries) ListGlobalAuditEntries(ctx context.Context) ([]AuditEntry, error) {
 	rows, err := q.db.Query(ctx, listGlobalAuditEntries)
 	if err != nil {
@@ -365,6 +410,50 @@ func (q *Queries) ListGlobalAuditEntries(ctx context.Context) ([]AuditEntry, err
 			&i.Payload,
 			&i.PrevHash,
 			&i.EntryHash,
+			&i.AccountID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listGlobalAuditEntriesByAccount = `-- name: ListGlobalAuditEntriesByAccount :many
+SELECT id, sequence, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id FROM audit_entries
+ WHERE run_id IS NULL AND account_id IS NOT DISTINCT FROM $1
+ ORDER BY sequence ASC
+`
+
+// One account's run-less chain partition in append order (ADR-057 /
+// #1828); IS NOT DISTINCT FROM folds the untenanted partition in — a
+// NULL $1 selects the account_id IS NULL rows. Feeds the per-account
+// compliance-export groups and per-partition verification.
+func (q *Queries) ListGlobalAuditEntriesByAccount(ctx context.Context, accountID *uuid.UUID) ([]AuditEntry, error) {
+	rows, err := q.db.Query(ctx, listGlobalAuditEntriesByAccount, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []AuditEntry
+	for rows.Next() {
+		var i AuditEntry
+		if err := rows.Scan(
+			&i.ID,
+			&i.Sequence,
+			&i.RunID,
+			&i.StageID,
+			&i.Ts,
+			&i.Category,
+			&i.ActorKind,
+			&i.ActorSubject,
+			&i.Payload,
+			&i.PrevHash,
+			&i.EntryHash,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}

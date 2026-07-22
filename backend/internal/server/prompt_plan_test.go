@@ -192,6 +192,10 @@ func (a *planAuditRepo) AppendGlobalChained(context.Context, audit.GlobalChainAp
 func (a *planAuditRepo) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
+func (a *planAuditRepo) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (a *planAuditRepo) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return a.allEntries, nil
 }

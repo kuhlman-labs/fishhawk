@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,6 +53,19 @@ func makeStageInRun(t *testing.T, pool *pgxpool.Pool, runID uuid.UUID) uuid.UUID
 		t.Fatalf("create stage: %v", err)
 	}
 	return s.ID
+}
+
+// makeAccount inserts a tenant workspace account so audit entries can
+// carry a resolvable account_id FK (ADR-057 / #1828).
+func makeAccount(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+		id, "acct-"+id.String()[:8]); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	return id
 }
 
 func entryHash(seq int64, payload []byte) string {
@@ -662,6 +676,260 @@ func TestPostgres_ListGlobal_ReturnsOnlyGlobalEntries(t *testing.T) {
 		if e.RunID != nil {
 			t.Errorf("ListGlobal returned a row with RunID = %v, want nil", e.RunID)
 		}
+	}
+}
+
+// --- Per-account run-less chain tests (ADR-057 / #1828) ---
+
+// appendGlobal is the per-account shorthand for AppendGlobalChained.
+func appendGlobal(t *testing.T, repo audit.Repository, accountID *uuid.UUID, category string) *audit.Entry {
+	t.Helper()
+	e, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		Payload:   json.RawMessage(`{}`),
+		AccountID: accountID,
+	})
+	if err != nil {
+		t.Fatalf("AppendGlobalChained(%v): %v", accountID, err)
+	}
+	return e
+}
+
+// TestPostgres_AppendGlobalChained_PerAccountChainSeparation is the core
+// #1828 assertion: interleaved run-less appends for accounts A and B each
+// chain WITHIN their account — A's second entry links to A's first (not to
+// B's, which was appended in between), and B is its own nil-prev_hash
+// genesis. Also pins that account_id round-trips on the Entry and stays
+// OUT of the canonical hash (the unchanged HashInputs recompute matches).
+func TestPostgres_AppendGlobalChained_PerAccountChainSeparation(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	acctA, acctB := makeAccount(t, pool), makeAccount(t, pool)
+
+	a1 := appendGlobal(t, repo, &acctA, "api_token_issued")
+	b1 := appendGlobal(t, repo, &acctB, "api_token_issued")
+	a2 := appendGlobal(t, repo, &acctA, "api_token_revoked")
+
+	if a1.PrevHash != nil {
+		t.Errorf("A genesis PrevHash = %v, want nil", a1.PrevHash)
+	}
+	if b1.PrevHash != nil {
+		t.Errorf("B genesis PrevHash = %v, want nil (own partition, not chained to A)", b1.PrevHash)
+	}
+	if a2.PrevHash == nil || *a2.PrevHash != a1.EntryHash {
+		t.Errorf("A second entry PrevHash = %v, want A's first EntryHash %q (NOT B's %q)",
+			a2.PrevHash, a1.EntryHash, b1.EntryHash)
+	}
+	if a2.PrevHash != nil && *a2.PrevHash == b1.EntryHash {
+		t.Error("A second entry chained to B's entry — partitions leaked")
+	}
+	if a1.AccountID == nil || *a1.AccountID != acctA {
+		t.Errorf("A entry AccountID = %v, want %s", a1.AccountID, acctA)
+	}
+	if b1.AccountID == nil || *b1.AccountID != acctB {
+		t.Errorf("B entry AccountID = %v, want %s", b1.AccountID, acctB)
+	}
+
+	// Frozen-HashInputs pin: recomputing through the UNCHANGED canonical
+	// shape (no account field) must reproduce the stored hash — fails if
+	// account_id ever leaks into the hash.
+	recomputed, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID:        a2.RunID,
+		StageID:      a2.StageID,
+		Timestamp:    a2.Timestamp,
+		Category:     a2.Category,
+		ActorKind:    a2.ActorKind,
+		ActorSubject: a2.ActorSubject,
+		Payload:      a2.Payload,
+		PrevHash:     a2.PrevHash,
+	})
+	if err != nil {
+		t.Fatalf("ComputeEntryHash: %v", err)
+	}
+	if recomputed != a2.EntryHash {
+		t.Errorf("hash mismatch: account_id must not enter the canonical hash\n  stored:     %s\n  recomputed: %s",
+			a2.EntryHash, recomputed)
+	}
+}
+
+// TestPostgres_AppendGlobalChained_UntenantedPartitionIndependent pins the
+// nil-AccountID fallback: untenanted appends chain within the account_id
+// IS NULL partition (#1829 NULL-allow window) and are unaffected by
+// tenanted appends interleaved between them.
+func TestPostgres_AppendGlobalChained_UntenantedPartitionIndependent(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	acct := makeAccount(t, pool)
+
+	u1 := appendGlobal(t, repo, nil, "api_token_issued")
+	tenanted := appendGlobal(t, repo, &acct, "api_token_issued")
+	u2 := appendGlobal(t, repo, nil, "api_token_revoked")
+
+	if u1.PrevHash != nil {
+		t.Errorf("untenanted genesis PrevHash = %v, want nil", u1.PrevHash)
+	}
+	if u1.AccountID != nil {
+		t.Errorf("untenanted entry AccountID = %v, want nil", u1.AccountID)
+	}
+	if u2.PrevHash == nil || *u2.PrevHash != u1.EntryHash {
+		t.Errorf("untenanted second entry PrevHash = %v, want untenanted first EntryHash %q (NOT the tenanted %q)",
+			u2.PrevHash, u1.EntryHash, tenanted.EntryHash)
+	}
+}
+
+// assertLinearPartition walks one run-less partition and asserts it is a
+// single unforked chain: exactly one nil-prev_hash genesis, and every
+// later entry's prev_hash equals its predecessor's entry_hash.
+func assertLinearPartition(t *testing.T, repo audit.Repository, accountID *uuid.UUID, wantLen int) {
+	t.Helper()
+	entries, err := repo.ListGlobalByAccount(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("ListGlobalByAccount(%v): %v", accountID, err)
+	}
+	if len(entries) != wantLen {
+		t.Fatalf("partition %v: got %d entries, want %d", accountID, len(entries), wantLen)
+	}
+	genesis := 0
+	for i, e := range entries {
+		if e.PrevHash == nil {
+			genesis++
+			continue
+		}
+		if i == 0 {
+			t.Errorf("partition %v: first entry has non-nil PrevHash %q", accountID, *e.PrevHash)
+			continue
+		}
+		if *e.PrevHash != entries[i-1].EntryHash {
+			t.Errorf("partition %v: fork at index %d — PrevHash %s != prior EntryHash %s",
+				accountID, i, *e.PrevHash, entries[i-1].EntryHash)
+		}
+	}
+	if genesis != 1 {
+		t.Errorf("partition %v: %d nil-prev_hash genesis entries, want exactly 1 (forked chain)", accountID, genesis)
+	}
+}
+
+// TestPostgres_AppendGlobalChained_ConcurrentSameAccountNoFork is the
+// binding concurrency assertion for the advisory-lock serialization:
+// parallel first appends for the same fresh account must yield exactly one
+// nil-prev genesis with every other entry linked linearly behind it —
+// without pg_advisory_xact_lock, two writers both see the empty partition
+// and both write a genesis (fork), since no unique constraint catches it.
+func TestPostgres_AppendGlobalChained_ConcurrentSameAccountNoFork(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	acct := makeAccount(t, pool)
+
+	const N = 8
+	var wg sync.WaitGroup
+	wg.Add(N)
+	errs := make([]error, N)
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			_, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+				Timestamp: time.Now().UTC(),
+				Category:  "concurrent_global",
+				Payload:   json.RawMessage(`{}`),
+				AccountID: &acct,
+			})
+			errs[i] = err
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent append #%d: %v", i, err)
+		}
+	}
+	assertLinearPartition(t, repo, &acct, N)
+}
+
+// TestPostgres_AppendGlobalChained_ConcurrentUntenantedNoFork is the same
+// no-fork assertion for the untenanted NULL partition, serialized by the
+// fixed sentinel advisory-lock key. (pgtest hands every test its own
+// database clone, so the partition is fresh here.)
+func TestPostgres_AppendGlobalChained_ConcurrentUntenantedNoFork(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+
+	const N = 8
+	var wg sync.WaitGroup
+	wg.Add(N)
+	errs := make([]error, N)
+	for i := 0; i < N; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			_, err := repo.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+				Timestamp: time.Now().UTC(),
+				Category:  "concurrent_global",
+				Payload:   json.RawMessage(`{}`),
+			})
+			errs[i] = err
+		}()
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("concurrent untenanted append #%d: %v", i, err)
+		}
+	}
+	assertLinearPartition(t, repo, nil, N)
+}
+
+// TestPostgres_ListGlobalByAccount pins the partition-listing contract:
+// a non-nil account returns ONLY that account's run-less entries in
+// append order; nil returns ONLY the untenanted partition; per-run rows
+// never appear; and ListGlobal still returns the union.
+func TestPostgres_ListGlobalByAccount(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	acctA, acctB := makeAccount(t, pool), makeAccount(t, pool)
+
+	a1 := appendGlobal(t, repo, &acctA, "a_one")
+	appendGlobal(t, repo, &acctB, "b_one")
+	u1 := appendGlobal(t, repo, nil, "u_one")
+	a2 := appendGlobal(t, repo, &acctA, "a_two")
+	if _, err := repo.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "per_run",
+		Payload:   json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	gotA, err := repo.ListGlobalByAccount(context.Background(), &acctA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotA) != 2 || gotA[0].ID != a1.ID || gotA[1].ID != a2.ID {
+		t.Errorf("ListGlobalByAccount(A) = %d entries, want [a1, a2] in append order", len(gotA))
+	}
+	for _, e := range gotA {
+		if e.AccountID == nil || *e.AccountID != acctA {
+			t.Errorf("ListGlobalByAccount(A) leaked entry with AccountID %v", e.AccountID)
+		}
+	}
+
+	gotU, err := repo.ListGlobalByAccount(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotU) != 1 || gotU[0].ID != u1.ID {
+		t.Errorf("ListGlobalByAccount(nil) = %d entries, want only the untenanted entry", len(gotU))
+	}
+
+	all, err := repo.ListGlobal(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 4 {
+		t.Errorf("ListGlobal = %d entries, want 4 (union of all partitions, no per-run rows)", len(all))
 	}
 }
 

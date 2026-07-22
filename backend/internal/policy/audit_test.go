@@ -32,6 +32,10 @@ func (f *fakeAuditRepo) ListGlobal(ctx context.Context) ([]*audit.Entry, error) 
 	return nil, nil
 }
 
+func (f *fakeAuditRepo) ListGlobalByAccount(ctx context.Context, accountID *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
+
 func (f *fakeAuditRepo) ListAll(ctx context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
 }

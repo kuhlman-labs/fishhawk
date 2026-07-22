@@ -926,6 +926,24 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		}
 	}
 
+	// 0058 (#1828, E44.4, ADR-057) added the partial index serving the
+	// per-account run-less chain's prev_hash lookup (run_id IS NULL AND
+	// account_id = $1 ORDER BY sequence DESC LIMIT 1). Shape pin: the index
+	// exists, is partial on run_id IS NULL, and leads on account_id.
+	var globalAccountIdxDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT indexdef FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_global_account_seq_idx'`,
+	).Scan(&globalAccountIdxDef); err != nil {
+		t.Fatalf("query audit_entries_global_account_seq_idx (missing?): %v", err)
+	}
+	if !strings.Contains(globalAccountIdxDef, "run_id IS NULL") {
+		t.Errorf("audit_entries_global_account_seq_idx indexdef = %q, want partial WHERE run_id IS NULL (0058)", globalAccountIdxDef)
+	}
+	if !strings.Contains(globalAccountIdxDef, "account_id") {
+		t.Errorf("audit_entries_global_account_seq_idx indexdef = %q, want account_id key column (0058)", globalAccountIdxDef)
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -954,13 +972,14 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 	defer pool.Close()
 
-	// MigrateDown rolls back one step. 0057 (#1830, E44.6, ADR-057) is now the
-	// latest migration: it enabled + FORCEd row-level security with a
-	// <table>_tenant_isolation policy on every account-scoped table. So its
-	// one-step rollback DROPs exactly those policies and disables RLS —
-	// touching nothing else. 0056's (#1827, E44.3) sessions.account_id,
-	// account_members.origin, and accounts.auto_join_role columns now SURVIVE,
-	// as do 0055's (#1825, E44.1) account_members table, its eight root-table
+	// MigrateDown rolls back one step. 0058 (#1828, E44.4, ADR-057) is now the
+	// latest migration: it created the audit_entries_global_account_seq_idx
+	// partial index for the per-account run-less audit chain. So its one-step
+	// rollback DROPs exactly that index — touching nothing else. 0057's
+	// (#1830, E44.6) RLS ENABLE+FORCE and its <table>_tenant_isolation
+	// policies now SURVIVE, as do 0056's (#1827, E44.3) sessions.account_id,
+	// account_members.origin, and accounts.auto_join_role columns, 0055's
+	// (#1825, E44.1) account_members table, its eight root-table
 	// account_id columns, and its Amendment A1 endpoint relocation, 0054's
 	// (#1861, ADR-058 / E45.8) runs_runner_kind_check 'gitlab_ci'
 	// member, 0053's (#1912) stages_state_check 'awaiting_host_dispatch' member,
@@ -977,10 +996,20 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// 0037's (#1385) artifacts_kind_check 'deployment', 0036's (#1346)
 	// runs.runner_kind_resolved column, etc.
 	//
-	// This is the binding TestMigrateDown flip for 0057: RLS and every
-	// tenant-isolation policy must be ABSENT, while 0056's three columns (now a
-	// prior migration) SURVIVE alongside 0055's account_members table and eight
-	// account_id columns.
+	// This is the binding TestMigrateDown flip for 0058: the
+	// audit_entries_global_account_seq_idx index must be ABSENT, while 0057's
+	// RLS + policies (now a prior migration) SURVIVE alongside 0056's three
+	// columns, 0055's account_members table and eight account_id columns.
+	var globalAccountIdxDown int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_global_account_seq_idx'`,
+	).Scan(&globalAccountIdxDown); err != nil {
+		t.Fatalf("query audit_entries_global_account_seq_idx: %v", err)
+	}
+	if globalAccountIdxDown != 0 {
+		t.Errorf("audit_entries_global_account_seq_idx count after MigrateDown = %d, want 0 (0058 rolled back)", globalAccountIdxDown)
+	}
 	var accountsTableDown, installationsTableDown int
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'accounts'`,
@@ -988,7 +1017,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query accounts table: %v", err)
 	}
 	if accountsTableDown != 1 {
-		t.Errorf("'accounts' table count after MigrateDown = %d, want 1 (0052 still applied; only 0057 rolled back)", accountsTableDown)
+		t.Errorf("'accounts' table count after MigrateDown = %d, want 1 (0052 still applied; only 0058 rolled back)", accountsTableDown)
 	}
 	if err := pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'installations'`,
@@ -996,10 +1025,10 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query installations table: %v", err)
 	}
 	if installationsTableDown != 1 {
-		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0052 still applied; only 0057 rolled back)", installationsTableDown)
+		t.Errorf("'installations' table count after MigrateDown = %d, want 1 (0052 still applied; only 0058 rolled back)", installationsTableDown)
 	}
-	// 0057 rolled back: RLS is disabled (and un-FORCEd) and every
-	// <table>_tenant_isolation policy is GONE on all ten tables.
+	// 0057 (now a prior migration) SURVIVES: RLS stays ENABLEd + FORCEd and
+	// every <table>_tenant_isolation policy remains on all ten tables.
 	for _, tbl := range []string{
 		"runs", "campaigns", "refinement_drafts", "refinement_decisions",
 		"refinement_filing_sessions", "refinement_filed_items", "api_tokens",
@@ -1011,17 +1040,18 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		).Scan(&rowSec, &forceSec); err != nil {
 			t.Fatalf("query %s pg_class RLS flags: %v", tbl, err)
 		}
-		if rowSec || forceSec {
-			t.Errorf("%s relrowsecurity=%v relforcerowsecurity=%v after MigrateDown, want false/false (0057 rolled back)", tbl, rowSec, forceSec)
+		if !rowSec || !forceSec {
+			t.Errorf("%s relrowsecurity=%v relforcerowsecurity=%v after MigrateDown, want true/true (0057 still applied; only 0058 rolled back)", tbl, rowSec, forceSec)
 		}
 		var polCount int
 		if err := pool.QueryRow(context.Background(),
-			`SELECT count(*) FROM pg_policies WHERE tablename = $1`, tbl,
+			`SELECT count(*) FROM pg_policies WHERE tablename = $1 AND policyname = $2`,
+			tbl, tbl+"_tenant_isolation",
 		).Scan(&polCount); err != nil {
 			t.Fatalf("query %s policies: %v", tbl, err)
 		}
-		if polCount != 0 {
-			t.Errorf("%s policy count after MigrateDown = %d, want 0 (0057 rolled back)", tbl, polCount)
+		if polCount != 1 {
+			t.Errorf("%s_tenant_isolation policy count after MigrateDown = %d, want 1 (0057 still applied; only 0058 rolled back)", tbl, polCount)
 		}
 	}
 	// 0056 (now a prior migration) SURVIVES: sessions.account_id,
@@ -1039,7 +1069,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 			t.Fatalf("query %s.%s column: %v", col.table, col.column, err)
 		}
 		if n != 1 {
-			t.Errorf("%s.%s count after MigrateDown = %d, want 1 (0056 still applied; only 0057 rolled back)", col.table, col.column, n)
+			t.Errorf("%s.%s count after MigrateDown = %d, want 1 (0056 still applied; only 0058 rolled back)", col.table, col.column, n)
 		}
 	}
 	// 0055 (now a prior migration) SURVIVES: account_members exists and every
@@ -1051,7 +1081,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query account_members table: %v", err)
 	}
 	if accountMembersTableDown != 1 {
-		t.Errorf("'account_members' table count after MigrateDown = %d, want 1 (0055 still applied; only 0057 rolled back)", accountMembersTableDown)
+		t.Errorf("'account_members' table count after MigrateDown = %d, want 1 (0055 still applied; only 0058 rolled back)", accountMembersTableDown)
 	}
 	for _, tbl := range []string{
 		"runs", "campaigns", "refinement_drafts", "refinement_decisions",
@@ -1404,14 +1434,14 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 		t.Fatalf("query runs_runner_kind_check constraint def: %v", err)
 	}
 	if !strings.Contains(runnerKindCheckDef, "gitlab_ci") {
-		t.Errorf("runs_runner_kind_check after MigrateDown dropped 'gitlab_ci' (0054 still applied; only 0057 rolled back): %s", runnerKindCheckDef)
+		t.Errorf("runs_runner_kind_check after MigrateDown dropped 'gitlab_ci' (0054 still applied; only 0058 rolled back): %s", runnerKindCheckDef)
 	}
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
 		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'gitlab_ci')`,
 		uuid.New(),
 	); err != nil {
-		t.Errorf("insert runner_kind='gitlab_ci' run after MigrateDown failed, want success (0054 survives; only 0057 rolled back): %v", err)
+		t.Errorf("insert runner_kind='gitlab_ci' run after MigrateDown failed, want success (0054 survives; only 0058 rolled back): %v", err)
 	}
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
@@ -1743,7 +1773,8 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0057 (drop the RLS policies + disable RLS — purely
+	// Step down past 0058 (drop the audit_entries_global_account_seq_idx
+	// partial index — inert re: campaigns) then 0057 (drop the RLS policies + disable RLS — purely
 	// declarative, inert re: campaigns) then 0056 (drop sessions.account_id + account_members.origin +
 	// accounts.auto_join_role — inert re: campaigns) then 0055 (drop account_members + the eight account_id columns +
 	// reverse the endpoint relocation — inert re: campaigns; no paused row holds
@@ -1763,6 +1794,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0058) failed: %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0057) failed: %v", err)
 	}
@@ -1850,7 +1884,8 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0057 (the RLS policies, inert re: stages —
+	// Apply everything, then roll 0058 (the run-less-chain partial index,
+	// inert re: stages), 0057 (the RLS policies, inert re: stages —
 	// this test connects as the superuser owner anyway), 0056
 	// (sessions.account_id + origin + auto_join_role, inert re: stages), 0055
 	// (account_members + account_id + endpoint relocation, inert re: stages),
@@ -1859,6 +1894,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0058 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0057 to reach 0053): %v", err)
@@ -1964,11 +2002,15 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 		t.Errorf("re-opened local stage (started_at set) state after backfill = %q, want dispatched (conservatively skipped)", got)
 	}
 
-	// Down reverses the backfill: roll back 0057 (the RLS policies, inert re:
+	// Down reverses the backfill: roll back 0058 (the run-less-chain partial
+	// index, inert re: stages) then 0057 (the RLS policies, inert re:
 	// stages) then 0056 (sessions.account_id + origin + auto_join_role, inert
 	// re: stages) then 0055 (account_members + account_id + endpoint
 	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
 	// inert re: stages) then 0053, and the flipped row returns to dispatched.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0058 to reach 0053): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0057 to reach 0053): %v", err)
 	}
@@ -2011,12 +2053,15 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0057, 0056 and 0055 back so we can seed a
+	// Apply everything, then roll 0058, 0057, 0056 and 0055 back so we can seed a
 	// run+installation pair under the pre-0055 schema (accounts + installations
 	// exist at 0052; runs.installation_id exists at 0005; runs.account_id does
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0058 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0057 to reach 0054): %v", err)

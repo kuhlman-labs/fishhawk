@@ -51,6 +51,11 @@ func (BaseFake) ListGlobal(_ context.Context) ([]*Entry, error) {
 	return nil, nil
 }
 
+// ListGlobalByAccount returns nil, nil.
+func (BaseFake) ListGlobalByAccount(_ context.Context, _ *uuid.UUID) ([]*Entry, error) {
+	return nil, nil
+}
+
 // LastForRun returns nil, ErrNotFound.
 func (BaseFake) LastForRun(_ context.Context, _ uuid.UUID) (*Entry, error) {
 	return nil, ErrNotFound

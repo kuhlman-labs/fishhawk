@@ -29,6 +29,11 @@ type AppendParams struct {
 	Payload      json.RawMessage
 	PrevHash     *string
 	EntryHash    string
+	// AccountID stamps the tenant workspace account on the row
+	// (ADR-057 / #1828). nil = untenanted. Callers of the raw path
+	// own chain correctness, so they also own passing the account
+	// their PrevHash lookup was scoped to.
+	AccountID *uuid.UUID
 }
 
 // Repository is the append-only audit log. Note the deliberate
@@ -48,11 +53,16 @@ type Repository interface {
 	Append(ctx context.Context, p AppendParams) (*Entry, error)
 	AppendChained(ctx context.Context, p ChainAppendParams) (*Entry, error)
 
-	// AppendGlobalChained writes an entry to the global chain
-	// (E2.7) — events not tied to a specific workflow run.
-	// Computes PrevHash from the previous global-chain entry +
-	// EntryHash inside a transaction. RunID on the resulting
-	// Entry is nil; StageID is also nil for these entries.
+	// AppendGlobalChained writes an entry to the run-less ("global")
+	// chain (E2.7) — events not tied to a specific workflow run.
+	// Since ADR-057 / #1828 the run-less partition is keyed by
+	// account_id: PrevHash is computed from the previous entry
+	// WITHIN p.AccountID's partition (nil = the untenanted
+	// account_id IS NULL partition), each partition an independent
+	// chain from a nil-prev_hash genesis. Appends to one partition
+	// are serialized by a Postgres advisory transaction lock so
+	// concurrent writers cannot fork the chain. RunID on the
+	// resulting Entry is nil; StageID is also nil for these entries.
 	AppendGlobalChained(ctx context.Context, p GlobalChainAppendParams) (*Entry, error)
 
 	Get(ctx context.Context, id uuid.UUID) (*Entry, error)
@@ -61,9 +71,18 @@ type Repository interface {
 	// sequence ascending. Used for run-detail UI and verification.
 	ListForRun(ctx context.Context, runID uuid.UUID) ([]*Entry, error)
 
-	// ListGlobal returns every global-chain entry in append order.
-	// Used by the compliance export and the audit verifier.
+	// ListGlobal returns every run-less entry in append order,
+	// across ALL account partitions. Used by the compliance export
+	// and the audit verifier; per-partition verification walks
+	// ListGlobalByAccount instead.
 	ListGlobal(ctx context.Context) ([]*Entry, error)
+
+	// ListGlobalByAccount returns the run-less entries of ONE chain
+	// partition in append order (ADR-057 / #1828): accountID's
+	// partition when non-nil, the untenanted account_id IS NULL
+	// partition when nil. Each result is an independently
+	// verifiable chain from a nil-prev_hash genesis.
+	ListGlobalByAccount(ctx context.Context, accountID *uuid.UUID) ([]*Entry, error)
 
 	// LastForRun returns the most recently appended entry in the run,
 	// or ErrNotFound if no entries exist yet.
