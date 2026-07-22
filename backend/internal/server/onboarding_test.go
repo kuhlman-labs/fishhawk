@@ -6,11 +6,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
+	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/directory/pkg/handoff"
 )
 
 // onboardingReviewersSpecYAML is a valid feature_change spec whose plan stage
@@ -553,5 +560,382 @@ func TestCollectSpecReviewers_Dedup(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("tuple[%d] = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cell-side region pin (ADR-062, E44.7 / #1831)
+// ---------------------------------------------------------------------------
+
+// fakeAccountsQuerier is an in-memory accounts table keyed by (provider,
+// account_key), mirroring UpsertAccount's ON CONFLICT semantics closely enough
+// for the pin path.
+type fakeAccountsQuerier struct {
+	rows    map[string]accountdb.Account
+	upserts int
+}
+
+func newFakeAccountsQuerier() *fakeAccountsQuerier {
+	return &fakeAccountsQuerier{rows: map[string]accountdb.Account{}}
+}
+
+func (f *fakeAccountsQuerier) k(provider, key string) string { return provider + "\x00" + key }
+
+func (f *fakeAccountsQuerier) seed(provider, key, region string) {
+	f.rows[f.k(provider, key)] = accountdb.Account{
+		ID: uuid.New(), Provider: provider, AccountKey: key,
+		Granularity: "enterprise", HomeRegion: &region,
+	}
+}
+
+func (f *fakeAccountsQuerier) GetAccountByKey(_ context.Context, arg accountdb.GetAccountByKeyParams) (accountdb.Account, error) {
+	a, ok := f.rows[f.k(arg.Provider, arg.AccountKey)]
+	if !ok {
+		return accountdb.Account{}, pgx.ErrNoRows
+	}
+	return a, nil
+}
+
+func (f *fakeAccountsQuerier) UpsertAccount(_ context.Context, arg accountdb.UpsertAccountParams) (accountdb.Account, error) {
+	f.upserts++
+	a := accountdb.Account{
+		ID: arg.ID, Provider: arg.Provider, AccountKey: arg.AccountKey,
+		DisplayName: arg.DisplayName, Granularity: arg.Granularity, HomeRegion: arg.HomeRegion,
+	}
+	f.rows[f.k(arg.Provider, arg.AccountKey)] = a
+	return a, nil
+}
+
+var regionPinTestSecret = []byte("region-handoff-secret")
+
+// newRegionPinServer builds a cell serving cellRegion with the shared handoff
+// secret wired. A nil querier is the no-account-store deployment.
+func newRegionPinServer(t *testing.T, q account.RegionQuerier, cellRegion string, secret []byte) *Server {
+	t.Helper()
+	srv := New(Config{Addr: "127.0.0.1:0"})
+	var pinner *account.RegionPinner
+	if q != nil {
+		pinner = account.NewRegionPinner(q, cellRegion)
+	}
+	srv.ConfigureRegionPin(pinner, secret)
+	return srv
+}
+
+// regionPinURL builds the redirect target the REAL directory codec would emit,
+// then returns just its path+query so a test can drive the cell handler with
+// exactly the bytes that crossed the wire. This deliberately goes through
+// handoff.AppendTo rather than hand-assembling parameters: the serialization
+// boundary between the two sides is the thing under test.
+func regionPinURL(t *testing.T, secret []byte, p handoff.Params, extra url.Values) string {
+	t.Helper()
+	loc, err := handoff.AppendTo("https://cell.example.com", "/v0/onboarding/region-pin", extra, secret, p)
+	if err != nil {
+		t.Fatalf("handoff.AppendTo: %v", err)
+	}
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse redirect location: %v", err)
+	}
+	return u.RequestURI()
+}
+
+func validPin() handoff.Params {
+	return handoff.Params{
+		Provider:   "github",
+		AccountKey: "acme",
+		HomeRegion: "eu",
+		ExpiresAt:  time.Now().Add(2 * time.Minute),
+		Nonce:      "nonce-1",
+	}
+}
+
+func decodeRegionPin(t *testing.T, body []byte) regionPinResponse {
+	t.Helper()
+	var got regionPinResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode region pin response: %v (%s)", err, body)
+	}
+	return got
+}
+
+func regionPinErrorCode(t *testing.T, body []byte) string {
+	t.Helper()
+	var env errorEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode error envelope: %v (%s)", err, body)
+	}
+	return env.Error.Code
+}
+
+// The cross-boundary happy path required by binding condition (7): the request
+// is built by the REAL directory codec, routed through the registered mux, and
+// asserted to have PERSISTED accounts.home_region — handler → account → db.
+func TestRegionPin_StampsHomeRegionThroughTheRealCodec(t *testing.T) {
+	q := newFakeAccountsQuerier()
+	s := newRegionPinServer(t, q, "eu", regionPinTestSecret)
+
+	// The directory's 302 preserves the original App-install parameters; they
+	// ride along and must not disturb the pin.
+	target := regionPinURL(t, regionPinTestSecret, validPin(), url.Values{
+		"installation_id": {"4242"}, "setup_action": {"install"},
+	})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got := decodeRegionPin(t, w.Body.Bytes())
+	if got.HomeRegion != "eu" || got.Provider != "github" || got.AccountKey != "acme" {
+		t.Fatalf("response = %+v", got)
+	}
+	if got.AccountID == "" {
+		t.Error("account_id is empty")
+	}
+	// The observable done-means: the row exists with home_region persisted.
+	row, err := q.GetAccountByKey(context.Background(), accountdb.GetAccountByKeyParams{Provider: "github", AccountKey: "acme"})
+	if err != nil {
+		t.Fatalf("account row not persisted: %v", err)
+	}
+	if row.HomeRegion == nil || *row.HomeRegion != "eu" {
+		t.Fatalf("persisted home_region = %v, want eu", row.HomeRegion)
+	}
+}
+
+// The replay bound (binding condition 3): replaying the same signed pin is
+// idempotent, and no pin can move an account's region.
+func TestRegionPin_ReplayBound(t *testing.T) {
+	t.Run("replay_is_idempotent", func(t *testing.T) {
+		q := newFakeAccountsQuerier()
+		s := newRegionPinServer(t, q, "eu", regionPinTestSecret)
+		target := regionPinURL(t, regionPinTestSecret, validPin(), nil)
+		for i := range 2 {
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("replay #%d status = %d, want 200:\n%s", i, w.Code, w.Body.String())
+			}
+			if got := decodeRegionPin(t, w.Body.Bytes()); got.HomeRegion != "eu" {
+				t.Fatalf("replay #%d home_region = %q", i, got.HomeRegion)
+			}
+		}
+	})
+
+	t.Run("cannot_move_an_existing_region", func(t *testing.T) {
+		q := newFakeAccountsQuerier()
+		q.seed("github", "acme", "eu")
+		// Untagged cell, so the residency check cannot be what rejects here.
+		s := newRegionPinServer(t, q, "", regionPinTestSecret)
+		p := validPin()
+		p.HomeRegion = "us"
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, regionPinURL(t, regionPinTestSecret, p, nil), nil))
+
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		if code := regionPinErrorCode(t, w.Body.Bytes()); code != "region_pin_conflict" {
+			t.Errorf("code = %q, want region_pin_conflict", code)
+		}
+		if q.upserts != 0 {
+			t.Errorf("a rejected pin must write nothing; got %d upserts", q.upserts)
+		}
+		row, _ := q.GetAccountByKey(context.Background(), accountdb.GetAccountByKeyParams{Provider: "github", AccountKey: "acme"})
+		if row.HomeRegion == nil || *row.HomeRegion != "eu" {
+			t.Fatalf("home_region moved to %v", row.HomeRegion)
+		}
+	})
+}
+
+// The residency invariant (binding condition 4): a VALID EU pin reaching a US
+// cell fails closed.
+func TestRegionPin_ForeignRegionIsMisdirected(t *testing.T) {
+	q := newFakeAccountsQuerier()
+	s := newRegionPinServer(t, q, "us", regionPinTestSecret)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, regionPinURL(t, regionPinTestSecret, validPin(), nil), nil))
+
+	if w.Code != http.StatusMisdirectedRequest {
+		t.Fatalf("status = %d, want 421:\n%s", w.Code, w.Body.String())
+	}
+	if code := regionPinErrorCode(t, w.Body.Bytes()); code != "region_pin_misdirected" {
+		t.Errorf("code = %q, want region_pin_misdirected", code)
+	}
+	if q.upserts != 0 {
+		t.Errorf("a misdirected pin must write nothing; got %d upserts", q.upserts)
+	}
+}
+
+// Every handoff rejection mode (binding condition 2), one case each, all
+// asserting that nothing was persisted.
+func TestRegionPin_HandoffRejections(t *testing.T) {
+	mutate := func(t *testing.T, fn func(url.Values)) string {
+		t.Helper()
+		target := regionPinURL(t, regionPinTestSecret, validPin(), nil)
+		u, err := url.Parse(target)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		q := u.Query()
+		fn(q)
+		u.RawQuery = q.Encode()
+		return u.RequestURI()
+	}
+
+	expiredPin := validPin()
+	expiredPin.ExpiresAt = time.Now().Add(-time.Second)
+
+	tests := []struct {
+		name   string
+		target func(t *testing.T) string
+		status int
+		code   string
+	}{
+		{
+			name:   "absent",
+			target: func(*testing.T) string { return "/v0/onboarding/region-pin" },
+			status: http.StatusBadRequest, code: "validation_failed",
+		},
+		{
+			name:   "unsigned",
+			target: func(t *testing.T) string { return mutate(t, func(v url.Values) { v.Del(handoff.ParamSignature) }) },
+			status: http.StatusForbidden, code: "region_pin_rejected",
+		},
+		{
+			name: "forged_signature",
+			target: func(t *testing.T) string {
+				return mutate(t, func(v url.Values) { v.Set(handoff.ParamSignature, strings.Repeat("ab", 32)) })
+			},
+			status: http.StatusForbidden, code: "region_pin_rejected",
+		},
+		{
+			name: "tampered_region",
+			target: func(t *testing.T) string {
+				return mutate(t, func(v url.Values) { v.Set(handoff.ParamHomeRegion, "us") })
+			},
+			status: http.StatusForbidden, code: "region_pin_rejected",
+		},
+		{
+			name: "tampered_account_key",
+			target: func(t *testing.T) string {
+				return mutate(t, func(v url.Values) { v.Set(handoff.ParamAccountKey, "someone-else") })
+			},
+			status: http.StatusForbidden, code: "region_pin_rejected",
+		},
+		{
+			name: "signed_by_a_foreign_secret",
+			target: func(t *testing.T) string {
+				return regionPinURL(t, []byte("attacker-secret"), validPin(), nil)
+			},
+			status: http.StatusForbidden, code: "region_pin_rejected",
+		},
+		{
+			name:   "expired",
+			target: func(t *testing.T) string { return regionPinURL(t, regionPinTestSecret, expiredPin, nil) },
+			status: http.StatusForbidden, code: "region_pin_rejected",
+		},
+		{
+			name: "malformed_expiry",
+			target: func(t *testing.T) string {
+				return mutate(t, func(v url.Values) { v.Set(handoff.ParamExpiresAt, "soon") })
+			},
+			status: http.StatusBadRequest, code: "validation_failed",
+		},
+		{
+			name: "blank_nonce",
+			target: func(t *testing.T) string {
+				return mutate(t, func(v url.Values) { v.Set(handoff.ParamNonce, "") })
+			},
+			status: http.StatusBadRequest, code: "validation_failed",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			q := newFakeAccountsQuerier()
+			s := newRegionPinServer(t, q, "eu", regionPinTestSecret)
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, tc.target(t), nil))
+			if w.Code != tc.status {
+				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.status, w.Body.String())
+			}
+			if code := regionPinErrorCode(t, w.Body.Bytes()); code != tc.code {
+				t.Errorf("code = %q, want %q", code, tc.code)
+			}
+			if q.upserts != 0 {
+				t.Errorf("a rejected pin must write nothing; got %d upserts", q.upserts)
+			}
+		})
+	}
+}
+
+// An unsupported region survives signature verification (the directory signed
+// it) and must still be refused by the cell's own closed-set check.
+func TestRegionPin_UnsupportedRegionIsRejected(t *testing.T) {
+	q := newFakeAccountsQuerier()
+	// Untagged cell, so the residency check is not what rejects here.
+	s := newRegionPinServer(t, q, "", regionPinTestSecret)
+	p := validPin()
+	p.HomeRegion = "uk"
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, regionPinURL(t, regionPinTestSecret, p, nil), nil))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if code := regionPinErrorCode(t, w.Body.Bytes()); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if q.upserts != 0 {
+		t.Errorf("got %d upserts, want 0", q.upserts)
+	}
+}
+
+// Both unavailable postures fail closed rather than trusting the parameters.
+func TestRegionPin_UnavailableDeployments(t *testing.T) {
+	t.Run("no_account_store", func(t *testing.T) {
+		s := newRegionPinServer(t, nil, "eu", regionPinTestSecret)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, regionPinURL(t, regionPinTestSecret, validPin(), nil), nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+		}
+		if code := regionPinErrorCode(t, w.Body.Bytes()); code != "region_pin_unavailable" {
+			t.Errorf("code = %q, want region_pin_unavailable", code)
+		}
+	})
+
+	t.Run("no_shared_secret", func(t *testing.T) {
+		q := newFakeAccountsQuerier()
+		s := newRegionPinServer(t, q, "eu", nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, regionPinURL(t, regionPinTestSecret, validPin(), nil), nil))
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+		}
+		if code := regionPinErrorCode(t, w.Body.Bytes()); code != "region_pin_unavailable" {
+			t.Errorf("code = %q, want region_pin_unavailable", code)
+		}
+		if q.upserts != 0 {
+			t.Errorf("got %d upserts, want 0", q.upserts)
+		}
+	})
+}
+
+// The route is GET-only by construction (binding condition 10): a POST to the
+// same path is not routed to the pin handler.
+func TestRegionPin_IsGetOnly(t *testing.T) {
+	q := newFakeAccountsQuerier()
+	s := newRegionPinServer(t, q, "eu", regionPinTestSecret)
+	target := regionPinURL(t, regionPinTestSecret, validPin(), nil)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost, target, nil))
+	if w.Code == http.StatusOK {
+		t.Fatalf("POST reached the pin handler (status 200); the route must be GET-only")
+	}
+	if q.upserts != 0 {
+		t.Errorf("POST must write nothing; got %d upserts", q.upserts)
 	}
 }

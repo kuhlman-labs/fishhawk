@@ -2986,6 +2986,30 @@ components:
             enforcement is E44.5); a cookie session with no resolvable account
             is refused with 403 `account_unresolved` instead of returning null.
 
+    RegionPin:
+      type: object
+      description: |
+        An account's data-residency region as recorded on this cell (ADR-062,
+        E44.7). The shape is identical whether the pin created the account row
+        or re-confirmed an existing one — the first-write-wins replay bound
+        makes a repeated pin idempotent, so a replay is indistinguishable from
+        the original by design.
+      required: [provider, account_key, home_region, account_id]
+      properties:
+        provider:
+          type: string
+          enum: [github, gitlab]
+        account_key:
+          type: string
+          example: kuhlman-labs
+        home_region:
+          type: string
+          enum: [us, eu, au]
+          description: The region now recorded on `accounts.home_region`.
+        account_id:
+          type: string
+          format: uuid
+
     OnboardingReadiness:
       type: object
       description: |
@@ -3482,6 +3506,121 @@ paths:
               schema: { $ref: '#/components/schemas/OnboardingReadiness' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v0/onboarding/region-pin:
+    get:
+      operationId: pinAccountHomeRegion
+      summary: Record the directory-decided home region for an account
+      description: |
+        The cell side of directory-first onboarding (ADR-062, E44.7). The
+        GLOBAL directory decides an account's data-residency region, records
+        it, and issues an HTTP 302 into that region's cell with a signed
+        handoff appended to the original request URL — every original
+        parameter (`code`, `state`, `installation_id`, …) survives the
+        redirect. This endpoint is where that redirect lands: it stamps
+        `accounts.home_region` from the region the directory already decided.
+
+        The cell NEVER derives the region itself and NEVER writes back to the
+        directory. The data flow is strictly directory → cell.
+
+        Deliberately NOT session-gated: it is reached by a browser redirect
+        before any session exists, so the HMAC-SHA256 signature over the
+        handoff parameters IS the authentication. Three gates must all pass
+        before anything is persisted:
+
+        1. **Signature + expiry** — the pin was issued by the directory
+           holding the shared secret and is inside its short TTL. Absent,
+           unsigned, forged, tampered and expired pins are all rejected.
+        2. **Residency invariant** — the pinned region must equal THIS cell's
+           own configured home region (`FISHHAWKD_HOME_REGION`). A valid EU
+           pin arriving at a US cell fails closed with `421`.
+        3. **Replay bound** — `home_region` is first-write-wins: a pin is
+           accepted only when the column is currently NULL or already equals
+           the incoming value, so a replayed pin is idempotent and can never
+           move an account between regions (`409` otherwise).
+
+        GET by construction: a 302 must be browser-followable and the routed
+        onboarding surfaces carry no request body.
+      tags: [onboarding]
+      security: []
+      parameters:
+        - name: fh_provider
+          in: query
+          required: true
+          description: Forge provider the account is registered under.
+          schema: { type: string, enum: [github, gitlab] }
+        - name: fh_account_key
+          in: query
+          required: true
+          description: Forge-neutral account key (enterprise slug / org login / group path).
+          schema: { type: string }
+          example: kuhlman-labs
+        - name: fh_home_region
+          in: query
+          required: true
+          description: The region the directory assigned to this account.
+          schema: { type: string, enum: [us, eu, au] }
+        - name: fh_expires_at
+          in: query
+          required: true
+          description: Handoff expiry as a Unix timestamp (seconds). Short TTL.
+          schema: { type: integer, format: int64 }
+        - name: fh_nonce
+          in: query
+          required: true
+          description: Per-issue nonce, so two pins for the same account are distinguishable.
+          schema: { type: string }
+        - name: fh_sig
+          in: query
+          required: true
+          description: |
+            Hex HMAC-SHA256 over the canonically-ordered handoff fields, keyed
+            by the secret shared between the directory and the cell.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The account's home region as now recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RegionPin' }
+        '400':
+          description: |
+            The handoff is absent or malformed (`validation_failed`), or the
+            region is outside the supported set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `region_pin_rejected` — the handoff signature does not verify
+            (unsigned, forged, or tampered) or the pin has expired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `region_pin_conflict` — the replay bound: the account is already
+            pinned to a DIFFERENT home region. Region assignment is
+            first-write-wins and cannot be moved by a pin.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '421':
+          description: |
+            `region_pin_misdirected` — the residency invariant: the pin names a
+            region other than the one this cell serves. Re-resolve via the
+            directory; do not retry here.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `region_pin_unavailable` — this deployment has no account store or
+            no shared handoff secret wired, so no pin can be authenticated or
+            recorded. Fails closed rather than trusting the parameters.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/tokens:
     get:

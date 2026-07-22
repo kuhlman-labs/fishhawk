@@ -301,3 +301,18 @@ func TestWebhookGitLabRouteRegistered(t *testing.T) {
 		t.Errorf("status = %d, want 503 (routed but secret unconfigured)", rec.Code)
 	}
 }
+
+func TestRegionPinRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/onboarding/region-pin", nil)
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("GET /v0/onboarding/region-pin returned 404 — route not registered in handlers.go")
+	}
+	// No account store wired on a bare Config: the endpoint fails closed
+	// rather than accepting a pin it cannot record.
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (routed but no account store wired)", rec.Code)
+	}
+}
