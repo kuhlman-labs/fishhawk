@@ -51,3 +51,26 @@ config:
 #   mergeReconciler: true
 #   childCompletionSweeper: true
 #   invariantMonitor: true
+
+# Mode 1 (self-hosted, single-tenant) example — commented; the default is the
+# hosted multi-tenant posture. Uncomment `accountKey` alone for a GitHub
+# Enterprise install: fishhawkd bootstraps that one implicit account at startup
+# and every member of the enterprise auto-joins at sign-in (granularity and
+# auto-join role then default INTERNALLY to enterprise / member). Setting any
+# other key below WITHOUT accountKey is a startup error, not hosted mode.
+# See docs/deploy/self-hosted.md.
+# singleTenant:
+#   accountKey: acme-corp
+#   granularity: enterprise
+#   autoJoinRole: member
+#   displayName: Acme Corp
+#   provider: github
+#
+# GHES / EMU endpoint overrides that usually accompany Mode 1:
+# config:
+#   githubApiUrl: https://ghes.acme.example/api/v3
+#   githubUploadUrl: https://ghes.acme.example/api/uploads
+#   oauthAuthorizeUrl: https://ghes.acme.example/login/oauth/authorize
+#   oauthTokenUrl: https://ghes.acme.example/login/oauth/access_token
+#   oauthUserUrl: https://ghes.acme.example/api/v3/user
+#   oauthOrgsUrl: https://ghes.acme.example/api/v3/user/orgs

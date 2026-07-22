@@ -8,6 +8,12 @@ tenant data, artifacts, and inference.
 The directory holds no run state, no tenant data, and performs no inference, so
 nothing regulated crosses a region boundary through it.
 
+This page is the **protocol reference** for that topology. The operator
+procedures built on it — bring-up order, secret rotation, adding a region,
+homing an account — live in [hosted-regional.md](hosted-regional.md) (ADR-057
+Mode 2). The single-cell, single-customer alternative is
+[self-hosted.md](self-hosted.md) (Mode 1), which uses none of this machinery.
+
 ## The two planes
 
 | Plane | Binary | Holds | Count |
@@ -157,5 +163,6 @@ region-resident deployment using those adapters must constrain them there.
 
 ## Out of scope here
 
-Per-region deploy topology — helm values, k8s manifests, CI workflows, and the
+Operator procedure — see [hosted-regional.md](hosted-regional.md). Per-region
+deploy topology — helm values, k8s manifests, CI workflows, and the
 `fishhawk-directory` container image — is human-led and not part of this change.

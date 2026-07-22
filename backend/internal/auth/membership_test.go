@@ -3,11 +3,14 @@ package auth_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -725,4 +728,83 @@ func assertMemberRowCount(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID,
 	if n != want {
 		t.Errorf("account_members rows for %s = %d, want %d", accountID, n, want)
 	}
+}
+
+// CROSS-BOUNDARY (E44.9 / #1833): deployment config → persistence → auth
+// admission. The single-tenant profile's REAL bootstrap writes the one
+// implicit account, and the REAL MembershipResolver then admits a member of
+// it — the seam per-layer unit tests would both pass while it broke, since
+// the bootstrap's whole purpose is to make the resolver's admission set
+// non-empty on a fresh install.
+func TestMembershipResolver_AdmitsViaSingleTenantBootstrap(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	accountID, bootstrapped, err := account.EnsureSingleTenantAccount(context.Background(),
+		accountdb.New(pool), account.SingleTenantConfig{
+			AccountKey:   "acme-corp",
+			Granularity:  "organization",
+			AutoJoinRole: "member",
+		}, logger)
+	if err != nil {
+		t.Fatalf("EnsureSingleTenantAccount: %v", err)
+	}
+	if !bootstrapped {
+		t.Fatal("bootstrapped = false, want true")
+	}
+
+	// The signing-in user is a member of the configured org on the forge.
+	lister.keys = []string{"acme-corp"}
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want the bootstrapped account [%s]", got, accountID)
+	}
+
+	var origin string
+	var role *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT origin, role FROM account_members WHERE account_id = $1`, accountID,
+	).Scan(&origin, &role); err != nil {
+		t.Fatalf("read minted grant: %v", err)
+	}
+	if origin != auth.MemberOriginAutoJoin {
+		t.Errorf("origin = %q, want auto_join", origin)
+	}
+	if role == nil || *role != "member" {
+		t.Errorf("role = %v, want the profile's auto-join role 'member'", role)
+	}
+}
+
+// The negative twin: the bootstrapped account's granularity must still BIND
+// its key. A profile bootstrapped at ENTERPRISE granularity is not admitted by
+// an ORGANIZATION key of the same name (no EMU posture here), so the profile
+// cannot widen admission across granularities.
+func TestMembershipResolver_SingleTenantBootstrap_NonMatchingGranularityDenied(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	accountID, _, err := account.EnsureSingleTenantAccount(context.Background(),
+		accountdb.New(pool), account.SingleTenantConfig{
+			AccountKey:   "acme-corp",
+			Granularity:  "enterprise",
+			AutoJoinRole: "member",
+		}, logger)
+	if err != nil {
+		t.Fatalf("EnsureSingleTenantAccount: %v", err)
+	}
+
+	lister.keys = []string{"acme-corp"} // an ORG key of the same name
+
+	got, err := resolve(t, r, "github")
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("admitted = %v, want none — an organization key must not admit an enterprise-granularity account", got)
+	}
+	assertMemberRowCount(t, pool, accountID, 0)
 }

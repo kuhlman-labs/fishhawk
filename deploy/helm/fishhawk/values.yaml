@@ -150,6 +150,38 @@ config:
   planReviewModel: "claude-sonnet-4-6"
   # IANA timezone for daily budget rollover.
   budgetTimezone: "UTC"
+  # GitHub Enterprise Server / EMU + data-resident GHEC endpoint overrides
+  # (E44.2 / #1826). All empty = github.com / api.github.com, i.e. the hosted
+  # posture. Set them together for a GHES install (Mode 1) or a
+  # <slug>.ghe.com tenant (Mode 2); see docs/deploy/self-hosted.md.
+  githubApiUrl: ""
+  githubUploadUrl: ""
+  oauthAuthorizeUrl: ""
+  oauthTokenUrl: ""
+  oauthUserUrl: ""
+  oauthOrgsUrl: ""
+
+# Single-tenant deployment profile (ADR-057 Mode 1, E44.9 / #1833). The
+# accountKey ALONE enables it: set it and fishhawkd bootstraps ONE implicit
+# account at startup, so every member of that enterprise / org / group
+# auto-joins at sign-in. Leave it empty for the hosted multi-tenant posture.
+#
+# Every field here defaults to EMPTY on purpose. Setting granularity /
+# autoJoinRole / provider / displayName while accountKey is empty is a startup
+# ERROR, not a silent fall-through to hosted mode — a deployment with no
+# admitting account is one nobody can sign in to. Once accountKey is set, the
+# omitted fields default INTERNALLY to github / enterprise / member.
+singleTenant:
+  # Enterprise slug, org login, or GitLab group path.
+  accountKey: ""
+  # enterprise | organization | group. Empty → enterprise.
+  granularity: ""
+  # Role granted to auto-joining members. Empty → member.
+  autoJoinRole: ""
+  # Cosmetic; empty stores NULL.
+  displayName: ""
+  # github | gitlab. Empty → github.
+  provider: ""
 
 # Background-worker enable toggles → FISHHAWKD_ENABLE_*. All default false so a
 # fresh deploy doesn't race the timers. These workers are singletons: exactly one

@@ -20,6 +20,29 @@ ON CONFLICT (provider, account_key) DO UPDATE
        home_region  = EXCLUDED.home_region
 RETURNING *;
 
+-- name: UpsertSingleTenantAccount :one
+-- The single-tenant deployment profile's boot-time bootstrap (E44.9 / #1833).
+-- Distinct from UpsertAccount above because it is the ONLY writer that sets
+-- auto_join_role: the implicit account a self-hosted install admits through
+-- must carry a non-NULL role or ListAutoJoinAccountsByKeys cannot see it and
+-- the login gate admits nobody.
+--
+-- home_region is deliberately absent from BOTH the insert column list and the
+-- DO UPDATE SET: PinAccountHomeRegion owns that column (first-write-wins), and
+-- a boot-time upsert re-running on every restart must never clear a pin.
+--
+-- The RETURNING list is EXPLICIT (not `*`) and held to the eight columns the
+-- hand-written db.Account model carries — auto_join_role (migration 0056) is
+-- written but not scanned back.
+INSERT INTO accounts (id, provider, account_key, display_name, granularity, auto_join_role)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (provider, account_key) DO UPDATE
+   SET display_name   = EXCLUDED.display_name,
+       granularity    = EXCLUDED.granularity,
+       auto_join_role = EXCLUDED.auto_join_role,
+       updated_at     = now()
+RETURNING id, provider, account_key, display_name, granularity, home_region, created_at, updated_at;
+
 -- name: GetAccount :one
 SELECT * FROM accounts WHERE id = $1;
 
