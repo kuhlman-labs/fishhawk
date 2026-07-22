@@ -46,6 +46,37 @@ install; a NULL column or unknown installation falls back to the deployment
 default; a **real DB error FAILS the mint** (fail-closed) rather than silently
 targeting the default host. See `backend/internal/account/README.md`.
 
+## Region-scoped model inference (ADR-062 / E44.7)
+
+A regional cell serves inference from its OWN region's model endpoint, so prompt content never
+leaves the region the account was routed to. Selection is **process-level**: one home region and
+one endpoint per `fishhawkd` process, resolved once at startup by `resolveRegionInference` in
+`serve.go`. There is deliberately **no per-account region → endpoint lookup** inside the cell — the
+global directory routes an account to its home cell, so in-cell inference never chooses between
+regions (a per-account choice would need its own ADR).
+
+| Env var | Flag | Effect | Default |
+|---|---|---|---|
+| `FISHHAWKD_ANTHROPIC_BASE_URL` | `--anthropic-base-url` | Threaded onto `anthropic.Config.BaseURL`, which the reviewer's Messages client applies via `option.WithBaseURL` | empty → SDK default |
+| `FISHHAWKD_HOME_REGION` | `--home-region` | This cell's region tag (`us`, `eu`, `au`), trimmed + lowercased | empty → unregionalized |
+
+`Config.BaseURL` is applied **before** the variadic `option.RequestOption`s, so a caller's explicit
+`option.WithBaseURL` (how tests point the client at an httptest server) still wins.
+
+**Fail-closed at startup.** `resolveRegionInference` aborts serve — never a warn-and-continue —
+when:
+
+- `FISHHAWKD_HOME_REGION` is set with no `FISHHAWKD_ANTHROPIC_BASE_URL` (the cell has no in-region
+  endpoint and every reviewer call would leave the region);
+- `FISHHAWKD_HOME_REGION` is set with no `FISHHAWKD_ANTHROPIC_API_KEY` (the region reviewer key is
+  absent, so reviews would silently degrade to gateless);
+- `FISHHAWKD_ANTHROPIC_BASE_URL` is not an absolute `http`/`https` URL (a typo'd endpoint must abort,
+  not reach the SDK).
+
+An empty `FISHHAWKD_HOME_REGION` is the unregionalized deployment: nothing is required and behavior
+is byte-identical to the pre-ADR-062 single-endpoint posture, which is also the rollback path
+(unset both vars).
+
 ## Work-management provider registration at startup (#1104)
 
 `workmgmt_wiring.go` — `registerWorkmgmtProviders(cfg.GitHub, jiraClient, gitlabClient)`, called from

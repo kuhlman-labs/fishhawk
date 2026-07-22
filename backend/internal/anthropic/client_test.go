@@ -240,3 +240,82 @@ func TestClient_Messages_NoTextBlockReturnsError(t *testing.T) {
 		t.Errorf("responseText = %q, want empty string on no-text-block error", text)
 	}
 }
+
+// TestClient_Messages_ConfigBaseURLTargetsRegionalEndpoint pins the
+// region-scoped inference plumbing (ADR-062 / E44.7): a Config carrying a
+// BaseURL sends the Messages request to THAT endpoint, so a regional cell's
+// prompt content reaches its in-region model endpoint rather than the SDK
+// default. Asserted behaviorally — the request must arrive at the configured
+// server — not by reading back a struct field.
+func TestClient_Messages_ConfigBaseURLTargetsRegionalEndpoint(t *testing.T) {
+	var gotPath string
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(okResp(`{"ok":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := testConfig()
+	cfg.BaseURL = srv.URL
+	c := NewClient(cfg)
+
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("configured-base-URL server hits = %d, want 1 (Config.BaseURL was not applied)", hits)
+	}
+	if !strings.Contains(gotPath, "/messages") {
+		t.Errorf("request path = %q, want it to contain '/messages'", gotPath)
+	}
+}
+
+// TestClient_Messages_ExplicitOptionBeatsConfigBaseURL pins the option-ordering
+// contract: Config.BaseURL is applied BEFORE the variadic opts, so a caller's
+// explicit option.WithBaseURL (every existing test points the client at an
+// httptest server this way) still wins. A reversed order would silently break
+// those callers.
+func TestClient_Messages_ExplicitOptionBeatsConfigBaseURL(t *testing.T) {
+	winnerHits, loserHits := 0, 0
+	loser := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		loserHits++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(okResp(`{"ok":true}`))
+	}))
+	t.Cleanup(loser.Close)
+	winner := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		winnerHits++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(okResp(`{"ok":true}`))
+	}))
+	t.Cleanup(winner.Close)
+
+	cfg := testConfig()
+	cfg.BaseURL = loser.URL
+	c := NewClient(cfg, option.WithBaseURL(winner.URL))
+
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if winnerHits != 1 || loserHits != 0 {
+		t.Errorf("hits: explicit-option server = %d (want 1), Config.BaseURL server = %d (want 0)", winnerHits, loserHits)
+	}
+}
+
+// TestClient_EmptyConfigBaseURLKeepsSDKDefault pins the unregionalized path: an
+// empty Config.BaseURL adds no base-URL option, so a caller-supplied one is the
+// only override and the pre-ADR-062 behavior is unchanged.
+func TestClient_EmptyConfigBaseURLKeepsSDKDefault(t *testing.T) {
+	srv, _ := captureSchemaServer(t)
+	cfg := testConfig()
+	if cfg.BaseURL != "" {
+		t.Fatalf("testConfig().BaseURL = %q, want empty", cfg.BaseURL)
+	}
+	c := NewClient(cfg, option.WithBaseURL(srv.URL))
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+}

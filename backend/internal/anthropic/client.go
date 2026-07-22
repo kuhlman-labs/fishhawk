@@ -27,6 +27,15 @@ type Config struct {
 	// nil the Messages request omits output_config entirely (unconstrained),
 	// leaving the caller's decode path as the fallback.
 	Schema map[string]any
+	// BaseURL, when non-empty, targets the Messages client at that API
+	// endpoint instead of the SDK default (ADR-062 / E44.7): a regional cell
+	// serves inference from its OWN region's model endpoint, so no prompt
+	// content leaves the cell's region. Selection is process-level — the cell
+	// carries ONE endpoint for its home region; there is no per-account
+	// region->endpoint lookup. serve.go resolves it from
+	// FISHHAWKD_ANTHROPIC_BASE_URL. Empty keeps the SDK default, so a
+	// single-region deployment is unchanged.
+	BaseURL string
 }
 
 // Client wraps the Anthropic SDK for Messages API calls.
@@ -41,11 +50,19 @@ type Client struct {
 // construction time via option.WithHTTPClient. Extra opts (e.g.
 // option.WithBaseURL for tests) are applied after the defaults. cfg.Schema (when
 // non-nil) is carried onto the Client and constrains every Messages response.
+//
+// A non-empty cfg.BaseURL is applied as option.WithBaseURL BEFORE the variadic
+// opts, so an explicit option.WithBaseURL passed by a caller (tests point the
+// client at an httptest server) still wins — last option applied takes effect.
 func NewClient(cfg Config, opts ...option.RequestOption) *Client {
-	allOpts := append([]option.RequestOption{
+	defaults := []option.RequestOption{
 		option.WithAPIKey(cfg.APIKey),
 		option.WithHTTPClient(&http.Client{Timeout: cfg.Timeout}),
-	}, opts...)
+	}
+	if cfg.BaseURL != "" {
+		defaults = append(defaults, option.WithBaseURL(cfg.BaseURL))
+	}
+	allOpts := append(defaults, opts...)
 	return &Client{
 		inner:     anthropicsdk.NewClient(allOpts...),
 		model:     cfg.Model,
