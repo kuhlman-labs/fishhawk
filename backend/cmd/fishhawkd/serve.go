@@ -396,13 +396,15 @@ func newWebhookDeliveryStore(pool *pgxpool.Pool, githubSecret, gitlabSecret stri
 
 // loadConventionsOverride reads and parses the deployment-level
 // work-management conventions file at path (FISHHAWKD_WORKMGMT_CONVENTIONS),
-// returning a loader that serves the parsed conventions for every repo
-// (ADR-058 Phase 2, #1856). An empty path returns a nil loader and nil error
-// (no override — the Default()-only stub stands). A read or parse failure
-// returns a precise error naming the path + cause so runServe fails startup
-// fast rather than serving a half-configured provider. Extracted so the
-// read/parse/fail-fast branches are unit-testable without booting the server.
-func loadConventionsOverride(path string) (func(repo string) (workmgmt.Conventions, error), error) {
+// returning the BREAK-GLASS fallback the per-repo conventions loader (#2022)
+// serves when its discriminator-driven resolution falls through (ADR-058
+// Phase 2, #1856). An empty path returns a nil func and nil error (no
+// override — the loader falls to workmgmt.Default()). A read or parse
+// failure returns a precise error naming the path + cause so runServe fails
+// startup fast rather than serving a half-configured provider. Extracted so
+// the read/parse/fail-fast branches are unit-testable without booting the
+// server.
+func loadConventionsOverride(path string) (func() (workmgmt.Conventions, bool), error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -414,7 +416,54 @@ func loadConventionsOverride(path string) (func(repo string) (workmgmt.Conventio
 	if err != nil {
 		return nil, fmt.Errorf("parse work-management conventions %q: %w", path, err)
 	}
-	return func(string) (workmgmt.Conventions, error) { return conv, nil }, nil
+	return func() (workmgmt.Conventions, bool) { return conv, true }, nil
+}
+
+// gitlabDeploymentScopeRef is the deployment-level credential-scope ref the
+// conventions loader fetches gitlab files under. The E45.5 gitlab forge is
+// wired with a static-token credential provider that ignores the ref, so the
+// value only needs to be non-zero — a zero scope is the loader's
+// "gitlab unconfigured" sentinel.
+const gitlabDeploymentScopeRef = "gitlab:deployment"
+
+// registeredFileFetcher resolves id from the forge registry as a
+// forge.FileFetcher, or nil when the forge is absent (unconfigured) or does
+// not implement the file-read capability — the per-repo conventions loader
+// then treats that provider like an unregistered forge and falls through to
+// its override/Default chain.
+func registeredFileFetcher(id string) forge.FileFetcher {
+	f, err := forge.Get(id)
+	if err != nil {
+		return nil
+	}
+	ff, ok := f.(forge.FileFetcher)
+	if !ok {
+		return nil
+	}
+	return ff
+}
+
+// buildRepoConventionsLoader assembles the per-repo work-management
+// conventions loader (E45.16 / #2022) from the registered forges (each
+// guarded — an absent forge yields a nil fetcher and that provider falls
+// through to override/Default), the server's GitHub repo-scope resolution,
+// the deployment gitlab scope, the accounts provider discriminator, and the
+// break-glass override. Extracted so serve_test.go can assert the wiring
+// (loader installed, override as fallback) without booting the server.
+func buildRepoConventionsLoader(srv *server.Server, resolver server.ProviderResolver, override func() (workmgmt.Conventions, bool)) *server.RepoConventionsLoader {
+	gitlabFetcher := registeredFileFetcher("gitlab")
+	var gitlabScope forge.CredentialScope
+	if gitlabFetcher != nil {
+		gitlabScope = forge.FromRef(gitlabDeploymentScopeRef)
+	}
+	return server.NewRepoConventionsLoader(server.RepoConventionsLoaderConfig{
+		Resolver:      resolver,
+		GitHubFetcher: registeredFileFetcher("github"),
+		GitLabFetcher: gitlabFetcher,
+		GitHubScope:   srv.GitHubRepoScopeResolver(),
+		GitLabScope:   gitlabScope,
+		Override:      override,
+	})
 }
 
 // resolveIdentityProvider is the OAuth-config gate for the forge-neutral
@@ -1194,14 +1243,11 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("gitlab partially configured; both of FISHHAWKD_GITLAB_BASE_URL and FISHHAWKD_GITLAB_TOKEN are required to enable the gitlab provider — leaving it disabled (provider: gitlab responds 501)")
 	}
 
-	// Deployment-level conventions override (ADR-058 Phase 2, #1856). When
-	// FISHHAWKD_WORKMGMT_CONVENTIONS names a YAML file, parse it fail-fast at
-	// startup and serve the parsed conventions for every repo — enough to run
-	// a non-github_projects provider (e.g. provider: gitlab) end-to-end
-	// against a single-tenant deployment. The true in-repo per-repo loader is
-	// deferred (#2022): the server cannot know which forge to fetch
-	// .fishhawk/work-management.yaml from before the conventions themselves
-	// declare the provider (the chicken-and-egg the override sidesteps).
+	// Deployment-level conventions override (ADR-058 Phase 2, #1856),
+	// retained as the BREAK-GLASS fallback inside the per-repo conventions
+	// loader (#2022): still parsed fail-fast at startup, but its result now
+	// feeds the loader's fallback chain (installed after server.New below)
+	// instead of being installed as THE loader.
 	conventionsOverride, cerr := loadConventionsOverride(*workmgmtConventions)
 	if cerr != nil {
 		logger.Error("invalid work-management conventions file",
@@ -1209,8 +1255,7 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 	if conventionsOverride != nil {
-		server.SetConventionsLoader(conventionsOverride)
-		logger.Info("work-management conventions override loaded",
+		logger.Info("work-management conventions break-glass override loaded",
 			slog.String("path", *workmgmtConventions))
 	}
 
@@ -1306,6 +1351,23 @@ func runServe(args []string, logSink io.Writer) int {
 	cfg.GitHubManifest = authpkg.NewGitHubManifest(authpkg.ManifestURLs{})
 
 	srv := server.New(cfg)
+
+	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
+	// .fishhawk/work-management.yaml from the filing repo's OWN forge,
+	// resolved via the ADR-057/ADR-058 accounts.provider discriminator, with
+	// the break-glass override parsed above as the fallback. Wired after
+	// server.New (the GitHub scope resolution lives on the Server) and after
+	// forge.Register above (the fetchers come from the registry). Without a
+	// database the discriminator resolver stays nil and every filing falls
+	// through to override/Default — the pre-#2022 posture.
+	var accountResolver server.ProviderResolver
+	if pool != nil {
+		accountResolver = account.NewResolver(accountdb.New(pool))
+	}
+	server.SetConventionsLoader(buildRepoConventionsLoader(srv, accountResolver, conventionsOverride).Load)
+	logger.Info("per-repo work-management conventions loader installed",
+		slog.Bool("discriminator_resolver", accountResolver != nil),
+		slog.Bool("break_glass_override", conventionsOverride != nil))
 
 	// Wire the slash-command approval handler now that the Server
 	// exists (#238). The dispatcher was constructed earlier without

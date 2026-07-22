@@ -83,7 +83,7 @@ func (s *Server) handleIssueLifecycleBoardSync(ctx context.Context, ev webhook.E
 	issueNum := p.Issue.Number
 	stateReason := p.Issue.StateReason
 
-	conv, err := conventionsLoader(ev.Repo)
+	conv, err := conventionsLoader(ctx, ev.Repo)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "issue board transition: load conventions failed",
 			slog.String("event", event),

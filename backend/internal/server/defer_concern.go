@@ -228,7 +228,7 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conv, err := conventionsLoader(rn.Repo)
+	conv, err := conventionsLoader(r.Context(), rn.Repo)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not load work-management conventions", map[string]any{"error": err.Error()})

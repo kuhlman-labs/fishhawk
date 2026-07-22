@@ -31,6 +31,7 @@ import (
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
 )
 
@@ -1079,11 +1080,12 @@ func TestResolveGitLabForge(t *testing.T) {
 }
 
 // TestLoadConventionsOverride covers the FISHHAWKD_WORKMGMT_CONVENTIONS
-// startup override (ADR-058 #1856): an empty path is a no-op (nil loader, nil
-// error, the Default() stub stands); an unreadable path fails fast with an
-// error naming the path; an invalid document fails fast with an error naming
-// the path + parse cause; a valid file returns a loader serving the parsed
-// conventions for every repo.
+// startup override (ADR-058 #1856), retained as the per-repo loader's
+// break-glass fallback (#2022): an empty path is a no-op (nil func, nil
+// error — the loader falls to Default()); an unreadable path fails fast with
+// an error naming the path; an invalid document STILL fails startup fast
+// with an error naming the path + parse cause; a valid file returns the
+// break-glass func serving the parsed conventions.
 func TestLoadConventionsOverride(t *testing.T) {
 	t.Run("empty path is a no-op", func(t *testing.T) {
 		loader, err := loadConventionsOverride("")
@@ -1128,7 +1130,7 @@ func TestLoadConventionsOverride(t *testing.T) {
 		}
 	})
 
-	t.Run("valid file serves the parsed conventions for every repo", func(t *testing.T) {
+	t.Run("valid file returns the parsed break-glass conventions", func(t *testing.T) {
 		good := filepath.Join(t.TempDir(), "work-management.yaml")
 		doc := "spec_version: work-management-v0\n" +
 			"provider: gitlab\n" +
@@ -1144,12 +1146,11 @@ func TestLoadConventionsOverride(t *testing.T) {
 			t.Fatalf("loadConventionsOverride(valid) err = %v, want nil", err)
 		}
 		if loader == nil {
-			t.Fatal("loader = nil for a valid file, want a loader")
+			t.Fatal("loader = nil for a valid file, want the break-glass func")
 		}
-		// The loader serves the SAME parsed conventions regardless of repo.
-		conv, lerr := loader("any/repo")
-		if lerr != nil {
-			t.Fatalf("loader err = %v, want nil", lerr)
+		conv, ok := loader()
+		if !ok {
+			t.Fatal("loader() ok = false, want true (override present)")
 		}
 		if conv.Provider != workmgmtgitlab.ProviderName {
 			t.Errorf("Provider = %q, want %q (parsed from the override file)", conv.Provider, workmgmtgitlab.ProviderName)
@@ -1157,11 +1158,40 @@ func TestLoadConventionsOverride(t *testing.T) {
 		if conv.GitLab == nil || conv.GitLab.Project != "group/subgroup/app" {
 			t.Errorf("GitLab = %+v, want the parsed project override", conv.GitLab)
 		}
-		conv2, _ := loader("another/repo")
-		if conv2.Provider != conv.Provider {
-			t.Error("loader served different conventions per repo; the override must serve one document for every repo")
-		}
 	})
+}
+
+// TestBuildRepoConventionsLoader_OverrideAsFallback pins the #2022 wiring
+// contract: buildRepoConventionsLoader assembles the per-repo loader with the
+// break-glass override as its fallback, so on a deployment with no accounts
+// database (nil resolver) and no registered forges a filing resolves the
+// override conventions — and with no override, workmgmt.Default(). Together
+// with TestLoadConventionsOverride's invalid-document branch this covers the
+// serve.go contract that a broken override still fails startup fail-fast
+// while a healthy one only surfaces when per-repo resolution falls through.
+func TestBuildRepoConventionsLoader_OverrideAsFallback(t *testing.T) {
+	srv := server.New(server.Config{})
+
+	override := workmgmt.Default()
+	override.Provider = workmgmtgitlab.ProviderName
+	override.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
+	loader := buildRepoConventionsLoader(srv, nil, func() (workmgmt.Conventions, bool) { return override, true })
+	conv, err := loader.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load err = %v, want nil", err)
+	}
+	if conv.Provider != workmgmtgitlab.ProviderName {
+		t.Errorf("Provider = %q, want %q (the break-glass override must be the fallback)", conv.Provider, workmgmtgitlab.ProviderName)
+	}
+
+	noOverride := buildRepoConventionsLoader(srv, nil, nil)
+	conv, err = noOverride.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load (no override) err = %v, want nil", err)
+	}
+	if conv.Provider != workmgmt.Default().Provider {
+		t.Errorf("Provider = %q, want the Default() provider %q", conv.Provider, workmgmt.Default().Provider)
+	}
 }
 
 // TestWebhookStoreNeeded pins the delivery-store gating (E45.6 / #1860):

@@ -193,7 +193,7 @@ func installGHProvider(t *testing.T, api *fakeGHAPI) {
 	conv := workmgmt.Default()
 	conv.Provider = name
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 }
 

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -231,7 +232,7 @@ func TestWebhook_BodyTooLarge(t *testing.T) {
 // would pass while this routing/decode/audit seam silently no-ops (#618).
 func TestWebhook_IssueClosedBoardSync(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "In Progress", To: "Done"}}

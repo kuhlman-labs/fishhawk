@@ -219,7 +219,7 @@ func TestExpectedSourceStates_CampaignStarted(t *testing.T) {
 func campaignBoardServer(t *testing.T) (*Server, *campaignAuditRecorder) {
 	t.Helper()
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	au := &campaignAuditRecorder{}
@@ -367,7 +367,7 @@ func TestBoardTransitionForCampaignItem_ProviderError_Swallowed(t *testing.T) {
 // installation cannot be resolved without a client.)
 func TestBoardTransitionForCampaignItem_NilGitHub_NoOp(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{}
@@ -474,7 +474,7 @@ func TestNotifyBoardTransition_ProviderError_Swallowed(t *testing.T) {
 // double-fire.
 func TestCreateRun_EmitsRunStartedBoardTransition(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{}
@@ -539,7 +539,7 @@ func TestCreateRun_EmitsRunStartedBoardTransition(t *testing.T) {
 // Transition call and NO work_item_transitioned audit.
 func TestCreateRun_NonIssueRun_NoBoardTransition(t *testing.T) {
 	prev := conventionsLoader
-	conventionsLoader = func(string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return workmgmt.Default(), nil }
 	t.Cleanup(func() { conventionsLoader = prev })
 
 	fp := &fakeTransitionProvider{}
