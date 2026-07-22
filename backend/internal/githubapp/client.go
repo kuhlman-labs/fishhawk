@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -43,7 +44,11 @@ type Client struct {
 	// package):
 	//
 	//   - a non-empty return OVERRIDES BaseURL/DefaultGitHubAPIBase — the
-	//     request targets the per-installation host.
+	//     request targets the per-installation host. It is validated as a
+	//     well-formed absolute https URL before it becomes the target host
+	//     (see validateResolvedBaseURL): the mint ships a live App JWT, so an
+	//     override that is not https-with-a-host FAILS the mint rather than
+	//     transmitting the credential to an unvalidated (or non-TLS) host.
 	//   - an empty return falls back to BaseURL then DefaultGitHubAPIBase:
 	//     the intentional absence of an override (NULL column / unknown
 	//     installation) keeps the deployment default.
@@ -92,6 +97,12 @@ func (c *Client) IssueInstallationToken(ctx context.Context, installationID int6
 			return nil, fmt.Errorf("githubapp: resolve installation base url: %w", err)
 		}
 		if resolved != "" {
+			// Validate BEFORE the JWT ships: an override host that is not a
+			// well-formed https URL fails the mint (never a live App JWT to an
+			// unvalidated or non-TLS host).
+			if err := validateResolvedBaseURL(resolved); err != nil {
+				return nil, err
+			}
 			base = resolved
 		}
 	}
@@ -131,6 +142,30 @@ func (c *Client) IssueInstallationToken(ctx context.Context, installationID int6
 		return nil, errors.New("githubapp: response missing required fields")
 	}
 	return &out, nil
+}
+
+// validateResolvedBaseURL rejects a per-installation override host that is not
+// a well-formed absolute https URL. IssueInstallationToken ships a live App JWT
+// in the Authorization header, so an override resolved from the installations
+// row must pass a scheme/parse sanity check before it can become the target
+// host: an http:// value would transmit the JWT without TLS, and a malformed or
+// hostless value could send it somewhere unintended (E44.2 / #1826). This is a
+// scheme/parse check, NOT a host allowlist — per-installation host pinning is
+// deferred to the follow-up that introduces a production (tenant / forge-sync)
+// writer for forge_base_url; today the sole writer is the operator-side
+// UpsertInstallation path.
+func validateResolvedBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("githubapp: malformed installation base url %q: %w", raw, err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("githubapp: installation base url %q must use https, got scheme %q", raw, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("githubapp: installation base url %q missing host", raw)
+	}
+	return nil
 }
 
 // readBriefBody reads up to 256 bytes for use in error messages.

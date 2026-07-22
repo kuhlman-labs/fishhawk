@@ -26,9 +26,7 @@ type fakeGitHub struct {
 	requestCounter int
 }
 
-func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
-	t.Helper()
-	fg := &fakeGitHub{status: http.StatusCreated}
+func fakeGitHubHandler(fg *fakeGitHub) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /app/installations/{installation_id}/access_tokens",
 		func(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +49,24 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 				})
 			}
 		})
-	srv := httptest.NewServer(mux)
+	return mux
+}
+
+func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
+	t.Helper()
+	fg := &fakeGitHub{status: http.StatusCreated}
+	srv := httptest.NewServer(fakeGitHubHandler(fg))
+	t.Cleanup(srv.Close)
+	return fg, srv
+}
+
+// newFakeGitHubTLS is the https variant, used to exercise the resolved-override
+// path whose validation requires an https target host (E44.2 / #1826). The
+// returned server's cert is trusted only by srv.Client().
+func newFakeGitHubTLS(t *testing.T) (*fakeGitHub, *httptest.Server) {
+	t.Helper()
+	fg := &fakeGitHub{status: http.StatusCreated}
+	srv := httptest.NewTLSServer(fakeGitHubHandler(fg))
 	t.Cleanup(srv.Close)
 	return fg, srv
 }
@@ -199,10 +214,11 @@ func TestIssueInstallationToken_DefaultBaseURL(t *testing.T) {
 // THAT host, not the client's default BaseURL. Two fakes prove routing: the
 // override server receives the request; the default (BaseURL) server does not.
 func TestIssueInstallationToken_ResolveBaseURL_Override(t *testing.T) {
-	overrideFake, overrideSrv := newFakeGitHub(t)
+	overrideFake, overrideSrv := newFakeGitHubTLS(t) // https: validation requires it
 	defaultFake, defaultSrv := newFakeGitHub(t)
 
 	c := newTestClient(t, defaultSrv.URL) // BaseURL = the default host
+	c.HTTP = overrideSrv.Client()         // trust the override host's TLS cert
 	c.ResolveBaseURL = func(_ context.Context, ref string) (string, error) {
 		if ref != "42" {
 			t.Errorf("ResolveBaseURL got installationRef = %q, want \"42\"", ref)
@@ -265,6 +281,61 @@ func TestIssueInstallationToken_ResolveBaseURL_Error(t *testing.T) {
 	}
 	if defaultFake.requestCounter != 0 {
 		t.Errorf("default host received %d requests, want 0 (a resolver error must not fall back to the default host)", defaultFake.requestCounter)
+	}
+}
+
+// TestIssueInstallationToken_ResolveBaseURL_RejectsInvalid pins the hardening
+// (E44.2 / #1826): a resolved override that is not a well-formed https URL FAILS
+// the mint before any request ships the App JWT. An http:// value (JWT without
+// TLS), a hostless value, and a malformed value must all be rejected, and the
+// default host must receive NO request.
+func TestIssueInstallationToken_ResolveBaseURL_RejectsInvalid(t *testing.T) {
+	cases := []struct {
+		name, override string
+	}{
+		{"http scheme (no TLS)", "http://evil.example.com"},
+		{"missing host", "https://"},
+		{"malformed url", "https://\x00bad"},
+		{"empty scheme", "://evil.example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			defaultFake, defaultSrv := newFakeGitHub(t)
+			c := newTestClient(t, defaultSrv.URL)
+			c.ResolveBaseURL = func(context.Context, string) (string, error) { return tc.override, nil }
+
+			_, err := c.IssueInstallationToken(context.Background(), 42)
+			if err == nil {
+				t.Fatalf("override %q: mint succeeded, want failure (invalid override must not ship the App JWT)", tc.override)
+			}
+			if defaultFake.requestCounter != 0 {
+				t.Errorf("override %q: default host received %d requests, want 0 (an invalid override must fail closed, never fall back)", tc.override, defaultFake.requestCounter)
+			}
+		})
+	}
+}
+
+func TestValidateResolvedBaseURL(t *testing.T) {
+	valid := []string{
+		"https://acme.ghe.com",
+		"https://acme.ghe.com/api/v3",
+	}
+	for _, s := range valid {
+		if err := validateResolvedBaseURL(s); err != nil {
+			t.Errorf("validateResolvedBaseURL(%q) = %v, want nil", s, err)
+		}
+	}
+	invalid := []string{
+		"http://acme.ghe.com", // not https
+		"https://",            // no host
+		"acme.ghe.com",        // no scheme
+		"://acme.ghe.com",     // empty scheme
+		"https://\x00bad",     // parse error
+	}
+	for _, s := range invalid {
+		if err := validateResolvedBaseURL(s); err == nil {
+			t.Errorf("validateResolvedBaseURL(%q) = nil, want error", s)
+		}
 	}
 }
 

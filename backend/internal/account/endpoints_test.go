@@ -81,6 +81,49 @@ func TestEndpointResolver_NullColumns(t *testing.T) {
 	}
 }
 
+func TestEndpointResolver_SetForge_NullOAuth(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	r := NewEndpointResolver(accountdb.New(pool))
+
+	// Mixed boundary: forge_base_url SET, oauth_base_url NULL. Each column is
+	// honored independently — the set forge is returned, the NULL oauth is the
+	// deployment default (empty).
+	forge := "https://acme.ghe.com/api/v3"
+	seedInstallation(t, pool, "1003", &forge, nil)
+
+	gotForge, gotOAuth, err := r.ResolveInstallationEndpoints(context.Background(), "github", "1003")
+	if err != nil {
+		t.Fatalf("ResolveInstallationEndpoints: %v", err)
+	}
+	if gotForge != forge {
+		t.Errorf("forgeBaseURL = %q, want %q", gotForge, forge)
+	}
+	if gotOAuth != "" {
+		t.Errorf("oauthBaseURL = %q, want empty (NULL oauth → deployment default)", gotOAuth)
+	}
+}
+
+func TestEndpointResolver_NullForge_SetOAuth(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	r := NewEndpointResolver(accountdb.New(pool))
+
+	// Mixed boundary: forge_base_url NULL, oauth_base_url SET. The NULL forge is
+	// the deployment default (empty); the set oauth is returned independently.
+	oauth := "https://acme.ghe.com"
+	seedInstallation(t, pool, "1004", nil, &oauth)
+
+	gotForge, gotOAuth, err := r.ResolveInstallationEndpoints(context.Background(), "github", "1004")
+	if err != nil {
+		t.Fatalf("ResolveInstallationEndpoints: %v", err)
+	}
+	if gotForge != "" {
+		t.Errorf("forgeBaseURL = %q, want empty (NULL forge → deployment default)", gotForge)
+	}
+	if gotOAuth != oauth {
+		t.Errorf("oauthBaseURL = %q, want %q", gotOAuth, oauth)
+	}
+}
+
 func TestEndpointResolver_NotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	r := NewEndpointResolver(accountdb.New(pool))
