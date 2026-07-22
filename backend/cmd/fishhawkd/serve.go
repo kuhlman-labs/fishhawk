@@ -136,6 +136,9 @@ type planReviewerOptions struct {
 // credential (the endpoint refuses the call) and a startup warning naming the
 // missing key.
 func (p *planReviewerOptions) inferenceAPIKey() string {
+	if p.regionKeyWithoutEndpoint() {
+		return ""
+	}
 	if p.modelAPIKey != "" {
 		return p.modelAPIKey
 	}
@@ -143,6 +146,26 @@ func (p *planReviewerOptions) inferenceAPIKey() string {
 		return ""
 	}
 	return p.anthropicAPIKey
+}
+
+// regionKeyWithoutEndpoint reports the MIRROR half-configured posture:
+// FISHHAWKD_MODEL_API_KEY set with no FISHHAWKD_MODEL_BASE_URL. The SDK then
+// falls back to its global default endpoint, so the region-scoped credential
+// AND the plan/implement-review text it authenticates — the residency-sensitive
+// payload the region endpoint exists to contain — would egress outside the
+// region. Withholding the credential alone is not enough here: the request
+// body still travels. So this posture withholds the anthropic SDK adapter
+// ENTIRELY (Default skips it, For refuses it by name), which is the only way
+// the cell sends nothing at all.
+func (p *planReviewerOptions) regionKeyWithoutEndpoint() bool {
+	return p.modelAPIKey != "" && p.modelBaseURL == ""
+}
+
+// anthropicConfigured reports whether the Anthropic SDK adapter may serve:
+// selected by FISHHAWKD_ANTHROPIC_API_KEY and not withheld by the
+// half-configured region posture above.
+func (p *planReviewerOptions) anthropicConfigured() bool {
+	return p.anthropicAPIKey != "" && !p.regionKeyWithoutEndpoint()
 }
 
 // planReviewerSet implements server.ReviewerSet over the deployment's
@@ -216,7 +239,7 @@ func (p *planReviewerSet) newCodex(model, reasoningEffort string) server.PlanRev
 // correct.
 func (p *planReviewerSet) Default() server.PlanReviewer {
 	switch {
-	case p.opts.anthropicAPIKey != "":
+	case p.opts.anthropicConfigured():
 		return p.newAnthropic(p.opts.planReviewModel)
 	case p.opts.enableLocalClaudeReviewer:
 		return p.newClaudeCode(p.opts.localClaudeModel)
@@ -257,6 +280,11 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 	}
 	switch provider {
 	case "anthropic":
+		if p.opts.regionKeyWithoutEndpoint() {
+			return nil, fmt.Errorf("reviewer provider %q is withheld: FISHHAWKD_MODEL_API_KEY is set without FISHHAWKD_MODEL_BASE_URL, "+
+				"which would send the region-scoped credential and the review text to the SDK's global default endpoint; "+
+				"set FISHHAWKD_MODEL_BASE_URL to the region endpoint, or unset FISHHAWKD_MODEL_API_KEY", provider)
+		}
 		if p.opts.anthropicAPIKey == "" {
 			return nil, fmt.Errorf("reviewer provider %q is not configured: set FISHHAWKD_ANTHROPIC_API_KEY", provider)
 		}
@@ -293,7 +321,7 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.ReviewerSet {
 	set := &planReviewerSet{opts: opts}
 	configured := 0
-	if opts.anthropicAPIKey != "" {
+	if opts.anthropicConfigured() {
 		configured++
 		logger.Info("plan review adapter configured",
 			slog.String("adapter", "anthropic"),
@@ -342,6 +370,12 @@ func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.
 				slog.String("base_url", opts.modelBaseURL),
 				slog.String("ref", "#1831"))
 		}
+	}
+	if opts.regionKeyWithoutEndpoint() {
+		// The mirror half-configuration, and the louder of the two: here the
+		// failure mode is egress, not a refused call.
+		logger.Warn("FISHHAWKD_MODEL_API_KEY is set without FISHHAWKD_MODEL_BASE_URL; the anthropic reviewer is WITHHELD rather than pointed at the SDK's global default endpoint, which would send the region-scoped credential and the plan/implement-review text outside this region. Set FISHHAWKD_MODEL_BASE_URL to the region-scoped inference endpoint, or unset FISHHAWKD_MODEL_API_KEY to run on the default endpoint with FISHHAWKD_ANTHROPIC_API_KEY",
+			slog.String("ref", "#1831"))
 	}
 	return set
 }

@@ -58,6 +58,9 @@ all-empty deployment is byte-identical to a single-cell one.
 | `FISHHAWKD_MODEL_BASE_URL` | `--model-base-url` | region-scoped inference endpoint for the Anthropic SDK reviewer | SDK default (`api.anthropic.com`) |
 | `FISHHAWKD_MODEL_API_KEY` | `--model-api-key` | credential presented to that endpoint | falls back to `FISHHAWKD_ANTHROPIC_API_KEY` **only when `FISHHAWKD_MODEL_BASE_URL` is also empty** |
 
+The two region-inference knobs are set **together or not at all**: either half alone is refused,
+in the direction each half fails (see below).
+
 **Pin surface construction is all-or-nothing.** `resolveRegionPin` (in `serve.go`) returns the
 `(server.Config.HandoffSecret, server.Config.RegionPinner)` pair only when the region, the secret
 **and** an account query surface (i.e. `FISHHAWKD_DATABASE_URL`) are all present; any one missing
@@ -87,6 +90,15 @@ the deployment's `FISHHAWKD_ANTHROPIC_API_KEY`: falling back there would send a 
 credential — and the plan/review text it authenticates — to an operator-supplied host, which is
 secret exfiltration via configurable egress. That half-configured posture fails closed (the endpoint
 refuses an uncredentialed call) and logs a startup warning naming the missing key.
+
+The **mirror** half-configuration fails closed harder. With `FISHHAWKD_MODEL_API_KEY` set and
+`FISHHAWKD_MODEL_BASE_URL` unset, the SDK would fall back to its **global default** endpoint and
+send both the region-scoped credential and the plan/implement-review text out of the region.
+Withholding the credential is not sufficient there — the request body still travels — so the
+Anthropic SDK adapter is withheld **entirely**: `planReviewerSet.Default()` skips it (falling
+through to `claudecode`/`codex` if either is configured) and `For("anthropic")` refuses by name,
+with a startup warning naming `FISHHAWKD_MODEL_BASE_URL`. Set the endpoint, or unset the region key
+to run on the default endpoint with `FISHHAWKD_ANTHROPIC_API_KEY`.
 
 ## Work-management provider registration at startup (#1104)
 

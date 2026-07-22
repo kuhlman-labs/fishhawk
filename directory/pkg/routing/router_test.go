@@ -210,6 +210,58 @@ func TestBothSurfacesRejectWrongBearer(t *testing.T) {
 	}
 }
 
+// The RIGHT token under the WRONG (or no) scheme must not authenticate: a
+// prefix trim leaves a bare `Authorization: <token>` header unchanged and
+// would have let it through.
+func TestBothSurfacesRequireTheBearerScheme(t *testing.T) {
+	fs := newFakeStore()
+	fs.regions["github/acme"] = "us"
+	rt := newRouter(t, testConfig(t), fs)
+
+	surfaces := []struct{ name, method, target, body string }{
+		{"assign", http.MethodPost, AssignPath, `{"provider":"github","account_key":"acme","region":"us"}`},
+		{"routed", http.MethodGet, DefaultRoutedPath + "?provider=github&account_key=acme", ""},
+	}
+	headers := map[string]string{
+		"no scheme":      testAdminToken,
+		"basic scheme":   "Basic " + testAdminToken,
+		"token scheme":   "Token " + testAdminToken,
+		"glued":          "Bearer" + testAdminToken,
+		"scheme as suff": testAdminToken + " Bearer",
+	}
+	for _, s := range surfaces {
+		for name, header := range headers {
+			t.Run(s.name+"/"+name, func(t *testing.T) {
+				var r *http.Request
+				if s.body == "" {
+					r = httptest.NewRequest(s.method, s.target, nil)
+				} else {
+					r = httptest.NewRequest(s.method, s.target, strings.NewReader(s.body))
+				}
+				r.Header.Set("Authorization", header)
+				w := httptest.NewRecorder()
+				rt.ServeHTTP(w, r)
+
+				if w.Code != http.StatusUnauthorized {
+					t.Fatalf("Authorization: %q -> status %d, want 401", header, w.Code)
+				}
+			})
+		}
+	}
+
+	// Positive control: the same token DOES authenticate under the scheme,
+	// case-insensitively (RFC 7235 §2.1).
+	for _, header := range []string{"Bearer " + testAdminToken, "bearer " + testAdminToken, "BEARER " + testAdminToken} {
+		r := httptest.NewRequest(http.MethodGet, DefaultRoutedPath+"?provider=github&account_key=acme", nil)
+		r.Header.Set("Authorization", header)
+		w := httptest.NewRecorder()
+		rt.ServeHTTP(w, r)
+		if w.Code != http.StatusFound {
+			t.Fatalf("Authorization: %q -> status %d, want 302", header, w.Code)
+		}
+	}
+}
+
 func TestAssignRefusesWhenAdminTokenUnset(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.AdminToken = ""
@@ -259,7 +311,11 @@ func TestRoutedRedirectPreservesPathAndQuery(t *testing.T) {
 	rt.Now = func() time.Time { return fixedNow }
 	rt.NewNonce = func() (string, error) { return "deadbeef", nil }
 
-	target := DefaultRoutedPath + "?provider=github&account_key=acme&state=caller-oauth-state&install_id=42"
+	// Deliberately NOT in sorted key order, and with a non-canonical escaping
+	// (%7E, which url.Values.Encode would rewrite to a literal "~"): a
+	// re-encoding round trip is detectable in both.
+	const origQuery = "state=caller%7Eoauth-state&provider=github&install_id=42&account_key=acme"
+	target := DefaultRoutedPath + "?" + origQuery
 	w := do(t, rt, http.MethodGet, target, testAdminToken, "")
 	if w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302 (body %s)", w.Code, w.Body)
@@ -268,6 +324,12 @@ func TestRoutedRedirectPreservesPathAndQuery(t *testing.T) {
 	loc, err := url.Parse(w.Header().Get("Location"))
 	if err != nil {
 		t.Fatalf("Location is unparsable: %v", err)
+	}
+	// "Verbatim" means the caller's query text survives byte for byte, in its
+	// original order, with the handoff appended AFTER it — not merely that
+	// each decoded value can still be looked up.
+	if !strings.HasPrefix(loc.RawQuery, origQuery+"&") {
+		t.Fatalf("redirect query = %q, want it to start with the caller's own query verbatim (%q)", loc.RawQuery, origQuery)
 	}
 	if loc.Scheme+"://"+loc.Host != "https://eu.cell.example" {
 		t.Fatalf("redirect host = %q, want the eu cell", loc.Scheme+"://"+loc.Host)
@@ -283,7 +345,7 @@ func TestRoutedRedirectPreservesPathAndQuery(t *testing.T) {
 	for name, want := range map[string]string{
 		"provider":    "github",
 		"account_key": "acme",
-		"state":       "caller-oauth-state",
+		"state":       "caller~oauth-state",
 		"install_id":  "42",
 	} {
 		if got := q.Get(name); got != want {

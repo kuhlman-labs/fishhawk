@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -1531,7 +1532,10 @@ func TestInferenceAPIKey_RegionKeyWinsElseAnthropicKey(t *testing.T) {
 		baseURL   string
 		want      string
 	}{
-		{"region key wins", "deployment-key", "region-key", "", "region-key"},
+		// A region-scoped key with NO region endpoint is half-configured in the
+		// direction that EGRESSES: the SDK would present it — and the review
+		// text — to its global default endpoint. Fail closed.
+		{"region key without a region endpoint", "deployment-key", "region-key", "", ""},
 		{"falls back to the anthropic key on the default endpoint", "deployment-key", "", "", "deployment-key"},
 		{"both empty", "", "", "", ""},
 		// A custom endpoint with no region key must NOT receive the
@@ -1556,9 +1560,17 @@ func TestInferenceAPIKey_RegionKeyWinsElseAnthropicKey(t *testing.T) {
 // alone would not prove what the adapter puts on the wire, so this drives a
 // real Review through an httptest endpoint and inspects the observed headers.
 func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing.T) {
+	// Hermetic: the SDK falls back to its own ambient credential sources when
+	// the client carries none, and an operator shell commonly exports these.
+	// Blank them so this asserts OUR resolution, not the host's.
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+
 	const deploymentKey = "deployment-anthropic-key"
 	var gotAPIKey, gotAuth string
+	var observed int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed++
 		gotAPIKey, gotAuth = r.Header.Get("x-api-key"), r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant",` +
@@ -1581,10 +1593,22 @@ func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing
 	if reviewer == nil {
 		t.Fatal("Default() = nil, want the anthropic adapter (the deployment key still selects it)")
 	}
-	// The call may fail (no credential is presented, by design); what matters
-	// is what did NOT travel.
-	_, _, _ = reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
+	// The call fails by design — no credential is presented.
+	_, _, err := reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
+	if err == nil {
+		t.Fatal("Review succeeded with no credential configured; some credential must have been presented")
+	}
 
+	// A bare "the key is absent from the observed headers" assertion would pass
+	// vacuously if nothing ever reached the endpoint, so assert the stronger
+	// fact that actually holds: with an empty credential the SDK refuses before
+	// it opens a connection, so NOTHING travels — not the deployment key, and
+	// not the plan text either. (The sibling positive test proves this same
+	// wiring does emit a request when a region key IS configured, so the zero
+	// here is the credential rule biting, not a dead endpoint.)
+	if observed != 0 {
+		t.Errorf("%d request(s) reached the custom endpoint with no region key configured; want none", observed)
+	}
 	if strings.Contains(gotAPIKey, deploymentKey) || strings.Contains(gotAuth, deploymentKey) {
 		t.Errorf("the deployment anthropic key reached the custom endpoint (x-api-key=%q Authorization=%q); "+
 			"FISHHAWKD_ANTHROPIC_API_KEY must never be sent to FISHHAWKD_MODEL_BASE_URL", gotAPIKey, gotAuth)
@@ -1602,6 +1626,54 @@ func TestResolvePlanReviewers_WarnsOnBaseURLWithoutRegionKey(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "FISHHAWKD_MODEL_API_KEY") {
 		t.Errorf("startup log = %q, want a warning naming FISHHAWKD_MODEL_API_KEY", buf.String())
+	}
+}
+
+// TestResolvePlanReviewers_RegionKeyWithoutEndpointWithholdsAnthropic is the
+// mirror fail-closed posture: FISHHAWKD_MODEL_API_KEY set with no
+// FISHHAWKD_MODEL_BASE_URL would point the SDK at its GLOBAL default endpoint,
+// sending both the region-scoped credential and the review text out of region.
+// Withholding the credential alone would not help — the request body still
+// travels — so the adapter itself must be withheld, on both resolution paths.
+func TestResolvePlanReviewers_RegionKeyWithoutEndpointWithholdsAnthropic(t *testing.T) {
+	var buf strings.Builder
+	set := resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey:     "deployment-key",
+		planReviewModel:     "claude-sonnet-4-6",
+		planReviewMaxTokens: 1024,
+		planReviewTimeout:   10 * time.Second,
+		modelAPIKey:         "eu-region-scoped-key",
+		modelBaseURL:        "", // the half-configured input under test
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+
+	if got := set.Default(); got != nil {
+		t.Errorf("Default() = %T, want nil — the anthropic adapter must not be constructed against the global default endpoint with a region key", got)
+	}
+	if _, err := set.For("anthropic", ""); err == nil {
+		t.Error("For(\"anthropic\") = nil error, want a refusal naming FISHHAWKD_MODEL_BASE_URL")
+	} else if !strings.Contains(err.Error(), "FISHHAWKD_MODEL_BASE_URL") {
+		t.Errorf("For(\"anthropic\") error = %v, want it to name FISHHAWKD_MODEL_BASE_URL", err)
+	}
+	if !strings.Contains(buf.String(), "FISHHAWKD_MODEL_BASE_URL") {
+		t.Errorf("startup log = %q, want a warning naming FISHHAWKD_MODEL_BASE_URL", buf.String())
+	}
+}
+
+// TestResolvePlanReviewers_RegionKeyWithoutEndpointFallsThroughToOtherAdapters
+// pins the blast radius of that withholding: only the SDK adapter egresses to
+// the global endpoint, so a deployment that also configured a subprocess
+// adapter still has a reviewer.
+func TestResolvePlanReviewers_RegionKeyWithoutEndpointFallsThroughToOtherAdapters(t *testing.T) {
+	set := resolvePlanReviewers(planReviewerOptions{
+		anthropicAPIKey:           "deployment-key",
+		enableLocalClaudeReviewer: true,
+		localClaudeBinary:         "claude",
+		localClaudeModel:          "claude-sonnet-4-6",
+		modelAPIKey:               "eu-region-scoped-key",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if _, ok := set.Default().(*claudecode.Reviewer); !ok {
+		t.Errorf("Default() = %T, want the claudecode adapter", set.Default())
 	}
 }
 

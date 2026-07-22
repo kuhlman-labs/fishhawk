@@ -82,6 +82,7 @@ Every one of these is a refusal, never a degrade-to-permissive.
 | Request carries no `fh_*` parameters | passes through untouched. A single-cell deployment behaves identically with or without any of these env vars. |
 | `FISHHAWK_DIRECTORY_ROUTED_PATHS` names a path the cell does not verify | startup fails naming the supported set. The routed-path list is a **closed set** kept in lockstep with the cell surfaces `withRegionPin` is mounted on; routing anything else would deliver a signed redirect to an endpoint that verifies no handoff and pins no account. |
 | Cell `MODEL_BASE_URL` set, `MODEL_API_KEY` unset | the anthropic reviewer presents **no** credential (its calls fail) and startup warns. `FISHHAWKD_ANTHROPIC_API_KEY` is deliberately never sent to a non-default endpoint — that would ship a production secret, and the review text it authenticates, to an operator-supplied host. |
+| Cell `MODEL_API_KEY` set, `MODEL_BASE_URL` unset | the anthropic SDK reviewer is **withheld entirely** (the count form falls through to `claudecode`/`codex`; a spec-declared `anthropic` reviewer is refused by name) and startup warns. The SDK would otherwise fall back to its global default endpoint and send the region-scoped credential **and** the review text out of region; withholding only the credential would still let the request body travel. |
 | Cell pin fails for an unclassified reason | 500 `region_pin_failed` with a **generic** message. The routed surface answers before any auth decision (the handoff is itself the credential), so a driver/query/host detail is logged, never returned. |
 
 ### Replay
@@ -126,6 +127,29 @@ closed: the adapter presents an empty credential rather than the deployment's
 an operator-configured endpoint would combine a production secret with
 configurable network egress; the endpoint refusing an uncredentialed call is the
 safer failure.
+
+The mirror posture — `FISHHAWKD_MODEL_API_KEY` set with `FISHHAWKD_MODEL_BASE_URL`
+**unset** — fails closed harder, because there the leak is egress rather than a
+refused call: the SDK falls back to its global default endpoint, which would send
+the region-scoped credential and the residency-sensitive review text outside the
+region. So the Anthropic SDK adapter is not constructed at all in that posture.
+Set the endpoint, or unset the region key to run on the default endpoint with
+`FISHHAWKD_ANTHROPIC_API_KEY`. Set both knobs together, or neither.
+
+## Directory authorization
+
+Both directory surfaces — `POST /v0/directory/assign` and the routed
+`GET /v0/onboarding/start` — require the operator credential
+(`FISHHAWK_DIRECTORY_ADMIN_TOKEN`) presented as `Authorization: Bearer <token>`.
+The **scheme is required**: a bare `Authorization: <token>`, or any other scheme,
+is 401 even when the token itself is correct. The scheme name is matched
+case-insensitively (RFC 7235 §2.1). An unset admin token refuses both surfaces
+with 503 — unset means closed, never open.
+
+The routed redirect preserves the caller's own query **verbatim**: the surviving
+pairs are carried across as their original bytes, in their original order, with
+the signed `fh_*` handoff appended after them. Inbound `fh_*` parameters are
+dropped first, so a caller cannot smuggle an attacker-chosen handoff through.
 
 This governs the Anthropic SDK adapter only. The `claudecode` and `codex`
 reviewers are subprocesses whose endpoint is the CLI's own configuration; a

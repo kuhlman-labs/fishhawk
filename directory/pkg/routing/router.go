@@ -231,31 +231,64 @@ func (rt *Router) handleRouted(w http.ResponseWriter, r *http.Request) {
 // redirectTarget builds `<cell base><original path>?<original query + fh_*>`.
 //
 // The caller's own parameters — including an OAuth `state`, which is a
-// wholly different role from the handoff's replay nonce — survive
-// untouched. Any INBOUND fh_* parameter is dropped first: it can only be an
-// attempt to smuggle an attacker-chosen handoff through the router, and
-// leaving it in place would emit two values for one parameter.
+// wholly different role from the handoff's replay nonce — survive VERBATIM:
+// the surviving pairs are carried across as their original bytes, in their
+// original order, and the signed handoff is appended after them. Re-encoding
+// through url.Values would sort the keys and canonicalise the escaping, which
+// is not preservation — a downstream signature or an order-sensitive consumer
+// of the caller's own query would see a different string than it sent.
+//
+// Any INBOUND fh_* parameter is dropped first: it can only be an attempt to
+// smuggle an attacker-chosen handoff through the router, and leaving it in
+// place would emit two values for one parameter.
 func redirectTarget(cellURL string, orig *url.URL, signed url.Values) (string, error) {
 	base, err := url.Parse(cellURL)
 	if err != nil {
 		return "", fmt.Errorf("cell URL %q is unparsable: %w", cellURL, err)
 	}
 
-	q := orig.Query()
-	for name := range q {
-		if strings.HasPrefix(name, "fh_") {
-			q.Del(name)
+	raw := stripHandoffParams(orig.RawQuery)
+	if appended := signed.Encode(); appended != "" {
+		if raw != "" {
+			raw += "&"
 		}
-	}
-	for name, values := range signed {
-		q[name] = values
+		raw += appended
 	}
 
 	target := *base
 	target.Path = strings.TrimSuffix(base.Path, "/") + orig.Path
 	target.RawPath = ""
-	target.RawQuery = q.Encode()
+	target.RawQuery = raw
 	return target.String(), nil
+}
+
+// stripHandoffParams returns rawQuery with every fh_* pair removed and every
+// other pair untouched, byte for byte and in order. The parameter NAME is
+// percent-decoded before the prefix test so an escaped spelling (fh%5Fsig)
+// cannot smuggle a handoff parameter past the filter, but the pair that
+// survives is the original text, not a re-encoding of it.
+func stripHandoffParams(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	kept := make([]string, 0, strings.Count(rawQuery, "&")+1)
+	for _, pair := range strings.Split(rawQuery, "&") {
+		if pair == "" {
+			continue
+		}
+		name := pair
+		if i := strings.IndexByte(pair, '='); i >= 0 {
+			name = pair[:i]
+		}
+		if decoded, err := url.QueryUnescape(name); err == nil {
+			name = decoded
+		}
+		if strings.HasPrefix(name, "fh_") {
+			continue
+		}
+		kept = append(kept, pair)
+	}
+	return strings.Join(kept, "&")
 }
 
 // authorize gates BOTH directory surfaces on the operator credential
@@ -267,13 +300,26 @@ func (rt *Router) authorize(w http.ResponseWriter, r *http.Request) bool {
 			fmt.Sprintf("%s is unset; the directory refuses every request until it is configured", EnvAdminToken))
 		return false
 	}
-	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-	if subtle.ConstantTimeCompare([]byte(presented), []byte(rt.cfg.AdminToken)) != 1 {
+	presented, ok := bearerCredential(r.Header.Get("Authorization"))
+	if !ok || subtle.ConstantTimeCompare([]byte(presented), []byte(rt.cfg.AdminToken)) != 1 {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "unauthorized", "a valid operator bearer credential is required")
 		return false
 	}
 	return true
+}
+
+// bearerCredential extracts the credential from an Authorization header,
+// REQUIRING the Bearer scheme (matched case-insensitively, per RFC 7235 §2.1).
+// A header carrying no scheme at all — a bare `Authorization: <token>` — or a
+// different scheme carries no bearer credential and must not authenticate; a
+// prefix trim alone would accept the raw token unchanged.
+func bearerCredential(header string) (string, bool) {
+	const scheme = "bearer "
+	if len(header) < len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
+		return "", false
+	}
+	return strings.TrimSpace(header[len(scheme):]), true
 }
 
 type errorBody struct {

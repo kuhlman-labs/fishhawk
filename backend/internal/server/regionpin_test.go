@@ -359,6 +359,48 @@ func TestOnboardingStart_AuthenticatedRequiresAccountIdentity(t *testing.T) {
 	}
 }
 
+// The single-cell operator path the OpenAPI documents: an AUTHENTICATED caller
+// naming an account, with no handoff at all, is served 200 with the
+// pass-through body shape — unpinned, no home region, no write. The refusal
+// branches only imply this path; this asserts it.
+func TestOnboardingStart_AuthenticatedWithoutHandoffPassesThrough(t *testing.T) {
+	q := &pinRecorder{}
+	s := regionPinServer(t, testHandoffSecret, testCellRegion, q)
+
+	req := httptest.NewRequest(http.MethodGet, RoutedOnboardingPath+"?provider=github&account_key=acme", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: "github:op"}))
+	w := httptest.NewRecorder()
+	// Through the middleware, not straight to the handler: the pass-through
+	// branch is part of what is under test.
+	s.withRegionPin(s.handleOnboardingStart)(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp onboardingStartResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v\n%s", err, w.Body.String())
+	}
+	if resp.Pinned {
+		t.Errorf("pinned = true, want false — no handoff accompanied this request")
+	}
+	if resp.HomeRegion != "" {
+		t.Errorf("home_region = %q, want empty — nothing pinned this account", resp.HomeRegion)
+	}
+	if resp.Provider != "github" || resp.AccountKey != "acme" {
+		t.Errorf("identity = %s/%s, want the query's github/acme", resp.Provider, resp.AccountKey)
+	}
+	if resp.CellRegion != testCellRegion {
+		t.Errorf("cell_region = %q, want %q", resp.CellRegion, testCellRegion)
+	}
+	if resp.ReadinessPath != "/v0/onboarding/readiness" {
+		t.Errorf("readiness_path = %q, want the onboarding continuation", resp.ReadinessPath)
+	}
+	if len(q.calls) != 0 {
+		t.Errorf("PinAccountHomeRegion called %d times, want 0 — a handoff-less request must not write", len(q.calls))
+	}
+}
+
 // End to end through the middleware: a handoff-bearing request is served
 // without any session, and the body reports the pinned region.
 func TestOnboardingStart_ReportsPinnedRegion(t *testing.T) {
