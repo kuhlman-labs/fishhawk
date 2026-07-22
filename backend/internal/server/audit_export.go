@@ -60,12 +60,17 @@ const scopeAuditExport = "read:audit-export"
 const exportSchemaV1 = "v1"
 
 // exportGlobalChainKey is the reserved runs-map key under which the
-// global (run-less) chain partition is exported. The nil UUID parses
-// as a valid UUID in the verifier's VerifyExport run walk; the
-// partition's entries carry run_id:null — exactly the value their
-// hashes were computed over via HashInputs — so the chain verifies
-// with no verifier change. Real run IDs are v4/v7 UUIDs, so this
-// reserved key cannot collide with a real run.
+// UNTENANTED run-less chain partition (account_id IS NULL) is
+// exported. Since ADR-057 / #1828 the run-less rows chain per
+// account_id, so each tenant account's partition is emitted under its
+// own account-UUID key alongside this one — every key an
+// independently-verifiable chain. All these keys parse as valid UUIDs
+// in the verifier's VerifyExport run walk; the entries carry
+// run_id:null — exactly the value their hashes were computed over via
+// HashInputs — so each partition verifies with no verifier change.
+// Real run IDs and account IDs are random v4/v7 UUIDs, so the
+// reserved nil-UUID key cannot collide and a run/account key
+// collision is negligible (122 random bits).
 const exportGlobalChainKey = "00000000-0000-0000-0000-000000000000"
 
 // Export-page bounding is at WHOLE-RUN granularity: a run's entire
@@ -264,8 +269,8 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Account-scope the page (ADR-057 / E44.5): a tenant can only export its
-	// own (and untenanted) run evidence. The global chain partition below is
-	// run-less and stays unfiltered.
+	// own (and untenanted) run evidence. The run-less chain partitions below
+	// have no owning run and stay unfiltered.
 	ep.page = accountVisiblePage(r, ep.page)
 
 	resp := exportResponse{
@@ -283,20 +288,20 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		resp.Runs[rn.ID.String()] = rd
 	}
 
-	// Global (run-less) chain partition: first page only (empty
-	// cursor). Emitted even when the chain is empty so consumers can
-	// distinguish "no global entries" from "not included" — never
-	// silently dropped (ADR-054 consequence). Absent on continuation
-	// pages (whole-chain bounding: it can't be split) and when
-	// include_global=false.
+	// Run-less chain partitions, one per account (ADR-057 / #1828):
+	// first page only (empty cursor). The untenanted partition is
+	// emitted under the reserved nil-UUID key even when empty so
+	// consumers can distinguish "no run-less entries" from "not
+	// included" — never silently dropped (ADR-054 consequence);
+	// tenant partitions appear under their account-UUID keys. Absent
+	// on continuation pages (whole-chain bounding: a partition can't
+	// be split) and when include_global=false.
 	if ep.includeGlobal && ep.firstPage {
-		globalEntries, gerr := s.cfg.AuditRepo.ListGlobal(r.Context())
-		if gerr != nil {
+		if gerr := s.assembleRunlessPartitions(r.Context(), resp.Runs); gerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"list global chain failed", map[string]any{"error": gerr.Error()})
+				"list run-less chain partitions failed", map[string]any{"error": gerr.Error()})
 			return
 		}
-		resp.Runs[exportGlobalChainKey] = exportRunData{AuditEntries: toExportEntries(globalEntries)}
 	}
 
 	// Continuation rides headers because ParseExport's
@@ -315,8 +320,8 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 // anonymous) is no constraint — the whole page is returned, the pre-tenancy
 // view. Every bulk-export surface (JSON, CSV, agent-changes report) routes its
 // page through this so a tenant can never export another account's run
-// evidence. The run-less global chain partition is NOT account-scoped (it has
-// no owning run) and is emitted unfiltered by each handler.
+// evidence. The run-less chain partitions are NOT account-scoped (they have
+// no owning run) and are emitted unfiltered by each handler.
 func accountVisiblePage(r *http.Request, page []*run.Run) []*run.Run {
 	acct := IdentityFrom(r.Context()).AccountID
 	if acct == "" {
@@ -329,6 +334,47 @@ func accountVisiblePage(r *http.Request, page []*run.Run) []*run.Run {
 		}
 	}
 	return out
+}
+
+// assembleRunlessPartitions emits the run-less (run_id IS NULL) chain
+// partitions into the export runs map, one key per account partition
+// (ADR-057 / #1828). ListGlobal enumerates which tenant partitions
+// exist; each emitted group is then read via ListGlobalByAccount so
+// what ships is exactly the repository's per-partition chain view —
+// the same view per-account verification walks. The untenanted
+// partition (reserved nil-UUID key) is ALWAYS emitted, even empty;
+// tenant partitions only when they have entries (an account with no
+// run-less events has no chain to verify). Partitions are not
+// account-scoped to the caller: run-less governance events have no
+// owning run, and this preserves the pre-ADR-057 ListGlobal surface.
+func (s *Server) assembleRunlessPartitions(ctx context.Context, runs map[string]exportRunData) error {
+	all, err := s.cfg.AuditRepo.ListGlobal(ctx)
+	if err != nil {
+		return err
+	}
+	seen := make(map[uuid.UUID]bool)
+	var accounts []uuid.UUID
+	for _, e := range all {
+		if e.AccountID != nil && !seen[*e.AccountID] {
+			seen[*e.AccountID] = true
+			accounts = append(accounts, *e.AccountID)
+		}
+	}
+
+	untenanted, err := s.cfg.AuditRepo.ListGlobalByAccount(ctx, nil)
+	if err != nil {
+		return err
+	}
+	runs[exportGlobalChainKey] = exportRunData{AuditEntries: toExportEntries(untenanted)}
+
+	for _, acct := range accounts {
+		entries, err := s.cfg.AuditRepo.ListGlobalByAccount(ctx, &acct)
+		if err != nil {
+			return err
+		}
+		runs[acct.String()] = exportRunData{AuditEntries: toExportEntries(entries)}
+	}
+	return nil
 }
 
 // selectExplicitRuns resolves an explicit run-id set. A compliance

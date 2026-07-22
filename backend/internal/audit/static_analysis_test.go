@@ -43,15 +43,18 @@ func TestNoAuditMutationsOutsideAuditPackage(t *testing.T) {
 
 	auditPkgRoot := filepath.Join(backendRoot, "internal", "audit")
 	migrationsRoot := filepath.Join(backendRoot, "internal", "postgres", "migrations")
-	// auditrehash is the canonical-hash data-migration package (#302).
-	// It legitimately UPDATEs audit_entries inside a transaction that
-	// temporarily disables the append-only triggers, walking every
-	// chain in sequence order to rewrite entry_hash + prev_hash under
-	// the new canonical form. The append-only invariant is preserved
-	// at every visible boundary — only the rehash transaction
-	// relaxes it, and rollback restores the triggers if anything
-	// fails. Treated like the audit package itself: exempt from the
-	// scan, gated by code review.
+	// auditrehash is the canonical-hash data-migration package (#302),
+	// which since ADR-057 / #1828 also serves as the account-aware
+	// re-anchor: it walks each per-run chain AND each run-less
+	// account partition (run_id IS NULL segmented by account_id, nil
+	// = untenanted) in sequence order, rewriting entry_hash +
+	// prev_hash so every partition chains from its own genesis. It
+	// legitimately UPDATEs audit_entries inside a transaction that
+	// temporarily disables the append-only triggers. The append-only
+	// invariant is preserved at every visible boundary — only the
+	// rehash transaction relaxes it, and rollback restores the
+	// triggers if anything fails. Treated like the audit package
+	// itself: exempt from the scan, gated by code review.
 	auditRehashRoot := filepath.Join(backendRoot, "internal", "auditrehash")
 
 	var violations []string
