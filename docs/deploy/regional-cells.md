@@ -164,6 +164,19 @@ At request time, an account whose recorded region has no configured cell gets an
 explicit `503` naming the region — **never** a fall-through to another region's
 cell.
 
+**Trust boundary: do not expose the directory to untrusted networks.**
+`GET /v0/onboarding/start` is unauthenticated and region assignment is
+first-write-wins with no move path, so anyone who can reach the directory can
+pre-register an arbitrary `(provider, account_key)` for an enterprise that has
+not onboarded yet and permanently pin it to a region of their choosing — and the
+signed handoff that results creates the account row on that cell with no
+forge-verified identity behind it. There is no recovery path short of editing
+the directory database by hand. Reachability is therefore the access control:
+confine the directory to an operator network (or front it with an
+authenticating proxy) until the endpoint is gated on an operator credential or a
+forge-verified identity. `/v0/login` and `/v0/install/callback` never assign a
+region and do not carry this exposure.
+
 ### Cell (`fishhawkd`)
 
 | Variable | Meaning |
@@ -173,16 +186,16 @@ cell.
 | `FISHHAWKD_ANTHROPIC_API_KEY` | The region's reviewer credential. Required whenever `FISHHAWKD_HOME_REGION` is set. |
 | `FISHHAWKD_DATABASE_URL` | This cell's own Postgres. One database per cell — never shared across regions. |
 | `FISHHAWKD_S3_BUCKET` | This cell's own trace bucket (see §5.2 of `docs/ARCHITECTURE.md`: bucket-per-region). |
+| `FISHHAWKD_HANDOFF_SECRET` | HMAC secret shared with the directory. MUST equal `FISHHAWK_DIRECTORY_HANDOFF_SECRET`. Empty leaves `GET /v0/onboarding/region-pin` failing closed with `503 region_pin_unavailable`. |
 
-**Current state (E44.7 as shipped).** The cell's region-pin route is registered
-and the pinner + shared secret are injected through
-`server.(*Server).ConfigureRegionPin`, but `fishhawkd`'s `serve.go` does not call
-it yet — there is no `FISHHAWKD_`-prefixed handoff-secret variable on the cell
-side. Until that wiring lands, `GET /v0/onboarding/region-pin` answers
-`503 region_pin_unavailable` on a real deployment: the directory and the codec
-are usable, the end-to-end onboarding redirect is not. Everything else in this
-document — the directory service, the handoff codec, the pin invariants, and
-region-scoped inference — is live.
+`fishhawkd`'s `serve.go` reads `FISHHAWKD_HANDOFF_SECRET` and injects it,
+together with the accounts store bound to `FISHHAWKD_HOME_REGION`, through
+`server.(*Server).ConfigureRegionPin`. Both are required: with no database pool
+or no secret the route stays failing-closed at `503 region_pin_unavailable`,
+which is the correct posture for a deployment that is not part of a regional
+topology. A cell whose secret does not match the directory's rejects every pin
+with `403 region_pin_rejected` — a secret mismatch fails closed, it never
+degrades to trusting the parameters.
 
 An empty `FISHHAWKD_HOME_REGION` is the untenanted, single-region posture: the
 residency self-check is disabled (every cell is the only cell) and inference
@@ -201,11 +214,13 @@ FISHHAWK_DIRECTORY_HANDOFF_SECRET=<shared secret>
 FISHHAWKD_HOME_REGION=us
 FISHHAWKD_ANTHROPIC_BASE_URL=https://api.anthropic.com
 FISHHAWKD_S3_BUCKET=fishhawk-traces-prod-us
+FISHHAWKD_HANDOFF_SECRET=<the same shared secret>
 
 # eu cell
 FISHHAWKD_HOME_REGION=eu
 FISHHAWKD_ANTHROPIC_BASE_URL=https://eu.api.example
 FISHHAWKD_S3_BUCKET=fishhawk-traces-prod-eu
+FISHHAWKD_HANDOFF_SECRET=<the same shared secret>
 ```
 
 Add a region by (1) standing up the cell with its own Postgres, bucket, and
@@ -228,3 +243,7 @@ The following are **human-led follow-ups**, not part of E44.7:
   instead of taking it as explicit onboarding input.
 - **Moving an account between regions** — no migration path exists, and
   first-write-wins deliberately forbids it in place.
+- **Authenticating `/v0/onboarding/start`** — the endpoint takes the region as
+  explicit input with no operator credential or forge-verified identity behind
+  it. Until that lands, network reachability is the access control (see the
+  trust-boundary note under *Directory* above).

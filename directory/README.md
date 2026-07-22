@@ -101,6 +101,25 @@ Region **discovery** (e.g. reading an enterprise's GHEC data-residency region)
 is out of scope: the region arrives as explicit input at
 `/v0/onboarding/start`.
 
+### Trust assumption: who may call `/v0/onboarding/start`
+
+`GET /v0/onboarding/start` is **unauthenticated**, and region assignment is
+first-write-wins with **no move path**. Those two facts compose into a
+residency-squatting exposure: anyone who can reach the directory can
+pre-register an arbitrary `(provider, account_key)` — a victim enterprise that
+has not onboarded yet — and permanently pin it to a region of their choosing,
+and the resulting signed handoff creates the account row on that cell without
+any forge-verified identity. Nothing recovers from that except operating on the
+directory database by hand.
+
+So the deployment topology carries the access control this endpoint does not:
+**the directory MUST NOT be exposed to untrusted networks.** Reachability of
+`/v0/onboarding/start` is the trust boundary — confine it to an operator
+network (or an authenticating reverse proxy) until the endpoint itself is gated
+on an operator credential or a forge-verified identity. Do not run it on the
+public internet as shipped. `/v0/login` and `/v0/install/callback` never assign
+a region, so they do not carry this exposure.
+
 ## Configuration
 
 | Variable | Required | Meaning |

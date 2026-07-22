@@ -304,6 +304,30 @@ func resolveRegionInference(homeRegion, anthropicBaseURL, anthropicAPIKey string
 	return regionInference{homeRegion: region, anthropicBaseURL: baseURL}, nil
 }
 
+// resolveRegionPin builds the cell-side region-pin dependencies (ADR-062 /
+// E44.7, #1831): the accounts store bound to THIS cell's home-region tag, and
+// the HMAC secret shared with the global directory. The bool reports whether
+// the pair is complete enough to wire.
+//
+// Both inputs are required and the gate is AND, not OR: the querier is what
+// records the pin, and the secret is the pin's only authentication. Missing
+// either, this returns ok=false and the caller leaves the route failing closed
+// with 503 region_pin_unavailable — the correct posture for a deployment that
+// is not part of a regional topology, and never a degrade to accepting
+// unauthenticated handoff parameters.
+//
+// Unlike resolveRegionInference this is deliberately NOT a startup abort:
+// region pinning is optional (a single-cell deployment has no directory in
+// front of it), whereas an out-of-region inference endpoint would silently
+// break the residency guarantee.
+func resolveRegionPin(q account.RegionQuerier, cellHomeRegion, handoffSecret string) (*account.RegionPinner, []byte, bool) {
+	secret := strings.TrimSpace(handoffSecret)
+	if q == nil || secret == "" {
+		return nil, nil, false
+	}
+	return account.NewRegionPinner(q, cellHomeRegion), []byte(secret), true
+}
+
 // resolvePlanReviewers builds the server.ReviewerSet from opts and logs every
 // configured adapter at startup (#955). Unlike the pre-#955 single-adapter
 // resolver, ALL configured backends are concurrently available to the
@@ -848,6 +872,9 @@ func runServe(args []string, logSink io.Writer) int {
 	anthropicBaseURL := fs.String("anthropic-base-url",
 		envOr("FISHHAWKD_ANTHROPIC_BASE_URL", ""),
 		"Anthropic API endpoint the reviewer's Messages client targets (ADR-062 / E44.7 regional cells). Set it to this cell's IN-REGION model endpoint so prompt content never leaves the cell's region. Empty keeps the SDK default (single-region deployment, unchanged). Process-level: one endpoint per cell, never a per-account lookup")
+	handoffSecret := fs.String("handoff-secret",
+		envOr("FISHHAWKD_HANDOFF_SECRET", ""),
+		"HMAC secret shared with the global directory (ADR-062 / E44.7 regional cells). It MUST match the directory's FISHHAWK_DIRECTORY_HANDOFF_SECRET — it is what authenticates a directory-issued region pin arriving at GET /v0/onboarding/region-pin. Empty leaves that route failing closed with 503 region_pin_unavailable (the unregionalized posture)")
 	homeRegion := fs.String("home-region",
 		envOr("FISHHAWKD_HOME_REGION", ""),
 		"this cell's home region tag (e.g. us, eu, au) under ADR-062 regional cells. Empty means an unregionalized deployment. When set, the cell fails startup unless its region-scoped model endpoint (--anthropic-base-url) AND its reviewer key (--anthropic-api-key) are both configured — a regionalized cell must never fall back to an out-of-region endpoint")
@@ -1539,6 +1566,29 @@ func runServe(args []string, logSink io.Writer) int {
 	cfg.GitHubManifest = authpkg.NewGitHubManifest(authpkg.ManifestURLs{})
 
 	srv := server.New(cfg)
+
+	// Cell-side region pin (ADR-062 / E44.7, #1831). Wires the two deps
+	// GET /v0/onboarding/region-pin needs: the accounts store bound to THIS
+	// cell's home-region tag (the residency self-check), and the HMAC secret
+	// shared with the global directory (the handoff's authentication). Both
+	// are required — a nil pool or an empty secret leaves the route failing
+	// closed with 503 region_pin_unavailable, which is the correct posture
+	// for a deployment that is not part of a regional topology.
+	var regionPinQuerier account.RegionQuerier
+	if pool != nil {
+		regionPinQuerier = accountdb.New(pool)
+	}
+	if pinner, secret, ok := resolveRegionPin(regionPinQuerier, region.homeRegion, *handoffSecret); ok {
+		srv.ConfigureRegionPin(pinner, secret)
+		logger.Info("region-pin handoff configured",
+			slog.String("home_region", region.homeRegion),
+			slog.String("ref", "ADR-062"))
+	} else {
+		logger.Info("region-pin handoff not configured; GET /v0/onboarding/region-pin fails closed",
+			slog.Bool("database", pool != nil),
+			slog.Bool("handoff_secret", strings.TrimSpace(*handoffSecret) != ""),
+			slog.String("ref", "ADR-062"))
+	}
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
 	// .fishhawk/work-management.yaml from the filing repo's OWN forge,

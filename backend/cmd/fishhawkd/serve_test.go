@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -1456,6 +1457,60 @@ func TestRunServe_RegionalCellWithoutEndpointFailsStartup(t *testing.T) {
 	if !strings.Contains(logs.String(), "region-scoped inference config invalid") {
 		t.Errorf("logs = %q, want them to name the region-scoped inference failure", logs.String())
 	}
+}
+
+// fakeRegionQuerier satisfies account.RegionQuerier so resolveRegionPin can be
+// driven without a database. Neither method is called — the resolver only
+// stores the querier — so both fail loudly if that ever changes.
+type fakeRegionQuerier struct{}
+
+func (fakeRegionQuerier) GetAccountByKey(context.Context, accountdb.GetAccountByKeyParams) (accountdb.Account, error) {
+	return accountdb.Account{}, errors.New("unexpected GetAccountByKey")
+}
+
+func (fakeRegionQuerier) UpsertAccount(context.Context, accountdb.UpsertAccountParams) (accountdb.Account, error) {
+	return accountdb.Account{}, errors.New("unexpected UpsertAccount")
+}
+
+// TestResolveRegionPin pins the cell-side handoff wiring gate (ADR-062 /
+// E44.7, #1831). The gate is AND: BOTH an accounts querier and a non-empty
+// FISHHAWKD_HANDOFF_SECRET are required, because the secret is the pin's only
+// authentication — missing either, serve leaves GET /v0/onboarding/region-pin
+// failing closed with 503 rather than trusting the handoff parameters.
+func TestResolveRegionPin(t *testing.T) {
+	t.Run("both present wires the pinner with this cell's region", func(t *testing.T) {
+		pinner, secret, ok := resolveRegionPin(fakeRegionQuerier{}, " EU ", "  shared-secret  ")
+		if !ok {
+			t.Fatal("resolveRegionPin ok = false, want true (querier and secret both present)")
+		}
+		if pinner == nil {
+			t.Fatal("resolveRegionPin returned a nil pinner with ok = true")
+		}
+		// The residency self-check reads this tag, so a raw/uncased
+		// FISHHAWKD_HOME_REGION must normalize on the way in.
+		if got := pinner.HomeRegion(); got != "eu" {
+			t.Errorf("pinner.HomeRegion() = %q, want %q", got, "eu")
+		}
+		if string(secret) != "shared-secret" {
+			t.Errorf("secret = %q, want %q (trimmed)", secret, "shared-secret")
+		}
+	})
+
+	t.Run("no querier fails closed", func(t *testing.T) {
+		pinner, secret, ok := resolveRegionPin(nil, "eu", "shared-secret")
+		if ok || pinner != nil || secret != nil {
+			t.Fatalf("resolveRegionPin(nil querier) = (%v, %q, %v), want (nil, nil, false)", pinner, secret, ok)
+		}
+	})
+
+	t.Run("empty or whitespace secret fails closed", func(t *testing.T) {
+		for _, s := range []string{"", "   "} {
+			pinner, secret, ok := resolveRegionPin(fakeRegionQuerier{}, "eu", s)
+			if ok || pinner != nil || secret != nil {
+				t.Fatalf("resolveRegionPin(secret=%q) = (%v, %q, %v), want (nil, nil, false)", s, pinner, secret, ok)
+			}
+		}
+	})
 }
 
 // TestPlanReviewerSet_AnthropicTargetsRegionalEndpoint is the cross-boundary

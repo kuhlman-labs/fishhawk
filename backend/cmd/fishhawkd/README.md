@@ -59,6 +59,15 @@ regions (a per-account choice would need its own ADR).
 |---|---|---|---|
 | `FISHHAWKD_ANTHROPIC_BASE_URL` | `--anthropic-base-url` | Threaded onto `anthropic.Config.BaseURL`, which the reviewer's Messages client applies via `option.WithBaseURL` | empty → SDK default |
 | `FISHHAWKD_HOME_REGION` | `--home-region` | This cell's region tag (`us`, `eu`, `au`), trimmed + lowercased | empty → unregionalized |
+| `FISHHAWKD_HANDOFF_SECRET` | `--handoff-secret` | HMAC secret shared with the global directory; authenticates a directory-issued region pin at `GET /v0/onboarding/region-pin`. Must equal the directory's `FISHHAWK_DIRECTORY_HANDOFF_SECRET` | empty → route fails closed `503` |
+
+`serve.go` injects the secret with the accounts store bound to
+`FISHHAWKD_HOME_REGION` through `server.(*Server).ConfigureRegionPin`, after `server.New`. Both a
+database pool and a non-empty secret are required; absent either, the region-pin route keeps
+answering `503 region_pin_unavailable`. Unlike the inference vars this is **not** a startup abort —
+region pinning is optional for a cell that is not part of a regional topology, whereas an
+out-of-region inference endpoint would silently break residency. A secret that does not match the
+directory's fails closed too: every pin is rejected `403 region_pin_rejected`.
 
 `Config.BaseURL` is applied **before** the variadic `option.RequestOption`s, so a caller's explicit
 `option.WithBaseURL` (how tests point the client at an httptest server) still wins.
