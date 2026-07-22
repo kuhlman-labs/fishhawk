@@ -134,6 +134,14 @@ func (f *fakeAuthRepo) EvictExpired(_ context.Context, _ int64) (int64, error) {
 // exchange + profile fetch.
 func stubGitHubOAuthServer(t *testing.T) (*httptest.Server, *auth.GitHubOAuth) {
 	t.Helper()
+	return stubGitHubOAuthServerWithLogin(t, "octocat")
+}
+
+// stubGitHubOAuthServerWithLogin is stubGitHubOAuthServer with a
+// caller-chosen profile login, so the EMU case can drive an
+// "<username>_<shortcode>" login through the real callback.
+func stubGitHubOAuthServerWithLogin(t *testing.T, login string) (*httptest.Server, *auth.GitHubOAuth) {
+	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login/oauth/access_token", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -142,7 +150,7 @@ func stubGitHubOAuthServer(t *testing.T) (*httptest.Server, *auth.GitHubOAuth) {
 	mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
 		body, _ := json.Marshal(map[string]any{
 			"id":    int64(42),
-			"login": "octocat",
+			"login": login,
 			"name":  "The Octo Cat",
 			"email": "octo@example.com",
 		})
@@ -829,7 +837,9 @@ func assertNoAuthCookies(t *testing.T, w *httptest.ResponseRecorder) {
 // accounts rows — the cross-boundary seam the per-layer units can't
 // cover (sessions.account_id persisted end-to-end).
 func TestGitHubCallback_MembershipGate_PostgresE2E(t *testing.T) {
-	newPGAuthServer := func(t *testing.T, lister *e2eOrgLister) (*Server, *pgxpool.Pool) {
+	// newPGAuthServerAs wires the REAL resolver over the real store with
+	// the given profile login and (optionally) an EMU-posture OAuth host.
+	newPGAuthServerAs := func(t *testing.T, lister *e2eOrgLister, login, emuOAuthHost string) (*Server, *pgxpool.Pool) {
 		t.Helper()
 		url := pgtest.NewURL(t)
 		if err := postgres.MigrateUp(url); err != nil {
@@ -840,29 +850,97 @@ func TestGitHubCallback_MembershipGate_PostgresE2E(t *testing.T) {
 			t.Fatalf("pool: %v", err)
 		}
 		t.Cleanup(pool.Close)
-		_, gh := stubGitHubOAuthServer(t)
+		_, gh := stubGitHubOAuthServerWithLogin(t, login)
 		s := New(Config{
 			Addr:        "127.0.0.1:0",
 			AuthRepo:    auth.NewPostgresRepository(pool),
 			GitHubOAuth: gh,
 			AuthMembership: auth.NewMembershipResolver(
-				auth.NewAccountMembershipStore(accountdb.New(pool)), lister),
+				auth.NewAccountMembershipStore(accountdb.New(pool)),
+				map[string]auth.ForgeMembershipLister{"github": lister},
+				auth.WithEMUOAuthHost(emuOAuthHost)),
 			AuthRedirectAfterLogin: "/app",
 		})
 		return s, pool
 	}
-	seedAccount := func(t *testing.T, pool *pgxpool.Pool, key string, autoJoinRole *string) uuid.UUID {
+	newPGAuthServer := func(t *testing.T, lister *e2eOrgLister) (*Server, *pgxpool.Pool) {
+		t.Helper()
+		return newPGAuthServerAs(t, lister, "octocat", "")
+	}
+	seedAccountAt := func(t *testing.T, pool *pgxpool.Pool, key, granularity string, autoJoinRole *string) uuid.UUID {
 		t.Helper()
 		id := uuid.New()
 		if _, err := pool.Exec(context.Background(),
 			`INSERT INTO accounts (id, provider, account_key, granularity, auto_join_role)
-			 VALUES ($1, 'github', $2, 'organization', $3)`,
-			id, key, autoJoinRole,
+			 VALUES ($1, 'github', $2, $3, $4)`,
+			id, key, granularity, autoJoinRole,
 		); err != nil {
 			t.Fatalf("seed account: %v", err)
 		}
 		return id
 	}
+	seedAccount := func(t *testing.T, pool *pgxpool.Pool, key string, autoJoinRole *string) uuid.UUID {
+		t.Helper()
+		return seedAccountAt(t, pool, key, "organization", autoJoinRole)
+	}
+
+	// EMU end-to-end: an "<username>_<shortcode>" login under EMU
+	// posture resolves profile → short code → the pair-wise auto-join
+	// SQL → minted grant → session bound to the ENTERPRISE account,
+	// across all four layers. No org membership is involved.
+	t.Run("EMU enterprise auto-join admits and binds the session", func(t *testing.T) {
+		lister := &e2eOrgLister{} // no org memberships at all
+		s, pool := newPGAuthServerAs(t, lister, "alice_acme",
+			"https://acme.ghe.com/login/oauth/authorize")
+		role := "member"
+		accountID := seedAccountAt(t, pool, "acme", "enterprise", &role)
+
+		w := callbackRequest(t, s)
+		if w.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+		}
+		var persisted *uuid.UUID
+		if err := pool.QueryRow(context.Background(),
+			`SELECT account_id FROM sessions`).Scan(&persisted); err != nil {
+			t.Fatalf("read sessions.account_id: %v", err)
+		}
+		if persisted == nil || *persisted != accountID {
+			t.Errorf("sessions.account_id = %v, want the enterprise account %s", persisted, accountID)
+		}
+		var origin string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT origin FROM account_members WHERE account_id = $1 AND member_ref = 'alice_acme'`,
+			accountID).Scan(&origin); err != nil {
+			t.Fatalf("read minted grant: %v", err)
+		}
+		if origin != "auto_join" {
+			t.Errorf("origin = %q, want auto_join", origin)
+		}
+	})
+
+	// The same login on github.com posture is DENIED: no enterprise key
+	// is derived, so a crafted underscore login cannot claim an
+	// enterprise end-to-end either.
+	t.Run("underscore login on github.com posture is denied", func(t *testing.T) {
+		lister := &e2eOrgLister{}
+		s, pool := newPGAuthServerAs(t, lister, "alice_acme", "")
+		role := "member"
+		seedAccountAt(t, pool, "acme", "enterprise", &role)
+
+		w := callbackRequest(t, s)
+		if loc := w.Header().Get("Location"); loc != "/access-denied" {
+			t.Errorf("Location = %q, want /access-denied", loc)
+		}
+		assertNoAuthCookies(t, w)
+		var sessions int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM sessions`).Scan(&sessions); err != nil {
+			t.Fatalf("count sessions: %v", err)
+		}
+		if sessions != 0 {
+			t.Errorf("sessions rows = %d, want 0 on deny", sessions)
+		}
+	})
 
 	t.Run("auto-join admits and binds the session", func(t *testing.T) {
 		lister := &e2eOrgLister{keys: []string{"acme-corp"}}

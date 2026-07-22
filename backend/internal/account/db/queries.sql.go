@@ -184,32 +184,46 @@ func (q *Queries) ListAccountsByAccountKey(ctx context.Context, accountKey strin
 }
 
 const listAutoJoinAccountsByKeys = `-- name: ListAutoJoinAccountsByKeys :many
-SELECT id, account_key, auto_join_role
-  FROM accounts
- WHERE provider = $1
-   AND granularity = 'organization'
-   AND auto_join_role IS NOT NULL
-   AND account_key = ANY($2::text[])
- ORDER BY account_key ASC
+SELECT a.id, a.account_key, a.granularity, a.auto_join_role
+  FROM accounts a
+  JOIN unnest($2::text[], $3::text[])
+       AS p(account_key, granularity)
+    ON a.account_key = p.account_key
+   AND a.granularity = p.granularity
+ WHERE a.provider = $1
+   AND a.auto_join_role IS NOT NULL
+ ORDER BY a.account_key ASC, a.granularity ASC
 `
 
 type ListAutoJoinAccountsByKeysParams struct {
-	Provider    string   `json:"provider"`
-	AccountKeys []string `json:"account_keys"`
+	Provider      string   `json:"provider"`
+	AccountKeys   []string `json:"account_keys"`
+	Granularities []string `json:"granularities"`
 }
 
 type ListAutoJoinAccountsByKeysRow struct {
 	ID           uuid.UUID `json:"id"`
 	AccountKey   string    `json:"account_key"`
+	Granularity  string    `json:"granularity"`
 	AutoJoinRole *string   `json:"auto_join_role"`
 }
 
-// Auto-join bootstrap intersection (E44.3): organization-granularity accounts
-// whose auto_join_role policy is set and whose org key appears in the user's
-// LIVE forge org list. Stable account_key order keeps the callback's
+// Auto-join bootstrap intersection (E44.3, generalized in E44.8): the
+// organization / enterprise / group-granularity accounts whose auto_join_role
+// policy is set and whose (account_key, granularity) PAIR appears in the
+// membership set the resolver derived for this login.
+//
+// The two arrays are POSITIONALLY PAIRED via unnest — never two independent
+// ANY() predicates. Their cartesian product would admit across granularities
+// (a live GitHub org key "acme" admitting an ENTERPRISE account keyed "acme",
+// or a derived enterprise short code admitting an organization account of the
+// same key), which is unauthorized admission. Each key stays bound to the
+// granularity it was derived from.
+//
+// Stable (account_key, granularity) order keeps the callback's
 // deterministic-first pick reproducible.
 func (q *Queries) ListAutoJoinAccountsByKeys(ctx context.Context, arg ListAutoJoinAccountsByKeysParams) ([]ListAutoJoinAccountsByKeysRow, error) {
-	rows, err := q.db.Query(ctx, listAutoJoinAccountsByKeys, arg.Provider, arg.AccountKeys)
+	rows, err := q.db.Query(ctx, listAutoJoinAccountsByKeys, arg.Provider, arg.AccountKeys, arg.Granularities)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +231,7 @@ func (q *Queries) ListAutoJoinAccountsByKeys(ctx context.Context, arg ListAutoJo
 	var items []ListAutoJoinAccountsByKeysRow
 	for rows.Next() {
 		var i ListAutoJoinAccountsByKeysRow
-		if err := rows.Scan(&i.ID, &i.AccountKey, &i.AutoJoinRole); err != nil {
+		if err := rows.Scan(&i.ID, &i.AccountKey, &i.Granularity, &i.AutoJoinRole); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

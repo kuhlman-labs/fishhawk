@@ -32,6 +32,21 @@ convention); `db/*.go` is hand-written to match sqlc's output shape.
   account), and a `BEFORE UPDATE` trigger reusing the shared
   `fishhawk_set_updated_at()` function from `0001`.
 
+## The auto-join intersection query is PAIR-WISE (E44.3, generalized in E44.8 / #1832)
+
+`ListAutoJoinAccountsByKeys` takes TWO string arrays — `account_keys` and
+`granularities` — that are **positionally paired**, `unnest`ed together and
+joined against `accounts`, so index *i*'s key only ever matches index *i*'s
+granularity. It is deliberately NOT
+`account_key = ANY(keys) AND granularity = ANY(granularities)`: those are
+independent predicates whose cartesian product would admit a user who is merely
+an org member of "acme" into an `enterprise`-granularity account keyed "acme"
+(and a derived enterprise short code into an `organization` account of the same
+key) — unauthorized admission in the login gate. The caller
+(`auth.MembershipResolver`) derives each key already bound to the granularity it
+came from (`organization` / `enterprise` / `group`); see
+`backend/internal/auth/README.md`.
+
 ## account_id threading
 
 Migration `0055` threads a **nullable** `account_id UUID` column through the

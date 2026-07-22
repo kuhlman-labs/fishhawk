@@ -658,6 +658,39 @@ func resolveGitHubEndpoints(apiURL, uploadURL, authorizeURL, tokenURL, userURL, 
 	return ep
 }
 
+// resolveMembershipListers builds the provider-keyed lister map the E44.8
+// membership resolver dispatches on. github is registered whenever OAuth is
+// configured (the GitHubOAuth client doubles as the org-membership lister);
+// gitlab registers ONLY when a base URL is configured, and deliberately needs
+// no token — the login gate reads groups with the signing-in USER's OAuth
+// access token, never the deployment's FISHHAWKD_GITLAB_TOKEN (which gates the
+// separate forge / work-item provider). A provider absent from the map denies,
+// so an unconfigured forge can never admit.
+//
+// Pure (no I/O, no globals) so serve_test.go pins the registration matrix
+// without booting the server. The nil check on the concrete lister matters: a
+// typed-nil pointer stored in the interface map would read as "registered".
+func resolveMembershipListers(githubOAuth *authpkg.GitHubOAuth, gitlabBaseURL string) map[string]authpkg.ForgeMembershipLister {
+	listers := map[string]authpkg.ForgeMembershipLister{}
+	if githubOAuth != nil {
+		listers["github"] = githubOAuth
+	}
+	if gl := authpkg.NewGitLabMembershipLister(gitlabBaseURL); gl != nil {
+		listers["gitlab"] = gl
+	}
+	return listers
+}
+
+// sortedKeys returns a map's keys in a stable order for logging.
+func sortedKeys(m map[string]authpkg.ForgeMembershipLister) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // resolveOperatorRepoToken builds the REST-read token accessor the forge-neutral
 // identity provider uses to authenticate its permission/membership reads
 // (E39.10 / #1753). The token-mint authz gate (#1708/#1709) reads
@@ -1603,14 +1636,23 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken,
 			githubEndpoints.IdentityAPIURL, githubEndpoints.IdentityOAuthURL)
 		// Workspace-membership login gate (E44.3 / ADR-057 Amendment
-		// A2): invited account_members rows admit DB-only; the
-		// GitHubOAuth client doubles as the ForgeMembershipLister for
-		// the auto-join bootstrap. Without a database the resolver
-		// stays nil and the callback denies every sign-in (fail
-		// closed).
+		// A2, generalized in E44.8 / #1832): invited account_members
+		// rows admit DB-only; the auto-join bootstrap consults a
+		// provider-keyed lister map. The GitHubOAuth client is the
+		// github lister (org granularity, plus EMU enterprise
+		// granularity derived from the login under a data-resident
+		// GHEC OAuth host); a configured FISHHAWKD_GITLAB_BASE_URL adds
+		// the gitlab lister (group granularity) — it uses the USER's
+		// OAuth token, never FISHHAWKD_GITLAB_TOKEN. Without a database
+		// the resolver stays nil and the callback denies every sign-in
+		// (fail closed).
+		membershipListers := resolveMembershipListers(cfg.GitHubOAuth, *gitlabBaseURL)
+		emuAutoJoin := authpkg.IsEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL)
 		if pool != nil {
 			cfg.AuthMembership = authpkg.NewMembershipResolver(
-				authpkg.NewAccountMembershipStore(accountdb.New(pool)), cfg.GitHubOAuth)
+				authpkg.NewAccountMembershipStore(accountdb.New(pool)),
+				membershipListers,
+				authpkg.WithEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL))
 		} else {
 			logger.Warn("membership resolver unconfigured (no database); every OAuth sign-in will be denied")
 		}
@@ -1618,7 +1660,21 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("callback_url", *oauthCallbackURL),
 			slog.String("redirect_after_login", *oauthRedirectAfterLogin),
 			slog.Bool("github_identity_provider", cfg.IdentityProvider != nil),
-			slog.Bool("rest_read_token", operatorRepoToken != nil))
+			slog.Bool("rest_read_token", operatorRepoToken != nil),
+			slog.Any("membership_providers", sortedKeys(membershipListers)),
+			slog.Bool("emu_enterprise_auto_join", emuAutoJoin))
+		if _, ok := membershipListers["gitlab"]; ok {
+			// The two GitLab surfaces are configured ASYMMETRICALLY:
+			// the login-gate lister needs only the base URL (it
+			// authenticates as the signing-in user), while the forge /
+			// work-item provider additionally needs
+			// FISHHAWKD_GITLAB_TOKEN and stays 501 without it. Say both
+			// out loud so the "gitlab is disabled" warning above is not
+			// read as covering the login gate. Note also that the
+			// lister is unreachable until a GitLab browser sign-in flow
+			// exists (seam-first delivery, E44.8).
+			logger.Info("gitlab login-gate group auto-join enabled by FISHHAWKD_GITLAB_BASE_URL alone (uses the signing-in user's OAuth token); the gitlab forge/work-item provider separately requires FISHHAWKD_GITLAB_TOKEN and stays 501 without it; no GitLab browser sign-in flow ships yet, so this lister is not reachable in production until one lands")
+		}
 	} else {
 		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/login + /callback respond 503; identity provider defaults to NoOp (deny-by-default)")
 	}
