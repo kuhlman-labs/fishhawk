@@ -1518,6 +1518,133 @@ func TestFileWorkItem_RunBound_RunAbsent_GitLab_Forbidden(t *testing.T) {
 	}
 }
 
+// TestFileWorkItem_RunBound_RunScoped_GitLab_Dispatches pins the load-bearing
+// POSITIVE run-scoped door (#2024 / E45.17): a run-bound agent token that
+// supplies its own repo-consistency-checked run_id for a run carrying a nil
+// InstallationID (every gitlab run) MUST dispatch successfully, even though
+// Target.Scope stays zero. The gate is keyed on activeRun == nil, NOT on
+// Target.Scope.IsZero() — this test proves it by configuring a GitHub client
+// (whose installation endpoint must never be hit for a gitlab-provider
+// filing, since the resolution branch is gated on
+// conv.Provider == github_projects). A refactor that re-keys the gate onto
+// Target.Scope.IsZero() would reject this filing and turn this test red.
+func TestFileWorkItem_RunBound_RunScoped_GitLab_Dispatches(t *testing.T) {
+	fp := &fakeWorkProvider{name: workmgmtgitlab.ProviderName}
+	workmgmt.Register(fp)
+
+	conv := workmgmt.Default()
+	conv.Provider = workmgmtgitlab.ProviderName
+	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
+	prev := conventionsLoader
+	conventionsLoader = func(string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	runID := uuid.New()
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", State: run.StateRunning}
+
+	// GitHub client configured so a refactor that re-keys the gate onto
+	// Target.Scope.IsZero() (rather than activeRun == nil) is actually
+	// exercised: with GitHub nil, the pre-diff predicate
+	// (target.Scope.IsZero() && s.cfg.GitHub != nil) would already be false
+	// and this test would pass for the wrong reason. Its /repos/ endpoint
+	// must never be hit — installation resolution only runs for
+	// conv.Provider == github_projects.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/", func(w http.ResponseWriter, _ *http.Request) {
+		t.Errorf("GetRepoInstallation called; want no GitHub resolution for a gitlab-provider filing")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	gh := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  &fakeTokenProvider{tok: "ghs_t"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "ghs_jwt", nil },
+	}
+	s := New(Config{RunRepo: rr, AuditRepo: au, GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "File a gitlab issue via the run-scoped door",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		RunID:     runID.String(),
+	}, "mcp:run:"+runID.String())
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.called {
+		t.Fatal("gitlab provider was not called")
+	}
+	if !fp.captured.Target.Scope.IsZero() {
+		t.Errorf("provider Target.Scope = %q, want zero (no GitHub resolveRepoScope for a gitlab-provider filing)", fp.captured.Target.Scope.Ref())
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Provider != workmgmtgitlab.ProviderName {
+		t.Errorf("provider = %q, want %q", resp.Provider, workmgmtgitlab.ProviderName)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category == categoryWorkItemFiled {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no work_item_filed audit entry; appended=%d", len(au.appended))
+	}
+}
+
+// TestFileWorkItem_RunBound_RunScoped_GitHubProjects_NilInstallation_Dispatches
+// is the github_projects twin of the gitlab test above: a run-bound token
+// whose run carries a nil InstallationID (e.g. a github_projects run whose
+// installation lookup never resolved) files run-scoped. The run-scoped door
+// lets this filing proceed (activeRun != nil) and, because Target.Scope
+// starts zero and the provider IS github_projects, it newly enters
+// resolveRepoScope — exactly as the diff intends.
+func TestFileWorkItem_RunBound_RunScoped_GitHubProjects_NilInstallation_Dispatches(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	runID := uuid.New()
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", State: run.StateRunning}
+
+	const wantInst = int64(5566)
+	gh := newInstallationGitHubClient(t, wantInst, false)
+	s := New(Config{RunRepo: rr, AuditRepo: au, GitHub: gh})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "chore",
+		Summary:   "File via the run-scoped door with a nil-installation run",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		RunID:     runID.String(),
+	}, "mcp:run:"+runID.String())
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.called {
+		t.Fatal("provider was not called")
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Provider != workmgmtgithub.ProviderName {
+		t.Errorf("provider = %q, want %q", resp.Provider, workmgmtgithub.ProviderName)
+	}
+	if fp.captured.Target.Scope != forge.FromGitHubInstallationID(wantInst) {
+		t.Errorf("provider Target.Scope = %q, want scope for installation %d (resolved via resolveRepoScope)",
+			fp.captured.Target.Scope.Ref(), wantInst)
+	}
+}
+
 // newEpicGitHubClient builds a *githubclient.Client whose installation
 // endpoint answers with installID and whose single-issue endpoint answers
 // with epicTitle — the harness for the #1184 epic auto-derivation seam
