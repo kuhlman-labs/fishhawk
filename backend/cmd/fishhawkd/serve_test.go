@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
@@ -897,7 +898,7 @@ func TestServeWiresRefinementConfig(t *testing.T) {
 // the assertion honest if the gate ever changes.
 func TestResolveIdentityProvider(t *testing.T) {
 	// Present: a GitHub provider is constructed.
-	present := resolveIdentityProvider("client-id", nil)
+	present := resolveIdentityProvider("client-id", nil, "", "")
 	if present == nil {
 		t.Fatal("resolveIdentityProvider with a client_id returned nil; want a GitHub provider")
 	}
@@ -910,7 +911,7 @@ func TestResolveIdentityProvider(t *testing.T) {
 	// otherwise the REST reads stay anonymous even when serve wires an
 	// accessor. Reflection reads the field's nil-ness without invoking it.
 	accessor := func(context.Context) (string, error) { return "tok", nil }
-	withTok := resolveIdentityProvider("client-id", accessor)
+	withTok := resolveIdentityProvider("client-id", accessor, "", "")
 	if got := identityProviderTokenIsNil(t, withTok); got {
 		t.Error("resolveIdentityProvider dropped the token accessor; provider.token is nil, want non-nil")
 	}
@@ -918,15 +919,82 @@ func TestResolveIdentityProvider(t *testing.T) {
 		t.Error("resolveIdentityProvider(nil) left provider.token non-nil, want nil")
 	}
 
+	// Endpoint override (E44.2 / #1826): a configured API/OAuth base threads
+	// onto the provider's unexported apiBaseURL/oauthBaseURL fields. Empty
+	// leaves the GitHub defaults; a configured value overrides them.
+	if got := identityProviderBaseURLs(t, present); got.api != identity.DefaultAPIBaseURL || got.oauth != identity.DefaultOAuthBaseURL {
+		t.Errorf("default provider base URLs = %+v, want GitHub defaults", got)
+	}
+	configured := resolveIdentityProvider("client-id", nil, "https://ghes.example.com/api/v3", "https://ghes.example.com")
+	if got := identityProviderBaseURLs(t, configured); got.api != "https://ghes.example.com/api/v3" || got.oauth != "https://ghes.example.com" {
+		t.Errorf("configured provider base URLs = %+v, want the GHES hosts", got)
+	}
+
 	// Absent: nil so server.New defaults to NoOp. Feeding it through
 	// server.New proves the end-to-end fallback the seam relies on.
-	absent := resolveIdentityProvider("", nil)
+	absent := resolveIdentityProvider("", nil, "", "")
 	if absent != nil {
 		t.Fatalf("resolveIdentityProvider with no client_id = %#v, want nil", absent)
 	}
 	srv := server.New(server.Config{IdentityProvider: absent})
 	if srv == nil {
 		t.Fatal("server.New returned nil")
+	}
+}
+
+// TestResolveGitHubEndpoints pins the Mode-1 (per-deployment) endpoint
+// resolution helper (E44.2 / #1826): unset env → empty override fields so
+// every GitHub client keeps its github.com / api.github.com default; a
+// configured deployment → each raw env string lands on the matching per-client
+// override surface, and the identity device-flow host is derived from the
+// scheme+host of the OAuth authorize URL.
+func TestResolveGitHubEndpoints(t *testing.T) {
+	// Unset: every override empty → clients keep their defaults.
+	unset := resolveGitHubEndpoints("", "", "", "", "", "")
+	if unset.APIBaseURL != "" || unset.UploadBaseURL != "" || unset.IdentityAPIURL != "" || unset.IdentityOAuthURL != "" {
+		t.Errorf("unset endpoints carried non-empty overrides: %+v", unset)
+	}
+	if unset.OAuth != (authpkg.OAuthURLs{}) {
+		t.Errorf("unset OAuth URLs = %+v, want zero (NewGitHubOAuth fills defaults)", unset.OAuth)
+	}
+
+	// Configured GHES/EMU deployment: raw strings map onto per-client fields.
+	got := resolveGitHubEndpoints(
+		"https://ghes.example.com/api/v3",
+		"https://ghes.example.com/api/uploads",
+		"https://ghes.example.com/login/oauth/authorize",
+		"https://ghes.example.com/login/oauth/access_token",
+		"https://ghes.example.com/api/v3/user",
+		"https://ghes.example.com/api/v3/user/orgs",
+	)
+	if got.APIBaseURL != "https://ghes.example.com/api/v3" {
+		t.Errorf("APIBaseURL = %q", got.APIBaseURL)
+	}
+	if got.UploadBaseURL != "https://ghes.example.com/api/uploads" {
+		t.Errorf("UploadBaseURL = %q", got.UploadBaseURL)
+	}
+	if got.IdentityAPIURL != "https://ghes.example.com/api/v3" {
+		t.Errorf("IdentityAPIURL = %q", got.IdentityAPIURL)
+	}
+	wantOAuth := authpkg.OAuthURLs{
+		AuthorizeURL: "https://ghes.example.com/login/oauth/authorize",
+		TokenURL:     "https://ghes.example.com/login/oauth/access_token",
+		UserURL:      "https://ghes.example.com/api/v3/user",
+		OrgsURL:      "https://ghes.example.com/api/v3/user/orgs",
+	}
+	if got.OAuth != wantOAuth {
+		t.Errorf("OAuth = %+v, want %+v", got.OAuth, wantOAuth)
+	}
+	// Identity device-flow host derived from the authorize URL's scheme+host.
+	if got.IdentityOAuthURL != "https://ghes.example.com" {
+		t.Errorf("IdentityOAuthURL = %q, want https://ghes.example.com", got.IdentityOAuthURL)
+	}
+
+	// An unparseable authorize URL leaves IdentityOAuthURL empty (default host)
+	// rather than propagating a malformed value.
+	bad := resolveGitHubEndpoints("", "", "://no-scheme", "", "", "")
+	if bad.IdentityOAuthURL != "" {
+		t.Errorf("unparseable authorize URL yielded IdentityOAuthURL = %q, want empty", bad.IdentityOAuthURL)
 	}
 }
 
@@ -945,6 +1013,24 @@ func identityProviderTokenIsNil(t *testing.T, p identity.IdentityProvider) bool 
 		t.Fatal("GitHubIdentityProvider has no token field; passthrough test is stale")
 	}
 	return f.IsNil()
+}
+
+// identityProviderBaseURLs reads the constructed provider's unexported
+// apiBaseURL / oauthBaseURL via reflection (E44.2 / #1826), so the endpoint-
+// override wiring assertion needs no exported test hook on identity.
+func identityProviderBaseURLs(t *testing.T, p identity.IdentityProvider) struct{ api, oauth string } {
+	t.Helper()
+	gh, ok := p.(*identity.GitHubIdentityProvider)
+	if !ok {
+		t.Fatalf("provider = %T, want *identity.GitHubIdentityProvider", p)
+	}
+	v := reflect.ValueOf(gh).Elem()
+	api := v.FieldByName("apiBaseURL")
+	oauth := v.FieldByName("oauthBaseURL")
+	if !api.IsValid() || !oauth.IsValid() {
+		t.Fatal("GitHubIdentityProvider missing apiBaseURL/oauthBaseURL fields; base-URL test is stale")
+	}
+	return struct{ api, oauth string }{api.String(), oauth.String()}
 }
 
 // fakeTokenProvider is a non-nil githubapp.TokenProvider for the wiring seam

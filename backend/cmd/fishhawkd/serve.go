@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os/signal"
 	"sort"
 	"syscall"
@@ -472,11 +473,58 @@ func buildRepoConventionsLoader(srv *server.Server, resolver server.ProviderReso
 // returns nil so server.New falls back to the deny-by-default NoOp. token
 // is the optional REST-read accessor (nil → anonymous reads). Extracted so
 // the config-gated wiring seam is unit-testable without booting the server.
-func resolveIdentityProvider(oauthClientID string, token func(context.Context) (string, error)) identity.IdentityProvider {
+func resolveIdentityProvider(oauthClientID string, token func(context.Context) (string, error), apiBaseURL, oauthBaseURL string) identity.IdentityProvider {
 	if oauthClientID == "" {
 		return nil
 	}
-	return identity.NewGitHubIdentityProvider(oauthClientID, token)
+	var opts []identity.Option
+	// Only override when the deployment configured a non-default endpoint
+	// (E44.2 / #1826). Empty values leave the GitHub hosts untouched, so an
+	// unconfigured deployment constructs exactly as before.
+	if apiBaseURL != "" || oauthBaseURL != "" {
+		opts = append(opts, identity.WithBaseURLs(apiBaseURL, oauthBaseURL))
+	}
+	return identity.NewGitHubIdentityProvider(oauthClientID, token, opts...)
+}
+
+// githubEndpoints holds the per-client base-URL overrides derived from the
+// FISHHAWKD_GITHUB_* / FISHHAWKD_OAUTH_* endpoint config (E44.2 / #1826). An
+// empty field means "unset" — each GitHub client keeps its github.com /
+// api.github.com default at use time. This is the Mode 1 (per-deployment)
+// realization; Mode 2 (per-installation) rides githubapp.Client.ResolveBaseURL.
+type githubEndpoints struct {
+	APIBaseURL       string            // githubapp.Client.BaseURL + githubclient.Client.BaseURL
+	UploadBaseURL    string            // githubclient.Client.UploadBaseURL
+	OAuth            authpkg.OAuthURLs // authpkg.NewGitHubOAuth urls
+	IdentityAPIURL   string            // identity REST base (WithBaseURLs apiBase)
+	IdentityOAuthURL string            // identity device-flow / OAuth host (WithBaseURLs oauthBase)
+}
+
+// resolveGitHubEndpoints maps the raw FISHHAWKD_* endpoint env strings onto the
+// per-client override surfaces. It is pure (no I/O, no globals) so serve_test.go
+// can pin both the unset-defaults and configured-hosts paths without booting the
+// server. The identity provider's device-flow / OAuth host is derived from the
+// scheme+host of the OAuth authorize URL (…/login/oauth/authorize lives on the
+// same host as the device-code + token endpoints); an unset or unparseable
+// authorize URL leaves it empty so the identity provider keeps github.com.
+func resolveGitHubEndpoints(apiURL, uploadURL, authorizeURL, tokenURL, userURL, orgsURL string) githubEndpoints {
+	ep := githubEndpoints{
+		APIBaseURL:    apiURL,
+		UploadBaseURL: uploadURL,
+		OAuth: authpkg.OAuthURLs{
+			AuthorizeURL: authorizeURL,
+			TokenURL:     tokenURL,
+			UserURL:      userURL,
+			OrgsURL:      orgsURL,
+		},
+		IdentityAPIURL: apiURL,
+	}
+	if authorizeURL != "" {
+		if u, err := url.Parse(authorizeURL); err == nil && u.Scheme != "" && u.Host != "" {
+			ep.IdentityOAuthURL = u.Scheme + "://" + u.Host
+		}
+	}
+	return ep
 }
 
 // resolveOperatorRepoToken builds the REST-read token accessor the forge-neutral
@@ -599,6 +647,30 @@ func runServe(args []string, logSink io.Writer) int {
 	projectsToken := fs.String("projects-token",
 		envOr("FISHHAWKD_PROJECTS_TOKEN", ""),
 		"optional user PAT/UAT with the `project` scope; lets fishhawk_file_issue board items on a USER-owned Projects v2 board, which App installation tokens cannot reach")
+	// Configurable GitHub / OAuth endpoints (E44.2 / #1826) for GitHub
+	// Enterprise Server (Mode 1, self-hosted) and data-resident GitHub
+	// Enterprise Cloud <slug>.ghe.com (Mode 2). Empty = unset → keep the
+	// github.com / api.github.com defaults, so existing deployments are
+	// unchanged. resolveGitHubEndpoints threads these onto the four
+	// already-override-capable GitHub clients.
+	githubAPIURL := fs.String("github-api-url",
+		envOr("FISHHAWKD_GITHUB_API_URL", ""),
+		"GitHub REST + App API base URL (e.g. https://ghes.example.com/api/v3); empty → https://api.github.com")
+	githubUploadURL := fs.String("github-upload-url",
+		envOr("FISHHAWKD_GITHUB_UPLOAD_URL", ""),
+		"GitHub release-asset upload host; empty → https://uploads.github.com")
+	oauthAuthorizeURL := fs.String("oauth-authorize-url",
+		envOr("FISHHAWKD_OAUTH_AUTHORIZE_URL", ""),
+		"GitHub OAuth authorize URL; empty → https://github.com/login/oauth/authorize")
+	oauthTokenURL := fs.String("oauth-token-url",
+		envOr("FISHHAWKD_OAUTH_TOKEN_URL", ""),
+		"GitHub OAuth token URL; empty → https://github.com/login/oauth/access_token")
+	oauthUserURL := fs.String("oauth-user-url",
+		envOr("FISHHAWKD_OAUTH_USER_URL", ""),
+		"GitHub OAuth user-profile URL; empty → https://api.github.com/user")
+	oauthOrgsURL := fs.String("oauth-orgs-url",
+		envOr("FISHHAWKD_OAUTH_ORGS_URL", ""),
+		"GitHub OAuth user-orgs URL; empty → https://api.github.com/user/orgs")
 	jiraBaseURL := fs.String("jira-base-url",
 		envOr("FISHHAWKD_JIRA_BASE_URL", ""),
 		"Jira Cloud instance base URL (e.g. https://acme.atlassian.net); with --jira-email + --jira-api-token, enables the jira work-item provider")
@@ -1035,6 +1107,14 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 	}
 
+	// Configurable GitHub / OAuth endpoints (E44.2 / #1826). Resolved once
+	// here and threaded onto the four already-override-capable GitHub clients
+	// below (App, REST, OAuth web flow, identity device flow). Empty fields
+	// leave each client on its github.com / api.github.com default.
+	githubEndpoints := resolveGitHubEndpoints(
+		*githubAPIURL, *githubUploadURL,
+		*oauthAuthorizeURL, *oauthTokenURL, *oauthUserURL, *oauthOrgsURL)
+
 	// GitHub App installation-token provider. Both ID and key file
 	// must be set; either alone is a misconfiguration. Wired before
 	// the webhook dispatcher / orchestrator below because both
@@ -1061,13 +1141,39 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Error("github app key parse failed", slog.String("error", err.Error()))
 			return exitFailure
 		}
-		cfg.GitHubTokens = githubapp.NewCachedProvider(githubapp.NewClient(signer))
+		appClient := githubapp.NewClient(signer)
+		// Mode 1 (per-deployment, E44.2 / #1826): a configured API base URL
+		// (GHES) overrides api.github.com for installation-token minting; empty
+		// keeps the default.
+		appClient.BaseURL = githubEndpoints.APIBaseURL
+		// Mode 2 (per-installation, E44.2 / #1826): resolve the data-resident
+		// API host from installations.forge_base_url. Late-bound AFTER the DB
+		// pool exists — a nil pool leaves ResolveBaseURL nil (every install
+		// keeps the deployment default). A real resolution fault FAILS the mint
+		// (fail-closed, see githubapp.Client.ResolveBaseURL); a NULL column /
+		// unknown installation falls back to the deployment default.
+		if pool != nil {
+			endpointResolver := account.NewEndpointResolver(accountdb.New(pool))
+			// githubapp hands us the stringified installation id (its
+			// installation_ref); we pass it straight to the forge-neutral
+			// resolver. Only forge_base_url feeds the App API host; oauth_base_url
+			// is a per-installation OAuth follow-up (no consumer here yet).
+			appClient.ResolveBaseURL = func(ctx context.Context, installationRef string) (string, error) {
+				forgeBase, _, err := endpointResolver.ResolveInstallationEndpoints(
+					ctx, "github", installationRef)
+				return forgeBase, err
+			}
+		}
+		cfg.GitHubTokens = githubapp.NewCachedProvider(appClient)
 		// This REST client backs every backend → GitHub read/write, including
 		// the code_scanning_alert webhook ingest (#1096), which reuses it via
 		// ListCodeScanningAlerts to surface CodeQL/SAST findings to the
 		// implement-review gate. Wired here once; the server consumes it as
 		// cfg.GitHub — no separate code-scanning client is constructed.
 		cfg.GitHub = githubclient.NewWithSigner(cfg.GitHubTokens, signer)
+		// Mode 1 REST + upload host overrides (E44.2 / #1826); empty → defaults.
+		cfg.GitHub.BaseURL = githubEndpoints.APIBaseURL
+		cfg.GitHub.UploadBaseURL = githubEndpoints.UploadBaseURL
 		// Optional user-scoped projects token. Presence-only log: the token
 		// is a secret and must never be logged or traced (#1114). Absent, a
 		// user-owned project board stays best-effort boarded:false (#1107).
@@ -1305,8 +1411,11 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Error("oauth misconfigured: --oauth-client-id, --oauth-client-secret, --oauth-callback-url must all be set")
 			return exitFailure
 		}
+		// Mode 1 OAuth endpoint overrides (E44.2 / #1826): a GHES/EMU
+		// deployment threads its authorize/token/user/orgs URLs; empty fields
+		// keep the github.com OAuth endpoints (NewGitHubOAuth fills defaults).
 		cfg.GitHubOAuth = authpkg.NewGitHubOAuth(
-			*oauthClientID, *oauthClientSecret, *oauthCallbackURL, authpkg.OAuthURLs{})
+			*oauthClientID, *oauthClientSecret, *oauthCallbackURL, githubEndpoints.OAuth)
 		cfg.AuthRedirectAfterLogin = *oauthRedirectAfterLogin
 		// Forge-neutral identity provider (E39.1 / #1706). Gated on the
 		// same OAuth client config: with a client_id present we construct
@@ -1322,7 +1431,8 @@ func runServe(args []string, logSink io.Writer) int {
 		if operatorRepoToken == nil {
 			logger.Warn("identity-provider REST reads stay anonymous: token-mint authz gate (fishhawk token login) will fail HTTP 500 until FISHHAWKD_GITHUB_APP_ID + key are configured")
 		}
-		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken)
+		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken,
+			githubEndpoints.IdentityAPIURL, githubEndpoints.IdentityOAuthURL)
 		// Workspace-membership login gate (E44.3 / ADR-057 Amendment
 		// A2): invited account_members rows admit DB-only; the
 		// GitHubOAuth client doubles as the ForgeMembershipLister for

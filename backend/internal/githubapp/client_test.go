@@ -194,6 +194,80 @@ func TestIssueInstallationToken_DefaultBaseURL(t *testing.T) {
 	_ = fg
 }
 
+// TestIssueInstallationToken_ResolveBaseURL_Override pins Mode 2 (E44.2 /
+// #1826): a resolver returning a non-empty override host makes the mint target
+// THAT host, not the client's default BaseURL. Two fakes prove routing: the
+// override server receives the request; the default (BaseURL) server does not.
+func TestIssueInstallationToken_ResolveBaseURL_Override(t *testing.T) {
+	overrideFake, overrideSrv := newFakeGitHub(t)
+	defaultFake, defaultSrv := newFakeGitHub(t)
+
+	c := newTestClient(t, defaultSrv.URL) // BaseURL = the default host
+	c.ResolveBaseURL = func(_ context.Context, ref string) (string, error) {
+		if ref != "42" {
+			t.Errorf("ResolveBaseURL got installationRef = %q, want \"42\"", ref)
+		}
+		return overrideSrv.URL, nil
+	}
+
+	tok, err := c.IssueInstallationToken(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("IssueInstallationToken: %v", err)
+	}
+	if tok.Token != "ghs_canned_token" {
+		t.Errorf("Token = %q", tok.Token)
+	}
+	if overrideFake.requestCounter != 1 {
+		t.Errorf("override host received %d requests, want 1", overrideFake.requestCounter)
+	}
+	if defaultFake.requestCounter != 0 {
+		t.Errorf("default host received %d requests, want 0 (override should win)", defaultFake.requestCounter)
+	}
+}
+
+// TestIssueInstallationToken_ResolveBaseURL_Empty pins the NULL-column /
+// unknown-installation fallback: a resolver returning ("", nil) is the
+// intentional absence of an override, so the mint stays on the client's
+// BaseURL (deployment default).
+func TestIssueInstallationToken_ResolveBaseURL_Empty(t *testing.T) {
+	defaultFake, defaultSrv := newFakeGitHub(t)
+	c := newTestClient(t, defaultSrv.URL)
+	c.ResolveBaseURL = func(context.Context, string) (string, error) { return "", nil }
+
+	tok, err := c.IssueInstallationToken(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("IssueInstallationToken: %v", err)
+	}
+	if tok.Token != "ghs_canned_token" {
+		t.Errorf("Token = %q", tok.Token)
+	}
+	if defaultFake.requestCounter != 1 {
+		t.Errorf("default host received %d requests, want 1 (empty override → default)", defaultFake.requestCounter)
+	}
+}
+
+// TestIssueInstallationToken_ResolveBaseURL_Error pins the FAIL-CLOSED
+// contract (E44.2 / #1826, binding condition 1): a resolver error FAILS the
+// mint and surfaces the error — it must NOT silently fall back to the default
+// host. The default server must receive NO request.
+func TestIssueInstallationToken_ResolveBaseURL_Error(t *testing.T) {
+	defaultFake, defaultSrv := newFakeGitHub(t)
+	c := newTestClient(t, defaultSrv.URL)
+	sentinel := errors.New("db unavailable")
+	c.ResolveBaseURL = func(context.Context, string) (string, error) { return "", sentinel }
+
+	_, err := c.IssueInstallationToken(context.Background(), 42)
+	if err == nil {
+		t.Fatal("IssueInstallationToken succeeded, want a failure (resolver error must fail the mint)")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("error = %v, want it to wrap the resolver error", err)
+	}
+	if defaultFake.requestCounter != 0 {
+		t.Errorf("default host received %d requests, want 0 (a resolver error must not fall back to the default host)", defaultFake.requestCounter)
+	}
+}
+
 func TestReadBriefBody_Truncates(t *testing.T) {
 	long := strings.Repeat("a", 1000)
 	got := readBriefBody(strings.NewReader(long))

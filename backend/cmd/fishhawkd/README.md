@@ -14,6 +14,38 @@ Deliberately asymmetric with GitHub: an absent GitLab secret logs nothing (GitLa
 would nag every GitHub-only deployment). The shared webhook delivery store (`webhook_deliveries` on Postgres,
 else in-memory) is created when EITHER secret is set, so a GitLab-only deployment gets the store too.
 
+## Configurable GitHub / OAuth endpoints (E44.2 / #1826)
+
+For GitHub Enterprise Server (Mode 1, self-hosted) and data-resident GitHub
+Enterprise Cloud `<slug>.ghe.com` (Mode 2, EMU), the GitHub REST / App API and
+OAuth hosts are configurable. All are **optional**: an empty value keeps the
+`github.com` / `api.github.com` default, so an existing github.com deployment is
+unchanged. `resolveGitHubEndpoints` (in `serve.go`) maps each env var onto the
+matching per-client override; the four GitHub clients already accept a base-URL
+override, so this is wiring only.
+
+| Env var | Flag | Overrides | Default |
+|---|---|---|---|
+| `FISHHAWKD_GITHUB_API_URL` | `--github-api-url` | App installation-token mint + REST client base | `https://api.github.com` |
+| `FISHHAWKD_GITHUB_UPLOAD_URL` | `--github-upload-url` | REST client release-asset upload host | `https://uploads.github.com` |
+| `FISHHAWKD_OAUTH_AUTHORIZE_URL` | `--oauth-authorize-url` | OAuth web-flow authorize URL | `https://github.com/login/oauth/authorize` |
+| `FISHHAWKD_OAUTH_TOKEN_URL` | `--oauth-token-url` | OAuth web-flow token URL | `https://github.com/login/oauth/access_token` |
+| `FISHHAWKD_OAUTH_USER_URL` | `--oauth-user-url` | OAuth web-flow user-profile URL | `https://api.github.com/user` |
+| `FISHHAWKD_OAUTH_ORGS_URL` | `--oauth-orgs-url` | OAuth web-flow user-orgs URL | `https://api.github.com/user/orgs` |
+
+The forge-neutral **identity provider** (device flow + REST reads) is threaded
+too: its REST base comes from `FISHHAWKD_GITHUB_API_URL`, and its device-flow /
+OAuth host is derived from the scheme+host of `FISHHAWKD_OAUTH_AUTHORIZE_URL`
+(an unset or unparseable value keeps `github.com`).
+
+**Mode 2 (per-installation)** rides on top of Mode 1: when a DB pool is present,
+`githubapp.Client.ResolveBaseURL` is late-bound (after the pool) to
+`account.EndpointResolver`, which reads `installations.forge_base_url` for the
+minting installation. A SET column overrides the deployment default for that
+install; a NULL column or unknown installation falls back to the deployment
+default; a **real DB error FAILS the mint** (fail-closed) rather than silently
+targeting the default host. See `backend/internal/account/README.md`.
+
 ## Work-management provider registration at startup (#1104)
 
 `workmgmt_wiring.go` — `registerWorkmgmtProviders(cfg.GitHub, jiraClient, gitlabClient)`, called from

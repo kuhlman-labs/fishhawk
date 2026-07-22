@@ -185,6 +185,24 @@ func TestFetchProfile_HappyPath(t *testing.T) {
 	}
 }
 
+// TestFetchProfile_EMULogin pins EMU handling (E44.2 / #1826): an Enterprise
+// Managed User profile login carries a "<username>_<shortcode>" enterprise
+// short-code suffix. FetchProfile must parse it without error and preserve the
+// FULL login (short code included) on the profile — never stripped or split.
+func TestFetchProfile_EMULogin(t *testing.T) {
+	fg, urls := newFakeGitHub(t)
+	fg.userResp = `{"id":42,"login":"alice_acme","name":"Alice"}`
+	o := NewGitHubOAuth("c", "s", "x", urls)
+
+	p, err := o.FetchProfile(context.Background(), "gho_emu")
+	if err != nil {
+		t.Fatalf("FetchProfile with an EMU login: %v", err)
+	}
+	if p.Login != "alice_acme" {
+		t.Errorf("Login = %q, want alice_acme (full EMU login preserved)", p.Login)
+	}
+}
+
 func TestFetchProfile_FallsBackToLoginWhenNameEmpty(t *testing.T) {
 	fg, urls := newFakeGitHub(t)
 	fg.userResp = `{"id":1,"login":"octocat","name":""}`

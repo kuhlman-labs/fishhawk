@@ -326,10 +326,24 @@ func (p *GitHubIdentityProvider) resolveLogin(ctx context.Context, accessToken s
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("identity: decode user: %w", err)
 	}
-	if out.Login == "" {
+	login := canonicalGitHubLogin(out.Login)
+	if login == "" {
 		return "", fmt.Errorf("identity: user response carried no login")
 	}
-	return subjectPrefix + out.Login, nil
+	return subjectPrefix + login, nil
+}
+
+// canonicalGitHubLogin returns the canonical Fishhawk login for a raw GitHub
+// login value. Enterprise Managed User (EMU) logins carry a
+// "<username>_<shortcode>" enterprise short-code suffix (e.g. "alice_acme");
+// Fishhawk keys identity on the FULL login (short code included), so the
+// suffix is preserved verbatim — never stripped or split — and only
+// surrounding whitespace is trimmed. A plain github.com login (no underscore)
+// passes through unchanged. "<username>_<shortcode>" and a bare "<username>"
+// are distinct accounts (different enterprises), so collapsing them would let
+// one EMU user impersonate another's subject.
+func canonicalGitHubLogin(login string) string {
+	return strings.TrimSpace(login)
 }
 
 // PermissionLevel maps GitHub's collaborator role_name onto the
