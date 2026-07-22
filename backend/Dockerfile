@@ -28,6 +28,11 @@ COPY backend/go.mod backend/go.sum ./backend/
 COPY runner/go.mod runner/go.sum ./runner/
 COPY cli/go.mod cli/go.sum ./cli/
 COPY verifier/go.mod verifier/go.sum ./verifier/
+# directory/ is in go.work, so `go mod download` resolves it even though
+# fishhawkd doesn't import it yet — every workspace module's go.mod must be
+# present here or the download fails with `cannot load module ../directory`
+# (AGENTS.md "Adding a Go module"; the #733/#672 red-main break).
+COPY directory/go.mod directory/go.sum ./directory/
 # pricing and redaction have no external imports, so no go.sum exists to copy.
 COPY pricing/go.mod ./pricing/
 COPY redaction/go.mod ./redaction/
@@ -44,6 +49,7 @@ COPY backend ./backend
 COPY runner ./runner
 COPY cli ./cli
 COPY verifier ./verifier
+COPY directory ./directory
 COPY pricing ./pricing
 COPY redaction ./redaction
 
