@@ -119,6 +119,34 @@ An unconfigured client leaves that provider unregistered, and the affected endpo
 **501** — the v0 not-yet-wired posture. This is the wiring behind #1104: `fishhawk_file_issue` /
 `fishhawk_report_product_issue` answer 501 unless the providers are registered.
 
+### The two GitLab surfaces are configured ASYMMETRICALLY (E44.8 / #1832)
+
+`FISHHAWKD_GITLAB_BASE_URL` alone now enables a GitLab surface, so the
+"gitlab partially configured … leaving it disabled" warning above does **not**
+describe every GitLab path. Both facts, explicitly:
+
+| Surface | Requires | Without the token |
+|---|---|---|
+| **Login-gate group auto-join** (`GitLabMembershipLister`, `backend/internal/auth/`) | `FISHHAWKD_GITLAB_BASE_URL` **only** — it reads `GET /api/v4/groups` with the **signing-in user's** OAuth access token | **enabled** |
+| **Forge + work-item provider** (`gitlab` adapter, `fishhawk_file_issue`, …) | `FISHHAWKD_GITLAB_BASE_URL` **and** `FISHHAWKD_GITLAB_TOKEN` (PRIVATE-TOKEN) | disabled, endpoint 501 |
+
+Startup logs both: the partial-config warning covers only the token-gated
+provider, and a separate `gitlab login-gate group auto-join enabled …` line
+names the lister. Note that the lister ships **seam-first** — no GitLab browser
+sign-in flow exists yet, so it is not reachable in production until one lands.
+
+### EMU enterprise auto-join (E44.8 / #1832)
+
+Pointing `FISHHAWKD_OAUTH_AUTHORIZE_URL` at a data-resident GitHub Enterprise
+Cloud host (`https://<slug>.ghe.com/login/oauth/authorize`) additionally enables
+**enterprise-granularity** login-gate auto-join: the enterprise short code is
+split off the EMU login (`<username>_<shortcode>`) and matched against
+`enterprise`-granularity accounts carrying an `auto_join_role`. No new flag and
+no extra forge call. On github.com / GHES posture no enterprise key is derived
+at all — a public login cannot contain an underscore, so an ungated derivation
+would be a spoofing surface. Seed such an account keyed by the enterprise SHORT
+CODE. Startup logs `emu_enterprise_auto_join` and `membership_providers`.
+
 ## Per-repo work-management conventions loader + break-glass override (E45.16 / #2022)
 
 `serve.go` installs the per-repo conventions loader after `server.New`:

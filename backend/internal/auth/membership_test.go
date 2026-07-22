@@ -33,7 +33,7 @@ func (f *fakeOrgLister) ListUserOrgKeys(context.Context, string) ([]string, erro
 	return f.keys, nil
 }
 
-func newMembershipFixture(t *testing.T) (*pgxpool.Pool, *fakeOrgLister, auth.MembershipResolver) {
+func newMembershipPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	url := pgtest.NewURL(t)
 	if err := postgres.MigrateUp(url); err != nil {
@@ -44,9 +44,41 @@ func newMembershipFixture(t *testing.T) (*pgxpool.Pool, *fakeOrgLister, auth.Mem
 		t.Fatalf("pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	return pool
+}
+
+func newMembershipFixture(t *testing.T) (*pgxpool.Pool, *fakeOrgLister, auth.MembershipResolver) {
+	t.Helper()
+	pool := newMembershipPool(t)
 	lister := &fakeOrgLister{}
 	resolver := auth.NewMembershipResolver(
-		auth.NewAccountMembershipStore(accountdb.New(pool)), lister)
+		auth.NewAccountMembershipStore(accountdb.New(pool)),
+		map[string]auth.ForgeMembershipLister{"github": lister})
+	return pool, lister, resolver
+}
+
+// newEMUFixture is newMembershipFixture under EMU posture: the
+// deployment's OAuth host is a data-resident <slug>.ghe.com endpoint,
+// so an underscore-bearing login yields an enterprise short code.
+func newEMUFixture(t *testing.T) (*pgxpool.Pool, *fakeOrgLister, auth.MembershipResolver) {
+	t.Helper()
+	pool := newMembershipPool(t)
+	lister := &fakeOrgLister{}
+	resolver := auth.NewMembershipResolver(
+		auth.NewAccountMembershipStore(accountdb.New(pool)),
+		map[string]auth.ForgeMembershipLister{"github": lister},
+		auth.WithEMUOAuthHost("https://acme.ghe.com/login/oauth/authorize"))
+	return pool, lister, resolver
+}
+
+// newGitLabFixture registers a gitlab group lister alongside github.
+func newGitLabFixture(t *testing.T) (*pgxpool.Pool, *fakeOrgLister, auth.MembershipResolver) {
+	t.Helper()
+	pool := newMembershipPool(t)
+	lister := &fakeOrgLister{}
+	resolver := auth.NewMembershipResolver(
+		auth.NewAccountMembershipStore(accountdb.New(pool)),
+		map[string]auth.ForgeMembershipLister{"gitlab": lister})
 	return pool, lister, resolver
 }
 
@@ -54,11 +86,16 @@ func newMembershipFixture(t *testing.T) (*pgxpool.Pool, *fakeOrgLister, auth.Mem
 // granularity and auto-join policy role (nil = no policy).
 func seedGitHubAccount(t *testing.T, pool *pgxpool.Pool, key, granularity string, autoJoinRole *string) uuid.UUID {
 	t.Helper()
+	return seedProviderAccount(t, pool, "github", key, granularity, autoJoinRole)
+}
+
+func seedProviderAccount(t *testing.T, pool *pgxpool.Pool, provider, key, granularity string, autoJoinRole *string) uuid.UUID {
+	t.Helper()
 	id := uuid.New()
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO accounts (id, provider, account_key, granularity, auto_join_role)
-		 VALUES ($1, 'github', $2, $3, $4)`,
-		id, key, granularity, autoJoinRole,
+		 VALUES ($1, $2, $3, $4, $5)`,
+		id, provider, key, granularity, autoJoinRole,
 	); err != nil {
 		t.Fatalf("seed account: %v", err)
 	}
@@ -68,10 +105,15 @@ func seedGitHubAccount(t *testing.T, pool *pgxpool.Pool, key, granularity string
 // seedMember inserts an account_members row with an explicit origin.
 func seedMember(t *testing.T, pool *pgxpool.Pool, accountID uuid.UUID, memberRef, origin string) {
 	t.Helper()
+	seedMemberFor(t, pool, "github", accountID, memberRef, origin)
+}
+
+func seedMemberFor(t *testing.T, pool *pgxpool.Pool, provider string, accountID uuid.UUID, memberRef, origin string) {
+	t.Helper()
 	if _, err := pool.Exec(context.Background(),
 		`INSERT INTO account_members (id, account_id, provider, member_ref, origin)
-		 VALUES ($1, $2, 'github', $3, $4)`,
-		uuid.New(), accountID, memberRef, origin,
+		 VALUES ($1, $2, $3, $4, $5)`,
+		uuid.New(), accountID, provider, memberRef, origin,
 	); err != nil {
 		t.Fatalf("seed member: %v", err)
 	}
@@ -279,9 +321,10 @@ func TestMembership_OriginsPersistDistinctly(t *testing.T) {
 	}
 }
 
-// A provider with no resolver implementation (gitlab today) denies —
-// even with an admitting row present the GitHub walk never runs.
-func TestMembership_GitLabProvider_Denies(t *testing.T) {
+// A provider with NO registered lister (gitlab when
+// FISHHAWKD_GITLAB_BASE_URL is unset) denies — the walk never runs and
+// the github lister is never called.
+func TestMembership_UnregisteredProvider_Denies(t *testing.T) {
 	_, lister, r := newMembershipFixture(t)
 	got, err := r.ResolveAccounts(context.Background(), "gitlab", "glpat-tok",
 		auth.GitHubProfile{ID: 7, Login: "gl-user"})
@@ -289,28 +332,314 @@ func TestMembership_GitLabProvider_Denies(t *testing.T) {
 		t.Fatalf("ResolveAccounts: %v", err)
 	}
 	if len(got) != 0 {
-		t.Errorf("admitted = %v, want deny (no gitlab impl)", got)
+		t.Errorf("admitted = %v, want deny (no gitlab lister registered)", got)
 	}
 	if lister.calls != 0 {
-		t.Errorf("forge lister called %d times for an unimplemented provider, want 0", lister.calls)
+		t.Errorf("forge lister called %d times for an unregistered provider, want 0", lister.calls)
 	}
 }
 
-// Auto-join anchors to ORGANIZATION granularity only: a policy role on
-// an enterprise-granularity account never auto-admits (the enterprise
-// membership API is not used; ADR-057 Amendment A2).
-func TestMembership_EnterpriseGranularityPolicy_NeverAutoJoins(t *testing.T) {
-	pool, lister, r := newMembershipFixture(t)
-	role := "member"
-	seedGitHubAccount(t, pool, "acme-ent", "enterprise", &role)
-	lister.keys = []string{"acme-ent"}
+// CONDITION (1) — the key/granularity product must NOT admit across
+// granularities. Both directions asserted, both DENIALS.
+func TestMembership_KeyGranularityPairing_NoCrossGranularityAdmission(t *testing.T) {
+	// (a) A live ORG key "acme" must not admit an ENTERPRISE account
+	// keyed "acme": the user is merely an org member.
+	t.Run("org key does not admit an enterprise account of the same key", func(t *testing.T) {
+		pool, lister, r := newEMUFixture(t)
+		role := "member"
+		seedGitHubAccount(t, pool, "acme", "enterprise", &role)
+		lister.keys = []string{"acme"} // org membership only
 
-	got, err := resolve(t, r, "github")
+		got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+			// A login with no underscore derives NO enterprise key, so
+			// the only candidate pair is ("acme", organization).
+			auth.GitHubProfile{ID: 42, Login: "octocat"})
+		if err != nil {
+			t.Fatalf("ResolveAccounts: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("admitted = %v, want deny (org key must not admit an enterprise account)", got)
+		}
+	})
+	// (b) A derived ENTERPRISE short code "acme" must not admit an
+	// ORGANIZATION account keyed "acme".
+	t.Run("enterprise short code does not admit an organization account of the same key", func(t *testing.T) {
+		pool, lister, r := newEMUFixture(t)
+		role := "member"
+		seedGitHubAccount(t, pool, "acme", "organization", &role)
+		lister.keys = nil // NOT an org member of acme
+
+		got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+			auth.GitHubProfile{ID: 42, Login: "alice_acme"})
+		if err != nil {
+			t.Fatalf("ResolveAccounts: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("admitted = %v, want deny (enterprise short code must not admit an organization account)", got)
+		}
+	})
+	// The same pairing governs RE-VERIFICATION of an existing
+	// auto_join grant: an enterprise-granularity grant must not
+	// re-admit off a same-named live ORG key.
+	t.Run("reverification does not cross granularities", func(t *testing.T) {
+		pool, lister, r := newEMUFixture(t)
+		role := "member"
+		accountID := seedGitHubAccount(t, pool, "acme", "enterprise", &role)
+		seedMember(t, pool, accountID, "octocat", auth.MemberOriginAutoJoin)
+		lister.keys = []string{"acme"} // org membership only
+
+		got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+			auth.GitHubProfile{ID: 42, Login: "octocat"})
+		if err != nil {
+			t.Fatalf("ResolveAccounts: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("admitted = %v, want deny (grant re-verification must stay granularity-bound)", got)
+		}
+		assertMemberRowCount(t, pool, accountID, 1) // kept for audit
+	})
+}
+
+// EMU posture: an enterprise-granularity policy account keyed by the
+// login's short code ADMITS and mints an audited grant. A no-op change
+// leaving the query at granularity='organization' fails this.
+func TestMembership_EMUEnterpriseAutoJoin_Admits(t *testing.T) {
+	pool, lister, r := newEMUFixture(t)
+	role := "member"
+	accountID := seedGitHubAccount(t, pool, "acme", "enterprise", &role)
+	lister.keys = nil // no org membership at all
+
+	got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+		auth.GitHubProfile{ID: 42, Login: "alice_acme"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want [%s]", got, accountID)
+	}
+	var origin, memberRef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT origin, member_ref FROM account_members WHERE account_id = $1`,
+		accountID).Scan(&origin, &memberRef); err != nil {
+		t.Fatalf("read minted grant: %v", err)
+	}
+	if origin != auth.MemberOriginAutoJoin {
+		t.Errorf("origin = %q, want auto_join", origin)
+	}
+	// The FULL login (short code included) stays the identity key.
+	if memberRef != "alice_acme" {
+		t.Errorf("member_ref = %q, want the full login alice_acme", memberRef)
+	}
+}
+
+// SPOOFING GUARD: on github.com posture NO enterprise key is derived,
+// so a crafted underscore-bearing login cannot claim an enterprise.
+func TestMembership_GitHubDotComPosture_UnderscoreLogin_DerivesNoEnterpriseKey(t *testing.T) {
+	pool, lister, r := newMembershipFixture(t) // no WithEMUOAuthHost
+	role := "member"
+	seedGitHubAccount(t, pool, "acme", "enterprise", &role)
+	lister.keys = nil
+
+	got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+		auth.GitHubProfile{ID: 42, Login: "alice_acme"})
 	if err != nil {
 		t.Fatalf("ResolveAccounts: %v", err)
 	}
 	if len(got) != 0 {
-		t.Errorf("admitted = %v, want deny (auto-join is org-granularity only)", got)
+		t.Errorf("admitted = %v, want deny (no EMU posture ⇒ no enterprise derivation)", got)
+	}
+}
+
+// EMU posture + a login with NO underscore contributes no enterprise
+// key; org auto-join is unaffected.
+func TestMembership_EMUPosture_NoUnderscoreLogin_OrgAutoJoinUnaffected(t *testing.T) {
+	pool, lister, r := newEMUFixture(t)
+	role := "member"
+	entID := seedGitHubAccount(t, pool, "octocat", "enterprise", &role)
+	orgID := seedGitHubAccount(t, pool, "acme-corp", "organization", &role)
+	lister.keys = []string{"acme-corp"}
+
+	got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+		auth.GitHubProfile{ID: 42, Login: "octocat"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != orgID {
+		t.Fatalf("admitted = %v, want only the org account [%s] (enterprise %s must not admit)",
+			got, orgID, entID)
+	}
+}
+
+// EMU posture + a derived short code with no matching policy account:
+// deny (empty, nil error).
+func TestMembership_EMUPosture_NoMatchingEnterpriseAccount_Denies(t *testing.T) {
+	pool, lister, r := newEMUFixture(t)
+	role := "member"
+	seedGitHubAccount(t, pool, "other-ent", "enterprise", &role)
+	lister.keys = nil
+
+	got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+		auth.GitHubProfile{ID: 42, Login: "alice_acme"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("admitted = %v, want deny", got)
+	}
+}
+
+// An existing ENTERPRISE auto_join grant whose short code no longer
+// matches stops admitting; the row is kept for audit.
+func TestMembership_EMUReverify_ShortCodeChanged_Denies(t *testing.T) {
+	pool, lister, r := newEMUFixture(t)
+	role := "member"
+	accountID := seedGitHubAccount(t, pool, "acme", "enterprise", &role)
+	seedMember(t, pool, accountID, "alice_other", auth.MemberOriginAutoJoin)
+	lister.keys = nil
+
+	got, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+		auth.GitHubProfile{ID: 42, Login: "alice_other"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("admitted = %v, want deny (short code no longer matches)", got)
+	}
+	assertMemberRowCount(t, pool, accountID, 1)
+}
+
+// GitLab: a group-granularity policy account admits a member whose
+// live group list carries its full_path.
+func TestMembership_GitLabGroupAutoJoin_Admits(t *testing.T) {
+	pool, lister, r := newGitLabFixture(t)
+	role := "member"
+	accountID := seedProviderAccount(t, pool, "gitlab", "acme/platform", "group", &role)
+	lister.keys = []string{"acme/platform", "unrelated/group"}
+
+	got, err := r.ResolveAccounts(context.Background(), "gitlab", "gl-tok",
+		auth.GitHubProfile{ID: 7, Login: "gl-user"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want [%s]", got, accountID)
+	}
+	var origin string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT origin FROM account_members WHERE account_id = $1`, accountID).Scan(&origin); err != nil {
+		t.Fatalf("read minted grant: %v", err)
+	}
+	if origin != auth.MemberOriginAutoJoin {
+		t.Errorf("origin = %q, want auto_join", origin)
+	}
+}
+
+// GitLab lister error with NO invited grant fails CLOSED: error, and
+// no grant minted.
+func TestMembership_GitLabListerError_NoInvitedRow_FailsClosed(t *testing.T) {
+	pool, lister, r := newGitLabFixture(t)
+	role := "member"
+	accountID := seedProviderAccount(t, pool, "gitlab", "acme/platform", "group", &role)
+	lister.err = errors.New("gitlab is down")
+
+	got, err := r.ResolveAccounts(context.Background(), "gitlab", "gl-tok",
+		auth.GitHubProfile{ID: 7, Login: "gl-user"})
+	if err == nil {
+		t.Fatalf("ResolveAccounts = %v, want fail-closed error", got)
+	}
+	assertMemberRowCount(t, pool, accountID, 0)
+}
+
+// GitLab invited grant admits DB-ONLY: the group lister is never
+// called (the invariant the GitHub path already holds).
+func TestMembership_GitLabInvitedRow_ListerNeverCalled(t *testing.T) {
+	pool, lister, r := newGitLabFixture(t)
+	accountID := seedProviderAccount(t, pool, "gitlab", "acme/platform", "group", nil)
+	seedMemberFor(t, pool, "gitlab", accountID, "gl-user", auth.MemberOriginInvited)
+	lister.keys = []string{"acme/platform"}
+
+	got, err := r.ResolveAccounts(context.Background(), "gitlab", "gl-tok",
+		auth.GitHubProfile{ID: 7, Login: "gl-user"})
+	if err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	if len(got) != 1 || got[0] != accountID {
+		t.Fatalf("admitted = %v, want [%s]", got, accountID)
+	}
+	if lister.calls != 0 {
+		t.Errorf("gitlab lister called %d times on the invited-admit path, want 0", lister.calls)
+	}
+}
+
+// A failed grant mint aborts the admission: the minted row IS the
+// audit record, so if it can't be written the admission doesn't happen.
+func TestMembership_MintGrantError_FailsClosed(t *testing.T) {
+	lister := &fakeOrgLister{keys: []string{"acme-corp"}}
+	role := "member"
+	accountID := uuid.New()
+	store := &fakeMembershipStore{
+		policies: []auth.AutoJoinAccount{{
+			AccountID: accountID, AccountKey: "acme-corp",
+			Granularity: "organization", AutoJoinRole: role,
+		}},
+		upsertErr: errors.New("write failed"),
+	}
+	r := auth.NewMembershipResolver(store,
+		map[string]auth.ForgeMembershipLister{"github": lister})
+
+	got, err := resolve(t, r, "github")
+	if err == nil {
+		t.Fatalf("ResolveAccounts = %v, want fail-closed error on mint failure", got)
+	}
+}
+
+// fakeMembershipStore drives the store-error branches the real SQL
+// cannot be made to fail on demand.
+type fakeMembershipStore struct {
+	grants    []auth.MemberGrant
+	policies  []auth.AutoJoinAccount
+	upsertErr error
+	gotPairs  []auth.MembershipKey
+}
+
+func (f *fakeMembershipStore) ListMemberGrants(context.Context, string, string) ([]auth.MemberGrant, error) {
+	return f.grants, nil
+}
+
+func (f *fakeMembershipStore) ListAutoJoinAccounts(_ context.Context, _ string, pairs []auth.MembershipKey) ([]auth.AutoJoinAccount, error) {
+	f.gotPairs = pairs
+	return f.policies, nil
+}
+
+func (f *fakeMembershipStore) UpsertAutoJoinGrant(context.Context, uuid.UUID, uuid.UUID, string, string, string) error {
+	return f.upsertErr
+}
+
+// The resolver hands the store PAIRS, each key bound to the
+// granularity it was derived from — the in-process half of condition
+// (1) (the SQL half is asserted by the DB-backed denial tests above).
+func TestMembership_DerivedPairsStayGranularityBound(t *testing.T) {
+	store := &fakeMembershipStore{}
+	lister := &fakeOrgLister{keys: []string{"acme-corp"}}
+	r := auth.NewMembershipResolver(store,
+		map[string]auth.ForgeMembershipLister{"github": lister},
+		auth.WithEMUOAuthHost("https://acme.ghe.com/login/oauth/authorize"))
+
+	if _, err := r.ResolveAccounts(context.Background(), "github", "gho_tok",
+		auth.GitHubProfile{ID: 42, Login: "alice_acme"}); err != nil {
+		t.Fatalf("ResolveAccounts: %v", err)
+	}
+	want := []auth.MembershipKey{
+		{Key: "acme-corp", Granularity: "organization"},
+		{Key: "acme", Granularity: "enterprise"},
+	}
+	if len(store.gotPairs) != len(want) {
+		t.Fatalf("pairs = %v, want %v", store.gotPairs, want)
+	}
+	for i, p := range want {
+		if store.gotPairs[i] != p {
+			t.Errorf("pair[%d] = %v, want %v", i, store.gotPairs[i], p)
+		}
 	}
 }
 

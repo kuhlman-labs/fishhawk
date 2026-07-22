@@ -1002,6 +1002,65 @@ func TestResolveGitHubEndpoints(t *testing.T) {
 	}
 }
 
+// The E44.8 membership-lister registration matrix: github registers
+// with OAuth configured; gitlab registers on the BASE URL ALONE (the
+// login gate reads groups with the signing-in user's OAuth token, so it
+// needs no FISHHAWKD_GITLAB_TOKEN) and stays unregistered otherwise —
+// an unregistered provider denies.
+func TestResolveMembershipListers(t *testing.T) {
+	gh := authpkg.NewGitHubOAuth("id", "secret", "https://example.com/cb", authpkg.OAuthURLs{})
+
+	t.Run("github only when gitlab is unconfigured", func(t *testing.T) {
+		got := resolveMembershipListers(gh, "")
+		if _, ok := got["github"]; !ok {
+			t.Error("github lister not registered")
+		}
+		if _, ok := got["gitlab"]; ok {
+			t.Error("gitlab lister registered with no base URL; an unconfigured forge must deny")
+		}
+	})
+	t.Run("gitlab registers on the base URL alone", func(t *testing.T) {
+		got := resolveMembershipListers(gh, "https://gitlab.example.com")
+		gl, ok := got["gitlab"]
+		if !ok {
+			t.Fatal("gitlab lister not registered with a base URL set")
+		}
+		if gl == nil {
+			t.Error("gitlab lister registered as a nil interface value")
+		}
+		if want := []string{"github", "gitlab"}; !reflect.DeepEqual(sortedKeys(got), want) {
+			t.Errorf("providers = %v, want %v", sortedKeys(got), want)
+		}
+	})
+	t.Run("no oauth leaves github unregistered", func(t *testing.T) {
+		got := resolveMembershipListers(nil, "")
+		if len(got) != 0 {
+			t.Errorf("listers = %v, want empty", sortedKeys(got))
+		}
+	})
+}
+
+// EMU enterprise auto-join is ON exactly for a data-resident GHEC OAuth
+// endpoint — the posture the serve wiring derives from the already-parsed
+// endpoint config, with no new flag.
+func TestEMUPostureFromGitHubEndpoints(t *testing.T) {
+	ghec := resolveGitHubEndpoints("", "",
+		"https://acme.ghe.com/login/oauth/authorize", "", "", "")
+	if !authpkg.IsEMUOAuthHost(ghec.OAuth.AuthorizeURL) {
+		t.Error("data-resident GHEC authorize URL did not yield EMU posture")
+	}
+	for _, authorize := range []string{
+		"", // github.com default
+		"https://github.com/login/oauth/authorize",
+		"https://ghes.example.com/login/oauth/authorize",
+	} {
+		ep := resolveGitHubEndpoints("", "", authorize, "", "", "")
+		if authpkg.IsEMUOAuthHost(ep.OAuth.AuthorizeURL) {
+			t.Errorf("authorize URL %q yielded EMU posture, want off", authorize)
+		}
+	}
+}
+
 // identityProviderTokenIsNil reports whether the constructed provider's
 // unexported REST-read token accessor is nil. It reads (never invokes) the
 // field via reflection so the passthrough assertion needs no exported test
