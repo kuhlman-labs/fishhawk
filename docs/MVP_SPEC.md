@@ -405,7 +405,9 @@ Failures are first-class. All failure modes are recorded in the audit log with c
 - Failure handling for four categories
 - Budget visibility (advisory enforcement only)
 - GitHub App + OAuth sign-in
-- Hosted-only deployment
+- Multi-tenancy: forge-neutral `accounts` / `installations` / `account_members` schema, a workspace-membership login gate, account-scoped authorization, and per-account audit chains (ADR-057 / ADR-058, epic E44)
+- Both deployment modes (ADR-057): **hosted regional** (many accounts across regional cells behind a global directory) and **self-hosted single-tenant** (one implicit account bootstrapped from deployment config; `docs/deploy/self-hosted.md`)
+- Data residency: per-region cells with a directory routing plane and region-scoped inference (ADR-062; `docs/deploy/regional-cells.md`)
 
 ### v0.x (next 90 days)
 
@@ -419,7 +421,7 @@ Failures are first-class. All failure modes are recorded in the audit log with c
 
 ### v1
 
-- SSO/SAML
+- SSO/SAML with Fishhawk as the SP (sign-in stays forge OAuth in v0), and SCIM directory sync
 - Multi-tenant audit retention tiers
 - Workflow spec custom predicates (Rego or Cedar)
 - BYO compute / self-hosted runner alternative

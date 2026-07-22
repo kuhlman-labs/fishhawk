@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -31,6 +32,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -1793,5 +1795,156 @@ func TestResolvePlanReviewers_AnthropicReviewerUsesRegionEndpoint(t *testing.T) 
 	if gotAPIKey != regionKey && gotAuth != "Bearer "+regionKey {
 		t.Errorf("credential = x-api-key:%q Authorization:%q, want the region-scoped key %q",
 			gotAPIKey, gotAuth, regionKey)
+	}
+}
+
+// --- Single-tenant deployment profile (ADR-057 Mode 1, E44.9 / #1833) -------
+//
+// These drive runServe ITSELF, not account.EnsureSingleTenantAccount, so the
+// startup-bootstrap criterion cannot pass while serve.go fails to invoke it
+// (binding condition 2). Each configured-profile case aborts startup at the
+// deliberately-invalid --review-resolution guard, which runs AFTER the
+// bootstrap and BEFORE the listener binds — so runServe returns rather than
+// serving, and the assertion is on what it wrote (or did not write) to the
+// database on the way there.
+const bootstrapAbortFlag = "-review-resolution=not-a-real-resolver"
+
+func serveWithProfile(t *testing.T, args ...string) (int, string) {
+	t.Helper()
+	var logSink bytes.Buffer
+	code := runServe(args, &logSink)
+	return code, logSink.String()
+}
+
+func countAccounts(t *testing.T, url, accountKey string) int {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM accounts WHERE $1 = '' OR account_key = $1`, accountKey).Scan(&n); err != nil {
+		t.Fatalf("count accounts: %v", err)
+	}
+	return n
+}
+
+// (b) A configured profile: runServe REALLY performs the bootstrap — the
+// accounts row exists afterwards, carrying the internally-defaulted
+// granularity and a non-NULL auto-join role.
+func TestServe_SingleTenantProfileBootstrapsAccountRow(t *testing.T) {
+	url := pgtest.NewURL(t)
+
+	code, log := serveWithProfile(t, "-db", url,
+		"-single-tenant-account-key", "acme-corp", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (startup aborts at the invalid review-resolution AFTER the bootstrap); log:\n%s", code, exitFailure, log)
+	}
+
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	var granularity, provider string
+	var role *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT provider, granularity, auto_join_role FROM accounts WHERE account_key = $1`, "acme-corp",
+	).Scan(&provider, &granularity, &role); err != nil {
+		t.Fatalf("runServe did not bootstrap the account row: %v; log:\n%s", err, log)
+	}
+	if provider != account.DefaultSingleTenantProvider || granularity != account.DefaultSingleTenantGranularity {
+		t.Errorf("(provider, granularity) = (%q, %q), want the internal defaults (%q, %q)",
+			provider, granularity, account.DefaultSingleTenantProvider, account.DefaultSingleTenantGranularity)
+	}
+	if role == nil || *role != account.DefaultSingleTenantAutoJoinRole {
+		t.Errorf("auto_join_role = %v, want the internal default %q (a NULL role admits nobody)",
+			role, account.DefaultSingleTenantAutoJoinRole)
+	}
+}
+
+// (a) Nothing set: runServe writes NO accounts row — the hosted multi-tenant
+// path is unchanged.
+func TestServe_NoSingleTenantProfile_WritesNoAccount(t *testing.T) {
+	url := pgtest.NewURL(t)
+
+	code, log := serveWithProfile(t, "-db", url, bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM accounts`).Scan(&n); err != nil {
+		t.Fatalf("count accounts: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("accounts rows = %d, want 0 — an unconfigured deployment must not bootstrap anything", n)
+	}
+}
+
+// (c) A single-tenant field set with the account key EMPTY fails startup with
+// a message naming the missing flag — the partial-configuration path, which
+// must never degrade to hosted mode.
+func TestServe_SingleTenantPartialConfig_FailsStartup(t *testing.T) {
+	url := pgtest.NewURL(t)
+
+	for _, tc := range []struct {
+		name string
+		flag []string
+	}{
+		{"granularity without a key", []string{"-single-tenant-granularity", "organization"}},
+		{"auto-join role without a key", []string{"-single-tenant-auto-join-role", "admin"}},
+		{"provider without a key", []string{"-single-tenant-provider", "gitlab"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			code, log := serveWithProfile(t, append([]string{"-db", url}, tc.flag...)...)
+			if code != exitFailure {
+				t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+			}
+			if !strings.Contains(log, "--single-tenant-account-key") {
+				t.Errorf("log does not name the missing --single-tenant-account-key:\n%s", log)
+			}
+			if n := countAccounts(t, url, ""); n != 0 {
+				t.Errorf("accounts rows = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// A configured profile with NO database fails startup rather than booting a
+// deployment whose bootstrap silently did not happen.
+func TestServe_SingleTenantConfiguredWithoutPool(t *testing.T) {
+	code, log := serveWithProfile(t, "-single-tenant-account-key", "acme-corp")
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if !strings.Contains(log, "FISHHAWKD_DATABASE_URL") {
+		t.Errorf("log does not name the missing database:\n%s", log)
+	}
+}
+
+// An invalid granularity fails startup with an actionable message rather than
+// a raw SQLSTATE 23514 from the accounts_granularity_check constraint.
+func TestServe_SingleTenantInvalidGranularity_FailsStartup(t *testing.T) {
+	url := pgtest.NewURL(t)
+
+	code, log := serveWithProfile(t, "-db", url,
+		"-single-tenant-account-key", "acme-corp",
+		"-single-tenant-granularity", "team")
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if !strings.Contains(log, "--single-tenant-granularity") {
+		t.Errorf("log does not name the offending flag:\n%s", log)
+	}
+	if n := countAccounts(t, url, "acme-corp"); n != 0 {
+		t.Errorf("accounts rows = %d, want 0 — validation must precede the write", n)
 	}
 }

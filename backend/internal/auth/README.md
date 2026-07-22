@@ -55,6 +55,8 @@ Multi-account members are admitted deterministically: the resolver returns a sor
 
 Wiring: `serve.go` builds `NewMembershipResolver(NewAccountMembershipStore(accountdb.New(pool)), resolveMembershipListers(…), WithEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL))` when both OAuth and the database are configured. `resolveMembershipListers` registers `github` whenever OAuth is configured and `gitlab` when `FISHHAWKD_GITLAB_BASE_URL` is set (no token needed — see `backend/cmd/fishhawkd/README.md` for the config asymmetry against the token-gated gitlab forge provider). EMU posture needs no new flag: it is derived from the existing endpoint config. The admission queries live in `backend/internal/account/queries.sql` (`ListMemberGrantsByRef`, `ListAutoJoinAccountsByKeys`, `UpsertAccountMemberWithOrigin`).
 
+Under the **single-tenant deployment profile** (ADR-057 Mode 1, E44.9 / #1833) this gate is unchanged: `account.EnsureSingleTenantAccount` bootstraps ONE `accounts` row with an `auto_join_role` at startup, so it is the only account auto-join can match and admission is scoped to the customer's enterprise / org / group. Invited rows remain the forge-independent fallback. See `backend/internal/account/README.md` and `docs/deploy/self-hosted.md`.
+
 ## GitHub App manifest flow (E4.7)
 
 `github_manifest.go` implements `GitHubManifest.Convert(ctx, code)`, which POSTs to `https://api.github.com/app-manifests/{code}/conversions` and returns App ID + slug + OAuth client ID/secret + webhook secret + PEM.

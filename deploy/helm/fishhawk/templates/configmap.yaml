@@ -48,3 +48,41 @@ data:
   {{- with .Values.config.budgetTimezone }}
   FISHHAWKD_BUDGET_TIMEZONE: {{ . | quote }}
   {{- end }}
+  {{- /* GHES / EMU / data-resident GHEC endpoint overrides (E44.2 / #1826).
+         Unset keys stay unset, which is the github.com posture. */}}
+  {{- with .Values.config.githubApiUrl }}
+  FISHHAWKD_GITHUB_API_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.githubUploadUrl }}
+  FISHHAWKD_GITHUB_UPLOAD_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oauthAuthorizeUrl }}
+  FISHHAWKD_OAUTH_AUTHORIZE_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oauthTokenUrl }}
+  FISHHAWKD_OAUTH_TOKEN_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oauthUserUrl }}
+  FISHHAWKD_OAUTH_USER_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.config.oauthOrgsUrl }}
+  FISHHAWKD_OAUTH_ORGS_URL: {{ . | quote }}
+  {{- end }}
+  {{- /* Single-tenant profile (ADR-057 Mode 1, E44.9 / #1833). The account key
+         alone enables it; the other keys render only when explicitly set, and
+         fishhawkd REFUSES to start if one is set without the key. */}}
+  {{- with .Values.singleTenant.accountKey }}
+  FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.singleTenant.granularity }}
+  FISHHAWKD_SINGLE_TENANT_GRANULARITY: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.singleTenant.autoJoinRole }}
+  FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.singleTenant.displayName }}
+  FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.singleTenant.provider }}
+  FISHHAWKD_SINGLE_TENANT_PROVIDER: {{ . | quote }}
+  {{- end }}

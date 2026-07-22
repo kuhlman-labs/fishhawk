@@ -57,8 +57,29 @@ future split-mode guard must be wired into
 
 A ConfigMap carries the non-secret `FISHHAWKD_*` env: addr, S3
 region/endpoint/bucket, external URL, OAuth callback/redirect, OIDC
-audience/JWKS, GitHub App id, plan-review model, budget timezone.
+audience/JWKS, GitHub App id, plan-review model, budget timezone, the
+GHES/EMU endpoint overrides, and the single-tenant profile.
 Empty keys are omitted to match fishhawkd's ignore-if-unset semantics.
+
+| Value | ConfigMap key | Notes |
+|---|---|---|
+| `config.githubApiUrl` | `FISHHAWKD_GITHUB_API_URL` | GHES REST + App API base (E44.2 / [#1826](https://github.com/kuhlman-labs/fishhawk/issues/1826)); empty → `api.github.com` |
+| `config.githubUploadUrl` | `FISHHAWKD_GITHUB_UPLOAD_URL` | release-asset upload host |
+| `config.oauthAuthorizeUrl` | `FISHHAWKD_OAUTH_AUTHORIZE_URL` | GHES/EMU OAuth authorize URL |
+| `config.oauthTokenUrl` | `FISHHAWKD_OAUTH_TOKEN_URL` | GHES/EMU OAuth token URL |
+| `config.oauthUserUrl` | `FISHHAWKD_OAUTH_USER_URL` | GHES/EMU user-profile URL |
+| `config.oauthOrgsUrl` | `FISHHAWKD_OAUTH_ORGS_URL` | GHES/EMU user-orgs URL (the login gate's org lister) |
+| `singleTenant.accountKey` | `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY` | **the enablement signal** — set it and fishhawkd bootstraps ONE implicit account at startup |
+| `singleTenant.granularity` | `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `enterprise` \| `organization` \| `group`; empty → `enterprise` |
+| `singleTenant.autoJoinRole` | `FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE` | empty → `member`; an account with no auto-join role admits nobody |
+| `singleTenant.displayName` | `FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME` | cosmetic; empty stores NULL |
+| `singleTenant.provider` | `FISHHAWKD_SINGLE_TENANT_PROVIDER` | `github` \| `gitlab`; empty → `github` |
+
+Every `singleTenant.*` value defaults to EMPTY. Setting one of them
+while `accountKey` is empty makes fishhawkd REFUSE to start (naming the
+missing key) rather than degrade to hosted multi-tenant — a deployment
+with no admitting account is one nobody can sign in to. Operator guide:
+[docs/deploy/self-hosted.md](../../../docs/deploy/self-hosted.md).
 
 ## Secrets ([#849](https://github.com/kuhlman-labs/fishhawk/issues/849))
 
@@ -218,4 +239,9 @@ helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-prod.
 helm template fishhawk deploy/helm/fishhawk --set deployment.mode=split --set workers.slaTimer=true
 # confirm the allInOne topology guard fails:
 helm template fishhawk deploy/helm/fishhawk --set replicaCount=2 --set workers.slaTimer=true
+# Mode-1 profile + GHES/EMU endpoints: unset renders NO such key, set renders each.
+helm template fishhawk deploy/helm/fishhawk | grep -c FISHHAWKD_SINGLE_TENANT_   # → 0
+helm template fishhawk deploy/helm/fishhawk \
+  --set singleTenant.accountKey=acme-corp \
+  --set config.githubApiUrl=https://ghes.acme.example/api/v3 | grep -E 'SINGLE_TENANT|GITHUB_API_URL'
 ```

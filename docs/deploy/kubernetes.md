@@ -5,6 +5,20 @@ chart under `deploy/helm/fishhawk/`. This is the M1 "works on Docker Desktop"
 path (ADR-034); it is an operator smoke test for the chart, not exercised in CI
 (no cluster is available there).
 
+## Deployment modes
+
+The chart serves both ADR-057 deployment modes; only the values differ.
+
+- **Mode 1 — self-hosted, single tenant**: one customer, own perimeter, one
+  implicit account bootstrapped from `singleTenant.accountKey`. See
+  [self-hosted.md](self-hosted.md).
+- **Mode 2 — hosted regional**: many accounts across N cells behind a global
+  directory. Runbook: [hosted-regional.md](hosted-regional.md); protocol:
+  [regional-cells.md](regional-cells.md).
+
+The rest of this page is the local Docker-Desktop bring-up, which is neither —
+it renders with both profiles unset.
+
 ## Prerequisites
 
 - **Docker Desktop with Kubernetes enabled** (Settings → Kubernetes → Enable

@@ -154,3 +154,64 @@ unexpired handoff verbatim changes nothing. See
 `backend/internal/server/regionpin.go` for the HTTP middleware that verifies the
 handoff before calling this, and `docs/deploy/regional-cells.md` for the
 two-plane topology.
+
+## Single-tenant deployment profile (ADR-057 Mode 1, E44.9 / #1833)
+
+`singletenant.go` is the boot-time bootstrap that gives a self-hosted install
+its ONE implicit tenant. It exists because the rest of the tenancy stack only
+*reads* accounts: `auth.MembershipResolver` admits a sign-in against an existing
+`accounts` row and denies when none matches, and nothing else creates the first
+row — so without this a fresh install denies every sign-in with hand-written SQL
+as the only remedy.
+
+`EnsureSingleTenantAccount(ctx, q, cfg, logger)` upserts a single row through
+`UpsertSingleTenantAccount`, the only query that writes `auto_join_role`. The
+write is `ON CONFLICT (provider, account_key) DO UPDATE`, so every restart
+converges the row on the configured profile without minting a second account,
+and `home_region` is absent from BOTH the insert list and the update set —
+`PinAccountHomeRegion` owns that column first-write-wins, and a boot-time upsert
+re-running on every restart must never clear a pin
+(`TestEnsureSingleTenantAccount_LeavesHomeRegionAlone`).
+
+### Enablement is the account key, and only the account key
+
+Every `FISHHAWKD_SINGLE_TENANT_*` flag defaults to EMPTY; the
+`github` / `enterprise` / `member` defaults are applied INTERNALLY by
+`resolveDefaults`, only after enablement. Making them flag defaults would force
+a choice between enabling the profile on every hosted boot and making the
+missing-key guard unreachable. The three states:
+
+| Configuration | Behavior |
+|---|---|
+| Nothing set | `(uuid.Nil, false, nil)` — bootstrap skipped, no write, hosted behavior unchanged |
+| Account key set | bootstrap runs; omitted fields filled from the internal defaults |
+| Any other field set, key EMPTY | `ErrSingleTenantMissingAccountKey`, which the caller turns into a startup abort |
+
+The third row is the load-bearing one. Reading a half-configured profile as
+"hosted" boots a deployment with **no admitting account** — nobody can sign in,
+and nothing says why. That is the failure this profile exists to prevent, so it
+fails closed instead.
+
+### Fail-closed branches
+
+| Branch | Result |
+|---|---|
+| Partial configuration (above) | `ErrSingleTenantMissingAccountKey` |
+| Granularity outside `enterprise` / `organization` / `group` | error naming the flag + accepted set (mirrors `accounts_granularity_check`, so the operator sees a message instead of SQLSTATE 23514) |
+| Provider outside `github` / `gitlab` | error naming the flag (mirrors `accounts_provider_check`) |
+| Empty `AutoJoinRole` on a directly-constructed config | error — `ListAutoJoinAccountsByKeys` selects only `auto_join_role IS NOT NULL`, so a NULL role is invisible to the login gate and the account would admit nobody. Unreachable through the flag path, where `resolveDefaults` fills `member`; `Validate` is the guard for direct construction |
+| Configured profile, nil query surface (no `FISHHAWKD_DATABASE_URL`) | error — never a silent skip |
+| Upsert fails | wrapped error; no id, no partial success |
+
+Validation runs BEFORE the write, so an invalid profile never leaves a row
+behind. `serve.go` aborts startup on any of these.
+
+`singletenant_test.go` covers each branch, and the create / idempotence /
+in-place-update / home-region cases run against real Postgres through the
+production `accountdb.Queries`. The cross-layer proof that the bootstrapped
+account actually admits a member — real bootstrap, then the real
+`MembershipResolver` — lives in
+`backend/internal/auth/membership_test.go`
+(`TestMembershipResolver_AdmitsViaSingleTenantBootstrap`, plus a
+non-matching-granularity negative twin). Operator guide:
+`docs/deploy/self-hosted.md`.

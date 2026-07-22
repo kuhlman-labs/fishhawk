@@ -835,6 +835,29 @@ func runServe(args []string, logSink io.Writer) int {
 	oauthOrgsURL := fs.String("oauth-orgs-url",
 		envOr("FISHHAWKD_OAUTH_ORGS_URL", ""),
 		"GitHub OAuth user-orgs URL; empty → https://api.github.com/user/orgs")
+	// Single-tenant deployment profile (ADR-057 Mode 1, E44.9 / #1833).
+	// EVERY flag here defaults to EMPTY on purpose: the ACCOUNT KEY ALONE is
+	// the enablement signal, and the github / enterprise / member defaults are
+	// applied internally (account.EnsureSingleTenantAccount) only after the
+	// profile is enabled. Making them flag defaults would either enable the
+	// profile on every hosted boot or make the missing-key guard unreachable.
+	// Setting any other --single-tenant-* flag with the key empty is a startup
+	// ERROR, not a silent fall-through to hosted mode.
+	singleTenantAccountKey := fs.String("single-tenant-account-key",
+		envOr("FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY", ""),
+		"enterprise slug / org login / GitLab group path of the ONE implicit account a self-hosted deployment admits through (ADR-057 Mode 1). Empty = hosted multi-tenant (no bootstrap); setting it bootstraps that account at startup so every member of it auto-joins at sign-in.")
+	singleTenantGranularity := fs.String("single-tenant-granularity",
+		envOr("FISHHAWKD_SINGLE_TENANT_GRANULARITY", ""),
+		"tier the single-tenant account key names: enterprise | organization | group. Empty defaults to enterprise ONCE --single-tenant-account-key is set; setting it alone is a startup error.")
+	singleTenantAutoJoinRole := fs.String("single-tenant-auto-join-role",
+		envOr("FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE", ""),
+		"role granted to members auto-joining the single-tenant account. Empty defaults to member ONCE --single-tenant-account-key is set; an account with no auto-join role admits nobody.")
+	singleTenantDisplayName := fs.String("single-tenant-display-name",
+		envOr("FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME", ""),
+		"cosmetic display name for the single-tenant account; empty stores NULL.")
+	singleTenantProvider := fs.String("single-tenant-provider",
+		envOr("FISHHAWKD_SINGLE_TENANT_PROVIDER", ""),
+		"forge the single-tenant account key belongs to: github | gitlab. Empty defaults to github ONCE --single-tenant-account-key is set; setting it alone is a startup error.")
 	jiraBaseURL := fs.String("jira-base-url",
 		envOr("FISHHAWKD_JIRA_BASE_URL", ""),
 		"Jira Cloud instance base URL (e.g. https://acme.atlassian.net); with --jira-email + --jira-api-token, enables the jira work-item provider")
@@ -1235,6 +1258,38 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth + account-roles)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
+	}
+
+	// Single-tenant profile bootstrap (ADR-057 Mode 1, E44.9 / #1833). Runs
+	// BEFORE the membership resolver is built (and before the server starts
+	// serving) so a self-hosted deployment has its one implicit admitting
+	// account in place by the time the first sign-in arrives — without it, the
+	// resolver denies every sign-in because no accounts row matches.
+	//
+	// Fail closed on EVERY branch: a partially-configured profile (any
+	// --single-tenant-* flag with the key empty), an invalid
+	// provider/granularity/role, a configured profile with no database, or a
+	// write error all abort startup. Booting into a deployment nobody can sign
+	// in to, with nothing saying why, is the failure this exists to prevent.
+	// An unconfigured profile skips the bootstrap entirely — hosted
+	// multi-tenant behavior is unchanged.
+	var singleTenantQueries account.SingleTenantQueries
+	if pool != nil {
+		singleTenantQueries = accountdb.New(pool)
+	}
+	if _, bootstrapped, err := account.EnsureSingleTenantAccount(context.Background(), singleTenantQueries,
+		account.SingleTenantConfig{
+			Provider:     *singleTenantProvider,
+			AccountKey:   *singleTenantAccountKey,
+			DisplayName:  *singleTenantDisplayName,
+			Granularity:  *singleTenantGranularity,
+			AutoJoinRole: *singleTenantAutoJoinRole,
+		}, logger); err != nil {
+		logger.Error("single-tenant profile bootstrap failed", slog.String("error", err.Error()))
+		return exitFailure
+	} else if !bootstrapped {
+		logger.Info("single-tenant profile not configured; running hosted multi-tenant (sign-in admits only against existing accounts rows)",
+			slog.String("ref", "#1833"))
 	}
 
 	// Regional handoff surface (ADR-062, E44.7 / #1831). Constructed only when

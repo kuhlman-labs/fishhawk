@@ -46,6 +46,33 @@ install; a NULL column or unknown installation falls back to the deployment
 default; a **real DB error FAILS the mint** (fail-closed) rather than silently
 targeting the default host. See `backend/internal/account/README.md`.
 
+## Single-tenant deployment profile (ADR-057 Mode 1, E44.9 / #1833)
+
+Five optional env vars bootstrap the ONE implicit account a self-hosted install admits through.
+All five default **empty**, and an all-empty deployment is byte-identical to the hosted
+multi-tenant posture (no bootstrap, no write).
+
+| Env var | Flag | Effect | Empty means |
+|---|---|---|---|
+| `FISHHAWKD_SINGLE_TENANT_ACCOUNT_KEY` | `--single-tenant-account-key` | enterprise slug / org login / GitLab group path — **and the sole enablement signal** | hosted multi-tenant; bootstrap skipped |
+| `FISHHAWKD_SINGLE_TENANT_GRANULARITY` | `--single-tenant-granularity` | `enterprise` \| `organization` \| `group` | `enterprise`, once the key is set |
+| `FISHHAWKD_SINGLE_TENANT_AUTO_JOIN_ROLE` | `--single-tenant-auto-join-role` | role minted on auto-joining members | `member`, once the key is set |
+| `FISHHAWKD_SINGLE_TENANT_DISPLAY_NAME` | `--single-tenant-display-name` | cosmetic | NULL |
+| `FISHHAWKD_SINGLE_TENANT_PROVIDER` | `--single-tenant-provider` | `github` \| `gitlab` | `github`, once the key is set |
+
+**The account key alone enables the profile.** The defaults above are applied INTERNALLY after
+enablement, never as flag defaults — otherwise every hosted boot would look configured. So the
+three states are unambiguous: nothing set → skip; key set → bootstrap with defaults filled; any
+other field set with the key EMPTY → **startup error** naming `--single-tenant-account-key`. That
+last one is deliberate: degrading a half-configured profile to hosted mode boots a deployment
+with no admitting account, where every sign-in is denied and nothing says why.
+
+Startup also fails on an out-of-set granularity or provider (naming the flag and the accepted
+values, instead of a raw SQLSTATE 23514 from the `accounts` CHECK constraints), on a configured
+profile with no `FISHHAWKD_DATABASE_URL`, and on a bootstrap write error. The upsert is idempotent
+and never touches `home_region`. Contract: `backend/internal/account/README.md`; operator guide:
+`docs/deploy/self-hosted.md`.
+
 ## Regional cells: handoff surface + region-scoped inference (ADR-062, E44.7 / #1831)
 
 Four optional env vars turn this process into a *regional cell*. All four default empty, and an
