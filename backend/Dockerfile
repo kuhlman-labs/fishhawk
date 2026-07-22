@@ -28,6 +28,10 @@ COPY backend/go.mod backend/go.sum ./backend/
 COPY runner/go.mod runner/go.sum ./runner/
 COPY cli/go.mod cli/go.sum ./cli/
 COPY verifier/go.mod verifier/go.sum ./verifier/
+# The directory module is in go.work, so `go mod download` must be able to
+# resolve it even though backend does not import it (AGENTS.md "Adding a
+# Go module" step 4 — omitting it fails with "cannot load module ../directory").
+COPY directory/go.mod directory/go.sum ./directory/
 # pricing and redaction have no external imports, so no go.sum exists to copy.
 COPY pricing/go.mod ./pricing/
 COPY redaction/go.mod ./redaction/
@@ -44,6 +48,7 @@ COPY backend ./backend
 COPY runner ./runner
 COPY cli ./cli
 COPY verifier ./verifier
+COPY directory ./directory
 COPY pricing ./pricing
 COPY redaction ./redaction
 
