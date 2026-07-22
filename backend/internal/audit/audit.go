@@ -38,6 +38,12 @@ type Entry struct {
 	Payload      json.RawMessage
 	PrevHash     *string
 	EntryHash    string
+	// AccountID is the tenant workspace account the entry belongs to
+	// (ADR-057 / #1828). Per-run entries carry their run's account;
+	// run-less entries carry the chain partition they chained within.
+	// nil = untenanted (historical rows and the #1829 NULL-allow
+	// window). Not part of the canonical hash — see HashInputs.
+	AccountID *uuid.UUID
 }
 
 // ActorKind enumerates who acted to produce the entry. Closed set

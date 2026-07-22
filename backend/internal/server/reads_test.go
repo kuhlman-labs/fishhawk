@@ -722,6 +722,10 @@ func (a *auditReadFake) AppendGlobalChained(context.Context, audit.GlobalChainAp
 func (a *auditReadFake) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (a *auditReadFake) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
 func (a *auditReadFake) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

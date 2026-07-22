@@ -142,6 +142,10 @@ func (a *traceReadAuditRepo) AppendGlobalChained(context.Context, audit.GlobalCh
 func (a *traceReadAuditRepo) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (a *traceReadAuditRepo) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
 func (a *traceReadAuditRepo) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }

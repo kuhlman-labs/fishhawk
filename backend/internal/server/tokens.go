@@ -412,6 +412,7 @@ func (s *Server) logTokenEvent(r *http.Request, event string, tok *apitoken.Toke
 		ActorKind:    &actorKind,
 		ActorSubject: &actorSubject,
 		Payload:      payload,
+		AccountID:    identityAccountID(r.Context()),
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"audit append failed for token event",

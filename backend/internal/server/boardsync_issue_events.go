@@ -220,6 +220,11 @@ func (s *Server) auditIssueBoardTransition(ctx context.Context, event, repo stri
 		Category:  categoryWorkItemTransitioned,
 		ActorKind: &kind,
 		Payload:   payload,
+		// AccountID stays nil (untenanted partition): a hand-closed issue has
+		// no run or campaign to carry a tenant, the webhook ctx has no request
+		// Identity, and the server has no installation→account resolution
+		// surface yet (ADR-057 / #1828 — the webhook Dispatcher's
+		// InstallationAccountLookup seam is the wiring point once one exists).
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "append issue work_item_transitioned audit",
 			slog.String("event", event),

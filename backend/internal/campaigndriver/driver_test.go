@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -33,6 +35,12 @@ type fakeCampaignStore struct {
 	transErr     error // injected error for TransitionCampaignItem (settle and start paths)
 	pauseErr     error // injected error for PauseCampaignItem (page path)
 	campTransErr error // injected error for TransitionCampaign (campaign-pause path)
+
+	// accounts maps campaign id → tenant account for the AccountGetter
+	// capability (ADR-057 / #1828); acctErr injects a lookup failure. An
+	// unmapped campaign resolves untenanted ("").
+	accounts map[uuid.UUID]string
+	acctErr  error
 
 	// recorded mutations
 	itemTransitions []itemTransition
@@ -80,6 +88,18 @@ func (f *fakeCampaignStore) seedItem(c *campaign.Campaign, ref string, state cam
 	it := &campaign.Item{ID: uuid.New(), CampaignID: c.ID, IssueRef: ref, DependsOn: deps, State: state, RunID: runID}
 	f.items[c.ID] = append(f.items[c.ID], it)
 	return it
+}
+
+// GetCampaignAccountID overrides the embedded campaign.BaseFake stub with a
+// seedable AccountGetter capability (ADR-057 / #1828). An unmapped campaign
+// resolves untenanted ("").
+func (f *fakeCampaignStore) GetCampaignAccountID(_ context.Context, id uuid.UUID) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.acctErr != nil {
+		return "", f.acctErr
+	}
+	return f.accounts[id], nil
 }
 
 func (f *fakeCampaignStore) ListCampaigns(_ context.Context, fil campaign.ListCampaignsFilter) ([]*campaign.Campaign, error) {
@@ -340,8 +360,9 @@ func (f *fakeStarter) StartCampaignRun(_ context.Context, item *campaign.Item, _
 // --- audit recorder fake ----------------------------------------------------
 
 type recordedAudit struct {
-	category string
-	payload  map[string]any
+	category  string
+	payload   map[string]any
+	accountID *uuid.UUID
 }
 
 type fakeAudit struct {
@@ -359,7 +380,7 @@ func (f *fakeAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAp
 	}
 	var payload map[string]any
 	_ = json.Unmarshal(p.Payload, &payload)
-	f.entries = append(f.entries, recordedAudit{category: p.Category, payload: payload})
+	f.entries = append(f.entries, recordedAudit{category: p.Category, payload: payload, accountID: p.AccountID})
 	return &audit.Entry{}, nil
 }
 
@@ -1293,5 +1314,77 @@ func TestTick_EndToEnd_AutoActsThenSettles_AndPagesReject(t *testing.T) {
 	}
 	if got := len(au.byCategory(categoryCampaignPaused)); got != 1 {
 		t.Fatalf("campaign_paused entries = %d, want 1 (one hand-off)", got)
+	}
+}
+
+// --- per-account audit stamping (ADR-057 / #1828) ---
+
+// TestTick_AuditStampsCampaignAccount is the campaign-driver caller-family
+// assertion: driver-emitted global-chain entries carry the owning campaign's
+// tenant account, resolved through the store's AccountGetter capability.
+func TestTick_AuditStampsCampaignAccount(t *testing.T) {
+	store := newFakeStore()
+	c := store.seedCampaign(campaign.StateRunning)
+	acct := uuid.New()
+	store.accounts = map[uuid.UUID]string{c.ID: acct.String()}
+	store.seedItem(c, "issue:42", campaign.ItemStatePending, nil, nil)
+	reader := newFakeRunReader()
+	starter := &fakeStarter{reader: reader}
+	au := &fakeAudit{}
+	tk := newTicker(store, reader, starter, au, 4)
+
+	tk.Tick(context.Background())
+
+	started := au.byCategory(categoryCampaignIssueStarted)
+	if len(started) != 1 {
+		t.Fatalf("started audit entries = %d, want 1", len(started))
+	}
+	if started[0].accountID == nil || *started[0].accountID != acct {
+		t.Fatalf("started entry AccountID = %v, want %s", started[0].accountID, acct)
+	}
+}
+
+// TestCampaignAccountID_Branches pins every defensive degrade of the
+// driver's campaign → account resolution: each falls back to nil (the
+// untenanted NULL partition) rather than suppressing the audit entry.
+func TestCampaignAccountID_Branches(t *testing.T) {
+	acct := uuid.New()
+	cID := uuid.New()
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	withAcct := newFakeStore()
+	withAcct.accounts = map[uuid.UUID]string{cID: acct.String()}
+	unparsable := newFakeStore()
+	unparsable.accounts = map[uuid.UUID]string{cID: "not-a-uuid"}
+	erroring := newFakeStore()
+	erroring.acctErr = errors.New("db down")
+	notFound := newFakeStore()
+	notFound.acctErr = campaign.ErrNotFound
+
+	cases := []struct {
+		name  string
+		store CampaignStore
+		want  *uuid.UUID
+	}{
+		// Interface-embedding strips the concrete fake's optional capability
+		// methods, so the AccountGetter type assertion fails.
+		{"store without the AccountGetter capability", struct{ CampaignStore }{newFakeStore()}, nil},
+		{"not-found campaign degrades silently", notFound, nil},
+		{"lookup error degrades to untenanted with a warn", erroring, nil},
+		{"untenanted campaign (empty account)", newFakeStore(), nil},
+		{"unparsable account value", unparsable, nil},
+		{"tenanted campaign resolves its account", withAcct, &acct},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tk := &Ticker{Campaigns: tc.store}
+			got := tk.campaignAccountID(context.Background(), discard, cID)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("got %s, want nil", *got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Fatalf("got %v, want %s", got, *tc.want)
+			}
+		})
 	}
 }

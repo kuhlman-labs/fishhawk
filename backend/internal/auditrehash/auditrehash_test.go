@@ -5,10 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -288,6 +291,259 @@ func TestRehashAllChains_DryRunReportsButDoesNotWrite(t *testing.T) {
 	}
 	if stillStored != oldHash {
 		t.Errorf("dry-run mutated the row: stored %q, want unchanged %q", stillStored, oldHash)
+	}
+}
+
+// makeAccount inserts a tenant workspace account so run-less audit
+// entries can reference it (audit_entries.account_id FK, migration
+// 0055).
+func makeAccount(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+		id, "acct-"+id.String()[:8]); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+	return id
+}
+
+// insertRunlessEntry inserts one run-less row with a CANONICAL hash
+// computed over the given prev — the shape a pre-ADR-057 single
+// interleaved global chain left on disk once account_id was
+// backfilled: hashes verify row-by-row, but prev_hash links across
+// account partitions. Returns the row id and its entry_hash.
+func insertRunlessEntry(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	accountID *uuid.UUID,
+	ts time.Time,
+	category string,
+	payload []byte,
+	prevHash *string,
+) (uuid.UUID, string) {
+	t.Helper()
+	hash, err := audit.ComputeEntryHash(audit.HashInputs{
+		Timestamp: ts,
+		Category:  category,
+		Payload:   payload,
+		PrevHash:  prevHash,
+	})
+	if err != nil {
+		t.Fatalf("compute hash: %v", err)
+	}
+	id := uuid.New()
+	_, err = pool.Exec(context.Background(), `
+		INSERT INTO audit_entries (id, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash, account_id)
+		VALUES ($1, NULL, NULL, $2, $3, NULL, NULL, $4, $5, $6, $7)`,
+		id, pgtype.Timestamptz{Time: ts, Valid: true},
+		category, payload, prevHash, hash, accountID)
+	if err != nil {
+		t.Fatalf("insert run-less entry: %v", err)
+	}
+	return id, hash
+}
+
+// verifyRunlessPartition walks ONE run-less account partition (nil =
+// untenanted) in sequence order and fails the test unless it is an
+// independent canonical chain: nil-prev_hash genesis, every
+// prev_hash linking the in-partition predecessor's entry_hash, every
+// entry_hash recomputing canonically. Returns the partition size.
+func verifyRunlessPartition(t *testing.T, pool *pgxpool.Pool, accountID *uuid.UUID) int {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT ts, category, payload, prev_hash, entry_hash
+		FROM audit_entries
+		WHERE run_id IS NULL AND (($1::uuid IS NULL AND account_id IS NULL) OR account_id = $1)
+		ORDER BY sequence ASC`, accountID)
+	if err != nil {
+		t.Fatalf("select partition: %v", err)
+	}
+	defer rows.Close()
+
+	n := 0
+	var prevEntryHash *string
+	for rows.Next() {
+		var (
+			ts        time.Time
+			category  string
+			payload   []byte
+			prevHash  *string
+			entryHash string
+		)
+		if err := rows.Scan(&ts, &category, &payload, &prevHash, &entryHash); err != nil {
+			t.Fatalf("scan partition row: %v", err)
+		}
+		if prevEntryHash == nil {
+			if prevHash != nil {
+				t.Errorf("partition %v entry %d: genesis prev_hash = %q, want nil", accountID, n, *prevHash)
+			}
+		} else if prevHash == nil || *prevHash != *prevEntryHash {
+			t.Errorf("partition %v entry %d: prev_hash does not link the in-partition predecessor", accountID, n)
+		}
+		got, err := audit.ComputeEntryHash(audit.HashInputs{
+			Timestamp: ts, Category: category, Payload: payload, PrevHash: prevHash,
+		})
+		if err != nil {
+			t.Fatalf("recompute: %v", err)
+		}
+		if got != entryHash {
+			t.Errorf("partition %v entry %d: entry_hash not canonical", accountID, n)
+		}
+		h := entryHash
+		prevEntryHash = &h
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate partition: %v", err)
+	}
+	return n
+}
+
+func TestRehashAllChains_SegmentsRunLessChainPerAccount(t *testing.T) {
+	// The legacy corpus shape after the account backfill and before
+	// the re-anchor: ONE interleaved run-less chain whose per-row
+	// hashes are canonical but whose prev_hash links cross account
+	// partitions. The re-anchor must segment it into one independent
+	// chain per account (plus the untenanted NULL partition), each
+	// with its own nil-prev_hash genesis.
+	pool := pgtest.NewPool(t)
+	acctA, acctB := makeAccount(t, pool), makeAccount(t, pool)
+
+	base := time.Date(2026, 7, 1, 9, 0, 0, 0, time.UTC)
+	// Interleave A, B, untenanted, A, B as one single chain.
+	_, h1 := insertRunlessEntry(t, pool, &acctA, base, "api_token_issued", []byte(`{"i":1}`), nil)
+	_, h2 := insertRunlessEntry(t, pool, &acctB, base.Add(time.Second), "api_token_issued", []byte(`{"i":2}`), &h1)
+	_, h3 := insertRunlessEntry(t, pool, nil, base.Add(2*time.Second), "oauth_signin", []byte(`{"i":3}`), &h2)
+	_, h4 := insertRunlessEntry(t, pool, &acctA, base.Add(3*time.Second), "api_token_revoked", []byte(`{"i":4}`), &h3)
+	_, _ = insertRunlessEntry(t, pool, &acctB, base.Add(4*time.Second), "api_token_revoked", []byte(`{"i":5}`), &h4)
+
+	summary, err := auditrehash.RehashAllChains(context.Background(), pool, false)
+	if err != nil {
+		t.Fatalf("RehashAllChains: %v", err)
+	}
+	// Three partitions (A, B, untenanted), five rows. Entry 1 is
+	// already A's genesis and stays put; the other four re-anchor.
+	if summary.Chains != 3 {
+		t.Errorf("Chains = %d, want 3 (A, B, untenanted)", summary.Chains)
+	}
+	if summary.EntriesTotal != 5 {
+		t.Errorf("EntriesTotal = %d, want 5", summary.EntriesTotal)
+	}
+	if summary.EntriesChanged != 4 {
+		t.Errorf("EntriesChanged = %d, want 4 (A's genesis already anchored)", summary.EntriesChanged)
+	}
+
+	if n := verifyRunlessPartition(t, pool, &acctA); n != 2 {
+		t.Errorf("partition A size = %d, want 2", n)
+	}
+	if n := verifyRunlessPartition(t, pool, &acctB); n != 2 {
+		t.Errorf("partition B size = %d, want 2", n)
+	}
+	if n := verifyRunlessPartition(t, pool, nil); n != 1 {
+		t.Errorf("untenanted partition size = %d, want 1", n)
+	}
+
+	// Idempotent: a second pass over the segmented corpus changes
+	// nothing.
+	again, err := auditrehash.RehashAllChains(context.Background(), pool, false)
+	if err != nil {
+		t.Fatalf("RehashAllChains (second pass): %v", err)
+	}
+	if again.EntriesChanged != 0 {
+		t.Errorf("second pass EntriesChanged = %d, want 0", again.EntriesChanged)
+	}
+	if again.Chains != 3 || again.EntriesTotal != 5 {
+		t.Errorf("second pass summary = %+v, want 3 chains / 5 total", again)
+	}
+}
+
+// failAfterDB injects a write failure after a fixed number of Execs
+// so the abort path (deferred rollback) is exercised against the
+// real database: the append-only triggers must come back and no row
+// may have been mutated.
+type failAfterDB struct {
+	pool      *pgxpool.Pool
+	execsLeft int
+}
+
+func (f *failAfterDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	return f.pool.Query(ctx, sql, args...)
+}
+
+func (f *failAfterDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &failAfterTx{Tx: tx, execsLeft: &f.execsLeft}, nil
+}
+
+type failAfterTx struct {
+	pgx.Tx
+	execsLeft *int
+}
+
+func (t *failAfterTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if *t.execsLeft <= 0 {
+		return pgconn.CommandTag{}, errors.New("injected write failure")
+	}
+	*t.execsLeft--
+	return t.Tx.Exec(ctx, sql, args...)
+}
+
+func TestRehashAllChains_InjectedFailureRestoresTriggersAndWritesNothing(t *testing.T) {
+	pool := pgtest.NewPool(t)
+
+	// THREE non-canonical run-less rows in the same (untenanted)
+	// partition, so the walk attempts three UPDATEs in sequence. A
+	// single-row corpus cannot test rollback-after-partial-mutation:
+	// if we fail on the first UPDATE, no write ever lands, so the
+	// unchanged-row assertion would still pass even if a committed
+	// earlier update escaped rollback. Here we let the FIRST UPDATE
+	// succeed inside the tx and fail on the SECOND, then assert every
+	// row — including the mutated-then-rolled-back first — retains its
+	// original hash.
+	loc := time.FixedZone("EDT", -4*3600)
+	ts1 := time.Date(2026, 5, 13, 8, 52, 53, 665435123, loc)
+	ts2 := ts1.Add(time.Second)
+	ts3 := ts2.Add(time.Second)
+	id1, oldHash1 := insertNonCanonicalEntry(t, pool, nil, nil, ts1, "api_token_issued", []byte(`{}`), nil)
+	id2, oldHash2 := insertNonCanonicalEntry(t, pool, nil, nil, ts2, "api_token_issued", []byte(`{}`), &oldHash1)
+	id3, oldHash3 := insertNonCanonicalEntry(t, pool, nil, nil, ts3, "api_token_revoked", []byte(`{}`), &oldHash2)
+
+	// Allow two Execs — the trigger disable and the first row's UPDATE
+	// — then fail on the second row's UPDATE. This drives a genuine
+	// partial mutation: row 1 is rewritten inside the tx before the
+	// abort.
+	db := &failAfterDB{pool: pool, execsLeft: 2}
+	if _, err := auditrehash.RehashAllChains(context.Background(), db, false); err == nil {
+		t.Fatal("RehashAllChains succeeded, want injected failure")
+	}
+
+	// The abort rolled back the trigger disable: audit_entries is
+	// still append-only.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE audit_entries SET category = category WHERE id = $1`, id1); err == nil {
+		t.Error("UPDATE succeeded after failed rehash — append-only trigger not restored")
+	}
+
+	// And NO row was left mutated — including id1, whose UPDATE landed
+	// inside the tx before the injected failure. If the earlier update
+	// escaped rollback, id1's stored hash would be the recomputed
+	// canonical value, not oldHash1.
+	for _, want := range []struct {
+		id   uuid.UUID
+		hash string
+	}{{id1, oldHash1}, {id2, oldHash2}, {id3, oldHash3}} {
+		var stored string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT entry_hash FROM audit_entries WHERE id = $1`, want.id).Scan(&stored); err != nil {
+			t.Fatal(err)
+		}
+		if stored != want.hash {
+			t.Errorf("failed rehash mutated row %s: stored %q, want unchanged %q", want.id, stored, want.hash)
+		}
 	}
 }
 

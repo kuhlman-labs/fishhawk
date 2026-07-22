@@ -2,6 +2,8 @@ package audit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -42,6 +44,7 @@ func (r *postgresRepo) Append(ctx context.Context, p AppendParams) (*Entry, erro
 		Payload:      []byte(p.Payload),
 		PrevHash:     p.PrevHash,
 		EntryHash:    p.EntryHash,
+		AccountID:    p.AccountID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("append audit entry: %w", err)
@@ -49,30 +52,63 @@ func (r *postgresRepo) Append(ctx context.Context, p AppendParams) (*Entry, erro
 	return rowToEntry(row), nil
 }
 
-// AppendGlobalChained writes an entry to the global chain (E2.7).
-// PrevHash links the new entry to the previous global-chain entry
-// (or nil for the first one). The whole append runs in a
-// transaction so concurrent calls can't both observe the same
-// prev_hash.
+// globalChainLockKey derives the pg_advisory_xact_lock key that
+// serializes run-less chain appends within one partition (ADR-057 /
+// #1828): the first 8 bytes of a domain-separated sha256 over the
+// account UUID, or over the domain prefix alone for the untenanted
+// NULL partition — a fixed sentinel key. Domain separation keeps the
+// key space disjoint from other subsystems' advisory locks (e.g.
+// refinement's raw-UUID filing locks); a residual 1-in-2^64 collision
+// merely serializes two unrelated writers, never a correctness
+// problem.
+func globalChainLockKey(accountID *uuid.UUID) int64 {
+	h := sha256.New()
+	h.Write([]byte("fishhawk:audit:global-chain:"))
+	if accountID != nil {
+		h.Write(accountID[:])
+	}
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
+}
+
+// AppendGlobalChained writes an entry to the run-less ("global")
+// chain (E2.7). Since ADR-057 / #1828 the run-less partition is keyed
+// by account_id: PrevHash links the new entry to the previous entry
+// WITHIN p.AccountID's partition (nil AccountID = the untenanted
+// account_id IS NULL partition), or nil for the partition's genesis
+// entry.
 //
-// Note: there's no per-row lock here because there's no run row
-// to lock — concurrent global writes serialize via the transaction
-// + the single chain partition. Postgres' default isolation
-// (read committed) is sufficient because GetLastGlobalAuditEntry
-// + AppendAuditEntry are run inside the same tx; a second tx
-// reading the last entry inside its own tx will see this tx's
-// committed write.
+// There is no run row to SELECT FOR UPDATE here, and read committed
+// alone is NOT enough — two concurrent transactions can both read the
+// same last entry (or both see an empty partition) before either
+// commits, forking the chain (there is no unique constraint to catch
+// it). So the append first takes a Postgres advisory TRANSACTION lock
+// keyed on the chain partition (globalChainLockKey); a concurrent
+// append to the same partition blocks at the lock until the holder
+// commits, exactly mirroring the per-run SELECT FOR UPDATE
+// serialization. Appends to different partitions run in parallel. The
+// xact-scoped lock releases automatically on commit or rollback.
 func (r *postgresRepo) AppendGlobalChained(ctx context.Context, p GlobalChainAppendParams) (*Entry, error) {
 	var result *Entry
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", globalChainLockKey(p.AccountID)); err != nil {
+			return fmt.Errorf("audit: acquire global-chain partition lock: %w", err)
+		}
+
 		aq := auditdb.New(tx)
 		var prev *string
-		last, err := aq.GetLastGlobalAuditEntry(ctx)
+		var last auditdb.AuditEntry
+		var err error
+		if p.AccountID != nil {
+			last, err = aq.GetLastGlobalAuditEntryForAccount(ctx, p.AccountID)
+		} else {
+			last, err = aq.GetLastGlobalAuditEntryUntenanted(ctx)
+		}
 		switch {
 		case err == nil:
 			prev = &last.EntryHash
 		case errors.Is(err, pgx.ErrNoRows):
-			// First entry in the global chain.
+			// Genesis entry of this partition's chain.
 		default:
 			return fmt.Errorf("audit: read last global entry: %w", err)
 		}
@@ -107,6 +143,7 @@ func (r *postgresRepo) AppendGlobalChained(ctx context.Context, p GlobalChainApp
 			Payload:      []byte(p.Payload),
 			PrevHash:     prev,
 			EntryHash:    hash,
+			AccountID:    p.AccountID,
 		})
 		if err != nil {
 			return fmt.Errorf("audit: append global: %w", err)
@@ -167,6 +204,18 @@ func AppendChainedTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams) (*Entr
 		return nil, fmt.Errorf("audit: lock run: %w", err)
 	}
 
+	// Stamp the locked run's account on the entry (ADR-057 / #1828).
+	// LockRunForUpdate's generated SELECT list predates the 0055
+	// account_id column, so the account is read via the dedicated
+	// GetRunAccountID query — inside the same tx, with the row lock
+	// already held, so the value cannot change under us. Per-run
+	// chains stay keyed by run_id alone; the account is a stamp, not
+	// a chain key, and stays out of the canonical hash.
+	accountID, err := rq.GetRunAccountID(ctx, p.RunID)
+	if err != nil {
+		return nil, fmt.Errorf("audit: read run account: %w", err)
+	}
+
 	// Fetch prev_hash from the run's last entry (if any).
 	aq := auditdb.New(tx)
 	var prev *string
@@ -212,6 +261,7 @@ func AppendChainedTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams) (*Entr
 		Payload:      []byte(p.Payload),
 		PrevHash:     prev,
 		EntryHash:    hash,
+		AccountID:    accountID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("audit: append: %w", err)
@@ -285,6 +335,19 @@ func (r *postgresRepo) ListGlobal(ctx context.Context) ([]*Entry, error) {
 	return out, nil
 }
 
+func (r *postgresRepo) ListGlobalByAccount(ctx context.Context, accountID *uuid.UUID) ([]*Entry, error) {
+	q := auditdb.New(r.pool)
+	rows, err := q.ListGlobalAuditEntriesByAccount(ctx, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("list global audit entries by account: %w", err)
+	}
+	out := make([]*Entry, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, rowToEntry(row))
+	}
+	return out, nil
+}
+
 func (r *postgresRepo) ListAll(ctx context.Context, p ListAllParams) ([]*Entry, error) {
 	q := auditdb.New(r.pool)
 	rows, err := q.ListAuditEntriesAll(ctx, auditdb.ListAuditEntriesAllParams{
@@ -347,6 +410,7 @@ func rowToEntry(r auditdb.AuditEntry) *Entry {
 		Payload:      r.Payload,
 		PrevHash:     r.PrevHash,
 		EntryHash:    r.EntryHash,
+		AccountID:    r.AccountID,
 	}
 	if r.ActorKind != nil {
 		ak := ActorKind(*r.ActorKind)

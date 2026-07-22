@@ -140,6 +140,9 @@ func (f *fakeAudit) ListForRun(context.Context, uuid.UUID) ([]*audit.Entry, erro
 	return nil, nil
 }
 func (f *fakeAudit) ListGlobal(context.Context) ([]*audit.Entry, error) { return nil, nil }
+func (f *fakeAudit) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (f *fakeAudit) LastForRun(context.Context, uuid.UUID) (*audit.Entry, error) {
 	return nil, audit.ErrNotFound
 }

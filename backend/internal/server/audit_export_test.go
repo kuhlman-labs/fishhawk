@@ -141,10 +141,11 @@ func verifyChain(t *testing.T, runID string, entries []verifierEntry) {
 
 type exportAuditFake struct {
 	audit.BaseFake
-	perRun        map[uuid.UUID][]*audit.Entry
-	global        []*audit.Entry
-	listForRunErr error
-	listGlobalErr error
+	perRun                 map[uuid.UUID][]*audit.Entry
+	global                 []*audit.Entry
+	listForRunErr          error
+	listGlobalErr          error
+	listGlobalByAccountErr error
 }
 
 func (f *exportAuditFake) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
@@ -159,6 +160,25 @@ func (f *exportAuditFake) ListGlobal(_ context.Context) ([]*audit.Entry, error) 
 		return nil, f.listGlobalErr
 	}
 	return f.global, nil
+}
+
+// ListGlobalByAccount filters the fake's run-less entries down to one
+// account partition (nil = untenanted), preserving append order —
+// the same contract as the postgres repository.
+func (f *exportAuditFake) ListGlobalByAccount(_ context.Context, accountID *uuid.UUID) ([]*audit.Entry, error) {
+	if f.listGlobalByAccountErr != nil {
+		return nil, f.listGlobalByAccountErr
+	}
+	var out []*audit.Entry
+	for _, e := range f.global {
+		switch {
+		case accountID == nil && e.AccountID == nil:
+			out = append(out, e)
+		case accountID != nil && e.AccountID != nil && *e.AccountID == *accountID:
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 type exportSigningFake struct {
@@ -227,6 +247,19 @@ func chainEntries(t *testing.T, runID *uuid.UUID, categories ...string) []*audit
 		prev = &hh
 	}
 	return out
+}
+
+// accountChain builds a genuinely-chained run-less partition for one
+// tenant account: chained exactly like an untenanted run-less chain
+// (account_id is NOT part of the canonical hash — ADR-057 frozen
+// HashInputs) with AccountID stamped on each entry afterwards.
+func accountChain(t *testing.T, accountID *uuid.UUID, categories ...string) []*audit.Entry {
+	t.Helper()
+	entries := chainEntries(t, nil, categories...)
+	for _, e := range entries {
+		e.AccountID = accountID
+	}
+	return entries
 }
 
 func makeSigningKey(t *testing.T, runID uuid.UUID) *signing.Key {
@@ -610,6 +643,77 @@ func TestAuditExport_GlobalPartition(t *testing.T) {
 			t.Error("global partition present despite include_global=false")
 		}
 	})
+}
+
+// (8b) per-account run-less partitions (ADR-057 / #1828): entries of
+// different accounts land under their own account-UUID keys, the
+// untenanted rows under the reserved nil-UUID key, and EVERY key —
+// including the account keys — passes the unchanged verifier
+// chain-walk. Had the handler emitted the partitions interleaved as
+// one list (the pre-ADR-057 shape with mixed accounts), or had
+// account_id leaked into the hash, strictDecodeAndVerify would fail.
+func TestAuditExport_RunlessPerAccountPartitions(t *testing.T) {
+	fr := newFakeRepo()
+	id := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	acctA, acctB := uuid.New(), uuid.New()
+	aChain := accountChain(t, &acctA, "api_token_issued", "api_token_revoked")
+	bChain := accountChain(t, &acctB, "oauth_signin")
+	unt := chainEntries(t, nil, "token_issued")
+	af := &exportAuditFake{
+		perRun: map[uuid.UUID][]*audit.Entry{id: chainEntries(t, &id, "run_created")},
+		// Interleaved append order across partitions — the shape
+		// ListGlobal returns when tenants write concurrently.
+		global: []*audit.Entry{aChain[0], bChain[0], unt[0], aChain[1]},
+	}
+	s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+
+	rec := doExport(s, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	ex := strictDecodeAndVerify(t, rec.Body.Bytes())
+
+	ad, ok := ex.Runs[acctA.String()]
+	if !ok || len(ad.AuditEntries) != 2 {
+		t.Fatalf("account A partition: ok=%v entries=%d, want 2 under key %s", ok, len(ad.AuditEntries), acctA)
+	}
+	bd, ok := ex.Runs[acctB.String()]
+	if !ok || len(bd.AuditEntries) != 1 {
+		t.Fatalf("account B partition: ok=%v entries=%d, want 1", ok, len(bd.AuditEntries))
+	}
+	gd, ok := ex.Runs[exportGlobalChainKey]
+	if !ok || len(gd.AuditEntries) != 1 {
+		t.Fatalf("untenanted partition: ok=%v entries=%d, want 1", ok, len(gd.AuditEntries))
+	}
+	for _, e := range append(append(ad.AuditEntries, bd.AuditEntries...), gd.AuditEntries...) {
+		if e.RunID != nil {
+			t.Errorf("run-less entry %s run_id = %v, want null", e.ID, e.RunID)
+		}
+	}
+	// 1 real run + 3 run-less partitions, nothing else.
+	if len(ex.Runs) != 4 {
+		t.Errorf("runs map has %d keys, want 4", len(ex.Runs))
+	}
+}
+
+// (8c) a ListGlobalByAccount error surfaces as 500 (defensive
+// per-partition read path).
+func TestAuditExport_RunlessByAccountError(t *testing.T) {
+	fr := newFakeRepo()
+	id := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	af := &exportAuditFake{
+		perRun:                 map[uuid.UUID][]*audit.Entry{id: chainEntries(t, &id, "run_created")},
+		global:                 chainEntries(t, nil, "token_issued"),
+		listGlobalByAccountErr: errors.New("partition boom"),
+	}
+	s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+	rec := doExport(s, "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "internal_error") {
+		t.Errorf("body = %s, want internal_error", rec.Body.String())
+	}
 }
 
 // (9) continuation round-trip: limit=1 over 3 runs → disjoint whole-run

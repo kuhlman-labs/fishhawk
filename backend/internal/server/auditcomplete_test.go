@@ -250,6 +250,10 @@ func (f *auditCompleteAuditFake) ListGlobal(context.Context) ([]*audit.Entry, er
 	return nil, nil
 }
 
+func (f *auditCompleteAuditFake) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
+
 func (f *auditCompleteAuditFake) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, nil
 }

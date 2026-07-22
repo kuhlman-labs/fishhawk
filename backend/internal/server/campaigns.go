@@ -1740,6 +1740,12 @@ func (s *Server) emitCampaignAudit(ctx context.Context, category string, payload
 		Category:  category,
 		ActorKind: &systemKind,
 		Payload:   body,
+		// Every emit site is request-triggered (create/restart handlers and
+		// the reconcile-on-read settle paths), so the caller's Identity is the
+		// account source (ADR-057 / #1828); for a tenanted campaign
+		// enforceCampaignAccount has already pinned it to the campaign's own
+		// account before any of these paths run.
+		AccountID: identityAccountID(ctx),
 	}); err != nil {
 		s.cfg.Logger.Warn("append campaign audit entry failed",
 			"category", category, "error", err.Error())

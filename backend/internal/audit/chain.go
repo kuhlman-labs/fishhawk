@@ -131,4 +131,12 @@ type GlobalChainAppendParams struct {
 	ActorKind    *ActorKind
 	ActorSubject *string
 	Payload      json.RawMessage
+	// AccountID selects the run-less chain partition the entry chains
+	// within (ADR-057 / #1828): each tenant account is an independent
+	// chain from a nil-prev_hash genesis; nil selects the untenanted
+	// legacy partition (account_id IS NULL, the #1829 NULL-allow
+	// window). Deliberately NOT part of HashInputs — the partition is
+	// carried by the prev_hash-lookup scope, so the canonical hash
+	// format and every stored hash stay valid.
+	AccountID *uuid.UUID
 }

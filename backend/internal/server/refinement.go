@@ -522,6 +522,7 @@ func (s *Server) appendRefinementAudit(r *http.Request, category string, payload
 		ActorKind:    &userKind,
 		ActorSubject: subjectPtr,
 		Payload:      body,
+		AccountID:    identityAccountID(r.Context()),
 	})
 	return err
 }

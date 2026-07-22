@@ -1980,6 +1980,10 @@ func (f *feedbackAuditRepo) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit
 func (f *feedbackAuditRepo) ListGlobal(_ context.Context) ([]*audit.Entry, error) {
 	return nil, nil
 }
+
+func (f *feedbackAuditRepo) ListGlobalByAccount(_ context.Context, _ *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, nil
+}
 func (f *feedbackAuditRepo) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
 	return nil, errors.New("not used")
 }

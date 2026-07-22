@@ -1121,6 +1121,10 @@ func (s *stubAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAp
 func (s *stubAudit) ListGlobal(context.Context) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
+
+func (s *stubAudit) ListGlobalByAccount(context.Context, *uuid.UUID) ([]*audit.Entry, error) {
+	return nil, errors.New("not used")
+}
 func (s *stubAudit) ListAll(context.Context, audit.ListAllParams) ([]*audit.Entry, error) {
 	return nil, errors.New("not used")
 }
@@ -3938,5 +3942,85 @@ func TestHandle_GitHubEvent_StillRoutesThroughMatchEvent(t *testing.T) {
 	}
 	if gh.dispatchCalls != 1 {
 		t.Errorf("dispatchCalls = %d, want 1 (GitHub dispatch path)", gh.dispatchCalls)
+	}
+}
+
+// --- per-account audit stamping (ADR-057 / #1828) ---
+
+// stubAccountLookup is a canned InstallationAccountLookup.
+type stubAccountLookup struct {
+	acct string
+	err  error
+	got  []int64
+}
+
+func (s *stubAccountLookup) AccountIDForInstallation(_ context.Context, installationID int64) (string, error) {
+	s.got = append(s.got, installationID)
+	return s.acct, s.err
+}
+
+// TestEventAccountID_Branches pins every defensive degrade of the
+// dispatcher's installation → account resolution: each falls back to nil
+// (the untenanted NULL partition) rather than failing the audit write it
+// feeds.
+func TestEventAccountID_Branches(t *testing.T) {
+	acct := uuid.New()
+	cases := []struct {
+		name     string
+		accounts InstallationAccountLookup
+		instID   int64
+		want     *uuid.UUID
+	}{
+		{"nil seam (not wired)", nil, 42, nil},
+		{"zero installation id (event not installation-scoped)", &stubAccountLookup{acct: acct.String()}, 0, nil},
+		{"lookup error degrades to untenanted with a warn", &stubAccountLookup{err: errors.New("db down")}, 42, nil},
+		{"unmapped installation (empty account)", &stubAccountLookup{acct: ""}, 42, nil},
+		{"unparsable account value", &stubAccountLookup{acct: "not-a-uuid"}, 42, nil},
+		{"mapped installation resolves its account", &stubAccountLookup{acct: acct.String()}, 42, &acct},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &Dispatcher{Accounts: tc.accounts, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+			got := d.eventAccountID(context.Background(), Event{InstallationID: tc.instID, DeliveryID: "d1"})
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("got %s, want nil", *got)
+			case tc.want != nil && (got == nil || *got != *tc.want):
+				t.Fatalf("got %v, want %s", got, *tc.want)
+			}
+		})
+	}
+}
+
+// TestWriteReviewerMisconfiguredAudit_StampsInstallationAccount is the
+// webhook-dispatcher caller-family assertion: the run-less
+// run_rejected_misconfigured entry carries the account owning the event's
+// App installation, resolved through the Accounts seam.
+func TestWriteReviewerMisconfiguredAudit_StampsInstallationAccount(t *testing.T) {
+	acct := uuid.New()
+	lookup := &stubAccountLookup{acct: acct.String()}
+	au := &stubAudit{}
+	d := &Dispatcher{
+		Audit:    au,
+		Accounts: lookup,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ev := Event{Type: "issues", DeliveryID: "d1", Repo: "acme/widgets", InstallationID: 4242}
+	st := spec.Stage{ID: "plan", Reviewers: &spec.ReviewersConfig{Agent: 1}}
+
+	d.writeReviewerMisconfiguredAudit(context.Background(), ev, Match{WorkflowID: "feature_change"}, st, time.Now().UTC())
+
+	if len(au.globalAppended) != 1 {
+		t.Fatalf("global appends = %d, want 1", len(au.globalAppended))
+	}
+	got := au.globalAppended[0]
+	if got.Category != "run_rejected_misconfigured" {
+		t.Fatalf("category = %q, want run_rejected_misconfigured", got.Category)
+	}
+	if got.AccountID == nil || *got.AccountID != acct {
+		t.Fatalf("AccountID = %v, want %s", got.AccountID, acct)
+	}
+	if len(lookup.got) != 1 || lookup.got[0] != 4242 {
+		t.Fatalf("lookup called with %v, want [4242]", lookup.got)
 	}
 }

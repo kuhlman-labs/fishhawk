@@ -51,6 +51,7 @@ type AuditEntry struct {
 	Payload      []byte             `json:"payload"`
 	PrevHash     *string            `json:"prev_hash"`
 	EntryHash    string             `json:"entry_hash"`
+	AccountID    *uuid.UUID         `json:"account_id"`
 }
 
 type McpToken struct {

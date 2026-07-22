@@ -72,6 +72,7 @@ func (s *Server) checkBlockingBudget(w http.ResponseWriter, r *http.Request, rep
 			Category:  "run_admitted_budget_override",
 			ActorKind: &systemKind,
 			Payload:   payload,
+			AccountID: identityAccountID(r.Context()),
 		}); aerr != nil {
 			s.cfg.Logger.Warn("append run_admitted_budget_override audit entry failed",
 				"repo", repo, "workflow_id", workflowID, "error", aerr.Error())
@@ -92,6 +93,7 @@ func (s *Server) checkBlockingBudget(w http.ResponseWriter, r *http.Request, rep
 		Category:  "run_rejected_budget",
 		ActorKind: &systemKind,
 		Payload:   payload,
+		AccountID: identityAccountID(r.Context()),
 	}); aerr != nil {
 		s.cfg.Logger.Warn("append run_rejected_budget audit entry failed",
 			"repo", repo, "workflow_id", workflowID, "error", aerr.Error())

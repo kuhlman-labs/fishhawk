@@ -390,7 +390,7 @@ func (t *Ticker) advance(ctx context.Context, logger *slog.Logger, c *campaign.C
 			continue
 		}
 		settledAny = true
-		t.emit(ctx, logger, categoryCampaignIssueSettled, map[string]any{
+		t.emit(ctx, logger, c.ID, categoryCampaignIssueSettled, map[string]any{
 			"campaign_id": c.ID.String(),
 			"issue_ref":   it.IssueRef,
 			"run_id":      it.RunID.String(),
@@ -435,7 +435,7 @@ func (t *Ticker) driveGate(ctx context.Context, logger *slog.Logger, c *campaign
 		return
 	}
 	if out.Acted {
-		t.emit(ctx, logger, categoryCampaignGateActed, map[string]any{
+		t.emit(ctx, logger, c.ID, categoryCampaignGateActed, map[string]any{
 			"campaign_id": c.ID.String(),
 			"issue_ref":   it.IssueRef,
 			"run_id":      runRow.ID.String(),
@@ -492,7 +492,7 @@ func (t *Ticker) pageGate(ctx context.Context, logger *slog.Logger, c *campaign.
 		}
 	}
 
-	t.emit(ctx, logger, categoryCampaignPaused, map[string]any{
+	t.emit(ctx, logger, c.ID, categoryCampaignPaused, map[string]any{
 		"campaign_id": c.ID.String(),
 		"issue_ref":   it.IssueRef,
 		"run_id":      runID.String(),
@@ -556,7 +556,7 @@ func (t *Ticker) deriveAndTransition(ctx context.Context, logger *slog.Logger, c
 			slog.String("error", err.Error()))
 		return
 	}
-	t.emit(ctx, logger, categoryCampaignAdvanced, map[string]any{
+	t.emit(ctx, logger, c.ID, categoryCampaignAdvanced, map[string]any{
 		"campaign_id": c.ID.String(),
 		"from":        string(c.State),
 		"to":          string(newState),
@@ -645,7 +645,7 @@ func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Cam
 			continue
 		}
 		budget--
-		t.emit(ctx, logger, categoryCampaignIssueStarted, map[string]any{
+		t.emit(ctx, logger, c.ID, categoryCampaignIssueStarted, map[string]any{
 			"campaign_id": c.ID.String(),
 			"issue_ref":   it.IssueRef,
 			"run_id":      runRow.ID.String(),
@@ -653,10 +653,11 @@ func (t *Ticker) start(ctx context.Context, logger *slog.Logger, c *campaign.Cam
 	}
 }
 
-// emit appends one campaign-level audit entry on the global chain.
+// emit appends one campaign-level audit entry on the global chain, stamped
+// with the owning campaign's tenant account partition (ADR-057 / #1828).
 // Best-effort: a marshal or append error WARN-logs and never unwinds the
 // transition it records, mirroring the sweeper/reconciler audit posture.
-func (t *Ticker) emit(ctx context.Context, logger *slog.Logger, category string, payload map[string]any) {
+func (t *Ticker) emit(ctx context.Context, logger *slog.Logger, campaignID uuid.UUID, category string, payload map[string]any) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: marshal audit payload failed",
@@ -670,11 +671,47 @@ func (t *Ticker) emit(ctx context.Context, logger *slog.Logger, category string,
 		Category:  category,
 		ActorKind: &systemKind,
 		Payload:   body,
+		AccountID: t.campaignAccountID(ctx, logger, campaignID),
 	}); err != nil {
 		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: append audit entry failed",
 			slog.String("category", category),
 			slog.String("error", err.Error()))
 	}
+}
+
+// campaignAccountID resolves the campaign's owning tenant account — the
+// run-less audit chain partition its driver-emitted entries chain within
+// (ADR-057 / #1828) — via the OPTIONAL campaign.AccountGetter capability on
+// the bound store (the production postgres repo carries it; the CampaignStore
+// interface deliberately doesn't, mirroring how the server type-asserts the
+// same capability). Best-effort like the emit it feeds: a store without the
+// capability, a not-found row (the campaign.BaseFake stub posture), an
+// untenanted ("") row, or an unparsable value degrade silently to nil — the
+// untenanted NULL partition — and any other lookup error degrades to nil
+// with a WARN log rather than suppressing the audit entry.
+func (t *Ticker) campaignAccountID(ctx context.Context, logger *slog.Logger, campaignID uuid.UUID) *uuid.UUID {
+	getter, ok := t.Campaigns.(campaign.AccountGetter)
+	if !ok {
+		return nil
+	}
+	acct, err := getter.GetCampaignAccountID(ctx, campaignID)
+	if errors.Is(err, campaign.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		logger.LogAttrs(ctx, slog.LevelWarn, "campaigndriver: resolve campaign account failed; stamping audit entry untenanted",
+			slog.String("campaign_id", campaignID.String()),
+			slog.String("error", err.Error()))
+		return nil
+	}
+	if acct == "" {
+		return nil
+	}
+	u, err := uuid.Parse(acct)
+	if err != nil {
+		return nil
+	}
+	return &u
 }
 
 // mapRunTerminalToItem maps a terminal run state to the campaign item's

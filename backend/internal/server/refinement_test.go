@@ -1115,3 +1115,34 @@ func equalIntWaves(a, b [][]int) bool {
 	}
 	return true
 }
+
+// TestAppendRefinementAudit_StampsIdentityAccount pins the refinement gate
+// entries' account source (ADR-057 / #1828): the caller Identity's account
+// selects the run-less chain partition; a caller with no binding lands on
+// the untenanted NULL partition.
+func TestAppendRefinementAudit_StampsIdentityAccount(t *testing.T) {
+	acct := uuid.New()
+	rec := &campaignAuditRecorder{}
+	s := New(Config{AuditRepo: rec})
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/refinements", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+		Identity{Subject: "github:alice", AccountID: acct.String()}))
+	if err := s.appendRefinementAudit(req, "refinement_created", map[string]any{"k": "v"}); err != nil {
+		t.Fatalf("appendRefinementAudit: %v", err)
+	}
+	bare := httptest.NewRequest(http.MethodPost, "/v0/refinements", nil)
+	if err := s.appendRefinementAudit(bare, "refinement_created", map[string]any{"k": "v"}); err != nil {
+		t.Fatalf("appendRefinementAudit (no identity): %v", err)
+	}
+
+	if len(rec.entries) != 2 {
+		t.Fatalf("audit entries = %d, want 2", len(rec.entries))
+	}
+	if rec.entries[0].AccountID == nil || *rec.entries[0].AccountID != acct {
+		t.Fatalf("bound-identity entry AccountID = %v, want %s", rec.entries[0].AccountID, acct)
+	}
+	if rec.entries[1].AccountID != nil {
+		t.Fatalf("identityless entry AccountID = %s, want nil (untenanted)", *rec.entries[1].AccountID)
+	}
+}
