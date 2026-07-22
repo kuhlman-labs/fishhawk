@@ -301,3 +301,45 @@ func TestWebhookGitLabRouteRegistered(t *testing.T) {
 		t.Errorf("status = %d, want 503 (routed but secret unconfigured)", rec.Code)
 	}
 }
+
+// TestOnboardingStartRouteRegistered guards the route table: GET
+// /v0/onboarding/start (ADR-062, E44.7 / #1831) must reach
+// handleOnboardingStart THROUGH the region-pin middleware. An anonymous,
+// handoff-less request passes straight through the middleware and lands on the
+// handler's auth ladder (401) — an UNregistered route would 404 instead.
+func TestOnboardingStartRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/onboarding/start?provider=github&account_key=acme", nil)
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("GET /v0/onboarding/start returned 404 — route not registered in handlers.go")
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (route reaches handler auth ladder)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "authentication_required") {
+		t.Errorf("body = %s, want authentication_required (handleOnboardingStart reached)", rec.Body.String())
+	}
+}
+
+// TestOnboardingStartRouteRefusesSignedHandoffWhenDisabled is the mounted-in-
+// production half of the fail-closed contract (approval condition 8): on a
+// cell with NO region configured, a request carrying fh_* parameters is
+// refused 503 by the middleware ON THE REAL ROUTE — it does not fall through
+// to the handler as though the handoff were absent.
+func TestOnboardingStartRouteRefusesSignedHandoffWhenDisabled(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/onboarding/start?provider=github&account_key=acme&fh_sig=deadbeef", nil)
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (region pin disabled):\n%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "region_pin_disabled") {
+		t.Errorf("body = %s, want region_pin_disabled", rec.Body.String())
+	}
+}

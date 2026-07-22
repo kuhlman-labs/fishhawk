@@ -281,6 +281,52 @@ func (q *Queries) ListMemberGrantsByRef(ctx context.Context, arg ListMemberGrant
 	return items, nil
 }
 
+const pinAccountHomeRegion = `-- name: PinAccountHomeRegion :one
+
+UPDATE accounts
+   SET home_region = $3,
+       updated_at  = now()
+ WHERE provider = $1
+   AND account_key = $2
+   AND (home_region IS NULL OR home_region = $3)
+RETURNING id, provider, account_key, display_name, granularity, home_region, created_at, updated_at
+`
+
+type PinAccountHomeRegionParams struct {
+	Provider   string  `json:"provider"`
+	AccountKey string  `json:"account_key"`
+	HomeRegion *string `json:"home_region"`
+}
+
+// The cell-side region pin (ADR-062 A2.3, E44.7 / #1831). First-write-wins is
+// enforced HERE, in SQL, rather than as a check-then-act read/write pair in Go:
+// the WHERE clause matches only a row that is unpinned or ALREADY pinned to the
+// same region, so two concurrent pins proposing different regions serialize on
+// the row lock and exactly one can match.
+//
+// The statement is UPDATE-only ON PURPOSE — it must never create an account. A
+// handoff naming an account this cell has never heard of matches no row and is
+// refused, not silently materialized (ADR-062 A2.5).
+//
+// Zero rows is therefore ambiguous by design and the Go layer disambiguates:
+// either the account does not exist here, or it is already pinned to a
+// DIFFERENT region. Both are refusals; neither is an overwrite.
+func (q *Queries) PinAccountHomeRegion(ctx context.Context, arg PinAccountHomeRegionParams) (Account, error) {
+	row := q.db.QueryRow(ctx, pinAccountHomeRegion, arg.Provider, arg.AccountKey, arg.HomeRegion)
+	var i Account
+	err := row.Scan(
+		&i.ID,
+		&i.Provider,
+		&i.AccountKey,
+		&i.DisplayName,
+		&i.Granularity,
+		&i.HomeRegion,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const upsertAccount = `-- name: UpsertAccount :one
 
 INSERT INTO accounts (id, provider, account_key, display_name, granularity, home_region)
