@@ -6,6 +6,18 @@
 // false-failing on chain_invalid for entries written before the
 // algorithm change.
 //
+// Since ADR-057 / #1828 the run-less (run_id IS NULL) rows are
+// chained PER account_id partition (nil = the untenanted legacy
+// partition), so the same one-shot doubles as the per-account
+// RE-ANCHOR: it walks each account's run-less partition as its own
+// chain and rewrites prev_hash + entry_hash so every partition
+// links from a nil-prev_hash genesis. Idempotent — a corpus whose
+// partitions already chain correctly reports EntriesChanged == 0.
+// Rollout ordering: backfill account_id onto historical run-less
+// rows first, then run the re-anchor, then rely on per-account
+// verification; until the backfill lands every historical row sits
+// in the untenanted partition and the re-anchor is a no-op.
+//
 // Why a separate package: the rehash needs the audit package's
 // ComputeEntryHash + the pgx pool, but it's not part of the
 // regular request hot-path. Keeping it here keeps cmd/fishhawkd
@@ -27,8 +39,10 @@ import (
 
 // Summary aggregates per-run counters for the rehash report.
 type Summary struct {
-	// Chains is the number of distinct chains walked, including the
-	// global chain (run_id NULL).
+	// Chains is the number of distinct chains walked: one per run
+	// plus one per run-less account partition (run_id NULL grouped
+	// by account_id, the NULL account being the untenanted legacy
+	// partition — ADR-057 / #1828).
 	Chains int
 	// EntriesTotal is the number of rows the walker visited.
 	EntriesTotal int
@@ -46,7 +60,8 @@ type DB interface {
 }
 
 // RehashAllChains finds every run_id with at least one audit row +
-// the global chain (run_id NULL), and rehashes each in turn.
+// every run-less account partition (run_id NULL, segmented by
+// account_id per ADR-057 / #1828), and rehashes each in turn.
 //
 // The implementation walks chains, not individual rows: rebuilding
 // a chain requires processing entries in sequence order and
@@ -103,7 +118,7 @@ func RehashAllChains(ctx context.Context, db DB, dryRun bool) (Summary, error) {
 	}
 
 	for _, id := range runIDs {
-		visited, changed, err := rehashChain(ctx, tx, &id, dryRun)
+		visited, changed, err := rehashChain(ctx, tx, whereRunChain, &id, dryRun)
 		if err != nil {
 			return summary, fmt.Errorf("run chain %s: %w", id, err)
 		}
@@ -112,10 +127,20 @@ func RehashAllChains(ctx context.Context, db DB, dryRun bool) (Summary, error) {
 		summary.EntriesChanged += changed
 	}
 
-	// Global chain (run_id NULL). One pass; no enumeration needed.
-	if visited, changed, err := rehashChain(ctx, tx, nil, dryRun); err != nil {
-		return summary, fmt.Errorf("global chain: %w", err)
-	} else if visited > 0 {
+	// Run-less partitions (run_id NULL), one chain PER account_id
+	// (ADR-057 / #1828). Enumerate the distinct partitions present —
+	// including the NULL (untenanted) one — and re-anchor each as an
+	// independent chain from a nil-prev_hash genesis. NULLS FIRST
+	// keeps the report order deterministic across Postgres defaults.
+	accountIDs, err := listRunlessPartitions(ctx, tx)
+	if err != nil {
+		return summary, err
+	}
+	for _, acct := range accountIDs {
+		visited, changed, err := rehashChain(ctx, tx, whereRunlessPartition, acct, dryRun)
+		if err != nil {
+			return summary, fmt.Errorf("run-less partition %s: %w", partitionLabel(acct), err)
+		}
 		summary.Chains++
 		summary.EntriesTotal += visited
 		summary.EntriesChanged += changed
@@ -139,22 +164,66 @@ func RehashAllChains(ctx context.Context, db DB, dryRun bool) (Summary, error) {
 	return summary, nil
 }
 
-// rehashChain walks the entries belonging to one chain (per-run
-// when runID != nil; global when nil) in sequence order, computes
-// each entry's new canonical hash, and updates entry_hash +
-// prev_hash so the chain links to the new predecessor.
+// Chain-selection predicates for rehashChain. Both take one
+// nullable uuid argument.
+const (
+	// whereRunChain selects one per-run chain.
+	whereRunChain = `run_id = $1`
+	// whereRunlessPartition selects one run-less account partition
+	// (ADR-057 / #1828): the given account's rows, or the untenanted
+	// account_id IS NULL rows when the argument is NULL.
+	whereRunlessPartition = `run_id IS NULL AND (($1::uuid IS NULL AND account_id IS NULL) OR account_id = $1)`
+)
+
+// listRunlessPartitions enumerates the distinct account_id values
+// present among run-less rows — each is one chain partition; a nil
+// element is the untenanted partition.
+func listRunlessPartitions(ctx context.Context, tx pgx.Tx) ([]*uuid.UUID, error) {
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT account_id FROM audit_entries WHERE run_id IS NULL ORDER BY account_id NULLS FIRST`)
+	if err != nil {
+		return nil, fmt.Errorf("list run-less partitions: %w", err)
+	}
+	defer rows.Close()
+	var out []*uuid.UUID
+	for rows.Next() {
+		var id *uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan run-less partition: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate run-less partitions: %w", err)
+	}
+	return out, nil
+}
+
+// partitionLabel names a run-less partition for error reports.
+func partitionLabel(accountID *uuid.UUID) string {
+	if accountID == nil {
+		return "untenanted"
+	}
+	return accountID.String()
+}
+
+// rehashChain walks the entries belonging to one chain — a per-run
+// chain (whereRunChain) or one run-less account partition
+// (whereRunlessPartition) — in sequence order, computes each
+// entry's new canonical hash, and updates entry_hash + prev_hash
+// so the chain links to the new predecessor.
 //
 // The caller owns the surrounding transaction; rehashChain just
 // runs the SELECT + UPDATEs against it. Idempotent on already-
 // canonical chains: every recomputed hash matches what's stored,
 // so no UPDATE fires.
-func rehashChain(ctx context.Context, tx pgx.Tx, runID *uuid.UUID, dryRun bool) (visited, changed int, err error) {
-	const selectChain = `
+func rehashChain(ctx context.Context, tx pgx.Tx, where string, arg *uuid.UUID, dryRun bool) (visited, changed int, err error) {
+	selectChain := `
 		SELECT id, run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash
 		FROM audit_entries
-		WHERE ($1::uuid IS NULL AND run_id IS NULL) OR run_id = $1
+		WHERE ` + where + `
 		ORDER BY sequence ASC`
-	rows, err := tx.Query(ctx, selectChain, runID)
+	rows, err := tx.Query(ctx, selectChain, arg)
 	if err != nil {
 		return 0, 0, fmt.Errorf("select chain: %w", err)
 	}

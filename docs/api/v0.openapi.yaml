@@ -2297,10 +2297,13 @@ components:
         runs:
           type: object
           description: |
-            Map keyed by run UUID. The reserved nil-UUID key
-            `00000000-0000-0000-0000-000000000000` holds the global
-            (run-less) chain partition, whose entries carry
-            `run_id: null`.
+            Map keyed by run UUID, plus one key per run-less chain
+            partition (ADR-057 / #1828): a tenant account's partition
+            under its account-UUID key, the untenanted partition under
+            the reserved nil-UUID key
+            `00000000-0000-0000-0000-000000000000`. Run-less entries
+            carry `run_id: null`; every key is an independently
+            verifiable chain.
           additionalProperties: { $ref: '#/components/schemas/AuditExportRunData' }
 
     AuditExportRunData:
@@ -5890,15 +5893,20 @@ paths:
         `DisallowUnknownFields`, making the exact three-field body shape
         binding. Every page byte-parses through `ParseExport`.
 
-        **Global (run-less) chain partition.** Entries not tied to a run
-        (token issue/revoke, OAuth events) are exported under the
-        reserved nil-UUID key `00000000-0000-0000-0000-000000000000`,
-        their `run_id` serialized as `null` — exactly the value their
-        hashes were computed over, so the partition chain-verifies with
-        no verifier change. It is emitted on the FIRST page only (empty
-        cursor), even when empty (as an empty `audit_entries` array) so
-        consumers distinguish "no global entries" from "not included" —
-        never silently dropped. Opt out with `include_global=false`.
+        **Run-less chain partitions, one per account (ADR-057 /
+        #1828).** Entries not tied to a run (token issue/revoke, OAuth
+        events) chain per `account_id` and export as one `runs`-map key
+        per partition: a tenant partition under its account-UUID key,
+        the untenanted partition under the reserved nil-UUID key
+        `00000000-0000-0000-0000-000000000000`. All carry `run_id:
+        null` — exactly the value their hashes were computed over, so
+        each partition chain-verifies with no verifier change. They are
+        emitted on the FIRST page only (empty cursor); the untenanted
+        key appears even when empty (as an empty `audit_entries` array)
+        so consumers distinguish "no run-less entries" from "not
+        included" — never silently dropped; tenant keys appear only
+        when the partition has entries. Opt out of all of them with
+        `include_global=false`.
 
         **Filtering (mutually exclusive shapes).** Either an explicit
         `run_id` set (repeatable; a requested run that does not exist is
@@ -5925,7 +5933,7 @@ paths:
         - { name: repo, in: query, description: "Filter by repository (owner/name), resolved through the runs join.", schema: { type: string } }
         - { name: from, in: query, description: "Lower bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
         - { name: to, in: query, description: "Upper bound (inclusive) on run created_at, RFC3339.", schema: { type: string, format: date-time } }
-        - { name: include_global, in: query, description: "Include the reserved nil-UUID global-chain partition on the first page. Default true; set false to omit.", schema: { type: boolean, default: true } }
+        - { name: include_global, in: query, description: "Include the run-less chain partitions (per-account keys + the reserved nil-UUID untenanted key) on the first page. Default true; set false to omit.", schema: { type: boolean, default: true } }
         - { name: limit, in: query, description: "Maximum RUNS per page (whole-run bounded).", schema: { type: integer, default: 50, maximum: 200 } }
         - { name: cursor, in: query, description: "Opaque keyset continuation cursor from a prior page's X-Fishhawk-Export-Next-Cursor header.", schema: { type: string } }
       responses:
