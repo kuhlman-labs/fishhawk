@@ -1354,3 +1354,139 @@ func TestNewWebhookDeliveryStore(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveRegionInference covers the region-scoped inference resolver
+// (ADR-062 / E44.7): the unregionalized default, the regionalized happy path,
+// and each fail-closed branch. A regional cell must never boot without its
+// in-region model endpoint and reviewer key.
+func TestResolveRegionInference(t *testing.T) {
+	tests := []struct {
+		name        string
+		homeRegion  string
+		baseURL     string
+		apiKey      string
+		wantErr     string
+		wantRegion  string
+		wantBaseURL string
+	}{
+		{
+			name: "unregionalized deployment: nothing required",
+		},
+		{
+			name:        "unregionalized deployment may still override the endpoint",
+			baseURL:     "https://api.anthropic.com",
+			wantBaseURL: "https://api.anthropic.com",
+		},
+		{
+			name:        "regional cell with endpoint and key",
+			homeRegion:  " EU ",
+			baseURL:     "https://eu.api.example.com",
+			apiKey:      "sk-test",
+			wantRegion:  "eu",
+			wantBaseURL: "https://eu.api.example.com",
+		},
+		{
+			name:       "fail closed: home region without a model endpoint",
+			homeRegion: "eu",
+			apiKey:     "sk-test",
+			wantErr:    "FISHHAWKD_ANTHROPIC_BASE_URL",
+		},
+		{
+			name:       "fail closed: home region without a reviewer key",
+			homeRegion: "eu",
+			baseURL:    "https://eu.api.example.com",
+			wantErr:    "FISHHAWKD_ANTHROPIC_API_KEY",
+		},
+		{
+			name:    "fail closed: endpoint is not an absolute http(s) URL",
+			baseURL: "eu.api.example.com",
+			wantErr: "not an absolute http(s) URL",
+		},
+		{
+			name:       "fail closed: endpoint scheme is not http(s)",
+			homeRegion: "eu",
+			baseURL:    "ftp://eu.api.example.com",
+			apiKey:     "sk-test",
+			wantErr:    "not an absolute http(s) URL",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveRegionInference(tc.homeRegion, tc.baseURL, tc.apiKey)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("resolveRegionInference = %+v, want error containing %q", got, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
+				}
+				if got != (regionInference{}) {
+					t.Errorf("on error got %+v, want the zero regionInference", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveRegionInference: %v", err)
+			}
+			if got.homeRegion != tc.wantRegion {
+				t.Errorf("homeRegion = %q, want %q", got.homeRegion, tc.wantRegion)
+			}
+			if got.anthropicBaseURL != tc.wantBaseURL {
+				t.Errorf("anthropicBaseURL = %q, want %q", got.anthropicBaseURL, tc.wantBaseURL)
+			}
+		})
+	}
+}
+
+// TestRunServe_RegionalCellWithoutEndpointFailsStartup pins the fail-closed
+// branch at the STARTUP boundary, not just in the pure resolver: runServe
+// returns a failure exit code (never binding a listener) when FISHHAWKD_HOME_REGION
+// is set without its in-region model endpoint.
+func TestRunServe_RegionalCellWithoutEndpointFailsStartup(t *testing.T) {
+	var logs strings.Builder
+	code := runServe([]string{
+		"--home-region", "eu",
+		"--anthropic-base-url", "",
+		"--anthropic-api-key", "sk-test",
+		"--operator-min-permission", "write",
+	}, &logs)
+	if code == 0 {
+		t.Fatalf("runServe exit code = 0, want non-zero (regional cell without a model endpoint must fail closed)")
+	}
+	if !strings.Contains(logs.String(), "region-scoped inference config invalid") {
+		t.Errorf("logs = %q, want them to name the region-scoped inference failure", logs.String())
+	}
+}
+
+// TestPlanReviewerSet_AnthropicTargetsRegionalEndpoint is the cross-boundary
+// wiring assertion: the base URL resolved in serve.go reaches the reviewer's
+// live Messages client, so a review request actually leaves for the in-region
+// endpoint. Asserted by driving a real Review against an httptest server that
+// stands in for the regional endpoint.
+func TestPlanReviewerSet_AnthropicTargetsRegionalEndpoint(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"{\"verdict\":\"approve\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	set := &planReviewerSet{opts: planReviewerOptions{
+		anthropicAPIKey:     "sk-test",
+		anthropicBaseURL:    srv.URL,
+		planReviewModel:     "claude-sonnet-4-6",
+		planReviewMaxTokens: 1024,
+		planReviewTimeout:   10 * time.Second,
+	}}
+	reviewer := set.Default()
+	if reviewer == nil {
+		t.Fatal("Default() = nil, want the anthropic adapter")
+	}
+	if _, _, err := reviewer.Review(context.Background(), "preamble"); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("regional endpoint hits = %d, want 1 (anthropicBaseURL was not threaded to the Messages client)", hits)
+	}
+}

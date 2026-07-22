@@ -100,6 +100,7 @@ func planReviewTimeoutBelowDefault(configured time.Duration) bool {
 // server.
 type planReviewerOptions struct {
 	anthropicAPIKey           string
+	anthropicBaseURL          string
 	planReviewModel           string
 	enableLocalClaudeReviewer bool
 	localClaudeBinary         string
@@ -132,6 +133,10 @@ func (p *planReviewerSet) newAnthropic(model string) server.PlanReviewer {
 		Model:     model,
 		MaxTokens: p.opts.planReviewMaxTokens,
 		Timeout:   p.opts.planReviewTimeout,
+		// Region-scoped inference (ADR-062 / E44.7): empty keeps the SDK
+		// default; on a regional cell this is the in-region model endpoint
+		// resolved once at startup by resolveRegionInference.
+		BaseURL: p.opts.anthropicBaseURL,
 	})
 	// Apply the env-resolved decode-retry budget (#901): a 200-response
 	// carrying structurally-malformed verdict JSON re-rolls the Messages
@@ -246,6 +251,57 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 	default:
 		return nil, fmt.Errorf("unknown reviewer provider %q (expected anthropic, claudecode, or codex)", provider)
 	}
+}
+
+// regionInference is the cell's resolved region-scoped inference configuration
+// (ADR-062 / E44.7). Selection is PROCESS-LEVEL: one home region and one model
+// endpoint per cell process, resolved once at startup. There is deliberately NO
+// per-account region->endpoint lookup inside the cell — an account is routed to
+// its home cell by the global directory, so in-cell inference never needs to
+// choose between regions (a per-account choice would need its own ADR).
+type regionInference struct {
+	// homeRegion is the lowercased, trimmed cell tag ("us", "eu", …); empty
+	// for an unregionalized deployment.
+	homeRegion string
+	// anthropicBaseURL is the in-region Messages endpoint threaded onto
+	// anthropic.Config.BaseURL; empty keeps the SDK default.
+	anthropicBaseURL string
+}
+
+// resolveRegionInference validates the cell's region-scoped inference config and
+// fails closed. A regionalized cell that cannot serve inference in its own
+// region MUST NOT boot and silently fall back to an out-of-region endpoint —
+// that would defeat the residency guarantee the regional-cell topology exists to
+// provide. Three rejection branches:
+//
+//   - homeRegion set with no anthropicBaseURL — the cell has no in-region model
+//     endpoint, so every reviewer call would leave the region.
+//   - homeRegion set with no anthropicAPIKey — the cell has no region reviewer
+//     key, so the region-scoped endpoint is unreachable and reviews would
+//     silently degrade to gateless.
+//   - anthropicBaseURL that is not an absolute http/https URL — a typo'd
+//     endpoint must abort startup, not be handed to the SDK.
+//
+// An empty homeRegion is the unregionalized deployment: the base URL is optional
+// there (it may still point at a proxy) and nothing is required.
+func resolveRegionInference(homeRegion, anthropicBaseURL, anthropicAPIKey string) (regionInference, error) {
+	region := strings.ToLower(strings.TrimSpace(homeRegion))
+	baseURL := strings.TrimSpace(anthropicBaseURL)
+	if baseURL != "" {
+		u, err := url.Parse(baseURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return regionInference{}, fmt.Errorf("FISHHAWKD_ANTHROPIC_BASE_URL %q is not an absolute http(s) URL", anthropicBaseURL)
+		}
+	}
+	if region != "" {
+		if baseURL == "" {
+			return regionInference{}, fmt.Errorf("FISHHAWKD_HOME_REGION=%q requires FISHHAWKD_ANTHROPIC_BASE_URL (this cell's in-region model endpoint); refusing to start a regional cell that would serve inference out of region", region)
+		}
+		if strings.TrimSpace(anthropicAPIKey) == "" {
+			return regionInference{}, fmt.Errorf("FISHHAWKD_HOME_REGION=%q requires FISHHAWKD_ANTHROPIC_API_KEY (this cell's region reviewer key); refusing to start a regional cell whose in-region model endpoint has no credential", region)
+		}
+	}
+	return regionInference{homeRegion: region, anthropicBaseURL: baseURL}, nil
 }
 
 // resolvePlanReviewers builds the server.ReviewerSet from opts and logs every
@@ -789,6 +845,12 @@ func runServe(args []string, logSink io.Writer) int {
 	anthropicAPIKey := fs.String("anthropic-api-key",
 		envOr("FISHHAWKD_ANTHROPIC_API_KEY", ""),
 		"Anthropic API key for plan-review agent invocations; when empty, plan review is gateless regardless of spec config")
+	anthropicBaseURL := fs.String("anthropic-base-url",
+		envOr("FISHHAWKD_ANTHROPIC_BASE_URL", ""),
+		"Anthropic API endpoint the reviewer's Messages client targets (ADR-062 / E44.7 regional cells). Set it to this cell's IN-REGION model endpoint so prompt content never leaves the cell's region. Empty keeps the SDK default (single-region deployment, unchanged). Process-level: one endpoint per cell, never a per-account lookup")
+	homeRegion := fs.String("home-region",
+		envOr("FISHHAWKD_HOME_REGION", ""),
+		"this cell's home region tag (e.g. us, eu, au) under ADR-062 regional cells. Empty means an unregionalized deployment. When set, the cell fails startup unless its region-scoped model endpoint (--anthropic-base-url) AND its reviewer key (--anthropic-api-key) are both configured — a regionalized cell must never fall back to an out-of-region endpoint")
 	planReviewModel := fs.String("plan-review-model",
 		envOr("FISHHAWKD_PLAN_REVIEW_MODEL", "claude-sonnet-4-6"),
 		"Anthropic model to use for plan-review agent invocations")
@@ -925,6 +987,21 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// Region-scoped inference (ADR-062 / E44.7). Resolved before any client is
+	// built so a regional cell missing its in-region model endpoint or reviewer
+	// key aborts startup instead of serving inference out of region.
+	region, err := resolveRegionInference(*homeRegion, *anthropicBaseURL, *anthropicAPIKey)
+	if err != nil {
+		logger.Error("region-scoped inference config invalid", slog.String("error", err.Error()))
+		return exitFailure
+	}
+	if region.homeRegion != "" {
+		logger.Info("regional cell configured",
+			slog.String("home_region", region.homeRegion),
+			slog.String("anthropic_base_url", region.anthropicBaseURL),
+			slog.String("ref", "ADR-062"))
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -981,6 +1058,7 @@ func runServe(args []string, logSink io.Writer) int {
 	// server.
 	cfg.PlanReviewers = resolvePlanReviewers(planReviewerOptions{
 		anthropicAPIKey:           *anthropicAPIKey,
+		anthropicBaseURL:          region.anthropicBaseURL,
 		planReviewModel:           *planReviewModel,
 		enableLocalClaudeReviewer: *enableLocalClaudeReviewer,
 		localClaudeBinary:         *localClaudeBinary,
