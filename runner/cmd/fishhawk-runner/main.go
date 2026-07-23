@@ -30,6 +30,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -4531,12 +4532,32 @@ func runDiffCoverageGate(ctx context.Context, cfg config, dc *upload.DiffCoverag
 		return diffCoverageEvent(ev), nil
 	}
 	if !committed {
-		// Measured-with-zero: the stage committed nothing, so nothing can
-		// be under-covered. Deliberately do NOT run the customer command —
-		// there is nothing for it to measure, and this is an explicit,
-		// auditable signal rather than an absent one.
-		ev.Outcome = "measured"
-		ev.Reason = fmt.Sprintf("no scope-only changes committed against %q; nothing to measure", baseRef)
+		// Nothing NEW was staged, but a clean tree is NOT proof of no added
+		// lines: HEAD can already be AHEAD of the pinned merge base (work
+		// committed on the run branch before the gate ran). Short-circuiting
+		// to measured-zero here would false-open exactly that case. So test
+		// the committed diff against the already-pinned merge base FIRST.
+		changed, cerr := diffcov.ChangedLines(ctx, diffcov.ExecGit(repoDir), mergeBase)
+		if cerr != nil {
+			ev.Outcome = "failed" // explicit, not inherited from the initializer, so a future default change can't flip this fail-closed path
+			ev.ExitCode = -1
+			ev.Reason = "could not determine the stage's added lines: " + cerr.Error()
+			return diffCoverageEvent(ev), nil
+		}
+		if len(changed) == 0 {
+			// Genuinely empty diff — the stage committed nothing and HEAD is
+			// at the merge base, so nothing can be under-covered. This stays
+			// the vacuous pass: an explicit, auditable measured-zero signal
+			// rather than an absent one. Deliberately do NOT run the customer
+			// command; there is nothing for it to measure.
+			ev.Outcome = "measured"
+			ev.Reason = fmt.Sprintf("no scope-only changes committed against %q; nothing to measure", baseRef)
+			return diffCoverageEvent(ev), nil
+		}
+		// HEAD is ahead of the base with a committed diff. Measure it. No
+		// throwaway commit was made on this path (committed == false), so
+		// there is NOTHING to reset --soft afterwards.
+		ev = measureDiffCoverage(ctx, ev, dc, repoDir, mergeBase)
 		return diffCoverageEvent(ev), nil
 	}
 
@@ -4661,23 +4682,31 @@ func measureDiffCoverage(ctx context.Context, ev diffCoverageEvidence, dc *uploa
 	ev.Percent = res.Percent
 	ev.UncoveredFiles = res.UncoveredFiles
 	switch {
-	case res.NewLines == 0 && (len(res.UnnormalizablePaths) > 0 || res.ResolvedFiles == 0):
-		// SYSTEMICALLY UNUSABLE REPORT — a measurement FAILURE, not the
-		// vacuous pass. The exclusions consumed the ENTIRE denominator:
-		// nothing the report named could be placed inside the checkout (a
-		// coverage tool that ran under a container/build root whose absolute
-		// paths resolve outside repoDir is the field case), so the zero says
-		// nothing about the stage's coverage. Reporting it as measured-zero
-		// would hand the backend its documented vacuous PASS on every run
-		// for an affected repo, with the explanation buried in a Reason
-		// nobody reads on a green result — the silent-neuter shape this
-		// constraint exists to eliminate. Failing here routes it through the
-		// backend's not-measured violation, which surfaces the reason.
+	case res.NewLines == 0:
+		// FAIL CLOSED (E46.7). We only reach here with len(changed) > 0 (the
+		// genuinely-empty diff returned its vacuous pass above), so the stage
+		// DID add lines yet the report measured NONE of them. diffcov is
+		// language-agnostic and cannot distinguish 'a Go package the coverage
+		// config wrongly excluded' (the bug we must catch) from 'a README the
+		// tool rightly never measures' (a benign no-coverable-lines change);
+		// for an OPT-IN gate whose sole purpose is catching unmeasured new
+		// code the correct rule is fail-closed. Reporting it as measured-zero
+		// would hand the backend its documented vacuous PASS with the
+		// explanation buried in a Reason nobody reads on a green result — the
+		// silent-neuter shape this constraint exists to eliminate. This
+		// subsumes the former wholly-unusable (ResolvedFiles==0) case. The
+		// reason distinguishes 'measured none of your changed files' from 'the
+		// report was wholly unusable' — it names the unmeasured changed files
+		// and how many report files resolved, and only appends the
+		// unnormalizable-path list (and the word "unusable") when there is
+		// one, so an operator can tell 'your tool did not instrument the new
+		// package' from 'your report paths do not match the checkout'.
 		ev.Outcome = "failed"
-		ev.Reason = fmt.Sprintf("coverage command %q exited %d and its report %q parsed, but the measurement is unusable: %d report file(s) resolved into the repository and 0 of the stage's added lines could be measured",
-			dc.Command, ev.ExitCode, dc.ReportPath, res.ResolvedFiles)
+		ev.Reason = fmt.Sprintf("coverage command %q exited %d and its report %q parsed, but it measured none of the stage's added lines: %d report file(s) resolved into the repository and none of the stage's changed file(s) were measured: %s",
+			dc.Command, ev.ExitCode, dc.ReportPath, res.ResolvedFiles,
+			strings.Join(boundStrings(sortedChangedPaths(changed), diffCoverageMaxUncovered), ", "))
 		if len(res.UnnormalizablePaths) > 0 {
-			ev.Reason += fmt.Sprintf("; %d path(s) could not be resolved into the repository: %s",
+			ev.Reason += fmt.Sprintf("; the report is unusable — %d path(s) could not be resolved into the repository: %s",
 				len(res.UnnormalizablePaths),
 				strings.Join(boundStrings(res.UnnormalizablePaths, diffCoverageMaxUncovered), ", "))
 		}
@@ -4685,13 +4714,21 @@ func measureDiffCoverage(ctx context.Context, ev diffCoverageEvidence, dc *uploa
 		ev.Reason = fmt.Sprintf("%d of %d new lines covered; %d report path(s) could not be resolved into the repository and were excluded: %s",
 			res.CoveredNewLines, res.NewLines, len(res.UnnormalizablePaths),
 			strings.Join(boundStrings(res.UnnormalizablePaths, diffCoverageMaxUncovered), ", "))
-	case res.NewLines == 0:
-		ev.Reason = fmt.Sprintf("the coverage report measured none of the stage's added lines (report %q); nothing to measure",
-			dc.ReportPath)
 	default:
 		ev.Reason = fmt.Sprintf("%d of %d new lines covered", res.CoveredNewLines, res.NewLines)
 	}
 	return ev
+}
+
+// sortedChangedPaths returns the stage's changed file paths in a stable,
+// deterministic order for inclusion in a fail-closed measurement reason.
+func sortedChangedPaths(changed diffcov.ChangedFiles) []string {
+	paths := make([]string, 0, len(changed))
+	for p := range changed {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 // boundStrings caps a list for inclusion in a bounded evidence field.

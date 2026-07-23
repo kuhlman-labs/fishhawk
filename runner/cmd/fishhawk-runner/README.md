@@ -121,11 +121,19 @@ coverage shortfall fails the stage through the backend's category-B
 re-evaluation of the uploaded bundle, never as an opaque runner abort.
 
 **It always emits evidence when the constraint is configured** — there is
-deliberately no "only if there was a diff" guard. A stage that added no
-coverable lines emits an explicit measured-with-zero result, because the
-backend treats an ABSENT signal as a violation and a legitimately vacuous
-stage must not be able to reach that state. (The customer command is not
-run in that case: there is nothing for it to measure.)
+deliberately no "only if there was a diff" guard. Only a **genuinely-empty
+diff** (no lines added against the merge base) emits an explicit
+measured-with-zero result, because the backend treats an ABSENT signal as a
+violation and a legitimately vacuous stage must not be able to reach that
+state. (The customer command is not run in that case: there is nothing for
+it to measure.) A stage that DID add lines but whose report measured none of
+them **fails closed**, naming the unmeasured changed files (E46.7) — see
+"Zero WITH added lines is a fail-closed failure" in
+`runner/internal/diffcov/README.md`. A clean work tree is **not** proof of
+no added lines: HEAD may already be ahead of the pinned merge base (work
+committed on the run branch), so when nothing new is staged the runner
+measures the committed diff against the merge base instead of
+short-circuiting — only a genuinely-empty change set stays the vacuous pass.
 
 **Containment (condition 6).** The customer command is untrusted input and
 runs through `runBoundedGateCommand` — the SAME bounded-exec path the
@@ -170,7 +178,11 @@ advances whatever branch HEAD is on, so a `base_ref` naming that same branch
 would otherwise merge-base to the throwaway commit itself and the
 measurement would see zero added lines — a silent false vacuous pass. The
 diff is computed before the command runs, so the report is not mistaken for
-an untracked added file.
+an untracked added file. The **same** pinned merge base backs the
+clean-tree (`!committed`) path: when nothing new is staged the runner runs
+`ChangedLines` against it in `repoDir` and, on a non-empty committed diff,
+measures it rather than emitting a false measured-zero — no throwaway commit
+is made on that path, so there is nothing to `reset --soft`.
 
 **Base ref resolution (condition 5).** `resolveDiffCoverageBaseRef` is the
 named resolver: the spec's `base_ref` wins when declared; an OMITTED

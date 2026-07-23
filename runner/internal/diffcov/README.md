@@ -174,35 +174,46 @@ exclusions, both deliberate:
 `Percent` is `covered*100/total`, or 0 when `NewLines` is 0. The backend
 compares with `>=`, so a measurement exactly **at** the threshold passes.
 
-`NewLines == 0` is the documented **vacuous pass**: a diff that added no
-coverable lines cannot be under-covered. The runner emits this as an
-explicit measured-with-zero signal rather than emitting nothing — an
-explicit zero is auditable, whereas absence is indistinguishable from a
+The **only** vacuous pass is the **genuinely-empty diff**: a change set that
+added no lines against the merge base cannot be under-covered. The runner
+detects this BEFORE it runs the customer command (`len(changed) == 0`) and
+emits an explicit measured-with-zero signal rather than emitting nothing —
+an explicit zero is auditable, whereas absence is indistinguishable from a
 runner that failed to run, which the backend treats as a violation.
 
-### Zero that is NOT a vacuous pass (`ResolvedFiles`)
+### Zero WITH added lines is a fail-closed failure (E46.7)
 
-`NewLines == 0` is only a legitimate vacuous pass when the report was
-*usable* — it placed into the repo and simply measured none of the stage's
-added lines. It is a measurement **failure** when the exclusions consumed
-the entire denominator: nothing in the report resolves into the checkout at
-all. That is the field case where a coverage tool ran under a
-container/build root whose absolute `SF:` paths all resolve *outside*
-`repoDir`, or an instrumentation config excluded the changed package — the
-zero says nothing about the stage's coverage, and reporting it as
-measured-zero would hand the backend its vacuous PASS on **every** run for
-an affected repo, with the only explanation buried in a `Reason` nobody
-reads on a green result. That is the silent-neuter shape this constraint
-exists to eliminate.
+Once the stage HAS added lines (`len(changed) > 0`), `NewLines == 0` is a
+measurement **failure**, not a vacuous pass — **regardless** of
+`ResolvedFiles`. The stage asserted its changes should be covered by opting
+into `diff_coverage`, yet the report measured none of them. `diffcov` is
+language-agnostic and cannot distinguish *a Go package the coverage config
+wrongly excluded* (the bug this gate exists to catch) from *a README the
+tool rightly never measures* (a benign no-coverable-lines change), so the
+two collapse to one fail-closed rule. Reporting it as measured-zero would
+hand the backend its vacuous PASS with the only explanation buried in a
+`Reason` nobody reads on a green result — the silent-neuter shape this
+constraint exists to eliminate. A stage that routinely changes only
+never-measured files is a workflow-config mismatch to resolve in the spec,
+not something the gate should silently paper over.
 
-`Result.ResolvedFiles` counts the distinct report files placed inside the
-repo, so the runner can tell the two zeros apart: when `NewLines == 0` **and**
-(`UnnormalizablePaths` is non-empty **or** `ResolvedFiles == 0`), the runner
-emits outcome `failed` naming what ran, its exit code, and that zero of the
-stage's added lines could be measured — routing it through the backend's
-not-measured violation, which surfaces the reason. A usable report that
-happens to measure none of the stage's files (`ResolvedFiles > 0`,
-no unnormalizable paths) stays the vacuous pass.
+The failure is LOUD and NAMED, and its reason distinguishes the two shapes
+so the operator knows which problem to fix:
+
+- **The report measured none of your changed files** (`ResolvedFiles > 0`,
+  no unnormalizable paths — the instrumentation-excludes-the-new-package
+  case): the reason names what ran, its exit code, the report, how many
+  report files resolved into the repo, and the unmeasured changed file
+  paths.
+- **The report was wholly unusable** (`UnnormalizablePaths` non-empty —
+  the field case where a coverage tool ran under a container/build root
+  whose absolute `SF:` paths all resolve *outside* `repoDir`): the reason
+  additionally calls the report `unusable` and lists the paths that could
+  not be resolved into the repository.
+
+`Result.ResolvedFiles` and `Result.UnnormalizablePaths` are what let the
+runner render that distinction. Either way the outcome is `failed`, routing
+it through the backend's not-measured violation, which surfaces the reason.
 
 ## Known limitation
 

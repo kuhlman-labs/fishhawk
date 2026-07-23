@@ -16236,6 +16236,47 @@ func TestRunDiffCoverageGate_NoAddedLinesMeasuresZero(t *testing.T) {
 	}
 }
 
+// TestRunDiffCoverageGate_CleanTreeHeadAheadOfBaseIsMeasured pins the E46.7
+// SHAPE-2 fix: a CLEAN work tree is not proof of no added lines. When the run
+// branch already committed its change (HEAD ahead of the pinned merge base)
+// and nothing new is left to stage, the old `!committed` short-circuit would
+// emit a false measured-zero vacuous pass. Now the committed diff against the
+// merge base is measured instead — no throwaway commit is made on this path,
+// so there is nothing to reset --soft.
+func TestRunDiffCoverageGate_CleanTreeHeadAheadOfBaseIsMeasured(t *testing.T) {
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "base.go"), "package p\n")
+	runGit("add", ".")
+	runGit("commit", "-m", "base", "--no-verify")
+	// The stage's work is ALREADY committed on a run branch: HEAD is ahead of
+	// main and the work tree is clean, so nothing new is staged.
+	runGit("checkout", "-b", "run-branch")
+	mustWrite(t, filepath.Join(repo, "app.go"), "package p\n\nfunc A() {}\n")
+	runGit("add", "app.go")
+	runGit("commit", "-m", "add app", "--no-verify")
+	headBefore := gitHead(t, repo)
+
+	dc := &upload.DiffCoverageConfig{
+		Command:            `printf 'SF:app.go\nDA:1,1\nDA:3,1\nend_of_record\n' > coverage.lcov`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := runDiffCov(t, context.Background(), diffCovCfg(), dc, repo, "main")
+	if got.Outcome != "measured" {
+		t.Fatalf("outcome = %q reason = %q, want measured — a committed diff on a clean tree must be measured, not short-circuited", got.Outcome, got.Reason)
+	}
+	if got.NewLines == 0 {
+		t.Errorf("new lines = %d, want > 0 — the committed diff carries added lines", got.NewLines)
+	}
+	if got.CoveredNewLines != got.NewLines {
+		t.Errorf("covered/total = %d/%d, want all covered", got.CoveredNewLines, got.NewLines)
+	}
+	// No throwaway commit was made on this path, so HEAD must be unchanged.
+	if after := gitHead(t, repo); after != headBefore {
+		t.Errorf("HEAD moved %s -> %s; the !committed path makes no throwaway commit and must not reset", headBefore, after)
+	}
+}
+
 // TestRunDiffCoverageGate_Failures covers every enumerated measurement
 // failure. Each must report outcome "failed" with an ACTIONABLE reason
 // naming what ran, its exit code, and what was measured (condition 7).
@@ -16374,29 +16415,46 @@ func TestRunDiffCoverageGate_WhollyUnusableReportFails(t *testing.T) {
 	}
 }
 
-// TestRunDiffCoverageGate_UsableReportMeasuringNothingStillPasses is the
-// other side of that discrimination, and the one that keeps the failure
-// above from becoming a false RED: a report that PLACES fine but simply
-// measures none of the stage's added lines (a docs-only change, a language
-// the tool does not cover) is the documented vacuous pass and must stay
-// measured-zero.
-func TestRunDiffCoverageGate_UsableReportMeasuringNothingStillPasses(t *testing.T) {
+// TestRunDiffCoverageGate_ReportMeasuringNoneOfTheChangeFailsClosed pins the
+// E46.7 inversion (option a, operator-ratified): a report that PLACES fine
+// (ResolvedFiles > 0) but measures NONE of the stage's added lines is NOT a
+// vacuous pass — it is the instrumentation-excludes-a-new-package shape this
+// gate exists to catch. diffcov is language-agnostic and cannot distinguish
+// that bug from a benign docs-only change, so for an opt-in gate the two
+// collapse to one fail-closed rule. The failure must be LOUD and NAMED: the
+// reason names the unmeasured changed file so the operator can fix
+// instrumentation, adjust the threshold, or stop gating the stage. Because
+// ResolvedFiles > 0 and UnnormalizablePaths is empty here, the reason must NOT
+// claim the report was "unusable" — that is the distinct wholly-unusable case
+// pinned by TestRunDiffCoverageGate_WhollyUnusableReportFails.
+func TestRunDiffCoverageGate_ReportMeasuringNoneOfTheChangeFailsClosed(t *testing.T) {
 	repo := diffCovRepo(t)
 	dc := &upload.DiffCoverageConfig{
-		// base.go is in the repo but is not a file this stage changed.
+		// base.go resolves cleanly into the repo but is not a file this stage
+		// changed (the stage changed app.go), so the report measures none of
+		// the added lines.
 		Command:            `printf 'SF:base.go\nDA:1,1\nend_of_record\n' > coverage.lcov`,
 		ReportPath:         "coverage.lcov",
 		MinNewLineCoverage: 80,
 	}
 	got := runDiffCov(t, context.Background(), diffCovCfg(), dc, repo, "main")
-	if got.Outcome != "measured" {
-		t.Fatalf("outcome = %q reason = %q, want measured (the vacuous pass)", got.Outcome, got.Reason)
+	if got.Outcome != "failed" {
+		t.Fatalf("outcome = %q reason = %q, want failed — a report measuring none of the change is not a vacuous pass", got.Outcome, got.Reason)
 	}
 	if got.NewLines != 0 {
 		t.Errorf("new lines = %d, want 0", got.NewLines)
 	}
-	if !strings.Contains(got.Reason, "nothing to measure") {
-		t.Errorf("reason = %q, want it to name the vacuous case", got.Reason)
+	// The reason names what ran, its exit code, the report, how many report
+	// files resolved, and the unmeasured changed file (app.go).
+	for _, want := range []string{"coverage command", "coverage.lcov", "exited 0", "app.go"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("reason %q does not name %q", got.Reason, want)
+		}
+	}
+	// A cleanly-resolving report is NOT "unusable" — that word is reserved for
+	// the wholly-unnormalizable case.
+	if strings.Contains(got.Reason, "unusable") {
+		t.Errorf("reason %q calls the report unusable, but its paths resolved fine (ResolvedFiles>0, no unnormalizable paths)", got.Reason)
 	}
 }
 
