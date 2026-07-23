@@ -371,7 +371,7 @@ stages:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `command` | yes | Shell command (`sh -c`, from the repo root) that produces the coverage report. Runs under the SAME containment as the verify gate: bounded timeout, process-group kill, default-deny gate-env allow-list — it never sees runner credentials. |
+| `command` | yes | Shell command (`sh -c`) that produces the coverage report, run from the repo root of a **throwaway `git worktree` checkout of the stage's committed tree**. Same containment as the verify gate: bounded timeout, process-group kill, default-deny gate-env allow-list (it never sees runner credentials), and a disposable checkout, so its filesystem side effects never reach the real working tree. |
 | `report_path` | yes | Repo-relative path the command writes the report to. An absolute path or a `..` escape is rejected at parse time. |
 | `format` | no (`lcov`) | Report format. `lcov` is the only v1.6 member; an enum so a later additive minor can add others. |
 | `min_new_line_coverage` | yes | Integer 0–100. Compared with `>=`, so a measurement exactly **at** the threshold passes and one below fails. |
@@ -398,7 +398,7 @@ It is the one per-line format every major ecosystem's tooling can emit: coverage
 
 ### What the measurement counts
 
-The added-line set is taken **merge-base → work tree**, so commits that landed on the base branch after the run branched are not attributed to this stage, and the diff describes the same snapshot the coverage command executed against. Untracked new files are folded in — `git diff` sees only tracked files, so without that sweep a never-added file would bypass the gate outright.
+The added-line set is taken **merge-base → the committed tree the coverage command ran against**, so commits that landed on the base branch after the run branched are not attributed to this stage, and the diff and the report describe one snapshot. The merge base is pinned to a SHA **before** the runner materializes that committed tree, so a `base_ref` naming the branch the runner is committing onto cannot collapse the diff to empty (a false vacuous pass). A new file inside the declared scope is part of that committed tree; a new file outside it is scope drift, excluded from the commit and correctly not attributed to the stage.
 
 Two exclusions from the denominator, both deliberate: an added line in a file the report never measured (a README, a generated file, a language the tool does not cover), and an added line the report measured no statement on (a blank line, a comment, a brace). Counting either would fail every docs-touching stage.
 
@@ -406,7 +406,7 @@ Report paths are **normalized to repo-relative form on both sides** before inter
 
 ### Bindings
 
-- **Post-hoc**, so it is valid on non-deploy stages only; a delegating deploy produces no reviewable diff (ADR-038).
+- **Post-hoc**, so a delegating deploy — which produces no reviewable diff — rejects it (ADR-038). It is narrower than its post-hoc siblings: valid on an **implement stage only**. The implement runner is the layer that measures, and since an absent signal on a declared constraint is a violation, declaring it on any other stage type would be a guaranteed false failure; the semantic validator rejects it there at parse time rather than at evaluation time on a real run.
 - **Runner-side it is backend-authoritative.** The runner's in-line constraint check fires on the implement push path, before the coverage command has run, so it skips this kind rather than asserting on it.
 - **Not deferrable**: `ci_green` remains the only outcome whose missing signal defers to branch protection.
 - The measurement is recorded in the `policy_evaluated` audit payload under `applied_constraints.diff_coverage` (the declaration) and `applied_constraints.diff_coverage_signal` (the measurement), so both survive the post-CI policy re-evaluation round-trip.

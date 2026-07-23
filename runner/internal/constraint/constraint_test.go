@@ -396,13 +396,11 @@ func TestEvaluate_DiffCoverageIsSkipped(t *testing.T) {
 		},
 	}
 	v := Evaluate(Diff{ChangedFiles: []ChangedFile{{Path: "a.go", Status: StatusModified}}}, c)
+	// Zero violations is the whole assertion: it subsumes "no
+	// unknown-constraint violation" and every other shape. An additional
+	// loop over v would be dead code — v is provably empty here.
 	if len(v) != 0 {
 		t.Fatalf("violations = %+v, want none (backend-authoritative)", v)
-	}
-	for _, got := range v {
-		if strings.Contains(got.Detail, "unknown") {
-			t.Errorf("got an unknown-constraint violation: %+v", got)
-		}
 	}
 }
 

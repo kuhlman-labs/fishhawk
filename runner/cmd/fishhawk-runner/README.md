@@ -110,8 +110,11 @@ ADR-035 lineage/tree-ownership is git-level and remote-shape independent — the
 When the stage's prompt response carries a `diff_coverage` config, `run()`
 calls `runDiffCoverageGate` on the implement path, **after** the
 committed-tree verify gates (the tree is final and the agent has stopped
-writing, so the coverage report and the diff describe one snapshot) and
-**before** `composeGateEvidence` folds the result into `gate_evidence`.
+writing) and **before** `composeGateEvidence` folds the result into
+`gate_evidence`. Implement is the only stage type that measures, which is
+why the spec validator rejects `diff_coverage` on every other stage type
+(#1888): an absent signal on a declared constraint is a violation, so
+allowing the declaration elsewhere would be a guaranteed false RED.
 
 **Measurement only.** It never touches `res.OK` / `res.FailureCategory`. A
 coverage shortfall fails the stage through the backend's category-B
@@ -135,6 +138,36 @@ isolated lint cache. Do NOT add a second exec path for a new spec-supplied
 command, and do NOT widen the env allow-list to make a particular coverage
 tool work — that is a separate, explicit decision.
 
+**Filesystem isolation: a throwaway checkout.** `runBoundedGateCommand`
+contains the process and the environment; only a separate checkout contains
+the **filesystem**. So the command runs in a disposable
+`git worktree add --detach` checkout of the stage's committed scope-only
+tree — the same isolation `runVerifyCommittedTree` gives the verify gate,
+and what the schema and API documentation promise. Build artifacts, deleted
+or modified sources, and the report itself land in the throwaway checkout
+and are swept with it; the operator's real repository is untouched, and the
+command cannot mutate the tree AFTER it was verified.
+
+Materializing that tree reuses the #651 scaffolding — `StageScoped` +
+`commitVerifyWIP` + `git reset --soft HEAD~1`. As in
+`runVerifyGateCommitted`, a failed undo is **fatal**, not a measurement
+failure: HEAD left on the throwaway commit would make the real commit stack
+on top and push a WIP commit into the PR. `runDiffCoverageGate` returns it
+as an error and the call site demotes the stage category-B. Both cleanup
+commands (worktree removal, `reset --soft`) run on a **bounded context
+detached from `ctx`'s cancellation** — a wedged coverage command is killed
+by cancelling `ctx`, and the undo must still happen.
+
+**One snapshot, pinned merge base.** The checkout is clean and detached at
+the committed head, so `ChangedLines`' merge-base → work-tree diff taken
+INSIDE it is exactly merge-base → committed tree. The merge base is resolved
+to a SHA (`diffcov.MergeBase`) **before** the throwaway commit: that commit
+advances whatever branch HEAD is on, so a `base_ref` naming that same branch
+would otherwise merge-base to the throwaway commit itself and the
+measurement would see zero added lines — a silent false vacuous pass. The
+diff is computed before the command runs, so the report is not mistaken for
+an untracked added file.
+
 **Base ref resolution (condition 5).** `resolveDiffCoverageBaseRef` is the
 named resolver: the spec's `base_ref` wins when declared; an OMITTED
 `base_ref` falls back to `resolveImplementBaseRef`, the same
@@ -143,10 +176,9 @@ uses, so the measurement's base and the PR's base can never disagree. It
 never returns empty, and `diffcov.ChangedLines` still fails closed on an
 empty ref rather than trusting that.
 
-**Report hygiene.** The report is the runner's own artifact, not the
-agent's work, so it is removed after reading (unless it already existed) —
-it never lands in the working tree as untracked litter or as an
-out-of-scope creation.
+**Report hygiene.** The report is written inside the throwaway checkout and
+swept with it, so it never lands in the real working tree as untracked
+litter or as an out-of-scope creation.
 
 **Evidence.** One `diff_coverage` event carrying either the measurement or
 a named failure reason. Every failure mode names what ran, its exit code,

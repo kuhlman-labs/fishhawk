@@ -128,6 +128,23 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 			// outside the tree the measurement claims to describe. Reject
 			// at parse time rather than as an opaque measurement failure.
 			if c.DiffCoverage != nil {
+				// diff_coverage is an IMPLEMENT-stage constraint (#1888).
+				// Only the implement path measures it: the runner's
+				// measurement needs the staged, committed scope-only tree
+				// the implement stage produces, and no other stage type
+				// emits a diff_coverage signal. Because an ABSENT signal on
+				// a declared constraint is by design a violation, declaring
+				// it on (say) an acceptance stage whose bundle carries a
+				// diff would be a GUARANTEED false category-B failure — the
+				// exact false-RED this opt-in gate exists to avoid. Reject
+				// it at parse time, where the spec author can act on it,
+				// rather than at evaluation time on a real run.
+				if stage.Type != "implement" {
+					return &ValidationError{
+						Path:    stagePath(i, fmt.Sprintf("/constraints/%d/diff_coverage", j)),
+						Message: fmt.Sprintf("diff_coverage is valid only on an implement stage, not a %q stage (#1888): the measurement is emitted by the implement runner, and a declared constraint with no measurement is a violation", stage.Type),
+					}
+				}
 				if err := validRepoRelativePath(c.DiffCoverage.ReportPath); err != nil {
 					return &ValidationError{
 						Path:    stagePath(i, fmt.Sprintf("/constraints/%d/diff_coverage/report_path", j)),

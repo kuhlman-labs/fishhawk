@@ -69,6 +69,39 @@ func ExecGit(repoDir string) GitRunner {
 	}
 }
 
+// MergeBase resolves the fork point of baseRef and HEAD — the anchor
+// ChangedLines diffs from, exposed separately because the caller may need
+// to PIN it before mutating HEAD.
+//
+// The runner does exactly that: it materializes the committed tree with a
+// throwaway commit, which advances whatever branch HEAD is on. A baseRef
+// naming that same branch (the ordinary local case — HEAD on `main`,
+// `base_ref: main`) would then merge-base to the throwaway commit ITSELF
+// and the measurement would see zero added lines: a silent false vacuous
+// pass, the failure mode this constraint must never produce. Resolving the
+// merge base to a SHA first makes the framing invariant to the commit, and
+// re-resolving that SHA against the later HEAD is a no-op because it is an
+// ancestor of it.
+//
+// An empty baseRef returns ErrEmptyBaseRef WITHOUT invoking git: the
+// caller resolves the workflow's omitted `base_ref` to the run's base
+// branch first, and a resolution that yielded nothing must be reported as
+// a named failure rather than shelling out with an empty argument.
+func MergeBase(ctx context.Context, git GitRunner, baseRef string) (string, error) {
+	if strings.TrimSpace(baseRef) == "" {
+		return "", ErrEmptyBaseRef
+	}
+	mb, err := git(ctx, "merge-base", baseRef, "HEAD")
+	if err != nil {
+		return "", err
+	}
+	mb = strings.TrimSpace(mb)
+	if mb == "" {
+		return "", fmt.Errorf("diffcov: no merge base between %q and HEAD", baseRef)
+	}
+	return mb, nil
+}
+
 // ChangedLines returns the lines this stage added relative to baseRef.
 //
 // The diff is taken MERGE-BASE → WORK TREE, the same framing the repo's
@@ -82,26 +115,22 @@ func ExecGit(repoDir string) GitRunner {
 //   - The WORK TREE, not HEAD, because the coverage report describes the
 //     tree the coverage command just executed against. Diffing HEAD
 //     instead would attribute coverage and lines to two different
-//     snapshots, and the measurement would be meaningless.
+//     snapshots, and the measurement would be meaningless. The runner
+//     points this at the THROWAWAY checkout the coverage command runs in,
+//     which is a clean detached checkout of the committed tree — so there
+//     the work tree IS the committed tree and the one-snapshot property
+//     holds by construction.
 //
 // `-U0` makes every hunk header describe exactly the changed lines with
 // no context, which is what the added-line set needs.
 //
-// An empty baseRef returns ErrEmptyBaseRef WITHOUT invoking git: the
-// caller resolves the workflow's omitted `base_ref` to the run's base
-// branch first, and a resolution that yielded nothing must be reported
-// as a named failure rather than shelling out with an empty argument.
+// baseRef may be either a ref name or an already-resolved merge-base SHA
+// (see MergeBase); an empty one returns ErrEmptyBaseRef without invoking
+// git.
 func ChangedLines(ctx context.Context, git GitRunner, baseRef string) (ChangedFiles, error) {
-	if strings.TrimSpace(baseRef) == "" {
-		return nil, ErrEmptyBaseRef
-	}
-	mb, err := git(ctx, "merge-base", baseRef, "HEAD")
+	mb, err := MergeBase(ctx, git, baseRef)
 	if err != nil {
 		return nil, err
-	}
-	mb = strings.TrimSpace(mb)
-	if mb == "" {
-		return nil, fmt.Errorf("diffcov: no merge base between %q and HEAD", baseRef)
 	}
 	out, err := git(ctx, "diff", "-U0", "--no-color", mb)
 	if err != nil {

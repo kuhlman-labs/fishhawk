@@ -8221,9 +8221,9 @@ func TestGetStagePrompt_CarriesDiffCoverage(t *testing.T) {
 		Repo:          "kuhlman-labs/example",
 		WorkflowID:    "feature_change",
 		TriggerSource: "manual",
-		WorkflowSpec:  diffCoverageSpecYAML("plan"),
+		WorkflowSpec:  diffCoverageSpecYAML("implement"),
 	}
-	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
 
 	want := diffCoverageConfig{
 		Command:            "make coverage",
@@ -8324,7 +8324,7 @@ func TestGetStagePrompt_DiffCoverageOmittedWhenAbsent(t *testing.T) {
 // the same spec lookup drives the backend's own constraint load.
 func TestResolveDiffCoverageConfig_Degradations(t *testing.T) {
 	s, _, _, _ := newPromptServer(t)
-	base := diffCoverageSpecYAML("plan")
+	base := diffCoverageSpecYAML("implement")
 
 	cases := []struct {
 		name       string
@@ -8332,10 +8332,10 @@ func TestResolveDiffCoverageConfig_Degradations(t *testing.T) {
 		workflowID string
 		stageType  run.StageType
 	}{
-		{"no cached spec", nil, "feature_change", run.StageTypePlan},
-		{"unparseable spec", []byte("{{{not yaml"), "feature_change", run.StageTypePlan},
-		{"workflow not in spec", base, "other_workflow", run.StageTypePlan},
-		{"stage type not in workflow", base, "feature_change", run.StageTypeImplement},
+		{"no cached spec", nil, "feature_change", run.StageTypeImplement},
+		{"unparseable spec", []byte("{{{not yaml"), "feature_change", run.StageTypeImplement},
+		{"workflow not in spec", base, "other_workflow", run.StageTypeImplement},
+		{"stage type not in workflow", base, "feature_change", run.StageTypePlan},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -8364,8 +8364,8 @@ func TestResolveDiffCoverageConfig_MostRestrictiveWins(t *testing.T) {
 			"workflows:\n" +
 			"  feature_change:\n" +
 			"    stages:\n" +
-			"      - id: plan\n" +
-			"        type: plan\n" +
+			"      - id: implement\n" +
+			"        type: implement\n" +
 			"        executor:\n" +
 			"          agent: claude-code\n" +
 			"        constraints:\n" +
@@ -8377,7 +8377,7 @@ func TestResolveDiffCoverageConfig_MostRestrictiveWins(t *testing.T) {
 			"              command: high\n" +
 			"              report_path: b.lcov\n" +
 			"              min_new_line_coverage: 95\n"),
-	}, run.StageTypePlan)
+	}, run.StageTypeImplement)
 	if got == nil {
 		t.Fatal("resolveDiffCoverageConfig = nil, want the declared constraint")
 	}

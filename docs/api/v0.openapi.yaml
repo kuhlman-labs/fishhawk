@@ -7711,11 +7711,14 @@ paths:
                       command:
                         type: string
                         description: |
-                          Shell command (`sh -c`, from the repo root) that
-                          produces the coverage report. Executed under the same
-                          containment as the verify gate: bounded timeout,
-                          process-group kill, and the runner's default-deny
-                          gate-env allow-list.
+                          Shell command (`sh -c`) that produces the coverage
+                          report. It runs from the repo root of a THROWAWAY
+                          `git worktree` checkout of the stage's committed
+                          tree, under the same containment as the verify gate:
+                          bounded timeout, process-group kill, the runner's
+                          default-deny gate-env allow-list, and a disposable
+                          checkout so its filesystem side effects never reach
+                          the real working tree.
                       report_path:
                         type: string
                         description: Repo-relative path the command writes the coverage report to. Validated repo-relative at spec-parse time.
@@ -7978,11 +7981,14 @@ paths:
                       command:
                         type: string
                         description: |
-                          Shell command (`sh -c`, from the repo root) that
-                          produces the coverage report. Executed under the same
-                          containment as the verify gate: bounded timeout,
-                          process-group kill, and the runner's default-deny
-                          gate-env allow-list.
+                          Shell command (`sh -c`) that produces the coverage
+                          report. It runs from the repo root of a THROWAWAY
+                          `git worktree` checkout of the stage's committed
+                          tree, under the same containment as the verify gate:
+                          bounded timeout, process-group kill, the runner's
+                          default-deny gate-env allow-list, and a disposable
+                          checkout so its filesystem side effects never reach
+                          the real working tree.
                       report_path:
                         type: string
                         description: Repo-relative path the command writes the coverage report to. Validated repo-relative at spec-parse time.

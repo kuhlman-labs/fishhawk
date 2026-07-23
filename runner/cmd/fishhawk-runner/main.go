@@ -1869,9 +1869,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 
 	// Diff-coverage measurement (#1888 / ADR-059). Placed AFTER the
 	// committed-tree verify gates above — the tree is final and the agent
-	// has stopped writing, so the coverage report and the diff describe one
-	// snapshot — and BEFORE composeGateEvidence folds the event into
-	// gate_evidence.
+	// has stopped writing — and BEFORE composeGateEvidence folds the event
+	// into gate_evidence. The untrusted coverage command runs in a
+	// THROWAWAY worktree of the committed scope-only tree (see
+	// runDiffCoverageGate), so it cannot leave side effects in the real
+	// checkout and cannot alter the tree it was measured against.
 	//
 	// Runs WHENEVER the stage declared the constraint, with no
 	// "only if there was a diff" guard: the no-added-lines case is reported
@@ -1886,7 +1888,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			repoDir = "."
 		}
 		baseRef := resolveDiffCoverageBaseRef(cfg, diffCoverage)
-		res.Events = append(res.Events, runDiffCoverageGate(ctx, diffCoverage, repoDir, baseRef))
+		ev, fatal := runDiffCoverageGate(ctx, cfg, diffCoverage, repoDir, baseRef)
+		res.Events = append(res.Events, ev)
+		if fatal != nil {
+			// NOT a coverage verdict — the gate's throwaway commit could not
+			// be undone, so HEAD is left where openPRAndShipArtifact's real
+			// commit would stack on top of it and push a WIP commit into the
+			// PR. Fatal for the same reason it is fatal in
+			// runVerifyGateCommitted (#802), which uses the same scaffolding.
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = fatal.Error()
+			invokeErr = fatal
+		}
 	}
 
 	// Binding-assertion gate evidence (#1171). The authoritative gate runs in
@@ -4428,6 +4442,12 @@ func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir strin
 // timeout — a coverage run is a test run.
 const diffCoverageTimeout = 10 * time.Minute
 
+// diffCoverageCleanupTimeout bounds the two cleanup git commands (worktree
+// removal, reset --soft) that MUST run even after ctx was cancelled to kill
+// a wedged coverage command. They are detached from ctx's cancellation but
+// never unbounded.
+const diffCoverageCleanupTimeout = 30 * time.Second
+
 // runDiffCoverageGate MEASURES the stage's new-line coverage for the
 // workflow-v1.6 `diff_coverage` constraint (ADR-059 / #1888) and returns
 // the trace event composeGateEvidence folds into gate_evidence. The BACKEND
@@ -4442,13 +4462,38 @@ const diffCoverageTimeout = 10 * time.Minute
 // failed to run, so the backend treats it as a violation, while an explicit
 // zero is an auditable vacuous pass.
 //
-// The diff and the coverage report describe ONE snapshot: the command runs
-// in the working tree, and ChangedLines diffs merge-base → work tree.
+// EXECUTION ENVIRONMENT. The customer command runs in a THROWAWAY
+// `git worktree add --detach` checkout of the stage's committed scope-only
+// tree — the same isolation runVerifyCommittedTree gives the verify gate,
+// and what this constraint's schema/API documentation promises. Two things
+// follow, and both are load-bearing:
+//
+//   - FILESYSTEM containment. runBoundedGateCommand contains the process
+//     (timeout, process-group kill) and the environment (default-deny
+//     allow-list), but only a separate checkout contains the FILESYSTEM. An
+//     untrusted coverage command's build artifacts, modified sources, and
+//     any other side effect land in the disposable checkout and are swept
+//     with it, instead of persisting in the operator's real repository —
+//     and the command cannot mutate the tree AFTER it was verified.
+//   - ONE snapshot. The checkout is clean and detached at the committed
+//     head, so ChangedLines' merge-base → work-tree diff taken INSIDE it is
+//     exactly merge-base → committed tree: the same tree the coverage
+//     command executed against. The diff is taken BEFORE the command runs,
+//     so the report the command writes is not itself mistaken for an
+//     untracked added file. (Untracked-file folding contributes nothing in
+//     a clean checkout, and does not need to: a new file inside the
+//     declared scope is IN the commit, and a new file outside it is scope
+//     drift, excluded from the commit and correctly not attributed here.)
+//
+// Materializing that committed tree reuses the #651 scaffolding —
+// StageScoped + commitVerifyWIP + reset --soft — so, exactly as in
+// runVerifyGateCommitted, a failed undo is FATAL rather than a measurement
+// failure: it is returned as the error, and the call site demotes the stage.
 //
 // baseRef is resolved by the CALLER (resolveDiffCoverageBaseRef) so this
 // function's empty-ref path is the fail-closed backstop, not the resolution
 // itself.
-func runDiffCoverageGate(ctx context.Context, dc *upload.DiffCoverageConfig, repoDir, baseRef string) agent.Event {
+func runDiffCoverageGate(ctx context.Context, cfg config, dc *upload.DiffCoverageConfig, repoDir, baseRef string) (agent.Event, error) {
 	ev := diffCoverageEvidence{
 		Outcome:    "failed",
 		Command:    dc.Command,
@@ -4456,73 +4501,160 @@ func runDiffCoverageGate(ctx context.Context, dc *upload.DiffCoverageConfig, rep
 		BaseRef:    baseRef,
 	}
 
-	// (a) The stage's added lines. An unresolved base ref never reaches
-	// git — diffcov returns ErrEmptyBaseRef and we name it.
-	changed, err := diffcov.ChangedLines(ctx, diffcov.ExecGit(repoDir), baseRef)
+	// (a) PIN the merge base BEFORE anything moves HEAD. The throwaway
+	// commit below advances whatever branch HEAD is on, so a base_ref
+	// naming that same branch (the ordinary local case) would merge-base to
+	// the throwaway commit itself and the measurement would see zero added
+	// lines — a silent false vacuous pass. Resolving it to a SHA first
+	// makes the diff framing invariant to the commit. This is also where
+	// an unresolved base ref is named: it never reaches git as an empty
+	// argument (#1888 condition 5).
+	mergeBase, err := diffcov.MergeBase(ctx, diffcov.ExecGit(repoDir), baseRef)
 	if err != nil {
 		ev.ExitCode = -1
 		ev.Reason = "could not determine the stage's added lines: " + err.Error()
-		return diffCoverageEvent(ev)
+		return diffCoverageEvent(ev), nil
 	}
-	if len(changed) == 0 {
-		// Measured-with-zero: nothing was added, so nothing can be
-		// under-covered. Deliberately do NOT run the customer command —
+
+	// (b) Materialize the committed scope-only tree. A pre-commit failure
+	// leaves HEAD untouched, so it returns a named measurement failure with
+	// no undo to perform.
+	if _, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopePaths(cfg.scopeFiles)); err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not stage the scope-only tree to measure: " + err.Error()
+		return diffCoverageEvent(ev), nil
+	}
+	committed, err := commitVerifyWIP(ctx, cfg, repoDir)
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not commit the scope-only tree to measure: " + err.Error()
+		return diffCoverageEvent(ev), nil
+	}
+	if !committed {
+		// Measured-with-zero: the stage committed nothing, so nothing can
+		// be under-covered. Deliberately do NOT run the customer command —
 		// there is nothing for it to measure, and this is an explicit,
 		// auditable signal rather than an absent one.
 		ev.Outcome = "measured"
-		ev.Reason = fmt.Sprintf("no added lines against %q; nothing to measure", baseRef)
-		return diffCoverageEvent(ev)
+		ev.Reason = fmt.Sprintf("no scope-only changes committed against %q; nothing to measure", baseRef)
+		return diffCoverageEvent(ev), nil
 	}
 
-	// (b) Run the customer command through the SHARED bounded-exec path:
-	// timeout, process-group kill, default-deny gate env. No second exec
-	// path, no widened allow-list.
-	lintCache, err := os.MkdirTemp("", "fishhawk-diffcov-cache-*")
+	// HEAD has MOVED. Every path from here must undo the throwaway commit,
+	// so the measurement runs to completion first and the reset below is
+	// unconditional.
+	ev = measureDiffCoverage(ctx, ev, dc, repoDir, mergeBase)
+
+	// The undo runs on a context DETACHED from ctx's cancellation: a wedged
+	// coverage command is killed by cancelling ctx, and a ctx-bound reset
+	// would then fail exactly when it matters most, stranding HEAD on the
+	// throwaway commit. It stays bounded so a broken git can't hang the
+	// stage.
+	resetCtx, resetCancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
+	defer resetCancel()
+	if rerr := gitResetSoftHEAD1(resetCtx, repoDir); rerr != nil {
+		return diffCoverageEvent(ev), rerr
+	}
+	return diffCoverageEvent(ev), nil
+}
+
+// measureDiffCoverage performs the measurement against the throwaway
+// checkout of the committed HEAD, returning the evidence it produced.
+// It NEVER moves HEAD in repoDir — the caller owns the reset --soft that
+// undoes the throwaway commit — so every failure path here is a named
+// measurement failure and none of them is fatal.
+//
+// mergeBase is the fork-point SHA the caller pinned BEFORE the throwaway
+// commit; ev.BaseRef keeps the human-meaningful ref name it was resolved
+// from.
+func measureDiffCoverage(ctx context.Context, ev diffCoverageEvidence, dc *upload.DiffCoverageConfig, repoDir, mergeBase string) diffCoverageEvidence {
+	headSHA, err := gitRevParseHEAD(ctx, repoDir)
 	if err != nil {
 		ev.ExitCode = -1
-		ev.Reason = "could not create a temp lint-cache dir: " + err.Error()
-		return diffCoverageEvent(ev)
+		ev.Reason = "could not resolve the committed tree to measure: " + err.Error()
+		return ev
 	}
-	defer func() { _ = os.RemoveAll(lintCache) }()
-
-	reportAbs := filepath.Join(repoDir, filepath.FromSlash(dc.ReportPath))
-	// The report is the runner's own artifact, not the agent's work: remove
-	// it after reading so it never lands in the working tree as untracked
-	// litter or as an out-of-scope creation.
-	_, preexisting := os.Stat(reportAbs)
+	parent, err := os.MkdirTemp("", "fishhawk-diffcov-*")
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not create the throwaway-checkout temp dir: " + err.Error()
+		return ev
+	}
+	wt := filepath.Join(parent, "tree")
 	defer func() {
-		if preexisting != nil {
-			_ = os.Remove(reportAbs)
-		}
+		// --force because the coverage command's own output (the report,
+		// build artifacts) leaves the checkout dirty by construction.
+		// Detached from ctx's cancellation for the same reason the reset is
+		// — a killed coverage command cancels ctx, and the throwaway
+		// checkout must still be swept — but bounded. RemoveAll is the
+		// backstop that guarantees nothing survives on disk either way.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
+		defer cleanupCancel()
+		_ = exec.CommandContext(cleanupCtx, "git", "-C", repoDir, "worktree", "remove", "--force", wt).Run()
+		_ = os.RemoveAll(parent)
 	}()
+	if out, werr := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"worktree", "add", "--detach", wt, headSHA).CombinedOutput(); werr != nil {
+		ev.ExitCode = -1
+		ev.Reason = fmt.Sprintf("could not create the throwaway checkout of %s to measure: %s",
+			headSHA, strings.TrimSpace(string(out)))
+		return ev
+	}
 
-	output, exitCode := runBoundedGateCommand(ctx, dc.Command, repoDir, lintCache, diffCoverageTimeout)
+	// (b) The stage's added lines, computed INSIDE the throwaway checkout
+	// and BEFORE the command runs. An unresolved base ref never reaches
+	// git — diffcov returns ErrEmptyBaseRef and we name it.
+	changed, err := diffcov.ChangedLines(ctx, diffcov.ExecGit(wt), mergeBase)
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not determine the stage's added lines: " + err.Error()
+		return ev
+	}
+	if len(changed) == 0 {
+		ev.Outcome = "measured"
+		ev.Reason = fmt.Sprintf("no added lines against %q (merge base %s); nothing to measure",
+			ev.BaseRef, mergeBase)
+		return ev
+	}
+
+	// (c) Run the customer command through the SHARED bounded-exec path:
+	// timeout, process-group kill, default-deny gate env. No second exec
+	// path, no widened allow-list.
+	output, exitCode := runBoundedGateCommand(ctx, dc.Command, wt,
+		filepath.Join(parent, "golangci-lint-cache"), diffCoverageTimeout)
 	ev.ExitCode = exitCode
 	if exitCode != 0 {
 		tail, _ := boundEvidenceTail(redactEvidenceText(output))
-		ev.Reason = fmt.Sprintf("coverage command exited %d: %s", exitCode, tail)
-		return diffCoverageEvent(ev)
+		ev.Reason = fmt.Sprintf("coverage command %q exited %d in the throwaway checkout: %s",
+			dc.Command, exitCode, tail)
+		return ev
 	}
 
-	// (c) Read + parse the report the command was declared to write.
+	// (d) Read + parse the report the command was declared to write. It
+	// lives inside the throwaway checkout, so it is swept with it and never
+	// lands in the real working tree as untracked litter or as an
+	// out-of-scope creation.
+	reportAbs := filepath.Join(wt, filepath.FromSlash(dc.ReportPath))
 	f, err := os.Open(reportAbs) //nolint:gosec // report_path is validated repo-relative at spec-parse time.
 	if err != nil {
-		ev.Reason = fmt.Sprintf("coverage command exited 0 but its report %q could not be read: %s",
-			dc.ReportPath, err.Error())
-		return diffCoverageEvent(ev)
+		ev.Reason = fmt.Sprintf("coverage command %q exited 0 but its report %q could not be read in the throwaway checkout: %s",
+			dc.Command, dc.ReportPath, err.Error())
+		return ev
 	}
 	cov, parseErr := diffcov.ParseLCOV(f)
 	_ = f.Close()
 	if parseErr != nil {
 		ev.Reason = fmt.Sprintf("coverage report %q could not be parsed as lcov: %s",
 			dc.ReportPath, parseErr.Error())
-		return diffCoverageEvent(ev)
+		return ev
 	}
 
-	// (d) Intersect. Both sides are normalized to repo-relative form inside
-	// Measure; a path that cannot be placed inside the repo is reported
-	// explicitly rather than silently counted as uncovered.
-	res := diffcov.Measure(repoDir, changed, cov)
+	// (e) Intersect. Both sides are normalized to repo-relative form inside
+	// Measure — against the THROWAWAY checkout's root, which is where the
+	// command ran and therefore what any absolute SF: path is relative to.
+	// A path that cannot be placed inside it is reported explicitly rather
+	// than silently counted as uncovered.
+	res := diffcov.Measure(wt, changed, cov)
 	ev.Outcome = "measured"
 	ev.NewLines = res.NewLines
 	ev.CoveredNewLines = res.CoveredNewLines
@@ -4539,7 +4671,7 @@ func runDiffCoverageGate(ctx context.Context, dc *upload.DiffCoverageConfig, rep
 	default:
 		ev.Reason = fmt.Sprintf("%d of %d new lines covered", res.CoveredNewLines, res.NewLines)
 	}
-	return diffCoverageEvent(ev)
+	return ev
 }
 
 // boundStrings caps a list for inclusion in a bounded evidence field.

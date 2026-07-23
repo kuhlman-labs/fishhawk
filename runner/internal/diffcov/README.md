@@ -36,8 +36,24 @@ The diff is taken **merge-base → work tree**, the same framing
 - The **work tree**, not `HEAD`, because the coverage report describes the
   tree the coverage command just executed against. Diffing `HEAD` would put
   coverage and lines on two different snapshots and the measurement would be
-  meaningless.
+  meaningless. The runner points this at the **throwaway checkout** the
+  coverage command runs in — a clean detached checkout of the committed
+  tree — so there the work tree *is* the committed tree and the
+  one-snapshot property holds by construction.
 - `-U0` makes every hunk header describe exactly the changed lines.
+
+### Pinning the merge base (`MergeBase`)
+
+`MergeBase` is exported separately so the caller can resolve the fork point
+to a SHA **before** anything moves `HEAD`. The runner needs that: it
+materializes the committed tree with a throwaway commit, which advances
+whatever branch `HEAD` is on, so a `base_ref` naming that same branch (the
+ordinary local case — `HEAD` on `main`, `base_ref: main`) would merge-base
+to the throwaway commit *itself* and the measurement would see zero added
+lines — a silent false vacuous pass, the exact failure mode this constraint
+must never produce. Re-resolving the pinned SHA against the later `HEAD` is
+a no-op, because it is an ancestor of it, so `ChangedLines` accepts either
+a ref name or an already-pinned SHA.
 
 An **empty base ref returns `ErrEmptyBaseRef` without invoking git**. The
 caller resolves an omitted `base_ref` to the run's base branch first
@@ -54,6 +70,14 @@ tracked diff, `ChangedLines` enumerates untracked files
 C-quotes exotic paths and a newline in a name would split one path into
 two) and folds every line of each in via
 `git diff --no-index -- /dev/null <path>`.
+
+In the runner's own use the sweep finds nothing — it diffs a clean
+throwaway checkout — and does not need to: a new file inside the declared
+scope is part of the committed tree, and one outside it is scope drift,
+excluded from the commit and correctly not attributed to the stage. The
+sweep stays because the package's contract is "added lines relative to a
+base in this work tree", and a dirty-tree caller must not silently lose
+untracked files.
 
 `ExecGit` therefore treats `git diff` exit status **1** as success — git
 uses it to mean "differences were found", which is the normal outcome

@@ -132,6 +132,43 @@ func (f *fakeGit) run(_ context.Context, args ...string) (string, error) {
 	return f.out[key], nil
 }
 
+// TestMergeBaseIsPinnableAheadOfTime pins the anchor the runner resolves
+// BEFORE it makes its throwaway commit. Without that pin, a base_ref naming
+// the branch HEAD is on merge-bases to the throwaway commit itself and the
+// measurement silently sees zero added lines — a false vacuous pass.
+// Re-resolving the returned SHA is a no-op, which is what makes pinning
+// safe: git merge-bases an ancestor SHA against its descendant back to
+// itself.
+func TestMergeBaseIsPinnableAheadOfTime(t *testing.T) {
+	f := &fakeGit{out: map[string]string{"merge-base": "abc123\n"}}
+	got, err := MergeBase(context.Background(), f.run, "main")
+	if err != nil {
+		t.Fatalf("MergeBase: %v", err)
+	}
+	if got != "abc123" {
+		t.Errorf("merge base = %q, want abc123 (trimmed)", got)
+	}
+	if want := "merge-base main HEAD"; strings.Join(f.calls[0], " ") != want {
+		t.Errorf("call = %q, want %q", strings.Join(f.calls[0], " "), want)
+	}
+
+	// An empty ref never reaches git (#1888 condition 5).
+	empty := &fakeGit{}
+	if _, err := MergeBase(context.Background(), empty.run, "  "); !errors.Is(err, ErrEmptyBaseRef) {
+		t.Errorf("err = %v, want ErrEmptyBaseRef", err)
+	}
+	if len(empty.calls) != 0 {
+		t.Errorf("git was invoked with an empty base ref: %v", empty.calls)
+	}
+
+	// A ref with no shared history is a NAMED failure, not an empty answer.
+	none := &fakeGit{out: map[string]string{"merge-base": "\n"}}
+	if _, err := MergeBase(context.Background(), none.run, "orphan"); err == nil ||
+		!strings.Contains(err.Error(), "no merge base") {
+		t.Errorf("err = %v, want it to name the missing merge base", err)
+	}
+}
+
 func TestChangedLinesResolvesMergeBaseThenDiffsWorkTree(t *testing.T) {
 	f := &fakeGit{out: map[string]string{
 		"merge-base": "abc123\n",

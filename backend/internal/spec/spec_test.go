@@ -3516,6 +3516,44 @@ workflows:
 	}
 }
 
+// TestParse_DiffCoverage_RejectedOffImplementStage pins the stage-type
+// binding the runner actually implements: ONLY the implement stage measures
+// diff coverage. Because an absent signal on a DECLARED constraint is by
+// design a violation, a spec that declared it on, say, an acceptance or
+// review stage would earn a guaranteed false category-B failure on every
+// run — the false-RED this opt-in gate exists to avoid. Reject it at parse
+// time instead, where the spec author can act on it.
+func TestParse_DiffCoverage_RejectedOffImplementStage(t *testing.T) {
+	for _, stageType := range []string{"plan", "review", "acceptance"} {
+		t.Run(stageType, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: s
+        type: ` + stageType + `
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 80
+`))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if !strings.Contains(ve.Message, "only on an implement stage") {
+				t.Errorf("ValidationError.Message = %q, want the implement-only binding message", ve.Message)
+			}
+			if !strings.Contains(ve.Path, "diff_coverage") {
+				t.Errorf("ValidationError.Path = %q, want it to name diff_coverage", ve.Path)
+			}
+		})
+	}
+}
+
 // TestParse_DiffCoverage_ReportPathMustStayInRepo pins the semantic check
 // the JSON Schema cannot express: the runner joins report_path onto the
 // checkout, so an absolute path or a `..` escape would read a file outside
