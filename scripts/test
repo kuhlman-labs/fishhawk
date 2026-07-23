@@ -489,9 +489,13 @@ _patch_cov_all_modules() {
 # record-separator NUL -> newline, and any newline (which at that point can only
 # be INSIDE a filename) -> \001. A record still containing \001 is therefore a
 # path this layer cannot present, and is handled fail-CLOSED below rather than
-# dropped. Returns non-zero if git/go/jq is unavailable or there is no merge base.
+# dropped — as is a path containing a TAB or a COMMA, the two delimiters this
+# layer's OWN output encoding uses (`<module>\t<pkg>` pairs, comma-joined
+# -coverpkg patterns), which would otherwise emit a corrupt pattern and leave
+# the package tested but un-instrumented.
+# Returns non-zero if git/go/jq is unavailable or there is no merge base.
 _patch_cov_changed_modules() {
-  local base="$1" mb files untracked mlist f cand m rel pkg pairs undecodable=0
+  local base="$1" mb files untracked mlist f cand m rel pkg pairs shown undecodable=0
   if ! mb="$(git -C "$ROOT" merge-base "$base" HEAD 2>/dev/null)"; then
     return 1
   fi
@@ -519,11 +523,21 @@ $untracked"
   while IFS= read -r f; do
     if [ -z "$f" ]; then continue; fi
     case "$f" in
-      *$'\001'*)
-        # A newline inside the filename: this layer cannot name the path, so it
-        # must not decide the path is uninteresting. Say so on one line and fall
-        # back to instrumenting every module.
-        echo "scripts/test: cannot decode changed path '${f//$'\001'/<NL>}' (newline in filename) — instrumenting every module (fail-closed)" >&2
+      *$'\001'*|*$'\t'*|*,*)
+        # A path this layer's own encoding cannot carry: a NEWLINE (surviving
+        # the `tr` remap as \001), a TAB (the `<module>\t<pkg>` pair delimiter,
+        # at which the awk grouping pass truncates), or a COMMA (the -coverpkg
+        # pattern-list separator, which `go test` would split the pattern on).
+        # Each would emit a corrupt pattern, leaving the package tested but
+        # UN-instrumented — its lines fall inside no profile block and the
+        # Python layer's denominator rule silently drops the file, printing the
+        # misleading "no coverable new Go statements" skip. So this layer must
+        # not decide the path is uninteresting: say so on one line and fall back
+        # to instrumenting every module. The Python layer's own enumeration is
+        # binary-safe and folds the path into the denominator from there.
+        shown="${f//$'\001'/<NL>}"
+        shown="${shown//$'\t'/<TAB>}"
+        echo "scripts/test: cannot decode changed path '$shown' (newline, tab or comma in path) — instrumenting every module (fail-closed)" >&2
         undecodable=1
         continue
         ;;
@@ -588,7 +602,17 @@ cmd_test_with_patch_coverage() {
     cmd_test
     return 0
   fi
-  local m mm pp pkgs slug
+  # The profile filename is keyed by a per-loop ORDINAL, not by a slug derived
+  # from the module path. A slug (`tr '/' '_'`) is NOT injective — the distinct
+  # valid module paths `a/b` and `a_b` both map to `a_b.out`, so the later
+  # module's `go test` would overwrite the earlier module's profile and every
+  # changed line in the overwritten module would fall inside no remaining
+  # profile block, silently leaving that module's new code ungated. The ordinal
+  # is unique by construction (the loop is sequential); the slug is retained
+  # only as a human-readable SUFFIX for provenance, where a collision is
+  # harmless. `(( ++cov_idx ))` is pre-increment: post-increment returns the old
+  # value, and `(( 0 ))` is false, which aborts under `set -e`.
+  local m mm pp pkgs slug cov_idx=0
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     pkgs=""
@@ -596,9 +620,10 @@ cmd_test_with_patch_coverage() {
       if [ "${mm#./}" = "${m#./}" ]; then pkgs="$pp"; fi
     done <<< "$mods"
     if [ -n "$pkgs" ]; then
+      (( ++cov_idx ))
       slug="$(printf '%s' "${m#./}" | tr '/' '_')"
       (cd "$m" && go test -race -p "$TEST_P" -covermode=atomic \
-        -coverprofile="$PATCHCOV_DIR/$slug.out" -coverpkg="$pkgs" ./...)
+        -coverprofile="$PATCHCOV_DIR/$cov_idx-$slug.out" -coverpkg="$pkgs" ./...)
     else
       (cd "$m" && go test -race -p "$TEST_P" ./...)
     fi

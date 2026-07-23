@@ -97,7 +97,16 @@ bypasses. So:
   point can only be *inside* a filename) becomes `\001`. A record still
   containing `\001` is a path this layer cannot name, so it prints a
   one-line reason and falls back to `_patch_cov_all_modules` —
-  instrumenting EVERY module rather than dropping the file. That costs
+  instrumenting EVERY module rather than dropping the file. The same
+  fail-closed widen covers a path containing a TAB or a COMMA, the two
+  delimiters this layer's OWN output encoding uses (`<module>\t<pkg>`
+  pairs, parsed by `awk -F'\t'`; comma-joined `-coverpkg` patterns,
+  which `go test` splits on). Either character would emit a truncated or
+  split pattern, leaving that package tested but UN-instrumented — its
+  lines then fall inside no profile block and the Python denominator
+  rule drops the file behind a misleading "no coverable new Go
+  statements" skip, which is the same silent de-instrumentation the
+  newline case is. That costs
   more, but keeps the file inside the reach of the Python layer's
   binary-safe denominator. This is the one shell-side branch that is
   fail-CLOSED in effect while still fail-open in form: it never aborts
@@ -132,7 +141,16 @@ window in which the scratch dir (or a symlink standing in for it) could
 be substituted locally to steer where profiles are written. Two
 concurrent `scripts/test verify` invocations therefore never share,
 corrupt, or delete each other's profile, no existing path is ever
-clobbered, and no artifact is left in the working tree. The dir is swept
+clobbered, and no artifact is left in the working tree.
+
+Within ONE invocation, each profile filename is keyed by a per-loop
+ORDINAL (`<n>-<slug>.out`), not by the module path alone. A slug built
+by `tr '/' '_'` is not injective — the distinct valid module paths `a/b`
+and `a_b` both map to `a_b` — so a path-only name lets the second
+module's `go test` overwrite the first's profile, after which every
+changed line in the overwritten module falls inside no remaining profile
+block and its uncovered new code passes the gate unseen. The slug is
+kept only as a human-readable suffix, where a collision is harmless. The dir is swept
 by the single EXIT handler (`EXIT_TRAP`), which also reaps the shared
 Postgres container only when this invocation actually recorded a lease.
 
@@ -163,7 +181,7 @@ degrade prints ONE line naming the reason and falls through to the plain
 | profile scratch dir uncreatable / no profiles emitted | shell |
 | git absent, non-git or bare root, invalid `--diff-base` override, unresolvable base ref, no merge base | Python (`GitSkip`) |
 | no changed Go files, no coverable new statements, sub-floor diff | Python |
-| undecodable changed path (`\001` record) — widens to every module, does NOT skip | shell (`_patch_cov_all_modules`) |
+| undecodable changed path (newline `\001` record, or a tab/comma in the path) — widens to every module, does NOT skip | shell (`_patch_cov_all_modules`) |
 
 Only the Python gate's below-threshold verdict and its `PathDecodeError`
 fail-closed verdict are allowed to fail verify. In COMBINED mode (`--threshold` AND `--diff-base`) a git failure
@@ -199,7 +217,12 @@ Binary-safe path handling is pinned on both sides with REAL files whose
 names carry a double quote, a backslash, a space and a non-ASCII
 character (`test-check-coverage` (p), `test-patch-coverage` (c7)) —
 each must be discovered and gated/bucketed. A literal-newline filename
-is created for real where the platform allows it ((p2), (c8)); the
+is created for real where the platform allows it ((p2), (c8)), and
+(c10) covers the same class one level up — a changed file under a
+DIRECTORY whose name carries a tab or a comma must take the same
+fail-closed widen, never a corrupt pattern. (g2) pins profile-name
+injectivity: modules `a/b` and `a_b` must get distinct profile paths.
+The
 parsing layer is covered directly regardless by (p3)'s C-quoted decode
 and synthetic NUL-delimited fixtures, so the case is never simply
 skipped. (p4) asserts the fail-closed end state: an unidentifiable path

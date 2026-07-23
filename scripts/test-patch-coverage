@@ -264,6 +264,38 @@ else
   echo "NOTE: this platform cannot create a newline filename; (c8) not exercised"
 fi
 
+# (c10) a changed .go file under a DIRECTORY whose name contains a TAB or a
+# COMMA is fail-CLOSED for the same reason (c8) is: a tab is this layer's
+# `<module>\t<pkg>` pair delimiter (awk truncates the pattern there) and a comma
+# is the -coverpkg pattern separator (`go test` splits the pattern there), so
+# either would emit a corrupt pattern and leave the package tested but
+# UN-instrumented — its lines then fall inside no profile block and the Python
+# denominator rule drops the file behind a misleading "no coverable new Go
+# statements" skip. Neither may be a silent drop.
+for wd_kind in tab comma; do
+  if [ "$wd_kind" = tab ]; then wd=$'ta\tb'; else wd='com,ma'; fi
+  ROOT="$tmproot/weirddir"
+  make_repo "$ROOT"
+  git -C "$ROOT" checkout -q -b feature
+  if ! mkdir -p "$ROOT/backend/internal/$wd" 2>/dev/null; then
+    echo "NOTE: this platform cannot create the directory name; (c10/$wd) not exercised"
+    continue
+  fi
+  printf 'package d\n\nfunc D() {}\n' > "$ROOT/backend/internal/$wd/d.go"
+  git -C "$ROOT" add -A
+  git -C "$ROOT" commit -q -m weirddir
+  err="$tmproot/c10.err"
+  got="$(_patch_cov_changed_modules main 2>"$err")"; rc=$?
+  expected="$(printf 'backend\t./...\ncli\t./...')"
+  if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ] \
+     && grep -q 'cannot decode changed path' "$err"; then
+    pass "(c10) a tab/comma directory name fails closed: printed reason + every-module fallback"
+  else
+    fail "(c10) tab/comma dir fail-closed (rc=$rc got='$got' expected='$expected' err='$(cat "$err")')"
+  fi
+done
+ROOT="$tmproot/weird"
+
 # (c9) _patch_cov_all_modules emits `<module>\t./...` per module, and returns
 # non-zero (fail-open, no abort) when the module list is unavailable.
 got="$(_patch_cov_all_modules)"; rc=$?
@@ -480,6 +512,34 @@ if [ "$e2e_rc" -eq 0 ] \
 else
   fail "(g) e2e loop (rc=$e2e_rc backend='$backend_cmd' cli='$cli_cmd')"
 fi
+
+# (g2) PROFILE-NAME INJECTIVITY within one invocation. A slug built by
+# `tr '/' '_'` is not injective: the distinct valid module paths `a/b` and `a_b`
+# both slug to `a_b`. If both own changed packages, the second `go test` would
+# overwrite the first module's profile, every changed line in the overwritten
+# module would then fall inside no remaining profile block, and its uncovered
+# new code would pass the gate unseen. The filename must therefore be keyed by a
+# per-loop ordinal, not by the module path alone.
+mkdir -p "$tmproot/collide/a/b" "$tmproot/collide/a_b"
+modules() { printf './a/b\n./a_b\n'; }
+: > "$GOLOG"
+saved_trap="$(trap -p EXIT)"
+pushd "$tmproot/collide" >/dev/null
+PATH="$tmproot/stubbin:$PATH" TMPDIR="$tmproot" \
+  cmd_test_with_patch_coverage "$(printf 'a/b\t./p\na_b\t./q\n')" >/dev/null 2>&1
+collide_rc=$?
+popd >/dev/null
+eval "$saved_trap"
+_patchcov_cleanup
+profiles="$(grep -o -- '-coverprofile=[^ ]*' "$GOLOG" | sort)"
+n_profiles="$(printf '%s\n' "$profiles" | grep -c 'coverprofile')"
+n_uniq="$(printf '%s\n' "$profiles" | sort -u | grep -c 'coverprofile')"
+if [ "$collide_rc" -eq 0 ] && [ "$n_profiles" -eq 2 ] && [ "$n_uniq" -eq 2 ]; then
+  pass "(g2) modules a/b and a_b get DISTINCT profile paths (slug is not injective)"
+else
+  fail "(g2) profile-name collision (rc=$collide_rc n=$n_profiles uniq=$n_uniq profiles='$profiles')"
+fi
+modules() { printf './backend\n./cli\n'; }
 
 # ---------------------------------------------------------------------------
 # (i) module enumeration failing INSIDE the coverage loop. Feeding the loop
