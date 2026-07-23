@@ -121,11 +121,6 @@ func TestRepoFilterFor_NotApplicable(t *testing.T) {
 				AccountRoles: fakeAccountRoles{role: account.RoleAdmin}}),
 			id: memberIdentity(),
 		},
-		{
-			name: "subject without a provider prefix",
-			srv:  visibilityServer(vis, nil),
-			id:   Identity{Subject: "alice", SessionID: "s", AccountID: testOperatorAccountID},
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -145,6 +140,28 @@ func TestRepoFilterFor_NotApplicable(t *testing.T) {
 				t.Fatalf("mirror consulted %d times, want 0", vis.callCount())
 			}
 		})
+	}
+}
+
+// TestRepoFilterFor_PrefixlessSubjectDeniesAll pins the fail-closed default for
+// a cookie subject that cannot be keyed into the mirror: it is filtered with a
+// deny-all filter, never left unfiltered, and asks the mirror nothing.
+func TestRepoFilterFor_PrefixlessSubjectDeniesAll(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{"acme/app": true})
+	srv := visibilityServer(vis, nil)
+	id := Identity{Subject: "alice", SessionID: "s", AccountID: testOperatorAccountID}
+	f, err := srv.repoFilterFor(ctxWith(id))
+	if err != nil {
+		t.Fatalf("repoFilterFor: %v", err)
+	}
+	if f == nil {
+		t.Fatal("filter = nil (unfiltered), want a deny-all filter")
+	}
+	if ok, err := f.allows(context.Background(), "acme/app"); ok || err != nil {
+		t.Fatalf("allows = (%v, %v), want (false, nil)", ok, err)
+	}
+	if vis.callCount() != 0 {
+		t.Fatalf("mirror consulted %d times on a deny-all filter, want 0", vis.callCount())
 	}
 }
 
@@ -227,10 +244,25 @@ func TestRepoFilter_Allows(t *testing.T) {
 		}
 	})
 
-	t.Run("unresolvable row forge draws no cross-forge conclusion", func(t *testing.T) {
+	t.Run("mode e: ambiguous row forge fails closed with ZERO forge calls", func(t *testing.T) {
 		vis := newFakeRepoVisibility(map[string]bool{"acme/app": true})
 		// found=false: unregistered owner, or one registered under BOTH forges.
+		// The mirror says acme/app IS visible to github:alice, so a fall-through
+		// would return the row — which is exactly the leak the criterion forbids
+		// when the row may belong to another forge.
 		srv := visibilityServer(vis, &fakeProviderResolver{})
+		f, _ := srv.repoFilterFor(ctxWith(memberIdentity()))
+		if ok, err := f.allows(context.Background(), "acme/app"); ok || err != nil {
+			t.Fatalf("allows = (%v, %v), want (false, nil) — ambiguous forge denies", ok, err)
+		}
+		if vis.callCount() != 0 {
+			t.Fatalf("mirror consulted %d times on an ambiguous row, want 0", vis.callCount())
+		}
+	})
+
+	t.Run("no resolver wired leaves the decision to the mirror", func(t *testing.T) {
+		vis := newFakeRepoVisibility(map[string]bool{"acme/app": true})
+		srv := visibilityServer(vis, nil) // cross-forge check not configured
 		f, _ := srv.repoFilterFor(ctxWith(memberIdentity()))
 		if ok, err := f.allows(context.Background(), "acme/app"); !ok || err != nil {
 			t.Fatalf("allows = (%v, %v), want (true, nil) — the mirror decides", ok, err)

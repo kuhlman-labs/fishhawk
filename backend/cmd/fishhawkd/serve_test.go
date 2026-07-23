@@ -2042,14 +2042,35 @@ func TestResolveRepoVisibility_ShipsDefaultTTL(t *testing.T) {
 
 // TestServeRegistersRepoACLTTLFlag pins the operator-facing surface: the flag
 // exists, is documented, and defaults to the shipped TTL.
+//
+// It inspects the flag set runServe ITSELF builds, by driving runServe with
+// -h: flag.ContinueOnError makes Parse print the usage of the real flag set to
+// the log sink and return ErrHelp, before any listener is bound. So renaming,
+// removing, or re-defaulting --repo-acl-ttl fails this test — which the
+// earlier hand-rolled FlagSet mirror of the registration could not do.
 func TestServeRegistersRepoACLTTLFlag(t *testing.T) {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	f := fs.Duration("repo-acl-ttl", envOrDuration("FISHHAWKD_REPO_ACL_TTL", repoacl.DefaultTTL), "")
-	if err := fs.Parse(nil); err != nil {
-		t.Fatal(err)
+	t.Setenv("FISHHAWKD_REPO_ACL_TTL", "")
+	var logSink bytes.Buffer
+	if code := runServe([]string{"-h"}, &logSink); code != exitFailure {
+		t.Fatalf("runServe(-h) = %d, want %d (parse aborts before serving)", code, exitFailure)
 	}
-	if *f != repoacl.DefaultTTL {
-		t.Errorf("--repo-acl-ttl default = %s, want %s", *f, repoacl.DefaultTTL)
+	usage := logSink.String()
+	// PrintDefaults emits "  -<name> <type>\n    \t<usage> (default <v>)\n",
+	// so slice from this flag's header to the next flag's to assert against
+	// THIS flag's entry rather than anywhere in the whole usage block.
+	const header = "  -repo-acl-ttl duration\n"
+	i := strings.Index(usage, header)
+	if i < 0 {
+		t.Fatalf("runServe usage does not register --repo-acl-ttl as a duration flag; got:\n%s", usage)
+	}
+	entry := usage[i+len(header):]
+	if j := strings.Index(entry, "\n  -"); j >= 0 {
+		entry = entry[:j]
+	}
+	if want := "(default " + repoacl.DefaultTTL.String() + ")"; !strings.Contains(entry, want) {
+		t.Errorf("--repo-acl-ttl entry = %q, want it to carry %s", entry, want)
+	}
+	if !strings.Contains(entry, "ADR-057 Amendment A2") {
+		t.Errorf("--repo-acl-ttl usage text lost its operator-facing documentation; got %q", entry)
 	}
 }

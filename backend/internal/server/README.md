@@ -98,10 +98,25 @@ resolves the row's forge through `Config.RepoProviders` (`ProviderResolver`,
 `accounts.provider` keyed by the repo owner) and denies immediately when it
 differs from the provider prefix of the caller's subject — a GitHub-only login
 sees no GitLab-installation data, and GitHub is never asked about a GitLab
-repo. A not-found / ambiguous answer (or no resolver wired) means the row's
-forge is UNKNOWN, so no cross-forge conclusion is drawn and the mirror decides;
-a resolver ERROR is a store fault and 503s. Per-repo answers are memoized for
-the life of one request, so a list page asks about each repo once.
+repo. A not-found / ambiguous answer from a WIRED resolver (the repo owner is
+unregistered, or — per `account.Resolver`'s contract — registered under BOTH
+forges) also DENIES, with zero forge calls: falling through to the mirror there
+would ask the caller's forge about the row's repo, so a GitLab-installation row
+`acme/app` could be shown to a GitHub-only login holding read on a same-named
+GitHub repo — both a leak and the forge lookup `[cross-forge-default-deny]`
+forbids. It is logged at WARN naming the repo, because an ambiguous owner is an
+operator-fixable account-registration state, not a permission answer. Only a
+NIL resolver (the cross-forge check not configured at all; in production the
+resolver and the mirror are wired together, both gated on `pool != nil` in
+`serve.go`) leaves the decision to the mirror. A resolver ERROR is a store fault
+and 503s. Per-repo answers are memoized for the life of one request, so a list
+page asks about each repo once.
+
+**An identity that cannot be keyed into the mirror is denied, not exempted.** A
+cookie subject with no `<provider>:` prefix yields a deny-all filter and a WARN,
+not an unfiltered request. No such subject is minted today (`bearerAuth` mints
+`github:<login>`), and that is precisely why the branch must not be the one path
+that silently bypasses filtering if a future auth path ever mints one.
 
 **The two failure classes are never collapsed** (the binding rule, stated once
 in `repoacl/README.md` and honored identically here). A FORGE error — including

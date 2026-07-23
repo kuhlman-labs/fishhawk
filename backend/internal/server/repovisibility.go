@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -41,10 +42,18 @@ type RepoVisibility interface {
 // branch on whether filtering is on.
 type repoFilter struct {
 	vis RepoVisibility
-	// providers resolves a repo's forge for the cross-forge deny. Nil (or a
-	// not-found answer) means the row's forge is unknown, in which case no
-	// cross-forge conclusion is drawn and the mirror decides.
+	// providers resolves a repo's forge for the cross-forge deny. A NIL
+	// resolver means the cross-forge check is not wired at all, so the mirror
+	// decides. A wired resolver answering found=false means the row's forge is
+	// AMBIGUOUS, which fails closed — see allows.
 	providers ProviderResolver
+	// denyAll makes the filter deny every repo without asking anything. It is
+	// the fail-closed posture for an identity that cannot be keyed into the
+	// mirror at all (a cookie subject with no "<provider>:" prefix).
+	denyAll bool
+	// logger, when non-nil, receives the WARN signals that explain a short
+	// page: an ambiguous row forge, or a mirror-unkeyable subject.
+	logger *slog.Logger
 	// provider is the caller's forge, from their identity subject prefix.
 	provider string
 	// subject is the forge-neutral member ref (the "<provider>:" prefix
@@ -71,6 +80,10 @@ type repoFilter struct {
 //   - The caller resolves to the workspace admin role — the admin bypass,
 //     resolved through the SAME Config.AccountRoles seam #1829 already uses.
 //
+// A cookie subject with no "<provider>:" prefix is NOT one of those postures:
+// it returns a deny-all filter, because "unfiltered" is the one default that
+// must never be reached by accident.
+//
 // A role-resolution error is NOT a bypass and NOT a deny: it surfaces so the
 // caller fails the request 503, per the store-fault rule.
 func (s *Server) repoFilterFor(ctx context.Context) (*repoFilter, error) {
@@ -84,10 +97,20 @@ func (s *Server) repoFilterFor(ctx context.Context) (*repoFilter, error) {
 	provider := providerFromSubject(id.Subject)
 	if provider == "" || provider == id.Subject {
 		// A subject with no "<provider>:" prefix cannot be keyed into the
-		// mirror at all. Leave it unfiltered rather than deny-all: the only
-		// subjects reaching here are cookie sessions, which always carry the
-		// prefix, so this is a defensive fall-through, not a policy.
-		return nil, nil
+		// mirror at all, so no repo can be shown to be visible to it. Fail
+		// CLOSED — deny every repo — rather than fall through unfiltered: the
+		// only subjects reaching here today are cookie sessions, which always
+		// carry the prefix, so this branch is unreachable in practice, and an
+		// unreachable branch must not be the one path that silently bypasses
+		// repo filtering if a future auth path ever mints a prefixless
+		// subject. The WARN names the subject so the resulting empty page is
+		// diagnosable rather than mysterious.
+		if s.cfg.Logger != nil {
+			s.cfg.Logger.WarnContext(ctx,
+				"repo visibility: subject carries no provider prefix; denying all repos (fail closed)",
+				"subject", id.Subject)
+		}
+		return &repoFilter{denyAll: true, logger: s.cfg.Logger}, nil
 	}
 	if s.cfg.AccountRoles != nil && id.AccountID != "" {
 		role, err := s.cfg.AccountRoles.MemberRole(ctx, id.AccountID, provider, id.Subject)
@@ -105,6 +128,7 @@ func (s *Server) repoFilterFor(ctx context.Context) (*repoFilter, error) {
 		providers: s.cfg.RepoProviders,
 		provider:  provider,
 		subject:   strings.TrimPrefix(id.Subject, provider+":"),
+		logger:    s.cfg.Logger,
 		decided:   make(map[string]bool, 8),
 	}, nil
 }
@@ -118,14 +142,33 @@ func (s *Server) repoFilterFor(ctx context.Context) (*repoFilter, error) {
 // wasted rate-limit unit.
 //
 // The row's forge is resolved through the ProviderResolver seam (accounts.
-// provider keyed by the repo owner). found=false (no resolver wired, an
-// unregistered owner, or an owner registered under BOTH forges) means the
-// row's forge is UNKNOWN, so no cross-forge conclusion is drawn and the mirror
-// decides — a resolver that cannot answer must not silently deny every row.
+// provider keyed by the repo owner), and the resolution outcome maps to three
+// distinct behaviours — the found=false case FAILS CLOSED (fix-up, E44.10):
+//
+//   - No resolver wired (f.providers == nil): the cross-forge check is not
+//     configured at all, so it draws no conclusion and the mirror decides.
+//     In production the resolver and the mirror are wired together (both gated
+//     on pool != nil in serve.go), so this is a test/degraded posture only.
+//   - A wired resolver answering found=false (the repo owner is unregistered,
+//     or — per account.Resolver's contract — registered under BOTH forges):
+//     the row's forge is AMBIGUOUS. Deny, with ZERO forge calls. Falling
+//     through to the mirror here would ask the CALLER'S forge about the row's
+//     repo, so a GitLab-installation row "acme/app" could be made visible to a
+//     GitHub-only login that happens to hold read on a same-named GitHub repo
+//     — both a leak and exactly the forge lookup the [cross-forge-default-deny]
+//     criterion forbids. Logged at WARN so the resulting short page is
+//     attributable to an unregistered/dual-registered owner, which is an
+//     operator-fixable account-registration state, not a permission answer.
+//   - A wired resolver answering a forge different from the caller's: deny,
+//     with ZERO forge calls (the criterion's main case).
+//
 // A resolver ERROR is a store fault and surfaces for the 503.
 func (f *repoFilter) allows(ctx context.Context, repo string) (bool, error) {
 	if f == nil {
 		return true, nil
+	}
+	if f.denyAll {
+		return false, nil
 	}
 	if v, ok := f.decided[repo]; ok {
 		return v, nil
@@ -135,7 +178,16 @@ func (f *repoFilter) allows(ctx context.Context, repo string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if found && rowProvider != f.provider {
+		if !found {
+			if f.logger != nil {
+				f.logger.WarnContext(ctx,
+					"repo visibility: row forge is ambiguous (owner unregistered or registered under both forges); denying (fail closed)",
+					"repo", repo, "caller_provider", f.provider)
+			}
+			f.decided[repo] = false
+			return false, nil
+		}
+		if rowProvider != f.provider {
 			f.decided[repo] = false
 			return false, nil
 		}
