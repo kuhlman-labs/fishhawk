@@ -889,6 +889,14 @@ The E31.6 ship-handler detail; the cross-component seam overview is the "Accepta
   When no installation is attributable, the runner's `openPRAndShipArtifact` maps this endpoint's `no_installation_for_run` to `upload.ErrNoInstallation` and falls back to the operator's local `gh auth token` for push + PR (logged `installation_token_received` with `source:gh_cli`); if `gh` is absent/not logged in it fails with an actionable error (install the App, or `gh auth login`) rather than the opaque token-fetch wrap.
   The merge reconciler can only poll the PR when the stamped App id is present — the `gh`-fallback path has no backend installation token, so its review gate resolves via the `pull_request.closed` webhook instead.
 
+## Trace-time policy re-evaluation (`trace.go::reEvaluatePolicy`)
+
+The backend's source-of-truth constraint evaluation on trace upload (E3.13): it loads constraints from the run row's cached workflow spec (#283), extracts the bundle's diff, and calls `policy.EmitEvaluation`, which writes the chained `policy_evaluated` audit entry the SPA renders.
+
+- **Verification-signal derivation (#1886 / ADR-059).** Before evaluating, `reEvaluatePolicy` sets `constraints.Verification` from `verificationSignalFromBundle`, which reads the SAME bundle's single pre-redacted `gate_evidence` event (#963) — the `verify_summary` when present, otherwise the last **non-superseded** `verify_run` (#1205, the only one reflecting the pushed tree). `Commands` carries `{command, exit_code, outcome}` per non-superseded run, no output tails. No new runner emission is involved; this only threads existing evidence into policy evaluation.
+- **nil is a violation, not a pass.** The helper returns nil on `bundle.ErrNoGateEvidence`, on any extract error, and when the evidence carries neither a summary nor a verify run — and the `verification_reported` required outcome treats nil as a violation (fail-closed). Contrast `ci_green`, whose nil signal *defers* to branch protection.
+- The `bundle` import stays on this side of the seam: `backend/internal/policy` never imports it. Outcome semantics and the audit round-trip invariant live in `backend/internal/policy/README.md`.
+
 ## Ship-time plan gates
 
 ### Plan-gate warnings advisory (`plan_warnings.go`, #1684)

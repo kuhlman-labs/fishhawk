@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -512,4 +513,100 @@ func TestReevaluateCIPolicy_NoRepos_NoOp(t *testing.T) {
 // tenant account, matching its pre-promotion effective behavior.
 func (*reevalRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
+}
+
+// TestReevaluateCIPolicy_PreservesVerificationSignal pins the audit
+// round-trip invariant for the verification_reported outcome (#1886 /
+// ADR-059). The post-CI re-evaluation decodes the PRIOR
+// policy_evaluated payload's applied_constraints, mutates only
+// CIGreen, and re-emits — so a json-tagged, exported Verification
+// field must survive that trip. If it were dropped, the re-emitted
+// evaluation would flip a satisfied verification_reported outcome into
+// a "no verification evidence in trace" violation on the next CI
+// event, failing the run for a reason that has nothing to do with CI.
+func TestReevaluateCIPolicy_PreservesVerificationSignal(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	// Seed a NEWER prior row carrying both outcomes plus a passing
+	// verification signal — the shape the trace-upload path writes for
+	// a workflow that opted into verification_reported.
+	fx.audit.seedPolicyEvaluated(fx.runID, fx.stageID, policy.EvaluationPayload{
+		StageType: "implement",
+		Diff:      []policy.DiffEntry{{Path: "x.go", Status: policy.Status("modified")}},
+		Applied: policy.Constraints{
+			RequiredOutcomes: []string{"ci_green", "verification_reported"},
+			Verification: &policy.VerificationSignal{
+				Outcome: "passed",
+				Commands: []policy.VerificationCommand{
+					{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed"},
+				},
+			},
+		},
+		Passed:           true,
+		DeferredOutcomes: []string{"ci_green"},
+	})
+	fx.seedCheck("ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	got := fx.latestPolicyEvaluatedAppend(t)
+	if got == nil {
+		t.Fatal("expected a new policy_evaluated audit row; got none")
+	}
+	if got.Applied.Verification == nil {
+		t.Fatal("Applied.Verification = nil after re-eval; the signal was dropped on the round-trip")
+	}
+	if got.Applied.Verification.Outcome != "passed" {
+		t.Errorf("Verification.Outcome = %q, want passed", got.Applied.Verification.Outcome)
+	}
+	if len(got.Applied.Verification.Commands) != 1 ||
+		got.Applied.Verification.Commands[0].Command != "scripts/test verify" {
+		t.Errorf("Verification.Commands = %+v, want the seeded command", got.Applied.Verification.Commands)
+	}
+	if len(got.Violations) != 0 {
+		t.Errorf("Violations = %+v, want none (both outcomes satisfied)", got.Violations)
+	}
+	if !got.Passed {
+		t.Error("Passed = false, want true")
+	}
+	// verification_reported is never deferred — only ci_green ever is,
+	// and it has a signal now.
+	if len(got.DeferredOutcomes) != 0 {
+		t.Errorf("DeferredOutcomes = %v, want empty", got.DeferredOutcomes)
+	}
+}
+
+// TestReevaluateCIPolicy_VerificationSignalAbsent_ViolatesOnReeval is
+// the negative half: a prior row that opted into verification_reported
+// with NO signal stays a violation across the CI-driven re-evaluation.
+// A green CI signal must not launder a missing verification signal into
+// a pass.
+func TestReevaluateCIPolicy_VerificationSignalAbsent_ViolatesOnReeval(t *testing.T) {
+	fx := newReevalFixture(t, []string{"ci_pass"})
+	fx.audit.seedPolicyEvaluated(fx.runID, fx.stageID, policy.EvaluationPayload{
+		StageType: "implement",
+		Diff:      []policy.DiffEntry{{Path: "x.go", Status: policy.Status("modified")}},
+		Applied: policy.Constraints{
+			RequiredOutcomes: []string{"ci_green", "verification_reported"},
+			// Verification nil — no gate evidence in the trace.
+		},
+		Passed:           false,
+		DeferredOutcomes: []string{"ci_green"},
+	})
+	fx.seedCheck("ci_pass", "completed", ptrStr("success"))
+
+	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
+	fx.srv.reevaluateCIPolicy(context.Background(), body)
+
+	got := fx.latestPolicyEvaluatedAppend(t)
+	if got == nil {
+		t.Fatal("expected a new policy_evaluated audit row; got none")
+	}
+	if got.Passed {
+		t.Error("Passed = true, want false (verification_reported unsatisfied)")
+	}
+	if len(got.Violations) != 1 ||
+		!strings.Contains(got.Violations[0].Detail, "no verification evidence in trace") {
+		t.Errorf("Violations = %+v, want the missing-verification-evidence violation", got.Violations)
+	}
 }

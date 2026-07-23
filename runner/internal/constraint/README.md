@@ -57,3 +57,13 @@ The db exemption mirrors CI's coverage exclusion (`scripts/check-coverage.py --e
 ## Lockstep with the backend copy
 
 Both copies (runner `constraint.go` + backend `policy.go`) carry identical `isTestPath`/`diffTouchesTestableCode`/`checkRequiredOutcomes`/`IsGeneratedPath`/`CountedFileCount` logic so the runner's in-line verdict and the backend re-eval agree. Change them together.
+
+## `verification_reported` — backend-authoritative (#1886 / ADR-059)
+
+The workflow-v1.5 `verification_reported` required outcome is **skipped** by this runner-side evaluator: it never emits a violation for it, and specifically not the `default:` branch's `unknown outcome` (which would fail every opted-in run as category-B before the agent's work was even verified).
+
+The reason is ordering, not policy. This in-line check runs on the implement push path **before** both committed-tree verify gates (`runner/cmd/fishhawk-runner/main.go`: the verify-fix loop and the single-shot gate both come later), so no verify result exists locally at check time — there is nothing truthful the runner could assert.
+
+The backend owns the outcome instead: `reEvaluatePolicy` derives a `policy.VerificationSignal` from the uploaded bundle's `gate_evidence` event (verify_summary, else the last non-superseded verify_run) and evaluates fail-closed — absent, `failed`, and `skipped` each violate. See `backend/internal/policy/README.md`.
+
+This is the one deliberate asymmetry with the lockstep rule below; the rest of `checkRequiredOutcomes` stays identical between the two copies.

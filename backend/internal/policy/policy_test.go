@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -433,5 +434,190 @@ func TestStatusConstants(t *testing.T) {
 		if string(s) != want {
 			t.Errorf("Status %q = %q, want %q", s, string(s), want)
 		}
+	}
+}
+
+// TestRequiredOutcomes_VerificationReported covers every enumerated
+// mode of the substance-aware verification_reported outcome (#1886 /
+// ADR-059). It is fail-closed in all three absent-or-negative modes: a
+// nil signal, a failed outcome, and a skipped outcome each violate.
+func TestRequiredOutcomes_VerificationReported(t *testing.T) {
+	cases := []struct {
+		name         string
+		d            Diff
+		sig          *VerificationSignal
+		wantViolate  bool
+		wantContains string
+	}{
+		{
+			name:         "nil signal violates",
+			d:            diff("a.go"),
+			sig:          nil,
+			wantViolate:  true,
+			wantContains: "no verification evidence in trace",
+		},
+		{
+			name:         "failed outcome violates",
+			d:            diff("a.go"),
+			sig:          &VerificationSignal{Outcome: "failed"},
+			wantViolate:  true,
+			wantContains: `"failed"`,
+		},
+		{
+			name: "failed outcome names the failing command",
+			d:    diff("a.go"),
+			sig: &VerificationSignal{
+				Outcome: "failed",
+				Commands: []VerificationCommand{
+					{Command: "scripts/test verify", ExitCode: 1, Outcome: "failed"},
+				},
+			},
+			wantViolate:  true,
+			wantContains: "scripts/test verify",
+		},
+		{
+			// A skipped verify gate is not a passed gate.
+			name:         "skipped outcome violates",
+			d:            diff("a.go"),
+			sig:          &VerificationSignal{Outcome: "skipped"},
+			wantViolate:  true,
+			wantContains: `"skipped"`,
+		},
+		{
+			name:        "passed outcome satisfies",
+			d:           diff("a.go"),
+			sig:         &VerificationSignal{Outcome: "passed"},
+			wantViolate: false,
+		},
+		{
+			// Anti-vacuity: exactly the diff shape that satisfies
+			// tests_added_or_updated must NOT satisfy this outcome.
+			// Fails if the case were wired to diffTouchesTests.
+			name:         "test-named file only, nil signal, still violates",
+			d:            diff("backend/internal/policy/foo_test.go"),
+			sig:          nil,
+			wantViolate:  true,
+			wantContains: "no verification evidence in trace",
+		},
+		{
+			// The docs-only vacuous-satisfaction branch of
+			// tests_added_or_updated is deliberately NOT inherited.
+			name:         "docs-only diff, nil signal, still violates",
+			d:            diff("README.md", "docs/ARCHITECTURE.md"),
+			sig:          nil,
+			wantViolate:  true,
+			wantContains: "no verification evidence in trace",
+		},
+		{
+			name:         "empty outcome string violates",
+			d:            diff("a.go"),
+			sig:          &VerificationSignal{},
+			wantViolate:  true,
+			wantContains: "unknown",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Evaluate(tc.d, Constraints{
+				RequiredOutcomes: []string{"verification_reported"},
+				Verification:     tc.sig,
+			})
+			if !tc.wantViolate {
+				if len(v) != 0 {
+					t.Fatalf("expected no violations, got %+v", v)
+				}
+				return
+			}
+			if len(v) != 1 {
+				t.Fatalf("expected exactly 1 violation, got %+v", v)
+			}
+			if v[0].Constraint != "required_outcomes" {
+				t.Errorf("Constraint = %q, want required_outcomes", v[0].Constraint)
+			}
+			if !strings.Contains(v[0].Detail, tc.wantContains) {
+				t.Errorf("Detail = %q, want it to contain %q", v[0].Detail, tc.wantContains)
+			}
+		})
+	}
+}
+
+// TestRequiredOutcomes_VerificationReported_IndependentOfTestsOutcome
+// asserts the two outcomes evaluate independently when declared
+// together: a test-file diff satisfies tests_added_or_updated while a
+// nil verification signal still violates verification_reported, and a
+// passing signal with a source-only diff leaves exactly the
+// tests_added_or_updated violation.
+func TestRequiredOutcomes_VerificationReported_IndependentOfTestsOutcome(t *testing.T) {
+	both := []string{"tests_added_or_updated", "verification_reported"}
+
+	v := Evaluate(diff("a.go", "a_test.go"), Constraints{RequiredOutcomes: both})
+	if len(v) != 1 || !strings.Contains(v[0].Detail, "no verification evidence") {
+		t.Errorf("test-file diff + nil signal: got %+v, want only the verification violation", v)
+	}
+
+	v = Evaluate(diff("a.go"), Constraints{
+		RequiredOutcomes: both,
+		Verification:     &VerificationSignal{Outcome: "passed"},
+	})
+	if len(v) != 1 || !strings.Contains(v[0].Detail, "no test files") {
+		t.Errorf("source-only diff + passing signal: got %+v, want only the tests violation", v)
+	}
+}
+
+// TestRequiredOutcomes_VerificationReported_NotDeferred pins binding
+// condition 2: the outcome is never deferrable. Deferring it would
+// reconstruct the vacuous pass this outcome exists to remove.
+func TestRequiredOutcomes_VerificationReported_NotDeferred(t *testing.T) {
+	c := Constraints{RequiredOutcomes: []string{"verification_reported", "ci_green"}}
+	got := DeferredRequiredOutcomes(c)
+	if len(got) != 1 || got[0] != "ci_green" {
+		t.Errorf("DeferredRequiredOutcomes = %+v, want only [ci_green]", got)
+	}
+}
+
+// TestConstraints_VerificationRoundTrip pins binding condition 5: the
+// signal must survive the marshal/unmarshal round-trip through the
+// audit payload's applied_constraints, which is what the post-CI policy
+// re-evaluation decodes and re-emits. An untagged or unexported field
+// would drop the signal and flip a satisfied outcome into a violation.
+func TestConstraints_VerificationRoundTrip(t *testing.T) {
+	in := Constraints{
+		RequiredOutcomes: []string{"verification_reported"},
+		Verification: &VerificationSignal{
+			Outcome: "passed",
+			Commands: []VerificationCommand{
+				{Command: "scripts/test verify", ExitCode: 0, Outcome: "passed"},
+			},
+		},
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"verification"`) {
+		t.Fatalf("marshalled constraints = %s, want a `verification` member", raw)
+	}
+	var out Constraints
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Verification == nil || out.Verification.Outcome != "passed" {
+		t.Fatalf("round-tripped Verification = %+v, want outcome passed", out.Verification)
+	}
+	if len(out.Verification.Commands) != 1 || out.Verification.Commands[0].Command != "scripts/test verify" {
+		t.Errorf("round-tripped Commands = %+v", out.Verification.Commands)
+	}
+	// The decoded signal still satisfies the outcome.
+	if v := Evaluate(diff("a.go"), out); len(v) != 0 {
+		t.Errorf("re-evaluation of round-tripped constraints = %+v, want no violations", v)
+	}
+	// omitempty: a nil signal leaves the payload byte-identical to
+	// pre-#1886 entries.
+	bare, err := json.Marshal(Constraints{RequiredOutcomes: []string{"ci_green"}})
+	if err != nil {
+		t.Fatalf("marshal bare: %v", err)
+	}
+	if strings.Contains(string(bare), "verification") {
+		t.Errorf("bare constraints = %s, want no verification member", bare)
 	}
 }

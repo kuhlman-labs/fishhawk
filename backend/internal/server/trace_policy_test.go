@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -178,6 +179,96 @@ func makeTestBundle(t *testing.T, files []map[string]string) []byte {
 	_ = w.Close()
 	return gz.Bytes()
 }
+
+// gateEvidenceSpec describes the runner-shaped `gate_evidence` event a
+// bundle should carry. Nil verifyRuns + nil summary means "emit no
+// gate_evidence event at all" — the no-evidence case.
+type gateEvidenceSpec struct {
+	verifyRuns    []map[string]any
+	verifySummary map[string]any
+}
+
+// makeTestBundleWithGateEvidence extends makeTestBundle with a
+// runner-shaped `gate_evidence` event (#963). The payload is written as
+// raw maps, NOT via bundle.GateEvidence, so the test exercises the
+// actual json tags of the runner↔backend wire contract: a tag drift
+// between the runner's composer and the backend's extractor shows up
+// here as a missing signal rather than silently reading a zero value.
+func makeTestBundleWithGateEvidence(t *testing.T, files []map[string]string, ge *gateEvidenceSpec) []byte {
+	t.Helper()
+	base := makeTestBundle(t, files)
+	if ge == nil {
+		return base
+	}
+
+	// Unpack the gz produced above, append the event, re-pack.
+	zr, err := gzip.NewReader(bytes.NewReader(base))
+	if err != nil {
+		t.Fatalf("gunzip base bundle: %v", err)
+	}
+	raw, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("read base bundle: %v", err)
+	}
+
+	payloadMap := map[string]any{}
+	if ge.verifyRuns != nil {
+		payloadMap["verify_runs"] = ge.verifyRuns
+	}
+	if ge.verifySummary != nil {
+		payloadMap["verify_summary"] = ge.verifySummary
+	}
+	payload, err := json.Marshal(payloadMap)
+	if err != nil {
+		t.Fatalf("marshal gate_evidence payload: %v", err)
+	}
+	line, err := json.Marshal(map[string]any{
+		"seq": 3, "kind": "gate_evidence", "data": json.RawMessage(payload),
+	})
+	if err != nil {
+		t.Fatalf("marshal gate_evidence line: %v", err)
+	}
+	raw = append(raw, line...)
+	raw = append(raw, '\n')
+
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	if _, err := w.Write(raw); err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return gz.Bytes()
+}
+
+// testWorkflowSpecRequireVerification opts the implement stage into the
+// workflow-v1.5 `verification_reported` required outcome (#1886 /
+// ADR-059). Pinned at version "1.5" — the outcome is workflow-v1-only.
+const testWorkflowSpecRequireVerification = `
+version: "1.5"
+roles:
+  eng_team:
+    members: ["@org/eng"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: scripts/test verify
+        constraints:
+          - required_outcomes:
+              - verification_reported
+        gates:
+          - type: approval
+            approvers:
+              any_of: [eng_team]
+            sla: 4_hours
+`
 
 const testWorkflowSpec = `
 version: "0.3"
@@ -641,4 +732,214 @@ func categoryNames(entries []audit.ChainAppendParams) []string {
 // tenant account, matching its pre-promotion effective behavior.
 func (*policyRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
+}
+
+// decodePolicyPayload returns the first appended policy_evaluated
+// audit payload, decoded. Fails the test when none was written.
+func decodePolicyPayload(t *testing.T, au *auditFake) policy.EvaluationPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := range au.appended {
+		if au.appended[i].Category != "policy_evaluated" {
+			continue
+		}
+		var pl policy.EvaluationPayload
+		if err := json.Unmarshal(au.appended[i].Payload, &pl); err != nil {
+			t.Fatalf("decode policy_evaluated payload: %v", err)
+		}
+		return pl
+	}
+	t.Fatalf("expected policy_evaluated audit entry; got %v", categoryNames(au.appended))
+	return policy.EvaluationPayload{}
+}
+
+// TestShipTrace_PolicyReEval_VerificationReported is the CROSS-BOUNDARY
+// end-to-end assertion for #1886 / ADR-059: it drives a real trace
+// upload carrying a runner-shaped `gate_evidence` event through the
+// bundle extractor, the signal derivation in trace.go, and the policy
+// evaluator, and asserts the emitted `policy_evaluated` audit payload.
+// scope.files for this change spans all four layers, so THIS test —
+// not the per-layer units — is what fails if the gate_evidence field
+// names drift between the runner and the backend.
+func TestShipTrace_PolicyReEval_VerificationReported(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+
+	cases := []struct {
+		name            string
+		evidence        *gateEvidenceSpec
+		wantPassed      bool
+		wantOutcome     string // expected applied_constraints.verification.outcome ("" = nil signal)
+		wantViolationIs string
+		wantState       run.StageState
+	}{
+		{
+			name: "verify_summary passed satisfies",
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "passed", "iterations": 1, "max_iterations": 3},
+				verifyRuns: []map[string]any{
+					{"command": "scripts/test verify", "exit_code": 0, "outcome": "passed"},
+				},
+			},
+			wantPassed:  true,
+			wantOutcome: "passed",
+			wantState:   run.StageStateAwaitingApproval,
+		},
+		{
+			name: "verify_summary failed violates",
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "failed", "iterations": 3, "max_iterations": 3},
+				verifyRuns: []map[string]any{
+					{"command": "scripts/test verify", "exit_code": 1, "outcome": "failed"},
+				},
+			},
+			wantPassed:      false,
+			wantOutcome:     "failed",
+			wantViolationIs: "scripts/test verify",
+			wantState:       run.StageStateFailed,
+		},
+		{
+			// A skipped verify gate is not a passed gate.
+			name: "verify_summary skipped violates",
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "skipped"},
+			},
+			wantPassed:      false,
+			wantOutcome:     "skipped",
+			wantViolationIs: `"skipped"`,
+			wantState:       run.StageStateFailed,
+		},
+		{
+			// Superseded case (#1205): the verify-fix loop's first
+			// iteration FAILED and was absorbed, the terminal run
+			// passed, and no summary was emitted. The last
+			// non-superseded run is authoritative → satisfied.
+			name: "superseded failing run then passing terminal run satisfies",
+			evidence: &gateEvidenceSpec{
+				verifyRuns: []map[string]any{
+					{"command": "scripts/test verify", "exit_code": 1, "outcome": "failed", "superseded": true},
+					{"command": "scripts/test verify", "exit_code": 0, "outcome": "passed"},
+				},
+			},
+			wantPassed:  true,
+			wantOutcome: "passed",
+			wantState:   run.StageStateAwaitingApproval,
+		},
+		{
+			// No summary, single-shot committed gate that failed.
+			name: "last verify_run failed violates",
+			evidence: &gateEvidenceSpec{
+				verifyRuns: []map[string]any{
+					{"command": "scripts/test verify", "exit_code": 2, "outcome": "failed"},
+				},
+			},
+			wantPassed:      false,
+			wantOutcome:     "failed",
+			wantViolationIs: "scripts/test verify",
+			wantState:       run.StageStateFailed,
+		},
+		{
+			// No gate_evidence event at all (older runner, or a stage
+			// that ran no gates). Fail-closed: nil signal → violation.
+			name:            "no gate_evidence violates",
+			evidence:        nil,
+			wantPassed:      false,
+			wantOutcome:     "",
+			wantViolationIs: "no verification evidence in trace",
+			wantState:       run.StageStateFailed,
+		},
+		{
+			// gate_evidence present but carrying neither a summary nor
+			// any verify run — nothing to assert on, so still nil.
+			name:            "empty gate_evidence violates",
+			evidence:        &gateEvidenceSpec{},
+			wantPassed:      false,
+			wantOutcome:     "",
+			wantViolationIs: "no verification evidence in trace",
+			wantState:       run.StageStateFailed,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, sf, repo, au := newPolicyTraceServer(t, changed)
+			repo.runRow.WorkflowSpec = []byte(testWorkflowSpecRequireVerification)
+			b := makeTestBundleWithGateEvidence(t, changed, tc.evidence)
+			priv, _ := sf.issue(t, repo.runRow.ID)
+
+			w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+
+			pl := decodePolicyPayload(t, au)
+			if pl.Passed != tc.wantPassed {
+				t.Errorf("Passed = %v, want %v (violations %+v)", pl.Passed, tc.wantPassed, pl.Violations)
+			}
+			if tc.wantOutcome == "" {
+				if pl.Applied.Verification != nil {
+					t.Errorf("Applied.Verification = %+v, want nil", pl.Applied.Verification)
+				}
+			} else {
+				if pl.Applied.Verification == nil {
+					t.Fatalf("Applied.Verification = nil, want outcome %q", tc.wantOutcome)
+				}
+				if pl.Applied.Verification.Outcome != tc.wantOutcome {
+					t.Errorf("Verification.Outcome = %q, want %q",
+						pl.Applied.Verification.Outcome, tc.wantOutcome)
+				}
+			}
+			if tc.wantViolationIs == "" {
+				if len(pl.Violations) != 0 {
+					t.Errorf("Violations = %+v, want none", pl.Violations)
+				}
+			} else {
+				if len(pl.Violations) != 1 {
+					t.Fatalf("Violations = %+v, want exactly 1", pl.Violations)
+				}
+				if pl.Violations[0].Constraint != "required_outcomes" ||
+					!strings.Contains(pl.Violations[0].Detail, tc.wantViolationIs) {
+					t.Errorf("Violation = %+v, want required_outcomes containing %q",
+						pl.Violations[0], tc.wantViolationIs)
+				}
+			}
+			// verification_reported is never deferred.
+			if len(pl.DeferredOutcomes) != 0 {
+				t.Errorf("DeferredOutcomes = %v, want empty", pl.DeferredOutcomes)
+			}
+			if repo.stage.State != tc.wantState {
+				t.Errorf("stage state = %q, want %q", repo.stage.State, tc.wantState)
+			}
+		})
+	}
+}
+
+// TestShipTrace_PolicyReEval_VerificationSignal_NotDerivedWithoutOptIn
+// asserts the derivation is inert for a workflow that did NOT opt in:
+// the signal is still recorded on the audit payload (it is cheap and
+// useful evidence), but it produces no violation and cannot change the
+// verdict of a spec declaring only tests_added_or_updated.
+func TestShipTrace_PolicyReEval_VerificationSignal_NotDerivedWithoutOptIn(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+	s, sf, repo, au := newPolicyTraceServer(t, changed)
+	// testWorkflowSpec declares forbidden_paths + max_files_changed
+	// only — no required_outcomes at all.
+	b := makeTestBundleWithGateEvidence(t, changed, &gateEvidenceSpec{
+		verifySummary: map[string]any{"outcome": "failed"},
+	})
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	pl := decodePolicyPayload(t, au)
+	if !pl.Passed || len(pl.Violations) != 0 {
+		t.Errorf("Passed = %v violations = %+v, want a clean pass (outcome not declared)",
+			pl.Passed, pl.Violations)
+	}
+	if repo.stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+	}
 }
