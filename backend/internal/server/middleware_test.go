@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
@@ -547,5 +548,135 @@ func TestLogging_EmitsStructuredEvent(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("log missing %s:\n%s", want, out)
 		}
+	}
+}
+
+// --- Repo-scoped visibility in the account middleware (#2071) ---
+
+// runAccessRequest builds a run-scoped request carrying id, as the
+// requireRunAccount wrapper sees it after routing.
+func runAccessRequest(runID uuid.UUID, id Identity) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String(), nil)
+	req.SetPathValue("run_id", runID.String())
+	return withIdentity(req, id)
+}
+
+// visibilityRunServer wires a run repo holding one run on repo, plus a mirror
+// and a role, so the tiered middleware can be driven end to end.
+func visibilityRunServer(t *testing.T, repo string, vis RepoVisibility, role string) (*Server, *run.Run) {
+	t.Helper()
+	fr := newFakeRepo()
+	rn := &run.Run{ID: uuid.New(), Repo: repo, WorkflowID: "feature_change",
+		State: run.StatePending, CreatedAt: time.Now().UTC()}
+	fr.runs[rn.ID] = rn
+	srv := New(Config{Addr: "127.0.0.1:0", RunRepo: fr,
+		AccountRoles: fakeAccountRoles{role: role}, RepoVisibility: vis})
+	return srv, rn
+}
+
+// TestEnforceAccount_RepoVisibility drives the CENTRAL point-read check every
+// run/stage/concern-scoped wrapper inherits: a non-visible repo 403s
+// repo_forbidden, a visible one passes, a store fault 503s, and the admin
+// bypass (mode f) clears a repo the member could not see.
+func TestEnforceAccount_RepoVisibility(t *testing.T) {
+	cases := []struct {
+		name       string
+		vis        *fakeRepoVisibility
+		role       string
+		wantStatus int
+		wantCode   string
+		wantNext   bool
+	}{
+		{name: "visible repo reaches the handler",
+			vis:  newFakeRepoVisibility(map[string]bool{"acme/app": true}),
+			role: account.RoleMember, wantStatus: http.StatusOK, wantNext: true},
+		{name: "non-visible repo 403 repo_forbidden",
+			vis: newFakeRepoVisibility(map[string]bool{}), role: account.RoleMember,
+			wantStatus: http.StatusForbidden, wantCode: "repo_forbidden"},
+		{name: "mode h: mirror store fault 503",
+			vis:        &fakeRepoVisibility{visible: map[string]bool{}, err: fmt.Errorf("db down")},
+			role:       account.RoleMember,
+			wantStatus: http.StatusServiceUnavailable, wantCode: "service_unavailable"},
+		{name: "mode f: admin bypasses an invisible repo",
+			vis: newFakeRepoVisibility(map[string]bool{}), role: account.RoleAdmin,
+			wantStatus: http.StatusOK, wantNext: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, rn := visibilityRunServer(t, "acme/app", tc.vis, tc.role)
+			reached := false
+			h := srv.requireRunAccount(readAccess, func(w http.ResponseWriter, _ *http.Request) {
+				reached = true
+				w.WriteHeader(http.StatusOK)
+			})
+			rec := httptest.NewRecorder()
+			h(rec, runAccessRequest(rn.ID, memberIdentity()))
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if reached != tc.wantNext {
+				t.Fatalf("handler reached = %v, want %v", reached, tc.wantNext)
+			}
+			if tc.wantCode != "" {
+				assertErrorCode(t, rec, tc.wantCode)
+			}
+		})
+	}
+}
+
+// TestEnforceAccount_RepoVisibility_WriteTier pins that the check runs BEFORE
+// the tier branch, so a write tier inherits it rather than reaching the
+// handler for a repo the caller cannot even read.
+func TestEnforceAccount_RepoVisibility_WriteTier(t *testing.T) {
+	srv, rn := visibilityRunServer(t, "acme/app",
+		newFakeRepoVisibility(map[string]bool{}), account.RoleMember)
+	reached := false
+	h := srv.requireRunAccount(memberWrite, func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	h(rec, runAccessRequest(rn.ID, memberIdentity()))
+	if rec.Code != http.StatusForbidden || reached {
+		t.Fatalf("status = %d reached = %v, want 403 / false; body %s",
+			rec.Code, reached, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "repo_forbidden")
+}
+
+// TestEnforceAccount_RepoVisibility_BearerUnfiltered is failure mode (i): a
+// bearer identity is bounded by ownership alone and never repo-filtered.
+func TestEnforceAccount_RepoVisibility_BearerUnfiltered(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{})
+	srv, rn := visibilityRunServer(t, "acme/app", vis, account.RoleMember)
+	reached := false
+	h := srv.requireRunAccount(readAccess, func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	h(rec, runAccessRequest(rn.ID, Identity{Subject: "svc:ci", TokenID: "tok-1"}))
+	if rec.Code != http.StatusOK || !reached {
+		t.Fatalf("status = %d reached = %v, want 200 / true; body %s",
+			rec.Code, reached, rec.Body.String())
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror consulted %d times for a bearer identity, want 0", vis.callCount())
+	}
+}
+
+// TestEnforceAccount_NoMirror_Unchanged is failure mode (g): with no mirror
+// wired the middleware behaves exactly as it did pre-#2071.
+func TestEnforceAccount_NoMirror_Unchanged(t *testing.T) {
+	srv, rn := visibilityRunServer(t, "acme/app", nil, account.RoleMember)
+	reached := false
+	h := srv.requireRunAccount(readAccess, func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	})
+	rec := httptest.NewRecorder()
+	h(rec, runAccessRequest(rn.ID, memberIdentity()))
+	if rec.Code != http.StatusOK || !reached {
+		t.Fatalf("status = %d reached = %v, want 200 / true", rec.Code, reached)
 	}
 }

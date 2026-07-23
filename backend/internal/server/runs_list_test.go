@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -267,5 +268,181 @@ func TestListRuns_RunnerKindFilter_RejectsUnknown(t *testing.T) {
 	s.Handler().ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+// --- Repo-scoped list filtering (#2071) ---
+
+// listRunsVisible drives GET /v0/runs through the handler with a filtered
+// cookie identity and returns the decoded page.
+func listRunsVisible(t *testing.T, s *Server, query string) (repos []string, nextCursor string, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v0/runs"+query, nil), memberIdentity())
+	rec = httptest.NewRecorder()
+	s.handleListRuns(rec, req)
+	if rec.Code != http.StatusOK {
+		return nil, "", rec
+	}
+	var got struct {
+		Items      []runResponse `json:"items"`
+		NextCursor string        `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, it := range got.Items {
+		repos = append(repos, it.Repo)
+	}
+	return repos, got.NextCursor, rec
+}
+
+func visibilityListServer(repo *fakeRepo, vis RepoVisibility, role string) *Server {
+	return New(Config{Addr: "127.0.0.1:0", RunRepo: repo,
+		AccountRoles: fakeAccountRoles{role: role}, RepoVisibility: vis})
+}
+
+// TestListRuns_RepoVisibilityFiltersPage covers the member (filtered) view,
+// the admin bypass (mode f), and the no-mirror posture (mode g).
+func TestListRuns_RepoVisibilityFiltersPage(t *testing.T) {
+	t0 := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	newRepo := func() *fakeRepo {
+		fr := newFakeRepo()
+		seedRun(fr, "acme/app", "feature_change", run.StatePending, t0)
+		seedRun(fr, "other/secret", "feature_change", run.StatePending, t0.Add(time.Second))
+		return fr
+	}
+	visible := map[string]bool{"acme/app": true}
+
+	t.Run("member sees only the repos they can read", func(t *testing.T) {
+		s := visibilityListServer(newRepo(), newFakeRepoVisibility(visible), account.RoleMember)
+		repos, _, rec := listRunsVisible(t, s, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		if len(repos) != 1 || repos[0] != "acme/app" {
+			t.Fatalf("repos = %v, want [acme/app]", repos)
+		}
+	})
+
+	t.Run("mode f: admin sees every repo", func(t *testing.T) {
+		s := visibilityListServer(newRepo(), newFakeRepoVisibility(visible), account.RoleAdmin)
+		repos, _, _ := listRunsVisible(t, s, "")
+		if len(repos) != 2 {
+			t.Fatalf("repos = %v, want both", repos)
+		}
+	})
+
+	t.Run("mode g: no mirror wired lists everything", func(t *testing.T) {
+		s := visibilityListServer(newRepo(), nil, account.RoleMember)
+		repos, _, _ := listRunsVisible(t, s, "")
+		if len(repos) != 2 {
+			t.Fatalf("repos = %v, want both", repos)
+		}
+	})
+
+	t.Run("mode h: mirror store fault 503s the page", func(t *testing.T) {
+		vis := &fakeRepoVisibility{visible: map[string]bool{}, err: errors.New("db down")}
+		s := visibilityListServer(newRepo(), vis, account.RoleMember)
+		_, _, rec := listRunsVisible(t, s, "")
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body %s", rec.Code, rec.Body.String())
+		}
+		assertErrorCode(t, rec, "service_unavailable")
+	})
+
+	t.Run("mode e: cross-forge rows are denied with no forge call", func(t *testing.T) {
+		fr := newFakeRepo()
+		seedRun(fr, "acme/app", "feature_change", run.StatePending, t0)
+		seedRun(fr, "gl-group/app", "feature_change", run.StatePending, t0.Add(time.Second))
+		vis := newFakeRepoVisibility(map[string]bool{"acme/app": true, "gl-group/app": true})
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: fr,
+			AccountRoles:   fakeAccountRoles{role: account.RoleMember},
+			RepoVisibility: vis,
+			RepoProviders:  mapProviderResolver{"acme/app": "github", "gl-group/app": "gitlab"}})
+		repos, _, _ := listRunsVisible(t, s, "")
+		if len(repos) != 1 || repos[0] != "acme/app" {
+			t.Fatalf("repos = %v, want [acme/app] — the gitlab row is cross-forge", repos)
+		}
+		for _, c := range vis.calls {
+			if strings.Contains(c, "gl-group/app") {
+				t.Fatalf("mirror consulted for a cross-forge repo: %v", vis.calls)
+			}
+		}
+	})
+}
+
+// TestListRuns_RepoVisibilityShortPagesFollowCursor pins the accepted
+// pagination artifact: because the offset cursor counts PRE-filter rows, a
+// filtered page can come back shorter than `limit` with next_cursor still set.
+// Following the cursor to exhaustion must still yield every visible run
+// exactly once — the property clients actually depend on.
+func TestListRuns_RepoVisibilityShortPagesFollowCursor(t *testing.T) {
+	fr := newFakeRepo()
+	t0 := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	wantVisible := map[string]bool{}
+	// Interleave visible and invisible repos so most pages are short.
+	for i := 0; i < 10; i++ {
+		repoName := "other/secret"
+		if i%2 == 0 {
+			repoName = "acme/app"
+		}
+		r := seedRun(fr, repoName, "feature_change", run.StatePending, t0.Add(time.Duration(i)*time.Second))
+		if repoName == "acme/app" {
+			wantVisible[r.ID.String()] = true
+		}
+	}
+	s := visibilityListServer(fr, newFakeRepoVisibility(map[string]bool{"acme/app": true}), account.RoleMember)
+
+	seen := map[string]int{}
+	cursor := ""
+	sawShortPage := false
+	for pages := 0; pages < 20; pages++ {
+		q := "?limit=2"
+		if cursor != "" {
+			q += "&cursor=" + cursor
+		}
+		req := withIdentity(httptest.NewRequest(http.MethodGet, "/v0/runs"+q, nil), memberIdentity())
+		rec := httptest.NewRecorder()
+		s.handleListRuns(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var got struct {
+			Items      []runResponse `json:"items"`
+			NextCursor string        `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Items) < 2 && got.NextCursor != "" {
+			sawShortPage = true
+		}
+		for _, it := range got.Items {
+			if it.Repo != "acme/app" {
+				t.Fatalf("page leaked a non-visible repo: %s", it.Repo)
+			}
+			seen[it.ID.String()]++
+		}
+		cursor = got.NextCursor
+		if cursor == "" {
+			break
+		}
+	}
+	if cursor != "" {
+		t.Fatal("cursor never exhausted")
+	}
+	if !sawShortPage {
+		t.Error("expected at least one short page with a non-empty next_cursor")
+	}
+	if len(seen) != len(wantVisible) {
+		t.Fatalf("saw %d distinct visible runs, want %d", len(seen), len(wantVisible))
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("run %s returned %d times, want exactly 1", id, n)
+		}
+		if !wantVisible[id] {
+			t.Errorf("run %s should not be visible", id)
+		}
 	}
 }
