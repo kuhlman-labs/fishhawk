@@ -201,6 +201,15 @@ func TestAuthorizeConventionsDestination(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// The empty-family guard: without it, jira's ""-family sentinel would
+			// equal an empty accountProvider and an empty destination key would
+			// EqualFold an empty account key, authorizing a jira destination with
+			// no allow-list entry.
+			name:            "jira destination with an empty account provider stays refused",
+			accountProvider: "", repo: "/widgets", conv: jiraDest(""),
+			wantErr: true,
+		},
+		{
 			name:            "jira with a nil connection block fails closed",
 			accountProvider: "github", repo: "acme/widgets",
 			conv:    workmgmt.Conventions{Provider: "jira"},

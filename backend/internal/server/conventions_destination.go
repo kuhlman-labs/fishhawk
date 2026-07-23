@@ -151,7 +151,12 @@ func authorizeConventionsDestination(accountProvider, repo string, conv workmgmt
 	if _, ok := allow[destinationAllowKey(accountKey, destProvider, destKey)]; ok {
 		return nil
 	}
-	if destinationForgeFamily(destProvider) == accountProvider && strings.EqualFold(destKey, accountKey) {
+	// A destination provider with NO forge family (jira, and anything unmapped)
+	// can never satisfy the family match — the empty-string sentinel must not
+	// become a match against an empty accountProvider. Unreachable from today's
+	// sole call site, but this function is the package's reusable policy
+	// primitive and its contract must hold for any future caller.
+	if family := destinationForgeFamily(destProvider); family != "" && family == accountProvider && strings.EqualFold(destKey, accountKey) {
 		return nil
 	}
 	return fmt.Errorf(
