@@ -197,7 +197,8 @@ func ChangedLines(ctx context.Context, git GitRunner, baseRef string) (ChangedFi
 //     control character, or non-ASCII byte) is decoded, so a
 //     non-ASCII-named file is attributed to its real name rather than to
 //     a literal `"src/caf\303\251.go"` key that could never match a
-//     coverage report entry.
+//     coverage report entry. git quotes the whole `b/<path>` token, so
+//     the decode runs BEFORE the `b/` strip.
 func ParseUnifiedDiff(diff string) (ChangedFiles, error) {
 	out := ChangedFiles{}
 	current := ""
@@ -215,11 +216,21 @@ func ParseUnifiedDiff(diff string) (ChangedFiles, error) {
 				current = ""
 				continue
 			}
-			p, err := decodeDiffPath(strings.TrimPrefix(target, "b/"))
+			// DECODE BEFORE stripping the "b/" prefix: git quotes the
+			// WHOLE token, emitting `+++ "b/caf\303\251.go"` — the opening
+			// quote sits OUTSIDE the prefix. Stripping first would find no
+			// "b/" to strip (the token starts with `"`), and the decode
+			// would then yield the key "b/café.go", which matches no
+			// coverage-report path. That file would fall out of the
+			// DENOMINATOR entirely (Measure excludes files the report never
+			// mentions), so a fully covered non-ASCII-named file measures
+			// zero new lines — a silent vacuous PASS rather than a visible
+			// failure.
+			p, err := decodeDiffPath(target)
 			if err != nil {
 				return nil, err
 			}
-			current = p
+			current = strings.TrimPrefix(p, "b/")
 			if _, ok := out[current]; !ok {
 				out[current] = map[int]bool{}
 			}

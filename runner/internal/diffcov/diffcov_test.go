@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
@@ -59,8 +62,11 @@ func TestParseUnifiedDiffHunkShapes(t *testing.T) {
 			want: ChangedFiles{"src/my file.go": lines(3)},
 		},
 		{
+			// The shape git ACTUALLY emits: the quotes wrap the whole
+			// `b/<path>` token, so the decode must precede the `b/` strip.
+			// Verified against `git diff -U0` on a real non-ASCII-named file.
 			name: "C-quoted non-ASCII path is decoded",
-			diff: "--- a/x\n+++ b/\"src/caf\\303\\251.go\"\n@@ -0,0 +1 @@\n+x\n",
+			diff: "--- \"a/src/caf\\303\\251.go\"\n+++ \"b/src/caf\\303\\251.go\"\n@@ -0,0 +1 @@\n+x\n",
 			want: ChangedFiles{"src/café.go": lines(1)},
 		},
 		{
@@ -100,7 +106,10 @@ func TestParseUnifiedDiffMalformedHeaders(t *testing.T) {
 	}{
 		{"non-numeric start", "+++ b/a.go\n@@ -0,0 +xx,2 @@\n", "non-numeric start"},
 		{"non-numeric count", "+++ b/a.go\n@@ -0,0 +1,zz @@\n", "non-numeric count"},
-		{"dangling path escape", "+++ b/\"a\\\"\n", "dangling escape"},
+		// Quotes wrap the whole `b/<path>` token, as git writes them.
+		{"dangling path escape", "+++ \"b/a\\\"\n", "dangling escape"},
+		{"truncated octal escape", "+++ \"b/a\\30\"\n", "truncated octal escape"},
+		{"invalid octal escape", "+++ \"b/a\\3z9\"\n", "invalid escape"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -388,6 +397,126 @@ func TestMeasureNormalizesBothSides(t *testing.T) {
 				t.Errorf("unnormalizable = %v, want none", res.UnnormalizablePaths)
 			}
 		})
+	}
+}
+
+// TestMeasureIntersectsDecodedCQuotedDiffPaths joins the two halves that
+// were each covered alone but never together: ParseUnifiedDiff DECODES a
+// C-quoted path (git quotes any path carrying a quote, backslash, control
+// character, or non-ASCII byte) and Measure must then intersect it with the
+// coverage report's plain repo-relative spelling of the SAME file.
+//
+// Testing the decode in isolation cannot catch this. If the decoded key and
+// the report key disagree — because the decode were dropped, or the two
+// sides normalized differently — the file falls out of the DENOMINATOR
+// entirely (Measure excludes files the report never mentions), so a fully
+// covered non-ASCII-named file reports 0 new lines: a vacuous PASS, not a
+// visible failure. That is the silent-no-op shape this constraint exists to
+// eliminate, so it is pinned end to end through both parsers.
+func TestMeasureIntersectsDecodedCQuotedDiffPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		quoted  string // exactly as git writes it in the `+++ b/` header
+		decoded string // the real bytes, as the coverage report spells them
+	}{
+		{"non-ASCII", `"b/src/caf\303\251.go"`, "src/café.go"},
+		{"embedded quote", `"b/src/a\"b.go"`, `src/a"b.go`},
+		{"embedded backslash", `"b/src/a\\b.go"`, `src/a\b.go`},
+		{"embedded tab", `"b/src/a\tb.go"`, "src/a\tb.go"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed, err := ParseUnifiedDiff(
+				"--- a/x\n+++ " + tc.quoted + "\n@@ -0,0 +1,2 @@\n+a\n+b\n")
+			if err != nil {
+				t.Fatalf("ParseUnifiedDiff: %v", err)
+			}
+			if _, ok := changed[tc.decoded]; !ok {
+				t.Fatalf("changed keys = %v, want the decoded path %q", changed, tc.decoded)
+			}
+			// The report names the file by its real bytes — no producer
+			// emits git's C-quoted form.
+			res := Measure("/build/repo", changed,
+				Coverage{tc.decoded: FileCoverage{1: 1, 2: 0}})
+			if res.NewLines != 2 || res.CoveredNewLines != 1 {
+				t.Fatalf("covered/total = %d/%d, want 1/2 — the decoded diff path did not intersect the report path (0/0 would be a vacuous pass)",
+					res.CoveredNewLines, res.NewLines)
+			}
+			if len(res.UnnormalizablePaths) != 0 {
+				t.Errorf("unnormalizable = %v, want none", res.UnnormalizablePaths)
+			}
+		})
+	}
+}
+
+// TestChangedLinesDecodesRealGitQuotingAndIntersects is the same pin driven
+// through REAL git rather than a hand-written fixture — the fixture encodes
+// whatever shape its author assumed, and the shape is exactly what was wrong:
+// git quotes the WHOLE `b/<path>` token (`+++ "b/caf\303\251.go"`), not the
+// path inside an unquoted `b/` prefix.
+//
+// Both a TRACKED and an UNTRACKED non-ASCII file are exercised, because they
+// reach ParseUnifiedDiff by different routes (the merge-base diff and the
+// `--no-index` untracked sweep) and a decode fix that missed either would
+// leave that route's files silently out of the denominator.
+func TestChangedLinesDecodesRealGitQuotingAndIntersects(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "-q", "--initial-branch=main")
+	runGit("config", "user.name", "t")
+	runGit("config", "user.email", "t@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "base.go"), []byte("package p\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "-A")
+	runGit("commit", "-qm", "base", "--no-verify")
+
+	const tracked = "café.go"   // staged → reaches the merge-base diff
+	const untracked = "naïf.go" // never added → reaches the untracked sweep
+	for _, n := range []string{tracked, untracked} {
+		if err := os.WriteFile(filepath.Join(repo, n), []byte("a\nb\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runGit("add", "--", tracked)
+
+	changed, err := ChangedLines(context.Background(), ExecGit(repo), "main")
+	if err != nil {
+		t.Fatalf("ChangedLines: %v", err)
+	}
+	for _, n := range []string{tracked, untracked} {
+		if _, ok := changed[n]; !ok {
+			t.Fatalf("changed keys = %v, want the DECODED name %q — git's C-quoted header was not decoded back to the real path",
+				changed, n)
+		}
+	}
+
+	// The coverage report names both files by their real bytes, as producers
+	// do. A key mismatch drops them from the denominator entirely, so a fully
+	// covered file would measure 0 new lines — a vacuous PASS, not a failure.
+	res := Measure(repo, changed, Coverage{
+		tracked:   FileCoverage{1: 1, 2: 1},
+		untracked: FileCoverage{1: 1, 2: 0},
+	})
+	if res.NewLines != 4 || res.CoveredNewLines != 3 {
+		t.Fatalf("covered/total = %d/%d, want 3/4 — the decoded diff paths did not intersect the report paths",
+			res.CoveredNewLines, res.NewLines)
+	}
+	if len(res.UncoveredFiles) != 1 || res.UncoveredFiles[0] != untracked {
+		t.Errorf("UncoveredFiles = %v, want [%s] reported by its real name", res.UncoveredFiles, untracked)
+	}
+	if len(res.UnnormalizablePaths) != 0 {
+		t.Errorf("unnormalizable = %v, want none", res.UnnormalizablePaths)
 	}
 }
 

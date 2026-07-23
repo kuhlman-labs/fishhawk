@@ -153,7 +153,11 @@ Materializing that tree reuses the #651 scaffolding — `StageScoped` +
 `runVerifyGateCommitted`, a failed undo is **fatal**, not a measurement
 failure: HEAD left on the throwaway commit would make the real commit stack
 on top and push a WIP commit into the PR. `runDiffCoverageGate` returns it
-as an error and the call site demotes the stage category-B. Both cleanup
+as an error and the call site demotes the stage category-B
+(`TestRunDiffCoverageGate_PostCommitResetFailureFatal` provokes the branch
+by having the coverage command plant the branch's ref lock, and asserts HEAD
+is left on the throwaway commit — which is precisely why the error must
+reach the call site). Both cleanup
 commands (worktree removal, `reset --soft`) run on a **bounded context
 detached from `ctx`'s cancellation** — a wedged coverage command is killed
 by cancelling `ctx`, and the undo must still happen.
@@ -186,3 +190,12 @@ and what was measured. `composeGateEvidence` pre-redacts the reason and
 caps `uncovered_files` at `diffCoverageMaxUncovered`, like every sibling
 field. The measurement itself lives in
 [`runner/internal/diffcov`](../../internal/diffcov/README.md).
+
+**`run()`-level wiring is pinned end to end.** A mis-threaded position in
+`fetchPromptToFile`'s return tuple or a wrong stage-type string compiles
+fine and silently emits NOTHING — the absent-signal false RED the rest of
+the design works to avoid. `TestRun_DiffCoverage_EmitsEventFromFetchedPrompt`
+drives a fetched prompt carrying the config through `run()` to a
+`diff_coverage` event in the uploaded bundle, and
+`TestRun_NoDiffCoverage_EmitsNoEvent` pins the other half: a stage with no
+declared constraint runs no command and emits no event.

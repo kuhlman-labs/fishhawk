@@ -94,9 +94,19 @@ under `--no-index`. Only status ≥ 2 is a real failure.
 | `--- /dev/null` | New file: its lines are added normally |
 
 Paths containing spaces survive (the `b/` prefix is stripped positionally);
-C-quoted paths (`"src/caf\303\251.go"`) are decoded, so a non-ASCII-named
-file is attributed to its real name rather than to a literal key that could
-never match a coverage report entry.
+C-quoted paths are decoded, so a non-ASCII-named file is attributed to its
+real name rather than to a literal key that could never match a coverage
+report entry.
+
+**The decode runs BEFORE the `b/` strip**, because git quotes the *whole*
+token — the header reads `+++ "b/caf\303\251.go"`, with the opening quote
+*outside* the prefix. Stripping first finds no `b/` to remove and yields the
+key `b/café.go`, which matches no report path; the file then falls out of
+the **denominator** (`Measure` excludes files the report never mentions), so
+a fully covered file measures zero new lines — a silent vacuous PASS rather
+than a visible failure. `TestChangedLinesDecodesRealGitQuotingAndIntersects`
+pins the header shape against real git (tracked *and* untracked, which reach
+the parser by different routes) rather than a hand-written fixture.
 
 ## LCOV parsing (`ParseLCOV`)
 
@@ -117,7 +127,11 @@ lcov's semantics for a file measured across several test binaries.
 Malformed input returns an error wrapping `ErrParse`, never a partially
 filled map. A truncated record, a non-numeric line number or hit count, a
 `DA` outside any `SF`, and a report with zero `SF` records are each a report
-the producer did not finish writing. Treating one as "nothing covered" would
+the producer did not finish writing. A record is truncated whether it runs
+off the end of the file **or** is cut short by a nested `SF:` that opens a
+new record without an intervening `end_of_record` — the mid-file case fails
+closed for the same reason as the end-of-file one, rather than keeping the
+first record's partial line set as if it were complete. Treating one as "nothing covered" would
 fail an opted-in run with a false RED — the worst failure mode for an
 opt-in gate.
 

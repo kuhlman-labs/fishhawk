@@ -16079,7 +16079,9 @@ func diffCovCfg() config {
 }
 
 // runDiffCov runs the gate and fails the test on the FATAL error return
-// (an undone-throwaway-commit failure), which no test in this file provokes.
+// (an undone-throwaway-commit failure). Tests that deliberately provoke it
+// call runDiffCoverageGate directly — see
+// TestRunDiffCoverageGate_PostCommitResetFailureFatal.
 func runDiffCov(t *testing.T, ctx context.Context, cfg config, dc *upload.DiffCoverageConfig, repo, baseRef string) diffCoverageEvidence {
 	t.Helper()
 	ev, fatal := runDiffCoverageGate(ctx, cfg, dc, repo, baseRef)
@@ -16471,5 +16473,141 @@ func TestRunDiffCoverageGate_OmittedBaseRefEndToEnd(t *testing.T) {
 	}
 	if got.NewLines != 2 || got.CoveredNewLines != 2 {
 		t.Errorf("covered/total = %d/%d, want 2/2", got.CoveredNewLines, got.NewLines)
+	}
+}
+
+// TestRunDiffCoverageGate_PostCommitResetFailureFatal pins the FATAL branch:
+// once the throwaway commit exists, a gitResetSoftHEAD1 failure leaves HEAD on
+// that WIP commit, where openPRAndShipArtifact's real commit would stack on
+// top of it and push it into the customer's PR. It must therefore be returned
+// as the error (not folded into the evidence), exactly as it is in
+// runVerifyGateCommitted (#802), whose scaffolding this reuses.
+//
+// The failure is forced by having the coverage command plant the branch's ref
+// lock, which is what `reset --soft` needs to move HEAD. That is a legitimate
+// provocation rather than a contrivance: the same "Another git process seems
+// to be running" state arises from a crashed or concurrent git in the real
+// checkout.
+func TestRunDiffCoverageGate_PostCommitResetFailureFatal(t *testing.T) {
+	repo := diffCovRepo(t)
+	headBefore := gitHead(t, repo)
+
+	lock := filepath.Join(repo, ".git", "refs", "heads", "main.lock")
+	t.Cleanup(func() { _ = os.Remove(lock) })
+	dc := &upload.DiffCoverageConfig{
+		// The measurement itself SUCCEEDS; only the undo fails, so the test
+		// discriminates the fatal undo from a measurement failure.
+		Command: `printf 'SF:app.go\nDA:1,1\nDA:3,1\nend_of_record\n' > coverage.lcov; ` +
+			"touch " + lock,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	ev, fatal := runDiffCoverageGate(context.Background(), diffCovCfg(), dc, repo, "main")
+	if fatal == nil {
+		t.Fatal("a post-commit reset failure must be FATAL (returned error), not swallowed into the evidence")
+	}
+	// HEAD is still on the throwaway commit — which is precisely why the
+	// error must reach the call site and demote the stage.
+	if after := gitHead(t, repo); after == headBefore {
+		t.Fatalf("HEAD = %s (unmoved); the test did not reach the post-commit state it means to pin", after)
+	}
+	// The event is still emitted: the measurement ran, and an absent signal
+	// would read to the backend as a violation for the wrong reason.
+	got := decodeDiffCovEvent(t, ev)
+	if got.Outcome != "measured" {
+		t.Errorf("outcome = %q reason = %q, want the completed measurement to still be reported", got.Outcome, got.Reason)
+	}
+}
+
+// TestRun_DiffCoverage_EmitsEventFromFetchedPrompt is the run()-level seam the
+// per-function tests above all bypass: a fetched prompt carrying the constraint
+// must thread through fetchPromptToFile's return tuple, satisfy the
+// `stageType == "implement"` gate, and land a diff_coverage event in the
+// uploaded bundle. A mis-threaded tuple position or a wrong stage-type string
+// here compiles fine and silently emits NOTHING — the absent-signal false RED
+// the whole design works to avoid.
+func TestRun_DiffCoverage_EmitsEventFromFetchedPrompt(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+
+	withFakeInvoker(t, &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+	})
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    verifyFixStageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+		ScopeFiles: []upload.ScopeFile{{Path: "mod/reg.go", Operation: "modify"}},
+		DiffCoverage: &upload.DiffCoverageConfig{
+			// mod/reg.go's added lines 1 and 3 are the coverable ones.
+			Command:            `printf 'SF:mod/reg.go\nDA:1,1\nDA:3,0\nend_of_record\n' > coverage.lcov`,
+			ReportPath:         "coverage.lcov",
+			MinNewLineCoverage: 80,
+			BaseRef:            "main",
+		},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	var payload string
+	for _, ev := range readBundleEvents(t, bundlePath) {
+		if ev.Kind == "diff_coverage" {
+			payload = string(ev.Data)
+		}
+	}
+	if payload == "" {
+		t.Fatal("no diff_coverage event in the bundle — the constraint did not thread from the fetched prompt through run()")
+	}
+	if !strings.Contains(payload, `"outcome":"measured"`) {
+		t.Errorf("diff_coverage event did not measure: %s", payload)
+	}
+	if !strings.Contains(payload, `"new_lines"`) {
+		t.Errorf("diff_coverage event carries no measurement: %s", payload)
+	}
+}
+
+// TestRun_NoDiffCoverage_EmitsNoEvent is the other half of the same seam: a
+// stage whose prompt declares no constraint runs no coverage command and emits
+// no event, so the runner is byte-identical to a pre-#1888 one for every
+// workflow that did not opt in.
+func TestRun_NoDiffCoverage_EmitsNoEvent(t *testing.T) {
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+
+	withFakeInvoker(t, &fakeInvoker{
+		mirrorWorkingTreeFrom: repo,
+		canned:                agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}},
+	})
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    verifyFixStageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+		ScopeFiles: []upload.ScopeFile{{Path: "mod/reg.go", Operation: "modify"}},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	for _, ev := range readBundleEvents(t, bundlePath) {
+		if ev.Kind == "diff_coverage" {
+			t.Fatalf("a stage with no declared constraint emitted a diff_coverage event: %s", ev.Data)
+		}
 	}
 }

@@ -81,6 +81,15 @@ func TestParseLCOVMalformed(t *testing.T) {
 		{"non-positive line number", "SF:a.go\nDA:0,1\nend_of_record\n", "not positive"},
 		{"negative hit count", "SF:a.go\nDA:1,-4\nend_of_record\n", "negative"},
 		{"DA outside any SF", "DA:1,1\n", "outside any SF"},
+		// A NESTED SF: truncates the record it interrupts exactly as a
+		// run-off-the-end does; it must fail closed for the same reason,
+		// rather than letting a partial first record be evaluated as a
+		// successful measurement.
+		{"nested SF without end_of_record", "SF:a.go\nDA:1,1\nSF:b.go\nDA:2,1\nend_of_record\n", "still open"},
+		// The nested-SF guard must not misfire on a record RE-opened after a
+		// proper close (TestParseLCOVRepeatedDASums pins the happy shape);
+		// here the second SF is nested inside the third, un-closed record.
+		{"nested SF after a closed record", "SF:a.go\nDA:1,1\nend_of_record\nSF:b.go\nSF:c.go\nend_of_record\n", "still open"},
 		{"empty SF path", "SF:\nend_of_record\n", "empty SF path"},
 		{"empty file", "", "no SF records"},
 		{"records but no SF", "TN:\nLF:0\n", "no SF records"},

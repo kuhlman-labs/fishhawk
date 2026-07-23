@@ -37,10 +37,12 @@ type Coverage map[string]FileCoverage
 // documented in the lcov/geninfo tracefile reference.
 //
 // Malformed input returns an error wrapping ErrParse rather than a
-// partially-filled map: a truncated record, a non-numeric line number or
-// hit count, and a DA line outside any SF record are each a report the
-// producer did not finish writing, and treating one as "nothing covered"
-// would fail an opted-in run with a false RED.
+// partially-filled map: a truncated record (whether it runs off the end of
+// the file or is cut short by a NESTED SF: that opens a new record without
+// closing the previous one), a non-numeric line number or hit count, and a
+// DA line outside any SF record are each a report the producer did not
+// finish writing, and treating one as "nothing covered" would fail an
+// opted-in run with a false RED.
 //
 // An empty report (no SF records at all) is likewise an error: a coverage
 // tool that wrote a zero-record file did not measure anything, which is a
@@ -66,6 +68,18 @@ func ParseLCOV(r io.Reader) (Coverage, error) {
 		}
 		switch {
 		case strings.HasPrefix(line, "SF:"):
+			if current != "" {
+				// A NESTED SF: the previous record was never closed. This is
+				// the same truncation the end-of-input check below catches,
+				// just in the middle of the file — a producer that died
+				// mid-record and then restarted, or two reports concatenated
+				// with one of them cut short. Accepting it would attribute
+				// the second record's DA lines correctly but silently keep
+				// the first record's PARTIAL line set as if it were complete,
+				// which is a measurement failure dressed up as a measurement.
+				return nil, fmt.Errorf("%w: SF record at line %d opens while the record for %q is still open (no end_of_record)",
+					ErrParse, lineNo, current)
+			}
 			path := strings.TrimSpace(strings.TrimPrefix(line, "SF:"))
 			if path == "" {
 				return nil, fmt.Errorf("%w: empty SF path at line %d", ErrParse, lineNo)
