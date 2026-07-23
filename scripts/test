@@ -195,10 +195,20 @@ EXIT_TRAP='_patchcov_cleanup; if [ "${LEASE_ARMED:-0}" = "1" ]; then _reap_share
 # _patchcov_mktemp: create the per-invocation profile dir and arm the EXIT trap.
 # Returns non-zero (never aborts) if the dir cannot be created — the caller then
 # degrades to the plain test loop.
+#
+# The dir is created by `mktemp -d`, which creates ATOMICALLY (mode 0700) and
+# fails rather than reusing an existing path. Deliberately NOT `rm -rf` then
+# `mkdir`: removing a pre-created path both destroys whatever is there and opens
+# a remove→create window in which a local attacker could substitute the scratch
+# dir (or a symlink to one) and steer where profiles are written. The PID stays
+# in the name (as the container leases are PID-keyed) for provenance; the mktemp
+# suffix is what makes collision and clobber impossible.
 _patchcov_mktemp() {
-  PATCHCOV_DIR="${TMPDIR:-/tmp}/fishhawk-patchcov-$$"
-  rm -rf "$PATCHCOV_DIR" 2>/dev/null || true
-  if ! mkdir -p "$PATCHCOV_DIR" 2>/dev/null; then
+  if ! PATCHCOV_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-patchcov-$$.XXXXXX" 2>/dev/null)"; then
+    PATCHCOV_DIR=""
+    return 1
+  fi
+  if [ -z "$PATCHCOV_DIR" ] || [ ! -d "$PATCHCOV_DIR" ]; then
     PATCHCOV_DIR=""
     return 1
   fi
@@ -243,6 +253,27 @@ modules() {
   go work edit -json | jq -r '.Use[].DiskPath'
 }
 
+# _module_list: the module list, or non-zero when it is unavailable or empty.
+# The test loops consume this instead of piping `modules` straight into a `while
+# read`, where a failing `modules` yields ZERO iterations and the loop reports
+# success having run no tests at all.
+_module_list() {
+  local mlist
+  if ! mlist="$(modules 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$mlist" ]; then
+    return 1
+  fi
+  printf '%s\n' "$mlist"
+}
+
+# Message for the fail-closed branch below. A test loop that enumerated no
+# modules must never exit 0 — that is a green gate that ran nothing. This is NOT
+# the patch-coverage gate failing (that one always degrades to the plain loop);
+# it is the plain loop being unable to run at all.
+NO_MODULES_MSG="scripts/test: could not enumerate go.work modules (go/jq unavailable, or an empty go.work) — refusing to report success without running any tests"
+
 # Full-suite test-binary parallelism (#972, #1174). Historically every backend
 # package started its OWN testcontainers Postgres, so at the default -p
 # (~GOMAXPROCS) a developer-Mac Docker daemon intermittently timed out starting
@@ -264,11 +295,16 @@ modules() {
 TEST_P="${FISHHAWK_TEST_P:-4}"
 
 cmd_test() {
+  local mlist m
+  if ! mlist="$(_module_list)"; then
+    echo "$NO_MODULES_MSG" >&2
+    exit 1
+  fi
   _arm_container_lease
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     (cd "$m" && go test -race -p "$TEST_P" ./...)
-  done < <(modules)
+  done <<< "$mlist"
 }
 
 cmd_coverage() {
@@ -417,10 +453,13 @@ _patch_cov_base() {
 # _patch_cov_changed_modules: emit one `<module>\t./pkg,./pkg2` line per go.work
 # module that owns a changed non-test .go file. Diffs the MERGE BASE against the
 # WORK TREE — the same snapshot `go test` compiles and the same snapshot
-# check-coverage.py diffs, so line attribution never skews on a dirty tree.
+# check-coverage.py diffs, so line attribution never skews on a dirty tree — and
+# adds UNTRACKED .go files, which `git diff` cannot see but the compiler can, so
+# a never-`git add`ed new file is bucketed rather than silently bypassing the
+# gate (it would otherwise be the only Go change and take the plain-test path).
 # Returns non-zero if git/go/jq is unavailable or there is no merge base.
 _patch_cov_changed_modules() {
-  local base="$1" mb files mlist f cand m rel pkg pairs
+  local base="$1" mb files untracked mlist f cand m rel pkg pairs
   if ! mb="$(git -C "$ROOT" merge-base "$base" HEAD 2>/dev/null)"; then
     return 1
   fi
@@ -429,6 +468,14 @@ _patch_cov_changed_modules() {
   fi
   if ! files="$(git -C "$ROOT" diff --name-only --diff-filter=ACMR "$mb" -- '*.go' 2>/dev/null)"; then
     return 1
+  fi
+  # Untracked files are additive: a failure here degrades to the tracked-only
+  # list rather than skipping the whole gate.
+  if untracked="$(git -C "$ROOT" ls-files --others --exclude-standard -- '*.go' 2>/dev/null)"; then
+    if [ -n "$untracked" ]; then
+      files="$files
+$untracked"
+    fi
   fi
   if ! mlist="$(modules 2>/dev/null)"; then
     return 1
@@ -477,7 +524,16 @@ _patch_cov_changed_modules() {
 # package's test still counts — while instrumentation cost is paid only for
 # changed code, and no second test run happens.
 cmd_test_with_patch_coverage() {
-  local mods="$1"
+  local mods="$1" mlist
+  # Re-enumerate defensively: bucketing enumerated the modules earlier, but if
+  # THIS call cannot, feeding the loop from a failed `modules` would run zero
+  # modules and still exit 0 — verify reporting success having tested nothing.
+  # Degrade to the plain loop, which fails closed on the same condition.
+  if ! mlist="$(_module_list)"; then
+    echo "scripts/test: could not enumerate go.work modules for the coverage loop — skipping the patch-coverage gate" >&2
+    cmd_test
+    return 0
+  fi
   _arm_container_lease
   if ! _patchcov_mktemp; then
     echo "scripts/test: could not create the coverage scratch dir — skipping the patch-coverage gate" >&2
@@ -498,7 +554,7 @@ cmd_test_with_patch_coverage() {
     else
       (cd "$m" && go test -race -p "$TEST_P" ./...)
     fi
-  done < <(modules)
+  done <<< "$mlist"
 }
 
 # _verify_patch_coverage: run the diff-scoped gate over the profiles the loop
@@ -529,6 +585,26 @@ _verify_patch_coverage() {
     "${profiles[@]}"
 }
 
+# _verify_gate_harnesses: run the standalone harnesses that pin the gate scripts
+# themselves (~3s total). They are the only machine check that scripts/test's
+# patch-coverage wiring and scripts/check-coverage.py still behave as documented,
+# and "must be green" is worth nothing if nothing ever runs them — `scripts/test
+# verify` on a Python/shell-only diff otherwise takes the no-changed-Go-packages
+# SKIP path and exercises neither the gate nor its harnesses. A missing or
+# non-executable harness prints a reason and is skipped; a FAILING one fails
+# verify (set -e), which is the point.
+_verify_gate_harnesses() {
+  local h
+  for h in test-check-coverage test-patch-coverage; do
+    if [ ! -x "$ROOT/scripts/$h" ]; then
+      echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
+      continue
+    fi
+    printf '>>> scripts/%s\n' "$h"
+    "$ROOT/scripts/$h"
+  done
+}
+
 # verify: the runner's committed-tree implement gate. Lint FIRST so a fast
 # format/lint failure leads the captured output and aborts (set -e) before the
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
@@ -542,6 +618,7 @@ cmd_verify() {
   cmd_lint
   _verify_doc_line_budget
   _verify_schema_sync
+  _verify_gate_harnesses
   local base="" mods=""
   if [ -n "${FISHHAWK_SKIP_PATCH_COVERAGE:-}" ]; then
     echo "scripts/test: FISHHAWK_SKIP_PATCH_COVERAGE set — skipping the patch-coverage gate" >&2

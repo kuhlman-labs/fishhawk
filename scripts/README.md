@@ -42,13 +42,26 @@ Coverage profiles reflect the tree `go test` compiled. Diffing HEAD
 would therefore skew line attribution on a dirty tree. Both layers
 instead diff the merge base against the **work tree** (`git diff
 <merge_base>`, no second revision), so attribution and coverage are
-always taken from the same snapshot: an uncommitted new function is
-gated rather than mis-attributed. Using the merge base (not the base
-tip) keeps commits that landed on the base branch after this branch
+always taken from the same snapshot: an uncommitted edit to a tracked
+file is gated rather than mis-attributed. Using the merge base (not the
+base tip) keeps commits that landed on the base branch after this branch
 forked out of the patch denominator, exactly as `base...HEAD` would.
 The real guarantee is therefore: *no skew between the diff and the
 profile*, not *no failure is ever spurious* — a genuinely uncovered new
 line fails, which is the point.
+
+`git diff` sees only TRACKED files, so the work-tree diff alone would
+miss a brand-new `.go` file that was never `git add`ed — the compiler
+sees it, the diff does not, and if it were the only Go change the gate
+would be bypassed entirely. Both layers therefore ALSO enumerate
+untracked Go files (`git ls-files --others --exclude-standard`): the
+shell buckets their packages, and `untracked_lines()` folds every line
+of each such file into the denominator (all of it is new). Ignored files
+are excluded, and `_test.go` files are skipped as everywhere else. The
+untracked enumeration is additive — if it fails, the shell degrades to
+the tracked-only list rather than dropping the gate. This is moot on the
+runner's committed tree, where every file is committed; it closes the
+local dirty-tree hole.
 
 ### Base-ref resolution ladder (`_patch_cov_base`)
 
@@ -69,14 +82,29 @@ the changed packages, so a function exercised only by a SIBLING
 package's test is not reported as uncovered — while instrumentation
 cost is paid only for changed code and no second test run happens.
 
-Profiles are written to `${TMPDIR:-/tmp}/fishhawk-patchcov-$$` — keyed by
-PID exactly as the container-lease files are, and OUTSIDE the repo. Two
-concurrent `scripts/test verify` invocations can therefore never share,
-corrupt, or delete each other's profile, no fixed in-repo filename is
-ever clobbered, and no artifact is left in the working tree. The dir is
-swept by the single EXIT handler (`EXIT_TRAP`), which also reaps the
-shared Postgres container only when this invocation actually recorded a
-lease.
+Profiles are written to a scratch dir created by `mktemp -d
+"${TMPDIR:-/tmp}/fishhawk-patchcov-$$.XXXXXX"` — PID-keyed for
+provenance exactly as the container-lease files are, and OUTSIDE the
+repo. `mktemp -d` creates ATOMICALLY at mode 0700 and fails rather than
+reusing an existing path; it is deliberately NOT `rm -rf` then `mkdir`,
+which would both destroy a pre-created path and open a remove→create
+window in which the scratch dir (or a symlink standing in for it) could
+be substituted locally to steer where profiles are written. Two
+concurrent `scripts/test verify` invocations therefore never share,
+corrupt, or delete each other's profile, no existing path is ever
+clobbered, and no artifact is left in the working tree. The dir is swept
+by the single EXIT handler (`EXIT_TRAP`), which also reaps the shared
+Postgres container only when this invocation actually recorded a lease.
+
+The module list is enumerated ONCE per loop via `_module_list` and fed
+to the loop as a here-string. Piping `modules` straight into `while
+read` meant a failing `modules` yielded zero iterations and still exited
+0 — a verify that reported success having run no tests at all. The
+coverage loop degrades to the plain loop on that condition, and the
+plain loop (`cmd_test`) FAILS CLOSED: an unavailable or empty module
+list exits 1 with a printed reason. That is not the patch gate
+red-lining verify (it never does); it is the test loop being unable to
+run at all, which must never read as green.
 
 ### Fail-open contract
 
@@ -91,6 +119,7 @@ degrade prints ONE line naming the reason and falls through to the plain
 | git absent / non-git or bare root / unresolvable base ref | shell (`_patch_cov_base`) |
 | no merge base, or `go`/`jq` unavailable | shell (`_patch_cov_changed_modules`) |
 | no changed Go packages | shell |
+| module list unavailable inside the coverage loop | shell (then the plain loop's own fail-closed check applies) |
 | profile scratch dir uncreatable / no profiles emitted | shell |
 | git absent, non-git or bare root, invalid `--diff-base` override, unresolvable base ref, no merge base | Python (`GitSkip`) |
 | no changed Go files, no coverable new statements, sub-floor diff | Python |
@@ -114,9 +143,24 @@ gate off.
 
 `scripts/test-check-coverage` (Python CLI, against throwaway git repos +
 hand-written profiles) and `scripts/test-patch-coverage` (shell wiring,
-sourcing `scripts/test` lib-only with an overridden `ROOT`). Both are
-standalone in the `scripts/test-*` style and must be green; run them
-when touching `scripts/check-coverage.py` or `scripts/test`. CI's
+sourcing `scripts/test` lib-only with an overridden `ROOT`). They are
+standalone in the `scripts/test-*` style AND `scripts/test verify` runs
+both (`_verify_gate_harnesses`, ~3s, right after the schema-sync check):
+"must be green" is machine-enforced rather than asserted in prose,
+because a Python/shell-only diff otherwise takes the
+no-changed-Go-packages SKIP path and exercises neither the gate nor its
+harnesses. A missing/non-executable harness prints a reason and is
+skipped; a failing one fails verify. `test-patch-coverage` must stub
+`_verify_gate_harnesses` wherever it calls the real `cmd_verify`, or it
+re-executes itself without bound.
+
+`test-patch-coverage` case (j) is the real-toolchain end-to-end for the
+load-bearing `-coverpkg` claim: a function with no test in its own
+package, exercised only by a SIBLING package's test, must report 100%
+patch coverage and `PATCH PASS`. The same fixture run without the
+restricted `-coverpkg` reports 0% and fails, so the case discriminates
+rather than merely running. It self-skips with a printed reason when no
+`go` toolchain is present. CI's
 aggregate invocation is unchanged — diff mode is inert without
 `--diff-base` — and `.github/workflows/**` is untouched (human-led).
 

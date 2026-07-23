@@ -459,6 +459,73 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# (n2) BINDING CONDITION 3, the harder half — an UNTRACKED new .go file. `git
+#      diff` cannot see a file that was never `git add`ed, yet `go test`
+#      compiles it, so every one of its lines is folded into the denominator.
+#      Without this the only-Go-change-is-a-new-file case bypasses the gate
+#      entirely on a dirty tree.
+# ---------------------------------------------------------------------------
+repo="$tmproot/n2"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+cat > "$repo/backend/internal/foo/brand_new.go" <<'EOF'
+package foo
+
+func Fresh(a int) int {
+	if a > 0 {
+		return a
+	}
+	return -a
+}
+EOF
+cat > "$tmproot/n2.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/brand_new.go:3.25,4.11 1 0
+${PFX}backend/internal/foo/brand_new.go:4.11,6.3 1 0
+${PFX}backend/internal/foo/brand_new.go:7.2,7.13 1 0
+EOF
+out="$(run_diff "$repo" "$tmproot/n2.out" --diff-min-statements 1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'backend/internal/foo/brand_new.go:3'; then
+  pass "(n2) an untracked new .go file is gated (git diff cannot see it; go test compiles it)"
+else
+  fail "(n2) expected the untracked new file to be gated (rc=$rc, out='$out')"
+fi
+
+# Covered, the same untracked file passes — the branch is not always-red.
+cat > "$tmproot/n2b.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/brand_new.go:3.25,4.11 1 1
+${PFX}backend/internal/foo/brand_new.go:4.11,6.3 1 1
+${PFX}backend/internal/foo/brand_new.go:7.2,7.13 1 1
+EOF
+out="$(run_diff "$repo" "$tmproot/n2b.out" --diff-min-statements 1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PATCH PASS'; then
+  pass "(n2b) the same untracked file fully covered passes"
+else
+  fail "(n2b) expected 0 + PATCH PASS (rc=$rc, out='$out')"
+fi
+
+# A git-IGNORED untracked file stays out of the denominator entirely.
+printf 'generated/\n' > "$repo/.gitignore"
+mkdir -p "$repo/generated"
+cat > "$repo/generated/gen.go" <<'EOF'
+package generated
+
+func G() int {
+	return 1
+}
+EOF
+out="$(run_diff "$repo" "$tmproot/n2b.out" --diff-min-statements 1)"
+rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'generated/gen.go'; then
+  pass "(n2c) a git-ignored untracked .go file is not folded into the denominator"
+else
+  fail "(n2c) expected generated/gen.go excluded (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
 # (o) --threshold and --diff-base both absent is a usage error, not a silent
 #     no-op gate.
 # ---------------------------------------------------------------------------

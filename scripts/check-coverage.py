@@ -23,7 +23,8 @@ Profiles must be in Go's standard `go test -coverprofile=` format.
 With --diff-base the tool ALSO runs a patch-scoped (diff) gate: the
 profiles' per-statement line ranges are intersected with the lines this
 branch added/changed relative to the merge base of <base> and the WORK
-TREE, and the gate fails when new-line coverage is below
+TREE (plus every line of each UNTRACKED .go file, which `git diff` cannot
+see but `go test` compiles), and the gate fails when new-line coverage is below
 --diff-threshold. Both gates are independent; with both requested the
 exit code is non-zero if EITHER fails, and a git failure in the diff
 path degrades to a printed SKIP so the aggregate gate still decides.
@@ -157,6 +158,39 @@ def resolve_merge_base(repo_root, base):
     return out
 
 
+def untracked_lines(repo_root):
+    """Return {repo_relative_path: set(all_line_numbers)} for untracked .go files.
+
+    `git diff <merge_base>` sees only TRACKED files, so a brand-new .go file
+    that was never `git add`ed is invisible to it — yet `go test` compiles it,
+    so its statements land in the profile. Every line of such a file is new, so
+    the whole file is folded into the patch denominator. This is what makes the
+    work-tree contract hold for an uncommitted NEW file, not just for edits to
+    tracked ones. Ignored files are excluded (`--exclude-standard`).
+    """
+    out = _git(
+        repo_root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        "*.go",
+    )
+    new = {}
+    for rel in out.split("\0"):
+        if not rel or rel.endswith("_test.go"):
+            continue
+        try:
+            with open(os.path.join(repo_root, rel), "rb") as f:
+                n = sum(1 for _ in f)
+        except OSError:
+            continue  # raced away or unreadable — nothing to attribute
+        if n:
+            new[rel] = set(range(1, n + 1))
+    return new
+
+
 def changed_lines(repo_root, merge_base):
     """Return {repo_relative_path: set(added_line_numbers)}.
 
@@ -166,7 +200,8 @@ def changed_lines(repo_root, merge_base):
     on the same snapshot; diffing HEAD would skew on a dirty tree. Using the
     merge base (rather than the base tip) keeps commits that landed on the base
     branch after this branch forked out of the patch denominator, exactly as
-    `git diff base...HEAD` would.
+    `git diff base...HEAD` would. UNTRACKED .go files are added on top (see
+    untracked_lines) — `git diff` cannot see them, but the compiler can.
     """
     out = _git(
         repo_root,
@@ -199,7 +234,10 @@ def changed_lines(repo_root, merge_base):
             # count == 0 is a pure-deletion hunk: it adds nothing.
             for i in range(count):
                 changed[current].add(start + i)
-    return {k: v for k, v in changed.items() if v}
+    result = {k: v for k, v in changed.items() if v}
+    for rel, lines in untracked_lines(repo_root).items():
+        result.setdefault(rel, set()).update(lines)
+    return result
 
 
 def map_profile_path(file_path, module_prefix, changed):
