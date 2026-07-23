@@ -186,6 +186,12 @@ func makeTestBundle(t *testing.T, files []map[string]string) []byte {
 type gateEvidenceSpec struct {
 	verifyRuns    []map[string]any
 	verifySummary map[string]any
+	// rawPayload, when non-empty, is written as the event's `data`
+	// VERBATIM instead of composing one from the fields above. Used to
+	// feed a structurally malformed payload — valid JSON at the event
+	// line level, undecodable into bundle.GateEvidence — through the
+	// extractor's error path (#1886 fix-up).
+	rawPayload json.RawMessage
 }
 
 // makeTestBundleWithGateEvidence extends makeTestBundle with a
@@ -211,16 +217,20 @@ func makeTestBundleWithGateEvidence(t *testing.T, files []map[string]string, ge 
 		t.Fatalf("read base bundle: %v", err)
 	}
 
-	payloadMap := map[string]any{}
-	if ge.verifyRuns != nil {
-		payloadMap["verify_runs"] = ge.verifyRuns
-	}
-	if ge.verifySummary != nil {
-		payloadMap["verify_summary"] = ge.verifySummary
-	}
-	payload, err := json.Marshal(payloadMap)
-	if err != nil {
-		t.Fatalf("marshal gate_evidence payload: %v", err)
+	payload := ge.rawPayload
+	if len(payload) == 0 {
+		payloadMap := map[string]any{}
+		if ge.verifyRuns != nil {
+			payloadMap["verify_runs"] = ge.verifyRuns
+		}
+		if ge.verifySummary != nil {
+			payloadMap["verify_summary"] = ge.verifySummary
+		}
+		var err error
+		payload, err = json.Marshal(payloadMap)
+		if err != nil {
+			t.Fatalf("marshal gate_evidence payload: %v", err)
+		}
 	}
 	line, err := json.Marshal(map[string]any{
 		"seq": 3, "kind": "gate_evidence", "data": json.RawMessage(payload),
@@ -858,6 +868,57 @@ func TestShipTrace_PolicyReEval_VerificationReported(t *testing.T) {
 			wantViolationIs: "no verification evidence in trace",
 			wantState:       run.StageStateFailed,
 		},
+		{
+			// The OTHER flavor of the extractor's error branch: the
+			// event is present and its `data` is valid JSON, but it
+			// does not decode into bundle.GateEvidence (verify_runs is
+			// a number, not an array). ExtractGateEvidence returns a
+			// parse error rather than ErrNoGateEvidence, and the
+			// derivation must fail closed exactly the same way — a
+			// garbled payload is never a passed gate.
+			name:            "malformed gate_evidence violates",
+			evidence:        &gateEvidenceSpec{rawPayload: json.RawMessage(`{"verify_runs":42}`)},
+			wantPassed:      false,
+			wantOutcome:     "",
+			wantViolationIs: "no verification evidence in trace",
+			wantState:       run.StageStateFailed,
+		},
+		{
+			// Summary precedence, conflict direction 1: the terminal
+			// non-superseded run PASSED but the once-per-stage summary
+			// says failed. The summary wins, so this violates — a
+			// last-run-wins implementation would pass it.
+			name: "failed summary beats passing terminal run",
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "failed", "iterations": 3, "max_iterations": 3},
+				verifyRuns: []map[string]any{
+					{"command": "scripts/test verify", "exit_code": 0, "outcome": "passed"},
+				},
+			},
+			wantPassed:  false,
+			wantOutcome: "failed",
+			// No non-passing command to name, so the detail falls back
+			// to the bare outcome — itself proof the summary, not the
+			// run list, produced the verdict.
+			wantViolationIs: `verification outcome "failed", want "passed"`,
+			wantState:       run.StageStateFailed,
+		},
+		{
+			// Summary precedence, conflict direction 2: the terminal
+			// non-superseded run FAILED but the summary says passed
+			// (the verify-fix loop's last iteration is recorded as the
+			// summary). The summary wins, so this satisfies.
+			name: "passing summary beats failing terminal run",
+			evidence: &gateEvidenceSpec{
+				verifySummary: map[string]any{"outcome": "passed", "iterations": 2, "max_iterations": 3},
+				verifyRuns: []map[string]any{
+					{"command": "scripts/test verify", "exit_code": 1, "outcome": "failed"},
+				},
+			},
+			wantPassed:  true,
+			wantOutcome: "passed",
+			wantState:   run.StageStateAwaitingApproval,
+		},
 	}
 
 	for _, tc := range cases {
@@ -941,5 +1002,16 @@ func TestShipTrace_PolicyReEval_VerificationSignal_NotDerivedWithoutOptIn(t *tes
 	}
 	if repo.stage.State != run.StageStateAwaitingApproval {
 		t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+	}
+	// The documented side behavior: reEvaluatePolicy sets
+	// constraints.Verification unconditionally, so the failed signal is
+	// still recorded as evidence on the payload even though the
+	// workflow never declared the outcome.
+	if pl.Applied.Verification == nil {
+		t.Fatal("Applied.Verification = nil; the signal should still be recorded for a non-opted-in workflow")
+	}
+	if pl.Applied.Verification.Outcome != "failed" {
+		t.Errorf("Applied.Verification.Outcome = %q, want failed",
+			pl.Applied.Verification.Outcome)
 	}
 }
