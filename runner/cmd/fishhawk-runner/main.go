@@ -4539,6 +4539,7 @@ func runDiffCoverageGate(ctx context.Context, cfg config, dc *upload.DiffCoverag
 		// the committed diff against the already-pinned merge base FIRST.
 		changed, cerr := diffcov.ChangedLines(ctx, diffcov.ExecGit(repoDir), mergeBase)
 		if cerr != nil {
+			ev.Outcome = "failed" // explicit, not inherited from the initializer, so a future default change can't flip this fail-closed path
 			ev.ExitCode = -1
 			ev.Reason = "could not determine the stage's added lines: " + cerr.Error()
 			return diffCoverageEvent(ev), nil
