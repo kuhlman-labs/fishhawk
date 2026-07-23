@@ -1487,3 +1487,10 @@ func TestListGlobalAudit_PaginationCursor(t *testing.T) {
 		t.Errorf("page3: items=%d cursor=%q (want 1, empty)", len(page3.Items), page3.NextCursor)
 	}
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*stagesRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}

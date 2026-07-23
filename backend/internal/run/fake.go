@@ -30,7 +30,12 @@ func (BaseFake) GetRun(_ context.Context, _ uuid.UUID) (*Run, error) {
 	return nil, ErrNotFound
 }
 
-// GetRunAccountID returns "", ErrNotFound.
+// GetRunAccountID returns "", ErrNotFound. It is what makes BaseFake satisfy
+// the REQUIRED AccountGetter portion of Repository (E44.11 / #2074) — no
+// longer an optional freebie. Because the lookup is now unconditional, a
+// BaseFake-backed server fails CLOSED (503) on the mcp:run bearer-auth path
+// and the campaign ownership gate, which is the intended posture: a fake that
+// wants those paths to pass must return a real account.
 func (BaseFake) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", ErrNotFound
 }

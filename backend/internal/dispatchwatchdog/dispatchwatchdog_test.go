@@ -356,3 +356,10 @@ func TestTicker_RunStopsOnContextCancel(t *testing.T) {
 		t.Fatal("Run didn't return after ctx cancel")
 	}
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*fakeRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}

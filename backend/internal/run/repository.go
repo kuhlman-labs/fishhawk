@@ -181,6 +181,11 @@ type ListRunsFilter struct {
 // Postgres adapter does this with row-level SELECT … FOR UPDATE
 // inside a transaction; in-memory test fakes use a mutex.
 type Repository interface {
+	// AccountGetter is a REQUIRED part of the interface (E44.11 / #2074):
+	// every Repository implementation MUST be able to resolve a run's
+	// owning tenant account, so no wiring can silently skip the lookup.
+	AccountGetter
+
 	CreateRun(ctx context.Context, p CreateRunParams) (*Run, error)
 	GetRun(ctx context.Context, id uuid.UUID) (*Run, error)
 
@@ -311,17 +316,23 @@ type StageCASTransitioner interface {
 	TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error)
 }
 
-// AccountGetter is an OPTIONAL capability on the concrete postgres repo —
-// the cheap tenant-account lookup (ADR-057 / E44.5) that returns just a run's
-// account_id ("" for an untenanted NULL row, the account UUID string
-// otherwise) without materializing the whole run. It is kept OFF the
-// Repository interface — mirroring StageCASTransitioner / AddRunCost /
-// ResolveRunnerKind — because adding a method to Repository would break the
-// ~20 hand-rolled full-interface test fakes across the backend. The
-// bearer-auth mcp:run path type-asserts it to populate Identity.AccountID;
-// when a fake doesn't implement it the mcp identity's AccountID stays empty
-// (untenanted), which the ownership check treats as allow. BaseFake provides a
-// no-op so a fake embedding it satisfies the capability for free.
+// AccountGetter is the cheap tenant-account lookup (ADR-057 / E44.5) that
+// returns just a run's account_id ("" for an untenanted NULL row, the account
+// UUID string otherwise) without materializing the whole run.
+//
+// It is REQUIRED, not optional: Repository embeds it (E44.11 / #2074), so
+// every Repository implementation must resolve a run's account. The named
+// interface survives as a readable name for the capability and as the anchor
+// for the `var _ run.AccountGetter = run.Repository(nil)` compile-time
+// assertion that a future refactor pulling the method back off Repository must
+// break.
+//
+// The bearer-auth mcp:run path calls it UNCONDITIONALLY — there is no
+// type-assertion degrade left, so a wiring gap can no longer produce an
+// accountless mcp identity (the #2074 exposure). Returning "" with a nil error
+// is the untenanted happy path (empty AccountID, allowed); ANY error fails
+// CLOSED with 503. BaseFake provides a stub so a fake embedding it satisfies
+// Repository.
 type AccountGetter interface {
 	GetRunAccountID(ctx context.Context, id uuid.UUID) (string, error)
 }

@@ -77,25 +77,25 @@ func TestPostgres_AccountID_RoundTrip(t *testing.T) {
 		t.Errorf("GetRun AccountID = %q, want %q", got.AccountID, acctID.String())
 	}
 
-	getter, ok := repo.(run.AccountGetter)
-	if !ok {
-		t.Fatal("postgres repo must implement run.AccountGetter")
-	}
-	acct, err := getter.GetRunAccountID(ctx, tenanted.ID)
+	// Called straight through the run.Repository value: GetRunAccountID is a
+	// REQUIRED interface method since E44.11 / #2074, so satisfaction is
+	// COMPILER-enforced and the old runtime type assertion (with its t.Fatal)
+	// can no longer fail — it is replaced by this direct call.
+	acct, err := repo.GetRunAccountID(ctx, tenanted.ID)
 	if err != nil {
 		t.Fatalf("get run account id: %v", err)
 	}
 	if acct != acctID.String() {
 		t.Errorf("GetRunAccountID = %q, want %q", acct, acctID.String())
 	}
-	acctPlain, err := getter.GetRunAccountID(ctx, plain.ID)
+	acctPlain, err := repo.GetRunAccountID(ctx, plain.ID)
 	if err != nil {
 		t.Fatalf("get run account id (untenanted): %v", err)
 	}
 	if acctPlain != "" {
 		t.Errorf("untenanted GetRunAccountID = %q, want empty", acctPlain)
 	}
-	if _, err := getter.GetRunAccountID(ctx, uuid.New()); !errors.Is(err, run.ErrNotFound) {
+	if _, err := repo.GetRunAccountID(ctx, uuid.New()); !errors.Is(err, run.ErrNotFound) {
 		t.Errorf("GetRunAccountID(missing) err = %v, want ErrNotFound", err)
 	}
 }

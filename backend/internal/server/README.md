@@ -11,9 +11,15 @@ scattered per-handler. `Identity.AccountID` is the caller's tenant workspace
 account, populated on every auth path in `bearerAuth`: the cookie path from the
 session row's `account_id` (#1827); the api_token bearer path from the resolved
 token's `AccountID` (selected by `apitoken` `GetTokenByHash`); the `mcp:run`
-path from the token's OWN run via the optional `run.AccountGetter`
-capability (`GetRunAccountID`), so an mcp token is bounded to its run's account
-exactly like a bearer token bound to it.
+path from the token's OWN run via `run.AccountGetter` (`GetRunAccountID`), so an
+mcp token is bounded to its run's account exactly like a bearer token bound to
+it. That lookup is **unconditional and fail-closed** (E44.11 / #2074):
+`AccountGetter` is a REQUIRED method on `run.Repository` (and on
+`campaign.Repository` for `enforceCampaignAccount`), not an optional
+type-asserted capability, so no wiring can skip account resolution and produce
+an accountless — and therefore globally-visible — `mcp:run` identity. `("", nil)`
+is the untenanted happy path (empty `AccountID`, allowed); ANY lookup error is a
+`503`.
 
 **The tiered wrappers.** `require{Run,Stage,Concern}Account(tier, next)` resolve
 the route's run WITH its `account_id` (`run_id` directly; `stage_id →

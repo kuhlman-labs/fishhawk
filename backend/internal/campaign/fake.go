@@ -27,9 +27,13 @@ func (BaseFake) GetCampaign(_ context.Context, _ uuid.UUID) (*Campaign, error) {
 	return nil, ErrNotFound
 }
 
-// GetCampaignAccountID returns "", ErrNotFound. It satisfies the OPTIONAL
-// AccountGetter capability (ADR-057 / #1830) so an embedding fake carries it
-// for free; the get-campaign handler treats the error as untenanted-allow.
+// GetCampaignAccountID returns "", ErrNotFound. It is what makes BaseFake
+// satisfy the REQUIRED AccountGetter portion of Repository (ADR-057 / #1830,
+// promoted by E44.11 / #2074) — no longer an optional freebie. Because
+// enforceCampaignAccount now calls it unconditionally and fails CLOSED on any
+// error, a BaseFake-backed repo yields 503 on the get-campaign ownership gate
+// rather than the old untenanted-allow; a fake that wants the gate to pass
+// must return a real account.
 func (BaseFake) GetCampaignAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", ErrNotFound
 }

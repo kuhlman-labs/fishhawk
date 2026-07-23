@@ -301,9 +301,13 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 							// (ADR-057 / E44.5): an mcp:run token acts within
 							// its run's tenant account, so the ownership
 							// middleware bounds it exactly as a bearer token
-							// bound to that account. Resolved via the optional
-							// AccountGetter capability — a fake repo that
-							// doesn't implement it leaves AccountID empty. The
+							// bound to that account. The lookup is
+							// UNCONDITIONAL: run.AccountGetter is a REQUIRED
+							// run.Repository method (E44.11 / #2074), so no
+							// wiring gap can produce an accountless mcp identity
+							// — the branch that used to skip resolution when a
+							// repo didn't implement the capability is gone by
+							// construction. The
 							// untenanted-run happy path is GetRunAccountID
 							// returning "" with NO error → empty AccountID
 							// (allowed). Any lookup ERROR fails CLOSED with 503:
@@ -315,14 +319,21 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 							// escalated to global read). A DB-unavailable error
 							// is the same 503; an ordinary error mirrors it via
 							// writeDBUnavailable rather than proceeding.
-							if getter, gok := s.cfg.RunRepo.(run.AccountGetter); gok {
-								acct, aerr := getter.GetRunAccountID(r.Context(), rec.RunID)
-								if aerr != nil {
-									s.writeDBUnavailable(w, r)
-									return
-								}
-								id.AccountID = acct
+							if s.cfg.RunRepo == nil {
+								// An UNCONFIGURED run repo cannot resolve the
+								// account either, and the deleted type
+								// assertion used to absorb it into the
+								// accountless-identity fall-through. Same
+								// fail-CLOSED posture as a lookup error.
+								s.writeDBUnavailable(w, r)
+								return
 							}
+							acct, aerr := s.cfg.RunRepo.GetRunAccountID(r.Context(), rec.RunID)
+							if aerr != nil {
+								s.writeDBUnavailable(w, r)
+								return
+							}
+							id.AccountID = acct
 						}
 					case tokens != nil:
 						rec, err := tokens.Authenticate(r.Context(), tok)

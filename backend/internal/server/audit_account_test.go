@@ -173,10 +173,27 @@ func TestCampaignAccountIDForAudit_Branches(t *testing.T) {
 		want *uuid.UUID
 	}{
 		{
-			name: "repo without the AccountGetter capability",
-			// Interface-embedding strips the concrete BaseFake's optional
-			// capability methods, so the type assertion fails.
+			name: "interface-embedded BaseFake: ErrNotFound degrades to untenanted",
+			// The capability can no longer be ABSENT: AccountGetter is a
+			// REQUIRED part of campaign.Repository (E44.11 / #2074), so
+			// interface-embedding no longer strips the method and the
+			// former "repo without the capability" branch is gone by
+			// construction. This wiring now reaches BaseFake's
+			// ErrNotFound, i.e. the lookup-error branch — which stays a
+			// nil (untenanted-partition) degrade here on purpose: this is
+			// a background, Identity-less audit-partition STAMP, not an
+			// authz gate, so failing it closed would suppress audit
+			// writes rather than protect a read.
 			repo: struct{ campaign.Repository }{campaign.BaseFake{}},
+			want: nil,
+		},
+		{
+			name: "unconfigured (nil) campaign repo degrades to untenanted",
+			// The deleted `!ok` type assertion used to absorb a nil repo
+			// implicitly; with the call unconditional this needs an
+			// explicit guard, and it stays a nil degrade for the same
+			// best-effort reason as the rest of this table.
+			repo: nil,
 			want: nil,
 		},
 		{

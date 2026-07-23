@@ -66,8 +66,9 @@ func (r *postgresRepo) GetCampaign(ctx context.Context, id uuid.UUID) (*Campaign
 	return rowToCampaign(row), nil
 }
 
-// GetCampaignAccountID implements the OPTIONAL AccountGetter capability
-// (ADR-057 / #1830): just the campaign's account_id, "" for an untenanted
+// GetCampaignAccountID satisfies the REQUIRED AccountGetter portion of
+// Repository (ADR-057 / #1830, promoted from an optional capability by
+// E44.11 / #2074): just the campaign's account_id, "" for an untenanted
 // NULL row, ErrNotFound for a missing campaign. Mirrors run's
 // GetRunAccountID.
 func (r *postgresRepo) GetCampaignAccountID(ctx context.Context, id uuid.UUID) (string, error) {
@@ -498,5 +499,7 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 // Compile-time check that postgresRepo implements Repository.
 var _ Repository = (*postgresRepo)(nil)
 
-// Compile-time check that postgresRepo carries the AccountGetter capability.
+// Compile-time check that postgresRepo carries the AccountGetter method set.
+// Redundant since Repository embeds AccountGetter (E44.11 / #2074) — retained
+// because it documents intent at the definition site and costs nothing.
 var _ AccountGetter = (*postgresRepo)(nil)

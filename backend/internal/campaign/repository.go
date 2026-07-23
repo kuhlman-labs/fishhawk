@@ -80,6 +80,12 @@ type ListCampaignsFilter struct {
 // memory test fakes use a mutex. This is the same atomicity contract as
 // run.Repository.
 type Repository interface {
+	// AccountGetter is a REQUIRED part of the interface (E44.11 / #2074):
+	// every Repository implementation MUST be able to resolve a campaign's
+	// owning tenant account, so the ownership gate can never be skipped by
+	// a repo that happens not to carry the method.
+	AccountGetter
+
 	CreateCampaign(ctx context.Context, p CreateCampaignParams) (*Campaign, error)
 	GetCampaign(ctx context.Context, id uuid.UUID) (*Campaign, error)
 
@@ -184,17 +190,22 @@ type Repository interface {
 	SettleCampaignItemOutOfBand(ctx context.Context, id uuid.UUID) (*Item, error)
 }
 
-// AccountGetter is an OPTIONAL capability on the concrete postgres repo —
-// the cheap tenant-account lookup (ADR-057 / #1830) that returns just a
-// campaign's account_id ("" for an untenanted NULL row, the account UUID
-// string otherwise) without the domain Campaign type carrying the column. It
-// is kept OFF the Repository interface — mirroring run.AccountGetter —
-// so adding it breaks no existing Repository implementation. The
-// GET /v0/campaigns/{id} handler type-asserts it for the ownership check
-// (caller's Identity.AccountID vs the campaign's account; untenanted =
-// allowed); a repo without the capability degrades to untenanted-allow.
-// BaseFake provides a no-op so a fake embedding it satisfies the capability
-// for free.
+// AccountGetter is the cheap tenant-account lookup (ADR-057 / #1830) that
+// returns just a campaign's account_id ("" for an untenanted NULL row, the
+// account UUID string otherwise) without the domain Campaign type carrying the
+// column.
+//
+// It is REQUIRED, not optional: Repository embeds it (E44.11 / #2074),
+// mirroring run.AccountGetter. The named interface survives as a readable name
+// for the capability and as the anchor for the
+// `var _ campaign.AccountGetter = campaign.Repository(nil)` compile-time
+// assertion a future refactor must break rather than silently restore the
+// skip-the-gate path.
+//
+// enforceCampaignAccount (GET /v0/campaigns/{id}) calls it UNCONDITIONALLY for
+// the ownership check — caller's Identity.AccountID vs the campaign's account,
+// untenanted ("") allowed, mismatch 403, and any lookup ERROR fails CLOSED with
+// 503. BaseFake provides a stub so a fake embedding it satisfies Repository.
 type AccountGetter interface {
 	GetCampaignAccountID(ctx context.Context, id uuid.UUID) (string, error)
 }

@@ -4024,3 +4024,10 @@ func TestWriteReviewerMisconfiguredAudit_StampsInstallationAccount(t *testing.T)
 		t.Fatalf("lookup called with %v, want [4242]", lookup.got)
 	}
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*stubRuns) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}

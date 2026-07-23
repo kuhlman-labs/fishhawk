@@ -313,19 +313,25 @@ func (s *Server) auditCampaignBoardTransition(ctx context.Context, c *campaign.C
 
 // campaignAccountIDForAudit resolves a campaign's owning tenant account for
 // stamping the run-less audit chain partition (ADR-057 / #1828), read via the
-// OPTIONAL campaign.AccountGetter capability (the domain Campaign type doesn't
-// carry the column). Best-effort like the audit writes it feeds — this is a
-// write-side partition stamp, not an authz gate, so unlike
-// enforceCampaignAccount it never fails the caller: a repo without the
-// capability, an untenanted ("") row, or an unparsable value degrade silently
-// to nil (the untenanted NULL partition), and a lookup error degrades to nil
-// with a WARN log.
+// campaign.AccountGetter method (the domain Campaign type doesn't carry the
+// column). The capability can no longer be ABSENT — AccountGetter is a
+// REQUIRED part of campaign.Repository (E44.11 / #2074) — so the former
+// "repo doesn't implement it" early return is gone and the call is
+// unconditional.
+//
+// This one deliberately keeps its BEST-EFFORT posture. It is a write-side
+// audit-chain partition stamp on a background, Identity-less path, not an
+// authz gate: failing it closed would suppress audit writes rather than
+// protect a read. So unlike enforceCampaignAccount it never fails the caller —
+// an untenanted ("") row or an unparsable value degrade silently to nil (the
+// untenanted NULL partition), and a lookup error degrades to nil with a WARN
+// log — as does an UNCONFIGURED (nil) CampaignRepo, which the deleted type
+// assertion used to absorb implicitly and now needs an explicit guard.
 func (s *Server) campaignAccountIDForAudit(ctx context.Context, campaignID uuid.UUID) *uuid.UUID {
-	getter, ok := s.cfg.CampaignRepo.(campaign.AccountGetter)
-	if !ok {
+	if s.cfg.CampaignRepo == nil {
 		return nil
 	}
-	acct, err := getter.GetCampaignAccountID(ctx, campaignID)
+	acct, err := s.cfg.CampaignRepo.GetCampaignAccountID(ctx, campaignID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "campaign audit: resolve account failed; stamping untenanted",
 			slog.String("campaign_id", campaignID.String()),

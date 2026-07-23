@@ -480,3 +480,10 @@ func TestGetStageTrace_StreamsValidGzippedJSONL(t *testing.T) {
 		t.Errorf("decompressed body missing expected events:\n%s", out)
 	}
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*traceReadStageRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}
