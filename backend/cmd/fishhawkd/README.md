@@ -73,6 +73,38 @@ profile with no `FISHHAWKD_DATABASE_URL`, and on a bootstrap write error. The up
 and never touches `home_region`. Contract: `backend/internal/account/README.md`; operator guide:
 `docs/deploy/self-hosted.md`.
 
+## Repo-scoped in-workspace visibility (ADR-057 Amendment A2, E44.10 / #2071)
+
+Membership in a workspace account is not membership in every repository inside it. On top of the
+existing account scoping, read paths are narrowed for a **non-admin cookie-session** caller to the
+repos that caller holds at least `read` on at the forge, mirrored per identity by
+`backend/internal/repoacl` with a freshness TTL.
+
+| Env var | Flag | Effect | Unset means |
+|---|---|---|---|
+| `FISHHAWKD_REPO_ACL_TTL` | `--repo-acl-ttl` | how long a mirrored forge permission is served before it is re-resolved | `repoacl.DefaultTTL` (15m) |
+
+**The filter is wired only when a database AND a configured identity provider are both present**
+(`resolveRepoVisibility`). Either one missing leaves `server.Config.RepoVisibility` nil, which is
+the untenanted-allow posture — exactly the pre-#2071 read surface, not a deny-all — and startup
+logs a WARN naming which input was missing. That is also the no-code-revert kill switch: unwire the
+identity provider and filtering stops. Startup logs an INFO with the effective TTL when it IS on.
+
+The TTL is the whole staleness bound, in both directions: a permission GRANTED on the forge becomes
+visible within it, and one REVOKED stays visible until the entry expires. Sign-in purges the
+signing-in subject's mirrored entries so a fresh session re-resolves immediately; that purge is
+deliberately **non-fatal** — if it fails, the surviving entries (grants included) simply revert to
+the same TTL-bounded exposure the design already accepts everywhere else, which is a better trade
+than failing sign-in closed on a transient DB blip. Shorter TTLs are safer but spend more forge
+rate limit on cold pages.
+
+Two failure classes are kept apart and must stay that way. A **forge** fault (outage or rate limit)
+means the permission is unknown: that repo is not visible for the request, nothing is memoized, the
+request otherwise proceeds, and it is logged at WARN naming the repo and reason — so a short page is
+never silent. A **mirror-store** fault means the filter cannot function and the request answers
+`503`. Long-form contract: `backend/internal/repoacl/README.md`; HTTP behavior and the
+`repo_forbidden` code: `docs/api/v0.md`.
+
 ## Regional cells: handoff surface + region-scoped inference (ADR-062, E44.7 / #1831)
 
 Four optional env vars turn this process into a *regional cell*. All four default empty, and an
