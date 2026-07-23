@@ -992,6 +992,34 @@ if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
 else
   fail "(t12) pristine-snapshot profile-delete (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
 fi
+
+# (t13) DEGRADE — the scratch-dir mktemp failing (cmd_test_with_patch_coverage
+# line ~660) prints a reason and falls through to the plain cmd_test loop: the
+# gate is skipped, the plain loop still runs and succeeds. _patchcov_mktemp is
+# forced to fail IN ISOLATION by stubbing it to return non-zero (the exact
+# sourced-lib override pattern t10/t11 use for a sibling fn), NOT by sabotaging
+# TMPDIR — which would also break the fallback loop this case exists to prove
+# works, making "the degrade fell through to a working plain loop" indistinguishable
+# from "the whole environment is broken". cmd_test is stubbed to a working plain
+# loop (as (i1)/(f) do) so the fallback runs in a genuinely working environment.
+# The reason prints to STDERR, so it is captured (2>&1) before grepping; assert
+# BOTH exit 0 AND the reason SUBSTRING (the full line has a
+# ' — skipping the patch-coverage gate' suffix). _patchcov_mktemp is restored
+# afterward like the sibling cases.
+orig_mktemp="$(declare -f _patchcov_mktemp)"
+_patchcov_mktemp() { return 1; }
+cmd_test() { echo "PLAIN_TEST"; return 0; }
+saved_trap="$(trap -p EXIT)"
+out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main 2>&1)"; rc=$?
+eval "$saved_trap"
+eval "$orig_mktemp"   # restore the sourced original (unset -f would delete it)
+if [ "$rc" -eq 0 ] \
+   && printf '%s' "$out" | grep -q 'could not create the coverage scratch dir' \
+   && printf '%s' "$out" | grep -q 'PLAIN_TEST'; then
+  pass "(t13) a failed coverage-scratch-dir mktemp degrades to the plain loop (gate skipped, exit 0)"
+else
+  fail "(t13) mktemp-degrade (rc=$rc out='$out')"
+fi
 modules() { printf './backend\n./cli\n'; }
 
 # ---------------------------------------------------------------------------

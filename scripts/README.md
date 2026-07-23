@@ -331,16 +331,26 @@ exits 1 naming the path rather than passing as "nothing to cover".
 `test-patch-coverage` case (j) is the real-toolchain end-to-end for the
 load-bearing `-coverpkg` claim: a function with no test in its own
 package, exercised only by a SIBLING package's test, must report 100%
-patch coverage and `PATCH PASS`. The same fixture run without the
-restricted `-coverpkg` reports 0% and fails, so the case discriminates
-rather than merely running. It self-skips with a printed reason when no
+patch coverage and `PATCH PASS`. Without the restricted `-coverpkg` the
+sibling test never instruments `foo`, so `foo` (having no test of its own)
+contributes no coverage block and the patch's changed lines fall inside no
+block: `total_new` is 0 and the gate prints a `SKIP` at exit 0 — not the
+asserted `PATCH PASS` + 100% — so the case discriminates rather than merely
+running. It self-skips with a printed reason when no
 `go` toolchain is present. CI's
 aggregate invocation is unchanged — diff mode is inert without
 `--diff-base` — and `.github/workflows/**` is untouched (human-led).
 
 The pre-test snapshot (#2124) is pinned on both sides. `test-check-coverage`
 (s1–s11): emit serializes the change set with a non-ASCII path key that
-round-trips; consume produces the correct verdict; **consume is invariant
+round-trips — and (s1b) with a truly-undecodable non-UTF-8 (0xFF) byte
+that surrogateescape-decodes and round-trips byte-identically (a real
+non-UTF-8 file where the platform allows one, e.g. Linux; where it does not,
+e.g. macOS APFS, `emit_changed_snapshot` is driven directly in-process with
+the same surrogateescape-decoded key — the (p2)→(p3) synthetic-fixture
+fallback — so the binary-byte edge is machine-enforced on every platform,
+not self-skipped on darwin); consume produces the correct
+verdict; **consume is invariant
 to a post-emit work-tree mutation while the recompute path SKIPs, shown
 side by side** (s3, the TOCTOU proof); one case each for skip-snapshot
 → skip, missing → exit 1, corrupt → exit 1, digest mismatch → exit 1,
