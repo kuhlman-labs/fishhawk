@@ -32,6 +32,7 @@ override, so this is wiring only.
 | `FISHHAWKD_OAUTH_TOKEN_URL` | `--oauth-token-url` | OAuth web-flow token URL | `https://github.com/login/oauth/access_token` |
 | `FISHHAWKD_OAUTH_USER_URL` | `--oauth-user-url` | OAuth web-flow user-profile URL | `https://api.github.com/user` |
 | `FISHHAWKD_OAUTH_ORGS_URL` | `--oauth-orgs-url` | OAuth web-flow user-orgs URL | `https://api.github.com/user/orgs` |
+| `FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST` | `--github-installation-host-allowlist` | fail-closed allowlist of hosts the Mode-2 per-installation base URL may resolve to (comma-separated; exact host or `.ghe.com` leading-dot suffix) | empty → scheme/parse validation only |
 
 The forge-neutral **identity provider** (device flow + REST reads) is threaded
 too: its REST base comes from `FISHHAWKD_GITHUB_API_URL`, and its device-flow /
@@ -45,6 +46,21 @@ minting installation. A SET column overrides the deployment default for that
 install; a NULL column or unknown installation falls back to the deployment
 default; a **real DB error FAILS the mint** (fail-closed) rather than silently
 targeting the default host. See `backend/internal/account/README.md`.
+
+The resolved override is always validated for scheme/parse/host before the App
+JWT ships (an `http://`, hostless, or malformed value fails the mint). On top of
+that, `FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST` is an **optional,
+default-off, fail-closed** host allowlist (E44.15 / #2093): when configured, the
+resolved per-installation host must be an allowlisted entry — an exact host
+(`acme.ghe.com`) or a leading-dot suffix (`.ghe.com`, matching any subdomain at
+a true label boundary, so `notghe.com` is rejected) — or the mint fails before
+the credential is transmitted. **Empty (the default) preserves today's posture
+exactly** (scheme/parse validation only), which is safe because the sole writer
+of `installations.forge_base_url` is the trusted operator-side
+`UpsertInstallation` path (the same trust boundary as any config column). A
+future production / tenant-facing writer of `forge_base_url` **must** configure
+this allowlist — that deferral trigger is recorded in
+`githubapp.Client.AllowedInstallationHosts`.
 
 ## Single-tenant deployment profile (ADR-057 Mode 1, E44.9 / #1833)
 

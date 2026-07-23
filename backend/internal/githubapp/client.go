@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -60,6 +61,27 @@ type Client struct {
 	// Nil (the default) preserves the pre-#1826 behavior: BaseURL, else the
 	// GitHub default.
 	ResolveBaseURL func(ctx context.Context, installationRef string) (string, error)
+
+	// AllowedInstallationHosts, when non-empty, restricts the resolved
+	// per-installation base URL (see ResolveBaseURL) to an operator-configured
+	// allowlist of hosts, enforced at mint time BEFORE the App JWT ships
+	// (E44.15 / #2093). Each entry is either an exact host ("acme.ghe.com") or a
+	// leading-dot suffix (".ghe.com") that matches any subdomain at a TRUE label
+	// boundary (".ghe.com" admits "acme.ghe.com" but NOT the look-alike
+	// "notghe.com", and NOT the bare apex "ghe.com" unless it is also listed).
+	// Matching is case-insensitive and port-insensitive; see matchesHostAllowlist.
+	//
+	// Empty/nil (the default) PRESERVES the pre-#2093 posture: the resolved
+	// override is validated for scheme/parse/host only (validateResolvedBaseURL),
+	// not pinned to an allowlist. That is safe TODAY because the sole writer of
+	// installations.forge_base_url is the trusted operator-side UpsertInstallation
+	// path (the same trust boundary as any config column), so no live
+	// credential-exfiltration path exists (the #2093 operator arbitration).
+	// DEFERRAL TRIGGER: a future production / tenant-facing writer of
+	// forge_base_url MUST configure this allowlist (fail-closed), closing the
+	// residual well-formed-but-attacker-/typo-controlled-HTTPS-host risk before a
+	// live App JWT could reach a non-forge endpoint.
+	AllowedInstallationHosts []string
 }
 
 // NewClient returns a Client with a 30s default timeout. signer
@@ -102,6 +124,17 @@ func (c *Client) IssueInstallationToken(ctx context.Context, installationID int6
 			// unvalidated or non-TLS host).
 			if err := validateResolvedBaseURL(resolved); err != nil {
 				return nil, err
+			}
+			// Optional host allowlist (E44.15 / #2093): when configured, the
+			// resolved per-installation host must be an allowlisted entry BEFORE
+			// the App JWT ships. Ordering is load-bearing — scheme/parse
+			// validation first, then allowlist, all strictly before the
+			// credential is transmitted. Empty allowlist = the default posture
+			// (scheme/parse only), safe today because forge_base_url's sole writer
+			// is the trusted operator-side UpsertInstallation path (#2093
+			// arbitration); a future tenant-facing writer MUST configure it.
+			if len(c.AllowedInstallationHosts) > 0 && !hostAllowed(resolved, c.AllowedInstallationHosts) {
+				return nil, fmt.Errorf("githubapp: installation base url host not in configured allowlist: %q", resolved)
 			}
 			base = resolved
 		}
@@ -166,6 +199,47 @@ func validateResolvedBaseURL(raw string) error {
 		return fmt.Errorf("githubapp: installation base url %q missing host", raw)
 	}
 	return nil
+}
+
+// hostAllowed reports whether resolved's host is permitted by allowlist.
+// resolved is expected already validated by validateResolvedBaseURL (an
+// absolute https URL with a host), so url.Parse cannot fail on the mint path; a
+// parse failure is nonetheless treated as NOT allowed (fail closed) rather than
+// trusted. The host is lower-cased and port-stripped before matching.
+func hostAllowed(resolved string, allowlist []string) bool {
+	u, err := url.Parse(resolved)
+	if err != nil {
+		return false
+	}
+	return matchesHostAllowlist(strings.ToLower(u.Hostname()), allowlist)
+}
+
+// matchesHostAllowlist reports whether host matches any entry in allowlist.
+// host is expected already lower-cased and port-stripped; allowlist entries are
+// expected already lower-cased by the configuration parser. An entry is either:
+//
+//   - an exact host ("acme.ghe.com") — matched by equality; or
+//   - a leading-dot suffix (".ghe.com") — matched when host ENDS WITH the
+//     dotted suffix, so the dot is a TRUE label boundary. This admits any
+//     subdomain ("acme.ghe.com") while rejecting the look-alike "notghe.com"
+//     (whose final labels are "…tghe.com", not ".ghe.com") and the bare apex
+//     "ghe.com" (unless "ghe.com" is also listed explicitly). Using the
+//     dot-prefixed suffix — NOT a raw strings.HasSuffix(host, "ghe.com") — is
+//     what pins label-boundary matching over substring matching (#2093,
+//     binding condition 2).
+func matchesHostAllowlist(host string, allowlist []string) bool {
+	for _, entry := range allowlist {
+		if strings.HasPrefix(entry, ".") {
+			if strings.HasSuffix(host, entry) {
+				return true
+			}
+			continue
+		}
+		if host == entry {
+			return true
+		}
+	}
+	return false
 }
 
 // readBriefBody reads up to 256 bytes for use in error messages.

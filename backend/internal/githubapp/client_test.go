@@ -315,6 +315,184 @@ func TestIssueInstallationToken_ResolveBaseURL_RejectsInvalid(t *testing.T) {
 	}
 }
 
+// TestIssueInstallationToken_AllowlistAllows pins binding condition 1
+// (E44.15 / #2093): with FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST
+// configured, a resolved override whose host is allowlisted STILL mints — both
+// an exact-host entry and a leading-dot suffix matching a subdomain. Together
+// with the reject test, this jointly falsifies a matcher that would reject
+// every host when the allowlist is non-empty (locking out legitimate
+// operators). Driven end-to-end through IssueInstallationToken so the override
+// host receives the mint request.
+func TestIssueInstallationToken_AllowlistAllows(t *testing.T) {
+	cases := []struct {
+		name      string
+		allowlist []string
+	}{
+		{"exact host", []string{"127.0.0.1"}},
+		{"leading-dot suffix subdomain", []string{".ghe.com", "127.0.0.1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			overrideFake, overrideSrv := newFakeGitHubTLS(t)
+			c := newTestClient(t, "")
+			c.HTTP = overrideSrv.Client()
+			c.AllowedInstallationHosts = tc.allowlist
+			c.ResolveBaseURL = func(context.Context, string) (string, error) { return overrideSrv.URL, nil }
+
+			tok, err := c.IssueInstallationToken(context.Background(), 42)
+			if err != nil {
+				t.Fatalf("IssueInstallationToken: %v (allowlisted host must still mint)", err)
+			}
+			if tok.Token != "ghs_canned_token" {
+				t.Errorf("Token = %q", tok.Token)
+			}
+			if overrideFake.requestCounter != 1 {
+				t.Errorf("override host received %d requests, want 1", overrideFake.requestCounter)
+			}
+		})
+	}
+}
+
+// TestIssueInstallationToken_AllowlistSuffixMatchesSubdomain proves the
+// leading-dot suffix admits a real subdomain (acme.ghe.com under .ghe.com) at
+// the matcher level, complementing the httptest allow test (which is pinned to
+// a loopback host). This is binding condition 1(b).
+func TestIssueInstallationToken_AllowlistSuffixMatchesSubdomain(t *testing.T) {
+	if !matchesHostAllowlist("acme.ghe.com", []string{".ghe.com"}) {
+		t.Error("matchesHostAllowlist(acme.ghe.com, .ghe.com) = false, want true (subdomain must match)")
+	}
+	if !matchesHostAllowlist("acme.ghe.com", []string{"acme.ghe.com"}) {
+		t.Error("matchesHostAllowlist(acme.ghe.com, acme.ghe.com) = false, want true (exact must match)")
+	}
+	// The bare apex is NOT admitted by the dotted suffix alone.
+	if matchesHostAllowlist("ghe.com", []string{".ghe.com"}) {
+		t.Error("matchesHostAllowlist(ghe.com, .ghe.com) = true, want false (apex needs explicit entry)")
+	}
+}
+
+// TestIssueInstallationToken_AllowlistEmptyInert pins the default posture: an
+// empty allowlist leaves the pre-#2093 behavior untouched — a well-formed HTTPS
+// override host still mints (scheme/parse validation only). This is a
+// behavioral done-means test that fails on a no-op/comment-only touch.
+func TestIssueInstallationToken_AllowlistEmptyInert(t *testing.T) {
+	overrideFake, overrideSrv := newFakeGitHubTLS(t)
+	c := newTestClient(t, "")
+	c.HTTP = overrideSrv.Client()
+	c.AllowedInstallationHosts = nil // default: allowlist inert
+	c.ResolveBaseURL = func(context.Context, string) (string, error) { return overrideSrv.URL, nil }
+
+	tok, err := c.IssueInstallationToken(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("IssueInstallationToken: %v (empty allowlist must not gate a well-formed host)", err)
+	}
+	if tok.Token != "ghs_canned_token" {
+		t.Errorf("Token = %q", tok.Token)
+	}
+	if overrideFake.requestCounter != 1 {
+		t.Errorf("override host received %d requests, want 1 (empty allowlist → mint proceeds)", overrideFake.requestCounter)
+	}
+}
+
+// TestIssueInstallationToken_AllowlistRejects pins binding condition 2 and the
+// credential-never-shipped invariant: with a non-empty allowlist, a well-formed
+// but non-allowlisted HTTPS host FAILS the mint before the App JWT ships, and
+// the override fake receives NO request (no Authorization header ever reaches
+// it). Includes the look-alike substring host (notghe.com) rejected by a
+// .ghe.com/ghe.com entry — true label-boundary matching, not strings.HasSuffix.
+func TestIssueInstallationToken_AllowlistRejects(t *testing.T) {
+	cases := []struct {
+		name      string
+		allowlist []string
+	}{
+		{"non-allowlisted host", []string{"acme.ghe.com"}},
+		{"look-alike substring vs dotted suffix", []string{".ghe.com"}},
+		{"look-alike substring vs exact apex", []string{"ghe.com"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// The override resolves to a look-alike / non-allowlisted host. We
+			// point the resolver at a well-formed https URL for a host that is
+			// NOT in the allowlist; the mint must fail before any request ships.
+			overrideFake, overrideSrv := newFakeGitHubTLS(t)
+			c := newTestClient(t, "")
+			c.HTTP = overrideSrv.Client()
+			c.AllowedInstallationHosts = tc.allowlist
+			// Resolve to a well-formed https host that is a look-alike / not
+			// allowlisted. Use a fixed hostname so the matcher — not the httptest
+			// port — decides. The request must never reach overrideSrv.
+			c.ResolveBaseURL = func(context.Context, string) (string, error) {
+				return "https://notghe.com", nil
+			}
+
+			_, err := c.IssueInstallationToken(context.Background(), 42)
+			if err == nil {
+				t.Fatal("IssueInstallationToken succeeded, want failure (non-allowlisted host must not ship the App JWT)")
+			}
+			if !strings.Contains(err.Error(), "allowlist") {
+				t.Errorf("err = %v, want an allowlist-rejection error", err)
+			}
+			if overrideFake.requestCounter != 0 {
+				t.Errorf("override host received %d requests, want 0 (credential-never-shipped invariant)", overrideFake.requestCounter)
+			}
+			if overrideFake.gotAuth != "" {
+				t.Errorf("override host saw Authorization = %q, want empty (JWT must never ship on reject)", overrideFake.gotAuth)
+			}
+		})
+	}
+}
+
+func TestMatchesHostAllowlist(t *testing.T) {
+	cases := []struct {
+		host      string
+		allowlist []string
+		want      bool
+	}{
+		{"acme.ghe.com", []string{"acme.ghe.com"}, true},           // exact
+		{"acme.ghe.com", []string{".ghe.com"}, true},               // suffix subdomain
+		{"deep.acme.ghe.com", []string{".ghe.com"}, true},          // multi-label subdomain
+		{"ghe.com", []string{"ghe.com"}, true},                     // exact apex
+		{"ghe.com", []string{".ghe.com"}, false},                   // apex not admitted by dotted suffix
+		{"notghe.com", []string{".ghe.com"}, false},                // look-alike vs dotted suffix
+		{"notghe.com", []string{"ghe.com"}, false},                 // look-alike vs exact apex
+		{"other.example.com", []string{"acme.ghe.com"}, false},     // unrelated
+		{"acme.ghe.com", []string{".other.com", ".ghe.com"}, true}, // second entry matches
+		{"acme.ghe.com", nil, false},                               // empty allowlist matches nothing
+	}
+	for _, tc := range cases {
+		if got := matchesHostAllowlist(tc.host, tc.allowlist); got != tc.want {
+			t.Errorf("matchesHostAllowlist(%q, %v) = %v, want %v", tc.host, tc.allowlist, got, tc.want)
+		}
+	}
+}
+
+// TestHostAllowed covers hostAllowed directly, including the fail-closed
+// parse-error branch (a malformed URL → NOT allowed) which is unreachable from
+// IssueInstallationToken (validateResolvedBaseURL parses first) but must still
+// fail closed if reached.
+func TestHostAllowed(t *testing.T) {
+	cases := []struct {
+		name      string
+		resolved  string
+		allowlist []string
+		want      bool
+	}{
+		{"exact host allowed", "https://acme.ghe.com", []string{"acme.ghe.com"}, true},
+		{"suffix subdomain allowed", "https://acme.ghe.com/api/v3", []string{".ghe.com"}, true},
+		{"host with port stripped", "https://acme.ghe.com:443", []string{"acme.ghe.com"}, true},
+		{"uppercase host normalized", "https://ACME.GHE.COM", []string{"acme.ghe.com"}, true},
+		{"look-alike rejected", "https://notghe.com", []string{".ghe.com"}, false},
+		{"non-allowlisted rejected", "https://evil.example.com", []string{"acme.ghe.com"}, false},
+		{"malformed url fails closed", "https://\x00bad", []string{"anything"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hostAllowed(tc.resolved, tc.allowlist); got != tc.want {
+				t.Errorf("hostAllowed(%q, %v) = %v, want %v", tc.resolved, tc.allowlist, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidateResolvedBaseURL(t *testing.T) {
 	valid := []string{
 		"https://acme.ghe.com",

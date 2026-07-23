@@ -3,6 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"io"
@@ -731,6 +735,95 @@ func TestParseCampaignPRURL(t *testing.T) {
 			t.Errorf("parseCampaignPRURL(%q) = nil error, want a reject", bad)
 		}
 	}
+}
+
+// TestParseInstallationHostAllowlist pins the Mode-2 allowlist config parser
+// (E44.15 / #2093): comma-split, trim, lower-case, drop empties; an empty /
+// all-whitespace value yields nil (the default scheme/parse-only posture).
+func TestParseInstallationHostAllowlist(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want []string
+	}{
+		{"empty", "", nil},
+		{"whitespace only", "   ", nil},
+		{"commas only", " , ,, ", nil},
+		{"single entry", "acme.ghe.com", []string{"acme.ghe.com"}},
+		{"comma list with whitespace", " acme.ghe.com , .ghe.com ", []string{"acme.ghe.com", ".ghe.com"}},
+		{"case normalization", "ACME.GHE.COM", []string{"acme.ghe.com"}},
+		{"trailing + duplicate empties dropped", "acme.ghe.com,,", []string{"acme.ghe.com"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseInstallationHostAllowlist(tc.raw)
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseInstallationHostAllowlist(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("entry %d = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// writeTempAppKey writes a PKCS#1 RSA private key to a temp PEM file and
+// returns the path, for driving runServe's GitHub-App block.
+func writeTempAppKey(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	})
+	path := filepath.Join(t.TempDir(), "app-key.pem")
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestServe_InstallationHostAllowlistWiring pins the E44.15 / #2093 boot wiring
+// by driving runServe ITSELF: a configured
+// FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST is parsed and threaded onto the
+// App client (proven by the presence log line), and startup proceeds past the
+// GitHub-App block (aborting later at the deliberately-invalid
+// --review-resolution). An UNSET allowlist must NOT emit the presence log —
+// pinning the default-off posture end to end through runServe.
+func TestServe_InstallationHostAllowlistWiring(t *testing.T) {
+	keyFile := writeTempAppKey(t)
+
+	t.Run("configured allowlist is threaded and logged", func(t *testing.T) {
+		code, log := serveWithProfile(t,
+			"-github-app-id", "12345",
+			"-github-app-private-key-file", keyFile,
+			"-github-installation-host-allowlist", "acme.ghe.com, .ghe.com",
+			bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (startup aborts at the invalid --review-resolution, AFTER the App block); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "installation host allowlist configured") {
+			t.Errorf("configured allowlist did not emit the presence log line:\n%s", log)
+		}
+	})
+
+	t.Run("unset allowlist stays silent (default-off)", func(t *testing.T) {
+		code, log := serveWithProfile(t,
+			"-github-app-id", "12345",
+			"-github-app-private-key-file", keyFile,
+			bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "installation host allowlist configured") {
+			t.Errorf("an unset allowlist must not emit the presence log line (default-off posture):\n%s", log)
+		}
+	})
 }
 
 // TestBuildModelProviders covers the live ModelOracle provider-registration

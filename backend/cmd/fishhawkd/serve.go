@@ -856,6 +856,12 @@ func runServe(args []string, logSink io.Writer) int {
 	githubUploadURL := fs.String("github-upload-url",
 		envOr("FISHHAWKD_GITHUB_UPLOAD_URL", ""),
 		"GitHub release-asset upload host; empty → https://uploads.github.com")
+	// Optional Mode-2 host allowlist (E44.15 / #2093): fail-closed pinning of the
+	// resolved per-installation base URL host. Empty → scheme/parse validation
+	// only (today's posture); non-empty restricts minting to allowlisted hosts.
+	githubInstallationHostAllowlist := fs.String("github-installation-host-allowlist",
+		envOr("FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST", ""),
+		"optional comma-separated allowlist of hosts the per-installation (Mode 2) base URL may resolve to; each entry is an exact host or a leading-dot suffix (.ghe.com); empty → scheme/parse validation only")
 	oauthAuthorizeURL := fs.String("oauth-authorize-url",
 		envOr("FISHHAWKD_OAUTH_AUTHORIZE_URL", ""),
 		"GitHub OAuth authorize URL; empty → https://github.com/login/oauth/authorize")
@@ -1442,6 +1448,16 @@ func runServe(args []string, logSink io.Writer) int {
 		// (GHES) overrides api.github.com for installation-token minting; empty
 		// keeps the default.
 		appClient.BaseURL = githubEndpoints.APIBaseURL
+		// Optional Mode-2 host allowlist (E44.15 / #2093): fail-closed pinning of
+		// the resolved per-installation host at mint time. Empty → nil → the
+		// default scheme/parse-only validation (unchanged posture, per the #2093
+		// arbitration that forge_base_url's sole writer is the trusted
+		// operator-side UpsertInstallation path).
+		appClient.AllowedInstallationHosts = parseInstallationHostAllowlist(*githubInstallationHostAllowlist)
+		if len(appClient.AllowedInstallationHosts) > 0 {
+			logger.Info("Mode-2 installation host allowlist configured (fail-closed)",
+				slog.Int("entries", len(appClient.AllowedInstallationHosts)))
+		}
 		// Mode 2 (per-installation, E44.2 / #1826): resolve the data-resident
 		// API host from installations.forge_base_url. Late-bound AFTER the DB
 		// pool exists — a nil pool leaves ResolveBaseURL nil (every install
@@ -2491,6 +2507,24 @@ func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.R
 		return m.gh.MergePullRequest(ctx, scope, repo, number, forge.MergeMethodSquash)
 	}
 	return err
+}
+
+// parseInstallationHostAllowlist splits a comma-separated
+// FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST value into normalized (trimmed,
+// lower-cased, empties dropped) host entries for
+// githubapp.Client.AllowedInstallationHosts (E44.15 / #2093). An empty or
+// all-whitespace value yields nil, which leaves the allowlist unset — the
+// default scheme/parse-only posture.
+func parseInstallationHostAllowlist(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		entry := strings.ToLower(strings.TrimSpace(part))
+		if entry == "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // parseCampaignPRURL splits a GitHub PR html_url into its repo ref and number.
