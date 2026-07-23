@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -69,6 +70,38 @@ func newFakeGitHubTLS(t *testing.T) (*fakeGitHub, *httptest.Server) {
 	srv := httptest.NewTLSServer(fakeGitHubHandler(fg))
 	t.Cleanup(srv.Close)
 	return fg, srv
+}
+
+// hostRewriteClient returns an HTTP client that trusts srv's TLS cert but
+// dials srv's listener for EVERY host, regardless of the URL's hostname. This
+// lets a resolved override name a FAKE host (acme.ghe.com, notghe.com) while
+// still reaching srv when the request is actually made — the piece that makes
+// the allowlist tests non-vacuous end-to-end:
+//
+//   - on the ALLOW path it lets the leading-dot suffix branch decide the mint
+//     (host acme.ghe.com under a .ghe.com entry, NOT a loopback exact match),
+//     so the subtest fails if matchesHostAllowlist rejected genuine subdomains;
+//   - on the REJECT path it makes the credential-never-shipped assertion real:
+//     were the matcher to WRONGLY admit notghe.com, the request would land on
+//     srv and set gotAuth, so the zero-request/empty-Authorization checks can
+//     actually detect credential transmission before rejection.
+//
+// TLS name verification is skipped because the httptest cert is issued for
+// 127.0.0.1/example.com, not the fake override hostname we dial under; these
+// tests pin the host ALLOWLIST decision, not TLS verification.
+func hostRewriteClient(t *testing.T, srv *httptest.Server) *http.Client {
+	t.Helper()
+	client := srv.Client()
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("srv.Client() transport is %T, want *http.Transport", client.Transport)
+	}
+	addr := srv.Listener.Addr().String()
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	tr.TLSClientConfig.InsecureSkipVerify = true
+	return client
 }
 
 func newTestClient(t *testing.T, baseURL string) *Client {
@@ -323,21 +356,28 @@ func TestIssueInstallationToken_ResolveBaseURL_RejectsInvalid(t *testing.T) {
 // every host when the allowlist is non-empty (locking out legitimate
 // operators). Driven end-to-end through IssueInstallationToken so the override
 // host receives the mint request.
+//
+// The suffix case resolves to a genuine subdomain (acme.ghe.com) allowed ONLY
+// by the .ghe.com suffix entry — no loopback exact match to fall back on — and
+// dials it through hostRewriteClient, so the mint reaches the fake IFF the
+// suffix branch admits it. A matcher that rejected genuine .ghe.com subdomains
+// would fail this subtest end-to-end, not merely at the matcher-unit level.
 func TestIssueInstallationToken_AllowlistAllows(t *testing.T) {
 	cases := []struct {
 		name      string
+		resolved  string
 		allowlist []string
 	}{
-		{"exact host", []string{"127.0.0.1"}},
-		{"leading-dot suffix subdomain", []string{".ghe.com", "127.0.0.1"}},
+		{"exact host", "https://acme.ghe.com", []string{"acme.ghe.com"}},
+		{"leading-dot suffix subdomain", "https://acme.ghe.com", []string{".ghe.com"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			overrideFake, overrideSrv := newFakeGitHubTLS(t)
 			c := newTestClient(t, "")
-			c.HTTP = overrideSrv.Client()
+			c.HTTP = hostRewriteClient(t, overrideSrv)
 			c.AllowedInstallationHosts = tc.allowlist
-			c.ResolveBaseURL = func(context.Context, string) (string, error) { return overrideSrv.URL, nil }
+			c.ResolveBaseURL = func(context.Context, string) (string, error) { return tc.resolved, nil }
 
 			tok, err := c.IssueInstallationToken(context.Background(), 42)
 			if err != nil {
@@ -355,8 +395,8 @@ func TestIssueInstallationToken_AllowlistAllows(t *testing.T) {
 
 // TestIssueInstallationToken_AllowlistSuffixMatchesSubdomain proves the
 // leading-dot suffix admits a real subdomain (acme.ghe.com under .ghe.com) at
-// the matcher level, complementing the httptest allow test (which is pinned to
-// a loopback host). This is binding condition 1(b).
+// the matcher level, complementing the end-to-end suffix-mint assertion in
+// TestIssueInstallationToken_AllowlistAllows. This is binding condition 1(b).
 func TestIssueInstallationToken_AllowlistSuffixMatchesSubdomain(t *testing.T) {
 	if !matchesHostAllowlist("acme.ghe.com", []string{".ghe.com"}) {
 		t.Error("matchesHostAllowlist(acme.ghe.com, .ghe.com) = false, want true (subdomain must match)")
@@ -415,7 +455,12 @@ func TestIssueInstallationToken_AllowlistRejects(t *testing.T) {
 			// NOT in the allowlist; the mint must fail before any request ships.
 			overrideFake, overrideSrv := newFakeGitHubTLS(t)
 			c := newTestClient(t, "")
-			c.HTTP = overrideSrv.Client()
+			// hostRewriteClient dials overrideSrv for ANY hostname, so the
+			// look-alike notghe.com WOULD reach the fake IF the matcher wrongly
+			// admitted it — this makes the credential-never-shipped assertion
+			// below detect real transmission, not a DNS/connection failure to an
+			// unrelated host. The matcher rejects, so nothing ever dials.
+			c.HTTP = hostRewriteClient(t, overrideSrv)
 			c.AllowedInstallationHosts = tc.allowlist
 			// Resolve to a well-formed https host that is a look-alike / not
 			// allowlisted. Use a fixed hostname so the matcher — not the httptest
