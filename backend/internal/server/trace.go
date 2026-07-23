@@ -1004,6 +1004,13 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		return nil
 	}
 
+	// Verification signal (#1886 / ADR-059): derived from the same
+	// bundle's gate_evidence event so the `verification_reported`
+	// outcome gates on what the stage actually ran. nil when the
+	// bundle carried no usable evidence — which that outcome treats
+	// as a violation, not a pass.
+	constraints.Verification = verificationSignalFromBundle(bundleBytes)
+
 	// Happy path: real evaluation. EmitEvaluation handles the empty-
 	// constraints case cleanly — Evaluate returns no violations, the
 	// row carries Applied={} and Passed=true. SPA renders "Policy
@@ -1017,6 +1024,66 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 		return nil
 	}
 	return violations
+}
+
+// verificationSignalFromBundle derives the policy verification signal
+// from the bundle's single pre-redacted `gate_evidence` event (#963),
+// which the runner composes from every machine-verified verify result.
+// No new runner emission is involved: this only threads existing
+// evidence into policy evaluation (#1886 / ADR-059).
+//
+// Resolution order:
+//
+//   - verify_summary, when present — the verify-fix loop's terminal,
+//     once-per-stage result (#804).
+//   - otherwise the LAST verify_run — the single-shot committed-tree
+//     gate (#802) path. Only the last run reflects the pushed tree;
+//     earlier verify-fix-loop iterations are marked Superseded (#1205)
+//     and are skipped.
+//
+// Returns nil — read by the policy engine as "no verification
+// evidence", i.e. a violation — when the bundle carries no
+// gate_evidence event, when extraction fails, and when the evidence
+// carries neither a summary nor any verify run.
+func verificationSignalFromBundle(bundleBytes []byte) *policy.VerificationSignal {
+	ev, err := bundle.ExtractGateEvidence(bundleBytes)
+	if err != nil {
+		// Includes ErrNoGateEvidence (older runner, or a stage that
+		// ran no gates at all). Fail closed: no evidence, no signal.
+		return nil
+	}
+
+	// Commands: the non-superseded runs, machine-checkable facts
+	// only — no output tails, so the audit payload stays bounded.
+	var cmds []policy.VerificationCommand
+	var lastRun *bundle.VerifyRunEvidence
+	for i := range ev.VerifyRuns {
+		vr := &ev.VerifyRuns[i]
+		if vr.Superseded {
+			continue
+		}
+		lastRun = vr
+		cmds = append(cmds, policy.VerificationCommand{
+			Command:  vr.Command,
+			ExitCode: vr.ExitCode,
+			Outcome:  vr.Outcome,
+		})
+	}
+
+	switch {
+	case ev.VerifySummary != nil:
+		return &policy.VerificationSignal{
+			Outcome:  ev.VerifySummary.Outcome,
+			Commands: cmds,
+		}
+	case lastRun != nil:
+		return &policy.VerificationSignal{
+			Outcome:  lastRun.Outcome,
+			Commands: cmds,
+		}
+	default:
+		return nil
+	}
 }
 
 // emitPolicySkipped is a thin wrapper around policy.EmitEvaluationSkipped

@@ -84,7 +84,8 @@ type Constraints struct {
 	// file count must be <= this value.
 	MaxFilesChanged int `json:"max_files_changed,omitempty"`
 	// RequiredOutcomes: closed set per the schema —
-	// "tests_added_or_updated", "ci_green".
+	// "tests_added_or_updated", "ci_green",
+	// "verification_reported".
 	RequiredOutcomes []string `json:"required_outcomes,omitempty"`
 	// CIGreen is what an upstream signal said about the customer
 	// CI's outcome. Required only if RequiredOutcomes contains
@@ -93,6 +94,38 @@ type Constraints struct {
 	// silently passing (MVP_SPEC §6: honesty about gaps beats
 	// fictional completeness).
 	CIGreen *bool `json:"ci_green,omitempty"`
+	// Verification is what the stage's committed-tree verify gate
+	// actually reported. Required only if RequiredOutcomes contains
+	// "verification_reported"; nil means "no verification signal was
+	// available at evaluation time" — which, unlike CIGreen, is a
+	// VIOLATION rather than a deferral (#1886 / ADR-059): the gate
+	// exists to assert that verification actually ran and passed, so
+	// an absent signal cannot be read as a pass.
+	//
+	// The json tag is load-bearing. EvaluationPayload.Applied is the
+	// audit-payload shape the post-CI re-evaluation decodes and
+	// re-emits (backend/internal/server/policy_reeval.go), so an
+	// untagged or unexported field would silently drop the signal on
+	// re-eval and flip a satisfied outcome into a violation.
+	Verification *VerificationSignal `json:"verification,omitempty"`
+}
+
+// VerificationSignal is the digest of what a stage's committed-tree
+// verify gate ran and reported, derived from the runner's
+// `gate_evidence` trace event. Outcome carries the runner's
+// vocabulary verbatim: "passed" | "failed" | "skipped".
+type VerificationSignal struct {
+	Outcome  string                `json:"outcome"`
+	Commands []VerificationCommand `json:"commands,omitempty"`
+}
+
+// VerificationCommand is one verify invocation the gate ran, kept to
+// the machine-checkable facts only (no output tails) so the audit
+// payload stays bounded.
+type VerificationCommand struct {
+	Command  string `json:"command"`
+	ExitCode int    `json:"exit_code"`
+	Outcome  string `json:"outcome"`
 }
 
 // Violation is one constraint failure. Constraint names match the
@@ -134,7 +167,7 @@ func Evaluate(diff Diff, c Constraints) []Violation {
 		out = append(out, checkMaxFiles(diff, c.MaxFilesChanged)...)
 	}
 	if len(c.RequiredOutcomes) > 0 {
-		out = append(out, checkRequiredOutcomes(diff, c.RequiredOutcomes, c.CIGreen)...)
+		out = append(out, checkRequiredOutcomes(diff, c.RequiredOutcomes, c.CIGreen, c.Verification)...)
 	}
 
 	return out
@@ -255,7 +288,7 @@ func IsGeneratedPath(p string) bool {
 	return false
 }
 
-func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violation {
+func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool, verification *VerificationSignal) []Violation {
 	var v []Violation
 	for _, o := range outcomes {
 		switch o {
@@ -303,6 +336,40 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violat
 					Detail:     "ci is not green",
 				})
 			}
+		case "verification_reported":
+			// Substance-aware sibling of tests_added_or_updated
+			// (#1886 / ADR-059 Option C.2). It gates on what the
+			// stage actually RAN and whether it PASSED, read from
+			// the runner's machine-verified gate evidence — NOT on
+			// whether the diff contains a test-shaped filename.
+			//
+			// Deliberately fail-closed and asymmetric with
+			// tests_added_or_updated: there is NO filename
+			// inspection (isTestPath / diffTouchesTests are not
+			// consulted, so a diff whose only change is a
+			// test-NAMED file does not satisfy this) and NO
+			// docs-only vacuous-satisfaction branch. A missing
+			// signal, a failed gate, and a SKIPPED gate are each a
+			// violation — a skipped verify gate is not a passed
+			// gate. That asymmetry is the entire point of the
+			// outcome, so do not "fix" it by borrowing a branch
+			// from above.
+			//
+			// Correspondingly this outcome is NOT deferrable (see
+			// DeferredRequiredOutcomes): deferring it would
+			// reconstruct the vacuous pass it exists to remove.
+			switch {
+			case verification == nil:
+				v = append(v, Violation{
+					Constraint: "required_outcomes",
+					Detail:     "no verification evidence in trace",
+				})
+			case verification.Outcome != "passed":
+				v = append(v, Violation{
+					Constraint: "required_outcomes",
+					Detail:     verificationNotPassedDetail(verification),
+				})
+			}
 		default:
 			// The schema enum bounds this; defense-in-depth catches
 			// drift between schema and code.
@@ -315,12 +382,35 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violat
 	return v
 }
 
+// verificationNotPassedDetail renders the violation detail for a
+// non-passing verification signal: the reported outcome, plus the
+// first non-passing command when the signal carried one, so the
+// audit entry names WHAT failed rather than just that something did.
+func verificationNotPassedDetail(v *VerificationSignal) string {
+	outcome := v.Outcome
+	if outcome == "" {
+		outcome = "unknown"
+	}
+	for _, c := range v.Commands {
+		if c.Outcome != "passed" && c.Command != "" {
+			return fmt.Sprintf("verification outcome %q (command %q exited %d)",
+				outcome, c.Command, c.ExitCode)
+		}
+	}
+	return fmt.Sprintf("verification outcome %q, want \"passed\"", outcome)
+}
+
 // DeferredRequiredOutcomes returns the names of required_outcomes
 // whose evaluation was skipped because no signal was available at
 // evaluation time (#297). At trace-upload time the only deferrable
 // outcome is `ci_green`: CI hasn't run on the just-opened PR yet,
 // so branch protection (#251 / ADR-017) is the actual gate at
 // merge time. Returns an empty slice when nothing was deferred.
+//
+// `verification_reported` is deliberately NOT deferrable (#1886): a
+// missing verification signal is a violation, not a deferral, so
+// adding it here would reconstruct exactly the vacuous pass that
+// outcome exists to remove.
 //
 // Callers persist this list in the policy_evaluated audit payload
 // so reviewers can see which outcomes the policy engine declined

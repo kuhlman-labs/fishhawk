@@ -278,6 +278,22 @@ func checkRequiredOutcomes(diff Diff, outcomes []string, ciGreen *bool) []Violat
 					Detail:     "ci is not green",
 				})
 			}
+		case "verification_reported":
+			// Backend-authoritative (#1886 / ADR-059): skipped here,
+			// never a violation. This in-line constraint check fires
+			// on the implement push path BEFORE either committed-tree
+			// verify gate runs (the verify-fix loop and the
+			// single-shot gate both come later in
+			// runner/cmd/fishhawk-runner/main.go), so no verify
+			// result exists yet locally — there is nothing truthful
+			// the runner could assert. The backend re-evaluates the
+			// outcome against the uploaded bundle's gate_evidence,
+			// where the terminal verify result IS available.
+			//
+			// Without this case the default branch below would emit
+			// `unknown outcome "verification_reported"` and fail
+			// every opted-in run as category-B before the agent's
+			// work was even verified.
 		default:
 			// The schema enum bounds this; defense-in-depth
 			// catches drift between schema and code.

@@ -470,3 +470,34 @@ workflows:
 		t.Errorf("error = %q, want it to name the reviewer agent_version", err.Error())
 	}
 }
+
+// TestValidate_RequiredOutcomes_VerificationReported pins the
+// workflow-v1 enum member added in v1.5 (#1886 / ADR-059) against the
+// CLI's embedded mirror — the two mirrors must agree, or a spec the
+// backend accepts is rejected by `fishhawk validate` (and vice versa).
+// workflow-v0 stays frozen.
+func TestValidate_RequiredOutcomes_VerificationReported(t *testing.T) {
+	const stages = `
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - required_outcomes:
+              - verification_reported
+`
+	if err := spec.ValidateBytes([]byte("version: \"1.5\"\n" + stages)); err != nil {
+		t.Fatalf("v1.5 validate: %v", err)
+	}
+
+	err := spec.ValidateBytes([]byte("version: \"0.7\"\n" + stages))
+	if err == nil {
+		t.Fatal("v0 validate = nil, want a rejection (workflow-v0 enum is frozen)")
+	}
+	if !strings.Contains(err.Error(), "required_outcomes") {
+		t.Errorf("v0 error = %q, want it to name required_outcomes", err.Error())
+	}
+}

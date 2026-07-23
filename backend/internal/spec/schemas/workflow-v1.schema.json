@@ -17,7 +17,8 @@
         "1.1",
         "1.2",
         "1.3",
-        "1.4"
+        "1.4",
+        "1.5"
       ],
       "description": "Spec syntax version. workflow-v1 advertises 1.0 (the initial grammar plus the E23.2 deploy surface), 1.1 (adds the `acceptance` stage type, ADR-049 / #1519), 1.2 (adds the `acceptance` produces artifact, ADR-049 / #1531, E31.3), 1.3 (adds the acceptance-stage `egress` allowance, ADR-050 / #1532, E31.4), and 1.4 (adds the `agent_version` compatibility range on the executor's agent branch and per reviewer in reviewers.agents[], E32.13 / #1743). Each is an additive minor — every lower-minor spec remains valid — mirroring v0's additive 0.3…0.7 minor chain. The validator routes a spec to this schema when its version major is 1 (minor is not routing-significant). Old specs in the audit log remain readable forever via their historical schemas; this enum gates *new* v1 specs only."
     },
@@ -526,9 +527,11 @@
             "type": "string",
             "enum": [
               "tests_added_or_updated",
-              "ci_green"
+              "ci_green",
+              "verification_reported"
             ]
-          }
+          },
+          "description": "Outcomes the stage must satisfy. `tests_added_or_updated` is filename-shape-aware (a test-named file in the diff satisfies it). `verification_reported` (v1.5, ADR-059 / #1886) is substance-aware: it reads the runner's machine-verified committed-tree verify evidence and is satisfied ONLY when that gate reported `passed` — an absent signal, a failed gate, and a skipped gate each violate. Opt-in per workflow; a workflow declaring it must configure `executor.verify` or it can never be satisfied."
         },
         "allowed_environments": {
           "type": "array",

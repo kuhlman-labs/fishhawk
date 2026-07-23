@@ -2,11 +2,11 @@
 
 Reference for `.fishhawk/workflows.yaml` at major version 1. The canonical schema is [`workflow-v1.schema.json`](workflow-v1.schema.json) (JSON Schema Draft 2020-12).
 
-> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v1.3 adds the acceptance-stage `egress` allowance (E31.4 / #1532, per ADR-050)** — the declared target host(s) the acceptance agent may reach through the runner's default-deny egress proxy; also an additive minor. **v1.4 adds the `agent_version` compatibility range (E32.13 / #1743)** — on the executor's agent branch and per reviewer in `reviewers.agents[]`, failing dispatch loudly when the resolved agent CLI version falls outside the declared range; also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
+> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v1.3 adds the acceptance-stage `egress` allowance (E31.4 / #1532, per ADR-050)** — the declared target host(s) the acceptance agent may reach through the runner's default-deny egress proxy; also an additive minor. **v1.4 adds the `agent_version` compatibility range (E32.13 / #1743)** — on the executor's agent branch and per reviewer in `reviewers.agents[]`, failing dispatch loudly when the resolved agent CLI version falls outside the declared range; also an additive minor. **v1.5 adds the `verification_reported` required outcome (E46.2 / #1886, per ADR-059)** — a substance-aware sibling of `tests_added_or_updated` that gates on the runner's machine-verified committed-tree verify result rather than on a test-shaped filename; opt-in per workflow, so also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
 
 ## Grammar
 
-Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) (v1.0), the [acceptance stage](#acceptance-stage-v11) (v1.1), the [acceptance artifact](#acceptance-artifact-v12) (v1.2), the [egress allowance](#egress-allowance-v13) (v1.3), and the [agent version compatibility](#agent-version-compatibility-v14) range (v1.4) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
+Every v0 field is inherited unchanged. For the full base reference (top-level shape, stages, executors, inputs, produces, constraints, budgets, gates, operator-agent delegation — including the `operator_agent.model_policy` scenario-A model-selection contract (#1421), inherited verbatim and surfaced identically on the run-status delegation block — decomposition controls), see [`workflow-v0.md`](workflow-v0.md). The v1 additions are the [deploy stage](#deploy-stage-v1) (v1.0), the [acceptance stage](#acceptance-stage-v11) (v1.1), the [acceptance artifact](#acceptance-artifact-v12) (v1.2), the [egress allowance](#egress-allowance-v13) (v1.3), the [agent version compatibility](#agent-version-compatibility-v14) range (v1.4), and the [verification-substance required outcome](#verification-substance-required-outcome-v15) (v1.5) members below. A minimal non-deploy v1 spec differs from a v0 spec only in its `version` value:
 
 ```yaml
 version: "1.0" # required; routes to workflow-v1.schema.json
@@ -308,6 +308,42 @@ stages:
           agent_version: ">=0.30 <0.31" # codex reviewer CLI range (codex-only)
         - provider: anthropic # SDK reviewer — agent_version ignored
       human: 1
+```
+
+## Verification-substance required outcome (v1.5)
+
+v1.5 (E46.2 / #1886, per ADR-059 Option C.2) adds **one additive enum member** to the existing `required_outcomes` constraint: **`verification_reported`**. It is **opt-in per workflow** and changes nothing for a spec that does not declare it.
+
+The existing `tests_added_or_updated` outcome is **filename-shape-aware**: a diff containing a test-*named* file satisfies it, whether or not that file contains a real test and whether or not anything was ever run. `verification_reported` is **substance-aware** — it gates on what the implement stage actually **ran** and whether it **passed**:
+
+| Signal at evaluation time | Result |
+|---|---|
+| Committed-tree verify reported `passed` | **satisfied** |
+| Committed-tree verify reported `failed` | violation (names the outcome and the failing command) |
+| Committed-tree verify reported `skipped` | violation — a skipped gate is not a passed gate |
+| No verification evidence in the trace at all | violation (`no verification evidence in trace`) |
+
+**It is fail-closed in every absent-or-negative mode, and — unlike `tests_added_or_updated` — it has no filename inspection and no docs-only vacuous-satisfaction branch.** A diff whose only change is `foo_test.go` does not satisfy it; neither does a docs-only diff. That asymmetry is the point of the outcome. It is also **not deferrable**: `ci_green` is still the only outcome whose missing signal defers to branch protection, because deferring this one would reconstruct the vacuous pass it exists to remove.
+
+**What it consumes.** The backend derives the signal from the runner's single pre-redacted `gate_evidence` trace event (#963) at trace-upload time: the once-per-stage `verify_summary` when present, otherwise the last non-superseded `verify_run` (#1205). No new runner emission is involved. The derived signal is recorded in the `policy_evaluated` audit payload under `applied_constraints.verification`, so it survives the post-CI policy re-evaluation round-trip.
+
+**A workflow opting in MUST configure `executor.verify`** on the stage. With no verify configured the gate reports `skipped` (or emits no evidence), and the outcome can never be satisfied.
+
+**Runner-side it is backend-authoritative.** The runner's in-line constraint check fires on the implement push path *before* either committed-tree verify gate runs, so no verify result exists locally; the runner skips this outcome rather than asserting on it.
+
+It **does not replace** `tests_added_or_updated` — the two are independent and may be declared together.
+
+```yaml
+stages:
+  - id: implement
+    type: implement
+    executor:
+      agent: claude-code
+      verify:
+        command: scripts/test verify # required, or the outcome can never be satisfied
+    constraints:
+      - required_outcomes:
+          - verification_reported
 ```
 
 ## Approval gate predicate (v1)

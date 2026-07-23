@@ -299,6 +299,37 @@ func TestRequiredOutcomes_UnknownOutcome(t *testing.T) {
 	}
 }
 
+// TestRequiredOutcomes_VerificationReported_SkippedRunnerSide pins the
+// backend-authoritative split (#1886 / ADR-059): this in-line check runs
+// BEFORE either committed-tree verify gate on the implement push path,
+// so no verify result exists yet locally and the runner must emit NO
+// violation — in particular not the default branch's `unknown outcome`,
+// which would fail every opted-in run as category-B. An actually
+// unrecognized outcome must still violate, so the skip is scoped to the
+// one known-deferred name rather than weakening the default branch.
+func TestRequiredOutcomes_VerificationReported_SkippedRunnerSide(t *testing.T) {
+	// Alone: no violations at all.
+	if v := Evaluate(diff("a.go"), Constraints{
+		RequiredOutcomes: []string{"verification_reported"},
+	}); len(v) != 0 {
+		t.Errorf("expected no violations for verification_reported, got %+v", v)
+	}
+	// Specifically not an unknown-outcome violation, even alongside a
+	// genuinely unknown outcome (which must still violate exactly once).
+	v := Evaluate(diff("a.go"), Constraints{
+		RequiredOutcomes: []string{"verification_reported", "sky_is_blue"},
+	})
+	if len(v) != 1 {
+		t.Fatalf("expected exactly 1 violation (the unknown outcome), got %+v", v)
+	}
+	if !strings.Contains(v[0].Detail, `unknown outcome "sky_is_blue"`) {
+		t.Errorf("Detail = %q, want it to name sky_is_blue only", v[0].Detail)
+	}
+	if strings.Contains(v[0].Detail, "verification_reported") {
+		t.Errorf("Detail = %q, want no verification_reported violation", v[0].Detail)
+	}
+}
+
 func TestEvaluate_MultipleConstraints(t *testing.T) {
 	// The classic feature_change implement stage from MVP_SPEC §4.2.
 	d := diff(

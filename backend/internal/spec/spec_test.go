@@ -3290,3 +3290,38 @@ workflows:
 		t.Errorf("ValidationError.Path = %q, want it to name the reviewer agent_version", ve.Path)
 	}
 }
+
+// TestParse_RequiredOutcomes_VerificationReported pins the workflow-v1
+// enum member added in v1.5 (#1886 / ADR-059) against the BACKEND's
+// embedded mirror. workflow-v0 stays frozen: the same declaration under
+// a 0.x version must still fail at the schema layer.
+func TestParse_RequiredOutcomes_VerificationReported(t *testing.T) {
+	const stages = `
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - required_outcomes:
+              - verification_reported
+`
+	s, err := spec.ParseBytes([]byte("version: \"1.5\"\n" + stages))
+	if err != nil {
+		t.Fatalf("v1.5 parse: %v", err)
+	}
+	got := s.Workflows["feature_change"].Stages[0].Constraints
+	if len(got) != 1 || len(got[0].RequiredOutcomes) != 1 ||
+		got[0].RequiredOutcomes[0] != "verification_reported" {
+		t.Fatalf("parsed constraints = %+v, want required_outcomes [verification_reported]", got)
+	}
+
+	// workflow-v0 is frozen — the outcome is not in its enum.
+	_, err = spec.ParseBytes([]byte("version: \"0.7\"\n" + stages))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("v0 err = %v, want *SchemaError (workflow-v0 enum is frozen)", err)
+	}
+}
