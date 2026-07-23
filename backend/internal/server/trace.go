@@ -1011,6 +1011,14 @@ func (s *Server) reEvaluatePolicy(r *http.Request, runID, stageID uuid.UUID, bun
 	// as a violation, not a pass.
 	constraints.Verification = verificationSignalFromBundle(bundleBytes)
 
+	// Diff-coverage signal (#1888 / ADR-059): same shape — the runner
+	// measured, this derives the signal from the same gate_evidence event,
+	// and checkDiffCoverage owns the verdict. nil when the bundle carried
+	// no diff-coverage record, which a DECLARED constraint treats as a
+	// violation (the runner emits a measured-zero result rather than
+	// nothing when there is simply nothing to measure).
+	constraints.DiffCoverageSignal = diffCoverageSignalFromBundle(bundleBytes)
+
 	// Happy path: real evaluation. EmitEvaluation handles the empty-
 	// constraints case cleanly — Evaluate returns no violations, the
 	// row carries Applied={} and Passed=true. SPA renders "Policy
@@ -1083,6 +1091,42 @@ func verificationSignalFromBundle(bundleBytes []byte) *policy.VerificationSignal
 		}
 	default:
 		return nil
+	}
+}
+
+// diffCoverageSignalFromBundle derives the policy diff-coverage signal
+// from the bundle's single pre-redacted `gate_evidence` event, the same
+// source verificationSignalFromBundle reads (#1888 / ADR-059). The runner
+// MEASURES and emits; this only threads the measurement into policy
+// evaluation.
+//
+// Returns nil — read by the policy engine as "no diff-coverage evidence",
+// i.e. a violation for a stage that DECLARED the constraint — when the
+// bundle carries no gate_evidence event, when extraction fails, or when
+// the evidence carries no diff-coverage record. A stage that did not
+// declare the constraint is unaffected: checkDiffCoverage never runs.
+func diffCoverageSignalFromBundle(bundleBytes []byte) *policy.DiffCoverageSignal {
+	ev, err := bundle.ExtractGateEvidence(bundleBytes)
+	if err != nil {
+		// Includes ErrNoGateEvidence (older runner, or a stage that ran
+		// no gates at all). Fail closed: no evidence, no signal.
+		return nil
+	}
+	if ev.DiffCoverage == nil {
+		return nil
+	}
+	dc := ev.DiffCoverage
+	return &policy.DiffCoverageSignal{
+		Outcome:         dc.Outcome,
+		Command:         dc.Command,
+		ExitCode:        dc.ExitCode,
+		ReportPath:      dc.ReportPath,
+		BaseRef:         dc.BaseRef,
+		NewLines:        dc.NewLines,
+		CoveredNewLines: dc.CoveredNewLines,
+		Percent:         dc.Percent,
+		UncoveredFiles:  dc.UncoveredFiles,
+		Reason:          dc.Reason,
 	}
 }
 
@@ -1165,6 +1209,21 @@ func mergeConstraints(in []spec.Constraint) policy.Constraints {
 		if len(c.RequiredOutcomes) > 0 {
 			out.RequiredOutcomes = append(out.RequiredOutcomes, c.RequiredOutcomes...)
 		}
+		// diff_coverage (#1888) is a scalar-ish rule like max_files_changed:
+		// a stage declaring it twice is pathological, so the most
+		// RESTRICTIVE (highest) threshold wins, keeping the fold
+		// order-independent.
+		if c.DiffCoverage != nil {
+			if out.DiffCoverage == nil || c.DiffCoverage.MinNewLineCoverage > out.DiffCoverage.MinNewLineCoverage {
+				out.DiffCoverage = &policy.DiffCoverageConfig{
+					Command:            c.DiffCoverage.Command,
+					ReportPath:         c.DiffCoverage.ReportPath,
+					Format:             c.DiffCoverage.Format,
+					MinNewLineCoverage: c.DiffCoverage.MinNewLineCoverage,
+					BaseRef:            c.DiffCoverage.BaseRef,
+				}
+			}
+		}
 	}
 	return out
 }
@@ -1173,7 +1232,11 @@ func isEmptyConstraints(c policy.Constraints) bool {
 	return len(c.ForbiddenPaths) == 0 &&
 		len(c.AllowedPaths) == 0 &&
 		c.MaxFilesChanged == 0 &&
-		len(c.RequiredOutcomes) == 0
+		len(c.RequiredOutcomes) == 0 &&
+		// A stage whose ONLY constraint is diff_coverage is not
+		// constraint-free; omitting this would route it down the
+		// no-constraints path and never evaluate the gate.
+		c.DiffCoverage == nil
 }
 
 // failStageCategoryB transitions the stage to failed with category

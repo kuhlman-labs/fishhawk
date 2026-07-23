@@ -2,7 +2,7 @@
 
 Reference for `.fishhawk/workflows.yaml` at major version 1. The canonical schema is [`workflow-v1.schema.json`](workflow-v1.schema.json) (JSON Schema Draft 2020-12).
 
-> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v1.3 adds the acceptance-stage `egress` allowance (E31.4 / #1532, per ADR-050)** — the declared target host(s) the acceptance agent may reach through the runner's default-deny egress proxy; also an additive minor. **v1.4 adds the `agent_version` compatibility range (E32.13 / #1743)** — on the executor's agent branch and per reviewer in `reviewers.agents[]`, failing dispatch loudly when the resolved agent CLI version falls outside the declared range; also an additive minor. **v1.5 adds the `verification_reported` required outcome (E46.2 / #1886, per ADR-059)** — a substance-aware sibling of `tests_added_or_updated` that gates on the runner's machine-verified committed-tree verify result rather than on a test-shaped filename; opt-in per workflow, so also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
+> **v1 began as a structural copy of v0 (ADR-046 / #1381) and now adds the deploy surface (E23.2 / #1382).** The inherited `$defs` and `properties` stay byte-for-byte identical to [`workflow-v0.schema.json`](workflow-v0.schema.json); v1 layers the delegating deploy grammar (per ADR-038 / #925) on top — the `deploy` stage type, the `deployment` artifact, the delegating executor, and three pre-flight constraint kinds. **v1.1 adds the `acceptance` stage type (E31.2 / #1519, per ADR-049)** — a runner-hosted advisory acceptance stage on the ordinary agent/human executor branches (no delegate, no deploy-only constraints); an additive minor, so every 1.0 spec stays valid. **v1.2 adds the `acceptance` produces artifact (E31.3 / #1531, per ADR-049)** — the durable acceptance-evidence record, valid only on an acceptance stage; also an additive minor. **v1.3 adds the acceptance-stage `egress` allowance (E31.4 / #1532, per ADR-050)** — the declared target host(s) the acceptance agent may reach through the runner's default-deny egress proxy; also an additive minor. **v1.4 adds the `agent_version` compatibility range (E32.13 / #1743)** — on the executor's agent branch and per reviewer in `reviewers.agents[]`, failing dispatch loudly when the resolved agent CLI version falls outside the declared range; also an additive minor. **v1.5 adds the `verification_reported` required outcome (E46.2 / #1886, per ADR-059)** — a substance-aware sibling of `tests_added_or_updated` that gates on the runner's machine-verified committed-tree verify result rather than on a test-shaped filename; opt-in per workflow, so also an additive minor. **v1.6 adds the `diff_coverage` constraint kind (E46.3 / #1888, per ADR-059)** — an opt-in, backend-authoritative gate on the new-line coverage a customer-declared coverage command reports for the stage's diff; also an additive minor. **v0 stays frozen** and rejects both `deploy` and `acceptance` via its closed enums, so a v0 spec carrying either fails at the schema layer.
 
 ## Grammar
 
@@ -345,6 +345,73 @@ stages:
       - required_outcomes:
           - verification_reported
 ```
+
+## Diff-coverage constraint (v1.6)
+
+v1.6 (E46.3 / #1888, per ADR-059) adds a new post-hoc diff constraint kind: **`diff_coverage`**. It is **opt-in per workflow** — a spec that does not declare it takes no new code path, the runner runs no extra command, and behavior is byte-identical to v1.5.
+
+The customer declares a coverage command, the report path it writes, and a minimum new-line coverage percentage. The runner **measures**; the backend is **authoritative** for the verdict — the same division of labour `verification_reported` (v1.5) established.
+
+```yaml
+stages:
+  - id: implement
+    type: implement
+    executor:
+      agent: claude-code
+    constraints:
+      - diff_coverage:
+          command: "coverage run -m pytest && coverage lcov -o coverage.lcov"
+          report_path: coverage.lcov
+          format: lcov          # optional; lcov is the only v1.6 member
+          min_new_line_coverage: 85
+          base_ref: main        # optional; omitted = the run's base branch
+```
+
+### Fields
+
+| Field | Required | Meaning |
+|---|---|---|
+| `command` | yes | Shell command (`sh -c`) that produces the coverage report, run from the repo root of a **throwaway `git worktree` checkout of the stage's committed tree**. Same containment as the verify gate: bounded timeout, process-group kill, default-deny gate-env allow-list (it never sees runner credentials), and a disposable checkout, so its filesystem side effects never reach the real working tree. |
+| `report_path` | yes | Repo-relative path the command writes the report to. An absolute path or a `..` escape is rejected at parse time. |
+| `format` | no (`lcov`) | Report format. `lcov` is the only v1.6 member; an enum so a later additive minor can add others. |
+| `min_new_line_coverage` | yes | Integer 0–100. Compared with `>=`, so a measurement exactly **at** the threshold passes and one below fails. |
+| `base_ref` | no | Git ref the diff is taken against (merge-base semantics). Omitted means the run's base branch, resolved by the **runner** at measurement time (`--base-branch` > `GITHUB_REF_NAME` > `main`). An empty ref never reaches git. |
+
+### Why LCOV
+
+It is the one per-line format every major ecosystem's tooling can emit: coverage.py (`coverage lcov`), Istanbul/nyc, cargo-llvm-cov, JaCoCo (via converter), and Go (via `gcov2lcov`). The parsed grammar is the stable `SF:` / `DA:<line>,<hits>` / `end_of_record` subset; all other record types are ignored, not rejected.
+
+### Failure modes
+
+| Signal at evaluation time | Result |
+|---|---|
+| Measured, coverage **at or above** the threshold | **satisfied** |
+| Measured, **zero** new coverable lines | **satisfied** — a vacuous pass; a diff that added nothing cannot be under-covered |
+| Measured, coverage **below** the threshold | violation naming covered/total, the percentage, the threshold, and the uncovered files |
+| Coverage command exited non-zero | violation naming the command, its exit code, and its output tail |
+| Command succeeded but wrote no readable report | violation naming the report path |
+| Report was not parseable as LCOV | violation naming the report path and the parse error |
+| Base ref could not be resolved | violation naming the unresolved ref |
+| **No diff-coverage evidence in the trace at all** | violation (`no diff-coverage evidence in trace`) |
+
+**Absence of a measurement is a violation, not a pass.** The runner emits evidence **whenever the constraint is configured** — including the zero-new-lines case, which is reported as an explicit measured-with-zero result rather than as silence. An explicit zero is auditable; absence is indistinguishable from a runner that failed to run.
+
+### What the measurement counts
+
+The added-line set is taken **merge-base → the committed tree the coverage command ran against**, so commits that landed on the base branch after the run branched are not attributed to this stage, and the diff and the report describe one snapshot. The merge base is pinned to a SHA **before** the runner materializes that committed tree, so a `base_ref` naming the branch the runner is committing onto cannot collapse the diff to empty (a false vacuous pass). A new file inside the declared scope is part of that committed tree; a new file outside it is scope drift, excluded from the commit and correctly not attributed to the stage.
+
+Two exclusions from the denominator, both deliberate: an added line in a file the report never measured (a README, a generated file, a language the tool does not cover), and an added line the report measured no statement on (a blank line, a comment, a brace). Counting either would fail every docs-touching stage.
+
+Report paths are **normalized to repo-relative form on both sides** before intersection — coverage producers emit absolute, `./`-prefixed and redundant-separator spellings, and an exact key match would classify covered lines as uncovered and fail every opted-in run. A path that cannot be placed inside the repository is named explicitly in the evidence reason, never silently counted as uncovered.
+
+### Bindings
+
+- **Post-hoc**, so a delegating deploy — which produces no reviewable diff — rejects it (ADR-038). It is narrower than its post-hoc siblings: valid on an **implement stage only**. The implement runner is the layer that measures, and since an absent signal on a declared constraint is a violation, declaring it on any other stage type would be a guaranteed false failure; the semantic validator rejects it there at parse time rather than at evaluation time on a real run.
+- **Runner-side it is backend-authoritative.** The runner's in-line constraint check fires on the implement push path, before the coverage command has run, so it skips this kind rather than asserting on it.
+- **Not deferrable**: `ci_green` remains the only outcome whose missing signal defers to branch protection.
+- The measurement is recorded in the `policy_evaluated` audit payload under `applied_constraints.diff_coverage` (the declaration) and `applied_constraints.diff_coverage_signal` (the measurement), so both survive the post-CI policy re-evaluation round-trip.
+
+**Known limitation.** A coverage percentage credits **execution, not assertion** — a vacuous test still earns diff coverage. This mirrors ADR-059's stated limitation for the repo-local gate.
 
 ## Approval gate predicate (v1)
 

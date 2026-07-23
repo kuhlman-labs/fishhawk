@@ -1223,3 +1223,113 @@ func TestGateEvidenceEvent_DoesNotPerturbOtherExtractors(t *testing.T) {
 		t.Errorf("ExtractManifest perturbed: %+v vs %+v", mEv, mBase)
 	}
 }
+
+// packGateEvidenceBundle packs a minimal bundle whose single event is a
+// gate_evidence line carrying payload verbatim.
+func packGateEvidenceBundle(t *testing.T, payload json.RawMessage) []byte {
+	t.Helper()
+	return packLines(t, []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: payload},
+		{Seq: 3, Kind: "trailer", Data: json.RawMessage(`{}`)},
+	})
+}
+
+// TestExtractGateEvidence_DiffCoverage round-trips the runner's
+// diff_coverage digest (#1888) field-for-field through PackBytes, spelling
+// the payload with the RUNNER's literal json field names. A silent zero
+// value here means the runner↔backend wire tags diverged — the drift that
+// disables the gate without any layer reporting a problem.
+func TestExtractGateEvidence_DiffCoverage(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"diff_coverage": map[string]any{
+			"outcome":           "measured",
+			"command":           "make coverage",
+			"exit_code":         0,
+			"report_path":       "coverage.lcov",
+			"base_ref":          "main",
+			"new_lines":         4,
+			"covered_new_lines": 3,
+			"percent":           75.0,
+			"uncovered_files":   []string{"src/app.go"},
+			"reason":            "3 of 4 new lines covered",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	b := packGateEvidenceBundle(t, payload)
+
+	got, err := ExtractGateEvidence(b)
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if got.DiffCoverage == nil {
+		t.Fatal("DiffCoverage = nil, want the runner's measurement")
+	}
+	dc := got.DiffCoverage
+	if dc.Outcome != "measured" || dc.Command != "make coverage" || dc.ExitCode != 0 ||
+		dc.ReportPath != "coverage.lcov" || dc.BaseRef != "main" {
+		t.Errorf("DiffCoverage identity = %+v", *dc)
+	}
+	if dc.NewLines != 4 || dc.CoveredNewLines != 3 || dc.Percent != 75 {
+		t.Errorf("DiffCoverage counts = %+v, want 3/4 at 75%%", *dc)
+	}
+	if len(dc.UncoveredFiles) != 1 || dc.UncoveredFiles[0] != "src/app.go" {
+		t.Errorf("UncoveredFiles = %v", dc.UncoveredFiles)
+	}
+	if dc.Reason != "3 of 4 new lines covered" {
+		t.Errorf("Reason = %q", dc.Reason)
+	}
+}
+
+// TestExtractGateEvidence_DiffCoverageZeroCountsSurvive pins that the
+// measured-with-zero signal is DISTINGUISHABLE from an absent one: the
+// counts decode as real zeros on a non-nil record. Collapsing the two
+// would fail a legitimately vacuous stage, since an absent record is a
+// violation.
+func TestExtractGateEvidence_DiffCoverageZeroCountsSurvive(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"diff_coverage": map[string]any{
+			"outcome":           "measured",
+			"new_lines":         0,
+			"covered_new_lines": 0,
+			"percent":           0,
+			"reason":            "no added lines against \"main\"; nothing to measure",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got, err := ExtractGateEvidence(packGateEvidenceBundle(t, payload))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if got.DiffCoverage == nil {
+		t.Fatal("DiffCoverage = nil — a measured-zero record must decode as present")
+	}
+	if got.DiffCoverage.Outcome != "measured" || got.DiffCoverage.NewLines != 0 {
+		t.Errorf("DiffCoverage = %+v, want measured with zero new lines", *got.DiffCoverage)
+	}
+}
+
+// TestExtractGateEvidence_OlderBundleWithoutDiffCoverage is the additive
+// /omitempty proof: a gate_evidence payload with NO diff_coverage field
+// (an older runner, or a non-declaring workflow) decodes to nil, which the
+// policy engine reads as "no measurement" — a violation only for a stage
+// that DECLARED the constraint.
+func TestExtractGateEvidence_OlderBundleWithoutDiffCoverage(t *testing.T) {
+	payload, err := json.Marshal(map[string]any{
+		"verify_summary": map[string]any{"outcome": "passed"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got, err := ExtractGateEvidence(packGateEvidenceBundle(t, payload))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if got.DiffCoverage != nil {
+		t.Errorf("DiffCoverage = %+v, want nil for a bundle without the field", got.DiffCoverage)
+	}
+}

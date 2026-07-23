@@ -1015,3 +1015,243 @@ func TestShipTrace_PolicyReEval_VerificationSignal_NotDerivedWithoutOptIn(t *tes
 			pl.Applied.Verification.Outcome)
 	}
 }
+
+// testWorkflowSpecRequireDiffCoverage opts the implement stage into the
+// workflow-v1.6 `diff_coverage` constraint (#1888 / ADR-059) at an 80%
+// threshold. Pinned at version "1.6" — the kind is workflow-v1-only.
+const testWorkflowSpecRequireDiffCoverage = `
+version: "1.6"
+roles:
+  eng_team:
+    members: ["@org/eng"]
+workflows:
+  feature_change:
+    description: Test workflow
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:
+              command: make coverage
+              report_path: coverage.lcov
+              min_new_line_coverage: 80
+`
+
+// TestShipTrace_PolicyReEval_DiffCoverage is the CROSS-BOUNDARY
+// end-to-end assertion for #1888 / ADR-059. Each case packs a bundle
+// carrying the RUNNER's literal `gate_evidence` json — field names spelled
+// exactly as runner/cmd/fishhawk-runner/gateevidence.go emits them, NOT
+// composed via bundle.GateEvidence — and drives it through the real trace
+// upload: the bundle extractor, diffCoverageSignalFromBundle, the spec
+// constraint load, and the policy evaluator, asserting the emitted
+// `policy_evaluated` payload and the resulting stage state.
+//
+// This change spans payload, evidence, persistence and evaluation layers,
+// so THIS test — not the per-layer units, which all pass through a tag
+// drift — is what fails when the runner and backend mirror structs
+// disagree.
+func TestShipTrace_PolicyReEval_DiffCoverage(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+
+	cases := []struct {
+		name string
+		// runnerJSON is the runner's literal gate_evidence payload.
+		runnerJSON      string
+		wantPassed      bool
+		wantOutcome     string // applied_constraints.diff_coverage_signal.outcome ("" = nil signal)
+		wantViolationIs string
+		wantState       run.StageState
+	}{
+		{
+			// The POSITIVE criterion: coverage above the threshold PASSES.
+			name: "above threshold passes",
+			runnerJSON: `{"diff_coverage":{"outcome":"measured","command":"make coverage",
+				"exit_code":0,"report_path":"coverage.lcov","base_ref":"main",
+				"new_lines":10,"covered_new_lines":10,"percent":100}}`,
+			wantPassed:  true,
+			wantOutcome: "measured",
+			wantState:   run.StageStateAwaitingApproval,
+		},
+		{
+			// Boundary: exactly AT the threshold passes (>= comparison).
+			name: "exactly at threshold passes",
+			runnerJSON: `{"diff_coverage":{"outcome":"measured","command":"make coverage",
+				"exit_code":0,"report_path":"coverage.lcov","base_ref":"main",
+				"new_lines":5,"covered_new_lines":4,"percent":80}}`,
+			wantPassed:  true,
+			wantOutcome: "measured",
+			wantState:   run.StageStateAwaitingApproval,
+		},
+		{
+			// One below the boundary fails.
+			name: "one below threshold fails",
+			runnerJSON: `{"diff_coverage":{"outcome":"measured","command":"make coverage",
+				"exit_code":0,"report_path":"coverage.lcov","base_ref":"main",
+				"new_lines":100,"covered_new_lines":79,"percent":79,
+				"uncovered_files":["src/app.go"]}}`,
+			wantPassed:      false,
+			wantOutcome:     "measured",
+			wantViolationIs: "below the required 80%",
+			wantState:       run.StageStateFailed,
+		},
+		{
+			// Condition 1: a configured stage whose diff added no coverable
+			// lines receives the documented VACUOUS PASS, carried as an
+			// explicit measured-with-zero signal rather than as silence.
+			name: "configured stage with no new lines passes",
+			runnerJSON: `{"diff_coverage":{"outcome":"measured","command":"make coverage",
+				"exit_code":0,"report_path":"coverage.lcov","base_ref":"main",
+				"new_lines":0,"covered_new_lines":0,"percent":0,
+				"reason":"no added lines against \"main\"; nothing to measure"}}`,
+			wantPassed:  true,
+			wantOutcome: "measured",
+			wantState:   run.StageStateAwaitingApproval,
+		},
+		{
+			// Fail-closed: no diff-coverage record in the evidence at all.
+			name:            "gate evidence without a diff-coverage record violates",
+			runnerJSON:      `{"verify_summary":{"outcome":"passed"}}`,
+			wantPassed:      false,
+			wantOutcome:     "",
+			wantViolationIs: "no diff-coverage evidence in trace",
+			wantState:       run.StageStateFailed,
+		},
+		{
+			name: "measurement failure violates with the runner's reason",
+			runnerJSON: `{"diff_coverage":{"outcome":"failed","command":"make coverage",
+				"exit_code":2,"report_path":"coverage.lcov",
+				"reason":"coverage command exited 2: FAIL ./pkg"}}`,
+			wantPassed:      false,
+			wantOutcome:     "failed",
+			wantViolationIs: "FAIL ./pkg",
+			wantState:       run.StageStateFailed,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, sf, repo, au := newPolicyTraceServer(t, changed)
+			repo.runRow.WorkflowSpec = []byte(testWorkflowSpecRequireDiffCoverage)
+			b := makeTestBundleWithGateEvidence(t, changed, &gateEvidenceSpec{
+				rawPayload: json.RawMessage(tc.runnerJSON),
+			})
+			priv, _ := sf.issue(t, repo.runRow.ID)
+
+			w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+			if w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+
+			pl := decodePolicyPayload(t, au)
+			if pl.Passed != tc.wantPassed {
+				t.Errorf("Passed = %v, want %v (violations %+v)", pl.Passed, tc.wantPassed, pl.Violations)
+			}
+			// The DECLARED constraint must round-trip onto the payload, or
+			// the post-CI re-evaluation would lose the gate entirely.
+			if pl.Applied.DiffCoverage == nil {
+				t.Fatalf("Applied.DiffCoverage = nil, want the declared constraint")
+			}
+			if pl.Applied.DiffCoverage.MinNewLineCoverage != 80 {
+				t.Errorf("Applied.DiffCoverage.MinNewLineCoverage = %d, want 80",
+					pl.Applied.DiffCoverage.MinNewLineCoverage)
+			}
+			if tc.wantOutcome == "" {
+				if pl.Applied.DiffCoverageSignal != nil {
+					t.Errorf("Applied.DiffCoverageSignal = %+v, want nil", pl.Applied.DiffCoverageSignal)
+				}
+			} else {
+				if pl.Applied.DiffCoverageSignal == nil {
+					t.Fatalf("Applied.DiffCoverageSignal = nil, want outcome %q — the runner's json field names did not survive the wire contract",
+						tc.wantOutcome)
+				}
+				if pl.Applied.DiffCoverageSignal.Outcome != tc.wantOutcome {
+					t.Errorf("DiffCoverageSignal.Outcome = %q, want %q",
+						pl.Applied.DiffCoverageSignal.Outcome, tc.wantOutcome)
+				}
+			}
+			if tc.wantViolationIs == "" {
+				if len(pl.Violations) != 0 {
+					t.Errorf("Violations = %+v, want none", pl.Violations)
+				}
+			} else {
+				if len(pl.Violations) != 1 {
+					t.Fatalf("Violations = %+v, want exactly 1", pl.Violations)
+				}
+				if pl.Violations[0].Constraint != "diff_coverage" ||
+					!strings.Contains(pl.Violations[0].Detail, tc.wantViolationIs) {
+					t.Errorf("Violation = %+v, want diff_coverage containing %q",
+						pl.Violations[0], tc.wantViolationIs)
+				}
+			}
+			// diff_coverage is never deferred.
+			if len(pl.DeferredOutcomes) != 0 {
+				t.Errorf("DeferredOutcomes = %v, want empty", pl.DeferredOutcomes)
+			}
+			if repo.stage.State != tc.wantState {
+				t.Errorf("stage state = %q, want %q", repo.stage.State, tc.wantState)
+			}
+		})
+	}
+}
+
+// TestShipTrace_PolicyReEval_DiffCoverage_SignalInertWithoutOptIn asserts
+// the derivation is inert for a workflow that did NOT declare the
+// constraint: a bundle carrying a catastrophic 0%-coverage measurement
+// produces no violation at all, so an opt-out workflow takes no new code
+// path (the revert-safety and no-regression property).
+func TestShipTrace_PolicyReEval_DiffCoverage_SignalInertWithoutOptIn(t *testing.T) {
+	changed := []map[string]string{{"path": "backend/main.go", "status": "M"}}
+	s, sf, repo, au := newPolicyTraceServer(t, changed)
+	// testWorkflowSpec declares forbidden_paths + max_files_changed only.
+	b := makeTestBundleWithGateEvidence(t, changed, &gateEvidenceSpec{
+		rawPayload: json.RawMessage(`{"diff_coverage":{"outcome":"measured",
+			"new_lines":100,"covered_new_lines":0,"percent":0}}`),
+	})
+	priv, _ := sf.issue(t, repo.runRow.ID)
+
+	w := shipRequest(t, s, repo.runRow.ID, repo.stage.ID, "raw", priv, b, "")
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+
+	pl := decodePolicyPayload(t, au)
+	if !pl.Passed || len(pl.Violations) != 0 {
+		t.Errorf("Passed = %v violations = %+v, want a clean pass (constraint not declared)",
+			pl.Passed, pl.Violations)
+	}
+	if pl.Applied.DiffCoverage != nil {
+		t.Errorf("Applied.DiffCoverage = %+v, want nil when not declared", pl.Applied.DiffCoverage)
+	}
+	if repo.stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", repo.stage.State)
+	}
+}
+
+// TestMergeConstraints_DiffCoverage pins the fold: the constraint is
+// carried onto policy.Constraints with its declared values, the most
+// restrictive threshold wins when declared twice, and a stage whose ONLY
+// constraint is diff_coverage is not treated as constraint-free.
+func TestMergeConstraints_DiffCoverage(t *testing.T) {
+	got := mergeConstraints([]spec.Constraint{
+		{DiffCoverage: &spec.DiffCoverageConstraint{
+			Command: "a", ReportPath: "a.lcov", MinNewLineCoverage: 60,
+		}},
+		{DiffCoverage: &spec.DiffCoverageConstraint{
+			Command: "b", ReportPath: "b.lcov", MinNewLineCoverage: 90, BaseRef: "release",
+		}},
+	})
+	if got.DiffCoverage == nil {
+		t.Fatal("DiffCoverage = nil, want the folded constraint")
+	}
+	if got.DiffCoverage.MinNewLineCoverage != 90 {
+		t.Errorf("MinNewLineCoverage = %d, want 90 (most restrictive)", got.DiffCoverage.MinNewLineCoverage)
+	}
+	if got.DiffCoverage.Command != "b" || got.DiffCoverage.BaseRef != "release" {
+		t.Errorf("folded constraint = %+v, want the winning entry's fields", got.DiffCoverage)
+	}
+	if isEmptyConstraints(got) {
+		t.Error("a stage whose only constraint is diff_coverage was treated as constraint-free")
+	}
+}

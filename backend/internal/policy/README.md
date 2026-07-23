@@ -8,6 +8,7 @@ Backend-side source of truth for the closed set of workflow-spec constraints (`f
 |---|---|---|
 | `tests_added_or_updated` | the diff's file **names** (`isTestPath`) | a test-named file was added/modified — or the diff touches no unit-testable source at all (docs/scripts/config only, #610) |
 | `verification_reported` (v1.5, #1886 / ADR-059) | the stage's **machine-verified verify result** | the committed-tree verify gate reported `passed` — nothing else |
+| `diff_coverage` (v1.6, #1888 / ADR-059) — a constraint KIND, not a required outcome | the stage's **measured new-line coverage** | the runner measured coverage at or above `min_new_line_coverage`, OR measured zero new coverable lines |
 
 `tests_added_or_updated` is filename-shape-aware: a diff containing `foo_test.go` satisfies it whether or not the file contains a real test and whether or not anything ever ran. `verification_reported` is the substance-aware sibling that closes that gap. The two are independent and may be declared together; `tests_added_or_updated` behavior is unchanged.
 
@@ -56,3 +57,25 @@ Returns **nil** (read as a violation, never a pass) when: the bundle carries no 
 - #297 / #251 (ADR-017) — deferred outcomes and branch protection.
 - #283 / #247 / #233 — constraints cache, always-emit, audit payload shape.
 - #963 / #1205 / #804 / #802 — gate evidence, superseded verify runs, verify summary, committed-tree gate.
+
+## `diff_coverage` semantics (fail-closed, #1888 / ADR-059)
+
+`diff_coverage` is a workflow-v1.6 post-hoc constraint KIND (a sibling of `max_files_changed`, not a `required_outcomes` member). The customer declares a coverage command, the report path it writes, and a minimum new-line percentage; the RUNNER executes and measures, and this package is AUTHORITATIVE for the verdict — the same division of labour `verification_reported` established.
+
+`Constraints.DiffCoverage` is the DECLARATION (nil = the stage did not opt in, so `checkDiffCoverage` never runs and behavior is byte-identical to before #1888). `Constraints.DiffCoverageSignal` is the MEASUREMENT, derived by `backend/internal/server/trace.go`'s `diffCoverageSignalFromBundle` from the same `gate_evidence` event the verification signal reads.
+
+| Signal | Result |
+|---|---|
+| `measured`, `Percent >= MinNewLineCoverage` | **satisfied** (compared with `>=`, so exactly AT the threshold passes) |
+| `measured`, `NewLines == 0` | **satisfied** — the documented vacuous pass |
+| `measured`, below the threshold | violation naming covered/total, the percentage, the threshold, the command + exit code, and the uncovered files |
+| `failed` (command exited non-zero, no readable report, unparseable report, unresolvable base ref) | violation naming the outcome, command, exit code, report path, and the runner's reason |
+| **nil** — no measurement reached evaluation time | violation (`no diff-coverage evidence in trace`) |
+
+**Absence is a violation, not a pass.** The runner emits a signal WHENEVER the constraint is configured — a stage that added no coverable lines reports an explicit measured-with-zero result. So a nil signal unambiguously means the runner never ran or the evidence was lost, never "there was nothing to measure". An explicit zero is auditable; absence is indistinguishable from a runner that failed to run.
+
+**Every failure detail is actionable** (#1888 condition 7): it names what ran, how it exited, and what was measured. A constraint that fails without saying why is not a usable gate.
+
+Like `verification_reported`, it is **not deferrable** — deferring it would reconstruct the vacuous pass it exists to remove.
+
+**Both json tags are load-bearing.** `EvaluationPayload.Applied` is the audit-payload shape the post-CI re-evaluation decodes and re-emits, so an untagged `DiffCoverage` or `DiffCoverageSignal` would silently drop the constraint or its measurement on re-eval and flip a satisfied constraint into a violation.

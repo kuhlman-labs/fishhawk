@@ -17,6 +17,28 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
+// helperExit terminates the re-exec'd helper process, detaching os.Stderr
+// first so the Go runtime's coverage exit hooks cannot contaminate the
+// captured stream.
+//
+// A test binary linked with -cover registers emitMetaData as an exit hook
+// (internal/coverage/cfile.InitHook); the hook is normally defused by
+// testmain, which the helper never reaches because it os.Exits directly.
+// When -coverpkg selects no package linked into THIS binary — exactly what
+// the patch-scoped verify gate passes, since it restricts -coverpkg to the
+// changed packages — the hook's meta-data list is empty and it prints
+// "program not built with -cover" to stderr. The invoker faithfully records
+// that as an extra `stderr` event, and every event-count assertion fails.
+//
+// Intentional helper stderr writes happen before their helperExit call, so
+// the swap never suppresses transcript output the tests assert on.
+func helperExit(code int) {
+	if devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
+		os.Stderr = devnull
+	}
+	os.Exit(code)
+}
+
 // TestHelperProcess is the test-helper-process pattern from the Go
 // stdlib: when invoked with GO_HELPER_PROCESS=1 set in env, this
 // test pretends to be a `claude` binary and emits a canned
@@ -27,7 +49,7 @@ func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_HELPER_PROCESS") != "1" {
 		return
 	}
-	defer os.Exit(0)
+	defer helperExit(0)
 
 	switch os.Getenv("HELPER_MODE") {
 	case "happy":
@@ -48,7 +70,7 @@ func TestHelperProcess(t *testing.T) {
 	case "error":
 		fmt.Println(`{"type":"system","subtype":"init"}`)
 		fmt.Fprintln(os.Stderr, "agent: model rate-limited")
-		os.Exit(1)
+		helperExit(1)
 	case "external_api_529":
 		// Emit a terminal result event carrying a 5xx api_error_status
 		// (529 overloaded, the agent's in-run retries exhausted) then exit
@@ -56,7 +78,7 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"system","subtype":"init"}`)
 		fmt.Println(`{"type":"result","subtype":"error","is_error":true,"api_error_status":529,"result":"Overloaded"}`)
 		fmt.Fprintln(os.Stderr, "API Error: 529 Overloaded")
-		os.Exit(1)
+		helperExit(1)
 	case "raw_line":
 		// Non-JSON output should not crash the harness; it must
 		// still appear in the trace as kind=raw.
@@ -72,7 +94,7 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"system","subtype":"init"}`)
 		fmt.Println(`{"type":"result","subtype":"error","is_error":true,"api_error_status":400,"result":"messages.1.content.0.thinking: thinking or redacted_thinking blocks in the latest assistant message cannot be modified"}`)
 		fmt.Fprintln(os.Stderr, "API Error: 400 thinking blocks cannot be modified")
-		os.Exit(1)
+		helperExit(1)
 	case "thinking_block_then_ok":
 		// Stateful across re-execs via a marker file: the first run
 		// fails with the thinking-block 400, the second succeeds. Lets
@@ -83,7 +105,7 @@ func TestHelperProcess(t *testing.T) {
 			_ = os.WriteFile(marker, []byte("1"), 0o600)
 			fmt.Println(`{"type":"system","subtype":"init"}`)
 			fmt.Println(`{"type":"result","subtype":"error","is_error":true,"api_error_status":400,"result":"thinking blocks in the latest assistant message cannot be modified"}`)
-			os.Exit(1)
+			helperExit(1)
 		}
 		// Second attempt: clean run with usage.
 		fmt.Println(`{"type":"system","subtype":"init"}`)
@@ -219,7 +241,7 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}`)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
-		os.Exit(2)
+		helperExit(2)
 	}
 }
 

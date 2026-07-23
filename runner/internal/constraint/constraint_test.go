@@ -374,3 +374,49 @@ func TestStatusConstants(t *testing.T) {
 		}
 	}
 }
+
+// TestEvaluate_DiffCoverageIsSkipped pins the backend-authoritative
+// contract for the workflow-v1.6 `diff_coverage` constraint (#1888 /
+// ADR-059): the runner-side evaluator CARRIES it but never evaluates it.
+//
+// This in-line check fires on the implement push path, before the coverage
+// command has run, so there is nothing truthful the runner could assert.
+// Asserting anything here would fail every opted-in run as category-B
+// before its work was even measured — the regression this test exists to
+// prevent. The backend re-evaluates from the uploaded bundle's
+// gate_evidence, where the measurement IS available.
+func TestEvaluate_DiffCoverageIsSkipped(t *testing.T) {
+	c := Constraints{
+		DiffCoverage: &DiffCoverage{
+			Command:            "make coverage",
+			ReportPath:         "coverage.lcov",
+			Format:             "lcov",
+			MinNewLineCoverage: 85,
+			BaseRef:            "main",
+		},
+	}
+	v := Evaluate(Diff{ChangedFiles: []ChangedFile{{Path: "a.go", Status: StatusModified}}}, c)
+	// Zero violations is the whole assertion: it subsumes "no
+	// unknown-constraint violation" and every other shape. An additional
+	// loop over v would be dead code — v is provably empty here.
+	if len(v) != 0 {
+		t.Fatalf("violations = %+v, want none (backend-authoritative)", v)
+	}
+}
+
+// TestEvaluate_DiffCoverageDoesNotSuppressSiblings confirms carrying the
+// constraint does not short-circuit the constraints the runner DOES
+// evaluate in-line.
+func TestEvaluate_DiffCoverageDoesNotSuppressSiblings(t *testing.T) {
+	c := Constraints{
+		MaxFilesChanged: 1,
+		DiffCoverage:    &DiffCoverage{Command: "make coverage", MinNewLineCoverage: 85},
+	}
+	v := Evaluate(Diff{ChangedFiles: []ChangedFile{
+		{Path: "a.go", Status: StatusModified},
+		{Path: "b.go", Status: StatusModified},
+	}}, c)
+	if len(v) != 1 || v[0].Constraint != "max_files_changed" {
+		t.Errorf("violations = %+v, want the max_files_changed violation", v)
+	}
+}

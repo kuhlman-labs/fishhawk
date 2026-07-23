@@ -41,6 +41,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent/claudecode"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/diffcov"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/egressproxy"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
@@ -516,6 +517,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// produced and consumed within run().
 	var acceptanceExpectedHeadSHA string
 
+	// diffCoverage is the stage's spec-declared `diff_coverage` constraint
+	// (#1888), served only when the workflow declares it. Nil on every
+	// non-declaring workflow and on local replay without --fetch-prompt, in
+	// which case no coverage command runs and no evidence is emitted.
+	// Function-scoped like acceptanceExpectedHeadSHA: produced here and
+	// consumed by the measurement block below.
+	var diffCoverage *upload.DiffCoverageConfig
+
 	// If --fetch-prompt is set and no --prompt-file was supplied,
 	// pull the constructed prompt from the backend and write it to
 	// a temp file. Sets cfg.promptFile so the rest of the path is
@@ -536,7 +545,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -611,6 +620,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		egressTargetHosts = promptEgressTargetHosts
 		acceptanceCriteriaIDs = promptAcceptanceCriteriaIDs
 		acceptanceExpectedHeadSHA = promptAcceptanceExpectedHeadSHA
+		// Diff-coverage constraint (#1888): held for the measurement block
+		// that runs after the committed-tree verify gate.
+		diffCoverage = promptDiffCoverage
 		stageType = sType
 		// Hand the resolved scope.files to the out-of-process CLI
 		// auto-PR path (#581) the same way the PR description is
@@ -1855,6 +1867,42 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Diff-coverage measurement (#1888 / ADR-059). Placed AFTER the
+	// committed-tree verify gates above — the tree is final and the agent
+	// has stopped writing — and BEFORE composeGateEvidence folds the event
+	// into gate_evidence. The untrusted coverage command runs in a
+	// THROWAWAY worktree of the committed scope-only tree (see
+	// runDiffCoverageGate), so it cannot leave side effects in the real
+	// checkout and cannot alter the tree it was measured against.
+	//
+	// Runs WHENEVER the stage declared the constraint, with no
+	// "only if there was a diff" guard: the no-added-lines case is reported
+	// as an explicit measured-with-zero result, because absence of evidence
+	// is a violation and must not be reachable from a legitimately vacuous
+	// stage. MEASUREMENT ONLY: it never touches res.OK / res.FailureCategory
+	// — the backend re-evaluates the threshold from the uploaded bundle and
+	// owns the category-B verdict.
+	if diffCoverage != nil && stageType == "implement" {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		baseRef := resolveDiffCoverageBaseRef(cfg, diffCoverage)
+		ev, fatal := runDiffCoverageGate(ctx, cfg, diffCoverage, repoDir, baseRef)
+		res.Events = append(res.Events, ev)
+		if fatal != nil {
+			// NOT a coverage verdict — the gate's throwaway commit could not
+			// be undone, so HEAD is left where openPRAndShipArtifact's real
+			// commit would stack on top of it and push a WIP commit into the
+			// PR. Fatal for the same reason it is fatal in
+			// runVerifyGateCommitted (#802), which uses the same scaffolding.
+			res.OK = false
+			res.FailureCategory = "B"
+			res.FailureReason = fatal.Error()
+			invokeErr = fatal
+		}
+	}
+
 	// Binding-assertion gate evidence (#1171). The authoritative gate runs in
 	// openPRAndShipArtifact's verifyCommit closure (category-B before the
 	// push), but that closure executes AFTER the trace bundle is shipped, so a
@@ -2674,13 +2722,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -2688,20 +2736,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -4327,18 +4375,47 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 			"worktree_add: "+strings.TrimSpace(string(out)), "skipped"), "", "skipped"
 	}
 
+	output, exitCode := runBoundedGateCommand(ctx, verifyCmd, wt,
+		filepath.Join(parent, "golangci-lint-cache"), timeout)
+	outcome := "passed"
+	if exitCode != 0 {
+		outcome = "failed"
+	}
+	return verifyRunEvent(verifyCmd, headSHA, treeSHA, exitCode, output, outcome), output, outcome
+}
+
+// runBoundedGateCommand executes `sh -c command` in dir under the runner's
+// ONE gate-containment contract, and is the ONLY path any untrusted
+// spec-supplied command takes:
+//
+//   - bounded: a child context with the caller's timeout,
+//   - process-group killed on cancellation: Setpgid puts the child in a new
+//     group and Cancel signals the whole group, because SIGKILL to the
+//     direct child alone leaves grandchildren (e.g. `go test` subprocesses)
+//     holding the inherited stdout pipe open, and CombinedOutput then blocks
+//     forever waiting for an EOF that never comes,
+//   - default-deny env: sanitizedGateEnv strips every runner credential
+//     (ADR-029 / #650 item 4) so agent- and customer-authored code cannot
+//     see the GitHub token, the agent API keys, or the backend token,
+//   - lint-cache isolated per invocation (#1796).
+//
+// It returns the combined output and the exit code: 0 on success, the
+// child's code on a non-zero exit, and -1 when the command could not be
+// run or was killed (including the timeout), so a caller can always name
+// what happened.
+//
+// Callers: the committed-tree verify gate (above, and through it the
+// verify-fix loop and the #960 strict re-verify) and the diff-coverage
+// measurement (#1888). Do NOT add a second exec path for a new
+// spec-supplied command — route it through here so containment cannot
+// diverge, and do NOT widen the gate-env allow-list to make a particular
+// tool work; that is a separate, explicit decision.
+func runBoundedGateCommand(ctx context.Context, command, dir, lintCacheDir string, timeout time.Duration) (string, int) {
 	childCtx, childCancel := context.WithTimeout(ctx, timeout)
 	defer childCancel()
-	cmd := exec.CommandContext(childCtx, "sh", "-c", verifyCmd)
-	cmd.Dir = wt
-	// Strip runner credentials from the gate subprocess env (ADR-029 #650
-	// item 4): the committed-tree verify command runs agent-authored code.
-	// Isolate golangci-lint's analysis cache to a per-invocation dir under the
-	// existing parent temp (cleaned by the defer above) so a concurrent local
-	// run's path-keyed lint results can't leak into this re-verify (#1796). This
-	// covers the committed gate, the verify-fix loop, and the #960 strict
-	// re-verify — all route through here.
-	cmd.Env = withIsolatedLintCache(sanitizedGateEnv(), filepath.Join(parent, "golangci-lint-cache"))
+	cmd := exec.CommandContext(childCtx, "sh", "-c", command)
+	cmd.Dir = dir
+	cmd.Env = withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -4357,11 +4434,301 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 			exitCode = -1
 		}
 	}
-	outcome := "passed"
-	if exitCode != 0 {
-		outcome = "failed"
+	return string(output), exitCode
+}
+
+// diffCoverageTimeout bounds the customer coverage command. It is the same
+// default the committed-tree verify gate uses when the spec declares no
+// timeout — a coverage run is a test run.
+const diffCoverageTimeout = 10 * time.Minute
+
+// diffCoverageCleanupTimeout bounds the two cleanup git commands (worktree
+// removal, reset --soft) that MUST run even after ctx was cancelled to kill
+// a wedged coverage command. They are detached from ctx's cancellation but
+// never unbounded.
+const diffCoverageCleanupTimeout = 30 * time.Second
+
+// runDiffCoverageGate MEASURES the stage's new-line coverage for the
+// workflow-v1.6 `diff_coverage` constraint (ADR-059 / #1888) and returns
+// the trace event composeGateEvidence folds into gate_evidence. The BACKEND
+// owns the verdict; this never touches res.OK, so a coverage shortfall
+// fails the stage through the backend's category-B evaluation and never as
+// an opaque runner abort.
+//
+// It ALWAYS returns an event when the constraint is configured — including
+// the case where the stage added no coverable lines, which is reported as
+// an explicit measured-with-zero result rather than as silence. That is the
+// whole point: absence of evidence is indistinguishable from a runner that
+// failed to run, so the backend treats it as a violation, while an explicit
+// zero is an auditable vacuous pass.
+//
+// EXECUTION ENVIRONMENT. The customer command runs in a THROWAWAY
+// `git worktree add --detach` checkout of the stage's committed scope-only
+// tree — the same isolation runVerifyCommittedTree gives the verify gate,
+// and what this constraint's schema/API documentation promises. Two things
+// follow, and both are load-bearing:
+//
+//   - FILESYSTEM containment. runBoundedGateCommand contains the process
+//     (timeout, process-group kill) and the environment (default-deny
+//     allow-list), but only a separate checkout contains the FILESYSTEM. An
+//     untrusted coverage command's build artifacts, modified sources, and
+//     any other side effect land in the disposable checkout and are swept
+//     with it, instead of persisting in the operator's real repository —
+//     and the command cannot mutate the tree AFTER it was verified.
+//   - ONE snapshot. The checkout is clean and detached at the committed
+//     head, so ChangedLines' merge-base → work-tree diff taken INSIDE it is
+//     exactly merge-base → committed tree: the same tree the coverage
+//     command executed against. The diff is taken BEFORE the command runs,
+//     so the report the command writes is not itself mistaken for an
+//     untracked added file. (Untracked-file folding contributes nothing in
+//     a clean checkout, and does not need to: a new file inside the
+//     declared scope is IN the commit, and a new file outside it is scope
+//     drift, excluded from the commit and correctly not attributed here.)
+//
+// Materializing that committed tree reuses the #651 scaffolding —
+// StageScoped + commitVerifyWIP + reset --soft — so, exactly as in
+// runVerifyGateCommitted, a failed undo is FATAL rather than a measurement
+// failure: it is returned as the error, and the call site demotes the stage.
+//
+// baseRef is resolved by the CALLER (resolveDiffCoverageBaseRef) so this
+// function's empty-ref path is the fail-closed backstop, not the resolution
+// itself.
+func runDiffCoverageGate(ctx context.Context, cfg config, dc *upload.DiffCoverageConfig, repoDir, baseRef string) (agent.Event, error) {
+	ev := diffCoverageEvidence{
+		Outcome:    "failed",
+		Command:    dc.Command,
+		ReportPath: dc.ReportPath,
+		BaseRef:    baseRef,
 	}
-	return verifyRunEvent(verifyCmd, headSHA, treeSHA, exitCode, string(output), outcome), string(output), outcome
+
+	// (a) PIN the merge base BEFORE anything moves HEAD. The throwaway
+	// commit below advances whatever branch HEAD is on, so a base_ref
+	// naming that same branch (the ordinary local case) would merge-base to
+	// the throwaway commit itself and the measurement would see zero added
+	// lines — a silent false vacuous pass. Resolving it to a SHA first
+	// makes the diff framing invariant to the commit. This is also where
+	// an unresolved base ref is named: it never reaches git as an empty
+	// argument (#1888 condition 5).
+	mergeBase, err := diffcov.MergeBase(ctx, diffcov.ExecGit(repoDir), baseRef)
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not determine the stage's added lines: " + err.Error()
+		return diffCoverageEvent(ev), nil
+	}
+
+	// (b) Materialize the committed scope-only tree. A pre-commit failure
+	// leaves HEAD untouched, so it returns a named measurement failure with
+	// no undo to perform.
+	if _, err := (&gitops.Pusher{}).StageScoped(ctx, repoDir, scopePaths(cfg.scopeFiles)); err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not stage the scope-only tree to measure: " + err.Error()
+		return diffCoverageEvent(ev), nil
+	}
+	committed, err := commitVerifyWIP(ctx, cfg, repoDir)
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not commit the scope-only tree to measure: " + err.Error()
+		return diffCoverageEvent(ev), nil
+	}
+	if !committed {
+		// Measured-with-zero: the stage committed nothing, so nothing can
+		// be under-covered. Deliberately do NOT run the customer command —
+		// there is nothing for it to measure, and this is an explicit,
+		// auditable signal rather than an absent one.
+		ev.Outcome = "measured"
+		ev.Reason = fmt.Sprintf("no scope-only changes committed against %q; nothing to measure", baseRef)
+		return diffCoverageEvent(ev), nil
+	}
+
+	// HEAD has MOVED. Every path from here must undo the throwaway commit,
+	// so the measurement runs to completion first and the reset below is
+	// unconditional.
+	ev = measureDiffCoverage(ctx, ev, dc, repoDir, mergeBase)
+
+	// The undo runs on a context DETACHED from ctx's cancellation: a wedged
+	// coverage command is killed by cancelling ctx, and a ctx-bound reset
+	// would then fail exactly when it matters most, stranding HEAD on the
+	// throwaway commit. It stays bounded so a broken git can't hang the
+	// stage.
+	resetCtx, resetCancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
+	defer resetCancel()
+	if rerr := gitResetSoftHEAD1(resetCtx, repoDir); rerr != nil {
+		return diffCoverageEvent(ev), rerr
+	}
+	return diffCoverageEvent(ev), nil
+}
+
+// measureDiffCoverage performs the measurement against the throwaway
+// checkout of the committed HEAD, returning the evidence it produced.
+// It NEVER moves HEAD in repoDir — the caller owns the reset --soft that
+// undoes the throwaway commit — so every failure path here is a named
+// measurement failure and none of them is fatal.
+//
+// mergeBase is the fork-point SHA the caller pinned BEFORE the throwaway
+// commit; ev.BaseRef keeps the human-meaningful ref name it was resolved
+// from.
+func measureDiffCoverage(ctx context.Context, ev diffCoverageEvidence, dc *upload.DiffCoverageConfig, repoDir, mergeBase string) diffCoverageEvidence {
+	headSHA, err := gitRevParseHEAD(ctx, repoDir)
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not resolve the committed tree to measure: " + err.Error()
+		return ev
+	}
+	parent, err := os.MkdirTemp("", "fishhawk-diffcov-*")
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not create the throwaway-checkout temp dir: " + err.Error()
+		return ev
+	}
+	wt := filepath.Join(parent, "tree")
+	defer func() {
+		// --force because the coverage command's own output (the report,
+		// build artifacts) leaves the checkout dirty by construction.
+		// Detached from ctx's cancellation for the same reason the reset is
+		// — a killed coverage command cancels ctx, and the throwaway
+		// checkout must still be swept — but bounded. RemoveAll is the
+		// backstop that guarantees nothing survives on disk either way.
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
+		defer cleanupCancel()
+		_ = exec.CommandContext(cleanupCtx, "git", "-C", repoDir, "worktree", "remove", "--force", wt).Run()
+		_ = os.RemoveAll(parent)
+	}()
+	if out, werr := exec.CommandContext(ctx, "git", "-C", repoDir,
+		"worktree", "add", "--detach", wt, headSHA).CombinedOutput(); werr != nil {
+		ev.ExitCode = -1
+		ev.Reason = fmt.Sprintf("could not create the throwaway checkout of %s to measure: %s",
+			headSHA, strings.TrimSpace(string(out)))
+		return ev
+	}
+
+	// (b) The stage's added lines, computed INSIDE the throwaway checkout
+	// and BEFORE the command runs. An unresolved base ref never reaches
+	// git — diffcov returns ErrEmptyBaseRef and we name it.
+	changed, err := diffcov.ChangedLines(ctx, diffcov.ExecGit(wt), mergeBase)
+	if err != nil {
+		ev.ExitCode = -1
+		ev.Reason = "could not determine the stage's added lines: " + err.Error()
+		return ev
+	}
+	if len(changed) == 0 {
+		ev.Outcome = "measured"
+		ev.Reason = fmt.Sprintf("no added lines against %q (merge base %s); nothing to measure",
+			ev.BaseRef, mergeBase)
+		return ev
+	}
+
+	// (c) Run the customer command through the SHARED bounded-exec path:
+	// timeout, process-group kill, default-deny gate env. No second exec
+	// path, no widened allow-list.
+	output, exitCode := runBoundedGateCommand(ctx, dc.Command, wt,
+		filepath.Join(parent, "golangci-lint-cache"), diffCoverageTimeout)
+	ev.ExitCode = exitCode
+	if exitCode != 0 {
+		tail, _ := boundEvidenceTail(redactEvidenceText(output))
+		ev.Reason = fmt.Sprintf("coverage command %q exited %d in the throwaway checkout: %s",
+			dc.Command, exitCode, tail)
+		return ev
+	}
+
+	// (d) Read + parse the report the command was declared to write. It
+	// lives inside the throwaway checkout, so it is swept with it and never
+	// lands in the real working tree as untracked litter or as an
+	// out-of-scope creation.
+	reportAbs := filepath.Join(wt, filepath.FromSlash(dc.ReportPath))
+	f, err := os.Open(reportAbs) //nolint:gosec // report_path is validated repo-relative at spec-parse time.
+	if err != nil {
+		ev.Reason = fmt.Sprintf("coverage command %q exited 0 but its report %q could not be read in the throwaway checkout: %s",
+			dc.Command, dc.ReportPath, err.Error())
+		return ev
+	}
+	cov, parseErr := diffcov.ParseLCOV(f)
+	_ = f.Close()
+	if parseErr != nil {
+		ev.Reason = fmt.Sprintf("coverage report %q could not be parsed as lcov: %s",
+			dc.ReportPath, parseErr.Error())
+		return ev
+	}
+
+	// (e) Intersect. Both sides are normalized to repo-relative form inside
+	// Measure — against the THROWAWAY checkout's root, which is where the
+	// command ran and therefore what any absolute SF: path is relative to.
+	// A path that cannot be placed inside it is reported explicitly rather
+	// than silently counted as uncovered.
+	res := diffcov.Measure(wt, changed, cov)
+	ev.Outcome = "measured"
+	ev.NewLines = res.NewLines
+	ev.CoveredNewLines = res.CoveredNewLines
+	ev.Percent = res.Percent
+	ev.UncoveredFiles = res.UncoveredFiles
+	switch {
+	case res.NewLines == 0 && (len(res.UnnormalizablePaths) > 0 || res.ResolvedFiles == 0):
+		// SYSTEMICALLY UNUSABLE REPORT — a measurement FAILURE, not the
+		// vacuous pass. The exclusions consumed the ENTIRE denominator:
+		// nothing the report named could be placed inside the checkout (a
+		// coverage tool that ran under a container/build root whose absolute
+		// paths resolve outside repoDir is the field case), so the zero says
+		// nothing about the stage's coverage. Reporting it as measured-zero
+		// would hand the backend its documented vacuous PASS on every run
+		// for an affected repo, with the explanation buried in a Reason
+		// nobody reads on a green result — the silent-neuter shape this
+		// constraint exists to eliminate. Failing here routes it through the
+		// backend's not-measured violation, which surfaces the reason.
+		ev.Outcome = "failed"
+		ev.Reason = fmt.Sprintf("coverage command %q exited %d and its report %q parsed, but the measurement is unusable: %d report file(s) resolved into the repository and 0 of the stage's added lines could be measured",
+			dc.Command, ev.ExitCode, dc.ReportPath, res.ResolvedFiles)
+		if len(res.UnnormalizablePaths) > 0 {
+			ev.Reason += fmt.Sprintf("; %d path(s) could not be resolved into the repository: %s",
+				len(res.UnnormalizablePaths),
+				strings.Join(boundStrings(res.UnnormalizablePaths, diffCoverageMaxUncovered), ", "))
+		}
+	case len(res.UnnormalizablePaths) > 0:
+		ev.Reason = fmt.Sprintf("%d of %d new lines covered; %d report path(s) could not be resolved into the repository and were excluded: %s",
+			res.CoveredNewLines, res.NewLines, len(res.UnnormalizablePaths),
+			strings.Join(boundStrings(res.UnnormalizablePaths, diffCoverageMaxUncovered), ", "))
+	case res.NewLines == 0:
+		ev.Reason = fmt.Sprintf("the coverage report measured none of the stage's added lines (report %q); nothing to measure",
+			dc.ReportPath)
+	default:
+		ev.Reason = fmt.Sprintf("%d of %d new lines covered", res.CoveredNewLines, res.NewLines)
+	}
+	return ev
+}
+
+// boundStrings caps a list for inclusion in a bounded evidence field.
+func boundStrings(in []string, max int) []string {
+	if len(in) <= max {
+		return in
+	}
+	return in[:max]
+}
+
+// diffCoverageEvent wraps the measurement in its trace event.
+// composeGateEvidence folds it into gate_evidence (#1888); the backend's
+// diffCoverageSignalFromBundle reads it back out.
+func diffCoverageEvent(ev diffCoverageEvidence) agent.Event {
+	return agent.Event{
+		Kind:    "diff_coverage",
+		Payload: agent.MakePayload(ev),
+	}
+}
+
+// resolveDiffCoverageBaseRef resolves the ref the diff-coverage
+// measurement is taken against (#1888 condition 5). The workflow spec's
+// `base_ref` wins when declared; an OMITTED base_ref means "the run's base
+// branch", and the RUNNER is the layer that resolves it — it is the only
+// layer that knows the run's actual base (the --base-branch flag, then
+// GITHUB_REF_NAME, then "main"), and it is the layer that shells out to
+// git, so resolving anywhere else would risk handing git an empty ref.
+//
+// resolveImplementBaseRef is the SAME resolver the implement push path
+// uses, so the measurement's base and the PR's base can never disagree.
+// It never returns empty, but ChangedLines still fails closed on an empty
+// ref rather than trusting that.
+func resolveDiffCoverageBaseRef(cfg config, dc *upload.DiffCoverageConfig) string {
+	if dc != nil && strings.TrimSpace(dc.BaseRef) != "" {
+		return strings.TrimSpace(dc.BaseRef)
+	}
+	return resolveImplementBaseRef(cfg)
 }
 
 // verifyRunEvent builds the verify_run trace event for a committed-tree verify

@@ -7693,6 +7693,52 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  diff_coverage:
+                    type: object
+                    required: [command, report_path, min_new_line_coverage]
+                    description: |
+                      The stage's spec-declared workflow-v1.6 `diff_coverage`
+                      constraint (ADR-059 / #1888), echoed so the runner knows
+                      what coverage command to run, where it writes its report,
+                      and what threshold the BACKEND will hold the measurement
+                      to. The runner MEASURES and emits the result as
+                      `gate_evidence`; the backend re-evaluates the threshold
+                      from the uploaded bundle and owns the category-B verdict.
+                      Absent when the stage does not declare the constraint —
+                      the runner then runs no coverage command and the gate
+                      never fires, byte-identical to before #1888.
+                    properties:
+                      command:
+                        type: string
+                        description: |
+                          Shell command (`sh -c`) that produces the coverage
+                          report. It runs from the repo root of a THROWAWAY
+                          `git worktree` checkout of the stage's committed
+                          tree, under the same containment as the verify gate:
+                          bounded timeout, process-group kill, the runner's
+                          default-deny gate-env allow-list, and a disposable
+                          checkout so its filesystem side effects never reach
+                          the real working tree.
+                      report_path:
+                        type: string
+                        description: Repo-relative path the command writes the coverage report to. Validated repo-relative at spec-parse time.
+                      format:
+                        type: string
+                        enum: [lcov]
+                        description: Coverage report format. `lcov` is the only v1.6 member. Absent means lcov (the schema default).
+                      min_new_line_coverage:
+                        type: integer
+                        minimum: 0
+                        maximum: 100
+                        description: Minimum percentage of the stage's ADDED lines the report must show as executed. Compared with `>=`, so a measurement exactly at the threshold passes.
+                      base_ref:
+                        type: string
+                        description: |
+                          Git ref the stage's diff is taken against (merge-base
+                          semantics). Absent means the run's base branch, which
+                          the RUNNER resolves at measurement time
+                          (`--base-branch` > `GITHUB_REF_NAME` > `main`); an
+                          empty ref never reaches git.
                   implement_model:
                     type: string
                     description: |
@@ -7917,6 +7963,52 @@ paths:
                         reason:
                           type: string
                           description: Operator justification for leaving the declared path unchanged.
+                  diff_coverage:
+                    type: object
+                    required: [command, report_path, min_new_line_coverage]
+                    description: |
+                      The stage's spec-declared workflow-v1.6 `diff_coverage`
+                      constraint (ADR-059 / #1888), echoed so the runner knows
+                      what coverage command to run, where it writes its report,
+                      and what threshold the BACKEND will hold the measurement
+                      to. The runner MEASURES and emits the result as
+                      `gate_evidence`; the backend re-evaluates the threshold
+                      from the uploaded bundle and owns the category-B verdict.
+                      Absent when the stage does not declare the constraint —
+                      the runner then runs no coverage command and the gate
+                      never fires, byte-identical to before #1888.
+                    properties:
+                      command:
+                        type: string
+                        description: |
+                          Shell command (`sh -c`) that produces the coverage
+                          report. It runs from the repo root of a THROWAWAY
+                          `git worktree` checkout of the stage's committed
+                          tree, under the same containment as the verify gate:
+                          bounded timeout, process-group kill, the runner's
+                          default-deny gate-env allow-list, and a disposable
+                          checkout so its filesystem side effects never reach
+                          the real working tree.
+                      report_path:
+                        type: string
+                        description: Repo-relative path the command writes the coverage report to. Validated repo-relative at spec-parse time.
+                      format:
+                        type: string
+                        enum: [lcov]
+                        description: Coverage report format. `lcov` is the only v1.6 member. Absent means lcov (the schema default).
+                      min_new_line_coverage:
+                        type: integer
+                        minimum: 0
+                        maximum: 100
+                        description: Minimum percentage of the stage's ADDED lines the report must show as executed. Compared with `>=`, so a measurement exactly at the threshold passes.
+                      base_ref:
+                        type: string
+                        description: |
+                          Git ref the stage's diff is taken against (merge-base
+                          semantics). Absent means the run's base branch, which
+                          the RUNNER resolves at measurement time
+                          (`--base-branch` > `GITHUB_REF_NAME` > `main`); an
+                          empty ref never reaches git.
                   implement_model:
                     type: string
                     description: Backend-resolved implement model id (#1013), echoed on implement stages so the runner pins the agent spawn to it (`--model <implement_model>`). Resolved through the implement-model ladder (operator gate decision < plan `model_recommendation.implement_model` < spec `executor.model` < deployment default). Absent when no rung supplied a model — the runner leaves the model unset and the agent spawns on the adapter's built-in default, byte-identical to today.

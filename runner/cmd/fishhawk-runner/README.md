@@ -104,3 +104,98 @@ The implement-stage push + open path targets a **change-request forge** selected
 **Runner-kind self-report.** `detectRunnerKind` reports `gitlab_ci` when `GITLAB_CI=true` or `CI_PIPELINE_ID` is non-empty (GitHub signals win when both are present; a bare `CI=true` still resolves `local`). The backend ignores the unrecognized value until #1861 adds the enum member, so shipping the detection first is additive-safe.
 
 ADR-035 lineage/tree-ownership is git-level and remote-shape independent — the push machinery never parses the forge host — pinned by `gitops.TestCommitAndPush_ShapedRemote_LineageIsRemoteShapeIndependent`. The live GitLab walk with real credentials is tracked in #2032 (E45.18).
+
+## Diff-coverage measurement (workflow-v1.6 `diff_coverage`, #1888 / ADR-059)
+
+When the stage's prompt response carries a `diff_coverage` config, `run()`
+calls `runDiffCoverageGate` on the implement path, **after** the
+committed-tree verify gates (the tree is final and the agent has stopped
+writing) and **before** `composeGateEvidence` folds the result into
+`gate_evidence`. Implement is the only stage type that measures, which is
+why the spec validator rejects `diff_coverage` on every other stage type
+(#1888): an absent signal on a declared constraint is a violation, so
+allowing the declaration elsewhere would be a guaranteed false RED.
+
+**Measurement only.** It never touches `res.OK` / `res.FailureCategory`. A
+coverage shortfall fails the stage through the backend's category-B
+re-evaluation of the uploaded bundle, never as an opaque runner abort.
+
+**It always emits evidence when the constraint is configured** — there is
+deliberately no "only if there was a diff" guard. A stage that added no
+coverable lines emits an explicit measured-with-zero result, because the
+backend treats an ABSENT signal as a violation and a legitimately vacuous
+stage must not be able to reach that state. (The customer command is not
+run in that case: there is nothing for it to measure.)
+
+**Containment (condition 6).** The customer command is untrusted input and
+runs through `runBoundedGateCommand` — the SAME bounded-exec path the
+committed-tree verify gate uses: a bounded child context, `Setpgid` plus a
+`Cancel` that kills the whole **process group** (SIGKILL to the direct child
+alone leaves grandchildren holding the inherited stdout pipe open and
+`CombinedOutput` never sees EOF), the default-deny gate-env allow-list from
+`gateenv.go` (no runner credential is visible to it), and a per-invocation
+isolated lint cache. Do NOT add a second exec path for a new spec-supplied
+command, and do NOT widen the env allow-list to make a particular coverage
+tool work — that is a separate, explicit decision.
+
+**Filesystem isolation: a throwaway checkout.** `runBoundedGateCommand`
+contains the process and the environment; only a separate checkout contains
+the **filesystem**. So the command runs in a disposable
+`git worktree add --detach` checkout of the stage's committed scope-only
+tree — the same isolation `runVerifyCommittedTree` gives the verify gate,
+and what the schema and API documentation promise. Build artifacts, deleted
+or modified sources, and the report itself land in the throwaway checkout
+and are swept with it; the operator's real repository is untouched, and the
+command cannot mutate the tree AFTER it was verified.
+
+Materializing that tree reuses the #651 scaffolding — `StageScoped` +
+`commitVerifyWIP` + `git reset --soft HEAD~1`. As in
+`runVerifyGateCommitted`, a failed undo is **fatal**, not a measurement
+failure: HEAD left on the throwaway commit would make the real commit stack
+on top and push a WIP commit into the PR. `runDiffCoverageGate` returns it
+as an error and the call site demotes the stage category-B
+(`TestRunDiffCoverageGate_PostCommitResetFailureFatal` provokes the branch
+by having the coverage command plant the branch's ref lock, and asserts HEAD
+is left on the throwaway commit — which is precisely why the error must
+reach the call site). Both cleanup
+commands (worktree removal, `reset --soft`) run on a **bounded context
+detached from `ctx`'s cancellation** — a wedged coverage command is killed
+by cancelling `ctx`, and the undo must still happen.
+
+**One snapshot, pinned merge base.** The checkout is clean and detached at
+the committed head, so `ChangedLines`' merge-base → work-tree diff taken
+INSIDE it is exactly merge-base → committed tree. The merge base is resolved
+to a SHA (`diffcov.MergeBase`) **before** the throwaway commit: that commit
+advances whatever branch HEAD is on, so a `base_ref` naming that same branch
+would otherwise merge-base to the throwaway commit itself and the
+measurement would see zero added lines — a silent false vacuous pass. The
+diff is computed before the command runs, so the report is not mistaken for
+an untracked added file.
+
+**Base ref resolution (condition 5).** `resolveDiffCoverageBaseRef` is the
+named resolver: the spec's `base_ref` wins when declared; an OMITTED
+`base_ref` falls back to `resolveImplementBaseRef`, the same
+`--base-branch` > `GITHUB_REF_NAME` > `main` ladder the implement push
+uses, so the measurement's base and the PR's base can never disagree. It
+never returns empty, and `diffcov.ChangedLines` still fails closed on an
+empty ref rather than trusting that.
+
+**Report hygiene.** The report is written inside the throwaway checkout and
+swept with it, so it never lands in the real working tree as untracked
+litter or as an out-of-scope creation.
+
+**Evidence.** One `diff_coverage` event carrying either the measurement or
+a named failure reason. Every failure mode names what ran, its exit code,
+and what was measured. `composeGateEvidence` pre-redacts the reason and
+caps `uncovered_files` at `diffCoverageMaxUncovered`, like every sibling
+field. The measurement itself lives in
+[`runner/internal/diffcov`](../../internal/diffcov/README.md).
+
+**`run()`-level wiring is pinned end to end.** A mis-threaded position in
+`fetchPromptToFile`'s return tuple or a wrong stage-type string compiles
+fine and silently emits NOTHING — the absent-signal false RED the rest of
+the design works to avoid. `TestRun_DiffCoverage_EmitsEventFromFetchedPrompt`
+drives a fetched prompt carrying the config through `run()` to a
+`diff_coverage` event in the uploaded bundle, and
+`TestRun_NoDiffCoverage_EmitsNoEvent` pins the other half: a stage with no
+declared constraint runs no command and emits no event.

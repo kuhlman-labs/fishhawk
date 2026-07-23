@@ -62,6 +62,22 @@ type promptResponse struct {
 	// single-shot demote-on-failure gate; >0 enables the bounded fix
 	// loop. Wired through but not yet consumed by the runner.
 	VerifyMaxIterations int `json:"verify_max_iterations,omitempty"`
+	// DiffCoverage is the stage's spec-declared `diff_coverage` constraint
+	// (workflow-v1.6, ADR-059 / #1888), echoed so the runner knows what
+	// coverage command to run, where it writes its report, and what
+	// threshold the BACKEND will hold the measurement to. Nil (the
+	// byte-identical default) when the stage does not declare it — a
+	// non-declaring workflow's response is unchanged and the runner runs
+	// no extra command.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+	// the runner's upload.FetchedPrompt.DiffCoverage / DiffCoverageConfig
+	// (runner/internal/upload/upload.go), the same independent-struct-by-tag
+	// convention as ScopeExemptions / BindingAssertions / AgentVersionRange.
+	// A tag drift here silently DISABLES the measurement: the runner sees no
+	// config, runs nothing, emits no evidence — and the gate reports nothing
+	// wrong because it never ran.
+	DiffCoverage *diffCoverageConfig `json:"diff_coverage,omitempty"`
 	// MinRunnerVersion is the minimum runner version the backend requires.
 	// Runners that are older than this should exit with a version-skew error
 	// rather than proceeding to invoke the agent.
@@ -1195,6 +1211,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		VerifyMaxIterations:  verifyMaxIterations,
+		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
@@ -1674,6 +1691,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		VerifyCommand:        verifyCmd,
 		VerifyTimeoutSeconds: verifyTimeoutSecs,
 		VerifyMaxIterations:  verifyMaxIterations,
+		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
@@ -2371,6 +2389,73 @@ func (s *Server) resolveVerifyConfig(ctx context.Context, runRow *run.Run, stage
 	}
 	secs := int(specStage.Executor.Verify.Timeout.Seconds())
 	return specStage.Executor.Verify.Command, secs, specStage.Executor.Verify.MaxIterations
+}
+
+// diffCoverageConfig is the prompt-response shape of the spec's
+// `diff_coverage` constraint (#1888). Mirrors the runner's
+// upload.DiffCoverageConfig field-for-field by json tag.
+type diffCoverageConfig struct {
+	Command            string `json:"command"`
+	ReportPath         string `json:"report_path"`
+	Format             string `json:"format,omitempty"`
+	MinNewLineCoverage int    `json:"min_new_line_coverage"`
+	BaseRef            string `json:"base_ref,omitempty"`
+}
+
+// resolveDiffCoverageConfig returns the stage's spec-declared
+// `diff_coverage` constraint (#1888) for the given stage type, threaded to
+// the runner as promptResponse.diff_coverage so it knows what to measure.
+// Mirrors resolveVerifyConfig's parse + stage-lookup pattern.
+//
+// Returns nil on every degradation — nil spec, parse failure, missing
+// workflow, missing stage, or a stage that simply does not declare the
+// constraint — so a non-declaring workflow's prompt response stays
+// byte-identical and the runner runs no coverage command. That is safe
+// precisely because it is symmetric: the same spec lookup drives the
+// BACKEND's policy.Constraints.DiffCoverage, so a spec the backend cannot
+// read yields neither a measurement request nor a gate.
+//
+// When more than one constraint entry declares diff_coverage the most
+// RESTRICTIVE (highest) threshold wins, matching mergeConstraints so the
+// runner measures against the same threshold the backend will enforce.
+func (s *Server) resolveDiffCoverageConfig(ctx context.Context, runRow *run.Run, stageType run.StageType) *diffCoverageConfig {
+	if runRow.WorkflowSpec == nil {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse workflow spec for diff_coverage config",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return nil
+	}
+	var out *diffCoverageConfig
+	for _, st := range wf.Stages {
+		if string(st.Type) != string(stageType) {
+			continue
+		}
+		for _, c := range st.Constraints {
+			if c.DiffCoverage == nil {
+				continue
+			}
+			if out == nil || c.DiffCoverage.MinNewLineCoverage > out.MinNewLineCoverage {
+				out = &diffCoverageConfig{
+					Command:            c.DiffCoverage.Command,
+					ReportPath:         c.DiffCoverage.ReportPath,
+					Format:             c.DiffCoverage.Format,
+					MinNewLineCoverage: c.DiffCoverage.MinNewLineCoverage,
+					BaseRef:            c.DiffCoverage.BaseRef,
+				}
+			}
+		}
+		break
+	}
+	return out
 }
 
 // resolveExecutorAgentVersionRange returns the stage executor's spec-declared

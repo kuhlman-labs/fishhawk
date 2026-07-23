@@ -501,3 +501,73 @@ workflows:
 		t.Errorf("v0 error = %q, want it to name required_outcomes", err.Error())
 	}
 }
+
+// TestValidate_DiffCoverage pins the workflow-v1 constraint kind added in
+// v1.6 (#1888 / ADR-059) against the CLI's embedded mirror — the two
+// mirrors must agree, or a spec the backend accepts is rejected by
+// `fishhawk validate` (and vice versa). workflow-v0 stays frozen.
+func TestValidate_DiffCoverage(t *testing.T) {
+	const stages = `
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              format: lcov
+              min_new_line_coverage: 85
+`
+	if err := spec.ValidateBytes([]byte("version: \"1.6\"\n" + stages)); err != nil {
+		t.Fatalf("v1.6 validate: %v", err)
+	}
+
+	err := spec.ValidateBytes([]byte("version: \"0.7\"\n" + stages))
+	if err == nil {
+		t.Fatal("v0 validate = nil, want a rejection (workflow-v0 constraint set is frozen)")
+	}
+	if !strings.Contains(err.Error(), "diff_coverage") {
+		t.Errorf("v0 error = %q, want it to name diff_coverage", err.Error())
+	}
+}
+
+// TestValidate_DiffCoverage_Rejections pins the schema-enforced
+// rejections against the CLI mirror too: a mirror missing the enum or the
+// range would accept a spec the backend rejects.
+func TestValidate_DiffCoverage_Rejections(t *testing.T) {
+	cases := map[string]string{
+		"unknown format": `
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              format: cobertura
+              min_new_line_coverage: 80`,
+		"threshold above 100": `
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 101`,
+		"missing command": `
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 80`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := spec.ValidateBytes([]byte(`version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:` + body + "\n"))
+			if err == nil {
+				t.Fatal("validate = nil, want a rejection")
+			}
+		})
+	}
+}

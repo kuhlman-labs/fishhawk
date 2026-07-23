@@ -38,6 +38,12 @@ const (
 	gateEvidenceTailBytes = 4096
 )
 
+// diffCoverageMaxUncovered bounds the uncovered-file sample carried in the
+// diff-coverage evidence (#1888). The list exists to make the violation
+// actionable, not to be exhaustive — a stage that leaves 400 files
+// uncovered must not push 400 paths into the review prompt.
+const diffCoverageMaxUncovered = 10
+
 // gateEvidencePayload is the body of a gate_evidence event in the
 // bundle. The json tags MUST stay identical to the backend's
 // bundle.ExtractGateEvidence mirror structs — this is the
@@ -69,6 +75,39 @@ type gateEvidencePayload struct {
 	// no claim, or claim and reality agreed. The json tag MUST stay identical to
 	// the backend's bundle.FixupSelfReportDivergenceEvidence mirror.
 	FixupSelfReportDivergence *fixupSelfReportDivergenceEvidence `json:"fixup_selfreport_divergence,omitempty"`
+	// DiffCoverage digests the workflow-v1.6 `diff_coverage` measurement
+	// (ADR-059 / #1888): what the customer coverage command was, how it
+	// exited, and how much of the stage's added-line set the resulting
+	// report showed as executed. Present WHENEVER the stage declared the
+	// constraint — including when the diff added no coverable lines, which
+	// is reported as an explicit measured-with-zero result. Absent (the
+	// byte-identical default) when the stage did not declare it. The json
+	// tag MUST stay identical to the backend's bundle.DiffCoverageEvidence
+	// mirror; a drift silently DISABLES the gate, because the backend then
+	// sees no signal and the constraint reports nothing wrong.
+	DiffCoverage *diffCoverageEvidence `json:"diff_coverage,omitempty"`
+}
+
+// diffCoverageEvidence digests one diff-coverage measurement (#1888).
+// Bounded like every sibling: no report body, no command output beyond the
+// existing tail cap, and UncoveredFiles capped at diffCoverageMaxUncovered.
+// The json tags MUST stay identical to the backend's
+// bundle.DiffCoverageEvidence mirror — the same lockstep runner↔backend
+// wire contract as the parent payload.
+type diffCoverageEvidence struct {
+	// Outcome is "measured" (the command ran, the report parsed, the
+	// counts below are meaningful) or "failed" (the measurement could not
+	// be completed; Reason names why).
+	Outcome         string   `json:"outcome"`
+	Command         string   `json:"command,omitempty"`
+	ExitCode        int      `json:"exit_code"`
+	ReportPath      string   `json:"report_path,omitempty"`
+	BaseRef         string   `json:"base_ref,omitempty"`
+	NewLines        int      `json:"new_lines"`
+	CoveredNewLines int      `json:"covered_new_lines"`
+	Percent         float64  `json:"percent"`
+	UncoveredFiles  []string `json:"uncovered_files,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
 }
 
 // fixupSelfReportDivergenceEvidence digests an advisory fix-up self-report
@@ -188,7 +227,7 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 	gateRan := false
 	for _, e := range events {
 		switch e.Kind {
-		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence":
+		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "diff_coverage":
 			gateRan = true
 		}
 	}
@@ -298,6 +337,21 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 				ClaimedVerifyStatus: w.ClaimedVerifyStatus,
 				ActualVerifyStatus:  w.ActualVerifyStatus,
 			}
+		case "diff_coverage":
+			var w diffCoverageEvidence
+			if json.Unmarshal(e.Payload, &w) != nil {
+				continue
+			}
+			// Pre-redact + bound the only free-text field, exactly like
+			// every other evidence tail: Reason can quote the coverage
+			// command's stderr, which is agent/customer-controlled text.
+			w.Reason, _ = boundEvidenceTail(redactEvidenceText(w.Reason))
+			w.Command = redactEvidenceText(w.Command)
+			if len(w.UncoveredFiles) > diffCoverageMaxUncovered {
+				w.UncoveredFiles = w.UncoveredFiles[:diffCoverageMaxUncovered]
+			}
+			dc := w
+			payload.DiffCoverage = &dc
 		case "git_diff":
 			var w struct {
 				NumFiles int `json:"num_files"`

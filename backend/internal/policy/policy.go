@@ -108,6 +108,70 @@ type Constraints struct {
 	// untagged or unexported field would silently drop the signal on
 	// re-eval and flip a satisfied outcome into a violation.
 	Verification *VerificationSignal `json:"verification,omitempty"`
+	// DiffCoverage is the stage's DECLARED diff-coverage constraint
+	// (workflow-v1.6 `diff_coverage`, ADR-059 / #1888) — the coverage
+	// command, the report path, and the minimum new-line percentage.
+	// Nil means the stage did not declare the constraint, in which case
+	// no diff-coverage branch runs at all and behavior is byte-identical
+	// to before the constraint existed.
+	DiffCoverage *DiffCoverageConfig `json:"diff_coverage,omitempty"`
+	// DiffCoverageSignal is what the runner MEASURED, derived from the
+	// bundle's gate_evidence event. Required only when DiffCoverage is
+	// set; nil means "no measurement reached evaluation time" — which,
+	// exactly like Verification, is a VIOLATION rather than a deferral.
+	// The runner ALWAYS emits a signal when the constraint is configured
+	// (a stage with no added lines reports a measured-with-zero result),
+	// so absence unambiguously means the runner never ran or the
+	// evidence was lost — never "there was nothing to measure".
+	//
+	// The json tags on both fields are load-bearing for the same reason
+	// Verification's is: EvaluationPayload.Applied is decoded and
+	// re-emitted by the post-CI re-evaluation, so an untagged field
+	// would silently drop the constraint or its signal on re-eval and
+	// flip a satisfied outcome into a violation.
+	DiffCoverageSignal *DiffCoverageSignal `json:"diff_coverage_signal,omitempty"`
+}
+
+// DiffCoverageConfig is the stage's declared `diff_coverage` constraint,
+// mirrored from spec.DiffCoverageConstraint. Format empty means "lcov"
+// (the schema default and the only v1.6 member); BaseRef empty means the
+// run's base branch, which the RUNNER resolves at measurement time.
+type DiffCoverageConfig struct {
+	Command            string `json:"command,omitempty"`
+	ReportPath         string `json:"report_path,omitempty"`
+	Format             string `json:"format,omitempty"`
+	MinNewLineCoverage int    `json:"min_new_line_coverage,omitempty"`
+	BaseRef            string `json:"base_ref,omitempty"`
+}
+
+// DiffCoverageSignal is the runner's measurement of new-line coverage for
+// the stage, derived from the `gate_evidence` trace event. Outcome carries
+// the runner's vocabulary verbatim:
+//
+//   - "measured" — the command ran, the report parsed, and NewLines /
+//     CoveredNewLines / Percent are meaningful. NewLines == 0 is the
+//     legitimate vacuous case (the diff added no coverable lines).
+//   - "failed"   — the measurement could not be completed: the command
+//     exited non-zero, wrote no readable report, produced an unparseable
+//     report, or the base ref could not be resolved. Reason names which.
+//
+// Every field the violation detail renders is present so the audit entry
+// can say what ran, how it exited, and what was measured (#1888
+// condition 7).
+type DiffCoverageSignal struct {
+	Outcome         string  `json:"outcome"`
+	Command         string  `json:"command,omitempty"`
+	ExitCode        int     `json:"exit_code"`
+	ReportPath      string  `json:"report_path,omitempty"`
+	BaseRef         string  `json:"base_ref,omitempty"`
+	NewLines        int     `json:"new_lines"`
+	CoveredNewLines int     `json:"covered_new_lines"`
+	Percent         float64 `json:"percent"`
+	// UncoveredFiles is a BOUNDED sample of files carrying uncovered new
+	// lines, capped by the runner before it reaches the wire.
+	UncoveredFiles []string `json:"uncovered_files,omitempty"`
+	// Reason names the failure (or the vacuous-pass rationale) in prose.
+	Reason string `json:"reason,omitempty"`
 }
 
 // VerificationSignal is the digest of what a stage's committed-tree
@@ -169,8 +233,98 @@ func Evaluate(diff Diff, c Constraints) []Violation {
 	if len(c.RequiredOutcomes) > 0 {
 		out = append(out, checkRequiredOutcomes(diff, c.RequiredOutcomes, c.CIGreen, c.Verification)...)
 	}
+	if c.DiffCoverage != nil {
+		out = append(out, checkDiffCoverage(*c.DiffCoverage, c.DiffCoverageSignal)...)
+	}
 
 	return out
+}
+
+// checkDiffCoverage evaluates the declared `diff_coverage` constraint
+// (workflow-v1.6, ADR-059 / #1888) against the runner's measurement. The
+// runner MEASURES; this is the AUTHORITATIVE verdict — the same
+// division of labour as `verification_reported` (#1886).
+//
+// Three violating states, each rendering an actionable detail that names
+// what ran, how it exited, and what was measured:
+//
+//   - signal nil — no measurement reached evaluation time. A VIOLATION,
+//     not a pass: the runner always emits a signal when the constraint is
+//     configured, so absence means it never ran or the evidence was lost.
+//   - outcome != "measured" — the runner could not complete the
+//     measurement (command failed, no readable report, unparseable
+//     report, unresolvable base ref). Reason names which.
+//   - outcome "measured" and below the threshold.
+//
+// Two SATISFIED states:
+//
+//   - measured at or above the threshold (compared with >=, so exactly
+//     AT the threshold passes and one below fails).
+//   - measured with NewLines == 0 — the documented vacuous pass. A diff
+//     that added no coverable lines cannot be under-covered. This is why
+//     the runner must emit measured-zero rather than emitting nothing:
+//     an explicit zero is auditable, whereas absence is indistinguishable
+//     from a runner that failed to run.
+//
+// Like `verification_reported`, this outcome is deliberately NOT
+// deferrable (see DeferredRequiredOutcomes).
+func checkDiffCoverage(cfg DiffCoverageConfig, sig *DiffCoverageSignal) []Violation {
+	if sig == nil {
+		return []Violation{{
+			Constraint: "diff_coverage",
+			Detail: fmt.Sprintf(
+				"no diff-coverage evidence in trace (declared command %q, report %q, minimum %d%%)",
+				cfg.Command, cfg.ReportPath, cfg.MinNewLineCoverage),
+		}}
+	}
+	if sig.Outcome != "measured" {
+		return []Violation{{
+			Constraint: "diff_coverage",
+			Detail:     diffCoverageNotMeasuredDetail(cfg, sig),
+		}}
+	}
+	if sig.NewLines == 0 {
+		// Vacuous pass — nothing to under-cover.
+		return nil
+	}
+	if sig.Percent >= float64(cfg.MinNewLineCoverage) {
+		return nil
+	}
+	v := Violation{
+		Constraint: "diff_coverage",
+		Detail: fmt.Sprintf(
+			"new-line coverage %.1f%% is below the required %d%% (%d of %d new lines covered; command %q exited %d, report %q)",
+			sig.Percent, cfg.MinNewLineCoverage, sig.CoveredNewLines, sig.NewLines,
+			sig.Command, sig.ExitCode, sig.ReportPath),
+		Files: sig.UncoveredFiles,
+	}
+	return []Violation{v}
+}
+
+// diffCoverageNotMeasuredDetail renders the violation detail for a
+// measurement the runner could not complete. It always names the reported
+// outcome, the command that ran and its exit code, and the runner's
+// reason when it supplied one — a constraint that fails without saying
+// why is not a usable gate (#1888 condition 7).
+func diffCoverageNotMeasuredDetail(cfg DiffCoverageConfig, sig *DiffCoverageSignal) string {
+	outcome := sig.Outcome
+	if outcome == "" {
+		outcome = "unknown"
+	}
+	command := sig.Command
+	if command == "" {
+		command = cfg.Command
+	}
+	reportPath := sig.ReportPath
+	if reportPath == "" {
+		reportPath = cfg.ReportPath
+	}
+	detail := fmt.Sprintf("diff-coverage outcome %q, want \"measured\" (command %q exited %d, report %q)",
+		outcome, command, sig.ExitCode, reportPath)
+	if sig.Reason != "" {
+		detail += ": " + sig.Reason
+	}
+	return detail
 }
 
 func checkForbidden(diff Diff, patterns []string) []Violation {

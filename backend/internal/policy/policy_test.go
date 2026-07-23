@@ -2,6 +2,7 @@ package policy
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -619,5 +620,249 @@ func TestConstraints_VerificationRoundTrip(t *testing.T) {
 	}
 	if strings.Contains(string(bare), "verification") {
 		t.Errorf("bare constraints = %s, want no verification member", bare)
+	}
+}
+
+// diffCoverageCfg is the declared constraint the diff-coverage tests
+// evaluate against: coverage.sh writes coverage.lcov, minimum 80%.
+func diffCoverageCfg() *DiffCoverageConfig {
+	return &DiffCoverageConfig{
+		Command:            "coverage.sh",
+		ReportPath:         "coverage.lcov",
+		Format:             "lcov",
+		MinNewLineCoverage: 80,
+	}
+}
+
+// TestDiffCoverage covers every enumerated mode of the diff_coverage
+// constraint (#1888 / ADR-059). Like verification_reported it is
+// fail-closed on an absent measurement, and unlike it there are two
+// SATISFIED states — at-or-above threshold, and the vacuous
+// zero-new-lines pass.
+func TestDiffCoverage(t *testing.T) {
+	cases := []struct {
+		name          string
+		sig           *DiffCoverageSignal
+		wantViolate   bool
+		wantContains  []string
+		wantFileNames []string
+	}{
+		{
+			// Fail-closed: the runner ALWAYS emits a signal when the
+			// constraint is configured, so absence means it never ran.
+			name:         "nil signal violates",
+			sig:          nil,
+			wantViolate:  true,
+			wantContains: []string{"no diff-coverage evidence in trace", "coverage.sh", "coverage.lcov", "80%"},
+		},
+		{
+			name: "command exited non-zero violates and names the exit code",
+			sig: &DiffCoverageSignal{
+				Outcome:  "failed",
+				Command:  "coverage.sh",
+				ExitCode: 2,
+				Reason:   "coverage command exited 2: FAIL ./pkg",
+			},
+			wantViolate:  true,
+			wantContains: []string{`"failed"`, "coverage.sh", "exited 2", "FAIL ./pkg"},
+		},
+		{
+			name: "unparseable report violates and names the report path",
+			sig: &DiffCoverageSignal{
+				Outcome:    "failed",
+				Command:    "coverage.sh",
+				ReportPath: "coverage.lcov",
+				Reason:     `coverage report "coverage.lcov" could not be parsed as lcov: truncated`,
+			},
+			wantViolate:  true,
+			wantContains: []string{"coverage.lcov", "could not be parsed"},
+		},
+		{
+			name: "missing report violates and names the report path",
+			sig: &DiffCoverageSignal{
+				Outcome:    "failed",
+				Command:    "coverage.sh",
+				ReportPath: "coverage.lcov",
+				Reason:     `coverage command exited 0 but its report "coverage.lcov" could not be read: no such file`,
+			},
+			wantViolate:  true,
+			wantContains: []string{"coverage.lcov", "could not be read"},
+		},
+		{
+			name: "unresolvable base ref violates with a named reason",
+			sig: &DiffCoverageSignal{
+				Outcome:  "failed",
+				Command:  "coverage.sh",
+				ExitCode: -1,
+				Reason:   "could not determine the stage's added lines: diffcov: base ref is empty (unresolved base branch)",
+			},
+			wantViolate:  true,
+			wantContains: []string{"base ref is empty"},
+		},
+		{
+			name:         "empty outcome string violates",
+			sig:          &DiffCoverageSignal{},
+			wantViolate:  true,
+			wantContains: []string{"unknown"},
+		},
+		{
+			name: "below threshold violates naming covered/total/percent/threshold",
+			sig: &DiffCoverageSignal{
+				Outcome:         "measured",
+				Command:         "coverage.sh",
+				ReportPath:      "coverage.lcov",
+				NewLines:        4,
+				CoveredNewLines: 3,
+				Percent:         75,
+				UncoveredFiles:  []string{"src/app.go"},
+			},
+			wantViolate:   true,
+			wantContains:  []string{"75.0%", "below the required 80%", "3 of 4", "coverage.sh", "coverage.lcov"},
+			wantFileNames: []string{"src/app.go"},
+		},
+		{
+			// Boundary: >= comparison, so exactly AT the threshold passes.
+			name: "exactly at threshold satisfies",
+			sig: &DiffCoverageSignal{
+				Outcome: "measured", NewLines: 5, CoveredNewLines: 4, Percent: 80,
+			},
+			wantViolate: false,
+		},
+		{
+			// The positive criterion: comfortably above the threshold
+			// passes. Without this an implementation that rejects every
+			// declared constraint would satisfy the rest of the list.
+			name: "above threshold satisfies",
+			sig: &DiffCoverageSignal{
+				Outcome: "measured", NewLines: 10, CoveredNewLines: 10, Percent: 100,
+			},
+			wantViolate: false,
+		},
+		{
+			// One below the boundary must still fail.
+			name: "one below threshold violates",
+			sig: &DiffCoverageSignal{
+				Outcome: "measured", NewLines: 100, CoveredNewLines: 79, Percent: 79,
+			},
+			wantViolate:  true,
+			wantContains: []string{"79.0%", "below the required 80%"},
+		},
+		{
+			// The documented vacuous pass: a diff that added no coverable
+			// lines cannot be under-covered. This is why the runner emits
+			// measured-with-zero instead of emitting nothing.
+			name: "measured with zero new lines satisfies",
+			sig: &DiffCoverageSignal{
+				Outcome:  "measured",
+				NewLines: 0,
+				Reason:   `no added lines against "main"; nothing to measure`,
+			},
+			wantViolate: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Evaluate(diff("a.go"), Constraints{
+				DiffCoverage:       diffCoverageCfg(),
+				DiffCoverageSignal: tc.sig,
+			})
+			if !tc.wantViolate {
+				if len(v) != 0 {
+					t.Fatalf("expected no violations, got %+v", v)
+				}
+				return
+			}
+			if len(v) != 1 {
+				t.Fatalf("expected exactly one violation, got %+v", v)
+			}
+			if v[0].Constraint != "diff_coverage" {
+				t.Errorf("constraint = %q, want diff_coverage", v[0].Constraint)
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(v[0].Detail, want) {
+					t.Errorf("detail %q does not name %q", v[0].Detail, want)
+				}
+			}
+			if tc.wantFileNames != nil && !reflect.DeepEqual(v[0].Files, tc.wantFileNames) {
+				t.Errorf("files = %v, want %v", v[0].Files, tc.wantFileNames)
+			}
+		})
+	}
+}
+
+// TestDiffCoverage_NotConfiguredIsNoOp is the no-regression pin: a
+// workflow that does not declare the constraint takes no new code path,
+// whatever signal happens to be present.
+func TestDiffCoverage_NotConfiguredIsNoOp(t *testing.T) {
+	sigs := []*DiffCoverageSignal{
+		nil,
+		{Outcome: "failed", Reason: "command exploded"},
+		{Outcome: "measured", NewLines: 10, CoveredNewLines: 0, Percent: 0},
+	}
+	for i, sig := range sigs {
+		if v := Evaluate(diff("a.go"), Constraints{DiffCoverageSignal: sig}); len(v) != 0 {
+			t.Errorf("signal %d: got %+v, want no violations when the constraint is absent", i, v)
+		}
+	}
+}
+
+// TestDiffCoverage_NotDeferred pins that diff_coverage never appears in
+// the deferred set. Deferring it would reconstruct the vacuous pass the
+// constraint exists to remove.
+func TestDiffCoverage_NotDeferred(t *testing.T) {
+	c := Constraints{
+		RequiredOutcomes: []string{"ci_green"},
+		DiffCoverage:     diffCoverageCfg(),
+	}
+	for _, got := range DeferredRequiredOutcomes(c) {
+		if strings.Contains(got, "diff_coverage") {
+			t.Errorf("DeferredRequiredOutcomes = %+v, want no diff_coverage member", DeferredRequiredOutcomes(c))
+		}
+	}
+}
+
+// TestConstraints_DiffCoverageRoundTrip pins the audit-payload round trip
+// the post-CI re-evaluation depends on: BOTH the declared constraint and
+// its signal must survive marshal/unmarshal through
+// applied_constraints. An untagged field would drop one of them and flip
+// a satisfied constraint into a violation on re-eval.
+func TestConstraints_DiffCoverageRoundTrip(t *testing.T) {
+	in := Constraints{
+		DiffCoverage: diffCoverageCfg(),
+		DiffCoverageSignal: &DiffCoverageSignal{
+			Outcome: "measured", NewLines: 10, CoveredNewLines: 9, Percent: 90,
+		},
+	}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, want := range []string{`"diff_coverage"`, `"diff_coverage_signal"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("marshalled constraints = %s, want a %s member", raw, want)
+		}
+	}
+	var out Constraints
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.DiffCoverage == nil || out.DiffCoverage.MinNewLineCoverage != 80 {
+		t.Fatalf("round-tripped DiffCoverage = %+v, want threshold 80", out.DiffCoverage)
+	}
+	if out.DiffCoverageSignal == nil || out.DiffCoverageSignal.Percent != 90 {
+		t.Fatalf("round-tripped signal = %+v, want percent 90", out.DiffCoverageSignal)
+	}
+	// The decoded pair still satisfies the constraint.
+	if v := Evaluate(diff("a.go"), out); len(v) != 0 {
+		t.Errorf("re-evaluation of round-tripped constraints = %+v, want no violations", v)
+	}
+	// omitempty: a non-declaring stage's payload stays byte-identical to
+	// pre-#1888 entries.
+	bare, err := json.Marshal(Constraints{RequiredOutcomes: []string{"ci_green"}})
+	if err != nil {
+		t.Fatalf("marshal bare: %v", err)
+	}
+	if strings.Contains(string(bare), "diff_coverage") {
+		t.Errorf("bare constraints = %s, want no diff_coverage member", bare)
 	}
 }

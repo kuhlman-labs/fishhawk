@@ -67,3 +67,11 @@ The reason is ordering, not policy. This in-line check runs on the implement pus
 The backend owns the outcome instead: `reEvaluatePolicy` derives a `policy.VerificationSignal` from the uploaded bundle's `gate_evidence` event (verify_summary, else the last non-superseded verify_run) and evaluates fail-closed — absent, `failed`, and `skipped` each violate. See `backend/internal/policy/README.md`.
 
 This is the one deliberate asymmetry with the lockstep rule below; the rest of `checkRequiredOutcomes` stays identical between the two copies.
+
+## `diff_coverage` — backend-authoritative (#1888 / ADR-059)
+
+The workflow-v1.6 `diff_coverage` constraint kind is **carried but not evaluated** by this runner-side evaluator: `Constraints.DiffCoverage` exists so the struct stays mirrored with the backend's `policy.Constraints` (and so a caller threading spec constraints through here cannot silently drop it), but `Evaluate` emits no violation for it.
+
+Same rationale as `verification_reported`: this in-line check fires on the implement push path, BEFORE the coverage command has run — the measurement happens after the committed-tree verify gate, in `runner/cmd/fishhawk-runner/main.go`'s `runDiffCoverageGate`. There is nothing truthful the runner could assert locally, and asserting anything would either fail every opted-in run before its work was measured or invent a pass. The backend re-evaluates from the uploaded bundle's `gate_evidence`, where the measurement IS available.
+
+The type is a LOCAL mirror (`constraint.DiffCoverage`), not an import: this package is deliberately dependency-free on the backend's policy package.

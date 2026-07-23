@@ -8184,3 +8184,204 @@ func TestGetStagePrompt_LivenessFlip_PersistsRunningInPostgres(t *testing.T) {
 func (*promptRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
 }
+
+// diffCoverageSpecYAML is a workflow-v1.6 spec declaring the
+// `diff_coverage` constraint on the given stage id/type (#1888).
+func diffCoverageSpecYAML(stageID string) []byte {
+	return []byte("version: \"1.6\"\n" +
+		"workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: " + stageID + "\n" +
+		"        type: " + stageID + "\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		"        constraints:\n" +
+		"          - diff_coverage:\n" +
+		"              command: make coverage\n" +
+		"              report_path: coverage.lcov\n" +
+		"              format: lcov\n" +
+		"              min_new_line_coverage: 85\n" +
+		"              base_ref: release\n")
+}
+
+// TestGetStagePrompt_CarriesDiffCoverage asserts the spec-declared
+// `diff_coverage` constraint (#1888) is served in the prompt response at
+// BOTH construction sites — the signed prompt fetch and the SPA-readable
+// prompt-render path — and pins the wire json tags byte-identical to the
+// runner's upload.DiffCoverageConfig decoder.
+func TestGetStagePrompt_CarriesDiffCoverage(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+		WorkflowSpec:  diffCoverageSpecYAML("implement"),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+
+	want := diffCoverageConfig{
+		Command:            "make coverage",
+		ReportPath:         "coverage.lcov",
+		Format:             "lcov",
+		MinNewLineCoverage: 85,
+		BaseRef:            "release",
+	}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DiffCoverage == nil {
+		t.Fatalf("DiffCoverage = nil, want the declared constraint:\n%s", w.Body.String())
+	}
+	if *resp.DiffCoverage != want {
+		t.Fatalf("DiffCoverage = %+v, want %+v", *resp.DiffCoverage, want)
+	}
+	// Pin every wire tag the runner's decoder reads. A drift on any of
+	// these silently disables the measurement.
+	for _, tag := range []string{
+		`"diff_coverage":`, `"command":"make coverage"`, `"report_path":"coverage.lcov"`,
+		`"format":"lcov"`, `"min_new_line_coverage":85`, `"base_ref":"release"`,
+	} {
+		if !contains(w.Body.String(), tag) {
+			t.Fatalf("response missing %s:\n%s", tag, w.Body.String())
+		}
+	}
+
+	// The SPA-readable render path (the SECOND construction site) carries
+	// the same resolution.
+	rreq := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	rw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rw, rreq)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("render status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+	}
+	var rendered promptResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &rendered); err != nil {
+		t.Fatalf("decode render: %v", err)
+	}
+	if rendered.DiffCoverage == nil || *rendered.DiffCoverage != want {
+		t.Fatalf("render DiffCoverage = %+v, want %+v", rendered.DiffCoverage, want)
+	}
+}
+
+// TestGetStagePrompt_DiffCoverageOmittedWhenAbsent asserts the
+// byte-identical back-compat path: with no spec constraint the object is
+// OMITTED entirely, so a non-declaring workflow's response is unchanged
+// and the runner runs no coverage command.
+func TestGetStagePrompt_DiffCoverageOmittedWhenAbsent(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+
+	rr.runRow = &run.Run{
+		ID:            runID,
+		Repo:          "kuhlman-labs/example",
+		WorkflowID:    "feature_change",
+		TriggerSource: "manual",
+		WorkflowSpec: []byte("version: \"1.5\"\n" +
+			"workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: plan\n" +
+			"        type: plan\n" +
+			"        executor:\n" +
+			"          agent: claude-code\n"),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.DiffCoverage != nil {
+		t.Fatalf("DiffCoverage = %+v, want nil", resp.DiffCoverage)
+	}
+	if contains(w.Body.String(), "diff_coverage") {
+		t.Fatalf("diff_coverage key must be omitted when absent:\n%s", w.Body.String())
+	}
+}
+
+// TestResolveDiffCoverageConfig_Degradations pins each fail-open branch of
+// the resolver: a run with no cached spec, an unparseable spec, a workflow
+// id absent from the spec, and a stage type absent from the workflow each
+// yield nil — no measurement request, and symmetrically no gate, because
+// the same spec lookup drives the backend's own constraint load.
+func TestResolveDiffCoverageConfig_Degradations(t *testing.T) {
+	s, _, _, _ := newPromptServer(t)
+	base := diffCoverageSpecYAML("implement")
+
+	cases := []struct {
+		name       string
+		spec       []byte
+		workflowID string
+		stageType  run.StageType
+	}{
+		{"no cached spec", nil, "feature_change", run.StageTypeImplement},
+		{"unparseable spec", []byte("{{{not yaml"), "feature_change", run.StageTypeImplement},
+		{"workflow not in spec", base, "other_workflow", run.StageTypeImplement},
+		{"stage type not in workflow", base, "feature_change", run.StageTypePlan},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := s.resolveDiffCoverageConfig(context.Background(), &run.Run{
+				ID:           uuid.New(),
+				WorkflowID:   tc.workflowID,
+				WorkflowSpec: tc.spec,
+			}, tc.stageType)
+			if got != nil {
+				t.Errorf("resolveDiffCoverageConfig = %+v, want nil", got)
+			}
+		})
+	}
+}
+
+// TestResolveDiffCoverageConfig_MostRestrictiveWins pins that a stage
+// declaring the constraint twice resolves to the HIGHEST threshold,
+// matching mergeConstraints — so the runner measures against the same
+// threshold the backend will enforce.
+func TestResolveDiffCoverageConfig_MostRestrictiveWins(t *testing.T) {
+	s, _, _, _ := newPromptServer(t)
+	got := s.resolveDiffCoverageConfig(context.Background(), &run.Run{
+		ID:         uuid.New(),
+		WorkflowID: "feature_change",
+		WorkflowSpec: []byte("version: \"1.6\"\n" +
+			"workflows:\n" +
+			"  feature_change:\n" +
+			"    stages:\n" +
+			"      - id: implement\n" +
+			"        type: implement\n" +
+			"        executor:\n" +
+			"          agent: claude-code\n" +
+			"        constraints:\n" +
+			"          - diff_coverage:\n" +
+			"              command: low\n" +
+			"              report_path: a.lcov\n" +
+			"              min_new_line_coverage: 50\n" +
+			"          - diff_coverage:\n" +
+			"              command: high\n" +
+			"              report_path: b.lcov\n" +
+			"              min_new_line_coverage: 95\n"),
+	}, run.StageTypeImplement)
+	if got == nil {
+		t.Fatal("resolveDiffCoverageConfig = nil, want the declared constraint")
+	}
+	if got.MinNewLineCoverage != 95 || got.Command != "high" {
+		t.Errorf("resolved = %+v, want the 95%% entry", got)
+	}
+}

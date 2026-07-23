@@ -3325,3 +3325,290 @@ workflows:
 		t.Fatalf("v0 err = %v, want *SchemaError (workflow-v0 enum is frozen)", err)
 	}
 }
+
+// diffCoverageStages is the v1.6 `diff_coverage` declaration the parse
+// tests below share.
+const diffCoverageStages = `
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              format: lcov
+              min_new_line_coverage: 85
+              base_ref: release
+`
+
+// TestParse_DiffCoverage pins the workflow-v1 constraint kind added in
+// v1.6 (#1888 / ADR-059) against the BACKEND's embedded mirror, asserting
+// the parsed constraint carries the DECLARED values rather than merely a
+// non-nil struct — a field wired to a zero default is exactly what a
+// presence-only check cannot catch. workflow-v0 stays frozen.
+func TestParse_DiffCoverage(t *testing.T) {
+	s, err := spec.ParseBytes([]byte("version: \"1.6\"\n" + diffCoverageStages))
+	if err != nil {
+		t.Fatalf("v1.6 parse: %v", err)
+	}
+	got := s.Workflows["feature_change"].Stages[0].Constraints
+	if len(got) != 1 || got[0].DiffCoverage == nil {
+		t.Fatalf("parsed constraints = %+v, want one diff_coverage entry", got)
+	}
+	dc := got[0].DiffCoverage
+	if dc.Command != "make coverage" {
+		t.Errorf("Command = %q, want %q", dc.Command, "make coverage")
+	}
+	if dc.ReportPath != "coverage.lcov" {
+		t.Errorf("ReportPath = %q, want %q", dc.ReportPath, "coverage.lcov")
+	}
+	if dc.Format != "lcov" {
+		t.Errorf("Format = %q, want lcov", dc.Format)
+	}
+	if dc.MinNewLineCoverage != 85 {
+		t.Errorf("MinNewLineCoverage = %d, want 85 (the DECLARED threshold, not a zero default)",
+			dc.MinNewLineCoverage)
+	}
+	if dc.BaseRef != "release" {
+		t.Errorf("BaseRef = %q, want release", dc.BaseRef)
+	}
+
+	// workflow-v0 is frozen — diff_coverage is not in its closed
+	// constraint set (additionalProperties: false).
+	_, err = spec.ParseBytes([]byte("version: \"0.7\"\n" + diffCoverageStages))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("v0 err = %v, want *SchemaError (workflow-v0 constraint set is frozen)", err)
+	}
+}
+
+// TestParse_DiffCoverage_OmittedOptionalFields pins that the two optional
+// fields are genuinely optional: format defaults to lcov (supplied by the
+// schema, surfaced as an empty string the runner reads as lcov) and an
+// omitted base_ref parses to empty, which the RUNNER resolves to the run's
+// base branch.
+func TestParse_DiffCoverage_OmittedOptionalFields(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 0
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	dc := s.Workflows["feature_change"].Stages[0].Constraints[0].DiffCoverage
+	if dc == nil {
+		t.Fatal("DiffCoverage = nil, want the declared constraint")
+	}
+	if dc.BaseRef != "" {
+		t.Errorf("BaseRef = %q, want empty (runner resolves the run's base branch)", dc.BaseRef)
+	}
+	if dc.MinNewLineCoverage != 0 {
+		t.Errorf("MinNewLineCoverage = %d, want 0 (a declared zero is legal)", dc.MinNewLineCoverage)
+	}
+}
+
+// TestParse_DiffCoverage_Rejected covers every schema- and
+// validator-enforced rejection: each required field missing, the format
+// enum, both ends of the 0..100 range, and the deploy-stage binding.
+func TestParse_DiffCoverage_Rejected(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"missing command", `
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 80`},
+		{"missing report_path", `
+              command: "make coverage"
+              min_new_line_coverage: 80`},
+		{"missing min_new_line_coverage", `
+              command: "make coverage"
+              report_path: "coverage.lcov"`},
+		{"empty command", `
+              command: ""
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 80`},
+		{"empty report_path", `
+              command: "make coverage"
+              report_path: ""
+              min_new_line_coverage: 80`},
+		{"unknown format", `
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              format: cobertura
+              min_new_line_coverage: 80`},
+		{"threshold above 100", `
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 101`},
+		{"negative threshold", `
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: -1`},
+		{"unknown field", `
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 80
+              exclude: "vendor/**"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:` + tc.body + "\n"))
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SchemaError", err)
+			}
+		})
+	}
+}
+
+// TestParse_DiffCoverage_RejectedOnDeployStage pins the type<->constraint
+// binding: diff_coverage is a post-hoc diff constraint, so a delegating
+// deploy stage — which produces no reviewable diff — rejects it exactly
+// like its four siblings (ADR-038).
+func TestParse_DiffCoverage_RejectedOnDeployStage(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`version: "1.6"
+workflows:
+  ship:
+    stages:
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        constraints:
+          - diff_coverage:
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 80
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "post-hoc diff constraint") {
+		t.Errorf("ValidationError.Message = %q, want the post-hoc binding message", ve.Message)
+	}
+}
+
+// TestParse_DiffCoverage_RejectedOffImplementStage pins the stage-type
+// binding the runner actually implements: ONLY the implement stage measures
+// diff coverage. Because an absent signal on a DECLARED constraint is by
+// design a violation, a spec that declared it on, say, an acceptance or
+// review stage would earn a guaranteed false category-B failure on every
+// run — the false-RED this opt-in gate exists to avoid. Reject it at parse
+// time instead, where the spec author can act on it.
+func TestParse_DiffCoverage_RejectedOffImplementStage(t *testing.T) {
+	for _, stageType := range []string{"plan", "review", "acceptance"} {
+		t.Run(stageType, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: s
+        type: ` + stageType + `
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:
+              command: "make coverage"
+              report_path: "coverage.lcov"
+              min_new_line_coverage: 80
+`))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if !strings.Contains(ve.Message, "only on an implement stage") {
+				t.Errorf("ValidationError.Message = %q, want the implement-only binding message", ve.Message)
+			}
+			if !strings.Contains(ve.Path, "diff_coverage") {
+				t.Errorf("ValidationError.Path = %q, want it to name diff_coverage", ve.Path)
+			}
+		})
+	}
+}
+
+// TestParse_DiffCoverage_ReportPathMustStayInRepo pins the semantic check
+// the JSON Schema cannot express: the runner joins report_path onto the
+// checkout, so an absolute path or a `..` escape would read a file outside
+// the tree the measurement claims to describe.
+func TestParse_DiffCoverage_ReportPathMustStayInRepo(t *testing.T) {
+	for _, bad := range []string{"/etc/passwd", "../../outside.lcov", "a/../../escape.lcov"} {
+		t.Run(bad, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - diff_coverage:
+              command: "make coverage"
+              report_path: "` + bad + `"
+              min_new_line_coverage: 80
+`))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if !strings.Contains(ve.Path, "diff_coverage/report_path") {
+				t.Errorf("ValidationError.Path = %q, want it to name report_path", ve.Path)
+			}
+		})
+	}
+}
+
+// TestParse_DiffCoverage_NoRegression is the opt-in pin: a v1 spec that
+// does NOT declare the constraint parses exactly as before, with a nil
+// DiffCoverage on every constraint entry.
+func TestParse_DiffCoverage_NoRegression(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "1.5"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 20
+          - required_outcomes:
+              - tests_added_or_updated
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for i, c := range s.Workflows["feature_change"].Stages[0].Constraints {
+		if c.DiffCoverage != nil {
+			t.Errorf("constraint %d DiffCoverage = %+v, want nil", i, c.DiffCoverage)
+		}
+	}
+}
