@@ -60,6 +60,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -618,6 +619,33 @@ func resolveIdentityProvider(oauthClientID string, token func(context.Context) (
 	return identity.NewGitHubIdentityProvider(oauthClientID, token, opts...)
 }
 
+// resolveRepoVisibility is the BOTH-REQUIRED config gate for the per-identity
+// repo-ACL mirror (ADR-057 Amendment A2, E44.10 / #2071), extracted from the
+// wiring for the same reason resolveIdentityProvider is: the gate is the
+// behavior, and it must be assertable without booting a server.
+//
+// The mirror needs a store (a database) AND a forge permission resolver (a
+// configured IdentityProvider). With either missing there is nothing to
+// resolve permissions against, so this returns nil and server.Config's
+// RepoVisibility stays nil — the untenanted-allow posture, which is EXACTLY
+// the pre-#2071 read surface. That is deliberately not a deny: a
+// no-database or no-OAuth deployment must keep working unchanged.
+//
+// It returns the INTERFACE, and returns an untyped nil, on purpose. Handing
+// back a typed (*repoacl.Mirror)(nil) would produce a non-nil interface whose
+// every call reports ErrNotConfigured, and the server maps a mirror error to
+// 503 — so the "unwired" posture would become a 503 on every read instead of
+// the intended passthrough. Returning the interface makes that unrepresentable.
+//
+// ttl is passed through to NewMirror, which substitutes DefaultTTL for any
+// non-positive value.
+func resolveRepoVisibility(store repoacl.Store, resolver repoacl.PermissionResolver, ttl time.Duration, logger *slog.Logger) server.RepoVisibility {
+	if store == nil || resolver == nil {
+		return nil
+	}
+	return repoacl.NewMirror(store, resolver, ttl, logger)
+}
+
 // githubEndpoints holds the per-client base-URL overrides derived from the
 // FISHHAWKD_GITHUB_* / FISHHAWKD_OAUTH_* endpoint config (E44.2 / #1826). An
 // empty field means "unset" — each GitHub client keeps its github.com /
@@ -882,6 +910,9 @@ func runServe(args []string, logSink io.Writer) int {
 	slaInterval := fs.Duration("sla-interval",
 		60*time.Second,
 		"SLA ticker scan interval; 60s default fits hour-grained SLAs comfortably")
+	repoACLTTL := fs.Duration("repo-acl-ttl",
+		envOrDuration("FISHHAWKD_REPO_ACL_TTL", repoacl.DefaultTTL),
+		"freshness window for a mirrored per-identity forge repo permission (ADR-057 Amendment A2 / #2071). A grant or a revocation made on the forge is reflected in workspace read filtering within this window; shorter is safer but spends more forge rate limit on cold reads. Non-positive falls back to the default")
 	enableDispatchWatchdog := fs.Bool("enable-dispatch-watchdog",
 		envOr("FISHHAWKD_ENABLE_DISPATCH_WATCHDOG", "false") == "true",
 		"start the dispatch watchdog ticker (E8.4); fails category-C any stage stuck in 'dispatched' past --dispatch-watchdog-timeout. Off by default for the same dev-loop reason as --enable-sla-timer")
@@ -1739,6 +1770,34 @@ func runServe(args []string, logSink io.Writer) int {
 	// returns App credentials in one shot. Always wired so operators
 	// can self-register an App from a fresh install.
 	cfg.GitHubManifest = authpkg.NewGitHubManifest(authpkg.ManifestURLs{})
+
+	// Repo-scoped in-workspace visibility (ADR-057 Amendment A2, E44.10 /
+	// #2071). Wired LAST among the config seams because it needs both a pool
+	// and the identity provider resolved in the OAuth block above, and BEFORE
+	// server.New because cfg is copied by value into the Server.
+	//
+	// RepoProviders is the cross-forge deny's row-provider resolver: with it
+	// wired, a row whose owner is registered under a different forge than the
+	// caller's login is denied with ZERO forge calls. It resolves through the
+	// same accounts.provider discriminator the conventions loader uses; nil
+	// (no database) means the row's forge is unknown, and the filter falls
+	// through to the mirror rather than denying everything.
+	if pool != nil {
+		cfg.RepoProviders = account.NewResolver(accountdb.New(pool))
+		cfg.RepoVisibility = resolveRepoVisibility(
+			repoacl.NewPostgresStore(pool), cfg.IdentityProvider, *repoACLTTL, logger)
+	}
+	if cfg.RepoVisibility != nil {
+		logger.Info("repo-scoped read filtering enabled (non-admin workspace members see only repos they hold forge read on)",
+			slog.Duration("ttl", *repoACLTTL),
+			slog.Bool("cross_forge_resolver", cfg.RepoProviders != nil),
+			slog.String("ref", "#2071"))
+	} else {
+		logger.Warn("repo-scoped read filtering DISABLED (needs both a database and a configured identity provider); every workspace member sees every run, campaign and audit entry in their account",
+			slog.Bool("database", pool != nil),
+			slog.Bool("identity_provider", cfg.IdentityProvider != nil),
+			slog.String("ref", "#2071"))
+	}
 
 	srv := server.New(cfg)
 

@@ -3189,6 +3189,28 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    RepoForbidden:
+      description: |
+        `error: repo_forbidden` — the caller is a workspace member in good
+        standing, but does not hold at least `read` on this resource's
+        repository on the forge (ADR-057 Amendment A2 / #2071).
+
+        Applies to non-admin **cookie-session** callers only. Bearer / MCP
+        token identities are bounded by token ownership and are never
+        repo-filtered; a workspace `admin` bypasses the check entirely; and a
+        deployment with no repo-ACL mirror wired (no database, or no identity
+        provider configured) does not filter at all.
+
+        Point reads DENY with this code while list endpoints silently OMIT the
+        rows instead — see the `repo-scoped visibility` note on each list
+        operation. A repo whose forge permission could not be resolved (a forge
+        outage or rate limit) is treated as NOT visible and answers this code
+        too; the server logs the distinction at WARN. If the mirror's own store
+        is unreachable the request fails `503 service_unavailable` rather than
+        denying, so a filter fault is never mistaken for a permission answer.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     NotFound:
       description: Referenced resource does not exist.
       content:
@@ -3826,6 +3848,17 @@ paths:
       description: |
         Cursor-paginated list ordered by `created_at` descending. Filter
         parameters are additive; multiple query values AND together.
+
+        **Repo-scoped visibility (ADR-057 Amendment A2 / #2071).** For a
+        non-admin cookie-session caller, this page is narrowed — on top of the
+        existing workspace-account scoping — to repositories the caller holds
+        at least `read` on at the forge. Rows for other repositories are
+        OMITTED, not errored. Because the offset cursor counts rows BEFORE this
+        narrowing, a page may come back shorter than `limit` while
+        `next_cursor` is still non-empty; following the cursor to exhaustion
+        still yields every visible row exactly once. Bearer / MCP identities
+        and workspace admins are not filtered, and a deployment with no
+        repo-ACL mirror wired behaves exactly as before.
       tags: [runs]
       parameters:
         - { name: repo, in: query, schema: { type: string } }
@@ -4056,6 +4089,12 @@ paths:
     get:
       operationId: getRun
       summary: Get a run
+      description: |
+        Point read. A non-admin cookie-session caller who does not hold `read`
+        on the run's repository at the forge is DENIED 403 `repo_forbidden`
+        (ADR-057 Amendment A2 / #2071) rather than filtered — the same rule
+        covers the run's stage, artifact, concern and per-run audit reads,
+        which share this run-scoped authorization path.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -4066,7 +4105,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /v0/runs/{run_id}/cancel:
     post:
@@ -6011,6 +6052,16 @@ paths:
         scoped to one run, used by the run-detail audit list and the
         per-run verifier path). The global-chain partition specifically
         is the verifier's input — not exposed over HTTP for now.
+
+        **Repo-scoped visibility (ADR-057 Amendment A2 / #2071).** For a
+        non-admin cookie-session caller, entries are narrowed to those whose
+        run's repository the caller holds at least `read` on at the forge.
+        Global-chain entries (no `run_id`) carry no repository to authorize
+        against and are therefore ADMIN-ONLY for such a caller — they are not
+        defaulted to visible. As on other list endpoints the narrowing happens
+        after paging, so a short page with a non-empty `next_cursor` is
+        expected. Bearer / MCP identities and workspace admins see the feed
+        unfiltered.
       tags: [audit]
       parameters:
         - { name: category, in: query, schema: { type: string } }
@@ -6036,7 +6087,10 @@ paths:
             `cursor_invalid` — opaque cursor failed to decode.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503':
-          description: Audit repository not configured on this instance.
+          description: |
+            Audit repository not configured on this instance, or the repo-ACL
+            mirror's store could not be reached so repo visibility could not be
+            resolved (`service_unavailable`, #2071).
 
   /v0/audit/export:
     get:
@@ -6608,6 +6662,17 @@ paths:
       description: |
         Cursor-paginated list ordered by `created_at` descending. Optional
         `repo` and `state` filters AND together.
+
+        **Repo-scoped visibility (ADR-057 Amendment A2 / #2071).** For a
+        non-admin cookie-session caller, this page is narrowed — on top of the
+        existing workspace-account scoping — to repositories the caller holds
+        at least `read` on at the forge. Rows for other repositories are
+        OMITTED, not errored. Because the offset cursor counts rows BEFORE this
+        narrowing, a page may come back shorter than `limit` while
+        `next_cursor` is still non-empty; following the cursor to exhaustion
+        still yields every visible row exactly once. Bearer / MCP identities
+        and workspace admins are not filtered, and a deployment with no
+        repo-ACL mirror wired behaves exactly as before.
       tags: [campaigns]
       parameters:
         - { name: repo, in: query, schema: { type: string } }
@@ -6779,10 +6844,14 @@ paths:
         '400':
           description: "`validation_failed` — `campaign_id` is not a valid UUID."
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
         '404':
           description: "`campaign_not_found` — no campaign with that id."
         '503':
-          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+          description: |
+            `campaign_repo_unconfigured` — no campaign repository wired; or
+            `service_unavailable` — the repo-ACL mirror's store could not be
+            reached so repo visibility could not be resolved (#2071).
 
   /v0/campaigns/{campaign_id}/items:
     get:
@@ -6806,10 +6875,14 @@ paths:
         '400':
           description: "`validation_failed` — `campaign_id` is not a valid UUID."
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
         '404':
           description: "`campaign_not_found` — no campaign with that id."
         '503':
-          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+          description: |
+            `campaign_repo_unconfigured` — no campaign repository wired; or
+            `service_unavailable` — the repo-ACL mirror's store could not be
+            reached so repo visibility could not be resolved (#2071).
 
   /v0/campaigns/{campaign_id}/status:
     get:
@@ -6840,10 +6913,14 @@ paths:
         '400':
           description: "`validation_failed` — `campaign_id` is not a valid UUID."
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
         '404':
           description: "`campaign_not_found` — no campaign with that id."
         '503':
-          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+          description: |
+            `campaign_repo_unconfigured` — no campaign repository wired; or
+            `service_unavailable` — the repo-ACL mirror's store could not be
+            reached so repo visibility could not be resolved (#2071).
 
   /v0/campaigns/{campaign_id}/runs:
     post:
@@ -7119,6 +7196,15 @@ paths:
         targets the latest revision and its pinned hash still matches — so an
         edit after approval structurally re-gates the session.
 
+        **Repo-scoped visibility (ADR-057 Amendment A2 / #2071).** Once a
+        session has been FILED, it is authorized against the repository its
+        filing session pinned: a non-admin cookie-session caller without at
+        least `read` on that repository at the forge is denied 403
+        `repo_forbidden`. The same gate applies to the draft-edit and decision
+        endpoints below, which share this session load. A session that has not
+        yet been filed has no repository to authorize against and stays
+        reachable to any caller holding the refinement scope.
+
         Requires `write:approvals` scope.
       tags: [refinement]
       parameters:
@@ -7134,9 +7220,16 @@ paths:
               schema: { $ref: '#/components/schemas/RefinementSession' }
         '400': { description: "`validation_failed` — `session_id` is not a UUID." }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '403':
+          description: |
+            `insufficient_scope` — token lacks `write:approvals`; or
+            `repo_forbidden` — the caller does not hold `read` on the
+            repository this session was filed against (#2071).
         '404': { description: "`refinement_session_not_found` — no session with that id." }
-        '503': { description: "`refinement_repo_unconfigured`." }
+        '503':
+          description: |
+            `refinement_repo_unconfigured`; or `service_unavailable` — repo
+            visibility could not be resolved (#2071).
 
 
   /v0/refinement/sessions/{session_id}/draft:

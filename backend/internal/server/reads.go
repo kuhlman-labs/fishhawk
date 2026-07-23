@@ -533,14 +533,100 @@ func (s *Server) handleListGlobalAudit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	page, nextCursor := pageOffset(entries, offset, limit)
+
+	// Repo-scoped narrowing (ADR-057 Amendment A2 / #2071), applied AFTER the
+	// account scoping and strictly on top of it. Same page-then-filter shape
+	// (and the same accepted short-page artifact) as handleListRuns: the
+	// cursor counts pre-filter rows, so following it to exhaustion still
+	// yields every visible entry exactly once.
+	filter, ok := s.requestRepoFilter(w, r)
+	if !ok {
+		return
+	}
+	// repoOf memoizes run→repo for the life of THIS page, so a run with fifty
+	// entries on the page costs one lookup, not fifty.
+	repoOf := make(map[uuid.UUID]string, 8)
 	items := make([]auditEntryResponse, 0, len(page))
 	for _, e := range page {
+		visible, ferr := s.auditEntryVisible(r.Context(), filter, e, repoOf)
+		if ferr != nil {
+			s.writeRepoFilterUnavailable(w, r)
+			return
+		}
+		if !visible {
+			continue
+		}
 		items = append(items, toAuditEntryResponse(e))
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{
 		"items":       items,
 		"next_cursor": nextCursor,
 	})
+}
+
+// auditEntryVisible decides ONE global-feed entry against a resolved repo
+// filter. A nil filter (no mirror wired, bearer / anonymous caller, or a
+// workspace admin) allows everything, so the feed is the pre-#2071 feed
+// verbatim for those callers.
+//
+// Two cases, and the second is the one worth stating out loud:
+//
+//   - A RUN-SCOPED entry authorizes against its run's repo, exactly as the
+//     per-run audit endpoint does through requireRunAccount.
+//
+//   - A GLOBAL-CHAIN entry (RunID == nil) is ADMIN-ONLY. Token issue/revoke,
+//     onboarding and the other cross-run records carry no repo at all, so
+//     there is nothing to authorize against — and "no repo" must not default
+//     to visible, or the global chain becomes the one hole through which a
+//     filtered member reads workspace activity for repos they hold no grant
+//     on. An admin reaches this with filter == nil and still sees them all.
+//
+// repoOf is a caller-owned, non-nil per-page memo.
+func (s *Server) auditEntryVisible(ctx context.Context, filter *repoFilter, e *audit.Entry, repoOf map[uuid.UUID]string) (bool, error) {
+	if filter == nil {
+		return true, nil
+	}
+	if e.RunID == nil {
+		return false, nil
+	}
+	repo, known, err := s.runRepoFor(ctx, *e.RunID, repoOf)
+	if err != nil {
+		// A run lookup that FAILS is a STORE fault, not a deny: the filter
+		// cannot function, so the caller 503s rather than silently shortening
+		// the page — the same rule the mirror applies to its own store.
+		return false, err
+	}
+	if !known {
+		// The run is gone, or no RunRepo is wired, so its repo is unknowable.
+		// Fail closed: an entry that cannot be authorized is not shown to a
+		// filtered caller. (This is a forge-unknowable-style deny, not a
+		// fault, so it shortens the page rather than 503ing it.)
+		return false, nil
+	}
+	return filter.allows(ctx, repo)
+}
+
+// runRepoFor resolves a run's repo through the caller-supplied memo. Reports
+// known=false (NOT an error) when no RunRepo is wired or the run does not
+// exist; both mean "repo unknowable", which the caller treats as not-visible.
+// A genuine query error propagates so the caller can 503.
+func (s *Server) runRepoFor(ctx context.Context, runID uuid.UUID, repoOf map[uuid.UUID]string) (string, bool, error) {
+	if s.cfg.RunRepo == nil {
+		return "", false, nil
+	}
+	if repo, hit := repoOf[runID]; hit {
+		return repo, repo != "", nil
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if errors.Is(err, run.ErrNotFound) {
+		repoOf[runID] = ""
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	repoOf[runID] = runRow.Repo
+	return runRow.Repo, true, nil
 }
 
 // parseLimit reads a query value with min=1, max=hardMax, returning

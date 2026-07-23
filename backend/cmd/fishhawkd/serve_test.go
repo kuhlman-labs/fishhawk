@@ -33,6 +33,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -1946,5 +1947,109 @@ func TestServe_SingleTenantInvalidGranularity_FailsStartup(t *testing.T) {
 	}
 	if n := countAccounts(t, url, "acme-corp"); n != 0 {
 		t.Errorf("accounts rows = %d, want 0 — validation must precede the write", n)
+	}
+}
+
+// ---- repo-ACL mirror wiring (ADR-057 Amendment A2, E44.10 / #2071) --------
+
+// stubRepoACLStore is a repoacl.Store that is never actually queried by these
+// wiring tests — they assert construction and gating, not mirror behavior.
+type stubRepoACLStore struct{}
+
+func (stubRepoACLStore) Get(context.Context, string, string, string) (repoacl.Entry, bool, error) {
+	return repoacl.Entry{}, false, nil
+}
+
+func (stubRepoACLStore) Upsert(context.Context, string, string, string, identity.Permission) error {
+	return nil
+}
+
+func (stubRepoACLStore) DeleteForSubject(context.Context, string, string) error { return nil }
+
+// stubPermissionResolver stands in for a configured IdentityProvider.
+type stubPermissionResolver struct{}
+
+func (stubPermissionResolver) PermissionLevel(context.Context, string, string) (identity.Permission, error) {
+	return identity.PermissionRead, nil
+}
+
+// TestResolveRepoVisibility_BothRequired pins the gating contract: the mirror
+// is constructed only when a store AND a permission resolver are both present.
+// Anything less leaves the seam nil, which is server.Config's untenanted-allow
+// posture — the pre-#2071 read surface, not a deny-all.
+func TestResolveRepoVisibility_BothRequired(t *testing.T) {
+	cases := []struct {
+		name     string
+		store    repoacl.Store
+		resolver repoacl.PermissionResolver
+		wantNil  bool
+	}{
+		{name: "both present", store: stubRepoACLStore{}, resolver: stubPermissionResolver{}},
+		{name: "no store (no database)", resolver: stubPermissionResolver{}, wantNil: true},
+		{name: "no resolver (no identity provider)", store: stubRepoACLStore{}, wantNil: true},
+		{name: "neither", wantNil: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveRepoVisibility(tc.store, tc.resolver, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if tc.wantNil {
+				// Must be an UNTYPED nil interface. A typed (*Mirror)(nil)
+				// would pass a `!= nil` check in the server and then report
+				// ErrNotConfigured on every call, turning the unwired posture
+				// into a 503 on every read.
+				if got != nil {
+					t.Fatalf("resolveRepoVisibility = %#v, want a nil interface", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("resolveRepoVisibility = nil, want a constructed mirror")
+			}
+			if _, ok := got.(*repoacl.Mirror); !ok {
+				t.Errorf("mirror = %T, want *repoacl.Mirror", got)
+			}
+		})
+	}
+}
+
+// TestResolveRepoVisibility_ShipsDefaultTTL is the DONE-MEANS behavioral test.
+// The shipped TTL is a config value the compiler cannot enforce, so this
+// asserts the value the constructed mirror actually carries: unset →
+// repoacl.DefaultTTL, set → the operator's value. A comment-only touch of the
+// wiring fails here where a scope-presence check would pass.
+func TestResolveRepoVisibility_ShipsDefaultTTL(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// The flag's default is what an unset FISHHAWKD_REPO_ACL_TTL resolves to.
+	t.Setenv("FISHHAWKD_REPO_ACL_TTL", "")
+	if got := envOrDuration("FISHHAWKD_REPO_ACL_TTL", repoacl.DefaultTTL); got != repoacl.DefaultTTL {
+		t.Fatalf("unset env TTL = %s, want the shipped default %s", got, repoacl.DefaultTTL)
+	}
+	shipped := resolveRepoVisibility(stubRepoACLStore{}, stubPermissionResolver{},
+		envOrDuration("FISHHAWKD_REPO_ACL_TTL", repoacl.DefaultTTL), logger)
+	if got := shipped.(*repoacl.Mirror).TTL(); got != repoacl.DefaultTTL {
+		t.Errorf("shipped mirror TTL = %s, want repoacl.DefaultTTL (%s)", got, repoacl.DefaultTTL)
+	}
+
+	// A configured value overrides it end to end.
+	t.Setenv("FISHHAWKD_REPO_ACL_TTL", "90s")
+	overridden := resolveRepoVisibility(stubRepoACLStore{}, stubPermissionResolver{},
+		envOrDuration("FISHHAWKD_REPO_ACL_TTL", repoacl.DefaultTTL), logger)
+	if got := overridden.(*repoacl.Mirror).TTL(); got != 90*time.Second {
+		t.Errorf("overridden mirror TTL = %s, want 90s", got)
+	}
+}
+
+// TestServeRegistersRepoACLTTLFlag pins the operator-facing surface: the flag
+// exists, is documented, and defaults to the shipped TTL.
+func TestServeRegistersRepoACLTTLFlag(t *testing.T) {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	f := fs.Duration("repo-acl-ttl", envOrDuration("FISHHAWKD_REPO_ACL_TTL", repoacl.DefaultTTL), "")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if *f != repoacl.DefaultTTL {
+		t.Errorf("--repo-acl-ttl default = %s, want %s", *f, repoacl.DefaultTTL)
 	}
 }

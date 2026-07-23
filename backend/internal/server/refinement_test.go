@@ -7,11 +7,13 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
@@ -1144,5 +1146,190 @@ func TestAppendRefinementAudit_StampsIdentityAccount(t *testing.T) {
 	}
 	if rec.entries[1].AccountID != nil {
 		t.Fatalf("identityless entry AccountID = %s, want nil (untenanted)", *rec.entries[1].AccountID)
+	}
+}
+
+// ---- repo-scoped refinement reads (ADR-057 Amendment A2 / #2071) ----------
+
+// filingRepoStub serves one draft revision plus, optionally, the filing session
+// that pinned its target repo. A refinement session has no repo of its own —
+// refinement.StoredDraft carries brief/draft/model/origin — so the pinned
+// filing repo IS the session's repo, and that is what the gate authorizes.
+type filingRepoStub struct {
+	refinement.Repository
+	drafts []*refinement.StoredDraft
+	repo   string // "" ⇒ never filed, so the session has no repo
+	err    error
+	gets   int
+}
+
+func (r *filingRepoStub) ListForSession(context.Context, uuid.UUID) ([]*refinement.StoredDraft, error) {
+	return r.drafts, nil
+}
+
+func (r *filingRepoStub) ListDecisions(context.Context, uuid.UUID) ([]*refinement.Decision, error) {
+	return nil, nil
+}
+
+func (r *filingRepoStub) GetFilingSession(_ context.Context, draftID uuid.UUID) (*refinement.FilingSession, error) {
+	r.gets++
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.repo == "" {
+		return nil, refinement.ErrNotFound
+	}
+	return &refinement.FilingSession{DraftID: draftID, Repo: r.repo}, nil
+}
+
+func newFilingRepoStub(repo string) *filingRepoStub {
+	return &filingRepoStub{
+		repo: repo,
+		drafts: []*refinement.StoredDraft{{
+			ID:        uuid.New(),
+			SessionID: uuid.New(),
+			Brief:     "stand up X",
+			Draft:     refinementValidDraft(),
+			Origin:    refinement.OriginBrief,
+		}},
+	}
+}
+
+// refinementCookieReq is refinementReq with a COOKIE identity — the only
+// identity kind repo filtering applies to (a bearer TokenID is mode (i),
+// deliberately unfiltered, which is why the existing refinement tests are
+// untouched by this gate).
+func refinementCookieReq(method, target, sessionID string) *http.Request {
+	r := httptest.NewRequest(method, target, nil)
+	if sessionID != "" {
+		r.SetPathValue("session_id", sessionID)
+	}
+	return withIdentity(r, memberIdentity())
+}
+
+func refinementVisibilityServer(t *testing.T, repo *filingRepoStub, vis RepoVisibility, role string) *Server {
+	t.Helper()
+	return New(Config{
+		Addr:           "127.0.0.1:0",
+		RefinementRepo: repo,
+		AuditRepo:      okAuditRepo{},
+		AccountRoles:   fakeAccountRoles{role: role},
+		RepoVisibility: vis,
+	})
+}
+
+func getRefinementSession(t *testing.T, s *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	sessionID := uuid.NewString()
+	req := refinementCookieReq(http.MethodGet, "/v0/refinement/sessions/"+sessionID, sessionID)
+	w := httptest.NewRecorder()
+	s.handleGetRefinementSession(w, req)
+	return w
+}
+
+// TestRefinementSession_NonVisibleRepo_403 is the point-read arm of binding
+// condition (3): a member's point read of a session whose filed repo they hold
+// no forge read on is 403 repo_forbidden, not a filtered-away 404.
+func TestRefinementSession_NonVisibleRepo_403(t *testing.T) {
+	repo := newFilingRepoStub("acme/hidden")
+	vis := newFakeRepoVisibility(map[string]bool{"acme/visible": true})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	w := getRefinementSession(t, s)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "repo_forbidden") {
+		t.Errorf("body missing repo_forbidden: %s", w.Body.String())
+	}
+}
+
+func TestRefinementSession_VisibleRepo_200(t *testing.T) {
+	repo := newFilingRepoStub("acme/visible")
+	vis := newFakeRepoVisibility(map[string]bool{"acme/visible": true})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	if w := getRefinementSession(t, s); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestRefinementSession_AdminBypass is the refinement half of binding condition
+// (3)'s admin criterion: the bypass covers refinement point reads too, and
+// consults the mirror zero times.
+func TestRefinementSession_AdminBypass(t *testing.T) {
+	repo := newFilingRepoStub("acme/hidden")
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleAdmin)
+
+	if w := getRefinementSession(t, s); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (admin bypass):\n%s", w.Code, w.Body.String())
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("admin bypass consulted the mirror %d times, want 0", vis.callCount())
+	}
+}
+
+// TestRefinementSession_Unfiled_NoRepoToGate documents the STATED limit: a
+// session that has never been filed has no repo, so there is nothing to
+// authorize against and it stays reachable. Closing this needs a repo on the
+// refinement session itself — a schema change outside this slice.
+func TestRefinementSession_Unfiled_NoRepoToGate(t *testing.T) {
+	repo := newFilingRepoStub("") // never filed
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	if w := getRefinementSession(t, s); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (an unfiled session has no repo):\n%s", w.Code, w.Body.String())
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror consulted %d times for a session with no repo, want 0", vis.callCount())
+	}
+}
+
+// TestRefinementSession_MirrorStoreFault_503 is mode (h) on the refinement
+// surface.
+func TestRefinementSession_MirrorStoreFault_503(t *testing.T) {
+	repo := newFilingRepoStub("acme/visible")
+	vis := newFakeRepoVisibility(map[string]bool{"acme/visible": true})
+	vis.err = errors.New("mirror store down")
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	if w := getRefinementSession(t, s); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 on a mirror store fault", w.Code)
+	}
+}
+
+// TestRefinementSession_FilingLookupFault_503 pins the same split for the
+// filing-session lookup this gate adds: a query FAULT is a store fault, never
+// a silent allow.
+func TestRefinementSession_FilingLookupFault_503(t *testing.T) {
+	repo := newFilingRepoStub("acme/visible")
+	repo.err = errors.New("filing_sessions unavailable")
+	vis := newFakeRepoVisibility(map[string]bool{"acme/visible": true})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	if w := getRefinementSession(t, s); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when the filing lookup faults", w.Code)
+	}
+}
+
+// TestRefinementSession_BearerUnfiltered is mode (i) on this surface: an MCP /
+// bearer caller is bounded by scope + ownership and never repo-filtered, so the
+// pre-#2071 refinement tests keep passing unchanged.
+func TestRefinementSession_BearerUnfiltered(t *testing.T) {
+	repo := newFilingRepoStub("acme/hidden")
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	sessionID := uuid.NewString()
+	req := refinementReq(http.MethodGet, "/v0/refinement/sessions/"+sessionID, sessionID, "")
+	w := httptest.NewRecorder()
+	s.handleGetRefinementSession(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (bearer identities are unfiltered):\n%s", w.Code, w.Body.String())
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("bearer caller consulted the mirror %d times, want 0", vis.callCount())
 	}
 }

@@ -175,6 +175,32 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Login-time mirror purge (ADR-057 Amendment A2, E44.10 / #2071). Drop
+	// every mirrored repo permission for this subject so the first read after
+	// sign-in re-resolves from the forge. Signing in is the one moment we know
+	// the user is present and expects their current access to apply, so it is
+	// the cheapest place to collapse the staleness window to zero.
+	//
+	// NON-FATAL, deliberately. Note precisely what a failed purge does and
+	// does not cost: the previously cached entries — INCLUDING GRANTS —
+	// survive until their TTL expires. It is NOT true that a failed purge
+	// merely leaves the mirror needing a re-resolve. What IS true is that the
+	// exposure is exactly the baseline this design already accepts everywhere
+	// else: any permission revoked on the forge mid-TTL stays visible until
+	// the entry expires. So the failure is BOUNDED BY repoacl.DefaultTTL, not
+	// unbounded, and it is the same bound that applies to a user who simply
+	// does not sign in again. Failing sign-in closed on a transient DB blip
+	// would be the worse trade — it converts a bounded, already-accepted
+	// staleness window into a total outage of the login path.
+	if s.cfg.RepoVisibility != nil {
+		if err := s.cfg.RepoVisibility.InvalidateSubject(r.Context(), "github", profile.Login); err != nil {
+			s.cfg.Logger.Warn("repo-acl mirror purge failed at sign-in; cached repo permissions for this subject survive until their TTL expires (bounded staleness, sign-in continues)",
+				"github_login", profile.Login,
+				"error", err.Error(),
+				"ref", "#2071")
+		}
+	}
+
 	// HttpOnly + Secure + SameSite=Lax per ADR-005. Path "/" so
 	// every backend route sees it.
 	http.SetCookie(w, &http.Cookie{
