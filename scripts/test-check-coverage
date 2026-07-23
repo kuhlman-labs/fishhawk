@@ -712,6 +712,198 @@ else
   fail "(o) expected a usage error (rc=$rc, out='$out')"
 fi
 
+# ===========================================================================
+# Pre-test change-set snapshot (#2124). --emit-changed-snapshot captures the
+# change set BEFORE the tests run; --changed-snapshot consumes it with an
+# integrity digest, closing the TOCTOU where a test mutates the work tree and
+# turns the recompute into a passing SKIP. One case per shipped behavior and one
+# per fail-closed branch.
+# ===========================================================================
+
+# sha256 of a file, matching the parent shell's anchor exactly.
+snap_digest() {
+  python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
+}
+emit_snap() {
+  # emit_snap <repo> <snapshot_path>
+  python3 "$CC" --emit-changed-snapshot "$2" --diff-base main --repo-root "$1" 2>&1
+}
+consume() {
+  # consume <repo> <snapshot> <digest> <profile> [extra args...]
+  local repo="$1" snap="$2" dig="$3" prof="$4"; shift 4
+  python3 "$CC" --diff-base main --repo-root "$repo" \
+    --changed-snapshot "$snap" --expected-snapshot-digest "$dig" "$@" "$prof" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# (s1) emit writes the expected snapshot, including a NON-ASCII path key that
+#      round-trips (binary-safe serialization).
+# ---------------------------------------------------------------------------
+repo="$tmproot/snap1"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+apply_patch_commit "$repo"
+printf 'package foo\n\nfunc Cafe() int {\n\treturn 1\n}\n' > "$repo/backend/internal/foo/café.go"
+git -C "$repo" add -A
+git -C "$repo" commit -q -m cafe
+emit_out="$(emit_snap "$repo" "$tmproot/snap1.json")"; emit_rc=$?
+if [ "$emit_rc" -eq 0 ] && python3 - "$tmproot/snap1.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["schema"] == 1, d
+assert d["base"] == "main", d
+assert "backend/internal/foo/foo.go" in d["changed"], list(d["changed"])
+assert "backend/internal/foo/café.go" in d["changed"], list(d["changed"])
+assert d["changed"]["backend/internal/foo/foo.go"] == sorted(d["changed"]["backend/internal/foo/foo.go"]), d
+PY
+then
+  pass "(s1) emit serializes the change set, non-ASCII path key round-trips"
+else
+  fail "(s1) emit snapshot (rc=$emit_rc out='$emit_out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s2) consume produces the correct verdict — a fully covered patch PASSES.
+# ---------------------------------------------------------------------------
+dig="$(snap_digest "$tmproot/snap1.json")"
+foo_profile "$tmproot/snap1_b.out" 1 1 1
+out="$(consume "$repo" "$tmproot/snap1.json" "$dig" "$tmproot/snap1_b.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PATCH PASS'; then
+  pass "(s2) consume of a valid snapshot produces the correct verdict (PATCH PASS)"
+else
+  fail "(s2) consume verdict (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s3) THE TOCTOU FIX: consume is invariant to a post-emit WORK-TREE mutation.
+#      After emit, the changed tracked .go file is reverted to merge-base
+#      contents (the exact bypass #2124 closes). The snapshot path still FAILS
+#      on the captured lines; the recompute path SKIPS — the bug, shown side by
+#      side so the snapshot is proven to be what saves the gate.
+# ---------------------------------------------------------------------------
+repo="$tmproot/snap3"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+apply_patch_commit "$repo"
+emit_snap "$repo" "$tmproot/snap3.json" >/dev/null
+dig3="$(snap_digest "$tmproot/snap3.json")"
+# Mid-loop mutation: revert foo.go to base contents. Snapshot is NOT touched.
+git -C "$repo" show main:backend/internal/foo/foo.go > "$repo/backend/internal/foo/foo.go"
+foo_profile "$tmproot/snap3.out" 0 0 0
+out_snap="$(consume "$repo" "$tmproot/snap3.json" "$dig3" "$tmproot/snap3.out")"; rc_snap=$?
+out_recompute="$(run_diff "$repo" "$tmproot/snap3.out")"; rc_recompute=$?
+if [ "$rc_snap" -ne 0 ] && printf '%s' "$out_snap" | grep -q 'backend/internal/foo/foo.go:7' \
+   && [ "$rc_recompute" -eq 0 ] && printf '%s' "$out_recompute" | grep -q 'no changed Go files'; then
+  pass "(s3) snapshot consume fails closed after a mid-loop revert; recompute would SKIP (the bypass)"
+else
+  fail "(s3) TOCTOU invariance (rc_snap=$rc_snap out_snap='$out_snap' rc_recompute=$rc_recompute out_recompute='$out_recompute')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s4) a skip-snapshot (written by emit on a git degrade) is consumed as a SKIP,
+#      exit 0 — a TRUSTED marker, not a recompute.
+# ---------------------------------------------------------------------------
+mkdir -p "$tmproot/snognit"
+emit_snap "$tmproot/snognit" "$tmproot/skip.json" >/dev/null   # non-git -> skip-snapshot
+sdig="$(snap_digest "$tmproot/skip.json")"
+out="$(consume "$repo" "$tmproot/skip.json" "$sdig" "$tmproot/snap3.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SKIP:'; then
+  pass "(s4) a skip-snapshot is consumed as a skip (exit 0)"
+else
+  fail "(s4) skip-snapshot consume (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s5) a MISSING snapshot fails closed (exit 1), never a skip.
+# ---------------------------------------------------------------------------
+out="$(consume "$repo" "$tmproot/does-not-exist.json" deadbeef "$tmproot/snap3.out")"
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'FAIL' \
+   && printf '%s' "$out" | grep -q 'cannot read changed snapshot' \
+   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+  pass "(s5) a missing snapshot fails closed (exit 1), never a skip"
+else
+  fail "(s5) missing-snapshot fail-closed (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s6) a CORRUPT snapshot fails closed (exit 1). The digest is computed over the
+#      garbage bytes so it MATCHES — isolating the malformed-JSON branch from the
+#      digest-mismatch branch below.
+# ---------------------------------------------------------------------------
+printf 'not json{' > "$tmproot/corrupt.json"
+cdig="$(snap_digest "$tmproot/corrupt.json")"
+out="$(consume "$repo" "$tmproot/corrupt.json" "$cdig" "$tmproot/snap3.out")"
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'malformed changed snapshot' \
+   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+  pass "(s6) a corrupt snapshot fails closed (exit 1), never a skip"
+else
+  fail "(s6) corrupt-snapshot fail-closed (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s7) a DIGEST MISMATCH (valid JSON, wrong anchor) fails closed (exit 1). This
+#      is the tamper-evidence property: any post-capture rewrite is detected.
+# ---------------------------------------------------------------------------
+out="$(consume "$repo" "$tmproot/snap3.json" 0000000000000000000000000000000000000000000000000000000000000000 "$tmproot/snap3.out")"
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'digest mismatch' \
+   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+  pass "(s7) a digest mismatch fails closed (exit 1), never a skip"
+else
+  fail "(s7) digest-mismatch fail-closed (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s7b) an ABSENT expected digest fails closed — the anchor is mandatory.
+# ---------------------------------------------------------------------------
+out="$(python3 "$CC" --diff-base main --repo-root "$repo" \
+        --changed-snapshot "$tmproot/snap3.json" "$tmproot/snap3.out" 2>&1)"
+rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no expected snapshot digest' \
+   && ! printf '%s' "$out" | grep -q 'SKIP'; then
+  pass "(s7b) a missing expected digest fails closed (exit 1)"
+else
+  fail "(s7b) absent-digest fail-closed (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s8) an UNDECODABLE changed path AT EMIT fails closed (exit 1) — the
+#      PathDecodeError guard, moved ahead of the tests. Simulated as in (p4):
+#      the authority set comes back empty while the diff still names a file.
+# ---------------------------------------------------------------------------
+out="$(python3 - "$CC" "$tmproot/snap1" "$tmproot/emit-undec.json" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+cc.tracked_changed_paths = lambda *a, **k: set()
+sys.argv = ["cc", "--emit-changed-snapshot", sys.argv[3], "--diff-base", "main", "--repo-root", sys.argv[2]]
+print(f"RC={cc.main()}")
+PY
+)"
+if printf '%s' "$out" | grep -q 'RC=1' \
+   && printf '%s' "$out" | grep -q 'FAIL: undecodable changed path' \
+   && printf '%s' "$out" | grep -q '\.go'; then
+  pass "(s8) an undecodable changed path at emit fails closed, naming the path"
+else
+  fail "(s8) emit undecodable-path fail-closed (out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (s9) the zero-profile guard still fires in non-emit mode after nargs +->*.
+# ---------------------------------------------------------------------------
+out="$(python3 "$CC" --diff-base main --repo-root "$repo" 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'at least one coverage profile is required'; then
+  pass "(s9) zero profiles is a usage error in non-emit mode (nargs guard preserved)"
+else
+  fail "(s9) zero-profile guard (rc=$rc out='$out')"
+fi
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

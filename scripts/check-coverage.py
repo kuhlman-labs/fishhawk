@@ -35,9 +35,27 @@ are decoded out of git's C-quoted form and cross-checked against that
 NUL-enumerated set. A path that still cannot be identified FAILS the
 patch gate with a printed reason naming it — never a silent omission,
 which would let Go code hide from the gate behind its filename.
+
+TOCTOU-safe changed-path discovery (#2124). The diff above reads the WORK
+TREE, which the repository-controlled test loop mutates while it runs. If
+changed-path discovery is recomputed AFTER the tests execute, a test that
+reverts a changed tracked .go file to merge-base contents (or deletes an
+untracked .go file) erases its own lines from the denominator and turns the
+gate into a passing SKIP. So `--emit-changed-snapshot PATH` captures the
+merge-base-resolved change set to JSON BEFORE any test runs, and
+`--changed-snapshot PATH` consumes that snapshot instead of re-running git.
+`--expected-snapshot-digest HEX` is verified against the on-disk snapshot
+before it is consumed: the digest is computed by scripts/test into the parent
+shell's memory pre-test and never written to a test-reachable path, so a test
+that rewrites the snapshot during the loop produces a digest mismatch that
+FAILS CLOSED. Missing, unreadable, malformed, and digest-mismatched snapshots
+all exit 1 — never a skip. The recompute path survives only as
+backward-compatible behavior when no snapshot is supplied.
 """
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -120,6 +138,16 @@ class PathDecodeError(Exception):
     denominator behind its filename — the blind-gate bypass this gate exists to
     close. So this is deliberately NOT a GitSkip: it fails the patch gate loudly
     and names the path.
+    """
+
+
+class SnapshotError(Exception):
+    """A pre-test changed-line snapshot that cannot be trusted. FAIL CLOSED.
+
+    Raised when a consumed snapshot is missing, unreadable, malformed, or its
+    on-disk bytes do not match the digest captured before the test loop ran.
+    Deliberately NOT a GitSkip: a tampered or corrupt snapshot must fail the
+    gate, never resolve to a passing skip (#2124).
     """
 
 
@@ -398,6 +426,103 @@ def changed_lines(repo_root, merge_base):
     return result
 
 
+# --------------------------------------------------------------------------
+# Pre-test change-set snapshot (#2124)
+#
+# The change set is a mutable read of the WORK TREE. Captured here BEFORE any
+# repository-controlled test runs, serialized to JSON, and consumed at gate time
+# instead of being recomputed after the tests could have mutated the tree.
+# --------------------------------------------------------------------------
+
+SNAPSHOT_SCHEMA = 1
+
+
+def emit_changed_snapshot(path, base, merge_base, changed):
+    """Serialize the change set to JSON at `path`.
+
+    Binary-safe: a path key may be a surrogateescape-decoded (non-UTF-8) string,
+    so we dump with ensure_ascii=True — every non-ASCII byte, including a lone
+    surrogate, is \\uXXXX-escaped and round-trips through json.loads back to the
+    identical key. The output is therefore pure ASCII.
+    """
+    payload = {
+        "schema": SNAPSHOT_SCHEMA,
+        "base": base,
+        "merge_base": merge_base,
+        "changed": {p: sorted(lines) for p, lines in changed.items()},
+    }
+    data = json.dumps(payload, ensure_ascii=True)
+    with open(path, "w", encoding="ascii") as f:
+        f.write(data)
+
+
+def emit_skip_snapshot(path, reason):
+    """Write a snapshot that instructs the consumer to SKIP.
+
+    A degrade at emit time (git absent, no merge base, …) writes this rather
+    than nothing, so the consume side skips cleanly on a trusted marker instead
+    of falling back to the very recompute this snapshot exists to avoid.
+    """
+    payload = {"schema": SNAPSHOT_SCHEMA, "skip": str(reason)}
+    with open(path, "w", encoding="ascii") as f:
+        f.write(json.dumps(payload, ensure_ascii=True))
+
+
+def load_verified_snapshot(path, expected_digest):
+    """Load a snapshot after verifying its integrity. FAIL CLOSED on any doubt.
+
+    Returns {"skip": reason} for a skip-snapshot, or {"changed": map, "base":
+    label}. Raises SnapshotError when the digest is absent/mismatched or the
+    content is unreadable/malformed — every one of which exits 1, never a skip.
+
+    The digest is the anchor: scripts/test computes it from the pristine
+    pre-test snapshot into the parent shell's memory and passes it here, so a
+    test that rewrites the file mid-loop changes its bytes and is DETECTED. The
+    bytes are read ONCE and both hashed and parsed, so no read-vs-hash window
+    exists inside this function.
+    """
+    if not expected_digest:
+        # The shell always passes the digest; its absence means the anchor was
+        # lost, so the snapshot cannot be trusted — refuse rather than consume.
+        raise SnapshotError(
+            "no expected snapshot digest supplied; refusing to consume snapshot"
+        )
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise SnapshotError(f"cannot read changed snapshot {path!r}: {e}")
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != expected_digest.strip():
+        raise SnapshotError(
+            f"changed-snapshot digest mismatch for {path!r}: "
+            f"expected {expected_digest.strip()}, got {actual} — the snapshot was "
+            "modified after it was captured; failing closed"
+        )
+    try:
+        payload = json.loads(raw.decode("ascii"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise SnapshotError(f"malformed changed snapshot {path!r}: {e}")
+    if not isinstance(payload, dict) or payload.get("schema") != SNAPSHOT_SCHEMA:
+        raise SnapshotError(f"unrecognized changed-snapshot shape in {path!r}")
+    if "skip" in payload:
+        return {"skip": str(payload["skip"])}
+    changed_raw = payload.get("changed")
+    if not isinstance(changed_raw, dict):
+        raise SnapshotError(f"changed-snapshot {path!r} has no 'changed' map")
+    changed = {}
+    try:
+        for p, lines in changed_raw.items():
+            if not isinstance(lines, list):
+                raise SnapshotError(
+                    f"changed-snapshot {path!r} entry {p!r} is not a line list"
+                )
+            changed[p] = {int(ln) for ln in lines}
+    except (TypeError, ValueError) as e:
+        raise SnapshotError(f"malformed line number in changed snapshot {path!r}: {e}")
+    return {"changed": changed, "base": payload.get("base")}
+
+
 def map_profile_path(file_path, module_prefix, changed):
     """Map a profile's import-path-based file field to a changed repo-relative path."""
     if module_prefix and file_path.startswith(module_prefix):
@@ -439,22 +564,72 @@ def diff_coverage(profiles, excludes, changed, module_prefix):
     return covered, total
 
 
-def run_diff_gate(args):
-    """Run the patch-scoped gate. Returns 0 (pass or skip) or 1 (fail)."""
+def run_emit_snapshot(args):
+    """Capture the pre-test change set to --emit-changed-snapshot. Returns 0/1.
+
+    Runs ONLY resolve_merge_base + changed_lines then serializes, short-circuiting
+    before any coverage gate — it is invoked before the test loop starts. A git
+    degrade writes a skip-snapshot and returns 0 so the consumer skips on a
+    trusted marker; an undecodable changed path FAILS CLOSED (exit 1) here, moved
+    ahead of the tests rather than after them.
+    """
+    if args.diff_base is None:
+        print(
+            "FAIL: --emit-changed-snapshot requires --diff-base", file=sys.stderr
+        )
+        return 1
     try:
         merge_base = resolve_merge_base(args.repo_root, args.diff_base)
         changed = changed_lines(args.repo_root, merge_base)
     except GitSkip as e:
+        # Degrade to a trusted skip marker rather than to a post-test recompute.
+        emit_skip_snapshot(args.emit_changed_snapshot, str(e))
         skip(str(e))
         return 0
     except PathDecodeError as e:
-        # FAIL CLOSED, not skip: a path the gate cannot identify must never be
-        # treated as "nothing to cover".
         print(f"FAIL: undecodable changed path — {e}", file=sys.stderr)
         return 1
+    emit_changed_snapshot(
+        args.emit_changed_snapshot, args.diff_base, merge_base, changed
+    )
+    return 0
+
+
+def run_diff_gate(args):
+    """Run the patch-scoped gate. Returns 0 (pass or skip) or 1 (fail)."""
+    if args.changed_snapshot is not None:
+        # Consume the pre-test snapshot instead of re-reading the (now
+        # test-mutated) work tree. Integrity is anchored by the digest; any
+        # tampering, corruption, or loss FAILS CLOSED here — never a skip.
+        try:
+            loaded = load_verified_snapshot(
+                args.changed_snapshot, args.expected_snapshot_digest
+            )
+        except SnapshotError as e:
+            print(f"FAIL: {e}", file=sys.stderr)
+            return 1
+        if "skip" in loaded:
+            skip(loaded["skip"])
+            return 0
+        changed = loaded["changed"]
+        base_label = loaded["base"] or args.diff_base
+    else:
+        # Backward-compatible recompute path (no snapshot supplied).
+        try:
+            merge_base = resolve_merge_base(args.repo_root, args.diff_base)
+            changed = changed_lines(args.repo_root, merge_base)
+        except GitSkip as e:
+            skip(str(e))
+            return 0
+        except PathDecodeError as e:
+            # FAIL CLOSED, not skip: a path the gate cannot identify must never
+            # be treated as "nothing to cover".
+            print(f"FAIL: undecodable changed path — {e}", file=sys.stderr)
+            return 1
+        base_label = args.diff_base
 
     if not changed:
-        skip(f"no changed Go files vs {args.diff_base}")
+        skip(f"no changed Go files vs {base_label}")
         return 0
 
     covered, total = diff_coverage(
@@ -485,7 +660,7 @@ def run_diff_gate(args):
 
     pct = 100.0 * total_cov / total_new
     print()
-    print(f"Patch coverage: {total_cov}/{total_new} = {pct:.1f}% (base {args.diff_base})")
+    print(f"Patch coverage: {total_cov}/{total_new} = {pct:.1f}% (base {base_label})")
     print(f"Diff threshold: {args.diff_threshold:.1f}%")
 
     if pct < args.diff_threshold:
@@ -603,16 +778,50 @@ def main():
         default=DEFAULT_MODULE_PREFIX,
         help="Import-path prefix stripped to map a profile path to a repo-relative path.",
     )
-    ap.add_argument("profile", nargs="+", help="One or more Go coverage profiles.")
+    ap.add_argument(
+        "--emit-changed-snapshot",
+        default=None,
+        metavar="PATH",
+        help="Capture the pre-test change set (resolved against --diff-base) to PATH "
+        "as JSON and exit, before any test runs. No profiles are needed.",
+    )
+    ap.add_argument(
+        "--changed-snapshot",
+        default=None,
+        metavar="PATH",
+        help="Consume the change set from a snapshot written by --emit-changed-snapshot "
+        "instead of recomputing it from the (test-mutated) work tree.",
+    )
+    ap.add_argument(
+        "--expected-snapshot-digest",
+        default=None,
+        metavar="HEX",
+        help="sha256 of the pristine snapshot, captured pre-test. Verified against the "
+        "on-disk --changed-snapshot before consuming; a mismatch fails closed.",
+    )
+    # nargs="*" (was "+"): emit mode needs no profiles. A zero-profile call in
+    # any gate mode is still rejected explicitly below, so the guard is not lost.
+    ap.add_argument("profile", nargs="*", help="Zero or more Go coverage profiles.")
     args = ap.parse_args()
 
-    if args.threshold is None and args.diff_base is None:
+    # Emit mode short-circuits: capture the snapshot and return before any gate.
+    if args.emit_changed_snapshot is not None:
+        return run_emit_snapshot(args)
+
+    if not args.profile:
+        ap.error("at least one coverage profile is required")
+
+    if (
+        args.threshold is None
+        and args.diff_base is None
+        and args.changed_snapshot is None
+    ):
         ap.error("one of --threshold or --diff-base is required")
 
     rc = 0
     if args.threshold is not None:
         rc = run_aggregate_gate(args)
-    if args.diff_base is not None:
+    if args.diff_base is not None or args.changed_snapshot is not None:
         # Combined mode: the diff gate never masks the aggregate verdict. A git
         # failure here degrades to a printed SKIP, so the aggregate result above
         # still decides the exit code.

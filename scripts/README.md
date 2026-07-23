@@ -63,6 +63,73 @@ the tracked-only list rather than dropping the gate. This is moot on the
 runner's committed tree, where every file is committed; it closes the
 local dirty-tree hole.
 
+### Pre-test change-set snapshot — TOCTOU ([#2124](https://github.com/kuhlman-labs/fishhawk/issues/2124))
+
+The work-tree diff above is a read of MUTABLE state, and the test loop
+it gates runs repository-controlled code. If changed-path discovery is
+recomputed AFTER the tests execute, a test can erase its own lines from
+the denominator: reverting a changed tracked `.go` file to merge-base
+contents (or deleting an untracked `.go` file) makes the recompute see
+no diff and the gate resolves to a passing SKIP — the exact bypass this
+epic exists to close.
+
+So the change set is captured ONCE, BEFORE any test runs, and consumed
+at gate time instead of being recomputed:
+
+- `check-coverage.py --emit-changed-snapshot PATH --diff-base <ref>` runs
+  only `resolve_merge_base` + `changed_lines` and serializes
+  `{"schema":1,"base","merge_base","changed":{path:[lines]}}` to PATH,
+  binary-safe (ASCII-escaped so a surrogateescape-decoded non-UTF-8 path
+  key round-trips). A git degrade writes a **skip-snapshot**
+  (`{"schema":1,"skip":<reason>}`) and exits 0; an undecodable changed
+  path FAILS CLOSED (exit 1) here — the `PathDecodeError` guard is thus
+  moved AHEAD of the tests, not left after them.
+- `check-coverage.py --changed-snapshot PATH --expected-snapshot-digest
+  HEX` loads the snapshot instead of re-running git. A skip-snapshot
+  skips (exit 0); a change map is used verbatim.
+
+`cmd_test_with_patch_coverage` emits the snapshot into the PID-keyed
+`PATCHCOV_DIR` and `_verify_patch_coverage` consumes it. The recompute
+path survives only as backward-compatible behavior when no
+`--changed-snapshot` is supplied.
+
+#### Tamper-evidence, not prevention — the digest anchor
+
+A snapshot written to a filesystem path the test loop can reach does not
+by itself close the TOCTOU: the tests run as the SAME OS user and can
+enumerate and overwrite the `0700` `PATCHCOV_DIR` (they even receive its
+path via `-coverprofile=<PATCHCOV_DIR>/…`), so a test could replace the
+snapshot with a skip-snapshot or a changed-line map that drops its file.
+Filesystem permissions do not protect the snapshot from same-user
+tampering.
+
+The integrity anchor is therefore held OUT of any test-reachable place —
+in the parent `scripts/test` shell's own memory. The ordering is
+load-bearing and is exactly: **emit → hash-into-parent-memory → run
+tests → verify-digest → consume**. After emitting, the parent shell
+computes `sha256` of the pristine snapshot into `PATCHCOV_SNAPSHOT_DIGEST`
+(`_sha256_file`, via `sha256sum`/`shasum`), a variable NEVER written to a
+test-reachable path and NEVER exported into a test subprocess. At consume
+time that digest is passed to `check-coverage.py`, which re-hashes the
+on-disk snapshot and consumes it only on an exact match. Any mismatch —
+i.e. any rewrite of the file after capture — **fails closed** with a
+named reason, never a skip. A test can still WRITE the file; what it
+cannot do is forge the digest in the parent's memory or make the mismatch
+resolve to a skip.
+
+This makes tampering tamper-EVIDENT (detected, fail-closed), **not
+impossible**. FULL prevention requires process/filesystem isolation of
+the untrusted test loop — the untrusted-command containment decision
+tracked in **[ADR-063](https://github.com/kuhlman-labs/fishhawk/issues/2127)**.
+Until that lands, the patch-coverage gate is a quality aid, not an
+adversary-proof control.
+
+Fail-closed discipline is uniform (binding condition 4): a missing,
+unreadable, malformed, or digest-mismatched snapshot, an absent expected
+digest, and an undecodable path at emit all exit 1 — never a skip. A gate
+that silently skips is indistinguishable from a passing gate, the exact
+failure this epic removes.
+
 ### Binary-safe path handling
 
 Repository contents are untrusted input, so a filename must never be
@@ -188,6 +255,21 @@ fail-closed verdict are allowed to fail verify. In COMBINED mode (`--threshold` 
 skips only the patch gate — the aggregate gate still runs and decides
 the exit code.
 
+The pre-test snapshot (#2124) adds FAIL-CLOSED branches — a non-skip exit
+1 (or a `return 1` from the shell that `set -e` turns into an aborted
+verify), because these represent an untrustworthy change set, not a
+missing one:
+
+| Branch | Layer |
+|---|---|
+| undecodable changed path AT EMIT (`PathDecodeError`, moved pre-test) | Python (`run_emit_snapshot`) |
+| snapshot emit failed / no sha256 tool to anchor the digest | shell (`cmd_test_with_patch_coverage` → `return 1`) |
+| snapshot missing / unreadable / malformed at consume | Python (`SnapshotError`) |
+| expected digest absent, or on-disk snapshot digest mismatch | Python (`SnapshotError`) |
+
+A git degrade at emit still writes a trusted **skip-snapshot** and the
+consume side skips (exit 0) — a degrade, not a tamper.
+
 ### Env overrides
 
 `FISHHAWK_DIFF_BASE`, `FISHHAWK_PATCH_COVERAGE_THRESHOLD` (default 85),
@@ -237,6 +319,25 @@ rather than merely running. It self-skips with a printed reason when no
 `go` toolchain is present. CI's
 aggregate invocation is unchanged — diff mode is inert without
 `--diff-base` — and `.github/workflows/**` is untouched (human-led).
+
+The pre-test snapshot (#2124) is pinned on both sides. `test-check-coverage`
+(s1–s9): emit serializes the change set with a non-ASCII path key that
+round-trips; consume produces the correct verdict; **consume is invariant
+to a post-emit work-tree mutation while the recompute path SKIPs, shown
+side by side** (s3, the TOCTOU proof); and one case each for skip-snapshot
+→ skip, missing → exit 1, corrupt → exit 1, digest mismatch → exit 1,
+absent digest → exit 1, undecodable-path-at-emit → exit 1, and the
+zero-profile guard surviving the `nargs +→*` change. `test-patch-coverage`
+(t1–t7) drives the ADVERSARIAL cases end to end through the real
+`cmd_test_with_patch_coverage` + `_verify_patch_coverage` with a `go` stub
+that mutates state mid-loop exactly as an untrusted test could (it receives
+`-coverprofile=<dir>/…` and so can reach the snapshot beside it): a
+tracked-file revert (t1) and an untracked-file delete (t2) — the issue's
+done-means — plus **snapshot tampering** to a skip-snapshot (t3) and to a
+changed-map that drops the file (t4), each asserted to FAIL CLOSED and
+never a passing SKIP; a no-mutation control that PASSES (t5); the
+emit-before-loop ordering + consume-flag wiring (t6); and that the digest
+anchor is never exported into the test environment (t7).
 
 ## Local k8s ergonomics (ADR-034 / [#852](https://github.com/kuhlman-labs/fishhawk/issues/852))
 

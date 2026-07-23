@@ -21,6 +21,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Directory of THIS script (the real scripts/), captured from BASH_SOURCE so it
+# is stable even when a test harness sources scripts/test lib-only and overrides
+# ROOT to a throwaway repo under test. The patch-coverage gate locates its
+# sibling check-coverage.py here rather than under $ROOT: $ROOT is the git repo
+# the gate operates ON (which the harness redirects), whereas check-coverage.py
+# always lives next to this file. In production the two coincide.
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 # Signing-agnostic isolation (#912): make every test that creates a temp repo
 # and commits ignore the operator's global/system git config. Otherwise a
 # global commit.gpgsign=true is inherited and red-lines the verify gate when
@@ -178,6 +186,35 @@ _register_lease() {
 # so an early test failure cannot leave litter behind.
 PATCHCOV_DIR=""
 LEASE_ARMED=0
+
+# Integrity anchor for the pre-test change-set snapshot (#2124). Computed by the
+# PARENT shell from the pristine snapshot BEFORE the go-test loop and held only
+# here in parent memory — never written to a test-reachable path, never exported
+# into a test subprocess. At consume time it is handed to check-coverage.py,
+# which re-hashes the on-disk snapshot and FAILS CLOSED on any mismatch, so a
+# test that rewrites the snapshot mid-loop is detected rather than silently
+# skipping the gate. The digest makes tampering tamper-EVIDENT, not impossible
+# (a same-user test can still write the file); full prevention needs test-loop
+# isolation (ADR-063 / #2127).
+PATCHCOV_SNAPSHOT_DIGEST=""
+
+# _sha256_file <path>: print the lowercase hex sha256 of a file, or return
+# non-zero if no sha256 tool is available or the file cannot be read. Tries
+# sha256sum (Linux/CI) then shasum -a 256 (macOS, ships with Perl). The output
+# byte-matches Python's hashlib.sha256(...).hexdigest() over the same bytes, so
+# the parent-computed anchor and the Python re-hash compare equal.
+_sha256_file() {
+  local f="$1" out
+  if command -v sha256sum >/dev/null 2>&1; then
+    out="$(sha256sum "$f" 2>/dev/null)" || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    out="$(shasum -a 256 "$f" 2>/dev/null)" || return 1
+  else
+    return 1
+  fi
+  [ -n "$out" ] || return 1
+  printf '%s' "${out%% *}"
+}
 
 _patchcov_cleanup() {
   if [ -n "$PATCHCOV_DIR" ]; then
@@ -578,6 +615,23 @@ $untracked"
     END { if (cur != "") print cur "\t" acc }'
 }
 
+# _patch_cov_emit_snapshot <base> <snapshot_path>: capture the pre-test change
+# set (resolved against <base>) to a JSON snapshot, before any test runs. This
+# is the load-bearing half of the TOCTOU fix (#2124): the change set is a read
+# of the mutable WORK TREE, so it MUST be taken before the repository-controlled
+# test loop can revert a changed file or delete an untracked one and erase its
+# own lines from the denominator. check-coverage.py writes a trusted skip-marker
+# and returns 0 on a git degrade, and FAILS CLOSED (non-zero) on an undecodable
+# changed path — moved ahead of the tests rather than after them.
+_patch_cov_emit_snapshot() {
+  local base="$1" snapshot="$2"
+  python3 "$SCRIPTS_DIR/check-coverage.py" \
+    --emit-changed-snapshot "$snapshot" \
+    --diff-base "$base" \
+    --exclude '/db/' \
+    --repo-root "$ROOT"
+}
+
 # cmd_test_with_patch_coverage: the same per-module test loop cmd_test runs, but
 # a module that owns changed packages also emits a coverage profile with
 # -coverpkg RESTRICTED to those packages. Restricting -coverpkg (rather than
@@ -585,8 +639,14 @@ $untracked"
 # set credits the changed packages — a function exercised only by a sibling
 # package's test still counts — while instrumentation cost is paid only for
 # changed code, and no second test run happens.
+#
+# ORDERING IS LOAD-BEARING (#2124): emit the change-set snapshot, hash it into
+# PATCHCOV_SNAPSHOT_DIGEST (parent memory) — both BEFORE the go-test loop — then
+# run the tests; _verify_patch_coverage verifies the digest and consumes the
+# snapshot AFTER. A snapshot rewritten by a test during the loop no longer
+# matches the pre-test digest and fails closed.
 cmd_test_with_patch_coverage() {
-  local mods="$1" mlist
+  local mods="$1" base="$2" mlist
   # Re-enumerate defensively: bucketing enumerated the modules earlier, but if
   # THIS call cannot, feeding the loop from a failed `modules` would run zero
   # modules and still exit 0 — verify reporting success having tested nothing.
@@ -601,6 +661,20 @@ cmd_test_with_patch_coverage() {
     echo "scripts/test: could not create the coverage scratch dir — skipping the patch-coverage gate" >&2
     cmd_test
     return 0
+  fi
+  # emit -> hash-into-parent-memory, BEFORE the loop (#2124). A non-zero exit
+  # here is a fail-closed condition (an undecodable changed path) — return 1 so
+  # `set -e` aborts verify rather than letting the gate proceed on an untrusted
+  # change set. A git degrade writes a trusted skip-snapshot and exits 0.
+  local snapshot="$PATCHCOV_DIR/changed-snapshot.json"
+  if ! _patch_cov_emit_snapshot "$base" "$snapshot"; then
+    echo "scripts/test: failed to capture the pre-test changed-line snapshot — failing the patch-coverage gate closed" >&2
+    return 1
+  fi
+  if ! PATCHCOV_SNAPSHOT_DIGEST="$(_sha256_file "$snapshot")" || [ -z "$PATCHCOV_SNAPSHOT_DIGEST" ]; then
+    PATCHCOV_SNAPSHOT_DIGEST=""
+    echo "scripts/test: could not anchor the snapshot digest (no sha256 tool, or snapshot unreadable) — failing the patch-coverage gate closed" >&2
+    return 1
   fi
   # The profile filename is keyed by a per-loop ORDINAL, not by a slug derived
   # from the module path. A slug (`tr '/' '_'`) is NOT injective — the distinct
@@ -633,6 +707,11 @@ cmd_test_with_patch_coverage() {
 # _verify_patch_coverage: run the diff-scoped gate over the profiles the loop
 # emitted. This is the ONE step allowed to fail verify — a below-threshold patch
 # exits non-zero and `set -e` aborts. Missing profiles degrade to a printed skip.
+#
+# It consumes the PRE-TEST snapshot (#2124) via --changed-snapshot rather than
+# letting the Python layer recompute the change set from the now-test-mutated
+# work tree, and passes --expected-snapshot-digest (the parent-memory anchor) so
+# a snapshot rewritten during the loop fails closed instead of skipping.
 _verify_patch_coverage() {
   local base="$1" f n=0
   local profiles=()
@@ -650,8 +729,10 @@ _verify_patch_coverage() {
     echo "scripts/test: no coverage profiles were produced — skipping the patch-coverage gate" >&2
     return 0
   fi
-  python3 "$ROOT/scripts/check-coverage.py" \
+  python3 "$SCRIPTS_DIR/check-coverage.py" \
     --diff-base "$base" \
+    --changed-snapshot "$PATCHCOV_DIR/changed-snapshot.json" \
+    --expected-snapshot-digest "$PATCHCOV_SNAPSHOT_DIGEST" \
     --diff-threshold "${FISHHAWK_PATCH_COVERAGE_THRESHOLD:-85}" \
     --exclude '/db/' \
     --repo-root "$ROOT" \
@@ -702,7 +783,7 @@ cmd_verify() {
   elif [ -z "$mods" ]; then
     echo "scripts/test: no changed Go packages vs $base — skipping the patch-coverage gate" >&2
   else
-    cmd_test_with_patch_coverage "$mods"
+    cmd_test_with_patch_coverage "$mods" "$base"
     _verify_patch_coverage "$base"
     return 0
   fi
