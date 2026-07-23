@@ -386,14 +386,46 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# (e) _verify_patch_coverage with no profiles -> printed skip, exit 0.
+# (e) _verify_patch_coverage with no profiles is a skip ONLY for a skip-snapshot
+#     or an empty change set (#2124). The snapshot's integrity is verified BEFORE
+#     any skip, so a VALID snapshot matching the parent-memory anchor must exist;
+#     zero profiles is then handed to check-coverage.py, which SKIPs a skip-snapshot
+#     (exit 0). (e2)/(e3) assert the fail-closed side (missing/tampered snapshot),
+#     and (t12) the integrity-anomaly side (a NON-EMPTY change set with no profiles).
 # ---------------------------------------------------------------------------
 PATCHCOV_DIR="$tmproot/emptyprof"; mkdir -p "$PATCHCOV_DIR"
+printf '{"schema":1,"skip":"none"}' > "$PATCHCOV_DIR/changed-snapshot.json"
+PATCHCOV_SNAPSHOT_DIGEST="$(_sha256_file "$PATCHCOV_DIR/changed-snapshot.json")"
 out="$(_verify_patch_coverage main 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'no coverage profiles'; then
-  pass "(e) no emitted profiles skips with a printed reason (exit 0)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SKIP' \
+   && ! printf '%s' "$out" | grep -q 'FAIL'; then
+  pass "(e) a skip-snapshot with no emitted profiles skips (exit 0)"
 else
-  fail "(e) expected 0 + no-profiles skip (rc=$rc out='$out')"
+  fail "(e) expected 0 + skip on a skip-snapshot with no profiles (rc=$rc out='$out')"
+fi
+
+# (e2) SECURITY: the no-profiles skip must NOT bypass snapshot integrity. With
+# the profiles gone AND the snapshot deleted, the gate fails CLOSED on the
+# missing snapshot rather than skipping.
+rm -f "$PATCHCOV_DIR/changed-snapshot.json"
+out="$(_verify_patch_coverage main 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'missing or unreadable' \
+   && ! printf '%s' "$out" | grep -q 'no coverage profiles'; then
+  pass "(e2) a missing snapshot fails closed before the no-profiles skip (exit 1)"
+else
+  fail "(e2) expected fail-closed on missing snapshot (rc=$rc out='$out')"
+fi
+
+# (e3) same path, tamper variant: the snapshot is present but its bytes no longer
+# match the parent-memory anchor. The no-profiles skip is again bypassed — a
+# digest mismatch fails closed.
+printf '{"schema":1,"skip":"pwned"}' > "$PATCHCOV_DIR/changed-snapshot.json"
+out="$(_verify_patch_coverage main 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'digest mismatch' \
+   && ! printf '%s' "$out" | grep -q 'no coverage profiles'; then
+  pass "(e3) a tampered snapshot fails closed before the no-profiles skip (exit 1)"
+else
+  fail "(e3) expected fail-closed on digest mismatch (rc=$rc out='$out')"
 fi
 
 # ---------------------------------------------------------------------------
@@ -494,7 +526,7 @@ ROOT="$tmproot/buckets"
 saved_trap="$(trap -p EXIT)"
 pushd "$ROOT" >/dev/null
 PATH="$tmproot/stubbin:$PATH" TMPDIR="$tmproot" \
-  cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" >/dev/null 2>&1
+  cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main >/dev/null 2>&1
 e2e_rc=$?
 popd >/dev/null
 eval "$saved_trap"
@@ -526,7 +558,7 @@ modules() { printf './a/b\n./a_b\n'; }
 saved_trap="$(trap -p EXIT)"
 pushd "$tmproot/collide" >/dev/null
 PATH="$tmproot/stubbin:$PATH" TMPDIR="$tmproot" \
-  cmd_test_with_patch_coverage "$(printf 'a/b\t./p\na_b\t./q\n')" >/dev/null 2>&1
+  cmd_test_with_patch_coverage "$(printf 'a/b\t./p\na_b\t./q\n')" main >/dev/null 2>&1
 collide_rc=$?
 popd >/dev/null
 eval "$saved_trap"
@@ -550,7 +582,7 @@ modules() { printf './backend\n./cli\n'; }
 saved_trap="$(trap -p EXIT)"
 modules() { return 1; }
 cmd_test() { echo "PLAIN_TEST"; }
-out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" 2>&1)"; rc=$?
+out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main 2>&1)"; rc=$?
 eval "$saved_trap"
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'could not enumerate go.work modules' \
    && printf '%s' "$out" | grep -q 'PLAIN_TEST'; then
@@ -642,10 +674,12 @@ EOF
   saved_trap="$(trap -p EXIT)"
   pushd "$ROOT" >/dev/null
   TMPDIR="$tmproot" GOWORK=off GOFLAGS= \
-    cmd_test_with_patch_coverage "$(printf 'svc\t./foo\n')" > "$tmproot/realcov.log" 2>&1
+    cmd_test_with_patch_coverage "$(printf 'svc\t./foo\n')" main > "$tmproot/realcov.log" 2>&1
   loop_rc=$?
   gate_out="$(TMPDIR="$tmproot" GOWORK=off python3 "$REPO_ROOT/scripts/check-coverage.py" \
     --diff-base main --diff-threshold 85 --diff-min-statements 1 \
+    --changed-snapshot "$PATCHCOV_DIR/changed-snapshot.json" \
+    --expected-snapshot-digest "$PATCHCOV_SNAPSHOT_DIGEST" \
     --repo-root "$ROOT" --module-prefix 'example.com/e2e/' \
     "$PATCHCOV_DIR"/*.out 2>&1)"
   gate_rc=$?
@@ -661,6 +695,304 @@ EOF
     fail "(j) sibling attribution (loop_rc=$loop_rc gate_rc=$gate_rc out='$gate_out' log='$(tail -5 "$tmproot/realcov.log")')"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# (t) BINDING CONDITION 2 — ADVERSARIAL: a repository-controlled test mutates
+#     state DURING the loop. The change set was snapshotted BEFORE the loop and
+#     its digest anchored in this (parent) shell's memory, so every mutation
+#     FAILS CLOSED at the gate — never a passing SKIP. Driven end to end through
+#     the REAL cmd_test_with_patch_coverage (which emits + hashes) and the REAL
+#     _verify_patch_coverage (which verifies the digest + consumes).
+#
+#     The mutation is performed by the `go` stub, which — exactly like an
+#     untrusted test in the real runner — receives `-coverprofile=<dir>/…` and
+#     can therefore reach the snapshot sitting beside it in <dir>. That is the
+#     precise threat model (a same-user test tampering with the snapshot file)
+#     the digest anchor is built to detect.
+# ---------------------------------------------------------------------------
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"   # restore real fns
+set +e
+modules() { printf './backend\n./cli\n'; }
+_arm_container_lease() { :; }
+
+adv_repo() {
+  # a repo whose feature branch adds New() at foo.go lines 7-11 (tracked).
+  local repo="$1"
+  rm -rf "$repo"
+  mkdir -p "$repo/backend/internal/foo" "$repo/cli/internal/bar"
+  git init -q -b main "$repo"
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name test
+  printf 'package foo\n\nfunc Old() int {\n\treturn 1\n}\n' > "$repo/backend/internal/foo/foo.go"
+  printf 'package bar\n' > "$repo/cli/internal/bar/bar.go"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m base
+  git -C "$repo" checkout -q -b feature
+  printf 'package foo\n\nfunc Old() int {\n\treturn 1\n}\n\nfunc New(a int) int {\n\tif a > 0 {\n\t\treturn a\n\t}\n\treturn -a\n}\n' \
+    > "$repo/backend/internal/foo/foo.go"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m patch
+}
+
+PFX='github.com/kuhlman-labs/fishhawk/'
+# foo.go new-line profile (0% covered): blocks span lines 7-11 = 5 statements.
+cat > "$tmproot/adv_foo.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:7.23,8.13 1 0
+${PFX}backend/internal/foo/foo.go:8.13,10.3 1 0
+${PFX}backend/internal/foo/foo.go:11.2,11.13 1 0
+EOF
+# brand_new.go (untracked) profile (0% covered): blocks span lines 3-7.
+cat > "$tmproot/adv_new.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/brand_new.go:3.25,4.11 1 0
+${PFX}backend/internal/foo/brand_new.go:4.11,6.3 1 0
+${PFX}backend/internal/foo/brand_new.go:7.2,7.13 1 0
+EOF
+
+# The malicious `go` stub. It receives -coverprofile=<PATCHCOV_DIR>/… so it
+# derives the snapshot path beside it, writes a realistic 0%-covered profile,
+# then performs the mid-loop mutation named by $ADV_ACTION.
+mkdir -p "$tmproot/advbin"
+cat > "$tmproot/advbin/go" <<'EOF'
+#!/usr/bin/env bash
+prof=""
+for a in "$@"; do
+  case "$a" in -coverprofile=*) prof="${a#-coverprofile=}";; esac
+done
+if [ -n "$prof" ]; then
+  cp "$ADV_PROFILE" "$prof"
+  snap="$(dirname "$prof")/changed-snapshot.json"
+  case "$ADV_ACTION" in
+    revert)   git -C "$ADV_REPO" show main:backend/internal/foo/foo.go > "$ADV_REPO/backend/internal/foo/foo.go" ;;
+    delnew)   rm -f "$ADV_REPO/backend/internal/foo/brand_new.go" ;;
+    skipsnap) printf '{"schema":1,"skip":"pwned"}' > "$snap" ;;
+    dropfile) printf '{"schema":1,"base":"main","merge_base":"deadbeef","changed":{}}' > "$snap" ;;
+    # Combined path: also remove the profile so verify reaches the no-profiles
+    # skip — the snapshot integrity check must still fire ahead of it.
+    delsnap)  rm -f "$snap" "$prof" ;;
+    tampernoprof) printf '{"schema":1,"skip":"pwned"}' > "$snap"; rm -f "$prof" ;;
+    # Profile deletion ONLY, snapshot left PRISTINE (digest matches): a non-empty
+    # change set with zero profiles is an integrity anomaly that must fail closed.
+    delprof)  rm -f "$prof" ;;
+    none)     : ;;
+  esac
+fi
+exit 0
+EOF
+chmod +x "$tmproot/advbin/go"
+
+# run_adv <action> <profile_fixture> [mods]: drive the real loop + gate, setting
+# ADV_LOOP_RC / ADV_SNAP_EXISTS / ADV_GATE_RC / ADV_GATE_OUT.
+run_adv() {
+  local action="$1" profile_fixture="$2" mods="${3:-$(printf 'backend\t./internal/foo\n')}"
+  local saved
+  saved="$(trap -p EXIT)"
+  PATH="$tmproot/advbin:$PATH" TMPDIR="$tmproot" \
+    ADV_ACTION="$action" ADV_PROFILE="$profile_fixture" ADV_REPO="$ROOT" \
+    cmd_test_with_patch_coverage "$mods" main >/dev/null 2>&1
+  ADV_LOOP_RC=$?
+  ADV_SNAP_EXISTS=no
+  [ -f "$PATCHCOV_DIR/changed-snapshot.json" ] && ADV_SNAP_EXISTS=yes
+  ADV_GATE_OUT="$(_verify_patch_coverage main 2>&1)"
+  ADV_GATE_RC=$?
+  eval "$saved"
+  _patchcov_cleanup
+}
+
+# (t1) DONE-MEANS: a test reverts the changed tracked .go file to merge-base
+# contents mid-loop. Snapshot untouched → digest matches → the gate still counts
+# the captured lines and FAILS. A post-test recompute would see no diff and SKIP.
+ROOT="$tmproot/adv1"
+adv_repo "$ROOT"
+run_adv revert "$tmproot/adv_foo.out"
+if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'backend/internal/foo/foo.go:7' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP: no changed'; then
+  pass "(t1) a mid-loop revert of a changed tracked .go file fails closed, never a passing SKIP"
+else
+  fail "(t1) tracked-revert (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
+fi
+
+# (t2) DONE-MEANS: a test deletes the UNTRACKED new .go file mid-loop. Captured
+# pre-loop; the gate still counts its lines and fails. A recompute would see
+# neither a tracked diff nor the (now-deleted) untracked file → SKIP.
+ROOT="$tmproot/adv2"
+adv_repo "$ROOT"
+# Replace the tracked patch with an untracked new file so the ONLY change is it.
+git -C "$ROOT" checkout -q main
+git -C "$ROOT" checkout -q -b feature2
+printf 'package foo\n\nfunc Fresh(a int) int {\n\tif a > 0 {\n\t\treturn a\n\t}\n\treturn -a\n}\n' \
+  > "$ROOT/backend/internal/foo/brand_new.go"   # UNTRACKED
+run_adv delnew "$tmproot/adv_new.out"
+if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'brand_new.go' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP: no'; then
+  pass "(t2) a mid-loop delete of an untracked new .go file fails closed, never a passing SKIP"
+else
+  fail "(t2) untracked-delete (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
+fi
+
+# (t3) SNAPSHOT TAMPER → skip-snapshot. A test rewrites the snapshot mid-loop to
+# a skip-snapshot, trying to turn the gate green. The pre-test digest no longer
+# matches → FAIL CLOSED with a digest-mismatch reason, NOT a skip.
+ROOT="$tmproot/adv3"
+adv_repo "$ROOT"
+run_adv skipsnap "$tmproot/adv_foo.out"
+if [ "$ADV_GATE_RC" -ne 0 ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'digest mismatch' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+  pass "(t3) a snapshot rewritten to a skip-snapshot mid-loop fails closed (digest mismatch), never a SKIP"
+else
+  fail "(t3) snapshot->skip tamper (gate_rc=$ADV_GATE_RC out='$ADV_GATE_OUT')"
+fi
+
+# (t4) SNAPSHOT TAMPER → altered changed-line map that DROPS the changed file. A
+# test rewrites the snapshot to an empty changed map. The digest still catches
+# it — any post-capture rewrite mismatches — FAIL CLOSED, NOT a skip.
+ROOT="$tmproot/adv4"
+adv_repo "$ROOT"
+run_adv dropfile "$tmproot/adv_foo.out"
+if [ "$ADV_GATE_RC" -ne 0 ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'digest mismatch' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+  pass "(t4) a snapshot rewritten to drop the changed file fails closed (digest mismatch), never a SKIP"
+else
+  fail "(t4) snapshot->drop-file tamper (gate_rc=$ADV_GATE_RC out='$ADV_GATE_OUT')"
+fi
+
+# (t5) control: with NO mutation the same pipeline PASSES (the gate is not
+# always-red) and the snapshot exists post-loop. Fully covered foo.go profile.
+cat > "$tmproot/adv_foo_cov.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:7.23,8.13 1 1
+${PFX}backend/internal/foo/foo.go:8.13,10.3 1 1
+${PFX}backend/internal/foo/foo.go:11.2,11.13 1 1
+EOF
+ROOT="$tmproot/adv5"
+adv_repo "$ROOT"
+run_adv none "$tmproot/adv_foo_cov.out"
+if [ "$ADV_GATE_RC" -eq 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS'; then
+  pass "(t5) with no mutation the snapshot pipeline passes and the snapshot exists post-loop"
+else
+  fail "(t5) clean-run control (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
+fi
+
+# (t6) WIRING: emit runs BEFORE the go-test loop (ordering is load-bearing), and
+# the gate consume passes --changed-snapshot + --expected-snapshot-digest.
+covbody="$(declare -f cmd_test_with_patch_coverage)"
+emit_ln=$(printf '%s\n' "$covbody" | grep -n '_patch_cov_emit_snapshot' | head -1 | cut -d: -f1)
+loop_ln=$(printf '%s\n' "$covbody" | grep -n 'go test' | head -1 | cut -d: -f1)
+vbody="$(declare -f _verify_patch_coverage)"
+if [ -n "$emit_ln" ] && [ -n "$loop_ln" ] && [ "$emit_ln" -lt "$loop_ln" ] \
+   && printf '%s' "$vbody" | grep -q -- '--changed-snapshot' \
+   && printf '%s' "$vbody" | grep -q -- '--expected-snapshot-digest'; then
+  pass "(t6) emit precedes the go-test loop; the gate consumes --changed-snapshot with a digest"
+else
+  fail "(t6) wiring (emit_ln=$emit_ln loop_ln=$loop_ln vbody has snapshot flags?)"
+fi
+
+# (t7) the digest anchor is held in parent memory only: never exported, never
+# written under the profile dir where a test could read it.
+if ! printf '%s' "$(export -p)" | grep -q 'PATCHCOV_SNAPSHOT_DIGEST'; then
+  pass "(t7) the snapshot digest is not exported into the test subprocess environment"
+else
+  fail "(t7) PATCHCOV_SNAPSHOT_DIGEST is exported (must stay in parent memory only)"
+fi
+
+# (t8) SECURITY, combined path: a test DELETES both the snapshot and the profile
+# mid-loop, trying to reach the "no coverage profiles" SKIP. _verify_patch_coverage
+# checks the snapshot digest BEFORE that skip, so a missing snapshot fails CLOSED
+# — the no-profiles skip never bypasses snapshot integrity.
+ROOT="$tmproot/adv8"
+adv_repo "$ROOT"
+run_adv delsnap "$tmproot/adv_foo.out"
+if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = no ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'missing or unreadable' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'no coverage profiles' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+  pass "(t8) deleting the snapshot AND the profile fails closed before the no-profiles skip"
+else
+  fail "(t8) combined snapshot-delete + no-profile (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
+fi
+
+# (t9) same combined path, tamper variant: a test rewrites the snapshot to a
+# skip-snapshot AND removes the profile. The pre-test digest catches the rewrite
+# ahead of the no-profiles skip — FAIL CLOSED (digest mismatch), never a SKIP.
+ROOT="$tmproot/adv9"
+adv_repo "$ROOT"
+run_adv tampernoprof "$tmproot/adv_foo.out"
+if [ "$ADV_GATE_RC" -ne 0 ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'digest mismatch' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'no coverage profiles' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+  pass "(t9) tampering the snapshot AND removing the profile fails closed (digest mismatch), never a SKIP"
+else
+  fail "(t9) combined snapshot-tamper + no-profile (gate_rc=$ADV_GATE_RC out='$ADV_GATE_OUT')"
+fi
+
+# (t10) FAIL-CLOSED shell branch: _patch_cov_emit_snapshot returning non-zero (an
+# emit failure / an undecodable changed path surfacing through the shell) aborts
+# the coverage loop with a non-zero return, so `set -e` fails verify — never a
+# silent fall-through past the un-captured change set. Stub emit to fail.
+ROOT="$tmproot/adv5"
+orig_emit="$(declare -f _patch_cov_emit_snapshot)"
+_patch_cov_emit_snapshot() { return 1; }
+saved_trap="$(trap -p EXIT)"
+out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main 2>&1)"; rc=$?
+eval "$saved_trap"
+_patchcov_cleanup
+eval "$orig_emit"   # restore the sourced original (unset -f would delete it)
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q 'failed to capture the pre-test changed-line snapshot'; then
+  pass "(t10) a failed snapshot emit fails the coverage loop closed (non-zero)"
+else
+  fail "(t10) emit-fail-closed (rc=$rc out='$out')"
+fi
+
+# (t11) FAIL-CLOSED shell branch: _sha256_file failing (no sha256 tool on PATH,
+# or the snapshot unreadable) leaves the digest anchor empty, so the loop returns
+# non-zero rather than proceeding on an un-anchored snapshot. emit is the real
+# one here (adv5 is a valid repo), so only the anchoring step fails.
+orig_sha="$(declare -f _sha256_file)"
+_sha256_file() { return 1; }
+saved_trap="$(trap -p EXIT)"
+out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" main 2>&1)"; rc=$?
+eval "$saved_trap"
+_patchcov_cleanup
+eval "$orig_sha"   # restore the sourced original (unset -f would delete it)
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q 'could not anchor the snapshot digest'; then
+  pass "(t11) a failed digest anchor fails the coverage loop closed (non-zero)"
+else
+  fail "(t11) digest-anchor-fail-closed (rc=$rc out='$out')"
+fi
+
+# (t12) SECURITY, snapshot-pristine profile deletion: a test deletes the *.out
+# profile mid-loop but leaves the snapshot UNTOUCHED (digest still matches). The
+# digest check passes, so verify reaches the no-profiles branch — but the snapshot
+# carries a NON-EMPTY changed map, so zero profiles is an integrity anomaly. The
+# gate must FAIL CLOSED, never a passing SKIP. This is the profile-deletion path
+# the snapshot-tamper cases (t8/t9) do not exercise (they also tamper the snapshot).
+ROOT="$tmproot/adv12"
+adv_repo "$ROOT"
+run_adv delprof "$tmproot/adv_foo.out"
+if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'no coverage profiles were produced' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+  pass "(t12) a pristine snapshot with a non-empty change set and zero profiles fails closed, never a SKIP"
+else
+  fail "(t12) pristine-snapshot profile-delete (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
+fi
+modules() { printf './backend\n./cli\n'; }
 
 # ---------------------------------------------------------------------------
 # (h) parse-clean.
