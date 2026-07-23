@@ -63,6 +63,103 @@ audit-chain partition is never account-scoped (it has no owning run).
 **403 codes:** `account_forbidden`, `account_unresolved`, `insufficient_role`.
 The cross-boundary integration matrix is `authz_account_test.go`.
 
+## Repo-scoped in-workspace visibility (`repovisibility.go`, ADR-057 Amendment A2 / E44.10, #2071)
+
+A second, narrower boundary layered STRICTLY ON TOP of the account-ownership
+checks above: within their own tenant account, a workspace member sees only the
+repos they hold at least `read` on at the forge. It loosens nothing — every
+ownership check and RLS predicate still applies first, and this only removes
+rows. Migration 0057's RLS policies are inert in production today (the runtime
+role is a superuser, which bypasses RLS even under FORCE), so this handler
+filter is the effective in-workspace boundary until that rollout completes; the
+tests assert filtering under the ordinary test role for exactly that reason.
+
+**Where the permission comes from.** `Config.RepoVisibility` (the
+`RepoVisibility` interface — `*repoacl.Mirror` in production) mirrors, per
+`(provider, subject, repo)`, the tier `identity.IdentityProvider.PermissionLevel`
+resolved, TTL-gated. The server package does NOT import `repoacl`, the same
+convention `AccountRoles` follows. See `backend/internal/repoacl/README.md` for
+the mirror contract.
+
+**Resolution, once per request** (`repoFilterFor`). Filtering resolves to a
+`*repoFilter`, or to nil meaning "not applicable" — and nil is nil-safe, so a
+handler holds one value and never branches on whether filtering is on. It is
+NOT applicable when: `Config.RepoVisibility` is nil (no mirror wired — the
+untenanted-allow posture, byte-identical to pre-#2071, and the documented
+no-code-change disable switch); the caller is anonymous; the caller is a
+bearer / MCP token (`TokenID != ""` — deliberately unfiltered, bounded by
+ownership alone, so the CLI and the runner's own MCP token are unaffected); or
+the caller resolves to the workspace `admin` role through the SAME
+`Config.AccountRoles` seam #1829 uses (the admin bypass). A role-resolution
+error is neither a bypass nor a deny — it 503s.
+
+**Cross-forge is default-deny, with ZERO forge calls.** `repoFilter.allows`
+resolves the row's forge through `Config.RepoProviders` (`ProviderResolver`,
+`accounts.provider` keyed by the repo owner) and denies immediately when it
+differs from the provider prefix of the caller's subject — a GitHub-only login
+sees no GitLab-installation data, and GitHub is never asked about a GitLab
+repo. A not-found / ambiguous answer from a WIRED resolver (the repo owner is
+unregistered, or — per `account.Resolver`'s contract — registered under BOTH
+forges) also DENIES, with zero forge calls: falling through to the mirror there
+would ask the caller's forge about the row's repo, so a GitLab-installation row
+`acme/app` could be shown to a GitHub-only login holding read on a same-named
+GitHub repo — both a leak and the forge lookup `[cross-forge-default-deny]`
+forbids. It is logged at WARN naming the repo, because an ambiguous owner is an
+operator-fixable account-registration state, not a permission answer. Only a
+NIL resolver (the cross-forge check not configured at all; in production the
+resolver and the mirror are wired together, both gated on `pool != nil` in
+`serve.go`) leaves the decision to the mirror. A resolver ERROR is a store fault
+and 503s. Per-repo answers are memoized for the life of one request, so a list
+page asks about each repo once.
+
+**An identity that cannot be keyed into the mirror is denied, not exempted.** A
+cookie subject with no `<provider>:` prefix yields a deny-all filter and a WARN,
+not an unfiltered request. No such subject is minted today (`bearerAuth` mints
+`github:<login>`), and that is precisely why the branch must not be the one path
+that silently bypasses filtering if a future auth path ever mints one.
+
+**The two failure classes are never collapsed** (the binding rule, stated once
+in `repoacl/README.md` and honored identically here). A FORGE error — including
+`identity.ErrRateLimited` — means the permission is UNKNOWN: the mirror returns
+`(false, nil)` and logs at WARN naming the repo and the reason, so that repo is
+not visible for this request, nothing is memoized in the mirror, and the request
+otherwise proceeds. A STORE error means the filter itself cannot function: the
+request fails `503 service_unavailable` via `writeRepoFilterUnavailable`. The
+classification rides in the return shape, so no handler can turn a forge fault
+into a 503 or a DB outage into a silent short page.
+
+**Lists FILTER, point reads 403** — the same convention #1829 uses. `GET
+/v0/runs` and `GET /v0/campaigns` drop non-visible page rows. Point reads answer
+`403 repo_forbidden`: for runs/stages/concerns centrally, inside
+`enforceAccount` (so `require{Run,Stage,Concern}Account` all inherit it — the
+run, stage, artifact, per-run-audit and concern point reads are covered without
+touching each handler); for campaigns, in `handleGetCampaign`,
+`handleListCampaignItems` and `handleGetCampaignStatus`, which the run-scoped
+wrappers do not cover.
+
+**READ paths only.** The `enforceAccount` check runs inside the `readAccess`
+branch, and the shared refinement loader applies it only to `GET`/`HEAD`
+(`isReadRequest`). The mirror is a **non-authoritative, TTL'd cache of a forge
+read permission**, and #2071 scopes it to read *visibility*. Gating
+`memberWrite`/`adminWrite` on it would let a cached deny — including one a
+forge fault produced — block a caller whose *current live* forge permission
+authorizes the action, and would reject a refinement decision or an approval
+before E39's live decision-point `PermissionLevel` check runs. Write and
+approval eligibility are unchanged by #2071: ownership, cookie role-bounding,
+and the live checks the write paths already make.
+
+**Pagination artifact (accepted).** The offset cursor counts PRE-filter rows, so
+a filtered page can come back shorter than `limit` with `next_cursor` still
+non-empty. Following the cursor to exhaustion still returns every visible row
+exactly once (`runs_list_test.go` pins it). The alternative — pushing an
+allowed-repo array into the SQL filter — needs an enumerable repo set the mirror
+cannot supply without a forge repo-list call the `IdentityProvider` seam does
+not expose.
+
+**403 code:** `repo_forbidden`. Branch matrix: `repovisibility_test.go`;
+per-surface assertions in `runs_list_test.go`, `runs_get_test.go`,
+`campaigns_test.go` and `middleware_test.go`.
+
 ## Per-repo work-management conventions loader (`conventions_loader.go`, E45.16 / #2022)
 
 `RepoConventionsLoader.Load` is what serve.go installs as the process-wide `conventionsLoader`

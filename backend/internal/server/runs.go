@@ -1661,8 +1661,33 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 		nextCursor = encodeOffsetCursor(offset + limit)
 		rows = rows[:limit]
 	}
+
+	// Repo-scoped narrowing (ADR-057 Amendment A2 / #2071), applied AFTER the
+	// account filter and strictly on top of it: drop page rows whose repo the
+	// caller holds no forge `read` on. Nil filter (no mirror wired, bearer /
+	// anonymous caller, or a workspace admin) allows every row.
+	//
+	// The cursor is deliberately computed BEFORE filtering, from the
+	// pre-filter row count: the offset cursor counts rows the QUERY returned,
+	// so a filtered page can come back shorter than `limit` while next_cursor
+	// stays non-empty. Following the cursor to exhaustion still yields every
+	// visible row exactly once (runs_list_test.go pins that), which is the
+	// property clients need; a page-fill loop would need an enumerable
+	// allowed-repo set the mirror cannot supply.
+	filter, ok := s.requestRepoFilter(w, r)
+	if !ok {
+		return
+	}
 	items := make([]runResponse, 0, len(rows))
 	for _, ru := range rows {
+		allowed, ferr := filter.allows(r.Context(), ru.Repo)
+		if ferr != nil {
+			s.writeRepoFilterUnavailable(w, r)
+			return
+		}
+		if !allowed {
+			continue
+		}
 		items = append(items, toRunResponse(ru))
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{

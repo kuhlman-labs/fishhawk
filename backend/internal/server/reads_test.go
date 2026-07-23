@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1493,4 +1494,260 @@ func TestListGlobalAudit_PaginationCursor(t *testing.T) {
 // tenant account, matching its pre-promotion effective behavior.
 func (*stagesRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
+}
+
+// ---- repo-scoped global audit feed (ADR-057 Amendment A2 / #2071) ---------
+
+// auditVisibilityRunRepo resolves run→repo for the global-audit filter. It
+// embeds run.Repository (nil) so only the method the filter actually calls is
+// implemented; any other call panics loudly rather than silently returning a
+// zero value.
+type auditVisibilityRunRepo struct {
+	run.Repository
+	mu    sync.Mutex
+	repos map[uuid.UUID]string
+	err   error
+	gets  int
+}
+
+func (r *auditVisibilityRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.gets++
+	if r.err != nil {
+		return nil, r.err
+	}
+	repo, ok := r.repos[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	return &run.Run{ID: id, Repo: repo}, nil
+}
+
+func (r *auditVisibilityRunRepo) getCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.gets
+}
+
+// auditVisibilityFixture builds a feed of four entries: two run-scoped on a
+// visible repo, one run-scoped on a hidden repo, and one global-chain entry
+// (RunID nil). Returns the entries and the run repo that resolves them.
+func auditVisibilityFixture() ([]*audit.Entry, *auditVisibilityRunRepo) {
+	visibleRun := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	hiddenRun := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+	entry := func(seq int64, runID *uuid.UUID, category string) *audit.Entry {
+		return &audit.Entry{
+			ID:        uuid.New(),
+			Sequence:  seq,
+			RunID:     runID,
+			Timestamp: time.Date(2026, 7, 22, 12, 0, int(seq), 0, time.UTC),
+			Category:  category,
+			Payload:   json.RawMessage(`{}`),
+			EntryHash: fmt.Sprintf("hash-%d", seq),
+		}
+	}
+	entries := []*audit.Entry{
+		entry(1, &visibleRun, "trace_uploaded"),
+		entry(2, &visibleRun, "plan_generated"),
+		entry(3, &hiddenRun, "trace_uploaded"),
+		entry(4, nil, "installation_token_issued"),
+	}
+	return entries, &auditVisibilityRunRepo{repos: map[uuid.UUID]string{
+		visibleRun: "acme/visible",
+		hiddenRun:  "acme/hidden",
+	}}
+}
+
+func getGlobalAudit(t *testing.T, s *Server, id Identity) (int, []auditEntryResponse) {
+	t.Helper()
+	req := withIdentity(httptest.NewRequest(http.MethodGet, "/v0/audit", nil), id)
+	w := httptest.NewRecorder()
+	s.handleListGlobalAudit(w, req)
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	return w.Code, got.Items
+}
+
+// TestListGlobalAudit_RepoFiltered covers failure mode (j): a filtering member
+// sees ONLY entries whose run's repo they hold forge read on, and the
+// global-chain (NULL run_id) entries — which carry no repo to authorize
+// against — are hidden from them entirely.
+func TestListGlobalAudit_RepoFiltered_HidesHiddenRepoAndGlobalChain(t *testing.T) {
+	entries, runRepo := auditVisibilityFixture()
+	a := newAuditReadFake()
+	a.all = entries
+	vis := newFakeRepoVisibility(map[string]bool{"acme/visible": true})
+	s := New(Config{
+		Addr:           "127.0.0.1:0",
+		AuditRepo:      a,
+		RunRepo:        runRepo,
+		AccountRoles:   fakeAccountRoles{role: account.RoleMember},
+		RepoVisibility: vis,
+	})
+
+	code, items := getGlobalAudit(t, s, memberIdentity())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2 (both visible-repo entries only)", len(items))
+	}
+	for _, e := range items {
+		if e.RunID == nil {
+			t.Errorf("global-chain entry %s leaked to a filtered member", e.ID)
+		}
+	}
+	// Per-page memoization: two entries share one run, and both runs are
+	// resolved once each — not once per entry.
+	if got := runRepo.getCount(); got != 2 {
+		t.Errorf("GetRun calls = %d, want 2 (one per distinct run on the page)", got)
+	}
+	if got := vis.callCount(); got != 2 {
+		t.Errorf("mirror calls = %d, want 2 (one per distinct repo)", got)
+	}
+}
+
+// TestListGlobalAudit_AdminSeesEverything is the mode (f) admin bypass on the
+// audit feed, including the global-chain entries the member cannot see.
+func TestListGlobalAudit_AdminSeesEverything(t *testing.T) {
+	entries, runRepo := auditVisibilityFixture()
+	a := newAuditReadFake()
+	a.all = entries
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s := New(Config{
+		Addr:           "127.0.0.1:0",
+		AuditRepo:      a,
+		RunRepo:        runRepo,
+		AccountRoles:   fakeAccountRoles{role: account.RoleAdmin},
+		RepoVisibility: vis,
+	})
+
+	code, items := getGlobalAudit(t, s, memberIdentity())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(items) != 4 {
+		t.Fatalf("items = %d, want 4 (admin bypasses filtering entirely)", len(items))
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("admin bypass consulted the mirror %d times, want 0", vis.callCount())
+	}
+}
+
+// TestListGlobalAudit_NoMirror_Unfiltered is mode (g): with no mirror wired the
+// feed is byte-identical to the pre-#2071 surface, global chain included.
+func TestListGlobalAudit_NoMirror_Unfiltered(t *testing.T) {
+	entries, runRepo := auditVisibilityFixture()
+	a := newAuditReadFake()
+	a.all = entries
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: a, RunRepo: runRepo})
+
+	code, items := getGlobalAudit(t, s, memberIdentity())
+	if code != http.StatusOK || len(items) != 4 {
+		t.Fatalf("status = %d items = %d, want 200 / 4 (untenanted-allow)", code, len(items))
+	}
+	if runRepo.getCount() != 0 {
+		t.Errorf("nil filter resolved %d run repos, want 0", runRepo.getCount())
+	}
+}
+
+// TestListGlobalAudit_MirrorStoreFault_503 is mode (h): a STORE fault fails the
+// request closed rather than silently returning a short page.
+func TestListGlobalAudit_MirrorStoreFault_503(t *testing.T) {
+	entries, runRepo := auditVisibilityFixture()
+	a := newAuditReadFake()
+	a.all = entries
+	vis := newFakeRepoVisibility(map[string]bool{"acme/visible": true})
+	vis.err = errors.New("mirror store down")
+	s := New(Config{
+		Addr:           "127.0.0.1:0",
+		AuditRepo:      a,
+		RunRepo:        runRepo,
+		AccountRoles:   fakeAccountRoles{role: account.RoleMember},
+		RepoVisibility: vis,
+	})
+
+	code, _ := getGlobalAudit(t, s, memberIdentity())
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 on a mirror store fault", code)
+	}
+}
+
+// TestListGlobalAudit_RunLookupFault_503 pins the same rule for the run→repo
+// lookup this handler adds: a query FAULT is a store fault (503), never a
+// silent drop that would shorten the page with no signal.
+func TestListGlobalAudit_RunLookupFault_503(t *testing.T) {
+	entries, runRepo := auditVisibilityFixture()
+	runRepo.err = errors.New("runs table unavailable")
+	a := newAuditReadFake()
+	a.all = entries
+	s := New(Config{
+		Addr:           "127.0.0.1:0",
+		AuditRepo:      a,
+		RunRepo:        runRepo,
+		AccountRoles:   fakeAccountRoles{role: account.RoleMember},
+		RepoVisibility: newFakeRepoVisibility(map[string]bool{"acme/visible": true}),
+	})
+
+	code, _ := getGlobalAudit(t, s, memberIdentity())
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when the run lookup faults", code)
+	}
+}
+
+// TestListGlobalAudit_UnknownRun_Dropped covers the other arm of that split: a
+// run that is GONE (not a fault) makes the entry's repo unknowable, which is a
+// deny — the entry is dropped and the rest of the page still renders.
+func TestListGlobalAudit_UnknownRun_Dropped(t *testing.T) {
+	entries, runRepo := auditVisibilityFixture()
+	orphan := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+	entries = append(entries, &audit.Entry{
+		ID: uuid.New(), Sequence: 5, RunID: &orphan,
+		Timestamp: time.Date(2026, 7, 22, 12, 0, 5, 0, time.UTC),
+		Category:  "trace_uploaded", Payload: json.RawMessage(`{}`), EntryHash: "hash-5",
+	})
+	a := newAuditReadFake()
+	a.all = entries
+	s := New(Config{
+		Addr:           "127.0.0.1:0",
+		AuditRepo:      a,
+		RunRepo:        runRepo,
+		AccountRoles:   fakeAccountRoles{role: account.RoleMember},
+		RepoVisibility: newFakeRepoVisibility(map[string]bool{"acme/visible": true}),
+	})
+
+	code, items := getGlobalAudit(t, s, memberIdentity())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a missing run is a deny, not a fault)", code)
+	}
+	if len(items) != 2 {
+		t.Fatalf("items = %d, want 2 (the orphan entry is dropped)", len(items))
+	}
+}
+
+// TestListGlobalAudit_NoRunRepo_FilteredCallerSeesNothing pins the last
+// unknowable-repo branch: with no RunRepo wired the filter cannot resolve any
+// entry's repo, so a filtering caller sees an empty feed rather than the whole
+// workspace's activity.
+func TestListGlobalAudit_NoRunRepo_FilteredCallerSeesNothing(t *testing.T) {
+	entries, _ := auditVisibilityFixture()
+	a := newAuditReadFake()
+	a.all = entries
+	s := New(Config{
+		Addr:           "127.0.0.1:0",
+		AuditRepo:      a,
+		AccountRoles:   fakeAccountRoles{role: account.RoleMember},
+		RepoVisibility: newFakeRepoVisibility(map[string]bool{"acme/visible": true}),
+	})
+
+	code, items := getGlobalAudit(t, s, memberIdentity())
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if len(items) != 0 {
+		t.Fatalf("items = %d, want 0 (no run repo ⇒ no entry is authorizable)", len(items))
+	}
 }

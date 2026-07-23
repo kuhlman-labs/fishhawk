@@ -16,8 +16,10 @@ import (
 
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
 )
 
 // fakeAuthRepo is the in-memory auth.Repository for handler tests.
@@ -1070,4 +1072,185 @@ func (f *e2eOrgLister) ListUserOrgKeys(context.Context, string) ([]string, error
 		return nil, f.err
 	}
 	return f.keys, nil
+}
+
+// ---- login-time repo-ACL mirror purge (ADR-057 Amendment A2 / #2071) ------
+
+// newAuthServerWithVisibility is newAuthServer plus a wired RepoVisibility
+// seam — the only difference that matters to the purge tests.
+func newAuthServerWithVisibility(t *testing.T, vis RepoVisibility) *Server {
+	t.Helper()
+	_, gh := stubGitHubOAuthServer(t)
+	return New(Config{
+		Addr:                   "127.0.0.1:0",
+		AuthRepo:               newFakeAuthRepo(),
+		GitHubOAuth:            gh,
+		AuthMembership:         &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}},
+		AuthRedirectAfterLogin: "/app",
+		RepoVisibility:         vis,
+	})
+}
+
+// signIn drives one full OAuth callback and returns the recorder.
+func signIn(t *testing.T, s *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	state := "state-purge"
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/github/callback?code=abc&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+func TestGitHubCallback_PurgesRepoACLMirrorForSubject(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s := newAuthServerWithVisibility(t, vis)
+
+	if w := signIn(t, s); w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	if vis.purgeCall != 1 {
+		t.Fatalf("InvalidateSubject calls = %d, want 1", vis.purgeCall)
+	}
+	// The purge keys on (provider, forge-neutral subject) — the SAME pair the
+	// read filter derives from the session identity, so a purge and a lookup
+	// address one row set.
+	if got, want := vis.purged[0], "github|octocat"; got != want {
+		t.Errorf("purged = %q, want %q", got, want)
+	}
+}
+
+// TestGitHubCallback_PurgeFailureIsNonFatal is the operator's binding condition
+// (2). Two things are asserted, and the SECOND is the one the plan originally
+// got wrong: a failed purge does NOT merely leave the mirror needing a
+// re-resolve — the previously cached entries, GRANTS INCLUDED, survive. What
+// bounds that exposure is the TTL, which is asserted separately below.
+func TestGitHubCallback_PurgeFailureIsNonFatal(t *testing.T) {
+	vis := newFakeRepoVisibility(map[string]bool{})
+	vis.purgeErr = errors.New("mirror store unavailable")
+	s := newAuthServerWithVisibility(t, vis)
+
+	w := signIn(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 — a purge failure must not fail sign-in closed:\n%s",
+			w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "/app" {
+		t.Errorf("Location = %q, want /app (normal post-login redirect)", loc)
+	}
+	var sess *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == auth.SessionCookieName {
+			sess = c
+		}
+	}
+	if sess == nil {
+		t.Fatal("no session cookie: the purge failure aborted sign-in")
+	}
+	if vis.purgeCall != 1 {
+		t.Errorf("InvalidateSubject calls = %d, want 1 (attempted, then tolerated)", vis.purgeCall)
+	}
+}
+
+// staleStore is a repoacl.Store holding ONE pre-seeded entry whose age the test
+// controls, and whose purge always fails. It is the fixture for the bound in
+// condition (2): the entries that survive a failed purge are still subject to
+// TTL expiry.
+type staleStore struct {
+	entry     repoacl.Entry
+	present   bool
+	upserts   int
+	deleteErr error
+}
+
+func (s *staleStore) Get(context.Context, string, string, string) (repoacl.Entry, bool, error) {
+	return s.entry, s.present, nil
+}
+
+func (s *staleStore) Upsert(_ context.Context, _, _, _ string, perm identity.Permission) error {
+	s.upserts++
+	s.entry = repoacl.Entry{Permission: perm, CheckedAt: time.Now()}
+	s.present = true
+	return nil
+}
+
+func (s *staleStore) DeleteForSubject(context.Context, string, string) error {
+	return s.deleteErr
+}
+
+// staleResolver answers the live forge lookup a TTL expiry forces.
+type staleResolver struct {
+	perm  identity.Permission
+	calls int
+}
+
+func (r *staleResolver) PermissionLevel(context.Context, string, string) (identity.Permission, error) {
+	r.calls++
+	return r.perm, nil
+}
+
+// TestGitHubCallback_PurgeFailure_EntriesStillExpireByTTL is the second half of
+// binding condition (2): with the purge failing, a surviving GRANT is bounded
+// by the TTL rather than persisting indefinitely.
+//
+// It drives a REAL repoacl.Mirror (not the seam stub) because the bound being
+// asserted is the mirror's, and asserts both arms against one store: an entry
+// INSIDE the freshness window is served from the mirror with no forge call
+// (this is the exposure the failed purge leaves), while the SAME entry aged
+// past the TTL is re-resolved from the forge — which now answers "none", so
+// the surviving grant is gone.
+func TestGitHubCallback_PurgeFailure_EntriesStillExpireByTTL(t *testing.T) {
+	const ttl = time.Hour
+	store := &staleStore{
+		entry:     repoacl.Entry{Permission: identity.PermissionWrite, CheckedAt: time.Now()},
+		present:   true,
+		deleteErr: errors.New("mirror store unavailable"),
+	}
+	// The forge has since REVOKED the grant.
+	resolver := &staleResolver{perm: identity.PermissionNone}
+	mirror := repoacl.NewMirror(store, resolver, ttl, nil)
+
+	s := newAuthServerWithVisibility(t, mirror)
+	if w := signIn(t, s); w.Code != http.StatusFound {
+		t.Fatalf("sign-in status = %d, want 302 (purge failure is non-fatal)", w.Code)
+	}
+
+	// Arm 1: the entry survived the failed purge and is still fresh, so the
+	// stale GRANT is still served. This is the exposure, stated as a test.
+	visible, err := mirror.Visible(context.Background(), "github", "octocat", "acme/app")
+	if err != nil {
+		t.Fatalf("Visible: %v", err)
+	}
+	if !visible {
+		t.Fatal("expected the surviving cached grant to still be visible inside the TTL")
+	}
+	if resolver.calls != 0 {
+		t.Errorf("forge calls = %d, want 0 while the entry is fresh", resolver.calls)
+	}
+
+	// Arm 2: age the SAME entry past the TTL. The mirror must re-resolve and
+	// serve the forge's current answer, not the stale grant — so the failed
+	// purge's exposure is bounded by the TTL.
+	store.entry.CheckedAt = time.Now().Add(-2 * ttl)
+	visible, err = mirror.Visible(context.Background(), "github", "octocat", "acme/app")
+	if err != nil {
+		t.Fatalf("Visible after TTL expiry: %v", err)
+	}
+	if visible {
+		t.Error("a surviving entry aged past the TTL is still visible: the purge-failure exposure is UNBOUNDED")
+	}
+	if resolver.calls != 1 {
+		t.Errorf("forge calls = %d, want 1 (TTL expiry forces a re-resolve)", resolver.calls)
+	}
+}
+
+// TestGitHubCallback_NoMirrorWired_SignsInNormally pins the untenanted-allow
+// posture on the login path: with no RepoVisibility seam there is no purge and
+// sign-in is unchanged.
+func TestGitHubCallback_NoMirrorWired_SignsInNormally(t *testing.T) {
+	s, _ := newAuthServer(t)
+	if w := signIn(t, s); w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 with no mirror wired", w.Code)
+	}
 }

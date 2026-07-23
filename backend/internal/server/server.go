@@ -312,6 +312,40 @@ type Config struct {
 	// cookie-only).
 	AccountRoles AccountRoles
 
+	// RepoVisibility is the per-identity forge repo-permission mirror behind
+	// repo-scoped in-workspace visibility (ADR-057 Amendment A2, E44.10 /
+	// #2071). Read paths consult it to narrow a caller's view WITHIN their
+	// tenant account to the repos they hold at least `read` on at the forge.
+	//
+	// Nil is the untenanted-allow posture: filtering is disabled entirely and
+	// every read surface behaves exactly as it did pre-#2071. That is also the
+	// documented no-code-change disable switch — leave the mirror unwired (no
+	// database or no identity provider) and the filter is off.
+	//
+	// The layering is strictly ADDITIVE: it narrows on top of the #1829
+	// ownership checks and the #1830 RLS predicates and loosens neither.
+	// Bearer/MCP token identities are deliberately never filtered (they are
+	// bounded by ownership alone), and a workspace admin bypasses filtering
+	// via the AccountRoles seam above.
+	RepoVisibility RepoVisibility
+
+	// RepoProviders resolves a repo's forge discriminator (accounts.provider
+	// keyed by the repo owner) for the repo-visibility CROSS-FORGE deny: a row
+	// whose forge differs from the caller's login forge is never visible, and
+	// is denied with zero forge calls. Satisfied by *account.Resolver, the
+	// same type the conventions loader consults.
+	//
+	// NIL means the cross-forge check is not wired at all: no cross-forge
+	// conclusion is drawn and the mirror alone decides (a test / degraded
+	// posture — in production this and RepoVisibility are wired together).
+	// A WIRED resolver answering found=false means the row's forge is
+	// AMBIGUOUS (owner unregistered, or registered under both forges), which
+	// FAILS CLOSED: the repo is denied with a WARN and ZERO forge calls, never
+	// handed to the mirror — asking the CALLER'S forge about a row from another
+	// forge is exactly the cross-forge leak the deny exists to prevent. A
+	// resolver ERROR fails the request closed with 503.
+	RepoProviders ProviderResolver
+
 	// ExternalURL is the operator-facing root URL for the SPA, e.g.
 	// `https://app.fishhawk.example.com`. Used to build links in
 	// surfaces that escape the backend (today: GitHub Check Runs,

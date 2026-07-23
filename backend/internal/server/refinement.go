@@ -469,7 +469,87 @@ func (s *Server) loadRefinementSession(w http.ResponseWriter, r *http.Request, s
 			"no refinement session with that id", map[string]any{"session_id": sessionID.String()})
 		return nil, false
 	}
+	// Repo-scoped gate (ADR-057 Amendment A2 / #2071). Applied HERE rather
+	// than per handler because every refinement read routes through this
+	// loader, so one check covers the surface and a new read handler inherits
+	// it by construction. Refinement is a POINT-read surface, so a non-visible
+	// session 403s repo_forbidden rather than being filtered away.
+	//
+	// READ requests only (fix-up, #2071), matching enforceAccount's readAccess
+	// scoping: the mirror is a non-authoritative TTL'd cache of a forge READ
+	// permission, so it must not decide whether PATCH .../draft or
+	// POST .../decision may proceed — a cached deny would block a caller whose
+	// live forge permission authorizes the edit, and a refinement DECISION is
+	// an approval, whose eligibility #2071 explicitly leaves untouched.
+	if isReadRequest(r) && !s.enforceRefinementRepoVisibility(w, r, drafts) {
+		return nil, false
+	}
 	return drafts, true
+}
+
+// enforceRefinementRepoVisibility applies repo filtering to a refinement
+// session. Returns true when the request may proceed.
+//
+// A refinement session's repo is the repo its FILING session pinned. That is
+// the session's only durable repo: refinement.StoredDraft carries brief,
+// draft, model and origin — no repo — because a session starts life as a
+// brief, before any target repo has been chosen. The repo is pinned exactly
+// once, at first filing invoke (refinement.FilingSession.Repo, E34.3 / #1594),
+// and a re-invoke naming a different repo fails closed there.
+//
+// So the gate is: a session that HAS been filed authorizes against its pinned
+// repo; a session that has NOT been filed has no repo to authorize against and
+// stays reachable to any member holding the refinement gate scope, exactly as
+// today. That is a deliberate, stated limit rather than a silent one — closing
+// it means giving refinement sessions a repo at creation, which is a schema
+// change to the refinement tables (outside this change's scope). The residual
+// exposure is bounded: a pre-filing session contains a brief and a proposed
+// epic draft, not run, campaign or audit data for a repo the caller lacks.
+//
+// The filing session is keyed by DRAFT id, and only the approved revision is
+// filed, so this walks the session's revisions newest-first and gates on the
+// first pinned repo it finds — at most one revision per session is ever filed.
+func (s *Server) enforceRefinementRepoVisibility(w http.ResponseWriter, r *http.Request, drafts []*refinement.StoredDraft) bool {
+	filter, ok := s.requestRepoFilter(w, r)
+	if !ok {
+		return false
+	}
+	if filter == nil {
+		// No mirror wired, bearer / anonymous caller, or a workspace admin —
+		// the admin bypass covers refinement just as it covers lists and
+		// point reads.
+		return true
+	}
+	repo, found, err := s.refinementSessionRepo(r.Context(), drafts)
+	if err != nil {
+		// A filing-session lookup fault is a STORE fault: the gate cannot
+		// function, so 503 rather than guess in either direction.
+		s.writeRepoFilterUnavailable(w, r)
+		return false
+	}
+	if !found {
+		return true
+	}
+	return s.repoVisibleOr403(w, r, filter, repo)
+}
+
+// refinementSessionRepo returns the repo pinned by the session's filing
+// session, if one has been opened. found=false means the session has not been
+// filed and therefore has no repo.
+func (s *Server) refinementSessionRepo(ctx context.Context, drafts []*refinement.StoredDraft) (string, bool, error) {
+	for i := len(drafts) - 1; i >= 0; i-- {
+		fs, err := s.cfg.RefinementRepo.GetFilingSession(ctx, drafts[i].ID)
+		if errors.Is(err, refinement.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if fs != nil && fs.Repo != "" {
+			return fs.Repo, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // decodeRefinementBody strict-decodes a bounded request body into dst, writing

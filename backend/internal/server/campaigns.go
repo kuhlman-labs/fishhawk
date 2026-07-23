@@ -560,8 +560,26 @@ func (s *Server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 		nextCursor = encodeOffsetCursor(offset + limit)
 		rows = rows[:limit]
 	}
+	// Repo-scoped narrowing (ADR-057 Amendment A2 / #2071), mirroring
+	// handleListRuns: drop page rows whose repo the caller holds no forge
+	// `read` on, strictly on top of the account filter. The cursor is computed
+	// from the PRE-filter count, so a page can come back short while
+	// next_cursor stays non-empty — following it to exhaustion still yields
+	// every visible campaign exactly once.
+	filter, ok := s.requestRepoFilter(w, r)
+	if !ok {
+		return
+	}
 	items := make([]campaignResponse, 0, len(rows))
 	for _, c := range rows {
+		allowed, ferr := filter.allows(r.Context(), c.Repo)
+		if ferr != nil {
+			s.writeRepoFilterUnavailable(w, r)
+			return
+		}
+		if !allowed {
+			continue
+		}
 		items = append(items, toCampaignResponse(c))
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{
@@ -646,6 +664,12 @@ func (s *Server) handleGetCampaign(w http.ResponseWriter, r *http.Request) {
 	if !s.enforceCampaignAccount(w, r, id) {
 		return
 	}
+	// Repo visibility (#2071): campaigns are NOT covered by the run-scoped
+	// account middleware wrappers, so each campaign point read applies the
+	// check itself. Point reads DENY (403 repo_forbidden) where lists filter.
+	if !s.enforceRepoVisibility(w, r, c.Repo) {
+		return
+	}
 	s.writeJSON(w, r, http.StatusOK, toCampaignResponse(c))
 }
 
@@ -714,7 +738,8 @@ func (s *Server) handleListCampaignItems(w http.ResponseWriter, r *http.Request)
 	// for an unknown campaign id, so existence is checked explicitly via
 	// GetCampaign first — a 404 for a missing campaign is more useful than an
 	// ambiguous empty list.
-	if _, err := s.cfg.CampaignRepo.GetCampaign(r.Context(), id); err != nil {
+	c, err := s.cfg.CampaignRepo.GetCampaign(r.Context(), id)
+	if err != nil {
 		if errors.Is(err, campaign.ErrNotFound) {
 			s.writeError(w, r, http.StatusNotFound, "campaign_not_found",
 				"no campaign with that id", map[string]any{"campaign_id": id.String()})
@@ -722,6 +747,11 @@ func (s *Server) handleListCampaignItems(w http.ResponseWriter, r *http.Request)
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"get campaign failed", map[string]any{"error": err.Error()})
+		return
+	}
+	// Repo visibility (#2071): the items of a campaign on a repo the caller
+	// cannot read are as sensitive as the campaign itself.
+	if !s.enforceRepoVisibility(w, r, c.Repo) {
 		return
 	}
 	items, err := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
@@ -763,6 +793,12 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"get campaign failed", map[string]any{"error": err.Error()})
+		return
+	}
+	// Repo visibility (#2071): deny the status rollup for a campaign on a repo
+	// the caller cannot read, BEFORE the reconcile-on-read pass — a denied
+	// caller must not drive campaign state as a side effect of a read.
+	if !s.enforceRepoVisibility(w, r, c.Repo) {
 		return
 	}
 	items, err := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
