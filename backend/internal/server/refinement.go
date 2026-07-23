@@ -470,12 +470,18 @@ func (s *Server) loadRefinementSession(w http.ResponseWriter, r *http.Request, s
 		return nil, false
 	}
 	// Repo-scoped gate (ADR-057 Amendment A2 / #2071). Applied HERE rather
-	// than per handler because every refinement point read and write —
-	// GET /sessions/{id}, PATCH .../draft, POST .../decision — routes through
-	// this loader, so one check covers the surface and a new handler inherits
+	// than per handler because every refinement read routes through this
+	// loader, so one check covers the surface and a new read handler inherits
 	// it by construction. Refinement is a POINT-read surface, so a non-visible
 	// session 403s repo_forbidden rather than being filtered away.
-	if !s.enforceRefinementRepoVisibility(w, r, drafts) {
+	//
+	// READ requests only (fix-up, #2071), matching enforceAccount's readAccess
+	// scoping: the mirror is a non-authoritative TTL'd cache of a forge READ
+	// permission, so it must not decide whether PATCH .../draft or
+	// POST .../decision may proceed — a cached deny would block a caller whose
+	// live forge permission authorizes the edit, and a refinement DECISION is
+	// an approval, whose eligibility #2071 explicitly leaves untouched.
+	if isReadRequest(r) && !s.enforceRefinementRepoVisibility(w, r, drafts) {
 		return nil, false
 	}
 	return drafts, true

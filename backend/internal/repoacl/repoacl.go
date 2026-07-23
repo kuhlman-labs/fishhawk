@@ -238,8 +238,17 @@ func (m *Mirror) InvalidateSubject(ctx context.Context, provider, subject string
 // expired reports whether a mirrored entry has aged past the freshness window.
 // A zero CheckedAt (an entry written by something that did not stamp it) is
 // unboundedly old and therefore expired — fail closed toward re-resolving.
+//
+// A checked_at in the FUTURE is also expired. checked_at is stamped by the
+// DATABASE clock and compared against the APPLICATION clock, so forward skew
+// (or a clock jump) yields a NEGATIVE age, which a bare `age >= ttl` test would
+// read as fresh until that future instant plus the TTL — extending stale-allow
+// past the bound DefaultTTL documents, by exactly the skew. Rejecting a
+// negative age keeps stale-allow strictly bounded by the TTL under any skew:
+// the worst a forward-skewed row costs is one extra live forge resolve.
 func (m *Mirror) expired(checkedAt time.Time) bool {
-	return time.Since(checkedAt) >= m.ttl
+	age := time.Since(checkedAt)
+	return age < 0 || age >= m.ttl
 }
 
 // SubjectRef derives the forge-neutral member ref from an identity subject by

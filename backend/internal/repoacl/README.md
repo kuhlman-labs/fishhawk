@@ -64,6 +64,15 @@ pre-#2071 visibility surface). It is deliberately an *error*, not a bare
   that matters, and it is **bounded by `DefaultTTL` (15 minutes)** — never
   unbounded. This is the baseline exposure the whole design accepts.
 
+That bound is enforced **in both directions of clock skew**. `checked_at` is
+stamped by the *database* clock and TTL'd against the *application* clock, so a
+row whose stamp is ahead of the app clock has a **negative** age; a bare
+`age >= ttl` test would call it fresh until that future instant plus the TTL,
+extending stale-allow past `DefaultTTL` by exactly the skew (and dramatically
+after a clock jump). `expired` therefore treats a negative age as expired —
+a forward-skewed row costs one extra live forge resolve, never an unbounded
+stale grant.
+
 `PermissionNone` **is** cached: a legitimate deny is worth memoizing, and
 caching it is what stops a no-access caller re-asking the forge on every page.
 A forge *error* is never cached — memoizing a transient fault would either

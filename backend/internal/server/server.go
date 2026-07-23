@@ -335,9 +335,15 @@ type Config struct {
 	// is denied with zero forge calls. Satisfied by *account.Resolver, the
 	// same type the conventions loader consults.
 	//
-	// Nil — or a not-found / ambiguous answer — means the row's forge is
-	// unknown, in which case no cross-forge conclusion is drawn and the mirror
-	// alone decides. A resolver ERROR fails the request closed with 503.
+	// NIL means the cross-forge check is not wired at all: no cross-forge
+	// conclusion is drawn and the mirror alone decides (a test / degraded
+	// posture — in production this and RepoVisibility are wired together).
+	// A WIRED resolver answering found=false means the row's forge is
+	// AMBIGUOUS (owner unregistered, or registered under both forges), which
+	// FAILS CLOSED: the repo is denied with a WARN and ZERO forge calls, never
+	// handed to the mirror — asking the CALLER'S forge about a row from another
+	// forge is exactly the cross-forge leak the deny exists to prevent. A
+	// resolver ERROR fails the request closed with 503.
 	RepoProviders ProviderResolver
 
 	// ExternalURL is the operator-facing root URL for the SPA, e.g.

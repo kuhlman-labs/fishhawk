@@ -1314,6 +1314,50 @@ func TestRefinementSession_FilingLookupFault_503(t *testing.T) {
 	}
 }
 
+// TestRefinementWrites_NotRepoGated pins the fix-up scoping: the shared
+// session loader applies repo visibility to READS only, so PATCH .../draft and
+// POST .../decision are never decided by the non-authoritative TTL'd mirror —
+// a cached deny must not block a caller whose live forge permission authorizes
+// the edit, and a decision is an APPROVAL, whose eligibility #2071 leaves
+// untouched. Both requests carry a deliberately malformed body, so reaching
+// the handler's own decode (400) proves the gate did not fire; the mirror
+// being consulted zero times proves it was never even asked.
+func TestRefinementWrites_NotRepoGated(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		call   func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{"patch draft", http.MethodPatch, "/draft",
+			func(s *Server, w http.ResponseWriter, r *http.Request) { s.handlePatchRefinementDraft(w, r) }},
+		{"post decision", http.MethodPost, "/decision",
+			func(s *Server, w http.ResponseWriter, r *http.Request) { s.handleDecideRefinementSession(w, r) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFilingRepoStub("acme/hidden")
+			vis := newFakeRepoVisibility(map[string]bool{})
+			s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+			sessionID := uuid.NewString()
+			req := httptest.NewRequest(tc.method,
+				"/v0/refinement/sessions/"+sessionID+tc.path, strings.NewReader("{"))
+			req.SetPathValue("session_id", sessionID)
+			req = withIdentity(req, memberIdentity())
+			w := httptest.NewRecorder()
+			tc.call(s, w, req)
+
+			if strings.Contains(w.Body.String(), "repo_forbidden") {
+				t.Fatalf("write was repo-gated on the read mirror: %d %s", w.Code, w.Body.String())
+			}
+			if vis.callCount() != 0 {
+				t.Errorf("mirror consulted %d times on a write, want 0", vis.callCount())
+			}
+		})
+	}
+}
+
 // TestRefinementSession_BearerUnfiltered is mode (i) on this surface: an MCP /
 // bearer caller is bounded by scope + ownership and never repo-filtered, so the
 // pre-#2071 refinement tests keep passing unchanged.

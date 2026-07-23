@@ -624,24 +624,43 @@ func TestEnforceAccount_RepoVisibility(t *testing.T) {
 	}
 }
 
-// TestEnforceAccount_RepoVisibility_WriteTier pins that the check runs BEFORE
-// the tier branch, so a write tier inherits it rather than reaching the
-// handler for a repo the caller cannot even read.
-func TestEnforceAccount_RepoVisibility_WriteTier(t *testing.T) {
-	srv, rn := visibilityRunServer(t, "acme/app",
-		newFakeRepoVisibility(map[string]bool{}), account.RoleMember)
-	reached := false
-	h := srv.requireRunAccount(memberWrite, func(w http.ResponseWriter, _ *http.Request) {
-		reached = true
-		w.WriteHeader(http.StatusOK)
-	})
-	rec := httptest.NewRecorder()
-	h(rec, runAccessRequest(rn.ID, memberIdentity()))
-	if rec.Code != http.StatusForbidden || reached {
-		t.Fatalf("status = %d reached = %v, want 403 / false; body %s",
-			rec.Code, reached, rec.Body.String())
+// TestEnforceAccount_RepoVisibility_WriteTiersNotGated pins the fix-up
+// scoping: the check lives INSIDE the readAccess branch, so a write tier is
+// NOT decided by the non-authoritative TTL'd read mirror. A cached deny —
+// including one a forge fault produced — must not block a caller whose current
+// live forge permission authorizes the action, and must not reject an approval
+// before E39's live decision-point PermissionLevel check runs. #2071 scopes
+// this mirror to read visibility; write and approval eligibility are unchanged.
+func TestEnforceAccount_RepoVisibility_WriteTiersNotGated(t *testing.T) {
+	for _, tier := range []struct {
+		name string
+		tier accountTier
+	}{{"memberWrite", memberWrite}, {"adminWrite", adminWrite}} {
+		t.Run(tier.name, func(t *testing.T) {
+			role := account.RoleMember
+			if tier.tier == adminWrite {
+				// adminWrite still requires the admin role — that gate is
+				// untouched here; this test isolates the repo-mirror question.
+				role = account.RoleAdmin
+			}
+			vis := newFakeRepoVisibility(map[string]bool{}) // nothing visible
+			srv, rn := visibilityRunServer(t, "acme/app", vis, role)
+			reached := false
+			h := srv.requireRunAccount(tier.tier, func(w http.ResponseWriter, _ *http.Request) {
+				reached = true
+				w.WriteHeader(http.StatusOK)
+			})
+			rec := httptest.NewRecorder()
+			h(rec, runAccessRequest(rn.ID, memberIdentity()))
+			if rec.Code != http.StatusOK || !reached {
+				t.Fatalf("status = %d reached = %v, want 200 / true; body %s",
+					rec.Code, reached, rec.Body.String())
+			}
+			if vis.callCount() != 0 {
+				t.Errorf("write tier consulted the read mirror %d times, want 0", vis.callCount())
+			}
+		})
 	}
-	assertErrorCode(t, rec, "repo_forbidden")
 }
 
 // TestEnforceAccount_RepoVisibility_BearerUnfiltered is failure mode (i): a

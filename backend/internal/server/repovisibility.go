@@ -213,6 +213,16 @@ func (s *Server) requestRepoFilter(w http.ResponseWriter, r *http.Request) (*rep
 	return f, true
 }
 
+// isReadRequest reports whether r is a read. It is how a surface whose loader
+// is SHARED between reads and writes (refinement) keeps repo visibility on the
+// read side only: the mirror is a non-authoritative TTL'd cache of a forge
+// READ permission and #2071 scopes it to read visibility, so it must never
+// decide whether a mutation or an approval may proceed. Where a surface
+// already carries an explicit tier (enforceAccount), that tier is used instead.
+func isReadRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet || r.Method == http.MethodHead
+}
+
 // enforceRepoVisibility is the POINT-READ counterpart to list filtering: a
 // non-visible repo answers 403 repo_forbidden rather than being silently
 // dropped, matching the #1829 convention that lists FILTER while point reads

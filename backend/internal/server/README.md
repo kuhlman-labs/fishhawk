@@ -135,9 +135,18 @@ into a 503 or a DB outage into a silent short page.
 run, stage, artifact, per-run-audit and concern point reads are covered without
 touching each handler); for campaigns, in `handleGetCampaign`,
 `handleListCampaignItems` and `handleGetCampaignStatus`, which the run-scoped
-wrappers do not cover. The `enforceAccount` check runs BEFORE the tier branch,
-so write tiers inherit it too: a caller who cannot read a repo has no business
-writing to its runs.
+wrappers do not cover.
+
+**READ paths only.** The `enforceAccount` check runs inside the `readAccess`
+branch, and the shared refinement loader applies it only to `GET`/`HEAD`
+(`isReadRequest`). The mirror is a **non-authoritative, TTL'd cache of a forge
+read permission**, and #2071 scopes it to read *visibility*. Gating
+`memberWrite`/`adminWrite` on it would let a cached deny — including one a
+forge fault produced — block a caller whose *current live* forge permission
+authorizes the action, and would reject a refinement decision or an approval
+before E39's live decision-point `PermissionLevel` check runs. Write and
+approval eligibility are unchanged by #2071: ownership, cookie role-bounding,
+and the live checks the write paths already make.
 
 **Pagination artifact (accepted).** The offset cursor counts PRE-filter rows, so
 a filtered page can come back shorter than `limit` with `next_cursor` still

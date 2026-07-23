@@ -417,10 +417,11 @@ func providerFromSubject(subject string) string {
 // untenanted run (AccountID == "") is allowed — the NULL-allow window #1830
 // closes once every row is populated.
 //
-// (a2) REPO VISIBILITY (all tiers, #2071): with a mirror wired, a filtered
-// caller (cookie session, non-admin) touching a run whose repo they hold no
-// forge `read` on → 403 repo_forbidden. A filter that cannot function → 503.
-// With no mirror wired the check is inert.
+// (a2) REPO VISIBILITY (readAccess ONLY, #2071): with a mirror wired, a
+// filtered caller (cookie session, non-admin) READING a run whose repo they
+// hold no forge `read` on → 403 repo_forbidden. A filter that cannot function
+// → 503. With no mirror wired the check is inert. Write tiers are deliberately
+// NOT gated on this non-authoritative read mirror.
 //
 // (b) COOKIE ROLE-BOUNDING (write tiers only, resolved OAuth cookie only —
 // SessionID != "" && TokenID == ""): an empty AccountID on a write is 403
@@ -441,35 +442,38 @@ func (s *Server) enforceAccount(w http.ResponseWriter, r *http.Request, tier acc
 	}
 
 	// (a2) REPO VISIBILITY (ADR-057 Amendment A2 / #2071). Applied here, once,
-	// so every wrapper — requireRunAccount, requireStageAccount,
-	// requireConcernAccount — inherits it and the run / stage / artifact /
-	// per-run-audit / concern point reads are covered CENTRALLY rather than
-	// handler by handler.
+	// so every READ wrapper — requireRunAccount, requireStageAccount,
+	// requireConcernAccount at readAccess — inherits it and the run / stage /
+	// artifact / per-run-audit / concern point reads are covered CENTRALLY
+	// rather than handler by handler.
 	//
-	// It runs for EVERY tier, not just readAccess. readAccess is the tier the
-	// point reads use and therefore the one this exists for, but a member who
-	// cannot READ a repo has no business WRITING to its runs either, and
-	// applying the check before the tier branch makes that true by
-	// construction instead of by review. It is a strict narrowing: with no
-	// mirror wired (Config.RepoVisibility nil) repoFilterFor resolves to nil
-	// and every tier behaves exactly as it did pre-#2071.
+	// It is scoped to readAccess ON PURPOSE (fix-up, #2071). The mirror is a
+	// NON-AUTHORITATIVE, TTL'd cache of a forge read permission, and #2071
+	// scopes it to read VISIBILITY only. Applying it to memberWrite /
+	// adminWrite would let a cached deny — including one a forge fault
+	// produced — block a caller whose CURRENT live forge permission authorizes
+	// the action, and would reject an approval before E39's live
+	// decision-point PermissionLevel check ever runs. Write and approval
+	// eligibility stay exactly where they were: ownership, the cookie
+	// role-bounding below, and the live checks the write paths already make.
 	//
 	// Failure classes stay separated: a forge fault makes the repo not visible
 	// (403 repo_forbidden, same as a genuine deny, logged at WARN by the
 	// mirror); a store / role-resolution fault is a 503.
-	filter, ferr := s.repoFilterFor(r.Context())
-	if ferr != nil {
-		s.writeRepoFilterUnavailable(w, r)
-		return false
-	}
-	if filter != nil && !s.repoVisibleOr403(w, r, filter, runRow.Repo) {
-		return false
+	if tier == readAccess {
+		filter, ferr := s.repoFilterFor(r.Context())
+		if ferr != nil {
+			s.writeRepoFilterUnavailable(w, r)
+			return false
+		}
+		if filter != nil && !s.repoVisibleOr403(w, r, filter, runRow.Repo) {
+			return false
+		}
+		// (b) Cookie role-bounding does not apply to reads.
+		return true
 	}
 
 	// (b) Cookie role-bounding, write tiers only.
-	if tier == readAccess {
-		return true
-	}
 	if id.SessionID == "" || id.TokenID != "" {
 		// Not a resolved OAuth cookie (bearer / mcp / anonymous): ownership
 		// alone governs.

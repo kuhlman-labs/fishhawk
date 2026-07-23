@@ -1,10 +1,12 @@
 package repoacl_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +129,43 @@ func TestRepoACLMirror_ExpiredEntryReResolvesAndDoesNotServeStale(t *testing.T) 
 	}
 }
 
+// A checked_at AHEAD of the application clock (database/app forward clock
+// skew) must NOT be treated as fresh. Age is negative there, and a bare
+// `age >= ttl` test would serve the stale row until that future instant plus
+// the TTL — extending stale-allow past the bound DefaultTTL documents, by
+// exactly the skew. The stale GRANT is the dangerous direction, so that is
+// what this drives.
+func TestRepoACLMirror_FutureCheckedAtIsExpired(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		skew time.Duration
+	}{
+		{"modest forward skew", time.Minute},
+		{"clock jump past the TTL", 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeStore{
+				entry: repoacl.Entry{Permission: identity.PermissionAdmin,
+					CheckedAt: time.Now().Add(tc.skew)},
+				found: true,
+			}
+			res := &fakeResolver{perm: identity.PermissionNone}
+			m := newTestMirror(t, store, res)
+
+			visible, err := m.Visible(context.Background(), "github", "octocat", "acme/app")
+			if err != nil {
+				t.Fatalf("Visible error: %v", err)
+			}
+			if visible {
+				t.Errorf("Visible = true, want false (a future-stamped grant must not be served)")
+			}
+			if res.calls != 1 {
+				t.Errorf("forge calls = %d, want 1 (a future checked_at must re-resolve)", res.calls)
+			}
+		})
+	}
+}
+
 // Failure mode (a): a generic forge error denies the repo for this request,
 // writes NOTHING, and does NOT error the request (Visible returns nil error so
 // the caller proceeds with a shortened page).
@@ -180,6 +219,45 @@ func TestRepoACLMirror_RateLimitedDeniesWithoutCaching(t *testing.T) {
 	}
 	if errors.Is(permErr, repoacl.ErrStoreUnavailable) {
 		t.Errorf("Permission error = %v, must NOT classify as a store fault", permErr)
+	}
+}
+
+// The forge-fault WARN is BINDING observability, not decoration: it is the
+// only signal that distinguishes a silently shortened page caused by a forge
+// outage from one caused by a genuine denial. Weakening or dropping it would
+// otherwise leave every behavioral test above green, so capture the logger and
+// assert the level, the repo, the reason, and the rate-limit discriminator.
+func TestRepoACLMirror_ForgeFaultLogsWarnWithRepoAndReason(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		forgeErr        error
+		wantReason      string
+		wantRateLimited string
+	}{
+		{"generic forge error", errors.New("forge: 502 bad gateway"),
+			"502 bad gateway", "rate_limited=false"},
+		{"rate limited", identity.ErrRateLimited,
+			identity.ErrRateLimited.Error(), "rate_limited=true"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			m := repoacl.NewMirror(&fakeStore{}, &fakeResolver{err: tc.forgeErr},
+				repoacl.DefaultTTL, logger)
+
+			if _, err := m.Visible(context.Background(), "github", "octocat", "acme/app"); err != nil {
+				t.Fatalf("Visible error: %v", err)
+			}
+			out := buf.String()
+			for _, want := range []string{
+				"level=WARN", "acme/app", "provider=github",
+				tc.wantReason, tc.wantRateLimited,
+			} {
+				if !strings.Contains(out, want) {
+					t.Errorf("forge-fault log missing %q; got:\n%s", want, out)
+				}
+			}
+		})
 	}
 }
 

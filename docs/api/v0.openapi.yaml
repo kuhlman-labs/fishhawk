@@ -3208,6 +3208,12 @@ components:
         too; the server logs the distinction at WARN. If the mirror's own store
         is unreachable the request fails `503 service_unavailable` rather than
         denying, so a filter fault is never mistaken for a permission answer.
+
+        This is a READ-visibility code only. Writes and approvals are never
+        gated on the mirror: it is a non-authoritative TTL'd cache of a forge
+        read permission, so a cached deny must not block a caller whose current
+        live forge permission authorizes the action, nor pre-empt the live
+        decision-point permission check an approval already makes.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
@@ -7200,8 +7206,10 @@ paths:
         session has been FILED, it is authorized against the repository its
         filing session pinned: a non-admin cookie-session caller without at
         least `read` on that repository at the forge is denied 403
-        `repo_forbidden`. The same gate applies to the draft-edit and decision
-        endpoints below, which share this session load. A session that has not
+        `repo_forbidden`. The gate is scoped to READS: the draft-edit and
+        decision endpoints below share this session load but are NOT gated on
+        the mirror, because it is a non-authoritative TTL'd cache of a forge
+        read permission and a decision is an approval. A session that has not
         yet been filed has no repository to authorize against and stays
         reachable to any caller holding the refinement scope.
 
