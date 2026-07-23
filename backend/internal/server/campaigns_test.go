@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -4788,5 +4789,140 @@ func TestEmitCampaignAudit_StampsIdentityAccount(t *testing.T) {
 	}
 	if rec.entries[1].AccountID != nil {
 		t.Fatalf("identityless entry AccountID = %s, want nil (untenanted)", *rec.entries[1].AccountID)
+	}
+}
+
+// --- Repo-scoped campaign visibility (#2071) ---
+
+// seedCampaignOnRepo inserts a campaign on repoName directly into the fake.
+func seedCampaignOnRepo(f *fakeCampaignRepo, repoName string, createdAt time.Time) *campaign.Campaign {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := &campaign.Campaign{
+		ID: uuid.New(), Repo: repoName, EpicRef: "issue:1",
+		State: campaign.StatePending, PausePolicy: campaign.PausePolicyPauseCampaign,
+		CreatedAt: createdAt, UpdatedAt: createdAt,
+	}
+	f.campaigns[c.ID] = c
+	return c
+}
+
+func campaignVisibilityServer(f *fakeCampaignRepo, vis RepoVisibility, role string) *Server {
+	return New(Config{Addr: "127.0.0.1:0", CampaignRepo: f,
+		AccountRoles: fakeAccountRoles{role: role}, RepoVisibility: vis})
+}
+
+// TestListCampaigns_RepoVisibilityFiltersPage mirrors handleListRuns: the
+// member view is narrowed, the admin bypasses (mode f), an unwired mirror
+// changes nothing (mode g), and a store fault 503s (mode h).
+func TestListCampaigns_RepoVisibilityFiltersPage(t *testing.T) {
+	t0 := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	newRepo := func() *fakeCampaignRepo {
+		f := newFakeCampaignRepo()
+		seedCampaignOnRepo(f, "acme/app", t0)
+		seedCampaignOnRepo(f, "other/secret", t0.Add(time.Second))
+		return f
+	}
+	list := func(t *testing.T, s *Server) ([]string, *httptest.ResponseRecorder) {
+		t.Helper()
+		req := withIdentity(httptest.NewRequest(http.MethodGet, "/v0/campaigns", nil), memberIdentity())
+		rec := httptest.NewRecorder()
+		s.handleListCampaigns(rec, req)
+		if rec.Code != http.StatusOK {
+			return nil, rec
+		}
+		var got struct {
+			Items []campaignResponse `json:"items"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		var repos []string
+		for _, it := range got.Items {
+			repos = append(repos, it.Repo)
+		}
+		return repos, rec
+	}
+
+	t.Run("member sees only readable repos", func(t *testing.T) {
+		s := campaignVisibilityServer(newRepo(),
+			newFakeRepoVisibility(map[string]bool{"acme/app": true}), account.RoleMember)
+		repos, rec := list(t, s)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		if len(repos) != 1 || repos[0] != "acme/app" {
+			t.Fatalf("repos = %v, want [acme/app]", repos)
+		}
+	})
+
+	t.Run("mode f: admin sees every repo", func(t *testing.T) {
+		s := campaignVisibilityServer(newRepo(),
+			newFakeRepoVisibility(map[string]bool{"acme/app": true}), account.RoleAdmin)
+		if repos, _ := list(t, s); len(repos) != 2 {
+			t.Fatalf("repos = %v, want both", repos)
+		}
+	})
+
+	t.Run("mode g: no mirror wired lists everything", func(t *testing.T) {
+		s := campaignVisibilityServer(newRepo(), nil, account.RoleMember)
+		if repos, _ := list(t, s); len(repos) != 2 {
+			t.Fatalf("repos = %v, want both", repos)
+		}
+	})
+
+	t.Run("mode h: store fault 503s the page", func(t *testing.T) {
+		vis := &fakeRepoVisibility{visible: map[string]bool{}, err: fmt.Errorf("db down")}
+		s := campaignVisibilityServer(newRepo(), vis, account.RoleMember)
+		_, rec := list(t, s)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body %s", rec.Code, rec.Body.String())
+		}
+		assertErrorCode(t, rec, "service_unavailable")
+	})
+}
+
+// TestCampaignPointReads_RepoVisibility covers the three campaign point reads
+// the run-scoped middleware does NOT wrap: each 403s repo_forbidden for a
+// non-visible repo and clears for an admin (mode f).
+func TestCampaignPointReads_RepoVisibility(t *testing.T) {
+	routes := []struct {
+		name   string
+		invoke func(s *Server, w http.ResponseWriter, r *http.Request)
+		path   string
+	}{
+		{name: "GET /v0/campaigns/{id}", path: "/v0/campaigns/",
+			invoke: func(s *Server, w http.ResponseWriter, r *http.Request) { s.handleGetCampaign(w, r) }},
+		{name: "GET /v0/campaigns/{id}/items", path: "/v0/campaigns/",
+			invoke: func(s *Server, w http.ResponseWriter, r *http.Request) { s.handleListCampaignItems(w, r) }},
+		{name: "GET /v0/campaigns/{id}/status", path: "/v0/campaigns/",
+			invoke: func(s *Server, w http.ResponseWriter, r *http.Request) { s.handleGetCampaignStatus(w, r) }},
+	}
+	for _, rt := range routes {
+		t.Run(rt.name+" denies a non-visible repo", func(t *testing.T) {
+			f := newFakeCampaignRepo()
+			c := seedCampaignOnRepo(f, "other/secret", time.Now().UTC())
+			s := campaignVisibilityServer(f, newFakeRepoVisibility(map[string]bool{}), account.RoleMember)
+			req := httptest.NewRequest(http.MethodGet, rt.path+c.ID.String(), nil)
+			req.SetPathValue("campaign_id", c.ID.String())
+			rec := httptest.NewRecorder()
+			rt.invoke(s, rec, withIdentity(req, memberIdentity()))
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body %s", rec.Code, rec.Body.String())
+			}
+			assertErrorCode(t, rec, "repo_forbidden")
+		})
+		t.Run(rt.name+" mode f: admin bypass", func(t *testing.T) {
+			f := newFakeCampaignRepo()
+			c := seedCampaignOnRepo(f, "other/secret", time.Now().UTC())
+			s := campaignVisibilityServer(f, newFakeRepoVisibility(map[string]bool{}), account.RoleAdmin)
+			req := httptest.NewRequest(http.MethodGet, rt.path+c.ID.String(), nil)
+			req.SetPathValue("campaign_id", c.ID.String())
+			rec := httptest.NewRecorder()
+			rt.invoke(s, rec, withIdentity(req, memberIdentity()))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+			}
+		})
 	}
 }

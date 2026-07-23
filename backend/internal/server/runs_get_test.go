@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
@@ -1854,5 +1855,49 @@ func TestListRuns_OmitsDelegation(t *testing.T) {
 	}
 	if _, present := resp.Items[0]["delegation"]; present {
 		t.Error("list item carries a delegation key — the list path must stay free of the per-row evaluation")
+	}
+}
+
+// --- Repo-scoped point read (#2071) ---
+
+// TestGetRun_RepoVisibility drives GET /v0/runs/{run_id} through the SAME
+// composition handlers.go registers — requireRunAccount(readAccess,
+// handleGetRun) — so the assertion covers the central middleware seam every
+// run/stage/concern point read inherits, not a bespoke handler check.
+//
+// Point reads DENY (403 repo_forbidden) where lists filter.
+func TestGetRun_RepoVisibility(t *testing.T) {
+	cases := []struct {
+		name     string
+		role     string
+		visible  map[string]bool
+		wantCode int
+		wantErr  string
+	}{
+		{name: "member: visible repo", role: account.RoleMember,
+			visible: map[string]bool{"acme/app": true}, wantCode: http.StatusOK},
+		{name: "member: non-visible repo 403", role: account.RoleMember,
+			visible: map[string]bool{}, wantCode: http.StatusForbidden, wantErr: "repo_forbidden"},
+		{name: "mode f: admin point read bypasses the filter", role: account.RoleAdmin,
+			visible: map[string]bool{}, wantCode: http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fr := newFakeRepo()
+			rn := seedRun(fr, "acme/app", "feature_change", run.StatePending, time.Now().UTC())
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: fr,
+				AccountRoles:   fakeAccountRoles{role: tc.role},
+				RepoVisibility: newFakeRepoVisibility(tc.visible)})
+			req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+rn.ID.String(), nil)
+			req.SetPathValue("run_id", rn.ID.String())
+			rec := httptest.NewRecorder()
+			s.requireRunAccount(readAccess, s.handleGetRun)(rec, withIdentity(req, memberIdentity()))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d; body %s", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			if tc.wantErr != "" {
+				assertErrorCode(t, rec, tc.wantErr)
+			}
+		})
 	}
 }
