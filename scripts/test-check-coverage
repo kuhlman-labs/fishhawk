@@ -940,6 +940,30 @@ else
   fail "(s10) malformed-snapshot structure validation"
 fi
 
+# ---------------------------------------------------------------------------
+# (s11) ZERO profiles while consuming a snapshot (main() now permits it): a
+#       digest-verified snapshot with a NON-EMPTY changed map + no profiles is
+#       an integrity anomaly (profiles deleted after capture) and FAILS CLOSED
+#       (exit 1), never the "no coverable new statements" skip a deletion would
+#       otherwise masquerade as. A skip-snapshot with zero profiles still SKIPs
+#       (exit 0), so the allowance does not fail-close a legitimate degrade. This
+#       is the snapshot-pristine profile-deletion path (#2124) at the Python layer.
+#       (s9) still pins that zero profiles is a usage error WITHOUT a snapshot.
+# ---------------------------------------------------------------------------
+dig1="$(snap_digest "$tmproot/snap1.json")"
+out="$(python3 "$CC" --diff-base main --repo-root "$repo" \
+  --changed-snapshot "$tmproot/snap1.json" --expected-snapshot-digest "$dig1" 2>&1)"; rc=$?
+out_skip="$(python3 "$CC" --diff-base main --repo-root "$repo" \
+  --changed-snapshot "$tmproot/skip.json" --expected-snapshot-digest "$sdig" 2>&1)"; rc_skip=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'FAIL' \
+   && printf '%s' "$out" | grep -q 'no coverage profiles were produced' \
+   && ! printf '%s' "$out" | grep -q 'SKIP' \
+   && [ "$rc_skip" -eq 0 ] && printf '%s' "$out_skip" | grep -q 'SKIP'; then
+  pass "(s11) zero profiles: a non-empty change set fails closed, a skip-snapshot still skips"
+else
+  fail "(s11) zero-profile snapshot handling (rc=$rc out='$out' rc_skip=$rc_skip out_skip='$out_skip')"
+fi
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

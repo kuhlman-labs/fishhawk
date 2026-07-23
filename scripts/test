@@ -742,8 +742,22 @@ _verify_patch_coverage() {
     fi
   done
   if [ "$n" -eq 0 ]; then
-    echo "scripts/test: no coverage profiles were produced — skipping the patch-coverage gate" >&2
-    return 0
+    # Zero profiles is NOT an unconditional skip (#2124). A skip-snapshot (emit
+    # degraded) or an empty change set legitimately has nothing to gate, but a
+    # digest-verified snapshot carrying a NON-EMPTY changed map means the loop
+    # instrumented the changed modules — their profiles vanishing is an integrity
+    # anomaly (a test deleted them after capture), not "nothing to cover". Hand
+    # the verdict to check-coverage.py with ZERO profiles: it SKIPs a skip-snapshot
+    # / empty change set and FAILS CLOSED on a non-empty change set. The snapshot
+    # digest was already verified above, so this consumes a trusted snapshot.
+    python3 "$SCRIPTS_DIR/check-coverage.py" \
+      --diff-base "$base" \
+      --changed-snapshot "$PATCHCOV_DIR/changed-snapshot.json" \
+      --expected-snapshot-digest "$PATCHCOV_SNAPSHOT_DIGEST" \
+      --diff-threshold "${FISHHAWK_PATCH_COVERAGE_THRESHOLD:-85}" \
+      --exclude '/db/' \
+      --repo-root "$ROOT"
+    return
   fi
   python3 "$SCRIPTS_DIR/check-coverage.py" \
     --diff-base "$base" \

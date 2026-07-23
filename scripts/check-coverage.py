@@ -658,6 +658,24 @@ def run_diff_gate(args):
         skip(f"no changed Go files vs {base_label}")
         return 0
 
+    if not args.profile:
+        # Reached ONLY when consuming a snapshot (main() allows zero profiles
+        # only then) whose changed map is non-empty. The test loop instruments
+        # every changed module, so a non-empty change set with ZERO coverage
+        # profiles is an integrity anomaly — the profiles were deleted after
+        # capture — not a legitimate "nothing to cover". FAIL CLOSED rather than
+        # fall through to diff_coverage, which with no profiles counts zero
+        # coverable statements and would masquerade as the "no coverable new Go
+        # statements" skip (#2124, snapshot-pristine profile-deletion path).
+        print(
+            "FAIL: the pre-test change set is non-empty but no coverage profiles "
+            "were produced — the changed modules were instrumented, so their "
+            "absence indicates profiles deleted after capture; failing the "
+            "patch-coverage gate closed",
+            file=sys.stderr,
+        )
+        return 1
+
     covered, total = diff_coverage(
         args.profile, args.exclude, changed, args.module_prefix
     )
@@ -834,7 +852,12 @@ def main():
     if args.emit_changed_snapshot is not None:
         return run_emit_snapshot(args)
 
-    if not args.profile:
+    if not args.profile and args.changed_snapshot is None:
+        # Zero profiles is a usage error EXCEPT when consuming a snapshot: a
+        # digest-verified snapshot with a non-empty changed map + zero profiles
+        # is an integrity anomaly run_diff_gate must fail closed on (#2124), not
+        # an argparse error. The guard is otherwise preserved for aggregate and
+        # recompute-diff modes.
         ap.error("at least one coverage profile is required")
 
     if (

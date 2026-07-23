@@ -386,20 +386,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# (e) _verify_patch_coverage with no profiles -> printed skip, exit 0. The
-#     snapshot's integrity is verified BEFORE the skip (#2124), so a VALID
-#     snapshot matching the parent-memory anchor must exist for the legitimate
-#     no-profiles degrade to still return 0. (e2)/(e3) below assert the
-#     fail-closed side: a missing or tampered snapshot fails the same path.
+# (e) _verify_patch_coverage with no profiles is a skip ONLY for a skip-snapshot
+#     or an empty change set (#2124). The snapshot's integrity is verified BEFORE
+#     any skip, so a VALID snapshot matching the parent-memory anchor must exist;
+#     zero profiles is then handed to check-coverage.py, which SKIPs a skip-snapshot
+#     (exit 0). (e2)/(e3) assert the fail-closed side (missing/tampered snapshot),
+#     and (t12) the integrity-anomaly side (a NON-EMPTY change set with no profiles).
 # ---------------------------------------------------------------------------
 PATCHCOV_DIR="$tmproot/emptyprof"; mkdir -p "$PATCHCOV_DIR"
 printf '{"schema":1,"skip":"none"}' > "$PATCHCOV_DIR/changed-snapshot.json"
 PATCHCOV_SNAPSHOT_DIGEST="$(_sha256_file "$PATCHCOV_DIR/changed-snapshot.json")"
 out="$(_verify_patch_coverage main 2>&1)"; rc=$?
-if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'no coverage profiles'; then
-  pass "(e) no emitted profiles skips with a printed reason (exit 0)"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SKIP' \
+   && ! printf '%s' "$out" | grep -q 'FAIL'; then
+  pass "(e) a skip-snapshot with no emitted profiles skips (exit 0)"
 else
-  fail "(e) expected 0 + no-profiles skip (rc=$rc out='$out')"
+  fail "(e) expected 0 + skip on a skip-snapshot with no profiles (rc=$rc out='$out')"
 fi
 
 # (e2) SECURITY: the no-profiles skip must NOT bypass snapshot integrity. With
@@ -770,6 +772,9 @@ if [ -n "$prof" ]; then
     # skip — the snapshot integrity check must still fire ahead of it.
     delsnap)  rm -f "$snap" "$prof" ;;
     tampernoprof) printf '{"schema":1,"skip":"pwned"}' > "$snap"; rm -f "$prof" ;;
+    # Profile deletion ONLY, snapshot left PRISTINE (digest matches): a non-empty
+    # change set with zero profiles is an integrity anomaly that must fail closed.
+    delprof)  rm -f "$prof" ;;
     none)     : ;;
   esac
 fi
@@ -968,6 +973,24 @@ if [ "$rc" -ne 0 ] \
   pass "(t11) a failed digest anchor fails the coverage loop closed (non-zero)"
 else
   fail "(t11) digest-anchor-fail-closed (rc=$rc out='$out')"
+fi
+
+# (t12) SECURITY, snapshot-pristine profile deletion: a test deletes the *.out
+# profile mid-loop but leaves the snapshot UNTOUCHED (digest still matches). The
+# digest check passes, so verify reaches the no-profiles branch — but the snapshot
+# carries a NON-EMPTY changed map, so zero profiles is an integrity anomaly. The
+# gate must FAIL CLOSED, never a passing SKIP. This is the profile-deletion path
+# the snapshot-tamper cases (t8/t9) do not exercise (they also tamper the snapshot).
+ROOT="$tmproot/adv12"
+adv_repo "$ROOT"
+run_adv delprof "$tmproot/adv_foo.out"
+if [ "$ADV_GATE_RC" -ne 0 ] && [ "$ADV_SNAP_EXISTS" = yes ] \
+   && printf '%s' "$ADV_GATE_OUT" | grep -q 'no coverage profiles were produced' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'PATCH PASS' \
+   && ! printf '%s' "$ADV_GATE_OUT" | grep -q 'SKIP'; then
+  pass "(t12) a pristine snapshot with a non-empty change set and zero profiles fails closed, never a SKIP"
+else
+  fail "(t12) pristine-snapshot profile-delete (gate_rc=$ADV_GATE_RC snap=$ADV_SNAP_EXISTS out='$ADV_GATE_OUT')"
 fi
 modules() { printf './backend\n./cli\n'; }
 
