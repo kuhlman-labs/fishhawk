@@ -224,8 +224,16 @@ func (f *visibilityFixture) getAs(t *testing.T, target string, id Identity, h ht
 	return w
 }
 
+// decodeItems asserts the response IS a successful list page before reading it.
+// Without the status check an empty-items assertion is vacuous: a 403/500/503
+// error envelope carries no "items" key, so it decodes to a nil slice and every
+// "want none" case passes on a failed request (as does a zero-forge-call
+// assertion, since a request that errors early never reaches the forge).
 func decodeItems(t *testing.T, w *httptest.ResponseRecorder) []map[string]any {
 	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a filtered list page must succeed):\n%s", w.Code, w.Body.String())
+	}
 	var body struct {
 		Items []map[string]any `json:"items"`
 	}
