@@ -1603,10 +1603,14 @@ func (e erroringAccountCampaignRepo) GetCampaignAccountID(context.Context, uuid.
 	return "", errInjected
 }
 
-// noCapabilityCampaignRepo narrows a fake to the plain Repository method
-// set (interface embedding drops GetCampaignAccountID), so the
-// capability-absent branch is testable.
-type noCapabilityCampaignRepo struct{ campaign.Repository }
+// interfaceEmbeddedCampaignRepo wraps a fake behind the campaign.Repository
+// INTERFACE rather than its concrete type. Before E44.11 / #2074 this
+// narrowed the method set (interface embedding dropped the then-optional
+// GetCampaignAccountID) and was the vehicle for the capability-absent
+// degrade-to-allow branch. Now that Repository EMBEDS AccountGetter the
+// wrapper narrows nothing: the method is part of the interface, so the call
+// forwards to the wrapped fake and the ownership gate runs for real.
+type interfaceEmbeddedCampaignRepo struct{ campaign.Repository }
 
 // TestGetCampaign_AccountOwnership_LookupError_FailsClosed pins the
 // security-critical fail-CLOSED posture (ADR-057 / #1830): an AccountGetter
@@ -1634,29 +1638,71 @@ func TestGetCampaign_AccountOwnership_LookupError_FailsClosed(t *testing.T) {
 	}
 }
 
-// TestGetCampaign_AccountOwnership_CapabilityAbsent pins the remaining
-// degrade-to-allow branch (ADR-057 / #1830): a repo WITHOUT the optional
-// AccountGetter capability degrades to untenanted-allow, matching the
-// run.AccountGetter posture bearerAuth uses when the capability is absent.
-// This branch is unreachable in production — the concrete postgres repo
-// carries AccountGetter (a compile-time assertion) — so only a
-// capability-narrowed test fake lands here.
-func TestGetCampaign_AccountOwnership_CapabilityAbsent(t *testing.T) {
+// TestGetCampaign_AccountOwnership_InterfaceEmbeddedRepo_FailsClosed is the
+// INVERTED former TestGetCampaign_AccountOwnership_CapabilityAbsent, and is
+// the regression pin for #2074 / #2082. It used to assert 200: an
+// interface-embedded repo dropped the then-optional AccountGetter, so
+// enforceCampaignAccount's `!ok` prelude skipped the gate entirely and handed
+// a tenanted campaign to a caller from another account. That 200 WAS the
+// exposure.
+//
+// With AccountGetter promoted to a REQUIRED campaign.Repository method the
+// wrapper can no longer strip it — the call forwards to the wrapped
+// *fakeCampaignRepo's override, which returns the seeded tenant account — so
+// the request lands on the real cross-account ownership check and is refused
+// 403 account_forbidden. (The ErrNotFound/lookup-error → 503 fail-closed path
+// is pinned separately by
+// TestGetCampaign_AccountOwnership_LookupError_FailsClosed.)
+func TestGetCampaign_AccountOwnership_InterfaceEmbeddedRepo_FailsClosed(t *testing.T) {
 	inner := newFakeCampaignRepo()
 	c := inner.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", nil)
-	inner.accounts[c.ID] = uuid.NewString() // tenanted, but the capability-narrowed repo can't see it
+	inner.accounts[c.ID] = uuid.NewString() // tenanted — and now VISIBLE through the wrapper
 
-	s := New(Config{CampaignRepo: noCapabilityCampaignRepo{inner}})
+	s := New(Config{CampaignRepo: interfaceEmbeddedCampaignRepo{inner}})
 	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String(), nil)
 	req.SetPathValue("campaign_id", c.ID.String())
 	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
 		Identity{Subject: "github:op", TokenID: "tok-1", AccountID: uuid.NewString()}))
 	w := httptest.NewRecorder()
 	s.handleGetCampaign(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("capability_absent: status = %d, want 200 (degrade to allow; body=%s)", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("interface_embedded: status = %d, want 403 (the old 200 was the #2074/#2082 exposure; body=%s)",
+			w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "account_forbidden" {
+		t.Errorf("interface_embedded: code = %q, want account_forbidden", code)
 	}
 }
+
+// TestEnforceCampaignAccount_NilRepo_FailsClosed pins the guard that replaced
+// the deleted `!ok` type-assertion prelude for an UNCONFIGURED repo: an
+// unresolvable account must deny (503), never allow. handleGetCampaign rejects
+// a nil repo earlier with campaign_repo_unconfigured, so this drives the helper
+// directly — the point is that the branch is not an allow, since an allow is
+// exactly the bypass shape #2074/#2082 closed.
+func TestEnforceCampaignAccount_NilRepo_FailsClosed(t *testing.T) {
+	s := New(Config{})
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+uuid.NewString(), nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity,
+		Identity{Subject: "github:op", TokenID: "tok-1", AccountID: uuid.NewString()}))
+	w := httptest.NewRecorder()
+	if ok := s.enforceCampaignAccount(w, req, uuid.New()); ok {
+		t.Fatal("nil repo must NOT be allowed through the ownership gate")
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "service_unavailable" {
+		t.Errorf("code = %q, want service_unavailable", code)
+	}
+}
+
+// Compile-time assertion that campaign.Repository's method set includes
+// GetCampaignAccountID (E44.11 / #2074). This is the done-means of the
+// promotion: a future refactor pulling the method back off Repository into an
+// optional capability must break the BUILD here rather than silently restore
+// the skip-the-ownership-gate path.
+var _ campaign.AccountGetter = campaign.Repository(nil)
 
 func TestGetCampaignStatus_RollupAndNextAction(t *testing.T) {
 	repo := newFakeCampaignRepo()

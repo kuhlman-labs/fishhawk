@@ -115,10 +115,12 @@ func TestPostgres_ListCampaigns(t *testing.T) {
 	}
 }
 
-// TestPostgres_GetCampaignAccountID exercises the AccountGetter capability
-// (ADR-057 / #1830): a tenanted campaign yields its account UUID string, an
-// untenanted (NULL account_id) one yields "", and a missing id yields
-// ErrNotFound. Also pins that GetCampaign still round-trips a tenanted row
+// TestPostgres_GetCampaignAccountID exercises the AccountGetter method — a
+// REQUIRED part of campaign.Repository since E44.11 / #2074, so interface
+// satisfaction is COMPILER-enforced and the call goes straight through the
+// Repository value (ADR-057 / #1830). A tenanted campaign yields its account
+// UUID string, an untenanted (NULL account_id) one yields "", and a missing id
+// yields ErrNotFound. Also pins that GetCampaign still round-trips a tenanted row
 // (the added account_id scan handles non-NULL values).
 func TestPostgres_GetCampaignAccountID(t *testing.T) {
 	pool := pgtest.NewPool(t)
@@ -135,25 +137,21 @@ func TestPostgres_GetCampaignAccountID(t *testing.T) {
 		t.Fatalf("bind account: %v", err)
 	}
 
-	getter, ok := repo.(campaign.AccountGetter)
-	if !ok {
-		t.Fatal("postgres repo does not implement campaign.AccountGetter")
-	}
-	got, err := getter.GetCampaignAccountID(ctx, tenanted.ID)
+	got, err := repo.GetCampaignAccountID(ctx, tenanted.ID)
 	if err != nil {
 		t.Fatalf("GetCampaignAccountID: %v", err)
 	}
 	if got != acct.String() {
 		t.Errorf("GetCampaignAccountID = %q, want %q", got, acct.String())
 	}
-	gotPlain, err := getter.GetCampaignAccountID(ctx, plain.ID)
+	gotPlain, err := repo.GetCampaignAccountID(ctx, plain.ID)
 	if err != nil {
 		t.Fatalf("GetCampaignAccountID(untenanted): %v", err)
 	}
 	if gotPlain != "" {
 		t.Errorf("untenanted GetCampaignAccountID = %q, want empty", gotPlain)
 	}
-	if _, err := getter.GetCampaignAccountID(ctx, uuid.New()); !errors.Is(err, campaign.ErrNotFound) {
+	if _, err := repo.GetCampaignAccountID(ctx, uuid.New()); !errors.Is(err, campaign.ErrNotFound) {
 		t.Errorf("GetCampaignAccountID(missing) err = %v, want ErrNotFound", err)
 	}
 

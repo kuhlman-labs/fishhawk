@@ -8177,3 +8177,10 @@ func TestGetStagePrompt_LivenessFlip_PersistsRunningInPostgres(t *testing.T) {
 		t.Fatal("persisted started_at is nil, want set (postgresRepo sets it on the first →running transition)")
 	}
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*promptRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}

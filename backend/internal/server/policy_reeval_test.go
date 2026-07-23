@@ -506,3 +506,10 @@ func TestReevaluateCIPolicy_NoRepos_NoOp(t *testing.T) {
 	body := makeCheckRunPayloadWithRepo("x/y", "completed", "ci_pass", "deadbeef", ptrStr("success"), []int{42})
 	s.reevaluateCIPolicy(context.Background(), body) // must not panic
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*reevalRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}

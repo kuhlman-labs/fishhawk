@@ -654,28 +654,31 @@ func (s *Server) handleGetCampaign(w http.ResponseWriter, r *http.Request) {
 // posture for runs: a tenanted campaign whose account disagrees with the
 // caller's Identity.AccountID → 403 account_forbidden; an untenanted
 // campaign (NULL account_id → "") is allowed — the NULL-allow window a
-// later E44 child closes. The account is read via the OPTIONAL
-// campaign.AccountGetter capability (the domain Campaign type doesn't
-// carry the column).
+// later E44 child closes. The account is read via the
+// campaign.AccountGetter method (the domain Campaign type doesn't carry the
+// column). The lookup is UNCONDITIONAL: AccountGetter is a REQUIRED part of
+// campaign.Repository (E44.11 / #2074), so there is no longer a
+// capability-absent branch that could degrade the gate to untenanted-allow —
+// a repo cannot escape this check by not carrying the method.
 //
 // A lookup ERROR fails CLOSED (503), never open: a transient DB failure on
 // the account probe must NOT fall through to untenanted-allow and disclose
 // the already-resolved tenanted campaign to a caller from another account.
 // This mirrors the mcp:run identity's account resolution in bearerAuth,
-// whose written contract is "any lookup ERROR fails CLOSED with 503". A repo
-// WITHOUT the capability still degrades to untenanted-allow — but that branch
-// is unreachable in production, where the concrete postgres repo carries
-// AccountGetter (a compile-time assertion pins it) and only a
-// capability-narrowed test fake lands there; it matches the run.AccountGetter
-// posture bearerAuth uses when the capability is absent. Returns true when the
-// request may proceed; on denial it writes the error envelope and returns
-// false.
+// whose written contract is "any lookup ERROR fails CLOSED with 503".
+// Returns true when the request may proceed; on denial it writes the error
+// envelope and returns false.
 func (s *Server) enforceCampaignAccount(w http.ResponseWriter, r *http.Request, id uuid.UUID) bool {
-	getter, ok := s.cfg.CampaignRepo.(campaign.AccountGetter)
-	if !ok {
-		return true
+	if s.cfg.CampaignRepo == nil {
+		// Unconfigured repo: fail CLOSED like any other unresolvable
+		// account. The sole caller (handleGetCampaign) rejects a nil repo
+		// with campaign_repo_unconfigured before reaching here, so this is
+		// belt-and-braces for the helper called directly — but it must NOT
+		// be an allow, which is the shape of the bypass #2074/#2082 closed.
+		s.writeDBUnavailable(w, r)
+		return false
 	}
-	acct, err := getter.GetCampaignAccountID(r.Context(), id)
+	acct, err := s.cfg.CampaignRepo.GetCampaignAccountID(r.Context(), id)
 	if err != nil {
 		// Fail CLOSED: a probe error must never fall through to allow.
 		s.writeDBUnavailable(w, r)

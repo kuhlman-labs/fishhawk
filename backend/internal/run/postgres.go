@@ -133,6 +133,10 @@ func (r *postgresRepo) GetRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 	return rowToRun(row), nil
 }
 
+// GetRunAccountID satisfies the REQUIRED AccountGetter portion of Repository
+// (ADR-057 / E44.5, promoted from an optional capability by E44.11 / #2074):
+// just the run's account_id, "" for an untenanted NULL row, ErrNotFound for a
+// missing run.
 func (r *postgresRepo) GetRunAccountID(ctx context.Context, id uuid.UUID) (string, error) {
 	q := rundb.New(r.pool)
 	acct, err := q.GetRunAccountID(ctx, id)

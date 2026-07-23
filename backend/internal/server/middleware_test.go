@@ -327,8 +327,9 @@ func TestBearerAuth_APIToken_StampsAccountID(t *testing.T) {
 
 // TestBearerAuth_MCPToken_StampsAccountIDFromRun pins the E44.5 identity
 // stamping on the mcp:run path: the token's AccountID is loaded from its OWN
-// run via the AccountGetter capability, so an mcp:run token is bounded to
-// its run's tenant account exactly as a bearer token bound to that account.
+// run via GetRunAccountID — now a REQUIRED run.Repository method (E44.11 /
+// #2074), called unconditionally — so an mcp:run token is bounded to its run's
+// tenant account exactly as a bearer token bound to that account.
 func TestBearerAuth_MCPToken_StampsAccountIDFromRun(t *testing.T) {
 	fr := newFakeRepo()
 	runID := uuid.New()
@@ -353,6 +354,87 @@ func TestBearerAuth_MCPToken_StampsAccountIDFromRun(t *testing.T) {
 
 	if captured.AccountID != acct {
 		t.Errorf("mcp Identity.AccountID = %q, want %q (loaded from its run)", captured.AccountID, acct)
+	}
+}
+
+// Compile-time assertion that run.Repository's method set includes
+// GetRunAccountID (E44.11 / #2074). This is the done-means of the promotion
+// from an OPTIONAL type-asserted capability to a required method: a future
+// refactor pulling GetRunAccountID back off Repository must break the BUILD
+// here rather than silently restore the `!ok` degrade that let a wiring gap
+// produce an accountless — and therefore globally-visible — mcp:run identity.
+var _ run.AccountGetter = run.Repository(nil)
+
+// TestBearerAuth_MCPToken_NilRunRepo_Returns503 pins the guard that replaced
+// the deleted type-assertion prelude for an UNCONFIGURED run repo. A nil repo
+// used to be absorbed by the `!ok` branch and fall through to a RESOLVED but
+// accountless mcp identity — the globally-visible identity #2074 describes. It
+// now fails CLOSED with 503 exactly like a lookup error.
+func TestBearerAuth_MCPToken_NilRunRepo_Returns503(t *testing.T) {
+	s := New(Config{})
+	mcpAuth := &stubMCPAuthenticator{token: &mcptoken.Token{
+		ID:        uuid.New(),
+		RunID:     uuid.New(),
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Scopes:    []string{"mcp:read"},
+	}}
+
+	var handlerRan bool
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		handlerRan = true
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+mcptoken.TokenPrefix+"matchingplaintext")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (fail closed on an unconfigured run repo)", rec.Code)
+	}
+	if handlerRan {
+		t.Error("handler should not run when the account cannot be resolved")
+	}
+}
+
+// TestBearerAuth_MCPToken_UntenantedRun_AllowedWithEmptyAccount pins the
+// untenanted HAPPY PATH of the now-unconditional mcp:run account lookup: a run
+// with a NULL account_id resolves as ("", nil), which is NOT an error — the
+// identity carries an empty AccountID and the request is ALLOWED through to the
+// handler. Distinguishing this from the fail-closed error branches is the point:
+// promoting AccountGetter to a required method must not turn untenanted runs
+// into 503s.
+func TestBearerAuth_MCPToken_UntenantedRun_AllowedWithEmptyAccount(t *testing.T) {
+	fr := newFakeRepo()
+	runID := uuid.New()
+	fr.runs[runID] = &run.Run{ID: runID} // AccountID "" → untenanted NULL row
+	s := newServer(t, fr)
+
+	mcpAuth := &stubMCPAuthenticator{token: &mcptoken.Token{
+		ID:        uuid.New(),
+		RunID:     runID,
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		Scopes:    []string{"mcp:read"},
+	}}
+
+	var captured Identity
+	var handlerRan bool
+	h := s.bearerAuth(nil, mcpAuth, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		handlerRan = true
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer "+mcptoken.TokenPrefix+"matchingplaintext")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if !handlerRan {
+		t.Fatalf("handler did not run for an untenanted run (status = %d, body=%s)", rec.Code, rec.Body.String())
+	}
+	if captured.AccountID != "" {
+		t.Errorf("mcp Identity.AccountID = %q, want \"\" (untenanted run)", captured.AccountID)
+	}
+	if captured.Subject != "mcp:run:"+runID.String() {
+		t.Errorf("mcp Identity.Subject = %q, want mcp:run:%s", captured.Subject, runID)
 	}
 }
 

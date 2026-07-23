@@ -394,3 +394,10 @@ func TestApproval_DeployAllOf_AdmitsSubjectInAllRoles(t *testing.T) {
 		t.Errorf("deploy stage state = %q, want dispatched", rr.stage.State)
 	}
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*approvalGateRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}

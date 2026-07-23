@@ -1063,3 +1063,10 @@ func promptRequestForStage(t *testing.T, s *Server, _ uuid.UUID, stageID uuid.UU
 	s.Handler().ServeHTTP(w, req)
 	return w
 }
+
+// GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
+// run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
+// tenant account, matching its pre-promotion effective behavior.
+func (*planPromptRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", nil
+}
