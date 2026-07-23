@@ -730,11 +730,38 @@ type Constraint struct {
 	ForbiddenPaths   []string `json:"forbidden_paths,omitempty" yaml:"forbidden_paths,omitempty"`
 	AllowedPaths     []string `json:"allowed_paths,omitempty" yaml:"allowed_paths,omitempty"`
 	RequiredOutcomes []string `json:"required_outcomes,omitempty" yaml:"required_outcomes,omitempty"`
+	// DiffCoverage is the v1.6 opt-in new-line coverage constraint
+	// (ADR-059 / #1888) — a post-hoc diff kind like the four above, so it
+	// is rejected on a deploy stage by the same isPostHoc binding.
+	DiffCoverage *DiffCoverageConstraint `json:"diff_coverage,omitempty" yaml:"diff_coverage,omitempty"`
 	// Pre-flight deploy constraint kinds (ADR-038 / #925). See the type
 	// doc; ChangeFreeze is *bool for presence detection.
 	AllowedEnvironments []string `json:"allowed_environments,omitempty" yaml:"allowed_environments,omitempty"`
 	ChangeFreeze        *bool    `json:"change_freeze,omitempty" yaml:"change_freeze,omitempty"`
 	RequiredUpstream    []string `json:"required_upstream,omitempty" yaml:"required_upstream,omitempty"`
+}
+
+// DiffCoverageConstraint declares the v1.6 opt-in new-line coverage gate
+// (ADR-059 / #1888): the coverage command the runner executes against the
+// stage's committed tree, the repo-relative report the command writes, and
+// the minimum percentage of the stage's ADDED lines that report must show
+// as executed.
+//
+// The runner MEASURES and emits the result as gate evidence; the BACKEND is
+// authoritative for the verdict (backend/internal/policy). Format is an enum
+// with "lcov" its only v1.6 member; the schema supplies the default, so an
+// empty Format here means "lcov". BaseRef empty means the run's base branch,
+// resolved by the runner at measurement time — an empty ref never reaches
+// git.
+//
+// Required-field, enum, and 0..100 range checks live in the JSON Schema,
+// which is expressive enough for all three; do not duplicate them here.
+type DiffCoverageConstraint struct {
+	Command            string `json:"command" yaml:"command"`
+	ReportPath         string `json:"report_path" yaml:"report_path"`
+	Format             string `json:"format,omitempty" yaml:"format,omitempty"`
+	MinNewLineCoverage int    `json:"min_new_line_coverage" yaml:"min_new_line_coverage"`
+	BaseRef            string `json:"base_ref,omitempty" yaml:"base_ref,omitempty"`
 }
 
 // isPreflight reports whether the constraint is one of the pre-flight
@@ -747,10 +774,13 @@ func (c Constraint) isPreflight() bool {
 
 // isPostHoc reports whether the constraint is one of the post-hoc diff
 // kinds (max_files_changed, forbidden_paths, allowed_paths,
-// required_outcomes).
+// required_outcomes, diff_coverage). diff_coverage presence is detected
+// via the pointer, so a `{diff_coverage: {...}}` entry on a deploy stage
+// is rejected by the same binding as its four siblings (#1888).
 func (c Constraint) isPostHoc() bool {
 	return c.MaxFilesChanged != 0 || len(c.ForbiddenPaths) > 0 ||
-		len(c.AllowedPaths) > 0 || len(c.RequiredOutcomes) > 0
+		len(c.AllowedPaths) > 0 || len(c.RequiredOutcomes) > 0 ||
+		c.DiffCoverage != nil
 }
 
 // Budget caps token / runtime usage for a stage.

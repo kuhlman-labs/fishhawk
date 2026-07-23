@@ -302,6 +302,32 @@ type GateEvidence struct {
 	// identical default) when there was no fix-up pass, no claim, or claim and
 	// reality agreed. The json tag MUST stay identical to the composer.
 	FixupSelfReportDivergence *FixupSelfReportDivergenceEvidence `json:"fixup_selfreport_divergence,omitempty"`
+	// DiffCoverage carries the workflow-v1.6 `diff_coverage` measurement
+	// (ADR-059 / #1888): the customer coverage command, its exit code, and
+	// how much of the stage's added-line set the report showed as
+	// executed. Non-nil WHENEVER the stage declared the constraint —
+	// including the measured-with-zero case (a diff that added no coverable
+	// lines), so the policy engine can distinguish "nothing to measure"
+	// from "the runner never ran". Nil when the stage did not declare it.
+	// The json tag MUST stay identical to the runner's composer; a drift
+	// silently DISABLES the gate.
+	DiffCoverage *DiffCoverageEvidence `json:"diff_coverage,omitempty"`
+}
+
+// DiffCoverageEvidence is one diff-coverage measurement (#1888). Mirrors
+// the runner's diffCoverageEvidence — the json tags MUST stay identical to
+// the composer, same lockstep wire contract as the parent payload.
+type DiffCoverageEvidence struct {
+	Outcome         string   `json:"outcome"`
+	Command         string   `json:"command,omitempty"`
+	ExitCode        int      `json:"exit_code"`
+	ReportPath      string   `json:"report_path,omitempty"`
+	BaseRef         string   `json:"base_ref,omitempty"`
+	NewLines        int      `json:"new_lines"`
+	CoveredNewLines int      `json:"covered_new_lines"`
+	Percent         float64  `json:"percent"`
+	UncoveredFiles  []string `json:"uncovered_files,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
 }
 
 // FixupSelfReportDivergenceEvidence is the advisory fix-up self-report

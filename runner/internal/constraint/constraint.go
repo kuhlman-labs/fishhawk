@@ -75,6 +75,37 @@ type Constraints struct {
 	// "ci_green"; nil when the runner doesn't have a CI signal
 	// available (the backend re-checks once CI completes).
 	CIGreen *bool
+	// DiffCoverage is the stage's declared `diff_coverage` constraint
+	// (workflow-v1.6, ADR-059 / #1888). Evaluate deliberately does NOT
+	// evaluate it — the field exists so this runner-side evaluator stays
+	// structurally mirrored with the backend's policy.Constraints, and so
+	// a caller threading the spec's constraints through here cannot
+	// silently drop it.
+	//
+	// BACKEND-AUTHORITATIVE, same rationale as `verification_reported`
+	// (#1886): this in-line check fires on the implement push path, before
+	// the coverage command has run — the measurement happens after the
+	// committed-tree verify gate, later in
+	// runner/cmd/fishhawk-runner/main.go. There is nothing truthful the
+	// runner could assert locally at this point, and asserting anything
+	// would either fail every opted-in run before its work was measured or
+	// invent a pass. The backend re-evaluates from the uploaded bundle's
+	// gate_evidence, where the measurement IS available.
+	//
+	// The type is the local mirror, not an import: this package is
+	// deliberately dependency-free on the backend's policy package.
+	DiffCoverage *DiffCoverage
+}
+
+// DiffCoverage mirrors the spec's `diff_coverage` constraint for the
+// runner-side evaluator (#1888). Carried, not evaluated — see the
+// Constraints.DiffCoverage doc for why.
+type DiffCoverage struct {
+	Command            string
+	ReportPath         string
+	Format             string
+	MinNewLineCoverage int
+	BaseRef            string
 }
 
 // Violation is one constraint failure. Constraint names match the

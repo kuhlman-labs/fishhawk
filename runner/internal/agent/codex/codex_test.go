@@ -16,6 +16,28 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
+// helperExit terminates the re-exec'd helper process, detaching os.Stderr
+// first so the Go runtime's coverage exit hooks cannot contaminate the
+// captured stream.
+//
+// A test binary linked with -cover registers emitMetaData as an exit hook
+// (internal/coverage/cfile.InitHook); the hook is normally defused by
+// testmain, which the helper never reaches because it os.Exits directly.
+// When -coverpkg selects no package linked into THIS binary — exactly what
+// the patch-scoped verify gate passes, since it restricts -coverpkg to the
+// changed packages — the hook's meta-data list is empty and it prints
+// "program not built with -cover" to stderr. The invoker faithfully records
+// that as an extra `stderr` event, and every event-count assertion fails.
+//
+// Intentional helper stderr writes happen before their helperExit call, so
+// the swap never suppresses transcript output the tests assert on.
+func helperExit(code int) {
+	if devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0); err == nil {
+		os.Stderr = devnull
+	}
+	os.Exit(code)
+}
+
 // TestHelperProcess is the test-helper-process pattern from the Go
 // stdlib: when invoked with GO_HELPER_PROCESS=1 set in env, this test
 // pretends to be a `codex` binary and emits a canned `codex exec --json`
@@ -32,7 +54,7 @@ func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_HELPER_PROCESS") != "1" {
 		return
 	}
-	defer os.Exit(0)
+	defer helperExit(0)
 
 	switch os.Getenv("HELPER_MODE") {
 	case "happy":
@@ -64,7 +86,7 @@ func TestHelperProcess(t *testing.T) {
 	case "error":
 		fmt.Println(`{"type":"thread.started","thread_id":"t-1"}`)
 		fmt.Fprintln(os.Stderr, "codex: model rate-limited")
-		os.Exit(1)
+		helperExit(1)
 	case "raw_line":
 		// A non-JSON log line (Codex interleaves these on stdout) must not
 		// crash the harness; it must surface as kind=raw.
@@ -108,7 +130,7 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":30,"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0}}`)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
-		os.Exit(2)
+		helperExit(2)
 	}
 }
 

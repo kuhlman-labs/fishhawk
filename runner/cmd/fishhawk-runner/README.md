@@ -104,3 +104,53 @@ The implement-stage push + open path targets a **change-request forge** selected
 **Runner-kind self-report.** `detectRunnerKind` reports `gitlab_ci` when `GITLAB_CI=true` or `CI_PIPELINE_ID` is non-empty (GitHub signals win when both are present; a bare `CI=true` still resolves `local`). The backend ignores the unrecognized value until #1861 adds the enum member, so shipping the detection first is additive-safe.
 
 ADR-035 lineage/tree-ownership is git-level and remote-shape independent — the push machinery never parses the forge host — pinned by `gitops.TestCommitAndPush_ShapedRemote_LineageIsRemoteShapeIndependent`. The live GitLab walk with real credentials is tracked in #2032 (E45.18).
+
+## Diff-coverage measurement (workflow-v1.6 `diff_coverage`, #1888 / ADR-059)
+
+When the stage's prompt response carries a `diff_coverage` config, `run()`
+calls `runDiffCoverageGate` on the implement path, **after** the
+committed-tree verify gates (the tree is final and the agent has stopped
+writing, so the coverage report and the diff describe one snapshot) and
+**before** `composeGateEvidence` folds the result into `gate_evidence`.
+
+**Measurement only.** It never touches `res.OK` / `res.FailureCategory`. A
+coverage shortfall fails the stage through the backend's category-B
+re-evaluation of the uploaded bundle, never as an opaque runner abort.
+
+**It always emits evidence when the constraint is configured** — there is
+deliberately no "only if there was a diff" guard. A stage that added no
+coverable lines emits an explicit measured-with-zero result, because the
+backend treats an ABSENT signal as a violation and a legitimately vacuous
+stage must not be able to reach that state. (The customer command is not
+run in that case: there is nothing for it to measure.)
+
+**Containment (condition 6).** The customer command is untrusted input and
+runs through `runBoundedGateCommand` — the SAME bounded-exec path the
+committed-tree verify gate uses: a bounded child context, `Setpgid` plus a
+`Cancel` that kills the whole **process group** (SIGKILL to the direct child
+alone leaves grandchildren holding the inherited stdout pipe open and
+`CombinedOutput` never sees EOF), the default-deny gate-env allow-list from
+`gateenv.go` (no runner credential is visible to it), and a per-invocation
+isolated lint cache. Do NOT add a second exec path for a new spec-supplied
+command, and do NOT widen the env allow-list to make a particular coverage
+tool work — that is a separate, explicit decision.
+
+**Base ref resolution (condition 5).** `resolveDiffCoverageBaseRef` is the
+named resolver: the spec's `base_ref` wins when declared; an OMITTED
+`base_ref` falls back to `resolveImplementBaseRef`, the same
+`--base-branch` > `GITHUB_REF_NAME` > `main` ladder the implement push
+uses, so the measurement's base and the PR's base can never disagree. It
+never returns empty, and `diffcov.ChangedLines` still fails closed on an
+empty ref rather than trusting that.
+
+**Report hygiene.** The report is the runner's own artifact, not the
+agent's work, so it is removed after reading (unless it already existed) —
+it never lands in the working tree as untracked litter or as an
+out-of-scope creation.
+
+**Evidence.** One `diff_coverage` event carrying either the measurement or
+a named failure reason. Every failure mode names what ran, its exit code,
+and what was measured. `composeGateEvidence` pre-redacts the reason and
+caps `uncovered_files` at `diffCoverageMaxUncovered`, like every sibling
+field. The measurement itself lives in
+[`runner/internal/diffcov`](../../internal/diffcov/README.md).

@@ -356,6 +356,24 @@ type FetchedPrompt struct {
 	// single-shot demote-on-failure gate; >0 enables the bounded fix
 	// loop. Decoded and threaded through but not yet consumed.
 	VerifyMaxIterations int `json:"verify_max_iterations,omitempty"`
+	// DiffCoverage is the stage's spec-declared `diff_coverage` constraint
+	// (workflow-v1.6, ADR-059 / #1888), echoed by the backend so the runner
+	// knows what coverage command to run, where it writes its report, and
+	// what threshold the backend will hold the measurement to. Nil (the
+	// byte-identical default) when the stage does not declare it — the
+	// runner then runs no coverage command and emits no evidence, and the
+	// backend's gate never fires.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+	// the backend's promptResponse.DiffCoverage / diffCoverageConfig
+	// (backend/internal/server/prompt.go). Same independent-struct-by-tag
+	// convention as ScopeExemptions / BindingAssertions / AgentVersionRange.
+	// A tag drift silently DISABLES the measurement — the runner decodes
+	// nil, runs nothing, and the gate reports nothing wrong because it never
+	// ran. That is the silent-no-op failure the constraint exists to
+	// eliminate, so the decode side is pinned by a test feeding the
+	// BACKEND's literal json field names.
+	DiffCoverage *DiffCoverageConfig `json:"diff_coverage,omitempty"`
 	// MinRunnerVersion is the minimum runner version the backend requires.
 	// Non-empty only when the backend is a release build. The runner compares
 	// this against its own version and exits with exitVersionSkew when it is
@@ -617,6 +635,27 @@ type BindingAssertion struct {
 type ScopeExemption struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
+}
+
+// DiffCoverageConfig is the stage's spec-declared `diff_coverage`
+// constraint (workflow-v1.6, ADR-059 / #1888) as the backend echoes it.
+//
+// Format empty means "lcov" — the schema default and the only v1.6 member.
+// BaseRef empty means the run's base branch, which the RUNNER resolves at
+// measurement time (--base-branch > GITHUB_REF_NAME > "main"); an empty ref
+// never reaches git.
+//
+// The json tags are byte-identical to the backend's diffCoverageConfig, the
+// same cross-module convention as ScopeExemption / BindingAssertion /
+// ScopeFile: each module defines its own struct agreeing by json tag, so a
+// drift surfaces in review against this documented counterpart — and is
+// caught by the decode test that feeds the backend's literal field names.
+type DiffCoverageConfig struct {
+	Command            string `json:"command"`
+	ReportPath         string `json:"report_path"`
+	Format             string `json:"format,omitempty"`
+	MinNewLineCoverage int    `json:"min_new_line_coverage"`
+	BaseRef            string `json:"base_ref,omitempty"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

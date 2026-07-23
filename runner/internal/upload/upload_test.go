@@ -2096,3 +2096,112 @@ func TestShipPlan_ReachabilityHeader_ReducedWhenOversized(t *testing.T) {
 		t.Errorf("shipped header = %q, want the reduced value %q", got, wire)
 	}
 }
+
+// TestFetchPrompt_DecodesDiffCoverage is the wire-contract pin for the
+// workflow-v1.6 `diff_coverage` config (#1888 condition 3). The body below
+// spells the field names EXACTLY as the backend's promptResponse /
+// diffCoverageConfig emit them, so a tag drift on either side fails here
+// rather than at runtime.
+//
+// This failure mode is uniquely dangerous: a drift makes the runner decode
+// nil, run no coverage command, and emit no evidence — and the gate then
+// reports nothing wrong because it never ran. Every other test on both
+// sides passes through that silence, which is why the contract is asserted
+// against literal JSON rather than by handing structs across.
+func TestFetchPrompt_DecodesDiffCoverage(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"diff_coverage": {
+			"command": "make coverage",
+			"report_path": "coverage.lcov",
+			"format": "lcov",
+			"min_new_line_coverage": 85,
+			"base_ref": "release"
+		}
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.DiffCoverage == nil {
+		t.Fatal("DiffCoverage = nil — the backend's json field names did not decode; the gate would silently never run")
+	}
+	want := DiffCoverageConfig{
+		Command:            "make coverage",
+		ReportPath:         "coverage.lcov",
+		Format:             "lcov",
+		MinNewLineCoverage: 85,
+		BaseRef:            "release",
+	}
+	if *got.DiffCoverage != want {
+		t.Errorf("DiffCoverage = %+v, want %+v", *got.DiffCoverage, want)
+	}
+}
+
+// TestFetchPrompt_DiffCoverageOptionalFieldsDecode pins that a response
+// omitting the two OPTIONAL members still decodes the constraint, with
+// format empty (read as lcov) and base_ref empty (the runner resolves the
+// run's base branch).
+func TestFetchPrompt_DiffCoverageOptionalFieldsDecode(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"diff_coverage": {
+			"command": "make coverage",
+			"report_path": "coverage.lcov",
+			"min_new_line_coverage": 0
+		}
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "stage-abc", PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.DiffCoverage == nil {
+		t.Fatal("DiffCoverage = nil, want the declared constraint")
+	}
+	if got.DiffCoverage.Format != "" || got.DiffCoverage.BaseRef != "" {
+		t.Errorf("optional fields = format %q base_ref %q, want both empty",
+			got.DiffCoverage.Format, got.DiffCoverage.BaseRef)
+	}
+	if got.DiffCoverage.Command != "make coverage" {
+		t.Errorf("Command = %q", got.DiffCoverage.Command)
+	}
+}
+
+// TestFetchPrompt_DiffCoverageOmittedWhenAbsent confirms DiffCoverage
+// decodes to nil when the backend omits the field — every non-declaring
+// workflow — so the runner runs no coverage command and behavior is
+// byte-identical to before #1888.
+func TestFetchPrompt_DiffCoverageOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID: "stage-abc", PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.DiffCoverage != nil {
+		t.Errorf("DiffCoverage = %+v, want nil when absent", got.DiffCoverage)
+	}
+}

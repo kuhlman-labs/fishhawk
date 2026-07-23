@@ -1,6 +1,10 @@
 package spec
 
-import "fmt"
+import (
+	"fmt"
+	"path"
+	"strings"
+)
 
 // Validate runs the semantic checks that the JSON Schema can't
 // express. Schema-level validation (structure, enums, types) has
@@ -97,10 +101,12 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 		// constraints (allowed_environments, change_freeze,
 		// required_upstream) are valid ONLY on a deploy stage; the
 		// post-hoc diff constraints (max_files_changed, forbidden_paths,
-		// allowed_paths, required_outcomes) are meaningless for a
-		// delegating deploy. Presence of change_freeze is detected via
+		// allowed_paths, required_outcomes, diff_coverage) are meaningless
+		// for a delegating deploy. Presence of change_freeze is detected via
 		// the *bool pointer, so `{change_freeze: false}` on a non-deploy
-		// stage is correctly rejected.
+		// stage is correctly rejected; diff_coverage presence (#1888) is
+		// detected the same way, so it is rejected on a deploy stage
+		// identically to its four post-hoc siblings.
 		for j, c := range stage.Constraints {
 			if c.isPreflight() && !isDeploy {
 				return &ValidationError{
@@ -112,6 +118,21 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 				return &ValidationError{
 					Path:    stagePath(i, fmt.Sprintf("/constraints/%d", j)),
 					Message: "post-hoc diff constraint is not valid on a deploy stage; a delegating deploy produces no reviewable diff (ADR-038)",
+				}
+			}
+			// diff_coverage.report_path must stay inside the checkout
+			// (#1888). The JSON Schema can express minLength but not
+			// "repo-relative", and the runner reads the report by joining
+			// this path onto a throwaway checkout of the committed tree —
+			// so an absolute path or a `..` escape would read a file
+			// outside the tree the measurement claims to describe. Reject
+			// at parse time rather than as an opaque measurement failure.
+			if c.DiffCoverage != nil {
+				if err := validRepoRelativePath(c.DiffCoverage.ReportPath); err != nil {
+					return &ValidationError{
+						Path:    stagePath(i, fmt.Sprintf("/constraints/%d/diff_coverage/report_path", j)),
+						Message: err.Error(),
+					}
 				}
 			}
 		}
@@ -243,6 +264,31 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// validRepoRelativePath rejects a path that does not name a location
+// inside the repository checkout: an absolute path, a Windows-style
+// drive/backslash path, or one that escapes upward via `..`. Used for
+// diff_coverage.report_path (#1888), which the runner joins onto a
+// throwaway checkout of the committed tree.
+//
+// The empty case is left to the schema's minLength, so this reports only
+// on paths that are non-empty but out-of-tree.
+func validRepoRelativePath(p string) error {
+	if p == "" {
+		return nil
+	}
+	if strings.HasPrefix(p, "/") || strings.Contains(p, `\`) ||
+		(len(p) > 1 && p[1] == ':') {
+		return fmt.Errorf("report_path %q must be repo-relative, not absolute", p)
+	}
+	// path.Clean collapses "a/../.." to ".." and "./x" to "x", so a
+	// cleaned result of ".." or a "../" prefix is exactly the escape set.
+	clean := path.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return fmt.Errorf("report_path %q must stay inside the repository (no `..` escape)", p)
 	}
 	return nil
 }

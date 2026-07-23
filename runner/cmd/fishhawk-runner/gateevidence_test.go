@@ -513,3 +513,120 @@ func TestBoundEvidenceTail_TrimsPartialRune(t *testing.T) {
 		t.Errorf("leading partial rune not trimmed: %q...", out[:4])
 	}
 }
+
+// TestComposeGateEvidence_FoldsDiffCoverage confirms a diff_coverage
+// event (#1888) folds into gate_evidence.DiffCoverage with its measured
+// counts intact, and that the event is itself a gate — a stage whose ONLY
+// gate is the coverage measurement still produces a gate_evidence event,
+// so the backend never sees the measurement as absent.
+func TestComposeGateEvidence_FoldsDiffCoverage(t *testing.T) {
+	events := []agent.Event{
+		diffCoverageEvent(diffCoverageEvidence{
+			Outcome:         "measured",
+			Command:         "make coverage",
+			ExitCode:        0,
+			ReportPath:      "coverage.lcov",
+			BaseRef:         "main",
+			NewLines:        4,
+			CoveredNewLines: 3,
+			Percent:         75,
+			UncoveredFiles:  []string{"src/app.go"},
+			Reason:          "3 of 4 new lines covered",
+		}),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 0))
+	if p.DiffCoverage == nil {
+		t.Fatal("DiffCoverage = nil, want the folded measurement")
+	}
+	got := p.DiffCoverage
+	if got.Outcome != "measured" || got.NewLines != 4 || got.CoveredNewLines != 3 || got.Percent != 75 {
+		t.Errorf("DiffCoverage = %+v", *got)
+	}
+	if got.Command != "make coverage" || got.ReportPath != "coverage.lcov" || got.BaseRef != "main" {
+		t.Errorf("DiffCoverage identity fields = %+v", *got)
+	}
+	if len(got.UncoveredFiles) != 1 || got.UncoveredFiles[0] != "src/app.go" {
+		t.Errorf("UncoveredFiles = %v", got.UncoveredFiles)
+	}
+}
+
+// TestComposeGateEvidence_FoldsDiffCoverageZeroMeasurement pins the
+// vacuous case end to end: a measured-with-zero result is carried as an
+// explicit signal, NOT dropped. Absence would read as a violation, so
+// dropping it here would fail a legitimately vacuous stage.
+func TestComposeGateEvidence_FoldsDiffCoverageZeroMeasurement(t *testing.T) {
+	events := []agent.Event{
+		diffCoverageEvent(diffCoverageEvidence{
+			Outcome: "measured",
+			Command: "make coverage",
+			BaseRef: "main",
+			Reason:  `no added lines against "main"; nothing to measure`,
+		}),
+	}
+	p := decodeEvidence(t, composeGateEvidence(events, 0))
+	if p.DiffCoverage == nil {
+		t.Fatal("DiffCoverage = nil — a measured-zero signal must survive the fold")
+	}
+	if p.DiffCoverage.Outcome != "measured" || p.DiffCoverage.NewLines != 0 {
+		t.Errorf("DiffCoverage = %+v, want measured with zero new lines", *p.DiffCoverage)
+	}
+	// The zero counts must be present on the wire, not dropped by
+	// omitempty — the backend distinguishes measured-zero from absent.
+	raw := string(composeGateEvidence(events, 0).Payload)
+	for _, want := range []string{`"new_lines":0`, `"covered_new_lines":0`} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("payload %s omits %s", raw, want)
+		}
+	}
+}
+
+// TestComposeGateEvidence_DiffCoverageBounded pins the two bounding
+// rules: the uncovered-file sample is capped, and the free-text reason is
+// pre-redacted (the raw bundle dispatches the implement review, so a
+// credential echoed by a coverage command's stderr must not reach it).
+func TestComposeGateEvidence_DiffCoverageBounded(t *testing.T) {
+	var many []string
+	for i := 0; i < diffCoverageMaxUncovered*3; i++ {
+		many = append(many, fmt.Sprintf("src/f%02d.go", i))
+	}
+	events := []agent.Event{
+		diffCoverageEvent(diffCoverageEvidence{
+			Outcome:        "failed",
+			Command:        "make coverage",
+			ExitCode:       1,
+			Reason:         "coverage command exited 1: token ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+			UncoveredFiles: many,
+		}),
+	}
+	ev := composeGateEvidence(events, 0)
+	p := decodeEvidence(t, ev)
+	if got := len(p.DiffCoverage.UncoveredFiles); got != diffCoverageMaxUncovered {
+		t.Errorf("UncoveredFiles len = %d, want the %d cap", got, diffCoverageMaxUncovered)
+	}
+	if strings.Contains(p.DiffCoverage.Reason, "ghp_0123456789abcdefghijklmnopqrstuvwxyz") {
+		t.Errorf("Reason %q still carries an unredacted credential", p.DiffCoverage.Reason)
+	}
+	// The redaction pass over the redacted bundle variant is a no-op on an
+	// already-redacted payload — the same property every sibling field has.
+	red, _ := redaction.RedactDefault(ev.Payload)
+	if !bytes.Equal(red, ev.Payload) {
+		t.Errorf("re-redaction changed the payload:\n got %s\nwant %s", red, ev.Payload)
+	}
+}
+
+// TestComposeGateEvidence_NoDiffCoverageField pins the opt-in default: a
+// stage with a verify gate but no diff_coverage event leaves the field
+// absent — byte-identical to before #1888.
+func TestComposeGateEvidence_NoDiffCoverageField(t *testing.T) {
+	events := []agent.Event{
+		verifyRunEvent("scripts/test", "", "", 0, "ok\n", "passed"),
+	}
+	ev := composeGateEvidence(events, 0)
+	p := decodeEvidence(t, ev)
+	if p.DiffCoverage != nil {
+		t.Errorf("DiffCoverage = %+v, want nil when no event", p.DiffCoverage)
+	}
+	if strings.Contains(string(ev.Payload), "diff_coverage") {
+		t.Errorf("payload %s carries a diff_coverage member, want it omitted", ev.Payload)
+	}
+}

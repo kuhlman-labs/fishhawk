@@ -1,0 +1,149 @@
+# runner/internal/diffcov
+
+New-line coverage measurement for the workflow-v1.6 `diff_coverage`
+constraint (ADR-059 / #1888).
+
+The package is pure and injectable: the git invocation is a function field
+(`GitRunner`), so every parser and the measurement itself test without a
+real repository. Execution of the customer coverage command and emission of
+the trace event live in `runner/cmd/fishhawk-runner` (`runDiffCoverageGate`);
+the VERDICT lives in `backend/internal/policy`. This package only computes
+the number.
+
+## Division of labour
+
+| Layer | Owns |
+|---|---|
+| `backend/internal/spec` | Parsing + validating the declaration |
+| `backend/internal/server/prompt.go` | Serving the config to the runner |
+| `runner/cmd/fishhawk-runner` | Running the command, emitting `diff_coverage` evidence |
+| **this package** | Diff parsing, LCOV parsing, path normalization, the intersection |
+| `backend/internal/policy` | The threshold verdict (authoritative) |
+
+The runner never fails the stage on a coverage shortfall. It measures and
+reports; the backend re-evaluates from the uploaded bundle and owns the
+category-B verdict. This mirrors `verification_reported` (#1886).
+
+## The added-line set (`ChangedLines`)
+
+The diff is taken **merge-base → work tree**, the same framing
+`scripts/check-coverage.py` uses:
+
+- The **merge base** is resolved explicitly rather than via the `A...B`
+  three-dot shorthand, so commits that landed on the base branch *after*
+  the run branched stay out of the denominator. (`git diff A...B` is
+  defined as `git diff $(git merge-base A B) B` — git-diff(1).)
+- The **work tree**, not `HEAD`, because the coverage report describes the
+  tree the coverage command just executed against. Diffing `HEAD` would put
+  coverage and lines on two different snapshots and the measurement would be
+  meaningless.
+- `-U0` makes every hunk header describe exactly the changed lines.
+
+An **empty base ref returns `ErrEmptyBaseRef` without invoking git**. The
+caller resolves an omitted `base_ref` to the run's base branch first
+(`resolveDiffCoverageBaseRef`, the same resolver the implement push uses);
+a resolution that yielded nothing is reported as a named failure rather
+than shelling out with an empty argument.
+
+### Untracked files
+
+`git diff` sees only **tracked** files, so a never-`git add`ed new file
+would contribute zero added lines and bypass the gate outright. After the
+tracked diff, `ChangedLines` enumerates untracked files
+(`git ls-files --others --exclude-standard -z`, NUL-split because git
+C-quotes exotic paths and a newline in a name would split one path into
+two) and folds every line of each in via
+`git diff --no-index -- /dev/null <path>`.
+
+`ExecGit` therefore treats `git diff` exit status **1** as success — git
+uses it to mean "differences were found", which is the normal outcome
+under `--no-index`. Only status ≥ 2 is a real failure.
+
+### Hunk-header shapes
+
+| Shape | Meaning |
+|---|---|
+| `@@ -0,0 +7 @@` | The `,d` count is **omitted when it equals 1** — one added line at 7 |
+| `@@ -10,0 +11,3 @@` | Three added lines, 11–13 |
+| `@@ -5,3 +4,0 @@` | Pure deletion: **zero** added lines |
+| `+++ /dev/null` | The file was deleted: nothing attributed |
+| `--- /dev/null` | New file: its lines are added normally |
+
+Paths containing spaces survive (the `b/` prefix is stripped positionally);
+C-quoted paths (`"src/caf\303\251.go"`) are decoded, so a non-ASCII-named
+file is attributed to its real name rather than to a literal key that could
+never match a coverage report entry.
+
+## LCOV parsing (`ParseLCOV`)
+
+The parsed subset is the stable per-line grammar from the lcov/geninfo
+tracefile reference:
+
+```
+SF:<path>          begins a record for one source file
+DA:<line>,<hits>   one line's execution count (a trailing checksum is ignored)
+end_of_record      closes the record
+```
+
+Every other record type (`TN`, `FN`/`FNDA`/`FNF`/`FNH`, `BRDA`/`BRF`/`BRH`,
+`LF`/`LH`) is **ignored**, not rejected — real producers emit them and none
+carry per-line data. Repeated `DA` lines for one line **sum**, matching
+lcov's semantics for a file measured across several test binaries.
+
+Malformed input returns an error wrapping `ErrParse`, never a partially
+filled map. A truncated record, a non-numeric line number or hit count, a
+`DA` outside any `SF`, and a report with zero `SF` records are each a report
+the producer did not finish writing. Treating one as "nothing covered" would
+fail an opted-in run with a false RED — the worst failure mode for an
+opt-in gate.
+
+LCOV is the interchange format because coverage.py (`coverage lcov`),
+Istanbul/nyc, cargo-llvm-cov, JaCoCo (via converter) and Go (via
+gcov2lcov) all emit it. `format` is an enum so a later additive minor can
+add others.
+
+## Path normalization (`NormalizePath`) — the load-bearing part
+
+Coverage producers spell `SF:` paths inconsistently — absolute
+(`/build/repo/src/app.go`), `./`-prefixed, or carrying redundant separators
+(`src//app.go`) — while the diff parser yields clean repo-relative paths.
+**Intersecting the two key sets verbatim would classify covered new lines as
+uncovered and fail every opted-in customer run with a false RED.** Both sides
+are therefore normalized to clean, slash-separated, repo-relative form
+before intersection.
+
+An absolute path is made relative to the repo root; when that fails, the
+**symlink-resolved** root is retried, because a tool running inside the
+checkout reports the resolved path (on macOS `/var/...` resolves to
+`/private/var/...`).
+
+A path that cannot be placed inside the repository — absolute and outside
+the root, or escaping via `..` — is returned in
+`Result.UnnormalizablePaths` and **named explicitly in the evidence
+reason**, never silently counted as uncovered.
+
+## The denominator (`Measure`)
+
+`NewLines` counts added lines the report could speak to at all. Two
+exclusions, both deliberate:
+
+- **A file the report never mentions** (a README, a generated file, a
+  language the tool does not cover). Counting these would make every
+  docs-touching stage fail an opted-in gate.
+- **A line the report measured no statement on** (a blank line, a comment,
+  a brace) — not a coverable statement.
+
+`Percent` is `covered*100/total`, or 0 when `NewLines` is 0. The backend
+compares with `>=`, so a measurement exactly **at** the threshold passes.
+
+`NewLines == 0` is the documented **vacuous pass**: a diff that added no
+coverable lines cannot be under-covered. The runner emits this as an
+explicit measured-with-zero signal rather than emitting nothing — an
+explicit zero is auditable, whereas absence is indistinguishable from a
+runner that failed to run, which the backend treats as a violation.
+
+## Known limitation
+
+A coverage percentage credits **execution, not assertion**: a vacuous test
+still earns diff coverage. This mirrors ADR-059's stated limitation for the
+repo-local gate and is deliberately not addressed here.

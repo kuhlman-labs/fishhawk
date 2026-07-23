@@ -16054,3 +16054,357 @@ func TestUploadPlan_NoReachabilityWhenNoSplitProposal(t *testing.T) {
 		t.Errorf("expected no reachability payload for a non-split plan, got %+v", fu.gotPlanArgs.Reachability)
 	}
 }
+
+// --- #1888: diff-coverage measurement -----------------------------------
+
+// diffCovRepo builds a git repo whose `main` carries base.go, then adds
+// three NEW lines to app.go in the work tree — the stage's added-line set.
+// Returns the repo dir.
+func diffCovRepo(t *testing.T) string {
+	t.Helper()
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "base.go"), "package p\n")
+	runGit("add", ".")
+	runGit("commit", "-m", "base", "--no-verify")
+	// Three added lines in the WORK TREE — the measurement's numerator.
+	mustWrite(t, filepath.Join(repo, "app.go"), "package p\n\nfunc A() {}\n")
+	return repo
+}
+
+// decodeDiffCovEvent unpacks a diff_coverage trace event for assertions.
+func decodeDiffCovEvent(t *testing.T, ev agent.Event) diffCoverageEvidence {
+	t.Helper()
+	if ev.Kind != "diff_coverage" {
+		t.Fatalf("kind = %q, want diff_coverage", ev.Kind)
+	}
+	var got diffCoverageEvidence
+	if err := json.Unmarshal(ev.Payload, &got); err != nil {
+		t.Fatalf("decode diff_coverage payload: %v", err)
+	}
+	return got
+}
+
+// TestRunDiffCoverageGate_Measures is the happy path: the coverage command
+// runs, writes an lcov report, and the measurement intersects it with the
+// stage's added lines. It also pins that the report is CLEANED UP — the
+// runner's own artifact must not be left as untracked litter in the tree.
+func TestRunDiffCoverageGate_Measures(t *testing.T) {
+	repo := diffCovRepo(t)
+	// app.go lines 1 and 3 are coverable; line 3 is uncovered.
+	dc := &upload.DiffCoverageConfig{
+		Command:            `printf 'SF:app.go\nDA:1,4\nDA:3,0\nend_of_record\n' > coverage.lcov`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := decodeDiffCovEvent(t, runDiffCoverageGate(context.Background(), dc, repo, "main"))
+
+	if got.Outcome != "measured" {
+		t.Fatalf("outcome = %q reason = %q, want measured", got.Outcome, got.Reason)
+	}
+	if got.NewLines != 2 || got.CoveredNewLines != 1 || got.Percent != 50 {
+		t.Errorf("covered/total = %d/%d (%.0f%%), want 1/2 50%%",
+			got.CoveredNewLines, got.NewLines, got.Percent)
+	}
+	if len(got.UncoveredFiles) != 1 || got.UncoveredFiles[0] != "app.go" {
+		t.Errorf("UncoveredFiles = %v, want [app.go]", got.UncoveredFiles)
+	}
+	if got.BaseRef != "main" || got.Command != dc.Command || got.ReportPath != "coverage.lcov" {
+		t.Errorf("identity fields = %+v", got)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "coverage.lcov")); !os.IsNotExist(err) {
+		t.Errorf("coverage report survived the measurement (err=%v); it must be cleaned up", err)
+	}
+}
+
+// TestRunDiffCoverageGate_AbsoluteReportPathsNormalize is the field-facing
+// regression: real coverage producers emit absolute SF paths, and an exact
+// map-key intersection would report 0% and fail every opted-in run.
+func TestRunDiffCoverageGate_AbsoluteReportPathsNormalize(t *testing.T) {
+	repo := diffCovRepo(t)
+	dc := &upload.DiffCoverageConfig{
+		// SF: carries the ABSOLUTE path, as coverage.py / nyc / llvm-cov do.
+		Command:            `printf 'SF:%s/app.go\nDA:1,1\nDA:3,1\nend_of_record\n' "$PWD" > coverage.lcov`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := decodeDiffCovEvent(t, runDiffCoverageGate(context.Background(), dc, repo, "main"))
+	if got.Outcome != "measured" {
+		t.Fatalf("outcome = %q reason = %q, want measured", got.Outcome, got.Reason)
+	}
+	if got.NewLines != 2 || got.CoveredNewLines != 2 || got.Percent != 100 {
+		t.Errorf("covered/total = %d/%d (%.0f%%), want 2/2 100%% — an absolute SF path failed to intersect",
+			got.CoveredNewLines, got.NewLines, got.Percent)
+	}
+}
+
+// TestRunDiffCoverageGate_NoAddedLinesMeasuresZero pins condition 1: a
+// CONFIGURED stage whose diff added nothing emits an explicit
+// measured-with-zero signal, never silence — and does NOT run the customer
+// command, which would have nothing to measure.
+func TestRunDiffCoverageGate_NoAddedLinesMeasuresZero(t *testing.T) {
+	repo, runGit := compileGateRepo(t)
+	mustWrite(t, filepath.Join(repo, "base.go"), "package p\n")
+	runGit("add", ".")
+	runGit("commit", "-m", "base", "--no-verify")
+	// Clean work tree: nothing added since the merge base.
+
+	sentinel := filepath.Join(t.TempDir(), "ran")
+	dc := &upload.DiffCoverageConfig{
+		Command:            "touch " + sentinel,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := decodeDiffCovEvent(t, runDiffCoverageGate(context.Background(), dc, repo, "main"))
+	if got.Outcome != "measured" {
+		t.Fatalf("outcome = %q reason = %q, want measured (the vacuous pass)", got.Outcome, got.Reason)
+	}
+	if got.NewLines != 0 || got.CoveredNewLines != 0 {
+		t.Errorf("covered/total = %d/%d, want 0/0", got.CoveredNewLines, got.NewLines)
+	}
+	if !strings.Contains(got.Reason, "nothing to measure") {
+		t.Errorf("reason = %q, want it to name the vacuous case", got.Reason)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Error("the coverage command ran even though nothing was added")
+	}
+}
+
+// TestRunDiffCoverageGate_Failures covers every enumerated measurement
+// failure. Each must report outcome "failed" with an ACTIONABLE reason
+// naming what ran, its exit code, and what was measured (condition 7).
+func TestRunDiffCoverageGate_Failures(t *testing.T) {
+	cases := []struct {
+		name         string
+		command      string
+		reportPath   string
+		baseRef      string
+		wantExit     int
+		wantContains []string
+	}{
+		{
+			name:         "command exits non-zero",
+			command:      "echo boom >&2; exit 3",
+			reportPath:   "coverage.lcov",
+			baseRef:      "main",
+			wantExit:     3,
+			wantContains: []string{"exited 3", "boom"},
+		},
+		{
+			name:         "command succeeds but writes no report",
+			command:      "true",
+			reportPath:   "coverage.lcov",
+			baseRef:      "main",
+			wantExit:     0,
+			wantContains: []string{"coverage.lcov", "could not be read"},
+		},
+		{
+			name:         "report is not parseable lcov",
+			command:      "echo 'not an lcov report' > coverage.lcov",
+			reportPath:   "coverage.lcov",
+			baseRef:      "main",
+			wantExit:     0,
+			wantContains: []string{"coverage.lcov", "could not be parsed as lcov"},
+		},
+		{
+			// Condition 5's backstop: an unresolved base ref is a named
+			// failure, never an empty argument handed to git.
+			name:         "empty base ref",
+			command:      "true",
+			reportPath:   "coverage.lcov",
+			baseRef:      "",
+			wantExit:     -1,
+			wantContains: []string{"base ref is empty"},
+		},
+		{
+			name:         "base ref does not exist",
+			command:      "true",
+			reportPath:   "coverage.lcov",
+			baseRef:      "no-such-branch",
+			wantExit:     -1,
+			wantContains: []string{"added lines"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := diffCovRepo(t)
+			got := decodeDiffCovEvent(t, runDiffCoverageGate(context.Background(),
+				&upload.DiffCoverageConfig{
+					Command:            tc.command,
+					ReportPath:         tc.reportPath,
+					MinNewLineCoverage: 80,
+				}, repo, tc.baseRef))
+			if got.Outcome != "failed" {
+				t.Fatalf("outcome = %q, want failed (reason %q)", got.Outcome, got.Reason)
+			}
+			if got.ExitCode != tc.wantExit {
+				t.Errorf("exit_code = %d, want %d", got.ExitCode, tc.wantExit)
+			}
+			if got.Reason == "" {
+				t.Fatal("reason is empty — a constraint that fails without saying why is not a usable gate")
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(got.Reason, want) {
+					t.Errorf("reason %q does not name %q", got.Reason, want)
+				}
+			}
+		})
+	}
+}
+
+// TestRunDiffCoverageGate_ReportPathOutsideRepoIsExplicit pins the
+// condition-2 tail: a report naming a file the measurement cannot place
+// inside the repo says so in the reason rather than silently counting it
+// as uncovered.
+func TestRunDiffCoverageGate_ReportPathOutsideRepoIsExplicit(t *testing.T) {
+	repo := diffCovRepo(t)
+	dc := &upload.DiffCoverageConfig{
+		Command:            `printf 'SF:app.go\nDA:1,1\nDA:3,1\nend_of_record\nSF:/elsewhere/vendored.go\nDA:1,0\nend_of_record\n' > coverage.lcov`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := decodeDiffCovEvent(t, runDiffCoverageGate(context.Background(), dc, repo, "main"))
+	if got.Outcome != "measured" {
+		t.Fatalf("outcome = %q reason = %q, want measured", got.Outcome, got.Reason)
+	}
+	if got.Percent != 100 {
+		t.Errorf("percent = %.0f, want 100 — an unplaceable path must not drag the measurement down", got.Percent)
+	}
+	if !strings.Contains(got.Reason, "could not be resolved into the repository") {
+		t.Errorf("reason = %q, want it to name the unresolvable path explicitly", got.Reason)
+	}
+	if !strings.Contains(got.Reason, "/elsewhere/vendored.go") {
+		t.Errorf("reason = %q, want it to name the offending path", got.Reason)
+	}
+}
+
+// TestRunDiffCoverageGate_UsesTheContainedExecPath pins condition 6: the
+// customer command runs under the default-deny gate env, so a runner
+// credential in the ambient environment is NOT visible to it.
+func TestRunDiffCoverageGate_UsesTheContainedExecPath(t *testing.T) {
+	repo := diffCovRepo(t)
+	t.Setenv("ANTHROPIC_API_KEY", "sk-ant-must-not-leak")
+	t.Setenv("FISHHAWK_GITHUB_TOKEN", "ghs-must-not-leak")
+
+	dc := &upload.DiffCoverageConfig{
+		// The command echoes whatever it can see of the two secrets into
+		// its own stderr, then fails so the tail lands in the reason.
+		Command:            `echo "seen:[$ANTHROPIC_API_KEY][$FISHHAWK_GITHUB_TOKEN]" >&2; exit 1`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := decodeDiffCovEvent(t, runDiffCoverageGate(context.Background(), dc, repo, "main"))
+	if !strings.Contains(got.Reason, "seen:[][]") {
+		t.Errorf("reason = %q, want the command to have seen NEITHER credential (seen:[][])", got.Reason)
+	}
+}
+
+// TestRunDiffCoverageGate_CancellationKillsTheProcessGroup pins that a
+// wedged customer command does not hang the stage. The measurement runs
+// under a context the test cancels; the shared bounded-exec path's
+// process-group kill is what makes it RETURN — SIGKILL to the direct child
+// alone would leave the backgrounded grandchild holding the inherited
+// output pipe open and CombinedOutput would block forever.
+//
+// The assertion is that the call returns at all (a regression hangs here
+// until the test binary's own timeout fires) and reports the killed
+// command as a failure. No elapsed upper bound is asserted: a raw
+// wall-clock bound is exactly the flake shape AGENTS.md forbids.
+func TestRunDiffCoverageGate_CancellationKillsTheProcessGroup(t *testing.T) {
+	repo := diffCovRepo(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Give the child time to spawn its grandchild, then cancel.
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	defer cancel()
+
+	dc := &upload.DiffCoverageConfig{
+		// A backgrounded grandchild inherits the output pipe.
+		Command:            "sleep 600 & sleep 600",
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := decodeDiffCovEvent(t, runDiffCoverageGate(ctx, dc, repo, "main"))
+	if got.Outcome != "failed" {
+		t.Errorf("outcome = %q, want failed on a killed command", got.Outcome)
+	}
+	if got.Reason == "" {
+		t.Error("reason is empty on a killed command")
+	}
+}
+
+// TestResolveDiffCoverageBaseRef pins condition 5's resolution ladder: the
+// spec's base_ref wins when declared, and an OMITTED base_ref falls back
+// to the same resolver the implement push uses, so the measurement's base
+// and the PR's base can never disagree. It never returns empty.
+func TestResolveDiffCoverageBaseRef(t *testing.T) {
+	t.Setenv("GITHUB_REF_NAME", "")
+	cases := []struct {
+		name string
+		cfg  config
+		dc   *upload.DiffCoverageConfig
+		want string
+	}{
+		{
+			name: "declared base_ref wins",
+			cfg:  config{baseBranch: "develop"},
+			dc:   &upload.DiffCoverageConfig{BaseRef: "release"},
+			want: "release",
+		},
+		{
+			name: "whitespace-only base_ref falls back",
+			cfg:  config{baseBranch: "develop"},
+			dc:   &upload.DiffCoverageConfig{BaseRef: "   "},
+			want: "develop",
+		},
+		{
+			name: "omitted base_ref uses the run's base branch",
+			cfg:  config{baseBranch: "develop"},
+			dc:   &upload.DiffCoverageConfig{},
+			want: "develop",
+		},
+		{
+			name: "no base branch at all falls back to main, never empty",
+			cfg:  config{},
+			dc:   &upload.DiffCoverageConfig{},
+			want: "main",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveDiffCoverageBaseRef(tc.cfg, tc.dc); got != tc.want {
+				t.Errorf("resolveDiffCoverageBaseRef = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRunDiffCoverageGate_OmittedBaseRefEndToEnd exercises the omitted
+// base_ref path all the way through a real repo: the runner resolves the
+// run's base branch and the measurement succeeds against it.
+func TestRunDiffCoverageGate_OmittedBaseRefEndToEnd(t *testing.T) {
+	repo := diffCovRepo(t)
+	t.Setenv("GITHUB_REF_NAME", "")
+	dc := &upload.DiffCoverageConfig{
+		Command:            `printf 'SF:app.go\nDA:1,1\nDA:3,1\nend_of_record\n' > coverage.lcov`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	// cfg carries no --base-branch, so the ladder lands on "main" — which
+	// is the branch diffCovRepo committed onto.
+	baseRef := resolveDiffCoverageBaseRef(config{}, dc)
+	if baseRef == "" {
+		t.Fatal("resolved base ref is empty; an empty ref must never reach git")
+	}
+	got := decodeDiffCovEvent(t, runDiffCoverageGate(context.Background(), dc, repo, baseRef))
+	if got.Outcome != "measured" {
+		t.Fatalf("outcome = %q reason = %q, want measured", got.Outcome, got.Reason)
+	}
+	if got.BaseRef != "main" {
+		t.Errorf("BaseRef = %q, want main (the resolved default)", got.BaseRef)
+	}
+	if got.NewLines != 2 || got.CoveredNewLines != 2 {
+		t.Errorf("covered/total = %d/%d, want 2/2", got.CoveredNewLines, got.NewLines)
+	}
+}
