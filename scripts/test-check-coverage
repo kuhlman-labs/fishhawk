@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+# Hermetic behavioral tests for scripts/check-coverage.py's patch-scoped (diff)
+# gate (#1887 / ADR-059). Drives the real CLI against throwaway git repos and
+# hand-written coverage profiles — one assertion per shipped behavior and one
+# per named degrade branch, so no skip path is left to prose. Standalone like
+# scripts/test-schema-sync-verify / scripts/test-container-lease — not wired
+# into scripts/test or CI.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CC="$REPO_ROOT/scripts/check-coverage.py"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+# Signing/identity isolation, mirroring scripts/test (#912): a global
+# commit.gpgsign would otherwise break the throwaway-repo commits below.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
+# Never let the importlib case below drop a __pycache__ dir in scripts/.
+export PYTHONDONTWRITEBYTECODE=1
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+PFX="github.com/kuhlman-labs/fishhawk/"
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+# base_go: the pre-patch content of backend/internal/foo/foo.go (lines 1-5).
+base_go() {
+  cat <<'EOF'
+package foo
+
+func Old() int {
+	return 1
+}
+EOF
+}
+
+# patched_go: base plus a new function occupying lines 6-12. Line 6 is blank and
+# line 12 is a bare brace — neither carries a statement, so neither appears in
+# any coverage block. Statement lines are 7-11.
+patched_go() {
+  base_go
+  cat <<'EOF'
+
+func New(a int) int {
+	if a > 0 {
+		return a
+	}
+	return -a
+}
+EOF
+}
+
+# new_repo <dir>: a git repo with an initial commit holding base foo.go.
+new_repo() {
+  local repo="$1"
+  rm -rf "$repo"
+  mkdir -p "$repo/backend/internal/foo"
+  git init -q -b main "$repo"
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name test
+  base_go > "$repo/backend/internal/foo/foo.go"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m base
+}
+
+# apply_patch_commit <dir>: commit the new function on top of the base.
+apply_patch_commit() {
+  local repo="$1"
+  patched_go > "$repo/backend/internal/foo/foo.go"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m patch
+}
+
+# foo_profile <out> <c1> <c2> <c3>: a coverage profile for foo.go whose three
+# blocks over the new function carry the given hit counts. The blocks mirror
+# Go's real output shape: 7.23,8.13 / 8.13,10.3 / 11.2,11.13 — spanning added
+# statement lines 7-11 and no others.
+foo_profile() {
+  local out="$1" c1="$2" c2="$3" c3="$4"
+  cat > "$out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:3.20,5.2 1 1
+${PFX}backend/internal/foo/foo.go:7.23,8.13 1 $c1
+${PFX}backend/internal/foo/foo.go:8.13,10.3 1 $c2
+${PFX}backend/internal/foo/foo.go:11.2,11.13 1 $c3
+EOF
+}
+
+run_diff() {
+  # run_diff <repo> <profile> [extra args...]
+  local repo="$1" prof="$2"
+  shift 2
+  python3 "$CC" --diff-base main --repo-root "$repo" "$@" "$prof" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# (a) DONE-MEANS: a 0%-covered new function FAILS and names path:line.
+# ---------------------------------------------------------------------------
+repo="$tmproot/a"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+apply_patch_commit "$repo"
+foo_profile "$tmproot/a.out" 0 0 0
+out="$(run_diff "$repo" "$tmproot/a.out")"
+rc=$?
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q 'backend/internal/foo/foo.go:7'; then
+  pass "(a) 0%-covered new function fails and names the uncovered path:line"
+else
+  fail "(a) expected non-zero + uncovered path:line (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (b) the same function fully covered PASSES (the gate is not always-red).
+# ---------------------------------------------------------------------------
+foo_profile "$tmproot/b.out" 1 1 1
+out="$(run_diff "$repo" "$tmproot/b.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PATCH PASS'; then
+  pass "(b) fully covered new function passes"
+else
+  fail "(b) expected 0 + PATCH PASS (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (c) threshold straddle: 4/5 = 80% fails at 90 and passes at 80.
+# ---------------------------------------------------------------------------
+foo_profile "$tmproot/c.out" 1 1 0
+out="$(run_diff "$repo" "$tmproot/c.out" --diff-threshold 90)"
+rc_low=$?
+out2="$(run_diff "$repo" "$tmproot/c.out" --diff-threshold 80)"
+rc_at=$?
+if [ "$rc_low" -ne 0 ] && printf '%s' "$out" | grep -q '80.0%' \
+   && [ "$rc_at" -eq 0 ]; then
+  pass "(c) 80% patch coverage fails at threshold 90 and passes at 80"
+else
+  fail "(c) expected fail-at-90 / pass-at-80 (rc_low=$rc_low rc_at=$rc_at out='$out' out2='$out2')"
+fi
+
+# ---------------------------------------------------------------------------
+# (d) --exclude '/db/' carve-out: a changed 0%-covered sqlc file under a /db/
+#     package does not fail the gate.
+# ---------------------------------------------------------------------------
+repo="$tmproot/d"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+mkdir -p "$repo/backend/internal/store/db"
+apply_patch_commit "$repo"
+cat > "$repo/backend/internal/store/db/queries.sql.go" <<'EOF'
+package db
+
+func Generated() int {
+	return 2
+}
+EOF
+git -C "$repo" add -A
+git -C "$repo" commit -q -m sqlc
+cat > "$tmproot/d.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:7.23,8.13 1 1
+${PFX}backend/internal/foo/foo.go:8.13,10.3 1 1
+${PFX}backend/internal/foo/foo.go:11.2,11.13 1 1
+${PFX}backend/internal/store/db/queries.sql.go:3.22,5.2 1 0
+EOF
+out="$(run_diff "$repo" "$tmproot/d.out" --exclude '/db/')"
+rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'queries.sql.go'; then
+  pass "(d) --exclude '/db/' drops the generated file from the patch denominator"
+else
+  fail "(d) expected 0 with no queries.sql.go in the report (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (e) aggregate-mode regression pin: with --diff-base ABSENT both the passing
+#     and failing aggregate paths are unchanged.
+# ---------------------------------------------------------------------------
+cat > "$tmproot/agg.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:3.20,5.2 4 1
+${PFX}backend/internal/foo/foo.go:7.23,8.13 1 0
+EOF
+out="$(python3 "$CC" --threshold 70 "$tmproot/agg.out" 2>&1)"
+rc_pass=$?
+out2="$(python3 "$CC" --threshold 90 "$tmproot/agg.out" 2>&1)"
+rc_fail=$?
+if [ "$rc_pass" -eq 0 ] && printf '%s' "$out" | grep -q '^PASS$' \
+   && [ "$rc_fail" -eq 1 ] && printf '%s' "$out2" | grep -q 'below threshold'; then
+  pass "(e) aggregate mode without --diff-base is unchanged (pass and fail paths)"
+else
+  fail "(e) aggregate regression (rc_pass=$rc_pass rc_fail=$rc_fail out='$out' out2='$out2')"
+fi
+
+# ---------------------------------------------------------------------------
+# (f) no changed Go files -> SKIP, exit 0, with a printed reason.
+# ---------------------------------------------------------------------------
+repo="$tmproot/f"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+echo "docs only" > "$repo/README.md"
+git -C "$repo" add -A
+git -C "$repo" commit -q -m docs
+foo_profile "$tmproot/f.out" 0 0 0
+out="$(run_diff "$repo" "$tmproot/f.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'SKIP: no changed Go files'; then
+  pass "(f) no changed Go files skips with a printed reason (exit 0)"
+else
+  fail "(f) expected 0 + 'no changed Go files' skip (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (g) sub-floor diff -> SKIP, exit 0, with a printed reason.
+# ---------------------------------------------------------------------------
+repo="$tmproot/g"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+printf '\nvar Tiny = 3\n' >> "$repo/backend/internal/foo/foo.go"
+git -C "$repo" add -A
+git -C "$repo" commit -q -m tiny
+cat > "$tmproot/g.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:7.1,7.13 1 0
+EOF
+out="$(run_diff "$repo" "$tmproot/g.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'diff-min-statements'; then
+  pass "(g) sub-floor diff skips with a printed reason (exit 0)"
+else
+  fail "(g) expected 0 + sub-floor skip (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (h) unresolvable base ref -> SKIP, exit 0.
+# ---------------------------------------------------------------------------
+repo="$tmproot/a"
+out="$(python3 "$CC" --diff-base nosuchref --repo-root "$repo" "$tmproot/a.out" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'does not resolve'; then
+  pass "(h) unresolvable base ref skips with a printed reason (exit 0)"
+else
+  fail "(h) expected 0 + does-not-resolve skip (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (h2) invalid base-ref override -> SKIP, exit 0, distinct reason.
+# ---------------------------------------------------------------------------
+out="$(python3 "$CC" --diff-base=-oops --repo-root "$repo" "$tmproot/a.out" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'invalid --diff-base value'; then
+  pass "(h2) invalid base-ref override skips with its own reason (exit 0)"
+else
+  fail "(h2) expected 0 + invalid-override skip (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (h3) resolved ref with NO merge base (unrelated histories) -> SKIP, exit 0.
+# ---------------------------------------------------------------------------
+repo="$tmproot/h3"
+new_repo "$repo"
+git -C "$repo" checkout -q --orphan orphan
+git -C "$repo" rm -rq --cached . 2>/dev/null
+patched_go > "$repo/backend/internal/foo/foo.go"
+git -C "$repo" add -A
+git -C "$repo" commit -q -m orphan
+out="$(run_diff "$repo" "$tmproot/a.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'no merge base'; then
+  pass "(h3) resolved ref with no merge base skips with a printed reason (exit 0)"
+else
+  fail "(h3) expected 0 + no-merge-base skip (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (i) non-git directory -> SKIP, exit 0. (i2) bare repo -> SKIP, exit 0.
+# ---------------------------------------------------------------------------
+mkdir -p "$tmproot/nogit"
+out="$(python3 "$CC" --diff-base main --repo-root "$tmproot/nogit" "$tmproot/a.out" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'not a git work tree'; then
+  pass "(i) non-git repo root skips with a printed reason (exit 0)"
+else
+  fail "(i) expected 0 + not-a-work-tree skip (rc=$rc, out='$out')"
+fi
+
+git init -q --bare "$tmproot/bare"
+out="$(python3 "$CC" --diff-base main --repo-root "$tmproot/bare" "$tmproot/a.out" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'not a git work tree'; then
+  pass "(i2) bare repo skips with a printed reason (exit 0)"
+else
+  fail "(i2) expected 0 + not-a-work-tree skip for a bare repo (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (i3) git binary absent from PATH -> SKIP, exit 0.
+# ---------------------------------------------------------------------------
+out="$(PATH="/nonexistent" "$(command -v python3)" "$CC" --diff-base main \
+        --repo-root "$tmproot/a" "$tmproot/a.out" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'git not found on PATH'; then
+  pass "(i3) git binary absent skips with a printed reason (exit 0)"
+else
+  fail "(i3) expected 0 + git-not-found skip (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (4) COMBINED MODE (binding condition 4): with both --threshold and
+#     --diff-base, a git failure skips the patch gate and the AGGREGATE gate
+#     still decides the exit code — proven on both aggregate verdicts.
+# ---------------------------------------------------------------------------
+out="$(python3 "$CC" --threshold 90 --diff-base main --repo-root "$tmproot/nogit" \
+        "$tmproot/agg.out" 2>&1)"
+rc_fail=$?
+out2="$(python3 "$CC" --threshold 70 --diff-base main --repo-root "$tmproot/nogit" \
+        "$tmproot/agg.out" 2>&1)"
+rc_pass=$?
+if [ "$rc_fail" -eq 1 ] && printf '%s' "$out" | grep -q 'not a git work tree' \
+   && printf '%s' "$out" | grep -q 'below threshold' \
+   && [ "$rc_pass" -eq 0 ] && printf '%s' "$out2" | grep -q 'not a git work tree'; then
+  pass "(4) combined mode: a git failure skips the patch gate; the aggregate decides"
+else
+  fail "(4) combined mode (rc_fail=$rc_fail rc_pass=$rc_pass out='$out' out2='$out2')"
+fi
+
+# ---------------------------------------------------------------------------
+# (j) profile import path -> repo-relative mapping via --module-prefix.
+# ---------------------------------------------------------------------------
+repo="$tmproot/a"
+cat > "$tmproot/j.out" <<'EOF'
+mode: atomic
+example.com/other/backend/internal/foo/foo.go:7.23,8.13 1 0
+example.com/other/backend/internal/foo/foo.go:8.13,10.3 1 0
+example.com/other/backend/internal/foo/foo.go:11.2,11.13 1 0
+EOF
+out="$(run_diff "$repo" "$tmproot/j.out" --module-prefix 'example.com/other/')"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'backend/internal/foo/foo.go:7'; then
+  pass "(j) --module-prefix maps a profile import path to the repo-relative path"
+else
+  fail "(j) expected the mapped path to be gated (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (k) added lines carrying no statement (blank line 6, bare brace line 12) are
+#     ignored, not counted uncovered: the fully covered patch reports exactly
+#     5/5, not 5/7.
+# ---------------------------------------------------------------------------
+out="$(run_diff "$repo" "$tmproot/b.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'Patch coverage: 5/5'; then
+  pass "(k) statement-free added lines are ignored, not counted uncovered"
+else
+  fail "(k) expected 5/5 (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (l) --unified=0 hunk-header edge cases, asserted directly against
+#     changed_lines with a canned diff: omitted line count, pure-deletion hunk,
+#     and a deleted file.
+# ---------------------------------------------------------------------------
+out="$(python3 - "$CC" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+DIFF = """diff --git a/a.go b/a.go
+--- a/a.go
++++ b/a.go
+@@ -3 +3 @@
+-old
++new
+@@ -10,3 +11,0 @@
+-gone
+-gone
+-gone
+@@ -20,0 +18,2 @@
++one
++two
+diff --git a/dead.go b/dead.go
+--- a/dead.go
++++ /dev/null
+@@ -1,4 +0,0 @@
+-package dead
+"""
+cc._git = lambda *a, **k: DIFF
+got = cc.changed_lines("/irrelevant", "base")
+assert got == {"a.go": {3, 18, 19}}, got
+assert "dead.go" not in got, got
+print("HUNK OK")
+PY
+)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'HUNK OK'; then
+  pass "(l) hunk-header edge cases: omitted count, pure deletion, deleted file"
+else
+  fail "(l) hunk-header parsing (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (m) merge-base semantics: a post-fork commit on the BASE branch is not
+#     attributed to the patch. sibling.go is added on main AFTER the branch
+#     forked and is 0%-covered; the gate must still pass on the covered patch.
+# ---------------------------------------------------------------------------
+repo="$tmproot/m"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+apply_patch_commit "$repo"
+git -C "$repo" checkout -q main
+cat > "$repo/backend/internal/foo/sibling.go" <<'EOF'
+package foo
+
+func Sibling() int {
+	return 3
+}
+EOF
+git -C "$repo" add -A
+git -C "$repo" commit -q -m sibling
+git -C "$repo" checkout -q feature
+cat > "$tmproot/m.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:7.23,8.13 1 1
+${PFX}backend/internal/foo/foo.go:8.13,10.3 1 1
+${PFX}backend/internal/foo/foo.go:11.2,11.13 1 1
+${PFX}backend/internal/foo/sibling.go:3.22,5.2 1 0
+EOF
+out="$(run_diff "$repo" "$tmproot/m.out")"
+rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'sibling.go'; then
+  pass "(m) a post-fork commit on the base branch is not attributed to the patch"
+else
+  fail "(m) expected sibling.go excluded via the merge base (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (n) BINDING CONDITION 3 — the diff is taken against the WORK TREE, the same
+#     snapshot `go test` compiled. An UNCOMMITTED 0%-covered new function is
+#     therefore gated (rather than skewing attribution against a stale HEAD).
+# ---------------------------------------------------------------------------
+repo="$tmproot/n"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+patched_go > "$repo/backend/internal/foo/foo.go"   # deliberately NOT committed
+foo_profile "$tmproot/n.out" 0 0 0
+out="$(run_diff "$repo" "$tmproot/n.out")"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'backend/internal/foo/foo.go:7'; then
+  pass "(n) work-tree diffing gates an uncommitted new function (dirty-tree contract)"
+else
+  fail "(n) expected the uncommitted change to be gated (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (o) --threshold and --diff-base both absent is a usage error, not a silent
+#     no-op gate.
+# ---------------------------------------------------------------------------
+out="$(python3 "$CC" "$tmproot/agg.out" 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'required'; then
+  pass "(o) neither --threshold nor --diff-base is a usage error"
+else
+  fail "(o) expected a usage error (rc=$rc, out='$out')"
+fi
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
