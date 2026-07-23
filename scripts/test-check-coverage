@@ -798,8 +798,12 @@ fi
 #       json.loads back to a string whose utf-8/surrogateescape ENCODING is
 #       byte-identical to git's output. Pins the emit_changed_snapshot binary-byte
 #       edge waived from #2124 / PR #2130. Created for real where the platform
-#       allows a non-UTF-8 filename (Linux); macOS APFS rejects it, so the case
-#       self-skips with a NOTE there (like (p2)'s newline file), never a failure.
+#       allows a non-UTF-8 filename (Linux); macOS APFS rejects it, so there the
+#       round-trip is driven DIRECTLY in-process with the same surrogateescape-
+#       decoded key git's -z enumeration would yield — the synthetic-fixture
+#       fallback (p2) uses for (p3), never a self-skip. So the binary-byte edge is
+#       machine-enforced on EVERY platform, including the darwin the local loop
+#       runs on, not just where a non-UTF-8 filename can be created on disk.
 # ---------------------------------------------------------------------------
 repo="$tmproot/snap1b"
 new_repo "$repo"
@@ -820,12 +824,36 @@ keys = [k.encode("utf-8", "surrogateescape") for k in d["changed"]]
 assert want in keys, list(d["changed"])
 PY
   then
-    pass "(s1b) emit round-trips a truly-undecodable non-UTF-8 (0xFF) path key byte-identically"
+    pass "(s1b) emit round-trips a truly-undecodable non-UTF-8 (0xFF) path key byte-identically (real on-disk file)"
   else
     fail "(s1b) non-UTF-8 emit snapshot (rc=$emit_rc out='$emit_out')"
   fi
 else
-  echo "NOTE: this platform cannot create a non-UTF-8 filename; (s1b) not exercised"
+  # macOS APFS rejects the non-UTF-8 filename, so the git-driven end-to-end path
+  # above cannot run here. Rather than leave the binary-byte pin unexercised on
+  # the platform the local loop runs on (darwin), drive emit_changed_snapshot
+  # DIRECTLY in-process with the exact surrogateescape-decoded key git's -z
+  # enumeration would have produced for a raw 0xFF byte — the same synthetic-
+  # fixture technique (p2) falls back to in (p3), no real non-UTF-8 file needed.
+  # emit is a pure serializer, so the utf-8/surrogateescape round-trip is
+  # identical to the on-disk path's; the pin is machine-enforced everywhere.
+  if python3 - "$CC" "$tmproot/snap1b_syn.json" <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+raw = b"backend/internal/foo/b\xff.go"        # git's raw 0xFF-byte -z path
+key = raw.decode("utf-8", "surrogateescape")  # what decode_git_path yields
+cc.emit_changed_snapshot(sys.argv[2], "main", "deadbeef", {key: [6, 7]})
+d = json.load(open(sys.argv[2]))
+keys = [k.encode("utf-8", "surrogateescape") for k in d["changed"]]
+assert raw in keys, list(d["changed"])
+PY
+  then
+    pass "(s1b) emit round-trips a truly-undecodable non-UTF-8 (0xFF) key byte-identically (synthetic in-process fixture; on-disk file unsupported here)"
+  else
+    fail "(s1b) synthetic non-UTF-8 emit round-trip failed"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

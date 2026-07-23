@@ -344,8 +344,12 @@ aggregate invocation is unchanged — diff mode is inert without
 The pre-test snapshot (#2124) is pinned on both sides. `test-check-coverage`
 (s1–s11): emit serializes the change set with a non-ASCII path key that
 round-trips — and (s1b) with a truly-undecodable non-UTF-8 (0xFF) byte
-that surrogateescape-decodes and round-trips byte-identically (created for
-real on Linux, self-skipped on macOS APFS); consume produces the correct
+that surrogateescape-decodes and round-trips byte-identically (a real
+non-UTF-8 file where the platform allows one, e.g. Linux; where it does not,
+e.g. macOS APFS, `emit_changed_snapshot` is driven directly in-process with
+the same surrogateescape-decoded key — the (p2)→(p3) synthetic-fixture
+fallback — so the binary-byte edge is machine-enforced on every platform,
+not self-skipped on darwin); consume produces the correct
 verdict; **consume is invariant
 to a post-emit work-tree mutation while the recompute path SKIPs, shown
 side by side** (s3, the TOCTOU proof); one case each for skip-snapshot
