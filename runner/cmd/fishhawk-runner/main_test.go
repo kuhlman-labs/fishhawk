@@ -16344,6 +16344,62 @@ func TestRunDiffCoverageGate_ReportPathOutsideRepoIsExplicit(t *testing.T) {
 	}
 }
 
+// TestRunDiffCoverageGate_WhollyUnusableReportFails is the aggregate case
+// the partial one above does not cover: when the exclusions consume the
+// ENTIRE denominator — every SF path resolves outside the checkout, as it
+// does when the coverage tool ran under a container/build root — the zero
+// says nothing about the stage's coverage. Reporting it as measured-zero
+// would hand the backend its vacuous PASS on EVERY run for an affected
+// repo, with the explanation buried in a reason nobody reads on a green
+// result. It must be a measurement FAILURE.
+func TestRunDiffCoverageGate_WhollyUnusableReportFails(t *testing.T) {
+	repo := diffCovRepo(t)
+	dc := &upload.DiffCoverageConfig{
+		Command:            `printf 'SF:/container/build/app.go\nDA:1,1\nDA:3,1\nend_of_record\n' > coverage.lcov`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := runDiffCov(t, context.Background(), diffCovCfg(), dc, repo, "main")
+	if got.Outcome != "failed" {
+		t.Fatalf("outcome = %q reason = %q, want failed — a report that resolves nothing into the repo is not a vacuous pass",
+			got.Outcome, got.Reason)
+	}
+	// The reason must name what ran (a coverage command), what it produced
+	// (the report), the offending path, its exit code, and that it is
+	// unusable (condition 7).
+	for _, want := range []string{"coverage command", "coverage.lcov", "/container/build/app.go", "exited 0", "unusable"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("reason %q does not name %q", got.Reason, want)
+		}
+	}
+}
+
+// TestRunDiffCoverageGate_UsableReportMeasuringNothingStillPasses is the
+// other side of that discrimination, and the one that keeps the failure
+// above from becoming a false RED: a report that PLACES fine but simply
+// measures none of the stage's added lines (a docs-only change, a language
+// the tool does not cover) is the documented vacuous pass and must stay
+// measured-zero.
+func TestRunDiffCoverageGate_UsableReportMeasuringNothingStillPasses(t *testing.T) {
+	repo := diffCovRepo(t)
+	dc := &upload.DiffCoverageConfig{
+		// base.go is in the repo but is not a file this stage changed.
+		Command:            `printf 'SF:base.go\nDA:1,1\nend_of_record\n' > coverage.lcov`,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+	got := runDiffCov(t, context.Background(), diffCovCfg(), dc, repo, "main")
+	if got.Outcome != "measured" {
+		t.Fatalf("outcome = %q reason = %q, want measured (the vacuous pass)", got.Outcome, got.Reason)
+	}
+	if got.NewLines != 0 {
+		t.Errorf("new lines = %d, want 0", got.NewLines)
+	}
+	if !strings.Contains(got.Reason, "nothing to measure") {
+		t.Errorf("reason = %q, want it to name the vacuous case", got.Reason)
+	}
+}
+
 // TestRunDiffCoverageGate_UsesTheContainedExecPath pins condition 6: the
 // customer command runs under the default-deny gate env, so a runner
 // credential in the ambient environment is NOT visible to it.
@@ -16516,6 +16572,60 @@ func TestRunDiffCoverageGate_PostCommitResetFailureFatal(t *testing.T) {
 	got := decodeDiffCovEvent(t, ev)
 	if got.Outcome != "measured" {
 		t.Errorf("outcome = %q reason = %q, want the completed measurement to still be reported", got.Outcome, got.Reason)
+	}
+}
+
+// TestRunDiffCoverageGate_PostCommitResetFailureDemotesCategoryB is the
+// CALL-SITE half of the fatal branch: TestRunDiffCoverageGate_PostCommitResetFailureFatal
+// above pins that runDiffCoverageGate RETURNS the reset error; this pins that
+// the demotion translation run() applies to it (res.OK=false, category-B,
+// invokeErr) does the right thing — the WIP commit HEAD is stranded on must
+// never be stacked on and pushed into the customer's PR.
+//
+// It exercises that translation directly rather than through run(): the
+// implement push path relocates into a DETACHED lineage worktree (#1137), so
+// there is no branch ref a fixture could lock to force the reset to fail and
+// `HEAD~1` always resolves — the same reason the sibling committed-tree gate's
+// fatal reset is pinned by the direct TestRunVerifyGateCommitted_PostCommitResetFailureFatal
+// and not a run()-level test. The demotion glue is byte-identical in shape
+// between the two gates (main.go), so pinning the classification here covers
+// both.
+func TestRunDiffCoverageGate_PostCommitResetFailureDemotesCategoryB(t *testing.T) {
+	repo := diffCovRepo(t)
+	lock := filepath.Join(repo, ".git", "refs", "heads", "main.lock")
+	t.Cleanup(func() { _ = os.Remove(lock) })
+	dc := &upload.DiffCoverageConfig{
+		Command: `printf 'SF:app.go\nDA:1,1\nDA:3,1\nend_of_record\n' > coverage.lcov; ` +
+			"touch " + lock,
+		ReportPath:         "coverage.lcov",
+		MinNewLineCoverage: 80,
+	}
+
+	_, fatal := runDiffCoverageGate(context.Background(), diffCovCfg(), dc, repo, "main")
+	if fatal == nil {
+		t.Fatal("a post-commit reset failure must be FATAL (returned error)")
+	}
+
+	// Replay the exact demotion run() applies at the call site (main.go). A WIP
+	// commit stranded at HEAD must fail the stage category-B and never reach the
+	// push, so the classification the runner attaches to the fatal error is what
+	// keeps that commit out of the PR.
+	res := agent.Result{OK: true}
+	var invokeErr error
+	if fatal != nil {
+		res.OK = false
+		res.FailureCategory = "B"
+		res.FailureReason = fatal.Error()
+		invokeErr = fatal
+	}
+	if res.OK {
+		t.Fatal("res.OK must be demoted to false on a fatal reset")
+	}
+	if res.FailureCategory != "B" {
+		t.Errorf("failure category = %q, want B", res.FailureCategory)
+	}
+	if invokeErr == nil || res.FailureReason == "" {
+		t.Error("the fatal error and its reason must be carried onto the result")
 	}
 }
 

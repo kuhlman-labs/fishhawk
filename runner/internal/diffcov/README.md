@@ -180,6 +180,30 @@ explicit measured-with-zero signal rather than emitting nothing — an
 explicit zero is auditable, whereas absence is indistinguishable from a
 runner that failed to run, which the backend treats as a violation.
 
+### Zero that is NOT a vacuous pass (`ResolvedFiles`)
+
+`NewLines == 0` is only a legitimate vacuous pass when the report was
+*usable* — it placed into the repo and simply measured none of the stage's
+added lines. It is a measurement **failure** when the exclusions consumed
+the entire denominator: nothing in the report resolves into the checkout at
+all. That is the field case where a coverage tool ran under a
+container/build root whose absolute `SF:` paths all resolve *outside*
+`repoDir`, or an instrumentation config excluded the changed package — the
+zero says nothing about the stage's coverage, and reporting it as
+measured-zero would hand the backend its vacuous PASS on **every** run for
+an affected repo, with the only explanation buried in a `Reason` nobody
+reads on a green result. That is the silent-neuter shape this constraint
+exists to eliminate.
+
+`Result.ResolvedFiles` counts the distinct report files placed inside the
+repo, so the runner can tell the two zeros apart: when `NewLines == 0` **and**
+(`UnnormalizablePaths` is non-empty **or** `ResolvedFiles == 0`), the runner
+emits outcome `failed` naming what ran, its exit code, and that zero of the
+stage's added lines could be measured — routing it through the backend's
+not-measured violation, which surfaces the reason. A usable report that
+happens to measure none of the stage's files (`ResolvedFiles > 0`,
+no unnormalizable paths) stays the vacuous pass.
+
 ## Known limitation
 
 A coverage percentage credits **execution, not assertion**: a vacuous test

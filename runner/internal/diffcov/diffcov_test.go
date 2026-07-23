@@ -543,6 +543,51 @@ func TestMeasureUnnormalizablePathIsReportedNotCountedUncovered(t *testing.T) {
 	}
 }
 
+// TestMeasureResolvedFilesDiscriminatesUnusableFromVacuous pins the count
+// the caller needs to tell a legitimate zero from a systemically unusable
+// report. Both cases measure zero new lines; only the second is a real
+// measurement, and reporting them alike would hand an affected repo the
+// vacuous PASS on EVERY run.
+func TestMeasureResolvedFilesDiscriminatesUnusableFromVacuous(t *testing.T) {
+	changed := ChangedFiles{"src/app.go": lines(1)}
+
+	t.Run("nothing in the report resolves into the repo", func(t *testing.T) {
+		// The coverage tool ran under a container/build root, so every SF
+		// path resolves outside the checkout.
+		res := Measure("/build/repo", changed, Coverage{
+			"/container/src/app.go":   FileCoverage{1: 1},
+			"/container/src/other.go": FileCoverage{1: 1},
+		})
+		if res.NewLines != 0 {
+			t.Fatalf("new lines = %d, want 0 (nothing resolved)", res.NewLines)
+		}
+		if res.ResolvedFiles != 0 {
+			t.Errorf("resolved files = %d, want 0", res.ResolvedFiles)
+		}
+		if len(res.UnnormalizablePaths) != 2 {
+			t.Errorf("unnormalizable = %v, want both report paths", res.UnnormalizablePaths)
+		}
+	})
+
+	t.Run("report is usable but measures none of the added lines", func(t *testing.T) {
+		// A docs-only or otherwise uninstrumented change: the report places
+		// fine, it simply says nothing about this stage's files. That is the
+		// legitimate vacuous case and must stay distinguishable.
+		res := Measure("/build/repo", changed, Coverage{
+			"src/other.go": FileCoverage{1: 1},
+		})
+		if res.NewLines != 0 {
+			t.Fatalf("new lines = %d, want 0", res.NewLines)
+		}
+		if res.ResolvedFiles != 1 {
+			t.Errorf("resolved files = %d, want 1 — a usable report must not read as unusable", res.ResolvedFiles)
+		}
+		if len(res.UnnormalizablePaths) != 0 {
+			t.Errorf("unnormalizable = %v, want none", res.UnnormalizablePaths)
+		}
+	})
+}
+
 // TestMeasureDenominatorExclusions pins the two ways an added line stays
 // out of the denominator: a file the report never measured, and a line
 // the report measured no statement on.

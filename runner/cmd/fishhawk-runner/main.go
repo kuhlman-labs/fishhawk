@@ -4661,6 +4661,26 @@ func measureDiffCoverage(ctx context.Context, ev diffCoverageEvidence, dc *uploa
 	ev.Percent = res.Percent
 	ev.UncoveredFiles = res.UncoveredFiles
 	switch {
+	case res.NewLines == 0 && (len(res.UnnormalizablePaths) > 0 || res.ResolvedFiles == 0):
+		// SYSTEMICALLY UNUSABLE REPORT — a measurement FAILURE, not the
+		// vacuous pass. The exclusions consumed the ENTIRE denominator:
+		// nothing the report named could be placed inside the checkout (a
+		// coverage tool that ran under a container/build root whose absolute
+		// paths resolve outside repoDir is the field case), so the zero says
+		// nothing about the stage's coverage. Reporting it as measured-zero
+		// would hand the backend its documented vacuous PASS on every run
+		// for an affected repo, with the explanation buried in a Reason
+		// nobody reads on a green result — the silent-neuter shape this
+		// constraint exists to eliminate. Failing here routes it through the
+		// backend's not-measured violation, which surfaces the reason.
+		ev.Outcome = "failed"
+		ev.Reason = fmt.Sprintf("coverage command %q exited %d and its report %q parsed, but the measurement is unusable: %d report file(s) resolved into the repository and 0 of the stage's added lines could be measured",
+			dc.Command, ev.ExitCode, dc.ReportPath, res.ResolvedFiles)
+		if len(res.UnnormalizablePaths) > 0 {
+			ev.Reason += fmt.Sprintf("; %d path(s) could not be resolved into the repository: %s",
+				len(res.UnnormalizablePaths),
+				strings.Join(boundStrings(res.UnnormalizablePaths, diffCoverageMaxUncovered), ", "))
+		}
 	case len(res.UnnormalizablePaths) > 0:
 		ev.Reason = fmt.Sprintf("%d of %d new lines covered; %d report path(s) could not be resolved into the repository and were excluded: %s",
 			res.CoveredNewLines, res.NewLines, len(res.UnnormalizablePaths),

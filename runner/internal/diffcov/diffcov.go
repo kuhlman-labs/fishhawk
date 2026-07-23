@@ -368,6 +368,17 @@ type Result struct {
 	// rather than silently counted as uncovered — a path the measurement
 	// could not place is a fact the operator needs, not a zero.
 	UnnormalizablePaths []string
+	// ResolvedFiles is how many DISTINCT report files were successfully
+	// placed inside the repository. It is what lets the caller tell a
+	// legitimate zero measurement (the report is usable; it simply
+	// measures none of this stage's added lines) from a SYSTEMICALLY
+	// unusable report (nothing in it resolves into the checkout at all —
+	// a coverage tool that ran under a container/build root, say). The
+	// first is the documented vacuous pass; the second must be reported
+	// as a measurement FAILURE, because a green result nobody is prompted
+	// to read the reason of is the silent-neuter shape this constraint
+	// exists to eliminate.
+	ResolvedFiles int
 }
 
 // Measure intersects the report's per-line coverage with the stage's
@@ -408,6 +419,7 @@ func Measure(repoDir string, changed ChangedFiles, coverage Coverage) Result {
 	}
 	sort.Strings(bad)
 	res.UnnormalizablePaths = bad
+	res.ResolvedFiles = len(norm)
 
 	uncovered := map[string]bool{}
 	for p, lines := range changed {
