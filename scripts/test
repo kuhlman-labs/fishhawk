@@ -9,7 +9,7 @@
 #   scripts/test              run `go test -race ./...` in every module
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
 #   scripts/test lint         run `golangci-lint run ./...` in every module
-#   scripts/test verify       lint + schema-sync + tests (no coverage) — the runner's gate
+#   scripts/test verify       lint + schema-sync + tests + patch-coverage — the runner's gate
 #   scripts/test single ARGS  pass-through to `go test -race ARGS`
 #                             example:
 #                             scripts/test single -run TestX ./backend/internal/version/...
@@ -170,6 +170,52 @@ _register_lease() {
   return 0
 }
 
+# Per-invocation coverage-profile scratch dir for the patch-coverage gate. It is
+# keyed by PID (as the container leases are) and lives OUTSIDE the repo, so two
+# concurrent `scripts/test verify` invocations can never share, corrupt, or
+# delete each other's profile, no fixed in-repo filename is ever clobbered, and
+# no build artifact is left in the working tree. Removed by the EXIT trap below,
+# so an early test failure cannot leave litter behind.
+PATCHCOV_DIR=""
+LEASE_ARMED=0
+
+_patchcov_cleanup() {
+  if [ -n "$PATCHCOV_DIR" ]; then
+    rm -rf "$PATCHCOV_DIR" 2>/dev/null || true
+  fi
+}
+
+# The single EXIT handler. It always sweeps the coverage scratch dir and reaps
+# the shared container ONLY when this invocation actually recorded a lease —
+# an invocation holding no lease must never docker-rm the container out from
+# under a peer (#1792). Kept as one string so both arming sites install the
+# identical handler.
+EXIT_TRAP='_patchcov_cleanup; if [ "${LEASE_ARMED:-0}" = "1" ]; then _reap_shared_container; fi'
+
+# _patchcov_mktemp: create the per-invocation profile dir and arm the EXIT trap.
+# Returns non-zero (never aborts) if the dir cannot be created — the caller then
+# degrades to the plain test loop.
+#
+# The dir is created by `mktemp -d`, which creates ATOMICALLY (mode 0700) and
+# fails rather than reusing an existing path. Deliberately NOT `rm -rf` then
+# `mkdir`: removing a pre-created path both destroys whatever is there and opens
+# a remove→create window in which a local attacker could substitute the scratch
+# dir (or a symlink to one) and steer where profiles are written. The PID stays
+# in the name (as the container leases are PID-keyed) for provenance; the mktemp
+# suffix is what makes collision and clobber impossible.
+_patchcov_mktemp() {
+  if ! PATCHCOV_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-patchcov-$$.XXXXXX" 2>/dev/null)"; then
+    PATCHCOV_DIR=""
+    return 1
+  fi
+  if [ -z "$PATCHCOV_DIR" ] || [ ! -d "$PATCHCOV_DIR" ]; then
+    PATCHCOV_DIR=""
+    return 1
+  fi
+  trap "$EXIT_TRAP" EXIT
+  return 0
+}
+
 # _arm_container_lease: register this invocation's lease and arm the reap trap
 # ONLY if the lease was actually recorded. Replaces the bare EXIT trap at the top
 # of cmd_test / cmd_coverage. If registration failed (no Docker, or a live-stuck
@@ -178,7 +224,8 @@ _register_lease() {
 # lease state.
 _arm_container_lease() {
   if _register_lease; then
-    trap _reap_shared_container EXIT
+    LEASE_ARMED=1
+    trap "$EXIT_TRAP" EXIT
   fi
 }
 
@@ -206,6 +253,27 @@ modules() {
   go work edit -json | jq -r '.Use[].DiskPath'
 }
 
+# _module_list: the module list, or non-zero when it is unavailable or empty.
+# The test loops consume this instead of piping `modules` straight into a `while
+# read`, where a failing `modules` yields ZERO iterations and the loop reports
+# success having run no tests at all.
+_module_list() {
+  local mlist
+  if ! mlist="$(modules 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$mlist" ]; then
+    return 1
+  fi
+  printf '%s\n' "$mlist"
+}
+
+# Message for the fail-closed branch below. A test loop that enumerated no
+# modules must never exit 0 — that is a green gate that ran nothing. This is NOT
+# the patch-coverage gate failing (that one always degrades to the plain loop);
+# it is the plain loop being unable to run at all.
+NO_MODULES_MSG="scripts/test: could not enumerate go.work modules (go/jq unavailable, or an empty go.work) — refusing to report success without running any tests"
+
 # Full-suite test-binary parallelism (#972, #1174). Historically every backend
 # package started its OWN testcontainers Postgres, so at the default -p
 # (~GOMAXPROCS) a developer-Mac Docker daemon intermittently timed out starting
@@ -227,11 +295,16 @@ modules() {
 TEST_P="${FISHHAWK_TEST_P:-4}"
 
 cmd_test() {
+  local mlist m
+  if ! mlist="$(_module_list)"; then
+    echo "$NO_MODULES_MSG" >&2
+    exit 1
+  fi
   _arm_container_lease
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
     (cd "$m" && go test -race -p "$TEST_P" ./...)
-  done < <(modules)
+  done <<< "$mlist"
 }
 
 cmd_coverage() {
@@ -334,16 +407,305 @@ EOF
   fi
 }
 
+# --------------------------------------------------------------------------
+# Patch-scoped coverage gate (#1887 / ADR-059)
+#
+# CI enforces only the whole-repo AGGREGATE floor, and it runs AFTER the agent
+# is terminal — so a new 0%-covered function barely moves the aggregate and
+# lands anyway. These helpers add a diff-scoped coverage check to the verify
+# gate so an uncovered new path fails IN-LOOP (#1064).
+#
+# FAIL-OPEN BY CONSTRUCTION: every git/go/jq call below runs in a TESTED context
+# (`if !`, `if [ ... ]`), so none of them can abort verify under `set -e`. Any
+# failure returns non-zero, and cmd_verify then prints a one-line reason and
+# falls through to the plain `cmd_test` loop. Only the Python gate itself is
+# allowed to fail verify.
+# --------------------------------------------------------------------------
+
+# _patch_cov_base: echo the diff base ref, or return non-zero when none is
+# usable. Ladder: FISHHAWK_DIFF_BASE (must resolve; an unresolvable override is
+# NOT silently replaced by a fallback), else the first of origin/main, main that
+# resolves.
+_patch_cov_base() {
+  if ! command -v git >/dev/null 2>&1; then
+    return 1
+  fi
+  if [ "$(git -C "$ROOT" rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
+    return 1
+  fi
+  local ref
+  if [ -n "${FISHHAWK_DIFF_BASE:-}" ]; then
+    if git -C "$ROOT" rev-parse --verify --quiet "${FISHHAWK_DIFF_BASE}^{commit}" >/dev/null 2>&1; then
+      printf '%s' "$FISHHAWK_DIFF_BASE"
+      return 0
+    fi
+    return 1
+  fi
+  for ref in origin/main main; do
+    if git -C "$ROOT" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+      printf '%s' "$ref"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# _patch_cov_all_modules: emit `<module>\t./...` for every go.work module. This
+# is the fail-CLOSED fallback used when a changed path cannot be decoded (see
+# _patch_cov_changed_modules): instrumenting every module costs more, but it
+# keeps the undecodable file inside the gate's reach — check-coverage.py's own
+# enumeration is binary-safe and will fold it into the denominator — instead of
+# dropping it, which is exactly the hide-behind-a-filename bypass. Returns
+# non-zero if the module list is unavailable.
+_patch_cov_all_modules() {
+  local mlist m
+  if ! mlist="$(modules 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$mlist" ]; then
+    return 1
+  fi
+  while IFS= read -r m; do
+    m="${m#./}"
+    m="${m%/}"
+    if [ -z "$m" ]; then continue; fi
+    printf '%s\t./...\n' "$m"
+  done <<< "$mlist"
+}
+
+# _patch_cov_changed_modules: emit one `<module>\t./pkg,./pkg2` line per go.work
+# module that owns a changed non-test .go file. Diffs the MERGE BASE against the
+# WORK TREE — the same snapshot `go test` compiles and the same snapshot
+# check-coverage.py diffs, so line attribution never skews on a dirty tree — and
+# adds UNTRACKED .go files, which `git diff` cannot see but the compiler can, so
+# a never-`git add`ed new file is bucketed rather than silently bypassing the
+# gate (it would otherwise be the only Go change and take the plain-test path).
+#
+# BINARY-SAFE ENUMERATION: both git listings use -z, because without it git
+# C-quotes any path carrying a double quote, a backslash, a control character or
+# a non-ASCII byte, and a filename containing a NEWLINE would split one path into
+# two — letting Go code hide from the gate behind its name. Command substitution
+# cannot carry NUL bytes, so the -z stream is remapped by an INJECTIVE `tr`:
+# record-separator NUL -> newline, and any newline (which at that point can only
+# be INSIDE a filename) -> \001. A record still containing \001 is therefore a
+# path this layer cannot present, and is handled fail-CLOSED below rather than
+# dropped — as is a path containing a TAB or a COMMA, the two delimiters this
+# layer's OWN output encoding uses (`<module>\t<pkg>` pairs, comma-joined
+# -coverpkg patterns), which would otherwise emit a corrupt pattern and leave
+# the package tested but un-instrumented.
+# Returns non-zero if git/go/jq is unavailable or there is no merge base.
+_patch_cov_changed_modules() {
+  local base="$1" mb files untracked mlist f cand m rel pkg pairs shown undecodable=0
+  if ! mb="$(git -C "$ROOT" merge-base "$base" HEAD 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$mb" ]; then
+    return 1
+  fi
+  if ! files="$(git -C "$ROOT" diff --name-only -z --diff-filter=ACMR "$mb" -- '*.go' 2>/dev/null | tr '\n\000' '\001\n')"; then
+    return 1
+  fi
+  # Untracked files are additive: a failure here degrades to the tracked-only
+  # list rather than skipping the whole gate.
+  if untracked="$(git -C "$ROOT" ls-files --others --exclude-standard -z -- '*.go' 2>/dev/null | tr '\n\000' '\001\n')"; then
+    if [ -n "$untracked" ]; then
+      files="$files
+$untracked"
+    fi
+  fi
+  if ! mlist="$(modules 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$mlist" ]; then
+    return 1
+  fi
+  pairs=""
+  while IFS= read -r f; do
+    if [ -z "$f" ]; then continue; fi
+    case "$f" in
+      *$'\001'*|*$'\t'*|*,*)
+        # A path this layer's own encoding cannot carry: a NEWLINE (surviving
+        # the `tr` remap as \001), a TAB (the `<module>\t<pkg>` pair delimiter,
+        # at which the awk grouping pass truncates), or a COMMA (the -coverpkg
+        # pattern-list separator, which `go test` would split the pattern on).
+        # Each would emit a corrupt pattern, leaving the package tested but
+        # UN-instrumented — its lines fall inside no profile block and the
+        # Python layer's denominator rule silently drops the file, printing the
+        # misleading "no coverable new Go statements" skip. So this layer must
+        # not decide the path is uninteresting: say so on one line and fall back
+        # to instrumenting every module. The Python layer's own enumeration is
+        # binary-safe and folds the path into the denominator from there.
+        shown="${f//$'\001'/<NL>}"
+        shown="${shown//$'\t'/<TAB>}"
+        echo "scripts/test: cannot decode changed path '$shown' (newline, tab or comma in path) — instrumenting every module (fail-closed)" >&2
+        undecodable=1
+        continue
+        ;;
+    esac
+    case "$f" in
+      *_test.go) continue ;;
+    esac
+    m=""
+    while IFS= read -r cand; do
+      cand="${cand#./}"
+      cand="${cand%/}"
+      if [ -z "$cand" ]; then continue; fi
+      case "$f" in
+        "$cand"/*)
+          if [ "${#cand}" -gt "${#m}" ]; then m="$cand"; fi
+          ;;
+      esac
+    done <<< "$mlist"
+    if [ -z "$m" ]; then continue; fi
+    rel="${f#"$m"/}"
+    pkg="${rel%/*}"
+    if [ "$pkg" = "$rel" ]; then pkg="."; else pkg="./$pkg"; fi
+    pairs="$pairs$m	$pkg
+"
+  done <<< "$files"
+  if [ "$undecodable" -eq 1 ]; then
+    if ! _patch_cov_all_modules; then
+      return 1
+    fi
+    return 0
+  fi
+  if [ -z "$pairs" ]; then
+    return 0
+  fi
+  printf '%s' "$pairs" | sort -u | awk -F'\t' '
+    { if ($1 != cur) { if (cur != "") print cur "\t" acc; cur = $1; acc = $2 }
+      else acc = acc "," $2 }
+    END { if (cur != "") print cur "\t" acc }'
+}
+
+# cmd_test_with_patch_coverage: the same per-module test loop cmd_test runs, but
+# a module that owns changed packages also emits a coverage profile with
+# -coverpkg RESTRICTED to those packages. Restricting -coverpkg (rather than
+# relying on Go's default per-package attribution) means the module's FULL test
+# set credits the changed packages — a function exercised only by a sibling
+# package's test still counts — while instrumentation cost is paid only for
+# changed code, and no second test run happens.
+cmd_test_with_patch_coverage() {
+  local mods="$1" mlist
+  # Re-enumerate defensively: bucketing enumerated the modules earlier, but if
+  # THIS call cannot, feeding the loop from a failed `modules` would run zero
+  # modules and still exit 0 — verify reporting success having tested nothing.
+  # Degrade to the plain loop, which fails closed on the same condition.
+  if ! mlist="$(_module_list)"; then
+    echo "scripts/test: could not enumerate go.work modules for the coverage loop — skipping the patch-coverage gate" >&2
+    cmd_test
+    return 0
+  fi
+  _arm_container_lease
+  if ! _patchcov_mktemp; then
+    echo "scripts/test: could not create the coverage scratch dir — skipping the patch-coverage gate" >&2
+    cmd_test
+    return 0
+  fi
+  # The profile filename is keyed by a per-loop ORDINAL, not by a slug derived
+  # from the module path. A slug (`tr '/' '_'`) is NOT injective — the distinct
+  # valid module paths `a/b` and `a_b` both map to `a_b.out`, so the later
+  # module's `go test` would overwrite the earlier module's profile and every
+  # changed line in the overwritten module would fall inside no remaining
+  # profile block, silently leaving that module's new code ungated. The ordinal
+  # is unique by construction (the loop is sequential); the slug is retained
+  # only as a human-readable SUFFIX for provenance, where a collision is
+  # harmless. `(( ++cov_idx ))` is pre-increment: post-increment returns the old
+  # value, and `(( 0 ))` is false, which aborts under `set -e`.
+  local m mm pp pkgs slug cov_idx=0
+  while IFS= read -r m; do
+    printf '>>> %s\n' "$m"
+    pkgs=""
+    while IFS=$'\t' read -r mm pp; do
+      if [ "${mm#./}" = "${m#./}" ]; then pkgs="$pp"; fi
+    done <<< "$mods"
+    if [ -n "$pkgs" ]; then
+      (( ++cov_idx ))
+      slug="$(printf '%s' "${m#./}" | tr '/' '_')"
+      (cd "$m" && go test -race -p "$TEST_P" -covermode=atomic \
+        -coverprofile="$PATCHCOV_DIR/$cov_idx-$slug.out" -coverpkg="$pkgs" ./...)
+    else
+      (cd "$m" && go test -race -p "$TEST_P" ./...)
+    fi
+  done <<< "$mlist"
+}
+
+# _verify_patch_coverage: run the diff-scoped gate over the profiles the loop
+# emitted. This is the ONE step allowed to fail verify — a below-threshold patch
+# exits non-zero and `set -e` aborts. Missing profiles degrade to a printed skip.
+_verify_patch_coverage() {
+  local base="$1" f n=0
+  local profiles=()
+  if [ -z "$PATCHCOV_DIR" ]; then
+    echo "scripts/test: no coverage profiles were produced — skipping the patch-coverage gate" >&2
+    return 0
+  fi
+  for f in "$PATCHCOV_DIR"/*.out; do
+    if [ -f "$f" ]; then
+      profiles[$n]="$f"
+      n=$((n + 1))
+    fi
+  done
+  if [ "$n" -eq 0 ]; then
+    echo "scripts/test: no coverage profiles were produced — skipping the patch-coverage gate" >&2
+    return 0
+  fi
+  python3 "$ROOT/scripts/check-coverage.py" \
+    --diff-base "$base" \
+    --diff-threshold "${FISHHAWK_PATCH_COVERAGE_THRESHOLD:-85}" \
+    --exclude '/db/' \
+    --repo-root "$ROOT" \
+    "${profiles[@]}"
+}
+
+# _verify_gate_harnesses: run the standalone harnesses that pin the gate scripts
+# themselves (~3s total). They are the only machine check that scripts/test's
+# patch-coverage wiring and scripts/check-coverage.py still behave as documented,
+# and "must be green" is worth nothing if nothing ever runs them — `scripts/test
+# verify` on a Python/shell-only diff otherwise takes the no-changed-Go-packages
+# SKIP path and exercises neither the gate nor its harnesses. A missing or
+# non-executable harness prints a reason and is skipped; a FAILING one fails
+# verify (set -e), which is the point.
+_verify_gate_harnesses() {
+  local h
+  for h in test-check-coverage test-patch-coverage; do
+    if [ ! -x "$ROOT/scripts/$h" ]; then
+      echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
+      continue
+    fi
+    printf '>>> scripts/%s\n' "$h"
+    "$ROOT/scripts/$h"
+  done
+}
+
 # verify: the runner's committed-tree implement gate. Lint FIRST so a fast
 # format/lint failure leads the captured output and aborts (set -e) before the
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
 # (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop.
-# Coverage is intentionally omitted to bound in-loop runtime — it stays on
-# `coverage` and in CI.
+# The AGGREGATE coverage gate is still intentionally omitted to bound in-loop
+# runtime — it stays on `coverage` and in CI. What runs here instead is the
+# PATCH-scoped gate (#1887), folded into the same test loop via -coverpkg so no
+# second run happens. Every precondition degrades to a one-line reason plus the
+# plain `cmd_test` loop; none of them can red-line verify.
 cmd_verify() {
   cmd_lint
   _verify_doc_line_budget
   _verify_schema_sync
+  _verify_gate_harnesses
+  local base="" mods=""
+  if [ -n "${FISHHAWK_SKIP_PATCH_COVERAGE:-}" ]; then
+    echo "scripts/test: FISHHAWK_SKIP_PATCH_COVERAGE set — skipping the patch-coverage gate" >&2
+  elif ! base="$(_patch_cov_base)"; then
+    echo "scripts/test: no usable diff base (git absent, not a work tree, or unresolvable ref) — skipping the patch-coverage gate" >&2
+  elif ! mods="$(_patch_cov_changed_modules "$base")"; then
+    echo "scripts/test: could not bucket changed Go files (no merge base, or go/jq unavailable) — skipping the patch-coverage gate" >&2
+  elif [ -z "$mods" ]; then
+    echo "scripts/test: no changed Go packages vs $base — skipping the patch-coverage gate" >&2
+  else
+    cmd_test_with_patch_coverage "$mods"
+    _verify_patch_coverage "$base"
+    return 0
+  fi
   cmd_test
 }
 
@@ -365,7 +727,7 @@ usage: scripts/test [SUBCOMMAND] [ARGS]
   test                 (default) run `go test -race ./...` in every module
   coverage             run tests + aggregate coverage gate
   lint                 run `golangci-lint run ./...` in every module
-  verify               lint + schema-sync + tests (no coverage) — the runner's verify gate
+  verify               lint + schema-sync + tests + patch-scoped coverage — the runner's verify gate
   single ARGS          pass-through to `go test -race ARGS`
   -h | --help | help   show this message
 EOF

@@ -1,0 +1,676 @@
+#!/usr/bin/env bash
+# Hermetic tests for the SHELL side of the patch-scoped coverage gate in
+# scripts/test (#1887 / ADR-059). Sources scripts/test lib-only
+# (FISHHAWK_TEST_LIB_ONLY=1, so no subcommand runs) and overrides ROOT after
+# sourcing, exactly as scripts/test-schema-sync-verify does. Asserts the
+# cmd_verify wiring/ordering, the base-resolution ladder, changed-file
+# bucketing, the per-invocation profile-dir contract, and one behavioral case
+# per fail-open degrade branch. Standalone — not wired into scripts/test or CI.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+cleanup_trap='rm -rf "$tmproot"'
+trap "$cleanup_trap" EXIT
+
+# Source the lib. scripts/test enables `set -e`; turn it back off so assertions
+# that run commands expected to fail don't abort the test.
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+
+# make_repo <dir>: a git repo on `main` with one Go file per module, committed.
+make_repo() {
+  local repo="$1"
+  rm -rf "$repo"
+  mkdir -p "$repo/backend/internal/foo" "$repo/cli/internal/bar"
+  git init -q -b main "$repo"
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" config user.name test
+  echo 'package foo' > "$repo/backend/internal/foo/foo.go"
+  echo 'package bar' > "$repo/cli/internal/bar/bar.go"
+  echo '# readme' > "$repo/README.md"
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m base
+}
+
+# ---------------------------------------------------------------------------
+# (a) cmd_verify ordering: lint -> doc budget -> schema sync -> the test /
+#     patch-coverage step. The fast checks must still lead the output.
+# ---------------------------------------------------------------------------
+verify_body="$(declare -f cmd_verify)"
+lint_line=$(printf '%s\n' "$verify_body" | grep -n 'cmd_lint' | head -1 | cut -d: -f1)
+doc_line=$(printf '%s\n' "$verify_body" | grep -n '_verify_doc_line_budget' | head -1 | cut -d: -f1)
+sync_line=$(printf '%s\n' "$verify_body" | grep -n '_verify_schema_sync' | head -1 | cut -d: -f1)
+harness_line=$(printf '%s\n' "$verify_body" | grep -n '_verify_gate_harnesses' | head -1 | cut -d: -f1)
+cov_line=$(printf '%s\n' "$verify_body" | grep -n '_patch_cov_base' | head -1 | cut -d: -f1)
+if [ -n "$lint_line" ] && [ -n "$doc_line" ] && [ -n "$sync_line" ] \
+   && [ -n "$harness_line" ] && [ -n "$cov_line" ] \
+   && [ "$lint_line" -lt "$doc_line" ] && [ "$doc_line" -lt "$sync_line" ] \
+   && [ "$sync_line" -lt "$harness_line" ] && [ "$harness_line" -lt "$cov_line" ]; then
+  pass "(a) cmd_verify order: lint < doc budget < schema sync < gate harnesses < patch coverage"
+else
+  fail "(a) cmd_verify ordering (lint=$lint_line doc=$doc_line sync=$sync_line harness=$harness_line cov=$cov_line)"
+fi
+
+# (a2) verify actually EXECUTES both standalone harnesses, so "must be green" is
+# machine-checked rather than asserted in prose.
+harness_body="$(declare -f _verify_gate_harnesses)"
+if printf '%s' "$harness_body" | grep -q 'test-check-coverage' \
+   && printf '%s' "$harness_body" | grep -q 'test-patch-coverage' \
+   && [ -x "$REPO_ROOT/scripts/test-check-coverage" ] \
+   && [ -x "$REPO_ROOT/scripts/test-patch-coverage" ]; then
+  pass "(a2) cmd_verify runs both gate harnesses, and both are executable"
+else
+  fail "(a2) gate-harness wiring ('$harness_body')"
+fi
+
+# ---------------------------------------------------------------------------
+# (b) _patch_cov_base ladder.
+# ---------------------------------------------------------------------------
+ROOT="$tmproot/base"
+make_repo "$ROOT"
+
+unset FISHHAWK_DIFF_BASE
+got="$(_patch_cov_base)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$got" = "main" ]; then
+  pass "(b1) _patch_cov_base falls back to main when origin/main is absent"
+else
+  fail "(b1) expected 'main' (rc=$rc got='$got')"
+fi
+
+git -C "$ROOT" update-ref refs/remotes/origin/main "$(git -C "$ROOT" rev-parse HEAD)"
+got="$(_patch_cov_base)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$got" = "origin/main" ]; then
+  pass "(b2) _patch_cov_base prefers origin/main when it resolves"
+else
+  fail "(b2) expected 'origin/main' (rc=$rc got='$got')"
+fi
+
+git -C "$ROOT" branch -q other
+FISHHAWK_DIFF_BASE=other got="$(_patch_cov_base)"; rc=$?
+if [ "$rc" -eq 0 ] && [ "$got" = "other" ]; then
+  pass "(b3) FISHHAWK_DIFF_BASE overrides the ladder"
+else
+  fail "(b3) expected 'other' (rc=$rc got='$got')"
+fi
+
+FISHHAWK_DIFF_BASE=nosuchref got="$(_patch_cov_base)"; rc=$?
+if [ "$rc" -ne 0 ] && [ -z "$got" ]; then
+  pass "(b4) an unresolvable FISHHAWK_DIFF_BASE returns non-zero (no silent fallback)"
+else
+  fail "(b4) expected non-zero + empty (rc=$rc got='$got')"
+fi
+# The two cases above are assignment-only statements, so the override persists
+# in this shell — clear it before the ladder/degrade cases below.
+unset FISHHAWK_DIFF_BASE
+
+ROOT="$tmproot/nogit"; mkdir -p "$ROOT"
+got="$(_patch_cov_base)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(b5) a non-git ROOT returns non-zero"
+else
+  fail "(b5) expected non-zero for a non-git ROOT (got='$got')"
+fi
+
+ROOT="$tmproot/bare"; git init -q --bare "$ROOT"
+got="$(_patch_cov_base)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(b6) a bare repo ROOT returns non-zero"
+else
+  fail "(b6) expected non-zero for a bare repo (got='$got')"
+fi
+
+ROOT="$tmproot/base"
+got="$(PATH=/nonexistent _patch_cov_base)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(b7) git absent from PATH returns non-zero"
+else
+  fail "(b7) expected non-zero with git absent (got='$got')"
+fi
+
+ROOT="$tmproot/norefs"; rm -rf "$ROOT"; mkdir -p "$ROOT"; git init -q -b feature "$ROOT"
+got="$(_patch_cov_base)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(b8) neither origin/main nor main resolving returns non-zero"
+else
+  fail "(b8) expected non-zero with no base refs (got='$got')"
+fi
+
+# ---------------------------------------------------------------------------
+# (c) _patch_cov_changed_modules bucketing.
+# ---------------------------------------------------------------------------
+ROOT="$tmproot/buckets"
+make_repo "$ROOT"
+git -C "$ROOT" checkout -q -b feature
+# Stub `modules` (the real one shells out to go + jq against the real go.work).
+modules() { printf './backend\n./cli\n'; }
+
+printf 'package foo\n\nfunc A() {}\n' > "$ROOT/backend/internal/foo/foo.go"
+mkdir -p "$ROOT/backend/internal/baz"
+printf 'package baz\n' > "$ROOT/backend/internal/baz/baz.go"
+printf 'package bar\n\nfunc B() {}\n' > "$ROOT/cli/internal/bar/bar.go"
+git -C "$ROOT" add -A
+git -C "$ROOT" commit -q -m change
+got="$(_patch_cov_changed_modules main)"; rc=$?
+expected="$(printf 'backend\t./internal/baz,./internal/foo\ncli\t./internal/bar')"
+if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ]; then
+  pass "(c1) changed files bucket into module + package patterns"
+else
+  fail "(c1) bucketing (rc=$rc got='$got' expected='$expected')"
+fi
+
+ROOT="$tmproot/testonly"
+make_repo "$ROOT"
+git -C "$ROOT" checkout -q -b feature
+printf 'package foo\n' > "$ROOT/backend/internal/foo/foo_test.go"
+echo 'changed' > "$ROOT/README.md"
+git -C "$ROOT" add -A
+git -C "$ROOT" commit -q -m testonly
+got="$(_patch_cov_changed_modules main)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$got" ]; then
+  pass "(c2) a _test.go-only / non-Go diff yields no buckets (exit 0, empty)"
+else
+  fail "(c2) expected empty output (rc=$rc got='$got')"
+fi
+
+# no merge base (unrelated histories) -> non-zero, never an abort
+ROOT="$tmproot/nomb"
+make_repo "$ROOT"
+git -C "$ROOT" checkout -q --orphan orphan
+git -C "$ROOT" rm -rq --cached . 2>/dev/null
+printf 'package foo\n\nfunc A() {}\n' > "$ROOT/backend/internal/foo/foo.go"
+git -C "$ROOT" add -A
+git -C "$ROOT" commit -q -m orphan
+got="$(_patch_cov_changed_modules main)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(c3) no merge base returns non-zero (fail-open, no abort)"
+else
+  fail "(c3) expected non-zero with unrelated histories (got='$got')"
+fi
+
+# (c5) an UNTRACKED new .go file is bucketed: `git diff` cannot see it, but
+# `go test` compiles it, so it must not bypass the gate by being invisible.
+ROOT="$tmproot/untracked"
+make_repo "$ROOT"
+git -C "$ROOT" checkout -q -b feature
+mkdir -p "$ROOT/backend/internal/newpkg"
+printf 'package newpkg\n\nfunc N() {}\n' > "$ROOT/backend/internal/newpkg/new.go"
+printf 'package newpkg\n' > "$ROOT/backend/internal/newpkg/new_test.go"
+got="$(_patch_cov_changed_modules main)"; rc=$?
+expected="$(printf 'backend\t./internal/newpkg')"
+if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ]; then
+  pass "(c5) an untracked new .go file buckets (invisible to git diff, seen by go test)"
+else
+  fail "(c5) untracked bucketing (rc=$rc got='$got' expected='$expected')"
+fi
+
+# (c6) an untracked file that git IGNORES stays out of the denominator.
+printf 'ignored/\n' > "$ROOT/.gitignore"
+mkdir -p "$ROOT/ignored"
+printf 'package ignored\n\nfunc I() {}\n' > "$ROOT/ignored/i.go"
+got="$(_patch_cov_changed_modules main)"; rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$got" | grep -q 'ignored'; then
+  pass "(c6) a git-ignored untracked .go file is not bucketed"
+else
+  fail "(c6) ignored-file bucketing (rc=$rc got='$got')"
+fi
+
+# (c7) BINARY-SAFE ENUMERATION: without -z git C-quotes a path carrying a quote,
+# a backslash or a non-ASCII byte, and the quoted form buckets into a bogus
+# module (or none) — the file then never reaches the gate. Real files with each
+# character must bucket into their real module.
+ROOT="$tmproot/weird"
+make_repo "$ROOT"
+git -C "$ROOT" checkout -q -b feature
+mkdir -p "$ROOT/backend/internal/w"
+for wf in 'qu"ote.go' 'back\slash.go' 'sp ace.go' 'café.go'; do
+  printf 'package w\n' > "$ROOT/backend/internal/w/$wf"
+done
+git -C "$ROOT" add -A
+git -C "$ROOT" commit -q -m weird
+got="$(_patch_cov_changed_modules main)"; rc=$?
+expected="$(printf 'backend\t./internal/w')"
+if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ]; then
+  pass "(c7) quote/backslash/space/non-ASCII filenames bucket into their real module"
+else
+  fail "(c7) special-character bucketing (rc=$rc got='$got' expected='$expected')"
+fi
+
+# (c8) a filename containing a NEWLINE cannot be presented by this layer, so it
+# is handled FAIL-CLOSED: a printed reason plus the every-module fallback, never
+# a silent drop that would let the file bypass the gate.
+nl_file="$(printf 'new\nline.go')"
+if printf 'package w\n' > "$ROOT/backend/internal/w/$nl_file" 2>/dev/null; then
+  git -C "$ROOT" add -A
+  git -C "$ROOT" commit -q -m newline
+  err="$tmproot/c8.err"
+  got="$(_patch_cov_changed_modules main 2>"$err")"; rc=$?
+  expected="$(printf 'backend\t./...\ncli\t./...')"
+  if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ] \
+     && grep -q 'cannot decode changed path' "$err"; then
+    pass "(c8) a newline filename fails closed: printed reason + every-module fallback"
+  else
+    fail "(c8) newline fail-closed (rc=$rc got='$got' expected='$expected' err='$(cat "$err")')"
+  fi
+  git -C "$ROOT" rm -q "$ROOT/backend/internal/w/$nl_file" >/dev/null 2>&1
+  git -C "$ROOT" commit -q -m unnewline
+else
+  echo "NOTE: this platform cannot create a newline filename; (c8) not exercised"
+fi
+
+# (c10) a changed .go file under a DIRECTORY whose name contains a TAB or a
+# COMMA is fail-CLOSED for the same reason (c8) is: a tab is this layer's
+# `<module>\t<pkg>` pair delimiter (awk truncates the pattern there) and a comma
+# is the -coverpkg pattern separator (`go test` splits the pattern there), so
+# either would emit a corrupt pattern and leave the package tested but
+# UN-instrumented — its lines then fall inside no profile block and the Python
+# denominator rule drops the file behind a misleading "no coverable new Go
+# statements" skip. Neither may be a silent drop.
+for wd_kind in tab comma; do
+  if [ "$wd_kind" = tab ]; then wd=$'ta\tb'; else wd='com,ma'; fi
+  ROOT="$tmproot/weirddir"
+  make_repo "$ROOT"
+  git -C "$ROOT" checkout -q -b feature
+  if ! mkdir -p "$ROOT/backend/internal/$wd" 2>/dev/null; then
+    echo "NOTE: this platform cannot create the directory name; (c10/$wd) not exercised"
+    continue
+  fi
+  printf 'package d\n\nfunc D() {}\n' > "$ROOT/backend/internal/$wd/d.go"
+  git -C "$ROOT" add -A
+  git -C "$ROOT" commit -q -m weirddir
+  err="$tmproot/c10.err"
+  got="$(_patch_cov_changed_modules main 2>"$err")"; rc=$?
+  expected="$(printf 'backend\t./...\ncli\t./...')"
+  if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ] \
+     && grep -q 'cannot decode changed path' "$err"; then
+    pass "(c10) a tab/comma directory name fails closed: printed reason + every-module fallback"
+  else
+    fail "(c10) tab/comma dir fail-closed (rc=$rc got='$got' expected='$expected' err='$(cat "$err")')"
+  fi
+done
+ROOT="$tmproot/weird"
+
+# (c9) _patch_cov_all_modules emits `<module>\t./...` per module, and returns
+# non-zero (fail-open, no abort) when the module list is unavailable.
+got="$(_patch_cov_all_modules)"; rc=$?
+expected="$(printf 'backend\t./...\ncli\t./...')"
+modules() { return 1; }
+got2="$(_patch_cov_all_modules)"; rc2=$?
+modules() { printf './backend\n./cli\n'; }
+if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ] && [ "$rc2" -ne 0 ]; then
+  pass "(c9) _patch_cov_all_modules emits every module, non-zero when unavailable"
+else
+  fail "(c9) all-modules fallback (rc=$rc got='$got' rc2=$rc2 got2='$got2')"
+fi
+
+# `modules` unavailable (go/jq missing) -> non-zero
+ROOT="$tmproot/buckets"
+modules() { return 1; }
+got="$(_patch_cov_changed_modules main)"; rc=$?
+if [ "$rc" -ne 0 ]; then
+  pass "(c4) an unavailable module list returns non-zero (fail-open)"
+else
+  fail "(c4) expected non-zero when modules fails (got='$got')"
+fi
+modules() { printf './backend\n./cli\n'; }
+
+# ---------------------------------------------------------------------------
+# (d) per-invocation profile dir (binding condition 1): PID-keyed, outside the
+#     repo, armed on an EXIT trap, and swept by _patchcov_cleanup.
+# ---------------------------------------------------------------------------
+saved_trap="$(trap -p EXIT)"
+TMPDIR="$tmproot" _patchcov_mktemp
+mk_rc=$?
+armed_trap="$(trap -p EXIT)"
+eval "$saved_trap"
+case "$PATCHCOV_DIR" in
+  "$REPO_ROOT"/*) inside_repo=yes ;;
+  *)              inside_repo=no ;;
+esac
+case "$PATCHCOV_DIR" in
+  */fishhawk-patchcov-$$.*) pid_keyed=yes ;;
+  *)                        pid_keyed=no ;;
+esac
+if [ "$mk_rc" -eq 0 ] && [ -d "$PATCHCOV_DIR" ] && [ "$inside_repo" = no ] \
+   && [ "$pid_keyed" = yes ] \
+   && printf '%s' "$armed_trap" | grep -q '_patchcov_cleanup'; then
+  pass "(d1) profile dir is PID-keyed, outside the repo, and swept by an EXIT trap"
+else
+  fail "(d1) profile dir contract (rc=$mk_rc dir='$PATCHCOV_DIR' inside_repo=$inside_repo pid_keyed=$pid_keyed trap='$armed_trap')"
+fi
+
+# (d1b) binding condition 1, sharpened: a PRE-EXISTING path with the PID-keyed
+# name is never removed or reused, and two calls never collide — the dir is
+# created atomically by mktemp, so there is no remove->create window in which
+# the scratch dir could be substituted locally.
+first_dir="$PATCHCOV_DIR"
+squatter="$tmproot/fishhawk-patchcov-$$"
+mkdir -p "$squatter"
+: > "$squatter/precious"
+saved_trap2="$(trap -p EXIT)"
+TMPDIR="$tmproot" _patchcov_mktemp
+mk2_rc=$?
+eval "$saved_trap2"
+if [ "$mk2_rc" -eq 0 ] && [ -f "$squatter/precious" ] \
+   && [ "$PATCHCOV_DIR" != "$squatter" ] && [ "$PATCHCOV_DIR" != "$first_dir" ]; then
+  pass "(d1b) a pre-existing path is never deleted or reused; two calls never collide"
+else
+  fail "(d1b) clobber contract (rc=$mk2_rc dir='$PATCHCOV_DIR' first='$first_dir' precious=$([ -f "$squatter/precious" ] && echo kept || echo DELETED))"
+fi
+_patchcov_cleanup
+rm -rf "$squatter" "$first_dir"
+PATCHCOV_DIR="$first_dir"
+mkdir -p "$PATCHCOV_DIR"
+
+: > "$PATCHCOV_DIR/litter.out"
+kept="$PATCHCOV_DIR"
+_patchcov_cleanup
+if [ ! -e "$kept" ]; then
+  pass "(d2) _patchcov_cleanup removes the profile dir (no litter on early failure)"
+else
+  fail "(d2) expected '$kept' removed"
+fi
+
+# The EXIT handler must reap the shared container ONLY when a lease was armed.
+if printf '%s' "$EXIT_TRAP" | grep -q 'LEASE_ARMED' \
+   && printf '%s' "$EXIT_TRAP" | grep -q '_reap_shared_container'; then
+  pass "(d3) the EXIT handler gates the container reap on LEASE_ARMED"
+else
+  fail "(d3) EXIT_TRAP does not gate the reap on LEASE_ARMED ('$EXIT_TRAP')"
+fi
+
+# ---------------------------------------------------------------------------
+# (e) _verify_patch_coverage with no profiles -> printed skip, exit 0.
+# ---------------------------------------------------------------------------
+PATCHCOV_DIR="$tmproot/emptyprof"; mkdir -p "$PATCHCOV_DIR"
+out="$(_verify_patch_coverage main 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'no coverage profiles'; then
+  pass "(e) no emitted profiles skips with a printed reason (exit 0)"
+else
+  fail "(e) expected 0 + no-profiles skip (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (f) cmd_verify path selection. Stub the preceding gates and both test loops
+#     so the assertion is purely about which path is taken and whether the
+#     skip reason is printed.
+# ---------------------------------------------------------------------------
+cmd_lint() { :; }
+_verify_doc_line_budget() { :; }
+_verify_schema_sync() { :; }
+# MUST be stubbed: the real one re-executes THIS harness (cmd_verify runs both
+# gate harnesses), which would recurse without bound.
+_verify_gate_harnesses() { :; }
+cmd_test() { echo "PLAIN_TEST"; }
+cmd_test_with_patch_coverage() { echo "COV_TEST:$1"; }
+_verify_patch_coverage() { echo "COV_GATE:$1"; }
+
+ROOT="$tmproot/testonly"          # a _test.go-only diff -> nothing to gate
+out="$(cmd_verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep -q 'no changed Go packages' \
+   && ! printf '%s' "$out" | grep -q 'COV_GATE'; then
+  pass "(f1) no changed Go packages: plain cmd_test, printed reason, gate not run"
+else
+  fail "(f1) no-changed-Go path (rc=$rc out='$out')"
+fi
+
+ROOT="$tmproot/buckets"
+out="$(cmd_verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'COV_TEST:' \
+   && printf '%s' "$out" | grep -q 'COV_GATE:main' \
+   && ! printf '%s' "$out" | grep -q 'PLAIN_TEST'; then
+  pass "(f2) changed Go packages: the coverage loop and the patch gate both run"
+else
+  fail "(f2) changed-Go path (rc=$rc out='$out')"
+fi
+
+out="$(FISHHAWK_SKIP_PATCH_COVERAGE=1 cmd_verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep -q 'FISHHAWK_SKIP_PATCH_COVERAGE' \
+   && ! printf '%s' "$out" | grep -q 'COV_GATE'; then
+  pass "(f3) FISHHAWK_SKIP_PATCH_COVERAGE takes the plain path with a printed reason"
+else
+  fail "(f3) skip-override path (rc=$rc out='$out')"
+fi
+
+ROOT="$tmproot/nogit"
+out="$(cmd_verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep -q 'no usable diff base'; then
+  pass "(f4) an unusable diff base degrades to plain cmd_test with a printed reason"
+else
+  fail "(f4) unusable-base path (rc=$rc out='$out')"
+fi
+
+ROOT="$tmproot/nomb"
+out="$(cmd_verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep -q 'could not bucket changed Go files'; then
+  pass "(f5) an unbucketable diff degrades to plain cmd_test with a printed reason"
+else
+  fail "(f5) bucketing-failure path (rc=$rc out='$out')"
+fi
+
+ROOT="$tmproot/base"
+out="$(PATH=/nonexistent cmd_verify 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'PLAIN_TEST' \
+   && printf '%s' "$out" | grep -q 'no usable diff base'; then
+  pass "(f6) git absent degrades to plain cmd_test with a printed reason"
+else
+  fail "(f6) git-absent path (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (g) END-TO-END across the shell layer: the real cmd_test_with_patch_coverage
+#     restricts -coverpkg to the changed packages of the owning module while
+#     still running that module's FULL ./... test set (so a package exercised
+#     only by a sibling package's test is still credited), and leaves an
+#     unchanged module's invocation exactly as cmd_test runs it.
+# ---------------------------------------------------------------------------
+# Re-source to restore the real cmd_test_with_patch_coverage / _verify_patch_coverage
+# over the (f) stubs.
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+modules() { printf './backend\n./cli\n'; }
+_arm_container_lease() { :; }
+
+mkdir -p "$tmproot/stubbin"
+cat > "$tmproot/stubbin/go" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$PWD|$*" >> "$GOLOG"
+EOF
+chmod +x "$tmproot/stubbin/go"
+export GOLOG="$tmproot/go.log"
+: > "$GOLOG"
+
+ROOT="$tmproot/buckets"
+saved_trap="$(trap -p EXIT)"
+pushd "$ROOT" >/dev/null
+PATH="$tmproot/stubbin:$PATH" TMPDIR="$tmproot" \
+  cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" >/dev/null 2>&1
+e2e_rc=$?
+popd >/dev/null
+eval "$saved_trap"
+_patchcov_cleanup
+
+backend_cmd="$(grep '/backend|' "$GOLOG" | head -1)"
+cli_cmd="$(grep '/cli|' "$GOLOG" | head -1)"
+if [ "$e2e_rc" -eq 0 ] \
+   && printf '%s' "$backend_cmd" | grep -q -- '-coverpkg=./internal/foo' \
+   && printf '%s' "$backend_cmd" | grep -q -- '-coverprofile=' \
+   && printf '%s' "$backend_cmd" | grep -q -- './\.\.\.' \
+   && printf '%s' "$cli_cmd" | grep -q 'test -race' \
+   && ! printf '%s' "$cli_cmd" | grep -q -- '-coverpkg'; then
+  pass "(g) changed module runs ./... with -coverpkg restricted; other modules unchanged"
+else
+  fail "(g) e2e loop (rc=$e2e_rc backend='$backend_cmd' cli='$cli_cmd')"
+fi
+
+# (g2) PROFILE-NAME INJECTIVITY within one invocation. A slug built by
+# `tr '/' '_'` is not injective: the distinct valid module paths `a/b` and `a_b`
+# both slug to `a_b`. If both own changed packages, the second `go test` would
+# overwrite the first module's profile, every changed line in the overwritten
+# module would then fall inside no remaining profile block, and its uncovered
+# new code would pass the gate unseen. The filename must therefore be keyed by a
+# per-loop ordinal, not by the module path alone.
+mkdir -p "$tmproot/collide/a/b" "$tmproot/collide/a_b"
+modules() { printf './a/b\n./a_b\n'; }
+: > "$GOLOG"
+saved_trap="$(trap -p EXIT)"
+pushd "$tmproot/collide" >/dev/null
+PATH="$tmproot/stubbin:$PATH" TMPDIR="$tmproot" \
+  cmd_test_with_patch_coverage "$(printf 'a/b\t./p\na_b\t./q\n')" >/dev/null 2>&1
+collide_rc=$?
+popd >/dev/null
+eval "$saved_trap"
+_patchcov_cleanup
+profiles="$(grep -o -- '-coverprofile=[^ ]*' "$GOLOG" | sort)"
+n_profiles="$(printf '%s\n' "$profiles" | grep -c 'coverprofile')"
+n_uniq="$(printf '%s\n' "$profiles" | sort -u | grep -c 'coverprofile')"
+if [ "$collide_rc" -eq 0 ] && [ "$n_profiles" -eq 2 ] && [ "$n_uniq" -eq 2 ]; then
+  pass "(g2) modules a/b and a_b get DISTINCT profile paths (slug is not injective)"
+else
+  fail "(g2) profile-name collision (rc=$collide_rc n=$n_profiles uniq=$n_uniq profiles='$profiles')"
+fi
+modules() { printf './backend\n./cli\n'; }
+
+# ---------------------------------------------------------------------------
+# (i) module enumeration failing INSIDE the coverage loop. Feeding the loop
+#     straight from a failing `modules` would iterate zero times and still exit
+#     0 — verify reporting success having tested nothing. The coverage loop
+#     degrades to the plain loop, and the plain loop itself fails CLOSED.
+# ---------------------------------------------------------------------------
+saved_trap="$(trap -p EXIT)"
+modules() { return 1; }
+cmd_test() { echo "PLAIN_TEST"; }
+out="$(TMPDIR="$tmproot" cmd_test_with_patch_coverage "$(printf 'backend\t./internal/foo\n')" 2>&1)"; rc=$?
+eval "$saved_trap"
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'could not enumerate go.work modules' \
+   && printf '%s' "$out" | grep -q 'PLAIN_TEST'; then
+  pass "(i1) module enumeration failing in the coverage loop degrades to the plain loop"
+else
+  fail "(i1) coverage-loop module-list degrade (rc=$rc out='$out')"
+fi
+
+# Restore the real cmd_test, then assert it refuses to report success with no
+# modules to run (a green gate that ran nothing is worse than a red one).
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+out="$(modules() { return 1; }; cmd_test 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'refusing to report success'; then
+  pass "(i2) cmd_test fails closed when no modules can be enumerated"
+else
+  fail "(i2) plain-loop fail-closed (rc=$rc out='$out')"
+fi
+
+out="$(modules() { printf ''; }; cmd_test 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'refusing to report success'; then
+  pass "(i3) cmd_test fails closed on an EMPTY module list"
+else
+  fail "(i3) empty-module-list fail-closed (rc=$rc out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (j) REAL-toolchain end-to-end for the load-bearing -coverpkg claim: a function
+#     with NO test in its own package, exercised only by a SIBLING package's
+#     test, must be credited as covered and produce a PASSING patch verdict.
+#     If -coverpkg attribution were broken the same fixture reports 0% and the
+#     gate fails, so this test discriminates rather than merely running.
+# ---------------------------------------------------------------------------
+if ! command -v go >/dev/null 2>&1; then
+  echo "SKIP: (j) go toolchain absent — sibling-attribution e2e not run"
+else
+  ROOT="$tmproot/realcov"
+  rm -rf "$ROOT"
+  mkdir -p "$ROOT/svc/foo" "$ROOT/svc/bar"
+  git init -q -b main "$ROOT"
+  git -C "$ROOT" config user.email test@example.com
+  git -C "$ROOT" config user.name test
+  cat > "$ROOT/svc/go.mod" <<'EOF'
+module example.com/e2e/svc
+
+go 1.21
+EOF
+  printf 'package foo\n' > "$ROOT/svc/foo/foo.go"
+  git -C "$ROOT" add -A
+  git -C "$ROOT" commit -q -m base
+  git -C "$ROOT" checkout -q -b feature
+  # foo.Classify: 6 statements, NO foo-package test anywhere.
+  cat > "$ROOT/svc/foo/foo.go" <<'EOF'
+package foo
+
+func Classify(n int) string {
+	if n < 0 {
+		return "neg"
+	}
+	if n == 0 {
+		return "zero"
+	}
+	return "pos"
+}
+EOF
+  # The only test lives in the SIBLING package bar.
+  cat > "$ROOT/svc/bar/bar_test.go" <<'EOF'
+package bar
+
+import (
+	"testing"
+
+	"example.com/e2e/svc/foo"
+)
+
+func TestClassify(t *testing.T) {
+	for in, want := range map[int]string{-1: "neg", 0: "zero", 1: "pos"} {
+		if got := foo.Classify(in); got != want {
+			t.Fatalf("Classify(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
+EOF
+  git -C "$ROOT" add -A
+  git -C "$ROOT" commit -q -m feature
+
+  modules() { printf './svc\n'; }
+  _arm_container_lease() { :; }
+  saved_trap="$(trap -p EXIT)"
+  pushd "$ROOT" >/dev/null
+  TMPDIR="$tmproot" GOWORK=off GOFLAGS= \
+    cmd_test_with_patch_coverage "$(printf 'svc\t./foo\n')" > "$tmproot/realcov.log" 2>&1
+  loop_rc=$?
+  gate_out="$(TMPDIR="$tmproot" GOWORK=off python3 "$REPO_ROOT/scripts/check-coverage.py" \
+    --diff-base main --diff-threshold 85 --diff-min-statements 1 \
+    --repo-root "$ROOT" --module-prefix 'example.com/e2e/' \
+    "$PATCHCOV_DIR"/*.out 2>&1)"
+  gate_rc=$?
+  popd >/dev/null
+  eval "$saved_trap"
+  _patchcov_cleanup
+
+  if [ "$loop_rc" -eq 0 ] && [ "$gate_rc" -eq 0 ] \
+     && printf '%s' "$gate_out" | grep -q 'PATCH PASS' \
+     && printf '%s' "$gate_out" | grep -qE 'Patch coverage: ([0-9]+)/\1 = 100\.0%'; then
+    pass "(j) a sibling package's test credits changed code: 100% patch coverage, PATCH PASS"
+  else
+    fail "(j) sibling attribution (loop_rc=$loop_rc gate_rc=$gate_rc out='$gate_out' log='$(tail -5 "$tmproot/realcov.log")')"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# (h) parse-clean.
+# ---------------------------------------------------------------------------
+if bash -n "$REPO_ROOT/scripts/test" 2>/dev/null; then
+  pass "(h) bash -n scripts/test parses clean"
+else
+  fail "(h) bash -n scripts/test reported a syntax error"
+fi
+
+echo ""
+echo "Results: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
