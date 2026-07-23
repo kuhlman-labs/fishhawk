@@ -581,9 +581,11 @@ func registeredFileFetcher(id string) forge.FileFetcher {
 // guarded — an absent forge yields a nil fetcher and that provider falls
 // through to override/Default), the server's GitHub repo-scope resolution,
 // the deployment gitlab scope, the accounts provider discriminator, and the
-// break-glass override. Extracted so serve_test.go can assert the wiring
-// (loader installed, override as fallback) without booting the server.
-func buildRepoConventionsLoader(srv *server.Server, resolver server.ProviderResolver, override func() (workmgmt.Conventions, bool)) *server.RepoConventionsLoader {
+// break-glass override, plus the administrator-controlled destination
+// allow-list (E44.14 / #2090). Extracted so serve_test.go can assert the
+// wiring (loader installed, override as fallback, allow-list threaded)
+// without booting the server.
+func buildRepoConventionsLoader(srv *server.Server, resolver server.ProviderResolver, override func() (workmgmt.Conventions, bool), allowedDestinations server.DestinationAllowList) *server.RepoConventionsLoader {
 	gitlabFetcher := registeredFileFetcher("gitlab")
 	var gitlabScope forge.CredentialScope
 	if gitlabFetcher != nil {
@@ -596,6 +598,9 @@ func buildRepoConventionsLoader(srv *server.Server, resolver server.ProviderReso
 		GitHubScope:   srv.GitHubRepoScopeResolver(),
 		GitLabScope:   gitlabScope,
 		Override:      override,
+		// Deployment-controlled exceptions to the destination binding
+		// (E44.14 / #2090); nil means strict binding.
+		AllowedDestinations: allowedDestinations,
 	})
 }
 
@@ -904,6 +909,9 @@ func runServe(args []string, logSink io.Writer) int {
 	workmgmtConventions := fs.String("workmgmt-conventions",
 		envOr("FISHHAWKD_WORKMGMT_CONVENTIONS", ""),
 		"path to a YAML work-management conventions file served for every repo; parsed fail-fast at startup. Empty uses the shipped default. A per-repo in-repo loader is a follow-up (#2022)")
+	workmgmtAllowedDestinations := fs.String("workmgmt-allowed-destinations",
+		envOr("FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS", ""),
+		"comma-separated <account-key>:<provider>:<destination-key> exceptions to the per-repo conventions destination binding (E44.14 / #2090); empty means strict binding. A malformed value FAILS startup rather than degrading to strict")
 	enableSLATimer := fs.Bool("enable-sla-timer",
 		envOr("FISHHAWKD_ENABLE_SLA_TIMER", "false") == "true",
 		"start the approval SLA timeout ticker; off by default to keep dev runs from racing with the timer")
@@ -1648,6 +1656,17 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("path", *workmgmtConventions), slog.String("error", cerr.Error()))
 		return exitFailure
 	}
+
+	// The destination allow-list (E44.14 / #2090) FAILS STARTUP when
+	// malformed rather than degrading to an empty (strict) allow-list: a typo
+	// silently reverting to strict would masquerade as the security posture
+	// working while breaking a legitimate cross-namespace deployment.
+	allowedDestinations, aerr := server.ParseWorkMgmtDestinationAllowList(*workmgmtAllowedDestinations)
+	if aerr != nil {
+		logger.Error("invalid FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS",
+			slog.String("error", aerr.Error()))
+		return exitFailure
+	}
 	if conventionsOverride != nil {
 		logger.Info("work-management conventions break-glass override loaded",
 			slog.String("path", *workmgmtConventions))
@@ -1813,10 +1832,11 @@ func runServe(args []string, logSink io.Writer) int {
 	if pool != nil {
 		accountResolver = account.NewResolver(accountdb.New(pool))
 	}
-	server.SetConventionsLoader(buildRepoConventionsLoader(srv, accountResolver, conventionsOverride).Load)
+	server.SetConventionsLoader(buildRepoConventionsLoader(srv, accountResolver, conventionsOverride, allowedDestinations).Load)
 	logger.Info("per-repo work-management conventions loader installed",
 		slog.Bool("discriminator_resolver", accountResolver != nil),
-		slog.Bool("break_glass_override", conventionsOverride != nil))
+		slog.Bool("break_glass_override", conventionsOverride != nil),
+		slog.Int("allowed_destinations", len(allowedDestinations)))
 
 	// Wire the slash-command approval handler now that the Server
 	// exists (#238). The dispatcher was constructed earlier without

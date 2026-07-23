@@ -226,3 +226,15 @@ the path + cause — but the parsed document is now served only when the per-rep
 through (provider not found/ambiguous, unregistered forge, no credential scope, or no committed
 file). The run-absent GitHub installation-resolution branch in `workitems.go` remains gated on
 `provider == github_projects`, so a gitlab filing never attempts GitHub egress.
+
+`FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS` (flag `--workmgmt-allowed-destinations`, E44.14 /
+#2090) is the administrator-controlled escape hatch for the loader's destination binding: a
+repo-fetched conventions file may only name a filing destination owned by the filing repo's own
+tenancy account (contract in `backend/internal/server/README.md`). The value is comma-separated
+`<account-key>:<provider>:<destination-key>` entries — e.g.
+`acme:github_projects:enterprise,acme:jira:FISH` — with `provider` one of `github_projects`,
+`gitlab`, `jira`; empty means strict binding with no exceptions. A **malformed value fails
+startup** with an error naming the variable and the offending entry: it must never degrade to an
+empty (strict) allow-list, because a typo silently reverting to strict would masquerade as the
+security posture working while breaking a legitimate cross-namespace deployment. Every refusal
+names the exact entry to add here.
