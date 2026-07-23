@@ -35,11 +35,12 @@ type DestinationAllowList map[string]struct{}
 // Each entry is <account-key>:<provider>:<destination-key>; surrounding
 // whitespace is trimmed, empty entries are skipped, and an empty raw value
 // yields an empty allow-list with a nil error. A malformed entry (wrong
-// arity, an empty segment, or a provider outside the closed set) returns an
-// actionable error naming the offending entry — the caller MUST fail boot on
-// it rather than degrade to an empty (strict) allow-list: a typo silently
-// reverting to strict would masquerade as the security posture working while
-// breaking a legitimate cross-namespace deployment.
+// arity, an empty segment, a provider outside the closed set, or a gitlab
+// destination key carrying a full project path) returns an actionable error
+// naming the offending entry — the caller MUST fail boot on it rather than
+// degrade to an empty (strict) allow-list: a typo silently reverting to
+// strict would masquerade as the security posture working while breaking a
+// legitimate cross-namespace deployment.
 func ParseWorkMgmtDestinationAllowList(raw string) (DestinationAllowList, error) {
 	allow := make(DestinationAllowList)
 	for _, entry := range strings.Split(raw, ",") {
@@ -59,6 +60,16 @@ func ParseWorkMgmtDestinationAllowList(raw string) (DestinationAllowList, error)
 		}
 		if _, ok := workMgmtDestinationProviders[provider]; !ok {
 			return nil, fmt.Errorf("work-management destination allow-list entry %q: provider %q is not one of github_projects, gitlab, jira", entry, provider)
+		}
+		// conventionsDestination derives a gitlab destination key as the
+		// NAMESPACE ROOT of the configured project path, so a full-path entry
+		// ("group/team") could never match at authorization time. Reject it at
+		// parse time for the same reason the closed provider set is validated
+		// here: a boot failure naming the fix beats a silently inert allow-list
+		// entry that only surfaces much later as a refused filing.
+		if provider == "gitlab" && strings.Contains(destKey, "/") {
+			root, _, _ := strings.Cut(destKey, "/")
+			return nil, fmt.Errorf("work-management destination allow-list entry %q: a gitlab destination key is the namespace ROOT, not a project path; use %q", entry, destinationAllowKey(accountKey, provider, root))
 		}
 		allow[destinationAllowKey(accountKey, provider, destKey)] = struct{}{}
 	}

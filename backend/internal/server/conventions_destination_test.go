@@ -26,13 +26,13 @@ func jiraDest(key string) workmgmt.Conventions {
 // (empty) allow-list.
 func TestParseWorkMgmtDestinationAllowList(t *testing.T) {
 	t.Run("well-formed multi-entry with whitespace", func(t *testing.T) {
-		allow, err := ParseWorkMgmtDestinationAllowList("  Acme:github_projects:Enterprise , , group:gitlab:other/team ,acme:jira:FISH")
+		allow, err := ParseWorkMgmtDestinationAllowList("  Acme:github_projects:Enterprise , , group:gitlab:Other ,acme:jira:FISH")
 		if err != nil {
 			t.Fatalf("parse err = %v, want nil", err)
 		}
 		for _, want := range []string{
 			"acme:github_projects:enterprise",
-			"group:gitlab:other/team",
+			"group:gitlab:other",
 			"acme:jira:fish",
 		} {
 			if _, ok := allow[want]; !ok {
@@ -64,6 +64,8 @@ func TestParseWorkMgmtDestinationAllowList(t *testing.T) {
 		{"empty provider segment", "acme::acme"},
 		{"empty destination-key segment", "acme:github_projects:"},
 		{"unknown provider segment", "acme:bitbucket:acme"},
+		{"gitlab destination key carrying a full project path", "group:gitlab:other/team"},
+		{"gitlab destination key carrying a nested-group path", "group:gitlab:other/sub/team"},
 	} {
 		t.Run("rejects "+tc.name, func(t *testing.T) {
 			allow, err := ParseWorkMgmtDestinationAllowList(tc.raw)
@@ -78,6 +80,20 @@ func TestParseWorkMgmtDestinationAllowList(t *testing.T) {
 			}
 		})
 	}
+
+	// A gitlab destination key is derived as the namespace ROOT
+	// (conventionsDestination cuts at the first "/"), so a full-path entry
+	// would be silently inert. The refusal must name the root-granularity
+	// entry to use instead, so remediation is a copy-paste.
+	t.Run("gitlab full-path rejection names the namespace-root entry", func(t *testing.T) {
+		_, err := ParseWorkMgmtDestinationAllowList("Group:gitlab:Other/Team")
+		if err == nil {
+			t.Fatal("parse err = nil, want a rejection of the full-path gitlab destination key")
+		}
+		if !strings.Contains(err.Error(), "group:gitlab:other") {
+			t.Errorf("err = %v, want the namespace-root entry %q named", err, "group:gitlab:other")
+		}
+	})
 }
 
 // TestConventionsDestination pins the per-provider destination derivation,

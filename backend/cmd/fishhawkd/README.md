@@ -233,7 +233,9 @@ repo-fetched conventions file may only name a filing destination owned by the fi
 tenancy account (contract in `backend/internal/server/README.md`). The value is comma-separated
 `<account-key>:<provider>:<destination-key>` entries — e.g.
 `acme:github_projects:enterprise,acme:jira:FISH` — with `provider` one of `github_projects`,
-`gitlab`, `jira`; empty means strict binding with no exceptions. A **malformed value fails
+`gitlab`, `jira`; empty means strict binding with no exceptions. A `gitlab` destination key is the
+namespace **root** (`group`), never a project path (`group/team`) — a full-path entry is rejected
+at startup naming the root entry to use, because it could never match. A **malformed value fails
 startup** with an error naming the variable and the offending entry: it must never degrade to an
 empty (strict) allow-list, because a typo silently reverting to strict would masquerade as the
 security posture working while breaking a legitimate cross-namespace deployment. Every refusal

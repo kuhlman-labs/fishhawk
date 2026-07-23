@@ -234,7 +234,10 @@ silently reopens the hole (`TestConventionsLoader_DestinationRedirect_Refused` a
 **Escape hatch is administrator-controlled, never repo-controlled**:
 `FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS` carries comma-separated
 `<account-key>:<provider>:<destination-key>` entries; a **malformed value fails boot** rather
-than degrading to an empty (strict) allow-list. Every refusal names the exact entry to add.
+than degrading to an empty (strict) allow-list. Every refusal names the exact entry to add. A
+`gitlab` destination key must be the namespace **root** (`group`), not a project path
+(`group/team`): the derived key is the namespace root, so a full-path entry could never match —
+it is rejected at parse time, naming the root entry to use, rather than sitting silently inert.
 
 **The administrator-controlled fallbacks are deliberately NOT validated.** The
 `FISHHAWKD_WORKMGMT_CONVENTIONS` override and `workmgmt.Default()` are the trusted deployment
