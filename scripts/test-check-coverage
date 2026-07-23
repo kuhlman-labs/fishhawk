@@ -391,16 +391,28 @@ diff --git a/dead.go b/dead.go
 @@ -1,4 +0,0 @@
 -package dead
 """
-cc._git = lambda *a, **k: DIFF
-got = cc.changed_lines("/irrelevant", "base")
+got = cc.parse_unified_diff(DIFF, {"a.go", "dead.go"})
 assert got == {"a.go": {3, 18, 19}}, got
 assert "dead.go" not in got, got
+
+# An ADDED source line beginning with `++ ` renders as `+++ …` inside a hunk
+# body. It must not be mistaken for a file header (which would either retarget
+# the hunk or fail the gate closed on a nonexistent path).
+BODY = """diff --git a/a.go b/a.go
+--- a/a.go
++++ b/a.go
+@@ -1,0 +2,2 @@
++++ not a header
++x
+"""
+got = cc.parse_unified_diff(BODY, {"a.go"})
+assert got == {"a.go": {2, 3}}, got
 print("HUNK OK")
 PY
 )"
 rc=$?
 if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'HUNK OK'; then
-  pass "(l) hunk-header edge cases: omitted count, pure deletion, deleted file"
+  pass "(l) hunk-header edge cases: omitted count, pure deletion, deleted file, ++-prefixed body line"
 else
   fail "(l) hunk-header parsing (rc=$rc, out='$out')"
 fi
@@ -523,6 +535,169 @@ if [ "$rc" -eq 0 ] && ! printf '%s' "$out" | grep -q 'generated/gen.go'; then
   pass "(n2c) a git-ignored untracked .go file is not folded into the denominator"
 else
   fail "(n2c) expected generated/gen.go excluded (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (p) BINARY-SAFE PATH HANDLING. git C-quotes a path carrying a double quote, a
+#     backslash, a control character or a non-ASCII byte, so a header-pattern
+#     parser silently loses exactly those files — executable Go code hiding
+#     from the gate behind its filename. Real files are created here with each
+#     of those characters and asserted to be DISCOVERED and GATED.
+# ---------------------------------------------------------------------------
+repo="$tmproot/p"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+d="$repo/backend/internal/foo"
+weird_quote='qu"ote.go'
+weird_slash='back\slash.go'
+weird_space='sp ace.go'
+weird_utf8='café.go'
+for wf in "$weird_quote" "$weird_slash" "$weird_space" "$weird_utf8"; do
+  cat > "$d/$wf" <<'EOF'
+package foo
+
+func W(a int) int {
+	return a
+}
+EOF
+done
+git -C "$repo" add -A
+git -C "$repo" commit -q -m weird
+{
+  echo "mode: atomic"
+  for wf in "$weird_quote" "$weird_slash" "$weird_space" "$weird_utf8"; do
+    echo "${PFX}backend/internal/foo/${wf}:3.20,5.2 1 0"
+  done
+} > "$tmproot/p.out"
+out="$(run_diff "$repo" "$tmproot/p.out" --diff-min-statements 1)"
+rc=$?
+miss=""
+for wf in "$weird_quote" "$weird_slash" "$weird_space" "$weird_utf8"; do
+  if ! printf '%s' "$out" | grep -qF "backend/internal/foo/${wf}:3"; then
+    miss="$miss $wf"
+  fi
+done
+if [ "$rc" -ne 0 ] && [ -z "$miss" ]; then
+  pass "(p) quote/backslash/space/non-ASCII filenames are discovered and gated"
+else
+  fail "(p) special-character filenames (rc=$rc missing='$miss' out='$out')"
+fi
+
+# (p2) a filename containing a literal NEWLINE — the case a newline-split
+# enumeration turns into two bogus paths. Created for real when the platform
+# allows it; otherwise the parsing layer is covered directly by the synthetic
+# NUL-delimited fixture in (p3), never skipped outright.
+nl_file="$(printf 'new\nline.go')"
+if cat > "$d/$nl_file" <<'EOF'
+package foo
+
+func NL() int {
+	return 1
+}
+EOF
+then
+  git -C "$repo" add -A
+  git -C "$repo" commit -q -m newline
+  out="$(python3 - "$CC" "$repo" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+repo = sys.argv[2]
+mb = cc.resolve_merge_base(repo, "main")
+got = cc.changed_lines(repo, mb)
+want = "backend/internal/foo/new\nline.go"
+assert want in got, sorted(got)
+assert got[want], got[want]
+print("NEWLINE OK")
+PY
+)"
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'NEWLINE OK'; then
+    pass "(p2) a filename containing a newline is discovered, not split into two paths"
+  else
+    fail "(p2) newline filename (rc=$rc, out='$out')"
+  fi
+  git -C "$repo" rm -q "$d/$nl_file" >/dev/null 2>&1
+  git -C "$repo" commit -q -m unnewline
+else
+  echo "NOTE: this platform cannot create a newline filename; (p3) covers the parsing layer"
+fi
+
+# ---------------------------------------------------------------------------
+# (p3) the parsing layer directly: git's C-quoted forms decode to the exact
+#      bytes, and a NUL-delimited enumeration is split on NUL only.
+# ---------------------------------------------------------------------------
+out="$(python3 - "$CC" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+cases = [
+    (r'"b/qu\"ote.go"', 'b/qu"ote.go'),
+    (r'"b/back\\slash.go"', "b/back\\slash.go"),
+    (r'"b/new\nline.go"', "b/new\nline.go"),
+    (r'"b/caf\303\251.go"', "b/café.go"),
+    ("b/plain space.go", "b/plain space.go"),
+]
+for raw, want in cases:
+    got = cc.decode_git_path(raw)
+    assert got == want, (raw, got, want)
+
+# A NUL-delimited stream carrying a newline inside a name stays ONE path.
+cc._git = lambda *a, **k: "a\nb.go\0c.go\0"
+assert cc.tracked_changed_paths("/x", "base") == {"a\nb.go", "c.go"}
+
+# Undecodable forms fail closed rather than decoding to something plausible.
+for bad in (r'"b/oops\q.go"', r'"b/oops\12.go"', '"b/trailing\\"'):
+    try:
+        cc.decode_git_path(bad)
+    except cc.PathDecodeError:
+        continue
+    raise AssertionError(f"expected PathDecodeError for {bad!r}")
+
+# A header path that does not resolve into the NUL-enumerated authority set is
+# rejected loudly — never dropped from the denominator.
+DIFF = 'diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -0,0 +1,2 @@\n+a\n+b\n'
+try:
+    cc.parse_unified_diff(DIFF, {"other.go"})
+except cc.PathDecodeError as e:
+    assert "x.go" in str(e), e
+else:
+    raise AssertionError("expected PathDecodeError for an unmatched header path")
+print("DECODE OK")
+PY
+)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'DECODE OK'; then
+  pass "(p3) C-quoted decoding, NUL-only splitting, and undecodable forms fail closed"
+else
+  fail "(p3) decoding layer (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (p4) end to end: an unidentifiable path FAILS the gate (exit 1) with a printed
+#      reason naming it — it is never treated as "nothing to cover" (exit 0).
+# ---------------------------------------------------------------------------
+out="$(python3 - "$CC" "$tmproot/a" "$tmproot/a.out" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+# Simulate a path the NUL enumeration presents but the header parser cannot
+# match: the authority set comes back empty while the diff still names a file.
+cc.tracked_changed_paths = lambda *a, **k: set()
+sys.argv = ["cc", "--diff-base", "main", "--repo-root", sys.argv[2], sys.argv[3]]
+rc = cc.main()
+print(f"RC={rc}")
+PY
+)"
+if printf '%s' "$out" | grep -q 'RC=1' \
+   && printf '%s' "$out" | grep -q 'FAIL: undecodable changed path' \
+   && printf '%s' "$out" | grep -q 'foo.go'; then
+  pass "(p4) an unidentifiable changed path fails the gate closed, naming the path"
+else
+  fail "(p4) expected a fail-closed exit 1 naming the path (out='$out')"
 fi
 
 # ---------------------------------------------------------------------------

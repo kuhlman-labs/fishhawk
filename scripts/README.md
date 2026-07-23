@@ -63,6 +63,46 @@ the tracked-only list rather than dropping the gate. This is moot on the
 runner's committed tree, where every file is committed; it closes the
 local dirty-tree hole.
 
+### Binary-safe path handling
+
+Repository contents are untrusted input, so a filename must never be
+able to hide executable Go code from the gate. Unless NUL-delimited
+output is requested, git presents a path containing a double quote, a
+backslash, a control character (including a NEWLINE) or a non-ASCII byte
+in C-style quoted form — and a newline inside a name splits one path
+into two under newline-delimited parsing. Both are silent-omission
+bypasses. So:
+
+- **Every git path enumeration uses `-z` and is split on NUL**, in both
+  layers: the changed-file list, the untracked-file list, and (Python)
+  `tracked_changed_paths()`.
+- **The unified diff is not the authority for WHICH files changed.**
+  `tracked_changed_paths()` (NUL-delimited) is; the `--unified=0` diff
+  only supplies line numbers. Each `+++` header is decoded out of git's
+  C-quoted form by `decode_git_path()` (leading/trailing quote,
+  single-character escapes, octal byte escapes, `surrogateescape` for
+  non-UTF-8 bytes) and must resolve back into that authoritative set.
+  Header recognition is state-machine bounded to the span between a
+  `diff --git` line and that file's first hunk, so an added source line
+  beginning with `++ ` — which renders as `+++ …` — cannot be mistaken
+  for a header.
+- **A path that still cannot be identified FAILS CLOSED.** Python raises
+  `PathDecodeError` (deliberately not a `GitSkip`), and the gate exits 1
+  with a printed reason naming the path. It is never dropped from the
+  denominator, because a path the gate cannot identify must never read
+  as "nothing to cover".
+- **The shell layer cannot carry NUL through command substitution**, so
+  it remaps the `-z` stream injectively with `tr '\n\000' '\001\n'`:
+  record-separator NUL becomes newline, and a newline (which at that
+  point can only be *inside* a filename) becomes `\001`. A record still
+  containing `\001` is a path this layer cannot name, so it prints a
+  one-line reason and falls back to `_patch_cov_all_modules` —
+  instrumenting EVERY module rather than dropping the file. That costs
+  more, but keeps the file inside the reach of the Python layer's
+  binary-safe denominator. This is the one shell-side branch that is
+  fail-CLOSED in effect while still fail-open in form: it never aborts
+  verify, it only widens instrumentation.
+
 ### Base-ref resolution ladder (`_patch_cov_base`)
 
 `FISHHAWK_DIFF_BASE` if set (and it must resolve — an unresolvable
@@ -123,9 +163,10 @@ degrade prints ONE line naming the reason and falls through to the plain
 | profile scratch dir uncreatable / no profiles emitted | shell |
 | git absent, non-git or bare root, invalid `--diff-base` override, unresolvable base ref, no merge base | Python (`GitSkip`) |
 | no changed Go files, no coverable new statements, sub-floor diff | Python |
+| undecodable changed path (`\001` record) — widens to every module, does NOT skip | shell (`_patch_cov_all_modules`) |
 
-Only the Python gate's below-threshold verdict is allowed to fail
-verify. In COMBINED mode (`--threshold` AND `--diff-base`) a git failure
+Only the Python gate's below-threshold verdict and its `PathDecodeError`
+fail-closed verdict are allowed to fail verify. In COMBINED mode (`--threshold` AND `--diff-base`) a git failure
 skips only the patch gate — the aggregate gate still runs and decides
 the exit code.
 
@@ -153,6 +194,16 @@ harnesses. A missing/non-executable harness prints a reason and is
 skipped; a failing one fails verify. `test-patch-coverage` must stub
 `_verify_gate_harnesses` wherever it calls the real `cmd_verify`, or it
 re-executes itself without bound.
+
+Binary-safe path handling is pinned on both sides with REAL files whose
+names carry a double quote, a backslash, a space and a non-ASCII
+character (`test-check-coverage` (p), `test-patch-coverage` (c7)) —
+each must be discovered and gated/bucketed. A literal-newline filename
+is created for real where the platform allows it ((p2), (c8)); the
+parsing layer is covered directly regardless by (p3)'s C-quoted decode
+and synthetic NUL-delimited fixtures, so the case is never simply
+skipped. (p4) asserts the fail-closed end state: an unidentifiable path
+exits 1 naming the path rather than passing as "nothing to cover".
 
 `test-patch-coverage` case (j) is the real-toolchain end-to-end for the
 load-bearing `-coverpkg` claim: a function with no test in its own

@@ -450,6 +450,29 @@ _patch_cov_base() {
   return 1
 }
 
+# _patch_cov_all_modules: emit `<module>\t./...` for every go.work module. This
+# is the fail-CLOSED fallback used when a changed path cannot be decoded (see
+# _patch_cov_changed_modules): instrumenting every module costs more, but it
+# keeps the undecodable file inside the gate's reach — check-coverage.py's own
+# enumeration is binary-safe and will fold it into the denominator — instead of
+# dropping it, which is exactly the hide-behind-a-filename bypass. Returns
+# non-zero if the module list is unavailable.
+_patch_cov_all_modules() {
+  local mlist m
+  if ! mlist="$(modules 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$mlist" ]; then
+    return 1
+  fi
+  while IFS= read -r m; do
+    m="${m#./}"
+    m="${m%/}"
+    if [ -z "$m" ]; then continue; fi
+    printf '%s\t./...\n' "$m"
+  done <<< "$mlist"
+}
+
 # _patch_cov_changed_modules: emit one `<module>\t./pkg,./pkg2` line per go.work
 # module that owns a changed non-test .go file. Diffs the MERGE BASE against the
 # WORK TREE — the same snapshot `go test` compiles and the same snapshot
@@ -457,21 +480,30 @@ _patch_cov_base() {
 # adds UNTRACKED .go files, which `git diff` cannot see but the compiler can, so
 # a never-`git add`ed new file is bucketed rather than silently bypassing the
 # gate (it would otherwise be the only Go change and take the plain-test path).
-# Returns non-zero if git/go/jq is unavailable or there is no merge base.
+#
+# BINARY-SAFE ENUMERATION: both git listings use -z, because without it git
+# C-quotes any path carrying a double quote, a backslash, a control character or
+# a non-ASCII byte, and a filename containing a NEWLINE would split one path into
+# two — letting Go code hide from the gate behind its name. Command substitution
+# cannot carry NUL bytes, so the -z stream is remapped by an INJECTIVE `tr`:
+# record-separator NUL -> newline, and any newline (which at that point can only
+# be INSIDE a filename) -> \001. A record still containing \001 is therefore a
+# path this layer cannot present, and is handled fail-CLOSED below rather than
+# dropped. Returns non-zero if git/go/jq is unavailable or there is no merge base.
 _patch_cov_changed_modules() {
-  local base="$1" mb files untracked mlist f cand m rel pkg pairs
+  local base="$1" mb files untracked mlist f cand m rel pkg pairs undecodable=0
   if ! mb="$(git -C "$ROOT" merge-base "$base" HEAD 2>/dev/null)"; then
     return 1
   fi
   if [ -z "$mb" ]; then
     return 1
   fi
-  if ! files="$(git -C "$ROOT" diff --name-only --diff-filter=ACMR "$mb" -- '*.go' 2>/dev/null)"; then
+  if ! files="$(git -C "$ROOT" diff --name-only -z --diff-filter=ACMR "$mb" -- '*.go' 2>/dev/null | tr '\n\000' '\001\n')"; then
     return 1
   fi
   # Untracked files are additive: a failure here degrades to the tracked-only
   # list rather than skipping the whole gate.
-  if untracked="$(git -C "$ROOT" ls-files --others --exclude-standard -- '*.go' 2>/dev/null)"; then
+  if untracked="$(git -C "$ROOT" ls-files --others --exclude-standard -z -- '*.go' 2>/dev/null | tr '\n\000' '\001\n')"; then
     if [ -n "$untracked" ]; then
       files="$files
 $untracked"
@@ -486,6 +518,16 @@ $untracked"
   pairs=""
   while IFS= read -r f; do
     if [ -z "$f" ]; then continue; fi
+    case "$f" in
+      *$'\001'*)
+        # A newline inside the filename: this layer cannot name the path, so it
+        # must not decide the path is uninteresting. Say so on one line and fall
+        # back to instrumenting every module.
+        echo "scripts/test: cannot decode changed path '${f//$'\001'/<NL>}' (newline in filename) — instrumenting every module (fail-closed)" >&2
+        undecodable=1
+        continue
+        ;;
+    esac
     case "$f" in
       *_test.go) continue ;;
     esac
@@ -507,6 +549,12 @@ $untracked"
     pairs="$pairs$m	$pkg
 "
   done <<< "$files"
+  if [ "$undecodable" -eq 1 ]; then
+    if ! _patch_cov_all_modules; then
+      return 1
+    fi
+    return 0
+  fi
   if [ -z "$pairs" ]; then
     return 0
   fi

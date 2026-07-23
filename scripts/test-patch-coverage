@@ -221,6 +221,62 @@ else
   fail "(c6) ignored-file bucketing (rc=$rc got='$got')"
 fi
 
+# (c7) BINARY-SAFE ENUMERATION: without -z git C-quotes a path carrying a quote,
+# a backslash or a non-ASCII byte, and the quoted form buckets into a bogus
+# module (or none) — the file then never reaches the gate. Real files with each
+# character must bucket into their real module.
+ROOT="$tmproot/weird"
+make_repo "$ROOT"
+git -C "$ROOT" checkout -q -b feature
+mkdir -p "$ROOT/backend/internal/w"
+for wf in 'qu"ote.go' 'back\slash.go' 'sp ace.go' 'café.go'; do
+  printf 'package w\n' > "$ROOT/backend/internal/w/$wf"
+done
+git -C "$ROOT" add -A
+git -C "$ROOT" commit -q -m weird
+got="$(_patch_cov_changed_modules main)"; rc=$?
+expected="$(printf 'backend\t./internal/w')"
+if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ]; then
+  pass "(c7) quote/backslash/space/non-ASCII filenames bucket into their real module"
+else
+  fail "(c7) special-character bucketing (rc=$rc got='$got' expected='$expected')"
+fi
+
+# (c8) a filename containing a NEWLINE cannot be presented by this layer, so it
+# is handled FAIL-CLOSED: a printed reason plus the every-module fallback, never
+# a silent drop that would let the file bypass the gate.
+nl_file="$(printf 'new\nline.go')"
+if printf 'package w\n' > "$ROOT/backend/internal/w/$nl_file" 2>/dev/null; then
+  git -C "$ROOT" add -A
+  git -C "$ROOT" commit -q -m newline
+  err="$tmproot/c8.err"
+  got="$(_patch_cov_changed_modules main 2>"$err")"; rc=$?
+  expected="$(printf 'backend\t./...\ncli\t./...')"
+  if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ] \
+     && grep -q 'cannot decode changed path' "$err"; then
+    pass "(c8) a newline filename fails closed: printed reason + every-module fallback"
+  else
+    fail "(c8) newline fail-closed (rc=$rc got='$got' expected='$expected' err='$(cat "$err")')"
+  fi
+  git -C "$ROOT" rm -q "$ROOT/backend/internal/w/$nl_file" >/dev/null 2>&1
+  git -C "$ROOT" commit -q -m unnewline
+else
+  echo "NOTE: this platform cannot create a newline filename; (c8) not exercised"
+fi
+
+# (c9) _patch_cov_all_modules emits `<module>\t./...` per module, and returns
+# non-zero (fail-open, no abort) when the module list is unavailable.
+got="$(_patch_cov_all_modules)"; rc=$?
+expected="$(printf 'backend\t./...\ncli\t./...')"
+modules() { return 1; }
+got2="$(_patch_cov_all_modules)"; rc2=$?
+modules() { printf './backend\n./cli\n'; }
+if [ "$rc" -eq 0 ] && [ "$got" = "$expected" ] && [ "$rc2" -ne 0 ]; then
+  pass "(c9) _patch_cov_all_modules emits every module, non-zero when unavailable"
+else
+  fail "(c9) all-modules fallback (rc=$rc got='$got' rc2=$rc2 got2='$got2')"
+fi
+
 # `modules` unavailable (go/jq missing) -> non-zero
 ROOT="$tmproot/buckets"
 modules() { return 1; }

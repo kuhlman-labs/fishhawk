@@ -28,6 +28,13 @@ see but `go test` compiles), and the gate fails when new-line coverage is below
 --diff-threshold. Both gates are independent; with both requested the
 exit code is non-zero if EITHER fails, and a git failure in the diff
 path degrades to a printed SKIP so the aggregate gate still decides.
+
+Path handling in the diff path is binary-safe: every git path
+enumeration is NUL-delimited (-z), and the unified diff's `+++` headers
+are decoded out of git's C-quoted form and cross-checked against that
+NUL-enumerated set. A path that still cannot be identified FAILS the
+patch gate with a printed reason naming it — never a silent omission,
+which would let Go code hide from the gate behind its filename.
 """
 
 import argparse
@@ -70,7 +77,10 @@ def parse_blocks(path, excludes):
 
 def _parse_blocks(path, excludes):
     """Yield (file_path, start_line, end_line, num_stmts, count) per profile block."""
-    with open(path) as f:
+    # surrogateescape: a profile's file field is a Go import path plus the real
+    # file name, which need not be valid UTF-8. Decoding strictly would raise
+    # rather than gate the file.
+    with open(path, errors="surrogateescape") as f:
         first = next(f, None)
         if first is None or not first.startswith("mode:"):
             raise SystemExit(f"{path}: missing mode line; not a coverage profile")
@@ -103,13 +113,87 @@ class GitSkip(Exception):
     """A git-side degrade: the patch gate is skipped, never failed."""
 
 
+class PathDecodeError(Exception):
+    """A path the gate cannot confidently identify. FAIL CLOSED, never skip.
+
+    Silently dropping such a path would let executable Go code hide from the
+    denominator behind its filename — the blind-gate bypass this gate exists to
+    close. So this is deliberately NOT a GitSkip: it fails the patch gate loudly
+    and names the path.
+    """
+
+
+# git's C-style quoting (`quote_c_style`) for a path that cannot be printed
+# raw. Only these single-character escapes are ever emitted; anything else is
+# an octal byte escape.
+_C_ESCAPES = {
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+    "\\": 0x5C,
+    '"': 0x22,
+}
+
+_OCTAL_DIGITS = "01234567"
+
+
+def decode_git_path(raw):
+    """Decode git's C-style quoted path form back to the real path.
+
+    git quotes a path containing a double quote, a backslash, a control
+    character (including a NEWLINE), or — unless core.quotePath=false — a
+    non-ASCII byte, wrapping it in double quotes and escaping the offending
+    bytes. An unquoted value is returned verbatim. Anything that does not decode
+    cleanly raises PathDecodeError rather than being pattern-matched and hoped
+    at.
+    """
+    if not (len(raw) >= 2 and raw.startswith('"') and raw.endswith('"')):
+        return raw
+    body = raw[1:-1]
+    out = bytearray()
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\":
+            out.extend(ch.encode("utf-8", "surrogateescape"))
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            raise PathDecodeError(f"trailing backslash in quoted git path {raw!r}")
+        esc = body[i]
+        if esc in _OCTAL_DIGITS:
+            digits = body[i : i + 3]
+            if len(digits) != 3 or any(d not in _OCTAL_DIGITS for d in digits):
+                raise PathDecodeError(f"bad octal escape in quoted git path {raw!r}")
+            out.append(int(digits, 8))
+            i += 3
+            continue
+        if esc not in _C_ESCAPES:
+            raise PathDecodeError(
+                f"unknown escape \\{esc} in quoted git path {raw!r}"
+            )
+        out.append(_C_ESCAPES[esc])
+        i += 1
+    return out.decode("utf-8", "surrogateescape")
+
+
 def _git(repo_root, *args):
     """Run a git command, raising GitSkip with a one-line reason on any failure."""
     try:
         proc = subprocess.run(
             ["git", "-C", repo_root, *args],
             capture_output=True,
-            text=True,
+            # surrogateescape, not strict UTF-8: a repository may legally carry
+            # a path whose bytes are not valid UTF-8, and a decode error here
+            # would crash the gate instead of gating the file.
+            encoding="utf-8",
+            errors="surrogateescape",
         )
     except FileNotFoundError:
         raise GitSkip("git not found on PATH")
@@ -184,11 +268,101 @@ def untracked_lines(repo_root):
         try:
             with open(os.path.join(repo_root, rel), "rb") as f:
                 n = sum(1 for _ in f)
-        except OSError:
-            continue  # raced away or unreadable — nothing to attribute
+        except OSError as e:
+            # Raced away or unreadable — nothing to attribute. Say so on one
+            # line: a path dropped from the denominator is never silent.
+            print(
+                f"WARN: untracked {rel!r} is unreadable ({e}); "
+                "not folded into the patch denominator",
+                file=sys.stderr,
+            )
+            continue
         if n:
             new[rel] = set(range(1, n + 1))
     return new
+
+
+def tracked_changed_paths(repo_root, merge_base):
+    """Return the AUTHORITATIVE set of changed tracked .go paths.
+
+    NUL-delimited (`-z`), so a path is never split by a newline inside a
+    filename and never arrives in git's C-quoted form. This set — not the
+    unified diff's `+++` headers — decides WHICH files changed; the headers only
+    supply line numbers, and every one of them must resolve back into this set
+    (see parse_unified_diff).
+    """
+    out = _git(
+        repo_root,
+        "diff",
+        "--name-only",
+        "-z",
+        "--diff-filter=ACMR",
+        merge_base,
+        "--",
+        "*.go",
+    )
+    return {p for p in out.split("\0") if p}
+
+
+def parse_unified_diff(text, authority):
+    """Return {path: set(added_line_numbers)} from a --unified=0 diff.
+
+    `authority` is the NUL-delimited changed-path set (tracked_changed_paths);
+    it decides which files count. A `+++` header is decoded out of git's
+    C-quoted form (decode_git_path) and must resolve back into `authority` — a
+    header that does not raises PathDecodeError, so a path the parser cannot
+    confidently identify FAILS the gate loudly instead of being dropped from the
+    denominator.
+
+    Header lines are recognised only between a `diff --git` line and that file's
+    first hunk. Inside hunk bodies an ADDED source line that itself begins with
+    `++ ` renders as `+++ …`, which a naive prefix match would mistake for a
+    file header; the state machine makes that structurally impossible.
+    """
+    changed = defaultdict(set)
+    current = None
+    in_header = False
+    for line in text.splitlines():
+        if line.startswith("diff --git "):
+            in_header = True
+            current = None
+            continue
+        if in_header and line.startswith("+++ "):
+            raw = line[4:]
+            if raw == "/dev/null":
+                current = None  # deleted file — nothing added
+                continue
+            # git appends a TAB after a header path containing a space so
+            # patch(1) can find the name boundary; a path that really ends in a
+            # tab arrives quoted instead. Both readings are offered to the
+            # authority cross-check below, which decides — no guessing.
+            forms = [raw]
+            if raw.endswith("\t"):
+                forms.append(raw[:-1])
+            candidates = []
+            for form in forms:
+                decoded = decode_git_path(form)
+                if decoded.startswith("b/"):
+                    candidates.append(decoded[2:])
+                candidates.append(decoded)
+            current = next((c for c in candidates if c in authority), None)
+            if current is None:
+                raise PathDecodeError(
+                    f"diff header path {raw!r} does not match any "
+                    "NUL-enumerated changed path"
+                )
+            continue
+        if line.startswith("@@"):
+            in_header = False
+            m = HUNK_RE.match(line)
+            if not m or current is None:
+                continue
+            start = int(m.group(1))
+            count = 1 if m.group(2) is None else int(m.group(2))
+            # count == 0 is a pure-deletion hunk: it adds nothing.
+            for i in range(count):
+                changed[current].add(start + i)
+    return {k: v for k, v in changed.items() if v}
 
 
 def changed_lines(repo_root, merge_base):
@@ -202,7 +376,12 @@ def changed_lines(repo_root, merge_base):
     branch after this branch forked out of the patch denominator, exactly as
     `git diff base...HEAD` would. UNTRACKED .go files are added on top (see
     untracked_lines) — `git diff` cannot see them, but the compiler can.
+
+    Path handling is binary-safe end to end: both enumerations are NUL-delimited
+    and the unified diff's headers are decoded and cross-checked against the
+    NUL-enumerated set, so no .go file can hide from the gate behind its name.
     """
+    authority = tracked_changed_paths(repo_root, merge_base)
     out = _git(
         repo_root,
         "diff",
@@ -213,28 +392,7 @@ def changed_lines(repo_root, merge_base):
         "--",
         "*.go",
     )
-    changed = defaultdict(set)
-    current = None
-    for line in out.splitlines():
-        if line.startswith("+++ "):
-            target = line[4:].strip()
-            if target == "/dev/null":
-                current = None  # deleted file — nothing added
-            elif target.startswith("b/"):
-                current = target[2:]
-            else:
-                current = target
-            continue
-        if line.startswith("@@"):
-            m = HUNK_RE.match(line)
-            if not m or current is None:
-                continue
-            start = int(m.group(1))
-            count = 1 if m.group(2) is None else int(m.group(2))
-            # count == 0 is a pure-deletion hunk: it adds nothing.
-            for i in range(count):
-                changed[current].add(start + i)
-    result = {k: v for k, v in changed.items() if v}
+    result = parse_unified_diff(out, authority)
     for rel, lines in untracked_lines(repo_root).items():
         result.setdefault(rel, set()).update(lines)
     return result
@@ -289,6 +447,11 @@ def run_diff_gate(args):
     except GitSkip as e:
         skip(str(e))
         return 0
+    except PathDecodeError as e:
+        # FAIL CLOSED, not skip: a path the gate cannot identify must never be
+        # treated as "nothing to cover".
+        print(f"FAIL: undecodable changed path — {e}", file=sys.stderr)
+        return 1
 
     if not changed:
         skip(f"no changed Go files vs {args.diff_base}")
