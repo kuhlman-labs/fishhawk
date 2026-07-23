@@ -264,11 +264,18 @@ missing one:
 |---|---|
 | undecodable changed path AT EMIT (`PathDecodeError`, moved pre-test) | Python (`run_emit_snapshot`) |
 | snapshot emit failed / no sha256 tool to anchor the digest | shell (`cmd_test_with_patch_coverage` → `return 1`) |
+| snapshot missing / unreadable, or digest mismatch, BEFORE the no-profiles skip | shell (`_verify_patch_coverage` → `return 1`) |
 | snapshot missing / unreadable / malformed at consume | Python (`SnapshotError`) |
+| malformed-but-parseable structure: non-string/ambiguous `skip`, or a line that is not a positive integer | Python (`SnapshotError`) |
 | expected digest absent, or on-disk snapshot digest mismatch | Python (`SnapshotError`) |
 
-A git degrade at emit still writes a trusted **skip-snapshot** and the
-consume side skips (exit 0) — a degrade, not a tamper.
+The **no-profiles skip is not a hole**: `_verify_patch_coverage` re-checks
+the on-disk snapshot against the parent-memory anchor BEFORE it can skip on
+"no coverage profiles", so a test that deletes/tampers the snapshot AND
+removes the profiles (to reach that skip) still fails closed — Python is
+never reached on that path, so the shell owns the check. A git degrade at
+emit still writes a trusted **skip-snapshot** and the consume side skips
+(exit 0) — a degrade, not a tamper.
 
 ### Env overrides
 
@@ -321,14 +328,18 @@ aggregate invocation is unchanged — diff mode is inert without
 `--diff-base` — and `.github/workflows/**` is untouched (human-led).
 
 The pre-test snapshot (#2124) is pinned on both sides. `test-check-coverage`
-(s1–s9): emit serializes the change set with a non-ASCII path key that
+(s1–s10): emit serializes the change set with a non-ASCII path key that
 round-trips; consume produces the correct verdict; **consume is invariant
 to a post-emit work-tree mutation while the recompute path SKIPs, shown
-side by side** (s3, the TOCTOU proof); and one case each for skip-snapshot
+side by side** (s3, the TOCTOU proof); one case each for skip-snapshot
 → skip, missing → exit 1, corrupt → exit 1, digest mismatch → exit 1,
 absent digest → exit 1, undecodable-path-at-emit → exit 1, and the
-zero-profile guard surviving the `nargs +→*` change. `test-patch-coverage`
-(t1–t7) drives the ADVERSARIAL cases end to end through the real
+zero-profile guard surviving the `nargs +→*` change; and (s10) a table of
+malformed-but-parseable snapshots — a non-string `skip`, a payload carrying
+BOTH `skip` and `changed`, and line values `int()` would silently coerce
+(bool, numeric string, float, zero, negative, nested list) — each asserted
+to exit 1 and never a SKIP. `test-patch-coverage`
+(t1–t11) drives the ADVERSARIAL cases end to end through the real
 `cmd_test_with_patch_coverage` + `_verify_patch_coverage` with a `go` stub
 that mutates state mid-loop exactly as an untrusted test could (it receives
 `-coverprofile=<dir>/…` and so can reach the snapshot beside it): a
@@ -336,8 +347,14 @@ tracked-file revert (t1) and an untracked-file delete (t2) — the issue's
 done-means — plus **snapshot tampering** to a skip-snapshot (t3) and to a
 changed-map that drops the file (t4), each asserted to FAIL CLOSED and
 never a passing SKIP; a no-mutation control that PASSES (t5); the
-emit-before-loop ordering + consume-flag wiring (t6); and that the digest
-anchor is never exported into the test environment (t7).
+emit-before-loop ordering + consume-flag wiring (t6); that the digest
+anchor is never exported into the test environment (t7); the **combined
+no-profiles path** (t8 deletes both snapshot and profile, t9 tampers the
+snapshot and removes the profile) proving the no-profiles skip cannot bypass
+snapshot integrity; and the two shell fail-closed branches themselves — a
+failed emit (t10) and a failed digest anchor (t11) — each aborting the
+coverage loop non-zero. The (e2)/(e3) unit cases pin the same no-profiles
+integrity re-check directly on `_verify_patch_coverage`.
 
 ## Local k8s ergonomics (ADR-034 / [#852](https://github.com/kuhlman-labs/fishhawk/issues/852))
 

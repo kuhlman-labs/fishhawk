@@ -472,8 +472,10 @@ def load_verified_snapshot(path, expected_digest):
     """Load a snapshot after verifying its integrity. FAIL CLOSED on any doubt.
 
     Returns {"skip": reason} for a skip-snapshot, or {"changed": map, "base":
-    label}. Raises SnapshotError when the digest is absent/mismatched or the
-    content is unreadable/malformed — every one of which exits 1, never a skip.
+    label}. Raises SnapshotError when the digest is absent/mismatched, the
+    content is unreadable/unparseable, or the structure is malformed (a
+    non-string/ambiguous skip, or a line value that is not a positive integer) —
+    every one of which exits 1, never a skip.
 
     The digest is the anchor: scripts/test computes it from the pristine
     pre-test snapshot into the parent shell's memory and passes it here, so a
@@ -506,20 +508,44 @@ def load_verified_snapshot(path, expected_digest):
     if not isinstance(payload, dict) or payload.get("schema") != SNAPSHOT_SCHEMA:
         raise SnapshotError(f"unrecognized changed-snapshot shape in {path!r}")
     if "skip" in payload:
-        return {"skip": str(payload["skip"])}
+        # A skip-snapshot carries a STRING reason and nothing that would make
+        # the verdict ambiguous. A non-string skip (`{"skip": null}`) or a
+        # payload that ALSO carries a `changed` map is malformed: fail closed
+        # rather than stringify-and-skip, or a tamperer could smuggle a skip in
+        # alongside real changed lines (#2124).
+        if "changed" in payload:
+            raise SnapshotError(
+                f"changed-snapshot {path!r} has both 'skip' and 'changed'"
+            )
+        reason = payload["skip"]
+        if not isinstance(reason, str):
+            raise SnapshotError(
+                f"changed-snapshot {path!r} 'skip' is not a string"
+            )
+        return {"skip": reason}
     changed_raw = payload.get("changed")
     if not isinstance(changed_raw, dict):
         raise SnapshotError(f"changed-snapshot {path!r} has no 'changed' map")
     changed = {}
-    try:
-        for p, lines in changed_raw.items():
-            if not isinstance(lines, list):
+    for p, lines in changed_raw.items():
+        if not isinstance(lines, list):
+            raise SnapshotError(
+                f"changed-snapshot {path!r} entry {p!r} is not a line list"
+            )
+        nums = set()
+        for ln in lines:
+            # A line number is a POSITIVE integer. Do NOT int()-coerce: that
+            # silently accepts a bool (True→1 — and bool IS an int subclass, so
+            # reject it explicitly), a numeric string ("5"), a float (5.0, 5.7
+            # truncating), zero, and negatives — every one of which is a
+            # malformed snapshot that must fail closed, not be normalized.
+            if isinstance(ln, bool) or not isinstance(ln, int) or ln < 1:
                 raise SnapshotError(
-                    f"changed-snapshot {path!r} entry {p!r} is not a line list"
+                    f"changed-snapshot {path!r} entry {p!r} has a "
+                    f"non-positive-integer line {ln!r}"
                 )
-            changed[p] = {int(ln) for ln in lines}
-    except (TypeError, ValueError) as e:
-        raise SnapshotError(f"malformed line number in changed snapshot {path!r}: {e}")
+            nums.add(ln)
+        changed[p] = nums
     return {"changed": changed, "base": payload.get("base")}
 
 

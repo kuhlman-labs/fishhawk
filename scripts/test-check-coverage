@@ -904,6 +904,42 @@ else
   fail "(s9) zero-profile guard (rc=$rc out='$out')"
 fi
 
+# ---------------------------------------------------------------------------
+# (s10) MALFORMED-BUT-VALID-JSON snapshots fail closed (exit 1), never a SKIP.
+#       s6 covers UNPARSEABLE JSON; these parse fine but carry a structure
+#       load_verified_snapshot must reject: a non-string skip, a payload with
+#       BOTH skip and changed, and line values int() would silently coerce (bool,
+#       numeric string, float, zero, negative, nested list). The digest is
+#       computed over each payload so it MATCHES — isolating the structure check
+#       from the digest-mismatch branch.
+# ---------------------------------------------------------------------------
+s10_fail=0
+for bad in \
+  '{"schema":1,"skip":null}' \
+  '{"schema":1,"skip":"x","changed":{"backend/internal/foo/foo.go":[7]}}' \
+  '{"schema":1,"changed":{"backend/internal/foo/foo.go":[true]}}' \
+  '{"schema":1,"changed":{"backend/internal/foo/foo.go":["7"]}}' \
+  '{"schema":1,"changed":{"backend/internal/foo/foo.go":[7.5]}}' \
+  '{"schema":1,"changed":{"backend/internal/foo/foo.go":[0]}}' \
+  '{"schema":1,"changed":{"backend/internal/foo/foo.go":[-7]}}' \
+  '{"schema":1,"changed":{"backend/internal/foo/foo.go":[[7]]}}' \
+  ; do
+  printf '%s' "$bad" > "$tmproot/s10.json"
+  bdig="$(snap_digest "$tmproot/s10.json")"
+  bout="$(consume "$repo" "$tmproot/s10.json" "$bdig" "$tmproot/snap3.out")"
+  brc=$?
+  if [ "$brc" -ne 1 ] || printf '%s' "$bout" | grep -q 'SKIP' \
+     || ! printf '%s' "$bout" | grep -q 'FAIL'; then
+    echo "  s10 payload not rejected: '$bad' (rc=$brc out='$bout')"
+    s10_fail=1
+  fi
+done
+if [ "$s10_fail" -eq 0 ]; then
+  pass "(s10) malformed-but-valid-JSON snapshots fail closed (exit 1), never a SKIP"
+else
+  fail "(s10) malformed-snapshot structure validation"
+fi
+
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

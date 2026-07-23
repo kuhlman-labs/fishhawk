@@ -719,6 +719,22 @@ _verify_patch_coverage() {
     echo "scripts/test: no coverage profiles were produced — skipping the patch-coverage gate" >&2
     return 0
   fi
+  # Verify the pre-test snapshot's integrity BEFORE any skip path (#2124). A
+  # test that tampered with or deleted the snapshot AND removed the profiles
+  # (to reach the no-profiles skip below) must still fail CLOSED — a snapshot
+  # failure is never a passing SKIP. check-coverage.py only re-checks the digest
+  # when it is invoked, which the no-profiles skip bypasses, so the parent-memory
+  # anchor is re-checked here against the on-disk snapshot: a missing/unreadable
+  # snapshot or a digest mismatch fails closed even when Python is never reached.
+  local snapshot="$PATCHCOV_DIR/changed-snapshot.json" actual
+  if ! actual="$(_sha256_file "$snapshot")" || [ -z "$actual" ]; then
+    echo "scripts/test: pre-test changed-line snapshot missing or unreadable at verify time — failing the patch-coverage gate closed" >&2
+    return 1
+  fi
+  if [ "$actual" != "$PATCHCOV_SNAPSHOT_DIGEST" ]; then
+    echo "scripts/test: pre-test changed-line snapshot digest mismatch (modified after capture) — failing the patch-coverage gate closed" >&2
+    return 1
+  fi
   for f in "$PATCHCOV_DIR"/*.out; do
     if [ -f "$f" ]; then
       profiles[$n]="$f"
