@@ -28,6 +28,43 @@ required_fields: [Summary, Done-means, complexity]
 types: {feature: {body_skeleton: [Summary]}}
 `
 
+// testGitHubConventionsYAMLAlt is the same owner (so it stays
+// destination-authorized for an acme-owned repo) with a DIFFERENT project
+// number, so a re-parse is observable without crossing the tenancy boundary.
+const testGitHubConventionsYAMLAlt = `
+spec_version: work-management-v0
+provider: github_projects
+project:
+  owner: acme
+  number: 9
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+
+// testGitLabConventionsYAMLAcme is the gitlab file for an acme-owned repo:
+// its project namespace root matches the repo owner, so it is
+// destination-authorized (E44.14 / #2090).
+const testGitLabConventionsYAMLAcme = `
+spec_version: work-management-v0
+provider: gitlab
+gitlab:
+  project: acme/app
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+
+// testGitHubRedirectConventionsYAML is the ATTACK: a file committed to a
+// victim-owned repo naming another account's project board.
+const testGitHubRedirectConventionsYAML = `
+spec_version: work-management-v0
+provider: github_projects
+project:
+  owner: attacker
+  number: 1
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+
 const testGitLabConventionsYAML = `
 spec_version: work-management-v0
 provider: gitlab
@@ -405,8 +442,11 @@ func TestConventionsLoader_Cache(t *testing.T) {
 		t.Errorf("after-TTL Provider = %q, want github_projects", conv.Provider)
 	}
 
-	// After TTL with a CHANGED SHA: the new content is parsed.
-	gh.fc = &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitLabConventionsYAML), SHA: "sha-2"}
+	// After TTL with a CHANGED SHA: the new content is parsed. The new
+	// content keeps the SAME project owner as the repo — a cross-owner file
+	// would be refused by the destination binding (#2090), which is the
+	// subject of TestConventionsLoader_DestinationRedirect_Refused.
+	gh.fc = &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAMLAlt), SHA: "sha-2"}
 	now = now.Add(2 * time.Minute)
 	conv, err = l.Load(context.Background(), "acme/widgets")
 	if err != nil {
@@ -415,8 +455,8 @@ func TestConventionsLoader_Cache(t *testing.T) {
 	if gh.calls != 3 || parses != 2 {
 		t.Errorf("changed-SHA: fetches = %d, parses = %d, want 3/2", gh.calls, parses)
 	}
-	if conv.Provider != "gitlab" {
-		t.Errorf("changed-SHA Provider = %q, want gitlab from the re-parsed content", conv.Provider)
+	if conv.Project == nil || conv.Project.Number != 9 {
+		t.Errorf("changed-SHA Project = %+v, want project number 9 from the re-parsed content", conv.Project)
 	}
 }
 
@@ -428,7 +468,7 @@ func TestConventionsLoader_Cache(t *testing.T) {
 // serve the stale github parse; the (provider, repo) key makes it a miss.
 func TestConventionsLoader_ProviderReassignment_ForgeQualifiedKey(t *testing.T) {
 	gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "gh-sha"}}
-	gl := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitLabConventionsYAML), SHA: "gl-sha"}}
+	gl := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitLabConventionsYAMLAcme), SHA: "gl-sha"}}
 	resolver := mapProviderResolver{"acme/widgets": "github"}
 	now := time.Unix(1_700_000_000, 0)
 	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
@@ -623,6 +663,174 @@ func TestConventionsLoader_OverrideAbsent_Default(t *testing.T) {
 	if conv.Provider != workmgmt.Default().Provider {
 		t.Errorf("Provider = %q, want the Default() provider %q", conv.Provider, workmgmt.Default().Provider)
 	}
+}
+
+// TestConventionsLoader_DestinationRedirect_Refused is the E44.14 / #2090
+// done-means test, driven across the whole resolver → fetch → parse →
+// authorize → cache seam: a file committed to a VICTIM-owned repo naming
+// ANOTHER account's project board is refused, the caller gets the ZERO
+// conventions (never the break-glass override and never workmgmt.Default() —
+// falling through would make the deployment default attacker-selectable), and
+// NOTHING is cached, so a second Load refetches and re-parses instead of
+// serving a cached refusal.
+func TestConventionsLoader_DestinationRedirect_Refused(t *testing.T) {
+	parses := 0
+	gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubRedirectConventionsYAML), SHA: "sha-1"}}
+	now := time.Unix(1_700_000_000, 0)
+	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+		Resolver:      &fakeProviderResolver{provider: "github", found: true},
+		GitHubFetcher: gh,
+		GitHubScope:   githubScopeFixed("42"),
+		Override:      breakGlass,
+		Parse:         countingParse(&parses),
+		Now:           func() time.Time { return now },
+		TTL:           time.Hour,
+	})
+
+	conv, err := l.Load(context.Background(), "victim/widgets")
+	if err == nil {
+		t.Fatal("Load err = nil, want a destination-authorization refusal")
+	}
+	if !errors.Is(err, errConventionsDestinationUnauthorized) {
+		t.Fatalf("Load err = %v, want it to wrap errConventionsDestinationUnauthorized", err)
+	}
+	if conv.Provider != "" {
+		t.Errorf("Provider = %q, want the ZERO conventions — a refused destination must serve neither the override nor Default()", conv.Provider)
+	}
+	if gh.calls != 1 || parses != 1 {
+		t.Fatalf("first Load: fetches = %d, parses = %d, want 1/1", gh.calls, parses)
+	}
+
+	// WITHIN the TTL: nothing was cached, so the second Load must refetch AND
+	// re-parse. This is the assertion that stops a future edit which caches
+	// before authorizing from silently reopening the redirect hole.
+	conv, err = l.Load(context.Background(), "victim/widgets")
+	if err == nil || !errors.Is(err, errConventionsDestinationUnauthorized) {
+		t.Fatalf("second Load err = %v, want the same refusal", err)
+	}
+	if conv.Provider != "" {
+		t.Errorf("second Load Provider = %q, want the ZERO conventions", conv.Provider)
+	}
+	if gh.calls != 2 {
+		t.Errorf("second Load fetches = %d, want 2 — a refused parse must NOT be cached", gh.calls)
+	}
+	if parses != 2 {
+		t.Errorf("second Load parses = %d, want 2 — a refused parse must NOT be cached", parses)
+	}
+}
+
+// TestConventionsLoader_DestinationAuthorized_Cached is the guard against a
+// regression that refuses everything: a file whose destination IS the repo's
+// own account is served and cached exactly as before (the second within-TTL
+// Load issues zero fetches).
+func TestConventionsLoader_DestinationAuthorized_Cached(t *testing.T) {
+	gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "sha-1"}}
+	now := time.Unix(1_700_000_000, 0)
+	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+		Resolver:      &fakeProviderResolver{provider: "github", found: true},
+		GitHubFetcher: gh,
+		GitHubScope:   githubScopeFixed("42"),
+		Override:      breakGlass,
+		Now:           func() time.Time { return now },
+		TTL:           time.Hour,
+	})
+
+	conv, err := l.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load err = %v, want nil for a file bound to the repo's own account", err)
+	}
+	if conv.Provider != "github_projects" {
+		t.Fatalf("Provider = %q, want github_projects from the committed file", conv.Provider)
+	}
+	if _, err = l.Load(context.Background(), "acme/widgets"); err != nil {
+		t.Fatalf("second Load err = %v, want nil", err)
+	}
+	if gh.calls != 1 {
+		t.Errorf("fetches = %d, want 1 — an authorized parse is cached as before", gh.calls)
+	}
+}
+
+// TestConventionsLoader_DestinationAllowListed: the administrator-controlled
+// allow-list is the escape hatch for a legitimate cross-namespace
+// destination.
+func TestConventionsLoader_DestinationAllowListed(t *testing.T) {
+	allow, err := ParseWorkMgmtDestinationAllowList("victim:github_projects:attacker")
+	if err != nil {
+		t.Fatalf("allow-list parse err = %v, want nil", err)
+	}
+	gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubRedirectConventionsYAML), SHA: "sha-1"}}
+	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+		Resolver:            &fakeProviderResolver{provider: "github", found: true},
+		GitHubFetcher:       gh,
+		GitHubScope:         githubScopeFixed("42"),
+		Override:            breakGlass,
+		AllowedDestinations: allow,
+	})
+
+	conv, err := l.Load(context.Background(), "victim/widgets")
+	if err != nil {
+		t.Fatalf("Load err = %v, want nil for an allow-listed destination", err)
+	}
+	if conv.Project == nil || conv.Project.Owner != "attacker" {
+		t.Errorf("Project = %+v, want the allow-listed cross-namespace owner", conv.Project)
+	}
+}
+
+// TestConventionsLoader_FallbacksNotDestinationValidated pins the deliberate
+// non-validation of the ADMINISTRATOR-controlled fallbacks: the break-glass
+// override and workmgmt.Default() are the trusted deployment inputs whose
+// displacement by untrusted repo input is the entire concern, so neither is
+// subjected to the destination binding. Both fixtures name a destination that
+// would be refused if it came from a repo-fetched file.
+func TestConventionsLoader_FallbacksNotDestinationValidated(t *testing.T) {
+	t.Run("override served unvalidated on ErrNotFound", func(t *testing.T) {
+		gh := &fakeFileFetcher{err: forge.ErrNotFound}
+		l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+			Resolver:      &fakeProviderResolver{provider: "github", found: true},
+			GitHubFetcher: gh,
+			GitHubScope:   githubScopeFixed("42"),
+			Override: func() (workmgmt.Conventions, bool) {
+				return ghDest("some-other-org"), true
+			},
+		})
+		conv, err := l.Load(context.Background(), "acme/widgets")
+		if err != nil {
+			t.Fatalf("Load err = %v, want nil", err)
+		}
+		if conv.Project == nil || conv.Project.Owner != "some-other-org" {
+			t.Errorf("Project = %+v, want the override served unvalidated", conv.Project)
+		}
+	})
+
+	t.Run("override served unvalidated when the resolver finds no account", func(t *testing.T) {
+		l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+			Resolver: &fakeProviderResolver{found: false},
+			Override: func() (workmgmt.Conventions, bool) {
+				return ghDest("some-other-org"), true
+			},
+		})
+		conv, err := l.Load(context.Background(), "acme/widgets")
+		if err != nil {
+			t.Fatalf("Load err = %v, want nil", err)
+		}
+		if conv.Project == nil || conv.Project.Owner != "some-other-org" {
+			t.Errorf("Project = %+v, want the override served unvalidated", conv.Project)
+		}
+	})
+
+	t.Run("Default served unvalidated for an unregistered forge", func(t *testing.T) {
+		l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+			Resolver: &fakeProviderResolver{provider: "github", found: true},
+			// No GitHubFetcher: the forge is unregistered.
+		})
+		conv, err := l.Load(context.Background(), "acme/widgets")
+		if err != nil {
+			t.Fatalf("Load err = %v, want nil", err)
+		}
+		if conv.Provider != workmgmt.Default().Provider {
+			t.Errorf("Provider = %q, want workmgmt.Default() served unvalidated", conv.Provider)
+		}
+	})
 }
 
 // TestConventionsLoader_MixedForge is the done-means cross-boundary test: ONE

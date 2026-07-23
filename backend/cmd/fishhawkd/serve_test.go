@@ -1327,7 +1327,7 @@ func TestBuildRepoConventionsLoader_OverrideAsFallback(t *testing.T) {
 	override := workmgmt.Default()
 	override.Provider = workmgmtgitlab.ProviderName
 	override.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
-	loader := buildRepoConventionsLoader(srv, nil, func() (workmgmt.Conventions, bool) { return override, true })
+	loader := buildRepoConventionsLoader(srv, nil, func() (workmgmt.Conventions, bool) { return override, true }, nil)
 	conv, err := loader.Load(context.Background(), "acme/widgets")
 	if err != nil {
 		t.Fatalf("Load err = %v, want nil", err)
@@ -1336,7 +1336,7 @@ func TestBuildRepoConventionsLoader_OverrideAsFallback(t *testing.T) {
 		t.Errorf("Provider = %q, want %q (the break-glass override must be the fallback)", conv.Provider, workmgmtgitlab.ProviderName)
 	}
 
-	noOverride := buildRepoConventionsLoader(srv, nil, nil)
+	noOverride := buildRepoConventionsLoader(srv, nil, nil, nil)
 	conv, err = noOverride.Load(context.Background(), "acme/widgets")
 	if err != nil {
 		t.Fatalf("Load (no override) err = %v, want nil", err)
@@ -1344,6 +1344,50 @@ func TestBuildRepoConventionsLoader_OverrideAsFallback(t *testing.T) {
 	if conv.Provider != workmgmt.Default().Provider {
 		t.Errorf("Provider = %q, want the Default() provider %q", conv.Provider, workmgmt.Default().Provider)
 	}
+}
+
+// TestServe_WorkMgmtAllowedDestinations pins the E44.14 / #2090 boot wiring
+// by driving runServe ITSELF: a MALFORMED
+// FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS FAILS startup with an error naming
+// the variable — it must never log-and-continue or degrade to an empty
+// (strict) allow-list, because a typo silently reverting to strict would
+// masquerade as the security posture working while breaking a legitimate
+// cross-namespace deployment. A well-formed value is accepted and startup
+// proceeds past the guard (aborting later at the deliberately-invalid
+// --review-resolution), proving the value was parsed rather than rejected.
+// That the parsed value reaches the loader is compile-enforced by
+// buildRepoConventionsLoader's signature and behaviorally covered by
+// server.TestConventionsLoader_DestinationAllowListed.
+func TestServe_WorkMgmtAllowedDestinations(t *testing.T) {
+	t.Run("malformed value fails boot", func(t *testing.T) {
+		for _, raw := range []string{"acme:github_projects", "acme:bitbucket:acme", ":github_projects:acme"} {
+			code, log := serveWithProfile(t, "-workmgmt-allowed-destinations", raw)
+			if code != exitFailure {
+				t.Fatalf("runServe(%q) exit = %d, want %d (a malformed allow-list must fail boot); log:\n%s", raw, code, exitFailure, log)
+			}
+			if !strings.Contains(log, "FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS") {
+				t.Errorf("runServe(%q) log does not name the offending variable:\n%s", raw, log)
+			}
+			if !strings.Contains(log, raw) {
+				t.Errorf("runServe(%q) log does not name the offending entry:\n%s", raw, log)
+			}
+		}
+	})
+
+	t.Run("well-formed value is accepted at boot", func(t *testing.T) {
+		code, log := serveWithProfile(t,
+			"-workmgmt-allowed-destinations", "acme:github_projects:enterprise,acme:jira:FISH",
+			bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (startup aborts at the invalid --review-resolution, AFTER the allow-list guard); log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "invalid FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS") {
+			t.Errorf("a well-formed allow-list was rejected at boot:\n%s", log)
+		}
+		if !strings.Contains(log, "review-resolution") {
+			t.Errorf("startup did not reach the later --review-resolution guard, so the allow-list guard was not passed:\n%s", log)
+		}
+	})
 }
 
 // TestWebhookStoreNeeded pins the delivery-store gating (E45.6 / #1860):

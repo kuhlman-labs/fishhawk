@@ -199,6 +199,57 @@ process-global, so a slow or hung forge round-trip for one repo does **not** sta
 other repo (the short map-guarding `mu` is never held across the fetch). The per-key lock map, like
 the cache, never evicts — bounded in practice by distinct authenticated filing targets.
 
+### Destination authorization (`conventions_destination.go`, E44.14 / #2090)
+
+Resolving where the file is READ FROM is not the same as authorizing where it FILES TO. A
+repo-committed conventions file is **untrusted input**: without a binding, a file committed to
+any repo the deployment can read could name any provider and any project reachable by deployment
+credentials, redirecting filed work items and product reports out of the repo's tenancy boundary.
+So a **repo-fetched** parse is destination-authorized immediately after `workmgmt.Parse` and
+**before** it is cached or returned:
+
+| Conventions provider | Destination key | Bound to |
+|---|---|---|
+| `github_projects` | `project.owner` | the repo's resolved account key (github family) |
+| `gitlab` | the namespace root of `gitlab.project`, or the filing repo's own owner when the block omits `project` | the repo's resolved account key (gitlab family) |
+| `jira` | `jira.project_key` | nothing — a jira destination has **no forge account to bind to**, so it is refused unless allow-listed |
+
+The account key is the filing repo's owner segment — by construction exactly the `account_key`
+the discriminator lookup used (`account.Resolver.ResolveProvider` cuts `repo` at the first `/`).
+Comparison is case-insensitive (forge logins and namespace paths are case-preserving but
+case-insensitive for identity). Both the forge **family** and the **key** must match; a
+cross-forge destination (a gitlab file under a github account, or the reverse) is refused. A
+provider outside the closed set, an empty provider, or a declared provider with a nil connection
+block all fail closed.
+
+**Not cached, no fall-through, on refusal.** A refused destination returns an error wrapping
+`errConventionsDestinationUnauthorized` and is neither written to the cache nor allowed to fall
+through to the break-glass override / `Default()` — caching would hide the redirect attempt
+behind the TTL, and falling through would let repo-committed content *select* the deployment
+default. That ordering is also why the cached-serve and unchanged-SHA branches need no re-check:
+nothing enters the cache without having passed authorization. An edit that caches earlier
+silently reopens the hole (`TestConventionsLoader_DestinationRedirect_Refused` asserts the second
+`Load` refetches and re-parses).
+
+**Escape hatch is administrator-controlled, never repo-controlled**:
+`FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS` carries comma-separated
+`<account-key>:<provider>:<destination-key>` entries; a **malformed value fails boot** rather
+than degrading to an empty (strict) allow-list. Every refusal names the exact entry to add. A
+`gitlab` destination key must be the namespace **root** (`group`), not a project path
+(`group/team`): the derived key is the namespace root, so a full-path entry could never match —
+it is rejected at parse time, naming the root entry to use, rather than sitting silently inert.
+
+**The administrator-controlled fallbacks are deliberately NOT validated.** The
+`FISHHAWKD_WORKMGMT_CONVENTIONS` override and `workmgmt.Default()` are the trusted deployment
+inputs whose displacement by untrusted repo input is the entire concern; validating `Default()`
+would also break every deployment whose shipped default names a project outside the filing repo's
+owner.
+
+**Residual limitation**: the binding is enforced only when the discriminator resolves an account.
+Until E44 populates repo→account rows, a repo with no account row still falls through to the
+trusted override / `Default()`, unvalidated. This change therefore only ever tightens the current
+posture — it never weakens it.
+
 **Operator-accepted E44 posture**: the E44 `accounts` tables are not yet populated in
 production, so the discriminator path resolves `found=false` and live filings degrade to the
 break-glass override / `Default()` — production effect begins when E44 wires repo→account rows.

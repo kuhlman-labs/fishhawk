@@ -72,6 +72,11 @@ type RepoConventionsLoaderConfig struct {
 	// parse is served with no fetch at all.
 	Now func() time.Time
 	TTL time.Duration
+	// AllowedDestinations is the deployment-controlled (never repo-controlled)
+	// set of exceptions to the destination binding (E44.14 / #2090), parsed
+	// from FISHHAWKD_WORKMGMT_ALLOWED_DESTINATIONS. Nil/empty means strict
+	// binding with no exceptions.
+	AllowedDestinations DestinationAllowList
 }
 
 // conventionsCacheEntry is one repo's cached parse keyed by the forge blob
@@ -203,6 +208,13 @@ func (l *RepoConventionsLoader) resolveFetch(ctx context.Context, repo string) (
 // never serves the prior forge's parse. A per-key mutex serializes concurrent
 // loads for the SAME key (one fetch, no thundering herd) without blocking
 // loads for any OTHER repo across the forge round-trip.
+//
+// A repo-FETCHED parse is destination-authorized (E44.14 / #2090) BEFORE it
+// is cached or returned, and a refusal is neither cached nor fallen through
+// from. That ordering is the invariant the cached-serve and unchanged-SHA
+// branches rest on: nothing enters the cache without having passed
+// authorization, so those branches need no re-check — and an edit that writes
+// the cache any earlier silently reopens the redirect hole.
 func (l *RepoConventionsLoader) loadCached(ctx context.Context, provider, repo string, fetcher forge.FileFetcher, scope forge.CredentialScope, ref forge.RepoRef, fetchRef string) (workmgmt.Conventions, error) {
 	key := provider + "\x00" + repo
 
@@ -236,6 +248,13 @@ func (l *RepoConventionsLoader) loadCached(ctx context.Context, provider, repo s
 		// FAIL CLOSED: a committed-but-invalid file is an operator error to
 		// surface, not a reason to serve some other repo's conventions.
 		return workmgmt.Conventions{}, fmt.Errorf("parse %s from %s: %w", conventionsFilePath, repo, err)
+	}
+	if err := authorizeConventionsDestination(provider, repo, conv, l.cfg.AllowedDestinations); err != nil {
+		// FAIL CLOSED, and deliberately WITHOUT caching and WITHOUT falling
+		// through: caching a refused parse would hide the redirect attempt
+		// behind the TTL, and falling back to the override/Default() would
+		// let repo-committed content SELECT the deployment default.
+		return workmgmt.Conventions{}, err
 	}
 	l.writeCache(key, conventionsCacheEntry{sha: fc.SHA, conv: conv, fetchedAt: now})
 	return conv, nil
