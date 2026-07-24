@@ -33,7 +33,7 @@ func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) 
 	f.gotEpic = req
 	return &EpicChildrenResult{
 		Children: []EpicChild{
-			{Number: 41, Title: "slice A", Autonomy: "low"},
+			{Number: 41, Title: "slice A", Autonomy: "low", Complete: true},
 			{Number: 42, Title: "slice B", Autonomy: "high"},
 		},
 		Edges: []DependsEdge{{From: 42, To: 41}},
@@ -184,8 +184,20 @@ func TestRegistry_DispatchEpicChildren(t *testing.T) {
 	if res.Children[0].Autonomy != "low" || res.Children[1].Autonomy != "high" {
 		t.Errorf("children autonomy = %q,%q, want low,high", res.Children[0].Autonomy, res.Children[1].Autonomy)
 	}
+	// The completion signal threads through EpicChild (the producer end of the
+	// campaign subset satisfied-dependency path, #2120): #41 is closed-and-
+	// completed, #42 is not.
+	if !res.Children[0].Complete || res.Children[1].Complete {
+		t.Errorf("children Complete = %v,%v, want true,false", res.Children[0].Complete, res.Children[1].Complete)
+	}
+	// A satisfied edge leaves Reason at the "" zero value, so the pre-#2120
+	// equality assertion on Edges still holds unchanged (the compatibility the
+	// additive DependsEdge.Reason field must preserve).
 	if len(res.Edges) != 1 || res.Edges[0] != (DependsEdge{From: 42, To: 41}) {
 		t.Errorf("edges = %+v", res.Edges)
+	}
+	if res.Edges[0].Reason != "" {
+		t.Errorf("satisfied edge Reason = %q, want \"\" (zero)", res.Edges[0].Reason)
 	}
 	if fp.gotEpic.Epic != "#1440" {
 		t.Errorf("provider did not receive epic-children request: %+v", fp.gotEpic)

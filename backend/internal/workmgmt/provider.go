@@ -110,23 +110,55 @@ type EpicChildrenResult struct {
 	DroppedEdges []DependsEdge
 }
 
-// EpicChild is one child issue of an epic: its number, title, and autonomy
-// tier. Autonomy is the tier parsed from the child's `autonomy:<tier>` label
-// (low|medium|high), empty when the child carries no autonomy label
-// (unknown/default). It is the producer end of the campaign autonomy-aware
-// eligibility path (#1551): the campaign engine diverts a deps-satisfied
-// autonomy:low child out of the auto-dispatch Eligible slice.
+// EpicChild is one child issue of an epic: its number, title, autonomy tier,
+// and completion state. Autonomy is the tier parsed from the child's
+// `autonomy:<tier>` label (low|medium|high), empty when the child carries no
+// autonomy label (unknown/default). It is the producer end of the campaign
+// autonomy-aware eligibility path (#1551): the campaign engine diverts a
+// deps-satisfied autonomy:low child out of the auto-dispatch Eligible slice.
+//
+// Complete is true when the child issue is closed-and-completed (GitHub
+// IssueState CLOSED with IssueStateReason COMPLETED) — the "already
+// merged/done" signal the campaign subset filter reads to treat an included
+// item's depends_on on an EXCLUDED sibling as satisfied rather than dangling
+// (#2120). A closed-as-not_planned or closed-as-duplicate child is NOT complete
+// (its work did not land), so it does not satisfy a dependency. False for an
+// open child and, fail-safe, whenever the completion signal is absent.
 type EpicChild struct {
 	Number   int
 	Title    string
 	Autonomy string
+	Complete bool
 }
 
+// DropReason categorizes why a DependsEdge was dropped from the wave DAG, so
+// the campaign-assembly failure can name the real cause and remedy per edge
+// (#2120). It is meaningful only on a DroppedEdges entry; a satisfied edge in
+// Edges leaves it "" (the zero value), keeping existing equality assertions on
+// Edges unchanged.
+type DropReason string
+
+const (
+	// DropNotChild marks an edge whose target is not a fellow child of the
+	// epic — a typo'd number or a genuine cross-epic dependency. It keeps the
+	// pre-#2120 "not a fellow child of the epic" wording.
+	DropNotChild DropReason = "not_child"
+	// DropExcludedIncomplete marks an edge from an INCLUDED subset item to a
+	// fellow child that was EXCLUDED from the items subset and is not yet
+	// complete, so its dependency cannot be honored within the campaign. The
+	// remedy is to include it in items, or omit items to sweep every child so a
+	// completed dependency auto-settles (#2120).
+	DropExcludedIncomplete DropReason = "excluded_incomplete"
+)
+
 // DependsEdge is one depends_on edge over the sibling set: From depends on
-// To. Both are child issue numbers of the queried epic.
+// To. Both are child issue numbers of the queried epic. Reason categorizes a
+// DROPPED edge (why it could not be honored) and is "" on a satisfied edge in
+// Edges (#2120).
 type DependsEdge struct {
-	From int
-	To   int
+	From   int
+	To     int
+	Reason DropReason
 }
 
 // DiscoverNumbersRequest is the resolved input to NumberDiscoverer: the

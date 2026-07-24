@@ -486,6 +486,18 @@ func decodeCampaignError(t *testing.T, w *httptest.ResponseRecorder) string {
 	return env.Error.Code
 }
 
+// decodeCampaignErrorDetails returns the error code AND the details map so a
+// test can assert the campaign_dangling_dependency category keys the MCP tool
+// branches on (#2120).
+func decodeCampaignErrorDetails(t *testing.T, w *httptest.ResponseRecorder) (string, map[string]any) {
+	t.Helper()
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body=%s)", err, w.Body.String())
+	}
+	return env.Error.Code, env.Error.Details
+}
+
 // --- create handler tests ---
 
 // TestCreateCampaign_CrossBoundary_E2E drives the full surface end-to-end
@@ -645,12 +657,13 @@ func TestCreateCampaign_ItemNotChild_422(t *testing.T) {
 	}
 }
 
-// TestCreateCampaign_SubsetIncludedDependsOnExcluded_422 is the re-classified
-// DroppedEdges path: including 101 (depends on 100) while excluding 100 makes
-// 101's dependency dangling, surfaced as 422 campaign_dangling_dependency —
-// reusing the existing mapping with no handler change.
-func TestCreateCampaign_SubsetIncludedDependsOnExcluded_422(t *testing.T) {
-	fp := &fakeEpicProvider{result: threeChildDAG()}
+// TestCreateCampaign_SubsetIncludedDependsOnExcludedIncomplete_422 is the
+// re-classified DroppedEdges path: including 101 (depends on 100) while
+// excluding the INCOMPLETE 100 makes 101's dependency dangling, surfaced as 422
+// campaign_dangling_dependency with the dangling_excluded_incomplete details key
+// the MCP tool branches on (#2120).
+func TestCreateCampaign_SubsetIncludedDependsOnExcludedIncomplete_422(t *testing.T) {
+	fp := &fakeEpicProvider{result: threeChildDAG()} // 100 not complete
 	registerEpicProvider(t, fp)
 	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
 
@@ -658,8 +671,71 @@ func TestCreateCampaign_SubsetIncludedDependsOnExcluded_422(t *testing.T) {
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
 	}
-	if code := decodeCampaignError(t, w); code != "campaign_dangling_dependency" {
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_dangling_dependency" {
 		t.Errorf("error code = %q, want campaign_dangling_dependency", code)
+	}
+	// The categorized details name the excluded-incomplete edge so the MCP tool
+	// renders the include/omit remedy; the not_child key is absent here.
+	if _, ok := details["dangling_excluded_incomplete"]; !ok {
+		t.Errorf("details = %+v, want a dangling_excluded_incomplete key", details)
+	}
+	if _, ok := details["dangling_not_child"]; ok {
+		t.Errorf("details = %+v, want NO dangling_not_child key (this is an excluded-incomplete cause)", details)
+	}
+	if refs, ok := details["dangling_excluded_incomplete"].([]any); !ok || len(refs) != 1 || refs[0] != "issue:101->issue:100" {
+		t.Errorf("dangling_excluded_incomplete = %v, want [issue:101->issue:100]", details["dangling_excluded_incomplete"])
+	}
+}
+
+// completeDepDAG is threeChildDAG but with the excluded dependency target #100
+// marked closed-and-completed — the state the subset filter reads to treat 101's
+// dependency as satisfied (#2120).
+func completeDepDAG() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 100, Title: "first", Complete: true}, // already merged
+			{Number: 101, Title: "second"},
+			{Number: 102, Title: "third"},
+		},
+		Edges: []workmgmt.DependsEdge{
+			{From: 101, To: 100},
+			{From: 102, To: 100},
+		},
+	}
+}
+
+// TestCreateCampaign_SubsetExcludesCompletedDepChild_201 is the #2120 done-means
+// end to end (request -> FilterToSubset -> Assemble -> Persist -> GET /status):
+// scoping the campaign to {101} while EXCLUDING its dependency #100 now SUCCEEDS
+// 201 because #100 is closed-and-completed — the satisfied dependency is dropped
+// silently instead of failing the whole subset campaign_dangling_dependency —
+// and the assembled items are exactly {101}.
+func TestCreateCampaign_SubsetExcludesCompletedDepChild_201(t *testing.T) {
+	fp := &fakeEpicProvider{result: completeDepDAG()}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:101"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	if len(items) != 1 || items[0].IssueRef != "issue:101" {
+		t.Fatalf("persisted items = %+v, want exactly [issue:101]", items)
+	}
+	// The satisfied dependency is not carried onto the item — #100 is not in the
+	// campaign, so 101 has no depends_on within the subset.
+	if len(items[0].DependsOn) != 0 {
+		t.Errorf("item issue:101 depends_on = %v, want none (dependency already complete)", items[0].DependsOn)
 	}
 }
 
@@ -1238,8 +1314,18 @@ func TestCreateCampaign_DanglingDependency_422(t *testing.T) {
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
 	}
-	if code := decodeCampaignError(t, w); code != "campaign_dangling_dependency" {
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_dangling_dependency" {
 		t.Errorf("code = %q, want campaign_dangling_dependency", code)
+	}
+	// A genuine out-of-epic edge (100 -> 999) is categorized under
+	// dangling_not_child, keeping the "not a fellow child" cause; the
+	// excluded-incomplete key is absent (#2120).
+	if refs, ok := details["dangling_not_child"].([]any); !ok || len(refs) != 1 || refs[0] != "issue:100->issue:999" {
+		t.Errorf("dangling_not_child = %v, want [issue:100->issue:999]", details["dangling_not_child"])
+	}
+	if _, ok := details["dangling_excluded_incomplete"]; ok {
+		t.Errorf("details = %+v, want NO dangling_excluded_incomplete key (out-of-epic cause)", details)
 	}
 }
 

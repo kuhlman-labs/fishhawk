@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -24,6 +25,53 @@ var (
 	// order the items.
 	ErrCycle = errors.New("campaign: dependency cycle among campaign items")
 )
+
+// DanglingDependencyError is the typed error Assemble returns when a
+// campaign's dropped depends_on edges block assembly. It categorizes the
+// blocking edges by cause so the create handler can enrich the 422 details map
+// (dangling_not_child / dangling_excluded_incomplete) and the MCP tool can name
+// the real remedy per cause, without string-parsing the message (#2120). It
+// wraps ErrDanglingDependency, so errors.Is(err, ErrDanglingDependency) still
+// holds for every existing caller.
+type DanglingDependencyError struct {
+	// NotChild are edges whose target is not a fellow child of the epic — a
+	// typo'd number or a genuine cross-epic dependency (DropNotChild, or an
+	// unclassified/zero-reason dropped edge, defensively).
+	NotChild []workmgmt.DependsEdge
+	// ExcludedIncomplete are edges from an included subset item to a fellow
+	// child excluded from the items subset that is not yet complete
+	// (DropExcludedIncomplete).
+	ExcludedIncomplete []workmgmt.DependsEdge
+}
+
+// Error renders one clause per non-empty category. The not_child clause keeps
+// the pre-#2120 "not a fellow child of the epic" wording (an out-of-epic cause);
+// the excluded_incomplete clause names the real cause and the include/omit
+// remedy.
+func (e *DanglingDependencyError) Error() string {
+	var clauses []string
+	if len(e.NotChild) > 0 {
+		clauses = append(clauses, fmt.Sprintf("%v target an issue that is not a fellow child of the epic", formatEdges(e.NotChild)))
+	}
+	if len(e.ExcludedIncomplete) > 0 {
+		clauses = append(clauses, fmt.Sprintf("%v depend on a sibling excluded from items that is not yet complete — include it in items, or omit items to sweep every child so a completed dependency auto-settles", formatEdges(e.ExcludedIncomplete)))
+	}
+	return fmt.Sprintf("%s: %s", ErrDanglingDependency.Error(), strings.Join(clauses, "; "))
+}
+
+// Unwrap makes errors.Is(err, ErrDanglingDependency) hold so the sentinel-based
+// status mapping (server + refinement) is unchanged.
+func (*DanglingDependencyError) Unwrap() error { return ErrDanglingDependency }
+
+// formatEdges renders a slice of edges as `[issue:From->issue:To ...]` in the
+// campaign ref convention, matching the pre-#2120 message shape.
+func formatEdges(edges []workmgmt.DependsEdge) []string {
+	parts := make([]string, 0, len(edges))
+	for _, e := range edges {
+		parts = append(parts, fmt.Sprintf("%s->%s", issueRef(e.From), issueRef(e.To)))
+	}
+	return parts
+}
 
 // Assembly is the in-memory result of decomposing an epic's children into a
 // wave-ordered campaign DAG, before it is persisted. It is produced by
@@ -83,9 +131,11 @@ func issueRef(number int) string {
 // 0-based index and back.
 //
 // It fails closed in two ways:
-//   - any DroppedEdges (a depends_on target that is not a fellow child) yields
-//     a wrapped ErrDanglingDependency naming the mis-targeted edges, so a
-//     missing dependency blocks assembly rather than being silently dropped;
+//   - any DroppedEdges (a depends_on target that is not a fellow child, or an
+//     excluded-but-incomplete subset sibling) yields a *DanglingDependencyError
+//     (which wraps ErrDanglingDependency) categorizing the mis-targeted edges by
+//     cause, so a missing dependency blocks assembly rather than being silently
+//     dropped;
 //   - a cycle or out-of-range edge surfaced by plan.Waves yields a wrapped
 //     ErrCycle.
 func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, error) {
@@ -94,14 +144,23 @@ func Assemble(epicRef string, res *workmgmt.EpicChildrenResult) (*Assembly, erro
 	}
 
 	// Fail closed on any mis-targeted depends_on edge surfaced by the
-	// provider. A dangling edge means a declared dependency cannot be honored
-	// within the epic, so the campaign would be built on a broken graph.
+	// provider (or the subset filter). A dangling edge means a declared
+	// dependency cannot be honored within the campaign, so it would be built on
+	// a broken graph. Group the edges by drop reason so the failure names the
+	// real cause per edge: an out-of-epic target keeps the "not a fellow child"
+	// wording, while an excluded-but-incomplete sibling names the include/omit
+	// remedy (#2120). An empty/unknown reason defaults to not_child, so a
+	// pre-existing dropped edge with no reason keeps the current wording.
 	if len(res.DroppedEdges) > 0 {
-		parts := make([]string, 0, len(res.DroppedEdges))
+		derr := &DanglingDependencyError{}
 		for _, e := range res.DroppedEdges {
-			parts = append(parts, fmt.Sprintf("%s->%s", issueRef(e.From), issueRef(e.To)))
+			if e.Reason == workmgmt.DropExcludedIncomplete {
+				derr.ExcludedIncomplete = append(derr.ExcludedIncomplete, e)
+			} else {
+				derr.NotChild = append(derr.NotChild, e)
+			}
 		}
-		return nil, fmt.Errorf("%w: %v", ErrDanglingDependency, parts)
+		return nil, derr
 	}
 
 	// Ascending index map: child issue number -> 0-based index. Children are

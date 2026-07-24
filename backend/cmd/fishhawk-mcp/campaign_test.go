@@ -290,6 +290,9 @@ func TestStartCampaign_RepoNotInstalled_MapsActionableError(t *testing.T) {
 	}
 }
 
+// TestStartCampaign_DanglingDependency_MapsActionableError is the fallback
+// branch: an error WITHOUT the #2120 category details (an older backend) keeps
+// the pre-existing "not a fellow child" fix-the-edges wording.
 func TestStartCampaign_DanglingDependency_MapsActionableError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.createCampaignStatus = http.StatusUnprocessableEntity
@@ -300,7 +303,78 @@ func TestStartCampaign_DanglingDependency_MapsActionableError(t *testing.T) {
 	if err == nil {
 		t.Fatal("err = nil, want campaign_dangling_dependency mapping")
 	}
-	for _, want := range []string{"campaign_dangling_dependency", "depends_on", "#25"} {
+	for _, want := range []string{"campaign_dangling_dependency", "depends_on", "not a fellow child", "#25"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	// No excluded-incomplete remedy leaks into the pure not_child fallback.
+	if strings.Contains(err.Error(), "include it in items") {
+		t.Errorf("fallback err %q must not name the excluded-incomplete remedy", err.Error())
+	}
+}
+
+// TestStartCampaign_DanglingNotChildDetails_KeepsNotChildWording is the #2120
+// not_child branch: details carrying only dangling_not_child render the
+// unchanged "not a fellow child" wording, not the excluded-incomplete remedy.
+func TestStartCampaign_DanglingNotChildDetails_KeepsNotChildWording(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"dangling edge","details":{"epic_ref":"#25","dangling_not_child":["issue:27->issue:999"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	for _, want := range []string{"campaign_dangling_dependency", "not a fellow child", "#25"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "include it in items") {
+		t.Errorf("not_child-only err %q must not name the excluded-incomplete remedy", err.Error())
+	}
+}
+
+// TestStartCampaign_DanglingExcludedIncompleteDetails_NamesIncludeOmitRemedy is
+// the #2120 excluded-incomplete branch: details carrying only
+// dangling_excluded_incomplete render the include-in-items / omit-items remedy
+// naming the real cause, NOT the generic fix-the-edges wording.
+func TestStartCampaign_DanglingExcludedIncompleteDetails_NamesIncludeOmitRemedy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"dangling edge","details":{"epic_ref":"#25","dangling_excluded_incomplete":["issue:101->issue:100"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	for _, want := range []string{"campaign_dangling_dependency", "include it in items", "omit items"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "fix the epic's dependency edges") {
+		t.Errorf("excluded-incomplete-only err %q must not name the generic fix-the-edges remedy", err.Error())
+	}
+}
+
+// TestStartCampaign_DanglingBothDetails_RendersBothCauses is the #2120
+// both-present branch: details carrying BOTH category keys render both the
+// not_child and the excluded-incomplete remedies.
+func TestStartCampaign_DanglingBothDetails_RendersBothCauses(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"dangling edges","details":{"epic_ref":"#25","dangling_not_child":["issue:27->issue:999"],"dangling_excluded_incomplete":["issue:101->issue:100"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	for _, want := range []string{"campaign_dangling_dependency", "not a fellow child", "include it in items", "omit items", "#25"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err %q missing %q", err.Error(), want)
 		}

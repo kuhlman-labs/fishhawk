@@ -70,21 +70,74 @@ func TestFilterToSubset_UnparseableItem_ReturnsErrItemNotChild(t *testing.T) {
 	}
 }
 
-// TestFilterToSubset_IncludedDependsOnExcluded_LandsInDroppedEdges is the
-// re-classification branch: an included item whose depends_on targets an
-// excluded item becomes a dropped edge, so Assemble fails it closed as a
-// dangling dependency — the same guarantee a cross-epic dangling edge gives.
-func TestFilterToSubset_IncludedDependsOnExcluded_LandsInDroppedEdges(t *testing.T) {
-	// Include 101 (depends on 100) but exclude 100.
+// TestFilterToSubset_IncludedDependsOnExcludedIncomplete_LandsInDroppedEdges is
+// the re-classification branch: an included item whose depends_on targets an
+// excluded item that is NOT complete becomes a dropped edge stamped
+// DropExcludedIncomplete, so Assemble fails it closed as a dangling dependency —
+// the same guarantee a cross-epic dangling edge gives (#2120).
+func TestFilterToSubset_IncludedDependsOnExcludedIncomplete_LandsInDroppedEdges(t *testing.T) {
+	// Include 101 (depends on 100) but exclude 100. 100 carries no completion
+	// flag (Complete == false), so its dependency is unsatisfied.
 	res, err := campaign.FilterToSubset(fullDAG(), []string{"issue:101"})
 	if err != nil {
 		t.Fatalf("FilterToSubset: %v", err)
 	}
-	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != (workmgmt.DependsEdge{From: 101, To: 100}) {
-		t.Fatalf("DroppedEdges = %+v, want [{101 100}]", res.DroppedEdges)
+	want := workmgmt.DependsEdge{From: 101, To: 100, Reason: workmgmt.DropExcludedIncomplete}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+		t.Fatalf("DroppedEdges = %+v, want [%+v]", res.DroppedEdges, want)
 	}
 	if _, err := campaign.Assemble("issue:99", res); !errors.Is(err, campaign.ErrDanglingDependency) {
 		t.Fatalf("Assemble(dropped edge) err = %v, want ErrDanglingDependency", err)
+	}
+}
+
+// TestFilterToSubset_IncludedDependsOnExcludedComplete_DroppedSilently is the
+// satisfied-dependency branch (#2120): an included item whose depends_on targets
+// an excluded item that IS closed-and-completed is a satisfied dependency, so
+// the edge is dropped silently (no DroppedEdges) and Assemble succeeds over the
+// included item — the same result the full all-children sweep produces via
+// closed-child auto-settle.
+func TestFilterToSubset_IncludedDependsOnExcludedComplete_DroppedSilently(t *testing.T) {
+	in := fullDAG()
+	// Mark the excluded dependency target #100 complete.
+	in.Children[0].Complete = true
+	res, err := campaign.FilterToSubset(in, []string{"issue:101"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	if len(res.DroppedEdges) != 0 {
+		t.Fatalf("DroppedEdges = %+v, want none (excluded #100 is complete → satisfied)", res.DroppedEdges)
+	}
+	a, err := campaign.Assemble("issue:99", res)
+	if err != nil {
+		t.Fatalf("Assemble(satisfied dep) = %v, want success", err)
+	}
+	if len(a.Items) != 1 || a.Items[0].IssueRef != "issue:101" {
+		t.Fatalf("assembled items = %+v, want [issue:101]", a.Items)
+	}
+}
+
+// TestFilterToSubset_ExcludedTargetMissingFromChildren_FailsClosed covers the
+// defensive fallback (#2120): if an included item's depends_on edge points at a
+// number that is not in childByNumber at all (an unexpected state the provider
+// should prevent), the completion lookup misses and the edge fails closed as
+// DropExcludedIncomplete rather than panicking or being dropped silently.
+func TestFilterToSubset_ExcludedTargetMissingFromChildren_FailsClosed(t *testing.T) {
+	in := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 200, Title: "only child"}},
+		// 200 depends on 201, which is NOT in Children at all.
+		Edges: []workmgmt.DependsEdge{{From: 200, To: 201}},
+	}
+	res, err := campaign.FilterToSubset(in, []string{"issue:200"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	want := workmgmt.DependsEdge{From: 200, To: 201, Reason: workmgmt.DropExcludedIncomplete}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != want {
+		t.Fatalf("DroppedEdges = %+v, want [%+v] (missing target fails closed)", res.DroppedEdges, want)
+	}
+	if _, err := campaign.Assemble("issue:99", res); !errors.Is(err, campaign.ErrDanglingDependency) {
+		t.Fatalf("Assemble err = %v, want ErrDanglingDependency", err)
 	}
 }
 

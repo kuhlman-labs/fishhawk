@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -464,8 +465,22 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case errors.Is(err, campaign.ErrDanglingDependency):
+			// Enrich the details with the categorized edge lists so the MCP tool
+			// can name the real cause+remedy per cause without string-parsing the
+			// message (#2120). A defensively-wrapped dangling error (no typed
+			// form) still maps to the 422 with just epic_ref.
+			details := map[string]any{"epic_ref": req.EpicRef}
+			var de *campaign.DanglingDependencyError
+			if errors.As(err, &de) {
+				if refs := edgeRefs(de.NotChild); len(refs) > 0 {
+					details["dangling_not_child"] = refs
+				}
+				if refs := edgeRefs(de.ExcludedIncomplete); len(refs) > 0 {
+					details["dangling_excluded_incomplete"] = refs
+				}
+			}
 			s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_dangling_dependency",
-				err.Error(), map[string]any{"epic_ref": req.EpicRef})
+				err.Error(), details)
 			return
 		case errors.Is(err, campaign.ErrCycle):
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
@@ -501,6 +516,21 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, toCampaignResponse(created))
+}
+
+// edgeRefs formats dropped depends_on edges as "issue:From->issue:To" strings
+// for the campaign_dangling_dependency details map, so the MCP tool can branch
+// its operator message on which categories are present (#2120). Returns nil for
+// an empty slice so the caller omits the details key.
+func edgeRefs(edges []workmgmt.DependsEdge) []string {
+	if len(edges) == 0 {
+		return nil
+	}
+	refs := make([]string, 0, len(edges))
+	for _, e := range edges {
+		refs = append(refs, "issue:"+strconv.Itoa(e.From)+"->issue:"+strconv.Itoa(e.To))
+	}
+	return refs
 }
 
 // handleListCampaigns implements GET /v0/campaigns. Offset-cursor
