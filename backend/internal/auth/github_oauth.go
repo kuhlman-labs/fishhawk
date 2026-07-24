@@ -35,7 +35,33 @@ type OAuthURLs struct {
 // AuthorizeURL renders the URL the browser should redirect to on
 // /v0/auth/github/login. ExchangeCode swaps the authorization
 // code for an access token. FetchProfile uses that token to
-// pull the user's GitHub profile.
+// pull the user's GitHub profile. ListUserOrgKeys reads the
+// authenticated user's org memberships (the auto-join gate).
+//
+// Endpoint binding — DEPLOYMENT DEFAULT ONLY, no per-installation routing
+// (E44.16 / #2094, DEFECT 2). Every operation of the web sign-in flow runs
+// at or BEFORE the user is identified, so none of them can know which
+// installation (hence which data-resident host) applies:
+//
+//   - AuthorizeURL — the browser redirect. The user is anonymous; only a
+//     state nonce exists.
+//   - ExchangeCode — a bare authorization code is in hand; still anonymous.
+//     Explicitly EXCLUDED from any per-installation-overridable set.
+//   - FetchProfile — GET /user, the INITIAL identifying read; the subject is
+//     being established BY this call, so no installation is known yet.
+//   - ListUserOrgKeys — GET /user/orgs, the org-discovery read that
+//     establishes WHICH account/installation the user belongs to. The
+//     installation only becomes known AFTER it returns.
+//
+// Because the whole flow is at-or-before identification, github_oauth.go
+// carries ZERO per-installation routing: each operation targets the
+// deployment-default host configured on this GitHubOAuth (the Mode 1
+// FISHHAWKD_OAUTH_* / api.github.com endpoints), and there is no
+// ResolveBaseURL hook on this type to consult even when one exists elsewhere
+// in the wiring. The oauth_base_url per-installation override's first genuine
+// consumer would be a component built for an ALREADY-KNOWN installation; no
+// such post-identification web-OAuth consumer exists, so the per-installation
+// OAuth/identity leg is deferred (see backend/internal/identity/github.go).
 //
 // Production wiring: NewGitHubOAuth(clientID, clientSecret,
 // callbackURL, OAuthURLs{}) (zero URLs → defaults).

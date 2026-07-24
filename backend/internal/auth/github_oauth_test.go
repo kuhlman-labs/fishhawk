@@ -295,3 +295,84 @@ func TestListUserOrgKeys_EmptyList(t *testing.T) {
 		t.Errorf("keys = %v, want empty", keys)
 	}
 }
+
+// TestWebOAuthFlow_DeploymentDefaultHostOnly is the DEFECT-2 sequencing guard
+// (E44.16 / #2094, binding conditions 1 + 2): every web sign-in operation runs
+// at or before identification, so each MUST target the single deployment-default
+// host and NEVER a per-installation host. AuthorizeURL, ExchangeCode,
+// FetchProfile, AND ListUserOrgKeys (the org-discovery read that establishes the
+// installation) are all asserted here. The structural proof that no
+// per-installation resolver is consulted is that GitHubOAuth carries no
+// ResolveBaseURL field at all — there is nothing for these methods to route
+// through — and every HTTP call lands on the one httptest host below.
+func TestWebOAuthFlow_DeploymentDefaultHostOnly(t *testing.T) {
+	seenHosts := map[string]string{} // path -> Host
+	mux := http.NewServeMux()
+	record := func(path string, body string) {
+		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+			seenHosts[path] = r.Host
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		})
+	}
+	record("/login/oauth/access_token", `{"access_token":"gho_default"}`)
+	record("/user", `{"id":7,"login":"octocat","name":"Octo"}`)
+	record("/user/orgs", `[{"login":"acme"}]`)
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	defaultHost := strings.TrimPrefix(srv.URL, "http://")
+
+	urls := OAuthURLs{
+		AuthorizeURL: srv.URL + "/login/oauth/authorize",
+		TokenURL:     srv.URL + "/login/oauth/access_token",
+		UserURL:      srv.URL + "/user",
+		OrgsURL:      srv.URL + "/user/orgs",
+	}
+	o := NewGitHubOAuth("cid", "csec", "https://example.com/cb", urls)
+
+	// AuthorizeURL: the browser-redirect host is the deployment default.
+	authURL, err := url.Parse(o.AuthorizeURL("state-1"))
+	if err != nil {
+		t.Fatalf("parse authorize url: %v", err)
+	}
+	if authURL.Host != defaultHost {
+		t.Errorf("AuthorizeURL host = %q, want deployment default %q (no per-installation routing pre-identification)", authURL.Host, defaultHost)
+	}
+
+	// ExchangeCode: still anonymous — must hit the default token host.
+	tok, err := o.ExchangeCode(context.Background(), "code-1")
+	if err != nil {
+		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if tok != "gho_default" {
+		t.Fatalf("ExchangeCode token = %q, want gho_default", tok)
+	}
+
+	// FetchProfile: the initial identifying read — default host.
+	if _, err := o.FetchProfile(context.Background(), tok); err != nil {
+		t.Fatalf("FetchProfile: %v", err)
+	}
+
+	// ListUserOrgKeys: the org-discovery read that establishes the
+	// installation — still default host (binding condition 2).
+	keys, err := o.ListUserOrgKeys(context.Background(), tok)
+	if err != nil {
+		t.Fatalf("ListUserOrgKeys: %v", err)
+	}
+	if len(keys) != 1 || keys[0] != "acme" {
+		t.Fatalf("ListUserOrgKeys = %v, want [acme]", keys)
+	}
+
+	// Every HTTP operation landed on the ONE deployment-default host.
+	for _, path := range []string{"/login/oauth/access_token", "/user", "/user/orgs"} {
+		got, ok := seenHosts[path]
+		if !ok {
+			t.Errorf("%s was never requested; the operation did not target the deployment-default host", path)
+			continue
+		}
+		if got != defaultHost {
+			t.Errorf("%s targeted host %q, want deployment default %q", path, got, defaultHost)
+		}
+	}
+}

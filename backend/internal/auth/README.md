@@ -6,6 +6,19 @@ Authentication helpers for fishhawkd: the GitHub OAuth sign-in flow, the browser
 
 `GitHubOAuth` wraps GitHub's authorize/token/user endpoints (`OAuthURLs` substitutes httptest servers). `Repository.SignIn` upserts the `users` row and creates a `sessions` row whose sha256 hash is stored server-side; the plaintext goes into the `fishhawk_session` cookie (HttpOnly + Secure + SameSite=Lax, sliding 24h / absolute 7d). The auth middleware resolves the cookie to an `Identity` carrying `Subject="github:<login>" + UserID + SessionID + AccountID`; cookie auth is tried before bearer so a browser carrying both prefers the user-bound credential. Handlers: `/v0/auth/github/login`, `/v0/auth/github/callback`, `/v0/auth/me`, `/v0/auth/logout`. Configured via `--oauth-client-id` / `--oauth-client-secret` / `--oauth-callback-url`. Requested scopes: `read:user user:email read:org` (`read:org` so the membership gate's `/user/orgs` read sees private org memberships).
 
+### Endpoint binding — deployment default only (E44.16 / #2094)
+
+The web sign-in flow carries **zero** per-installation (Mode 2) endpoint routing, by sequencing not omission. Every operation runs at or **before** the user is identified, so none can know which installation (hence which data-resident host) applies:
+
+| Operation | Read | Identification stage | Host |
+|---|---|---|---|
+| `AuthorizeURL` | browser redirect | anonymous (only a state nonce) | deployment default |
+| `ExchangeCode` | POST token | anonymous (bare code) — **excluded** from any overridable set | deployment default |
+| `FetchProfile` | GET `/user` | the INITIAL identifying read (subject established *by* this call) | deployment default |
+| `ListUserOrgKeys` | GET `/user/orgs` | org-discovery that establishes *which* installation | deployment default |
+
+The installation only becomes known **after** `ListUserOrgKeys` returns, at which point the flow is over. `GitHubOAuth` therefore has no `ResolveBaseURL` hook at all — each request targets the Mode 1 `FISHHAWKD_OAUTH_*` / `api.github.com` endpoints configured on the client, and there is structurally nothing to route through. The `oauth_base_url` per-installation override (migration 0055) has **no genuine post-identification web-OAuth consumer**, so its per-installation leg is deferred alongside the identity provider's (see `backend/internal/identity`). Pinned by `TestWebOAuthFlow_DeploymentDefaultHostOnly` (all four operations asserted against one host).
+
 ## Workspace-membership login gate (E44.3 / #1827, ADR-057 Amendment A2)
 
 The OAuth callback consults `Config.AuthMembership` (a `MembershipResolver`) AFTER the profile fetch and BEFORE `SignIn` — a successful GitHub login is NOT admission. The resolved account binds the session (`sessions.account_id`, migration 0056, FK `ON DELETE SET NULL`), is stamped onto `server.Identity.AccountID` by the cookie path, and surfaces as `account_id` on `/v0/auth/me`.
