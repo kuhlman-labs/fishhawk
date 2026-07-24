@@ -1155,7 +1155,17 @@ var ErrBranchCheckedOutElsewhere = errors.New("gitops: run branch already checke
 // bare-repo tests file remotes need no auth at all. Like CaptureHead /
 // RestoreHead it is a package-level function because the caller has no
 // *Pusher in scope.
-func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch, pushToken string) (tipSHA string, err error) {
+//
+// createdPaths is the run's own create-operation scope subset (#2128). After
+// the fetch resolves the target ref and BEFORE the `checkout -B`, any of those
+// paths still sitting in the working tree as an UNTRACKED file that the target
+// ref tracks is pruned by pruneStrandedCreatedFiles — otherwise a prior
+// reset-to-main that stranded the run's created files makes the checkout abort
+// with "untracked working tree files would be overwritten" (the #2128
+// category-C fix-up_base_checkout failure). The prune is a DESTRUCTIVE removal
+// doubly bounded to a safe set; see pruneStrandedCreatedFiles for the safety
+// invariant. A nil/empty createdPaths reduces to prior behavior exactly.
+func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch, pushToken string, createdPaths []string) (tipSHA string, err error) {
 	if branch == "" {
 		return "", errors.New("gitops: branch required")
 	}
@@ -1172,10 +1182,89 @@ func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch, pushToke
 	if err != nil {
 		return "", err
 	}
+	if err := pruneStrandedCreatedFiles(ctx, p, repoDir, trackingRef, createdPaths); err != nil {
+		return "", err
+	}
 	if err := p.run(ctx, repoDir, "checkout", "-B", branch, trackingRef); err != nil {
 		return "", fmt.Errorf("gitops: checkout -B %s %s: %w", branch, trackingRef, err)
 	}
 	return tip, nil
+}
+
+// pruneStrandedCreatedFiles removes UNTRACKED working-tree files that a prior
+// reset-to-main stranded at paths the run CREATES, so the subsequent
+// `checkout -B <branch> <trackingRef>` is not aborted by git's "untracked
+// working tree files would be overwritten by checkout" guard (the #2128
+// category-C fix-up_base_checkout failure). createdPaths is the run's
+// create-operation scope subset; trackingRef is the target ref the caller is
+// about to check out.
+//
+// Safety — this is a DESTRUCTIVE removal, so each candidate is DOUBLY bounded
+// and removed ONLY on positive confirmation of BOTH:
+//
+//  1. The path is POSITIVELY UNTRACKED. pathIsUntracked reports true only when
+//     git LISTS the path as an "other" (untracked) file; a tracked path is
+//     never listed, and any git error/ambiguity yields false → SKIP. We do NOT
+//     use `git ls-files --error-unmatch`, whose non-zero exit conflates a
+//     genuinely-untracked path with a git/repo/index/lock error: a transient
+//     error on a TRACKED file would be misread as "untracked" and the file
+//     deleted, losing local changes. The invariant "never remove a tracked
+//     working-tree file" therefore holds even when a git predicate errors.
+//  2. The target ref POSITIVELY tracks a blob at that path
+//     (`git cat-file -e <trackingRef>:<path>` exits 0). A non-zero exit → SKIP,
+//     so an operator's unrelated untracked file (absent from the target ref) is
+//     never removed.
+//
+// Containment: because bound (2) requires the path to name a blob in the target
+// ref's TREE, removal is bounded to paths the target ref tracks — a path that
+// escapes repoDir (a "../" traversal or an absolute path) can never name a blob
+// in that tree, so it is never removed. Do NOT reorder or weaken the cat-file
+// guard: together with the untracked check it is the containment boundary that
+// keeps this destructive step from reaching any path outside the run's own
+// created, target-ref-tracked set.
+func pruneStrandedCreatedFiles(ctx context.Context, p *Pusher, repoDir, trackingRef string, createdPaths []string) error {
+	for _, rel := range createdPaths {
+		if rel == "" {
+			continue
+		}
+		full := filepath.Join(repoDir, rel)
+		if _, err := os.Lstat(full); err != nil {
+			continue // nothing on disk at this path — nothing stranded
+		}
+		if !pathIsUntracked(ctx, p, repoDir, rel) {
+			continue // not POSITIVELY untracked — never touch a tracked file
+		}
+		if err := p.run(ctx, repoDir, "cat-file", "-e", trackingRef+":"+rel); err != nil {
+			continue // target ref does not track this path — out of the safe set
+		}
+		if err := os.Remove(full); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("gitops: prune stranded created file %q: %w", rel, err)
+		}
+	}
+	return nil
+}
+
+// pathIsUntracked reports whether rel names a working-tree file that git
+// POSITIVELY reports as untracked (present in the working tree, absent from the
+// index). It lists untracked files at that pathspec with
+// `git ls-files --others -z -- <rel>` and returns true ONLY when the exact path
+// appears in the output. This is a POSITIVE signal, deliberately distinct from
+// `git ls-files --error-unmatch` (whose non-zero exit cannot tell a genuinely
+// untracked path apart from a git/repo/index error): a tracked path is never
+// listed here, and ANY error (bad repo/index/lock, a pathspec outside the repo)
+// makes runOut return an error → false, so the caller fails safe and skips the
+// destructive remove.
+func pathIsUntracked(ctx context.Context, p *Pusher, repoDir, rel string) bool {
+	out, err := p.runOut(ctx, repoDir, "ls-files", "--others", "-z", "--", rel)
+	if err != nil {
+		return false
+	}
+	for _, f := range strings.Split(out, "\x00") {
+		if f == rel {
+			return true
+		}
+	}
+	return false
 }
 
 // worktreeHoldingBranch reports the path of any OTHER linked worktree of

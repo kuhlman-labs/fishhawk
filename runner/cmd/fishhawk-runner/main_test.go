@@ -2851,7 +2851,7 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	// test must never fetch + force-checkout the runner's own source repo.
 	// The canned tip flows into the lineage comparison; tests that assert
 	// the wiring swap in recording spies AFTER this.
-	checkoutFixupBase = func(_ context.Context, _, _, _, _ string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, _, _, _ string, _ []string) (string, error) {
 		return "fixup-branch-tip-sha", nil
 	}
 	// Stub the subsequent-child base establishment (#1036) the same way: a
@@ -6102,7 +6102,7 @@ func TestRun_Fixup_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 		return nil
 	}
 	var gotBranch, gotRemote string
-	checkoutFixupBase = func(_ context.Context, _, remote, branch, _ string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, remote, branch, _ string, _ []string) (string, error) {
 		order = append(order, "checkout")
 		gotRemote = remote
 		gotBranch = branch
@@ -6156,6 +6156,61 @@ func TestRun_Fixup_EstablishesBaseBeforeAgentInvoke(t *testing.T) {
 	}
 }
 
+// TestRun_Fixup_ThreadsCreatedScopePathsToBaseCheckout is the #2128 threading
+// test: the fix-up base checkout receives exactly the CREATE-operation subset
+// of cfg.scopeFiles as its createdPaths argument — modify/delete operations are
+// excluded — so the stranded-created-file prune is bounded to paths the run
+// actually creates. A capturing checkoutFixupBase fake records the createdPaths
+// arg and it is asserted equal to the create subset in declaration order.
+func TestRun_Fixup_ThreadsCreatedScopePathsToBaseCheckout(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	resp := fixupPromptResp("fixup-branch-tip-sha")
+	resp.ScopeFiles = []upload.ScopeFile{
+		{Path: "pkg/new_one.go", Operation: "create"},
+		{Path: "pkg/existing.go", Operation: "modify"},
+		{Path: "pkg/new_two.go", Operation: "create"},
+		{Path: "pkg/gone.go", Operation: "delete"},
+	}
+	fu.promptResp = resp
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	origCap, origRes, origCheckout := captureHead, restoreHead, checkoutFixupBase
+	origResPres := restoreHeadPreserving
+	captureHead = func(_ context.Context, _ string) (string, bool, error) { return "main", false, nil }
+	restoreHead = func(_ context.Context, _, _ string) error { return nil }
+	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { return nil }
+	var gotCreated []string
+	checkoutFixupBase = func(_ context.Context, _, _, _, _ string, createdPaths []string) (string, error) {
+		gotCreated = createdPaths
+		return "fixup-branch-tip-sha", nil
+	}
+	t.Cleanup(func() {
+		captureHead = origCap
+		restoreHead = origRes
+		checkoutFixupBase = origCheckout
+		restoreHeadPreserving = origResPres
+	})
+
+	var stderr strings.Builder
+	if got := runFixupStage(t, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	want := []string{"pkg/new_one.go", "pkg/new_two.go"}
+	if len(gotCreated) != len(want) {
+		t.Fatalf("createdPaths = %v, want exactly the create subset %v", gotCreated, want)
+	}
+	for i, w := range want {
+		if gotCreated[i] != w {
+			t.Errorf("createdPaths[%d] = %q, want %q (modify/delete must be excluded)", i, gotCreated[i], w)
+		}
+	}
+}
+
 // TestRun_Fixup_MintsFreshTokenForBaseCheckout is the #1951 threading test: the
 // fix-up base-checkout fetch receives the freshly-minted installation token
 // (the fake backend's ghs_app_token) so it authenticates per-invocation and
@@ -6176,7 +6231,7 @@ func TestRun_Fixup_MintsFreshTokenForBaseCheckout(t *testing.T) {
 	restoreHead = func(_ context.Context, _, _ string) error { return nil }
 	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { return nil }
 	var gotToken string
-	checkoutFixupBase = func(_ context.Context, _, _, _, token string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, _, _, token string, _ []string) (string, error) {
 		gotToken = token
 		return "fixup-branch-tip-sha", nil
 	}
@@ -6225,7 +6280,7 @@ func TestRun_Fixup_BaseTokenMintFailure_DegradesNotFails(t *testing.T) {
 	restoreHeadPreserving = func(_ context.Context, _, _ string, _ []string) error { return nil }
 	var checkoutCalled bool
 	var gotToken = "sentinel"
-	checkoutFixupBase = func(_ context.Context, _, _, _, token string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, _, _, token string, _ []string) (string, error) {
 		checkoutCalled = true
 		gotToken = token
 		return "fixup-branch-tip-sha", nil
@@ -6326,7 +6381,7 @@ func TestRun_Fixup_BaseMismatch_FailsBeforeAgentInvoke(t *testing.T) {
 		restoredRefs = append(restoredRefs, ref)
 		return nil
 	}
-	checkoutFixupBase = func(_ context.Context, _, _, _, _ string) (string, error) {
+	checkoutFixupBase = func(_ context.Context, _, _, _, _ string, _ []string) (string, error) {
 		return "foreign-tip-sha", nil
 	}
 	t.Cleanup(func() { captureHead = origCap; restoreHead = origRes; checkoutFixupBase = origCheckout })
