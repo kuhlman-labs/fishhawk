@@ -88,7 +88,8 @@ Every one of these is a refusal, never a degrade-to-permissive.
 | Request carries no `fh_*` parameters | passes through untouched. A single-cell deployment behaves identically with or without any of these env vars. |
 | `FISHHAWK_DIRECTORY_ROUTED_PATHS` names a path the cell does not verify | startup fails naming the supported set. The routed-path list is a **closed set** kept in lockstep with the cell surfaces `withRegionPin` is mounted on; routing anything else would deliver a signed redirect to an endpoint that verifies no handoff and pins no account. |
 | Cell `MODEL_BASE_URL` set, `MODEL_API_KEY` unset | the anthropic reviewer presents **no** credential (its calls fail) and startup warns. `FISHHAWKD_ANTHROPIC_API_KEY` is deliberately never sent to a non-default endpoint — that would ship a production secret, and the review text it authenticates, to an operator-supplied host. |
-| Cell `MODEL_API_KEY` set, `MODEL_BASE_URL` unset | the anthropic SDK reviewer is **withheld entirely** (the count form falls through to `claudecode`/`codex`; a spec-declared `anthropic` reviewer is refused by name) and startup warns. The SDK would otherwise fall back to its global default endpoint and send the region-scoped credential **and** the review text out of region; withholding only the credential would still let the request body travel. |
+| Cell `MODEL_API_KEY` set, `MODEL_BASE_URL` unset, **`HOME_REGION` unset** | the anthropic SDK reviewer is **withheld entirely** (the count form falls through to `claudecode`/`codex`; a spec-declared `anthropic` reviewer is refused by name) and startup warns. The SDK would otherwise fall back to its global default endpoint and send the region-scoped credential **and** the review text out of region; withholding only the credential would still let the request body travel. |
+| Cell **`HOME_REGION` set**, in-region inference not fully configured (`MODEL_BASE_URL` and `MODEL_API_KEY` not both set), a reviewer adapter configured | **startup fails** naming the missing variable(s) (#2107). A region-scoped cell must not fall through to `claudecode`/`codex` (subprocesses that egress via their own unverified global endpoint) or run the anthropic adapter on the global default endpoint, so it refuses to boot rather than run **any** reviewer. A region-scoped cell with **no** reviewer configured still boots (no egress risk). |
 | Cell pin fails for an unclassified reason | 500 `region_pin_failed` with a **generic** message. The routed surface answers before any auth decision (the handoff is itself the credential), so a driver/query/host detail is logged, never returned. |
 
 ### Replay
@@ -142,6 +143,22 @@ region. So the Anthropic SDK adapter is not constructed at all in that posture.
 Set the endpoint, or unset the region key to run on the default endpoint with
 `FISHHAWKD_ANTHROPIC_API_KEY`. Set both knobs together, or neither.
 
+### A region-scoped cell refuses to boot without in-region inference (#2107)
+
+The withhold-and-fall-through above is safe only on a **non**-region-scoped cell.
+On a region-scoped cell (`FISHHAWKD_HOME_REGION` set) the fall-through would hand
+the review to `claudecode`/`codex` — subprocesses that carry their **own**
+(unverified, potentially global) endpoints — so residency-sensitive review text
+could still egress. So when `FISHHAWKD_HOME_REGION` is set **and** in-region
+inference is not fully configured (`FISHHAWKD_MODEL_BASE_URL` and
+`FISHHAWKD_MODEL_API_KEY` not both set) **and** any reviewer adapter is
+configured, `fishhawkd` **refuses to start**, naming the missing variable(s): no
+reviewer can run without egressing out of region. A region-scoped cell with **no**
+reviewer configured still boots (nothing egresses), so a cell brought up
+DB/pin-surface-first with reviewers added later is not blocked. When
+`FISHHAWKD_HOME_REGION` is unset (every deployment today) the behavior is
+unchanged — the mirror withhold-and-warn and the fall-through above still apply.
+
 ## Directory authorization
 
 Both directory surfaces — `POST /v0/directory/assign` and the routed
@@ -158,8 +175,14 @@ the signed `fh_*` handoff appended after them. Inbound `fh_*` parameters are
 dropped first, so a caller cannot smuggle an attacker-chosen handoff through.
 
 This governs the Anthropic SDK adapter only. The `claudecode` and `codex`
-reviewers are subprocesses whose endpoint is the CLI's own configuration; a
-region-resident deployment using those adapters must constrain them there.
+reviewers are subprocesses whose endpoint is the CLI's own configuration. For the
+**not-fully-configured** posture the #2107 startup refusal above now closes this
+gap outright: a region-scoped cell will not boot into a fall-through to those
+subprocesses. A region-scoped cell that IS fully inference-configured but ALSO
+enables a `claudecode`/`codex` subprocess adapter can still egress via a
+spec-declared `reviewers.agents[i].provider = claudecode/codex`; fully locking a
+regional cell to region-pinned Anthropic only is a broader change tracked as an
+operator follow-up beyond #2107.
 
 ## Out of scope here
 

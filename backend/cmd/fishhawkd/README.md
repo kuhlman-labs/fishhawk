@@ -171,9 +171,33 @@ The **mirror** half-configuration fails closed harder. With `FISHHAWKD_MODEL_API
 send both the region-scoped credential and the plan/implement-review text out of the region.
 Withholding the credential is not sufficient there — the request body still travels — so the
 Anthropic SDK adapter is withheld **entirely**: `planReviewerSet.Default()` skips it (falling
-through to `claudecode`/`codex` if either is configured) and `For("anthropic")` refuses by name,
-with a startup warning naming `FISHHAWKD_MODEL_BASE_URL`. Set the endpoint, or unset the region key
-to run on the default endpoint with `FISHHAWKD_ANTHROPIC_API_KEY`.
+through to `claudecode`/`codex` if either is configured, on a **non**-region-scoped cell — see the
+refusal below) and `For("anthropic")` refuses by name, with a startup warning naming
+`FISHHAWKD_MODEL_BASE_URL`. Set the endpoint, or unset the region key to run on the default endpoint
+with `FISHHAWKD_ANTHROPIC_API_KEY`.
+
+### A region-scoped cell refuses to boot without fully-configured in-region inference (#2107)
+
+The subprocess fall-through above closes the SDK egress hole but not the subprocess one: `claudecode`
+and `codex` carry their **own** (unverified, potentially global) endpoints, so on a region-scoped
+cell a fall-through to them would still egress residency-sensitive review text outside the region.
+`resolvePlanReviewers` therefore keys a hard **startup refusal** on the cell being region-scoped, not
+on the inference config alone: when `FISHHAWKD_HOME_REGION` is set (`regionScoped()`) **and** in-region
+inference is not fully configured (`FISHHAWKD_MODEL_BASE_URL` and `FISHHAWKD_MODEL_API_KEY` not both
+set, `regionInferenceFullyConfigured()`) **and** any reviewer adapter is configured
+(`anyReviewerConfigured()`), `resolvePlanReviewers` returns an error naming the missing variable(s)
+and `serve()` logs it and returns `exitFailure` — the process refuses to start, so **no** reviewer
+adapter can run. The refusal gates on `anyReviewerConfigured()`, so a region-scoped cell brought up
+with **no** reviewer (e.g. DB/pin-surface first, reviewers added later) still boots and keeps the
+existing "plan-review agent not configured" warning — the refusal fires only when a reviewer would
+actually run and therefore egress.
+
+When `FISHHAWKD_HOME_REGION` is **unset** (every deployment today), `resolvePlanReviewers` is
+byte-for-byte unchanged: the mirror withhold-and-warn and the `claudecode`/`codex` fall-through above
+are preserved. Residual (tracked as an operator follow-up): a region-scoped cell that IS fully
+inference-configured but ALSO enables a `claudecode`/`codex` subprocess adapter could still egress via
+a spec-declared `reviewers.agents[i].provider = claudecode/codex`; fully locking a regional cell to
+region-pinned Anthropic only is a broader change than #2107.
 
 ## Work-management provider registration at startup (#1104)
 

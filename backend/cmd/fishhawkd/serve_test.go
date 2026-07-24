@@ -25,6 +25,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -1779,7 +1780,7 @@ func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing
 	}))
 	defer srv.Close()
 
-	set := resolvePlanReviewers(planReviewerOptions{
+	set, err := resolvePlanReviewers(planReviewerOptions{
 		anthropicAPIKey:     deploymentKey,
 		planReviewModel:     "claude-sonnet-4-6",
 		planReviewMaxTokens: 1024,
@@ -1787,13 +1788,16 @@ func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing
 		modelBaseURL:        srv.URL,
 		modelAPIKey:         "", // the half-configured input under test
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("resolvePlanReviewers error = %v, want nil (no FISHHAWKD_HOME_REGION, so no fail-closed refusal)", err)
+	}
 
 	reviewer := set.Default()
 	if reviewer == nil {
 		t.Fatal("Default() = nil, want the anthropic adapter (the deployment key still selects it)")
 	}
 	// The call fails by design — no credential is presented.
-	_, _, err := reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
+	_, _, err = reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
 	if err == nil {
 		t.Fatal("Review succeeded with no credential configured; some credential must have been presented")
 	}
@@ -1836,7 +1840,7 @@ func TestResolvePlanReviewers_WarnsOnBaseURLWithoutRegionKey(t *testing.T) {
 // travels — so the adapter itself must be withheld, on both resolution paths.
 func TestResolvePlanReviewers_RegionKeyWithoutEndpointWithholdsAnthropic(t *testing.T) {
 	var buf strings.Builder
-	set := resolvePlanReviewers(planReviewerOptions{
+	set, err := resolvePlanReviewers(planReviewerOptions{
 		anthropicAPIKey:     "deployment-key",
 		planReviewModel:     "claude-sonnet-4-6",
 		planReviewMaxTokens: 1024,
@@ -1844,6 +1848,9 @@ func TestResolvePlanReviewers_RegionKeyWithoutEndpointWithholdsAnthropic(t *test
 		modelAPIKey:         "eu-region-scoped-key",
 		modelBaseURL:        "", // the half-configured input under test
 	}, slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatalf("resolvePlanReviewers error = %v, want nil (no FISHHAWKD_HOME_REGION, so the withhold-and-warn path stays, not a refusal)", err)
+	}
 
 	if got := set.Default(); got != nil {
 		t.Errorf("Default() = %T, want nil — the anthropic adapter must not be constructed against the global default endpoint with a region key", got)
@@ -1858,21 +1865,200 @@ func TestResolvePlanReviewers_RegionKeyWithoutEndpointWithholdsAnthropic(t *test
 	}
 }
 
-// TestResolvePlanReviewers_RegionKeyWithoutEndpointFallsThroughToOtherAdapters
-// pins the blast radius of that withholding: only the SDK adapter egresses to
-// the global endpoint, so a deployment that also configured a subprocess
-// adapter still has a reviewer.
-func TestResolvePlanReviewers_RegionKeyWithoutEndpointFallsThroughToOtherAdapters(t *testing.T) {
-	set := resolvePlanReviewers(planReviewerOptions{
+// TestResolvePlanReviewers_RegionScopedHalfConfiguredRefusesAllAdapters is the
+// #2107 fix and inverts the former
+// ...RegionKeyWithoutEndpointFallsThroughToOtherAdapters test: when the cell is
+// REGION-SCOPED (FISHHAWKD_HOME_REGION set), a subprocess adapter is no longer a
+// safe fall-through — it would egress residency-sensitive review text via its
+// own unverified global endpoint. So in the region-key-without-endpoint posture
+// with claudecode enabled, resolvePlanReviewers refuses: a nil set and a
+// non-nil error naming the missing FISHHAWKD_MODEL_BASE_URL. Mode (1) of the
+// per-mode matrix.
+func TestResolvePlanReviewers_RegionScopedHalfConfiguredRefusesAllAdapters(t *testing.T) {
+	set, err := resolvePlanReviewers(planReviewerOptions{
+		homeRegion:                "eu",
+		anthropicAPIKey:           "deployment-key",
+		enableLocalClaudeReviewer: true,
+		localClaudeBinary:         "claude",
+		localClaudeModel:          "claude-sonnet-4-6",
+		modelAPIKey:               "eu-region-scoped-key",
+		modelBaseURL:              "", // region-scoped, in-region endpoint missing
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err == nil {
+		t.Fatal("resolvePlanReviewers error = nil, want a fail-closed refusal (a region-scoped cell must not fall through to the claudecode subprocess, which egresses out of region)")
+	}
+	if !strings.Contains(err.Error(), "FISHHAWKD_MODEL_BASE_URL") {
+		t.Errorf("refusal error = %v, want it to name the missing FISHHAWKD_MODEL_BASE_URL", err)
+	}
+	if set != nil {
+		t.Errorf("resolvePlanReviewers set = %T, want nil on refusal (no reviewer may run)", set)
+	}
+}
+
+// TestServe_RegionScopedHalfConfiguredRefusesToBoot pins the binding-condition
+// call-site wiring (#2107): the serve() production path MUST consume the
+// resolvePlanReviewers error and return exitFailure — an implementer who writes
+// `set, _ := resolvePlanReviewers(...)` and drops the error must be caught here,
+// not silently boot. It drives runServe ITSELF in a region-scoped half-configured
+// posture (FISHHAWKD_HOME_REGION set, region endpoint missing, claudecode
+// enabled). bootstrapAbortFlag is included so that IF the error were discarded,
+// startup would continue past the reviewer-resolution point and abort later at
+// the review-resolution guard (still exitFailure) WITHOUT the reviewer-refusal
+// log line — so the log assertion, not the exit code alone, is what fails when
+// the call site ignores the error.
+func TestServe_RegionScopedHalfConfiguredRefusesToBoot(t *testing.T) {
+	code, log := serveWithProfile(t,
+		"-home-region=eu",
+		"-model-api-key=eu-region-scoped-key",
+		"-enable-local-claude-reviewer",
+		bootstrapAbortFlag)
+
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d — a region-scoped cell with half-configured in-region inference must refuse to boot; log:\n%s", code, exitFailure, log)
+	}
+	// "plan-review configuration refused startup" is emitted ONLY by the serve()
+	// call site's error branch (the resolver returns the error, it does not log
+	// it). So this phrase's presence proves the boot aborted AT the reviewer
+	// resolution because the call site consumed the error — not later at the
+	// bootstrapAbortFlag guard because the call site discarded it.
+	if !strings.Contains(log, "plan-review configuration refused startup") {
+		t.Errorf("startup log did not carry the call-site refusal; the call site likely discarded the resolvePlanReviewers error and aborted elsewhere. log:\n%s", log)
+	}
+	if !strings.Contains(log, "FISHHAWKD_MODEL_BASE_URL") {
+		t.Errorf("refusal log = %q, want it to name the missing FISHHAWKD_MODEL_BASE_URL", log)
+	}
+}
+
+// TestServe_RegionScopedBaseURLWithoutKeyRefusesToBoot is the mirror call-site
+// wiring assertion for the other half-configured posture (endpoint set, key
+// missing): runServe returns exitFailure and the refusal names
+// FISHHAWKD_MODEL_API_KEY.
+func TestServe_RegionScopedBaseURLWithoutKeyRefusesToBoot(t *testing.T) {
+	code, log := serveWithProfile(t,
+		"-home-region=eu",
+		"-model-base-url=https://eu.inference.example.com",
+		"-enable-local-claude-reviewer",
+		bootstrapAbortFlag)
+
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+	}
+	if !strings.Contains(log, "plan-review configuration refused startup") || !strings.Contains(log, "FISHHAWKD_MODEL_API_KEY") {
+		t.Errorf("startup log did not carry the call-site reviewer refusal naming FISHHAWKD_MODEL_API_KEY; log:\n%s", log)
+	}
+}
+
+// TestResolvePlanReviewers_RegionScopedBaseURLWithoutKeyRefuses is mode (2): the
+// other half-configured posture (FISHHAWKD_MODEL_BASE_URL set, API key unset) on
+// a region-scoped cell refuses too, and the error names the missing
+// FISHHAWKD_MODEL_API_KEY.
+func TestResolvePlanReviewers_RegionScopedBaseURLWithoutKeyRefuses(t *testing.T) {
+	set, err := resolvePlanReviewers(planReviewerOptions{
+		homeRegion:      "eu",
+		anthropicAPIKey: "deployment-key",
+		modelBaseURL:    "https://eu.inference.example.com",
+		modelAPIKey:     "", // region-scoped, credential missing
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err == nil {
+		t.Fatal("resolvePlanReviewers error = nil, want a fail-closed refusal for a region-scoped cell with FISHHAWKD_MODEL_API_KEY unset")
+	}
+	if !strings.Contains(err.Error(), "FISHHAWKD_MODEL_API_KEY") {
+		t.Errorf("refusal error = %v, want it to name the missing FISHHAWKD_MODEL_API_KEY", err)
+	}
+	if set != nil {
+		t.Errorf("resolvePlanReviewers set = %T, want nil on refusal", set)
+	}
+}
+
+// TestResolvePlanReviewers_RegionScopedNoInferenceNamesBothVars is mode (3): a
+// region-scoped cell with BOTH region knobs unset and only FISHHAWKD_ANTHROPIC_API_KEY
+// set — the posture that would otherwise run the anthropic adapter on the SDK's
+// global default endpoint — refuses, and the error names BOTH missing variables.
+func TestResolvePlanReviewers_RegionScopedNoInferenceNamesBothVars(t *testing.T) {
+	set, err := resolvePlanReviewers(planReviewerOptions{
+		homeRegion:      "eu",
+		anthropicAPIKey: "deployment-key",
+		// both region knobs unset
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if err == nil {
+		t.Fatal("resolvePlanReviewers error = nil, want a refusal — the anthropic adapter would otherwise run on the SDK global default endpoint out of region")
+	}
+	if !strings.Contains(err.Error(), "FISHHAWKD_MODEL_BASE_URL") || !strings.Contains(err.Error(), "FISHHAWKD_MODEL_API_KEY") {
+		t.Errorf("refusal error = %v, want it to name BOTH FISHHAWKD_MODEL_BASE_URL and FISHHAWKD_MODEL_API_KEY", err)
+	}
+	if set != nil {
+		t.Errorf("resolvePlanReviewers set = %T, want nil on refusal", set)
+	}
+}
+
+// TestResolvePlanReviewers_RegionScopedFullyConfiguredBoots is mode (4): the
+// happy regional path — a region-scoped cell with both region knobs set and an
+// anthropic key boots with no error, and Default() returns the region-pinned
+// anthropic adapter.
+func TestResolvePlanReviewers_RegionScopedFullyConfiguredBoots(t *testing.T) {
+	set, err := resolvePlanReviewers(planReviewerOptions{
+		homeRegion:      "eu",
+		anthropicAPIKey: "deployment-key",
+		planReviewModel: "claude-sonnet-4-6",
+		modelBaseURL:    "https://eu.inference.example.com",
+		modelAPIKey:     "eu-region-scoped-key",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("resolvePlanReviewers error = %v, want nil on the fully-configured regional path", err)
+	}
+	if _, ok := set.Default().(*anthropic.Reviewer); !ok {
+		t.Errorf("Default() = %T, want the region-pinned *anthropic.Reviewer", set.Default())
+	}
+}
+
+// TestResolvePlanReviewers_HomeRegionUnsetPreservesFallThrough is mode (5) and
+// guards against over-reach: with FISHHAWKD_HOME_REGION UNSET (every deployment
+// today) the region-key-without-endpoint posture still falls through to the
+// claudecode subprocess adapter, byte-for-byte as before the #2107 fix — the
+// refusal keys on the cell being region-scoped, not on the inference config
+// alone.
+func TestResolvePlanReviewers_HomeRegionUnsetPreservesFallThrough(t *testing.T) {
+	set, err := resolvePlanReviewers(planReviewerOptions{
+		// homeRegion deliberately unset
 		anthropicAPIKey:           "deployment-key",
 		enableLocalClaudeReviewer: true,
 		localClaudeBinary:         "claude",
 		localClaudeModel:          "claude-sonnet-4-6",
 		modelAPIKey:               "eu-region-scoped-key",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
+	if err != nil {
+		t.Fatalf("resolvePlanReviewers error = %v, want nil when FISHHAWKD_HOME_REGION is unset (fall-through preserved)", err)
+	}
 	if _, ok := set.Default().(*claudecode.Reviewer); !ok {
-		t.Errorf("Default() = %T, want the claudecode adapter", set.Default())
+		t.Errorf("Default() = %T, want the claudecode adapter (the preserved fall-through)", set.Default())
+	}
+}
+
+// TestResolvePlanReviewers_RegionScopedNoReviewerBoots is mode (6): a
+// region-scoped cell with in-region inference NOT fully configured but NO
+// reviewer adapter configured has no egress risk, so it still boots (nil error)
+// and keeps the existing configured==0 warning. The refusal fires only when a
+// reviewer would actually run.
+func TestResolvePlanReviewers_RegionScopedNoReviewerBoots(t *testing.T) {
+	var buf strings.Builder
+	set, err := resolvePlanReviewers(planReviewerOptions{
+		homeRegion: "eu",
+		// no reviewer adapter, region inference not fully configured
+	}, slog.New(slog.NewTextHandler(&buf, nil)))
+	if err != nil {
+		t.Fatalf("resolvePlanReviewers error = %v, want nil — a reviewer-less region-scoped cell has no egress risk and must still boot", err)
+	}
+	if set == nil {
+		t.Fatal("resolvePlanReviewers set = nil, want a usable (empty) set")
+	}
+	if got := set.Default(); got != nil {
+		t.Errorf("Default() = %T, want nil when no adapter is configured", got)
+	}
+	if !strings.Contains(buf.String(), "plan-review agent not configured") {
+		t.Errorf("startup log = %q, want the existing configured==0 warning preserved", buf.String())
 	}
 }
 
@@ -1881,10 +2067,13 @@ func TestResolvePlanReviewers_RegionKeyWithoutEndpointFallsThroughToOtherAdapter
 // does not enable an adapter FISHHAWKD_ANTHROPIC_API_KEY did not select.
 func TestResolvePlanReviewers_RegionKeyAloneDoesNotSelectAnthropic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	set := resolvePlanReviewers(planReviewerOptions{
+	set, err := resolvePlanReviewers(planReviewerOptions{
 		modelAPIKey:  "region-key",
 		modelBaseURL: "https://eu.inference.example.com",
 	}, logger)
+	if err != nil {
+		t.Fatalf("resolvePlanReviewers error = %v, want nil (no FISHHAWKD_HOME_REGION, no reviewer adapter)", err)
+	}
 	if set.Default() != nil {
 		t.Errorf("Default() = %T, want nil — a region key alone must not select the anthropic adapter", set.Default())
 	}
@@ -1910,7 +2099,7 @@ func TestResolvePlanReviewers_AnthropicReviewerUsesRegionEndpoint(t *testing.T) 
 	}))
 	defer srv.Close()
 
-	set := resolvePlanReviewers(planReviewerOptions{
+	set, err := resolvePlanReviewers(planReviewerOptions{
 		anthropicAPIKey:     "deployment-key",
 		planReviewModel:     "claude-sonnet-4-6",
 		planReviewMaxTokens: 1024,
@@ -1918,6 +2107,9 @@ func TestResolvePlanReviewers_AnthropicReviewerUsesRegionEndpoint(t *testing.T) 
 		modelBaseURL:        srv.URL,
 		modelAPIKey:         regionKey,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("resolvePlanReviewers error = %v, want nil (fully configured, no FISHHAWKD_HOME_REGION)", err)
+	}
 
 	reviewer := set.Default()
 	if reviewer == nil {
