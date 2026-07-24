@@ -60,6 +60,59 @@ func TestRenderEconomicsBlock_FullContent(t *testing.T) {
 	}
 }
 
+// TestRenderEconomicsBlock_SingleRunByteIdentical pins the regression guard
+// (criterion 4 / #2100): an undecomposed run (nil PerRun) renders exactly the
+// pre-change block — the per-run breakdown adds nothing when there are no
+// children. Asserted byte-for-byte against the frozen golden so the lineage
+// rollup can never silently perturb the single-run output.
+func TestRenderEconomicsBlock_SingleRunByteIdentical(t *testing.T) {
+	got := RenderEconomicsBlock(fullEconomics()) // PerRun is nil (undecomposed)
+	const golden = "**Economics**\n\n" +
+		"- **Total cost**: $0.42\n" +
+		"  - `agent`: $0.30\n" +
+		"  - `implement_review`: $0.08\n" +
+		"  - `plan_review`: $0.04\n" +
+		"- **Wall clock**: 2h 14m\n" +
+		"- **Wait on human**: 1h 30m\n" +
+		"  - plan approval: 45m\n" +
+		"  - implement review → dispatch: 30m\n" +
+		"  - checks green → merge: 15m\n" +
+		"- **Cache net savings**: $0.12 (vs uncached replay)"
+	if got != golden {
+		t.Errorf("single-run block drifted from golden:\n--- got ---\n%s\n--- want ---\n%s", got, golden)
+	}
+	if strings.Contains(got, "By run") {
+		t.Errorf("single-run block must not render a per-run breakdown:\n%s", got)
+	}
+}
+
+// TestRenderEconomicsBlock_PerRunBreakdown asserts the per-run breakdown renders
+// one row per listed run (parent + each slice) with the short run id and each
+// run's rolled cost when PerRun is populated (#2100).
+func TestRenderEconomicsBlock_PerRunBreakdown(t *testing.T) {
+	in := fullEconomics()
+	in.PerRun = []PerRunCost{
+		{Label: "parent", RunID: "aaaaaaaa-1111-2222-3333-444444444444", CostUSD: 9.29},
+		{Label: "slice 1", RunID: "bbbbbbbb-1111-2222-3333-444444444444", CostUSD: 40.00},
+		{Label: "slice 2", RunID: "cccccccc-1111-2222-3333-444444444444", CostUSD: 44.54},
+	}
+	got := RenderEconomicsBlock(in)
+	for _, want := range []string{
+		"- **By run**:",
+		"  - parent (aaaaaaaa): $9.29",
+		"  - slice 1 (bbbbbbbb): $40.00",
+		"  - slice 2 (cccccccc): $44.54",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("per-run breakdown missing %q:\n%s", want, got)
+		}
+	}
+	// The breakdown sits after the per-stage cost rows and before wall clock.
+	if idxRun, idxWall := strings.Index(got, "By run"), strings.Index(got, "Wall clock"); idxRun < 0 || idxWall < 0 || idxRun > idxWall {
+		t.Errorf("per-run breakdown should render before wall clock:\n%s", got)
+	}
+}
+
 // TestRenderEconomicsBlock_Empty is the defensive branch: an all-zero input
 // (no cost, no gates, no wall clock, no cache) renders as "" so the caller
 // drops the section rather than showing a bare heading.

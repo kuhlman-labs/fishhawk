@@ -23,6 +23,22 @@ type EconomicsInput struct {
 	Cost    cost.RunCostSummary
 	Cache   cost.CacheEfficiency
 	Latency latency.Rollup
+	// PerRun is the per-run cost breakdown rendered for a decomposed run's
+	// lineage rollup (#2100): the parent plus each decomposition slice child,
+	// so every listed run's spend stays attributable even though the displayed
+	// total folds the whole lineage. Empty for an undecomposed run (no children)
+	// — the single-run block then renders byte-identically to before.
+	PerRun []PerRunCost
+}
+
+// PerRunCost is one row of the economics block's per-run breakdown: a run's
+// human label ("parent" or "slice N"), its id (rendered short), and its
+// authoritative rolled cost (the run row's CostUSDTotal). Populated only when a
+// decomposed parent's lineage is rolled up.
+type PerRunCost struct {
+	Label   string
+	RunID   string
+	CostUSD float64
 }
 
 // RenderEconomicsBlock renders the compact per-change economics markdown
@@ -49,6 +65,17 @@ func RenderEconomicsBlock(in EconomicsInput) string {
 	// per-stage breakdown is already deterministic.
 	for _, st := range in.Cost.Stages {
 		fmt.Fprintf(&b, "  - `%s`: %s\n", st.Source, formatUSD(st.CostUSD))
+	}
+
+	// Per-run breakdown for a rolled-up decomposition lineage (#2100): one row
+	// per listed run so each slice's spend stays attributable under the folded
+	// total. Emitted only when children were folded (PerRun non-empty); an
+	// undecomposed run renders nothing here, keeping its block byte-identical.
+	if len(in.PerRun) > 0 {
+		b.WriteString("- **By run**:\n")
+		for _, pr := range in.PerRun {
+			fmt.Fprintf(&b, "  - %s (%s): %s\n", pr.Label, shortRunIDString(pr.RunID), formatUSD(pr.CostUSD))
+		}
 	}
 
 	if in.Latency.WallClockSeconds > 0 {
@@ -108,6 +135,17 @@ func economicsGateLabel(gate string) string {
 	default:
 		return gate
 	}
+}
+
+// shortRunIDString truncates a run id string to its first 8 characters for the
+// per-run breakdown, mirroring shortID (which takes a uuid.UUID). Kept as a
+// string helper so PerRunCost can carry the full id (attributable) and the
+// renderer shortens it at display time.
+func shortRunIDString(id string) string {
+	if len(id) >= 8 {
+		return id[:8]
+	}
+	return id
 }
 
 // formatUSD renders a dollar figure for the economics block. It shows two

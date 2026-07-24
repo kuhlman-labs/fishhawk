@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strconv"
@@ -905,13 +906,31 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 		return fmt.Errorf("issuecomment: list audit: %w", err)
 	}
 	current, superseded := n.loadAnchorPlans(ctx, stages, entries)
+	// Roll the full decomposition lineage into the economics block (#2100). A
+	// load failure to ENUMERATE children warn-logs and falls back to the
+	// single-run block rather than aborting the anchor rebuild — best-effort per
+	// the package posture, symmetric with the server-side stamp's degrade
+	// (deriveEconomicsBlock). A childless run returns nil children (single-run).
+	children, cErr := LoadChildRunEconomics(ctx, n.runs, n.audit, runID)
+	if cErr != nil {
+		// LoadChildRunEconomics already returns nil children on error; the log —
+		// not the (belt-and-suspenders) assignment — is what makes a decomposed
+		// run silently degrading to single-run figures diagnosable after a
+		// transient ListRuns failure. The notifier carries no logger dependency,
+		// so use the process default (the runnerbackend/webhook fallback idiom).
+		slog.Default().WarnContext(ctx,
+			"issuecomment: load lineage children failed; economics degraded to single-run",
+			slog.String("run_id", runID.String()),
+			slog.String("error", cErr.Error()))
+		children = nil
+	}
 	body := RenderAnchorBody(AnchorInput{
 		Run:             runRow,
 		Stages:          stages,
 		Audit:           entries,
 		CurrentPlan:     current,
 		SupersededPlans: superseded,
-		Economics:       BuildRunEconomics(runRow, entries),
+		Economics:       BuildRunEconomics(runRow, entries, children),
 		ExternalURL:     n.externalURL,
 		Now:             n.now(),
 	})
@@ -1048,6 +1067,69 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, ent
 	return &current, superseded
 }
 
+// ChildRunEconomics bundles a decomposition slice child's run row and its
+// cost_recorded audit ledger for the lineage rollup (#2100). The two data
+// sources are DELIBERATELY separated (binding condition 1): Run comes from the
+// parent's decomposition-children ListRuns walk and is ALWAYS present, so the
+// child's authoritative CostUSDTotal always counts toward the displayed total
+// and the per-run breakdown; Entries is the child's cost ledger and may be nil
+// when the child's audit read failed — in which case only the child's
+// cache/per-stage FOLD degrades, never its presence in the total.
+type ChildRunEconomics struct {
+	Run     *run.Run
+	Entries []*audit.Entry
+}
+
+// childRunListLimit bounds the decomposition-children ListRuns query. Children
+// per parent are few; a single bounded page mirroring the server's
+// runCostListLimit cap suffices without pagination. Defined locally so this
+// package does not import the server package.
+const childRunListLimit = 1000
+
+// LoadChildRunEconomics enumerates a decomposed parent's decomposition slice
+// children and loads each child's cost_recorded ledger for the economics
+// lineage rollup (#2100). Filters by DecomposedFrom — the decomposition
+// lineage field — NOT ParentRunID, so the parent's recovery/retry children are
+// never folded (repository.go's #1751 do-not-conflate invariant; binding
+// condition 2). This returns exactly the decomposition slices, matching the
+// existing server-side listAllDecomposedChildren query.
+//
+// Best-effort with the child data sources SEPARATED (binding condition 1): a
+// per-child audit-read failure leaves that child in the result with nil
+// Entries (its run-row CostUSDTotal still counts and it still names a per-run
+// row), so an audit failure never drops a child from the total or the
+// breakdown — only its cache/per-stage fold degrades. A failure to ENUMERATE
+// the children (the ListRuns call itself) returns the error so the caller can
+// fall back to the single-run block; a childless parent returns (nil, nil).
+func LoadChildRunEconomics(ctx context.Context, runs run.Repository, auditRepo audit.Repository, parentID uuid.UUID) ([]ChildRunEconomics, error) {
+	children, err := runs.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &parentID,
+		Limit:          childRunListLimit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("issuecomment: list decomposition children: %w", err)
+	}
+	if len(children) == 0 {
+		return nil, nil
+	}
+	out := make([]ChildRunEconomics, 0, len(children))
+	for _, ch := range children {
+		if ch == nil {
+			continue
+		}
+		entries, aerr := auditRepo.ListForRunByCategory(ctx, ch.ID, "cost_recorded")
+		if aerr != nil {
+			// Best-effort per binding condition 1: keep the child (its
+			// CostUSDTotal still counts) with nil entries so ONLY its
+			// cache/per-stage fold degrades.
+			out = append(out, ChildRunEconomics{Run: ch})
+			continue
+		}
+		out = append(out, ChildRunEconomics{Run: ch, Entries: entries})
+	}
+	return out, nil
+}
+
 // BuildRunEconomics folds the run's audit chain into the economics rollups
 // the living anchor renders (#1702): the cost + cache-efficiency aggregates
 // over the cost_recorded ledger and the gate-latency rollup over the whole
@@ -1056,16 +1138,27 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, stages []*run.Stage, ent
 // rolled cost total (runRow.CostUSDTotal) and the run-start bound
 // (runRow.CreatedAt).
 //
+// On a DECOMPOSED run (children non-empty), it rolls up the whole lineage
+// (#2100): each child's cost_recorded ledger folds into the SAME cost + cache
+// aggregates so the per-stage breakdown and cache rollup cover every slice, the
+// displayed total becomes parent.CostUSDTotal + Σ child.Run.CostUSDTotal over
+// every listed child (from the RUN ROWS, independent of any per-child
+// audit-read outcome — binding condition 1), and PerRun names each run so the
+// slices stay attributable. Gate/wait-on-human events stay PARENT-scoped
+// (children have independent gate lifecycles); a child's entries only fold cost
+// + cache and extend the wall-clock end bound.
+//
 // Exported so the merge-time PR-body stamp (server.resolveReviewStageOnMerge)
 // derives the SAME block the anchor shows from one fold, rather than
-// re-implementing the mapping in the server package.
+// re-implementing the mapping in the server package. Stays PURE over its inputs
+// — the caller does all fetching (LoadChildRunEconomics).
 //
 // Best-effort and pure over the loaded entries: an unparsable cost payload is
 // skipped, and a chain with no economics signal yields an all-zero
 // EconomicsInput that RenderEconomicsBlock renders as "" — the block is
 // dropped from the anchor rather than shown empty. Always returns a non-nil
 // input; emptiness is decided by the renderer.
-func BuildRunEconomics(runRow *run.Run, entries []*audit.Entry) *EconomicsInput {
+func BuildRunEconomics(runRow *run.Run, entries []*audit.Entry, children []ChildRunEconomics) *EconomicsInput {
 	costEntries := make([]cost.RunCostEntry, 0)
 	cacheEntries := make([]cost.CacheEfficiencyEntry, 0)
 	events := make([]latency.GateEvent, 0, len(entries))
@@ -1082,26 +1175,7 @@ func BuildRunEconomics(runRow *run.Run, entries []*audit.Entry) *EconomicsInput 
 			runEnd = e.Timestamp
 		}
 		if e.Category == "cost_recorded" {
-			var p struct {
-				Model            string  `json:"model"`
-				USD              float64 `json:"usd"`
-				Source           string  `json:"source"`
-				InputTokens      int     `json:"input_tokens"`
-				OutputTokens     int     `json:"output_tokens"`
-				CacheReadTokens  int     `json:"cache_read_input_tokens"`
-				CacheWriteTokens int     `json:"cache_write_input_tokens"`
-			}
-			if json.Unmarshal(e.Payload, &p) == nil {
-				costEntries = append(costEntries, cost.RunCostEntry{Source: p.Source, USD: p.USD})
-				cacheEntries = append(cacheEntries, cost.CacheEfficiencyEntry{
-					Model:      p.Model,
-					Source:     p.Source,
-					FreshInput: p.InputTokens,
-					CacheRead:  p.CacheReadTokens,
-					CacheWrite: p.CacheWriteTokens,
-					Output:     p.OutputTokens,
-				})
-			}
+			foldCostEntry(e.Payload, &costEntries, &cacheEntries)
 		}
 		if cat, ok := latencyGateCategory(e.Category, e.Payload); ok {
 			events = append(events, latency.GateEvent{Category: cat, Timestamp: e.Timestamp})
@@ -1117,16 +1191,94 @@ func BuildRunEconomics(runRow *run.Run, entries []*audit.Entry) *EconomicsInput 
 		runEnd = terminal
 	}
 
+	// Fold each decomposition slice child's cost_recorded ledger into the SAME
+	// cost + cache aggregates (#2100). Gate events stay parent-scoped; a child's
+	// entries only fold cost + cache and extend the wall-clock end bound.
+	for _, ch := range children {
+		for _, e := range ch.Entries {
+			if e.Timestamp.After(runEnd) {
+				runEnd = e.Timestamp
+			}
+			if e.Category == "cost_recorded" {
+				foldCostEntry(e.Payload, &costEntries, &cacheEntries)
+			}
+		}
+	}
+
 	costSummary := cost.AggregateRunCost(costEntries)
-	// total_cost mirrors the /cost surface's authoritative figure — the run
-	// record's rolled total, which the per-stage sum breaks down.
-	costSummary.TotalUSD = runRow.CostUSDTotal
+	// Displayed total mirrors the /cost surface's authoritative figure — the
+	// run record's rolled total — plus, when the run decomposed, every listed
+	// child's rolled total from its RUN ROW. Sourcing the child total from the
+	// run row (not its audit ledger) is what keeps an audit-read failure from
+	// dropping a child from the total (binding condition 1).
+	total := runRow.CostUSDTotal
+	var perRun []PerRunCost
+	if len(children) > 0 {
+		perRun = make([]PerRunCost, 0, len(children)+1)
+		perRun = append(perRun, PerRunCost{
+			Label:   "parent",
+			RunID:   runRow.ID.String(),
+			CostUSD: runRow.CostUSDTotal,
+		})
+		for _, ch := range children {
+			if ch.Run == nil {
+				continue
+			}
+			total += ch.Run.CostUSDTotal
+			perRun = append(perRun, PerRunCost{
+				Label:   childRunLabel(ch.Run),
+				RunID:   ch.Run.ID.String(),
+				CostUSD: ch.Run.CostUSDTotal,
+			})
+		}
+	}
+	costSummary.TotalUSD = total
 
 	return &EconomicsInput{
 		Cost:    costSummary,
 		Cache:   cost.AggregateCacheEfficiency(cacheEntries),
 		Latency: latency.AggregateGateLatency(events, runRow.CreatedAt, runEnd),
+		PerRun:  perRun,
 	}
+}
+
+// foldCostEntry decodes one cost_recorded audit payload and appends its cost +
+// cache-efficiency rows to the running aggregates. An unparsable payload is
+// skipped (contributes nothing), never fatal — the same best-effort posture the
+// parent fold has always had, now shared with the child fold (#2100).
+func foldCostEntry(payload json.RawMessage, costEntries *[]cost.RunCostEntry, cacheEntries *[]cost.CacheEfficiencyEntry) {
+	var p struct {
+		Model            string  `json:"model"`
+		USD              float64 `json:"usd"`
+		Source           string  `json:"source"`
+		InputTokens      int     `json:"input_tokens"`
+		OutputTokens     int     `json:"output_tokens"`
+		CacheReadTokens  int     `json:"cache_read_input_tokens"`
+		CacheWriteTokens int     `json:"cache_write_input_tokens"`
+	}
+	if json.Unmarshal(payload, &p) != nil {
+		return
+	}
+	*costEntries = append(*costEntries, cost.RunCostEntry{Source: p.Source, USD: p.USD})
+	*cacheEntries = append(*cacheEntries, cost.CacheEfficiencyEntry{
+		Model:      p.Model,
+		Source:     p.Source,
+		FreshInput: p.InputTokens,
+		CacheRead:  p.CacheReadTokens,
+		CacheWrite: p.CacheWriteTokens,
+		Output:     p.OutputTokens,
+	})
+}
+
+// childRunLabel renders a decomposition slice child's per-run breakdown label.
+// A child with a recorded SliceIndex renders "slice N" (1-based for human
+// reading: the 0-based SliceIndex 0 is "slice 1"); a child missing its
+// SliceIndex falls back to "slice <short id>" so it is never unlabeled.
+func childRunLabel(r *run.Run) string {
+	if r.SliceIndex != nil {
+		return fmt.Sprintf("slice %d", *r.SliceIndex+1)
+	}
+	return "slice " + shortID(r.ID)
 }
 
 // latencyGateCategory maps an audit entry to the latency category the
