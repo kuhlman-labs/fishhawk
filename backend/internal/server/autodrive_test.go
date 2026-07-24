@@ -82,8 +82,41 @@ workflows:
 // (the base fakeRepo errors on it) so run.RetryStage's failed → pending
 // reopen lands — the auto-retry path needs it. Owned by this slice's test
 // file; it does not touch the shared driveE2ERepo helper.
+//
+// transitionStageErr, when set, forces TransitionStage to return a GENERIC
+// (non-sentinel) error — the injection the #2091 route_fixup genuine-dispatch-
+// error test uses to prove a non-sentinel autoFixup failure still propagates as
+// the raw error (a 500) rather than being classified as a decision_required
+// outcome. Default nil leaves every other fixture's transitions untouched.
 type autoDriveRepo struct {
 	*driveE2ERepo
+	transitionStageErr error
+}
+
+func (r *autoDriveRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if r.transitionStageErr != nil {
+		return nil, r.transitionStageErr
+	}
+	return r.driveE2ERepo.TransitionStage(ctx, id, to, c)
+}
+
+// seedFixupPass appends prior stage_fixup_triggered audit entries keyed to the
+// stage so countFixupPasses reads back n consumed passes — the durable fix-up
+// budget counter the route_fixup arm's ErrFixupBudgetExhausted /
+// ErrFixupCeilingReached sentinels are enforced against (#2091). The seeded
+// entries carry the stage id (countFixupPasses filters on StageID) but need no
+// payload.
+func seedFixupPass(t *testing.T, au *auditFake, runID, stageID uuid.UUID, n int) {
+	t.Helper()
+	rid := runID
+	sid := stageID
+	for i := 0; i < n; i++ {
+		au.seeded = append(au.seeded, &audit.Entry{
+			RunID: &rid, StageID: &sid, Sequence: int64(1000 + i),
+			Category: CategoryStageFixupTriggered, Payload: []byte("{}"),
+			Timestamp: time.Now().UTC(),
+		})
+	}
 }
 
 func (r *autoDriveRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
@@ -354,6 +387,112 @@ func TestAutoDriveRunGate_RouteFixupThresholdLowRoutes(t *testing.T) {
 	assertOperatorActor(t, e)
 	if rule := auditDelegatedRule(t, e); rule != "convergent_concerns" {
 		t.Errorf("delegated rule = %q, want convergent_concerns", rule)
+	}
+}
+
+// --- (b') route_fixup with an exhausted budget/ceiling -> decision_required --
+
+// seedRouteFixupReady puts the run in the exact state TestAutoDriveRunGate_RouteFixup
+// drives — implement parked awaiting_approval, a dual approve_with_concerns
+// round, and one open medium implement concern so may_route_fixup(convergent_concerns)
+// is Met — and returns the implement stage so the caller can seed prior passes.
+func seedRouteFixupReady(t *testing.T, s *Server, repo *autoDriveRepo, au *auditFake, cr *fakeConcernRepo) (uuid.UUID, *run.Stage) {
+	t.Helper()
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan, impl := stages[0], stages[1]
+	plan.State = run.StageStateSucceeded
+	impl.State = run.StageStateAwaitingApproval
+	seedReviewEntry(t, au, runID, 1, "implement_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
+	seedReviewEntry(t, au, runID, 3, "implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns})
+	seedOpenConcern(t, cr, runID, impl.ID, concern.StageKindImplement, "medium", "scope", "tighten the seam")
+	return runID, impl
+}
+
+// TestAutoDriveRunGate_RouteFixupBudgetExhausted is the #2091 headline: when the
+// delegated route_fixup arm's dispatch hits ErrFixupBudgetExhausted (the normal
+// budget is spent), the actor returns a decision_required outcome (nil error) —
+// NOT the raw sentinel that would map to a 500 — so the driver parks the
+// operator instead of failing loud. NO fix-up is dispatched (the budget refused
+// it), so ZERO NEW stage_fixup_triggered entries land beyond the seeded prior
+// pass.
+func TestAutoDriveRunGate_RouteFixupBudgetExhausted(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	// One prior pass == the default normal budget (defaultMaxFixupPasses) with
+	// no refunds -> FixupStage refuses with ErrFixupBudgetExhausted, and the
+	// hard ceiling (3) still has headroom so it is NOT ErrFixupCeilingReached.
+	seedFixupPass(t, au, runID, impl.ID, 1)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || out.Paged {
+		t.Fatalf("outcome = %+v, want a non-acted, non-paged decision_required", out)
+	}
+	if !out.DecisionRequired || out.DecisionState != "fixup_budget_exhausted" {
+		t.Fatalf("outcome = %+v, want DecisionRequired with DecisionState=fixup_budget_exhausted", out)
+	}
+	if out.Action != delegation.ActionRouteFixup {
+		t.Errorf("Action = %q, want %q (the arm that surfaced the decision)", out.Action, delegation.ActionRouteFixup)
+	}
+	// The budget refused the dispatch: no NEW trigger entry beyond the seeded
+	// prior pass (seedFixupPass writes to au.seeded, not au.appended).
+	if n := countAudit(au, CategoryStageFixupTriggered); n != 0 {
+		t.Errorf("%d NEW %s entries appended, want 0 (budget refused the dispatch)", n, CategoryStageFixupTriggered)
+	}
+}
+
+// TestAutoDriveRunGate_RouteFixupCeilingReached asserts the DISTINCT hard-ceiling
+// sentinel maps to DecisionState=fixup_ceiling_reached (nil error) — the state
+// the operator override can never push past — rather than being collapsed into
+// the budget-exhausted branch.
+func TestAutoDriveRunGate_RouteFixupCeilingReached(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	// defaultFixupCeiling (3) prior passes -> FixupStage refuses with
+	// ErrFixupCeilingReached BEFORE the budget check.
+	seedFixupPass(t, au, runID, impl.ID, 3)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.DecisionRequired || out.DecisionState != "fixup_ceiling_reached" {
+		t.Fatalf("outcome = %+v, want DecisionRequired with DecisionState=fixup_ceiling_reached", out)
+	}
+	if out.Acted || out.Paged {
+		t.Errorf("outcome = %+v, want a non-acted, non-paged decision_required", out)
+	}
+}
+
+// TestAutoDriveRunGate_RouteFixupGenuineErrorPropagates pins the untouched
+// fail-loud path: a NON-sentinel autoFixup failure (here a repo TransitionStage
+// error, a genuine dispatch failure) still bubbles as the raw NON-NIL error —
+// NOT a decision_required outcome — so the HTTP layer maps it to a 500 exactly
+// as before. This is the branch that must NOT be swallowed by the new
+// sentinel classification.
+func TestAutoDriveRunGate_RouteFixupGenuineErrorPropagates(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, _ := seedRouteFixupReady(t, s, repo, au, cr)
+	// No prior passes: the budget admits the fix-up, so FixupStage proceeds to
+	// the stage transition — which the injected repo error fails. errors.Is on
+	// neither sentinel matches, so the arm returns the raw error.
+	repo.transitionStageErr = errors.New("stage store down")
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err == nil {
+		t.Fatalf("err = nil, want the genuine dispatch error to propagate; outcome = %+v", out)
+	}
+	if out.DecisionRequired {
+		t.Errorf("outcome = %+v, want NO decision_required on a genuine (non-sentinel) dispatch error", out)
+	}
+	if out.Acted {
+		t.Errorf("outcome = %+v, want a non-acted outcome alongside the error", out)
+	}
+	if out.Action != delegation.ActionRouteFixup {
+		t.Errorf("Action = %q, want %q", out.Action, delegation.ActionRouteFixup)
 	}
 }
 

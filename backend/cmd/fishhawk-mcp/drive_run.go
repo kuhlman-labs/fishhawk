@@ -853,6 +853,15 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			}
 			driveSleep(ctx, pollInterval)
 			continue
+		case gate.DecisionRequired:
+			// A well-defined but non-auto-routable gate state (#2091): an
+			// exhausted fix-up budget / ceiling on the delegated route_fixup arm.
+			// This is NOT observe-only (keep polling) and NOT a fail-loud gate
+			// error — the driver STOPS and hands the operator the real next moves
+			// (force an extra fix-up pass, waive / defer the concerns, or cancel).
+			out.StoppedReason = "decision_required:" + gate.DecisionState
+			out.NextActions = driveDecisionActions(gate.DecisionState, runUUID, in.WorkingDir)
+			return nil, out, nil
 		default:
 			// Observe-only. If a real gate is parked (a stage awaiting
 			// approval the driver could not auto-act), it is a decision — EXCEPT a
@@ -1332,6 +1341,27 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 			Consumes:     consumesNone,
 			Reason:       "bring up the acceptance target at the expected head SHA (e.g. scripts/dev preview), then re-dispatch the acceptance stage and re-invoke fishhawk_drive_run",
 		}}}
+	case state == "fixup_budget_exhausted":
+		// The delegated route_fixup gate met but the NORMAL fix-up budget is
+		// spent (#2091). The hard ceiling still has headroom, so the operator's
+		// real moves are: grant ONE bounded override pass, or resolve the open
+		// concern(s) out of band (waive / defer), or cancel. fishhawk_merge_run
+		// is deliberately omitted — it only becomes legal once the concerns are
+		// waived/deferred, so surfacing it here would name an illegal action.
+		forcedFixup := SuggestedAction{
+			Action:       "fishhawk_fixup_stage",
+			Params:       withParams(params, map[string]string{"concern_ids": "run.concerns.items[].id", "force_additional_pass": "true"}),
+			Precondition: "the delegated route_fixup gate met but the NORMAL fix-up budget is spent (fixup_budget_exhausted); the hard ceiling of 3 total passes is not reached. Stay on a clean default branch — the runner owns the run branch in its lineage worktree",
+			Consumes:     consumesFixupBudget,
+			Reason:       "grant ONE bounded operator override pass (force_additional_pass=true) to route the open concern(s) back to the agent; the forced pass is audited, then re-invoke fishhawk_drive_run",
+		}
+		return &NextActions{State: state, Actions: append([]SuggestedAction{forcedFixup}, driveFixupConcernActions(params)...)}
+	case state == "fixup_ceiling_reached":
+		// The absolute hard fix-up ceiling is reached (#2091) — the operator
+		// override (force_additional_pass) can NEVER push past it, so the forced
+		// fixup_stage action is dropped. Only the out-of-band concern
+		// dispositions (waive / defer) and cancel remain.
+		return &NextActions{State: state, Actions: driveFixupConcernActions(params)}
 	case strings.HasPrefix(state, "plan_"):
 		return &NextActions{State: state, Actions: []SuggestedAction{{
 			Action:       "fishhawk_approve_plan",
@@ -1348,5 +1378,52 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 			Consumes:     consumesNone,
 			Reason:       "inspect the run's full next_actions block and decide",
 		}}}
+	}
+}
+
+// withParams returns a NEW params map: a copy of base with extra folded in
+// (extra wins on a key collision). Used by the decision-action arms so an
+// action-specific param set (concern_ids, force_additional_pass, ...) never
+// mutates the shared base map the sibling actions read.
+func withParams(base, extra map[string]string) map[string]string {
+	out := make(map[string]string, len(base)+len(extra))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range extra {
+		out[k] = v
+	}
+	return out
+}
+
+// driveFixupConcernActions is the out-of-band concern-disposition roster the
+// fixup_budget_exhausted and fixup_ceiling_reached decision stops share (#2091):
+// waive the concern (no follow-up), defer it into a pre-drafted follow-up, or
+// cancel the run. fishhawk_merge_run is deliberately absent — it only becomes a
+// legal move once the open concerns are resolved (waived/deferred), so naming it
+// here would surface an action that is not yet actionable at this gate.
+func driveFixupConcernActions(params map[string]string) []SuggestedAction {
+	return []SuggestedAction{
+		{
+			Action:       "fishhawk_waive_concern",
+			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id"}),
+			Precondition: "an open concern is a false positive or does not block the merge",
+			Consumes:     consumesNone,
+			Reason:       "resolve the concern with NO follow-up and NO fix-up budget; the waive rationale is shown verbatim to later re-reviews, then re-invoke fishhawk_drive_run",
+		},
+		{
+			Action:       "fishhawk_defer_concern",
+			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id", "parent_epic": "<epic the follow-up rolls up to, e.g. #2091>"}),
+			Precondition: "an open concern is worth a separate change but should not block the merge",
+			Consumes:     consumesNone,
+			Reason:       "file a pre-drafted follow-up work item and resolve the concern in one call (no fix-up budget spent), then re-invoke fishhawk_drive_run",
+		},
+		{
+			Action:       "fishhawk_cancel_run",
+			Params:       params,
+			Precondition: "the remaining concerns are not resolvable in this run",
+			Consumes:     consumesNone,
+			Reason:       "cancel this run, then start a fresh one with fishhawk_start_run once the concerns are addressed",
+		},
 	}
 }

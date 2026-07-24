@@ -824,3 +824,54 @@ func TestMergeRun_WireShape(t *testing.T) {
 		}
 	})
 }
+
+// TestAutoDriveRunGate_DecodesDecisionRequired drives the REAL
+// apiClient.AutoDriveRunGate JSON unmarshalling across an httptest server that
+// returns a decision_required=true / decision_state=fixup_budget_exhausted body
+// (the #2091 outcome), and asserts the decoded local AutoDriveOutcome carries
+// DecisionRequired=true and DecisionState=fixup_budget_exhausted.
+//
+// This is the ONE test that catches a mistyped/wrong json tag on the client.go
+// AutoDriveOutcome struct copy: a wrong `decision_required` tag would decode to
+// the zero value (false) and silently route the driver to the observe-only
+// default — every other planned test (which builds the AutoDriveOutcome value
+// through the interface fake in drive_run_test.go) bypasses this wire decode and
+// would still pass. Binding approval condition 1.
+func TestAutoDriveRunGate_DecodesDecisionRequired(t *testing.T) {
+	const body = `{
+		"acted": false,
+		"paged": false,
+		"decision_required": true,
+		"decision_state": "fixup_budget_exhausted",
+		"action": "route_fixup",
+		"note": "fixup budget exhausted"
+	}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/auto-drive") {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer ts.Close()
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+	out, err := c.AutoDriveRunGate(context.Background(), uuid.New())
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.DecisionRequired {
+		t.Errorf("DecisionRequired = false, want true (a wrong decision_required json tag drops it to the observe-only default)")
+	}
+	if out.DecisionState != "fixup_budget_exhausted" {
+		t.Errorf("DecisionState = %q, want fixup_budget_exhausted", out.DecisionState)
+	}
+	// Sanity: the sibling flags decode as sent — this is a decision-required
+	// outcome, not an acted/paged one.
+	if out.Acted || out.Paged {
+		t.Errorf("outcome = %+v, want a non-acted, non-paged decision_required decode", out)
+	}
+	if out.Action != "route_fixup" {
+		t.Errorf("Action = %q, want route_fixup", out.Action)
+	}
+}

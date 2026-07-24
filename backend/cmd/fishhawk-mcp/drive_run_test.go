@@ -862,6 +862,152 @@ func TestDriveRun_GateError_HaltsActing(t *testing.T) {
 	}
 }
 
+// --- (k') gate returns decision_required -> park, NOT gate_error ------------
+
+// TestDriveRun_DecisionRequired_FixupBudgetExhausted is the #2091 driver-layer
+// pin: when the auto-drive endpoint returns a decision_required outcome (an
+// exhausted fix-up budget on the delegated route_fixup arm), the loop STOPS at
+// decision_required:fixup_budget_exhausted with next_actions naming
+// fishhawk_fixup_stage(force_additional_pass) — and crucially NOT stoppedGateError
+// (that is reserved for a genuine fail-loud gate error, pinned by
+// TestDriveRun_GateError_HaltsActing). This is the branch a mistyped client.go
+// json tag would silently route to the observe-only default instead (the wire
+// decode is pinned separately in client_test.go).
+func TestDriveRun_DecisionRequired_FixupBudgetExhausted(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    "fixup_budget_exhausted",
+			Action:           "route_fixup",
+			Note:             "fixup budget exhausted",
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:fixup_budget_exhausted" {
+		t.Fatalf("stopped_reason = %q, want decision_required:fixup_budget_exhausted", out.StoppedReason)
+	}
+	// Explicitly NOT the fail-loud gate_error path (condition 2 pairs this park
+	// with the genuine-error gate_error stop in TestDriveRun_GateError_HaltsActing).
+	if out.StoppedReason == stoppedGateError {
+		t.Fatal("decision_required must not collapse into gate_error")
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("decision_required stop carried no next_actions")
+	}
+	var forced *SuggestedAction
+	for i := range out.NextActions.Actions {
+		if out.NextActions.Actions[i].Action == "fishhawk_fixup_stage" {
+			forced = &out.NextActions.Actions[i]
+		}
+	}
+	if forced == nil {
+		t.Fatalf("next_actions did not name fishhawk_fixup_stage: %+v", out.NextActions.Actions)
+	}
+	if forced.Params["force_additional_pass"] != "true" {
+		t.Errorf("fixup_stage action params = %v, want force_additional_pass=true", forced.Params)
+	}
+	// Pin the FULL budget-exhausted roster (medium/verification concern): the
+	// forced fix-up pass PLUS the out-of-band concern dispositions must all be
+	// present, so a regression that drops a required option (waive / defer /
+	// cancel) is caught, not just one that mistypes the forced action.
+	names := driveActionNames(out.NextActions.Actions)
+	for _, want := range []string{"fishhawk_fixup_stage", "fishhawk_waive_concern", "fishhawk_defer_concern", "fishhawk_cancel_run"} {
+		if !names[want] {
+			t.Errorf("budget-exhausted roster missing %s; got %v", want, actionNameList(out.NextActions.Actions))
+		}
+	}
+	if len(rec.list()) != 0 {
+		t.Errorf("a spawn happened on a decision_required stop: %v", rec.list())
+	}
+}
+
+// driveActionNames indexes a next-actions roster by action name for membership
+// checks.
+func driveActionNames(actions []SuggestedAction) map[string]bool {
+	names := make(map[string]bool, len(actions))
+	for _, a := range actions {
+		names[a.Action] = true
+	}
+	return names
+}
+
+// actionNameList renders the roster's action names for a failure message.
+func actionNameList(actions []SuggestedAction) []string {
+	out := make([]string, len(actions))
+	for i, a := range actions {
+		out[i] = a.Action
+	}
+	return out
+}
+
+// TestDriveRun_DecisionRequired_FixupCeilingReached is the #2091 driver-layer
+// pin for the HARD-ceiling arm (low/untested-path concern): when the auto-drive
+// endpoint returns decision_required with decision_state=fixup_ceiling_reached,
+// the loop STOPS at decision_required:fixup_ceiling_reached and its next_actions
+// roster OMITS the forced fishhawk_fixup_stage option — force_additional_pass can
+// never push past the absolute ceiling, so surfacing it would name an illegal
+// action — while still carrying the out-of-band waive / defer / cancel
+// dispositions. The budget arm (which DOES carry the forced pass) is pinned by
+// TestDriveRun_DecisionRequired_FixupBudgetExhausted; this asserts the ceiling
+// arm's distinct roster so a regression that re-surfaced the illegal forced pass
+// (or emitted an empty roster) is caught at the driver layer.
+func TestDriveRun_DecisionRequired_FixupCeilingReached(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    "fixup_ceiling_reached",
+			Action:           "route_fixup",
+			Note:             "fixup ceiling reached",
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:fixup_ceiling_reached" {
+		t.Fatalf("stopped_reason = %q, want decision_required:fixup_ceiling_reached", out.StoppedReason)
+	}
+	if out.StoppedReason == stoppedGateError {
+		t.Fatal("decision_required must not collapse into gate_error")
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("fixup_ceiling_reached stop carried no next_actions")
+	}
+	names := driveActionNames(out.NextActions.Actions)
+	// The forced fix-up pass is ILLEGAL at the hard ceiling and MUST be dropped.
+	if names["fishhawk_fixup_stage"] {
+		t.Errorf("ceiling roster illegally surfaced fishhawk_fixup_stage; got %v", actionNameList(out.NextActions.Actions))
+	}
+	// The out-of-band dispositions MUST remain.
+	for _, want := range []string{"fishhawk_waive_concern", "fishhawk_defer_concern", "fishhawk_cancel_run"} {
+		if !names[want] {
+			t.Errorf("ceiling roster missing %s; got %v", want, actionNameList(out.NextActions.Actions))
+		}
+	}
+	if len(rec.list()) != 0 {
+		t.Errorf("a spawn happened on a decision_required stop: %v", rec.list())
+	}
+}
+
 // --- (l) resume of an in-flight 'dispatched' stage -> no double-spawn -------
 
 func TestDriveRun_ResumeDispatchedInFlight_NoDoubleSpawn(t *testing.T) {

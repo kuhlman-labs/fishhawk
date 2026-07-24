@@ -5238,6 +5238,15 @@ paths:
         webhook. A nil merge seam keeps `may_merge` fail-closed to
         observe-only.
 
+        **Decision-required parks the operator, not a 500.** When the
+        delegated `route_fixup` arm cannot dispatch because the fix-up budget
+        is spent (`fixup_budget_exhausted`) or the hard ceiling is reached
+        (`fixup_ceiling_reached`), the outcome is a `decision_required:true`
+        200 naming `decision_state` (E48.41 / #2091) — the driver STOPS and
+        hands the gate to the operator with real next moves. This is a
+        well-defined, EXPECTED gate state, distinct from a genuine dispatch
+        failure (still a 500 below).
+
         **Authorization.** Requires `write:approvals` — the strictest action
         the gate can dispatch (approve); operator and operator-agent tokens
         already carry it.
@@ -5247,18 +5256,23 @@ paths:
       responses:
         '200':
           description: |
-            The gate outcome. Exactly one of `acted`/`paged` is true on a
-            non-observe-only outcome; observe-only has both false.
+            The gate outcome. A non-observe-only outcome is exactly one of
+            three kinds — `acted`, `paged`, or `decision_required` (an
+            exhausted fix-up budget/ceiling on the delegated `route_fixup`
+            arm the driver must STOP on and hand to the operator, #2091);
+            observe-only has all three false.
           content:
             application/json:
               schema:
                 type: object
-                required: [acted, paged, note]
+                required: [acted, paged, decision_required, note]
                 properties:
                   acted: { type: boolean, description: 'True when a delegated gate action was dispatched.' }
-                  action: { type: string, description: 'The delegation verb taken (approve|route_fixup|retry|merge), set when acted.' }
+                  action: { type: string, description: 'The delegation verb taken (approve|route_fixup|retry|merge), set when acted or when decision_required surfaced from that arm.' }
                   paged: { type: boolean, description: 'True when a must_page_human condition was refused.' }
                   page_event: { type: string, description: 'The page event name, set when paged.' }
+                  decision_required: { type: boolean, description: 'True when the actor could not auto-act on a well-defined, expected gate state and hands it to the operator (distinct from observe-only, which keeps polling). #2091.' }
+                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required (e.g. fixup_budget_exhausted, fixup_ceiling_reached).' }
                   note: { type: string, description: 'Short human-readable summary of the outcome.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
@@ -5270,8 +5284,10 @@ paths:
         '500':
           description: |
             `auto_drive_dispatch_failed` (the gate action was attempted and
-            errored) or `auto_drive_record_failed` (the gate action landed but
-            the supplementary `run_auto_driven` attribution row failed to
+            errored with a GENUINE failure — an exhausted fix-up budget/ceiling
+            is NOT a dispatch failure; it parks `decision_required` on the 200
+            above, #2091) or `auto_drive_record_failed` (the gate action landed
+            but the supplementary `run_auto_driven` attribution row failed to
             append — fail-loud; the authoritative delegated-action row is
             durable, but the driver must stop).
           content:
