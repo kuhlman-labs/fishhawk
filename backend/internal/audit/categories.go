@@ -105,6 +105,7 @@ var KnownCategories = map[string]struct{}{
 	"operator_scope_path_undelivered":         {},
 	"parent_awaiting_redrive":                 {},
 	"plan_acceptance_precheck":                {},
+	"plan_add_scope_files_fans_into_slices":   {},
 	"plan_budget_override_acknowledged":       {},
 	"plan_coerced":                            {},
 	"plan_decomposed":                         {},

@@ -1128,8 +1128,14 @@ func TestSubmitApproval_UnknownField(t *testing.T) {
 // decoder accepting the field is implicitly proven by the 200; an adjacent
 // unknown field still 400s (TestSubmitApproval_UnknownField).
 func TestSubmitApproval_AddScopeFiles_RecordedInAuditPayload(t *testing.T) {
-	s, _, rr, au := newApprovalServer(t)
-	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	// A non-empty add_scope_files approve now passes the #2103 fan-in gate only
+	// on a POSITIVELY-loadable non-decomposed plan (the gate fails closed on an
+	// unconfirmed plan). Wire an ArtifactRepo + a flat plan so this audit-payload
+	// path exercises a legitimate flat-plan approve.
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	p := &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 5}
+	_, stage := seedBudgetRun(t, rr, art, p)
 
 	w := submitApproval(t, s, stage.ID,
 		`{"decision":"approve","add_scope_files":["backend/internal/agenteval/testdata/corpus/newcase/","go.work","backend/cmd/fishhawk-mcp/README.md"]}`)
@@ -4157,6 +4163,258 @@ func TestSubmitApproval_ScopeCap_NoPlanArtifact_FailsOpen(t *testing.T) {
 		if e.Category == "plan_violates_scope_cap" {
 			t.Errorf("unexpected plan_violates_scope_cap on fail-open")
 		}
+	}
+}
+
+// --- Add-scope-files single-owner-file gate (#2103) --------------------
+
+// decomposedPlanWithSlices returns an under-budget standard_v1 plan carrying a
+// decomposition with one sub-plan per given title, so the add-scope-files gate
+// (#2103) sees a positively decomposed plan.
+func decomposedPlanWithSlices(titles ...string) *plan.Plan {
+	subs := make([]plan.SubPlanSummary, 0, len(titles))
+	for _, ti := range titles {
+		subs = append(subs, plan.SubPlanSummary{Title: ti, PredictedRuntimeMinutes: 5})
+	}
+	return &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 5, // under the 15m default budget
+		Decomposition: &plan.Decomposition{
+			Rationale: "split for size",
+			SubPlans:  subs,
+		},
+	}
+}
+
+// TestCheckDecomposedAddScopeFiles_Decomposed_Returns422 asserts the reject
+// branch (#2103): add_scope_files on a decomposed plan → 422
+// plan_add_scope_files_fans_into_slices, details.slices names every sub-plan,
+// NO approval row recorded (the ADR-036 no-row-on-reject invariant), and the
+// gate's own audit entry exists while approval_submitted does not.
+func TestCheckDecomposedAddScopeFiles_Decomposed_Returns422(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+
+	p := decomposedPlanWithSlices("slice-a", "slice-b")
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/internal/pkg/handoff.go"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "plan_add_scope_files_fans_into_slices" {
+		t.Fatalf("code = %q, want plan_add_scope_files_fans_into_slices", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["slice_count"].(float64); int(got) != 2 {
+		t.Errorf("details.slice_count = %v, want 2", env.Error.Details["slice_count"])
+	}
+	slices, ok := env.Error.Details["slices"].([]any)
+	if !ok || len(slices) != 2 {
+		t.Fatalf("details.slices = %v, want 2 entries", env.Error.Details["slices"])
+	}
+	wantTitles := map[string]bool{"slice-a": false, "slice-b": false}
+	for _, raw := range slices {
+		m, _ := raw.(map[string]any)
+		if ti, _ := m["title"].(string); ti != "" {
+			if _, want := wantTitles[ti]; want {
+				wantTitles[ti] = true
+			}
+		}
+	}
+	for ti, seen := range wantTitles {
+		if !seen {
+			t.Errorf("details.slices missing sub-plan %q", ti)
+		}
+	}
+
+	// ADR-036 no-row invariant: refused pre-Submit → no approval row.
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0 (refused before insert)", len(rows), err)
+	}
+
+	var foundGate bool
+	for _, e := range au.appended {
+		if e.Category == "plan_add_scope_files_fans_into_slices" {
+			foundGate = true
+		}
+		if e.Category == "approval_submitted" {
+			t.Errorf("unexpected approval_submitted audit entry (advance was blocked)")
+		}
+	}
+	if !foundGate {
+		t.Errorf("expected plan_add_scope_files_fans_into_slices audit entry, got %+v", au.appended)
+	}
+}
+
+// TestCheckDecomposedAddScopeFiles_FlatPlan_Proceeds asserts the pass branch:
+// add_scope_files on a positively-flat (non-decomposition) plan succeeds
+// unchanged, records the approval, and emits no fan-in audit noise.
+func TestCheckDecomposedAddScopeFiles_FlatPlan_Proceeds(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 5}
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/internal/pkg/handoff.go"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (flat-plan add is safe):\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_add_scope_files_fans_into_slices" {
+			t.Errorf("unexpected plan_add_scope_files_fans_into_slices audit on a flat plan")
+		}
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Errorf("approval rows = %d (err=%v), want 1 (approve recorded)", len(rows), err)
+	}
+}
+
+// TestCheckDecomposedAddScopeFiles_DecomposedNoAdd_Proceeds asserts the gate
+// does not over-fire: a decomposed plan approved WITHOUT add_scope_files flows
+// normally (the empty-add short-circuit).
+func TestCheckDecomposedAddScopeFiles_DecomposedNoAdd_Proceeds(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+
+	p := decomposedPlanWithSlices("slice-a", "slice-b")
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (decomposed but no add):\n%s", w.Code, w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_add_scope_files_fans_into_slices" {
+			t.Errorf("unexpected plan_add_scope_files_fans_into_slices audit on a no-add approve")
+		}
+	}
+}
+
+// TestCheckDecomposedAddScopeFiles_IndeterminatePlan_FailsClosed asserts the
+// fail-CLOSED branch (binding condition 2): when add_scope_files is non-empty
+// but the plan cannot be positively confirmed non-decomposed —
+// loadApprovedPlanForRun returns (nil, nil) for a run with no plan artifact —
+// the approve is REJECTED with 422 (not allowed through), and no approval row
+// is recorded.
+func TestCheckDecomposedAddScopeFiles_IndeterminatePlan_FailsClosed(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, _, app := newBudgetCheckServer(t, art)
+
+	// Seed a plan-stage run WITHOUT a plan artifact → loadApprovedPlanForRun
+	// returns (nil, nil): the decomposition status cannot be positively
+	// determined, so a non-empty add_scope_files must fail closed.
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/internal/pkg/handoff.go"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (fail closed on indeterminate plan):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "plan_add_scope_files_fans_into_slices" {
+		t.Errorf("code = %q, want plan_add_scope_files_fans_into_slices", env.Error.Code)
+	}
+	if reason, _ := env.Error.Details["reason"].(string); reason != "plan_indeterminate" {
+		t.Errorf("details.reason = %q, want plan_indeterminate", reason)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+	}
+}
+
+// TestCheckDecomposedAddScopeFiles_NoArtifactRepo_FailsClosed asserts the
+// universal fail-CLOSED guarantee under partial configuration (binding
+// condition 2; claude-fable-5's authz-bypass HIGH): when the plan-artifact
+// subsystem is unconfigured (ArtifactRepo unset), loadApprovedPlanForRun returns
+// (nil, nil) — the plan's decomposition status cannot be POSITIVELY confirmed
+// non-decomposed — so a non-empty add_scope_files approve is REFUSED (422) with
+// no approval row recorded, rather than passing an unconfirmed add through. This
+// closes the fail-open carve-out the earlier revision left. Unreachable in
+// production (the artifact repo is always wired); the tightening only affects a
+// test/misconfiguration path.
+func TestCheckDecomposedAddScopeFiles_NoArtifactRepo_FailsClosed(t *testing.T) {
+	rr := newOrchestratorRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	// No ArtifactRepo wired → plan-gating subsystem absent.
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: app,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+	})
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/internal/pkg/handoff.go"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (fail closed with no artifact subsystem):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "plan_add_scope_files_fans_into_slices" {
+		t.Errorf("code = %q, want plan_add_scope_files_fans_into_slices", env.Error.Code)
+	}
+	if reason, _ := env.Error.Details["reason"].(string); reason != "plan_indeterminate" {
+		t.Errorf("details.reason = %q, want plan_indeterminate", reason)
+	}
+	// ADR-036 no-row invariant: refused pre-Submit → no approval row.
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0 (refused before insert)", len(rows), err)
+	}
+}
+
+// TestCheckDecomposedAddScopeFiles_LoadError_FailsClosed exercises the OTHER
+// fail-closed sub-branch (the medium/verification + low/untested-path concerns):
+// loadApprovedPlanForRun returning err != nil — a genuine repo IO failure, here
+// ArtifactRepo.ListForStage erroring — distinct from the (nil, nil) indeterminate
+// case. It differs only by a WARN log before the same 422. Asserts the 422
+// response, the plan_indeterminate reason, and the no-approval-row invariant.
+func TestCheckDecomposedAddScopeFiles_LoadError_FailsClosed(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, _, app := newBudgetCheckServer(t, art)
+
+	// A positively-flat plan is seeded, but the artifact read is then forced to
+	// fail so loadApprovedPlanForRun returns err != nil (not (nil, nil)).
+	p := &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 5}
+	_, stage := seedBudgetRun(t, rr, art, p)
+	art.listErr = errors.New("simulated artifact repo IO failure")
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/internal/pkg/handoff.go"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (fail closed on plan-load error):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "plan_add_scope_files_fans_into_slices" {
+		t.Errorf("code = %q, want plan_add_scope_files_fans_into_slices", env.Error.Code)
+	}
+	if reason, _ := env.Error.Details["reason"].(string); reason != "plan_indeterminate" {
+		t.Errorf("details.reason = %q, want plan_indeterminate", reason)
+	}
+	// ADR-036 no-row invariant: refused pre-Submit → no approval row.
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0 (refused before insert)", len(rows), err)
 	}
 }
 
