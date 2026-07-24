@@ -13,11 +13,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1400,6 +1402,40 @@ func TestResolveGitLabClient(t *testing.T) {
 	})
 }
 
+// gitlabBranchServer is a TLS httptest server answering the single
+// Repository-branch read GetBranchSHA issues, counting requests (atomic) and
+// recording the PRIVATE-TOKEN it saw. It mirrors the forge/gitlab package's
+// countingBranchServer so the serve-seam test can observe which host
+// resolveGitLabForge's constructed adapter actually reaches — proving the
+// per-installation resolver + allowlist opts are forwarded, not dropped. TLS so
+// a resolved base passes account.ValidateResolvedBaseURL's https requirement.
+func gitlabBranchServer(t *testing.T) (*httptest.Server, *int64, *string) {
+	t.Helper()
+	var count int64
+	var gotToken string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/42/repository/branches/{branch}", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&count, 1)
+		gotToken = r.Header.Get("PRIVATE-TOKEN")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"name":"main","commit":{"id":"deadbeef"}}`)
+	})
+	srv := httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &count, &gotToken
+}
+
+// mustHostname returns rawURL's host with any port stripped — the shape
+// account.HostAllowed matches an allowlist entry against.
+func mustHostname(t *testing.T, rawURL string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", rawURL, err)
+	}
+	return u.Hostname()
+}
+
 // TestResolveGitLabForge pins the gated registration of the gitlab
 // forge.Forge adapter (ADR-058 / E45.5, #1859): a complete config
 // (both base URL and token) yields a registerable "gitlab" adapter, and any
@@ -1443,19 +1479,57 @@ func TestResolveGitLabForge(t *testing.T) {
 	})
 	t.Run("threads per-installation resolver + allowlist options", func(t *testing.T) {
 		// The variadic opts (E44.16 / #2094) plumb the per-installation base-URL
-		// resolver + host allowlist onto the underlying factory. Passing them
-		// still constructs a registerable adapter; a nil resolver / empty
-		// allowlist (the no-pool posture) is accepted as a backward-compatible
-		// no-op. The resolver→client→outbound-host cross-boundary behavior is
-		// pinned in the forge/gitlab package's own tests.
-		glForge := resolveGitLabForge("https://gitlab.com", "glpat-tok",
-			forgegitlab.WithResolveBaseURL(func(context.Context, string) (string, error) { return "", nil }),
-			forgegitlab.WithAllowedInstallationHosts([]string{"gitlab.acme.example", ".gitlab.example.com"}))
-		if glForge == nil {
-			t.Fatal("adapter = nil with resolver + allowlist options set, want a constructed adapter")
+		// resolver + host allowlist onto the underlying factory. A non-nil +
+		// Name()=="gitlab" assertion is VACUOUS for this seam — it would pass
+		// unchanged if resolveGitLabForge silently DROPPED the opts. So drive a
+		// real scope-taking forge op through the constructed adapter and observe
+		// the outbound host: if WithResolveBaseURL is dropped the request lands
+		// on the deployment default instead of the resolved host, and if
+		// WithAllowedInstallationHosts is dropped a reachable-but-disallowed
+		// resolved host is admitted instead of failing closed. The forge-package
+		// tests pin the resolver→client→outbound-host contract itself; this pins
+		// that serve.go's helper actually forwards the opts into it.
+
+		// Forwarded resolver → the outbound request lands on the RESOLVED host.
+		resolvedSrv, resolvedCount, _ := gitlabBranchServer(t)
+		defaultSrv, defaultCount, _ := gitlabBranchServer(t)
+		glForge := resolveGitLabForge(defaultSrv.URL, "glpat-tok",
+			forgegitlab.WithHTTPClient(resolvedSrv.Client()),
+			forgegitlab.WithResolveBaseURL(func(context.Context, string) (string, error) { return resolvedSrv.URL, nil }),
+			forgegitlab.WithAllowedInstallationHosts([]string{mustHostname(t, resolvedSrv.URL)}))
+		if glForge == nil || glForge.Name() != "gitlab" {
+			t.Fatalf("adapter = %v, want a constructed gitlab adapter", glForge)
 		}
-		if glForge.Name() != "gitlab" {
-			t.Errorf("Name() = %q, want gitlab", glForge.Name())
+		if _, _, err := glForge.GetBranchSHA(context.Background(),
+			forge.FromRef("gitlab:42"), forge.RepoRef{}, "main"); err != nil {
+			t.Fatalf("GetBranchSHA: %v", err)
+		}
+		if got := atomic.LoadInt64(resolvedCount); got != 1 {
+			t.Errorf("resolved host received %d requests, want 1 (WithResolveBaseURL must reach the factory through resolveGitLabForge)", got)
+		}
+		if got := atomic.LoadInt64(defaultCount); got != 0 {
+			t.Errorf("default host received %d requests, want 0 (a forwarded override wins)", got)
+		}
+
+		// Forwarded allowlist → a reachable-but-disallowed resolved host FAILS
+		// CLOSED. resolvedSrv is reachable, so WITHOUT the allowlist opt this op
+		// would succeed; a non-matching allowlist must make it error and ship
+		// no request (no token to the disallowed host).
+		disSrv, disCount, disToken := gitlabBranchServer(t)
+		glForge = resolveGitLabForge("https://gitlab.com", "glpat-tok",
+			forgegitlab.WithHTTPClient(disSrv.Client()),
+			forgegitlab.WithResolveBaseURL(func(context.Context, string) (string, error) { return disSrv.URL, nil }),
+			forgegitlab.WithAllowedInstallationHosts([]string{"not-the-resolved-host.example"}))
+		_, _, err := glForge.GetBranchSHA(context.Background(),
+			forge.FromRef("gitlab:42"), forge.RepoRef{}, "main")
+		if err == nil {
+			t.Fatal("GetBranchSHA succeeded on a disallowed resolved host, want fail-closed (WithAllowedInstallationHosts must reach the factory through resolveGitLabForge)")
+		}
+		if got := atomic.LoadInt64(disCount); got != 0 {
+			t.Errorf("disallowed host received %d requests, want 0 (token must never ship past the allowlist)", got)
+		}
+		if *disToken != "" {
+			t.Errorf("disallowed host saw PRIVATE-TOKEN = %q, want empty (fail-closed before the token ships)", *disToken)
 		}
 	})
 	t.Run("nil resolver option is a backward-compatible no-op", func(t *testing.T) {

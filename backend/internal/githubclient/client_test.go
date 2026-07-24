@@ -3728,6 +3728,22 @@ func TestApplyInstallationBaseURL_RewriteGate(t *testing.T) {
 			in:   c.uploadEndpoint("/repos/x/y/releases/1/assets?name=n"),
 			want: "https://uploads.github.com/repos/x/y/releases/1/assets?name=n",
 		},
+		{
+			// Security (fix-up): a look-alike host that merely shares the API
+			// base as a TEXTUAL prefix is a DIFFERENT host and must never be
+			// rewritten — otherwise the installation token would ship to the
+			// resolved installation host on a request bound for evil.example.
+			// A bare strings.HasPrefix gate would misclassify this; the
+			// host+path-boundary check (urlTargetsBase) rejects it.
+			name: "look-alike host (shared textual prefix) is NOT rewritten",
+			in:   "https://api.github.com.evil.example/repos/x/y",
+			want: "https://api.github.com.evil.example/repos/x/y",
+		},
+		{
+			name: "unrelated other-host URL is NOT rewritten",
+			in:   "https://example.com/repos/x/y",
+			want: "https://example.com/repos/x/y",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3763,5 +3779,59 @@ func TestClient_StaticTokenPath_NotRewritten(t *testing.T) {
 	}
 	if pf.gotGraphQLAuth != "Bearer pat_projects" {
 		t.Errorf("Authorization = %q, want the projects token on the default host", pf.gotGraphQLAuth)
+	}
+}
+
+// TestApplyInstallationBaseURL_ResolvedBaseShapes pins the URL-surgery edges the
+// applyInstallationBaseURL doc comment promises but the rewrite-gate/cross-
+// boundary tests (bare-host httptest URLs) leave uncovered (#2094 fix-up): a
+// resolved base carrying its OWN path prefix (GHES-style .../api/v3) is honored
+// by APPENDING the endpoint remainder, and a trailing slash on the resolved
+// base — bare-host or path-carrying — is trimmed so it behaves identically to
+// the no-slash form.
+func TestApplyInstallationBaseURL_ResolvedBaseShapes(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name     string
+		resolved string
+		want     string
+	}{
+		{
+			name:     "bare host, no trailing slash",
+			resolved: "https://acme.ghe.com",
+			want:     "https://acme.ghe.com/repos/x/y/contents/z",
+		},
+		{
+			name:     "bare host, trailing slash is trimmed",
+			resolved: "https://acme.ghe.com/",
+			want:     "https://acme.ghe.com/repos/x/y/contents/z",
+		},
+		{
+			name:     "path-carrying override (GHES /api/v3) appends the remainder",
+			resolved: "https://acme.ghe.com/api/v3",
+			want:     "https://acme.ghe.com/api/v3/repos/x/y/contents/z",
+		},
+		{
+			name:     "path-carrying override with trailing slash is trimmed",
+			resolved: "https://acme.ghe.com/api/v3/",
+			want:     "https://acme.ghe.com/api/v3/repos/x/y/contents/z",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Client{
+				BaseURL: "https://api.github.com",
+				ResolveBaseURL: func(context.Context, string) (string, error) {
+					return tc.resolved, nil
+				},
+			}
+			got, err := c.applyInstallationBaseURL(ctx, c.endpoint("/repos/x/y/contents/z"), 5)
+			if err != nil {
+				t.Fatalf("applyInstallationBaseURL: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("applyInstallationBaseURL(resolved=%q) = %q, want %q", tc.resolved, got, tc.want)
+			}
+		})
 	}
 }

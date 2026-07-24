@@ -3264,9 +3264,20 @@ func (c *Client) applyInstallationBaseURL(ctx context.Context, rawURL string, in
 	if apiBase == "" {
 		apiBase = DefaultBaseURL
 	}
-	// Only REST API-base requests are per-installation routable. Upload-host and
-	// any other-host request is left exactly as built.
-	if !strings.HasPrefix(rawURL, apiBase) {
+	uploadBase := c.UploadBaseURL
+	if uploadBase == "" {
+		uploadBase = DefaultUploadBaseURL
+	}
+	// Only REST API-base requests are per-installation routable. An upload-host
+	// request is excluded FIRST — so an upload base that shares a textual prefix
+	// with the API base still wins the classification — and any other-host
+	// request is left exactly as built. The match is host+path-boundary aware
+	// (urlTargetsBase), NOT a bare strings.HasPrefix: a raw prefix test would
+	// misclassify a look-alike host ("https://api.github.com.evil.example/…") or
+	// a longer path segment as the API base and rewrite it to the resolved
+	// installation host, shipping the installation token to a route this rewrite
+	// is explicitly meant to leave untouched (#2094 fix-up, security).
+	if urlTargetsBase(rawURL, uploadBase) || !urlTargetsBase(rawURL, apiBase) {
 		return rawURL, nil
 	}
 	resolved, err := c.ResolveBaseURL(ctx, strconv.FormatInt(installationID, 10))
@@ -3292,6 +3303,25 @@ func (c *Client) applyInstallationBaseURL(ctx context.Context, rawURL string, in
 	// identically; a resolved base carrying its own path prefix (GHES /api/v3)
 	// is honored by appending the remainder.
 	return strings.TrimSuffix(resolved, "/") + strings.TrimPrefix(rawURL, apiBase), nil
+}
+
+// urlTargetsBase reports whether rawURL targets base at a host+path-segment
+// boundary: rawURL must equal base, or the character immediately after base
+// must begin a path/query/fragment ('/', '?', or '#'). This is stricter than a
+// bare strings.HasPrefix, which would treat a look-alike host that merely
+// shares base as a textual prefix as targeting base — "https://api.github.com"
+// is a string-prefix of "https://api.github.com.evil.example", but the latter
+// is a DIFFERENT host and must never be rewritten to the resolved installation
+// host. base is expected to carry no trailing slash (endpoint()/uploadEndpoint()
+// build "<base><path>" with path starting at '/'), so the boundary check both
+// pins the host and prevents a longer path segment from matching a shorter base
+// path prefix.
+func urlTargetsBase(rawURL, base string) bool {
+	if !strings.HasPrefix(rawURL, base) {
+		return false
+	}
+	rest := rawURL[len(base):]
+	return rest == "" || rest[0] == '/' || rest[0] == '?' || rest[0] == '#'
 }
 
 // buildStaticTokenRequest constructs an http.Request authenticated with a
