@@ -166,8 +166,13 @@ func (p *planReviewerOptions) anyReviewerConfigured() bool {
 // and falling back there would send the deployment's Anthropic credential —
 // along with plan and review text — to an operator-supplied host. That is
 // secret exfiltration via configurable egress, so it fails closed with an empty
-// credential (the endpoint refuses the call) and a startup warning naming the
-// missing key.
+// credential and a startup warning naming the missing key. Returning "" is
+// backed by anthropic.NewClient neutralizing the SDK's ambient credential
+// sources (option.WithoutEnvironmentDefaults) whenever the resolved key is
+// empty, so no ambient ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN autoloaded from
+// the deployment shell reaches the operator endpoint either — the protection is
+// the neutralized adapter, not merely an endpoint that refuses an uncredentialed
+// call (#2108).
 func (p *planReviewerOptions) inferenceAPIKey() string {
 	if p.regionKeyWithoutEndpoint() {
 		return ""

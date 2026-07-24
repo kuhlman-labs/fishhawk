@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1756,22 +1757,40 @@ func TestInferenceAPIKey_RegionKeyWinsElseAnthropicKey(t *testing.T) {
 // TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint is the
 // behavioral half of the no-fallback rule: with a custom endpoint configured
 // and NO region-scoped key, the reviewer must not present
-// FISHHAWKD_ANTHROPIC_API_KEY to that endpoint. Asserting the resolved string
-// alone would not prove what the adapter puts on the wire, so this drives a
-// real Review through an httptest endpoint and inspects the observed headers.
+// FISHHAWKD_ANTHROPIC_API_KEY — nor any ambient Anthropic credential — to that
+// endpoint. Asserting the resolved string alone would not prove what the adapter
+// puts on the wire, so this drives the real resolvePlanReviewers -> Default() ->
+// Review path through an httptest endpoint and inspects the observed headers.
+//
+// It proves PRODUCTION behavior, not an environment-cleared artifact: an
+// operator shell commonly exports ambient Anthropic credentials, so this SETS
+// ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN to distinct sentinels (never clears
+// them). With the fix (anthropic.NewClient appending
+// option.WithoutEnvironmentDefaults() on an empty key), the SDK autoloader is
+// suppressed, so a request may legitimately reach the mock carrying NO
+// credential — the security invariant is header-ABSENCE on the wire, not a
+// request count or a NoCredentialsError. The assertion is therefore that neither
+// the deployment key nor either ambient sentinel appears in any observed
+// x-api-key / Authorization header.
 func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing.T) {
-	// Hermetic: the SDK falls back to its own ambient credential sources when
-	// the client carries none, and an operator shell commonly exports these.
-	// Blank them so this asserts OUR resolution, not the host's.
-	t.Setenv("ANTHROPIC_API_KEY", "")
-	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	const (
+		deploymentKey    = "deployment-anthropic-key"
+		ambientAPIKey    = "ambient-api-key-sentinel"
+		ambientAuthToken = "ambient-auth-token-sentinel"
+	)
+	// SET the ambient sources to distinct sentinels — the production posture —
+	// rather than blanking them, so the test proves the autoloader is neutralized
+	// and not merely that the host environment happened to be empty.
+	t.Setenv("ANTHROPIC_API_KEY", ambientAPIKey)
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", ambientAuthToken)
 
-	const deploymentKey = "deployment-anthropic-key"
-	var gotAPIKey, gotAuth string
-	var observed int
+	var mu sync.Mutex
+	var seenAPIKey, seenAuth []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		observed++
-		gotAPIKey, gotAuth = r.Header.Get("x-api-key"), r.Header.Get("Authorization")
+		mu.Lock()
+		seenAPIKey = append(seenAPIKey, r.Header.Get("x-api-key"))
+		seenAuth = append(seenAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant",` +
 			`"content":[{"type":"text","text":"{\"verdict\":\"approve\"}"}],` +
@@ -1796,25 +1815,28 @@ func TestResolvePlanReviewers_DeploymentKeyNeverReachesCustomEndpoint(t *testing
 	if reviewer == nil {
 		t.Fatal("Default() = nil, want the anthropic adapter (the deployment key still selects it)")
 	}
-	// The call fails by design — no credential is presented.
-	_, _, err = reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
-	if err == nil {
-		t.Fatal("Review succeeded with no credential configured; some credential must have been presented")
-	}
+	// Whether this reaches the 200 stub or errors before opening a connection is
+	// irrelevant post-fix: with the autoloader suppressed and an empty explicit
+	// key the request carries no credential either way. The return is ignored;
+	// the observed wire headers are the invariant.
+	_, _, _ = reviewer.Review(context.Background(), "criteria\n### Plan artifact\n\nthe plan")
 
-	// A bare "the key is absent from the observed headers" assertion would pass
-	// vacuously if nothing ever reached the endpoint, so assert the stronger
-	// fact that actually holds: with an empty credential the SDK refuses before
-	// it opens a connection, so NOTHING travels — not the deployment key, and
-	// not the plan text either. (The sibling positive test proves this same
-	// wiring does emit a request when a region key IS configured, so the zero
-	// here is the credential rule biting, not a dead endpoint.)
-	if observed != 0 {
-		t.Errorf("%d request(s) reached the custom endpoint with no region key configured; want none", observed)
-	}
-	if strings.Contains(gotAPIKey, deploymentKey) || strings.Contains(gotAuth, deploymentKey) {
-		t.Errorf("the deployment anthropic key reached the custom endpoint (x-api-key=%q Authorization=%q); "+
-			"FISHHAWKD_ANTHROPIC_API_KEY must never be sent to FISHHAWKD_MODEL_BASE_URL", gotAPIKey, gotAuth)
+	mu.Lock()
+	defer mu.Unlock()
+	// No operator or ambient credential may travel to FISHHAWKD_MODEL_BASE_URL —
+	// one assertion per named credential source, across every observed request.
+	for i := range seenAPIKey {
+		for _, secret := range []struct{ name, val string }{
+			{"deployment FISHHAWKD_ANTHROPIC_API_KEY", deploymentKey},
+			{"ambient ANTHROPIC_API_KEY", ambientAPIKey},
+			{"ambient ANTHROPIC_AUTH_TOKEN", ambientAuthToken},
+		} {
+			if strings.Contains(seenAPIKey[i], secret.val) || strings.Contains(seenAuth[i], secret.val) {
+				t.Errorf("request %d carried the %s to the custom endpoint (x-api-key=%q Authorization=%q); "+
+					"no operator or ambient credential may reach FISHHAWKD_MODEL_BASE_URL",
+					i, secret.name, seenAPIKey[i], seenAuth[i])
+			}
+		}
 	}
 }
 

@@ -163,8 +163,13 @@ The credential fallback is confined to the **default** endpoint. With `FISHHAWKD
 set and `FISHHAWKD_MODEL_API_KEY` unset, `inferenceAPIKey` resolves to the empty string rather than
 the deployment's `FISHHAWKD_ANTHROPIC_API_KEY`: falling back there would send a production
 credential — and the plan/review text it authenticates — to an operator-supplied host, which is
-secret exfiltration via configurable egress. That half-configured posture fails closed (the endpoint
-refuses an uncredentialed call) and logs a startup warning naming the missing key.
+secret exfiltration via configurable egress. That half-configured posture fails closed and logs a
+startup warning naming the missing key. Crucially, the protection does **not** rely on an empty
+explicit key alone: because an empty `X-Api-Key` would not clear an ambient `Authorization: Bearer`
+header, `anthropic.NewClient` appends `option.WithoutEnvironmentDefaults()` whenever the resolved key
+is empty, so the Anthropic SDK adapter **neutralizes its ambient credential sources**
+(`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / profiles) too. A deployment shell's ambient Anthropic
+credential therefore cannot reach the operator-configured region endpoint (#2108).
 
 The **mirror** half-configuration fails closed harder. With `FISHHAWKD_MODEL_API_KEY` set and
 `FISHHAWKD_MODEL_BASE_URL` unset, the SDK would fall back to its **global default** endpoint and
