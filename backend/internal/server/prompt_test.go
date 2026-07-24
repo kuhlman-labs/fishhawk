@@ -2906,6 +2906,120 @@ func TestGetStagePrompt_Implement_FixupConcerns_AmendmentIncluded(t *testing.T) 
 	}
 }
 
+// TestGetStagePrompt_Implement_RetryShowsApprovedAmendment is the #2095 gap #2
+// cross-layer regression. A retried implement stage keeps the SAME stage.ID, so
+// the enforced scope fold (mergeApprovedScopeAmendments, stage-scoped) already
+// re-includes an approved mid-stage amendment on retry — but before this fix the
+// SHOWN scope in the agent prompt (amendedScopeFilesForReview) folded ONLY
+// add_scope_files and never amendments, so the re-run agent could not see paths
+// it was already allowed to touch and defensively re-filed an identical request,
+// burning its last amendment slot. This test constructs a run with an approved
+// amendment on the (retried) implement stage, renders the implement prompt, and
+// asserts: (a) the SHOWN scope names the amendment path, (b) the ENFORCED scope
+// permits it (binding condition 3 — proving the agent will not re-file), and
+// (c) the REVIEW-facing amendedScopeFilesForReview output is UNCHANGED (still
+// excludes amendments — binding condition holds the review baseline).
+func TestGetStagePrompt_Implement_RetryShowsApprovedAmendment(t *testing.T) {
+	rr := newPromptRunRepo()
+	art := newFakeArtifactRepo()
+	sa := newFakeScopeAmendmentRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	// implStageID stands in for the retried stage: fishhawk_retry_stage re-opens
+	// the SAME stage row in place, so the amendment (keyed on this stage.ID) stays
+	// associated across the retry. Re-rendering with the same ID IS the retry path.
+	implStageID := uuid.New()
+
+	const planFile = "backend/internal/server/prompt.go"
+	const amendPath = "backend/internal/server/coupled_seam.go"
+
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: planFile, Operation: plan.FileOpModify}},
+		},
+	}
+	planBytes, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       planStageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {
+			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
+			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
+		},
+	}
+	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+
+	// Approve a mid-stage amendment on the implement stage for an out-of-plan path.
+	seedApprovedAmendment(t, sa, runID, implStageID, amendPath)
+
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ArtifactRepo:       art,
+		ScopeAmendmentRepo: sa,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := promptRenderRequest(t, s, implStageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// (a) SHOWN scope: the amendment path appears in the agent prompt's
+	// "Operator-added scope files" section so the re-run agent sees it.
+	if !contains(resp.Prompt, "Operator-added scope files") {
+		t.Errorf("implement prompt missing the operator-added scope section:\n%s", resp.Prompt)
+	}
+	if !contains(resp.Prompt, amendPath) {
+		t.Errorf("SHOWN scope must name the approved amendment path %q so the agent does not re-file:\n%s", amendPath, resp.Prompt)
+	}
+
+	// (b) ENFORCED scope (binding condition 3): the amendment path is folded into
+	// the runner-enforced scope_files, proving the agent is actually permitted to
+	// touch it on retry (stage.ID preserved → stage-scoped fold re-includes it).
+	enforced := map[string]bool{}
+	for _, f := range resp.ScopeFiles {
+		enforced[f.Path] = true
+	}
+	if !enforced[planFile] {
+		t.Errorf("enforced scope must retain the plan file %q: %+v", planFile, resp.ScopeFiles)
+	}
+	if !enforced[amendPath] {
+		t.Errorf("enforced scope must permit the approved amendment path %q on retry: %+v", amendPath, resp.ScopeFiles)
+	}
+
+	// (c) REVIEW surface unchanged: amendedScopeFilesForReview still EXCLUDES the
+	// amendment (only add_scope_files feeds it), so the reviewer's drift baseline
+	// is not widened by this fix.
+	review := map[string]bool{}
+	for _, path := range s.amendedScopeFilesForReview(context.Background(), rr.getRuns[runID], p) {
+		review[path] = true
+	}
+	if review[amendPath] {
+		t.Errorf("REVIEW-facing amendedScopeFilesForReview must NOT surface the amendment path %q (review baseline unchanged); got %v", amendPath, review)
+	}
+}
+
 // TestGetStagePrompt_Implement_FixupConcerns_ProseConcernPlusAmendment is the
 // #1314 regression test (mode 1): the exact silent-collapse the fix reverses. A
 // fix-up dispatch whose approved plan scope has MULTIPLE files, whose routed

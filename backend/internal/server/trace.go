@@ -3512,6 +3512,68 @@ func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run
 	return amended
 }
 
+// shownScopeFilesForPrompt returns the paths surfaced in the AGENT-facing
+// implement prompt's "Operator-added scope files" section (#2095 gap #2): the
+// union of the run-scoped approval-time add_scope_files
+// (resolveApprovalAddScopeFiles — exactly the set amendedScopeFilesForReview
+// folds) AND the CURRENT stage's APPROVED mid-stage scope amendment paths
+// (resolveApprovedScopeAmendments, the SAME stage filter — a.StageID == stageID
+// — the ENFORCED fold mergeApprovedScopeAmendments applies).
+//
+// It is DELIBERATELY separate from amendedScopeFilesForReview: that helper is
+// shared by the REVIEW trigger surface (trace.go, buildTriggerForReview) whose
+// contract is to fold ONLY resolveApprovalAddScopeFiles and NEVER approved
+// mid-stage amendments — widening the reviewer's drift baseline would be wrong.
+// Only the agent PROMPT gains the amendment paths, so a retried/dispatched
+// implement stage shows the agent the mid-stage-amendment paths it is already
+// permitted to touch and does not defensively re-file an identical request
+// (which would burn its last amendment slot — the #2095 retry_stage incident).
+//
+// The shown set is STAGE-SCOPED by construction — it is a SUBSET of what the
+// enforced fold permits for THIS stage, never a superset — so it can never
+// display a path the runner-side scope gate would reject (category-B). A
+// mid-stage amendment approved on a DIFFERENT stage is NOT folded here.
+//
+// Mirrors amendedScopeFilesForReview's empty-scope philosophy: a nil approvedPlan
+// or empty scope.files → nil; paths already in raw scope.files are excluded
+// (writeApprovedPlan already renders them); returns nil (not an empty slice)
+// when there is nothing to add, keeping the prompt byte-identical when there is
+// no operator addition (audit prompt-hash replay stability).
+func (s *Server) shownScopeFilesForPrompt(ctx context.Context, runRow *run.Run, approvedPlan *plan.Plan, stageID uuid.UUID) []string {
+	if approvedPlan == nil || len(approvedPlan.Scope.Files) == 0 {
+		return nil
+	}
+	inRawScope := make(map[string]struct{}, len(approvedPlan.Scope.Files))
+	for _, f := range approvedPlan.Scope.Files {
+		inRawScope[f.Path] = struct{}{}
+	}
+
+	var shown []string
+	seen := make(map[string]struct{})
+	add := func(paths []string) {
+		for _, p := range paths {
+			if _, ok := inRawScope[p]; ok {
+				continue
+			}
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			shown = append(shown, p)
+		}
+	}
+
+	// The same run-scoped add_scope_files fold amendedScopeFilesForReview uses,
+	// so the review-facing and agent-facing surfaces agree on this channel.
+	add(s.resolveApprovalAddScopeFiles(ctx, runRow))
+	// PLUS the current stage's approved mid-stage amendments — the channel the
+	// review-facing helper deliberately omits. Stage-scoped via the SAME filter
+	// the enforced fold uses (resolveApprovedScopeAmendments, a.StageID ==
+	// stageID), so the shown set is a subset of the enforced permission.
+	add(s.resolveApprovedScopeAmendments(ctx, runRow.ID, stageID))
+	return shown
+}
+
 // approvedAmendmentScopePaths returns the paths of every APPROVED mid-stage
 // scope amendment on the run (#1407). It is the SECOND operator-add provenance
 // channel the operator_scope_path_undelivered signal must union with the
