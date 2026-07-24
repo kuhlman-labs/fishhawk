@@ -21,6 +21,15 @@ const (
 	defaultOrgsURL      = "https://api.github.com/user/orgs"
 )
 
+// gitHubMaxOrgsBytes caps how much of the ListUserOrgKeys response body
+// is read. The orgs read is a single per_page=100 page, so 4 MiB is
+// ~100x a full page. The forge response is semi-trusted input on an
+// authentication path, so an oversized body is REJECTED rather than
+// truncated-and-parsed: a truncated listing would be a partial
+// membership set, and admitting on one is exactly what this client's
+// fail-closed contract forbids. Mirrors gitLabMaxPageBytes.
+const gitHubMaxOrgsBytes = 4 << 20
+
 // OAuthURLs lets tests substitute httptest.Server URLs for the
 // real GitHub endpoints.
 type OAuthURLs struct {
@@ -238,10 +247,18 @@ func (g *GitHubOAuth) ListUserOrgKeys(ctx context.Context, accessToken string) (
 		return nil, fmt.Errorf("auth: orgs endpoint returned %d", resp.StatusCode)
 	}
 
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, gitHubMaxOrgsBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("auth: read orgs: %w", err)
+	}
+	if len(raw) > gitHubMaxOrgsBytes {
+		return nil, fmt.Errorf("auth: orgs response exceeded %d bytes", gitHubMaxOrgsBytes)
+	}
+
 	var body []struct {
 		Login string `json:"login"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(raw, &body); err != nil {
 		return nil, fmt.Errorf("auth: decode orgs: %w", err)
 	}
 	keys := make([]string, 0, len(body))

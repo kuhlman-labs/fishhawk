@@ -3,6 +3,8 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -293,6 +295,68 @@ func TestListUserOrgKeys_EmptyList(t *testing.T) {
 	}
 	if len(keys) != 0 {
 		t.Errorf("keys = %v, want empty", keys)
+	}
+}
+
+// TestListUserOrgKeys_RejectsOversizedBody mirrors
+// TestGitLabMembershipLister_OversizedBody_FailsClosed: an oversized
+// orgs body is REJECTED rather than truncated-and-parsed. The body is
+// valid JSON (whitespace padding inside an empty array) padded past
+// gitHubMaxOrgsBytes, so a truncate-and-parse implementation would
+// happily decode it — only a byte-cap check catches this.
+func TestListUserOrgKeys_RejectsOversizedBody(t *testing.T) {
+	fg, urls := newFakeGitHub(t)
+	fg.orgsResp = "[" + strings.Repeat(" ", gitHubMaxOrgsBytes+1) + "]"
+	o := NewGitHubOAuth("c", "s", "x", urls)
+
+	keys, err := o.ListUserOrgKeys(context.Background(), "tok")
+	if err == nil {
+		t.Fatalf("ListUserOrgKeys = %v, want an error on an oversized body", keys)
+	}
+	if keys != nil {
+		t.Errorf("keys = %v on the oversized-body path, want nil (fail closed)", keys)
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%d bytes", gitHubMaxOrgsBytes)) {
+		t.Errorf("error = %v, want it to name the byte cap", err)
+	}
+}
+
+// erroringBody is an io.ReadCloser whose Read always fails, simulating
+// a connection drop mid-body so ListUserOrgKeys's io.ReadAll surfaces
+// an error distinct from the oversized-body case above.
+type erroringBody struct{}
+
+func (erroringBody) Read([]byte) (int, error) { return 0, errors.New("simulated read failure") }
+func (erroringBody) Close() error             { return nil }
+
+type erroringBodyTransport struct{}
+
+func (erroringBodyTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       erroringBody{},
+	}, nil
+}
+
+// TestListUserOrgKeys_ReadError covers the io.ReadAll error path,
+// distinct from the oversized-body rejection: a body that fails to
+// read (e.g. a dropped connection) must surface as an error, not a
+// decode of a truncated partial body.
+func TestListUserOrgKeys_ReadError(t *testing.T) {
+	_, urls := newFakeGitHub(t)
+	o := NewGitHubOAuth("c", "s", "x", urls)
+	o.http = &http.Client{Transport: erroringBodyTransport{}}
+
+	keys, err := o.ListUserOrgKeys(context.Background(), "tok")
+	if err == nil {
+		t.Fatalf("ListUserOrgKeys = %v, want an error on a body read failure", keys)
+	}
+	if keys != nil {
+		t.Errorf("keys = %v on the read-error path, want nil (fail closed)", keys)
+	}
+	if !strings.Contains(err.Error(), "read orgs") {
+		t.Errorf("error = %v, want it to identify the orgs read", err)
 	}
 }
 
