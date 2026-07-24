@@ -3473,6 +3473,116 @@ func TestAmendedScopeFilesForReview_DoesNotSurfaceReasonProse(t *testing.T) {
 	}
 }
 
+// TestShownScopeFilesForPrompt covers the #2095 gap #2 agent-prompt shown-scope
+// helper: it unions the run-scoped approval-time add_scope_files with the
+// CURRENT stage's approved mid-stage amendments, excludes raw plan scope.files,
+// and — the load-bearing binding-condition-1 property — NEVER folds an amendment
+// approved on a DIFFERENT stage (which would show a path enforcement rejects for
+// this stage → category-B).
+func TestShownScopeFilesForPrompt(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	const addPath = "docs/api/v0.md"
+	const amendPath = "backend/internal/server/amended_test.go"
+
+	approvedPlan := &plan.Plan{
+		Scope: plan.Scope{Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}}},
+	}
+	// setOf collapses a []string into a membership set for order-independent asserts.
+	setOf := func(ss []string) map[string]bool {
+		m := make(map[string]bool, len(ss))
+		for _, s := range ss {
+			m[s] = true
+		}
+		return m
+	}
+
+	t.Run("add_scope_files only", func(t *testing.T) {
+		runID := uuid.New()
+		stageID := uuid.New()
+		s := New(Config{
+			Addr: "127.0.0.1:0",
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithScopeFilesEntry(runID, []string{addPath})},
+			}},
+		})
+		got := setOf(s.shownScopeFilesForPrompt(context.Background(), &run.Run{ID: runID}, approvedPlan, stageID))
+		if !got[addPath] {
+			t.Errorf("add_scope_files path %q must be shown; got %v", addPath, got)
+		}
+		if got[plannedFile] {
+			t.Errorf("raw plan scope file %q must be excluded; got %v", plannedFile, got)
+		}
+	})
+
+	t.Run("amendments only", func(t *testing.T) {
+		runID := uuid.New()
+		stageID := uuid.New()
+		sa := newFakeScopeAmendmentRepo()
+		seedApprovedAmendment(t, sa, runID, stageID, amendPath)
+		s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
+		got := setOf(s.shownScopeFilesForPrompt(context.Background(), &run.Run{ID: runID}, approvedPlan, stageID))
+		if !got[amendPath] {
+			t.Errorf("approved amendment path %q must be shown; got %v", amendPath, got)
+		}
+	})
+
+	t.Run("both channels unioned", func(t *testing.T) {
+		runID := uuid.New()
+		stageID := uuid.New()
+		sa := newFakeScopeAmendmentRepo()
+		seedApprovedAmendment(t, sa, runID, stageID, amendPath)
+		s := New(Config{
+			Addr: "127.0.0.1:0",
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				runID: {makeApproveWithScopeFilesEntry(runID, []string{addPath})},
+			}},
+			ScopeAmendmentRepo: sa,
+		})
+		got := setOf(s.shownScopeFilesForPrompt(context.Background(), &run.Run{ID: runID}, approvedPlan, stageID))
+		if !got[addPath] || !got[amendPath] {
+			t.Errorf("both add_scope_files %q and amendment %q must be shown; got %v", addPath, amendPath, got)
+		}
+	})
+
+	t.Run("empty when no additions", func(t *testing.T) {
+		runID := uuid.New()
+		stageID := uuid.New()
+		s := New(Config{Addr: "127.0.0.1:0"})
+		if got := s.shownScopeFilesForPrompt(context.Background(), &run.Run{ID: runID}, approvedPlan, stageID); got != nil {
+			t.Errorf("no additions must return nil (byte-identical prompt), got %v", got)
+		}
+		// A nil/empty-scope plan also short-circuits to nil.
+		if got := s.shownScopeFilesForPrompt(context.Background(), &run.Run{ID: runID}, nil, stageID); got != nil {
+			t.Errorf("nil plan must return nil, got %v", got)
+		}
+		emptyPlan := &plan.Plan{Scope: plan.Scope{}}
+		if got := s.shownScopeFilesForPrompt(context.Background(), &run.Run{ID: runID}, emptyPlan, stageID); got != nil {
+			t.Errorf("empty-scope plan must return nil, got %v", got)
+		}
+	})
+
+	// BINDING CONDITION 1: an amendment approved on a DIFFERENT stage of the same
+	// run must NOT be shown in THIS stage's prompt — the shown set must be
+	// stage-scoped by the same a.StageID == stageID filter the enforced fold uses.
+	t.Run("amendment on a different stage is not shown", func(t *testing.T) {
+		runID := uuid.New()
+		thisStage := uuid.New()
+		otherStage := uuid.New()
+		const otherStagePath = "backend/internal/server/other_stage.go"
+		sa := newFakeScopeAmendmentRepo()
+		seedApprovedAmendment(t, sa, runID, thisStage, amendPath)
+		seedApprovedAmendment(t, sa, runID, otherStage, otherStagePath)
+		s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
+		got := setOf(s.shownScopeFilesForPrompt(context.Background(), &run.Run{ID: runID}, approvedPlan, thisStage))
+		if !got[amendPath] {
+			t.Errorf("this-stage amendment %q must be shown; got %v", amendPath, got)
+		}
+		if got[otherStagePath] {
+			t.Errorf("amendment approved on a DIFFERENT stage %q must NOT be shown (category-B risk); got %v", otherStagePath, got)
+		}
+	})
+}
+
 func TestGateEvidenceForReview_MapsUndeclaredCategorized(t *testing.T) {
 	staged := 2
 	ev := bundle.GateEvidence{

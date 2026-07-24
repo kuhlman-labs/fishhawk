@@ -271,6 +271,19 @@ Output: ordered `steps_taken[]` (each labeled mechanical vs delegated), the fina
 
 Returns `children[]` (one entry per discovered child, in `plan_decomposed` order), `dispatched_count` (how many were pending and spawned), and `effective_cap` (the cap used; 0 = unlimited). Requires the `fishhawk-runner` binary to resolve on the MCP host, exactly like `fishhawk_run_stage`.
 
+### Pending scope amendment surfacing ([#2095](https://github.com/kuhlman-labs/fishhawk/issues/2095) gap #1)
+
+Because `run_children` holds **one** MCP session and **awaits every child**, a child that files a mid-stage scope amendment cannot have it decided **in-band** — the child's `?wait` long-poll times out and proceeds **as denied**, after which the child either **fails** (the #2095 primary incident) or ships an **inferior fallback** without the amendment. `run_children` observes the child's already-emitted `scope_amendment_pending` runner event (the same `{event, amendment_id, paths}` JSONL seam `run_stage` relays) **post-hoc** and surfaces it:
+
+- Each affected child carries `pending_amendments[]` (`amendment_id` + requested `paths`), and their run ids are listed in the top-level `pending_amendment_children`.
+- A **terminal-state-accurate** recovery warning is appended per child, because re-invoking `run_children` only re-runs children still in a **dispatchable** state (`pending`/`awaiting_host_dispatch`) and **skips terminal ones**:
+  - **Failed child:** `fishhawk_decide_scope_amendment` → `fishhawk_retry_stage` (return the failed implement stage to a dispatchable state) → then re-invoke `fishhawk_run_children` / `fishhawk_dispatch_stage`. Re-invoking `run_children` **alone is a no-op** for a failed child.
+  - **Succeeded child:** it already shipped **without** the amendment; a re-run will **not** reopen it. Decide the amendment, then bring the change in via `fishhawk_fixup_stage` (or review the child's PR).
+  - **Indeterminate child:** when the child's terminal outcome cannot be read from the runner stream (a spawn error, a cancellation, or a missing `runner_completed` event — an empty `outcome`), the guidance **hedges** rather than asserting FAILED: it names **both** the failed-path (`fishhawk_retry_stage`) and succeeded-path (`fishhawk_fixup_stage`) recovery and tells the operator to **inspect the child's `stage_state`** first. Emitting an unconditional `retry_stage` here would be incorrect if the stage were actually succeeded/running/dispatchable.
+- The scan surfaces the runner's **park event**, not the amendment's **current decision state**, so each warning is **hedged** ("appears to have timed out UNDECIDED") and points at `fishhawk_list_scope_amendments` to confirm — under the single-session blocking premise the long-poll times out proceed-as-denied, but a second operator session or an auto-approver could have decided it within the poll window, in which case the child already proceeded **with** the decision and no recovery is needed.
+
+**Limitation (accepted, bounded).** This is **post-hoc** surfacing: it converts a silent timeout into an actionable signal but does **not** prevent the **first-attempt** timeout — the operator still cannot decide the amendment in-band while the blocking fan-out holds the session. True in-band decision needs an out-of-scope runner rearchitecture (detach children + server-side wave sequencing, or a runner-side park-in-progress mechanism); a follow-up tracks it.
+
 ### Topological-wave dispatch (E24.X / [#1278](https://github.com/kuhlman-labs/fishhawk/issues/1278) slice B)
 
 Decompositions whose `sub_plans` declare `depends_on` edges are dispatched in **topological waves** rather than one

@@ -2263,3 +2263,288 @@ func TestRunChildren_CrossBoundary_OrchestratorFanoutToRunChildren(t *testing.T)
 		t.Errorf("spawn seam invoked %d times, want 2", got)
 	}
 }
+
+// --- pending scope amendment surfacing (#2095 gap #1) ---
+
+// amendmentThenCompletedEvents returns an event stream where the child first
+// emits a scope_amendment_pending event (the mid-stage amendment that timed out
+// undecided during the blocking fan-out) and then terminates with a
+// runner_completed of the given outcome.
+func amendmentThenCompletedEvents(amendmentID string, paths []string, outcome string) []RunnerEvent {
+	pathObjs := make([]any, 0, len(paths))
+	for _, p := range paths {
+		pathObjs = append(pathObjs, map[string]any{"path": p, "operation": "modify"})
+	}
+	return []RunnerEvent{
+		{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": amendmentID, "paths": pathObjs}},
+		{Payload: map[string]any{"event": "runner_completed", "outcome": outcome}},
+	}
+}
+
+// warningContaining returns the first warning mentioning needle, or "".
+func warningContaining(warnings []string, needle string) string {
+	for _, w := range warnings {
+		if strings.Contains(w, needle) {
+			return w
+		}
+	}
+	return ""
+}
+
+// TestRunChildren_PendingAmendment_FailedChildGuidesRetry is binding-condition-2
+// branch (a): a child files a mid-stage amendment that times out UNDECIDED and
+// then FAILS (the #2095 primary incident). The amendment (id + paths) is recorded
+// on the child and in pending_amendment_children, and the recovery warning is
+// TERMINAL-STATE-ACCURATE — it names fishhawk_decide_scope_amendment THEN
+// fishhawk_retry_stage (a failed child is not re-run by a bare re-invoke), and
+// does NOT route to fixup (that is the succeeded-child move).
+func TestRunChildren_PendingAmendment_FailedChildGuidesRetry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child := uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+
+	const amendID = "8f14e45f-ceea-467d-9a0c-1a2b3c4d5e6f"
+	const amendPath = "backend/internal/foo/foo_test.go"
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		return amendmentThenCompletedEvents(amendID, []string{amendPath}, "failed"), nil, 1, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if len(out.Children) != 1 {
+		t.Fatalf("want 1 child, got %d", len(out.Children))
+	}
+	c := out.Children[0]
+	if len(c.PendingAmendments) != 1 || c.PendingAmendments[0].AmendmentID != amendID {
+		t.Fatalf("child must record the pending amendment %q; got %+v", amendID, c.PendingAmendments)
+	}
+	if len(c.PendingAmendments[0].Paths) != 1 || c.PendingAmendments[0].Paths[0] != amendPath {
+		t.Errorf("amendment paths = %v, want [%q]", c.PendingAmendments[0].Paths, amendPath)
+	}
+	if len(out.PendingAmendmentChildren) != 1 || out.PendingAmendmentChildren[0] != child.String() {
+		t.Errorf("pending_amendment_children = %v, want [%s]", out.PendingAmendmentChildren, child)
+	}
+	msg := warningContaining(out.Warnings, child.String())
+	if msg == "" {
+		t.Fatalf("no recovery warning naming child %s in %v", child, out.Warnings)
+	}
+	for _, want := range []string{"fishhawk_decide_scope_amendment", "fishhawk_retry_stage"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("failed-child guidance must name %q: %s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "fishhawk_fixup_stage") {
+		t.Errorf("failed-child guidance must NOT route to fixup (that is the succeeded-child move): %s", msg)
+	}
+}
+
+// TestRunChildren_PendingAmendment_SucceededChildGuidesFixup is binding-condition-2
+// branch (b): a child surfaces a mid-stage amendment but ultimately SUCCEEDS — it
+// shipped WITHOUT the amendment (an inferior fallback). The amendment is still
+// recorded (not silently swallowed), and the recovery warning states a re-run will
+// NOT reopen it: it names fishhawk_decide_scope_amendment + fishhawk_fixup_stage and
+// does NOT name fishhawk_retry_stage (which is the failed-child move).
+func TestRunChildren_PendingAmendment_SucceededChildGuidesFixup(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child := uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+
+	const amendID = "1b4e28ba-2fa1-11d2-883f-0016d3cca427"
+	const amendPath = "docs/api/v0.md"
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		return amendmentThenCompletedEvents(amendID, []string{amendPath}, "ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if len(out.Children) != 1 {
+		t.Fatalf("want 1 child, got %d", len(out.Children))
+	}
+	c := out.Children[0]
+	if len(c.PendingAmendments) != 1 || c.PendingAmendments[0].AmendmentID != amendID {
+		t.Fatalf("succeeded child must STILL record the pending amendment %q (not swallowed); got %+v", amendID, c.PendingAmendments)
+	}
+	if len(out.PendingAmendmentChildren) != 1 || out.PendingAmendmentChildren[0] != child.String() {
+		t.Errorf("pending_amendment_children = %v, want [%s]", out.PendingAmendmentChildren, child)
+	}
+	msg := warningContaining(out.Warnings, child.String())
+	if msg == "" {
+		t.Fatalf("no recovery warning naming child %s in %v", child, out.Warnings)
+	}
+	for _, want := range []string{"fishhawk_decide_scope_amendment", "fishhawk_fixup_stage"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("succeeded-child guidance must name %q: %s", want, msg)
+		}
+	}
+	if !strings.Contains(msg, "will NOT reopen") {
+		t.Errorf("succeeded-child guidance must state a re-run will NOT reopen it: %s", msg)
+	}
+	if strings.Contains(msg, "fishhawk_retry_stage") {
+		t.Errorf("succeeded-child guidance must NOT route to retry_stage (that is the failed-child move): %s", msg)
+	}
+}
+
+// TestRunChildren_NoAmendment_NoSurfacing is binding-condition-2 branch (c): a
+// child with NO scope_amendment_pending event produces output identical to today
+// — no pending_amendments, no pending_amendment_children, and no amendment
+// recovery warning (no false surfacing).
+func TestRunChildren_NoAmendment_NoSurfacing(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child := uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if len(out.Children) != 1 || len(out.Children[0].PendingAmendments) != 0 {
+		t.Errorf("no amendment event must leave pending_amendments empty; got %+v", out.Children)
+	}
+	if out.PendingAmendmentChildren != nil {
+		t.Errorf("pending_amendment_children must be nil with no amendment; got %v", out.PendingAmendmentChildren)
+	}
+	if msg := warningContaining(out.Warnings, "scope amendment"); msg != "" {
+		t.Errorf("no amendment must emit no amendment recovery warning; got %q", msg)
+	}
+}
+
+// TestRunChildren_PendingAmendment_IndeterminateChildHedges pins the
+// high/untested_edge fix (#2095): an amendment-emitting child whose runner
+// stream ends with a spawn error and NO runner_completed event has an
+// INDETERMINATE terminal state — it must NOT be misclassified as FAILED and
+// handed a possibly-invalid fishhawk_retry_stage instruction. The guidance must
+// HEDGE: say the outcome could not be determined, name BOTH the failed-path
+// (retry_stage) and succeeded-path (fixup_stage) recovery, and tell the operator
+// to inspect the child's stage_state rather than assume failure.
+func TestRunChildren_PendingAmendment_IndeterminateChildHedges(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child := uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+
+	const amendID = "3d813cbb-47fb-32ba-91df-831e1593ac29"
+	const amendPath = "backend/internal/bar/bar.go"
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		// The child emits the scope_amendment_pending event, then its spawn
+		// errors out with NO runner_completed — an indeterminate terminal state
+		// (empty Outcome).
+		pathObjs := []any{map[string]any{"path": amendPath, "operation": "modify"}}
+		events := []RunnerEvent{
+			{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": amendID, "paths": pathObjs}},
+		}
+		return events, nil, 0, errors.New("fork/exec: process killed before runner_completed")
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if len(out.Children) != 1 {
+		t.Fatalf("want 1 child, got %d", len(out.Children))
+	}
+	c := out.Children[0]
+	// The amendment is still surfaced despite the indeterminate outcome.
+	if len(c.PendingAmendments) != 1 || c.PendingAmendments[0].AmendmentID != amendID {
+		t.Fatalf("indeterminate child must record the pending amendment %q; got %+v", amendID, c.PendingAmendments)
+	}
+	// The child has an empty terminal Outcome (no runner_completed) — the seam the
+	// classifier keys on for indeterminacy.
+	if c.Outcome != "" {
+		t.Fatalf("indeterminate child must have an empty Outcome; got %q", c.Outcome)
+	}
+	if len(out.PendingAmendmentChildren) != 1 || out.PendingAmendmentChildren[0] != child.String() {
+		t.Errorf("pending_amendment_children = %v, want [%s]", out.PendingAmendmentChildren, child)
+	}
+	msg := warningContaining(out.Warnings, child.String())
+	if msg == "" {
+		t.Fatalf("no recovery warning naming child %s in %v", child, out.Warnings)
+	}
+	// The guidance must always name the decide verb.
+	if !strings.Contains(msg, "fishhawk_decide_scope_amendment") {
+		t.Errorf("indeterminate guidance must name fishhawk_decide_scope_amendment: %s", msg)
+	}
+	// It must HEDGE — say the outcome could not be determined and not assume failure.
+	if !strings.Contains(msg, "could NOT be determined") {
+		t.Errorf("indeterminate guidance must state the terminal outcome could not be determined (no FAILED assertion): %s", msg)
+	}
+	if !strings.Contains(msg, "Do NOT assume it failed") {
+		t.Errorf("indeterminate guidance must tell the operator not to assume failure: %s", msg)
+	}
+	// It must name BOTH recovery verbs (failed-path retry, succeeded-path fixup),
+	// unlike the determinate failed/succeeded branches which name exactly one.
+	for _, want := range []string{"fishhawk_retry_stage", "fishhawk_fixup_stage"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("indeterminate guidance must name both recovery verbs (missing %q): %s", want, msg)
+		}
+	}
+}
+
+// TestScanPendingScopeAmendments_MalformedEventsNotSwallowed pins the
+// low/untested_path fix (#2095): scanPendingScopeAmendments's doc contract that a
+// malformed/absent field degrades to an empty value rather than DROPPING the
+// event, so a pending amendment is never silently swallowed. Exercises a
+// missing amendment_id, a non-string amendment_id, a non-[]any paths value, and
+// path entries that are not maps — none of which existing tests (which feed only
+// well-formed events via amendmentThenCompletedEvents) cover.
+func TestScanPendingScopeAmendments_MalformedEventsNotSwallowed(t *testing.T) {
+	events := []RunnerEvent{
+		// (0) missing amendment_id → empty id, well-formed paths preserved.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "paths": []any{map[string]any{"path": "a.go"}}}},
+		// (1) non-string amendment_id → degrades to empty id, event kept.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": 12345, "paths": []any{map[string]any{"path": "b.go"}}}},
+		// (2) non-[]any paths → nil paths, event kept.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": "id-3", "paths": "not-a-list"}},
+		// (3) path entries that are not maps → skipped, event kept.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": "id-4", "paths": []any{"not-a-map", 42}}},
+		// A non-amendment event is correctly ignored (not surfaced).
+		{Payload: map[string]any{"event": "runner_completed", "outcome": "ok"}},
+	}
+	got := scanPendingScopeAmendments(events)
+	// The never-swallowed contract: all four malformed pending events surface.
+	if len(got) != 4 {
+		t.Fatalf("all 4 malformed scope_amendment_pending events must be surfaced (never swallowed); got %d: %+v", len(got), got)
+	}
+	if got[0].AmendmentID != "" || len(got[0].Paths) != 1 || got[0].Paths[0] != "a.go" {
+		t.Errorf("missing amendment_id must degrade to empty id with paths preserved; got %+v", got[0])
+	}
+	if got[1].AmendmentID != "" || len(got[1].Paths) != 1 || got[1].Paths[0] != "b.go" {
+		t.Errorf("non-string amendment_id must degrade to empty id with paths preserved; got %+v", got[1])
+	}
+	if got[2].AmendmentID != "id-3" || len(got[2].Paths) != 0 {
+		t.Errorf("non-[]any paths must degrade to nil paths with the event kept; got %+v", got[2])
+	}
+	if got[3].AmendmentID != "id-4" || len(got[3].Paths) != 0 {
+		t.Errorf("non-map path entries must be skipped with the event kept; got %+v", got[3])
+	}
+}
