@@ -67,6 +67,15 @@ var fileWritingTools = map[string]string{
 // (#580). Used when Invoker.HeartbeatInterval is zero.
 const defaultHeartbeatInterval = 15 * time.Second
 
+// quotaUnavailableMaxWall bounds the "instant post-init exit" window that
+// fingerprints a model-quota exhaustion (a usage / rate cap): a non-zero
+// exit that reached no model call within this long of spawn is the
+// "cannot obtain model quota" shape from run a75b0765 (#2085). It is a
+// conservative heuristic guard, not a precise marker — a slow zero-token
+// HANG is NOT a cap — so it is set generously (well past the few-second
+// real-world observation) rather than tight. See isQuotaUnavailable.
+const quotaUnavailableMaxWall = 30 * time.Second
+
 // Invoker is the agent.Invoker implementation for Claude Code.
 type Invoker struct {
 	// Binary is the executable name or absolute path. Empty means
@@ -629,6 +638,10 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// absent). A 5xx value denotes a terminal external-API incident (the
 	// agent's in-run retries were exhausted), lifted below onto the Result.
 	apiStatus := terminalAPIErrorStatus(resultPayload)
+	// elapsed is the wall-clock span from spawn to the terminal switch,
+	// derived from the same fake-clock seam (now/start) the heartbeat uses,
+	// so the quota-unavailable wall-clock bound is deterministic in tests.
+	elapsed := now().Sub(start)
 
 	switch {
 	case budgetHit:
@@ -675,6 +688,27 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			fmt.Sprintf("terminal external API error %d (retries exhausted): %v", apiStatus, waitErr),
 			"external_api",
 		), false, fmt.Errorf("%w: %v", agent.ErrExternalAPI, waitErr)
+
+	case isQuotaUnavailable(waitErr, tokensUsed, model, elapsed):
+		// Model-quota exhaustion (a usage / rate cap): the agent exited
+		// non-zero having reached no model call (0 tokens, no model id) within
+		// a short wall-clock bound of spawn, after runner-side init already
+		// succeeded — the "cannot obtain model quota" fingerprint (#2085 / run
+		// a75b0765). Category "A" (agent-surface) but the
+		// ErrAgentQuotaUnavailable sentinel plus the stable "could not obtain
+		// model quota" reason phrase let the operator surface tell it apart
+		// from a transient crash. NOT retried in-driver (false): re-running the
+		// same prompt against an unreset cap would fail identically. Checked
+		// AFTER the thinking-block and external-API arms so a fast zero-token
+		// exit that ALSO carried a thinking-block marker or a 5xx
+		// api_error_status still classifies as those; a failure with tokens>0,
+		// a model id, or elapsed over the bound falls through unchanged to the
+		// generic agent_error arm.
+		return failureResult(res, now(), "A",
+			fmt.Sprintf("could not obtain model quota (likely a usage/rate cap): agent exited with %v after %s having made no model call (0 tokens)",
+				waitErr, elapsed.Round(time.Second)),
+			"agent_quota_unavailable",
+		), false, fmt.Errorf("%w: %v", agent.ErrAgentQuotaUnavailable, waitErr)
 
 	case waitErr != nil:
 		return failureResult(res, now(), "A",
@@ -743,6 +777,24 @@ func terminalAPIErrorStatus(resultPayload []byte) int {
 		return *meta.APIErrorStatus
 	}
 	return 0
+}
+
+// isQuotaUnavailable reports whether a failed attempt matches the
+// model-quota-exhaustion fingerprint (#2085): the agent exited non-zero
+// (waitErr != nil) having reached NO model call — zero reported tokens
+// (tokensUsed == 0) AND no model id seen (model == "") — within a short
+// wall-clock bound of spawn (elapsed <= quotaUnavailableMaxWall). model=="" is
+// the load-bearing "no model call was reached" signal: only assistant/result
+// stream-json events carry a model id, and system.init does not (see the
+// pin comment near the model-id capture in the scan loop), so an empty model
+// means no model turn ever started. tokensUsed==0 discriminates a
+// cap-exhausted session (0 tokens) from a genuine transient crash (which
+// reports non-zero usage — run a75b0765's ~52000-token crash). The wall-clock
+// bound is a conservative guard so a slow zero-token HANG is not mislabeled a
+// cap. Mirrors isThinkingBlock400 as a pure, side-effect-free helper the
+// terminal switch keys an arm on.
+func isQuotaUnavailable(waitErr error, tokensUsed int, model string, elapsed time.Duration) bool {
+	return waitErr != nil && tokensUsed == 0 && model == "" && elapsed <= quotaUnavailableMaxWall
 }
 
 func (i *Invoker) now() time.Time {

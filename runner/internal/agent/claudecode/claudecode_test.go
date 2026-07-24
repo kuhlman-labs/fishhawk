@@ -68,8 +68,33 @@ func TestHelperProcess(t *testing.T) {
 		// cleanly the test still validates that budget was hit.
 		time.Sleep(200 * time.Millisecond)
 	case "error":
+		// A GENERIC agent crash that reached a model call and made progress
+		// (a model id + non-zero token usage) before dying non-zero — the
+		// realistic transient-crash shape (#2085 run a75b0765: ~52000 tokens).
+		// The tokens>0 / model!="" progress signal is what keeps this on the
+		// generic agent_error path and OFF the model-quota-unavailable
+		// fingerprint (0 tokens + no model). See isQuotaUnavailable.
 		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"assistant","message":{"model":"claude-opus-4-8","usage":{"input_tokens":30,"output_tokens":12}}}`)
 		fmt.Fprintln(os.Stderr, "agent: model rate-limited")
+		helperExit(1)
+	case "quota_unavailable":
+		// Post-init exit having reached NO model call: only a system.init
+		// event (which carries no model id), no assistant/result usage line
+		// (so 0 tokens), then a non-zero exit — the model-quota-exhaustion
+		// fingerprint (#2085). With a fast fake clock elapsed stays under the
+		// wall-clock bound, so isQuotaUnavailable matches.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Fprintln(os.Stderr, "cannot obtain model quota")
+		helperExit(1)
+	case "quota_model_seen":
+		// Zero-token, fast, non-zero exit but WITH a model id surfaced (an
+		// assistant event carrying model but no usage) — a model call WAS
+		// reached, so model!="" and this must fall through to agent_error, not
+		// quota. Isolates the model discriminator.
+		fmt.Println(`{"type":"system","subtype":"init"}`)
+		fmt.Println(`{"type":"assistant","message":{"model":"claude-opus-4-8"}}`)
+		fmt.Fprintln(os.Stderr, "agent crashed after first model turn")
 		helperExit(1)
 	case "external_api_529":
 		// Emit a terminal result event carrying a 5xx api_error_status
@@ -1843,6 +1868,196 @@ func TestInvokeOnce_ProgressSinkReturnsPromptly(t *testing.T) {
 				// Returned — the heartbeat goroutine was joined, no hang.
 			case <-time.After(5 * time.Second):
 				t.Fatal("invokeOnce did not return within 5s — goroutine leak / hang")
+			}
+		})
+	}
+}
+
+// steppedNow returns a fake clock that advances by step on every call. It
+// generalizes frozenNow (which advances 1ms): a large step drives the
+// invokeOnce elapsed = now().Sub(start) span past quotaUnavailableMaxWall
+// deterministically, with no wall-clock flakiness (#2085).
+func steppedNow(step time.Duration) func() time.Time {
+	t := time.Date(2026, 5, 2, 9, 30, 0, 0, time.UTC)
+	return func() time.Time {
+		t = t.Add(step)
+		return t
+	}
+}
+
+// terminalOutcome returns the "outcome" string stamped on the invocation_end
+// event (the shipped classification the bundle carries), or "" if absent.
+func terminalOutcome(res agent.Result) string {
+	for i := len(res.Events) - 1; i >= 0; i-- {
+		if res.Events[i].Kind != "invocation_end" {
+			continue
+		}
+		var p struct {
+			Outcome string `json:"outcome"`
+		}
+		if err := json.Unmarshal(res.Events[i].Payload, &p); err == nil {
+			return p.Outcome
+		}
+	}
+	return ""
+}
+
+func countInvocationStarts(res agent.Result) int {
+	n := 0
+	for _, ev := range res.Events {
+		if ev.Kind == "invocation_start" {
+			n++
+		}
+	}
+	return n
+}
+
+// TestInvoke_QuotaUnavailable asserts the model-quota-exhaustion arm (#2085):
+// a non-zero exit that reached no model call (0 tokens, no model id) within the
+// wall-clock bound is classified category-A with the ErrAgentQuotaUnavailable
+// sentinel, the stable "could not obtain model quota" reason phrase, the
+// agent_quota_unavailable outcome, and NO retry (single attempt).
+func TestInvoke_QuotaUnavailable(t *testing.T) {
+	inv := &Invoker{
+		Cmd:                     helperCommand("quota_unavailable"),
+		Now:                     frozenNow(),
+		MaxThinkingBlockRetries: 1,
+	}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{})
+	if !errors.Is(err, agent.ErrAgentQuotaUnavailable) {
+		t.Fatalf("err = %v, want wrapping ErrAgentQuotaUnavailable", err)
+	}
+	// A quota exhaustion is neither the thinking-block fault nor an
+	// external-API incident.
+	if errors.Is(err, agent.ErrAgentThinkingBlock) || errors.Is(err, agent.ErrExternalAPI) {
+		t.Errorf("quota failure misclassified: %v", err)
+	}
+	// It deliberately does NOT wrap ErrAgentFailed — it is a peer sentinel, so
+	// err_class classification stays unambiguous.
+	if errors.Is(err, agent.ErrAgentFailed) {
+		t.Error("ErrAgentQuotaUnavailable must NOT wrap ErrAgentFailed (peer sentinel)")
+	}
+	if res.OK {
+		t.Error("OK = true on quota exhaustion")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A", res.FailureCategory)
+	}
+	if !strings.Contains(res.FailureReason, "could not obtain model quota") {
+		t.Errorf("FailureReason = %q, want the stable quota phrase", res.FailureReason)
+	}
+	if got := terminalOutcome(res); got != "agent_quota_unavailable" {
+		t.Errorf("invocation_end outcome = %q, want agent_quota_unavailable", got)
+	}
+	if got := countInvocationStarts(res); got != 1 {
+		t.Errorf("invocation_start count = %d, want 1 (quota is not retried in-driver)", got)
+	}
+}
+
+// TestInvoke_QuotaFingerprintNegativeAndPrecedence drives the terminal switch
+// through every negative / precedence mode of the quota fingerprint, asserting
+// the SHIPPED sentinel + outcome per mode (#2085):
+//   - tokens>0 (a real crash that made progress) => generic agent_error
+//   - model!="" (a model call WAS reached) => generic agent_error
+//   - elapsed>bound (a slow zero-token hang) => generic agent_error
+//   - PRECEDENCE: a zero-token fast exit ALSO carrying a thinking-block marker
+//     still classifies thinking-block; one carrying a 5xx api_error_status
+//     still classifies external-API.
+func TestInvoke_QuotaFingerprintNegativeAndPrecedence(t *testing.T) {
+	cases := []struct {
+		name        string
+		mode        string
+		now         func() time.Time
+		maxRetries  int
+		wantErr     error
+		wantOutcome string
+		notQuota    bool
+	}{
+		{
+			name:        "tokens_present_stays_agent_error",
+			mode:        "error", // emits model + non-zero usage before exit
+			now:         frozenNow(),
+			wantErr:     agent.ErrAgentFailed,
+			wantOutcome: "agent_error",
+			notQuota:    true,
+		},
+		{
+			name:        "model_seen_stays_agent_error",
+			mode:        "quota_model_seen", // 0 tokens but a model id surfaced
+			now:         frozenNow(),
+			wantErr:     agent.ErrAgentFailed,
+			wantOutcome: "agent_error",
+			notQuota:    true,
+		},
+		{
+			name:        "elapsed_over_bound_stays_agent_error",
+			mode:        "quota_unavailable",          // the fingerprint shape...
+			now:         steppedNow(40 * time.Second), // ...but elapsed > 30s bound
+			wantErr:     agent.ErrAgentFailed,
+			wantOutcome: "agent_error",
+			notQuota:    true,
+		},
+		{
+			name:        "thinking_block_wins_over_quota",
+			mode:        "thinking_block", // 0 tokens, no model, fast — matches quota shape
+			now:         frozenNow(),
+			maxRetries:  0, // no retry so the first-attempt classification is terminal
+			wantErr:     agent.ErrAgentThinkingBlock,
+			wantOutcome: "agent_api_thinking_block",
+			notQuota:    true,
+		},
+		{
+			name:        "external_api_wins_over_quota",
+			mode:        "external_api_529", // 0 tokens, no model, fast — matches quota shape
+			now:         frozenNow(),
+			maxRetries:  1,
+			wantErr:     agent.ErrExternalAPI,
+			wantOutcome: "external_api",
+			notQuota:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inv := &Invoker{Cmd: helperCommand(tc.mode), Now: tc.now, MaxThinkingBlockRetries: tc.maxRetries}
+			res, err := inv.Invoke(context.Background(), agent.Invocation{})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want wrapping %v", err, tc.wantErr)
+			}
+			if tc.notQuota && errors.Is(err, agent.ErrAgentQuotaUnavailable) {
+				t.Errorf("err = %v, must NOT be classified as quota-unavailable", err)
+			}
+			if got := terminalOutcome(res); got != tc.wantOutcome {
+				t.Errorf("invocation_end outcome = %q, want %q", got, tc.wantOutcome)
+			}
+		})
+	}
+}
+
+// TestIsQuotaUnavailable pins the pure fingerprint helper directly: true iff a
+// non-zero exit reached no model call (0 tokens, no model) within the bound;
+// each discriminator flips it off (#2085).
+func TestIsQuotaUnavailable(t *testing.T) {
+	errExit := errors.New("exit status 1")
+	cases := []struct {
+		name    string
+		waitErr error
+		tokens  int
+		model   string
+		elapsed time.Duration
+		want    bool
+	}{
+		{"positive_fast_zero_token_no_model", errExit, 0, "", 5 * time.Second, true},
+		{"boundary_at_bound_is_inclusive", errExit, 0, "", quotaUnavailableMaxWall, true},
+		{"tokens_present", errExit, 52000, "", 5 * time.Second, false},
+		{"model_present", errExit, 0, "claude-opus-4-8", 5 * time.Second, false},
+		{"elapsed_over_bound", errExit, 0, "", quotaUnavailableMaxWall + time.Nanosecond, false},
+		{"no_wait_err", nil, 0, "", 5 * time.Second, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isQuotaUnavailable(tc.waitErr, tc.tokens, tc.model, tc.elapsed); got != tc.want {
+				t.Errorf("isQuotaUnavailable(%v, %d, %q, %s) = %v, want %v",
+					tc.waitErr, tc.tokens, tc.model, tc.elapsed, got, tc.want)
 			}
 		})
 	}

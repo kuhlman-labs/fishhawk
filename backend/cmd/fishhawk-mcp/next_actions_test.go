@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
 
 // --- fixture helpers -------------------------------------------------------
@@ -871,6 +876,65 @@ func TestNextActions_FailedRunOffersReviveRun(t *testing.T) {
 			}
 			if !strings.Contains(lower, "fishhawk_retry_stage") {
 				t.Errorf("revive reason must contrast with fishhawk_retry_stage; got %q", revive.Reason)
+			}
+		})
+	}
+}
+
+// TestNextActions_CategoryAQuotaCitation pins the #2085 quota hint: a
+// category-A failure whose reason carries the runner's stable "could not obtain
+// model quota" phrase steers the operator to wait for the cap to reset (and
+// says it is not a transient crash) rather than burning retry budget; a plain
+// category-A failure keeps the generic retry reason. This locks the parse end
+// of the runner->next_actions FailureReason string contract (the emit end is
+// locked in the runner's claudecode/main tests).
+func TestNextActions_CategoryAQuotaCitation(t *testing.T) {
+	run := naRun("failed")
+	cited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
+		naFailedImplement("A", "could not obtain model quota (likely a usage/rate cap): agent exited with exit status 1 after 2s having made no model call (0 tokens)")},
+		nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+	retry := findAction(t, cited, "fishhawk_retry_stage")
+	if !strings.Contains(retry.Reason, "wait for the cap to reset") {
+		t.Errorf("retry reason should tell the operator to wait for the cap to reset; got %q", retry.Reason)
+	}
+	if !strings.Contains(retry.Reason, "not a transient crash") {
+		t.Errorf("retry reason should distinguish quota from a transient crash; got %q", retry.Reason)
+	}
+
+	// A plain category-A failure keeps the generic reason and names no quota cap.
+	uncited := nextActionsFor(run, []Stage{naStage("plan", "succeeded"),
+		naFailedImplement("A", "agent crashed")}, nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+	retry = findAction(t, uncited, "fishhawk_retry_stage")
+	if strings.Contains(retry.Reason, "wait for the cap to reset") || strings.Contains(retry.Reason, "model quota") {
+		t.Errorf("generic category-A retry reason must not cite a quota cap: %q", retry.Reason)
+	}
+}
+
+// TestCitedQuotaUnavailable pins the nil-safe fingerprint helper: the stable
+// quota phrase yields true; a nil stage, nil reason, or an unrelated reason
+// yield false so the caller keeps the generic hint.
+func TestCitedQuotaUnavailable(t *testing.T) {
+	mk := func(reason string) *Stage {
+		s := naStage("implement", "failed")
+		if reason != "__nil__" {
+			s.FailureReason = &reason
+		}
+		return &s
+	}
+	cases := []struct {
+		name  string
+		stage *Stage
+		want  bool
+	}{
+		{"nil stage", nil, false},
+		{"nil reason", mk("__nil__"), false},
+		{"absent phrase", mk("agent exited with error: exit status 1"), false},
+		{"quota phrase", mk("could not obtain model quota (likely a usage/rate cap): x"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := citedQuotaUnavailable(tc.stage); got != tc.want {
+				t.Errorf("citedQuotaUnavailable = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -2038,4 +2102,148 @@ func TestNextActions_ReleaseStates(t *testing.T) {
 			}
 		}
 	})
+}
+
+// quotaSeamRepo is a minimal runmodel.Repository sufficient to walk the
+// stage-failure-reason PERSIST -> READ seam end to end: runmodel.FailStage
+// (persist) uses GetStage + TransitionStage, the backend's GET
+// /v0/runs/{id}/stages read handler uses GetRun (via requireRunAccount) +
+// ListStagesForRun. Every other method is promoted from the embedded nil
+// interface and is never called on this path. It is deliberately NOT a
+// StageCASTransitioner, so runmodel.FailStage takes its non-CAS branch.
+type quotaSeamRepo struct {
+	runmodel.Repository
+	mu     sync.Mutex
+	runRow *runmodel.Run
+	stages map[uuid.UUID]*runmodel.Stage
+}
+
+func (r *quotaSeamRepo) GetRun(_ context.Context, id uuid.UUID) (*runmodel.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.runRow != nil && r.runRow.ID == id {
+		cp := *r.runRow
+		return &cp, nil
+	}
+	return nil, runmodel.ErrNotFound
+}
+
+func (r *quotaSeamRepo) GetStage(_ context.Context, id uuid.UUID) (*runmodel.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stages[id]
+	if !ok {
+		return nil, runmodel.ErrNotFound
+	}
+	cp := *s
+	return &cp, nil
+}
+
+func (r *quotaSeamRepo) TransitionStage(_ context.Context, id uuid.UUID, to runmodel.StageState, c *runmodel.StageCompletion) (*runmodel.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stages[id]
+	if !ok {
+		return nil, runmodel.ErrNotFound
+	}
+	s.State = to
+	if c != nil {
+		s.FailureCategory = c.FailureCategory
+		s.FailureReason = c.FailureReason
+	}
+	cp := *s
+	return &cp, nil
+}
+
+func (r *quotaSeamRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*runmodel.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []*runmodel.Stage
+	for _, s := range r.stages {
+		if s.RunID == runID {
+			cp := *s
+			out = append(out, &cp)
+		}
+	}
+	return out, nil
+}
+
+// TestNextActions_QuotaReasonSurvivesPersistAndRead is the transit-coverage
+// integration test for the #2085 quota classification (binding operator
+// condition 1). It walks the BACKEND half of the runner->operator seam end to
+// end: a realistic-length quota FailureReason is PERSISTED via the exact call
+// the runner's trace-upload path makes (runmodel.FailStage with FailureA), then READ
+// back through the real backend GET /v0/runs/{id}/stages HTTP handler
+// (ListStagesForRun -> toStageResponse -> JSON) by the real MCP client, and fed
+// to implementFailedNextActions. The classifier must yield the quota-aware
+// guidance ("wait for the cap to reset", "not a transient crash") with the
+// phrase INTACT — so any truncation/transform of FailureReason in persistence
+// or read (the two go.work modules can't share the literal, the #1548
+// limitation) fails this test rather than silently degrading the operator hint.
+func TestNextActions_QuotaReasonSurvivesPersistAndRead(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	repo := &quotaSeamRepo{
+		// Untenanted run (AccountID ""), so the readAccess account gate admits
+		// the anonymous identity the test's tokenless client carries.
+		runRow: &runmodel.Run{ID: runID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", State: runmodel.StateFailed},
+		stages: map[uuid.UUID]*runmodel.Stage{
+			stageID: {
+				ID:           stageID,
+				RunID:        runID,
+				Sequence:     1,
+				Type:         runmodel.StageTypeImplement,
+				ExecutorKind: runmodel.ExecutorAgent,
+				ExecutorRef:  "claude-code",
+				State:        runmodel.StageStateRunning, // failable in one step
+			},
+		},
+	}
+
+	// The verbatim, realistic-length reason the runner's claudecode adapter
+	// emits for a model-quota exhaustion. Persisted via the actual FailStage
+	// call the trace-upload handler uses.
+	const quotaReason = "could not obtain model quota (likely a usage/rate cap): agent exited with exit status 1 after 2s having made no model call (0 tokens)"
+	if _, err := runmodel.FailStage(context.Background(), repo, stageID, runmodel.FailureA, quotaReason); err != nil {
+		t.Fatalf("FailStage (persist): %v", err)
+	}
+
+	// Serve the real backend stage-read handler over HTTP.
+	srv := server.New(server.Config{RunRepo: repo})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Read the persisted stage back through the real MCP client.
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	stages, err := client.ListRunStages(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListRunStages (read): %v", err)
+	}
+	var impl *Stage
+	for i := range stages {
+		if stages[i].Type == "implement" {
+			impl = &stages[i]
+			break
+		}
+	}
+	if impl == nil {
+		t.Fatalf("no implement stage read back; got %+v", stages)
+	}
+	if impl.FailureCategory == nil || *impl.FailureCategory != "A" {
+		t.Fatalf("FailureCategory = %v, want A", impl.FailureCategory)
+	}
+	// The phrase must survive persistence + read byte-for-byte.
+	if impl.FailureReason == nil || *impl.FailureReason != quotaReason {
+		t.Fatalf("FailureReason did not survive persist->read intact:\n got  %v\n want %q", impl.FailureReason, quotaReason)
+	}
+
+	// Feed the read-back stage to the classifier and assert the quota guidance.
+	na := implementFailedNextActions(naRun("failed"), nil, nil, impl)
+	retry := findAction(t, na, "fishhawk_retry_stage")
+	if !strings.Contains(retry.Reason, "wait for the cap to reset") {
+		t.Errorf("retry reason should tell the operator to wait for the cap to reset; got %q", retry.Reason)
+	}
+	if !strings.Contains(retry.Reason, "not a transient crash") {
+		t.Errorf("retry reason should distinguish quota from a transient crash; got %q", retry.Reason)
+	}
 }

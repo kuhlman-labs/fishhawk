@@ -2839,6 +2839,8 @@ func classifyErr(err error) string {
 		return "loop_detected"
 	case errors.Is(err, agent.ErrExternalAPI):
 		return "external_api"
+	case errors.Is(err, agent.ErrAgentQuotaUnavailable):
+		return "agent_quota_unavailable"
 	case errors.Is(err, agent.ErrAgentFailed):
 		return "agent_failed"
 	default:

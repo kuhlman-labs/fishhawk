@@ -758,6 +758,12 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 		// than immediately burning a retry slot re-hitting the same incident.
 		if status, ok := citedExternalAPIStatus(impl); ok {
 			reason = fmt.Sprintf("category-A failure from a terminal external API error %d (e.g. 529 overloaded) — likely an upstream incident, not a task failure; back off before fishhawk_retry_stage and check status.claude.com", status)
+		} else if citedQuotaUnavailable(impl) {
+			// Model-quota exhaustion (a usage / rate cap, #2085): a retry
+			// against an unreset cap fails identically, so tell the operator to
+			// wait for the cap to reset rather than burn retry budget. Checked
+			// after the external-API 5xx arm and before the flake arm.
+			reason = "category-A failure: the agent could not obtain model quota (likely a usage/rate cap) — this is not a transient crash and will fail identically until the limit resets; wait for the cap to reset before fishhawk_retry_stage rather than burning retry budget against the wall"
 		} else if flake := citedFlakeEvent(impl); flake != "" {
 			reason = fmt.Sprintf("category-A failure whose detail cites %s — an absorbed infra flake recurred; a retry is the cheapest next step", flake)
 		}
@@ -1456,6 +1462,28 @@ func citedExternalAPIStatus(s *Stage) (int, bool) {
 		return 0, false
 	}
 	return status, true
+}
+
+// quotaUnavailableReasonPhrase is the stable phrase the runner's claudecode
+// adapter embeds in a model-quota-exhaustion failure reason ("could not
+// obtain model quota (likely a usage/rate cap): …", #2085). next_actions
+// substring-matches it to give the operator a quota-aware retry hint (wait
+// for the cap to reset rather than burning retry budget). It is a best-effort
+// string contract — no backend Stage-field plumbing — mirroring the
+// externalAPIReasonPhrase / citedFlakeEvent discipline. The runner and backend
+// are separate go.work modules and cannot share the constant, so the runner
+// emits this exact prefix and the backend reads it (same #1548 limitation).
+const quotaUnavailableReasonPhrase = "could not obtain model quota"
+
+// citedQuotaUnavailable reports whether the stage's failure reason cites the
+// runner's model-quota-exhaustion phrase. Nil-safe and fail-soft: a nil stage
+// or nil reason yields false, so a plain category-A failure keeps its generic
+// retry hint.
+func citedQuotaUnavailable(s *Stage) bool {
+	if s == nil || s.FailureReason == nil {
+		return false
+	}
+	return strings.Contains(*s.FailureReason, quotaUnavailableReasonPhrase)
 }
 
 // citedFlakeEvent returns the known flake trace-event name the stage's
