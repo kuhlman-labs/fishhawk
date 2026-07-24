@@ -373,4 +373,28 @@ func TestEngineLatestRuleIs(t *testing.T) {
 	if (&Engine{Audit: auEmpty}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
 		t.Error("LatestRuleIs = true on an empty trail; want false")
 	}
+
+	// (e) malformed HIGHEST-sequence entry: LatestRuleIs skips the undecodable
+	// newest entry and derives from the last DECODABLE one — mirroring
+	// applyDriveSurfaces' identical skip-undecodable/take-last loop (runs.go),
+	// so the engine and GET /v0/runs derived_status stay in agreement even
+	// when the newest entry is corrupt (a divergent fail-open here would let
+	// the engine re-stamp while derived_status still reads the older entry).
+	// Concretely: with a decodable RuleAcceptancePending at seq 3 and an
+	// undecodable entry at seq 12, both derivations land on acceptance_pending,
+	// so LatestRuleIs returns true and the arm correctly suppresses a duplicate
+	// re-stamp. Pins the #2122 fix-up-review malformed-payload edge path.
+	badPayload := &audit.Entry{ID: uuid.New(), RunID: &runID, Sequence: 12, Category: Category, Payload: []byte("{not valid advance json")}
+	auMalformedLatest := &auditStub{entries: []*audit.Entry{
+		seqEntry(runID, 3, RuleAcceptancePending),
+		badPayload,
+	}}
+	if !(&Engine{Audit: auMalformedLatest}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = false when the highest-sequence entry is undecodable and the last decodable entry names the rule; want true (mirrors applyDriveSurfaces skip-undecodable/take-last)")
+	}
+	// ...and false for a rule that only the undecodable entry might have named:
+	// a malformed newest entry cannot be treated as the latest rule.
+	if (&Engine{Audit: auMalformedLatest}).LatestRuleIs(ctx, runID, RuleFixupRereviewRepark) {
+		t.Error("LatestRuleIs = true for a rule not named by any decodable entry; want false")
+	}
 }

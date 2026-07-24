@@ -468,6 +468,14 @@ func (e *Engine) Recorded(ctx context.Context, runID uuid.UUID, stageID *uuid.UU
 // worst one duplicate". This is symmetric with Recorded's fail-open
 // (the same ListForRunByCategory read on the same tick cadence), so it
 // introduces no new failure class.
+//
+// A malformed HIGHEST-sequence entry is NOT a fail-open case: like
+// applyDriveSurfaces' identical skip-undecodable/take-last loop, this
+// method continues past the undecodable newest entry and derives from
+// the last DECODABLE one. That keeps the engine and derived_status in
+// agreement on a corrupt newest entry (both read the same older entry) —
+// a divergent fail-open here would let the engine re-stamp while
+// derived_status still surfaces the older entry.
 func (e *Engine) LatestRuleIs(ctx context.Context, runID uuid.UUID, rule Rule) bool {
 	if e == nil || e.Audit == nil {
 		return false
