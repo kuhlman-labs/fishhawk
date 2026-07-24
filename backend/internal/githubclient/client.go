@@ -24,9 +24,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 )
@@ -189,6 +191,49 @@ type Client struct {
 	// is unchanged. It is backend config, never run data — it MUST
 	// NOT be logged, traced, or included in any error message.
 	ProjectsToken string
+
+	// ResolveBaseURL, when non-nil, resolves the per-installation REST API base
+	// URL for an installation (Mode 2, data-resident installs on
+	// <slug>.ghe.com), following the githubapp mint precedent (E44.2 / #1826)
+	// promoted to the whole REST surface here (E44.16 / #2094). It is consulted
+	// at the buildRequest choke point — the SOLE request-construction path for
+	// every installation-scoped method (codescanning/gitdata/projects/... all
+	// route through it) — passing the stringified installation id (the
+	// forge-neutral installation_ref the account resolver keys on):
+	//
+	//   - a non-empty return OVERRIDES the deployment API base for that request:
+	//     the request's scheme+host (and any base path) is swapped to the
+	//     resolved base, path+query preserved. It is validated as a well-formed
+	//     absolute https URL (account.ValidateResolvedBaseURL) and, when
+	//     AllowedInstallationHosts is non-empty, pinned to the allowlist
+	//     (account.HostAllowed) BEFORE the installation token ships — a bad
+	//     scheme or a disallowed host FAILS CLOSED (the request is never issued).
+	//   - an empty return keeps the deployment default (BaseURL/DefaultBaseURL):
+	//     the intentional absence of an override (NULL column / unknown
+	//     installation) is byte-identical to Mode 1.
+	//   - a NON-NIL error FAILS CLOSED (the request is never issued): a real
+	//     endpoint-resolution fault must never silently target the default host
+	//     for a data-resident install.
+	//
+	// ONLY requests targeting the REST API base are rewritten. Release-asset
+	// uploads (UploadBaseURL/DefaultUploadBaseURL) and the static-token
+	// user-Projects GraphQL path (buildStaticTokenRequest) are NOT installation
+	// scoped and are left byte-identical — the rewrite is gated on the request
+	// URL's API-base prefix, not on which caller issued it, so installation
+	// GraphQL via buildRequest IS rewritten while an upload is not (#2094
+	// binding condition 3).
+	//
+	// Nil (the default) preserves the pre-#2094 behavior for every method.
+	ResolveBaseURL func(ctx context.Context, installationRef string) (string, error)
+
+	// AllowedInstallationHosts, when non-empty, restricts the resolved
+	// per-installation base URL (see ResolveBaseURL) to an operator-configured
+	// allowlist, enforced at buildRequest time BEFORE the installation token
+	// ships. Entries and matching semantics are the shared forge-neutral
+	// account.HostAllowed contract (exact host or leading-dot label-boundary
+	// suffix, case- and port-insensitive). Empty/nil (the default) applies
+	// scheme/parse validation only, per the #2093 operator arbitration.
+	AllowedInstallationHosts []string
 }
 
 // New returns a Client with sensible defaults. tokens is required;
@@ -3163,12 +3208,26 @@ func (*Client) buildAnonymousRequest(ctx context.Context, method, rawURL string,
 // buildRequest constructs an http.Request with the standard
 // GitHub headers (auth, accept, version). Centralized so every
 // call site uses the same shape.
-func (c *Client) buildRequest(ctx context.Context, method, url string, body io.Reader, installationID int64) (*http.Request, error) {
+//
+// This is the SOLE request-construction path for every installation-scoped
+// method, so it is also the single choke point where a per-installation REST
+// API base override (Mode 2, E44.16 / #2094) is applied — see
+// applyInstallationBaseURL. A resolver fault, a bad scheme, or a disallowed
+// host FAILS CLOSED here, before the installation token is even minted, so no
+// request ever ships to an unvalidated host.
+func (c *Client) buildRequest(ctx context.Context, method, rawURL string, body io.Reader, installationID int64) (*http.Request, error) {
+	// Resolve the per-installation base BEFORE minting the token so a
+	// resolver/allowlist rejection fails closed without touching the token
+	// provider or the wire.
+	targetURL, err := c.applyInstallationBaseURL(ctx, rawURL, installationID)
+	if err != nil {
+		return nil, err
+	}
 	token, err := c.Tokens.Token(ctx, installationID)
 	if err != nil {
 		return nil, fmt.Errorf("githubclient: get token: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, targetURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("githubclient: build request: %w", err)
 	}
@@ -3176,6 +3235,63 @@ func (c *Client) buildRequest(ctx context.Context, method, url string, body io.R
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	return req, nil
+}
+
+// applyInstallationBaseURL rewrites rawURL's scheme+host (and any base path) to
+// the per-installation REST API base resolved by c.ResolveBaseURL, when one is
+// configured and returns a non-empty override for installationID. It is the
+// centralized Mode 2 hook (E44.16 / #2094): every installation-scoped method
+// builds its URL via c.endpoint(...) and passes it here through buildRequest,
+// so no per-method (codescanning/gitdata/projects) edit is needed.
+//
+// The rewrite is gated on rawURL being prefixed by the deployment REST API base
+// (c.BaseURL, else DefaultBaseURL): release-asset uploads (uploadEndpoint →
+// UploadBaseURL/DefaultUploadBaseURL) and any other-host URL are left
+// byte-identical. Installation-scoped GraphQL issued via buildRequest targets
+// the API base and IS rewritten; the static-token user-Projects GraphQL path
+// uses buildStaticTokenRequest and never reaches here.
+//
+// Fail-closed contract (no request issued): a resolver error, an override that
+// is not a well-formed absolute https URL (account.ValidateResolvedBaseURL), or
+// — when AllowedInstallationHosts is non-empty — a host outside the allowlist
+// (account.HostAllowed) each return an error. An empty override (nil resolver /
+// NULL column / unknown installation) returns rawURL unchanged.
+func (c *Client) applyInstallationBaseURL(ctx context.Context, rawURL string, installationID int64) (string, error) {
+	if c.ResolveBaseURL == nil {
+		return rawURL, nil
+	}
+	apiBase := c.BaseURL
+	if apiBase == "" {
+		apiBase = DefaultBaseURL
+	}
+	// Only REST API-base requests are per-installation routable. Upload-host and
+	// any other-host request is left exactly as built.
+	if !strings.HasPrefix(rawURL, apiBase) {
+		return rawURL, nil
+	}
+	resolved, err := c.ResolveBaseURL(ctx, strconv.FormatInt(installationID, 10))
+	if err != nil {
+		return "", fmt.Errorf("githubclient: resolve installation base url: %w", err)
+	}
+	if resolved == "" {
+		return rawURL, nil
+	}
+	// Validate BEFORE the token ships: an override that is not a well-formed
+	// https URL fails closed rather than transmitting to an unvalidated host.
+	if err := account.ValidateResolvedBaseURL(resolved); err != nil {
+		return "", err
+	}
+	// Optional host allowlist: a configured allowlist pins the resolved host
+	// before the token ships. Empty allowlist = scheme/parse validation only.
+	if len(c.AllowedInstallationHosts) > 0 && !account.HostAllowed(resolved, c.AllowedInstallationHosts) {
+		return "", fmt.Errorf("githubclient: installation base url host not in configured allowlist: %q", resolved)
+	}
+	// Swap the API base for the resolved base, preserving the path+query built
+	// by endpoint(). A trailing slash on the resolved base is trimmed so a
+	// resolved "https://acme.ghe.com/" and "https://acme.ghe.com" behave
+	// identically; a resolved base carrying its own path prefix (GHES /api/v3)
+	// is honored by appending the remainder.
+	return strings.TrimSuffix(resolved, "/") + strings.TrimPrefix(rawURL, apiBase), nil
 }
 
 // buildStaticTokenRequest constructs an http.Request authenticated with a
