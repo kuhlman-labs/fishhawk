@@ -3835,3 +3835,433 @@ func TestApplyInstallationBaseURL_ResolvedBaseShapes(t *testing.T) {
 		})
 	}
 }
+
+// ---- Retry transport (#2167 / E48.45) ----
+
+// recordingTransport is a base RoundTripper that records each request (method +
+// body) and returns canned responses in order (the last repeats). It never
+// dials, so retries are observed purely by call count.
+type recordingTransport struct {
+	responses []stubResp
+	calls     int
+	methods   []string
+	bodies    []string
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body string
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		body = string(b)
+		_ = req.Body.Close()
+	}
+	rt.methods = append(rt.methods, req.Method)
+	rt.bodies = append(rt.bodies, body)
+	i := rt.calls
+	rt.calls++
+	if i >= len(rt.responses) {
+		i = len(rt.responses) - 1
+	}
+	r := rt.responses[i]
+	h := http.Header{}
+	for k, v := range r.headers {
+		h.Set(k, v)
+	}
+	return &http.Response{
+		StatusCode: r.code,
+		Header:     h,
+		Body:       io.NopCloser(strings.NewReader(r.body)),
+		Request:    req,
+	}, nil
+}
+
+// stubResp is one canned response for recordingTransport.
+type stubResp struct {
+	code    int
+	body    string
+	headers map[string]string
+}
+
+func newTestRetryTransport(base http.RoundTripper) *retryTransport {
+	return &retryTransport{
+		base:        base,
+		maxRetries:  3,
+		backoffBase: time.Microsecond,
+		maxDelay:    time.Second,
+		sleeper:     func(context.Context, time.Duration) error { return nil },
+		now:         time.Now,
+	}
+}
+
+func retryTestClient(rt *retryTransport) *Client {
+	return &Client{
+		Tokens: &stubTokens{token: "ghs_canned_token"},
+		HTTP:   &http.Client{Transport: rt},
+	}
+}
+
+// A GET read absorbs a transient 500 and succeeds on the retry.
+func TestRetryTransport_GetRetried(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{"message":"down"}`},
+		{code: http.StatusOK, body: `[]`},
+	}}
+	c := retryTestClient(newTestRetryTransport(base))
+
+	_, err := c.ListOpenPullRequestsByHead(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main")
+	if err != nil {
+		t.Fatalf("ListOpenPullRequestsByHead: %v", err)
+	}
+	if base.calls != 2 {
+		t.Errorf("calls = %d, want 2 (one retry)", base.calls)
+	}
+}
+
+// An allowlisted create-PR POST absorbs a 500 and replays a BYTE-IDENTICAL body.
+func TestRetryTransport_CreatePRRetried_ByteIdenticalBody(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{"message":"down"}`},
+		{code: http.StatusCreated, body: `{"number":5,"html_url":"https://x/5","node_id":"n","state":"open","head":{"sha":"abc"}}`},
+	}}
+	c := retryTestClient(newTestRetryTransport(base))
+
+	pr, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body")
+	if err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if pr.Number != 5 {
+		t.Errorf("Number = %d, want 5", pr.Number)
+	}
+	if base.calls != 2 {
+		t.Fatalf("calls = %d, want 2 (one retry)", base.calls)
+	}
+	if base.methods[0] != http.MethodPost || base.methods[1] != http.MethodPost {
+		t.Errorf("methods = %v, want two POSTs", base.methods)
+	}
+	if base.bodies[0] != base.bodies[1] {
+		t.Errorf("replayed body differs:\n first=%q\nsecond=%q", base.bodies[0], base.bodies[1])
+	}
+	if base.bodies[0] == "" {
+		t.Error("replayed body was empty; GetBody rewind failed")
+	}
+}
+
+// A non-allowlisted mutation POST (issue-comment) is NOT retried on a 5xx.
+func TestRetryTransport_IssueCommentNotRetried(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{"message":"down"}`},
+	}}
+	c := retryTestClient(newTestRetryTransport(base))
+
+	_, err := c.CreateIssueComment(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, 7, "a comment")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if base.calls != 1 {
+		t.Errorf("calls = %d, want 1 (issue-comment POST must not be retried)", base.calls)
+	}
+}
+
+// A non-retryable 404 returns promptly with no retry.
+func TestRetryTransport_NonRetryable404(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusNotFound, body: `{"message":"nope"}`},
+	}}
+	c := retryTestClient(newTestRetryTransport(base))
+
+	_, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body")
+	if err == nil || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if base.calls != 1 {
+		t.Errorf("calls = %d, want 1 (no retry)", base.calls)
+	}
+}
+
+// A sustained 500 exhausts bounded retries (calls == maxRetries+1) and returns
+// the classified error promptly.
+func TestRetryTransport_SustainedExhausts(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{"message":"down"}`},
+	}}
+	rt := newTestRetryTransport(base)
+	rt.maxRetries = 2
+	c := retryTestClient(rt)
+
+	_, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body")
+	if err == nil || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("err = %v, want a 500 error", err)
+	}
+	if base.calls != 3 {
+		t.Errorf("calls = %d, want 3 (maxRetries+1)", base.calls)
+	}
+}
+
+// A bodyless (nil GetBody) marked POST is NOT retried: the transport cannot
+// safely replay it. Exercised directly since buildRequest always sets GetBody.
+func TestRetryTransport_BodylessPOSTNotRetried(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{"message":"down"}`},
+	}}
+	rt := newTestRetryTransport(base)
+
+	req, err := http.NewRequestWithContext(withRetryableMutation(context.Background()),
+		http.MethodPost, "https://api.github.com/x", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.GetBody = nil // force the no-replay path
+	resp, err := rt.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	_ = resp.Body.Close()
+	if base.calls != 1 {
+		t.Errorf("calls = %d, want 1 (bodyless POST must not be retried)", base.calls)
+	}
+}
+
+// An integer Retry-After header is honored as the exact delay VALUE (capped).
+func TestRetryTransport_HonorsRetryAfterDelayValue(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{}`, headers: map[string]string{"Retry-After": "1"}},
+		{code: http.StatusCreated, body: `{"number":5,"html_url":"https://x/5"}`},
+	}}
+	rt := newTestRetryTransport(base)
+	rt.maxDelay = 30 * time.Second // large enough that 1s passes through uncapped
+	var delays []time.Duration
+	rt.sleeper = func(_ context.Context, d time.Duration) error {
+		delays = append(delays, d)
+		return nil
+	}
+	c := retryTestClient(rt)
+
+	if _, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body"); err != nil {
+		t.Fatalf("CreatePullRequest: %v", err)
+	}
+	if len(delays) != 1 {
+		t.Fatalf("delays = %v, want exactly one", delays)
+	}
+	if delays[0] != time.Second {
+		t.Errorf("delay = %v, want 1s (honored Retry-After)", delays[0])
+	}
+}
+
+// A header-gated 403 (rate limit) IS retried; a plain permission 403 is NOT.
+func TestRetryTransport_403Pair(t *testing.T) {
+	t.Run("rate-limited 403 is retried", func(t *testing.T) {
+		base := &recordingTransport{responses: []stubResp{
+			{code: http.StatusForbidden, body: `{"message":"rate limited"}`, headers: map[string]string{"Retry-After": "0"}},
+			{code: http.StatusCreated, body: `{"number":5,"html_url":"https://x/5"}`},
+		}}
+		c := retryTestClient(newTestRetryTransport(base))
+		if _, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(1),
+			RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body"); err != nil {
+			t.Fatalf("CreatePullRequest: %v", err)
+		}
+		if base.calls != 2 {
+			t.Errorf("calls = %d, want 2 (retried)", base.calls)
+		}
+	})
+
+	t.Run("plain 403 is not retried", func(t *testing.T) {
+		base := &recordingTransport{responses: []stubResp{
+			{code: http.StatusForbidden, body: `{"message":"forbidden"}`},
+		}}
+		c := retryTestClient(newTestRetryTransport(base))
+		_, err := c.CreatePullRequest(context.Background(), forge.FromGitHubInstallationID(1),
+			RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body")
+		if err == nil || !errors.Is(err, ErrForbidden) {
+			t.Fatalf("err = %v, want ErrForbidden", err)
+		}
+		if base.calls != 1 {
+			t.Errorf("calls = %d, want 1 (plain 403 not retried)", base.calls)
+		}
+	})
+}
+
+// A server delay exceeding the remaining context budget gives up promptly
+// instead of sleeping past the deadline. now/deadline are fixed since the
+// recording transport ignores the context.
+func TestRetryTransport_RetryAfterExceedingBudgetGivesUp(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{}`, headers: map[string]string{"Retry-After": "10"}},
+	}}
+	fixed := time.Unix(1_700_000_000, 0)
+	rt := newTestRetryTransport(base)
+	rt.maxDelay = 30 * time.Second
+	rt.now = func() time.Time { return fixed }
+	sleeperCalled := false
+	rt.sleeper = func(context.Context, time.Duration) error { sleeperCalled = true; return nil }
+	c := retryTestClient(rt)
+
+	ctx, cancel := context.WithDeadline(context.Background(), fixed.Add(time.Second))
+	defer cancel()
+
+	_, err := c.CreatePullRequest(ctx, forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if base.calls != 1 {
+		t.Errorf("calls = %d, want 1 (budget exceeded, no retry)", base.calls)
+	}
+	if sleeperCalled {
+		t.Error("sleeper was called; expected prompt give-up")
+	}
+}
+
+// contextSleep returns promptly with ctx.Err() on an already-cancelled context.
+func TestContextSleep_CancelledReturnsPromptly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := contextSleep(ctx, time.Hour); err == nil {
+		t.Error("expected ctx.Err() on a cancelled context")
+	}
+}
+
+// retryableStatus predicate: all 5xx + 429 + header-gated 403; plain 403/404 not.
+func TestRetryableStatus_Predicate(t *testing.T) {
+	rl := http.Header{"Retry-After": []string{"1"}}
+	primary := http.Header{"X-Ratelimit-Remaining": []string{"0"}}
+	cases := []struct {
+		code int
+		h    http.Header
+		want bool
+	}{
+		{500, nil, true},
+		{502, nil, true},
+		{503, nil, true},
+		{504, nil, true},
+		{599, nil, true},
+		{429, nil, true},
+		{403, rl, true},
+		{403, primary, true},
+		{403, nil, false},
+		{404, nil, false},
+		{422, nil, false},
+		{200, nil, false},
+	}
+	for _, tc := range cases {
+		if got := retryableStatus(tc.code, tc.h); got != tc.want {
+			t.Errorf("retryableStatus(%d, %v) = %v, want %v", tc.code, tc.h, got, tc.want)
+		}
+	}
+}
+
+// errBaseTransport fails every round trip, exercising the transport-error branch.
+type errBaseTransport struct{ err error }
+
+func (t errBaseTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, t.err }
+
+// A transport-level error propagates out of RoundTrip without retry.
+func TestRetryTransport_TransportErrorPropagates(t *testing.T) {
+	rt := newTestRetryTransport(errBaseTransport{err: io.ErrUnexpectedEOF})
+	c := retryTestClient(rt)
+	_, err := c.ListOpenPullRequestsByHead(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main")
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+}
+
+// A sleeper error (mid-sleep cancel) aborts the retry loop.
+func TestRetryTransport_SleeperErrorAborts(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{{code: http.StatusInternalServerError, body: `{}`}}}
+	rt := newTestRetryTransport(base)
+	rt.sleeper = func(context.Context, time.Duration) error { return context.Canceled }
+	_, err := rt.RoundTrip(mustGet(t, "https://api.github.com/x"))
+	if err == nil {
+		t.Fatal("expected error from aborted retry")
+	}
+	if base.calls != 1 {
+		t.Errorf("calls = %d, want 1 (aborted before second attempt)", base.calls)
+	}
+}
+
+func mustGet(t *testing.T, url string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	return req
+}
+
+// newRetryTransport (the production constructor) yields a usable, transparent
+// transport for a successful response.
+func TestNewRetryTransport_Defaults(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{{code: http.StatusOK, body: `[]`}}}
+	rt := newRetryTransport(base)
+	if rt.maxRetries != defaultMaxRetries || rt.sleeper == nil || rt.now == nil {
+		t.Fatalf("defaults not wired: %+v", rt)
+	}
+	c := retryTestClient(rt)
+	if _, err := c.ListOpenPullRequestsByHead(context.Background(), forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main"); err != nil {
+		t.Fatalf("ListOpenPullRequestsByHead: %v", err)
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	mk := func(headers map[string]string) *http.Response {
+		h := http.Header{}
+		for k, v := range headers {
+			h.Set(k, v)
+		}
+		return &http.Response{Header: h}
+	}
+	limit := 30 * time.Second
+
+	if got := retryDelay(mk(map[string]string{"Retry-After": "5"}), 0, time.Millisecond, limit, now); got != 5*time.Second {
+		t.Errorf("integer Retry-After: got %v, want 5s", got)
+	}
+	if got := retryDelay(mk(map[string]string{"Retry-After": "999999"}), 0, time.Millisecond, limit, now); got != limit {
+		t.Errorf("huge Retry-After: got %v, want %v (capped)", got, limit)
+	}
+	httpDate := now.Add(3 * time.Second).UTC().Format(http.TimeFormat)
+	if got := retryDelay(mk(map[string]string{"Retry-After": httpDate}), 0, time.Millisecond, limit, now); got != 3*time.Second {
+		t.Errorf("HTTP-date Retry-After: got %v, want 3s", got)
+	}
+	reset := strconv.FormatInt(now.Add(4*time.Second).Unix(), 10)
+	if got := retryDelay(mk(map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": reset}), 0, time.Millisecond, limit, now); got != 4*time.Second {
+		t.Errorf("X-RateLimit-Reset: got %v, want 4s", got)
+	}
+	got := retryDelay(mk(map[string]string{"Retry-After": "not-a-number"}), 0, time.Millisecond, limit, now)
+	if got < 0 || got > time.Millisecond {
+		t.Errorf("malformed Retry-After: got %v, want backoff in [0, 1ms]", got)
+	}
+	got = retryDelay(mk(nil), 2, time.Millisecond, limit, now)
+	if got < 0 || got > 4*time.Millisecond {
+		t.Errorf("backoff attempt=2: got %v, want in [0, 4ms]", got)
+	}
+}
+
+func TestClampDelay(t *testing.T) {
+	limit := 10 * time.Second
+	if got := clampDelay(-time.Second, limit); got != 0 {
+		t.Errorf("negative: got %v, want 0", got)
+	}
+	if got := clampDelay(limit+time.Second, limit); got != limit {
+		t.Errorf("over cap: got %v, want %v", got, limit)
+	}
+	if got := clampDelay(3*time.Second, limit); got != 3*time.Second {
+		t.Errorf("in range: got %v, want 3s", got)
+	}
+}
+
+func TestContextSleep_CompletesAndNoop(t *testing.T) {
+	if err := contextSleep(context.Background(), time.Millisecond); err != nil {
+		t.Errorf("positive sleep: %v", err)
+	}
+	if err := contextSleep(context.Background(), 0); err != nil {
+		t.Errorf("zero sleep: %v", err)
+	}
+}
