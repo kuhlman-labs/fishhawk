@@ -91,6 +91,21 @@ func doExportCSV(s *Server, query string) *httptest.ResponseRecorder {
 	return rec
 }
 
+// doExportCSVAs mirrors doExportAs for the CSV projection: it drives the
+// CSV handler under an identity whose AccountID is accountID, so the
+// run-less rows are scoped exactly as the JSON export scopes its run-less
+// partitions (#2097). Empty = operator full view; a UUID = tenant own
+// partition; a non-UUID = malformed-account fail-closed.
+func doExportCSVAs(s *Server, accountID, query string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit/export.csv"+query, nil)
+	id := Identity{Subject: "github:tenant", TokenID: "tok_export_test",
+		Scopes: []string{"read:audit-export"}, AccountID: accountID}
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	s.handleAuditExportCSV(rec, req)
+	return rec
+}
+
 // parseCSV parses a CSV response body into header + data rows, failing
 // the test on any malformed structure.
 func parseCSV(t *testing.T, body []byte) (header []string, rows [][]string) {
@@ -826,6 +841,130 @@ func TestAuditExportCSV_GlobalOmittedAndNilActors(t *testing.T) {
 		}
 		if !found {
 			t.Error("global token_issued row missing")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------
+// (j) run-less CSV rows are scoped to the caller's tenant (#2097),
+// mirroring the JSON export's assembleRunlessPartitions scoping at row
+// level. Asserts on payload_summary + entry_hash so a withheld partition
+// is proven absent by CONTENT, not just by a missing category.
+// ---------------------------------------------------------------------
+
+func TestAuditExportCSV_RunlessTenantScope(t *testing.T) {
+	acctA, acctB := uuid.New(), uuid.New()
+	// Fixture: one untenanted run (visible to every caller) plus
+	// interleaved run-less partitions for two tenants and the untenanted
+	// chain. accountChain / chainEntries live in audit_export_test.go.
+	newFixture := func(t *testing.T) (*fakeRepo, *exportAuditFake) {
+		fr := newFakeRepo()
+		id := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+		aChain := accountChain(t, &acctA, "api_token_issued", "api_token_revoked")
+		bChain := accountChain(t, &acctB, "oauth_signin")
+		unt := chainEntries(t, nil, "token_issued")
+		af := &exportAuditFake{
+			perRun: map[uuid.UUID][]*audit.Entry{id: chainEntries(t, &id, "run_created")},
+			global: []*audit.Entry{aChain[0], bChain[0], unt[0], aChain[1]},
+		}
+		return fr, af
+	}
+
+	// runlessRows returns the data rows whose run_id cell is empty (the
+	// run-less partition rows), keyed for content assertions.
+	runlessRows := func(t *testing.T, rec *httptest.ResponseRecorder) (header []string, runless [][]string) {
+		t.Helper()
+		header, rows := parseCSV(t, rec.Body.Bytes())
+		runIDCol := col(t, header, "run_id")
+		for _, row := range rows {
+			if row[runIDCol] == "" {
+				runless = append(runless, row)
+			}
+		}
+		return header, runless
+	}
+
+	t.Run("TENANT-OWN-ONLY: own run-less rows only; other tenant + untenanted withheld", func(t *testing.T) {
+		fr, af := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportCSVAs(s, acctA.String(), "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		header, runless := runlessRows(t, rec)
+		catCol := col(t, header, "category")
+		// Exactly account A's two run-less rows.
+		if len(runless) != 2 {
+			t.Fatalf("got %d run-less rows, want 2 (account A only); rows=%v", len(runless), runless)
+		}
+		for _, row := range runless {
+			if row[catCol] != "api_token_issued" && row[catCol] != "api_token_revoked" {
+				t.Errorf("unexpected run-less row category %q (want account A's)", row[catCol])
+			}
+		}
+		// Withheld B + untenanted entries absent by content (payload +
+		// entry_hash never appear anywhere in the CSV body).
+		for _, e := range af.global {
+			if e.AccountID != nil && *e.AccountID == acctA {
+				continue
+			}
+			if strings.Contains(body, e.EntryHash) {
+				t.Errorf("withheld entry_hash %s (category %s) leaked into tenant CSV", e.EntryHash, e.Category)
+			}
+			if strings.Contains(body, string(e.Payload)) {
+				t.Errorf("withheld payload %s (category %s) leaked into tenant CSV", e.Payload, e.Category)
+			}
+		}
+	})
+
+	t.Run("OPERATOR-FULL: all run-less rows present", func(t *testing.T) {
+		fr, af := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportCSVAs(s, "", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		header, runless := runlessRows(t, rec)
+		catCol := col(t, header, "category")
+		// All four run-less rows: A(2) + B(1) + untenanted(1).
+		if len(runless) != 4 {
+			t.Fatalf("operator got %d run-less rows, want 4", len(runless))
+		}
+		got := map[string]int{}
+		for _, row := range runless {
+			got[row[catCol]]++
+		}
+		for _, cat := range []string{"api_token_issued", "api_token_revoked", "oauth_signin", "token_issued"} {
+			if got[cat] != 1 {
+				t.Errorf("operator CSV category %q count = %d, want 1", cat, got[cat])
+			}
+		}
+	})
+
+	t.Run("MALFORMED-ACCOUNT: no run-less rows", func(t *testing.T) {
+		fr, af := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportCSVAs(s, "not-a-uuid", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		_, runless := runlessRows(t, rec)
+		if len(runless) != 0 {
+			t.Errorf("malformed-account caller got %d run-less rows, want 0", len(runless))
+		}
+	})
+
+	t.Run("INCLUDE_GLOBAL=false: no run-less rows for a tenant", func(t *testing.T) {
+		fr, af := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportCSVAs(s, acctA.String(), "?include_global=false")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		_, runless := runlessRows(t, rec)
+		if len(runless) != 0 {
+			t.Errorf("tenant with include_global=false got %d run-less rows, want 0", len(runless))
 		}
 	})
 }

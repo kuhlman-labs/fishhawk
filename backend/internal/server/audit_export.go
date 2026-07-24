@@ -70,7 +70,10 @@ const exportSchemaV1 = "v1"
 // HashInputs — so each partition verifies with no verifier change.
 // Real run IDs and account IDs are random v4/v7 UUIDs, so the
 // reserved nil-UUID key cannot collide and a run/account key
-// collision is negligible (122 random bits).
+// collision is negligible (122 random bits). The untenanted partition
+// under this key is OPERATOR-ONLY since #2097: a tenant caller sees
+// only its own account partition (callerRunlessScope /
+// assembleRunlessPartitions), never this key nor another tenant's.
 const exportGlobalChainKey = "00000000-0000-0000-0000-000000000000"
 
 // Export-page bounding is at WHOLE-RUN granularity: a run's entire
@@ -288,16 +291,18 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		resp.Runs[rn.ID.String()] = rd
 	}
 
-	// Run-less chain partitions, one per account (ADR-057 / #1828):
-	// first page only (empty cursor). The untenanted partition is
-	// emitted under the reserved nil-UUID key even when empty so
-	// consumers can distinguish "no run-less entries" from "not
-	// included" — never silently dropped (ADR-054 consequence);
-	// tenant partitions appear under their account-UUID keys. Absent
-	// on continuation pages (whole-chain bounding: a partition can't
-	// be split) and when include_global=false.
+	// Run-less chain partitions, one per account (ADR-057 / #1828),
+	// scoped to the caller's tenant (#2097): first page only (empty
+	// cursor). An operator/no-account caller gets the full view — the
+	// untenanted partition under the reserved nil-UUID key even when
+	// empty (so consumers can distinguish "no run-less entries" from
+	// "not included" — never silently dropped, ADR-054 consequence)
+	// plus every tenant partition under its account-UUID key. A tenant
+	// caller gets ONLY its own account partition. Absent on
+	// continuation pages (whole-chain bounding: a partition can't be
+	// split) and when include_global=false.
 	if ep.includeGlobal && ep.firstPage {
-		if gerr := s.assembleRunlessPartitions(r.Context(), resp.Runs); gerr != nil {
+		if gerr := s.assembleRunlessPartitions(r.Context(), callerRunlessScope(r), resp.Runs); gerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"list run-less chain partitions failed", map[string]any{"error": gerr.Error()})
 			return
@@ -320,8 +325,10 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 // anonymous) is no constraint — the whole page is returned, the pre-tenancy
 // view. Every bulk-export surface (JSON, CSV, agent-changes report) routes its
 // page through this so a tenant can never export another account's run
-// evidence. The run-less chain partitions are NOT account-scoped (they have
-// no owning run) and are emitted unfiltered by each handler.
+// evidence. The run-less chain partitions carry their OWN account scoping
+// (they have no owning run to filter on): each handler routes them through
+// callerRunlessScope / assembleRunlessPartitions (#2097) so a tenant sees
+// only its own account partition.
 func accountVisiblePage(r *http.Request, page []*run.Run) []*run.Run {
 	acct := IdentityFrom(r.Context()).AccountID
 	if acct == "" {
@@ -336,18 +343,76 @@ func accountVisiblePage(r *http.Request, page []*run.Run) []*run.Run {
 	return out
 }
 
+// runlessScope classifies a caller's visibility into the run-less
+// (run_id IS NULL) chain partitions, mirroring accountVisiblePage's
+// account read (ADR-057 / E44.5, #2097). It is one of three shapes:
+// operator (full pre-tenancy view), a bound tenant account (own
+// partition only), or the zero value (fail closed — no run-less
+// partitions).
+type runlessScope struct {
+	// operator is true for a caller with no bound account
+	// (bearer/operator token, anonymous): the full view — the
+	// untenanted partition plus every tenant partition.
+	operator bool
+	// account, when non-nil, is the tenant caller's own account: it
+	// sees ONLY this partition. Nil with operator=false is the
+	// fail-closed shape.
+	account *uuid.UUID
+}
+
+// callerRunlessScope resolves the caller's run-less visibility from its
+// Identity.AccountID, the same read accountVisiblePage does for run
+// evidence (#2097). An empty AccountID (bearer/operator token, or
+// anonymous) is the operator full view. A parseable AccountID scopes the
+// caller to that one account partition. An UNPARSEABLE AccountID fails
+// closed to the zero value (no run-less partitions) — a malformed tenant
+// binding can never widen back into the operator view.
+func callerRunlessScope(r *http.Request) runlessScope {
+	acct := IdentityFrom(r.Context()).AccountID
+	if acct == "" {
+		return runlessScope{operator: true}
+	}
+	parsed, err := uuid.Parse(acct)
+	if err != nil {
+		return runlessScope{}
+	}
+	return runlessScope{account: &parsed}
+}
+
 // assembleRunlessPartitions emits the run-less (run_id IS NULL) chain
-// partitions into the export runs map, one key per account partition
-// (ADR-057 / #1828). ListGlobal enumerates which tenant partitions
-// exist; each emitted group is then read via ListGlobalByAccount so
-// what ships is exactly the repository's per-partition chain view —
-// the same view per-account verification walks. The untenanted
-// partition (reserved nil-UUID key) is ALWAYS emitted, even empty;
-// tenant partitions only when they have entries (an account with no
-// run-less events has no chain to verify). Partitions are not
-// account-scoped to the caller: run-less governance events have no
-// owning run, and this preserves the pre-ADR-057 ListGlobal surface.
-func (s *Server) assembleRunlessPartitions(ctx context.Context, runs map[string]exportRunData) error {
+// partitions into the export runs map, scoped to the caller (ADR-057 /
+// #1828, #2097). Each emitted group is read via ListGlobalByAccount so
+// what ships is exactly the repository's per-partition chain view — the
+// same view per-account verification walks.
+//
+// Operator scope (no bound account): the full pre-tenancy view.
+// ListGlobal enumerates which tenant partitions exist; the untenanted
+// partition (reserved nil-UUID key) is ALWAYS emitted, even empty (so
+// consumers can distinguish "no run-less entries" from "not included");
+// every tenant partition follows under its account-UUID key when it has
+// entries.
+//
+// Tenant scope: ONLY the caller's own account partition, emitted under
+// its account-UUID key when non-empty — never the untenanted NULL
+// partition nor another tenant's key. A malformed-account (nil account,
+// non-operator) scope emits NOTHING (fail closed).
+func (s *Server) assembleRunlessPartitions(ctx context.Context, scope runlessScope, runs map[string]exportRunData) error {
+	if !scope.operator {
+		// Tenant (or fail-closed) caller: only the caller's own account
+		// partition, and only when it has entries.
+		if scope.account == nil {
+			return nil
+		}
+		entries, err := s.cfg.AuditRepo.ListGlobalByAccount(ctx, scope.account)
+		if err != nil {
+			return err
+		}
+		if len(entries) > 0 {
+			runs[scope.account.String()] = exportRunData{AuditEntries: toExportEntries(entries)}
+		}
+		return nil
+	}
+
 	all, err := s.cfg.AuditRepo.ListGlobal(ctx)
 	if err != nil {
 		return err
@@ -375,6 +440,23 @@ func (s *Server) assembleRunlessPartitions(ctx context.Context, runs map[string]
 		runs[acct.String()] = exportRunData{AuditEntries: toExportEntries(entries)}
 	}
 	return nil
+}
+
+// callerRunlessEntries returns the flat run-less (run_id IS NULL) audit
+// entries visible to the caller for the CSV projection, scoped exactly as
+// assembleRunlessPartitions scopes the JSON export (#2097): the full
+// ListGlobal set (untenanted + every tenant, interleaved) for an
+// operator/no-account caller, only the caller's own account partition for
+// a tenant, and nothing for a malformed-account fail-closed caller.
+func (s *Server) callerRunlessEntries(ctx context.Context, r *http.Request) ([]*audit.Entry, error) {
+	scope := callerRunlessScope(r)
+	if scope.operator {
+		return s.cfg.AuditRepo.ListGlobal(ctx)
+	}
+	if scope.account == nil {
+		return nil, nil
+	}
+	return s.cfg.AuditRepo.ListGlobalByAccount(ctx, scope.account)
 }
 
 // selectExplicitRuns resolves an explicit run-id set. A compliance
