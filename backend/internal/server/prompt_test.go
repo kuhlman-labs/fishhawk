@@ -2907,33 +2907,72 @@ func TestGetStagePrompt_Implement_FixupConcerns_AmendmentIncluded(t *testing.T) 
 }
 
 // TestGetStagePrompt_Implement_RetryShowsApprovedAmendment is the #2095 gap #2
-// cross-layer regression. A retried implement stage keeps the SAME stage.ID, so
-// the enforced scope fold (mergeApprovedScopeAmendments, stage-scoped) already
-// re-includes an approved mid-stage amendment on retry — but before this fix the
-// SHOWN scope in the agent prompt (amendedScopeFilesForReview) folded ONLY
-// add_scope_files and never amendments, so the re-run agent could not see paths
-// it was already allowed to touch and defensively re-filed an identical request,
-// burning its last amendment slot. This test constructs a run with an approved
-// amendment on the (retried) implement stage, renders the implement prompt, and
-// asserts: (a) the SHOWN scope names the amendment path, (b) the ENFORCED scope
-// permits it (binding condition 3 — proving the agent will not re-file), and
-// (c) the REVIEW-facing amendedScopeFilesForReview output is UNCHANGED (still
-// excludes amendments — binding condition holds the review baseline).
+// cross-layer regression, driven through the REAL retry transition
+// (run.RetryStage against Postgres) rather than a hand-picked stage.ID. Before
+// this fix the SHOWN scope in the agent prompt folded ONLY add_scope_files and
+// never amendments, so a re-run agent could not see paths it was already allowed
+// to touch and defensively re-filed an identical request, burning its last
+// amendment slot. The fix widens the SHOWN scope to the CURRENT stage's approved
+// amendments — and that only works because retry re-opens the SAME stage row in
+// place, so the stage-scoped fold (mergeApprovedScopeAmendments / the shown-scope
+// helper, both filtering a.StageID == stageID) still matches the amendment.
+//
+// This test seeds an approved mid-stage amendment on the implement stage, walks
+// that stage to failed, and RETRIES it through the real repository — the
+// transition the earlier fake-only test never invoked (it merely re-rendered
+// with a fixed id, so it would have stayed green even if retry minted a NEW
+// stage row and silently dropped the amendment). It then asserts: (0) the real
+// retry PRESERVED the stage.ID (the load-bearing invariant approval condition 3
+// rests on), (a) the SHOWN scope names the amendment path, (b) the ENFORCED
+// scope permits it (binding condition 3 — proving the agent will not re-file),
+// and (c) the REVIEW-facing amendedScopeFilesForReview output is UNCHANGED
+// (still excludes amendments). The prompt is rendered for the RETRIED stage's
+// id and the amendment is keyed on the ORIGINAL id, so a future change that made
+// retry create a new stage row would drop the amendment from both folds and fail
+// (a)/(b) — the exact #2095 re-file behavior, now caught end to end.
 func TestGetStagePrompt_Implement_RetryShowsApprovedAmendment(t *testing.T) {
-	rr := newPromptRunRepo()
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+
+	runRepo := run.NewPostgresRepository(pool)
 	art := newFakeArtifactRepo()
 	sa := newFakeScopeAmendmentRepo()
-
-	runID := uuid.New()
-	planStageID := uuid.New()
-	// implStageID stands in for the retried stage: fishhawk_retry_stage re-opens
-	// the SAME stage row in place, so the amendment (keyed on this stage.ID) stays
-	// associated across the retry. Re-rendering with the same ID IS the retry path.
-	implStageID := uuid.New()
 
 	const planFile = "backend/internal/server/prompt.go"
 	const amendPath = "backend/internal/server/coupled_seam.go"
 
+	realRun, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	planStage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID:        realRun.ID,
+		Sequence:     0,
+		Type:         run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create plan stage: %v", err)
+	}
+	implStage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID:        realRun.ID,
+		Sequence:     1,
+		Type:         run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent,
+		ExecutorRef:  "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create implement stage: %v", err)
+	}
+	origImplStageID := implStage.ID
+
+	// Seed the approved plan artifact on the plan stage.
 	p := &plan.Plan{
 		PlanVersion:  "standard_v1",
 		Summary:      "scoped plan",
@@ -2947,8 +2986,8 @@ func TestGetStagePrompt_Implement_RetryShowsApprovedAmendment(t *testing.T) {
 		t.Fatalf("marshal plan: %v", err)
 	}
 	sv := "standard_v1"
-	if _, err := art.Create(context.Background(), artifact.CreateParams{
-		StageID:       planStageID,
+	if _, err := art.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
 		Kind:          artifact.KindPlan,
 		SchemaVersion: &sv,
 		Content:       planBytes,
@@ -2956,27 +2995,52 @@ func TestGetStagePrompt_Implement_RetryShowsApprovedAmendment(t *testing.T) {
 		t.Fatalf("seed plan artifact: %v", err)
 	}
 
-	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
-		runID: {
-			{ID: planStageID, RunID: runID, Type: run.StageTypePlan},
-			{ID: implStageID, RunID: runID, Type: run.StageTypeImplement},
-		},
-	}
-	rr.getRuns[runID] = &run.Run{ID: runID, Repo: "o/r", WorkflowID: "feature_change"}
-	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+	// Approve a mid-stage amendment on the implement stage (keyed on its
+	// ORIGINAL id) for an out-of-plan path.
+	seedApprovedAmendment(t, sa, realRun.ID, origImplStageID, amendPath)
 
-	// Approve a mid-stage amendment on the implement stage for an out-of-plan path.
-	seedApprovedAmendment(t, sa, runID, implStageID, amendPath)
+	// Walk the implement stage to failed, then RETRY it through the real
+	// repository — the transition the earlier fake-only test never invoked.
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := runRepo.TransitionStage(ctx, origImplStageID, to, nil); err != nil {
+			t.Fatalf("transition implement stage to %s: %v", to, err)
+		}
+	}
+	catA := run.FailureA
+	failReason := "agent exited mid-run"
+	if _, err := runRepo.TransitionStage(ctx, origImplStageID, run.StageStateFailed, &run.StageCompletion{
+		FailureCategory: &catA,
+		FailureReason:   &failReason,
+	}); err != nil {
+		t.Fatalf("transition implement stage to failed: %v", err)
+	}
+	retried, err := runRepo.RetryStage(ctx, origImplStageID, run.StageStatePending)
+	if err != nil {
+		t.Fatalf("retry implement stage: %v", err)
+	}
+
+	// (0) The load-bearing invariant (approval condition 3): the real retry
+	// re-opened the SAME stage row in place. If a future change made retry mint
+	// a new stage row, this fails here — and the amendment (keyed on the original
+	// id) would silently drop from both folds asserted below.
+	if retried.ID != origImplStageID {
+		t.Fatalf("retry must preserve stage.ID (approval condition 3): got %s, want %s", retried.ID, origImplStageID)
+	}
+	if retried.State != run.StageStatePending {
+		t.Fatalf("retried stage state = %q, want pending (runnable)", retried.State)
+	}
 
 	s := New(Config{
 		Addr:               "127.0.0.1:0",
-		RunRepo:            rr,
+		RunRepo:            runRepo,
 		ArtifactRepo:       art,
 		ScopeAmendmentRepo: sa,
 	})
 	s.promptIssueGetterOverride = &stubIssueGetter{}
 
-	w := promptRenderRequest(t, s, implStageID)
+	// Render the prompt for the RETRIED stage id — so the amendment fold depends
+	// on retry having preserved the id, not on a test-held constant.
+	w := promptRenderRequest(t, s, retried.ID)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -2991,7 +3055,7 @@ func TestGetStagePrompt_Implement_RetryShowsApprovedAmendment(t *testing.T) {
 		t.Errorf("implement prompt missing the operator-added scope section:\n%s", resp.Prompt)
 	}
 	if !contains(resp.Prompt, amendPath) {
-		t.Errorf("SHOWN scope must name the approved amendment path %q so the agent does not re-file:\n%s", amendPath, resp.Prompt)
+		t.Errorf("SHOWN scope must name the approved amendment path %q after a real retry so the agent does not re-file:\n%s", amendPath, resp.Prompt)
 	}
 
 	// (b) ENFORCED scope (binding condition 3): the amendment path is folded into
@@ -3005,14 +3069,14 @@ func TestGetStagePrompt_Implement_RetryShowsApprovedAmendment(t *testing.T) {
 		t.Errorf("enforced scope must retain the plan file %q: %+v", planFile, resp.ScopeFiles)
 	}
 	if !enforced[amendPath] {
-		t.Errorf("enforced scope must permit the approved amendment path %q on retry: %+v", amendPath, resp.ScopeFiles)
+		t.Errorf("enforced scope must permit the approved amendment path %q after a real retry: %+v", amendPath, resp.ScopeFiles)
 	}
 
 	// (c) REVIEW surface unchanged: amendedScopeFilesForReview still EXCLUDES the
 	// amendment (only add_scope_files feeds it), so the reviewer's drift baseline
 	// is not widened by this fix.
 	review := map[string]bool{}
-	for _, path := range s.amendedScopeFilesForReview(context.Background(), rr.getRuns[runID], p) {
+	for _, path := range s.amendedScopeFilesForReview(ctx, realRun, p) {
 		review[path] = true
 	}
 	if review[amendPath] {
