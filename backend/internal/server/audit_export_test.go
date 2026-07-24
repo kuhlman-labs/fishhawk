@@ -300,6 +300,23 @@ func doExport(s *Server, query string) *httptest.ResponseRecorder {
 	return rec
 }
 
+// doExportAs drives the JSON export under an identity whose AccountID is
+// accountID (the tenant-scope input callerRunlessScope reads). An empty
+// accountID is the operator/no-account full view; a UUID string scopes the
+// caller to that account's run-less partition; a non-UUID string exercises
+// the malformed-account fail-closed path (#2097). read:audit-export is held
+// throughout so the run-less scoping — not the auth gate — is what the test
+// observes.
+func doExportAs(s *Server, accountID, query string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit/export"+query, nil)
+	id := Identity{Subject: "github:tenant", TokenID: "tok_export_test",
+		Scopes: []string{"read:audit-export"}, AccountID: accountID}
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	s.handleAuditExport(rec, req)
+	return rec
+}
+
 func configuredExportServer(af *exportAuditFake, fr *fakeRepo, sf *exportSigningFake) *Server {
 	return New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: sf})
 }
@@ -714,6 +731,183 @@ func TestAuditExport_RunlessByAccountError(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "internal_error") {
 		t.Errorf("body = %s, want internal_error", rec.Body.String())
 	}
+}
+
+// (8c-tenant) a ListGlobalByAccount error in the TENANT scope also
+// surfaces as 500. The operator case (8c) drives the untenanted
+// ListGlobalByAccount(nil) read; this pins the DISTINCT tenant branch of
+// assembleRunlessPartitions (scope.account != nil, #2097), whose error
+// return the operator path never reaches.
+func TestAuditExport_RunlessByAccountErrorTenant(t *testing.T) {
+	fr := newFakeRepo()
+	id := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	af := &exportAuditFake{
+		perRun:                 map[uuid.UUID][]*audit.Entry{id: chainEntries(t, &id, "run_created")},
+		global:                 chainEntries(t, nil, "token_issued"),
+		listGlobalByAccountErr: errors.New("tenant partition boom"),
+	}
+	s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+	rec := doExportAs(s, uuid.New().String(), "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "internal_error") {
+		t.Errorf("body = %s, want internal_error", rec.Body.String())
+	}
+}
+
+// (8d) run-less partitions are scoped to the caller's tenant (#2097).
+// The five modes the plan enumerates, each end-to-end through the real
+// handler + exportAuditFake (ListGlobal/ListGlobalByAccount):
+//
+//	TENANT-OWN-ONLY  — a tenant sees ONLY its own account partition;
+//	                   exportGlobalChainKey and a second tenant's key are
+//	                   absent, and their withheld entries' payload +
+//	                   entry_hash are proven absent from the wire.
+//	TENANT-EMPTY     — a tenant with no own run-less entries gets no key.
+//	OPERATOR-FULL    — a no-account caller still gets exportGlobalChainKey
+//	                   always plus every tenant partition (regression).
+//	MALFORMED-ACCT   — a non-UUID AccountID fails closed to zero keys.
+//	INCLUDE_GLOBAL=0 — omits all run-less output for a tenant too.
+func TestAuditExport_RunlessTenantScope(t *testing.T) {
+	// Shared fixture: one untenanted run (AccountID "" → visible to every
+	// caller through accountVisiblePage) plus interleaved run-less
+	// partitions for two tenant accounts and the untenanted chain.
+	acctA, acctB := uuid.New(), uuid.New()
+	newFixture := func(t *testing.T) (*fakeRepo, *exportAuditFake, uuid.UUID) {
+		fr := newFakeRepo()
+		id := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+		aChain := accountChain(t, &acctA, "api_token_issued", "api_token_revoked")
+		bChain := accountChain(t, &acctB, "oauth_signin")
+		unt := chainEntries(t, nil, "token_issued")
+		af := &exportAuditFake{
+			perRun: map[uuid.UUID][]*audit.Entry{id: chainEntries(t, &id, "run_created")},
+			global: []*audit.Entry{aChain[0], bChain[0], unt[0], aChain[1]},
+		}
+		return fr, af, id
+	}
+	t.Run("TENANT-OWN-ONLY: only own partition, other tenant + untenanted withheld", func(t *testing.T) {
+		fr, af, runID := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportAs(s, acctA.String(), "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+		}
+		body := rec.Body.String()
+		ex := strictDecodeAndVerify(t, rec.Body.Bytes())
+
+		ad, ok := ex.Runs[acctA.String()]
+		if !ok || len(ad.AuditEntries) != 2 {
+			t.Fatalf("own account A partition: ok=%v entries=%d, want 2", ok, len(ad.AuditEntries))
+		}
+		if _, ok := ex.Runs[acctB.String()]; ok {
+			t.Error("other tenant B partition leaked to account-A caller")
+		}
+		if _, ok := ex.Runs[exportGlobalChainKey]; ok {
+			t.Error("untenanted partition leaked to a tenant caller (must be operator-only)")
+		}
+		// The real run is still visible (untenanted run) — 1 run + 1 own
+		// run-less partition, nothing else.
+		if _, ok := ex.Runs[runID.String()]; !ok {
+			t.Error("untenanted run missing from tenant export")
+		}
+		if len(ex.Runs) != 2 {
+			t.Errorf("runs map has %d keys, want 2 (own run-less + untenanted run)", len(ex.Runs))
+		}
+		// Prove the withheld governance payloads/hashes are absent by
+		// CONTENT: account B's oauth_signin and the untenanted token_issued.
+		for _, e := range af.global {
+			if e.AccountID != nil && *e.AccountID == acctA {
+				continue // account A's own entries are expected on the wire
+			}
+			if strings.Contains(body, e.EntryHash) {
+				t.Errorf("withheld entry_hash %s (category %s) leaked to tenant", e.EntryHash, e.Category)
+			}
+			if strings.Contains(body, string(e.Payload)) {
+				t.Errorf("withheld payload %s (category %s) leaked to tenant", e.Payload, e.Category)
+			}
+		}
+	})
+
+	t.Run("TENANT-EMPTY: no own run-less entries -> no key", func(t *testing.T) {
+		fr, af, _ := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		// A third tenant with no run-less entries in the fixture.
+		acctC := uuid.New()
+		rec := doExportAs(s, acctC.String(), "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+		}
+		ex := strictDecodeAndVerify(t, rec.Body.Bytes())
+		if _, ok := ex.Runs[acctC.String()]; ok {
+			t.Error("empty tenant got a run-less key with no entries")
+		}
+		if _, ok := ex.Runs[exportGlobalChainKey]; ok {
+			t.Error("untenanted partition leaked to an empty tenant caller")
+		}
+	})
+
+	t.Run("OPERATOR-FULL: untenanted key always + every tenant partition", func(t *testing.T) {
+		fr, af, _ := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportAs(s, "", "") // empty AccountID = operator
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+		}
+		ex := strictDecodeAndVerify(t, rec.Body.Bytes())
+		if _, ok := ex.Runs[exportGlobalChainKey]; !ok {
+			t.Error("operator missing the untenanted partition")
+		}
+		if ad, ok := ex.Runs[acctA.String()]; !ok || len(ad.AuditEntries) != 2 {
+			t.Errorf("operator missing account A partition: ok=%v entries=%d", ok, len(ad.AuditEntries))
+		}
+		if bd, ok := ex.Runs[acctB.String()]; !ok || len(bd.AuditEntries) != 1 {
+			t.Errorf("operator missing account B partition: ok=%v entries=%d", ok, len(bd.AuditEntries))
+		}
+	})
+
+	t.Run("MALFORMED-ACCOUNT: non-UUID AccountID -> zero run-less keys", func(t *testing.T) {
+		fr, af, runID := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportAs(s, "not-a-uuid", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+		}
+		ex := strictDecodeAndVerify(t, rec.Body.Bytes())
+		if _, ok := ex.Runs[exportGlobalChainKey]; ok {
+			t.Error("malformed-account caller got the untenanted partition")
+		}
+		if _, ok := ex.Runs[acctA.String()]; ok {
+			t.Error("malformed-account caller got account A partition")
+		}
+		if _, ok := ex.Runs[acctB.String()]; ok {
+			t.Error("malformed-account caller got account B partition")
+		}
+		// Only the untenanted run remains (its account_id is "" so the page
+		// filter keeps it); no run-less partition of any kind.
+		if _, ok := ex.Runs[runID.String()]; !ok {
+			t.Error("untenanted run missing")
+		}
+		if len(ex.Runs) != 1 {
+			t.Errorf("runs map has %d keys, want 1 (only the untenanted run)", len(ex.Runs))
+		}
+	})
+
+	t.Run("INCLUDE_GLOBAL=false still omits for a tenant", func(t *testing.T) {
+		fr, af, _ := newFixture(t)
+		s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+		rec := doExportAs(s, acctA.String(), "?include_global=false")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body %s", rec.Code, rec.Body.String())
+		}
+		ex := strictDecodeAndVerify(t, rec.Body.Bytes())
+		if _, ok := ex.Runs[acctA.String()]; ok {
+			t.Error("own partition present despite include_global=false")
+		}
+		if _, ok := ex.Runs[exportGlobalChainKey]; ok {
+			t.Error("untenanted partition present despite include_global=false")
+		}
+	})
 }
 
 // (9) continuation round-trip: limit=1 over 3 runs → disjoint whole-run

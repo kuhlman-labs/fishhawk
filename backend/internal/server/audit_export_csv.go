@@ -135,11 +135,13 @@ func (s *Server) handleAuditExportCSV(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Global (run-less) chain partition: first page only. Its rows carry
-	// empty run_id and repo cells and pass through the same predicate,
-	// emitted after the run rows.
+	// Run-less chain partition: first page only, scoped to the caller
+	// (#2097). Its rows carry empty run_id and repo cells and pass
+	// through the same predicate, emitted after the run rows. An
+	// operator sees the full untenanted+tenant set; a tenant sees only
+	// its own account partition; a malformed-account caller sees none.
 	if ep.includeGlobal && ep.firstPage {
-		globalEntries, gerr := s.cfg.AuditRepo.ListGlobal(r.Context())
+		globalEntries, gerr := s.callerRunlessEntries(r.Context(), r)
 		if gerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"list global chain failed", map[string]any{"error": gerr.Error()})
