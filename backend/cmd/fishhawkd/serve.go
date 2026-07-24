@@ -120,6 +120,38 @@ type planReviewerOptions struct {
 	// single-cell posture: the SDK default endpoint, the anthropic API key.
 	modelBaseURL string
 	modelAPIKey  string
+	// homeRegion is FISHHAWKD_HOME_REGION: the region THIS cell serves. It is
+	// what makes the fail-closed refusal below key on the cell being
+	// region-scoped rather than on the inference config alone (#2107). Empty is
+	// every deployment today — a non-region-scoped cell — for which
+	// resolvePlanReviewers behaves byte-for-byte as before (the subprocess
+	// fall-through is preserved).
+	homeRegion string
+}
+
+// regionScoped reports whether this cell is region-scoped: FISHHAWKD_HOME_REGION
+// is set (#2107). The fail-closed refusal in resolvePlanReviewers keys on this,
+// so a cell with HOME_REGION unset (every deployment today) is never affected
+// and the existing subprocess fall-through is preserved byte-for-byte.
+func (p *planReviewerOptions) regionScoped() bool {
+	return p.homeRegion != ""
+}
+
+// regionInferenceFullyConfigured reports whether in-region inference is fully
+// configured: BOTH FISHHAWKD_MODEL_BASE_URL and FISHHAWKD_MODEL_API_KEY are set
+// (#2107). Only then can the anthropic SDK adapter reach a region-pinned
+// endpoint with a region credential.
+func (p *planReviewerOptions) regionInferenceFullyConfigured() bool {
+	return p.modelBaseURL != "" && p.modelAPIKey != ""
+}
+
+// anyReviewerConfigured reports whether ANY reviewer adapter is configured and
+// would therefore actually run — and, being a plan/implement-review adapter,
+// egress residency-sensitive review text (#2107). A region-scoped cell with no
+// reviewer configured has no egress risk and still boots (the existing
+// configured==0 warning path is unchanged), so the refusal gates on this.
+func (p *planReviewerOptions) anyReviewerConfigured() bool {
+	return p.anthropicAPIKey != "" || p.enableLocalClaudeReviewer || p.enableCodexReviewer
 }
 
 // inferenceAPIKey resolves the credential the Anthropic SDK adapter presents.
@@ -319,8 +351,41 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 // resolver, ALL configured backends are concurrently available to the
 // heterogeneous reviewers.agents spec form; the bare count form keeps the
 // historical precedence via Default().
-func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.ReviewerSet {
+//
+// It returns a non-nil error — a fail-closed startup refusal (#2107) — in
+// exactly one posture: the cell is REGION-SCOPED (FISHHAWKD_HOME_REGION set),
+// its in-region inference is NOT fully configured (FISHHAWKD_MODEL_BASE_URL and
+// FISHHAWKD_MODEL_API_KEY not both set), AND a reviewer adapter is configured.
+// There, no reviewer can run without egressing residency-sensitive review text
+// outside the region: a claudecode/codex subprocess would egress via its own
+// unverified global endpoint, and the anthropic SDK adapter would either be
+// withheld (mirror half-config) or run against the global default endpoint. The
+// guard keys on the cell being region-scoped, not on the inference config
+// alone: when FISHHAWKD_HOME_REGION is UNSET (every deployment today), this
+// returns (set, nil) unchanged, preserving the existing regionKeyWithoutEndpoint
+// withhold-and-warn and the subprocess fall-through byte-for-byte.
+func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) (server.ReviewerSet, error) {
 	set := &planReviewerSet{opts: opts}
+	if opts.regionScoped() && !opts.regionInferenceFullyConfigured() && opts.anyReviewerConfigured() {
+		var missing []string
+		if opts.modelBaseURL == "" {
+			missing = append(missing, "FISHHAWKD_MODEL_BASE_URL")
+		}
+		if opts.modelAPIKey == "" {
+			missing = append(missing, "FISHHAWKD_MODEL_API_KEY")
+		}
+		joined := strings.Join(missing, " and ")
+		// The error is returned (not logged here) so the serve() call site is the
+		// single, distinctive point that logs the refusal and returns exitFailure
+		// (#2107). Keeping the log at the call site — not the resolver — makes the
+		// boot-refusal falsifiable: a call site that discarded this error would
+		// emit no refusal log at all, which the call-site test asserts on.
+		return nil, fmt.Errorf("region-scoped cell (FISHHAWKD_HOME_REGION=%s) has incompletely-configured in-region inference: %s not set. "+
+			"A configured reviewer adapter would egress residency-sensitive plan/implement-review text outside the region "+
+			"(a claudecode/codex subprocess via its own unverified global endpoint; the anthropic SDK adapter via the SDK's global default endpoint), "+
+			"so this cell will not run ANY reviewer. Set %s to the region-scoped inference endpoint and credential, "+
+			"or unset FISHHAWKD_HOME_REGION to run a non-region-scoped deployment", opts.homeRegion, joined, joined)
+	}
 	configured := 0
 	if opts.anthropicConfigured() {
 		configured++
@@ -378,7 +443,7 @@ func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) server.
 		logger.Warn("FISHHAWKD_MODEL_API_KEY is set without FISHHAWKD_MODEL_BASE_URL; the anthropic reviewer is WITHHELD rather than pointed at the SDK's global default endpoint, which would send the region-scoped credential and the plan/implement-review text outside this region. Set FISHHAWKD_MODEL_BASE_URL to the region-scoped inference endpoint, or unset FISHHAWKD_MODEL_API_KEY to run on the default endpoint with FISHHAWKD_ANTHROPIC_API_KEY",
 			slog.String("ref", "#1831"))
 	}
-	return set
+	return set, nil
 }
 
 // regionPinOptions carries the two env values that decide whether this cell
@@ -1233,8 +1298,12 @@ func runServe(args []string, logSink io.Writer) int {
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a
-	// server.
-	cfg.PlanReviewers = resolvePlanReviewers(planReviewerOptions{
+	// server. A region-scoped cell with incompletely-configured in-region
+	// inference and a reviewer configured returns a fail-closed error here
+	// (#2107): the process MUST refuse to boot rather than run a reviewer that
+	// would egress residency-sensitive review text outside the region, so the
+	// error is consumed into exitFailure and never discarded.
+	planReviewers, err := resolvePlanReviewers(planReviewerOptions{
 		anthropicAPIKey:           *anthropicAPIKey,
 		planReviewModel:           *planReviewModel,
 		enableLocalClaudeReviewer: *enableLocalClaudeReviewer,
@@ -1250,7 +1319,13 @@ func runServe(args []string, logSink io.Writer) int {
 		planReviewTimeout:         *planReviewTimeout,
 		modelBaseURL:              *modelBaseURL,
 		modelAPIKey:               *modelAPIKey,
+		homeRegion:                *homeRegion,
 	}, logger)
+	if err != nil {
+		logger.Error("plan-review configuration refused startup", slog.String("error", err.Error()), slog.String("ref", "#2107"))
+		return exitFailure
+	}
+	cfg.PlanReviewers = planReviewers
 
 	// Refinement drafting agent (E34.2 / #1593). Reuses the local-claude
 	// reviewer options: when the local claude adapter is configured, the E34.1

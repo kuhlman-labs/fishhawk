@@ -287,7 +287,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	t.Run("codex flag selects the codex default adapter", func(t *testing.T) {
-		set := resolvePlanReviewers(planReviewerOptions{
+		set, _ := resolvePlanReviewers(planReviewerOptions{
 			enableCodexReviewer:  true,
 			codexBinary:          "codex",
 			openAIAPIKey:         "sk-test",
@@ -304,7 +304,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 	})
 
 	t.Run("no flags means no default reviewer (nil)", func(t *testing.T) {
-		set := resolvePlanReviewers(planReviewerOptions{}, logger)
+		set, _ := resolvePlanReviewers(planReviewerOptions{}, logger)
 		if got := set.Default(); got != nil {
 			t.Errorf("Default() = %T, want nil when no adapter flag is set", got)
 		}
@@ -314,7 +314,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 	})
 
 	t.Run("anthropic key wins default over the codex flag", func(t *testing.T) {
-		set := resolvePlanReviewers(planReviewerOptions{
+		set, _ := resolvePlanReviewers(planReviewerOptions{
 			anthropicAPIKey:      "sk-ant",
 			planReviewModel:      "claude-sonnet-4-6",
 			enableCodexReviewer:  true,
@@ -332,7 +332,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 	})
 
 	t.Run("local-claude wins default over the codex flag", func(t *testing.T) {
-		set := resolvePlanReviewers(planReviewerOptions{
+		set, _ := resolvePlanReviewers(planReviewerOptions{
 			enableLocalClaudeReviewer: true,
 			localClaudeBinary:         "claude",
 			enableCodexReviewer:       true,
@@ -343,7 +343,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 	})
 
 	t.Run("For resolves codex alongside anthropic (#955 concurrent topology)", func(t *testing.T) {
-		set := resolvePlanReviewers(planReviewerOptions{
+		set, _ := resolvePlanReviewers(planReviewerOptions{
 			anthropicAPIKey:     "sk-ant",
 			planReviewModel:     "claude-sonnet-4-6",
 			enableCodexReviewer: true,
@@ -360,7 +360,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 	})
 
 	t.Run("For on an unconfigured provider errors and names the knob", func(t *testing.T) {
-		set := resolvePlanReviewers(planReviewerOptions{
+		set, _ := resolvePlanReviewers(planReviewerOptions{
 			anthropicAPIKey: "sk-ant",
 		}, logger)
 		if _, err := set.For("codex", ""); err == nil || !strings.Contains(err.Error(), "FISHHAWKD_ENABLE_CODEX_REVIEWER") {
@@ -372,7 +372,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 	})
 
 	t.Run("For constructs independent model-overridden instances", func(t *testing.T) {
-		set := resolvePlanReviewers(planReviewerOptions{
+		set, _ := resolvePlanReviewers(planReviewerOptions{
 			anthropicAPIKey: "sk-ant",
 			planReviewModel: "claude-sonnet-4-6",
 		}, logger)
@@ -401,7 +401,7 @@ func TestResolvePlanReviewers(t *testing.T) {
 		if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s' '"+envelope+"'\n"), 0o755); err != nil {
 			t.Fatalf("write stub binary: %v", err)
 		}
-		set := resolvePlanReviewers(planReviewerOptions{
+		set, _ := resolvePlanReviewers(planReviewerOptions{
 			enableLocalClaudeReviewer: true,
 			localClaudeBinary:         stub,
 			localClaudeModel:          "claude-sonnet-4-6",
