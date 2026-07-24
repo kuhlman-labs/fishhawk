@@ -1354,6 +1354,37 @@ func TestServeWiresGitLabOAuthConfig(t *testing.T) {
 		if !strings.Contains(log, "gitlab oauth sign-in configured") {
 			t.Errorf("a complete GitLab OAuth trio did not wire cfg.GitLabOAuth through runServe (missing the sign-in-configured log); /v0/auth/gitlab/* would stay 503. log:\n%s", log)
 		}
+
+		// The log above proves the client was CONSTRUCTED, but it is now guarded
+		// on cfg.GitLabOAuth (the field the routes read) rather than the local
+		// var — so deleting `cfg.GitLabOAuth = gitlabOAuth` in runServe stops the
+		// log AND fails the assertion above. Beyond that, exercise the ROUTE that
+		// consumes the field so the Config field — not a bare non-nil check — is
+		// the load-bearing observation (#2109 fix-up): build a server from a
+		// Config carrying the SAME resolveGitLabOAuth-constructed client runServe
+		// wires and drive GET /v0/auth/gitlab/login. A wired field 302-redirects
+		// to the authorize URL and sets the state cookie; a nil field (the
+		// deleted-assignment regression) would 503 oauth_unconfigured.
+		oauth, err := resolveGitLabOAuth("https://gitlab.example.com", "cid", "csec", "https://ex/cb")
+		if err != nil {
+			t.Fatalf("resolveGitLabOAuth: %v", err)
+		}
+		srv := server.New(server.Config{Addr: "127.0.0.1:0", GitLabOAuth: oauth})
+		req := httptest.NewRequest(http.MethodGet, "/v0/auth/gitlab/login", nil)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusFound {
+			t.Fatalf("GET /v0/auth/gitlab/login with the wired cfg.GitLabOAuth = %d, want 302 (a nil field would 503 oauth_unconfigured):\n%s", w.Code, w.Body.String())
+		}
+		var stateCookie *http.Cookie
+		for _, c := range w.Result().Cookies() {
+			if c.Name == authpkg.StateCookieName {
+				stateCookie = c
+			}
+		}
+		if stateCookie == nil {
+			t.Error("GET /v0/auth/gitlab/login did not set the OAuth state cookie; cfg.GitLabOAuth did not reach the route")
+		}
 	})
 
 	t.Run("partial trio aborts startup with the misconfigured refusal", func(t *testing.T) {

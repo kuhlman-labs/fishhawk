@@ -2045,7 +2045,11 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("membership resolver unconfigured (no database); every OAuth sign-in will be denied")
 	}
 
-	if gitlabOAuth != nil {
+	// Guarded on cfg.GitLabOAuth — the FIELD the /v0/auth/gitlab/* routes read —
+	// not the local gitlabOAuth var, so deleting the `cfg.GitLabOAuth = gitlabOAuth`
+	// assignment above stops this log and fails the serve-wiring test rather than
+	// silently leaving the routes at 503 (#2109 fix-up).
+	if cfg.GitLabOAuth != nil {
 		logger.Info("gitlab oauth sign-in configured",
 			slog.String("callback_url", *gitlabOAuthCallbackURL),
 			slog.String("base_url", *gitlabBaseURL),
