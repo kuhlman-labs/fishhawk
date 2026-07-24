@@ -16,19 +16,37 @@ import (
 
 // fakeStore records every call so a test can assert that a forge fault wrote
 // NOTHING — the "no upsert" half of the fail-closed contract is not observable
-// from the return value alone.
+// from the return value alone. It also models the purge-watermark generation
+// discipline (#2116): a per-(provider, subject) generation map, and a guarded
+// Upsert that REJECTS (records nothing, returns nil) when the captured
+// generation trails the current one — the in-memory analogue of the FOR SHARE
+// guard.
 type fakeStore struct {
 	entry     repoacl.Entry
 	found     bool
 	getErr    error
 	upsertErr error
 	deleteErr error
+	ensureErr error
+	bumpErr   error
 
 	upserts  []identity.Permission
 	deletes  int
 	lastKey  [3]string
 	getCalls int
+
+	// gens tracks the current purge generation per (provider, subject); absent
+	// keys are generation 0. capturedGens/ensureCalls record what Permission
+	// threaded into Upsert. calls is an ORDERED log of mutating calls so a test
+	// can assert bump-before-delete and ensure-before-upsert by order, not
+	// merely counts.
+	gens         map[string]int64
+	capturedGens []int64
+	ensureCalls  int
+	calls        []string
 }
+
+func (f *fakeStore) key(provider, subject string) string { return provider + "\x00" + subject }
 
 func (f *fakeStore) Get(_ context.Context, provider, subject, repo string) (repoacl.Entry, bool, error) {
 	f.getCalls++
@@ -39,11 +57,42 @@ func (f *fakeStore) Get(_ context.Context, provider, subject, repo string) (repo
 	return f.entry, f.found, nil
 }
 
-func (f *fakeStore) Upsert(_ context.Context, _, _, _ string, perm identity.Permission) error {
+func (f *fakeStore) EnsurePurgeGeneration(_ context.Context, provider, subject string) (int64, error) {
+	if f.ensureErr != nil {
+		return 0, f.ensureErr
+	}
+	f.ensureCalls++
+	f.calls = append(f.calls, "ensure")
+	if f.gens == nil {
+		f.gens = map[string]int64{}
+	}
+	return f.gens[f.key(provider, subject)], nil
+}
+
+func (f *fakeStore) BumpPurgeWatermark(_ context.Context, provider, subject string) error {
+	if f.bumpErr != nil {
+		return f.bumpErr
+	}
+	if f.gens == nil {
+		f.gens = map[string]int64{}
+	}
+	f.gens[f.key(provider, subject)]++
+	f.calls = append(f.calls, "bump")
+	return nil
+}
+
+func (f *fakeStore) Upsert(_ context.Context, provider, subject, _ string, perm identity.Permission, capturedGen int64) error {
 	if f.upsertErr != nil {
 		return f.upsertErr
 	}
+	f.capturedGens = append(f.capturedGens, capturedGen)
+	// Model the guarded rejection: a purge that bumped the generation past the
+	// captured value rejects the write (records nothing, returns nil).
+	if f.gens != nil && capturedGen < f.gens[f.key(provider, subject)] {
+		return nil
+	}
 	f.upserts = append(f.upserts, perm)
+	f.calls = append(f.calls, "upsert")
 	return nil
 }
 
@@ -52,6 +101,7 @@ func (f *fakeStore) DeleteForSubject(_ context.Context, _, _ string) error {
 		return f.deleteErr
 	}
 	f.deletes++
+	f.calls = append(f.calls, "delete")
 	return nil
 }
 
@@ -61,11 +111,18 @@ type fakeResolver struct {
 	calls    int
 	lastRepo string
 	lastSubj string
+	// onResolve, if set, runs as a side effect of PermissionLevel — used to
+	// simulate a purge that bumps the watermark DURING the forge lookup, in the
+	// [capture, write] window.
+	onResolve func()
 }
 
 func (f *fakeResolver) PermissionLevel(_ context.Context, repo, subject string) (identity.Permission, error) {
 	f.calls++
 	f.lastRepo, f.lastSubj = repo, subject
+	if f.onResolve != nil {
+		f.onResolve()
+	}
 	if f.err != nil {
 		return identity.PermissionNone, f.err
 	}
@@ -422,6 +479,121 @@ func TestRepoACLMirror_InvalidateSubject(t *testing.T) {
 	err := failing.InvalidateSubject(context.Background(), "github", "octocat")
 	if !errors.Is(err, repoacl.ErrStoreUnavailable) {
 		t.Errorf("purge error = %v, want ErrStoreUnavailable", err)
+	}
+}
+
+// Failure mode (m4): InvalidateSubject must BUMP the watermark STRICTLY BEFORE
+// deleting the subject's rows — the security-critical ordering (#2116). Asserted
+// via the ordered call log, not counts: a swapped order would keep both counts
+// at 1 yet reopen the race the bump-before-delete discipline closes.
+func TestRepoACLMirror_InvalidateSubjectBumpsBeforeDelete(t *testing.T) {
+	store := &fakeStore{}
+	m := newTestMirror(t, store, &fakeResolver{})
+	if err := m.InvalidateSubject(context.Background(), "github", "octocat"); err != nil {
+		t.Fatalf("InvalidateSubject error: %v", err)
+	}
+	if len(store.calls) != 2 || store.calls[0] != "bump" || store.calls[1] != "delete" {
+		t.Fatalf("call order = %v, want [bump delete] (bump strictly before delete)", store.calls)
+	}
+	if store.gens[store.key("github", "octocat")] != 1 {
+		t.Errorf("generation = %d after purge, want 1 (bump raised it)", store.gens[store.key("github", "octocat")])
+	}
+}
+
+// A BumpPurgeWatermark failure surfaces as a store fault (non-fatal-to-sign-in,
+// like the delete failure) AND short-circuits before the delete — the bump is
+// the security-critical half, so a failed bump must not silently proceed to a
+// delete that reopens the window without raising the watermark.
+func TestRepoACLMirror_InvalidateSubjectBumpFailureSurfaces(t *testing.T) {
+	store := &fakeStore{bumpErr: errors.New("db: down")}
+	m := repoacl.NewMirror(store, &fakeResolver{}, 0, testLogger())
+	err := m.InvalidateSubject(context.Background(), "github", "octocat")
+	if !errors.Is(err, repoacl.ErrStoreUnavailable) {
+		t.Errorf("bump error = %v, want ErrStoreUnavailable", err)
+	}
+	if store.deletes != 0 {
+		t.Errorf("deletes = %d, want 0 (a failed bump must not proceed to delete)", store.deletes)
+	}
+}
+
+// Failure mode (a): on a MISS, Permission calls EnsurePurgeGeneration BEFORE the
+// resolver and threads the captured generation into Upsert. Asserted by both the
+// ordered call log (ensure before upsert) and the value threaded through.
+func TestRepoACLMirror_PermissionCapturesGenerationBeforeResolve(t *testing.T) {
+	store := &fakeStore{gens: map[string]int64{}}
+	// Pre-set the subject's generation to 3 so the captured value is
+	// distinguishable from the zero value.
+	store.gens[store.key("github", "octocat")] = 3
+	res := &fakeResolver{perm: identity.PermissionWrite}
+	m := newTestMirror(t, store, res)
+
+	perm, err := m.Permission(context.Background(), "github", "octocat", "acme/app")
+	if err != nil {
+		t.Fatalf("Permission: %v", err)
+	}
+	if perm != identity.PermissionWrite {
+		t.Errorf("perm = %q, want write", perm)
+	}
+	if store.ensureCalls != 1 {
+		t.Errorf("ensure calls = %d, want 1", store.ensureCalls)
+	}
+	// EnsurePurgeGeneration must precede the forge resolve, which precedes the
+	// upsert. The resolver has no entry in the store call log, so assert
+	// ensure-before-upsert directly.
+	if len(store.calls) != 2 || store.calls[0] != "ensure" || store.calls[1] != "upsert" {
+		t.Fatalf("call order = %v, want [ensure upsert]", store.calls)
+	}
+	if len(store.capturedGens) != 1 || store.capturedGens[0] != 3 {
+		t.Errorf("captured generations = %v, want [3] (the generation read at resolution start)", store.capturedGens)
+	}
+}
+
+// Failure mode (m7): a guarded-rejection Upsert (a purge bumped the generation
+// after capture) still returns the resolved perm to THIS caller (perm, nil) and
+// memoizes NOTHING — correct for this request; the next request re-resolves.
+func TestRepoACLMirror_GuardedRejectionStillReturnsPerm(t *testing.T) {
+	store := &fakeStore{gens: map[string]int64{}}
+	res := &fakeResolver{perm: identity.PermissionAdmin}
+	m := newTestMirror(t, store, res)
+
+	// EnsurePurgeGeneration captures generation 0 at resolution start. A purge
+	// then bumps the generation to 1 DURING the forge lookup — the [capture,
+	// write] window — so the guarded Upsert (capturedGen 0 < live 1) is
+	// rejected.
+	res.onResolve = func() { store.gens[store.key("github", "octocat")] = 1 }
+
+	perm, err := m.Permission(context.Background(), "github", "octocat", "acme/app")
+	if err != nil {
+		t.Fatalf("Permission: %v", err)
+	}
+	if perm != identity.PermissionAdmin {
+		t.Errorf("perm = %q, want admin (the caller still gets the resolved answer)", perm)
+	}
+	if len(store.upserts) != 0 {
+		t.Errorf("upserts = %v, want none (a guarded rejection memoizes nothing)", store.upserts)
+	}
+	if len(store.capturedGens) != 1 || store.capturedGens[0] != 0 {
+		t.Errorf("captured generations = %v, want [0] (captured before the purge bumped to 1)", store.capturedGens)
+	}
+}
+
+// Failure mode (m5): an EnsurePurgeGeneration store error surfaces
+// ErrStoreUnavailable from Permission — the filter cannot function, and it must
+// not silently proceed to write with a bogus generation.
+func TestRepoACLMirror_EnsureGenerationErrorSurfaces(t *testing.T) {
+	store := &fakeStore{ensureErr: errors.New("db: connection refused")}
+	res := &fakeResolver{perm: identity.PermissionWrite}
+	m := newTestMirror(t, store, res)
+
+	_, err := m.Permission(context.Background(), "github", "octocat", "acme/app")
+	if !errors.Is(err, repoacl.ErrStoreUnavailable) {
+		t.Fatalf("Permission error = %v, want ErrStoreUnavailable", err)
+	}
+	if errors.Is(err, repoacl.ErrForgeUnavailable) {
+		t.Errorf("error = %v, must NOT classify as a forge fault", err)
+	}
+	if res.calls != 0 {
+		t.Errorf("forge calls = %d, want 0 (a failed generation capture short-circuits before the forge)", res.calls)
 	}
 }
 

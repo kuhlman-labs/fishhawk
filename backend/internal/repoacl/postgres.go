@@ -44,16 +44,50 @@ func (s *postgresStore) Get(ctx context.Context, provider, subject, repo string)
 	}, true, nil
 }
 
-func (s *postgresStore) Upsert(ctx context.Context, provider, subject, repo string, perm identity.Permission) error {
+func (s *postgresStore) Upsert(ctx context.Context, provider, subject, repo string, perm identity.Permission, capturedGen int64) error {
 	// The ID is only consumed on INSERT; a conflicting row keeps its own PK.
-	if _, err := s.q.UpsertRepoACLEntry(ctx, repoacldb.UpsertRepoACLEntryParams{
+	if _, err := s.q.UpsertRepoACLEntryGuarded(ctx, repoacldb.UpsertRepoACLEntryGuardedParams{
 		ID:         uuid.New(),
 		Provider:   provider,
 		Subject:    subject,
 		Repo:       repo,
 		Permission: string(perm),
+		Generation: capturedGen,
 	}); err != nil {
+		// A guarded rejection (a purge bumped the watermark past capturedGen)
+		// yields zero rows → pgx.ErrNoRows. That is BENIGN: the write is simply
+		// not memoized and the next request re-resolves. Only a real fault
+		// wraps as a store error.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
 		return fmt.Errorf("repoacl: upsert entry: %w", err)
+	}
+	return nil
+}
+
+// EnsurePurgeGeneration guarantees the watermark row exists (creating it at
+// generation 0 if absent) and returns the current generation. Called at
+// resolution start so the guarded Upsert's FOR SHARE lock has a row to bite on.
+func (s *postgresStore) EnsurePurgeGeneration(ctx context.Context, provider, subject string) (int64, error) {
+	gen, err := s.q.EnsureRepoACLPurgeWatermark(ctx, repoacldb.EnsureRepoACLPurgeWatermarkParams{
+		Provider: provider,
+		Subject:  subject,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("repoacl: ensure purge watermark: %w", err)
+	}
+	return gen, nil
+}
+
+// BumpPurgeWatermark raises the purge generation (creating the row on the
+// first-ever purge). InvalidateSubject calls it BEFORE DeleteForSubject.
+func (s *postgresStore) BumpPurgeWatermark(ctx context.Context, provider, subject string) error {
+	if err := s.q.BumpRepoACLPurgeWatermark(ctx, repoacldb.BumpRepoACLPurgeWatermarkParams{
+		Provider: provider,
+		Subject:  subject,
+	}); err != nil {
+		return fmt.Errorf("repoacl: bump purge watermark: %w", err)
 	}
 	return nil
 }
