@@ -21,25 +21,40 @@ var childNumberPlaceholderRE = regexp.MustCompile(`\{([a-zA-Z0-9_]+)\}`)
 //
 // It builds an anchored regexp from titleFormat with the resolved epic value
 // substituted as a literal, scans every child title, collects the {n} values
-// that match, and returns max+1 — or 1 when no child title matches (a
-// genuinely-first child, an empty children slice, or a malformed title_format).
-// Anchoring at ^ plus the literal '.' after the epic value means an epic "7"
-// can never be confused with "[E17.x]", "[E70.x]", or the bare "[E7]" epic
-// title itself. Non-conforming child titles are skipped, and gaps are
-// tolerated ([E7.1],[E7.5] -> 6), so the number is always max+1 over the
-// matched set, never a count.
+// that match, and returns (max+1, true). Anchoring at ^ plus the literal '.'
+// after the epic value means an epic "7" can never be confused with "[E17.x]",
+// "[E70.x]", or the bare "[E7]" epic title itself. Non-conforming child titles
+// are skipped, and gaps are tolerated ([E7.1],[E7.5] -> 6), so the number is
+// always max+1 over the matched set, never a count.
 //
-// The claim is collision-free within one deployment, not globally impossible:
+// The second return value reports whether allocation is UNAMBIGUOUS, and the
+// function fails CLOSED when it is not — mirroring #1265's empty-list guard for
+// ADR numbering. It distinguishes a genuinely-EMPTY child set from a NON-EMPTY
+// set with zero numbered matches:
+//   - regexp nil (no {n} placeholder or a non-compiling title_format, a
+//     caller-guarded / config case): (1, true), unchanged behavior.
+//   - zero matches AND len(children) == 0 (a genuinely-first child): (1, true).
+//   - zero matches AND len(children) > 0 (children exist but none carry the
+//     numbered [E<epic>.<n>] form — the ambiguous zero-match, e.g. epic #389's
+//     placeholder [E22.X] corpus): (0, false). Allocating 1 here would collide
+//     with an existing child, so the caller must fail closed and ask for an
+//     explicit n. A title that matches the regexp but whose digit run overflows
+//     strconv.Atoi is NOT counted as a match (so it cannot yield a spurious
+//     (1, true)), yet still counts toward "children exist".
+//   - one or more matches: (max+1, true).
+//
+// The collision-free claim is within one deployment, not globally impossible:
 // two concurrent omitted-n filings against the same epic are serialized by the
 // caller's per-epic in-process lock (server/workitems.go), and hosted
 // multi-instance deployments would need a Postgres advisory lock (see the
 // workmgmt README).
-func NextChildNumber(titleFormat, epic string, children []EpicChild) int {
+func NextChildNumber(titleFormat, epic string, children []EpicChild) (int, bool) {
 	re := childNumberRegexp(titleFormat, epic)
 	if re == nil {
-		return 1
+		return 1, true
 	}
 	max := 0
+	matched := 0
 	for _, c := range children {
 		m := re.FindStringSubmatch(c.Title)
 		if m == nil {
@@ -47,13 +62,26 @@ func NextChildNumber(titleFormat, epic string, children []EpicChild) int {
 		}
 		n, err := strconv.Atoi(m[1])
 		if err != nil {
+			// A digit run that overflows Atoi (or is otherwise unparseable) is
+			// NOT a numbered match — counting it could yield a spurious
+			// (1, true) with max==0. It still counts toward len(children) > 0.
 			continue
 		}
+		matched++
 		if n > max {
 			max = n
 		}
 	}
-	return max + 1
+	if matched == 0 {
+		if len(children) == 0 {
+			// Genuinely-first child of an empty epic: allocate 1.
+			return 1, true
+		}
+		// Children exist but none carry the numbered form: allocating 1 would
+		// collide. Fail closed — the caller must supply n explicitly.
+		return 0, false
+	}
+	return max + 1, true
 }
 
 // childNumberRegexp builds an anchored regexp from a child type's title_format

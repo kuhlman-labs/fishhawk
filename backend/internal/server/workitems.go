@@ -667,10 +667,13 @@ func childNumberLockKey(target workmgmt.Target, epicRef string) string {
 // caller as unlock, released after File) and calls EpicChildren. A genuine
 // query error releases the lock and returns a *workItemError 422
 // work_item_invalid naming the failure and the fallback ("pass n explicitly"),
-// with details {type, n_discovery_failed}. On success it sets
-// filing.TitleVars["n"] = NextChildNumber(...) (with the mandatory nil-map
-// guard, the #1184 precedent) and returns the still-held unlock so the caller
-// serializes Apply + File under it.
+// with details {type, n_discovery_failed}. It ALSO fails closed the same way
+// (unlock, 422 work_item_invalid, details.n_discovery_failed) when the query
+// succeeds but NextChildNumber cannot allocate — children exist yet none carry
+// the numbered [E<epic>.<n>] form, so allocating 1 would collide (#2101). On
+// success it sets filing.TitleVars["n"] = NextChildNumber(...) (with the
+// mandatory nil-map guard, the #1184 precedent) and returns the still-held
+// unlock so the caller serializes Apply + File under it.
 // The receiver is unused (discovery resolves the provider through the global
 // workmgmt registry, not server config) but the method form mirrors
 // deriveEpicTitleVar/discoverExistingNumbers and keeps the call site uniform.
@@ -720,12 +723,32 @@ func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.F
 			},
 		}
 	}
+	n, ok := workmgmt.NextChildNumber(itemType.TitleFormat, epic, res.Children)
+	if !ok {
+		// Children exist but none carry the numbered [E<epic>.<n>] form, so the
+		// next number cannot be allocated without colliding with an existing
+		// child (e.g. epic #389's placeholder [E22.X] corpus). Fail closed —
+		// mirror the EpicChildren-error branch's unlock-before-return discipline.
+		unlock()
+		return nil, &workItemError{
+			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
+			msg: fmt.Sprintf(
+				"could not discover the child number for the parent epic %q: it has %d children but none carry the numbered [E%s.<n>] form; pass n explicitly",
+				filing.Relations.ParentEpic, len(res.Children), epic),
+			details: map[string]any{
+				"type": filing.Type,
+				"n_discovery_failed": fmt.Sprintf(
+					"parent epic %q has %d children but none match the numbered [E%s.<n>] form",
+					filing.Relations.ParentEpic, len(res.Children), epic),
+			},
+		}
+	}
 	// MANDATORY nil-map guard (#1184): allocate before assigning so a filing
 	// that omits title_vars entirely does not panic.
 	if filing.TitleVars == nil {
 		filing.TitleVars = map[string]string{}
 	}
-	filing.TitleVars["n"] = strconv.Itoa(workmgmt.NextChildNumber(itemType.TitleFormat, epic, res.Children))
+	filing.TitleVars["n"] = strconv.Itoa(n)
 	return unlock, nil
 }
 
