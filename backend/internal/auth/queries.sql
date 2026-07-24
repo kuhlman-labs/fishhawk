@@ -17,9 +17,6 @@ RETURNING *;
 -- name: GetUser :one
 SELECT * FROM users WHERE id = $1;
 
--- name: GetUserByGitHubID :one
-SELECT * FROM users WHERE github_user_id = $1;
-
 -- name: CreateSession :one
 -- account_id is the workspace account the membership gate resolved at
 -- sign-in (E44.3); NULL only where no gate ran.

@@ -119,26 +119,6 @@ func (q *Queries) GetUser(ctx context.Context, id uuid.UUID) (User, error) {
 	return i, err
 }
 
-const getUserByGitHubID = `-- name: GetUserByGitHubID :one
-SELECT id, github_user_id, github_login, name, email, created_at, updated_at, provider FROM users WHERE github_user_id = $1
-`
-
-func (q *Queries) GetUserByGitHubID(ctx context.Context, githubUserID int64) (User, error) {
-	row := q.db.QueryRow(ctx, getUserByGitHubID, githubUserID)
-	var i User
-	err := row.Scan(
-		&i.ID,
-		&i.GithubUserID,
-		&i.GithubLogin,
-		&i.Name,
-		&i.Email,
-		&i.CreatedAt,
-		&i.UpdatedAt,
-		&i.Provider,
-	)
-	return i, err
-}
-
 const revokeSessionByID = `-- name: RevokeSessionByID :exec
 UPDATE sessions
    SET revoked_at = COALESCE(revoked_at, $2)

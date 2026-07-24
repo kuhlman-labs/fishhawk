@@ -1967,16 +1967,11 @@ func runServe(args []string, logSink io.Writer) int {
 		// OAuth token, never FISHHAWKD_GITLAB_TOKEN. Without a database
 		// the resolver stays nil and the callback denies every sign-in
 		// (fail closed).
+		// membershipListers here is for THIS block's logging only; the resolver
+		// itself is constructed once, below, gated on the database alone so a
+		// GitLab-only deployment reaches it too (#2109 fix-up).
 		membershipListers := resolveMembershipListers(cfg.GitHubOAuth, *gitlabBaseURL)
 		emuAutoJoin := authpkg.IsEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL)
-		if pool != nil {
-			cfg.AuthMembership = authpkg.NewMembershipResolver(
-				authpkg.NewAccountMembershipStore(accountdb.New(pool)),
-				membershipListers,
-				authpkg.WithEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL))
-		} else {
-			logger.Warn("membership resolver unconfigured (no database); every OAuth sign-in will be denied")
-		}
 		logger.Info("github oauth sign-in configured",
 			slog.String("callback_url", *oauthCallbackURL),
 			slog.String("redirect_after_login", *oauthRedirectAfterLogin),
@@ -2010,9 +2005,11 @@ func runServe(args []string, logSink io.Writer) int {
 	// Deployment-default only (no per-installation hook): the whole flow runs at
 	// or before user identification, so no installation is knowable — mirroring
 	// the deferred GitHub web-OAuth leg. All-three-or-error, like the GitHub trio;
-	// a partial config exits rather than running half-configured. The membership
-	// resolver + AuthRepo are shared with the GitHub block above (nil when no DB /
-	// no GitHub OAuth → the callback fails closed and denies every sign-in).
+	// a partial config exits rather than running half-configured. AuthRepo comes
+	// from the database block, and the membership resolver is built just below
+	// gated on the database ALONE (not on GitHub OAuth), so a GitLab-only
+	// deployment reaches both; without a database the callback fails closed and
+	// denies every sign-in.
 	gitlabOAuth, err := resolveGitLabOAuth(*gitlabBaseURL,
 		*gitlabOAuthClientID, *gitlabOAuthClientSecret, *gitlabOAuthCallbackURL)
 	if err != nil {
@@ -2021,6 +2018,34 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 	if gitlabOAuth != nil {
 		cfg.GitLabOAuth = gitlabOAuth
+	}
+
+	// Workspace-membership login gate (E44.3 / ADR-057 Amendment A2, generalized
+	// E44.8 / #1832). Constructed here — AFTER both the GitHub and GitLab OAuth
+	// blocks have populated cfg.GitHubOAuth / cfg.GitLabOAuth — and gated on the
+	// DATABASE ALONE, independent of which forge OAuth leg is configured. A
+	// GitLab-only deployment (a database + FISHHAWKD_GITLAB_OAUTH_* + base URL,
+	// no GitHub OAuth) must reach this resolver; wiring it inside the GitHub
+	// block left cfg.AuthMembership nil there, so /v0/auth/gitlab/callback denied
+	// every sign-in via the nil-resolver 503 branch even though cfg.GitLabOAuth
+	// was built (#2109 fix-up). The provider-keyed lister map registers github
+	// (the GitHubOAuth client) and/or gitlab (the base URL) as each is
+	// configured; an empty map denies every sign-in. The EMU auto-join host is
+	// derived from the GitHub OAuth authorize URL and is inert when GitHub OAuth
+	// is absent.
+	membershipListers := resolveMembershipListers(cfg.GitHubOAuth, *gitlabBaseURL)
+	if pool != nil {
+		cfg.AuthMembership = authpkg.NewMembershipResolver(
+			authpkg.NewAccountMembershipStore(accountdb.New(pool)),
+			membershipListers,
+			authpkg.WithEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL))
+		logger.Info("membership resolver configured",
+			slog.Any("membership_providers", sortedKeys(membershipListers)))
+	} else if cfg.GitHubOAuth != nil || cfg.GitLabOAuth != nil {
+		logger.Warn("membership resolver unconfigured (no database); every OAuth sign-in will be denied")
+	}
+
+	if gitlabOAuth != nil {
 		logger.Info("gitlab oauth sign-in configured",
 			slog.String("callback_url", *gitlabOAuthCallbackURL),
 			slog.String("base_url", *gitlabBaseURL),

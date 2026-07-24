@@ -1276,12 +1276,38 @@ func TestGitHubCallback_NoMirrorWired_SignsInNormally(t *testing.T) {
 
 // ---- GitLab browser sign-in (E44.22 / #2109) --------------------------------
 
+// gitlabGroupsRecorder captures the Bearer token the caller forwarded to
+// /api/v4/groups, so the e2e can prove the PRODUCTION GitLabMembershipLister
+// actually reached that endpoint with the exchanged user token. Guarded by a
+// mutex because the httptest handler runs in a server goroutine while the test
+// reads after the request completes (#2109 fix-up).
+type gitlabGroupsRecorder struct {
+	mu     sync.Mutex
+	called bool
+	token  string
+}
+
+func (r *gitlabGroupsRecorder) record(authHeader string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.called = true
+	r.token = strings.TrimPrefix(authHeader, "Bearer ")
+}
+
+func (r *gitlabGroupsRecorder) seenToken() (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.token, r.called
+}
+
 // stubGitLabOAuthServer mounts httptest endpoints the GitLabOAuth client
 // (and, for the e2e, the real GitLabMembershipLister) point at: /oauth/token,
 // /api/v4/user, and /api/v4/groups. The username + group full_paths are
-// caller-chosen so the auto-join case can drive a real group listing.
-func stubGitLabOAuthServer(t *testing.T, username string, groups []string) (*httptest.Server, *auth.GitLabOAuth) {
+// caller-chosen so the auto-join case can drive a real group listing. The
+// returned recorder captures the token seen at /api/v4/groups.
+func stubGitLabOAuthServer(t *testing.T, username string, groups []string) (*httptest.Server, *auth.GitLabOAuth, *gitlabGroupsRecorder) {
 	t.Helper()
+	rec := &gitlabGroupsRecorder{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1297,7 +1323,8 @@ func stubGitLabOAuthServer(t *testing.T, username string, groups []string) (*htt
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(body)
 	})
-	mux.HandleFunc("/api/v4/groups", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/v4/groups", func(w http.ResponseWriter, req *http.Request) {
+		rec.record(req.Header.Get("Authorization"))
 		rows := make([]map[string]any, 0, len(groups))
 		for _, g := range groups {
 			rows = append(rows, map[string]any{"full_path": g})
@@ -1310,7 +1337,7 @@ func stubGitLabOAuthServer(t *testing.T, username string, groups []string) (*htt
 	t.Cleanup(srv.Close)
 	gl := auth.NewGitLabOAuth(srv.URL, "gitlab-client", "gitlab-secret",
 		"https://example.com/gitlab/cb", auth.GitLabOAuthURLs{})
-	return srv, gl
+	return srv, gl, rec
 }
 
 // newGitLabAuthServerWithResolver wires a server with the GitLab OAuth client
@@ -1318,7 +1345,7 @@ func stubGitLabOAuthServer(t *testing.T, username string, groups []string) (*htt
 func newGitLabAuthServerWithResolver(t *testing.T, resolver auth.MembershipResolver) (*Server, *fakeAuthRepo) {
 	t.Helper()
 	repo := newFakeAuthRepo()
-	_, gl := stubGitLabOAuthServer(t, "gluser", nil)
+	_, gl, _ := stubGitLabOAuthServer(t, "gluser", nil)
 	s := New(Config{
 		Addr:                   "127.0.0.1:0",
 		AuthRepo:               repo,
@@ -1477,7 +1504,7 @@ func TestGitLabCallback_ThreadsProviderGitLab(t *testing.T) {
 // the resolver saw provider="gitlab" and no GitLab id clobbers a pre-existing
 // GitHub user of the same numeric id.
 func TestGitLabCallback_MembershipGate_PostgresE2E(t *testing.T) {
-	newPGGitLabServer := func(t *testing.T, username string, groups []string) (*Server, *pgxpool.Pool, *stubGitLabLister) {
+	newPGGitLabServer := func(t *testing.T, username string, groups []string) (*Server, *pgxpool.Pool, *gitlabGroupsRecorder) {
 		t.Helper()
 		url := pgtest.NewURL(t)
 		if err := postgres.MigrateUp(url); err != nil {
@@ -1488,22 +1515,24 @@ func TestGitLabCallback_MembershipGate_PostgresE2E(t *testing.T) {
 			t.Fatalf("pool: %v", err)
 		}
 		t.Cleanup(pool.Close)
-		_, gl := stubGitLabOAuthServer(t, username, groups)
-		lister := &stubGitLabLister{keys: groups}
+		srv, gl, rec := stubGitLabOAuthServer(t, username, groups)
+		// The PRODUCTION lister, pointed at the stub's /api/v4/groups — not a
+		// hand-rolled fake — so this exercises the real group-list HTTP boundary
+		// end to end (#2109 fix-up).
 		s := New(Config{
 			Addr:        "127.0.0.1:0",
 			AuthRepo:    auth.NewPostgresRepository(pool),
 			GitLabOAuth: gl,
 			AuthMembership: auth.NewMembershipResolver(
 				auth.NewAccountMembershipStore(accountdb.New(pool)),
-				map[string]auth.ForgeMembershipLister{"gitlab": lister}),
+				map[string]auth.ForgeMembershipLister{"gitlab": auth.NewGitLabMembershipLister(srv.URL)}),
 			AuthRedirectAfterLogin: "/app",
 		})
-		return s, pool, lister
+		return s, pool, rec
 	}
 
 	t.Run("group auto-join admits and binds the session", func(t *testing.T) {
-		s, pool, lister := newPGGitLabServer(t, "gluser", []string{"acme-group/team"})
+		s, pool, rec := newPGGitLabServer(t, "gluser", []string{"acme-group/team"})
 		// A group-granularity account whose key is the group full_path.
 		accountID := uuid.New()
 		role := "member"
@@ -1519,8 +1548,12 @@ func TestGitLabCallback_MembershipGate_PostgresE2E(t *testing.T) {
 		if w.Code != http.StatusFound {
 			t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
 		}
-		if lister.gotToken != "glpat_xxx" {
-			t.Errorf("lister saw token %q, want the exchanged glpat_xxx", lister.gotToken)
+		tok, called := rec.seenToken()
+		if !called {
+			t.Error("production GitLabMembershipLister never called the stub /api/v4/groups endpoint; the group-list boundary was not exercised")
+		}
+		if tok != "glpat_xxx" {
+			t.Errorf("groups endpoint saw token %q, want the exchanged glpat_xxx", tok)
 		}
 		var sessCookie, csrfCookie *http.Cookie
 		for _, c := range w.Result().Cookies() {
@@ -1607,20 +1640,4 @@ func TestGitLabCallback_MembershipGate_PostgresE2E(t *testing.T) {
 			t.Errorf("github row = %q/%q, want gh-collide/github (not overwritten)", ghLogin, ghProvider)
 		}
 	})
-}
-
-// stubGitLabLister is the fake ForgeMembershipLister for the GitLab postgres
-// e2e — it records the token the resolver forwards and returns preset keys.
-type stubGitLabLister struct {
-	keys     []string
-	gotToken string
-	err      error
-}
-
-func (f *stubGitLabLister) ListUserOrgKeys(_ context.Context, token string) ([]string, error) {
-	f.gotToken = token
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.keys, nil
 }
