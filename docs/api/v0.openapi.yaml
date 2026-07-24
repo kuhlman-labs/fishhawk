@@ -8835,6 +8835,30 @@ paths:
               scope is an upper bound on the eventual diff, so the
               override exists for legitimately-forced cases (e.g. the
               cap itself is about to change).
+            - `plan_add_scope_files_fans_into_slices` — #2103: the
+              request supplied `add_scope_files` on a DECOMPOSED plan
+              (one carrying `decomposition.sub_plans`). An operator-added
+              path is folded into the effective scope across the
+              decomposition fan-out boundary and returned unchanged to
+              EVERY child slice, so the file lands in every slice's scope,
+              violating single-owner-file and guaranteeing an add/add
+              fan-in conflict (duplicate, incompatible implementations).
+              There is NO override and NO per-slice add channel — the
+              outcome is categorically broken, not an upper-bound
+              heuristic. `details` includes `stage_id`, `add_scope_files`
+              (the requested paths), `slice_count`, and `slices` — an
+              ordered `{index, title}` list of every sub-plan that would
+              inherit each added path. Refused BEFORE any approval row is
+              recorded, so a retry after re-planning the decomposition so
+              each added file is declared in exactly one slice's
+              `scope.files` flows normally; the refusal appends a
+              `plan_add_scope_files_fans_into_slices` audit entry. The
+              gate also FAILS CLOSED with the same code when
+              `add_scope_files` is non-empty and the plan cannot be
+              positively confirmed non-decomposed (a load failure or an
+              indeterminate/nil plan) — `details.reason` is
+              `plan_indeterminate` — so an add is never recorded without
+              positive confirmation the plan is flat.
             - `plan_invalid_model` — #1013: the RESOLVED implement model
               (the ladder of deployment default < spec `executor.model` <
               plan `model_recommendation` < the `implement_model` override)

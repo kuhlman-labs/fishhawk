@@ -411,6 +411,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		// " backend/b.go " passes the trimmed presence/empty checks yet fails to
 		// subtract the actual scope entry backend/b.go downstream.
 		req.RemoveScopeFiles = trimmedRemove
+		// Single-owner-file gate (#2103): refuse an approve that supplies
+		// add_scope_files on a DECOMPOSED plan, because an added path fans into
+		// EVERY slice's effective scope (no per-slice add channel), guaranteeing
+		// an add/add fan-in conflict. PRE-Submit for the same ADR-036 reason as
+		// its siblings — a refused approve records no row, so a corrected retry
+		// after re-planning the decomposition flows normally. Placed BEFORE the
+		// scope-cap gate so this categorical (no-override) error precedes the
+		// override-able cap error. Only add_scope_files is gated; a subtractive
+		// remove_scope_files fan-out is harmless (removing an absent path no-ops).
+		if !s.checkDecomposedAddScopeFiles(w, r, stage, req.AddScopeFiles) {
+			return
+		}
 		// Scope-cap gate (#983): refuse an approve whose effective scope
 		// (plan scope.files ∪ add_scope_files ∖ remove_scope_files) exceeds
 		// the implement stage's max_files_changed, unless the comment carries
@@ -1896,6 +1908,120 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 			"spec_budget_minutes": specBudgetMinutes,
 			"timeout_source":      timeoutSource,
 		})
+	return false
+}
+
+// checkDecomposedAddScopeFiles enforces the single-owner-file invariant on a
+// plan-stage approve's add_scope_files (#2103). An operator-added path is
+// persisted as a flat []string and folded into the effective scope at
+// implement-prompt-build time by resolveApprovalAddScopeFiles, which returns
+// the SAME parent-approval paths to EVERY decomposition child with no per-slice
+// filtering — so an added path lands in every slice's effective scope,
+// violating the single-owner-file rule checkCrossSliceSharedFiles already
+// enforces for PLANNED files and producing a guaranteed add/add fan-in conflict
+// (run bc47d2c4). There is no per-slice targeting channel for add_scope_files,
+// so the gate fails CLOSED at approval time, before any row is recorded.
+//
+// Returns true (proceed) ONLY when add_scope_files is empty, OR the plan
+// positively loads AND is confirmed non-decomposed (Decomposition == nil).
+// Every other state with a NON-EMPTY add_scope_files FAILS CLOSED (writes a 422
+// and returns false):
+//   - a positively decomposed plan → the guaranteed-conflict case, naming every
+//     slice that would inherit each added path;
+//   - a load error or a nil/indeterminate plan whose decomposition status cannot
+//     be positively determined → refused rather than let through, because an
+//     add_scope_files approve must never be recorded without positive
+//     confirmation the plan is flat.
+//
+// This deliberately DIVERGES from checkPlanBudget's fail-open posture on a
+// per-request load failure: that gate is an override-able upper-bound heuristic,
+// so a transient blip fails open; this gate is categorical (guaranteed conflict,
+// no override), so a transient blip must not let the offending approval through.
+// With the artifact subsystem wired, loadApprovedPlanForRun returns a non-nil
+// *plan.Plan for every real flat plan (a nil/error return means no plan was
+// found or a read failed, never a valid flat state), so failing closed on nil
+// does not over-block a legitimate flat-plan approve.
+//
+// The ONE fail-open precondition is a config-level absence — ArtifactRepo or
+// RunRepo unset — where no decomposition can exist at all and there is no
+// fan-out surface to protect. This mirrors checkPlanBudget/checkPlanScopeCap's
+// ArtifactRepo==nil posture and is unreachable in production (both repos are
+// always wired), so the universal fail-closed guarantee holds where it matters.
+func (s *Server) checkDecomposedAddScopeFiles(w http.ResponseWriter, r *http.Request, stage *run.Stage, addScopeFiles []string) bool {
+	// Empty add is always safe — nothing to fan out.
+	if len(addScopeFiles) == 0 {
+		return true
+	}
+
+	// Plan-artifact subsystem not configured: no decomposition can exist, so
+	// there is nothing to fan into. Fail OPEN, matching the sibling plan gates.
+	// Production always wires both repos, so this branch never fires there.
+	if s.cfg.ArtifactRepo == nil || s.cfg.RunRepo == nil {
+		return true
+	}
+
+	approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), stage.RunID)
+	if err != nil || approvedPlan == nil {
+		// Indeterminate: the plan's decomposition status cannot be positively
+		// determined, so a non-empty add fails closed (see the doc comment).
+		if err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "add-scope-files gate: load plan failed",
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+		s.writeError(w, r, http.StatusUnprocessableEntity, "plan_add_scope_files_fans_into_slices",
+			"add_scope_files was supplied but the run's plan could not be confirmed non-decomposed; the approve is refused so an added path cannot silently fan into every decomposition slice (single-owner-file). Retry once the plan is loadable, or re-plan the decomposition so each added file is declared in exactly one slice's scope.files",
+			map[string]any{
+				"stage_id":        stage.ID.String(),
+				"add_scope_files": addScopeFiles,
+				"reason":          "plan_indeterminate",
+			})
+		return false
+	}
+
+	// Positively flat — the safe case, proceed.
+	if approvedPlan.Decomposition == nil {
+		return true
+	}
+
+	// Positively decomposed with a non-empty add: the guaranteed-conflict case.
+	// Every slice inherits every added path today, so name them all, in declared
+	// order, so the reject surfaces exactly which slices would collide.
+	subPlans := approvedPlan.Decomposition.SubPlans
+	slices := make([]map[string]any, 0, len(subPlans))
+	for i, sp := range subPlans {
+		slices = append(slices, map[string]any{
+			"index": i,
+			"title": sp.Title,
+		})
+	}
+	details := map[string]any{
+		"stage_id":        stage.ID.String(),
+		"add_scope_files": addScopeFiles,
+		"slice_count":     len(subPlans),
+		"slices":          slices,
+	}
+
+	if s.cfg.AuditRepo != nil {
+		auditPayload, _ := json.Marshal(details)
+		systemKind := audit.ActorKind("system")
+		if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+			RunID:     stage.RunID,
+			StageID:   &stage.ID,
+			Timestamp: time.Now().UTC(),
+			Category:  "plan_add_scope_files_fans_into_slices",
+			ActorKind: &systemKind,
+			Payload:   auditPayload,
+		}); err != nil {
+			s.cfg.Logger.Error("audit append failed for add-scope-files fan-in",
+				"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+		}
+	}
+
+	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_add_scope_files_fans_into_slices",
+		"add_scope_files on a decomposed plan fans into EVERY sub-plan slice, violating single-owner-file and guaranteeing an add/add fan-in conflict; there is no per-slice add channel and no override. Re-plan the decomposition so each added file is declared in exactly one slice's scope.files",
+		details)
 	return false
 }
 

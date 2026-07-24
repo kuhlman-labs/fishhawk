@@ -714,6 +714,15 @@ type approvalResult struct {
 //     max_files_changed; re-scope the plan or include
 //     --override-scope-cap in the comment. Also pre-insert and
 //     override-retryable, same as plan_violates_budget)
+//   - 422 plan_add_scope_files_fans_into_slices (#2103: add_scope_files
+//     was supplied on a DECOMPOSED plan; an added path fans into EVERY
+//     sub-plan slice, violating single-owner-file and guaranteeing an
+//     add/add fan-in conflict. There is NO override and NO per-slice add
+//     channel; details carry add_scope_files, slice_count, and slices
+//     (the {index,title} of every inheriting slice). Pre-insert: re-plan
+//     the decomposition so each added file lands in exactly one slice's
+//     scope.files. Also fails closed when add_scope_files is non-empty and
+//     the plan cannot be confirmed non-decomposed)
 //   - 422 plan_invalid_model (#1013: the RESOLVED implement model — the
 //     ladder of deployment default < spec executor.model < plan
 //     model_recommendation < implement_model override — is not in the
