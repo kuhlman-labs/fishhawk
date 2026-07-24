@@ -317,4 +317,60 @@ func TestEngine_NilSafe(t *testing.T) {
 	if e.Recorded(context.Background(), uuid.New(), nil, RuleMerge) {
 		t.Fatal("nil engine Recorded = true")
 	}
+	if e.LatestRuleIs(context.Background(), uuid.New(), RuleMerge) {
+		t.Fatal("nil engine LatestRuleIs = true")
+	}
+}
+
+// seqEntry builds a run_auto_advanced audit entry with an explicit
+// Sequence so "latest" is unambiguous — the auditStub's AppendChained
+// does not assign one, and LatestRuleIs selects by highest Sequence
+// (mirroring applyDriveSurfaces' sort-by-Sequence-take-last).
+func seqEntry(runID uuid.UUID, seq int64, rule Rule) *audit.Entry {
+	payload, _ := json.Marshal(Advance{Rule: rule})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid, Sequence: seq, Category: Category, Payload: payload}
+}
+
+func TestEngineLatestRuleIs(t *testing.T) {
+	ctx := context.Background()
+	runID := uuid.New()
+
+	// (a) true when the highest-sequence entry names the rule.
+	auMatch := &auditStub{entries: []*audit.Entry{
+		seqEntry(runID, 1, RuleReviewsSettledGate),
+		seqEntry(runID, 2, RuleAcceptancePending),
+	}}
+	if !(&Engine{Audit: auMatch}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = false when the latest entry names the rule; want true")
+	}
+
+	// (b) false when a LATER entry (a higher-sequence fixup_rereview_repark)
+	// supersedes an earlier RuleAcceptancePending stamp — the #2122 shape.
+	// Deliberately seed the superseding entry BEFORE the earlier one in the
+	// slice so selection is by Sequence, not append order.
+	auSuperseded := &auditStub{entries: []*audit.Entry{
+		seqEntry(runID, 9, RuleFixupRereviewRepark),
+		seqEntry(runID, 3, RuleAcceptancePending),
+	}}
+	if (&Engine{Audit: auSuperseded}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = true when a later repark superseded the acceptance_pending stamp; want false")
+	}
+	// ...and true for the rule that IS latest.
+	if !(&Engine{Audit: auSuperseded}).LatestRuleIs(ctx, runID, RuleFixupRereviewRepark) {
+		t.Error("LatestRuleIs = false for the actual latest (repark) rule; want true")
+	}
+
+	// (c) false on a list/read error (fail-open — a re-stamp beats a
+	// suppressed derived status).
+	auErr := &auditStub{listErr: errors.New("db down")}
+	if (&Engine{Audit: auErr}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = true on a read error; want false (fail-open)")
+	}
+
+	// (d) false when no run_auto_advanced entries exist.
+	auEmpty := &auditStub{}
+	if (&Engine{Audit: auEmpty}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = true on an empty trail; want false")
+	}
 }

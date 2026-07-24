@@ -1035,6 +1035,60 @@ func TestGetRun_Drive_AcceptancePendingSupersededByAwaitingMerge(t *testing.T) {
 	}
 }
 
+// TestGetRun_Drive_AcceptancePendingRestampAfterRepark_DerivesAcceptancePending
+// is the BINDING cross-boundary integration test (#2122). It models the exact
+// regression sequence: a prior acceptance_pending stamp, a LATER
+// fixup_rereview_repark (the fix-up re-park) that made derived_status stale, and
+// the re-stamped acceptance_pending the observer now re-asserts on
+// Engine.LatestRuleIs — sequenced HIGHEST so it is the latest entry. It derives
+// derived_status through the REAL applyDriveSurfaces path (seed the entries and
+// let sort-by-Sequence-take-last pick the winner; the field is NOT hand-set),
+// so the observer->surface seam is genuinely exercised.
+//
+// SHARED SEAM: the asserted raw JSON "derived_status" field IS the value
+// cmd/fishhawk-mcp/drive_run.go:427 reads (view.DerivedStatus ==
+// derivedAcceptancePending) to key acceptancePendingDerived and DISPATCH the
+// acceptance stage instead of parking review_gate_parked. This test, the
+// observer re-stamp test (server_test.go
+// TestObserveParkedReview_AcceptancePending_RestampsAfterFixupRepark), and the
+// existing MCP test (drive_run_test.go
+// TestDriveRun_DerivedAcceptancePending_DispatchesAcceptance) together cover the
+// full repark -> re-stamp -> derived_status -> dispatch path.
+func TestGetRun_Drive_AcceptancePendingRestampAfterRepark_DerivesAcceptancePending(t *testing.T) {
+	s, _, au, seeded := newDriveGetServer(t)
+	pr := "https://github.com/x/y/pull/7"
+	seeded.PullRequestURL = &pr
+
+	t0 := time.Now().UTC().Add(-9 * time.Minute)
+	// 1. Prior acceptance_pending stamp.
+	seedAutoAdvance(t, au, seeded.ID, 5, t0, drive.Advance{
+		Rule: drive.RuleAcceptancePending, From: "review:awaiting_approval", To: "acceptance_pending",
+		NextAction: &drive.NextAction{Action: "await_acceptance", PRURL: pr},
+	})
+	// 2. Fix-up re-park supersedes it as the latest entry (the #2122 staleness).
+	seedAutoAdvance(t, au, seeded.ID, 8, t0.Add(2*time.Minute), drive.Advance{
+		Rule: drive.RuleFixupRereviewRepark, From: "review:awaiting_approval", To: "review:pending",
+	})
+	// 3. Observer re-asserts acceptance_pending (LatestRuleIs was false) — the
+	// re-stamp, sequenced highest so applyDriveSurfaces derives it.
+	seedAutoAdvance(t, au, seeded.ID, 12, t0.Add(5*time.Minute), drive.Advance{
+		Rule: drive.RuleAcceptancePending, From: "review:awaiting_approval", To: "acceptance_pending",
+		NextAction: &drive.NextAction{Action: "await_acceptance", PRURL: pr},
+	})
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	// Assert on the exact serialized field drive_run.go:427 reads.
+	if got := raw["derived_status"]; got != "acceptance_pending" {
+		t.Errorf("raw derived_status = %v, want acceptance_pending (the seam drive_run.go:427 reads)", got)
+	}
+	if resp.DerivedStatus != "acceptance_pending" {
+		t.Errorf("derived_status = %q, want acceptance_pending after the repark re-stamp restored it", resp.DerivedStatus)
+	}
+	if resp.NextAction == nil || resp.NextAction.Action != "await_acceptance" {
+		t.Errorf("next_action = %+v, want await_acceptance", resp.NextAction)
+	}
+}
+
 // TestGetRun_Drive_AcceptancePending_NoPR_OmitsDerivedStatus: like
 // awaiting_merge / ci_failed, an acceptance-gate derived_status requires an
 // open PR on the row.

@@ -7,7 +7,12 @@ Drive mode: the rule engine classifying a drive-enabled run's named transition p
 - **Mechanical** (auto-advance or auto-detect): `plan_approved_dispatch`, `reviews_settled_gate`, `fixup_rereview_repark`, `checks_green_awaiting_merge`, `ci_failed`, `children_dispatch`, `deploy_initialization`.
 - **Judgment** (always park): `gate_approval`, `concern_routing`, `merge` — absent ADR-040 delegation.
 
-The package also owns the `run_auto_advanced` audit emission (`Engine.Record`) and the per-(run, stage, rule) idempotency read (`Engine.Recorded`).
+The package also owns the `run_auto_advanced` audit emission (`Engine.Record`) and two idempotency reads:
+
+- `Engine.Recorded` — per-(run, stage, rule) "was this rule EVER stamped for this stage". The dedup for the poll-driven mergereconciler tick and the re-checkable gates whose staleness does not affect the drive loop.
+- `Engine.LatestRuleIs` — run-wide "is this rule the run's CURRENT derived status", i.e. does the run's highest-`Sequence` `run_auto_advanced` entry name this rule (mirroring `applyDriveSurfaces`' sort-by-`Sequence`-take-last, so the engine and `GET /v0/runs` `derived_status` agree). The **acceptance-gate presentation stamps** (`acceptance_pending` / `acceptance_settled_outcome_unknown` / `acceptance_triage`) dedup on THIS rather than `Recorded`, because a fix-up re-park stamps a LATER `fixup_rereview_repark` entry that supersedes them: under `Recorded` the per-stage guard suppresses a re-stamp so `derived_status` stays stale (no longer `acceptance_pending`) after the re-review re-settles, the #1961 drive-loop guards go inert, and `drive_run` parks `decision_required:review_gate_parked` at a state whose authoritative next act is a bare acceptance dispatch (#2122). Keying on `LatestRuleIs` re-asserts the current derived status. Both reads FAIL-OPEN identically (nil/err/empty → `false`), so a persistently failing audit read re-stamps once per observation tick (per-tick duplication) rather than suppressing the current derived status forever.
+
+Deliberate scoping (#2122): the `ci_failed` / `checks_green_awaiting_merge` stamps stay on `Recorded` (their staleness does not affect the drive loop, which merges via `AutoDriveRunGate`, not `derived_status`), and the precursor `reviews_settled_gate` stays on `Recorded` too — re-stamping it would oscillate the latest entry.
 
 ## Hook points
 
