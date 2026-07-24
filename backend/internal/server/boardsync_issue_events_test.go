@@ -80,6 +80,35 @@ func TestHandleIssueLifecycle_ClosedCompleted_Moves(t *testing.T) {
 	}
 }
 
+// (a2) the issue-events board transition stamps AccountID=nil on the persisted
+// work_item_transitioned global-chain write: a hand-closed issue has no run,
+// campaign, or request Identity to resolve a tenant, so the write lands in the
+// untenanted partition (auditIssueBoardTransition, ADR-057/#1828). This is the
+// issue-events counterpart to TestAuditCampaignBoardTransition_StampsCampaignAccount
+// (campaign path, non-nil stamp) and TestCampaignAccountIDForAudit_Branches (every
+// degrade-to-nil branch), both in audit_account_test.go — together they pin the
+// full boardsync AccountID stamp as a complete set. It reads the RAW recorded
+// entry (au.entries[0]) rather than campaignTransitionAudits, which decodes only
+// the payload and drops AccountID.
+func TestHandleIssueLifecycle_AuditStampsUntenantedAccount(t *testing.T) {
+	fp := &fakeTransitionProvider{result: &workmgmt.TransitionResult{Moved: true, From: "In Progress", To: "Done"}}
+	registerTransitionProvider(t, fp)
+	s, au := issueEventServer(t)
+
+	s.handleIssueLifecycleBoardSync(context.Background(), issuesEvent("closed", 1817, "completed"))
+
+	if len(au.entries) != 1 {
+		t.Fatalf("recorded entries = %d, want exactly 1 work_item_transitioned write", len(au.entries))
+	}
+	e := au.entries[0]
+	if e.Category != categoryWorkItemTransitioned {
+		t.Errorf("entry category = %q, want %q", e.Category, categoryWorkItemTransitioned)
+	}
+	if e.AccountID != nil {
+		t.Errorf("entry AccountID = %s, want nil: a hand-closed issue has no run/campaign/Identity tenant, so the issue-events transition writes the untenanted partition (ADR-057/#1828)", *e.AccountID)
+	}
+}
+
 // (b) closed when the card is already in Done yields a provider skip audited
 // skipped=true — the run_merged idempotency overlap: exactly one audit row, no
 // second move.
