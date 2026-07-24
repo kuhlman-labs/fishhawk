@@ -80,10 +80,14 @@ var (
 )
 
 // User mirrors the OpenAPI User schema. ID is Fishhawk's UUID;
-// GitHubUserID is GitHub's stable numeric id (preserved across
-// login renames). GitHubLogin is the current handle.
+// GitHubUserID is the forge's stable numeric id (preserved across
+// login renames). GitHubLogin is the current handle. Provider is the
+// forge the identity came from ("github" | "gitlab", E44.22 / #2109);
+// it scopes GitHubUserID so a GitLab numeric id can never collide with
+// a GitHub user of the same id.
 type User struct {
 	ID           string
+	Provider     string
 	GitHubUserID int64
 	GitHubLogin  string
 	Name         string

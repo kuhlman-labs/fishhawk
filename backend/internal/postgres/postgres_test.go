@@ -1056,6 +1056,64 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 		t.Errorf("repo_acl_purge_watermarks relrowsecurity count = %d, want 0 (outside the 0057 RLS regime by design)", watermarkRowSec)
 	}
 
+	// 0061 (#2109, E44.22) adds the users.provider discriminator so a GitLab
+	// browser sign-in lands alongside GitHub. Behavioral done-means (a
+	// comment-only touch cannot pass): the column exists and defaults to
+	// 'github'; the CHECK admits 'gitlab' but rejects 'bitbucket'; and the old
+	// single-column UNIQUE(github_user_id) is REPLACED by UNIQUE(provider,
+	// github_user_id) — a github id and a gitlab id sharing a numeric value are
+	// two distinct rows, but a duplicate (provider, id) still conflicts.
+	var usersProviderCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'users' AND column_name = 'provider'`,
+	).Scan(&usersProviderCol); err != nil {
+		t.Fatalf("query users.provider column: %v", err)
+	}
+	if usersProviderCol != 1 {
+		t.Errorf("users.provider count after MigrateUp = %d, want 1", usersProviderCol)
+	}
+	ghUserID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, github_user_id, github_login, name) VALUES ($1, 500, 'gh-500', 'GH')`,
+		ghUserID,
+	); err != nil {
+		t.Errorf("insert user without provider after MigrateUp failed: %v", err)
+	}
+	var userProvider string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT provider FROM users WHERE id = $1`, ghUserID,
+	).Scan(&userProvider); err != nil {
+		t.Fatalf("read back users.provider default: %v", err)
+	}
+	if userProvider != "github" {
+		t.Errorf("users.provider default = %q, want github", userProvider)
+	}
+	// A gitlab user with the SAME numeric id is a distinct row (composite UNIQUE).
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, provider, github_user_id, github_login, name)
+		 VALUES ($1, 'gitlab', 500, 'gl-500', 'GL')`,
+		uuid.New(),
+	); err != nil {
+		t.Errorf("insert (gitlab, 500) user failed, want success (numeric id is provider-scoped): %v", err)
+	}
+	// A duplicate (github, 500) still conflicts.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, provider, github_user_id, github_login, name)
+		 VALUES ($1, 'github', 500, 'gh-500-dup', 'Dup')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("duplicate (github, 500) user insert succeeded, want users_provider_github_user_id_key conflict")
+	}
+	// CHECK fail-closed: an out-of-set provider is rejected.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, provider, github_user_id, github_login, name)
+		 VALUES ($1, 'bitbucket', 501, 'bb', 'BB')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("insert user with provider='bitbucket' succeeded, want users_provider_check rejection")
+	}
+
 	// Second application is a no-op.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Errorf("second MigrateUp returned %v, want nil (idempotent)", err)
@@ -1074,8 +1132,16 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
+	// 0061 (#2109, E44.22) is now the latest migration (users.provider
+	// discriminator). Roll it back FIRST so this test's historical assertions —
+	// which pin 0060 as the one-step-rollback target — stay valid; 0061's own
+	// up/down reversal, including the gitlab-provider-row data state, is pinned
+	// by TestMigrateDown_UsersProviderReversal below.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown: %v", err)
+		t.Fatalf("MigrateDown (roll back 0061): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0060): %v", err)
 	}
 
 	pool, err := postgres.Connect(context.Background(), url)
@@ -1864,6 +1930,93 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_UsersProviderReversal is the binding-condition-#3
+// rollback-realism guard for 0061 (#2109, E44.22): the down migration must
+// succeed against the POST-feature data state — after GitLab sign-ins, and even
+// when a GitLab numeric id collides with a GitHub row. It removes the
+// gitlab-provider rows (they have no representation in the github-only pre-0061
+// schema) before restoring the single-column UNIQUE(github_user_id), so the
+// reversal cannot raise a 23505 on the collision, and it leaves the github rows
+// intact. Seeds a github user id=900, a gitlab user id=901, AND a gitlab user
+// id=900 that COLLIDES with the github row, then asserts the one-step down
+// SUCCEEDS, drops both gitlab rows, and keeps the github row.
+func TestMigrateDown_UsersProviderReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ghID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, provider, github_user_id, github_login, name)
+		 VALUES ($1, 'github', 900, 'gh-user', 'GH')`, ghID,
+	); err != nil {
+		t.Fatalf("seed github user: %v", err)
+	}
+	// A gitlab user whose numeric id COLLIDES with the github row (900) — the
+	// case a github-only single-column UNIQUE cannot represent.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, provider, github_user_id, github_login, name)
+		 VALUES ($1, 'gitlab', 900, 'gl-collide', 'GL')`, uuid.New(),
+	); err != nil {
+		t.Fatalf("seed colliding gitlab user: %v", err)
+	}
+	// A non-colliding gitlab user too.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, provider, github_user_id, github_login, name)
+		 VALUES ($1, 'gitlab', 901, 'gl-user', 'GL2')`, uuid.New(),
+	); err != nil {
+		t.Fatalf("seed gitlab user: %v", err)
+	}
+
+	// The reversal must SUCCEED despite the collision.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0061 with a github/gitlab id collision present) failed: %v", err)
+	}
+
+	// provider column is gone (0061 reverted).
+	var providerCol int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.columns
+		 WHERE table_name = 'users' AND column_name = 'provider'`,
+	).Scan(&providerCol); err != nil {
+		t.Fatalf("query users.provider after down: %v", err)
+	}
+	if providerCol != 0 {
+		t.Errorf("users.provider count after MigrateDown = %d, want 0 (0061 reverted)", providerCol)
+	}
+	// The github row survives; both gitlab rows are gone.
+	var total, ghSurvives int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users`).Scan(&total); err != nil {
+		t.Fatalf("count users after down: %v", err)
+	}
+	if total != 1 {
+		t.Errorf("users count after MigrateDown = %d, want 1 (gitlab rows removed, github kept)", total)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users WHERE id = $1 AND github_login = 'gh-user'`, ghID,
+	).Scan(&ghSurvives); err != nil {
+		t.Fatalf("read github row after down: %v", err)
+	}
+	if ghSurvives != 1 {
+		t.Errorf("github row survives count = %d, want 1 (reversal keeps github-provider rows intact)", ghSurvives)
+	}
+	// The restored single-column UNIQUE(github_user_id) is in force: a second
+	// row with github_user_id=900 now conflicts.
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO users (id, github_user_id, github_login, name) VALUES ($1, 900, 'dup', 'Dup')`,
+		uuid.New(),
+	); err == nil {
+		t.Error("duplicate github_user_id=900 insert succeeded after down, want the restored users_github_user_id_key conflict")
+	}
+}
+
 // TestMigrateDown_NormalizesPausedRows is the binding-condition-#1
 // rollback-realism guard: 0040's down migration must NOT fail when live
 // 'paused' rows exist. Before re-adding the narrower state CHECK constraints
@@ -1929,6 +2082,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0061 (drop users.provider) failed): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0060 (drop repo_acl_purge_watermarks) failed): %v", err)
 	}
@@ -2037,6 +2193,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0061 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0060 to reach 0053): %v", err)
@@ -2160,6 +2319,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
 	// inert re: stages) then 0053, and the flipped row returns to dispatched.
 	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0061 to reach 0053): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0060 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
@@ -2216,6 +2378,9 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0061 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0060 to reach 0054): %v", err)

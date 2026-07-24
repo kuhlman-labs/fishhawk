@@ -302,6 +302,48 @@ func TestWebhookGitLabRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestGitLabLoginRouteRegistered guards the route table: GET
+// /v0/auth/gitlab/login (E44.22 / #2109) must reach handleGitLabLogin.
+// With no GitLabOAuth configured the handler returns 503 oauth_unconfigured
+// — an UNregistered route would 404 with the default not-found body, so a
+// 503 here proves the route is wired in handlers.go.
+func TestGitLabLoginRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/gitlab/login", nil)
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("GET /v0/auth/gitlab/login returned 404 — route not registered in handlers.go")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (routed but GitLab OAuth unconfigured)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "oauth_unconfigured") {
+		t.Errorf("body = %s, want oauth_unconfigured (handleGitLabLogin reached)", rec.Body.String())
+	}
+}
+
+// TestGitLabCallbackRouteRegistered guards the route table: GET
+// /v0/auth/gitlab/callback (E44.22 / #2109) must reach handleGitLabCallback.
+// With no GitLabOAuth configured the handler returns 503 oauth_unconfigured —
+// an UNregistered route would 404 instead, so a 503 here proves the route is
+// wired in handlers.go.
+func TestGitLabCallbackRouteRegistered(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/gitlab/callback?code=x&state=y", nil)
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("GET /v0/auth/gitlab/callback returned 404 — route not registered in handlers.go")
+	}
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (routed but GitLab OAuth unconfigured)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "oauth_unconfigured") {
+		t.Errorf("body = %s, want oauth_unconfigured (handleGitLabCallback reached)", rec.Body.String())
+	}
+}
+
 // TestOnboardingStartRouteRegistered guards the route table: GET
 // /v0/onboarding/start (ADR-062, E44.7 / #1831) must reach
 // handleOnboardingStart THROUGH the region-pin middleware. An anonymous,

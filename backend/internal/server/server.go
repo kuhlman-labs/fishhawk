@@ -278,6 +278,13 @@ type Config struct {
 	// login + callback handlers; nil leaves both at 503.
 	GitHubOAuth *auth.GitHubOAuth
 
+	// GitLabOAuth is the OAuth client wrapping a GitLab instance's
+	// authorize / token / user endpoints (E44.22 / #2109). Required for
+	// the /v0/auth/gitlab/login + /callback handlers; nil leaves both at
+	// 503. A GitLab sign-in threads provider="gitlab" through the
+	// membership gate to the group-granularity auto-join lister.
+	GitLabOAuth *auth.GitLabOAuth
+
 	// GitHubManifest converts the one-shot `code` GitHub returns from
 	// the manifest-flow redirect into App credentials. Required for
 	// the manifest-flow start + callback handlers (E4.7); nil leaves

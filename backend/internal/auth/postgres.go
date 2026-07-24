@@ -28,14 +28,18 @@ func NewPostgresRepository(pool *pgxpool.Pool) Repository {
 	}
 }
 
-func (r *postgresRepo) SignIn(ctx context.Context, p GitHubProfile, accountID uuid.UUID) (*User, *Session, error) {
+func (r *postgresRepo) SignIn(ctx context.Context, provider string, p GitHubProfile, accountID uuid.UUID) (*User, *Session, error) {
 	if p.ID == 0 || p.Login == "" {
-		return nil, nil, errors.New("auth: GitHub profile id + login required")
+		return nil, nil, errors.New("auth: forge profile id + login required")
+	}
+	if provider == "" {
+		provider = "github"
 	}
 	q := authdb.New(r.pool)
 
 	userRow, err := q.UpsertUser(ctx, authdb.UpsertUserParams{
 		ID:           uuid.New(),
+		Provider:     provider,
 		GithubUserID: p.ID,
 		GithubLogin:  p.Login,
 		Name:         p.Name,
@@ -152,6 +156,7 @@ func (r *postgresRepo) EvictExpired(ctx context.Context, beforeUnix int64) (int6
 func rowToUser(r authdb.User) *User {
 	return &User{
 		ID:           r.ID.String(),
+		Provider:     r.Provider,
 		GitHubUserID: r.GithubUserID,
 		GitHubLogin:  r.GithubLogin,
 		Name:         r.Name,

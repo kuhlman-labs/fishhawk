@@ -2,11 +2,13 @@
 -- typed Go into ./db per backend/sqlc.yaml.
 
 -- name: UpsertUser :one
--- Upsert keyed on github_user_id (stable across login renames).
--- Refreshes login + name + email on every sign-in.
-INSERT INTO users (id, github_user_id, github_login, name, email)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (github_user_id) DO UPDATE
+-- Upsert keyed on (provider, github_user_id) — stable across login
+-- renames, and forge-scoped so a GitLab numeric id never overwrites a
+-- GitHub user of the same id (E44.22 / #2109). Refreshes login + name +
+-- email on every sign-in.
+INSERT INTO users (id, provider, github_user_id, github_login, name, email)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (provider, github_user_id) DO UPDATE
    SET github_login = EXCLUDED.github_login,
        name         = EXCLUDED.name,
        email        = EXCLUDED.email

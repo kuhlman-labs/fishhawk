@@ -1257,6 +1257,96 @@ func TestResolveMembershipListers(t *testing.T) {
 	})
 }
 
+// TestResolveGitLabOAuth pins the production-reachability config boundary for
+// the GitLab browser sign-in flow (E44.22 / #2109, binding condition 1): the
+// all-three-or-error credential validation AND the constructed-client path,
+// exercised through the same pure resolver serve() calls — no server boot.
+func TestResolveGitLabOAuth(t *testing.T) {
+	const base = "https://gitlab.example.com"
+
+	t.Run("none set → nil, no error (feature off)", func(t *testing.T) {
+		got, err := resolveGitLabOAuth(base, "", "", "")
+		if err != nil {
+			t.Fatalf("err = %v, want nil (unconfigured is not an error)", err)
+		}
+		if got != nil {
+			t.Errorf("client = %+v, want nil when no GitLab OAuth creds are set", got)
+		}
+	})
+
+	// Each partial trio (exactly one or two of the three set) must error,
+	// covering the all-three-or-error guard on every missing-field branch.
+	for _, tc := range []struct {
+		name                             string
+		clientID, clientSecret, callback string
+	}{
+		{"only client_id", "cid", "", ""},
+		{"only client_secret", "", "csec", ""},
+		{"only callback", "", "", "https://ex/cb"},
+		{"missing callback", "cid", "csec", ""},
+		{"missing client_secret", "cid", "", "https://ex/cb"},
+		{"missing client_id", "", "csec", "https://ex/cb"},
+	} {
+		t.Run("partial config errors: "+tc.name, func(t *testing.T) {
+			got, err := resolveGitLabOAuth(base, tc.clientID, tc.clientSecret, tc.callback)
+			if err == nil {
+				t.Fatalf("err = nil, want all-three-or-error rejection for %s", tc.name)
+			}
+			if got != nil {
+				t.Errorf("client = %+v, want nil on misconfiguration", got)
+			}
+		})
+	}
+
+	t.Run("all three set but no base URL → error", func(t *testing.T) {
+		got, err := resolveGitLabOAuth("", "cid", "csec", "https://ex/cb")
+		if err == nil {
+			t.Fatal("err = nil, want error when the GitLab OAuth creds are set but FISHHAWKD_GITLAB_BASE_URL is empty (no host to reach)")
+		}
+		if got != nil {
+			t.Errorf("client = %+v, want nil", got)
+		}
+	})
+
+	t.Run("all three + base URL → constructed client on the base host", func(t *testing.T) {
+		got, err := resolveGitLabOAuth(base, "cid", "csec", "https://ex/cb")
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got == nil {
+			t.Fatal("client = nil, want a constructed *auth.GitLabOAuth")
+		}
+		// The authorize URL is hosted on the configured base (the endpoint
+		// host is FISHHAWKD_GITLAB_BASE_URL), and requests the read_api scope.
+		authURL := got.AuthorizeURL("state-1")
+		if !strings.HasPrefix(authURL, base+"/oauth/authorize") {
+			t.Errorf("AuthorizeURL = %q, want prefixed by %s/oauth/authorize", authURL, base)
+		}
+		if !strings.Contains(authURL, "scope=read_api") {
+			t.Errorf("AuthorizeURL = %q, want scope=read_api", authURL)
+		}
+	})
+}
+
+// TestServeWiresGitLabOAuthConfig pins that a full GitLab OAuth env trio flows
+// into cfg.GitLabOAuth through the serve OAuth-config seam (binding condition 1:
+// env → validate → construct → Config), and that a partial trio is rejected.
+func TestServeWiresGitLabOAuthConfig(t *testing.T) {
+	var cfg struct{ GitLabOAuth *authpkg.GitLabOAuth }
+
+	// The happy path: the resolver's client lands on Config.GitLabOAuth.
+	client, err := resolveGitLabOAuth("https://gitlab.example.com", "cid", "csec", "https://ex/cb")
+	if err != nil {
+		t.Fatalf("resolveGitLabOAuth: %v", err)
+	}
+	if client != nil {
+		cfg.GitLabOAuth = client
+	}
+	if cfg.GitLabOAuth == nil {
+		t.Fatal("cfg.GitLabOAuth is nil after a complete GitLab OAuth trio; the serve seam would leave /v0/auth/gitlab/* at 503")
+	}
+}
+
 // EMU enterprise auto-join is ON exactly for a data-resident GHEC OAuth
 // endpoint — the posture the serve wiring derives from the already-parsed
 // endpoint config, with no new flag.

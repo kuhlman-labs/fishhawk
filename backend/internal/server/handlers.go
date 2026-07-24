@@ -114,6 +114,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/auth/github/callback", s.handleGitHubCallback)
 	mux.HandleFunc("GET /v0/auth/github/manifest-flow-start", s.handleGitHubManifestFlowStart)
 	mux.HandleFunc("GET /v0/auth/github/manifest-callback", s.handleGitHubManifestCallback)
+	mux.HandleFunc("GET /v0/auth/gitlab/login", s.handleGitLabLogin)
+	mux.HandleFunc("GET /v0/auth/gitlab/callback", s.handleGitLabCallback)
 	mux.HandleFunc("GET /v0/auth/me", s.handleGetMe)
 	mux.HandleFunc("GET /v0/onboarding/readiness", s.handleGetOnboardingReadiness)
 	// The one directory-routed surface (ADR-062 A2.1, E44.7 / #1831). The

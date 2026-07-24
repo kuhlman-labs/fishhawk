@@ -145,6 +145,7 @@ type User struct {
 	Email        *string            `json:"email"`
 	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt    pgtype.Timestamptz `json:"updated_at"`
+	Provider     string             `json:"provider"`
 }
 
 type WebhookDelivery struct {

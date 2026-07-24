@@ -3382,6 +3382,85 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/auth/gitlab/login:
+    get:
+      operationId: gitlabLogin
+      summary: Begin GitLab OAuth sign-in
+      description: |
+        Redirects the browser to the configured GitLab instance's OAuth
+        authorize endpoint with a backend-generated state value. The state
+        is bound to the browser via a temporary cookie and verified on
+        callback. Requests the `read_api` scope, which authorizes BOTH
+        `GET /api/v4/user` (the profile) and `GET /api/v4/groups` (the
+        group-membership auto-join list). Responds `503 oauth_unconfigured`
+        when GitLab OAuth is not configured.
+      security: []
+      tags: [auth]
+      responses:
+        '302':
+          description: Redirect to the GitLab instance's OAuth authorize URL.
+        '500':
+          description: OAuth state could not be issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: GitLab OAuth is not configured (`oauth_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/auth/gitlab/callback:
+    get:
+      operationId: gitlabCallback
+      summary: GitLab OAuth callback
+      description: |
+        Verifies the state, exchanges the code for a GitLab access token,
+        fetches the GitLab profile, then runs the workspace-membership gate
+        (E44.3 / ADR-057 Amendment A2) with `provider=gitlab` BEFORE any
+        session exists: an `invited` `account_members` row admits DB-only;
+        otherwise the user's live GitLab group list (`GET /api/v4/groups`
+        with the signing-in user's OAuth token) is intersected with
+        group-granularity accounts whose `auto_join_role` policy is set
+        (minting an audited `auto_join` row on first match). Only an admitted
+        user gets a `fishhawk_session` cookie, bound to the resolved account.
+        A user no account admits is redirected to the access-denied page with
+        NO session cookie; a forge error during auto-join evaluation (with no
+        invited row) fails closed. The user identity is scoped by provider so
+        a GitLab numeric id never collides with a GitHub user of the same id.
+      security: []
+      tags: [auth]
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '302':
+          description: |
+            Admitted: redirect to the SPA root with the session cookie set,
+            bound to the resolved account. Denied (no admitting account, or
+            no membership resolver configured): redirect to the access-denied
+            page (default `/access-denied`) with NO session cookie.
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '502':
+          description: |
+            Membership resolution failed closed — the GitLab membership API
+            errored during auto-join evaluation and no invited grant admits
+            (`membership_resolution_failed`). No session is created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: GitLab OAuth is not configured (`oauth_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/auth/github/manifest-flow-start:
     get:
       operationId: githubManifestFlowStart

@@ -100,7 +100,7 @@ func (q *Queries) GetSessionByHash(ctx context.Context, tokenHash string) (Sessi
 }
 
 const getUser = `-- name: GetUser :one
-SELECT id, github_user_id, github_login, name, email, created_at, updated_at FROM users WHERE id = $1
+SELECT id, github_user_id, github_login, name, email, created_at, updated_at, provider FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUser(ctx context.Context, id uuid.UUID) (User, error) {
@@ -114,12 +114,13 @@ func (q *Queries) GetUser(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.Email,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Provider,
 	)
 	return i, err
 }
 
 const getUserByGitHubID = `-- name: GetUserByGitHubID :one
-SELECT id, github_user_id, github_login, name, email, created_at, updated_at FROM users WHERE github_user_id = $1
+SELECT id, github_user_id, github_login, name, email, created_at, updated_at, provider FROM users WHERE github_user_id = $1
 `
 
 func (q *Queries) GetUserByGitHubID(ctx context.Context, githubUserID int64) (User, error) {
@@ -133,6 +134,7 @@ func (q *Queries) GetUserByGitHubID(ctx context.Context, githubUserID int64) (Us
 		&i.Email,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Provider,
 	)
 	return i, err
 }
@@ -177,17 +179,18 @@ func (q *Queries) TouchSession(ctx context.Context, arg TouchSessionParams) erro
 
 const upsertUser = `-- name: UpsertUser :one
 
-INSERT INTO users (id, github_user_id, github_login, name, email)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (github_user_id) DO UPDATE
+INSERT INTO users (id, provider, github_user_id, github_login, name, email)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (provider, github_user_id) DO UPDATE
    SET github_login = EXCLUDED.github_login,
        name         = EXCLUDED.name,
        email        = EXCLUDED.email
-RETURNING id, github_user_id, github_login, name, email, created_at, updated_at
+RETURNING id, github_user_id, github_login, name, email, created_at, updated_at, provider
 `
 
 type UpsertUserParams struct {
 	ID           uuid.UUID `json:"id"`
+	Provider     string    `json:"provider"`
 	GithubUserID int64     `json:"github_user_id"`
 	GithubLogin  string    `json:"github_login"`
 	Name         string    `json:"name"`
@@ -196,11 +199,14 @@ type UpsertUserParams struct {
 
 // Auth (users + sessions) queries (E4.2 / #49). sqlc generates
 // typed Go into ./db per backend/sqlc.yaml.
-// Upsert keyed on github_user_id (stable across login renames).
-// Refreshes login + name + email on every sign-in.
+// Upsert keyed on (provider, github_user_id) — stable across login
+// renames, and forge-scoped so a GitLab numeric id never overwrites a
+// GitHub user of the same id (E44.22 / #2109). Refreshes login + name +
+// email on every sign-in.
 func (q *Queries) UpsertUser(ctx context.Context, arg UpsertUserParams) (User, error) {
 	row := q.db.QueryRow(ctx, upsertUser,
 		arg.ID,
+		arg.Provider,
 		arg.GithubUserID,
 		arg.GithubLogin,
 		arg.Name,
@@ -215,6 +221,7 @@ func (q *Queries) UpsertUser(ctx context.Context, arg UpsertUserParams) (User, e
 		&i.Email,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Provider,
 	)
 	return i, err
 }
