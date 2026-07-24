@@ -2458,6 +2458,82 @@ func TestFileWorkItem_ChildNumberFirstChild(t *testing.T) {
 	}
 }
 
+// TestFileWorkItem_ChildNumberZeroMatchFailsClosed is the #2101 fix: an epic
+// whose children are NON-EMPTY but carry only unmatched [E22.X]-style
+// placeholder titles (the #389 corpus shape) must fail the omitted-n filing
+// closed — 422 work_item_invalid with details.n_discovery_failed naming the
+// epic, and NO issue created — instead of silently allocating a colliding
+// [E22.1]. This asserts the SHIPPED behavior, not merely that the branch exists.
+func TestFileWorkItem_ChildNumberZeroMatchFailsClosed(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: []workmgmt.EpicChild{
+		{Number: 601, Title: "[E22.X] placeholder one"},
+		{Number: 602, Title: "[E22.X] placeholder two"},
+	}}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Zero-match epic",
+		TitleVars: map[string]string{"epic": "22"}, // n omitted -> discovery -> zero match
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	got, _ := env.Error.Details["n_discovery_failed"].(string)
+	if got == "" || !strings.Contains(got, "#389") {
+		t.Errorf("details.n_discovery_failed = %v, want it present and naming the epic #389", env.Error.Details["n_discovery_failed"])
+	}
+	if fp.fileCalls != 0 {
+		t.Error("provider File dispatched despite a fail-closed zero-match discovery")
+	}
+}
+
+// TestFileWorkItem_ChildNumberZeroMatchExplicitOverride pins acceptance
+// criterion 3 against the EXACT zero-match scenario the #2101 fix names: an
+// explicit title_vars.n supplied against an epic whose children are non-empty
+// but carry only unmatched [E22.X] titles STILL succeeds (201, issue filed),
+// because the explicit-n override short-circuits discovery entirely —
+// EpicChildren and NextChildNumber never run, so the fail-closed branch cannot
+// fire. This proves the override path is unaffected by the fix.
+func TestFileWorkItem_ChildNumberZeroMatchExplicitOverride(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: []workmgmt.EpicChild{
+		{Number: 601, Title: "[E22.X] placeholder one"},
+		{Number: 602, Title: "[E22.X] placeholder two"},
+	}}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Caller knows the number",
+		TitleVars: map[string]string{"epic": "22", "n": "7"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.epicCalls != 0 {
+		t.Errorf("EpicChildren called %d times, want 0 (explicit n short-circuits discovery)", fp.epicCalls)
+	}
+	if fp.fileCalls != 1 {
+		t.Errorf("File called %d times, want 1 (the filing succeeds)", fp.fileCalls)
+	}
+	if fp.lastFileReq.Item.Title != "[E22.7] Caller knows the number" {
+		t.Errorf("filed title = %q, want [E22.7] Caller knows the number (explicit n verbatim)", fp.lastFileReq.Item.Title)
+	}
+}
+
 // TestFileWorkItem_ChildNumberConcurrentFilingsDistinct is binding condition (1):
 // two parallel omitted-n filings against the SAME epic must serialize through
 // the per-epic in-process lock and file DISTINCT consecutive numbers ([E7.3] and
