@@ -112,6 +112,50 @@ func TestFilterToSubset_EdgeWhollyExcluded_DroppedSilently(t *testing.T) {
 	}
 }
 
+// TestFilterToSubset_ExcludedItemCrossEpicEdge_DroppedSilently asserts that a
+// provider-surfaced cross-epic DroppedEdges entry whose From is EXCLUDED from
+// the subset is dropped silently — so an excluded child's real cross-epic
+// depends_on no longer makes the whole epic un-campaignable for a subset that
+// leaves that child out (#2087). FilterToSubset returns zero DroppedEdges and
+// Assemble succeeds over the included items.
+func TestFilterToSubset_ExcludedItemCrossEpicEdge_DroppedSilently(t *testing.T) {
+	in := fullDAG()
+	// 102 carries a real cross-epic depends_on (e.g. E45.22 -> ADR-057 #1823)
+	// the provider already surfaced as a dropped edge.
+	in.DroppedEdges = []workmgmt.DependsEdge{{From: 102, To: 1823}}
+	// Scope to {100, 101}: 102 (and its cross-epic dropped edge) is excluded.
+	res, err := campaign.FilterToSubset(in, []string{"issue:100", "issue:101"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	if len(res.DroppedEdges) != 0 {
+		t.Fatalf("DroppedEdges = %+v, want none (excluded item's cross-epic edge dropped silently)", res.DroppedEdges)
+	}
+	if _, err := campaign.Assemble("issue:99", res); err != nil {
+		t.Fatalf("Assemble(subset excluding cross-epic child): %v, want success", err)
+	}
+}
+
+// TestFilterToSubset_IncludedItemCrossEpicEdge_StillDangling is the fail-closed
+// counterpart: the SAME provider cross-epic dropped edge whose From is INCLUDED
+// in the subset still carries through, so Assemble fails it closed as a dangling
+// dependency — the guarantee is preserved for edges that matter (#2087).
+func TestFilterToSubset_IncludedItemCrossEpicEdge_StillDangling(t *testing.T) {
+	in := fullDAG()
+	in.DroppedEdges = []workmgmt.DependsEdge{{From: 102, To: 1823}}
+	// Scope to {100, 102}: 102 (and its cross-epic dropped edge) is included.
+	res, err := campaign.FilterToSubset(in, []string{"issue:100", "issue:102"})
+	if err != nil {
+		t.Fatalf("FilterToSubset: %v", err)
+	}
+	if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != (workmgmt.DependsEdge{From: 102, To: 1823}) {
+		t.Fatalf("DroppedEdges = %+v, want [{102 1823}] (included item's cross-epic edge carried through)", res.DroppedEdges)
+	}
+	if _, err := campaign.Assemble("issue:99", res); !errors.Is(err, campaign.ErrDanglingDependency) {
+		t.Fatalf("Assemble(included cross-epic edge) err = %v, want ErrDanglingDependency", err)
+	}
+}
+
 // TestFilterToSubset_EmptyItems_ReturnsUnchanged is the backward-compatible
 // no-op: an empty/nil items list returns the exact same result pointer, so the
 // all-children sweep is preserved.
