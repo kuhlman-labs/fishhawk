@@ -53,6 +53,30 @@ const minPollInterval = 5 * time.Second
 // endpoints, and the role_name → Permission mapping) to this package.
 //
 // Concurrent use is safe: the struct holds only immutable config.
+//
+// Endpoint binding — Mode 1 (per-DEPLOYMENT) only; per-installation
+// (Mode 2) routing is DEFERRED (E44.16 / #2094, binding condition 1).
+// apiBaseURL / oauthBaseURL are set once at construction from the
+// deployment-default endpoints (WithBaseURLs, threaded from the
+// FISHHAWKD_GITHUB_API_URL / FISHHAWKD_OAUTH_* config); they are never
+// re-resolved per installation. The reason the per-installation leg is
+// deferred rather than wired:
+//
+//   - The provider is a boot-time SINGLETON and its IdentityProvider
+//     interface carries NO installation ref on any method.
+//   - oauthBaseURL feeds the device-flow / OAuth LOGIN host, and login is
+//     pre-identification — the installation is unknown until AFTER the
+//     default-host device flow resolves the subject. So oauth_base_url has
+//     no genuine post-identification per-installation consumer here.
+//   - PermissionLevel / ResolveMembership run post-identification but take
+//     repo / subject / ref (not an installation ref) and read the API host,
+//     with no seam to resolve an installation from those inputs.
+//
+// Shipping a per-installation construction path exercised only by tests
+// would be dead routing (binding condition 1 forbids it). A per-installation
+// identity leg needs an interface that carries installation context — tracked
+// as a follow-up, mirroring the deferred web-OAuth leg
+// (backend/internal/auth/github_oauth.go).
 type GitHubIdentityProvider struct {
 	// clientID is the OAuth App client_id. The device flow needs no
 	// client secret.

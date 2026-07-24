@@ -558,11 +558,48 @@ func resolveGitLabClient(baseURL, token string) (client *gitlabclient.Client, pa
 // provider carrying token — the v0 group/project access-token path; the
 // group-scoped OAuth broker is deferred. Extracted so the gating is
 // unit-testable without booting the server.
-func resolveGitLabForge(baseURL, token string) *forgegitlab.Forge {
+//
+// opts thread the per-installation base-URL resolver + host allowlist (E44.16 /
+// #2094) onto the underlying gitlabclient.Factory. They are additive: passing a
+// nil resolver / empty allowlist (the no-pool posture) leaves every constructed
+// client on the deployment-default base, byte-identical to the pre-#2094 forge.
+func resolveGitLabForge(baseURL, token string, opts ...forgegitlab.Option) *forgegitlab.Forge {
 	if baseURL == "" || token == "" {
 		return nil
 	}
-	return forgegitlab.New(baseURL, forgegitlab.NewStaticCredentialProvider(token))
+	return forgegitlab.New(baseURL, forgegitlab.NewStaticCredentialProvider(token), opts...)
+}
+
+// installationBaseURLResolver builds the late-bound per-installation base-URL
+// hook (E44.16 / #2094) that EVERY per-installation forge consumer shares — the
+// GitHub App mint, the githubclient REST client, and the gitlab forge. It
+// closes over the forge-neutral account.EndpointResolver and a provider
+// discriminator ("github" / "gitlab") and returns that provider's
+// installations.forge_base_url for a given installation ref, propagating a real
+// resolution fault UNCHANGED so the consuming client FAILS CLOSED (the library
+// layer refuses to ship a credential when the hook errors). A NULL column /
+// unknown installation resolves to "" — the deployment default, byte-identical
+// to Mode 1.
+//
+// A nil resolver (nil DB pool) returns a nil hook, so the consumer's
+// ResolveBaseURL stays nil and its deployment default is untouched. Extracted as
+// the single closure factory so the three consumers cannot drift onto different
+// resolution logic, and so the resolver→forge_base_url mapping (including the
+// fail-closed DB-fault propagation) is unit-testable without booting the server.
+//
+// Only forge_base_url is consumed. oauth_base_url is deliberately dropped: its
+// sole would-be consumer is the OAuth / device-flow LOGIN host, which is
+// pre-identification (no installation is known until AFTER the default-host
+// login completes), so the per-installation OAuth/identity leg is DEFERRED — see
+// resolveIdentityProvider and backend/internal/auth/github_oauth.go.
+func installationBaseURLResolver(r *account.EndpointResolver, provider string) func(ctx context.Context, installationRef string) (string, error) {
+	if r == nil {
+		return nil
+	}
+	return func(ctx context.Context, installationRef string) (string, error) {
+		forgeBase, _, err := r.ResolveInstallationEndpoints(ctx, provider, installationRef)
+		return forgeBase, err
+	}
 }
 
 // webhookStoreNeeded reports whether the shared webhook delivery store
@@ -982,6 +1019,13 @@ func runServe(args []string, logSink io.Writer) int {
 	gitlabToken := fs.String("gitlab-token",
 		envOr("FISHHAWKD_GITLAB_TOKEN", ""),
 		"GitLab access token for PRIVATE-TOKEN auth (secret: never logged); required with --gitlab-base-url to enable the gitlab provider")
+	// Per-forge Mode-2 host allowlist for GitLab (E44.16 / #2094). Kept SEPARATE
+	// from --github-installation-host-allowlist: a forge-agnostic workspace's
+	// github.com install and gitlab.com group resolve to different hosts, so one
+	// allowlist cannot cover both. Empty → scheme/parse validation only.
+	gitlabInstallationHostAllowlist := fs.String("gitlab-installation-host-allowlist",
+		envOr("FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST", ""),
+		"optional comma-separated allowlist of hosts the per-installation GitLab (Mode 2) base URL may resolve to; each entry is an exact host or a leading-dot suffix (.gitlab.example.com); empty → scheme/parse validation only")
 	workmgmtConventions := fs.String("workmgmt-conventions",
 		envOr("FISHHAWKD_WORKMGMT_CONVENTIONS", ""),
 		"path to a YAML work-management conventions file served for every repo; parsed fail-fast at startup. Empty uses the shipped default. A per-repo in-repo loader is a follow-up (#2022)")
@@ -1354,6 +1398,13 @@ func runServe(args []string, logSink io.Writer) int {
 	// typed-nil *accountdb.Queries, which would read as "configured" to
 	// resolveRegionPin's q == nil check).
 	var accountQueries account.RegionPinnerQueries
+	// endpointResolver reads installations.forge_base_url / oauth_base_url for
+	// per-installation (Mode 2) endpoint routing (E44.2 #1826, E44.16 #2094).
+	// Constructed once when a pool exists and SHARED by every per-installation
+	// forge consumer (App mint, githubclient REST, gitlab forge) via
+	// installationBaseURLResolver; a nil pool leaves it nil so every consumer
+	// keeps its deployment default byte-identical.
+	var endpointResolver *account.EndpointResolver
 	if *dbURL != "" {
 		var err error
 		pool, err = pgxpool.New(context.Background(), *dbURL)
@@ -1380,6 +1431,7 @@ func runServe(args []string, logSink io.Writer) int {
 		// — role-bounding skipped), mirroring AuthMembership's nil-pool posture.
 		cfg.AccountRoles = account.NewStore(accountdb.New(pool))
 		accountQueries = accountdb.New(pool)
+		endpointResolver = account.NewEndpointResolver(accountdb.New(pool))
 		logger.Info("repositories configured (run + signing + audit + approval + artifact + stagecheck + apitoken + auth + account-roles)", slog.String("driver", "postgres"))
 	} else {
 		logger.Warn("FISHHAWKD_DATABASE_URL not set; /v0/runs and /v0/runs/{id}/signing-key endpoints will respond 503")
@@ -1539,23 +1591,14 @@ func runServe(args []string, logSink io.Writer) int {
 				slog.Int("entries", len(appClient.AllowedInstallationHosts)))
 		}
 		// Mode 2 (per-installation, E44.2 / #1826): resolve the data-resident
-		// API host from installations.forge_base_url. Late-bound AFTER the DB
-		// pool exists — a nil pool leaves ResolveBaseURL nil (every install
-		// keeps the deployment default). A real resolution fault FAILS the mint
-		// (fail-closed, see githubapp.Client.ResolveBaseURL); a NULL column /
-		// unknown installation falls back to the deployment default.
-		if pool != nil {
-			endpointResolver := account.NewEndpointResolver(accountdb.New(pool))
-			// githubapp hands us the stringified installation id (its
-			// installation_ref); we pass it straight to the forge-neutral
-			// resolver. Only forge_base_url feeds the App API host; oauth_base_url
-			// is a per-installation OAuth follow-up (no consumer here yet).
-			appClient.ResolveBaseURL = func(ctx context.Context, installationRef string) (string, error) {
-				forgeBase, _, err := endpointResolver.ResolveInstallationEndpoints(
-					ctx, "github", installationRef)
-				return forgeBase, err
-			}
-		}
+		// API host from installations.forge_base_url. Late-bound via the SHARED
+		// endpointResolver hoisted above — a nil pool leaves it nil so
+		// installationBaseURLResolver returns a nil hook and ResolveBaseURL stays
+		// nil (every install keeps the deployment default). A real resolution
+		// fault FAILS the mint (fail-closed, see githubapp.Client.ResolveBaseURL);
+		// a NULL column / unknown installation falls back to the deployment
+		// default.
+		appClient.ResolveBaseURL = installationBaseURLResolver(endpointResolver, "github")
 		cfg.GitHubTokens = githubapp.NewCachedProvider(appClient)
 		// This REST client backs every backend → GitHub read/write, including
 		// the code_scanning_alert webhook ingest (#1096), which reuses it via
@@ -1566,6 +1609,17 @@ func runServe(args []string, logSink io.Writer) int {
 		// Mode 1 REST + upload host overrides (E44.2 / #1826); empty → defaults.
 		cfg.GitHub.BaseURL = githubEndpoints.APIBaseURL
 		cfg.GitHub.UploadBaseURL = githubEndpoints.UploadBaseURL
+		// Mode 2 (per-installation, E44.16 / #2094): the REST client resolves the
+		// data-resident API host from installations.forge_base_url at its
+		// buildRequest choke point. It reuses the SAME github allowlist +
+		// endpointResolver as the App mint (an install's forge host is identical
+		// whoever reads it), so REST and mint can never route to different hosts.
+		// Fail-closed on a DB fault / bad scheme / disallowed host is enforced in
+		// githubclient; a nil resolver (nil pool) leaves ResolveBaseURL nil →
+		// deployment default. oauth_base_url is deliberately NOT threaded here —
+		// the REST client speaks to the API host, not the OAuth host.
+		cfg.GitHub.AllowedInstallationHosts = appClient.AllowedInstallationHosts
+		cfg.GitHub.ResolveBaseURL = installationBaseURLResolver(endpointResolver, "github")
 		// Optional user-scoped projects token. Presence-only log: the token
 		// is a secret and must never be logged or traced (#1114). Absent, a
 		// user-owned project board stays best-effort boarded:false (#1107).
@@ -1798,7 +1852,23 @@ func runServe(args []string, logSink io.Writer) int {
 	if cfg.GitHub != nil {
 		forge.Register(forgegithub.New(cfg.GitHub))
 	}
-	if glForge := resolveGitLabForge(*gitlabBaseURL, *gitlabToken); glForge != nil {
+	// Per-forge (GitLab) Mode-2 host allowlist (E44.16 / #2094): a separate
+	// allowlist from GitHub's because a workspace's github.com and gitlab.com
+	// hosts differ. Non-empty emits a fail-closed presence log, mirroring the
+	// App-mint allowlist line.
+	gitlabInstallationAllowlist := parseInstallationHostAllowlist(*gitlabInstallationHostAllowlist)
+	if len(gitlabInstallationAllowlist) > 0 {
+		logger.Info("gitlab installation host allowlist configured (fail-closed)",
+			slog.Int("entries", len(gitlabInstallationAllowlist)))
+	}
+	// Thread the SHARED endpointResolver (provider "gitlab") + the GitLab
+	// allowlist onto the forge. A nil resolver (nil pool) leaves the factory's
+	// hook nil → deployment-default base; fail-closed on a DB fault / bad scheme
+	// / disallowed host is enforced inside the gitlabclient factory.
+	if glForge := resolveGitLabForge(*gitlabBaseURL, *gitlabToken,
+		forgegitlab.WithResolveBaseURL(installationBaseURLResolver(endpointResolver, "gitlab")),
+		forgegitlab.WithAllowedInstallationHosts(gitlabInstallationAllowlist),
+	); glForge != nil {
 		forge.Register(glForge)
 	}
 	if len(forge.Registered()) > 0 {
@@ -1834,6 +1904,18 @@ func runServe(args []string, logSink io.Writer) int {
 		if operatorRepoToken == nil {
 			logger.Warn("identity-provider REST reads stay anonymous: token-mint authz gate (fishhawk token login) will fail HTTP 500 until FISHHAWKD_GITHUB_APP_ID + key are configured")
 		}
+		// Per-installation (Mode 2) identity routing is DEFERRED, not wired here
+		// (E44.16 / #2094, binding condition 1). The identity provider is a
+		// boot-time SINGLETON whose interface (VerifyUser / VerifyAccessToken /
+		// PermissionLevel / ResolveMembership) carries NO installation ref, and
+		// oauth_base_url's only consumer would be the device-flow / OAuth LOGIN
+		// host — which is pre-identification (the installation is unknown until
+		// AFTER the default-host login resolves the subject + org). No genuine
+		// post-identification per-installation oauth_base_url consumer exists in
+		// the current code, so wiring endpointResolver here would be dead routing.
+		// It stays on Mode 1 (per-deployment) endpoints; a per-installation
+		// identity leg needs an interface that carries installation context — a
+		// follow-up, mirroring the deferred web-OAuth leg.
 		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken,
 			githubEndpoints.IdentityAPIURL, githubEndpoints.IdentityOAuthURL)
 		// Workspace-membership login gate (E44.3 / ADR-057 Amendment

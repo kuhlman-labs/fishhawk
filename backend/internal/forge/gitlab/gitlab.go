@@ -56,17 +56,31 @@ const forgeName = "gitlab"
 // ResolveRepoScope emits and every other method parses back.
 const scopeRefPrefix = "gitlab:"
 
-// Forge adapts the GitLab REST v4 client onto forge.Forge. It holds the
-// instance base URL, a forge.CredentialProvider that resolves a scope to a
-// PRIVATE-TOKEN bearer, and an optional injectable Doer so tests drive every
-// method against a stub without touching the network. A concrete
+// Forge adapts the GitLab REST v4 client onto forge.Forge. It holds a
+// forge.CredentialProvider that resolves a scope to a PRIVATE-TOKEN bearer and
+// a gitlabclient.Factory that constructs a client per call. A concrete
 // gitlabclient.Client is a cheap struct, constructed per call around the
 // freshly-resolved token rather than cached, mirroring the scope-first shape
 // the interface declares.
+//
+// The factory carries the deployment-default instance base URL, the optional
+// injectable Doer (so tests drive every method against a stub without touching
+// the network), and the ADR-057 Amendment A1 per-installation endpoint routing
+// (E44.16 / #2094): when a resolver is wired, a scope-taking method resolves
+// the instance base URL for that installation, validated + allowlisted +
+// fail-closed, so a workspace owning both a github.com install and a
+// gitlab.com group resolves each endpoint independently. A nil resolver keeps
+// the deployment default byte-identical (Mode 1).
 type Forge struct {
-	baseURL  string
 	provider forge.CredentialProvider
-	doer     gitlabclient.Doer // optional; nil → gitlabclient's http.DefaultClient
+	factory  *gitlabclient.Factory
+}
+
+// forgeConfig accumulates Option mutations before New builds the factory.
+type forgeConfig struct {
+	doer                     gitlabclient.Doer // optional; nil → gitlabclient's http.DefaultClient
+	resolveBaseURL           func(ctx context.Context, installationRef string) (string, error)
+	allowedInstallationHosts []string
 }
 
 // Compile-time assertion that *Forge satisfies the full Forge surface.
@@ -77,13 +91,29 @@ var _ forge.Forge = (*Forge)(nil)
 var _ forge.FileFetcher = (*Forge)(nil)
 
 // Option customises a Forge at construction.
-type Option func(*Forge)
+type Option func(*forgeConfig)
 
 // WithHTTPClient injects the HTTP transport used for every per-call
 // gitlabclient.Client. Tests pass a stub Doer here; production leaves it
 // unset so the client uses http.DefaultClient.
 func WithHTTPClient(d gitlabclient.Doer) Option {
-	return func(f *Forge) { f.doer = d }
+	return func(c *forgeConfig) { c.doer = d }
+}
+
+// WithResolveBaseURL wires the per-installation base-URL resolver (E44.16 /
+// #2094). When set, a scope-taking method resolves the instance base URL for
+// the scope's installation ref, validated + allowlisted + fail-closed before
+// the PRIVATE-TOKEN ships. A nil fn (the default) keeps the deployment default
+// byte-identical. serve.go builds this closure over account.EndpointResolver.
+func WithResolveBaseURL(fn func(ctx context.Context, installationRef string) (string, error)) Option {
+	return func(c *forgeConfig) { c.resolveBaseURL = fn }
+}
+
+// WithAllowedInstallationHosts pins the resolved per-installation host to an
+// operator-configured allowlist (account.HostAllowed). An empty slice leaves
+// the resolved base subject to scheme/parse validation only.
+func WithAllowedInstallationHosts(hosts []string) Option {
+	return func(c *forgeConfig) { c.allowedInstallationHosts = hosts }
 }
 
 // New returns a GitLab Forge for the instance at baseURL, resolving tokens
@@ -92,11 +122,21 @@ func WithHTTPClient(d gitlabclient.Doer) Option {
 // slash. provider is the credential seam; v0 wires a StaticCredentialProvider
 // carrying the configured group/project access token.
 func New(baseURL string, provider forge.CredentialProvider, opts ...Option) *Forge {
-	f := &Forge{baseURL: baseURL, provider: provider}
+	cfg := &forgeConfig{}
 	for _, opt := range opts {
-		opt(f)
+		opt(cfg)
 	}
-	return f
+	facOpts := []gitlabclient.FactoryOption{}
+	if cfg.doer != nil {
+		facOpts = append(facOpts, gitlabclient.WithFactoryHTTPClient(cfg.doer))
+	}
+	if cfg.resolveBaseURL != nil {
+		facOpts = append(facOpts, gitlabclient.WithFactoryResolveBaseURL(cfg.resolveBaseURL))
+	}
+	if len(cfg.allowedInstallationHosts) > 0 {
+		facOpts = append(facOpts, gitlabclient.WithFactoryAllowedInstallationHosts(cfg.allowedInstallationHosts))
+	}
+	return &Forge{provider: provider, factory: gitlabclient.NewFactory(baseURL, facOpts...)}
 }
 
 // Name returns the forge id ("gitlab").
@@ -125,20 +165,23 @@ func (p StaticCredentialProvider) Token(context.Context, forge.CredentialScope) 
 
 var _ forge.CredentialProvider = StaticCredentialProvider{}
 
-// client constructs a gitlabclient.Client for one call, authed with token
-// and pointed at the configured base URL. The injected Doer (if any) is
+// client constructs a deployment-default gitlabclient.Client for one call,
+// authed with token and pointed at the factory's configured base URL. It is
+// the no-installation path (ResolveRepoScope, which PRODUCES a scope): passing
+// an empty installation ref skips per-installation resolution, so it never
+// fails closed and never touches the resolver. The injected Doer (if any) is
 // threaded so tests observe the request.
-func (f *Forge) client(token string) *gitlabclient.Client {
-	if f.doer != nil {
-		return gitlabclient.New(f.baseURL, token, gitlabclient.WithHTTPClient(f.doer))
-	}
-	return gitlabclient.New(f.baseURL, token)
+func (f *Forge) client(ctx context.Context, token string) (*gitlabclient.Client, error) {
+	return f.factory.Client(ctx, "", token)
 }
 
 // resolve is the per-call entry shared by every scope-taking method: it
-// resolves the token for scope and parses the project id back out of the
-// scope ref. A non-gitlab-shaped ref (or a token-resolution failure) fails
-// closed here before any HTTP call.
+// resolves the token for scope, parses the project id back out of the scope
+// ref, and constructs a per-installation client bound to the resolved instance
+// base URL for the scope's installation ref (E44.16 / #2094). A non-gitlab-
+// shaped ref, a token-resolution failure, OR a per-installation base-URL
+// fail-closed (resolver fault / disallowed host / bad scheme) all fail closed
+// here before any HTTP call.
 func (f *Forge) resolve(ctx context.Context, scope forge.CredentialScope) (*gitlabclient.Client, int, error) {
 	pid, err := projectIDFromScope(scope)
 	if err != nil {
@@ -148,7 +191,11 @@ func (f *Forge) resolve(ctx context.Context, scope forge.CredentialScope) (*gitl
 	if err != nil {
 		return nil, 0, err
 	}
-	return f.client(token), pid, nil
+	c, err := f.factory.Client(ctx, scope.Ref(), token)
+	if err != nil {
+		return nil, 0, err
+	}
+	return c, pid, nil
 }
 
 // projectIDFromScope parses the numeric project id out of a
@@ -214,7 +261,13 @@ func (f *Forge) ResolveRepoScope(ctx context.Context, repo forge.RepoRef) (forge
 	if err != nil {
 		return forge.CredentialScope{}, err
 	}
-	proj, err := f.client(token).GetProject(ctx, repo.String())
+	// The scope is being PRODUCED here — no installation is known yet — so this
+	// read stays on the deployment default (empty installation ref).
+	c, err := f.client(ctx, token)
+	if err != nil {
+		return forge.CredentialScope{}, err
+	}
+	proj, err := c.GetProject(ctx, repo.String())
 	if err != nil {
 		if apiStatus(err) == http.StatusNotFound {
 			return forge.CredentialScope{}, errors.Join(forge.ErrNotInstalled, err)
@@ -673,7 +726,14 @@ func (f *Forge) FetchFile(ctx context.Context, scope forge.CredentialScope, repo
 	if ref == "" {
 		ref = "HEAD"
 	}
-	file, err := f.client(token).GetFile(ctx, repo.String(), path, ref)
+	// FetchFile carries a scope, so it routes per-installation on the scope's
+	// installation ref (fail-closed on resolver fault / disallowed host / bad
+	// scheme); a deployment-level scope with an empty ref keeps the default.
+	c, err := f.factory.Client(ctx, scope.Ref(), token)
+	if err != nil {
+		return nil, err
+	}
+	file, err := c.GetFile(ctx, repo.String(), path, ref)
 	if err != nil {
 		return nil, mapError(err)
 	}

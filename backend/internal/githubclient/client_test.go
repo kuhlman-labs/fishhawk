@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -3487,5 +3488,350 @@ func TestUploadReleaseAsset_Errors(t *testing.T) {
 	if err := cc.UploadReleaseAsset(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "o", Name: "r"}, 555, "", "text/markdown", nil); err == nil ||
 		!strings.Contains(err.Error(), "asset name is required") {
 		t.Errorf("missing name err = %v", err)
+	}
+}
+
+// --- Per-installation REST base-URL routing (Mode 2, E44.16 / #2094) ---------
+//
+// These tests pin the buildRequest choke-point override: the resolver ->
+// buildRequest -> outbound-host cross-boundary path, the per-mode fail-closed
+// contract, the deployment-default backward-compat path, and the URL-prefix
+// rewrite gate (API base rewritten; upload host + static-token GraphQL not).
+
+// perInstallCSServer serves GET .../code-scanning/alerts with an empty findings
+// array, recording the request count and the Authorization header seen. The
+// code-scanning read is an out-of-scope sibling method (codescanning.go),
+// deliberately used to prove the override applies at the shared buildRequest
+// choke point without editing that file. tls picks an https listener (required
+// to exercise a resolved https override host).
+func perInstallCSServer(t *testing.T, tls bool) (srv *httptest.Server, count *int, gotAuth *string) {
+	t.Helper()
+	var n int
+	var auth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/code-scanning/alerts",
+		func(w http.ResponseWriter, r *http.Request) {
+			n++
+			auth = r.Header.Get("Authorization")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "[]")
+		})
+	if tls {
+		srv = httptest.NewTLSServer(mux)
+	} else {
+		srv = httptest.NewServer(mux)
+	}
+	t.Cleanup(srv.Close)
+	return srv, &n, &auth
+}
+
+// anyHostClient trusts srv's TLS cert but dials srv's listener for EVERY host.
+// A wrongly-admitted resolved host (e.g. a look-alike) would therefore actually
+// reach srv, making the "no request reached any server" fail-closed assertions
+// detect real credential transmission rather than a DNS/connection failure.
+func anyHostClient(t *testing.T, srv *httptest.Server) *http.Client {
+	t.Helper()
+	client := srv.Client()
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("srv.Client() transport is %T, want *http.Transport", client.Transport)
+	}
+	addr := srv.Listener.Addr().String()
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	tr.TLSClientConfig.InsecureSkipVerify = true
+	return client
+}
+
+// TestClient_ResolveBaseURL_RoutesToResolvedHost is the cross-boundary happy
+// path: a resolved forge base URL makes a real public method (a code-scanning
+// read, routed through the buildRequest choke point) hit the resolved host, not
+// the deployment default. Proves the override reaches the wire and carries the
+// installation token, and that the resolver is keyed on the stringified id.
+func TestClient_ResolveBaseURL_RoutesToResolvedHost(t *testing.T) {
+	overrideSrv, overrideCount, overrideAuth := perInstallCSServer(t, true)
+	defaultSrv, defaultCount, _ := perInstallCSServer(t, false)
+
+	c := &Client{
+		BaseURL: defaultSrv.URL,
+		Tokens:  &stubTokens{token: "ghs_canned_token"},
+		HTTP:    overrideSrv.Client(), // trust the override host's TLS cert
+	}
+	var gotRef string
+	c.ResolveBaseURL = func(_ context.Context, ref string) (string, error) {
+		gotRef = ref
+		return overrideSrv.URL, nil
+	}
+
+	if _, err := c.ListCodeScanningAlerts(context.Background(),
+		forge.FromGitHubInstallationID(77), RepoRef{Owner: "x", Name: "y"}, "main"); err != nil {
+		t.Fatalf("ListCodeScanningAlerts: %v", err)
+	}
+	if gotRef != "77" {
+		t.Errorf("ResolveBaseURL got installationRef = %q, want \"77\"", gotRef)
+	}
+	if *overrideCount != 1 {
+		t.Errorf("override host received %d requests, want 1", *overrideCount)
+	}
+	if *defaultCount != 0 {
+		t.Errorf("default host received %d requests, want 0 (override should win)", *defaultCount)
+	}
+	if *overrideAuth != "Bearer ghs_canned_token" {
+		t.Errorf("override host Authorization = %q, want the installation token", *overrideAuth)
+	}
+}
+
+// TestClient_ResolveBaseURL_FailClosed pins the per-mode fail-closed contract
+// (#2094 binding condition 1): a resolver DB fault, a disallowed host, and a
+// bad scheme each FAIL the request before the installation token ships, and NO
+// outbound request reaches any server. anyHostClient dials the fake for every
+// host, so a wrongly-admitted override would actually land — count==0 and an
+// empty Authorization prove the credential never shipped.
+func TestClient_ResolveBaseURL_FailClosed(t *testing.T) {
+	sentinel := errors.New("db unavailable")
+	cases := []struct {
+		name            string
+		allowlist       []string
+		resolve         func(context.Context, string) (string, error)
+		wantErrContains string
+	}{
+		{
+			name:    "resolver db fault",
+			resolve: func(context.Context, string) (string, error) { return "", sentinel },
+		},
+		{
+			name:            "disallowed host (allowlist miss)",
+			allowlist:       []string{"acme.ghe.com"},
+			resolve:         func(context.Context, string) (string, error) { return "https://notghe.com", nil },
+			wantErrContains: "allowlist",
+		},
+		{
+			name:    "bad scheme (http, no TLS)",
+			resolve: func(context.Context, string) (string, error) { return "http://evil.example.com", nil },
+		},
+		{
+			name:    "malformed override (missing host)",
+			resolve: func(context.Context, string) (string, error) { return "https://", nil },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, count, gotAuth := perInstallCSServer(t, true)
+			c := &Client{
+				// BaseURL empty → DefaultBaseURL; the code-scanning URL is prefixed
+				// by the API base, so the rewrite gate is entered and the
+				// fail-closed branch is genuinely exercised.
+				Tokens:                   &stubTokens{token: "ghs_canned_token"},
+				HTTP:                     anyHostClient(t, srv),
+				AllowedInstallationHosts: tc.allowlist,
+				ResolveBaseURL:           tc.resolve,
+			}
+			_, err := c.ListCodeScanningAlerts(context.Background(),
+				forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "main")
+			if err == nil {
+				t.Fatal("ListCodeScanningAlerts succeeded, want a fail-closed error")
+			}
+			if tc.name == "resolver db fault" && !errors.Is(err, sentinel) {
+				t.Errorf("err = %v, want it to wrap the resolver error", err)
+			}
+			if tc.wantErrContains != "" && !strings.Contains(err.Error(), tc.wantErrContains) {
+				t.Errorf("err = %v, want it to contain %q", err, tc.wantErrContains)
+			}
+			if *count != 0 {
+				t.Errorf("server received %d requests, want 0 (fail-closed, no request issued)", *count)
+			}
+			if *gotAuth != "" {
+				t.Errorf("server saw Authorization = %q, want empty (token must never ship on fail-closed)", *gotAuth)
+			}
+		})
+	}
+}
+
+// TestClient_ResolveBaseURL_BackwardCompat pins the deployment-default posture:
+// a nil resolver and an empty resolved base (NULL column / unknown
+// installation) both leave the request on the deployment default host,
+// byte-identical to Mode 1.
+func TestClient_ResolveBaseURL_BackwardCompat(t *testing.T) {
+	t.Run("nil resolver", func(t *testing.T) {
+		defaultSrv, count, _ := perInstallCSServer(t, false)
+		c := &Client{
+			BaseURL: defaultSrv.URL,
+			Tokens:  &stubTokens{token: "ghs_canned_token"},
+			HTTP:    &http.Client{Timeout: 5 * time.Second},
+		}
+		if _, err := c.ListCodeScanningAlerts(context.Background(),
+			forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "main"); err != nil {
+			t.Fatalf("ListCodeScanningAlerts: %v", err)
+		}
+		if *count != 1 {
+			t.Errorf("default host received %d requests, want 1 (nil resolver → default)", *count)
+		}
+	})
+	t.Run("empty resolved base", func(t *testing.T) {
+		defaultSrv, count, _ := perInstallCSServer(t, false)
+		consulted := false
+		c := &Client{
+			BaseURL: defaultSrv.URL,
+			Tokens:  &stubTokens{token: "ghs_canned_token"},
+			HTTP:    &http.Client{Timeout: 5 * time.Second},
+			ResolveBaseURL: func(context.Context, string) (string, error) {
+				consulted = true
+				return "", nil
+			},
+		}
+		if _, err := c.ListCodeScanningAlerts(context.Background(),
+			forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "main"); err != nil {
+			t.Fatalf("ListCodeScanningAlerts: %v", err)
+		}
+		if !consulted {
+			t.Error("resolver was not consulted, want it consulted for the empty-override branch")
+		}
+		if *count != 1 {
+			t.Errorf("default host received %d requests, want 1 (empty override → default)", *count)
+		}
+	})
+}
+
+// TestApplyInstallationBaseURL_RewriteGate pins #2094 binding condition 3 at the
+// choke point: the rewrite is gated on the request URL's prefix (API base vs
+// upload base), NOT on which caller issued it. An installation-scoped GraphQL
+// URL (API base, via buildRequest) IS rewritten; a REST API path IS rewritten;
+// a release-asset upload URL (upload base) is NOT.
+func TestApplyInstallationBaseURL_RewriteGate(t *testing.T) {
+	c := &Client{
+		BaseURL:       "https://api.github.com",
+		UploadBaseURL: "https://uploads.github.com",
+		ResolveBaseURL: func(context.Context, string) (string, error) {
+			return "https://acme.ghe.com", nil
+		},
+	}
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "installation graphql via buildRequest is rewritten",
+			in:   c.endpoint("/graphql"),
+			want: "https://acme.ghe.com/graphql",
+		},
+		{
+			name: "rest api path is rewritten",
+			in:   c.endpoint("/repos/x/y/contents/z"),
+			want: "https://acme.ghe.com/repos/x/y/contents/z",
+		},
+		{
+			name: "upload host is NOT rewritten",
+			in:   c.uploadEndpoint("/repos/x/y/releases/1/assets?name=n"),
+			want: "https://uploads.github.com/repos/x/y/releases/1/assets?name=n",
+		},
+		{
+			// Security (fix-up): a look-alike host that merely shares the API
+			// base as a TEXTUAL prefix is a DIFFERENT host and must never be
+			// rewritten — otherwise the installation token would ship to the
+			// resolved installation host on a request bound for evil.example.
+			// A bare strings.HasPrefix gate would misclassify this; the
+			// host+path-boundary check (urlTargetsBase) rejects it.
+			name: "look-alike host (shared textual prefix) is NOT rewritten",
+			in:   "https://api.github.com.evil.example/repos/x/y",
+			want: "https://api.github.com.evil.example/repos/x/y",
+		},
+		{
+			name: "unrelated other-host URL is NOT rewritten",
+			in:   "https://example.com/repos/x/y",
+			want: "https://example.com/repos/x/y",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := c.applyInstallationBaseURL(ctx, tc.in, 5)
+			if err != nil {
+				t.Fatalf("applyInstallationBaseURL: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("applyInstallationBaseURL(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestClient_StaticTokenPath_NotRewritten pins #2094 binding condition 3's
+// carve-out on the static-token (buildStaticTokenRequest) path specifically:
+// user-owned-Projects GraphQL authenticates with the static ProjectsToken and
+// is NOT installation-scoped, so it must bypass the per-installation resolver
+// entirely. A resolver that would FAIL CLOSED if consulted is wired in; the
+// request still lands on the default host, proving the static-token path never
+// reaches applyInstallationBaseURL.
+func TestClient_StaticTokenPath_NotRewritten(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	c.ProjectsToken = "pat_projects"
+	pf.graphqlByOp["AddItem"] = `{"data":{"addProjectV2ItemById":{"item":{"id":"ITEM"}}}}`
+	c.ResolveBaseURL = func(context.Context, string) (string, error) {
+		return "", errors.New("resolver must not be consulted on the static-token path")
+	}
+
+	ctx := WithProjectsToken(context.Background())
+	if _, err := c.AddProjectItem(ctx, forge.FromGitHubInstallationID(7), "PROJ", "ISSUE_NODE"); err != nil {
+		t.Fatalf("AddProjectItem: %v (static-token path must bypass the per-installation resolver)", err)
+	}
+	if pf.gotGraphQLAuth != "Bearer pat_projects" {
+		t.Errorf("Authorization = %q, want the projects token on the default host", pf.gotGraphQLAuth)
+	}
+}
+
+// TestApplyInstallationBaseURL_ResolvedBaseShapes pins the URL-surgery edges the
+// applyInstallationBaseURL doc comment promises but the rewrite-gate/cross-
+// boundary tests (bare-host httptest URLs) leave uncovered (#2094 fix-up): a
+// resolved base carrying its OWN path prefix (GHES-style .../api/v3) is honored
+// by APPENDING the endpoint remainder, and a trailing slash on the resolved
+// base — bare-host or path-carrying — is trimmed so it behaves identically to
+// the no-slash form.
+func TestApplyInstallationBaseURL_ResolvedBaseShapes(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name     string
+		resolved string
+		want     string
+	}{
+		{
+			name:     "bare host, no trailing slash",
+			resolved: "https://acme.ghe.com",
+			want:     "https://acme.ghe.com/repos/x/y/contents/z",
+		},
+		{
+			name:     "bare host, trailing slash is trimmed",
+			resolved: "https://acme.ghe.com/",
+			want:     "https://acme.ghe.com/repos/x/y/contents/z",
+		},
+		{
+			name:     "path-carrying override (GHES /api/v3) appends the remainder",
+			resolved: "https://acme.ghe.com/api/v3",
+			want:     "https://acme.ghe.com/api/v3/repos/x/y/contents/z",
+		},
+		{
+			name:     "path-carrying override with trailing slash is trimmed",
+			resolved: "https://acme.ghe.com/api/v3/",
+			want:     "https://acme.ghe.com/api/v3/repos/x/y/contents/z",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Client{
+				BaseURL: "https://api.github.com",
+				ResolveBaseURL: func(context.Context, string) (string, error) {
+					return tc.resolved, nil
+				},
+			}
+			got, err := c.applyInstallationBaseURL(ctx, c.endpoint("/repos/x/y/contents/z"), 5)
+			if err != nil {
+				t.Fatalf("applyInstallationBaseURL: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("applyInstallationBaseURL(resolved=%q) = %q, want %q", tc.resolved, got, tc.want)
+			}
+		})
 	}
 }
