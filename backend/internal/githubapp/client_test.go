@@ -393,23 +393,6 @@ func TestIssueInstallationToken_AllowlistAllows(t *testing.T) {
 	}
 }
 
-// TestIssueInstallationToken_AllowlistSuffixMatchesSubdomain proves the
-// leading-dot suffix admits a real subdomain (acme.ghe.com under .ghe.com) at
-// the matcher level, complementing the end-to-end suffix-mint assertion in
-// TestIssueInstallationToken_AllowlistAllows. This is binding condition 1(b).
-func TestIssueInstallationToken_AllowlistSuffixMatchesSubdomain(t *testing.T) {
-	if !matchesHostAllowlist("acme.ghe.com", []string{".ghe.com"}) {
-		t.Error("matchesHostAllowlist(acme.ghe.com, .ghe.com) = false, want true (subdomain must match)")
-	}
-	if !matchesHostAllowlist("acme.ghe.com", []string{"acme.ghe.com"}) {
-		t.Error("matchesHostAllowlist(acme.ghe.com, acme.ghe.com) = false, want true (exact must match)")
-	}
-	// The bare apex is NOT admitted by the dotted suffix alone.
-	if matchesHostAllowlist("ghe.com", []string{".ghe.com"}) {
-		t.Error("matchesHostAllowlist(ghe.com, .ghe.com) = true, want false (apex needs explicit entry)")
-	}
-}
-
 // TestIssueInstallationToken_AllowlistEmptyInert pins the default posture: an
 // empty allowlist leaves the pre-#2093 behavior untouched — a well-formed HTTPS
 // override host still mints (scheme/parse validation only). This is a
@@ -486,81 +469,12 @@ func TestIssueInstallationToken_AllowlistRejects(t *testing.T) {
 	}
 }
 
-func TestMatchesHostAllowlist(t *testing.T) {
-	cases := []struct {
-		host      string
-		allowlist []string
-		want      bool
-	}{
-		{"acme.ghe.com", []string{"acme.ghe.com"}, true},           // exact
-		{"acme.ghe.com", []string{".ghe.com"}, true},               // suffix subdomain
-		{"deep.acme.ghe.com", []string{".ghe.com"}, true},          // multi-label subdomain
-		{"ghe.com", []string{"ghe.com"}, true},                     // exact apex
-		{"ghe.com", []string{".ghe.com"}, false},                   // apex not admitted by dotted suffix
-		{"notghe.com", []string{".ghe.com"}, false},                // look-alike vs dotted suffix
-		{"notghe.com", []string{"ghe.com"}, false},                 // look-alike vs exact apex
-		{"other.example.com", []string{"acme.ghe.com"}, false},     // unrelated
-		{"acme.ghe.com", []string{".other.com", ".ghe.com"}, true}, // second entry matches
-		{"acme.ghe.com", nil, false},                               // empty allowlist matches nothing
-	}
-	for _, tc := range cases {
-		if got := matchesHostAllowlist(tc.host, tc.allowlist); got != tc.want {
-			t.Errorf("matchesHostAllowlist(%q, %v) = %v, want %v", tc.host, tc.allowlist, got, tc.want)
-		}
-	}
-}
-
-// TestHostAllowed covers hostAllowed directly, including the fail-closed
-// parse-error branch (a malformed URL → NOT allowed) which is unreachable from
-// IssueInstallationToken (validateResolvedBaseURL parses first) but must still
-// fail closed if reached.
-func TestHostAllowed(t *testing.T) {
-	cases := []struct {
-		name      string
-		resolved  string
-		allowlist []string
-		want      bool
-	}{
-		{"exact host allowed", "https://acme.ghe.com", []string{"acme.ghe.com"}, true},
-		{"suffix subdomain allowed", "https://acme.ghe.com/api/v3", []string{".ghe.com"}, true},
-		{"host with port stripped", "https://acme.ghe.com:443", []string{"acme.ghe.com"}, true},
-		{"uppercase host normalized", "https://ACME.GHE.COM", []string{"acme.ghe.com"}, true},
-		{"look-alike rejected", "https://notghe.com", []string{".ghe.com"}, false},
-		{"non-allowlisted rejected", "https://evil.example.com", []string{"acme.ghe.com"}, false},
-		{"malformed url fails closed", "https://\x00bad", []string{"anything"}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := hostAllowed(tc.resolved, tc.allowlist); got != tc.want {
-				t.Errorf("hostAllowed(%q, %v) = %v, want %v", tc.resolved, tc.allowlist, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestValidateResolvedBaseURL(t *testing.T) {
-	valid := []string{
-		"https://acme.ghe.com",
-		"https://acme.ghe.com/api/v3",
-	}
-	for _, s := range valid {
-		if err := validateResolvedBaseURL(s); err != nil {
-			t.Errorf("validateResolvedBaseURL(%q) = %v, want nil", s, err)
-		}
-	}
-	invalid := []string{
-		"http://acme.ghe.com", // not https
-		"https://",            // no host
-		"acme.ghe.com",        // no scheme
-		"://acme.ghe.com",     // empty scheme
-		"https://\x00bad",     // parse error
-	}
-	for _, s := range invalid {
-		if err := validateResolvedBaseURL(s); err == nil {
-			t.Errorf("validateResolvedBaseURL(%q) = nil, want error", s)
-		}
-	}
-}
+// The host-policy contract (matchesHostAllowlist / HostAllowed /
+// ValidateResolvedBaseURL) now lives in package account and is unit-tested by
+// account/hostpolicy_test.go. githubapp's mint fail-closed tests above
+// (AllowlistAllows / AllowlistRejects / AllowlistEmptyInert / RejectsInvalid)
+// exercise the delegation end-to-end and are the regression check that the
+// promotion preserved the contract.
 
 func TestReadBriefBody_Truncates(t *testing.T) {
 	long := strings.Repeat("a", 1000)
