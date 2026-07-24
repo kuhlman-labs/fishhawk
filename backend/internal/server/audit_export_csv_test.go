@@ -700,6 +700,31 @@ func TestAuditExportCSV_GlobalErrorNoPartialCSV(t *testing.T) {
 	}
 }
 
+// A ListGlobalByAccount error in the TENANT scope also surfaces as 500
+// with no partial CSV. The operator case above drives ListGlobal; this
+// pins callerRunlessEntries' DISTINCT tenant branch (scope.account !=
+// nil, #2097), whose error return the operator path never reaches.
+func TestAuditExportCSV_TenantGlobalErrorNoPartialCSV(t *testing.T) {
+	fr := newFakeRepo()
+	id := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	af := &exportAuditFake{
+		perRun:                 map[uuid.UUID][]*audit.Entry{id: chainEntries(t, &id, "run_created")},
+		global:                 chainEntries(t, nil, "token_issued"),
+		listGlobalByAccountErr: errors.New("tenant partition boom"),
+	}
+	s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+	rec := doExportCSVAs(s, uuid.New().String(), "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "internal_error") {
+		t.Errorf("body = %s, want internal_error", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "ts,run_id,repo") {
+		t.Errorf("partial CSV leaked into the error body: %s", rec.Body.String())
+	}
+}
+
 // ---------------------------------------------------------------------
 // (g) headers: Content-Type, Content-Disposition filename derived from
 // the injected nowFunc, continuation headers.
@@ -903,8 +928,20 @@ func TestAuditExportCSV_RunlessTenantScope(t *testing.T) {
 				t.Errorf("unexpected run-less row category %q (want account A's)", row[catCol])
 			}
 		}
-		// Withheld B + untenanted entries absent by content (payload +
-		// entry_hash never appear anywhere in the CSV body).
+		// Withheld B + untenanted entries absent by content. entry_hash is
+		// a bare hex cell, so a raw-body substring search is load-bearing.
+		// The payload check operates on the PARSED payload_summary cells,
+		// NOT the raw body: CSV quoting doubles a payload's embedded quotes,
+		// so a raw-body substring of the payload would be vacuous — never
+		// matching whether leaked or not (#2097 review). Comparing the
+		// projected payloadSummary against every emitted cell gives it
+		// independent signal.
+		_, allRows := parseCSV(t, rec.Body.Bytes())
+		payCol := col(t, header, "payload_summary")
+		emittedSummaries := map[string]bool{}
+		for _, row := range allRows {
+			emittedSummaries[row[payCol]] = true
+		}
 		for _, e := range af.global {
 			if e.AccountID != nil && *e.AccountID == acctA {
 				continue
@@ -912,8 +949,8 @@ func TestAuditExportCSV_RunlessTenantScope(t *testing.T) {
 			if strings.Contains(body, e.EntryHash) {
 				t.Errorf("withheld entry_hash %s (category %s) leaked into tenant CSV", e.EntryHash, e.Category)
 			}
-			if strings.Contains(body, string(e.Payload)) {
-				t.Errorf("withheld payload %s (category %s) leaked into tenant CSV", e.Payload, e.Category)
+			if summary := payloadSummary(e.Payload); emittedSummaries[summary] {
+				t.Errorf("withheld payload_summary %q (category %s) leaked into tenant CSV", summary, e.Category)
 			}
 		}
 	})

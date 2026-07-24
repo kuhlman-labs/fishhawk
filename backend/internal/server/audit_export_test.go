@@ -733,6 +733,29 @@ func TestAuditExport_RunlessByAccountError(t *testing.T) {
 	}
 }
 
+// (8c-tenant) a ListGlobalByAccount error in the TENANT scope also
+// surfaces as 500. The operator case (8c) drives the untenanted
+// ListGlobalByAccount(nil) read; this pins the DISTINCT tenant branch of
+// assembleRunlessPartitions (scope.account != nil, #2097), whose error
+// return the operator path never reaches.
+func TestAuditExport_RunlessByAccountErrorTenant(t *testing.T) {
+	fr := newFakeRepo()
+	id := seedExportRun(fr, "acme/app", time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	af := &exportAuditFake{
+		perRun:                 map[uuid.UUID][]*audit.Entry{id: chainEntries(t, &id, "run_created")},
+		global:                 chainEntries(t, nil, "token_issued"),
+		listGlobalByAccountErr: errors.New("tenant partition boom"),
+	}
+	s := New(Config{AuditRepo: af, RunRepo: fr, SigningRepo: &exportSigningFake{}})
+	rec := doExportAs(s, uuid.New().String(), "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500; body %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "internal_error") {
+		t.Errorf("body = %s, want internal_error", rec.Body.String())
+	}
+}
+
 // (8d) run-less partitions are scoped to the caller's tenant (#2097).
 // The five modes the plan enumerates, each end-to-end through the real
 // handler + exportAuditFake (ListGlobal/ListGlobalByAccount):
