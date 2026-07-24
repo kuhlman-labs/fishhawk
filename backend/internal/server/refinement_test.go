@@ -1195,6 +1195,23 @@ func newFilingRepoStub(repo string) *filingRepoStub {
 	}
 }
 
+// refinementOtherAccountID is a workspace account DIFFERENT from
+// memberIdentity's testOperatorAccountID — used to seed a session owned by
+// another tenant so the authoritative account gate (E44.24 / #2115) refuses the
+// memberIdentity caller.
+const refinementOtherAccountID = "00000000-0000-0000-0000-0000000000bb"
+
+// withAccount stamps every seeded draft with a tenant account marker, so the
+// authoritative account-ownership gate (E44.24 / #2115) has a creation-time
+// account (drafts[0].AccountID) to authorize against. Returns the stub for
+// chaining. An empty account leaves the session on the NULL-allow window.
+func (r *filingRepoStub) withAccount(account string) *filingRepoStub {
+	for _, d := range r.drafts {
+		d.AccountID = account
+	}
+	return r
+}
+
 // refinementCookieReq is refinementReq with a COOKIE identity — the only
 // identity kind repo filtering applies to (a bearer TokenID is mode (i),
 // deliberately unfiltered, which is why the existing refinement tests are
@@ -1270,20 +1287,165 @@ func TestRefinementSession_AdminBypass(t *testing.T) {
 	}
 }
 
-// TestRefinementSession_Unfiled_NoRepoToGate documents the STATED limit: a
-// session that has never been filed has no repo, so there is nothing to
-// authorize against and it stays reachable. Closing this needs a repo on the
-// refinement session itself — a schema change outside this slice.
+// TestRefinementSession_Unfiled_NoRepoToGate is INVERTED (E44.24 / #2115): an
+// unfiled session no longer stays reachable workspace-wide. It now carries a
+// creation-time account marker, so a cross-account caller is refused 403
+// account_forbidden on the AUTHORITATIVE tenant boundary — BEFORE the
+// non-authoritative repo mirror is consulted (callCount 0), proving the account
+// gate runs first and closes the exposure the repo gate could not.
 func TestRefinementSession_Unfiled_NoRepoToGate(t *testing.T) {
-	repo := newFilingRepoStub("") // never filed
+	repo := newFilingRepoStub("").withAccount(refinementOtherAccountID) // unfiled, owned by another tenant
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	w := getRefinementSession(t, s)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (cross-account unfiled session refused):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "account_forbidden") {
+		t.Errorf("body missing account_forbidden: %s", w.Body.String())
+	}
+	if vis.callCount() != 0 {
+		t.Errorf("mirror consulted %d times, want 0 (account gate refuses before the repo mirror)", vis.callCount())
+	}
+}
+
+// TestRefinementSession_SameAccount_200 proves the feature stays usable: a
+// member reading an unfiled session OWNED BY THEIR OWN account passes the
+// account gate and gets 200 (E44.24 / #2115). Without this, closing the
+// exposure would make refinement admin-only — the posture the operator
+// rejected.
+func TestRefinementSession_SameAccount_200(t *testing.T) {
+	repo := newFilingRepoStub("").withAccount(testOperatorAccountID) // owned by memberIdentity's account
 	vis := newFakeRepoVisibility(map[string]bool{})
 	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
 
 	if w := getRefinementSession(t, s); w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (an unfiled session has no repo):\n%s", w.Code, w.Body.String())
+		t.Fatalf("status = %d, want 200 (same-account session stays usable):\n%s", w.Code, w.Body.String())
 	}
-	if vis.callCount() != 0 {
-		t.Errorf("mirror consulted %d times for a session with no repo, want 0", vis.callCount())
+}
+
+// TestRefinementSession_NullAccount_Allowed pins the NULL-allow window: a
+// session with no account marker (a bearer / MCP caller pre-E44.5, or a legacy
+// row) stays reachable for any member, matching enforceAccount and the 0057 RLS
+// predicate. This is the documented bearer/MCP residual (binding condition 1).
+func TestRefinementSession_NullAccount_Allowed(t *testing.T) {
+	repo := newFilingRepoStub("") // unfiled, NULL account (withAccount not called)
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+	if w := getRefinementSession(t, s); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (NULL-account session stays reachable):\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestRefinementWrites_CrossAccountForbidden proves the shared WRITE paths are
+// gated on the authoritative account boundary (E44.24 / #2115): a cross-account
+// caller's PATCH .../draft and POST .../decision are refused 403
+// account_forbidden by loadRefinementSession before the handler body decode —
+// closing the "shared write paths reachable workspace-wide" half of the #2115
+// exposure. The read-only repo mirror never fires on a write (callCount 0).
+func TestRefinementWrites_CrossAccountForbidden(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		call   func(*Server, http.ResponseWriter, *http.Request)
+	}{
+		{"patch draft", http.MethodPatch, "/draft", `{"brief_amendment":"more"}`,
+			func(s *Server, w http.ResponseWriter, r *http.Request) { s.handlePatchRefinementDraft(w, r) }},
+		{"post decision", http.MethodPost, "/decision", `{"decision":"approved","reason":"r"}`,
+			func(s *Server, w http.ResponseWriter, r *http.Request) { s.handleDecideRefinementSession(w, r) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newFilingRepoStub("").withAccount(refinementOtherAccountID)
+			vis := newFakeRepoVisibility(map[string]bool{})
+			s := refinementVisibilityServer(t, repo, vis, account.RoleMember)
+
+			sessionID := uuid.NewString()
+			req := httptest.NewRequest(tc.method,
+				"/v0/refinement/sessions/"+sessionID+tc.path, strings.NewReader(tc.body))
+			req.SetPathValue("session_id", sessionID)
+			req = withIdentity(req, memberIdentity())
+			w := httptest.NewRecorder()
+			tc.call(s, w, req)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (cross-account write refused):\n%s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "account_forbidden") {
+				t.Errorf("body missing account_forbidden: %s", w.Body.String())
+			}
+			if vis.callCount() != 0 {
+				t.Errorf("mirror consulted %d times on a write, want 0", vis.callCount())
+			}
+		})
+	}
+}
+
+// TestRefinement_AccountGate_EndToEnd is the binding-condition-2 proof through
+// the REAL repository: it drives handleCreateRefinementSession under a cookie
+// identity bound to a real workspace account, so the account flows
+// request-identity -> identityAccountID -> CreateParams.AccountID -> postgres ->
+// StoredDraft, then asserts the loadRefinementSession gate REFUSES a
+// cross-account reader (403 account_forbidden) while ADMITTING the same-account
+// creator (200). A handler that failed to stamp the account (leaving the session
+// NULL) would let the cross-account read through and FAIL here — so this catches
+// an omitted handler-to-repository handoff the per-layer unit tests each pass.
+func TestRefinement_AccountGate_EndToEnd(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	drafter := &fakeRefinementDrafter{draft: refinementValidDraft(), model: "claude-opus-4-8"}
+	s := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, RefinementDrafter: drafter})
+
+	// The creating identity is bound to a real account (FK target for account_id).
+	acct := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "acme-ent"); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	creator := Identity{Subject: "github:alice", SessionID: "s1", AccountID: acct.String(), Scopes: []string{"write:approvals"}}
+
+	// Create the session under the account-bound identity — the handler stamps
+	// CreateParams.AccountID from identityAccountID(ctx).
+	rec := httptest.NewRecorder()
+	createReq := withIdentity(
+		httptest.NewRequest(http.MethodPost, "/v0/refinement/sessions", strings.NewReader(`{"brief":"build X"}`)),
+		creator)
+	s.handleCreateRefinementSession(rec, createReq)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d, want 201:\n%s", rec.Code, rec.Body.String())
+	}
+	var created refinementSessionView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+
+	readReq := func(id Identity) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/v0/refinement/sessions/"+created.SessionID.String(), nil)
+		r.SetPathValue("session_id", created.SessionID.String())
+		return withIdentity(r, id)
+	}
+
+	// Same-account read → 200 (the marker was stamped and the gate admits it).
+	sameRec := httptest.NewRecorder()
+	s.handleGetRefinementSession(sameRec, readReq(creator))
+	if sameRec.Code != http.StatusOK {
+		t.Fatalf("same-account read: status = %d, want 200 (marker stamped, gate admits):\n%s", sameRec.Code, sameRec.Body.String())
+	}
+
+	// Cross-account read → 403 account_forbidden (the marker persisted and gates).
+	crossReader := Identity{Subject: "github:bob", SessionID: "s2", AccountID: uuid.NewString(), Scopes: []string{"write:approvals"}}
+	crossRec := httptest.NewRecorder()
+	s.handleGetRefinementSession(crossRec, readReq(crossReader))
+	if crossRec.Code != http.StatusForbidden {
+		t.Fatalf("cross-account read: status = %d, want 403:\n%s", crossRec.Code, crossRec.Body.String())
+	}
+	if !strings.Contains(crossRec.Body.String(), "account_forbidden") {
+		t.Errorf("cross-account body missing account_forbidden: %s", crossRec.Body.String())
 	}
 }
 

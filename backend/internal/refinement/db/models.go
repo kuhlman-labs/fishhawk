@@ -107,6 +107,7 @@ type RefinementDraft struct {
 	Model     *string            `json:"model"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 	Origin    string             `json:"origin"`
+	AccountID *uuid.UUID         `json:"account_id"`
 }
 
 type RefinementFiledItem struct {

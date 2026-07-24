@@ -64,18 +64,19 @@ func (q *Queries) CreateRefinementDecision(ctx context.Context, arg CreateRefine
 
 const createRefinementDraft = `-- name: CreateRefinementDraft :one
 
-INSERT INTO refinement_drafts (id, session_id, brief, draft, model, origin)
-VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, session_id, brief, draft, model, created_at, origin
+INSERT INTO refinement_drafts (id, session_id, brief, draft, model, origin, account_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+RETURNING id, session_id, brief, draft, model, created_at, origin, account_id
 `
 
 type CreateRefinementDraftParams struct {
-	ID        uuid.UUID `json:"id"`
-	SessionID uuid.UUID `json:"session_id"`
-	Brief     string    `json:"brief"`
-	Draft     []byte    `json:"draft"`
-	Model     *string   `json:"model"`
-	Origin    string    `json:"origin"`
+	ID        uuid.UUID  `json:"id"`
+	SessionID uuid.UUID  `json:"session_id"`
+	Brief     string     `json:"brief"`
+	Draft     []byte     `json:"draft"`
+	Model     *string    `json:"model"`
+	Origin    string     `json:"origin"`
+	AccountID *uuid.UUID `json:"account_id"`
 }
 
 // Refinement queries consumed by the postgres adapter for the
@@ -91,6 +92,7 @@ func (q *Queries) CreateRefinementDraft(ctx context.Context, arg CreateRefinemen
 		arg.Draft,
 		arg.Model,
 		arg.Origin,
+		arg.AccountID,
 	)
 	var i RefinementDraft
 	err := row.Scan(
@@ -101,6 +103,7 @@ func (q *Queries) CreateRefinementDraft(ctx context.Context, arg CreateRefinemen
 		&i.Model,
 		&i.CreatedAt,
 		&i.Origin,
+		&i.AccountID,
 	)
 	return i, err
 }
@@ -169,7 +172,7 @@ func (q *Queries) CreateRefinementFilingSession(ctx context.Context, arg CreateR
 }
 
 const getRefinementDraft = `-- name: GetRefinementDraft :one
-SELECT id, session_id, brief, draft, model, created_at, origin FROM refinement_drafts WHERE id = $1
+SELECT id, session_id, brief, draft, model, created_at, origin, account_id FROM refinement_drafts WHERE id = $1
 `
 
 func (q *Queries) GetRefinementDraft(ctx context.Context, id uuid.UUID) (RefinementDraft, error) {
@@ -183,6 +186,7 @@ func (q *Queries) GetRefinementDraft(ctx context.Context, id uuid.UUID) (Refinem
 		&i.Model,
 		&i.CreatedAt,
 		&i.Origin,
+		&i.AccountID,
 	)
 	return i, err
 }
@@ -240,7 +244,7 @@ func (q *Queries) ListRefinementDecisionsForSession(ctx context.Context, session
 }
 
 const listRefinementDraftsForSession = `-- name: ListRefinementDraftsForSession :many
-SELECT id, session_id, brief, draft, model, created_at, origin FROM refinement_drafts
+SELECT id, session_id, brief, draft, model, created_at, origin, account_id FROM refinement_drafts
 WHERE session_id = $1
 ORDER BY created_at ASC
 `
@@ -262,6 +266,7 @@ func (q *Queries) ListRefinementDraftsForSession(ctx context.Context, sessionID 
 			&i.Model,
 			&i.CreatedAt,
 			&i.Origin,
+			&i.AccountID,
 		); err != nil {
 			return nil, err
 		}
