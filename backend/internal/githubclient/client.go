@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -252,8 +253,245 @@ type Client struct {
 func New(tokens githubapp.TokenProvider) *Client {
 	return &Client{
 		Tokens: tokens,
-		HTTP:   &http.Client{Timeout: 30 * time.Second},
+		HTTP: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: newRetryTransport(http.DefaultTransport),
+		},
 	}
+}
+
+// retryTransport is a bounded transient-retry RoundTripper wrapping a base
+// transport (http.DefaultTransport in production). It absorbs an isolated GitHub
+// 5xx / secondary-rate-limit / primary-rate-limit blip so a single request fault
+// never fails the caller (#2167 / E48.45).
+//
+// Retry-SAFETY is method-gated, not body-presence-gated (a GetBody-present POST
+// is NOT automatically retry-safe: a 5xx arriving AFTER the server applied the
+// mutation would duplicate it). Only genuinely retry-safe requests are retried:
+//
+//   - Idempotent read methods (GET, HEAD) always.
+//   - A mutation POST/PATCH ONLY when its call site EXPLICITLY opts in via
+//     withRetryableMutation(ctx) AND the request carries a replayable body
+//     (req.GetBody != nil). The only opt-in call sites are CreatePullRequest and
+//     CreateRef, each guarded server-side by an already-exists 422 sniff, so a
+//     re-applied create is a benign no-op. Issue-comment / GraphQL-mutation /
+//     create-issue / label / release-asset-upload POSTs never opt in and are
+//     never retried.
+//
+// The retryable-status predicate is retryableStatus (all 5xx, 429, and the
+// header-gated 403). Backoff honors Retry-After / X-RateLimit-Reset, capped to
+// maxDelay AND to the remaining request-context budget; a server-provided delay
+// exceeding the budget gives up PROMPTLY (returns the final response) rather than
+// sleeping past the 30s client Timeout. Every sleep is context-aware, so a
+// caller cancellation / client Timeout stops retries cleanly mid-sleep.
+type retryTransport struct {
+	base http.RoundTripper
+
+	// maxRetries is the number of ADDITIONAL attempts after the first (so up to
+	// maxRetries+1 total round trips).
+	maxRetries int
+	// backoffBase seeds the exponential fallback (base * 2^attempt), before full
+	// jitter. Tests inject a sub-millisecond base.
+	backoffBase time.Duration
+	// maxDelay caps any single honored/backoff delay.
+	maxDelay time.Duration
+
+	// sleeper performs a context-aware sleep; injected in tests to record the
+	// requested delay VALUE without real time. Returns ctx.Err() if the context
+	// is cancelled mid-sleep.
+	sleeper func(ctx context.Context, d time.Duration) error
+	// now supplies the wall clock for HTTP-date / X-RateLimit-Reset arithmetic
+	// and the remaining-budget cap; injected in tests.
+	now func() time.Time
+}
+
+// Default retry tuning. maxDelay is bounded well under the 30s client Timeout so
+// a single honored Retry-After can never consume the whole budget on its own.
+const (
+	defaultMaxRetries    = 4
+	defaultRetryBackoff  = 200 * time.Millisecond
+	defaultMaxRetryDelay = 20 * time.Second
+)
+
+// newRetryTransport wraps base with the production retry defaults.
+func newRetryTransport(base http.RoundTripper) *retryTransport {
+	return &retryTransport{
+		base:        base,
+		maxRetries:  defaultMaxRetries,
+		backoffBase: defaultRetryBackoff,
+		maxDelay:    defaultMaxRetryDelay,
+		sleeper:     contextSleep,
+		now:         time.Now,
+	}
+}
+
+// RoundTrip implements http.RoundTripper. It retries only retry-safe requests
+// (see retryTransport) on a retryable status, draining and closing each
+// non-final response before the next attempt and rewinding the body via
+// req.GetBody.
+func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	retryable := rt.requestRetryable(req)
+
+	var resp *http.Response
+	var err error
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			// Rewind the body for a replayed mutation. Reads always have a nil
+			// body. requestRetryable guarantees GetBody != nil for a body-bearing
+			// retryable request, so this only no-ops for bodyless requests.
+			if req.GetBody != nil {
+				body, gerr := req.GetBody()
+				if gerr != nil {
+					return nil, gerr
+				}
+				req.Body = body
+			}
+		}
+
+		resp, err = rt.base.RoundTrip(req)
+		if err != nil {
+			// A transport-level error (dial/timeout/ctx-cancel) is returned as-is;
+			// we retry on retryable STATUS codes, not on transport faults.
+			return nil, err
+		}
+
+		if !retryable || attempt >= rt.maxRetries || !retryableStatus(resp.StatusCode, resp.Header) {
+			return resp, nil
+		}
+
+		delay := retryDelay(resp, attempt, rt.backoffBase, rt.maxDelay, rt.now())
+		// Cap to the remaining context/timeout budget: if the server-provided
+		// delay would consume the whole remaining budget (delay >= remaining, the
+		// boundary), give up promptly and return the classified final response
+		// rather than sleeping the entire deadline only to issue a doomed retry.
+		if deadline, ok := ctx.Deadline(); ok {
+			if remaining := deadline.Sub(rt.now()); remaining <= 0 || delay >= remaining {
+				return resp, nil
+			}
+		}
+
+		drainAndClose(resp.Body)
+		if serr := rt.sleeper(ctx, delay); serr != nil {
+			// Context cancelled / client Timeout fired mid-sleep — stop cleanly.
+			return nil, serr
+		}
+	}
+}
+
+// requestRetryable reports whether req is safe to retry: an idempotent read, or
+// an explicitly opted-in mutation with a replayable body.
+func (*retryTransport) requestRetryable(req *http.Request) bool {
+	switch req.Method {
+	case http.MethodGet, http.MethodHead:
+		return true
+	default:
+		return isRetryableMutation(req.Context()) && req.GetBody != nil
+	}
+}
+
+// retryableMutationKey marks a request context whose non-idempotent method is
+// nonetheless retry-safe because the server dedups a re-applied mutation.
+type retryableMutationKey struct{}
+
+// withRetryableMutation opts a mutation call site into transport-level retry.
+// ONLY create-PR and create-ref use it: both sniff an already-exists 422, so a
+// re-applied create collapses to a no-op. Do NOT add call sites whose re-apply
+// is observable (issue-comment, create-issue, label, release-asset upload).
+func withRetryableMutation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, retryableMutationKey{}, true)
+}
+
+// isRetryableMutation reports whether ctx was marked by withRetryableMutation.
+func isRetryableMutation(ctx context.Context) bool {
+	v, _ := ctx.Value(retryableMutationKey{}).(bool)
+	return v
+}
+
+// retryableStatus reports whether an HTTP status (with its headers) is a
+// transient fault worth retrying: ALL 5xx (>=500), 429, and a 403 that carries a
+// rate-limit signal (a Retry-After header, or x-ratelimit-remaining:0). A plain
+// permission 403 (no rate-limit headers) is NOT retryable and returns promptly.
+// Retrying a rare permanent 5xx is fail-safe: bounded retries then a return.
+func retryableStatus(code int, h http.Header) bool {
+	switch {
+	case code >= 500:
+		return true
+	case code == http.StatusTooManyRequests:
+		return true
+	case code == http.StatusForbidden:
+		return h.Get("Retry-After") != "" || h.Get("X-RateLimit-Remaining") == "0"
+	default:
+		return false
+	}
+}
+
+// retryDelay computes the wait before the next attempt. It honors, in order:
+// Retry-After (integer seconds OR an HTTP-date per RFC 7231 §7.1.3), then
+// X-RateLimit-Reset (unix epoch seconds) when x-ratelimit-remaining:0, else
+// exponential backoff (base * 2^attempt) with full jitter. Every result is
+// clamped to [0, cap]. A malformed header falls through to backoff (fail-safe,
+// never a hang). now is injected so tests assert the honored delay VALUE.
+func retryDelay(resp *http.Response, attempt int, base, limit time.Duration, now time.Time) time.Duration {
+	if v := strings.TrimSpace(resp.Header.Get("Retry-After")); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+			return clampDelay(time.Duration(secs)*time.Second, limit)
+		}
+		if t, err := http.ParseTime(v); err == nil {
+			return clampDelay(t.Sub(now), limit)
+		}
+	}
+	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
+		if v := strings.TrimSpace(resp.Header.Get("X-RateLimit-Reset")); v != "" {
+			if epoch, err := strconv.ParseInt(v, 10, 64); err == nil {
+				return clampDelay(time.Unix(epoch, 0).Sub(now), limit)
+			}
+		}
+	}
+	// Exponential backoff with full jitter: a random duration in [0, base*2^attempt],
+	// itself capped. Jitter spreads concurrent retriers off a synchronized wave.
+	backoff := base << attempt
+	if backoff <= 0 || backoff > limit {
+		backoff = limit
+	}
+	return time.Duration(rand.Int63n(int64(backoff) + 1))
+}
+
+// clampDelay bounds d to [0, limit].
+func clampDelay(d, limit time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	if d > limit {
+		return limit
+	}
+	return d
+}
+
+// contextSleep sleeps for d unless ctx is cancelled first, in which case it
+// returns ctx.Err() promptly. A non-positive d is a no-op.
+func contextSleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// drainAndClose drains up to a bounded amount of a to-be-discarded response body
+// then closes it, so the underlying connection can be reused for the retry.
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<16))
+	_ = body.Close()
 }
 
 // AppJWTSigner mints an App-level JWT. Satisfied by *githubapp.Signer
@@ -1724,6 +1962,9 @@ func (c *Client) CreateRef(ctx context.Context, scope forge.CredentialScope,
 
 	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
 		"/" + url.PathEscape(repo.Name) + "/git/refs")
+	// Opt this POST into transport-level transient retry: the already-exists 422
+	// sniff below makes a re-applied create-ref a benign no-op.
+	ctx = withRetryableMutation(ctx)
 	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
 	if err != nil {
 		return err
@@ -1857,6 +2098,13 @@ func (c *Client) MergeBranch(ctx context.Context, scope forge.CredentialScope,
 // exhaust the 256-byte brief body). Callers recover the existing PR via
 // ListOpenPullRequestsByHead. ErrNotFound when the repo isn't visible to
 // the installation, ErrForbidden when the App lacks `pull_requests:write`.
+//
+// Idempotent open-PR is already satisfied here (no semantic change in #2167):
+// the duplicate 422 → ErrPullRequestExists → ListOpenPullRequestsByHead
+// adopt-by-head path recovers a lost create race. This POST additionally opts
+// into the retryTransport (withRetryableMutation) so an isolated transient
+// 5xx / rate-limit blip on the create itself is absorbed in-process; the 422
+// duplicate sniff is a 4xx, so the transport never retries it.
 func (c *Client) CreatePullRequest(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, head, base, title, body string) (*PullRequest, error) {
 	installationID, err := installationIDForScope(scope)
@@ -1889,6 +2137,10 @@ func (c *Client) CreatePullRequest(ctx context.Context, scope forge.CredentialSc
 	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
 		"/" + url.PathEscape(repo.Name) + "/pulls")
 
+	// Opt this POST into transport-level transient retry: the already-exists 422
+	// sniff below makes a re-applied create a benign no-op, so an isolated 5xx /
+	// rate-limit blip is absorbed instead of failing the consolidated PR open.
+	ctx = withRetryableMutation(ctx)
 	req, err := c.buildRequest(ctx, http.MethodPost, endpoint, bytes.NewReader(raw), installationID)
 	if err != nil {
 		return nil, err
