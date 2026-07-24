@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -440,6 +441,72 @@ func (e *Engine) Recorded(ctx context.Context, runID uuid.UUID, stageID *uuid.UU
 		}
 	}
 	return false
+}
+
+// LatestRuleIs reports whether the run's MOST RECENT run_auto_advanced
+// audit entry names rule. It mirrors applyDriveSurfaces'
+// sort-by-Sequence-take-last derivation (runs.go), so the drive engine
+// and the GET /v0/runs derived_status field agree on which entry is
+// "latest" — the read the acceptance-gate presentation arms dedup on so
+// a fix-up re-park (a LATER fixup_rereview_repark entry) makes a prior
+// acceptance_pending stamp re-assert the current derived status (#2122 /
+// #1961).
+//
+// This differs from Recorded, which is per-(run, stage) ever-recorded:
+// Recorded answers "was this rule EVER stamped for this stage", while
+// LatestRuleIs answers "is this rule the run's CURRENT derived status".
+// A rule that was recorded once but has since been superseded by a later
+// entry returns false here (so it re-stamps) but true from Recorded (so
+// it would be suppressed) — that supersession-aware semantic is the fix.
+//
+// FAIL-OPEN, exactly like Recorded: a nil engine/Audit, a list error, or
+// no run_auto_advanced entries returns false, so a degraded read
+// re-stamps rather than suppressing the current derived status forever.
+// Because a persistently failing audit read returns false on EVERY
+// observation tick, the fail-open path re-stamps ONCE PER TICK
+// (per-tick duplication) for as long as the read stays broken — not "at
+// worst one duplicate". This is symmetric with Recorded's fail-open
+// (the same ListForRunByCategory read on the same tick cadence), so it
+// introduces no new failure class.
+//
+// A malformed HIGHEST-sequence entry is NOT a fail-open case: like
+// applyDriveSurfaces' identical skip-undecodable/take-last loop, this
+// method continues past the undecodable newest entry and derives from
+// the last DECODABLE one. That keeps the engine and derived_status in
+// agreement on a corrupt newest entry (both read the same older entry) —
+// a divergent fail-open here would let the engine re-stamp while
+// derived_status still surfaces the older entry.
+func (e *Engine) LatestRuleIs(ctx context.Context, runID uuid.UUID, rule Rule) bool {
+	if e == nil || e.Audit == nil {
+		return false
+	}
+	entries, err := e.Audit.ListForRunByCategory(ctx, runID, Category)
+	if err != nil {
+		e.logger().LogAttrs(ctx, slog.LevelWarn, "drive: list run_auto_advanced failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return false
+	}
+	// Mirror applyDriveSurfaces exactly: stable-sort ascending by Sequence,
+	// then take the LAST decodable entry — so on equal sequences (a fake
+	// that leaves Sequence unset appends at 0) the later-appended entry
+	// wins, agreeing with the derived_status derivation's iterate-and-
+	// last-assignment-wins semantic.
+	sort.SliceStable(entries, func(i, j int) bool {
+		return entries[i].Sequence < entries[j].Sequence
+	})
+	var latest *Advance
+	for _, entry := range entries {
+		var p Advance
+		if json.Unmarshal(entry.Payload, &p) != nil {
+			continue
+		}
+		latest = &p
+	}
+	if latest == nil {
+		return false
+	}
+	return latest.Rule == rule
 }
 
 func (e *Engine) logger() *slog.Logger {

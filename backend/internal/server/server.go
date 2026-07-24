@@ -1027,7 +1027,13 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 	}
 	switch gateState {
 	case acceptanceGatePending:
-		if !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleAcceptancePending) {
+		// Idempotent on LatestRuleIs (run-wide latest), NOT Recorded
+		// (per-(run,stage) ever-recorded): a fix-up re-park stamps a LATER
+		// fixup_rereview_repark entry that supersedes this one, so when the
+		// re-review re-settles the current derived status must be
+		// re-asserted (else GET /v0/runs derived_status stays stale and the
+		// drive loop parks — #2122 / #1961).
+		if !s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleAcceptancePending) {
 			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
 				Rule:  drive.RuleAcceptancePending,
 				From:  "review:awaiting_approval",
@@ -1042,7 +1048,10 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		}
 		return
 	case acceptanceGateOutcomeUnknown:
-		if !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleAcceptanceOutcomeUnknown) {
+		// Idempotent on LatestRuleIs, not Recorded: a fix-up re-park
+		// supersedes this stamp, so the current derived status is
+		// re-asserted when the re-review re-settles (#2122 / #1961).
+		if !s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleAcceptanceOutcomeUnknown) {
 			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
 				Rule:  drive.RuleAcceptanceOutcomeUnknown,
 				From:  "review:awaiting_approval",
@@ -1057,7 +1066,10 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		}
 		return
 	case acceptanceGateTriage:
-		if !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleAcceptanceTriage) {
+		// Idempotent on LatestRuleIs, not Recorded: a fix-up re-park
+		// supersedes this stamp, so the current derived status is
+		// re-asserted when the re-review re-settles (#2122 / #1961).
+		if !s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleAcceptanceTriage) {
 			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
 				Rule:  drive.RuleAcceptanceTriage,
 				From:  "review:awaiting_approval",

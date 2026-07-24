@@ -317,4 +317,84 @@ func TestEngine_NilSafe(t *testing.T) {
 	if e.Recorded(context.Background(), uuid.New(), nil, RuleMerge) {
 		t.Fatal("nil engine Recorded = true")
 	}
+	if e.LatestRuleIs(context.Background(), uuid.New(), RuleMerge) {
+		t.Fatal("nil engine LatestRuleIs = true")
+	}
+}
+
+// seqEntry builds a run_auto_advanced audit entry with an explicit
+// Sequence so "latest" is unambiguous — the auditStub's AppendChained
+// does not assign one, and LatestRuleIs selects by highest Sequence
+// (mirroring applyDriveSurfaces' sort-by-Sequence-take-last).
+func seqEntry(runID uuid.UUID, seq int64, rule Rule) *audit.Entry {
+	payload, _ := json.Marshal(Advance{Rule: rule})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), RunID: &rid, Sequence: seq, Category: Category, Payload: payload}
+}
+
+func TestEngineLatestRuleIs(t *testing.T) {
+	ctx := context.Background()
+	runID := uuid.New()
+
+	// (a) true when the highest-sequence entry names the rule.
+	auMatch := &auditStub{entries: []*audit.Entry{
+		seqEntry(runID, 1, RuleReviewsSettledGate),
+		seqEntry(runID, 2, RuleAcceptancePending),
+	}}
+	if !(&Engine{Audit: auMatch}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = false when the latest entry names the rule; want true")
+	}
+
+	// (b) false when a LATER entry (a higher-sequence fixup_rereview_repark)
+	// supersedes an earlier RuleAcceptancePending stamp — the #2122 shape.
+	// Deliberately seed the superseding entry BEFORE the earlier one in the
+	// slice so selection is by Sequence, not append order.
+	auSuperseded := &auditStub{entries: []*audit.Entry{
+		seqEntry(runID, 9, RuleFixupRereviewRepark),
+		seqEntry(runID, 3, RuleAcceptancePending),
+	}}
+	if (&Engine{Audit: auSuperseded}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = true when a later repark superseded the acceptance_pending stamp; want false")
+	}
+	// ...and true for the rule that IS latest.
+	if !(&Engine{Audit: auSuperseded}).LatestRuleIs(ctx, runID, RuleFixupRereviewRepark) {
+		t.Error("LatestRuleIs = false for the actual latest (repark) rule; want true")
+	}
+
+	// (c) false on a list/read error (fail-open — a re-stamp beats a
+	// suppressed derived status).
+	auErr := &auditStub{listErr: errors.New("db down")}
+	if (&Engine{Audit: auErr}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = true on a read error; want false (fail-open)")
+	}
+
+	// (d) false when no run_auto_advanced entries exist.
+	auEmpty := &auditStub{}
+	if (&Engine{Audit: auEmpty}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = true on an empty trail; want false")
+	}
+
+	// (e) malformed HIGHEST-sequence entry: LatestRuleIs skips the undecodable
+	// newest entry and derives from the last DECODABLE one — mirroring
+	// applyDriveSurfaces' identical skip-undecodable/take-last loop (runs.go),
+	// so the engine and GET /v0/runs derived_status stay in agreement even
+	// when the newest entry is corrupt (a divergent fail-open here would let
+	// the engine re-stamp while derived_status still reads the older entry).
+	// Concretely: with a decodable RuleAcceptancePending at seq 3 and an
+	// undecodable entry at seq 12, both derivations land on acceptance_pending,
+	// so LatestRuleIs returns true and the arm correctly suppresses a duplicate
+	// re-stamp. Pins the #2122 fix-up-review malformed-payload edge path.
+	badPayload := &audit.Entry{ID: uuid.New(), RunID: &runID, Sequence: 12, Category: Category, Payload: []byte("{not valid advance json")}
+	auMalformedLatest := &auditStub{entries: []*audit.Entry{
+		seqEntry(runID, 3, RuleAcceptancePending),
+		badPayload,
+	}}
+	if !(&Engine{Audit: auMalformedLatest}).LatestRuleIs(ctx, runID, RuleAcceptancePending) {
+		t.Error("LatestRuleIs = false when the highest-sequence entry is undecodable and the last decodable entry names the rule; want true (mirrors applyDriveSurfaces skip-undecodable/take-last)")
+	}
+	// ...and false for a rule that only the undecodable entry might have named:
+	// a malformed newest entry cannot be treated as the latest rule.
+	if (&Engine{Audit: auMalformedLatest}).LatestRuleIs(ctx, runID, RuleFixupRereviewRepark) {
+		t.Error("LatestRuleIs = true for a rule not named by any decodable entry; want false")
+	}
 }

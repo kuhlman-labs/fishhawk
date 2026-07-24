@@ -640,6 +640,72 @@ func TestObserveParkedReview_AcceptancePendingIdempotent(t *testing.T) {
 	}
 }
 
+// seedRunAutoAdvanced seeds a run_auto_advanced audit entry naming rule at the
+// given Sequence, so LatestRuleIs (and applyDriveSurfaces) can pick the latest
+// unambiguously — the auditFake assigns no Sequence to appended entries.
+func (h *driveObserverHarness) seedRunAutoAdvanced(seq int64, rule drive.Rule) {
+	payload, _ := json.Marshal(drive.Advance{Rule: rule})
+	rid := h.runID
+	h.au.seeded = append(h.au.seeded, &audit.Entry{
+		RunID: &rid, Sequence: seq, Category: drive.Category, Payload: payload,
+	})
+}
+
+// TestObserveParkedReview_AcceptancePending_RestampsAfterFixupRepark pins the
+// exact #2122 shape: a prior RuleAcceptancePending stamp superseded by a LATER
+// RuleFixupRereviewRepark entry (the fix-up re-park) is no longer the run's
+// latest run_auto_advanced entry, so derived_status is stale. Because the
+// acceptance-pending arm is now idempotent on Engine.LatestRuleIs (run-wide
+// latest) rather than Engine.Recorded (per-(run,stage) ever-recorded), the
+// observer RE-STAMPS acceptance_pending — re-asserting the current derived
+// status so GET /v0/runs derived_status returns to acceptance_pending and the
+// MCP drive loop dispatches acceptance instead of parking (#1961).
+func TestObserveParkedReview_AcceptancePending_RestampsAfterFixupRepark(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateRunning)) // non-terminal, no verdict
+	// Model the completed fix-up round: a prior acceptance_pending stamp, then a
+	// LATER fixup_rereview_repark that superseded it as the latest entry.
+	h.seedRunAutoAdvanced(30, drive.RuleAcceptancePending)
+	h.seedRunAutoAdvanced(40, drive.RuleFixupRereviewRepark)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	restamped := 0
+	for _, a := range advances {
+		if a.Rule == drive.RuleAcceptancePending {
+			restamped++
+			if a.To != "acceptance_pending" || a.NextAction == nil || a.NextAction.Action != "await_acceptance" {
+				t.Errorf("re-stamped entry = %+v, want acceptance_pending / await_acceptance", a)
+			}
+		}
+	}
+	if restamped != 1 {
+		t.Fatalf("acceptance_pending re-stamps = %d, want 1 (LatestRuleIs returned false after the repark superseded the prior stamp)", restamped)
+	}
+}
+
+// TestObserveParkedReview_AcceptancePending_NoRestampWhenAlreadyLatest is the
+// anti-oscillation control: with a prior RuleAcceptancePending already the
+// LATEST run_auto_advanced entry and no intervening repark, LatestRuleIs returns
+// true, so a fresh observation appends NO duplicate acceptance_pending.
+func TestObserveParkedReview_AcceptancePending_NoRestampWhenAlreadyLatest(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateRunning))
+	h.seedRunAutoAdvanced(30, drive.RuleAcceptancePending) // already the latest entry
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	for _, a := range advances {
+		if a.Rule == drive.RuleAcceptancePending {
+			t.Fatalf("acceptance_pending re-stamped when it was already the latest entry; want no duplicate (%+v)", advances)
+		}
+	}
+}
+
 // TestObserveParkedReview_StageListError_NoMerge pins BINDING approval
 // condition 1: a ListStagesForRun error on an acceptance-declaring run must NOT
 // fall through to checks_green_awaiting_merge / merge_pr — the observer skips
