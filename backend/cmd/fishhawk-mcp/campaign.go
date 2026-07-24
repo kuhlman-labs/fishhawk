@@ -150,8 +150,27 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_item_not_child: %s — an items ref is not a child of epic %s; pass only issue refs that are children of the epic, or omit items to sweep every child", ae.Message, in.EpicRef)
 			case "campaign_dangling_dependency":
-				return nil, StartCampaignOutput{}, fmt.Errorf(
-					"campaign_dangling_dependency: %s — an epic child declares a depends_on that is not a fellow child of %s; fix the epic's dependency edges and retry", ae.Message, in.EpicRef)
+				// Branch the operator remedy on which categories the backend
+				// enriched into details (#2120): an out-of-epic target keeps the
+				// "not a fellow child" fix-the-edges wording; an excluded-but-
+				// incomplete subset sibling names the include-in-items / omit-items
+				// remedy. Render both when both are present; fall back to the
+				// not_child wording when details are absent (older backend).
+				_, notChild := ae.Details["dangling_not_child"]
+				_, excluded := ae.Details["dangling_excluded_incomplete"]
+				const notChildRemedy = "an epic child declares a depends_on that is not a fellow child of %s; fix the epic's dependency edges and retry"
+				const excludedRemedy = "an included item's depends_on targets a sibling excluded from items that is not yet complete; include it in items, or omit items to sweep every child so a completed dependency auto-settles"
+				switch {
+				case excluded && notChild:
+					return nil, StartCampaignOutput{}, fmt.Errorf(
+						"campaign_dangling_dependency: %s — two causes: (1) "+notChildRemedy+"; (2) "+excludedRemedy, ae.Message, in.EpicRef)
+				case excluded:
+					return nil, StartCampaignOutput{}, fmt.Errorf(
+						"campaign_dangling_dependency: %s — "+excludedRemedy, ae.Message)
+				default:
+					return nil, StartCampaignOutput{}, fmt.Errorf(
+						"campaign_dangling_dependency: %s — "+notChildRemedy, ae.Message, in.EpicRef)
+				}
 			case "campaign_repo_unconfigured":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired, so campaigns cannot be created", ae.Message)

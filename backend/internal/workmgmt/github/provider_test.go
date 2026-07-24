@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -353,10 +354,13 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 	api := &fakeAPI{
 		parentNode: "EPIC_NODE",
 		listSubResults: []githubclient.SubIssue{
-			// out-of-order on purpose: EpicChildren sorts ascending.
-			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n", Labels: []string{"type:feature", "autonomy:medium"}},
-			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n", Labels: []string{"autonomy:low"}},
-			{Number: 43, NodeID: "N43", Title: "slice C", Body: "Depends on: #41, #42, #999\n"},
+			// out-of-order on purpose: EpicChildren sorts ascending. State/
+			// stateReason exercise the Complete matrix: #41 CLOSED+COMPLETED
+			// (complete), #42 OPEN (not complete), #43 CLOSED+NOT_PLANNED (closed
+			// but its work did not land → not complete).
+			{Number: 42, NodeID: "N42", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n", Labels: []string{"type:feature", "autonomy:medium"}, State: "OPEN"},
+			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n", Labels: []string{"autonomy:low"}, State: "CLOSED", StateReason: "COMPLETED"},
+			{Number: 43, NodeID: "N43", Title: "slice C", Body: "Depends on: #41, #42, #999\n", State: "CLOSED", StateReason: "NOT_PLANNED"},
 		},
 	}
 	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
@@ -390,6 +394,14 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 			t.Errorf("child #%d Autonomy = %q, want %q", c.Number, c.Autonomy, wantAutonomy[c.Number])
 		}
 	}
+	// Complete is true ONLY for the closed+completed child (#41). #42 is open
+	// and #43 is closed-as-not_planned, so neither is complete (#2120).
+	wantComplete := map[int]bool{41: true, 42: false, 43: false}
+	for _, c := range res.Children {
+		if c.Complete != wantComplete[c.Number] {
+			t.Errorf("child #%d Complete = %v, want %v", c.Number, c.Complete, wantComplete[c.Number])
+		}
+	}
 	// Edges: 42->41, 43->41, 43->42. The #999 reference is not a child → it is
 	// kept out of Edges and surfaced in DroppedEdges (not silently discarded).
 	want := []workmgmt.DependsEdge{{From: 42, To: 41}, {From: 43, To: 41}, {From: 43, To: 42}}
@@ -401,9 +413,10 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 			t.Errorf("edge[%d] = %+v, want %+v", i, e, want[i])
 		}
 	}
-	// The mis-targeted #999 reference lands in DroppedEdges so assembly can
-	// fail closed on it rather than the provider silently dropping it.
-	wantDropped := []workmgmt.DependsEdge{{From: 43, To: 999}}
+	// The mis-targeted #999 reference lands in DroppedEdges stamped
+	// DropNotChild so assembly can fail closed on it (keeping the "not a fellow
+	// child" wording) rather than the provider silently dropping it.
+	wantDropped := []workmgmt.DependsEdge{{From: 43, To: 999, Reason: workmgmt.DropNotChild}}
 	if len(res.DroppedEdges) != len(wantDropped) {
 		t.Fatalf("dropped edges = %+v, want %+v (#999 must be surfaced)", res.DroppedEdges, wantDropped)
 	}
@@ -412,6 +425,72 @@ func TestProvider_EpicChildren_ResolvesChildrenAndEdges(t *testing.T) {
 			t.Errorf("dropped edge[%d] = %+v, want %+v", i, e, wantDropped[i])
 		}
 	}
+}
+
+// TestProvider_EpicChildren_CompletionThreadsToSubsetDrop is the binding
+// source-to-consumer test (#2120, operator condition 1a): it drives the REAL
+// EpicChildren mapping from a faked ListSubIssues carrying a CLOSED+COMPLETED
+// child and an OPEN (incomplete) child, then feeds the mapped result straight
+// into campaign.FilterToSubset — so SubIssue.State/StateReason →
+// EpicChild.Complete → the subset-drop classification is exercised together in
+// one flow, not only per-layer with a Complete-preset fake. It proves the two
+// endpoints of the fix: an included item depending on an EXCLUDED-but-COMPLETED
+// sibling is a satisfied (silently-dropped) dependency, while depending on an
+// EXCLUDED-but-INCOMPLETE sibling is still dangling.
+func TestProvider_EpicChildren_CompletionThreadsToSubsetDrop(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			// #100: closed-and-completed → Complete. The already-merged wave-0
+			// dependency the natural "campaign the remaining open children" call
+			// excludes from the subset.
+			{Number: 100, NodeID: "N100", Title: "done dep", Body: "no deps", State: "CLOSED", StateReason: "COMPLETED"},
+			// #101: open, depends on the completed #100.
+			{Number: 101, NodeID: "N101", Title: "open A", Body: "Depends on: #100", State: "OPEN"},
+			// #103: open (incomplete) — the not-yet-done sibling.
+			{Number: 103, NodeID: "N103", Title: "open dep", Body: "no deps", State: "OPEN"},
+			// #104: open, depends on the incomplete #103.
+			{Number: 104, NodeID: "N104", Title: "open B", Body: "Depends on: #103", State: "OPEN"},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#99",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+
+	// Included #101 depends on EXCLUDED #100, which the mapping marked Complete:
+	// the edge is a satisfied dependency, dropped silently, and Assemble
+	// succeeds over just {101}.
+	t.Run("excluded_complete_dependency_satisfied", func(t *testing.T) {
+		sub, err := campaign.FilterToSubset(res, []string{"issue:101"})
+		if err != nil {
+			t.Fatalf("FilterToSubset: %v", err)
+		}
+		if len(sub.DroppedEdges) != 0 {
+			t.Fatalf("DroppedEdges = %+v, want none (excluded #100 is complete → satisfied)", sub.DroppedEdges)
+		}
+		if _, err := campaign.Assemble("issue:99", sub); err != nil {
+			t.Fatalf("Assemble(subset {101}) = %v, want success", err)
+		}
+	})
+
+	// Included #104 depends on EXCLUDED #103, which is open (not complete): the
+	// edge is still dangling, so Assemble fails closed.
+	t.Run("excluded_incomplete_dependency_dangling", func(t *testing.T) {
+		sub, err := campaign.FilterToSubset(res, []string{"issue:104"})
+		if err != nil {
+			t.Fatalf("FilterToSubset: %v", err)
+		}
+		if len(sub.DroppedEdges) != 1 || sub.DroppedEdges[0].Reason != workmgmt.DropExcludedIncomplete {
+			t.Fatalf("DroppedEdges = %+v, want one DropExcludedIncomplete edge", sub.DroppedEdges)
+		}
+		if _, err := campaign.Assemble("issue:99", sub); !errors.Is(err, campaign.ErrDanglingDependency) {
+			t.Fatalf("Assemble(subset {104}) = %v, want ErrDanglingDependency", err)
+		}
+	})
 }
 
 // TestParseAutonomyLabel covers the tier extraction: the first autonomy:<tier>

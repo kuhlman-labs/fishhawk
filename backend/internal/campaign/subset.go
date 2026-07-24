@@ -31,10 +31,15 @@ var ErrItemNotChild = errors.New("campaign: subset item is not a child of the ep
 //
 // The edge set is re-partitioned against the included item set:
 //   - an edge with BOTH endpoints included is kept in Edges;
-//   - an edge whose From is included but whose To is EXCLUDED is appended to
-//     DroppedEdges — an included item depending on an excluded one is a dangling
-//     dependency, so Assemble fails it closed as campaign_dangling_dependency,
-//     exactly as a cross-epic dangling edge does today;
+//   - an edge whose From is included but whose To is EXCLUDED is resolved
+//     against the excluded target's completion state: if that target is already
+//     closed-and-completed (EpicChild.Complete) the dependency is satisfied and
+//     the edge is dropped SILENTLY (the same result the full all-children sweep
+//     produces via closed-child auto-settle, #2120); otherwise it is appended to
+//     DroppedEdges stamped DropExcludedIncomplete — an included item depending
+//     on an excluded, not-yet-complete sibling is a dangling dependency, so
+//     Assemble fails it closed as campaign_dangling_dependency, exactly as a
+//     cross-epic dangling edge does today;
 //   - an edge whose From is excluded is dropped silently (the depending item is
 //     not in the campaign, so its dependency is irrelevant).
 //
@@ -104,8 +109,19 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 		case fromIn && toIn:
 			edges = append(edges, e)
 		case fromIn && !toIn:
-			// An included item depends on an excluded one: a dangling
-			// dependency, surfaced closed exactly like a cross-epic edge.
+			// An included item depends on an EXCLUDED fellow child. If that
+			// excluded target is already closed-and-completed, its dependency is
+			// satisfied — drop the edge silently, the same result the full
+			// all-children sweep produces via closed-child auto-settle (#2120).
+			// Otherwise the dependency cannot be honored within the campaign, so
+			// surface it as a dropped edge stamped DropExcludedIncomplete.
+			// childByNumber indexes ALL children (included and excluded), so the
+			// lookup resolves; an unexpectedly-missing target fails closed
+			// (treated as excluded-incomplete) rather than panicking.
+			if child, ok := childByNumber[e.To]; ok && child.Complete {
+				continue
+			}
+			e.Reason = workmgmt.DropExcludedIncomplete
 			dropped = append(dropped, e)
 		default:
 			// From is excluded: the depending item is not in the campaign, so

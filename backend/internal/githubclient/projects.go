@@ -576,15 +576,23 @@ func (c *Client) AddSubIssue(ctx context.Context, scope forge.CredentialScope, p
 
 // SubIssue is the slice of a sub-issue connection node the work-management
 // epic-children query consumes: the child issue's human Number, GraphQL
-// NodeID, Title, Body (the depends_on body marker is parsed from Body), and
+// NodeID, Title, Body (the depends_on body marker is parsed from Body),
 // Labels (the `autonomy:` tier is parsed from Labels by the workmgmt github
-// provider — #1551). Labels is nil for a labelless child.
+// provider — #1551), and the issue's State / StateReason (the closed+completed
+// completion signal the campaign subset filter reads to treat an excluded-but-
+// already-completed sibling dependency as satisfied — #2120). Labels is nil for
+// a labelless child. State/StateReason carry the GraphQL IssueState /
+// IssueStateReason enums verbatim (uppercase: OPEN|CLOSED, and
+// COMPLETED|REOPENED|NOT_PLANNED|DUPLICATE); StateReason is "" for an OPEN issue
+// (GraphQL returns null, which decodes to the zero value).
 type SubIssue struct {
-	Number int
-	NodeID string
-	Title  string
-	Body   string
-	Labels []string
+	Number      int
+	NodeID      string
+	Title       string
+	Body        string
+	Labels      []string
+	State       string
+	StateReason string
 }
 
 // listSubIssuesFirst is the sub-issues connection page size. v0 reads a
@@ -604,7 +612,7 @@ const listSubIssuesLabelsFirst = 100
 // ListSubIssues returns the sub-issues (children) of the issue identified by
 // parentNodeID — its number, node id, title, body, and labels.
 //
-//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id labels(first: 100){ nodes{ name } } } } } }
+//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id state stateReason labels(first: 100){ nodes{ name } } } } } }
 //
 // It reads a SINGLE first:100 page (listSubIssuesFirst); a parent with more
 // than 100 sub-issues is truncated to the first 100 — out of scope for the
@@ -632,6 +640,8 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
           title
           body
           id
+          state
+          stateReason
           labels(first: $labelsFirst) {
             nodes { name }
           }
@@ -644,11 +654,13 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
 		Node *struct {
 			SubIssues struct {
 				Nodes []struct {
-					Number int    `json:"number"`
-					Title  string `json:"title"`
-					Body   string `json:"body"`
-					ID     string `json:"id"`
-					Labels struct {
+					Number      int    `json:"number"`
+					Title       string `json:"title"`
+					Body        string `json:"body"`
+					ID          string `json:"id"`
+					State       string `json:"state"`
+					StateReason string `json:"stateReason"`
+					Labels      struct {
 						Nodes []struct {
 							Name string `json:"name"`
 						} `json:"nodes"`
@@ -678,7 +690,7 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
 				labels = append(labels, l.Name)
 			}
 		}
-		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, Labels: labels})
+		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, Labels: labels, State: n.State, StateReason: n.StateReason})
 	}
 	return results, nil
 }

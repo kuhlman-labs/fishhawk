@@ -6895,8 +6895,11 @@ paths:
                     the campaign to. `epic_ref` stays required and every entry
                     must be a child of it; the DAG is built over just these
                     items. An included item whose `depends_on` targets an
-                    EXCLUDED item fails `campaign_dangling_dependency` (the same
-                    fail-closed guarantee a cross-epic edge gives). A ref that is
+                    EXCLUDED item that is not yet complete fails
+                    `campaign_dangling_dependency` (the same fail-closed
+                    guarantee a cross-epic edge gives); an excluded target that
+                    is already closed-and-completed is treated as a satisfied
+                    dependency and the campaign assembles (#2120). A ref that is
                     not a child of the epic fails `campaign_item_not_child`. Omit
                     (or send an empty array) to sweep every child — the
                     backward-compatible default.
@@ -6932,8 +6935,10 @@ paths:
             `depends_on` targets an issue that is not a fellow child of the
             epic (assembly fails closed rather than dropping the edge), which
             also covers an `items` subset that includes an item whose
-            `depends_on` points at an EXCLUDED item; `campaign_item_not_child` —
-            an `items` entry is not a child of the epic.
+            `depends_on` points at an EXCLUDED item that is not yet complete (an
+            excluded closed-and-completed target is a satisfied dependency and
+            assembles, #2120); `campaign_item_not_child` — an `items` entry is
+            not a child of the epic.
         '501':
           description: |
             `provider_unimplemented` — the conventions name an unregistered

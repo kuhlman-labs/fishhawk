@@ -530,16 +530,26 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	children := make([]workmgmt.EpicChild, 0, len(subs))
 	var edges, dropped []workmgmt.DependsEdge
 	for _, s := range subs {
-		children = append(children, workmgmt.EpicChild{Number: s.Number, Title: s.Title, Autonomy: parseAutonomyLabel(s.Labels)})
+		children = append(children, workmgmt.EpicChild{
+			Number:   s.Number,
+			Title:    s.Title,
+			Autonomy: parseAutonomyLabel(s.Labels),
+			// Complete = closed-AND-completed (GitHub IssueState CLOSED with
+			// IssueStateReason COMPLETED, uppercase GraphQL enums). A
+			// not_planned / duplicate close is NOT complete — its work did not
+			// land — so it does not satisfy a downstream dependency (#2120).
+			Complete: s.State == "CLOSED" && s.StateReason == "COMPLETED",
+		})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			if isChild[dep] {
 				edges = append(edges, workmgmt.DependsEdge{From: s.Number, To: dep})
 			} else {
 				// A depends_on reference to a non-child: a typo'd number or a
 				// real cross-epic dependency. Surface it as a dropped edge
-				// (campaign assembly fails closed on it) rather than silently
+				// stamped DropNotChild (campaign assembly fails closed on it,
+				// keeping the "not a fellow child" wording) rather than silently
 				// discarding it.
-				dropped = append(dropped, workmgmt.DependsEdge{From: s.Number, To: dep})
+				dropped = append(dropped, workmgmt.DependsEdge{From: s.Number, To: dep, Reason: workmgmt.DropNotChild})
 			}
 		}
 	}

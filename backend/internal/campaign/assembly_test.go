@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -81,6 +82,68 @@ func TestAssemble_DanglingDependencyRejected(t *testing.T) {
 	_, err := campaign.Assemble("issue:40", res)
 	if !errors.Is(err, campaign.ErrDanglingDependency) {
 		t.Fatalf("Assemble(dangling) err = %v, want ErrDanglingDependency", err)
+	}
+}
+
+// TestAssemble_DanglingDependency_Categorized asserts the typed
+// DanglingDependencyError groups dropped edges by cause and renders one clause
+// per non-empty category (#2120): a DropNotChild (or unclassified/zero-reason)
+// edge keeps the "not a fellow child of the epic" wording, a
+// DropExcludedIncomplete edge names the include/omit remedy, and errors.As
+// recovers the categorized edge lists. errors.Is(ErrDanglingDependency) still
+// holds through the wrap.
+func TestAssemble_DanglingDependency_Categorized(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 41}, {Number: 42}},
+		DroppedEdges: []workmgmt.DependsEdge{
+			{From: 41, To: 999, Reason: workmgmt.DropNotChild},
+			{From: 42, To: 43, Reason: workmgmt.DropExcludedIncomplete},
+		},
+	}
+	_, err := campaign.Assemble("issue:40", res)
+	if !errors.Is(err, campaign.ErrDanglingDependency) {
+		t.Fatalf("err = %v, want wrapped ErrDanglingDependency", err)
+	}
+	var de *campaign.DanglingDependencyError
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v, want *DanglingDependencyError via errors.As", err)
+	}
+	if len(de.NotChild) != 1 || de.NotChild[0] != (workmgmt.DependsEdge{From: 41, To: 999, Reason: workmgmt.DropNotChild}) {
+		t.Errorf("NotChild = %+v, want [{41 999 not_child}]", de.NotChild)
+	}
+	if len(de.ExcludedIncomplete) != 1 || de.ExcludedIncomplete[0] != (workmgmt.DependsEdge{From: 42, To: 43, Reason: workmgmt.DropExcludedIncomplete}) {
+		t.Errorf("ExcludedIncomplete = %+v, want [{42 43 excluded_incomplete}]", de.ExcludedIncomplete)
+	}
+	msg := err.Error()
+	// not_child clause keeps the pre-#2120 wording and names its edge.
+	if !strings.Contains(msg, "not a fellow child of the epic") || !strings.Contains(msg, "issue:41->issue:999") {
+		t.Errorf("message %q missing not_child clause naming issue:41->issue:999", msg)
+	}
+	// excluded_incomplete clause names cause + include/omit remedy and its edge.
+	if !strings.Contains(msg, "include it in items") || !strings.Contains(msg, "omit items") || !strings.Contains(msg, "issue:42->issue:43") {
+		t.Errorf("message %q missing excluded_incomplete remedy clause naming issue:42->issue:43", msg)
+	}
+}
+
+// TestAssemble_DanglingDependency_ZeroReasonIsNotChild asserts a dropped edge
+// with an empty (zero) Reason — a pre-#2120 provider edge or a hand-built
+// fixture — defaults to the not_child category, preserving the current wording
+// (#2120 zero-value compatibility).
+func TestAssemble_DanglingDependency_ZeroReasonIsNotChild(t *testing.T) {
+	res := &workmgmt.EpicChildrenResult{
+		Children:     []workmgmt.EpicChild{{Number: 41}},
+		DroppedEdges: []workmgmt.DependsEdge{{From: 41, To: 999}}, // no Reason
+	}
+	_, err := campaign.Assemble("issue:40", res)
+	var de *campaign.DanglingDependencyError
+	if !errors.As(err, &de) {
+		t.Fatalf("err = %v, want *DanglingDependencyError", err)
+	}
+	if len(de.NotChild) != 1 || len(de.ExcludedIncomplete) != 0 {
+		t.Errorf("categories = NotChild %+v / ExcludedIncomplete %+v, want the zero-reason edge in NotChild only", de.NotChild, de.ExcludedIncomplete)
+	}
+	if !strings.Contains(err.Error(), "not a fellow child of the epic") {
+		t.Errorf("message %q missing not_child wording", err.Error())
 	}
 }
 

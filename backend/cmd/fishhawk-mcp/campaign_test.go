@@ -8,6 +8,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // --- fishhawk_start_campaign (E25.8 / #1447) ---
@@ -290,6 +294,9 @@ func TestStartCampaign_RepoNotInstalled_MapsActionableError(t *testing.T) {
 	}
 }
 
+// TestStartCampaign_DanglingDependency_MapsActionableError is the fallback
+// branch: an error WITHOUT the #2120 category details (an older backend) keeps
+// the pre-existing "not a fellow child" fix-the-edges wording.
 func TestStartCampaign_DanglingDependency_MapsActionableError(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.createCampaignStatus = http.StatusUnprocessableEntity
@@ -300,9 +307,129 @@ func TestStartCampaign_DanglingDependency_MapsActionableError(t *testing.T) {
 	if err == nil {
 		t.Fatal("err = nil, want campaign_dangling_dependency mapping")
 	}
-	for _, want := range []string{"campaign_dangling_dependency", "depends_on", "#25"} {
+	for _, want := range []string{"campaign_dangling_dependency", "depends_on", "not a fellow child", "#25"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	// No excluded-incomplete remedy leaks into the pure not_child fallback.
+	if strings.Contains(err.Error(), "include it in items") {
+		t.Errorf("fallback err %q must not name the excluded-incomplete remedy", err.Error())
+	}
+}
+
+// TestStartCampaign_DanglingNotChildDetails_KeepsNotChildWording is the #2120
+// not_child branch: details carrying only dangling_not_child render the
+// unchanged "not a fellow child" wording, not the excluded-incomplete remedy.
+func TestStartCampaign_DanglingNotChildDetails_KeepsNotChildWording(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"dangling edge","details":{"epic_ref":"#25","dangling_not_child":["issue:27->issue:999"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	for _, want := range []string{"campaign_dangling_dependency", "not a fellow child", "#25"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "include it in items") {
+		t.Errorf("not_child-only err %q must not name the excluded-incomplete remedy", err.Error())
+	}
+}
+
+// TestStartCampaign_DanglingExcludedIncompleteDetails_NamesIncludeOmitRemedy is
+// the #2120 excluded-incomplete branch: details carrying only
+// dangling_excluded_incomplete render the include-in-items / omit-items remedy
+// naming the real cause, NOT the generic fix-the-edges wording.
+func TestStartCampaign_DanglingExcludedIncompleteDetails_NamesIncludeOmitRemedy(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"dangling edge","details":{"epic_ref":"#25","dangling_excluded_incomplete":["issue:101->issue:100"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	for _, want := range []string{"campaign_dangling_dependency", "include it in items", "omit items"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+	if strings.Contains(err.Error(), "fix the epic's dependency edges") {
+		t.Errorf("excluded-incomplete-only err %q must not name the generic fix-the-edges remedy", err.Error())
+	}
+}
+
+// TestStartCampaign_DanglingBothDetails_RendersBothCauses is the #2120
+// both-present branch: details carrying BOTH category keys render both the
+// not_child and the excluded-incomplete remedies.
+func TestStartCampaign_DanglingBothDetails_RendersBothCauses(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_dangling_dependency","message":"dangling edges","details":{"epic_ref":"#25","dangling_not_child":["issue:27->issue:999"],"dangling_excluded_incomplete":["issue:101->issue:100"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err == nil {
+		t.Fatal("err = nil, want mapping")
+	}
+	for _, want := range []string{"campaign_dangling_dependency", "not a fellow child", "include it in items", "omit items", "#25"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestStartCampaign_DanglingDetails_SourceToConsumer closes the serialization
+// seam binding condition 1(b) names: it threads a REAL categorized
+// campaign.DanglingDependencyError through the REAL server details-map builder
+// (server.DanglingDependencyDetails) into the REAL MCP operator-message render
+// in ONE flow — so the error-categorization → details-keys → operator-message
+// path is covered source-to-consumer, not split across a server-only test that
+// asserts the keys and an MCP-only test fed hand-written details JSON (#2120).
+//
+// A key rename on only one side of the seam now fails this test: the details map
+// is produced by the server (not a literal), so the MCP consumer's key lookups
+// must agree with what the server actually emits for the remedy to render.
+func TestStartCampaign_DanglingDetails_SourceToConsumer(t *testing.T) {
+	// A real categorized error: one out-of-epic edge (NotChild) and one
+	// included→excluded-incomplete edge, exactly as campaign.Assemble returns.
+	de := &campaign.DanglingDependencyError{
+		NotChild:           []workmgmt.DependsEdge{{From: 27, To: 999}},
+		ExcludedIncomplete: []workmgmt.DependsEdge{{From: 101, To: 100}},
+	}
+	// Build the 422 body with the REAL server-side details map + message, then
+	// serialize the same error envelope the server writes on the wire.
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code":    "campaign_dangling_dependency",
+			"message": de.Error(),
+			"details": server.DanglingDependencyDetails(de, "#25"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = string(body)
+	r := newResolver(srv, nil)
+
+	_, _, gotErr := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if gotErr == nil {
+		t.Fatal("err = nil, want campaign_dangling_dependency mapping")
+	}
+	// Both category keys are present in the real details map, so the operator
+	// message must name BOTH remedies (not_child fix-the-edges + include/omit).
+	for _, want := range []string{"campaign_dangling_dependency", "not a fellow child", "include it in items", "omit items", "#25"} {
+		if !strings.Contains(gotErr.Error(), want) {
+			t.Errorf("err %q missing %q", gotErr.Error(), want)
 		}
 	}
 }

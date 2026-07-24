@@ -307,9 +307,11 @@ func TestAddSubIssue(t *testing.T) {
 
 func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	pf, c := newProjectsFake(t)
+	// #41 is OPEN (stateReason null); #42 is CLOSED as COMPLETED — the
+	// closed+completed pair the workmgmt provider maps to EpicChild.Complete.
 	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{"nodes":[
-		{"number":41,"title":"slice A","body":"## Summary","id":"N41","labels":{"nodes":[{"name":"type:feature"},{"name":"autonomy:low"}]}},
-		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","labels":{"nodes":[]}}
+		{"number":41,"title":"slice A","body":"## Summary","id":"N41","state":"OPEN","stateReason":null,"labels":{"nodes":[{"name":"type:feature"},{"name":"autonomy:low"}]}},
+		{"number":42,"title":"slice B","body":"Depends on: #41","id":"N42","state":"CLOSED","stateReason":"COMPLETED","labels":{"nodes":[]}}
 	]}}}}`
 	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
 	if err != nil {
@@ -320,6 +322,15 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	}
 	if subs[0].Number != 41 || subs[0].NodeID != "N41" || subs[0].Title != "slice A" {
 		t.Errorf("subs[0] = %+v", subs[0])
+	}
+	// State / stateReason decode onto the SubIssue: an OPEN issue's null
+	// stateReason lands as "", a CLOSED+COMPLETED issue carries both enums
+	// verbatim (uppercase) so the provider can compute Complete (#2120).
+	if subs[0].State != "OPEN" || subs[0].StateReason != "" {
+		t.Errorf("subs[0] state/reason = %q/%q, want OPEN/\"\"", subs[0].State, subs[0].StateReason)
+	}
+	if subs[1].State != "CLOSED" || subs[1].StateReason != "COMPLETED" {
+		t.Errorf("subs[1] state/reason = %q/%q, want CLOSED/COMPLETED", subs[1].State, subs[1].StateReason)
 	}
 	// Labels decode alongside the existing number/title/body/id fields; an
 	// empty labels connection yields a nil Labels slice (#1551).
@@ -338,6 +349,11 @@ func TestListSubIssues_PopulatedMapsNodes(t *testing.T) {
 	// The query must request the labels connection so the tier is on the wire.
 	if q := pf.gotGraphQLQuery["ListSubIssues"]; !strings.Contains(q, "labels(first:") {
 		t.Errorf("ListSubIssues query does not request labels: %q", q)
+	}
+	// The query must select state + stateReason so the completion signal
+	// reaches the campaign subset filter (#2120).
+	if q := pf.gotGraphQLQuery["ListSubIssues"]; !strings.Contains(q, "state") || !strings.Contains(q, "stateReason") {
+		t.Errorf("ListSubIssues query does not request state/stateReason: %q", q)
 	}
 }
 
