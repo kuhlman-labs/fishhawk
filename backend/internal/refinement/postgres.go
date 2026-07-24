@@ -52,6 +52,7 @@ func (r *postgresRepo) CreateDraft(ctx context.Context, p CreateParams) (*Stored
 		Draft:     raw,
 		Model:     model,
 		Origin:    origin,
+		AccountID: p.AccountID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create refinement draft: %w", err)
@@ -252,7 +253,7 @@ func rowToFiledItem(row refinementdb.RefinementFiledItem) *FiledItem {
 }
 
 // rowToStoredDraft unmarshals the JSONB draft column back into an EpicDraft
-// and maps the nullable model column to a string ("" when NULL).
+// and maps the nullable model + account_id columns to strings ("" when NULL).
 func rowToStoredDraft(r refinementdb.RefinementDraft) (*StoredDraft, error) {
 	var draft EpicDraft
 	if err := json.Unmarshal(r.Draft, &draft); err != nil {
@@ -262,6 +263,10 @@ func rowToStoredDraft(r refinementdb.RefinementDraft) (*StoredDraft, error) {
 	if r.Model != nil {
 		model = *r.Model
 	}
+	accountID := ""
+	if r.AccountID != nil {
+		accountID = r.AccountID.String()
+	}
 	return &StoredDraft{
 		ID:        r.ID,
 		SessionID: r.SessionID,
@@ -270,6 +275,7 @@ func rowToStoredDraft(r refinementdb.RefinementDraft) (*StoredDraft, error) {
 		Model:     model,
 		Origin:    r.Origin,
 		CreatedAt: r.CreatedAt.Time,
+		AccountID: accountID,
 	}, nil
 }
 

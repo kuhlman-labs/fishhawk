@@ -47,6 +47,14 @@ type CreateParams struct {
 	Draft     EpicDraft
 	Model     string
 	Origin    string
+	// AccountID is the workspace account the session is stamped to at creation
+	// (E44.24 / #2115). It marks the tenant that owns the session so an unfiled
+	// session — which has no repo to authorize against — is still gated on the
+	// authoritative account boundary, mirroring how every root entity carries a
+	// nullable account_id (migration 0055). nil ⇒ the NULL partition: a bearer /
+	// MCP caller (no Identity.AccountID until E44.5) or an anonymous caller
+	// stamps NULL, which stays reachable under the NULL-allow window.
+	AccountID *uuid.UUID
 }
 
 // StoredDraft is a persisted refinement draft with its decoded EpicDraft. It
@@ -60,6 +68,12 @@ type StoredDraft struct {
 	Model     string
 	Origin    string
 	CreatedAt time.Time
+	// AccountID is the workspace account the session was stamped to at creation
+	// (E44.24 / #2115), or "" when the account_id column is NULL (a bearer / MCP
+	// session pre-E44.5, or a legacy row). A string — matching run.Run.AccountID
+	// — so the handler's account-ownership gate compares it exactly as
+	// enforceAccount compares a run's owner.
+	AccountID string
 }
 
 // Decision is an append-only approve/reject verdict on ONE draft revision. It

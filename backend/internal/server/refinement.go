@@ -174,6 +174,11 @@ func (s *Server) handleCreateRefinementSession(w http.ResponseWriter, r *http.Re
 		Draft:     draft,
 		Model:     model,
 		Origin:    refinement.OriginBrief,
+		// Stamp the caller's workspace account at CREATION so an unfiled session
+		// carries an authoritative tenant marker (E44.24 / #2115). Cookie callers
+		// stamp their account; bearer / MCP callers (no AccountID until E44.5)
+		// stamp NULL and read back under the NULL-allow window.
+		AccountID: identityAccountID(r.Context()),
 	}); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not persist the refinement draft", map[string]any{"error": err.Error()})
@@ -314,6 +319,11 @@ func (s *Server) handlePatchRefinementDraft(w http.ResponseWriter, r *http.Reque
 		Draft:     newDraft,
 		Model:     model,
 		Origin:    origin,
+		// Carry the caller's account onto each revision (E44.24 / #2115). The
+		// authoritative gate anchors on the creation-time marker (drafts[0]), so a
+		// same-account amendment is a no-op change and a cross-account writer is
+		// already refused by loadRefinementSession above.
+		AccountID: identityAccountID(r.Context()),
 	}); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not persist the edited revision", map[string]any{"error": err.Error()})
@@ -469,6 +479,27 @@ func (s *Server) loadRefinementSession(w http.ResponseWriter, r *http.Request, s
 			"no refinement session with that id", map[string]any{"session_id": sessionID.String()})
 		return nil, false
 	}
+	// Account-ownership gate (E44.24 / #2115), the AUTHORITATIVE tenant
+	// boundary. Applied to READS AND WRITES alike (NOT gated on isReadRequest,
+	// unlike the repo-visibility mirror below) and BEFORE that mirror, so a
+	// cross-account caller is refused on the authoritative boundary before the
+	// non-authoritative repo cache is ever consulted. This closes the #2115
+	// exposure: an unfiled session has no repo, so the repo-visibility gate
+	// allowed every unfiled session workspace-wide; a creation-time account
+	// marker gives even a pre-filing session a tenant to authorize against.
+	//
+	// The gate mirrors enforceAccount's ownership branch (middleware.go) and the
+	// 0057 RLS predicate exactly: a session whose account is set and DIFFERS
+	// from the caller's Identity.AccountID → 403 account_forbidden; a
+	// NULL-account session stays reachable (the NULL-allow window). A
+	// NULL-account session is a bearer / MCP caller (no AccountID until E44.5)
+	// or a legacy row — reachability there is the established tenancy pattern,
+	// closed for bearer tokens once E44.5 stamps their AccountID at creation and
+	// backstopped by the #2083 RLS predicate. Denying a bearer-created session
+	// here would break the MCP loop, so it is deliberately allowed.
+	if !s.enforceRefinementAccount(w, r, drafts) {
+		return nil, false
+	}
 	// Repo-scoped gate (ADR-057 Amendment A2 / #2071). Applied HERE rather
 	// than per handler because every refinement read routes through this
 	// loader, so one check covers the surface and a new read handler inherits
@@ -487,6 +518,32 @@ func (s *Server) loadRefinementSession(w http.ResponseWriter, r *http.Request, s
 	return drafts, true
 }
 
+// enforceRefinementAccount is the authoritative account-ownership gate for a
+// refinement session (E44.24 / #2115). Returns true when the request may
+// proceed. The session's account is anchored on the creation-time marker
+// (drafts[0].AccountID — drafts are ordered created_at ASC, so drafts[0] is the
+// oldest revision, stamped when the session was opened). When that marker is
+// empty (NULL) the session is allowed for any caller holding the gate scope —
+// the NULL-allow window that matches enforceAccount and the 0057 RLS predicate.
+// When it is set and differs from the caller's Identity.AccountID, the caller is
+// refused 403 account_forbidden. Applies to reads and writes alike: this is the
+// tenant boundary, not the read-only repo-visibility mirror.
+func (s *Server) enforceRefinementAccount(w http.ResponseWriter, r *http.Request, drafts []*refinement.StoredDraft) bool {
+	sessionAccount := drafts[0].AccountID
+	if sessionAccount == "" {
+		// NULL-allow window: a bearer / MCP or legacy session has no tenant
+		// marker and stays reachable, exactly as enforceAccount allows an
+		// untenanted run.
+		return true
+	}
+	if IdentityFrom(r.Context()).AccountID != sessionAccount {
+		s.writeError(w, r, http.StatusForbidden, "account_forbidden",
+			"this refinement session belongs to a different workspace account", nil)
+		return false
+	}
+	return true
+}
+
 // enforceRefinementRepoVisibility applies repo filtering to a refinement
 // session. Returns true when the request may proceed.
 //
@@ -498,13 +555,13 @@ func (s *Server) loadRefinementSession(w http.ResponseWriter, r *http.Request, s
 // and a re-invoke naming a different repo fails closed there.
 //
 // So the gate is: a session that HAS been filed authorizes against its pinned
-// repo; a session that has NOT been filed has no repo to authorize against and
-// stays reachable to any member holding the refinement gate scope, exactly as
-// today. That is a deliberate, stated limit rather than a silent one — closing
-// it means giving refinement sessions a repo at creation, which is a schema
-// change to the refinement tables (outside this change's scope). The residual
-// exposure is bounded: a pre-filing session contains a brief and a proposed
-// epic draft, not run, campaign or audit data for a repo the caller lacks.
+// repo for finer, repo-level scoping. A session that has NOT been filed has no
+// repo to authorize against here — but it is no longer reachable workspace-wide:
+// the authoritative account-ownership gate (enforceRefinementAccount, E44.24 /
+// #2115) runs BEFORE this mirror and refuses a cross-account caller on the
+// creation-time account marker, so the unfiled-session exposure this comment
+// once documented as a stated limit is now closed at the tenant boundary. This
+// repo mirror only adds finer repo-level scoping once a session is filed.
 //
 // The filing session is keyed by DRAFT id, and only the approved revision is
 // filed, so this walks the session's revisions newest-first and gates on the

@@ -78,6 +78,71 @@ func TestPostgres_CreateWithoutModel(t *testing.T) {
 	}
 }
 
+// TestPostgres_AccountIDRoundTrip pins the E44.24 (#2115) tenant marker: a
+// non-nil CreateParams.AccountID persists through the hand-edited INSERT /
+// RETURNING / SELECT column lists and reloads on StoredDraft.AccountID (as the
+// account's UUID string) via BOTH GetDraft and ListForSession, while a nil
+// AccountID round-trips as "" (the NULL-allow window). This is the done-means
+// that the marker is actually written and read back — a no-op touch would fail
+// it, and any pgx scan / column-count mismatch from the hand-edit errors here.
+func TestPostgres_AccountIDRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+
+	// A non-nil account_id needs a real accounts row (FK, ON DELETE SET NULL).
+	acct := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "acme-ent"); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	// Tenanted draft: AccountID round-trips as the account's UUID string.
+	sessionID := uuid.New()
+	tenanted, err := repo.CreateDraft(context.Background(), CreateParams{
+		SessionID: sessionID, Brief: "b", Draft: validDraft(), AccountID: &acct,
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft (tenanted): %v", err)
+	}
+	if tenanted.AccountID != acct.String() {
+		t.Errorf("CreateDraft returned AccountID = %q, want %s", tenanted.AccountID, acct)
+	}
+
+	got, err := repo.GetDraft(context.Background(), tenanted.ID)
+	if err != nil {
+		t.Fatalf("GetDraft: %v", err)
+	}
+	if got.AccountID != acct.String() {
+		t.Errorf("GetDraft AccountID = %q, want %s (tenant marker persisted)", got.AccountID, acct)
+	}
+	list, err := repo.ListForSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("ListForSession: %v", err)
+	}
+	if len(list) != 1 || list[0].AccountID != acct.String() {
+		t.Errorf("ListForSession AccountID = %+v, want one draft with %s", list, acct)
+	}
+
+	// Untenanted draft: a nil AccountID persists as NULL and reloads as "".
+	nullSession := uuid.New()
+	untenanted, err := repo.CreateDraft(context.Background(), CreateParams{
+		SessionID: nullSession, Brief: "b", Draft: validDraft(), AccountID: nil,
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft (untenanted): %v", err)
+	}
+	if untenanted.AccountID != "" {
+		t.Errorf("CreateDraft nil-account returned AccountID = %q, want empty (NULL column)", untenanted.AccountID)
+	}
+	gotNull, err := repo.GetDraft(context.Background(), untenanted.ID)
+	if err != nil {
+		t.Fatalf("GetDraft (untenanted): %v", err)
+	}
+	if gotNull.AccountID != "" {
+		t.Errorf("GetDraft untenanted AccountID = %q, want empty (NULL-allow window)", gotNull.AccountID)
+	}
+}
+
 func TestPostgres_GetDraftNotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := NewPostgresRepository(pool)

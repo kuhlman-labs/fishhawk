@@ -7220,16 +7220,30 @@ paths:
         targets the latest revision and its pinned hash still matches — so an
         edit after approval structurally re-gates the session.
 
+        **Account-scoped access (E44.24 / #2115).** Each session carries a
+        workspace-account marker stamped at creation. A caller whose
+        workspace account differs from the session's is denied 403
+        `account_forbidden` — the authoritative tenant boundary, applied to
+        READS AND WRITES (the draft-edit and decision endpoints below share
+        this check), ahead of the repo mirror below. A session with a NULL
+        account marker (a bearer/MCP caller before E44.5, or a legacy row)
+        stays reachable under the NULL-allow window — the established tenancy
+        pattern (matching every root entity's `account_id` gate and the
+        row-level-security predicate). That residual is closed for bearer
+        tokens once E44.5 stamps their account at creation, and is backstopped
+        by the #2083 row-level-security policy.
+
         **Repo-scoped visibility (ADR-057 Amendment A2 / #2071).** Once a
-        session has been FILED, it is authorized against the repository its
-        filing session pinned: a non-admin cookie-session caller without at
-        least `read` on that repository at the forge is denied 403
-        `repo_forbidden`. The gate is scoped to READS: the draft-edit and
-        decision endpoints below share this session load but are NOT gated on
-        the mirror, because it is a non-authoritative TTL'd cache of a forge
-        read permission and a decision is an approval. A session that has not
-        yet been filed has no repository to authorize against and stays
-        reachable to any caller holding the refinement scope.
+        session has been FILED, it is additionally authorized against the
+        repository its filing session pinned: a non-admin cookie-session caller
+        without at least `read` on that repository at the forge is denied 403
+        `repo_forbidden`. This finer repo gate is scoped to READS only: the
+        draft-edit and decision endpoints below share this session load but are
+        NOT gated on the mirror, because it is a non-authoritative TTL'd cache
+        of a forge read permission and a decision is an approval. A session that
+        has not yet been filed has no repository for this finer gate, but is
+        still bounded by the account gate above rather than reachable
+        workspace-wide.
 
         Requires `write:approvals` scope.
       tags: [refinement]
@@ -7248,9 +7262,10 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            `insufficient_scope` — token lacks `write:approvals`; or
-            `repo_forbidden` — the caller does not hold `read` on the
-            repository this session was filed against (#2071).
+            `insufficient_scope` — token lacks `write:approvals`;
+            `account_forbidden` — the session belongs to a different workspace
+            account (E44.24 / #2115); or `repo_forbidden` — the caller does not
+            hold `read` on the repository this session was filed against (#2071).
         '404': { description: "`refinement_session_not_found` — no session with that id." }
         '503':
           description: |
@@ -7275,6 +7290,11 @@ paths:
         Every successful edit writes a `refinement_draft_edited` audit entry on
         the global chain BEFORE persisting the revision (durable-before-state-
         change): an audit-append failure is a `500` and nothing is persisted.
+
+        Gated on the session's workspace account (E44.24 / #2115): a
+        cross-account caller is denied 403 `account_forbidden` before the edit
+        is applied. A NULL-account session (bearer/MCP pre-E44.5, or legacy)
+        stays writable under the NULL-allow window.
 
         Requires `write:approvals` scope.
       tags: [refinement]
@@ -7304,7 +7324,11 @@ paths:
               schema: { $ref: '#/components/schemas/RefinementSession' }
         '400': { description: "`validation_failed` — malformed JSON, unknown fields, or non-UUID `session_id`." }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '403':
+          description: |
+            `insufficient_scope` — token lacks `write:approvals`; or
+            `account_forbidden` — the session belongs to a different workspace
+            account (E44.24 / #2115).
         '404': { description: "`refinement_session_not_found`." }
         '409': { description: "`amendment_budget_exhausted` — the per-session brief-amendment budget is spent." }
         '422':
@@ -7338,6 +7362,11 @@ paths:
         (durable-before-state-change): the audit entry IS the gate's record, so
         an audit-append failure is a `500` and no approval is recorded.
 
+        Gated on the session's workspace account (E44.24 / #2115): a
+        cross-account caller is denied 403 `account_forbidden` before the
+        decision is recorded. A NULL-account session (bearer/MCP pre-E44.5, or
+        legacy) stays decidable under the NULL-allow window.
+
         Requires `write:approvals` scope.
       tags: [refinement]
       parameters:
@@ -7364,7 +7393,11 @@ paths:
               schema: { $ref: '#/components/schemas/RefinementSession' }
         '400': { description: "`validation_failed` — malformed JSON, unknown fields, or non-UUID `session_id`." }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '403':
+          description: |
+            `insufficient_scope` — token lacks `write:approvals`; or
+            `account_forbidden` — the session belongs to a different workspace
+            account (E44.24 / #2115).
         '404': { description: "`refinement_session_not_found`." }
         '409': { description: "`decision_already_recorded` — the latest revision already carries a decision." }
         '422': { description: "`validation_failed` — `decision` not in {approved, rejected}, or a missing/blank `reason`." }
