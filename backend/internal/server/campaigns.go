@@ -469,18 +469,8 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			// can name the real cause+remedy per cause without string-parsing the
 			// message (#2120). A defensively-wrapped dangling error (no typed
 			// form) still maps to the 422 with just epic_ref.
-			details := map[string]any{"epic_ref": req.EpicRef}
-			var de *campaign.DanglingDependencyError
-			if errors.As(err, &de) {
-				if refs := edgeRefs(de.NotChild); len(refs) > 0 {
-					details["dangling_not_child"] = refs
-				}
-				if refs := edgeRefs(de.ExcludedIncomplete); len(refs) > 0 {
-					details["dangling_excluded_incomplete"] = refs
-				}
-			}
 			s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_dangling_dependency",
-				err.Error(), details)
+				err.Error(), DanglingDependencyDetails(err, req.EpicRef))
 			return
 		case errors.Is(err, campaign.ErrCycle):
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
@@ -516,6 +506,41 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, r, http.StatusCreated, toCampaignResponse(created))
+}
+
+// Detail keys the campaign_dangling_dependency error carries, one per cause
+// (#2120). They are the CONTRACT between this producer and the fishhawk-mcp
+// consumer (campaign.go's startCampaign), which branches its operator remedy on
+// their presence — so the source-to-consumer test drives DanglingDependencyDetails
+// (below) and asserts the operator message rather than pinning the seam only with
+// matching string literals in two files.
+const (
+	danglingNotChildKey           = "dangling_not_child"
+	danglingExcludedIncompleteKey = "dangling_excluded_incomplete"
+)
+
+// DanglingDependencyDetails builds the campaign_dangling_dependency error's
+// details map from a (possibly-wrapped) assembly error, categorizing the
+// blocking edges so the MCP tool can name the real cause+remedy per cause
+// without string-parsing the message (#2120). It always carries epic_ref; a
+// typed *campaign.DanglingDependencyError additionally contributes the
+// dangling_not_child / dangling_excluded_incomplete edge lists. A defensively-
+// wrapped dangling error (no typed form) maps to just epic_ref. Exported so the
+// fishhawk-mcp source-to-consumer test can thread the REAL details map into the
+// operator-message render (binding condition 1(b) / #2120), rather than feeding
+// the consumer hand-written details JSON.
+func DanglingDependencyDetails(err error, epicRef string) map[string]any {
+	details := map[string]any{"epic_ref": epicRef}
+	var de *campaign.DanglingDependencyError
+	if errors.As(err, &de) {
+		if refs := edgeRefs(de.NotChild); len(refs) > 0 {
+			details[danglingNotChildKey] = refs
+		}
+		if refs := edgeRefs(de.ExcludedIncomplete); len(refs) > 0 {
+			details[danglingExcludedIncompleteKey] = refs
+		}
+	}
+	return details
 }
 
 // edgeRefs formats dropped depends_on edges as "issue:From->issue:To" strings

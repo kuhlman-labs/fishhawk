@@ -8,6 +8,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // --- fishhawk_start_campaign (E25.8 / #1447) ---
@@ -377,6 +381,55 @@ func TestStartCampaign_DanglingBothDetails_RendersBothCauses(t *testing.T) {
 	for _, want := range []string{"campaign_dangling_dependency", "not a fellow child", "include it in items", "omit items", "#25"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestStartCampaign_DanglingDetails_SourceToConsumer closes the serialization
+// seam binding condition 1(b) names: it threads a REAL categorized
+// campaign.DanglingDependencyError through the REAL server details-map builder
+// (server.DanglingDependencyDetails) into the REAL MCP operator-message render
+// in ONE flow — so the error-categorization → details-keys → operator-message
+// path is covered source-to-consumer, not split across a server-only test that
+// asserts the keys and an MCP-only test fed hand-written details JSON (#2120).
+//
+// A key rename on only one side of the seam now fails this test: the details map
+// is produced by the server (not a literal), so the MCP consumer's key lookups
+// must agree with what the server actually emits for the remedy to render.
+func TestStartCampaign_DanglingDetails_SourceToConsumer(t *testing.T) {
+	// A real categorized error: one out-of-epic edge (NotChild) and one
+	// included→excluded-incomplete edge, exactly as campaign.Assemble returns.
+	de := &campaign.DanglingDependencyError{
+		NotChild:           []workmgmt.DependsEdge{{From: 27, To: 999}},
+		ExcludedIncomplete: []workmgmt.DependsEdge{{From: 101, To: 100}},
+	}
+	// Build the 422 body with the REAL server-side details map + message, then
+	// serialize the same error envelope the server writes on the wire.
+	body, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code":    "campaign_dangling_dependency",
+			"message": de.Error(),
+			"details": server.DanglingDependencyDetails(de, "#25"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = string(body)
+	r := newResolver(srv, nil)
+
+	_, _, gotErr := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if gotErr == nil {
+		t.Fatal("err = nil, want campaign_dangling_dependency mapping")
+	}
+	// Both category keys are present in the real details map, so the operator
+	// message must name BOTH remedies (not_child fix-the-edges + include/omit).
+	for _, want := range []string{"campaign_dangling_dependency", "not a fellow child", "include it in items", "omit items", "#25"} {
+		if !strings.Contains(gotErr.Error(), want) {
+			t.Errorf("err %q missing %q", gotErr.Error(), want)
 		}
 	}
 }
