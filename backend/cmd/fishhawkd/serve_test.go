@@ -32,6 +32,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubapp"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
@@ -828,6 +829,122 @@ func TestServe_InstallationHostAllowlistWiring(t *testing.T) {
 	})
 }
 
+// TestServe_GitLabInstallationHostAllowlistWiring pins the per-forge GitLab
+// Mode-2 allowlist (E44.16 / #2094): --gitlab-installation-host-allowlist is a
+// SEPARATE flag from GitHub's (a workspace's github.com and gitlab.com hosts
+// differ) and emits its own fail-closed presence log when set. bootstrapAbortFlag
+// aborts startup AFTER the forge-registration block, so the log line is
+// observable. The log fires independent of GitHub App / GitLab base+token config
+// (it is gated only on the allowlist flag).
+func TestServe_GitLabInstallationHostAllowlistWiring(t *testing.T) {
+	t.Run("configured gitlab allowlist is threaded and logged", func(t *testing.T) {
+		code, log := serveWithProfile(t,
+			"-gitlab-installation-host-allowlist", "gitlab.acme.example, .gitlab.example.com",
+			bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (startup aborts at the invalid --review-resolution, AFTER the forge-registration block); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "gitlab installation host allowlist configured") {
+			t.Errorf("configured gitlab allowlist did not emit the presence log line:\n%s", log)
+		}
+	})
+
+	t.Run("unset gitlab allowlist stays silent (default-off)", func(t *testing.T) {
+		code, log := serveWithProfile(t, bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "gitlab installation host allowlist configured") {
+			t.Errorf("an unset gitlab allowlist must not emit the presence log line (default-off posture):\n%s", log)
+		}
+	})
+}
+
+// TestInstallationBaseURLResolver pins the shared per-installation base-URL
+// closure factory (E44.16 / #2094) that the App mint, the githubclient REST
+// client, and the gitlab forge all consume. A nil resolver yields a nil hook
+// (deployment default); a configured resolver returns the provider's
+// forge_base_url and propagates a real DB fault UNCHANGED so the consumer fails
+// closed; a NULL column resolves to "" (deployment default). The provider
+// discriminator is routed verbatim so github and gitlab installs resolve
+// independently.
+func TestInstallationBaseURLResolver(t *testing.T) {
+	t.Run("nil resolver yields a nil hook (deployment default)", func(t *testing.T) {
+		if installationBaseURLResolver(nil, "github") != nil {
+			t.Fatal("a nil resolver must yield a nil hook so the consumer's ResolveBaseURL stays nil")
+		}
+	})
+
+	t.Run("github resolves forge_base_url and routes the provider", func(t *testing.T) {
+		base := "https://acme.ghe.com"
+		fg := &fakeInstGetter{inst: accountdb.Installation{ForgeBaseUrl: &base}}
+		hook := installationBaseURLResolver(account.NewEndpointResolver(fg), "github")
+		got, err := hook(context.Background(), "1001")
+		if err != nil {
+			t.Fatalf("hook returned error: %v", err)
+		}
+		if got != base {
+			t.Errorf("resolved base = %q, want %q", got, base)
+		}
+		if fg.gotProvider != "github" || fg.gotRef != "1001" {
+			t.Errorf("resolver called with (%q, %q), want (github, 1001)", fg.gotProvider, fg.gotRef)
+		}
+	})
+
+	t.Run("gitlab routes the gitlab provider discriminator", func(t *testing.T) {
+		base := "https://gitlab.acme.example"
+		fg := &fakeInstGetter{inst: accountdb.Installation{ForgeBaseUrl: &base}}
+		hook := installationBaseURLResolver(account.NewEndpointResolver(fg), "gitlab")
+		got, err := hook(context.Background(), "gitlab:42")
+		if err != nil {
+			t.Fatalf("hook returned error: %v", err)
+		}
+		if got != base {
+			t.Errorf("resolved base = %q, want %q", got, base)
+		}
+		if fg.gotProvider != "gitlab" {
+			t.Errorf("resolver called with provider %q, want gitlab", fg.gotProvider)
+		}
+	})
+
+	t.Run("DB fault propagates (fail-closed)", func(t *testing.T) {
+		sentinel := errors.New("connection refused")
+		fg := &fakeInstGetter{err: sentinel}
+		hook := installationBaseURLResolver(account.NewEndpointResolver(fg), "github")
+		if _, err := hook(context.Background(), "1001"); !errors.Is(err, sentinel) {
+			t.Fatalf("hook error = %v, want the sentinel propagated so the consumer fails closed", err)
+		}
+	})
+
+	t.Run("NULL column resolves to empty (deployment default)", func(t *testing.T) {
+		fg := &fakeInstGetter{} // ForgeBaseUrl nil, no error
+		hook := installationBaseURLResolver(account.NewEndpointResolver(fg), "github")
+		got, err := hook(context.Background(), "1001")
+		if err != nil {
+			t.Fatalf("hook returned error: %v", err)
+		}
+		if got != "" {
+			t.Errorf("resolved base = %q, want empty (deployment default) for a NULL column", got)
+		}
+	})
+}
+
+// fakeInstGetter is an account.InstallationGetter that records the lookup key
+// and returns a programmed Installation / error, exercising the resolver closure
+// without a live database.
+type fakeInstGetter struct {
+	inst        accountdb.Installation
+	err         error
+	gotProvider string
+	gotRef      string
+}
+
+func (f *fakeInstGetter) GetInstallationByRef(_ context.Context, arg accountdb.GetInstallationByRefParams) (accountdb.Installation, error) {
+	f.gotProvider = arg.Provider
+	f.gotRef = arg.InstallationRef
+	return f.inst, f.err
+}
+
 // TestBuildModelProviders covers the live ModelOracle provider-registration
 // wiring (#1341, binding condition 1 — the previously-untested serve.go
 // activation seam). A provider is registered ONLY when its API key is present;
@@ -1322,6 +1439,33 @@ func TestResolveGitLabForge(t *testing.T) {
 	t.Run("both empty is not registered", func(t *testing.T) {
 		if glForge := resolveGitLabForge("", ""); glForge != nil {
 			t.Errorf("adapter = %v with nothing set, want nil (not registered)", glForge)
+		}
+	})
+	t.Run("threads per-installation resolver + allowlist options", func(t *testing.T) {
+		// The variadic opts (E44.16 / #2094) plumb the per-installation base-URL
+		// resolver + host allowlist onto the underlying factory. Passing them
+		// still constructs a registerable adapter; a nil resolver / empty
+		// allowlist (the no-pool posture) is accepted as a backward-compatible
+		// no-op. The resolver→client→outbound-host cross-boundary behavior is
+		// pinned in the forge/gitlab package's own tests.
+		glForge := resolveGitLabForge("https://gitlab.com", "glpat-tok",
+			forgegitlab.WithResolveBaseURL(func(context.Context, string) (string, error) { return "", nil }),
+			forgegitlab.WithAllowedInstallationHosts([]string{"gitlab.acme.example", ".gitlab.example.com"}))
+		if glForge == nil {
+			t.Fatal("adapter = nil with resolver + allowlist options set, want a constructed adapter")
+		}
+		if glForge.Name() != "gitlab" {
+			t.Errorf("Name() = %q, want gitlab", glForge.Name())
+		}
+	})
+	t.Run("nil resolver option is a backward-compatible no-op", func(t *testing.T) {
+		// installationBaseURLResolver(nil, …) returns a nil hook; passing it
+		// through WithResolveBaseURL must leave a working deployment-default
+		// adapter (not panic, not fail).
+		glForge := resolveGitLabForge("https://gitlab.com", "glpat-tok",
+			forgegitlab.WithResolveBaseURL(installationBaseURLResolver(nil, "gitlab")))
+		if glForge == nil {
+			t.Fatal("adapter = nil with a nil resolver hook, want a deployment-default adapter")
 		}
 	})
 }

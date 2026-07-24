@@ -32,20 +32,38 @@ override, so this is wiring only.
 | `FISHHAWKD_OAUTH_TOKEN_URL` | `--oauth-token-url` | OAuth web-flow token URL | `https://github.com/login/oauth/access_token` |
 | `FISHHAWKD_OAUTH_USER_URL` | `--oauth-user-url` | OAuth web-flow user-profile URL | `https://api.github.com/user` |
 | `FISHHAWKD_OAUTH_ORGS_URL` | `--oauth-orgs-url` | OAuth web-flow user-orgs URL | `https://api.github.com/user/orgs` |
-| `FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST` | `--github-installation-host-allowlist` | fail-closed allowlist of hosts the Mode-2 per-installation base URL may resolve to (comma-separated; exact host or `.ghe.com` leading-dot suffix) | empty → scheme/parse validation only |
+| `FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST` | `--github-installation-host-allowlist` | fail-closed allowlist of hosts the Mode-2 per-installation GitHub base URL (App mint + REST) may resolve to (comma-separated; exact host or `.ghe.com` leading-dot suffix) | empty → scheme/parse validation only |
+| `FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST` | `--gitlab-installation-host-allowlist` | fail-closed allowlist of hosts the Mode-2 per-installation **GitLab** base URL may resolve to (separate from GitHub's — a workspace's github.com and gitlab.com hosts differ) | empty → scheme/parse validation only |
 
 The forge-neutral **identity provider** (device flow + REST reads) is threaded
-too: its REST base comes from `FISHHAWKD_GITHUB_API_URL`, and its device-flow /
-OAuth host is derived from the scheme+host of `FISHHAWKD_OAUTH_AUTHORIZE_URL`
-(an unset or unparseable value keeps `github.com`).
+too, at Mode 1 only: its REST base comes from `FISHHAWKD_GITHUB_API_URL`, and its
+device-flow / OAuth host is derived from the scheme+host of
+`FISHHAWKD_OAUTH_AUTHORIZE_URL` (an unset or unparseable value keeps
+`github.com`).
 
 **Mode 2 (per-installation)** rides on top of Mode 1: when a DB pool is present,
-`githubapp.Client.ResolveBaseURL` is late-bound (after the pool) to
-`account.EndpointResolver`, which reads `installations.forge_base_url` for the
-minting installation. A SET column overrides the deployment default for that
-install; a NULL column or unknown installation falls back to the deployment
-default; a **real DB error FAILS the mint** (fail-closed) rather than silently
-targeting the default host. See `backend/internal/account/README.md`.
+a single shared `account.EndpointResolver` (reading `installations.forge_base_url`)
+is late-bound via `installationBaseURLResolver` into every per-installation forge
+consumer:
+
+- **GitHub App mint** — `githubapp.Client.ResolveBaseURL` (provider `github`).
+- **GitHub REST client** — `githubclient.Client.ResolveBaseURL` (provider
+  `github`), applied at the `buildRequest` choke point so every REST method
+  routes without per-method edits; it reuses the SAME
+  `FISHHAWKD_GITHUB_INSTALLATION_HOST_ALLOWLIST` as the mint (an install's host is
+  identical whoever reads it).
+- **GitLab forge** — the `gitlabclient.Factory` behind `forge/gitlab` (provider
+  `gitlab`), gated by the separate `FISHHAWKD_GITLAB_INSTALLATION_HOST_ALLOWLIST`.
+
+A SET column overrides the deployment default for that install; a NULL column or
+unknown installation falls back to the deployment default; a **real DB error
+FAILS CLOSED** (no credential shipped) rather than silently targeting the default
+host. A nil DB pool leaves every hook nil → deployment default everywhere. Only
+`forge_base_url` is consumed; `oauth_base_url` is **not** — its would-be consumer
+(the OAuth / device-flow login host) is pre-identification, so the
+per-installation OAuth + identity leg is **deferred** (see
+`backend/internal/auth` and `backend/internal/identity`). See
+`backend/internal/account/README.md`.
 
 The resolved override is always validated for scheme/parse/host before the App
 JWT ships (an `http://`, hostless, or malformed value fails the mint). On top of
