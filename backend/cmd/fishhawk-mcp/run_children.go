@@ -224,14 +224,48 @@ func scanPendingScopeAmendments(events []RunnerEvent) []PendingScopeAmendment {
 	return out
 }
 
-// childSucceeded reports whether a dispatched child reached a terminal SUCCESS
-// (#2095 gap #1). It keys the recovery-guidance branch: a succeeded child's
-// implement stage is terminal 'succeeded' and re-invoking fishhawk_run_children
-// will NOT reopen it, whereas a non-succeeded (failed) child's stage is terminal
-// 'failed' and must be returned to a dispatchable state with fishhawk_retry_stage
-// before a re-run. Uses the runner's authoritative outcome/exit signal.
-func childSucceeded(c ChildResult) bool {
-	return c.Dispatched && c.Outcome == "ok" && c.ExitCode == 0
+// childTerminalClass is a dispatched child's recovery-relevant terminal
+// classification (#2095 gap #1).
+type childTerminalClass int
+
+const (
+	// childIndeterminate: the child's terminal state could NOT be determined
+	// from the runner stream — a spawn error, a cancellation, a missing
+	// runner_completed event, or any outcome other than a clean ok/failed. The
+	// stage may be succeeded, still running, or already dispatchable, so neither
+	// retry_stage nor fixup/review is unconditionally correct and the recovery
+	// guidance must HEDGE rather than assert FAILED.
+	childIndeterminate childTerminalClass = iota
+	// childSucceededClass: a clean terminal SUCCESS (outcome "ok", exit 0). Its
+	// implement stage is terminal 'succeeded'; re-invoking fishhawk_run_children
+	// will NOT reopen it.
+	childSucceededClass
+	// childFailedClass: an explicit terminal FAILURE (runner_completed outcome
+	// "failed"). Its stage is terminal 'failed' and must be returned to a
+	// dispatchable state with fishhawk_retry_stage before a re-run.
+	childFailedClass
+)
+
+// classifyChildTerminal maps a dispatched child's authoritative runner
+// outcome/exit signal to one of three recovery classes (#2095 gap #1). Only an
+// EXPLICIT runner_completed outcome discriminates succeeded vs failed: an empty
+// Outcome (spawn error, cancellation, or a stream missing runner_completed)
+// leaves the terminal state UNKNOWN and must NOT be misclassified as FAILED,
+// because emitting fishhawk_retry_stage guidance for a stage that is actually
+// succeeded/running/dispatchable would be incorrect or invalid. A non-dispatched
+// child (marker fail-closed / concurrent no-op) is likewise indeterminate.
+func classifyChildTerminal(c ChildResult) childTerminalClass {
+	if !c.Dispatched {
+		return childIndeterminate
+	}
+	switch {
+	case c.Outcome == "ok" && c.ExitCode == 0:
+		return childSucceededClass
+	case c.Outcome == "failed":
+		return childFailedClass
+	default:
+		return childIndeterminate
+	}
 }
 
 // runChildren is the tool handler.
@@ -675,6 +709,14 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 	//     Re-invoking run_children ALONE is a no-op for a failed child.
 	//   - SUCCEEDED: the child already shipped without the amendment; a re-run will
 	//     NOT reopen it — bring the change in via fishhawk_fixup_stage / review.
+	//   - INDETERMINATE: the terminal state could not be read from the runner
+	//     stream (spawn error / cancellation / missing runner_completed) — the
+	//     guidance HEDGES (inspect stage_state; do NOT assert FAILED) rather than
+	//     emit a possibly-invalid retry_stage instruction.
+	// The scan observes the runner's park EVENT, not the amendment's current
+	// decision state, so each branch hedges ("appears to have timed out") and
+	// points at fishhawk_list_scope_amendments — an out-of-band decision within the
+	// poll window would make an unhedged "timed out UNDECIDED" claim wrong.
 	// This does NOT prevent the first-attempt timeout (that needs an out-of-scope
 	// runner rearchitecture); it converts a silent timeout into an actionable signal.
 	for i := range out.Children {
@@ -688,14 +730,27 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 			ids = append(ids, pa.AmendmentID)
 		}
 		idList := strings.Join(ids, ", ")
-		if childSucceeded(c) {
+		// The scan surfaces the scope_amendment_pending event the runner emits when
+		// it PARKS the request; it does NOT re-read the amendment's current decision
+		// state. Under the single-session blocking premise the child's ?wait
+		// long-poll times out proceed-as-denied, but a second operator session or an
+		// auto-approver could have decided it within the poll window — so the
+		// wording HEDGES ("appears to have"), and every branch points at
+		// fishhawk_list_scope_amendments to confirm before acting (#2095 low/correctness).
+		const verifyHint = " Verify the amendment's current decision state with fishhawk_list_scope_amendments first — if a second operator session or an auto-approver decided it within the poll window, the child may have already proceeded WITH the decision and no recovery is needed."
+		switch classifyChildTerminal(c) {
+		case childSucceededClass:
 			out.Warnings = append(out.Warnings, fmt.Sprintf(
-				"child %s filed a mid-stage scope amendment (%s) that timed out UNDECIDED during the blocking fan-out, then the child SUCCEEDED WITHOUT it (an inferior fallback). Re-invoking fishhawk_run_children will NOT reopen a succeeded child. Decide it with fishhawk_decide_scope_amendment, then bring the missing change in via fishhawk_fixup_stage (or review the child's PR) — do NOT expect a re-run to apply it.",
-				c.RunID, idList))
-		} else {
+				"child %s filed a mid-stage scope amendment (%s) that appears to have timed out UNDECIDED during the blocking fan-out, then the child SUCCEEDED (likely WITHOUT the amendment — an inferior fallback). Re-invoking fishhawk_run_children will NOT reopen a succeeded child. Decide it with fishhawk_decide_scope_amendment, then bring any missing change in via fishhawk_fixup_stage (or review the child's PR) — do NOT expect a re-run to apply it.%s",
+				c.RunID, idList, verifyHint))
+		case childFailedClass:
 			out.Warnings = append(out.Warnings, fmt.Sprintf(
-				"child %s filed a mid-stage scope amendment (%s) that timed out UNDECIDED during the blocking fan-out, then the child FAILED. Recover in order: (1) fishhawk_decide_scope_amendment to approve/deny it, (2) fishhawk_retry_stage to return the failed implement stage to a dispatchable state, (3) re-invoke fishhawk_run_children (or fishhawk_dispatch_stage) to re-run it with the decision applied. Re-invoking fishhawk_run_children ALONE is a no-op for a failed child.",
-				c.RunID, idList))
+				"child %s filed a mid-stage scope amendment (%s) that appears to have timed out UNDECIDED during the blocking fan-out, then the child FAILED. Recover in order: (1) fishhawk_decide_scope_amendment to approve/deny it, (2) fishhawk_retry_stage to return the failed implement stage to a dispatchable state, (3) re-invoke fishhawk_run_children (or fishhawk_dispatch_stage) to re-run it with the decision applied. Re-invoking fishhawk_run_children ALONE is a no-op for a failed child.%s",
+				c.RunID, idList, verifyHint))
+		default: // childIndeterminate
+			out.Warnings = append(out.Warnings, fmt.Sprintf(
+				"child %s filed a mid-stage scope amendment (%s) that appears to have timed out UNDECIDED during the blocking fan-out, but its terminal outcome could NOT be determined from the runner stream (a spawn error, a cancellation, or a missing runner_completed event) — its implement stage may be failed, still running, or already dispatchable. Decide it with fishhawk_decide_scope_amendment, then INSPECT the child's stage_state (%q) before recovering: if the stage is failed, fishhawk_retry_stage then re-run; if it already succeeded, fishhawk_fixup_stage (a re-run will NOT reopen it). Do NOT assume it failed.%s",
+				c.RunID, idList, c.StageState, verifyHint))
 		}
 	}
 

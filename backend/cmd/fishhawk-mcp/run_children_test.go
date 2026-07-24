@@ -2433,3 +2433,118 @@ func TestRunChildren_NoAmendment_NoSurfacing(t *testing.T) {
 		t.Errorf("no amendment must emit no amendment recovery warning; got %q", msg)
 	}
 }
+
+// TestRunChildren_PendingAmendment_IndeterminateChildHedges pins the
+// high/untested_edge fix (#2095): an amendment-emitting child whose runner
+// stream ends with a spawn error and NO runner_completed event has an
+// INDETERMINATE terminal state — it must NOT be misclassified as FAILED and
+// handed a possibly-invalid fishhawk_retry_stage instruction. The guidance must
+// HEDGE: say the outcome could not be determined, name BOTH the failed-path
+// (retry_stage) and succeeded-path (fixup_stage) recovery, and tell the operator
+// to inspect the child's stage_state rather than assume failure.
+func TestRunChildren_PendingAmendment_IndeterminateChildHedges(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child := uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+
+	const amendID = "3d813cbb-47fb-32ba-91df-831e1593ac29"
+	const amendPath = "backend/internal/bar/bar.go"
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		// The child emits the scope_amendment_pending event, then its spawn
+		// errors out with NO runner_completed — an indeterminate terminal state
+		// (empty Outcome).
+		pathObjs := []any{map[string]any{"path": amendPath, "operation": "modify"}}
+		events := []RunnerEvent{
+			{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": amendID, "paths": pathObjs}},
+		}
+		return events, nil, 0, errors.New("fork/exec: process killed before runner_completed")
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if len(out.Children) != 1 {
+		t.Fatalf("want 1 child, got %d", len(out.Children))
+	}
+	c := out.Children[0]
+	// The amendment is still surfaced despite the indeterminate outcome.
+	if len(c.PendingAmendments) != 1 || c.PendingAmendments[0].AmendmentID != amendID {
+		t.Fatalf("indeterminate child must record the pending amendment %q; got %+v", amendID, c.PendingAmendments)
+	}
+	// The child has an empty terminal Outcome (no runner_completed) — the seam the
+	// classifier keys on for indeterminacy.
+	if c.Outcome != "" {
+		t.Fatalf("indeterminate child must have an empty Outcome; got %q", c.Outcome)
+	}
+	if len(out.PendingAmendmentChildren) != 1 || out.PendingAmendmentChildren[0] != child.String() {
+		t.Errorf("pending_amendment_children = %v, want [%s]", out.PendingAmendmentChildren, child)
+	}
+	msg := warningContaining(out.Warnings, child.String())
+	if msg == "" {
+		t.Fatalf("no recovery warning naming child %s in %v", child, out.Warnings)
+	}
+	// The guidance must always name the decide verb.
+	if !strings.Contains(msg, "fishhawk_decide_scope_amendment") {
+		t.Errorf("indeterminate guidance must name fishhawk_decide_scope_amendment: %s", msg)
+	}
+	// It must HEDGE — say the outcome could not be determined and not assume failure.
+	if !strings.Contains(msg, "could NOT be determined") {
+		t.Errorf("indeterminate guidance must state the terminal outcome could not be determined (no FAILED assertion): %s", msg)
+	}
+	if !strings.Contains(msg, "Do NOT assume it failed") {
+		t.Errorf("indeterminate guidance must tell the operator not to assume failure: %s", msg)
+	}
+	// It must name BOTH recovery verbs (failed-path retry, succeeded-path fixup),
+	// unlike the determinate failed/succeeded branches which name exactly one.
+	for _, want := range []string{"fishhawk_retry_stage", "fishhawk_fixup_stage"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("indeterminate guidance must name both recovery verbs (missing %q): %s", want, msg)
+		}
+	}
+}
+
+// TestScanPendingScopeAmendments_MalformedEventsNotSwallowed pins the
+// low/untested_path fix (#2095): scanPendingScopeAmendments's doc contract that a
+// malformed/absent field degrades to an empty value rather than DROPPING the
+// event, so a pending amendment is never silently swallowed. Exercises a
+// missing amendment_id, a non-string amendment_id, a non-[]any paths value, and
+// path entries that are not maps — none of which existing tests (which feed only
+// well-formed events via amendmentThenCompletedEvents) cover.
+func TestScanPendingScopeAmendments_MalformedEventsNotSwallowed(t *testing.T) {
+	events := []RunnerEvent{
+		// (0) missing amendment_id → empty id, well-formed paths preserved.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "paths": []any{map[string]any{"path": "a.go"}}}},
+		// (1) non-string amendment_id → degrades to empty id, event kept.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": 12345, "paths": []any{map[string]any{"path": "b.go"}}}},
+		// (2) non-[]any paths → nil paths, event kept.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": "id-3", "paths": "not-a-list"}},
+		// (3) path entries that are not maps → skipped, event kept.
+		{Payload: map[string]any{"event": "scope_amendment_pending", "amendment_id": "id-4", "paths": []any{"not-a-map", 42}}},
+		// A non-amendment event is correctly ignored (not surfaced).
+		{Payload: map[string]any{"event": "runner_completed", "outcome": "ok"}},
+	}
+	got := scanPendingScopeAmendments(events)
+	// The never-swallowed contract: all four malformed pending events surface.
+	if len(got) != 4 {
+		t.Fatalf("all 4 malformed scope_amendment_pending events must be surfaced (never swallowed); got %d: %+v", len(got), got)
+	}
+	if got[0].AmendmentID != "" || len(got[0].Paths) != 1 || got[0].Paths[0] != "a.go" {
+		t.Errorf("missing amendment_id must degrade to empty id with paths preserved; got %+v", got[0])
+	}
+	if got[1].AmendmentID != "" || len(got[1].Paths) != 1 || got[1].Paths[0] != "b.go" {
+		t.Errorf("non-string amendment_id must degrade to empty id with paths preserved; got %+v", got[1])
+	}
+	if got[2].AmendmentID != "id-3" || len(got[2].Paths) != 0 {
+		t.Errorf("non-[]any paths must degrade to nil paths with the event kept; got %+v", got[2])
+	}
+	if got[3].AmendmentID != "id-4" || len(got[3].Paths) != 0 {
+		t.Errorf("non-map path entries must be skipped with the event kept; got %+v", got[3])
+	}
+}
