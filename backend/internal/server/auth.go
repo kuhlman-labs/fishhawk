@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"time"
@@ -22,22 +23,47 @@ type userResponse struct {
 	AccountID   *string `json:"account_id"`
 }
 
-// handleGitHubLogin implements GET /v0/auth/github/login. Mints a
-// state value, stores it in a short-lived browser cookie, and
-// redirects to GitHub's authorize URL.
-//
-// Optionally accepts ?next=<relative-path>. When a valid relative
-// path is supplied, it's stored in fishhawk_oauth_next so the
-// callback can route the user back to the page they originally
-// asked for (E7.2.1 #153). Anything that fails the open-redirect
-// validation is dropped silently — the configured default applies
-// instead.
+// forgeOAuth is the provider-agnostic slice of a forge OAuth client the
+// shared login + callback helpers consume. *auth.GitHubOAuth and
+// *auth.GitLabOAuth both satisfy it (their FetchProfile returns the same
+// shared *auth.GitHubProfile shape).
+type forgeOAuth interface {
+	AuthorizeURL(state string) string
+	ExchangeCode(ctx context.Context, code string) (string, error)
+	FetchProfile(ctx context.Context, accessToken string) (*auth.GitHubProfile, error)
+}
+
+// handleGitHubLogin implements GET /v0/auth/github/login.
 func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.GitHubOAuth == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "oauth_unconfigured",
 			"GitHub OAuth not configured", nil)
 		return
 	}
+	s.handleForgeLogin(w, r, s.cfg.GitHubOAuth, "/v0/auth/github/")
+}
+
+// handleGitLabLogin implements GET /v0/auth/gitlab/login (E44.22 / #2109),
+// mirroring handleGitHubLogin against the GitLab OAuth client.
+func (s *Server) handleGitLabLogin(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.GitLabOAuth == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "oauth_unconfigured",
+			"GitLab OAuth not configured", nil)
+		return
+	}
+	s.handleForgeLogin(w, r, s.cfg.GitLabOAuth, "/v0/auth/gitlab/")
+}
+
+// handleForgeLogin is the provider-parameterized login handler. Mints a
+// state value, stores it in a short-lived browser cookie scoped to the
+// provider's callback path, and redirects to the forge's authorize URL.
+//
+// Optionally accepts ?next=<relative-path>. When a valid relative path is
+// supplied, it's stored in fishhawk_oauth_next so the callback can route
+// the user back to the page they originally asked for (E7.2.1 #153).
+// Anything that fails the open-redirect validation is dropped silently —
+// the configured default applies instead.
+func (s *Server) handleForgeLogin(w http.ResponseWriter, r *http.Request, oauth forgeOAuth, cookiePath string) {
 	state, err := auth.GenerateState()
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -47,7 +73,7 @@ func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.StateCookieName,
 		Value:    state,
-		Path:     "/v0/auth/github/",
+		Path:     cookiePath,
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
@@ -59,7 +85,7 @@ func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{
 			Name:     auth.NextCookieName,
 			Value:    next,
-			Path:     "/v0/auth/github/",
+			Path:     cookiePath,
 			HttpOnly: true,
 			Secure:   true,
 			SameSite: http.SameSiteLaxMode,
@@ -68,20 +94,40 @@ func (s *Server) handleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	http.Redirect(w, r, s.cfg.GitHubOAuth.AuthorizeURL(state), http.StatusFound)
+	http.Redirect(w, r, oauth.AuthorizeURL(state), http.StatusFound)
 }
 
 // handleGitHubCallback implements GET /v0/auth/github/callback.
-// Verifies state, exchanges code, fetches the GitHub profile,
-// upserts the user + creates a session, sets the session cookie,
-// and redirects to the SPA.
 func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.GitHubOAuth == nil || s.cfg.AuthRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "oauth_unconfigured",
 			"GitHub OAuth not configured", nil)
 		return
 	}
+	s.handleForgeCallback(w, r, "github", s.cfg.GitHubOAuth, "/v0/auth/github/")
+}
 
+// handleGitLabCallback implements GET /v0/auth/gitlab/callback (E44.22 /
+// #2109). Mirrors handleGitHubCallback but threads provider="gitlab"
+// through the membership resolver, the SignIn identity write, and the
+// repo-acl mirror purge, so a GitLab sign-in reaches the group-granularity
+// auto-join lister shipped seam-first by #1832.
+func (s *Server) handleGitLabCallback(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.GitLabOAuth == nil || s.cfg.AuthRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "oauth_unconfigured",
+			"GitLab OAuth not configured", nil)
+		return
+	}
+	s.handleForgeCallback(w, r, "gitlab", s.cfg.GitLabOAuth, "/v0/auth/gitlab/")
+}
+
+// handleForgeCallback is the provider-parameterized OAuth callback.
+// Verifies state, exchanges the code, fetches the forge profile, runs the
+// workspace-membership gate under `provider`, upserts the user + creates a
+// session, sets the session + CSRF cookies, and redirects to the SPA. The
+// caller has already checked the provider's OAuth client and AuthRepo are
+// wired.
+func (s *Server) handleForgeCallback(w http.ResponseWriter, r *http.Request, provider string, oauth forgeOAuth, cookiePath string) {
 	stateParam := r.URL.Query().Get("state")
 	stateCookie, err := r.Cookie(auth.StateCookieName)
 	if err != nil || stateParam == "" || stateCookie.Value != stateParam {
@@ -93,7 +139,7 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     auth.StateCookieName,
 		Value:    "",
-		Path:     "/v0/auth/github/",
+		Path:     cookiePath,
 		HttpOnly: true,
 		Secure:   true,
 		MaxAge:   -1,
@@ -110,7 +156,7 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		http.SetCookie(w, &http.Cookie{
 			Name:     auth.NextCookieName,
 			Value:    "",
-			Path:     "/v0/auth/github/",
+			Path:     cookiePath,
 			HttpOnly: true,
 			Secure:   true,
 			MaxAge:   -1,
@@ -124,43 +170,43 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accessToken, err := s.cfg.GitHubOAuth.ExchangeCode(r.Context(), code)
+	accessToken, err := oauth.ExchangeCode(r.Context(), code)
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "oauth_exchange_failed",
-			"GitHub rejected the authorization code",
-			map[string]any{"error": err.Error()})
+			"forge rejected the authorization code",
+			map[string]any{"error": err.Error(), "provider": provider})
 		return
 	}
-	profile, err := s.cfg.GitHubOAuth.FetchProfile(r.Context(), accessToken)
+	profile, err := oauth.FetchProfile(r.Context(), accessToken)
 	if err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "oauth_profile_fetch_failed",
-			"could not fetch GitHub profile",
-			map[string]any{"error": err.Error()})
+			"could not fetch forge profile",
+			map[string]any{"error": err.Error(), "provider": provider})
 		return
 	}
 
 	// Workspace-membership gate (E44.3 / ADR-057 Amendment A2): the
 	// profile fetch succeeding is NOT admission. Resolve which
 	// account(s) admit this user — invited account_members rows
-	// DB-only, auto-join via the live org-list bootstrap — BEFORE any
+	// DB-only, auto-join via the live membership bootstrap — BEFORE any
 	// session exists. Fail closed on every branch: no resolver and no
 	// match both deny with no session cookie.
 	if s.cfg.AuthMembership == nil {
 		s.cfg.Logger.Warn("oauth sign-in denied: no membership resolver configured",
-			"github_login", profile.Login)
+			"provider", provider, "login", profile.Login)
 		http.Redirect(w, r, s.accessDeniedRedirect(), http.StatusFound)
 		return
 	}
-	accountIDs, err := s.cfg.AuthMembership.ResolveAccounts(r.Context(), "github", accessToken, *profile)
+	accountIDs, err := s.cfg.AuthMembership.ResolveAccounts(r.Context(), provider, accessToken, *profile)
 	if err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "membership_resolution_failed",
 			"could not resolve workspace membership; sign-in denied",
-			map[string]any{"error": err.Error()})
+			map[string]any{"error": err.Error(), "provider": provider})
 		return
 	}
 	if len(accountIDs) == 0 {
 		s.cfg.Logger.Info("oauth sign-in denied: no admitting account",
-			"github_login", profile.Login)
+			"provider", provider, "login", profile.Login)
 		http.Redirect(w, r, s.accessDeniedRedirect(), http.StatusFound)
 		return
 	}
@@ -168,7 +214,7 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	// multi-account picker is out of scope for v0.
 	accountID := accountIDs[0]
 
-	user, sess, err := s.cfg.AuthRepo.SignIn(r.Context(), *profile, accountID)
+	user, sess, err := s.cfg.AuthRepo.SignIn(r.Context(), provider, *profile, accountID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"sign-in failed", map[string]any{"error": err.Error()})
@@ -193,9 +239,10 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	// would be the worse trade — it converts a bounded, already-accepted
 	// staleness window into a total outage of the login path.
 	if s.cfg.RepoVisibility != nil {
-		if err := s.cfg.RepoVisibility.InvalidateSubject(r.Context(), "github", profile.Login); err != nil {
+		if err := s.cfg.RepoVisibility.InvalidateSubject(r.Context(), provider, profile.Login); err != nil {
 			s.cfg.Logger.Warn("repo-acl mirror purge failed at sign-in; cached repo permissions for this subject survive until their TTL expires (bounded staleness, sign-in continues)",
-				"github_login", profile.Login,
+				"provider", provider,
+				"login", profile.Login,
 				"error", err.Error(),
 				"ref", "#2071")
 		}
@@ -244,8 +291,9 @@ func (s *Server) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.cfg.Logger.Info("oauth sign-in",
+		"provider", provider,
 		"user_id", user.ID,
-		"github_login", user.GitHubLogin,
+		"login", user.GitHubLogin,
 		"session_id", sess.ID,
 		"account_id", accountID.String(),
 	)

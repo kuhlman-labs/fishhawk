@@ -41,6 +41,33 @@ device-flow / OAuth host is derived from the scheme+host of
 `FISHHAWKD_OAUTH_AUTHORIZE_URL` (an unset or unparseable value keeps
 `github.com`).
 
+## GitLab browser sign-in (E44.22 / #2109)
+
+Per-deployment OAuth credentials enable the GitLab browser sign-in pair
+`GET /v0/auth/gitlab/{login,callback}`, mirroring the GitHub OAuth leg. The
+endpoint host is `FISHHAWKD_GITLAB_BASE_URL` — the **same** base URL the
+login-gate group lister uses — so a configured base URL both registers the
+gitlab group lister and hosts this sign-in flow, making the seam-first group
+auto-join (#1832) reachable. Deployment-default only: the whole flow runs at or
+before user identification, so no installation (hence no per-installation
+`oauth_base_url`) is knowable, mirroring the deferred GitHub web-OAuth leg. The
+credential trio is **all-three-or-error** — a partial config exits at startup —
+and all three are empty by default (feature off, both endpoints respond `503`).
+
+| Env var | Flag | Purpose |
+|---|---|---|
+| `FISHHAWKD_GITLAB_OAUTH_CLIENT_ID` | `--gitlab-oauth-client-id` | GitLab (group-scoped) OAuth application client_id; empty disables `/v0/auth/gitlab/*` (503) |
+| `FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET` | `--gitlab-oauth-client-secret` | GitLab OAuth application client_secret (secret: never logged); required with the client_id |
+| `FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL` | `--gitlab-oauth-callback-url` | public URL of `/v0/auth/gitlab/callback`; required with the client_id |
+
+The requested OAuth **scope is `read_api`**, which authorizes BOTH
+`GET /api/v4/user` (the profile) and `GET /api/v4/groups` (the group-membership
+auto-join list). `read_user` grants only the former and would deny every group
+auto-join, so `read_api` is the single scope the whole flow needs. User identity
+is forge-scoped (`users.provider`, migration 0061, `UNIQUE (provider,
+github_user_id)`) so a GitLab numeric id never overwrites a GitHub user of the
+same id.
+
 **Mode 2 (per-installation)** rides on top of Mode 1: when a DB pool is present,
 a single shared `account.EndpointResolver` (reading `installations.forge_base_url`)
 is late-bound via `installationBaseURLResolver` into every per-installation forge
@@ -254,8 +281,15 @@ describe every GitLab path. Both facts, explicitly:
 
 Startup logs both: the partial-config warning covers only the token-gated
 provider, and a separate `gitlab login-gate group auto-join enabled …` line
-names the lister. Note that the lister ships **seam-first** — no GitLab browser
-sign-in flow exists yet, so it is not reachable in production until one lands.
+names the lister. The lister becomes **reachable in production** once the GitLab
+browser sign-in flow is configured (`FISHHAWKD_GITLAB_OAUTH_*`, E44.22 / #2109 —
+see "GitLab browser sign-in" above), which drives `/v0/auth/gitlab/callback`
+through the resolver with `provider=gitlab`. The two GitLab OAuth surfaces are a
+THIRD asymmetry axis: the login-gate lister needs only the base URL (it reads as
+the signing-in user), the forge/work-item provider additionally needs
+`FISHHAWKD_GITLAB_TOKEN`, and the browser sign-in flow additionally needs the
+`FISHHAWKD_GITLAB_OAUTH_*` credential trio (which shares the base URL as its
+endpoint host).
 
 ### EMU enterprise auto-join (E44.8 / #1832)
 

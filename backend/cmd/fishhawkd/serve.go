@@ -821,6 +821,30 @@ func resolveMembershipListers(githubOAuth *authpkg.GitHubOAuth, gitlabBaseURL st
 	return listers
 }
 
+// resolveGitLabOAuth builds the GitLab browser sign-in OAuth client (E44.22 /
+// #2109) from the per-deployment credential trio, or returns an error when the
+// trio is partially configured — the all-three-or-error contract the GitHub
+// OAuth leg uses. Returns (nil, nil) when NONE of the three is set (the
+// feature-off posture). The endpoint host is the shared
+// FISHHAWKD_GITLAB_BASE_URL (the same base the login-gate group lister uses);
+// when OAuth creds ARE present but the base URL is empty there is no host to
+// reach, so that is a misconfiguration and errors rather than building a client
+// against a bare "/oauth/authorize". Pure (no I/O, no globals) so serve_test.go
+// can pin both the validation branches and the constructed-client path without
+// booting the server.
+func resolveGitLabOAuth(baseURL, clientID, clientSecret, callbackURL string) (*authpkg.GitLabOAuth, error) {
+	if clientID == "" && clientSecret == "" && callbackURL == "" {
+		return nil, nil
+	}
+	if clientID == "" || clientSecret == "" || callbackURL == "" {
+		return nil, errors.New("gitlab oauth misconfigured: --gitlab-oauth-client-id, --gitlab-oauth-client-secret, --gitlab-oauth-callback-url must all be set")
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, errors.New("gitlab oauth misconfigured: FISHHAWKD_GITLAB_BASE_URL must name the GitLab instance host for the browser sign-in flow")
+	}
+	return authpkg.NewGitLabOAuth(baseURL, clientID, clientSecret, callbackURL, authpkg.GitLabOAuthURLs{}), nil
+}
+
 // sortedKeys returns a map's keys in a stable order for logging.
 func sortedKeys(m map[string]authpkg.ForgeMembershipLister) []string {
 	out := make([]string, 0, len(m))
@@ -1119,6 +1143,20 @@ func runServe(args []string, logSink io.Writer) int {
 	oauthRedirectAfterLogin := fs.String("oauth-redirect-after-login",
 		envOr("FISHHAWKD_OAUTH_REDIRECT_AFTER_LOGIN", "/"),
 		"URL the callback handler redirects to on successful sign-in (must be a relative path)")
+	// GitLab browser sign-in (E44.22 / #2109). Per-deployment OAuth credentials
+	// for /v0/auth/gitlab/*, mirroring the GitHub OAuth leg. The endpoint host is
+	// FISHHAWKD_GITLAB_BASE_URL (the same base the login-gate group lister uses);
+	// these three add the browser sign-in credentials on top. All-three-or-error,
+	// like the GitHub trio.
+	gitlabOAuthClientID := fs.String("gitlab-oauth-client-id",
+		envOr("FISHHAWKD_GITLAB_OAUTH_CLIENT_ID", ""),
+		"GitLab (group-scoped) OAuth application client_id for the /v0/auth/gitlab/* sign-in flow; empty disables the endpoints (503)")
+	gitlabOAuthClientSecret := fs.String("gitlab-oauth-client-secret",
+		envOr("FISHHAWKD_GITLAB_OAUTH_CLIENT_SECRET", ""),
+		"GitLab OAuth application client_secret; required when --gitlab-oauth-client-id is set")
+	gitlabOAuthCallbackURL := fs.String("gitlab-oauth-callback-url",
+		envOr("FISHHAWKD_GITLAB_OAUTH_CALLBACK_URL", ""),
+		"public URL of /v0/auth/gitlab/callback; required when --gitlab-oauth-client-id is set")
 	operatorRepo := fs.String("oauth-operator-repo",
 		envOr("FISHHAWKD_OPERATOR_REPO", ""),
 		"owner/name repository the OAuth token-mint gate (POST /v0/tokens/login, E39.3 / #1708) reads a "+
@@ -1929,16 +1967,11 @@ func runServe(args []string, logSink io.Writer) int {
 		// OAuth token, never FISHHAWKD_GITLAB_TOKEN. Without a database
 		// the resolver stays nil and the callback denies every sign-in
 		// (fail closed).
+		// membershipListers here is for THIS block's logging only; the resolver
+		// itself is constructed once, below, gated on the database alone so a
+		// GitLab-only deployment reaches it too (#2109 fix-up).
 		membershipListers := resolveMembershipListers(cfg.GitHubOAuth, *gitlabBaseURL)
 		emuAutoJoin := authpkg.IsEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL)
-		if pool != nil {
-			cfg.AuthMembership = authpkg.NewMembershipResolver(
-				authpkg.NewAccountMembershipStore(accountdb.New(pool)),
-				membershipListers,
-				authpkg.WithEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL))
-		} else {
-			logger.Warn("membership resolver unconfigured (no database); every OAuth sign-in will be denied")
-		}
 		logger.Info("github oauth sign-in configured",
 			slog.String("callback_url", *oauthCallbackURL),
 			slog.String("redirect_after_login", *oauthRedirectAfterLogin),
@@ -1953,13 +1986,74 @@ func runServe(args []string, logSink io.Writer) int {
 			// work-item provider additionally needs
 			// FISHHAWKD_GITLAB_TOKEN and stays 501 without it. Say both
 			// out loud so the "gitlab is disabled" warning above is not
-			// read as covering the login gate. Note also that the
-			// lister is unreachable until a GitLab browser sign-in flow
-			// exists (seam-first delivery, E44.8).
-			logger.Info("gitlab login-gate group auto-join enabled by FISHHAWKD_GITLAB_BASE_URL alone (uses the signing-in user's OAuth token); the gitlab forge/work-item provider separately requires FISHHAWKD_GITLAB_TOKEN and stays 501 without it; no GitLab browser sign-in flow ships yet, so this lister is not reachable in production until one lands")
+			// read as covering the login gate. The lister becomes
+			// REACHABLE once the GitLab browser sign-in flow is configured
+			// (FISHHAWKD_GITLAB_OAUTH_*, E44.22 / #2109) — logged
+			// separately below.
+			logger.Info("gitlab login-gate group auto-join enabled by FISHHAWKD_GITLAB_BASE_URL alone (uses the signing-in user's OAuth token); the gitlab forge/work-item provider separately requires FISHHAWKD_GITLAB_TOKEN and stays 501 without it; configure FISHHAWKD_GITLAB_OAUTH_CLIENT_ID/_SECRET/_CALLBACK_URL to reach this lister via /v0/auth/gitlab/*")
 		}
 	} else {
 		logger.Warn("FISHHAWKD_OAUTH_CLIENT_ID not set; /v0/auth/github/login + /callback respond 503; identity provider defaults to NoOp (deny-by-default)")
+	}
+
+	// GitLab browser sign-in (E44.22 / #2109). Per-deployment OAuth credentials
+	// (client_id + client_secret + callback_url) enable /v0/auth/gitlab/login +
+	// /callback, mirroring the GitHub OAuth leg. The endpoint host is
+	// FISHHAWKD_GITLAB_BASE_URL — the SAME base the login-gate group lister uses,
+	// so a configured base URL both registers the gitlab lister (above) and hosts
+	// this sign-in flow, making the seam-first group auto-join (#1832) reachable.
+	// Deployment-default only (no per-installation hook): the whole flow runs at
+	// or before user identification, so no installation is knowable — mirroring
+	// the deferred GitHub web-OAuth leg. All-three-or-error, like the GitHub trio;
+	// a partial config exits rather than running half-configured. AuthRepo comes
+	// from the database block, and the membership resolver is built just below
+	// gated on the database ALONE (not on GitHub OAuth), so a GitLab-only
+	// deployment reaches both; without a database the callback fails closed and
+	// denies every sign-in.
+	gitlabOAuth, err := resolveGitLabOAuth(*gitlabBaseURL,
+		*gitlabOAuthClientID, *gitlabOAuthClientSecret, *gitlabOAuthCallbackURL)
+	if err != nil {
+		logger.Error("gitlab oauth misconfigured", slog.String("error", err.Error()))
+		return exitFailure
+	}
+	if gitlabOAuth != nil {
+		cfg.GitLabOAuth = gitlabOAuth
+	}
+
+	// Workspace-membership login gate (E44.3 / ADR-057 Amendment A2, generalized
+	// E44.8 / #1832). Constructed here — AFTER both the GitHub and GitLab OAuth
+	// blocks have populated cfg.GitHubOAuth / cfg.GitLabOAuth — and gated on the
+	// DATABASE ALONE, independent of which forge OAuth leg is configured. A
+	// GitLab-only deployment (a database + FISHHAWKD_GITLAB_OAUTH_* + base URL,
+	// no GitHub OAuth) must reach this resolver; wiring it inside the GitHub
+	// block left cfg.AuthMembership nil there, so /v0/auth/gitlab/callback denied
+	// every sign-in via the nil-resolver 503 branch even though cfg.GitLabOAuth
+	// was built (#2109 fix-up). The provider-keyed lister map registers github
+	// (the GitHubOAuth client) and/or gitlab (the base URL) as each is
+	// configured; an empty map denies every sign-in. The EMU auto-join host is
+	// derived from the GitHub OAuth authorize URL and is inert when GitHub OAuth
+	// is absent.
+	membershipListers := resolveMembershipListers(cfg.GitHubOAuth, *gitlabBaseURL)
+	if pool != nil {
+		cfg.AuthMembership = authpkg.NewMembershipResolver(
+			authpkg.NewAccountMembershipStore(accountdb.New(pool)),
+			membershipListers,
+			authpkg.WithEMUOAuthHost(githubEndpoints.OAuth.AuthorizeURL))
+		logger.Info("membership resolver configured",
+			slog.Any("membership_providers", sortedKeys(membershipListers)))
+	} else if cfg.GitHubOAuth != nil || cfg.GitLabOAuth != nil {
+		logger.Warn("membership resolver unconfigured (no database); every OAuth sign-in will be denied")
+	}
+
+	// Guarded on cfg.GitLabOAuth — the FIELD the /v0/auth/gitlab/* routes read —
+	// not the local gitlabOAuth var, so deleting the `cfg.GitLabOAuth = gitlabOAuth`
+	// assignment above stops this log and fails the serve-wiring test rather than
+	// silently leaving the routes at 503 (#2109 fix-up).
+	if cfg.GitLabOAuth != nil {
+		logger.Info("gitlab oauth sign-in configured",
+			slog.String("callback_url", *gitlabOAuthCallbackURL),
+			slog.String("base_url", *gitlabBaseURL),
+			slog.Bool("membership_resolver", cfg.AuthMembership != nil))
 	}
 
 	// GitHub App manifest-flow client (E4.7). No credentials needed —

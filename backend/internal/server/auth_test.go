@@ -42,16 +42,20 @@ func newFakeAuthRepo() *fakeAuthRepo {
 	}
 }
 
-func (f *fakeAuthRepo) SignIn(_ context.Context, p auth.GitHubProfile, accountID uuid.UUID) (*auth.User, *auth.Session, error) {
+func (f *fakeAuthRepo) SignIn(_ context.Context, provider string, p auth.GitHubProfile, accountID uuid.UUID) (*auth.User, *auth.Session, error) {
 	if f.signInErr != nil {
 		return nil, nil, f.signInErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if provider == "" {
+		provider = "github"
+	}
 	now := time.Now().UTC()
 	user := &auth.User{
 		ID:           uuid.New().String(),
+		Provider:     provider,
 		GitHubUserID: p.ID,
 		GitHubLogin:  p.Login,
 		Name:         p.Name,
@@ -456,7 +460,7 @@ func TestGitHubCallback_RejectsUnsafeRedirect(t *testing.T) {
 func TestGetMe_HappyPath(t *testing.T) {
 	s, repo := newAuthServer(t)
 	// Sign in once via the repo to get a user + session.
-	user, sess, err := repo.SignIn(context.Background(), auth.GitHubProfile{
+	user, sess, err := repo.SignIn(context.Background(), "github", auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "The Octo Cat",
 	}, testAccountID)
 	if err != nil {
@@ -493,7 +497,7 @@ func TestGetMe_NoSession_401(t *testing.T) {
 
 func TestLogout_HappyPath(t *testing.T) {
 	s, repo := newAuthServer(t)
-	_, sess, _ := repo.SignIn(context.Background(), auth.GitHubProfile{
+	_, sess, _ := repo.SignIn(context.Background(), "github", auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "Octocat",
 	}, testAccountID)
 
@@ -584,7 +588,7 @@ func TestIsSafeRelativeRedirect(t *testing.T) {
 
 func TestBearerAuth_SessionCookieResolvesIdentity(t *testing.T) {
 	repo := newFakeAuthRepo()
-	user, sess, _ := repo.SignIn(context.Background(), auth.GitHubProfile{
+	user, sess, _ := repo.SignIn(context.Background(), "github", auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "x",
 	}, testAccountID)
 
@@ -609,7 +613,7 @@ func TestBearerAuth_SessionCookieResolvesIdentity(t *testing.T) {
 
 func TestBearerAuth_RevokedSessionFallsBackToAnonymous(t *testing.T) {
 	repo := newFakeAuthRepo()
-	_, sess, _ := repo.SignIn(context.Background(), auth.GitHubProfile{
+	_, sess, _ := repo.SignIn(context.Background(), "github", auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "x",
 	}, testAccountID)
 	sid, _ := uuid.Parse(sess.ID)
@@ -648,7 +652,7 @@ func TestBearerAuth_AuthRepoNil_AnonymousOnCookie(t *testing.T) {
 func TestFakeAuthRepo_SignInError(t *testing.T) {
 	r := newFakeAuthRepo()
 	r.signInErr = errors.New("boom")
-	_, _, err := r.SignIn(context.Background(), auth.GitHubProfile{ID: 1, Login: "x"}, uuid.Nil)
+	_, _, err := r.SignIn(context.Background(), "github", auth.GitHubProfile{ID: 1, Login: "x"}, uuid.Nil)
 	if err == nil {
 		t.Error("expected propagated error")
 	}
@@ -789,7 +793,7 @@ func TestGitHubCallback_AdmittedAccountBindsSession(t *testing.T) {
 // account_unresolved from /v0/auth/me, not another tenant's data.
 func TestGetMe_SessionWithoutAccount_403AccountUnresolved(t *testing.T) {
 	s, repo := newAuthServer(t)
-	_, sess, err := repo.SignIn(context.Background(), auth.GitHubProfile{
+	_, sess, err := repo.SignIn(context.Background(), "github", auth.GitHubProfile{
 		ID: 42, Login: "octocat", Name: "x",
 	}, uuid.Nil) // unbound session
 	if err != nil {
@@ -1268,4 +1272,372 @@ func TestGitHubCallback_NoMirrorWired_SignsInNormally(t *testing.T) {
 	if w := signIn(t, s); w.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302 with no mirror wired", w.Code)
 	}
+}
+
+// ---- GitLab browser sign-in (E44.22 / #2109) --------------------------------
+
+// gitlabGroupsRecorder captures the Bearer token the caller forwarded to
+// /api/v4/groups, so the e2e can prove the PRODUCTION GitLabMembershipLister
+// actually reached that endpoint with the exchanged user token. Guarded by a
+// mutex because the httptest handler runs in a server goroutine while the test
+// reads after the request completes (#2109 fix-up).
+type gitlabGroupsRecorder struct {
+	mu     sync.Mutex
+	called bool
+	token  string
+}
+
+func (r *gitlabGroupsRecorder) record(authHeader string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.called = true
+	r.token = strings.TrimPrefix(authHeader, "Bearer ")
+}
+
+func (r *gitlabGroupsRecorder) seenToken() (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.token, r.called
+}
+
+// stubGitLabOAuthServer mounts httptest endpoints the GitLabOAuth client
+// (and, for the e2e, the real GitLabMembershipLister) point at: /oauth/token,
+// /api/v4/user, and /api/v4/groups. The username + group full_paths are
+// caller-chosen so the auto-join case can drive a real group listing. The
+// returned recorder captures the token seen at /api/v4/groups.
+func stubGitLabOAuthServer(t *testing.T, username string, groups []string) (*httptest.Server, *auth.GitLabOAuth, *gitlabGroupsRecorder) {
+	t.Helper()
+	rec := &gitlabGroupsRecorder{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/token", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"glpat_xxx"}`))
+	})
+	mux.HandleFunc("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+		body, _ := json.Marshal(map[string]any{
+			"id":       int64(4242),
+			"username": username,
+			"name":     "GitLab User",
+			"email":    "gl@example.com",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	mux.HandleFunc("/api/v4/groups", func(w http.ResponseWriter, req *http.Request) {
+		rec.record(req.Header.Get("Authorization"))
+		rows := make([]map[string]any, 0, len(groups))
+		for _, g := range groups {
+			rows = append(rows, map[string]any{"full_path": g})
+		}
+		body, _ := json.Marshal(rows)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	gl := auth.NewGitLabOAuth(srv.URL, "gitlab-client", "gitlab-secret",
+		"https://example.com/gitlab/cb", auth.GitLabOAuthURLs{})
+	return srv, gl, rec
+}
+
+// newGitLabAuthServerWithResolver wires a server with the GitLab OAuth client
+// and an injectable membership resolver (the fake, for handler-unit cases).
+func newGitLabAuthServerWithResolver(t *testing.T, resolver auth.MembershipResolver) (*Server, *fakeAuthRepo) {
+	t.Helper()
+	repo := newFakeAuthRepo()
+	_, gl, _ := stubGitLabOAuthServer(t, "gluser", nil)
+	s := New(Config{
+		Addr:                   "127.0.0.1:0",
+		AuthRepo:               repo,
+		GitLabOAuth:            gl,
+		AuthMembership:         resolver,
+		AuthRedirectAfterLogin: "/app",
+	})
+	return s, repo
+}
+
+// gitlabCallbackRequest drives a state-valid GET /v0/auth/gitlab/callback.
+func gitlabCallbackRequest(t *testing.T, s *Server) *httptest.ResponseRecorder {
+	t.Helper()
+	state := "gl-state"
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/gitlab/callback?code=abc&state="+state, nil)
+	req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: state})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
+}
+
+func TestGitLabLogin_RedirectsAndSetsStateCookie(t *testing.T) {
+	s, _ := newGitLabAuthServerWithResolver(t, &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}})
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/gitlab/login", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302", w.Code)
+	}
+	loc := w.Header().Get("Location")
+	if !strings.Contains(loc, "/oauth/authorize") || !strings.Contains(loc, "state=") ||
+		!strings.Contains(loc, "scope=read_api") {
+		t.Errorf("Location missing GitLab authorize params (want /oauth/authorize, state, scope=read_api): %q", loc)
+	}
+	var state *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		if c.Name == auth.StateCookieName {
+			state = c
+		}
+	}
+	if state == nil {
+		t.Fatal("state cookie not set")
+	}
+	if state.Path != "/v0/auth/gitlab/" {
+		t.Errorf("state cookie Path = %q, want /v0/auth/gitlab/", state.Path)
+	}
+	if !state.HttpOnly || !state.Secure {
+		t.Errorf("state cookie missing HttpOnly/Secure: %+v", state)
+	}
+}
+
+// The GitLab OAuth endpoints fail closed with 503 when unconfigured — the same
+// posture the GitHub pair has.
+func TestGitLabLogin_Unconfigured_503(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", AuthRepo: newFakeAuthRepo()})
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/gitlab/login", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "oauth_unconfigured") {
+		t.Errorf("body = %s, want oauth_unconfigured", w.Body.String())
+	}
+}
+
+func TestGitLabCallback_Unconfigured_503(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", AuthRepo: newFakeAuthRepo()})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v0/auth/gitlab/callback?code=x&state=y", nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "oauth_unconfigured") {
+		t.Errorf("body = %s, want oauth_unconfigured", w.Body.String())
+	}
+}
+
+func TestGitLabCallback_StateMismatch_400(t *testing.T) {
+	s, _ := newGitLabAuthServerWithResolver(t, &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}})
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/gitlab/callback?code=abc&state=fromBrowser", nil)
+	req.AddCookie(&http.Cookie{Name: auth.StateCookieName, Value: "different"})
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestGitLabCallback_StateCookieMissing_400(t *testing.T) {
+	s, _ := newGitLabAuthServerWithResolver(t, &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}})
+	req := httptest.NewRequest(http.MethodGet,
+		"/v0/auth/gitlab/callback?code=abc&state=whatever", nil)
+	// No state cookie attached.
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", w.Code)
+	}
+}
+
+func TestGitLabCallback_MembershipResolutionError_502(t *testing.T) {
+	resolver := &fakeMembershipResolver{err: errors.New("gitlab is down")}
+	s, repo := newGitLabAuthServerWithResolver(t, resolver)
+	w := gitlabCallbackRequest(t, s)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", w.Code, w.Body.String())
+	}
+	assertNoAuthCookies(t, w)
+	if len(repo.users) != 0 {
+		t.Errorf("users = %d, want 0 (no SignIn on resolver error)", len(repo.users))
+	}
+}
+
+func TestGitLabCallback_EmptyAccounts_AccessDenied(t *testing.T) {
+	resolver := &fakeMembershipResolver{} // empty result = deny
+	s, repo := newGitLabAuthServerWithResolver(t, resolver)
+	w := gitlabCallbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	if loc := w.Header().Get("Location"); loc != "/access-denied" {
+		t.Errorf("Location = %q, want /access-denied", loc)
+	}
+	assertNoAuthCookies(t, w)
+	if len(repo.users) != 0 {
+		t.Errorf("users = %d, want 0 (no SignIn on deny)", len(repo.users))
+	}
+}
+
+// TestGitLabCallback_ThreadsProviderGitLab pins the cross-boundary contract at
+// the handler level: the callback passes provider="gitlab" (never "github") to
+// the resolver, along with the exchanged token and the GitLab username.
+func TestGitLabCallback_ThreadsProviderGitLab(t *testing.T) {
+	resolver := &fakeMembershipResolver{ids: []uuid.UUID{testAccountID}}
+	s, _ := newGitLabAuthServerWithResolver(t, resolver)
+	w := gitlabCallbackRequest(t, s)
+	if w.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+	}
+	if resolver.calls != 1 || resolver.gotProvider != "gitlab" ||
+		resolver.gotToken != "glpat_xxx" || resolver.gotLogin != "gluser" {
+		t.Errorf("resolver saw %+v, want gitlab/glpat_xxx/gluser once", resolver)
+	}
+}
+
+// TestGitLabCallback_MembershipGate_PostgresE2E is the cross-boundary
+// end-to-end: a GitLab stub server (token + /api/v4/user + /api/v4/groups)
+// drives GET /v0/auth/gitlab/callback through the REAL membership resolver +
+// account/db store against a migrated Postgres — profile fetch → group list →
+// group-granularity auto-join → account-bound session + CSRF cookie — asserting
+// the resolver saw provider="gitlab" and no GitLab id clobbers a pre-existing
+// GitHub user of the same numeric id.
+func TestGitLabCallback_MembershipGate_PostgresE2E(t *testing.T) {
+	newPGGitLabServer := func(t *testing.T, username string, groups []string) (*Server, *pgxpool.Pool, *gitlabGroupsRecorder) {
+		t.Helper()
+		url := pgtest.NewURL(t)
+		if err := postgres.MigrateUp(url); err != nil {
+			t.Fatalf("MigrateUp: %v", err)
+		}
+		pool, err := pgxpool.New(context.Background(), url)
+		if err != nil {
+			t.Fatalf("pool: %v", err)
+		}
+		t.Cleanup(pool.Close)
+		srv, gl, rec := stubGitLabOAuthServer(t, username, groups)
+		// The PRODUCTION lister, pointed at the stub's /api/v4/groups — not a
+		// hand-rolled fake — so this exercises the real group-list HTTP boundary
+		// end to end (#2109 fix-up).
+		s := New(Config{
+			Addr:        "127.0.0.1:0",
+			AuthRepo:    auth.NewPostgresRepository(pool),
+			GitLabOAuth: gl,
+			AuthMembership: auth.NewMembershipResolver(
+				auth.NewAccountMembershipStore(accountdb.New(pool)),
+				map[string]auth.ForgeMembershipLister{"gitlab": auth.NewGitLabMembershipLister(srv.URL)}),
+			AuthRedirectAfterLogin: "/app",
+		})
+		return s, pool, rec
+	}
+
+	t.Run("group auto-join admits and binds the session", func(t *testing.T) {
+		s, pool, rec := newPGGitLabServer(t, "gluser", []string{"acme-group/team"})
+		// A group-granularity account whose key is the group full_path.
+		accountID := uuid.New()
+		role := "member"
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO accounts (id, provider, account_key, granularity, auto_join_role)
+			 VALUES ($1, 'gitlab', $2, 'group', $3)`,
+			accountID, "acme-group/team", &role,
+		); err != nil {
+			t.Fatalf("seed gitlab group account: %v", err)
+		}
+
+		w := gitlabCallbackRequest(t, s)
+		if w.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+		}
+		tok, called := rec.seenToken()
+		if !called {
+			t.Error("production GitLabMembershipLister never called the stub /api/v4/groups endpoint; the group-list boundary was not exercised")
+		}
+		if tok != "glpat_xxx" {
+			t.Errorf("groups endpoint saw token %q, want the exchanged glpat_xxx", tok)
+		}
+		var sessCookie, csrfCookie *http.Cookie
+		for _, c := range w.Result().Cookies() {
+			switch c.Name {
+			case auth.SessionCookieName:
+				sessCookie = c
+			case CSRFCookieName:
+				csrfCookie = c
+			}
+		}
+		if sessCookie == nil || csrfCookie == nil {
+			t.Fatalf("session/CSRF cookies = %v/%v, want both set", sessCookie, csrfCookie)
+		}
+		// The persisted session binds the group account.
+		var persisted *uuid.UUID
+		if err := pool.QueryRow(context.Background(),
+			`SELECT account_id FROM sessions`).Scan(&persisted); err != nil {
+			t.Fatalf("read sessions.account_id: %v", err)
+		}
+		if persisted == nil || *persisted != accountID {
+			t.Errorf("sessions.account_id = %v, want the group account %s", persisted, accountID)
+		}
+		// The minted grant is provider=gitlab, origin=auto_join.
+		var origin, provider string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT origin, provider FROM account_members WHERE account_id = $1 AND member_ref = 'gluser'`,
+			accountID).Scan(&origin, &provider); err != nil {
+			t.Fatalf("read minted grant: %v", err)
+		}
+		if origin != "auto_join" || provider != "gitlab" {
+			t.Errorf("minted grant origin/provider = %q/%q, want auto_join/gitlab", origin, provider)
+		}
+		// The user row carries provider=gitlab.
+		var userProvider string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT provider FROM users WHERE github_login = 'gluser'`).Scan(&userProvider); err != nil {
+			t.Fatalf("read user provider: %v", err)
+		}
+		if userProvider != "gitlab" {
+			t.Errorf("users.provider = %q, want gitlab", userProvider)
+		}
+	})
+
+	t.Run("gitlab id does not clobber a pre-existing github user of the same id", func(t *testing.T) {
+		s, pool, _ := newPGGitLabServer(t, "gluser", []string{"acme-group/team"})
+		accountID := uuid.New()
+		role := "member"
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO accounts (id, provider, account_key, granularity, auto_join_role)
+			 VALUES ($1, 'gitlab', $2, 'group', $3)`,
+			accountID, "acme-group/team", &role,
+		); err != nil {
+			t.Fatalf("seed gitlab group account: %v", err)
+		}
+		// Pre-seed a GitHub user whose numeric id equals the GitLab stub's id
+		// (4242) via the real repo.
+		ghUser, _, err := auth.NewPostgresRepository(pool).SignIn(context.Background(), "github",
+			auth.GitHubProfile{ID: 4242, Login: "gh-collide", Name: "GH"}, uuid.Nil)
+		if err != nil {
+			t.Fatalf("seed github user: %v", err)
+		}
+
+		w := gitlabCallbackRequest(t, s)
+		if w.Code != http.StatusFound {
+			t.Fatalf("status = %d, want 302:\n%s", w.Code, w.Body.String())
+		}
+		// Two DISTINCT users rows share github_user_id=4242 across providers.
+		var n int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM users WHERE github_user_id = 4242`).Scan(&n); err != nil {
+			t.Fatalf("count users: %v", err)
+		}
+		if n != 2 {
+			t.Fatalf("users with github_user_id=4242 = %d, want 2 (github + gitlab, no clobber)", n)
+		}
+		// The github row is untouched.
+		var ghLogin, ghProvider string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT github_login, provider FROM users WHERE id = $1`, uuid.MustParse(ghUser.ID)).
+			Scan(&ghLogin, &ghProvider); err != nil {
+			t.Fatalf("read github row: %v", err)
+		}
+		if ghLogin != "gh-collide" || ghProvider != "github" {
+			t.Errorf("github row = %q/%q, want gh-collide/github (not overwritten)", ghLogin, ghProvider)
+		}
+	})
 }

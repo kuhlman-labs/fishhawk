@@ -60,7 +60,7 @@ var sampleProfile = auth.GitHubProfile{
 
 func TestPostgres_SignIn_CreatesUserAndSession(t *testing.T) {
 	r := newRepo(t)
-	user, sess, err := r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	user, sess, err := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 	if err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestPostgres_SignIn_CreatesUserAndSession(t *testing.T) {
 
 func TestPostgres_SignIn_UpsertsOnSecondSignIn(t *testing.T) {
 	r := newRepo(t)
-	first, _, err := r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	first, _, err := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestPostgres_SignIn_UpsertsOnSecondSignIn(t *testing.T) {
 	// Second sign-in: same GitHub id, renamed login.
 	renamed := sampleProfile
 	renamed.Login = "octocat-renamed"
-	second, _, err := r.SignIn(context.Background(), renamed, uuid.Nil)
+	second, _, err := r.SignIn(context.Background(), "github", renamed, uuid.Nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestPostgres_SignIn_UpsertsOnSecondSignIn(t *testing.T) {
 
 func TestPostgres_Authenticate_HappyPath(t *testing.T) {
 	r := newRepo(t)
-	_, sess, _ := r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	_, sess, _ := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 
 	user, gotSess, err := r.Authenticate(context.Background(), sess.PlainText)
 	if err != nil {
@@ -121,7 +121,7 @@ func TestPostgres_Authenticate_HappyPath(t *testing.T) {
 
 func TestPostgres_Authenticate_RevokedSessionRejected(t *testing.T) {
 	r := newRepo(t)
-	_, sess, _ := r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	_, sess, _ := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 	sid, _ := uuid.Parse(sess.ID)
 	if err := r.Revoke(context.Background(), sid); err != nil {
 		t.Fatal(err)
@@ -151,7 +151,7 @@ func TestPostgres_Authenticate_NotFound(t *testing.T) {
 
 func TestPostgres_GetUser_HappyPath(t *testing.T) {
 	r := newRepo(t)
-	user, _, _ := r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	user, _, _ := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 	uid, _ := uuid.Parse(user.ID)
 	got, err := r.GetUser(context.Background(), uid)
 	if err != nil {
@@ -164,7 +164,7 @@ func TestPostgres_GetUser_HappyPath(t *testing.T) {
 
 func TestPostgres_Revoke_Idempotent(t *testing.T) {
 	r := newRepo(t)
-	_, sess, _ := r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	_, sess, _ := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 	sid, _ := uuid.Parse(sess.ID)
 	if err := r.Revoke(context.Background(), sid); err != nil {
 		t.Fatal(err)
@@ -176,7 +176,7 @@ func TestPostgres_Revoke_Idempotent(t *testing.T) {
 
 func TestPostgres_EvictExpired(t *testing.T) {
 	r := newRepo(t)
-	_, _, _ = r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	_, _, _ = r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 
 	// Cutoff well past the absolute TTL (7 days); should evict
 	// the row regardless of when SignIn ran.
@@ -191,7 +191,7 @@ func TestPostgres_EvictExpired(t *testing.T) {
 
 func TestPostgres_EvictExpired_RespectsCutoff(t *testing.T) {
 	r := newRepo(t)
-	_, _, _ = r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	_, _, _ = r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 
 	// Cutoff before the session's absolute_expires_at (~7d from
 	// now). Nothing should be evicted.
@@ -211,7 +211,7 @@ func TestPostgres_SignIn_BindsAccountID(t *testing.T) {
 	r, pool := newRepoWithPool(t)
 	accountID := seedAccount(t, pool, "github", "acme-corp")
 
-	_, sess, err := r.SignIn(context.Background(), sampleProfile, accountID)
+	_, sess, err := r.SignIn(context.Background(), "github", sampleProfile, accountID)
 	if err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestPostgres_SignIn_BindsAccountID(t *testing.T) {
 // carries an empty AccountID (which /v0/auth/me then refuses).
 func TestPostgres_SignIn_NilAccountIDStaysNull(t *testing.T) {
 	r, pool := newRepoWithPool(t)
-	_, sess, err := r.SignIn(context.Background(), sampleProfile, uuid.Nil)
+	_, sess, err := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
 	if err != nil {
 		t.Fatalf("SignIn: %v", err)
 	}
@@ -263,8 +263,76 @@ func TestPostgres_SignIn_NilAccountIDStaysNull(t *testing.T) {
 
 func TestPostgres_SignIn_RejectsEmptyProfile(t *testing.T) {
 	r := newRepo(t)
-	_, _, err := r.SignIn(context.Background(), auth.GitHubProfile{ID: 0, Login: ""}, uuid.Nil)
+	_, _, err := r.SignIn(context.Background(), "github", auth.GitHubProfile{ID: 0, Login: ""}, uuid.Nil)
 	if err == nil {
 		t.Error("expected error on empty profile")
+	}
+}
+
+// TestPostgres_SignIn_ProviderRoundTrips pins that the provider passed to
+// SignIn is persisted and read back on the User (E44.22 / #2109).
+func TestPostgres_SignIn_ProviderRoundTrips(t *testing.T) {
+	r := newRepo(t)
+	glProfile := auth.GitHubProfile{ID: 7, Login: "octo", Name: "Octo", Email: ptrStr("o@ex.com")}
+	user, _, err := r.SignIn(context.Background(), "gitlab", glProfile, uuid.Nil)
+	if err != nil {
+		t.Fatalf("SignIn(gitlab): %v", err)
+	}
+	if user.Provider != "gitlab" {
+		t.Errorf("User.Provider = %q, want gitlab", user.Provider)
+	}
+	// A GitHub sign-in defaults the discriminator to github.
+	ghUser, _, err := r.SignIn(context.Background(), "github", sampleProfile, uuid.Nil)
+	if err != nil {
+		t.Fatalf("SignIn(github): %v", err)
+	}
+	if ghUser.Provider != "github" {
+		t.Errorf("User.Provider = %q, want github", ghUser.Provider)
+	}
+
+	// Defensive default: an empty provider falls back to github rather than
+	// writing an empty discriminator (which the CHECK would reject).
+	emptyProv := auth.GitHubProfile{ID: 8, Login: "empty-prov", Name: "E"}
+	defUser, _, err := r.SignIn(context.Background(), "", emptyProv, uuid.Nil)
+	if err != nil {
+		t.Fatalf("SignIn(empty provider): %v", err)
+	}
+	if defUser.Provider != "github" {
+		t.Errorf("empty-provider User.Provider = %q, want github (defaulted)", defUser.Provider)
+	}
+}
+
+// TestPostgres_SignIn_NoCollisionAcrossProviders is the identity-no-collision
+// done-means (E44.22 / #2109): a GitLab profile whose numeric id equals a
+// pre-existing GitHub user's id upserts a DISTINCT users row under the new
+// UNIQUE (provider, github_user_id) — a GitLab id can never overwrite a GitHub
+// user of the same numeric id.
+func TestPostgres_SignIn_NoCollisionAcrossProviders(t *testing.T) {
+	r := newRepo(t)
+	ctx := context.Background()
+
+	ghUser, _, err := r.SignIn(ctx, "github",
+		auth.GitHubProfile{ID: 100, Login: "gh-user", Name: "GH", Email: ptrStr("gh@ex.com")}, uuid.Nil)
+	if err != nil {
+		t.Fatalf("SignIn(github): %v", err)
+	}
+	glUser, _, err := r.SignIn(ctx, "gitlab",
+		auth.GitHubProfile{ID: 100, Login: "gl-user", Name: "GL", Email: ptrStr("gl@ex.com")}, uuid.Nil)
+	if err != nil {
+		t.Fatalf("SignIn(gitlab) with colliding numeric id: %v", err)
+	}
+	if ghUser.ID == glUser.ID {
+		t.Fatalf("GitLab sign-in reused the GitHub user's row (id %s); the composite UNIQUE must keep them distinct", ghUser.ID)
+	}
+	if glUser.GitHubLogin != "gl-user" {
+		t.Errorf("GitLab user login = %q, want gl-user", glUser.GitHubLogin)
+	}
+	// The GitHub row is untouched — re-fetch it by its id.
+	got, err := r.GetUser(ctx, uuid.MustParse(ghUser.ID))
+	if err != nil {
+		t.Fatalf("GetUser(github): %v", err)
+	}
+	if got.GitHubLogin != "gh-user" || got.Provider != "github" {
+		t.Errorf("github row after gitlab sign-in = %+v, want login=gh-user provider=github (not overwritten)", got)
 	}
 }

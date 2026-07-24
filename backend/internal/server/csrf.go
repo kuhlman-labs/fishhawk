@@ -84,10 +84,10 @@ func csrfSafeMethod(m string) bool {
 // kept as a small exact-match list rather than a dynamic config so
 // every exemption is reviewable here. New paths default to enforced.
 func csrfExemptPath(p string) bool {
-	// /v0/auth/github/* — the OAuth handshake itself; the cookie
-	// doesn't exist yet on /login, and /callback's POST-CSRF
-	// substitute is the OAuth `state` parameter (auth.go).
-	if strings.HasPrefix(p, "/v0/auth/github/") {
+	// /v0/auth/github/* and /v0/auth/gitlab/* — the OAuth handshake
+	// itself; the cookie doesn't exist yet on /login, and /callback's
+	// POST-CSRF substitute is the OAuth `state` parameter (auth.go).
+	if strings.HasPrefix(p, "/v0/auth/github/") || strings.HasPrefix(p, "/v0/auth/gitlab/") {
 		return true
 	}
 	// Runner-facing endpoints authenticate via GitHub Actions OIDC

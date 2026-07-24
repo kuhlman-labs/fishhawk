@@ -46,6 +46,11 @@ func TestCSRFExemptPath(t *testing.T) {
 	exempt := []string{
 		"/v0/auth/github/login",
 		"/v0/auth/github/callback",
+		// GitLab OAuth handshake (E44.22 / #2109): same rationale as
+		// github — no session cookie exists yet on /login, and /callback's
+		// POST-CSRF substitute is the OAuth `state` parameter.
+		"/v0/auth/gitlab/login",
+		"/v0/auth/gitlab/callback",
 		"/webhooks/github",
 		"/webhooks/gitlab",
 	}
@@ -73,7 +78,7 @@ func TestCSRFExemptPath(t *testing.T) {
 func signInWithSession(t *testing.T) (s *Server, sessCookie, csrfCookie *http.Cookie) {
 	t.Helper()
 	srv, repo := newAuthServer(t)
-	_, sess, err := repo.SignIn(context.Background(), auth.GitHubProfile{
+	_, sess, err := repo.SignIn(context.Background(), "github", auth.GitHubProfile{
 		ID: 99, Login: "csrf-tester", Name: "Tester",
 	}, uuid.New())
 	if err != nil {

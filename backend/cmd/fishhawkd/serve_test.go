@@ -1257,6 +1257,185 @@ func TestResolveMembershipListers(t *testing.T) {
 	})
 }
 
+// TestResolveGitLabOAuth pins the production-reachability config boundary for
+// the GitLab browser sign-in flow (E44.22 / #2109, binding condition 1): the
+// all-three-or-error credential validation AND the constructed-client path,
+// exercised through the same pure resolver serve() calls — no server boot.
+func TestResolveGitLabOAuth(t *testing.T) {
+	const base = "https://gitlab.example.com"
+
+	t.Run("none set → nil, no error (feature off)", func(t *testing.T) {
+		got, err := resolveGitLabOAuth(base, "", "", "")
+		if err != nil {
+			t.Fatalf("err = %v, want nil (unconfigured is not an error)", err)
+		}
+		if got != nil {
+			t.Errorf("client = %+v, want nil when no GitLab OAuth creds are set", got)
+		}
+	})
+
+	// Each partial trio (exactly one or two of the three set) must error,
+	// covering the all-three-or-error guard on every missing-field branch.
+	for _, tc := range []struct {
+		name                             string
+		clientID, clientSecret, callback string
+	}{
+		{"only client_id", "cid", "", ""},
+		{"only client_secret", "", "csec", ""},
+		{"only callback", "", "", "https://ex/cb"},
+		{"missing callback", "cid", "csec", ""},
+		{"missing client_secret", "cid", "", "https://ex/cb"},
+		{"missing client_id", "", "csec", "https://ex/cb"},
+	} {
+		t.Run("partial config errors: "+tc.name, func(t *testing.T) {
+			got, err := resolveGitLabOAuth(base, tc.clientID, tc.clientSecret, tc.callback)
+			if err == nil {
+				t.Fatalf("err = nil, want all-three-or-error rejection for %s", tc.name)
+			}
+			if got != nil {
+				t.Errorf("client = %+v, want nil on misconfiguration", got)
+			}
+		})
+	}
+
+	t.Run("all three set but no base URL → error", func(t *testing.T) {
+		got, err := resolveGitLabOAuth("", "cid", "csec", "https://ex/cb")
+		if err == nil {
+			t.Fatal("err = nil, want error when the GitLab OAuth creds are set but FISHHAWKD_GITLAB_BASE_URL is empty (no host to reach)")
+		}
+		if got != nil {
+			t.Errorf("client = %+v, want nil", got)
+		}
+	})
+
+	t.Run("all three + base URL → constructed client on the base host", func(t *testing.T) {
+		got, err := resolveGitLabOAuth(base, "cid", "csec", "https://ex/cb")
+		if err != nil {
+			t.Fatalf("err = %v, want nil", err)
+		}
+		if got == nil {
+			t.Fatal("client = nil, want a constructed *auth.GitLabOAuth")
+		}
+		// The authorize URL is hosted on the configured base (the endpoint
+		// host is FISHHAWKD_GITLAB_BASE_URL), and requests the read_api scope.
+		authURL := got.AuthorizeURL("state-1")
+		if !strings.HasPrefix(authURL, base+"/oauth/authorize") {
+			t.Errorf("AuthorizeURL = %q, want prefixed by %s/oauth/authorize", authURL, base)
+		}
+		if !strings.Contains(authURL, "scope=read_api") {
+			t.Errorf("AuthorizeURL = %q, want scope=read_api", authURL)
+		}
+	})
+}
+
+// TestServeWiresGitLabOAuthConfig drives runServe ITSELF to pin the
+// production-reachability boundary the earlier vacuous form only claimed to
+// cover (E44.22 / #2109 fix-up). That form assigned resolveGitLabOAuth's result
+// to a LOCAL anonymous struct — never touching runServe, env parsing, or the
+// real Config wiring — so it would have passed even if runServe never set
+// cfg.GitLabOAuth. Here a full GitLab OAuth trio + base URL flows env/flag →
+// validate → construct → cfg.GitLabOAuth through the actual boot path (proven by
+// the "gitlab oauth sign-in configured" startup log emitted only from that
+// assignment branch in serve.go), and a partial trio aborts startup at the
+// misconfigured-refusal branch BEFORE the flow is wired. bootstrapAbortFlag
+// halts the boot at the invalid review-resolution AFTER the GitLab OAuth block,
+// so the full-trio log line is observable.
+func TestServeWiresGitLabOAuthConfig(t *testing.T) {
+	t.Run("full trio is validated, constructed, and wired", func(t *testing.T) {
+		code, log := serveWithProfile(t,
+			"-gitlab-base-url", "https://gitlab.example.com",
+			"-gitlab-oauth-client-id", "cid",
+			"-gitlab-oauth-client-secret", "csec",
+			"-gitlab-oauth-callback-url", "https://ex/cb",
+			bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (startup aborts at the invalid review-resolution AFTER the GitLab OAuth block); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "gitlab oauth sign-in configured") {
+			t.Errorf("a complete GitLab OAuth trio did not wire cfg.GitLabOAuth through runServe (missing the sign-in-configured log); /v0/auth/gitlab/* would stay 503. log:\n%s", log)
+		}
+
+		// The log above proves the client was CONSTRUCTED, but it is now guarded
+		// on cfg.GitLabOAuth (the field the routes read) rather than the local
+		// var — so deleting `cfg.GitLabOAuth = gitlabOAuth` in runServe stops the
+		// log AND fails the assertion above. Beyond that, exercise the ROUTE that
+		// consumes the field so the Config field — not a bare non-nil check — is
+		// the load-bearing observation (#2109 fix-up): build a server from a
+		// Config carrying the SAME resolveGitLabOAuth-constructed client runServe
+		// wires and drive GET /v0/auth/gitlab/login. A wired field 302-redirects
+		// to the authorize URL and sets the state cookie; a nil field (the
+		// deleted-assignment regression) would 503 oauth_unconfigured.
+		oauth, err := resolveGitLabOAuth("https://gitlab.example.com", "cid", "csec", "https://ex/cb")
+		if err != nil {
+			t.Fatalf("resolveGitLabOAuth: %v", err)
+		}
+		srv := server.New(server.Config{Addr: "127.0.0.1:0", GitLabOAuth: oauth})
+		req := httptest.NewRequest(http.MethodGet, "/v0/auth/gitlab/login", nil)
+		w := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(w, req)
+		if w.Code != http.StatusFound {
+			t.Fatalf("GET /v0/auth/gitlab/login with the wired cfg.GitLabOAuth = %d, want 302 (a nil field would 503 oauth_unconfigured):\n%s", w.Code, w.Body.String())
+		}
+		var stateCookie *http.Cookie
+		for _, c := range w.Result().Cookies() {
+			if c.Name == authpkg.StateCookieName {
+				stateCookie = c
+			}
+		}
+		if stateCookie == nil {
+			t.Error("GET /v0/auth/gitlab/login did not set the OAuth state cookie; cfg.GitLabOAuth did not reach the route")
+		}
+	})
+
+	t.Run("partial trio aborts startup with the misconfigured refusal", func(t *testing.T) {
+		code, log := serveWithProfile(t,
+			"-gitlab-base-url", "https://gitlab.example.com",
+			"-gitlab-oauth-client-id", "cid",
+			// client-secret and callback deliberately omitted → all-three-or-error.
+			bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (a partial GitLab OAuth trio must refuse to boot); log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, "gitlab oauth misconfigured") {
+			t.Errorf("partial GitLab OAuth trio did not emit the misconfigured refusal from runServe; log:\n%s", log)
+		}
+		if strings.Contains(log, "gitlab oauth sign-in configured") {
+			t.Errorf("a partial trio must NOT wire the sign-in flow; log:\n%s", log)
+		}
+	})
+
+	// A GitLab-ONLY deployment (a database + GitLab OAuth, NO GitHub OAuth) must
+	// build the membership resolver — the #2109 fix-up decoupled it from the
+	// GitHub OAuth block. Before the fix cfg.AuthMembership stayed nil here, so
+	// /v0/auth/gitlab/callback denied every sign-in with a nil-resolver 503 even
+	// though cfg.GitLabOAuth was built. The "membership resolver configured" log
+	// fires only from that construction branch, so its presence — with NO
+	// "github oauth sign-in configured" line — proves the resolver is wired
+	// independent of GitHub OAuth.
+	t.Run("gitlab-only deployment with a database wires the membership resolver", func(t *testing.T) {
+		url := pgtest.NewURL(t)
+		code, log := serveWithProfile(t,
+			"-db", url,
+			"-gitlab-base-url", "https://gitlab.example.com",
+			"-gitlab-oauth-client-id", "cid",
+			"-gitlab-oauth-client-secret", "csec",
+			"-gitlab-oauth-callback-url", "https://ex/cb",
+			bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if strings.Contains(log, "github oauth sign-in configured") {
+			t.Fatalf("test drove a GitLab-only deployment but GitHub OAuth was configured; log:\n%s", log)
+		}
+		if !strings.Contains(log, "membership resolver configured") {
+			t.Errorf("a GitLab-only deployment with a database did not build the membership resolver; the gitlab callback would 503 on a nil resolver. log:\n%s", log)
+		}
+		if !strings.Contains(log, "gitlab oauth sign-in configured") {
+			t.Errorf("gitlab sign-in flow not wired in a GitLab-only deployment; log:\n%s", log)
+		}
+	})
+}
+
 // EMU enterprise auto-join is ON exactly for a data-resident GHEC OAuth
 // endpoint — the posture the serve wiring derives from the already-parsed
 // endpoint config, with no new flag.

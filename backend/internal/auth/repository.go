@@ -19,13 +19,15 @@ type GitHubProfile struct {
 // Repository persists the user + session state. v0 has a single
 // Postgres implementation; tests substitute a fake.
 type Repository interface {
-	// SignIn upserts the user (keyed by GitHub id) and creates a
-	// fresh session bound to the account the membership gate
-	// resolved (E44.3 / ADR-057 Amendment A2). accountID may be
-	// uuid.Nil only where no gate ran (tests); the callback always
-	// passes a resolved account. Returns the populated Session
-	// including its PlainText (set exactly once at issue time).
-	SignIn(ctx context.Context, p GitHubProfile, accountID uuid.UUID) (*User, *Session, error)
+	// SignIn upserts the user (keyed by (provider, forge id)) and
+	// creates a fresh session bound to the account the membership gate
+	// resolved (E44.3 / ADR-057 Amendment A2). provider is the forge the
+	// identity came from ("github" | "gitlab", E44.22 / #2109); it scopes
+	// the numeric-id upsert so a GitLab id never overwrites a GitHub user.
+	// accountID may be uuid.Nil only where no gate ran (tests); the
+	// callback always passes a resolved account. Returns the populated
+	// Session including its PlainText (set exactly once at issue time).
+	SignIn(ctx context.Context, provider string, p GitHubProfile, accountID uuid.UUID) (*User, *Session, error)
 
 	// Authenticate hashes plaintext, looks up an active session,
 	// validates sliding + absolute TTLs against the current

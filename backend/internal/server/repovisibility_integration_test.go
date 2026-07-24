@@ -184,7 +184,7 @@ func newVisibilityFixture(t *testing.T) *visibilityFixture {
 	// exactly what repoFilterFor keys on.
 	signIn := func(githubID int64, login string) *http.Cookie {
 		t.Helper()
-		_, sess, err := authRepo.SignIn(ctx,
+		_, sess, err := authRepo.SignIn(ctx, "github",
 			authpkg.GitHubProfile{ID: githubID, Login: login, Name: login}, accountID)
 		if err != nil {
 			t.Fatalf("sign in %s: %v", login, err)
