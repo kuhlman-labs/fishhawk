@@ -630,6 +630,8 @@ func TestClassifyErr(t *testing.T) {
 		{fmt.Errorf("wrapped: %w", agent.ErrLoopDetected), "loop_detected"},
 		{agent.ErrExternalAPI, "external_api"},
 		{fmt.Errorf("wrapped: %w", agent.ErrExternalAPI), "external_api"},
+		{agent.ErrAgentQuotaUnavailable, "agent_quota_unavailable"},
+		{fmt.Errorf("wrapped: %w", agent.ErrAgentQuotaUnavailable), "agent_quota_unavailable"},
 		{agent.ErrAgentFailed, "agent_failed"},
 		{fmt.Errorf("wrapped: %w", agent.ErrAgentFailed), "agent_failed"},
 		{errors.New("anything else"), "other"},
@@ -727,6 +729,35 @@ func TestLogCompletion_ExternalAPIStatus(t *testing.T) {
 			t.Errorf("missing err_class agent_failed: %s", out)
 		}
 	})
+}
+
+// TestLogCompletion_QuotaUnavailable asserts the runner_completed line for a
+// model-quota exhaustion (#2085): err_class agent_quota_unavailable, category A,
+// tokens_used 0, the stable reason phrase, and NO api_error_status (quota
+// carries no upstream status, unlike external-API).
+func TestLogCompletion_QuotaUnavailable(t *testing.T) {
+	var w strings.Builder
+	logCompletion(&w, agent.Result{
+		OK:              false,
+		FailureCategory: "A",
+		FailureReason:   "could not obtain model quota (likely a usage/rate cap): agent exited with exit status 1 after 2s having made no model call (0 tokens)",
+		TokensUsed:      0,
+	}, fmt.Errorf("wrapped: %w", agent.ErrAgentQuotaUnavailable))
+	out := w.String()
+	for _, want := range []string{
+		`"outcome":"failed"`,
+		`"category":"A"`,
+		`"tokens_used":0`,
+		`"err_class":"agent_quota_unavailable"`,
+		"could not obtain model quota",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %s in: %s", want, out)
+		}
+	}
+	if strings.Contains(out, "api_error_status") {
+		t.Errorf("api_error_status must be absent for a quota failure: %s", out)
+	}
 }
 
 func TestRun_PromptInvokesAgentAndEmitsEvents(t *testing.T) {

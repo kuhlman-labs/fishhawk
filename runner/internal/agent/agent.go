@@ -278,6 +278,25 @@ var (
 	// stable failure-reason phrase so the operator surface can name it
 	// without trace archaeology.
 	ErrExternalAPI = errors.New("agent: terminal external API error")
+
+	// ErrAgentQuotaUnavailable marks a model-quota exhaustion (a usage /
+	// rate cap): the agent exited non-zero having reached NO model call —
+	// zero reported tokens and no model id seen — within a short wall-clock
+	// bound of spawn, after runner-side init already succeeded. This is the
+	// "cannot obtain model quota" fingerprint from run a75b0765 (#2085): a
+	// capped account's post-init exit (~2s / 0 tokens) is indistinguishable
+	// from a genuine transient crash (~11min / ~52000 tokens) only when both
+	// collapse to a generic agent_failed, so a memoryless operator thrashes
+	// doomed auto-retries against the wall. Like ErrAgentThinkingBlock,
+	// ErrLoopDetected, and ErrExternalAPI it is a PEER sentinel and does NOT
+	// wrap ErrAgentFailed, so err_class classification stays unambiguous;
+	// downstream category-A handling keys off Result.FailureCategory=="A"
+	// (still set on this path). No new Result field is needed (unlike
+	// APIErrorStatus): the classification is carried entirely by the sentinel
+	// plus the stable failure-reason phrase. It is NOT retried in-driver —
+	// re-running the same prompt against an unreset cap would fail
+	// identically.
+	ErrAgentQuotaUnavailable = errors.New("agent: model quota unavailable")
 )
 
 // MakePayload marshals v to a json.RawMessage or panics. Helper for
