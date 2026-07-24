@@ -19,3 +19,11 @@ type RepoAclEntry struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
 }
+
+type RepoAclPurgeWatermark struct {
+	Provider   string             `json:"provider"`
+	Subject    string             `json:"subject"`
+	Generation int64              `json:"generation"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt  pgtype.Timestamptz `json:"updated_at"`
+}

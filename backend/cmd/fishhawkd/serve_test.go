@@ -2289,9 +2289,15 @@ func (stubRepoACLStore) Get(context.Context, string, string, string) (repoacl.En
 	return repoacl.Entry{}, false, nil
 }
 
-func (stubRepoACLStore) Upsert(context.Context, string, string, string, identity.Permission) error {
+func (stubRepoACLStore) Upsert(context.Context, string, string, string, identity.Permission, int64) error {
 	return nil
 }
+
+func (stubRepoACLStore) EnsurePurgeGeneration(context.Context, string, string) (int64, error) {
+	return 0, nil
+}
+
+func (stubRepoACLStore) BumpPurgeWatermark(context.Context, string, string) error { return nil }
 
 func (stubRepoACLStore) DeleteForSubject(context.Context, string, string) error { return nil }
 

@@ -11,6 +11,32 @@ import (
 	"github.com/google/uuid"
 )
 
+const bumpRepoACLPurgeWatermark = `-- name: BumpRepoACLPurgeWatermark :exec
+INSERT INTO repo_acl_purge_watermarks (provider, subject, generation)
+VALUES ($1, $2, 1)
+ON CONFLICT (provider, subject) DO UPDATE
+   SET generation = repo_acl_purge_watermarks.generation + 1,
+       updated_at = now()
+`
+
+type BumpRepoACLPurgeWatermarkParams struct {
+	Provider string `json:"provider"`
+	Subject  string `json:"subject"`
+}
+
+// Raise the purge watermark for one identity. InvalidateSubject calls this
+// FIRST (strictly BEFORE deleting the subject's entry rows) so every in-flight
+// resolution that captured an older generation is invalidated across the entry
+// delete. Creates the row at generation 1 on the FIRST-EVER purge (a
+// never-purged subject) and increments monotonically thereafter. The UPDATE of
+// the non-key generation column takes a FOR NO KEY UPDATE row lock, which
+// CONFLICTS with the guarded upsert's FOR SHARE — that conflict is the
+// serialization the guard relies on.
+func (q *Queries) BumpRepoACLPurgeWatermark(ctx context.Context, arg BumpRepoACLPurgeWatermarkParams) error {
+	_, err := q.db.Exec(ctx, bumpRepoACLPurgeWatermark, arg.Provider, arg.Subject)
+	return err
+}
+
 const deleteRepoACLEntriesForSubject = `-- name: DeleteRepoACLEntriesForSubject :exec
 DELETE FROM repo_acl_entries
  WHERE provider = $1
@@ -28,6 +54,35 @@ type DeleteRepoACLEntriesForSubjectParams struct {
 func (q *Queries) DeleteRepoACLEntriesForSubject(ctx context.Context, arg DeleteRepoACLEntriesForSubjectParams) error {
 	_, err := q.db.Exec(ctx, deleteRepoACLEntriesForSubject, arg.Provider, arg.Subject)
 	return err
+}
+
+const ensureRepoACLPurgeWatermark = `-- name: EnsureRepoACLPurgeWatermark :one
+INSERT INTO repo_acl_purge_watermarks (provider, subject)
+VALUES ($1, $2)
+ON CONFLICT (provider, subject) DO UPDATE
+   SET generation = repo_acl_purge_watermarks.generation
+RETURNING generation
+`
+
+type EnsureRepoACLPurgeWatermarkParams struct {
+	Provider string `json:"provider"`
+	Subject  string `json:"subject"`
+}
+
+// Guarantee the watermark row for (provider, subject) EXISTS and return its
+// current generation. Called at resolution START (before the forge lookup) so
+// the memoizing write can later take a FOR SHARE lock on a row that is
+// guaranteed present — FOR SHARE on an ABSENT row locks nothing and silently
+// reopens the race, so this ensure-row step is mandatory.
+//
+// The no-op DO UPDATE (assign generation to itself) is what makes RETURNING
+// yield the EXISTING row's generation on conflict; ON CONFLICT DO NOTHING would
+// return no row on an existing key.
+func (q *Queries) EnsureRepoACLPurgeWatermark(ctx context.Context, arg EnsureRepoACLPurgeWatermarkParams) (int64, error) {
+	row := q.db.QueryRow(ctx, ensureRepoACLPurgeWatermark, arg.Provider, arg.Subject)
+	var generation int64
+	err := row.Scan(&generation)
+	return generation, err
 }
 
 const getRepoACLEntry = `-- name: GetRepoACLEntry :one
@@ -61,9 +116,14 @@ func (q *Queries) GetRepoACLEntry(ctx context.Context, arg GetRepoACLEntryParams
 	return i, err
 }
 
-const upsertRepoACLEntry = `-- name: UpsertRepoACLEntry :one
+const upsertRepoACLEntryGuarded = `-- name: UpsertRepoACLEntryGuarded :one
 INSERT INTO repo_acl_entries (id, provider, subject, repo, permission)
-VALUES ($1, $2, $3, $4, $5)
+SELECT $1, $2, $3, $4, $5
+  FROM repo_acl_purge_watermarks w
+ WHERE w.provider = $2
+   AND w.subject = $3
+   AND $6 >= w.generation
+   FOR SHARE OF w
 ON CONFLICT (provider, subject, repo) DO UPDATE
    SET permission = EXCLUDED.permission,
        checked_at = now(),
@@ -71,28 +131,35 @@ ON CONFLICT (provider, subject, repo) DO UPDATE
 RETURNING id, provider, subject, repo, permission, checked_at, created_at, updated_at
 `
 
-type UpsertRepoACLEntryParams struct {
+type UpsertRepoACLEntryGuardedParams struct {
 	ID         uuid.UUID `json:"id"`
 	Provider   string    `json:"provider"`
 	Subject    string    `json:"subject"`
 	Repo       string    `json:"repo"`
 	Permission string    `json:"permission"`
+	Generation int64     `json:"generation"`
 }
 
-// Memoize a permission the forge just reported. checked_at is refreshed on
-// EVERY upsert, including one whose permission is unchanged — the TTL clock
-// tracks "when did we last ask", not "when did the answer last change".
+// Memoize a permission the forge just reported, GUARDED by the purge watermark
+// so a purge that raced this resolution rejects the write. checked_at is
+// refreshed on EVERY write. Only a resolved answer is ever written here.
 //
-// Only a resolved answer is ever written here. A forge ERROR must never reach
-// this statement: memoizing a transient fault would either cache a phantom
-// deny or, worse, hold a stale grant past its real revocation.
-func (q *Queries) UpsertRepoACLEntry(ctx context.Context, arg UpsertRepoACLEntryParams) (RepoAclEntry, error) {
-	row := q.db.QueryRow(ctx, upsertRepoACLEntry,
+// FOR SHARE OF w is LOAD-BEARING: it row-locks the watermark so the generation
+// read SERIALIZES against a concurrent BumpRepoACLPurgeWatermark (FOR SHARE
+// conflicts with the bump's FOR NO KEY UPDATE lock — FOR KEY SHARE would NOT and
+// would leave the race open). On unblock EvalPlanQual re-reads the BUMPED
+// generation, so a captured generation ($6) now behind the live one fails the
+// WHERE, the SELECT yields zero rows, and NOTHING is inserted. A rejected write
+// returns pgx.ErrNoRows, which the Go layer treats as a benign non-memoized
+// rejection.
+func (q *Queries) UpsertRepoACLEntryGuarded(ctx context.Context, arg UpsertRepoACLEntryGuardedParams) (RepoAclEntry, error) {
+	row := q.db.QueryRow(ctx, upsertRepoACLEntryGuarded,
 		arg.ID,
 		arg.Provider,
 		arg.Subject,
 		arg.Repo,
 		arg.Permission,
+		arg.Generation,
 	)
 	var i RepoAclEntry
 	err := row.Scan(

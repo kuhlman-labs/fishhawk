@@ -73,9 +73,43 @@ var (
 //
 // Get reports found=false for a miss (the underlying pgx.ErrNoRows is
 // translated there, not here) so a miss is never confused with an error.
+//
+// The generation discipline (#2116) closes the login-purge-vs-in-flight-
+// resolution race (race B). A per-(provider, subject) purge WATERMARK — a
+// DB-side monotonic generation counter that SURVIVES deletion of the entry
+// rows — orders a purge against an in-flight resolution:
+//
+//   - EnsurePurgeGeneration, called at resolution START, guarantees the
+//     watermark row EXISTS (creating it at generation 0 if absent) and returns
+//     the current generation. Its row-creation is load-bearing: the memoizing
+//     write later takes a FOR SHARE lock on that row, and FOR SHARE on an ABSENT
+//     row locks nothing and reopens the race.
+//   - BumpPurgeWatermark, called by InvalidateSubject BEFORE DeleteForSubject,
+//     raises the generation under a row-level write lock.
+//   - Upsert is a GUARDED write: it carries the generation captured at
+//     resolution start and, under a FOR SHARE lock on the watermark row,
+//     serializes against a concurrent bump. A write whose captured generation
+//     trails the live one is REJECTED (no error — a benign non-memoized
+//     rejection). This holds ACROSS the entry-row delete because the watermark
+//     survives it.
+//
+// Race A (two concurrent non-purge resolutions of the same key committing out
+// of order) is NOT given a total order; it remains last-writer-wins bounded by
+// the TTL.
 type Store interface {
 	Get(ctx context.Context, provider, subject, repo string) (Entry, bool, error)
-	Upsert(ctx context.Context, provider, subject, repo string, perm identity.Permission) error
+	// Upsert memoizes a resolved permission, GUARDED by capturedGen: a purge
+	// that bumped the watermark after the generation was captured rejects the
+	// write. A guarded rejection is NOT an error — the answer is simply not
+	// memoized and the next request re-resolves.
+	Upsert(ctx context.Context, provider, subject, repo string, perm identity.Permission, capturedGen int64) error
+	// EnsurePurgeGeneration ensures the watermark row exists (creating it at
+	// generation 0 if absent) and returns the current generation. The
+	// row-creation is what makes the later FOR SHARE lock in Upsert bite.
+	EnsurePurgeGeneration(ctx context.Context, provider, subject string) (int64, error)
+	// BumpPurgeWatermark raises the purge generation (creating the row on the
+	// first-ever purge). InvalidateSubject calls it BEFORE DeleteForSubject.
+	BumpPurgeWatermark(ctx context.Context, provider, subject string) error
 	DeleteForSubject(ctx context.Context, provider, subject string) error
 }
 
@@ -166,14 +200,31 @@ func (m *Mirror) Permission(ctx context.Context, provider, subject, repo string)
 		return entry.Permission, nil
 	}
 
-	// MISS or EXPIRED — the stale value is never served. Ask the forge.
+	// MISS or EXPIRED — the stale value is never served. Capture the purge
+	// generation BEFORE the forge lookup (and guarantee the lockable watermark
+	// row exists): any purge in the [capture, write] window bumps the watermark
+	// so capturedGen < live and the guarded write is rejected, while a
+	// resolution that captured AFTER a purge captured the bumped generation and
+	// its forge read is post-purge, correctly allowed to write. This is the
+	// race-B ordering discipline (#2116); the cache-hit path above stays a
+	// single Get with no extra query.
+	gen, err := m.store.EnsurePurgeGeneration(ctx, provider, subject)
+	if err != nil {
+		return identity.PermissionNone, fmt.Errorf("%w: ensure purge generation %s/%s: %w", ErrStoreUnavailable, provider, subject, err)
+	}
+
+	// Ask the forge.
 	perm, err := m.resolver.PermissionLevel(ctx, repo, subject)
 	if err != nil {
 		// No upsert: a transient fault must never be memoized, as a phantom
 		// deny or (worse) as a refreshed checked_at on a stale grant.
 		return identity.PermissionNone, fmt.Errorf("%w: %s: %w", ErrForgeUnavailable, repo, err)
 	}
-	if err := m.store.Upsert(ctx, provider, subject, repo, perm); err != nil {
+	// A guarded rejection (a purge won the race) is NOT a store error —
+	// postgresStore.Upsert maps pgx.ErrNoRows to nil, so this caller STILL gets
+	// (perm, nil) for THIS request; it is simply not memoized, and the next
+	// request re-resolves.
+	if err := m.store.Upsert(ctx, provider, subject, repo, perm, gen); err != nil {
 		return identity.PermissionNone, fmt.Errorf("%w: upsert %s/%s: %w", ErrStoreUnavailable, provider, repo, err)
 	}
 	return perm, nil
@@ -217,6 +268,17 @@ func (m *Mirror) Visible(ctx context.Context, provider, subject, repo string) (b
 // login so a fresh sign-in re-resolves from the forge instead of inheriting
 // pre-login answers.
 //
+// It BUMPS the purge watermark FIRST, then deletes the subject's rows. The
+// bump is the security-critical half (#2116): it raises the generation under a
+// row-level write lock BEFORE any row is deleted, so every in-flight resolution
+// that captured an older generation is invalidated across the delete (its
+// guarded write is rejected under FOR SHARE), AND it creates the watermark row
+// on a first-ever purge so the lock always has a row to bite on. The delete
+// then removes existing rows so the next read is a miss that re-resolves now.
+// Race A (concurrent non-purge resolutions of the same key) remains
+// TTL-bounded last-writer-wins — the watermark orders purges, not two ordinary
+// resolutions.
+//
 // Callers treat a failure as NON-FATAL to sign-in. See README.md: a failed
 // purge leaves the caller at exactly the baseline TTL exposure the design
 // already accepts everywhere else — surviving entries, grants included, expire
@@ -228,6 +290,11 @@ func (m *Mirror) InvalidateSubject(ctx context.Context, provider, subject string
 	}
 	if provider == "" || subject == "" {
 		return nil
+	}
+	// Bump BEFORE delete: the raised watermark invalidates in-flight writes
+	// across the delete that follows.
+	if err := m.store.BumpPurgeWatermark(ctx, provider, subject); err != nil {
+		return fmt.Errorf("%w: bump purge watermark %s: %w", ErrStoreUnavailable, provider, err)
 	}
 	if err := m.store.DeleteForSubject(ctx, provider, subject); err != nil {
 		return fmt.Errorf("%w: purge %s: %w", ErrStoreUnavailable, provider, err)

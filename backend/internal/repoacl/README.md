@@ -1,6 +1,8 @@
 # `backend/internal/repoacl` — per-identity forge repo-ACL mirror
 
-Anchor: #2071 (E44.10), ADR-057 Amendment A2. Migration `0059_repo_acl_mirror`.
+Anchor: #2071 (E44.10), ADR-057 Amendment A2. Migrations
+`0059_repo_acl_mirror`, `0060_repo_acl_purge_watermark` (#2116, E44.25 — the
+purge-ordering discipline below).
 
 Repo-scoped in-workspace visibility needs one question answered on every read:
 **does this signed-in human hold at least `read` on this repo, on the forge?**
@@ -80,9 +82,11 @@ plant a phantom deny or, worse, refresh `checked_at` on a stale grant.
 
 ## Login purge
 
-`InvalidateSubject(ctx, provider, subject)` drops every mirrored row for one
-identity, called at the end of the OAuth callback so a fresh sign-in
-re-resolves rather than inheriting pre-login answers.
+`InvalidateSubject(ctx, provider, subject)` bumps the purge watermark and then
+drops every mirrored row for one identity, called at the end of the OAuth
+callback so a fresh sign-in re-resolves rather than inheriting pre-login
+answers. The bump-before-delete ordering that also invalidates an *in-flight*
+resolution is the subject of the next section.
 
 **The purge is NON-FATAL to sign-in**, and the reason is worth stating
 precisely, because the obvious rationale is wrong. It is *not* true that a
@@ -95,6 +99,91 @@ is therefore bounded by `DefaultTTL`, not unbounded. Failing sign-in closed on
 a transient DB blip would be the worse trade, so the callback logs and
 continues.
 
+## Purge ordering: closing the login-purge-vs-in-flight-resolution race (#2116)
+
+A login purge (`InvalidateSubject`) and a concurrent cache-miss resolution race
+each other. Two races exist, and this package treats them **differently and
+states which is which precisely** — an over-claim here would be worse than an
+honest bound:
+
+- **Race B (login purge vs an in-flight resolution) is GENUINELY CLOSED.** This
+  is the security-critical one: without ordering, a resolution could read a
+  pre-purge world, the purge could delete the subject's rows, and the stale
+  grant could then be written and SURVIVE the purge — exactly what a fresh
+  sign-in must not inherit.
+- **Race A (two concurrent NON-purge resolutions of the same key committing out
+  of order) is NOT given a total order.** It remains last-writer-wins,
+  **TTL-bounded convergence** — the loser's answer is at most `DefaultTTL` stale
+  and re-resolves on expiry. The design deliberately does **not** claim a total
+  order for two ordinary resolutions.
+
+### The mechanism (race B)
+
+A `repo_acl_purge_watermarks` table (migration 0060) holds a per-`(provider,
+subject)` **BIGINT `generation`** counter. It is a **DB-side monotonic counter,
+clock-INDEPENDENT** — chosen over a wall-clock `checked_at` because a wall clock
+cannot survive the persistence boundary or an NTP rollback, and sub-second
+precision collapses under ties. Crucially the counter **SURVIVES deletion of the
+`repo_acl_entries` rows** (deleting an entry never touches the watermark), which
+is what lets the ordering hold ACROSS the purge's row delete.
+
+Three steps, in this order:
+
+1. **Resolution start** — `Permission`, on a miss/expired path only, calls
+   `EnsurePurgeGeneration` BEFORE the forge lookup. It upserts-and-returns the
+   watermark row, **guaranteeing the row EXISTS** and capturing the current
+   generation. Capturing *before* the forge read is load-bearing: any purge in
+   the `[capture, write]` window bumps the generation, so the later guarded
+   write sees `capturedGen < live` and is rejected; a resolution that captured
+   *after* a purge captured the bumped generation and its forge read is
+   post-purge, correctly allowed to write.
+2. **Purge** — `InvalidateSubject` calls `BumpPurgeWatermark` (raises the
+   generation, creating the row on a first-ever purge) **strictly BEFORE**
+   `DeleteForSubject`. Bump-before-delete is the invariant: the raised watermark
+   invalidates every in-flight write across the delete that follows.
+3. **Memoizing write** — the guarded upsert (`UpsertRepoACLEntryGuarded`) is an
+   `INSERT ... SELECT ... FROM repo_acl_purge_watermarks w WHERE $capturedGen >=
+   w.generation FOR SHARE OF w ...`. The **`FOR SHARE` row lock is
+   load-bearing**: it serializes the generation read against a concurrent
+   `BumpPurgeWatermark`.
+
+### Why `FOR SHARE`, not `FOR KEY SHARE`
+
+`BumpPurgeWatermark` updates only the non-key `generation` column, so it takes a
+**`FOR NO KEY UPDATE`** tuple lock. Per the PostgreSQL row-level-lock conflict
+table, `FOR KEY SHARE` does **NOT** conflict with `FOR NO KEY UPDATE` (it exists
+precisely so FK checks don't block on non-key updates) — a `FOR KEY SHARE`
+guarded read would **not block** behind an in-flight bump and race B would stay
+open. **`FOR SHARE` DOES conflict** with `FOR NO KEY UPDATE` (and `FOR UPDATE`),
+so the guarded read **blocks** behind an in-flight bump and, on unblock, the
+`EvalPlanQual` re-read under READ COMMITTED observes the **bumped** generation —
+`capturedGen >= w.generation` is now false, the SELECT yields zero rows, and
+nothing is inserted. The window closes in **both** directions: a bump also
+blocks behind an in-flight guarded upsert. A rejected write returns zero rows
+(`pgx.ErrNoRows`), which the store maps to a **benign non-memoized rejection**,
+not an error — `Permission` still returns the resolved answer to *this* caller;
+it is simply not memoized, and the next request re-resolves.
+
+### The ensure-row requirement (and its cost)
+
+`FOR SHARE` on an **absent** row locks **nothing** and silently reopens the
+race, so the watermark row MUST exist before it is ever locked. That is exactly
+what `EnsurePurgeGeneration` (at resolution start) and `BumpPurgeWatermark` (on a
+first-ever purge) guarantee; watermark rows are never deleted, so once created
+they persist. The cost, stated honestly: `EnsureRepoACLPurgeWatermark` is an
+`INSERT ... ON CONFLICT DO UPDATE SET generation = generation` — a **no-op
+self-assignment that still takes a `FOR NO KEY UPDATE` write lock and writes a
+new row version on the read-only hot path**, i.e. dead-tuple churn that
+autovacuum reclaims. This is the deliberate price of guaranteeing a lockable row
+on every miss; a `DO NOTHING` + plain-`SELECT` fallback would avoid the churn
+but at the cost of a second round-trip on the row-absent path, and the churn is
+bounded (one dead tuple per cache miss, not per read served from the mirror).
+
+Two prior-round notes fold in here: (i) `checked_at` is still `now()` on every
+write and the `expired()` TTL prose above stays accurate — but the **generation
+guard**, not `checked_at`, is the purge-ordering authority; (ii) `Permission`
+remains an exported method with no production caller today.
+
 ## Not account-scoped, and outside the RLS regime
 
 `repo_acl_entries` carries no `account_id`. The fact it mirrors — "does forge
@@ -105,6 +194,11 @@ row per account and invite the copies to disagree. The rationale lives in
 0059's header where it stays challengeable, and
 `TestMigrateUp` asserts both the absent column and the absent
 `relrowsecurity` so the choice cannot drift silently.
+
+`repo_acl_purge_watermarks` (0060) is outside the RLS regime for the **same**
+reason — it mirrors an identity-scoped purge ordering, not account-scoped
+tenant data — and `TestMigrateUp` pins its absent `account_id` and
+`relrowsecurity = 0` identically.
 
 Related: 0057's RLS policies are **inert in production today** (the runtime
 role is a superuser and superusers bypass RLS even under FORCE), so the
@@ -121,6 +215,6 @@ affected rows immediately, shrinking the stale-allow window below the TTL) is
 
 | File | Role |
 |---|---|
-| `repoacl.go` | `Mirror` (`Permission` / `Visible` / `InvalidateSubject`), the `Store` and `PermissionResolver` seams, `DefaultTTL`, the three sentinels, `SubjectRef` |
-| `postgres.go` | the pgx/sqlc-backed `Store` |
-| `queries.sql` + `db/` | the sqlc surface (hand-written to sqlc's output shape — see the header in `queries.sql`) |
+| `repoacl.go` | `Mirror` (`Permission` / `Visible` / `InvalidateSubject`), the `Store` (incl. `EnsurePurgeGeneration` / `BumpPurgeWatermark`) and `PermissionResolver` seams, `DefaultTTL`, the three sentinels, `SubjectRef` |
+| `postgres.go` | the pgx/sqlc-backed `Store`, including the guarded upsert and the watermark ensure/bump |
+| `queries.sql` + `db/` | the sqlc surface (hand-written to sqlc's output shape — see the header in `queries.sql`); includes the `FOR SHARE`-guarded `UpsertRepoACLEntryGuarded` and the watermark ensure/bump queries |

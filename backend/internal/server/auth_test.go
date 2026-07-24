@@ -1161,6 +1161,7 @@ type staleStore struct {
 	entry     repoacl.Entry
 	present   bool
 	upserts   int
+	bumps     int
 	deleteErr error
 }
 
@@ -1168,10 +1169,24 @@ func (s *staleStore) Get(context.Context, string, string, string) (repoacl.Entry
 	return s.entry, s.present, nil
 }
 
-func (s *staleStore) Upsert(_ context.Context, _, _, _ string, perm identity.Permission) error {
+func (s *staleStore) Upsert(_ context.Context, _, _, _ string, perm identity.Permission, _ int64) error {
 	s.upserts++
 	s.entry = repoacl.Entry{Permission: perm, CheckedAt: time.Now()}
 	s.present = true
+	return nil
+}
+
+// EnsurePurgeGeneration is a no-op watermark that always reports generation 0 —
+// this fixture models the TTL bound, not the generation guard, so Get ignores
+// the generation entirely and the captured value is inert.
+func (s *staleStore) EnsurePurgeGeneration(context.Context, string, string) (int64, error) {
+	return 0, nil
+}
+
+// BumpPurgeWatermark records the bump so the test can confirm InvalidateSubject
+// bumps before it hits the failing delete; the bump itself succeeds.
+func (s *staleStore) BumpPurgeWatermark(context.Context, string, string) error {
+	s.bumps++
 	return nil
 }
 
