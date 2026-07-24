@@ -60,13 +60,23 @@ var autoDriveDispatchStages = map[string]struct{}{
 }
 
 // autoDriveResponse is the POST /v0/runs/{run_id}/auto-drive body: the
-// AutoDriveRunGate outcome, flattened for the drive verb to switch on.
+// AutoDriveRunGate outcome, flattened for the drive verb to switch on. The
+// handler serializes it via the direct conversion autoDriveResponse(out), so
+// its fields MUST stay in the SAME order as AutoDriveOutcome (tags are ignored
+// by the conversion; a field-order mismatch fails to compile).
+//
+// decision_required / decision_state carry the #2091 decision-required outcome
+// (an exhausted fix-up budget / ceiling on the delegated route_fixup arm): the
+// driver STOPS and hands the gate to the operator rather than the endpoint
+// returning a 500.
 type autoDriveResponse struct {
-	Acted     bool   `json:"acted"`
-	Action    string `json:"action,omitempty"`
-	Paged     bool   `json:"paged"`
-	PageEvent string `json:"page_event,omitempty"`
-	Note      string `json:"note"`
+	Acted            bool   `json:"acted"`
+	Action           string `json:"action,omitempty"`
+	Paged            bool   `json:"paged"`
+	PageEvent        string `json:"page_event,omitempty"`
+	DecisionRequired bool   `json:"decision_required"`
+	DecisionState    string `json:"decision_state,omitempty"`
+	Note             string `json:"note"`
 }
 
 // handleAutoDrive implements POST /v0/runs/{run_id}/auto-drive (#1700): it

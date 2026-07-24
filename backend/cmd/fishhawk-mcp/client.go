@@ -1458,15 +1458,23 @@ func (c *apiClient) VouchCommit(ctx context.Context, runID uuid.UUID, sha, reaso
 
 // AutoDriveOutcome mirrors the backend's POST /v0/runs/{run_id}/auto-drive
 // 200 body (#1700): the AutoDriveRunGate result the local drive verb switches
-// on. Exactly one of Acted / Paged is true on a non-observe-only outcome; an
-// observe-only outcome has both false. Repeated (not imported) per the thin
-// local-copy rule — import direction is cli → backend, not the reverse.
+// on. A non-observe-only outcome is exactly one of three kinds — Acted (a
+// delegated gate action fired), Paged (a must_page_human refusal), or
+// DecisionRequired (a well-defined gate state the driver must STOP on and hand
+// to the operator, e.g. an exhausted fix-up budget on the delegated
+// route_fixup arm, #2091); observe-only is all three false. Repeated (not
+// imported) per the thin local-copy rule — import direction is cli → backend,
+// not the reverse. A mistyped json tag here would silently drop
+// DecisionRequired to false and route the driver to the observe-only default,
+// so client_test.go pins the wire decode.
 type AutoDriveOutcome struct {
-	Acted     bool   `json:"acted"`
-	Action    string `json:"action,omitempty"`
-	Paged     bool   `json:"paged"`
-	PageEvent string `json:"page_event,omitempty"`
-	Note      string `json:"note"`
+	Acted            bool   `json:"acted"`
+	Action           string `json:"action,omitempty"`
+	Paged            bool   `json:"paged"`
+	PageEvent        string `json:"page_event,omitempty"`
+	DecisionRequired bool   `json:"decision_required"`
+	DecisionState    string `json:"decision_state,omitempty"`
+	Note             string `json:"note"`
 }
 
 // AutoDriveRunGate calls POST /v0/runs/{run_id}/auto-drive (#1700): it drives

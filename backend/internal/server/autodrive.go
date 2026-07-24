@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
@@ -50,7 +51,11 @@ type GitHubMerger interface {
 
 // AutoDriveOutcome reports what AutoDriveRunGate did at a run gate so the
 // campaign driver (E25.6 slice 3) can record the campaign-level marker.
-// Exactly one of Acted / Paged is true on a non-observe-only outcome.
+// A non-observe-only outcome is exactly one of three kinds: Acted (a
+// delegated gate action was dispatched), Paged (a must_page_human
+// condition was refused), or DecisionRequired (a well-defined but
+// non-auto-routable gate state the driver must STOP on and hand to the
+// operator). Observe-only is all four booleans false.
 type AutoDriveOutcome struct {
 	// Acted is true when the actor dispatched a delegated gate action;
 	// Action then names the delegation verb taken (delegation.Action*).
@@ -61,6 +66,17 @@ type AutoDriveOutcome struct {
 	// emitted. No gate action was taken.
 	Paged     bool
 	PageEvent string
+	// DecisionRequired is true when the actor could not auto-act on a
+	// well-defined, EXPECTED gate state and must hand the gate to the
+	// operator — distinct from observe-only (which means keep polling): the
+	// driver must STOP, not spin. DecisionState names the state (e.g.
+	// fixup_budget_exhausted / fixup_ceiling_reached) and Action names the
+	// delegated verb whose arm surfaced it. Set with Acted=false and
+	// Paged=false. Introduced by the E48.41 / #2091 fix so an exhausted
+	// fix-up budget on the delegated route_fixup arm parks the operator with
+	// real next moves instead of bubbling to an HTTP 500.
+	DecisionRequired bool
+	DecisionState    string
 	// Note is a short human-readable summary for the driver log /
 	// observe-only audit. Always set.
 	Note string
@@ -154,6 +170,30 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 	if d, found := res.Decision(delegation.ActionRouteFixup); found && d.Met {
 		dispatched, ferr := s.autoFixup(ctx, id, runRow, stages, open, string(d.Condition))
 		if ferr != nil {
+			// An exhausted fix-up budget / hard ceiling is a well-defined,
+			// EXPECTED gate state, not a dispatch failure (#2091): the direct
+			// fishwawk_fixup_stage path reports it cleanly as a 422, so the
+			// delegated arm must NOT bubble the sentinel to the 500 mapper.
+			// Return a decision_required outcome (nil error) so the driver parks
+			// the operator with real next moves (force an extra pass, waive /
+			// defer the concerns, or cancel). A NON-sentinel ferr is a genuine
+			// dispatch failure and still propagates as the raw error (a 500).
+			if errors.Is(ferr, run.ErrFixupBudgetExhausted) {
+				return AutoDriveOutcome{
+					DecisionRequired: true,
+					DecisionState:    "fixup_budget_exhausted",
+					Action:           delegation.ActionRouteFixup,
+					Note:             ferr.Error(),
+				}, nil
+			}
+			if errors.Is(ferr, run.ErrFixupCeilingReached) {
+				return AutoDriveOutcome{
+					DecisionRequired: true,
+					DecisionState:    "fixup_ceiling_reached",
+					Action:           delegation.ActionRouteFixup,
+					Note:             ferr.Error(),
+				}, nil
+			}
 			return AutoDriveOutcome{Action: delegation.ActionRouteFixup, Note: "fixup dispatch failed"}, ferr
 		}
 		if dispatched {

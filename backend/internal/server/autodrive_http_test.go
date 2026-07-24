@@ -49,6 +49,21 @@ func autoDriveOperatorIdentity() Identity {
 	}
 }
 
+// autoDriveFixupCapableIdentity is the operator-agent HTTP identity carrying the
+// FULL campaign-actor scope set (write:approvals + write:stages/write:fixups/…),
+// as a real operator-agent token driving the delegated route_fixup arm does. The
+// route_fixup dispatch (fixupStageAs) enforces write:stages/write:fixups, which
+// the bare write:approvals autoDriveOperatorIdentity lacks — so the #2091
+// route_fixup HTTP tests use this identity to reach the budget/transition logic
+// rather than short-circuiting on the gate scope check.
+func autoDriveFixupCapableIdentity() Identity {
+	return Identity{
+		Subject: operatorrole.CampaignActorSubject,
+		TokenID: "tok-op-agent",
+		Scopes:  operatorrole.CampaignActorScopes(),
+	}
+}
+
 // autoDrivePost issues POST run_id/auto-drive[/acts] against the handler
 // directly with an injected identity, returning the recorder.
 func autoDrivePost(t *testing.T, s *Server, handler http.HandlerFunc, runID uuid.UUID, suffix, body string, id Identity) *httptest.ResponseRecorder {
@@ -334,6 +349,60 @@ func TestAutoDrive_MergeDispatchError_Surfaces(t *testing.T) {
 	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveOperatorIdentity())
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500 (dispatch error surfaced):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error.Code != "auto_drive_dispatch_failed" {
+		t.Errorf("error code = %q, want auto_drive_dispatch_failed", env.Error.Code)
+	}
+}
+
+// --- (8b, #2091) exhausted route_fixup budget parks decision_required (200) ---
+
+// TestAutoDrive_RouteFixupBudgetExhausted_ParksDecision is the #2091 HTTP pin:
+// a delegated route_fixup arm whose fix-up budget is spent returns 200 with
+// decision_required=true / decision_state=fixup_budget_exhausted — NOT the 500
+// auto_drive_dispatch_failed the pre-#2091 code returned. No gate action fired,
+// so no supplementary run_auto_driven row lands.
+func TestAutoDrive_RouteFixupBudgetExhausted_ParksDecision(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	seedFixupPass(t, au, runID, impl.ID, 1) // budget spent, ceiling has headroom
+
+	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveFixupCapableIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (decision_required parks, not a 500):\n%s", w.Code, w.Body.String())
+	}
+	var out autoDriveResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Acted || out.Paged {
+		t.Fatalf("outcome = %+v, want decision_required (not acted/paged)", out)
+	}
+	if !out.DecisionRequired || out.DecisionState != "fixup_budget_exhausted" {
+		t.Fatalf("outcome = %+v, want decision_required=true decision_state=fixup_budget_exhausted", out)
+	}
+	if countAudit(au, CategoryRunAutoDriven) != 0 {
+		t.Error("run_auto_driven row appended on a decision_required (non-acted) outcome")
+	}
+}
+
+// TestAutoDrive_RouteFixupGenuineError_Surfaces500 is the sibling to the
+// decision-required park: a GENUINE (non-sentinel) route_fixup dispatch failure
+// — here a repo transition error — still surfaces as 500 auto_drive_dispatch_failed,
+// so the new sentinel classification narrows only the budget/ceiling states and
+// leaves real failures fail-loud.
+func TestAutoDrive_RouteFixupGenuineError_Surfaces500(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, _ := seedRouteFixupReady(t, s, repo, au, cr)
+	repo.transitionStageErr = errors.New("stage store down") // genuine dispatch failure
+
+	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveFixupCapableIdentity())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (genuine dispatch error surfaced):\n%s", w.Code, w.Body.String())
 	}
 	var env errorEnvelope
 	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
