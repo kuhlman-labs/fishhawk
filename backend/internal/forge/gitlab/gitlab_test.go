@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -858,5 +859,147 @@ func TestFetchFileNotFound(t *testing.T) {
 	}
 	if fc != nil {
 		t.Errorf("FileContent = %+v on error, want nil", fc)
+	}
+}
+
+// --- per-installation endpoint routing (E44.16 / #2094) -----------------
+
+// countingBranchServer answers GET .../projects/42/repository/branches/{branch}
+// with a fixed tip, counting requests and recording the PRIVATE-TOKEN so a
+// cross-boundary test can prove a resolved base routes a real forge op here and
+// a fail-closed test can prove ZERO requests reach it (no token ships). TLS so
+// a resolved base passes account.ValidateResolvedBaseURL's https requirement.
+func countingBranchServer(t *testing.T) (*httptest.Server, *int64, *string) {
+	t.Helper()
+	var count int64
+	var gotToken string
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/42/repository/branches/{branch}", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&count, 1)
+		gotToken = r.Header.Get("PRIVATE-TOKEN")
+		writeJSON(w, http.StatusOK, `{"name":"main","commit":{"id":"deadbeef"}}`)
+	})
+	srv := httptest.NewTLSServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, &count, &gotToken
+}
+
+// TestForge_PerInstallation_RoutesToResolvedHost is the cross-boundary happy
+// path (resolver -> Forge -> client construction -> real outbound host): a
+// scope-taking forge op (GetBranchSHA) reaches the RESOLVED instance host, the
+// resolver is keyed on the scope's installation ref, and the token ships there
+// — not to the deployment default.
+func TestForge_PerInstallation_RoutesToResolvedHost(t *testing.T) {
+	resolvedSrv, resolvedCount, gotToken := countingBranchServer(t)
+	defaultSrv, defaultCount, _ := countingBranchServer(t)
+
+	var gotRef string
+	f := forgegitlab.New(defaultSrv.URL, staticToken{},
+		forgegitlab.WithHTTPClient(resolvedSrv.Client()),
+		forgegitlab.WithResolveBaseURL(func(_ context.Context, ref string) (string, error) {
+			gotRef = ref
+			return resolvedSrv.URL, nil
+		}),
+	)
+
+	sha, ok, err := f.GetBranchSHA(context.Background(), gitlabScope("42"), forge.RepoRef{}, "main")
+	if err != nil {
+		t.Fatalf("GetBranchSHA: %v", err)
+	}
+	if !ok || sha != "deadbeef" {
+		t.Fatalf("GetBranchSHA = (%q, %v), want (deadbeef, true)", sha, ok)
+	}
+	if gotRef != "gitlab:42" {
+		t.Errorf("resolver got installation ref = %q, want %q", gotRef, "gitlab:42")
+	}
+	if atomic.LoadInt64(resolvedCount) != 1 {
+		t.Errorf("resolved host received %d requests, want 1", atomic.LoadInt64(resolvedCount))
+	}
+	if atomic.LoadInt64(defaultCount) != 0 {
+		t.Errorf("default host received %d requests, want 0 (routed to resolved host)", atomic.LoadInt64(defaultCount))
+	}
+	if *gotToken != "glpat-test" {
+		t.Errorf("resolved host saw PRIVATE-TOKEN = %q, want glpat-test", *gotToken)
+	}
+}
+
+// TestForge_PerInstallation_FailClosed pins the per-mode fail-closed contract
+// (#2094 binding condition 1): a resolver DB fault, a disallowed host
+// (allowlist miss), and a bad scheme (http / relative) each make a scope-taking
+// forge op return an error, construct NO client, and issue NO request — the
+// token never ships.
+func TestForge_PerInstallation_FailClosed(t *testing.T) {
+	sentinel := errors.New("boom: db fault")
+	for _, tc := range []struct {
+		name      string
+		allowlist []string
+		resolve   func(context.Context, string) (string, error)
+		wantWrap  error
+	}{
+		{
+			name:     "resolver db fault",
+			resolve:  func(context.Context, string) (string, error) { return "", sentinel },
+			wantWrap: sentinel,
+		},
+		{
+			name:      "disallowed host (allowlist miss)",
+			allowlist: []string{"allowed.example.com"},
+			resolve:   func(context.Context, string) (string, error) { return "https://evil.example.com", nil },
+		},
+		{
+			name:    "bad scheme (http)",
+			resolve: func(context.Context, string) (string, error) { return "http://insecure.example.com", nil },
+		},
+		{
+			name:    "bad scheme (relative)",
+			resolve: func(context.Context, string) (string, error) { return "/api/v4", nil },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, count, gotToken := countingBranchServer(t)
+			f := forgegitlab.New(srv.URL, staticToken{},
+				forgegitlab.WithHTTPClient(srv.Client()),
+				forgegitlab.WithResolveBaseURL(tc.resolve),
+				forgegitlab.WithAllowedInstallationHosts(tc.allowlist),
+			)
+
+			_, _, err := f.GetBranchSHA(context.Background(), gitlabScope("42"), forge.RepoRef{}, "main")
+			if err == nil {
+				t.Fatal("GetBranchSHA succeeded, want a fail-closed error")
+			}
+			if tc.wantWrap != nil && !errors.Is(err, tc.wantWrap) {
+				t.Errorf("err = %v, want it to wrap the resolver error", err)
+			}
+			if atomic.LoadInt64(count) != 0 {
+				t.Errorf("server received %d requests, want 0 (fail-closed, no request issued)", atomic.LoadInt64(count))
+			}
+			if *gotToken != "" {
+				t.Errorf("server saw PRIVATE-TOKEN = %q, want empty (token must never ship on fail-closed)", *gotToken)
+			}
+		})
+	}
+}
+
+// TestForge_PerInstallation_BackwardCompat_NilResolver pins the deployment-
+// default posture: with NO resolver wired, a scope-taking forge op targets the
+// deployment-default host byte-identical to Mode 1 (no per-installation
+// routing, no resolver consulted because none exists).
+func TestForge_PerInstallation_BackwardCompat_NilResolver(t *testing.T) {
+	defaultSrv, defaultCount, gotToken := countingBranchServer(t)
+	f := forgegitlab.New(defaultSrv.URL, staticToken{},
+		forgegitlab.WithHTTPClient(defaultSrv.Client()))
+
+	sha, ok, err := f.GetBranchSHA(context.Background(), gitlabScope("42"), forge.RepoRef{}, "main")
+	if err != nil {
+		t.Fatalf("GetBranchSHA: %v", err)
+	}
+	if !ok || sha != "deadbeef" {
+		t.Fatalf("GetBranchSHA = (%q, %v), want (deadbeef, true)", sha, ok)
+	}
+	if atomic.LoadInt64(defaultCount) != 1 {
+		t.Errorf("default host received %d requests, want 1 (nil resolver -> deployment default)", atomic.LoadInt64(defaultCount))
+	}
+	if *gotToken != "glpat-test" {
+		t.Errorf("default host saw PRIVATE-TOKEN = %q, want glpat-test", *gotToken)
 	}
 }
