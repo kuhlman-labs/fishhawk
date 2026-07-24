@@ -739,6 +739,71 @@ func TestNotifyStatusUpdateForRun_NilReceiver_NoOp(t *testing.T) {
 	}
 }
 
+// TestNotifyStatusUpdateForRun_RollsUpChildLineage is the anchor-rebuild
+// call-site integration for the lineage rollup (#2100): the real Notifier over
+// fake repos, seeded with a decomposition slice child, threads
+// NotifyStatusUpdateForRun → LoadChildRunEconomics → BuildRunEconomics(children)
+// end to end. The rendered anchor carries the By-run breakdown naming parent +
+// child and a displayed total summed from the RUN ROWS ($10 + $5 = $15),
+// independent of the child's cost ledger.
+func TestNotifyStatusUpdateForRun_RollsUpChildLineage(t *testing.T) {
+	runID, gh, au, runs, n := happyDepsWithStages(t)
+	runs.runs[runID].CostUSDTotal = 10.00
+	childID := uuid.New()
+	sliceIdx := 0
+	runs.decomposedChildren = []*run.Run{{
+		ID: childID, Repo: "x/y", WorkflowID: "feature_change",
+		State: run.StateSucceeded, CostUSDTotal: 5.00, SliceIndex: &sliceIdx,
+	}}
+	// Child cost ledger folds into the per-stage / cache aggregates.
+	au.preSeed(childID, "cost_recorded", map[string]any{
+		"model": "claude-opus-4-8", "usd": 5.00, "source": "implement",
+		"input_tokens": 100, "output_tokens": 50,
+	})
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	for _, want := range []string{"**By run**", "parent", runID.String()[:8], "slice 1", childID.String()[:8], "$15.00"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q\n---\n%s", want, body)
+		}
+	}
+}
+
+// TestNotifyStatusUpdateForRun_ChildListError_DegradesToSingleRun proves the
+// anchor-rebuild cErr fallback (#2100): when the DecomposedFrom lineage walk
+// itself fails, the rebuild warn-logs and renders the single-run economics
+// block (parent cost only, NO By-run breakdown) rather than aborting.
+func TestNotifyStatusUpdateForRun_ChildListError_DegradesToSingleRun(t *testing.T) {
+	runID, gh, au, runs, n := happyDepsWithStages(t)
+	runs.runs[runID].CostUSDTotal = 10.00
+	runs.listErr = errors.New("list boom")
+	// A parent cost ledger so the single-run block is non-empty.
+	au.preSeed(runID, "cost_recorded", map[string]any{
+		"model": "claude-opus-4-8", "usd": 10.00, "source": "implement",
+		"input_tokens": 100, "output_tokens": 50,
+	})
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if strings.Contains(body, "**By run**") {
+		t.Errorf("expected single-run degrade with no By-run breakdown\n---\n%s", body)
+	}
+	if !strings.Contains(body, "$10.00") {
+		t.Errorf("expected the parent's single-run total; body:\n%s", body)
+	}
+}
+
 // countAppendedCategory returns how many audit rows the notifier appended in
 // the given category (page-class dedup-row assertions).
 func countAppendedCategory(au *fakeAudit, category string) int {
@@ -1557,12 +1622,19 @@ type fakeRuns struct {
 	// filter (the economics lineage rollup, #2100). Nil by default so every
 	// existing test takes the single-run economics path.
 	decomposedChildren []*run.Run
+	// listErr, when non-nil, fails the DecomposedFrom lineage walk so a test can
+	// prove the anchor-rebuild cErr fallback degrades to the single-run block
+	// (#2100).
+	listErr error
 }
 
 // ListRuns serves the decomposition-children lineage walk (#2100). Only the
 // DecomposedFrom filter returns children; any other filter yields none.
 func (f *fakeRuns) ListRuns(_ context.Context, filter run.ListRunsFilter) ([]*run.Run, error) {
 	if filter.DecomposedFrom != nil {
+		if f.listErr != nil {
+			return nil, f.listErr
+		}
 		return f.decomposedChildren, nil
 	}
 	return nil, nil

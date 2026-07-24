@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strconv"
@@ -906,11 +907,21 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	}
 	current, superseded := n.loadAnchorPlans(ctx, stages, entries)
 	// Roll the full decomposition lineage into the economics block (#2100). A
-	// load failure to ENUMERATE children falls back to the single-run block
-	// (children=nil) rather than aborting the anchor rebuild — best-effort per
-	// the package posture. A childless run returns nil children (single-run).
+	// load failure to ENUMERATE children warn-logs and falls back to the
+	// single-run block rather than aborting the anchor rebuild — best-effort per
+	// the package posture, symmetric with the server-side stamp's degrade
+	// (deriveEconomicsBlock). A childless run returns nil children (single-run).
 	children, cErr := LoadChildRunEconomics(ctx, n.runs, n.audit, runID)
 	if cErr != nil {
+		// LoadChildRunEconomics already returns nil children on error; the log —
+		// not the (belt-and-suspenders) assignment — is what makes a decomposed
+		// run silently degrading to single-run figures diagnosable after a
+		// transient ListRuns failure. The notifier carries no logger dependency,
+		// so use the process default (the runnerbackend/webhook fallback idiom).
+		slog.Default().WarnContext(ctx,
+			"issuecomment: load lineage children failed; economics degraded to single-run",
+			slog.String("run_id", runID.String()),
+			slog.String("error", cErr.Error()))
 		children = nil
 	}
 	body := RenderAnchorBody(AnchorInput{

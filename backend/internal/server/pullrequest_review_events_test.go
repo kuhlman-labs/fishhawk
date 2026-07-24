@@ -1418,6 +1418,38 @@ func TestDeriveEconomicsBlock_RollsUpLineageMatchesNotifier(t *testing.T) {
 	}
 }
 
+// TestDeriveEconomicsBlock_ChildListError_DegradesToSingleRun covers the
+// server-seam lineage-load failure branch (#2100): when the DecomposedFrom walk
+// itself errors, deriveEconomicsBlock warn-logs and falls back to the
+// single-run block (children=nil) — the parent's own figures with NO By-run
+// breakdown — rather than dropping the economics stamp. This is the one error
+// path the change introduces at the server call site.
+func TestDeriveEconomicsBlock_ChildListError_DegradesToSingleRun(t *testing.T) {
+	parentID := uuid.New()
+	parent := &run.Run{ID: parentID, Repo: "x/y", CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 9.29}
+	parentChain := stampChain(parentID)
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{parent},
+		listErr:    errors.New("list boom"), // fails the DecomposedFrom walk
+	}
+	ar := &prEventsAuditRepo{listForRun: parentChain}
+	s := prEventsTestServer(t, rr, ar)
+
+	got := s.deriveEconomicsBlock(context.Background(), parent)
+
+	// Byte-identical to the single-run block over the parent's own chain.
+	want := issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(parent, parentChain, nil))
+	if got != want {
+		t.Errorf("degraded block != single-run block:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+	if strings.Contains(got, "**By run**") {
+		t.Errorf("a child-list error must degrade to single-run (no By-run breakdown):\n%s", got)
+	}
+	if !strings.Contains(got, "$9.29") {
+		t.Errorf("expected the parent's own total in the degraded block:\n%s", got)
+	}
+}
+
 // TestSpliceEconomicsSection covers the splice branches directly: append into
 // a plain body, replace an existing section (idempotent identity), append into
 // an empty body, and recover from a corrupted begin-marker-without-end.
