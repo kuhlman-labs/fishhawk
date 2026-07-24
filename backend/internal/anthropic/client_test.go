@@ -351,6 +351,95 @@ func TestRegionScopedInference_BothReviewPaths(t *testing.T) {
 	}
 }
 
+// TestNewClient_EmptyKeyNeutralizesAmbientCredentials proves the empty-key
+// boundary invariant (#2108): when cfg.APIKey is empty, NewClient appends
+// option.WithoutEnvironmentDefaults() so the SDK's credential autoloader
+// contributes NOTHING from the process environment. Each sub-case SETS a
+// distinct ambient sentinel via t.Setenv (never clears it) and drives a real
+// Messages call to a custom endpoint, then asserts that neither sentinel appears
+// in the observed x-api-key / Authorization headers. Header-ABSENCE on the wire
+// is the security invariant — NOT a request count or an error shape: with the
+// autoloader suppressed a request may legitimately reach the endpoint carrying
+// no credential at all, and either outcome (no request, or a credential-less
+// request) satisfies absence. Without the fix, the ambient sentinel would be
+// autoloaded onto the request and this test would catch it.
+func TestNewClient_EmptyKeyNeutralizesAmbientCredentials(t *testing.T) {
+	const (
+		ambientAPIKey    = "ambient-api-key-sentinel"
+		ambientAuthToken = "ambient-auth-token-sentinel"
+	)
+	// One behavioral assertion per named ambient source: ANTHROPIC_API_KEY
+	// only, ANTHROPIC_AUTH_TOKEN only, and both.
+	for _, tc := range []struct {
+		name         string
+		apiKeyEnv    string
+		authTokenEnv string
+	}{
+		{"ANTHROPIC_API_KEY only", ambientAPIKey, ""},
+		{"ANTHROPIC_AUTH_TOKEN only", "", ambientAuthToken},
+		{"both ambient sources", ambientAPIKey, ambientAuthToken},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ANTHROPIC_API_KEY", tc.apiKeyEnv)
+			t.Setenv("ANTHROPIC_AUTH_TOKEN", tc.authTokenEnv)
+
+			srv, seen := regionEndpoint(t)
+			cfg := testConfig()
+			cfg.APIKey = "" // the withhold posture: no explicit credential
+			cfg.BaseURL = srv.URL
+			c := NewClient(cfg)
+
+			// The call MAY reach the endpoint with no credential or MAY error
+			// before opening a connection — both are legitimate with the
+			// autoloader suppressed, so the return is deliberately ignored. The
+			// invariant is what any observed request carried on the wire.
+			_, _, _, _, _, _, _ = c.Messages(context.Background(), "sys", "user")
+
+			for i, obs := range *seen {
+				if strings.Contains(obs.apiKey, ambientAPIKey) || strings.Contains(obs.auth, ambientAPIKey) {
+					t.Errorf("request %d carried the ambient ANTHROPIC_API_KEY sentinel to the endpoint (x-api-key=%q Authorization=%q); an empty explicit key must neutralize it",
+						i, obs.apiKey, obs.auth)
+				}
+				if strings.Contains(obs.apiKey, ambientAuthToken) || strings.Contains(obs.auth, ambientAuthToken) {
+					t.Errorf("request %d carried the ambient ANTHROPIC_AUTH_TOKEN sentinel to the endpoint (x-api-key=%q Authorization=%q); an empty explicit key must neutralize it",
+						i, obs.apiKey, obs.auth)
+				}
+			}
+		})
+	}
+
+	// Positive control (no-regression): with a NON-empty explicit key the guard
+	// is inert — the autoloader is NOT suppressed, yet the explicit key still
+	// wins and is presented on the wire. Proves the neutralization bites only on
+	// the empty-key path, leaving every existing non-empty-key caller unchanged.
+	t.Run("non-empty key still presented", func(t *testing.T) {
+		t.Setenv("ANTHROPIC_API_KEY", ambientAPIKey)
+
+		srv, seen := regionEndpoint(t)
+		const explicitKey = "explicit-region-key"
+		cfg := testConfig()
+		cfg.APIKey = explicitKey
+		cfg.BaseURL = srv.URL
+		c := NewClient(cfg)
+
+		if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+			t.Fatalf("Messages: %v", err)
+		}
+		if len(*seen) != 1 {
+			t.Fatalf("endpoint saw %d requests, want 1", len(*seen))
+		}
+		obs := (*seen)[0]
+		if obs.apiKey != explicitKey && obs.auth != "Bearer "+explicitKey {
+			t.Errorf("explicit key not presented: x-api-key=%q Authorization=%q, want the explicit key %q in one of them",
+				obs.apiKey, obs.auth, explicitKey)
+		}
+		if strings.Contains(obs.apiKey, ambientAPIKey) || strings.Contains(obs.auth, ambientAPIKey) {
+			t.Errorf("the ambient ANTHROPIC_API_KEY sentinel shadowed the explicit key (x-api-key=%q Authorization=%q)",
+				obs.apiKey, obs.auth)
+		}
+	})
+}
+
 // TestNewClient_EmptyBaseURLKeepsSDKDefault asserts the single-cell posture:
 // an unset BaseURL adds no override, so an explicit option.WithBaseURL (what
 // every other test here relies on) still governs.

@@ -55,6 +55,21 @@ type Client struct {
 // A non-empty cfg.BaseURL is applied as a DEFAULT (before opts), so the
 // region-scoped endpoint governs production while a test's explicit
 // option.WithBaseURL still wins.
+//
+// Empty-key boundary invariant (#2108): when cfg.APIKey == "" the client
+// appends option.WithoutEnvironmentDefaults(), which makes anthropicsdk.NewClient
+// skip DefaultClientOptions() (only the hardcoded production base-URL default is
+// kept). This suppresses the SDK's credential autoloader — ANTHROPIC_API_KEY /
+// ANTHROPIC_AUTH_TOKEN / ANTHROPIC_PROFILE / env-federation — so an empty
+// explicit key means "present no credential from ANY source", not "empty
+// X-Api-Key layered over whatever ambient Authorization header the autoloader
+// set". The withhold posture (#2108: FISHHAWKD_MODEL_BASE_URL set with no
+// FISHHAWKD_MODEL_API_KEY) relies on THIS to keep an operator shell's ambient
+// Anthropic credential from reaching the operator-configured region endpoint —
+// not on the empty explicit key alone. Our explicit option.WithBaseURL(cfg.BaseURL)
+// (always non-empty in that withhold posture) still routes the call, since
+// WithoutEnvironmentDefaults keeps only the base-URL default and our option is
+// applied after it.
 func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 	defaults := []option.RequestOption{
 		option.WithAPIKey(cfg.APIKey),
@@ -62,6 +77,11 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 	}
 	if cfg.BaseURL != "" {
 		defaults = append(defaults, option.WithBaseURL(cfg.BaseURL))
+	}
+	if cfg.APIKey == "" {
+		// Neutralize every ambient SDK credential source so an empty explicit
+		// key contributes NO credential from the process environment (#2108).
+		defaults = append(defaults, option.WithoutEnvironmentDefaults())
 	}
 	allOpts := append(defaults, opts...)
 	return &Client{
