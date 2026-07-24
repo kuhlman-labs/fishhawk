@@ -1942,21 +1942,21 @@ func (s *Server) checkPlanBudget(w http.ResponseWriter, r *http.Request, stage *
 // found or a read failed, never a valid flat state), so failing closed on nil
 // does not over-block a legitimate flat-plan approve.
 //
-// The ONE fail-open precondition is a config-level absence — ArtifactRepo or
-// RunRepo unset — where no decomposition can exist at all and there is no
-// fan-out surface to protect. This mirrors checkPlanBudget/checkPlanScopeCap's
-// ArtifactRepo==nil posture and is unreachable in production (both repos are
-// always wired), so the universal fail-closed guarantee holds where it matters.
+// The fail-closed guarantee is UNIVERSAL — there is NO config-absence carve-out
+// (binding condition 2 / gpt-5.6-sol's HIGH internal-inconsistency,
+// claude-fable-5's authz bypass). If ArtifactRepo or RunRepo is unset,
+// loadApprovedPlanForRun returns (nil, nil), which this gate treats as
+// indeterminate and fails CLOSED rather than passing an unconfirmed add through:
+// a non-empty add_scope_files approve must never be recorded without POSITIVE
+// confirmation the plan is non-decomposed. Diverging here from
+// checkPlanBudget/checkPlanScopeCap's ArtifactRepo==nil fail-open is correct
+// because those gates are override-able upper-bound heuristics while this one is
+// categorical (guaranteed conflict, no override). Production always wires both
+// repos, so the config-absent branch is unreachable there; the divergence only
+// tightens a test/misconfiguration path.
 func (s *Server) checkDecomposedAddScopeFiles(w http.ResponseWriter, r *http.Request, stage *run.Stage, addScopeFiles []string) bool {
 	// Empty add is always safe — nothing to fan out.
 	if len(addScopeFiles) == 0 {
-		return true
-	}
-
-	// Plan-artifact subsystem not configured: no decomposition can exist, so
-	// there is nothing to fan into. Fail OPEN, matching the sibling plan gates.
-	// Production always wires both repos, so this branch never fires there.
-	if s.cfg.ArtifactRepo == nil || s.cfg.RunRepo == nil {
 		return true
 	}
 

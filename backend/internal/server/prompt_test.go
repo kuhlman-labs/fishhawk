@@ -6571,9 +6571,11 @@ func TestGetStagePrompt_Implement_AddScopeFilesVisibleInPromptText(t *testing.T)
 // The assertion is the happens-before: at the instant the plan stage flips to
 // succeeded, the add_scope_files audit is already queryable. This FAILS on the
 // pre-fix ordering and PASSES once writeApprovalAudit is moved ahead of
-// advanceStage. No ArtifactRepo/SigningRepo is wired — the prompt is never
-// fetched; the test isolates the write→transition ordering inside the approval
-// handler.
+// advanceStage. A flat plan artifact is wired only so the #2103 add_scope_files
+// fan-in gate confirms the plan non-decomposed and the approve reaches Submit
+// (the gate now fails closed on an unconfirmed plan); the prompt is never
+// fetched, so the test still isolates the write→transition ordering inside the
+// approval handler.
 func TestSubmitApproval_AddScopeFiles_AuditVisibleBeforePlanStageAdvance(t *testing.T) {
 	addScopeFiles := []string{
 		"runner/cmd/fishhawk-runner/main_test.go",
@@ -6588,6 +6590,14 @@ func TestSubmitApproval_AddScopeFiles_AuditVisibleBeforePlanStageAdvance(t *test
 
 	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
 	rr.getStages[planStageID] = planStage
+	// The #2103 add_scope_files fan-in gate now fails CLOSED unless the plan can
+	// be POSITIVELY confirmed non-decomposed, so make the plan stage discoverable
+	// (ListStagesForRun) and wire a flat plan artifact so this add_scope_files
+	// approve reaches 200 legitimately (not via the removed ArtifactRepo==nil
+	// fail-open). This test still isolates the write→transition ordering.
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
+	art := newFakeArtifactRepo()
+	seedBudgetPlanArtifact(t, art, planStageID, &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 5})
 	rr.getRuns[runID] = &run.Run{
 		ID:            runID,
 		Repo:          "o/r",
@@ -6618,6 +6628,7 @@ func TestSubmitApproval_AddScopeFiles_AuditVisibleBeforePlanStageAdvance(t *test
 		RunRepo:      rr,
 		ApprovalRepo: newFakeApprovalRepo(),
 		AuditRepo:    au,
+		ArtifactRepo: art,
 	})
 
 	body := fmt.Sprintf(`{"decision":"approve","add_scope_files":[%q,%q]}`, addScopeFiles[0], addScopeFiles[1])
