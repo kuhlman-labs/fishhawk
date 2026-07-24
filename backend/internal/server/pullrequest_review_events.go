@@ -695,7 +695,19 @@ func (s *Server) deriveEconomicsBlock(ctx context.Context, target *run.Run) stri
 			slog.String("error", err.Error()))
 		return ""
 	}
-	return issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(target, entries))
+	// Roll the full decomposition lineage in from the SAME walk the anchor uses
+	// (#2100), so the merge-time PR-body stamp and the living anchor render the
+	// identical figures. A failure to enumerate children warn-logs and falls
+	// back to the single-run block (children=nil).
+	children, err := issuecomment.LoadChildRunEconomics(ctx, s.cfg.RunRepo, s.cfg.AuditRepo, target.ID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"economics stamp: load lineage children failed",
+			slog.String("run_id", target.ID.String()),
+			slog.String("error", err.Error()))
+		children = nil
+	}
+	return issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(target, entries, children))
 }
 
 // spliceEconomicsSection returns body with the delimited fishhawk:economics

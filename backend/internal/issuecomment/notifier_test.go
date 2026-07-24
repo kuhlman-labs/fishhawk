@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -1552,6 +1553,19 @@ type fakeRuns struct {
 	run.Repository
 	runs   map[uuid.UUID]*run.Run
 	stages map[uuid.UUID][]*run.Stage
+	// decomposedChildren, when non-nil, is returned for a DecomposedFrom ListRuns
+	// filter (the economics lineage rollup, #2100). Nil by default so every
+	// existing test takes the single-run economics path.
+	decomposedChildren []*run.Run
+}
+
+// ListRuns serves the decomposition-children lineage walk (#2100). Only the
+// DecomposedFrom filter returns children; any other filter yields none.
+func (f *fakeRuns) ListRuns(_ context.Context, filter run.ListRunsFilter) ([]*run.Run, error) {
+	if filter.DecomposedFrom != nil {
+		return f.decomposedChildren, nil
+	}
+	return nil, nil
 }
 
 func (f *fakeRuns) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
@@ -1895,7 +1909,7 @@ func TestBuildRunEconomics_FoldsChain(t *testing.T) {
 		econEntry(8, "pr_merged", 7900, nil), // checks_green_to_merge = 900; wall clock = 7800
 	}
 
-	econ := issuecomment.BuildRunEconomics(runRow, entries)
+	econ := issuecomment.BuildRunEconomics(runRow, entries, nil)
 	if econ == nil {
 		t.Fatal("BuildRunEconomics returned nil")
 	}
@@ -1950,7 +1964,7 @@ func TestBuildRunEconomics_EmptyChainRendersNothing(t *testing.T) {
 	runRow := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(100, 0).UTC()}
 	econ := issuecomment.BuildRunEconomics(runRow, []*audit.Entry{
 		econEntry(1, "stage_dispatched", 200, nil),
-	})
+	}, nil)
 	if got := issuecomment.RenderEconomicsBlock(*econ); got != "" {
 		t.Errorf("empty-signal chain should render an empty block; got %q", got)
 	}
@@ -1965,7 +1979,7 @@ func TestBuildRunEconomics_MalformedCostSkipped(t *testing.T) {
 		{Sequence: 1, Category: "cost_recorded", Timestamp: time.Unix(150, 0).UTC(), Payload: json.RawMessage(`{not valid json`)},
 		econEntry(2, "cost_recorded", 200, map[string]any{"usd": 0.25, "source": "agent", "model": "claude-opus-4-8"}),
 	}
-	econ := issuecomment.BuildRunEconomics(runRow, entries)
+	econ := issuecomment.BuildRunEconomics(runRow, entries, nil)
 	// The single valid entry is the only stage; the malformed one contributed nothing.
 	if len(econ.Cost.Stages) != 1 || econ.Cost.Stages[0].Source != "agent" {
 		t.Fatalf("malformed cost entry must be skipped, valid one kept: %+v", econ.Cost.Stages)
@@ -1987,7 +2001,7 @@ func TestBuildRunEconomics_SynthesizesCIGreenGate(t *testing.T) {
 		econEntry(3, "pr_merged", 7900, nil), // checks_green_to_merge = 900
 		econEntry(4, drive.Category, 7950, map[string]any{"rule": "some_other_rule"}),
 	}
-	econ := issuecomment.BuildRunEconomics(runRow, entries)
+	econ := issuecomment.BuildRunEconomics(runRow, entries, nil)
 	var checksGreen float64 = -1
 	for _, g := range econ.Latency.Gates {
 		if g.Gate == latency.GateChecksGreenToMerge {
@@ -1997,6 +2011,270 @@ func TestBuildRunEconomics_SynthesizesCIGreenGate(t *testing.T) {
 	if checksGreen != 900 {
 		t.Errorf("checks_green_to_merge wait = %v, want 900 (synthesized from run_auto_advanced)", checksGreen)
 	}
+}
+
+// econIntPtr returns a pointer to i for the nullable SliceIndex field.
+func econIntPtr(i int) *int { return &i }
+
+// costChildEntry builds a single-entry cost_recorded ledger for a slice child
+// fixture at the given timestamp with the given cost + cache tokens.
+func costChildEntry(seq int64, ts int64, source string, usd float64, cacheRead, cacheWrite int) []*audit.Entry {
+	return []*audit.Entry{econEntry(seq, "cost_recorded", ts, map[string]any{
+		"usd": usd, "source": source, "model": "claude-opus-4-8",
+		"input_tokens": 100, "output_tokens": 50,
+		"cache_read_input_tokens": cacheRead, "cache_write_input_tokens": cacheWrite,
+	})}
+}
+
+// TestBuildRunEconomics_RollsUpLineage is the core rollup behavior (#2100): a
+// decomposed parent's displayed total = parent.CostUSDTotal + Σ child.Run
+// .CostUSDTotal, each child's cache tokens fold in (net savings differs from the
+// parent-only value), the wall-clock end bound extends past a child's later
+// entry, and PerRun names the parent + each slice with its rolled cost.
+func TestBuildRunEconomics_RollsUpLineage(t *testing.T) {
+	parentID := uuid.New()
+	runRow := &run.Run{ID: parentID, CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 9.29}
+	parentEntries := []*audit.Entry{
+		econEntry(1, "cost_recorded", 200, map[string]any{"usd": 9.29, "source": "agent", "model": "claude-opus-4-8",
+			"cache_read_input_tokens": 500, "cache_write_input_tokens": 100}),
+	}
+	child0 := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(150, 0).UTC(), CostUSDTotal: 40.00, SliceIndex: econIntPtr(0)}
+	child1 := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(160, 0).UTC(), CostUSDTotal: 44.54, SliceIndex: econIntPtr(1)}
+	children := []issuecomment.ChildRunEconomics{
+		{Run: child0, Entries: costChildEntry(1, 5000, "agent", 40.00, 3000, 400)},
+		{Run: child1, Entries: costChildEntry(1, 9000, "agent", 44.54, 2000, 300)}, // ts 9000 > parent max 200
+	}
+
+	econ := issuecomment.BuildRunEconomics(runRow, parentEntries, children)
+
+	// (a) Displayed total = parent + Σ children.
+	const wantTotal = 9.29 + 40.00 + 44.54
+	if math.Abs(econ.Cost.TotalUSD-wantTotal) > 1e-9 {
+		t.Errorf("rolled total = %v, want %v (parent + both slices)", econ.Cost.TotalUSD, wantTotal)
+	}
+
+	// (b) Cache folds the children's token splits — net savings differs from the
+	// parent-only fold.
+	parentOnly := issuecomment.BuildRunEconomics(runRow, parentEntries, nil)
+	if econ.Cache.CacheReadTokens <= parentOnly.Cache.CacheReadTokens {
+		t.Errorf("folded cache read tokens %d should exceed parent-only %d", econ.Cache.CacheReadTokens, parentOnly.Cache.CacheReadTokens)
+	}
+	if econ.Cache.NetSavingsUSD == parentOnly.Cache.NetSavingsUSD {
+		t.Errorf("folded net savings %v should differ from parent-only %v", econ.Cache.NetSavingsUSD, parentOnly.Cache.NetSavingsUSD)
+	}
+
+	// (c) Wall clock extends to the latest child entry (ts 9000 - created 100).
+	if econ.Latency.WallClockSeconds != 8900 {
+		t.Errorf("wall clock = %v, want 8900 (extended by child entry)", econ.Latency.WallClockSeconds)
+	}
+
+	// (d) PerRun names parent + each slice with its rolled cost.
+	if len(econ.PerRun) != 3 {
+		t.Fatalf("PerRun = %d rows, want 3 (parent + 2 slices): %+v", len(econ.PerRun), econ.PerRun)
+	}
+	if econ.PerRun[0].Label != "parent" || econ.PerRun[0].CostUSD != 9.29 {
+		t.Errorf("PerRun[0] = %+v, want parent $9.29", econ.PerRun[0])
+	}
+	if econ.PerRun[1].Label != "slice 1" || econ.PerRun[1].CostUSD != 40.00 {
+		t.Errorf("PerRun[1] = %+v, want slice 1 $40.00", econ.PerRun[1])
+	}
+	if econ.PerRun[2].Label != "slice 2" || econ.PerRun[2].CostUSD != 44.54 {
+		t.Errorf("PerRun[2] = %+v, want slice 2 $44.54", econ.PerRun[2])
+	}
+
+	// Rendered block reflects the rolled total + the per-run breakdown.
+	block := issuecomment.RenderEconomicsBlock(*econ)
+	for _, want := range []string{"**Total cost**: $93.83", "- **By run**:", "slice 1 (", "slice 2 ("} {
+		if !strings.Contains(block, want) {
+			t.Errorf("rendered block missing %q:\n%s", want, block)
+		}
+	}
+}
+
+// TestBuildRunEconomics_ChildAuditFailureStillCounts pins binding condition 1:
+// a child whose cost_recorded audit read failed (nil Entries) STILL appears in
+// the displayed total AND the per-run breakdown with its run-row CostUSDTotal;
+// ONLY its cache contribution is omitted. The two child data sources are
+// separated so an audit-read failure never drops a child.
+func TestBuildRunEconomics_ChildAuditFailureStillCounts(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 9.29}
+	parentEntries := []*audit.Entry{
+		econEntry(1, "cost_recorded", 200, map[string]any{"usd": 9.29, "source": "agent", "model": "claude-opus-4-8"}),
+	}
+	okChild := &run.Run{ID: uuid.New(), CostUSDTotal: 40.00, SliceIndex: econIntPtr(0)}
+	failedChild := &run.Run{ID: uuid.New(), CostUSDTotal: 44.54, SliceIndex: econIntPtr(1)}
+	children := []issuecomment.ChildRunEconomics{
+		{Run: okChild, Entries: costChildEntry(1, 5000, "agent", 40.00, 3000, 400)},
+		{Run: failedChild, Entries: nil}, // audit read failed -> nil entries
+	}
+
+	econ := issuecomment.BuildRunEconomics(runRow, parentEntries, children)
+
+	// Total still includes the failed child's run-row cost.
+	const wantTotal = 9.29 + 40.00 + 44.54
+	if math.Abs(econ.Cost.TotalUSD-wantTotal) > 1e-9 {
+		t.Errorf("total = %v, want %v — a per-child audit failure must not drop the child from the total", econ.Cost.TotalUSD, wantTotal)
+	}
+	// The failed child still names a per-run row with its cost.
+	var sawFailed bool
+	for _, pr := range econ.PerRun {
+		if pr.RunID == failedChild.ID.String() {
+			sawFailed = true
+			if pr.CostUSD != 44.54 || pr.Label != "slice 2" {
+				t.Errorf("failed child row = %+v, want slice 2 $44.54", pr)
+			}
+		}
+	}
+	if !sawFailed {
+		t.Error("failed-audit child missing from the per-run breakdown; condition 1 requires it be named")
+	}
+	// Only the OK child's cache tokens folded — the failed child contributed none.
+	if econ.Cache.CacheReadTokens != 3000 || econ.Cache.CacheWriteTokens != 400 {
+		t.Errorf("cache tokens = read %d / write %d, want only the OK child's 3000 / 400", econ.Cache.CacheReadTokens, econ.Cache.CacheWriteTokens)
+	}
+}
+
+// TestBuildRunEconomics_AllZeroLineageSuppressed pins binding condition 3: an
+// all-zero-cost lineage (parent + children all CostUSDTotal 0, no cost/stage/
+// gate/cache entries) still suppresses the block via economicsEmpty exactly as
+// an undecomposed empty run does — a populated PerRun does NOT force the block.
+func TestBuildRunEconomics_AllZeroLineageSuppressed(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 0}
+	children := []issuecomment.ChildRunEconomics{
+		{Run: &run.Run{ID: uuid.New(), CostUSDTotal: 0, SliceIndex: econIntPtr(0)}},
+		{Run: &run.Run{ID: uuid.New(), CostUSDTotal: 0, SliceIndex: econIntPtr(1)}},
+	}
+	econ := issuecomment.BuildRunEconomics(runRow, nil, children)
+	if got := issuecomment.RenderEconomicsBlock(*econ); got != "" {
+		t.Errorf("all-zero lineage should render an empty block (byte-identical to today); got %q", got)
+	}
+}
+
+// TestBuildRunEconomics_ChildLabelFallsBackToShortID pins the childRunLabel
+// fallback: a child missing its SliceIndex is labeled "slice <short id>" rather
+// than left unlabeled, and still counts toward the total.
+func TestBuildRunEconomics_ChildLabelFallsBackToShortID(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 1.00}
+	child := &run.Run{ID: uuid.New(), CostUSDTotal: 2.00} // no SliceIndex
+	econ := issuecomment.BuildRunEconomics(runRow, nil, []issuecomment.ChildRunEconomics{{Run: child}})
+	if econ.Cost.TotalUSD != 3.00 {
+		t.Errorf("total = %v, want 3.00", econ.Cost.TotalUSD)
+	}
+	if len(econ.PerRun) != 2 {
+		t.Fatalf("PerRun = %d rows, want 2", len(econ.PerRun))
+	}
+	want := "slice " + child.ID.String()[:8]
+	if econ.PerRun[1].Label != want {
+		t.Errorf("fallback label = %q, want %q", econ.PerRun[1].Label, want)
+	}
+}
+
+// lineageRuns is a minimal run.Repository for the LoadChildRunEconomics tests:
+// ListRuns returns the seeded decomposition children ONLY for a DecomposedFrom
+// filter — proving the walk uses the decomposition lineage field, not
+// ParentRunID (binding condition 2 / #1751) — and records the filter it saw.
+type lineageRuns struct {
+	run.Repository
+	children       []*run.Run
+	listErr        error
+	lastFilter     run.ListRunsFilter
+	sawParentRunID bool
+}
+
+func (r *lineageRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	r.lastFilter = f
+	if f.ParentRunID != nil {
+		r.sawParentRunID = true
+	}
+	if r.listErr != nil {
+		return nil, r.listErr
+	}
+	if f.DecomposedFrom == nil {
+		return nil, nil
+	}
+	return r.children, nil
+}
+
+// lineageAudit serves per-run cost_recorded entries and can fail the read for
+// one specific run id (the per-child audit-failure path, binding condition 1).
+type lineageAudit struct {
+	audit.Repository
+	byRun   map[uuid.UUID][]*audit.Entry
+	failFor map[uuid.UUID]bool
+}
+
+func (a *lineageAudit) ListForRunByCategory(_ context.Context, runID uuid.UUID, _ string) ([]*audit.Entry, error) {
+	if a.failFor[runID] {
+		return nil, errors.New("lineageAudit: audit read failed")
+	}
+	return a.byRun[runID], nil
+}
+
+// TestLoadChildRunEconomics covers the loader's branches: a childless parent
+// returns empty; the walk filters by DecomposedFrom (NOT ParentRunID); a child
+// whose audit read errors is KEPT with nil entries (condition 1); and a
+// failure to enumerate the children propagates so the caller can fall back.
+func TestLoadChildRunEconomics(t *testing.T) {
+	ctx := context.Background()
+	parentID := uuid.New()
+
+	t.Run("childless parent returns empty", func(t *testing.T) {
+		runs := &lineageRuns{children: nil}
+		au := &lineageAudit{}
+		got, err := issuecomment.LoadChildRunEconomics(ctx, runs, au, parentID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("childless parent should yield no children; got %+v", got)
+		}
+		// The walk used the decomposition lineage field, not ParentRunID.
+		if runs.lastFilter.DecomposedFrom == nil || *runs.lastFilter.DecomposedFrom != parentID {
+			t.Errorf("expected DecomposedFrom=%v filter; got %+v", parentID, runs.lastFilter)
+		}
+		if runs.sawParentRunID {
+			t.Error("loader must NOT filter by ParentRunID (conflates recovery lineage, #1751)")
+		}
+	})
+
+	t.Run("per-child audit failure keeps the child with nil entries", func(t *testing.T) {
+		okChild := &run.Run{ID: uuid.New(), CostUSDTotal: 40.00, SliceIndex: econIntPtr(0)}
+		failChild := &run.Run{ID: uuid.New(), CostUSDTotal: 44.54, SliceIndex: econIntPtr(1)}
+		runs := &lineageRuns{children: []*run.Run{okChild, failChild}}
+		au := &lineageAudit{
+			byRun:   map[uuid.UUID][]*audit.Entry{okChild.ID: costChildEntry(1, 5000, "agent", 40.00, 100, 10)},
+			failFor: map[uuid.UUID]bool{failChild.ID: true},
+		}
+		got, err := issuecomment.LoadChildRunEconomics(ctx, runs, au, parentID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("both children must be present; got %d", len(got))
+		}
+		byID := map[uuid.UUID]issuecomment.ChildRunEconomics{}
+		for _, ch := range got {
+			byID[ch.Run.ID] = ch
+		}
+		if got := byID[okChild.ID]; len(got.Entries) != 1 {
+			t.Errorf("ok child should carry its 1 ledger entry; got %d", len(got.Entries))
+		}
+		if got := byID[failChild.ID]; got.Run == nil || got.Entries != nil {
+			t.Errorf("failed-audit child must be kept with nil entries; got %+v", got)
+		}
+	})
+
+	t.Run("enumerate failure propagates", func(t *testing.T) {
+		runs := &lineageRuns{listErr: errors.New("boom")}
+		au := &lineageAudit{}
+		got, err := issuecomment.LoadChildRunEconomics(ctx, runs, au, parentID)
+		if err == nil {
+			t.Fatal("expected an error when the children ListRuns fails")
+		}
+		if got != nil {
+			t.Errorf("a failed enumeration should return nil children; got %+v", got)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------

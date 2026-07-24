@@ -47,6 +47,13 @@ type prEventsRunRepo struct {
 	// returns listResult for every filter — every existing consumer of this
 	// fake is unaffected.
 	exactURLResult []*run.Run
+
+	// decomposedResult, when non-nil, models the DecomposedFrom lineage filter
+	// the economics lineage rollup uses (#2100): a ListRuns call carrying
+	// f.DecomposedFrom returns this slice (the parent's decomposition slice
+	// children). Left nil, a DecomposedFrom query returns no children — the
+	// single-run economics path every existing consumer of this fake relies on.
+	decomposedResult []*run.Run
 }
 
 type prEventsTransition struct {
@@ -57,6 +64,11 @@ type prEventsTransition struct {
 func (r *prEventsRunRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if f.DecomposedFrom != nil {
+		// Decomposition lineage walk (#2100): return the seeded children (nil by
+		// default, so the single-run economics path is preserved).
+		return r.decomposedResult, r.listErr
+	}
 	if f.PullRequestURL != nil {
 		r.listURLs = append(r.listURLs, *f.PullRequestURL)
 		if r.exactURLResult != nil {
@@ -175,6 +187,10 @@ type prEventsAuditRepo struct {
 	err           error
 	listForRun    []*audit.Entry
 	listForRunErr error
+	// byCategory serves per-run cost_recorded ledgers for the economics lineage
+	// rollup's per-child audit read (#2100), keyed by run id. Nil-safe: an
+	// un-seeded run id returns no entries.
+	byCategory map[uuid.UUID][]*audit.Entry
 }
 
 func (r *prEventsAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
@@ -194,6 +210,18 @@ func (r *prEventsAuditRepo) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.listForRun, r.listForRunErr
+}
+
+// ListForRunByCategory serves the per-run cost ledger the economics lineage
+// rollup reads for each decomposition child (#2100). Returns the seeded slice
+// for the run id (nil when unseeded); category is always cost_recorded here.
+func (r *prEventsAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, _ string) ([]*audit.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byCategory == nil {
+		return nil, nil
+	}
+	return r.byCategory[runID], nil
 }
 
 func prEventsTestServer(t *testing.T, rr *prEventsRunRepo, ar *prEventsAuditRepo) *Server {
@@ -1306,7 +1334,7 @@ func TestEconomicsStamp_IdempotentOnReObservedMerge(t *testing.T) {
 	chain := stampChain(runID)
 	// Precompute the block the stamp would derive, and seed the PR body as if
 	// a prior stamp already wrote it.
-	block := issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(runRow, chain))
+	block := issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(runRow, chain, nil))
 	if block == "" {
 		t.Fatal("precondition: derived block must be non-empty")
 	}
@@ -1328,6 +1356,65 @@ func TestEconomicsStamp_IdempotentOnReObservedMerge(t *testing.T) {
 	defer stub.mu.Unlock()
 	if stub.patchCalled {
 		t.Errorf("re-observed merge with identical section must skip the PATCH; got body:\n%s", stub.patchBody)
+	}
+}
+
+// childCostChain builds a single-entry cost_recorded ledger for a decomposition
+// slice child fixture.
+func childCostChain(runID uuid.UUID, usd float64, cacheRead int) []*audit.Entry {
+	rid := runID
+	raw, _ := json.Marshal(map[string]any{
+		"usd": usd, "source": "agent", "model": "claude-opus-4-8",
+		"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": cacheRead,
+	})
+	return []*audit.Entry{{RunID: &rid, Sequence: 1, Category: "cost_recorded", Timestamp: time.Unix(3000, 0).UTC(), Payload: raw}}
+}
+
+// TestDeriveEconomicsBlock_RollsUpLineageMatchesNotifier is the cross-boundary
+// same-figures assertion (criterion 5 / #2100): the server's merge-time
+// deriveEconomicsBlock rolls the decomposition lineage in from the SAME walk
+// the living anchor uses, so its rendered block is byte-identical to the
+// notifier-path block for the same parent + children fixture, and reflects the
+// rolled total (parent + both slices).
+func TestDeriveEconomicsBlock_RollsUpLineageMatchesNotifier(t *testing.T) {
+	parentID := uuid.New()
+	sliceZero := 0
+	sliceOne := 1
+	child0 := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(120, 0).UTC(), CostUSDTotal: 40.00, DecomposedFrom: &parentID, SliceIndex: &sliceZero}
+	child1 := &run.Run{ID: uuid.New(), CreatedAt: time.Unix(130, 0).UTC(), CostUSDTotal: 44.54, DecomposedFrom: &parentID, SliceIndex: &sliceOne}
+	parent := &run.Run{ID: parentID, Repo: "x/y", CreatedAt: time.Unix(100, 0).UTC(), CostUSDTotal: 9.29}
+
+	parentChain := stampChain(parentID)
+	rr := &prEventsRunRepo{
+		listResult:       []*run.Run{parent},
+		decomposedResult: []*run.Run{child0, child1},
+	}
+	ar := &prEventsAuditRepo{
+		listForRun: parentChain,
+		byCategory: map[uuid.UUID][]*audit.Entry{
+			child0.ID: childCostChain(child0.ID, 40.00, 3000),
+			child1.ID: childCostChain(child1.ID, 44.54, 2000),
+		},
+	}
+	s := prEventsTestServer(t, rr, ar)
+
+	got := s.deriveEconomicsBlock(context.Background(), parent)
+
+	// Independent notifier-path render over the SAME lineage.
+	children, err := issuecomment.LoadChildRunEconomics(context.Background(), rr, ar, parentID)
+	if err != nil {
+		t.Fatalf("LoadChildRunEconomics: %v", err)
+	}
+	want := issuecomment.RenderEconomicsBlock(*issuecomment.BuildRunEconomics(parent, parentChain, children))
+
+	if got != want {
+		t.Errorf("server stamp block diverges from the notifier-path block:\n--- server ---\n%s\n--- notifier ---\n%s", got, want)
+	}
+	// The rolled total (9.29 + 40.00 + 44.54) and the per-run breakdown are present.
+	for _, sub := range []string{"**Total cost**: $93.83", "- **By run**:", "parent (", "slice 1 (", "slice 2 ("} {
+		if !strings.Contains(got, sub) {
+			t.Errorf("rolled block missing %q:\n%s", sub, got)
+		}
 	}
 }
 
