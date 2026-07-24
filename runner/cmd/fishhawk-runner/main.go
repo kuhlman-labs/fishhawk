@@ -1265,7 +1265,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// config — the run-0ae81e43 fix-up_base_checkout failure (#1951). A mint
 		// failure degrades to "" (ambient auth), never a stage failure.
 		baseAuthToken := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
-		tipSHA, coErr := checkoutFixupBase(ctx, repoDir, gitops.DefaultRemote, cfg.fixupBranch, baseAuthToken)
+		tipSHA, coErr := checkoutFixupBase(ctx, repoDir, gitops.DefaultRemote, cfg.fixupBranch, baseAuthToken, createdScopePaths(cfg.scopeFiles))
 		if coErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n", fixupCheckoutFailReason(coErr), coErr.Error())
@@ -5120,12 +5120,16 @@ var (
 	// Production wires it to gitops.CheckoutRemoteBranch, which fetches the
 	// run's PR branch from the named remote and checks the working tree out
 	// onto the fetched tip, returning that tip SHA for the ADR-035 lineage
-	// comparison. Its final pushToken argument (#1951) authenticates the fetch
+	// comparison. Its pushToken argument (#1951) authenticates the fetch
 	// with a freshly-minted token that also resets any stale persisted
 	// extraheader (the run-0ae81e43 fix-up_base_checkout failure); "" falls back
-	// to ambient auth. A package-level var for the same reason as captureHead /
-	// restoreHead: the fake-pusher run() tests default repoDir to "." and
-	// must never fetch + force-checkout the runner's own source repo.
+	// to ambient auth. Its final createdPaths argument (#2128) is the run's
+	// create-operation scope subset (createdScopePaths(cfg.scopeFiles)); the
+	// checkout prunes only untracked stranded copies of those paths that the
+	// target ref tracks, so a prior reset-to-main leftover cannot abort the
+	// fix-up base checkout. A package-level var for the same reason as
+	// captureHead / restoreHead: the fake-pusher run() tests default repoDir to
+	// "." and must never fetch + force-checkout the runner's own source repo.
 	checkoutFixupBase = gitops.CheckoutRemoteBranch
 
 	// checkoutChildBase is the subsequent-decomposed-child base-establishment
@@ -7795,6 +7799,25 @@ func scopePaths(files []upload.ScopeFile) []string {
 	paths := make([]string, 0, len(files))
 	for _, f := range files {
 		if f.Path == "" {
+			continue
+		}
+		paths = append(paths, f.Path)
+	}
+	return paths
+}
+
+// createdScopePaths returns only the create-operation paths from a scope-file
+// set, the input to CheckoutRemoteBranch's stranded-created-file prune (#2128).
+// modify/delete operations are excluded: only a path the run CREATES can be a
+// leftover untracked file that a prior reset-to-main stranded and that the
+// fix-up base checkout would then abort on.
+func createdScopePaths(files []upload.ScopeFile) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		if f.Path == "" || f.Operation != "create" {
 			continue
 		}
 		paths = append(paths, f.Path)

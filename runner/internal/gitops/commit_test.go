@@ -1066,7 +1066,7 @@ func TestCheckoutRemoteBranch_EstablishesFixupBase(t *testing.T) {
 	mustGit(t, repo, "branch", "-D", branch)
 	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/"+branch)
 
-	tip, err := CheckoutRemoteBranch(context.Background(), repo, "origin", branch, "")
+	tip, err := CheckoutRemoteBranch(context.Background(), repo, "origin", branch, "", nil)
 	if err != nil {
 		t.Fatalf("CheckoutRemoteBranch: %v", err)
 	}
@@ -1087,6 +1087,275 @@ func TestCheckoutRemoteBranch_EstablishesFixupBase(t *testing.T) {
 	// The agent's edits land on the run branch from here.
 	if err := os.WriteFile(filepath.Join(repo, "fix.txt"), []byte("fix v2\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// strandedFixupRepo builds the #2128 reproduction: a src repo on main with a
+// bare origin, a run branch carrying create-operation files under a subdir
+// pushed to origin, then the working tree switched back to main with those
+// created files WRITTEN BACK as untracked leftovers (the shape a prior
+// reset-to-main strands) plus an unrelated untracked operator file. It returns
+// the repo dir, the run branch name, its pushed tip, and the relative created
+// paths. The stranded copies carry DIFFERENT bytes than the branch versions so
+// an un-pruned `checkout -B` would abort on "untracked working tree files would
+// be overwritten".
+func strandedFixupRepo(t *testing.T) (repo, branch, remoteTip string, createdRel []string) {
+	t.Helper()
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	branch = "fishhawk/run-2128abcd/stage-2128wxyz"
+	createdRel = []string{"pkg/created_one.go", "created_two.txt"}
+	mustGit(t, repo, "checkout", "-b", branch)
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range createdRel {
+		if err := os.WriteFile(filepath.Join(repo, rel), []byte("branch content: "+rel+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "create files on run branch")
+	mustGit(t, repo, "push", "origin", branch)
+	remoteTip = mustGitOut(t, repo, "rev-parse", "HEAD")
+
+	// Back to main and erase every local trace of the branch, then strand the
+	// created files as untracked leftovers with DIFFERENT bytes.
+	mustGit(t, repo, "checkout", "main")
+	mustGit(t, repo, "branch", "-D", branch)
+	mustGit(t, repo, "update-ref", "-d", "refs/remotes/origin/"+branch)
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range createdRel {
+		if err := os.WriteFile(filepath.Join(repo, rel), []byte("stranded leftover: "+rel+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repo, branch, remoteTip, createdRel
+}
+
+// TestCheckoutRemoteBranch_ClearsStrandedCreatedFiles is the #2128 happy path:
+// the run's create-operation files sit in the working tree as untracked
+// leftovers from a prior reset-to-main, and CheckoutRemoteBranch — handed those
+// paths in createdPaths — prunes them so the on-branch checkout establishes the
+// fix-up base cleanly. An unrelated untracked operator file is left untouched
+// (the double-bounding safety property), and a createdPaths entry whose file is
+// NOT tracked by the target ref survives the prune (the cat-file guard).
+func TestCheckoutRemoteBranch_ClearsStrandedCreatedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, branch, remoteTip, createdRel := strandedFixupRepo(t)
+
+	// Unrelated untracked operator file — never in the run's create set, never
+	// in the target ref; must survive byte-intact.
+	const operatorRel = "operator-scratch.txt"
+	operatorBytes := []byte("operator local scratch — do not touch\n")
+	if err := os.WriteFile(filepath.Join(repo, operatorRel), operatorBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// An untracked file at a createdPaths path that the target ref does NOT
+	// track (cat-file guard must SKIP it → survives).
+	const notInRefRel = "pkg/not_in_target_ref.go"
+	notInRefBytes := []byte("not tracked by the branch tip\n")
+	if err := os.WriteFile(filepath.Join(repo, notInRefRel), notInRefBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	createdPaths := append(append([]string{}, createdRel...), notInRefRel)
+	tip, err := CheckoutRemoteBranch(context.Background(), repo, "origin", branch, "", createdPaths)
+	if err != nil {
+		t.Fatalf("CheckoutRemoteBranch with stranded created files: %v", err)
+	}
+	if tip != remoteTip {
+		t.Errorf("returned tip = %q, want the remote branch tip %q", tip, remoteTip)
+	}
+	if got := mustGitOut(t, repo, "symbolic-ref", "--short", "HEAD"); got != branch {
+		t.Errorf("HEAD = %q, want %q", got, branch)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != remoteTip {
+		t.Errorf("HEAD sha = %q, want %q", got, remoteTip)
+	}
+	// The pruned created files now carry the BRANCH content the checkout wrote.
+	for _, rel := range createdRel {
+		got, rerr := os.ReadFile(filepath.Join(repo, rel))
+		if rerr != nil {
+			t.Fatalf("read created file %q after checkout: %v", rel, rerr)
+		}
+		if want := "branch content: " + rel + "\n"; string(got) != want {
+			t.Errorf("created file %q = %q, want branch content %q", rel, got, want)
+		}
+	}
+	// Safety: the unrelated operator file survives byte-intact.
+	if got, rerr := os.ReadFile(filepath.Join(repo, operatorRel)); rerr != nil {
+		t.Errorf("operator file was removed — the prune must never touch a file outside the created set: %v", rerr)
+	} else if string(got) != string(operatorBytes) {
+		t.Errorf("operator file = %q, want it untouched %q", got, operatorBytes)
+	}
+	// Fail-safe guard: a createdPaths file NOT in the target ref survives (the
+	// branch does not carry it, so the checkout never overwrites it either).
+	if got, rerr := os.ReadFile(filepath.Join(repo, notInRefRel)); rerr != nil {
+		t.Errorf("not-in-target-ref file was removed — the cat-file guard must SKIP a path absent from the target ref: %v", rerr)
+	} else if string(got) != string(notInRefBytes) {
+		t.Errorf("not-in-target-ref file = %q, want it untouched %q", got, notInRefBytes)
+	}
+}
+
+// TestCheckoutRemoteBranch_WithoutCreatedPaths_StillAbortsOnStranded is the
+// negative control: with NO createdPaths threaded (nil), the stranded untracked
+// leftovers are not pruned and the on-branch `checkout -B` aborts exactly as it
+// did before the #2128 fix. This pins the reproduced failure the prune fixes.
+func TestCheckoutRemoteBranch_WithoutCreatedPaths_StillAbortsOnStranded(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo, branch, _, _ := strandedFixupRepo(t)
+
+	if _, err := CheckoutRemoteBranch(context.Background(), repo, "origin", branch, "", nil); err == nil {
+		t.Fatal("CheckoutRemoteBranch with nil createdPaths must still abort on stranded untracked files, got nil error")
+	}
+}
+
+// TestPruneStrandedCreatedFiles_SafeSet exercises pruneStrandedCreatedFiles
+// directly across every bound of its safe set, asserting removal happens ONLY
+// for a positively-untracked path the target ref tracks and that every other
+// shape FAILS SAFE (is left in place):
+//
+//   - untracked + in target ref            → REMOVED (the only remove case)
+//   - untracked + NOT in target ref        → survives (cat-file guard)
+//   - TRACKED with a local modification     → survives (positive-untracked check
+//     returns false; the invariant "never remove a tracked working-tree file"
+//     holds even though the path IS in the target ref — closes gpt-5.6-sol's
+//     HIGH: a git-predicate error/ambiguity must never delete a tracked file)
+//   - "../escape" traversal path            → survives (pathspec errors → skip,
+//     and the cat-file guard cannot name a blob outside the tree — closes
+//     claude-fable-5's path-containment concern)
+//   - absolute path                         → survives (off-repo, unresolvable)
+//   - absent on disk                        → no-op (Lstat skip)
+func TestPruneStrandedCreatedFiles_SafeSet(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	parent := t.TempDir()
+	repo := filepath.Join(parent, "src")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	// tracked-common.go is committed on main AND the branch — a genuinely
+	// tracked path we will list in createdPaths to prove the untracked check
+	// protects it.
+	const trackedRel = "tracked-common.go"
+	if err := os.WriteFile(filepath.Join(repo, trackedRel), []byte("package p // committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial + tracked-common")
+
+	const branch = "fishhawk/run-2128prune/stage-2128prune"
+	const createdInRef = "pkg/created_in_ref.go"
+	mustGit(t, repo, "checkout", "-b", branch)
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, createdInRef), []byte("branch: created_in_ref\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "create in-ref file on branch")
+	mustGit(t, repo, "checkout", "main")
+
+	// Working-tree fixture on main:
+	// (a) untracked leftover at an in-ref path → will be REMOVED.
+	if err := os.MkdirAll(filepath.Join(repo, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, createdInRef), []byte("stranded leftover\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// (b) untracked, NOT in the target ref → survives.
+	const notInRef = "pkg/operator_untracked.go"
+	notInRefBytes := []byte("operator untracked, absent from branch\n")
+	if err := os.WriteFile(filepath.Join(repo, notInRef), notInRefBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// (c) tracked-common.go modified locally → survives with its modification.
+	trackedModified := []byte("package p // committed\n// local modification\n")
+	if err := os.WriteFile(filepath.Join(repo, trackedRel), trackedModified, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// (d) an "../escape" traversal: a real file in the parent dir.
+	const escapeRel = "../escape.txt"
+	escapeBytes := []byte("outside the repo\n")
+	if err := os.WriteFile(filepath.Join(repo, escapeRel), escapeBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// (e) an absolute path to a real file outside the repo.
+	absFile := filepath.Join(parent, "absolute-outside.txt")
+	absBytes := []byte("absolute outside\n")
+	if err := os.WriteFile(absFile, absBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// (f) absent on disk — a create path never written back.
+	const ghostRel = "pkg/ghost.go"
+
+	// An empty string entry must be skipped (the guard against a blank scope
+	// path) without disturbing any other row.
+	createdPaths := []string{"", createdInRef, notInRef, trackedRel, escapeRel, absFile, ghostRel}
+	if err := pruneStrandedCreatedFiles(context.Background(), &Pusher{}, repo, branch, createdPaths); err != nil {
+		t.Fatalf("pruneStrandedCreatedFiles: %v", err)
+	}
+
+	// (a) the only remove case.
+	if _, err := os.Lstat(filepath.Join(repo, createdInRef)); !os.IsNotExist(err) {
+		t.Errorf("in-ref untracked leftover %q must be removed; Lstat err = %v", createdInRef, err)
+	}
+	// (b) untracked-but-not-in-ref survives.
+	if got, err := os.ReadFile(filepath.Join(repo, notInRef)); err != nil {
+		t.Errorf("not-in-ref untracked file removed — cat-file guard must skip it: %v", err)
+	} else if string(got) != string(notInRefBytes) {
+		t.Errorf("not-in-ref file = %q, want untouched %q", got, notInRefBytes)
+	}
+	// (c) tracked-with-local-modification survives — the safety invariant.
+	if got, err := os.ReadFile(filepath.Join(repo, trackedRel)); err != nil {
+		t.Errorf("tracked file removed — the untracked check must protect a tracked path even in createdPaths: %v", err)
+	} else if string(got) != string(trackedModified) {
+		t.Errorf("tracked file = %q, want its local modification preserved %q", got, trackedModified)
+	}
+	// (d) "../escape" survives.
+	if got, err := os.ReadFile(filepath.Join(repo, escapeRel)); err != nil {
+		t.Errorf("../escape path removed — containment must bound the prune to the repo/target ref: %v", err)
+	} else if string(got) != string(escapeBytes) {
+		t.Errorf("escape file = %q, want untouched %q", got, escapeBytes)
+	}
+	// (e) absolute path survives.
+	if got, err := os.ReadFile(absFile); err != nil {
+		t.Errorf("absolute path removed — containment must bound the prune to the repo/target ref: %v", err)
+	} else if string(got) != string(absBytes) {
+		t.Errorf("absolute file = %q, want untouched %q", got, absBytes)
+	}
+	// (f) absent path is a clean no-op (already asserted err == nil above).
+	if _, err := os.Lstat(filepath.Join(repo, ghostRel)); !os.IsNotExist(err) {
+		t.Errorf("ghost path should not exist; Lstat err = %v", err)
 	}
 }
 
@@ -1144,7 +1413,7 @@ func TestCheckoutRemoteBranch_RemoteNameLockstep(t *testing.T) {
 	mustGit(t, repo, "update-ref", "-d", "refs/remotes/upstream/"+branch)
 	mustGit(t, repo, "checkout", "main")
 
-	tip, err := CheckoutRemoteBranch(context.Background(), repo, "upstream", branch, "")
+	tip, err := CheckoutRemoteBranch(context.Background(), repo, "upstream", branch, "", nil)
 	if err != nil {
 		t.Fatalf("CheckoutRemoteBranch: %v", err)
 	}
@@ -1170,7 +1439,7 @@ func TestCheckoutRemoteBranch_RemoteNameLockstep(t *testing.T) {
 
 // TestCheckoutRemoteBranch_RejectsEmptyBranch pins the input contract.
 func TestCheckoutRemoteBranch_RejectsEmptyBranch(t *testing.T) {
-	if _, err := CheckoutRemoteBranch(context.Background(), t.TempDir(), "origin", "", ""); err == nil {
+	if _, err := CheckoutRemoteBranch(context.Background(), t.TempDir(), "origin", "", "", nil); err == nil {
 		t.Fatal("expected error for empty branch")
 	}
 }
@@ -1229,7 +1498,7 @@ func TestCheckoutRemoteBranchDetached_NoBranchCollisionWithSiblingWorktree(t *te
 	// holding `main`) with the distinct ErrBranchCheckedOutElsewhere sentinel,
 	// naming the competing worktree path and the `git checkout main` recovery —
 	// not the raw git-128 `already used by worktree` it used to surface.
-	if _, err := CheckoutRemoteBranch(context.Background(), child, "origin", "main", ""); err == nil {
+	if _, err := CheckoutRemoteBranch(context.Background(), child, "origin", "main", "", nil); err == nil {
 		t.Fatal("CheckoutRemoteBranch (-B main) unexpectedly succeeded with `main` held by a sibling worktree; the collision the detach fixes is gone")
 	} else if !errors.Is(err, ErrBranchCheckedOutElsewhere) {
 		t.Fatalf("CheckoutRemoteBranch (-B main) failed with %v, want errors.Is ErrBranchCheckedOutElsewhere", err)
@@ -3539,7 +3808,7 @@ func TestCheckoutRemoteBranch_DumbHTTP_EnvScopedAuth(t *testing.T) {
 		local, key, remoteTip, reqs, closeSrv := dumbHTTPBranchRemote(t, branch, true, staleValue)
 		defer closeSrv()
 
-		tip, err := CheckoutRemoteBranch(context.Background(), local, "origin", branch, token)
+		tip, err := CheckoutRemoteBranch(context.Background(), local, "origin", branch, token, nil)
 		if err != nil {
 			t.Fatalf("CheckoutRemoteBranch: %v", err)
 		}
@@ -3586,7 +3855,7 @@ func TestCheckoutRemoteBranch_DumbHTTP_EnvScopedAuth(t *testing.T) {
 		local, _, _, reqs, closeSrv := dumbHTTPBranchRemote(t, branch, true, staleValue)
 		defer closeSrv()
 
-		if _, err := CheckoutRemoteBranch(context.Background(), local, "origin", branch, ""); err != nil {
+		if _, err := CheckoutRemoteBranch(context.Background(), local, "origin", branch, "", nil); err != nil {
 			t.Fatalf("CheckoutRemoteBranch (empty token): %v", err)
 		}
 		// No token → no reset entry → the fetch carries the ambient stale header
