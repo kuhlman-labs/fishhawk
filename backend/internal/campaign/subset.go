@@ -38,8 +38,13 @@ var ErrItemNotChild = errors.New("campaign: subset item is not a child of the ep
 //   - an edge whose From is excluded is dropped silently (the depending item is
 //     not in the campaign, so its dependency is irrelevant).
 //
-// Any pre-existing DroppedEdges on res are carried through unchanged, so a
-// subset filter never hides a dangling edge the provider already surfaced.
+// A pre-existing DroppedEdge on res carries through only when its From is IN
+// the subset: an INCLUDED item's provider-surfaced dangling/cross-epic edge
+// still fails Assemble closed, while an EXCLUDED item's dropped edge is dropped
+// silently — mirroring the From-excluded handling of res.Edges above. So the
+// dangling-dependency error fires only for edges among or FROM included items,
+// and a subset that excludes a child no longer inherits that child's cross-epic
+// dependency (#2087).
 //
 // When items is empty/nil, res is returned unchanged — the backward-compatible
 // no-op that sweeps every child, so omitting the field preserves prior
@@ -81,11 +86,17 @@ func FilterToSubset(res *workmgmt.EpicChildrenResult, items []string) (*workmgmt
 		}
 	}
 
-	// Re-partition the edges against the included set. Carry any pre-existing
-	// dropped edges through unchanged.
+	// Re-partition the edges against the included set. Carry a pre-existing
+	// dropped edge through only when its From is IN the subset; an excluded
+	// item's dropped (cross-epic/dangling) edge is dropped silently, mirroring
+	// the From-excluded handling of res.Edges below.
 	var edges []workmgmt.DependsEdge
 	dropped := make([]workmgmt.DependsEdge, 0, len(res.DroppedEdges))
-	dropped = append(dropped, res.DroppedEdges...)
+	for _, e := range res.DroppedEdges {
+		if _, fromIn := included[e.From]; fromIn {
+			dropped = append(dropped, e)
+		}
+	}
 	for _, e := range res.Edges {
 		_, fromIn := included[e.From]
 		_, toIn := included[e.To]

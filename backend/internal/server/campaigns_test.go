@@ -689,6 +689,65 @@ func TestCreateCampaign_OmittedItems_SweepsAllChildren(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_SubsetExcludesCrossEpicDepChild_201 is the #2087 done-means
+// across the handler -> FilterToSubset -> Assemble -> Persist path: the provider
+// result carries a real cross-epic DroppedEdges entry from child C to an
+// out-of-epic issue, but a POST scoping the campaign to {A,B} (excluding C)
+// now succeeds 201 — C's cross-epic dependency is dropped silently rather than
+// failing the whole subset campaign_dangling_dependency — and the assembled
+// items are exactly {A,B}.
+func TestCreateCampaign_SubsetExcludesCrossEpicDepChild_201(t *testing.T) {
+	// A=100, B=101 are clean siblings; C=102 carries a cross-epic depends_on
+	// (102 -> out-of-epic #1823) the provider surfaced as a dropped edge.
+	result := &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 100, Title: "A"},
+			{Number: 101, Title: "B"},
+			{Number: 102, Title: "C"},
+		},
+		DroppedEdges: []workmgmt.DependsEdge{{From: 102, To: 1823}},
+	}
+	fp := &fakeEpicProvider{result: result}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:100","issue:101"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+
+	// GET /status: the assembled items must be exactly {A,B} — C and its
+	// cross-epic dropped edge are excluded from the subset.
+	statusReq := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+created.ID.String()+"/status", nil)
+	statusReq.SetPathValue("campaign_id", created.ID.String())
+	sw := httptest.NewRecorder()
+	s.handleGetCampaignStatus(sw, withAuth(statusReq))
+	if sw.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200 (body=%s)", sw.Code, sw.Body.String())
+	}
+	var status struct {
+		Items []campaignItemResponse `json:"items"`
+	}
+	if err := json.Unmarshal(sw.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v (body=%s)", err, sw.Body.String())
+	}
+	if len(status.Items) != 2 {
+		t.Fatalf("items = %d, want 2 (subset {100,101})", len(status.Items))
+	}
+	refs := map[string]bool{}
+	for _, it := range status.Items {
+		refs[it.IssueRef] = true
+	}
+	if !refs["issue:100"] || !refs["issue:101"] || refs["issue:102"] {
+		t.Errorf("item refs = %v, want exactly {issue:100, issue:101}", refs)
+	}
+}
+
 // TestCreateCampaign_OperatorAgent_CrossBoundary_E2E is the slice-A cross-layer
 // done-means for the campaign-level operator_agent override (E25.12): a POST
 // carrying an operator_agent block flows payload -> domain -> JSONB persistence
