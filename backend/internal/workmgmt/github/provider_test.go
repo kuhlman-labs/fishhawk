@@ -493,6 +493,47 @@ func TestProvider_EpicChildren_CompletionThreadsToSubsetDrop(t *testing.T) {
 	})
 }
 
+// TestProvider_EpicChildren_CrossPageDependencyIsEdgeNotDropped is the #2102
+// done-means at the consumer layer: once ListSubIssues paginates and returns
+// the COMPLETE child set, a depends_on reference between two children that
+// conceptually straddle a page boundary (child A on page 1, child B on page 2)
+// classifies into Edges, NOT DroppedEdges. Before pagination, B would have been
+// truncated at the first :100 page, failing the isChild test exactly like a
+// typo'd number and landing a legitimate edge in DroppedEdges — feeding campaign
+// assembly a partial DAG. The fake ListSubIssues returns the complete set (as
+// pagination now guarantees), so a complete child set yields a complete edge
+// set.
+func TestProvider_EpicChildren_CrossPageDependencyIsEdgeNotDropped(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			// #41: the "page 1" child. #142: the "page 2" overflow child whose body
+			// depends on #41 — the edge that only survives once the second page is read.
+			{Number: 41, NodeID: "N41", Title: "slice A", Body: "## Summary\n\nno deps\n", State: "OPEN"},
+			{Number: 142, NodeID: "N142", Title: "slice B", Body: "## Summary\n\nDepends on: #41\n", State: "OPEN"},
+		},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#1005",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if len(res.Children) != 2 {
+		t.Fatalf("children = %+v, want both 41 and 142 (complete set)", res.Children)
+	}
+	// The cross-page dependency is a real edge: 142 -> 41 in Edges, and nothing
+	// dropped — the complete child set makes #41 a recognized sibling of #142.
+	want := []workmgmt.DependsEdge{{From: 142, To: 41}}
+	if len(res.Edges) != len(want) || res.Edges[0] != want[0] {
+		t.Fatalf("edges = %+v, want %+v (cross-page dep classified as an edge)", res.Edges, want)
+	}
+	if len(res.DroppedEdges) != 0 {
+		t.Errorf("dropped edges = %+v, want none (the overflow sibling is a child, not a dangling target)", res.DroppedEdges)
+	}
+}
+
 // TestParseAutonomyLabel covers the tier extraction: the first autonomy:<tier>
 // label's suffix wins, a non-autonomy label is ignored, no autonomy label
 // yields "" (unknown/default), and an out-of-set tier normalizes to "" so a

@@ -30,9 +30,16 @@ type projectsFake struct {
 	// graphqlByOp maps a marker substring of the query to its 200 body.
 	graphqlByOp map[string]string
 
+	// graphqlByOpFn maps a marker substring to a responder that computes the
+	// 200 body from the request variables — used by the cursor-aware
+	// pagination tests to serve a different page keyed by the `after` cursor.
+	// It takes precedence over graphqlByOp for a matching marker.
+	graphqlByOpFn map[string]func(vars map[string]any) string
+
 	gotCreateBody   []byte
-	gotGraphQLVars  map[string]map[string]any // op marker -> variables
+	gotGraphQLVars  map[string]map[string]any // op marker -> last request's variables
 	gotGraphQLQuery map[string]string         // op marker -> full query text
+	gotGraphQLReqs  map[string]int            // op marker -> request count
 
 	// gotGraphQLAuth records the Authorization header of the most recent
 	// GraphQL request, so token-selection tests can assert which token
@@ -42,7 +49,13 @@ type projectsFake struct {
 
 func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
 	t.Helper()
-	pf := &projectsFake{graphqlByOp: map[string]string{}, gotGraphQLVars: map[string]map[string]any{}, gotGraphQLQuery: map[string]string{}}
+	pf := &projectsFake{
+		graphqlByOp:     map[string]string{},
+		graphqlByOpFn:   map[string]func(vars map[string]any) string{},
+		gotGraphQLVars:  map[string]map[string]any{},
+		gotGraphQLQuery: map[string]string{},
+		gotGraphQLReqs:  map[string]int{},
+	}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /repos/{owner}/{repo}/issues", func(w http.ResponseWriter, r *http.Request) {
@@ -66,10 +79,23 @@ func newProjectsFake(t *testing.T) (*projectsFake, *Client) {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "application/json")
+		// A cursor-aware responder (graphqlByOpFn) wins over a fixed body so a
+		// pagination test can serve a different page keyed by the `after` cursor.
+		for marker, fn := range pf.graphqlByOpFn {
+			if strings.Contains(body.Query, marker) {
+				pf.gotGraphQLVars[marker] = body.Variables
+				pf.gotGraphQLQuery[marker] = body.Query
+				pf.gotGraphQLReqs[marker]++
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, fn(body.Variables))
+				return
+			}
+		}
 		for marker, resp := range pf.graphqlByOp {
 			if strings.Contains(body.Query, marker) {
 				pf.gotGraphQLVars[marker] = body.Variables
 				pf.gotGraphQLQuery[marker] = body.Query
+				pf.gotGraphQLReqs[marker]++
 				w.WriteHeader(http.StatusOK)
 				_, _ = io.WriteString(w, resp)
 				return
@@ -411,10 +437,142 @@ func TestListSubIssues_EmptyReturnsNil(t *testing.T) {
 	}
 }
 
+// TestListSubIssues_NilNodeFirstPageReturnsNil proves a nil `node` on the
+// FIRST request (the issue resolves to no sub-issues connection) is the
+// no-children early return — nil result, no error — not a fail-closed error.
+func TestListSubIssues_NilNodeFirstPageReturnsNil(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":null}}`
+	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
+	if err != nil {
+		t.Fatalf("ListSubIssues: %v", err)
+	}
+	if len(subs) != 0 {
+		t.Errorf("subs = %+v, want empty (nil node, no children)", subs)
+	}
+	if pf.gotGraphQLReqs["ListSubIssues"] != 1 {
+		t.Errorf("requests = %d, want 1 (no second page on a nil first-page node)", pf.gotGraphQLReqs["ListSubIssues"])
+	}
+}
+
 func TestListSubIssues_MissingParentRejected(t *testing.T) {
 	_, c := newProjectsFake(t)
 	if _, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), ""); err == nil || !strings.Contains(err.Error(), "parent node id required") {
 		t.Fatalf("want parent-required error, got %v", err)
+	}
+}
+
+// TestListSubIssues_PaginatesAcrossPages proves the accumulation loop threads
+// the cursor: a two-page connection returns every node from both pages, and
+// page 2's request carries page 1's endCursor as `after` (criterion 1). A
+// child overflowing the first :100 page — and its depends_on edges — would
+// vanish without this, silently truncating the campaign DAG.
+func TestListSubIssues_PaginatesAcrossPages(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOpFn["ListSubIssues"] = func(vars map[string]any) string {
+		// Page 1 (after: null/absent) advertises more pages via endCursor "C1";
+		// page 2 (after: "C1") is the last page (hasNextPage:false).
+		if after, _ := vars["after"].(string); after == "C1" {
+			return `{"data":{"node":{"subIssues":{
+				"pageInfo":{"hasNextPage":false,"endCursor":"C2"},
+				"nodes":[{"number":142,"title":"slice B","body":"Depends on: #41","id":"N142","state":"OPEN","stateReason":null,"labels":{"nodes":[]}}]
+			}}}}`
+		}
+		return `{"data":{"node":{"subIssues":{
+			"pageInfo":{"hasNextPage":true,"endCursor":"C1"},
+			"nodes":[{"number":41,"title":"slice A","body":"## Summary","id":"N41","state":"OPEN","stateReason":null,"labels":{"nodes":[{"name":"autonomy:low"}]}}]
+		}}}}`
+	}
+	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
+	if err != nil {
+		t.Fatalf("ListSubIssues: %v", err)
+	}
+	// Both pages' nodes accumulate, in page order.
+	if len(subs) != 2 || subs[0].Number != 41 || subs[1].Number != 142 {
+		t.Fatalf("subs = %+v, want [41 142] across two pages", subs)
+	}
+	if subs[1].Body != "Depends on: #41" {
+		t.Errorf("subs[1].Body = %q, want the overflow child's depends_on marker preserved", subs[1].Body)
+	}
+	// Exactly two GraphQL requests: page 1 then page 2 (no extra round trip).
+	if pf.gotGraphQLReqs["ListSubIssues"] != 2 {
+		t.Errorf("ListSubIssues requests = %d, want 2 (two-page walk)", pf.gotGraphQLReqs["ListSubIssues"])
+	}
+	// The LAST request (page 2) must carry page 1's endCursor as `after`.
+	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["after"] != "C1" {
+		t.Errorf("page 2 after = %v, want C1 (page 1's endCursor threaded as the next cursor)", vars["after"])
+	}
+}
+
+// TestListSubIssues_SingleRequestWhenNoNextPage proves the common case issues
+// exactly one GraphQL request: a single page reporting hasNextPage:false does
+// not make a second, cursorless round trip (criterion 5).
+func TestListSubIssues_SingleRequestWhenNoNextPage(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOp["ListSubIssues"] = `{"data":{"node":{"subIssues":{
+		"pageInfo":{"hasNextPage":false,"endCursor":"C1"},
+		"nodes":[{"number":41,"title":"slice A","body":"b","id":"N41","state":"OPEN","stateReason":null,"labels":{"nodes":[]}}]
+	}}}}`
+	subs, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
+	if err != nil {
+		t.Fatalf("ListSubIssues: %v", err)
+	}
+	if len(subs) != 1 || subs[0].Number != 41 {
+		t.Fatalf("subs = %+v, want the single child", subs)
+	}
+	if pf.gotGraphQLReqs["ListSubIssues"] != 1 {
+		t.Errorf("ListSubIssues requests = %d, want exactly 1 (hasNextPage:false common case)", pf.gotGraphQLReqs["ListSubIssues"])
+	}
+	// The first request's cursor is nil (from-the-start), not a stray value.
+	if vars := pf.gotGraphQLVars["ListSubIssues"]; vars["after"] != nil {
+		t.Errorf("first request after = %v, want nil (start of the connection)", vars["after"])
+	}
+}
+
+// TestListSubIssues_BoundedByPageCap proves the loop is bounded: a connection
+// that ALWAYS reports hasNextPage:true fails closed at the page cap with an
+// actionable error (naming the parent node id + accumulated count) rather than
+// spinning forever (criterion 2). The request count is bounded by the cap.
+func TestListSubIssues_BoundedByPageCap(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	// Every page advertises another page, so only the hard cap can stop the walk.
+	pf.graphqlByOpFn["ListSubIssues"] = func(vars map[string]any) string {
+		return `{"data":{"node":{"subIssues":{
+			"pageInfo":{"hasNextPage":true,"endCursor":"CURSOR"},
+			"nodes":[{"number":1,"title":"t","body":"b","id":"N1","state":"OPEN","stateReason":null,"labels":{"nodes":[]}}]
+		}}}}`
+	}
+	_, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
+	if err == nil || !strings.Contains(err.Error(), "exceeded the") || !strings.Contains(err.Error(), "EPIC_NODE") {
+		t.Fatalf("want a fail-closed cap error naming the parent node, got %v", err)
+	}
+	// The error must name the accumulated count so campaign assembly can diagnose.
+	if !strings.Contains(err.Error(), "children") {
+		t.Errorf("cap error should name the accumulated child count, got %v", err)
+	}
+	if got := pf.gotGraphQLReqs["ListSubIssues"]; got != listSubIssuesMaxPages || got > listSubIssuesMaxPages+1 {
+		t.Errorf("requests = %d, want the %d-page cap (bounded, <= cap+1)", got, listSubIssuesMaxPages)
+	}
+}
+
+// TestListSubIssues_NilNodeMidPaginationFailsClosed proves a node that decodes
+// non-nil on page 1 but nil on a later page is a fail-closed error naming the
+// parent node — not a silently-truncated slice of the pages seen so far.
+func TestListSubIssues_NilNodeMidPaginationFailsClosed(t *testing.T) {
+	pf, c := newProjectsFake(t)
+	pf.graphqlByOpFn["ListSubIssues"] = func(vars map[string]any) string {
+		if after, _ := vars["after"].(string); after == "C1" {
+			// Page 2: the node came back null (anomaly) while page 1 promised more.
+			return `{"data":{"node":null}}`
+		}
+		return `{"data":{"node":{"subIssues":{
+			"pageInfo":{"hasNextPage":true,"endCursor":"C1"},
+			"nodes":[{"number":41,"title":"slice A","body":"b","id":"N41","state":"OPEN","stateReason":null,"labels":{"nodes":[]}}]
+		}}}}`
+	}
+	_, err := c.ListSubIssues(context.Background(), forge.FromGitHubInstallationID(7), "EPIC_NODE")
+	if err == nil || !strings.Contains(err.Error(), "nil node mid-pagination") || !strings.Contains(err.Error(), "EPIC_NODE") {
+		t.Fatalf("want a fail-closed nil-node-mid-pagination error naming the parent, got %v", err)
 	}
 }
 

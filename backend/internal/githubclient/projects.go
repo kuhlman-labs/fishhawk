@@ -595,11 +595,20 @@ type SubIssue struct {
 	StateReason string
 }
 
-// listSubIssuesFirst is the sub-issues connection page size. v0 reads a
-// single first:100 page — an epic with more than 100 children is out of
-// scope for the campaign DAG source (ADR-047 / #1437) and the cap is noted
-// here so a >100-child epic silently reads only the first 100.
+// listSubIssuesFirst is the sub-issues connection page size. ListSubIssues
+// paginates the connection (ADR-047 / #1437, #2102): it reads first:100 pages
+// and follows the `pageInfo.endCursor` cursor until `hasNextPage` is false, so
+// an epic with more than 100 children yields its COMPLETE child set to the
+// campaign DAG source rather than truncating at the first page.
 const listSubIssuesFirst = 100
+
+// listSubIssuesMaxPages bounds the pagination loop so a pathological
+// connection that never reports hasNextPage:false (or reports it without a
+// usable endCursor) cannot spin. 100 pages * first:100 = 10 000 children — far
+// beyond any real epic — and reaching it with more pages remaining is a
+// fail-closed error (naming the parent node id + accumulated count), never a
+// silently-partial slice the caller could mistake for the complete child set.
+const listSubIssuesMaxPages = 100
 
 // listSubIssuesLabelsFirst caps the per-child labels connection page. 100 is
 // GitHub's documented maximum number of labels per issue, so a single
@@ -612,17 +621,28 @@ const listSubIssuesLabelsFirst = 100
 // ListSubIssues returns the sub-issues (children) of the issue identified by
 // parentNodeID — its number, node id, title, body, and labels.
 //
-//	query node(id: $parentId) { ... on Issue { subIssues(first: 100) { nodes { number title body id state stateReason labels(first: 100){ nodes{ name } } } } } }
+//	query node(id: $parentId) { ... on Issue { subIssues(first: 100, after: $after) { pageInfo{ hasNextPage endCursor } nodes { number title body id state stateReason labels(first: 100){ nodes{ name } } } } } }
 //
-// It reads a SINGLE first:100 page (listSubIssuesFirst); a parent with more
-// than 100 sub-issues is truncated to the first 100 — out of scope for the
-// v0 campaign DAG source. The `subIssues` connection is the same GraphQL
-// surface the AddSubIssue mutation operates on, so the children read and the
-// parent-epic link agree on one relation. Honors the user-owned-projects
-// token opt-in (WithProjectsToken) like the other GraphQL calls, since it
-// routes through doGraphQL; sub-issues are repo-scoped, so the installation
-// token reaches them. Returns ErrForbidden on auth issues, ErrValidation
-// when GraphQL reports an application error.
+// It PAGINATES the sub-issues connection (#2102): starting with a nil cursor
+// it reads first:100 pages and follows `pageInfo.endCursor` as the next
+// `after` while `pageInfo.hasNextPage` is true, accumulating every child, so
+// an epic with more than 100 children yields its COMPLETE set to the campaign
+// DAG source instead of silently truncating at the first page. An epic under
+// 100 children reports hasNextPage:false on the first page and issues exactly
+// one GraphQL request. The loop is bounded by listSubIssuesMaxPages: reaching
+// the cap with more pages remaining is a fail-closed error (naming the parent
+// node id + accumulated count), never a silently-partial slice — the caller
+// gets either the complete child set or a hard error, so it can never mistake
+// a truncated read for a complete one. A nil `node` on the first page means
+// the issue has no sub-issues (early nil return); a nil `node` mid-pagination
+// is a fail-closed error naming the parent node id.
+//
+// The `subIssues` connection is the same GraphQL surface the AddSubIssue
+// mutation operates on, so the children read and the parent-epic link agree on
+// one relation. Honors the user-owned-projects token opt-in (WithProjectsToken)
+// like the other GraphQL calls, since it routes through doGraphQL; sub-issues
+// are repo-scoped, so the installation token reaches them. Returns ErrForbidden
+// on auth issues, ErrValidation when GraphQL reports an application error.
 func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope, parentNodeID string) ([]SubIssue, error) {
 	installationID, err := installationIDForScope(scope)
 	if err != nil {
@@ -631,10 +651,14 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
 	if parentNodeID == "" {
 		return nil, errors.New("githubclient: parent node id required")
 	}
-	const query = `query ListSubIssues($parentId: ID!, $first: Int!, $labelsFirst: Int!) {
+	const query = `query ListSubIssues($parentId: ID!, $first: Int!, $labelsFirst: Int!, $after: String) {
   node(id: $parentId) {
     ... on Issue {
-      subIssues(first: $first) {
+      subIssues(first: $first, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           number
           title
@@ -650,47 +674,74 @@ func (c *Client) ListSubIssues(ctx context.Context, scope forge.CredentialScope,
     }
   }
 }`
-	var data struct {
-		Node *struct {
-			SubIssues struct {
-				Nodes []struct {
-					Number      int    `json:"number"`
-					Title       string `json:"title"`
-					Body        string `json:"body"`
-					ID          string `json:"id"`
-					State       string `json:"state"`
-					StateReason string `json:"stateReason"`
-					Labels      struct {
-						Nodes []struct {
-							Name string `json:"name"`
-						} `json:"nodes"`
-					} `json:"labels"`
-				} `json:"nodes"`
-			} `json:"subIssues"`
-		} `json:"node"`
-	}
-	if err := c.doGraphQL(ctx, installationID, query, map[string]any{
-		"parentId":    parentNodeID,
-		"first":       listSubIssuesFirst,
-		"labelsFirst": listSubIssuesLabelsFirst,
-	}, &data); err != nil {
-		return nil, err
-	}
-	if data.Node == nil {
-		return nil, nil
-	}
-	results := make([]SubIssue, 0, len(data.Node.SubIssues.Nodes))
-	for _, n := range data.Node.SubIssues.Nodes {
-		// The GraphQL labels connection is uniformly {nodes{name}} — unlike the
-		// REST string-or-object shape decodeLabelNames tolerates — so extract the
-		// names directly, skipping any empty name. nil for a labelless child.
-		var labels []string
-		for _, l := range n.Labels.Nodes {
-			if l.Name != "" {
-				labels = append(labels, l.Name)
-			}
+	var results []SubIssue
+	// after is nil on the first request (GraphQL treats after:null as "from the
+	// start") and carries the prior page's endCursor thereafter.
+	var after *string
+	for page := 1; ; page++ {
+		var data struct {
+			Node *struct {
+				SubIssues struct {
+					PageInfo struct {
+						HasNextPage bool   `json:"hasNextPage"`
+						EndCursor   string `json:"endCursor"`
+					} `json:"pageInfo"`
+					Nodes []struct {
+						Number      int    `json:"number"`
+						Title       string `json:"title"`
+						Body        string `json:"body"`
+						ID          string `json:"id"`
+						State       string `json:"state"`
+						StateReason string `json:"stateReason"`
+						Labels      struct {
+							Nodes []struct {
+								Name string `json:"name"`
+							} `json:"nodes"`
+						} `json:"labels"`
+					} `json:"nodes"`
+				} `json:"subIssues"`
+			} `json:"node"`
 		}
-		results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, Labels: labels, State: n.State, StateReason: n.StateReason})
+		if err := c.doGraphQL(ctx, installationID, query, map[string]any{
+			"parentId":    parentNodeID,
+			"first":       listSubIssuesFirst,
+			"labelsFirst": listSubIssuesLabelsFirst,
+			"after":       after,
+		}, &data); err != nil {
+			return nil, err
+		}
+		if data.Node == nil {
+			// A nil node on the FIRST page means the issue has no sub-issues; a nil
+			// node MID-pagination (after we already accumulated children) is an
+			// anomaly, so fail closed rather than returning a partial slice.
+			if page == 1 {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("githubclient: list sub-issues: parent node %q returned a nil node mid-pagination after %d children", parentNodeID, len(results))
+		}
+		for _, n := range data.Node.SubIssues.Nodes {
+			// The GraphQL labels connection is uniformly {nodes{name}} — unlike the
+			// REST string-or-object shape decodeLabelNames tolerates — so extract the
+			// names directly, skipping any empty name. nil for a labelless child.
+			var labels []string
+			for _, l := range n.Labels.Nodes {
+				if l.Name != "" {
+					labels = append(labels, l.Name)
+				}
+			}
+			results = append(results, SubIssue{Number: n.Number, NodeID: n.ID, Title: n.Title, Body: n.Body, Labels: labels, State: n.State, StateReason: n.StateReason})
+		}
+		if !data.Node.SubIssues.PageInfo.HasNextPage {
+			break
+		}
+		if page >= listSubIssuesMaxPages {
+			// The connection still reports more pages at the cap: refuse to return a
+			// silently-partial child set. The message names the parent node id + the
+			// accumulated count so campaign assembly surfaces a diagnosable failure.
+			return nil, fmt.Errorf("githubclient: list sub-issues for parent node %q exceeded the %d-page cap after accumulating %d children with more pages remaining; refusing to return a partial child set", parentNodeID, listSubIssuesMaxPages, len(results))
+		}
+		cursor := data.Node.SubIssues.PageInfo.EndCursor
+		after = &cursor
 	}
 	return results, nil
 }
