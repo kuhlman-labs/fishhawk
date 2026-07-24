@@ -331,6 +331,35 @@ func TestOpenPR_RetryAfterExceedingBudgetGivesUp(t *testing.T) {
 	}
 }
 
+// A server delay EXACTLY equal to the remaining context budget gives up rather
+// than sleeping the whole deadline only to retry with none left (#2167 boundary:
+// delay >= remaining, not just delay > remaining).
+func TestOpenPR_RetryAfterEqualsBudgetGivesUp(t *testing.T) {
+	stub, srv := newStubAPI(t)
+	stub.createResponses = []stubResp{{code: http.StatusInternalServerError, body: `{}`, headers: map[string]string{"Retry-After": "1"}}}
+	// Injected clock parked 9s in against a 10s deadline: remaining == 1s,
+	// exactly the honored 1s Retry-After delay.
+	realNow := time.Now()
+	sleeperCalled := false
+	c := newRetryClient(srv)
+	c.now = func() time.Time { return realNow.Add(9 * time.Second) }
+	c.sleeper = func(context.Context, time.Duration) error { sleeperCalled = true; return nil }
+
+	ctx, cancel := context.WithDeadline(context.Background(), realNow.Add(10*time.Second))
+	defer cancel()
+
+	_, err := c.OpenPR(ctx, OpenPRArgs{Owner: "o", Repo: "r", Head: "h", Base: "b", Title: "t"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if stub.createCalls != 1 {
+		t.Errorf("createCalls = %d, want 1 (delay == budget, no retry)", stub.createCalls)
+	}
+	if sleeperCalled {
+		t.Error("sleeper was called; expected give-up at the budget boundary")
+	}
+}
+
 // contextSleep returns promptly with ctx.Err() when the context is already
 // cancelled, so a retry loop cannot block past caller cancellation.
 func TestContextSleep_CancelledReturnsPromptly(t *testing.T) {
@@ -338,6 +367,23 @@ func TestContextSleep_CancelledReturnsPromptly(t *testing.T) {
 	cancel()
 	if err := contextSleep(ctx, time.Hour); err == nil {
 		t.Error("expected ctx.Err() on a cancelled context")
+	}
+}
+
+// contextSleep returns ctx.Err() when the context is cancelled MID-sleep, taking
+// the timer-vs-ctx.Done() select race path (not just the already-cancelled path).
+func TestContextSleep_CancelledMidSleep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	if err := contextSleep(ctx, time.Hour); err == nil {
+		t.Error("expected ctx.Err() on mid-sleep cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("contextSleep blocked %v; expected a prompt return once cancelled", elapsed)
 	}
 }
 

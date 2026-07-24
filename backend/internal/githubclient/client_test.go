@@ -4117,12 +4117,86 @@ func TestRetryTransport_RetryAfterExceedingBudgetGivesUp(t *testing.T) {
 	}
 }
 
+// A server delay EXACTLY equal to the remaining budget gives up rather than
+// sleeping the whole deadline only to retry with no budget left (#2167 boundary:
+// delay >= remaining, not just delay > remaining).
+func TestRetryTransport_RetryAfterEqualsBudgetGivesUp(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{}`, headers: map[string]string{"Retry-After": "1"}},
+	}}
+	fixed := time.Unix(1_700_000_000, 0)
+	rt := newTestRetryTransport(base)
+	rt.maxDelay = 30 * time.Second
+	rt.now = func() time.Time { return fixed }
+	sleeperCalled := false
+	rt.sleeper = func(context.Context, time.Duration) error { sleeperCalled = true; return nil }
+	c := retryTestClient(rt)
+
+	// remaining == 1s, honored delay == 1s: exactly on the boundary.
+	ctx, cancel := context.WithDeadline(context.Background(), fixed.Add(time.Second))
+	defer cancel()
+
+	_, err := c.CreatePullRequest(ctx, forge.FromGitHubInstallationID(1),
+		RepoRef{Owner: "x", Name: "y"}, "head", "main", "Title", "body")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if base.calls != 1 {
+		t.Errorf("calls = %d, want 1 (delay == budget, no retry)", base.calls)
+	}
+	if sleeperCalled {
+		t.Error("sleeper was called; expected give-up at the budget boundary")
+	}
+}
+
+// A GetBody rewind failure on a replay attempt aborts the retry loop with the
+// rewind error rather than silently replaying an empty body.
+func TestRetryTransport_GetBodyRewindError(t *testing.T) {
+	base := &recordingTransport{responses: []stubResp{
+		{code: http.StatusInternalServerError, body: `{}`},
+	}}
+	rt := newTestRetryTransport(base)
+
+	req, err := http.NewRequestWithContext(withRetryableMutation(context.Background()),
+		http.MethodPost, "https://api.github.com/x", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	wantErr := errors.New("rewind boom")
+	req.GetBody = func() (io.ReadCloser, error) { return nil, wantErr }
+
+	_, err = rt.RoundTrip(req)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if base.calls != 1 {
+		t.Errorf("calls = %d, want 1 (aborted before the replay round trip)", base.calls)
+	}
+}
+
 // contextSleep returns promptly with ctx.Err() on an already-cancelled context.
 func TestContextSleep_CancelledReturnsPromptly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := contextSleep(ctx, time.Hour); err == nil {
 		t.Error("expected ctx.Err() on a cancelled context")
+	}
+}
+
+// contextSleep returns ctx.Err() when the context is cancelled MID-sleep, taking
+// the timer-vs-ctx.Done() select race path (not just the already-cancelled path).
+func TestContextSleep_CancelledMidSleep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	if err := contextSleep(ctx, time.Hour); err == nil {
+		t.Error("expected ctx.Err() on mid-sleep cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("contextSleep blocked %v; expected a prompt return once cancelled", elapsed)
 	}
 }
 

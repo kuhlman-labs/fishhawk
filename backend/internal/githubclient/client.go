@@ -362,10 +362,11 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		delay := retryDelay(resp, attempt, rt.backoffBase, rt.maxDelay, rt.now())
 		// Cap to the remaining context/timeout budget: if the server-provided
-		// delay would sleep past the deadline, give up promptly and return the
-		// classified final response instead of timing out mid-sleep.
+		// delay would consume the whole remaining budget (delay >= remaining, the
+		// boundary), give up promptly and return the classified final response
+		// rather than sleeping the entire deadline only to issue a doomed retry.
 		if deadline, ok := ctx.Deadline(); ok {
-			if remaining := deadline.Sub(rt.now()); remaining <= 0 || delay > remaining {
+			if remaining := deadline.Sub(rt.now()); remaining <= 0 || delay >= remaining {
 				return resp, nil
 			}
 		}

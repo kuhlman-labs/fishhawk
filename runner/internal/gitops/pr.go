@@ -293,10 +293,12 @@ func (c *OpenPRClient) doRetrying(ctx context.Context, httpClient *http.Client, 
 		}
 
 		delay := retryDelay(resp, attempt, base, maxRetryDelay, now())
-		// Cap to the remaining context budget: if the honored delay would sleep
-		// past the deadline, give up promptly and return the final response.
+		// Cap to the remaining context budget: if the honored delay would consume
+		// the whole remaining budget (delay >= remaining, the boundary), give up
+		// promptly and return the final response rather than sleeping the entire
+		// deadline only to issue a doomed retry.
 		if deadline, ok := ctx.Deadline(); ok {
-			if remaining := deadline.Sub(now()); remaining <= 0 || delay > remaining {
+			if remaining := deadline.Sub(now()); remaining <= 0 || delay >= remaining {
 				return resp, nil
 			}
 		}
