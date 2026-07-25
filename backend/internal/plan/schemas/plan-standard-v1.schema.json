@@ -309,6 +309,10 @@
           "type": "string",
           "minLength": 1,
           "description": "Required when skip_expected is true (#1748). Cites where the criterion's expectation is actually validated — e.g. the integration / end-to-end test with a fake that exercises the externally-triggered behavior."
+        },
+        "requires_live_validation": {
+          "type": "boolean",
+          "description": "Optional (#2045). Marks a criterion whose TRUE verification needs a LIVE forge/deploy/external target the default-deny sandbox lacks (not merely an external trigger event, which skip_expected covers). When true, the criterion should ALSO be marked skip_expected with an expectation_basis so acceptance short-circuits via all-skip-with-basis instead of dispatching an unvalidatable live-target criterion to the acceptance agent. On plan approval the system auto-files-or-links an operator-validation walk so the live check is tracked rather than shipped silently unvalidated. Strictly additive: omitted on a legacy criterion changes nothing."
         }
       }
     },
