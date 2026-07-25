@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
@@ -262,18 +267,47 @@ func TestStartCampaign_MissingRepo_FailsLocally(t *testing.T) {
 	}
 }
 
-// TestStartCampaign_MissingEpicRef_FailsLocally proves the empty-epic_ref guard
-// rejects before any HTTP call.
-func TestStartCampaign_MissingEpicRef_FailsLocally(t *testing.T) {
+// TestStartCampaign_NeitherEpicRefNorItems_FailsLocally proves the
+// neither-provided guard (#2051) rejects before any HTTP call: with repo set but
+// NEITHER epic_ref NOR items, the tool fails locally with the actionable
+// one-of-epic_ref-or-items message. (An items-only call is accepted — see
+// TestStartCampaign_ItemsOnly_NoEpicRef_Forwarded.)
+func TestStartCampaign_NeitherEpicRefNorItems_FailsLocally(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
 	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y"})
-	if err == nil || !strings.Contains(err.Error(), "epic_ref is required") {
-		t.Fatalf("err = %v, want local epic_ref-required validation", err)
+	if err == nil || !strings.Contains(err.Error(), "one of epic_ref or items is required") {
+		t.Fatalf("err = %v, want local one-of-epic_ref-or-items validation", err)
 	}
 	if fb.createCampaignBody.Repo != "" {
-		t.Errorf("backend was called despite missing epic_ref: %+v", fb.createCampaignBody)
+		t.Errorf("backend was called despite neither epic_ref nor items: %+v", fb.createCampaignBody)
+	}
+}
+
+// TestStartCampaign_ItemsOnly_NoEpicRef_Forwarded proves the no-epic variant
+// (#2051) is accepted at the tool layer: items present with epic_ref ABSENT
+// passes local validation and forwards to the backend with an EMPTY epic_ref
+// (no omitempty on the wire) and the items list — the server owns the branch.
+func TestStartCampaign_ItemsOnly_NoEpicRef_Forwarded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:  "kuhlman-labs/fishhawk",
+		Items: []string{"issue:101", "issue:102"},
+	})
+	if err != nil {
+		t.Fatalf("startCampaign (items-only): %v", err)
+	}
+	if fb.createCampaignBody.Repo != "kuhlman-labs/fishhawk" {
+		t.Errorf("backend repo = %q, want the request repo", fb.createCampaignBody.Repo)
+	}
+	if fb.createCampaignBody.EpicRef != "" {
+		t.Errorf("backend epic_ref = %q, want empty (no-epic variant)", fb.createCampaignBody.EpicRef)
+	}
+	if got := fb.createCampaignBody.Items; len(got) != 2 || got[0] != "issue:101" || got[1] != "issue:102" {
+		t.Errorf("backend items = %v, want [issue:101 issue:102]", got)
 	}
 }
 
@@ -806,5 +840,148 @@ func TestStartCampaignItemRun_ItemNotFound_MapsActionableError(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "campaign_item_not_found") {
 		t.Fatalf("err = %v, want campaign_item_not_found mapping", err)
+	}
+}
+
+// --- no-epic (items-without-epic_ref) TRUE end-to-end test (E48.36 / #2051,
+// binding condition 1) ---
+
+// fakeMCPResolverProvider is a workmgmt.Provider that implements
+// IssueSetDependencyResolver, so the E2E test can drive the REAL server no-epic
+// branch without any GitHub. It returns a canned result over the named issues.
+type fakeMCPResolverProvider struct {
+	name     string
+	result   *workmgmt.EpicChildrenResult
+	captured workmgmt.IssueSetRequest
+}
+
+func (f *fakeMCPResolverProvider) Name() string { return f.name }
+
+func (f *fakeMCPResolverProvider) File(_ context.Context, _ workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	return &workmgmt.CreatedItem{Provider: f.name}, nil
+}
+
+func (f *fakeMCPResolverProvider) ResolveDependencies(_ context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.captured = req
+	return f.result, nil
+}
+
+// stubMCPAPITokens is a minimal apitoken.Repository that resolves exactly one
+// bearer string to a canned token (with write:campaigns), so the E2E test can
+// drive the REAL server auth middleware. Every other method is nil via the
+// embedded interface — an accidental call panics loudly.
+type stubMCPAPITokens struct {
+	apitoken.Repository
+	tok *apitoken.Token
+}
+
+func (s *stubMCPAPITokens) Authenticate(_ context.Context, plaintext string) (*apitoken.Token, error) {
+	if s.tok != nil && plaintext == s.tok.PlainText {
+		return s.tok, nil
+	}
+	return nil, apitoken.ErrNotFound
+}
+
+// TestStartCampaign_NoEpic_E2E_ThroughRealServer is the binding-condition-1 TRUE
+// end-to-end test: it drives fishhawk_start_campaign with items present and
+// epic_ref ABSENT through the REAL MCP client request-build/serialization → an
+// httptest server wrapping the REAL server.Handler() (so handleCreateCampaign
+// runs, including its bearerAuth + requireWriteScope) → the no-epic branch → a
+// fake IssueSetDependencyResolver → campaign.Assemble → Persist (real Postgres),
+// and asserts the campaign assembles over EXACTLY the named issues. This proves
+// epic_ref is emitted as "" and the server treats "" as ABSENT (routing to the
+// no-epic branch) AND that the branch wiring reaches ResolveDependencies — so a
+// serialization change (epic_ref dropped/renamed) or a branch-decision
+// regression turns this test RED.
+func TestStartCampaign_NoEpic_E2E_ThroughRealServer(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	// A no-epic resolver over exactly {101, 102}: 102 depends on 101.
+	prov := &fakeMCPResolverProvider{
+		name: workmgmt.Default().Provider,
+		result: &workmgmt.EpicChildrenResult{
+			Children: []workmgmt.EpicChild{{Number: 101, Title: "first"}, {Number: 102, Title: "second"}},
+			Edges:    []workmgmt.DependsEdge{{From: 102, To: 101}},
+		},
+	}
+	workmgmt.Register(prov)
+
+	const bearer = "fhk_noepic_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:campaigns"}, PlainText: bearer,
+	}}
+	// GitHub nil: the runless install resolution is skipped, so scope stays zero
+	// and the fake resolver (which ignores scope) still runs.
+	s := server.New(server.Config{CampaignRepo: repo, APITokenRepo: tokRepo})
+	// Interpose a capturing middleware so the test can inspect the RAW request
+	// body the real MCP client serialized. Routing to the no-epic branch alone is
+	// vacuous for the load-bearing serialization claim: the server trims and
+	// branches identically whether epic_ref is "" or absent, so only the raw wire
+	// body proves the client emitted epic_ref as "" (non-omitempty) rather than
+	// dropping the key. If a future refactor re-adds omitempty and drops the key,
+	// this assertion — not the routing check — turns the test RED.
+	handler := s.Handler()
+	var capturedBody []byte
+	capture := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v0/campaigns" {
+			b, rerr := io.ReadAll(req.Body)
+			if rerr != nil {
+				t.Errorf("read captured request body: %v", rerr)
+			}
+			capturedBody = b
+			req.Body = io.NopCloser(bytes.NewReader(b))
+		}
+		handler.ServeHTTP(w, req)
+	})
+	httpSrv := httptest.NewServer(capture)
+	t.Cleanup(httpSrv.Close)
+
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+
+	// items present, epic_ref ABSENT — the load-bearing no-epic serialization.
+	_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo:  "kuhlman-labs/fishhawk",
+		Items: []string{"issue:101", "issue:102"},
+	})
+	if err != nil {
+		t.Fatalf("startCampaign (no-epic E2E): %v", err)
+	}
+	// The REAL client emitted epic_ref as "" on the wire (not omitted): the
+	// load-bearing no-epic serialization binding condition 1 requires. This is the
+	// non-vacuous assertion — routing works whether the key is "" or absent, so the
+	// raw body is the only proof the client kept the key and serialized "".
+	if !bytes.Contains(capturedBody, []byte(`"epic_ref":""`)) {
+		t.Errorf("request body = %s, want it to carry \"epic_ref\":\"\" (client must serialize the no-epic sentinel, not drop the key)", capturedBody)
+	}
+	// The server routed to the no-epic branch and forwarded the named items.
+	if got := prov.captured.Items; len(got) != 2 || got[0] != "issue:101" || got[1] != "issue:102" {
+		t.Fatalf("resolver got items = %v, want [issue:101 issue:102] (proves epic_ref==\"\" routed to the no-epic branch)", got)
+	}
+	if out.Campaign.EpicRef != "" {
+		t.Errorf("created epic_ref = %q, want empty (no-epic variant)", out.Campaign.EpicRef)
+	}
+
+	// The campaign assembled + persisted over EXACTLY the named issues.
+	id, perr := uuid.Parse(out.Campaign.ID)
+	if perr != nil {
+		t.Fatalf("parse created id %q: %v", out.Campaign.ID, perr)
+	}
+	items, lerr := repo.ListCampaignItemsForCampaign(context.Background(), id)
+	if lerr != nil {
+		t.Fatalf("list items: %v", lerr)
+	}
+	if len(items) != 2 {
+		t.Fatalf("persisted items = %+v, want exactly {101,102}", items)
+	}
+	byRef := map[string][]string{}
+	for _, it := range items {
+		byRef[it.IssueRef] = it.DependsOn
+	}
+	if _, ok := byRef["issue:101"]; !ok {
+		t.Errorf("missing issue:101; items = %+v", items)
+	}
+	if deps, ok := byRef["issue:102"]; !ok || len(deps) != 1 || deps[0] != "issue:101" {
+		t.Errorf("issue:102 depends_on = %v, want [issue:101]", deps)
 	}
 }

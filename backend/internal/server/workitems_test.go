@@ -1904,6 +1904,13 @@ func (f *fakeGithubAPI) SearchIssuesByTitle(_ context.Context, _ forge.Credentia
 	return nil, nil
 }
 
+// GetIssue satisfies the widened github.API (#2051): the no-epic
+// ResolveDependencies path reads each named issue via GetIssue. Minimal stub —
+// these tests do not exercise the no-epic path — returning ErrNotFound.
+func (f *fakeGithubAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, _ int) (*githubclient.Issue, error) {
+	return nil, githubclient.ErrNotFound
+}
+
 func (f *fakeGithubAPI) ProjectsTokenConfigured() bool { return true }
 
 // TestFileWorkItem_DependsOn_EndToEnd is the binding-condition end-to-end

@@ -6857,14 +6857,25 @@ paths:
           application/json:
             schema:
               type: object
-              required: [repo, epic_ref]
+              required: [repo]
+              description: |
+                `repo` is always required, plus ONE of `epic_ref` / `items`.
+                Pass `epic_ref` to decompose an epic's children (optionally
+                narrowed by `items`), OR omit `epic_ref` and pass `items` alone
+                to assemble a NO-EPIC campaign over exactly that issue list
+                (#2051). An empty request (neither `epic_ref` nor `items`) fails
+                `400 validation_failed`.
               properties:
                 repo:
                   type: string
                   example: kuhlman-labs/fishhawk
                 epic_ref:
                   type: string
-                  description: The epic to decompose, in `issue:N` form.
+                  description: |
+                    OPTIONAL as of #2051. The epic to decompose, in `issue:N`
+                    form. Omit it and pass `items` to assemble a no-epic campaign
+                    over an explicit issue list instead; one of `epic_ref` /
+                    `items` is required.
                   example: "issue:1439"
                 pause_policy:
                   type: string
@@ -6890,19 +6901,24 @@ paths:
                   type: array
                   items: { type: string }
                   description: |
-                    OPTIONAL subset filter (#2003): issue refs (bare number or
-                    `issue:N`) naming the subset of the epic's children to scope
-                    the campaign to. `epic_ref` stays required and every entry
-                    must be a child of it; the DAG is built over just these
-                    items. An included item whose `depends_on` targets an
-                    EXCLUDED item that is not yet complete fails
-                    `campaign_dangling_dependency` (the same fail-closed
-                    guarantee a cross-epic edge gives); an excluded target that
-                    is already closed-and-completed is treated as a satisfied
-                    dependency and the campaign assembles (#2120). A ref that is
-                    not a child of the epic fails `campaign_item_not_child`. Omit
-                    (or send an empty array) to sweep every child — the
-                    backward-compatible default.
+                    OPTIONAL subset filter (#2003) / no-epic item list (#2051):
+                    issue refs (bare number or `issue:N`). WITH `epic_ref` it
+                    names the subset of the epic's children to scope the campaign
+                    to — every entry must be a child of the epic (a non-child
+                    fails `campaign_item_not_child`) and the DAG is built over
+                    just those children; omit (or send an empty array) to sweep
+                    every child (the backward-compatible default). WITHOUT
+                    `epic_ref` it is the AUTHORITATIVE issue set the no-epic
+                    campaign assembles over, resolving each issue's `depends_on`
+                    directly with no shared epic parent (#2051). In BOTH modes an
+                    included item whose `depends_on` targets an issue OUTSIDE the
+                    set fails `campaign_dangling_dependency` (the same fail-closed
+                    guarantee a cross-epic edge gives); with `epic_ref`, an
+                    excluded target that is already closed-and-completed is
+                    treated as a satisfied dependency and the campaign assembles
+                    (#2120). NOTE: the no-epic path fails-dangling for EVERY
+                    out-of-set target — it does not apply the #2120
+                    completion-satisfied refinement.
                   example: ["issue:1440", "issue:1441"]
       responses:
         '200':
@@ -6920,11 +6936,12 @@ paths:
               schema: { $ref: '#/components/schemas/Campaign' }
         '400':
           description: |
-            `validation_failed` — `repo` not in owner/name form, `epic_ref`
-            missing, `pause_policy` not a recognized value, `operator_agent`
-            not a valid operator-agent block (malformed or an unknown knob),
-            body malformed / unknown field, or a dependency cycle among the
-            epic's children.
+            `validation_failed` — `repo` not in owner/name form, NEITHER
+            `epic_ref` NOR `items` provided, `pause_policy` not a recognized
+            value, `operator_agent` not a valid operator-agent block (malformed
+            or an unknown knob), body malformed / unknown field, or a dependency
+            cycle among the assembled items (the cycle case is determinately
+            `400`, never `422`, in both the epic and no-epic branches).
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: "`insufficient_scope` — bearer token missing `write:campaigns`."
@@ -6943,12 +6960,16 @@ paths:
           description: |
             `provider_unimplemented` — the conventions name an unregistered
             provider; `epic_children_unsupported` — the provider cannot query
-            epic children.
+            epic children (epic_ref path); `issue_set_resolution_unsupported` —
+            the provider cannot resolve an explicit issue set without an epic
+            (no-epic `items`-only path).
         '502':
           description: |
             `installation_resolution_failed` — a transient failure resolving
             the App installation; `epic_children_query_failed` — the provider
-            could not query the epic's children.
+            could not query the epic's children (epic_ref path);
+            `issue_set_resolution_failed` — the provider could not resolve the
+            named issue set (no-epic `items`-only path).
         '503':
           description: "`campaign_repo_unconfigured` — no campaign repository wired."
 

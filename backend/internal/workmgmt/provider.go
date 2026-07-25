@@ -92,6 +92,40 @@ type EpicChildrenRequest struct {
 	Epic   string
 }
 
+// IssueSetDependencyResolver is the optional no-epic campaign source (E48.36 /
+// #2051): resolve the depends_on edges over an ARBITRARY, explicitly-named set
+// of issues that share no epic parent. It is the items-without-epic_ref
+// counterpart to EpicChildrenQuerier — where EpicChildren derives its sibling
+// set from an epic's sub-issue graph, ResolveDependencies is HANDED the exact
+// set of issues (req.Items) and resolves each one's `Depends on: #X` body marker
+// directly, because there is no epic sweep to derive the edge set from. Like
+// Transitioner / NumberDiscoverer / EpicChildrenQuerier it is a SEPARATE
+// capability interface rather than folded into Provider, because not every
+// provider can resolve an issue set (jira is interface-only in v0) and widening
+// Provider would force every registered fake to grow the method. The campaign
+// create handler resolves a provider via Get and type-asserts this capability;
+// a provider that does not implement it yields 501.
+//
+// ResolveDependencies emits the SAME *EpicChildrenResult shape Assemble already
+// consumes: Children are the named issues ascending by number, Edges are the
+// in-set depends_on edges, and DroppedEdges are edges whose target is NOT in the
+// named set (stamped DropNotChild — the issue-literal contract fails closed on
+// EVERY out-of-set target, deliberately WITHOUT the #2120 excluded-but-completed
+// refinement the epic path applies, since there is no epic child set to derive
+// completion state for an out-of-set target from).
+type IssueSetDependencyResolver interface {
+	ResolveDependencies(ctx context.Context, req IssueSetRequest) (*EpicChildrenResult, error)
+}
+
+// IssueSetRequest is the resolved input to ResolveDependencies: the filing
+// Target (repo + installation) and the explicit set of issue references
+// (`#N`/`N` or `issue:N`) the campaign scopes to. Unlike EpicChildrenRequest
+// there is no epic ref — Items IS the authoritative set, resolved directly.
+type IssueSetRequest struct {
+	Target Target
+	Items  []string
+}
+
 // EpicChildrenResult is the epic-children query output: the epic's child
 // issues and the depends_on edges among them. Children are ordered
 // ascending by number; Edges are deterministically sorted. It is the input

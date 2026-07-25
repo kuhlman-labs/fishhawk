@@ -42,6 +42,12 @@ type API interface {
 	AddSubIssue(ctx context.Context, scope forge.CredentialScope, parentNodeID, childNodeID string) error
 	ListSubIssues(ctx context.Context, scope forge.CredentialScope, parentNodeID string) ([]githubclient.SubIssue, error)
 	SearchIssuesByTitle(ctx context.Context, scope forge.CredentialScope, query string) ([]githubclient.IssueTitleResult, error)
+	// GetIssue fetches a single issue's body/labels/state — the per-issue
+	// resolution the no-epic campaign source (ResolveDependencies) reads each
+	// named issue's depends_on marker, autonomy label, and completion state
+	// from. Signature matches *githubclient.Client.GetIssue, so the production
+	// client satisfies it directly.
+	GetIssue(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, number int) (*githubclient.Issue, error)
 	ProjectsTokenConfigured() bool
 }
 
@@ -54,9 +60,10 @@ type Provider struct {
 // optional board-transition, number-discovery, and epic-children capability
 // interfaces in addition to the base Provider.
 var (
-	_ workmgmt.Transitioner        = (*Provider)(nil)
-	_ workmgmt.NumberDiscoverer    = (*Provider)(nil)
-	_ workmgmt.EpicChildrenQuerier = (*Provider)(nil)
+	_ workmgmt.Transitioner               = (*Provider)(nil)
+	_ workmgmt.NumberDiscoverer           = (*Provider)(nil)
+	_ workmgmt.EpicChildrenQuerier        = (*Provider)(nil)
+	_ workmgmt.IssueSetDependencyResolver = (*Provider)(nil)
 )
 
 // New returns a Provider backed by api (in production *githubclient.Client).
@@ -550,6 +557,102 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 				// keeping the "not a fellow child" wording) rather than silently
 				// discarding it.
 				dropped = append(dropped, workmgmt.DependsEdge{From: s.Number, To: dep, Reason: workmgmt.DropNotChild})
+			}
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].Number < children[j].Number })
+	sortEdges := func(es []workmgmt.DependsEdge) {
+		sort.Slice(es, func(i, j int) bool {
+			if es[i].From != es[j].From {
+				return es[i].From < es[j].From
+			}
+			return es[i].To < es[j].To
+		})
+	}
+	sortEdges(edges)
+	sortEdges(dropped)
+	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped}, nil
+}
+
+// ResolveDependencies resolves the depends_on edges over an ARBITRARY,
+// explicitly-named set of issues that share no epic parent — the no-epic
+// campaign source (E48.36 / #2051, the items-without-epic_ref variant). Where
+// EpicChildren derives its sibling set from an epic's sub-issue graph, this is
+// HANDED the exact set (req.Items) and resolves each named issue directly: it
+// parses each ref via parseIssueRef, fetches the issue body via GetIssue, and
+// runs the SAME depends_on marker / autonomy-label / completion helpers
+// EpicChildren uses (no regex duplication), emitting the same
+// *workmgmt.EpicChildrenResult shape campaign.Assemble consumes.
+//
+// The named set IS the sibling set: a parsed depends_on ref pointing at a
+// member is an Edge; a ref pointing OUTSIDE the named set is a DroppedEdge
+// stamped DropNotChild — the issue-literal contract fails closed on EVERY
+// out-of-set target (a dangling dependency the campaign cannot honor within the
+// batch), deliberately WITHOUT the #2120 excluded-but-completed refinement the
+// epic path applies (there is no epic child set to derive an out-of-set target's
+// completion state from). Children are returned ascending by number and both
+// edge slices are deterministically sorted (by From, then To), mirroring
+// EpicChildren. It validates the target repo + installation (fail closed with
+// File's actionable style).
+func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
+	if p.api == nil {
+		return nil, errors.New("workmgmt/github: provider missing API client")
+	}
+	if req.Target.Repo.Owner == "" || req.Target.Repo.Name == "" {
+		return nil, errors.New("workmgmt/github: target repo owner and name required")
+	}
+	scope := req.Target.Scope
+	if scope.IsZero() {
+		return nil, errors.New("workmgmt/github: no installation id available; issue-set dependency resolution is run-scoped in v0 — file with a run_id whose run carries an installation")
+	}
+	repo := forge.RepoRef{Owner: req.Target.Repo.Owner, Name: req.Target.Repo.Name}
+
+	// Resolve each named ref to an issue number up front, so the sibling set is
+	// known before edges are partitioned. Parse errors fail closed naming the ref.
+	numbers := make([]int, 0, len(req.Items))
+	inSet := make(map[int]bool, len(req.Items))
+	for _, ref := range req.Items {
+		// Items arrive in the bare-number ("101") or issue:N ("issue:101") ref
+		// convention (the campaign subset ref shape); strip the optional issue:
+		// prefix, then REUSE parseIssueRef (which also tolerates a leading #) so
+		// the number parse stays a single helper — no regex duplication.
+		n, err := parseIssueRef(strings.TrimPrefix(strings.TrimSpace(ref), "issue:"))
+		if err != nil {
+			return nil, fmt.Errorf("workmgmt/github: item %q: %w", ref, err)
+		}
+		if inSet[n] {
+			continue // tolerate a duplicate ref: resolve each named issue once.
+		}
+		inSet[n] = true
+		numbers = append(numbers, n)
+	}
+
+	children := make([]workmgmt.EpicChild, 0, len(numbers))
+	var edges, dropped []workmgmt.DependsEdge
+	for _, n := range numbers {
+		issue, err := p.api.GetIssue(ctx, scope, repo, n)
+		if err != nil {
+			return nil, fmt.Errorf("workmgmt/github: get issue #%d: %w", n, err)
+		}
+		children = append(children, workmgmt.EpicChild{
+			Number:   issue.Number,
+			Title:    issue.Title,
+			Autonomy: parseAutonomyLabel(issue.Labels),
+			// Complete = closed-AND-completed. GetIssue is the REST issue payload,
+			// whose state/state_reason are LOWERCASE ("closed"/"completed") — unlike
+			// ListSubIssues' uppercase GraphQL enums — so match case-insensitively.
+			// A not_planned / duplicate close is NOT complete (its work did not land).
+			Complete: strings.EqualFold(issue.State, "closed") && strings.EqualFold(issue.StateReason, "completed"),
+		})
+		for _, dep := range parseDependsOnMarker(issue.Body) {
+			if inSet[dep] {
+				edges = append(edges, workmgmt.DependsEdge{From: issue.Number, To: dep})
+			} else {
+				// A depends_on reference to an issue outside the named set: a typo'd
+				// number or a genuine cross-batch dependency. Surface it as a dropped
+				// edge stamped DropNotChild — campaign assembly fails closed on it,
+				// keeping the fail-dangling-for-all-out-of-set contract (#2051).
+				dropped = append(dropped, workmgmt.DependsEdge{From: issue.Number, To: dep, Reason: workmgmt.DropNotChild})
 			}
 		}
 	}

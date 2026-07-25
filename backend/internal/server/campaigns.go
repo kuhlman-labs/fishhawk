@@ -109,11 +109,18 @@ type campaignNextActionPayload struct {
 	Detail   string `json:"detail,omitempty"`
 }
 
-// createCampaignRequest is the POST /v0/campaigns body: the repo and the
-// epic ref to decompose into the campaign DAG. Both required.
+// createCampaignRequest is the POST /v0/campaigns body: the repo and EITHER an
+// epic ref to decompose into the campaign DAG OR an explicit items issue list
+// (the no-epic variant, E48.36 / #2051). repo is always required; at least one
+// of epic_ref / items must be present.
 type createCampaignRequest struct {
-	Repo    string `json:"repo"`
-	EpicRef string `json:"epic_ref"`
+	Repo string `json:"repo"`
+	// EpicRef is the epic to decompose into the campaign DAG. OPTIONAL as of
+	// #2051: when it is absent AND items is present, the campaign is assembled
+	// over exactly the named items (the no-epic variant) by resolving each
+	// item's depends_on directly. An empty request (neither epic_ref nor items)
+	// still fails closed with 400 validation_failed.
+	EpicRef string `json:"epic_ref,omitempty"`
 	// PausePolicy is the OPTIONAL pause behavior for a gate hand-off (E25.7):
 	// "pause_campaign" (block the whole campaign, the default) or "pause_item"
 	// (continue-others). Empty normalizes to pause_campaign inside
@@ -127,13 +134,17 @@ type createCampaignRequest struct {
 	// handler before it is stored opaquely. Omit it for no override (each
 	// issue-run inherits its workflow's contract — the unchanged default).
 	OperatorAgent json.RawMessage `json:"operator_agent,omitempty"`
-	// Items is the OPTIONAL subset filter (#2003): issue refs (bare number or
-	// issue:N) naming the subset of the epic's children the campaign should
-	// scope to. Every ref must be a child of epic_ref (a non-child fails
-	// campaign_item_not_child, 422); the DAG is built over just these items and
-	// an included item whose depends_on targets an EXCLUDED item fails
+	// Items is the OPTIONAL subset filter (#2003) / no-epic item list (#2051):
+	// issue refs (bare number or issue:N). WITH epic_ref it is a subset filter —
+	// every ref must be a child of epic_ref (a non-child fails
+	// campaign_item_not_child, 422) and the DAG is built over just these
+	// children. WITHOUT epic_ref it is the AUTHORITATIVE set — the campaign
+	// assembles over exactly these issues, resolving each one's depends_on
+	// directly (the no-epic variant). In BOTH modes an included item whose
+	// depends_on targets an issue OUTSIDE the set fails
 	// campaign_dangling_dependency, exactly as a cross-epic dangling edge does.
-	// Empty/omitted sweeps every child — the backward-compatible default.
+	// Empty/omitted WITH epic_ref sweeps every child — the backward-compatible
+	// default; empty/omitted WITHOUT epic_ref fails 400 validation_failed.
 	Items []string `json:"items,omitempty"`
 }
 
@@ -323,9 +334,14 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "repo", "got": req.Repo})
 		return
 	}
-	if strings.TrimSpace(req.EpicRef) == "" {
+	// epic_ref is OPTIONAL as of #2051, but an empty request still fails closed:
+	// at least one of epic_ref / items must be present. epic_ref PRESENT keeps
+	// the epic-sweep + optional items-subset path byte-identical; epic_ref ABSENT
+	// with items present routes to the no-epic branch below.
+	epicRef := strings.TrimSpace(req.EpicRef)
+	if epicRef == "" && len(req.Items) == 0 {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"epic_ref is required", map[string]any{"field": "epic_ref"})
+			"one of epic_ref or items is required", map[string]any{"field": "epic_ref"})
 		return
 	}
 	// pause_policy is optional; an empty value normalizes to pause_campaign in
@@ -418,50 +434,94 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			"could not resolve work-item provider", map[string]any{"error": err.Error()})
 		return
 	}
-	querier, ok := provider.(workmgmt.EpicChildrenQuerier)
-	if !ok {
-		s.writeError(w, r, http.StatusNotImplemented, "epic_children_unsupported",
-			"the configured work-item provider cannot query epic children",
-			map[string]any{"provider": conv.Provider})
-		return
+	// The filing Target is shared by both branches (epic sweep + no-epic
+	// item-set resolution).
+	target := workmgmt.Target{
+		Repo:    workmgmt.Repo{Owner: owner, Name: name},
+		Scope:   scope,
+		Project: conv.Project,
+		Jira:    conv.Jira,
 	}
 
-	result, err := querier.EpicChildren(r.Context(), workmgmt.EpicChildrenRequest{
-		Target: workmgmt.Target{
-			Repo:    workmgmt.Repo{Owner: owner, Name: name},
-			Scope:   scope,
-			Project: conv.Project,
-			Jira:    conv.Jira,
-		},
-		Epic: req.EpicRef,
-	})
-	if err != nil {
-		s.writeError(w, r, http.StatusBadGateway, "epic_children_query_failed",
-			"could not query the epic's children",
-			map[string]any{"error": err.Error()})
-		return
-	}
-
-	// Narrow the children to the OPTIONAL requested subset (#2003) before
-	// assembly. FilterToSubset fails closed on a ref that is not a child of the
-	// epic (campaign_item_not_child) and re-classifies an included->excluded
-	// depends_on into a dropped edge, which Assemble then surfaces as a dangling
-	// dependency. Empty/omitted items is a no-op that sweeps every child.
-	result, err = campaign.FilterToSubset(result, req.Items)
-	if err != nil {
-		if errors.Is(err, campaign.ErrItemNotChild) {
-			s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_not_child",
-				err.Error(), map[string]any{"epic_ref": req.EpicRef, "items": req.Items})
+	// Resolve the epic-children (or no-epic item-set) result to assemble from.
+	// epic_ref PRESENT keeps the EpicChildrenQuerier sweep + optional
+	// FilterToSubset path byte-identical; epic_ref ABSENT + items present routes
+	// to the IssueSetDependencyResolver, which resolves each named issue's
+	// depends_on directly (there is no epic sweep to derive the edge set from,
+	// #2051). Both branches feed the same *EpicChildrenResult into
+	// campaign.Assemble below.
+	var result *workmgmt.EpicChildrenResult
+	if epicRef != "" {
+		querier, ok := provider.(workmgmt.EpicChildrenQuerier)
+		if !ok {
+			s.writeError(w, r, http.StatusNotImplemented, "epic_children_unsupported",
+				"the configured work-item provider cannot query epic children",
+				map[string]any{"provider": conv.Provider})
 			return
 		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"filter campaign items to subset failed", map[string]any{"error": err.Error()})
-		return
+
+		result, err = querier.EpicChildren(r.Context(), workmgmt.EpicChildrenRequest{
+			Target: target,
+			Epic:   req.EpicRef,
+		})
+		if err != nil {
+			s.writeError(w, r, http.StatusBadGateway, "epic_children_query_failed",
+				"could not query the epic's children",
+				map[string]any{"error": err.Error()})
+			return
+		}
+
+		// Narrow the children to the OPTIONAL requested subset (#2003) before
+		// assembly. FilterToSubset fails closed on a ref that is not a child of the
+		// epic (campaign_item_not_child) and re-classifies an included->excluded
+		// depends_on into a dropped edge, which Assemble then surfaces as a dangling
+		// dependency. Empty/omitted items is a no-op that sweeps every child.
+		result, err = campaign.FilterToSubset(result, req.Items)
+		if err != nil {
+			if errors.Is(err, campaign.ErrItemNotChild) {
+				s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_not_child",
+					err.Error(), map[string]any{"epic_ref": req.EpicRef, "items": req.Items})
+				return
+			}
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"filter campaign items to subset failed", map[string]any{"error": err.Error()})
+			return
+		}
+	} else {
+		// No-epic variant (#2051): items is the authoritative set. Resolve each
+		// named issue's depends_on directly. A provider that cannot resolve an
+		// arbitrary issue set (jira is interface-only in v0) fails 501, mirroring
+		// the epic_children_unsupported shape.
+		resolver, ok := provider.(workmgmt.IssueSetDependencyResolver)
+		if !ok {
+			s.writeError(w, r, http.StatusNotImplemented, "issue_set_resolution_unsupported",
+				"the configured work-item provider cannot resolve an explicit issue set without an epic",
+				map[string]any{"provider": conv.Provider})
+			return
+		}
+		result, err = resolver.ResolveDependencies(r.Context(), workmgmt.IssueSetRequest{
+			Target: target,
+			Items:  req.Items,
+		})
+		if err != nil {
+			s.writeError(w, r, http.StatusBadGateway, "issue_set_resolution_failed",
+				"could not resolve the campaign's issue set",
+				map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	// Assemble the wave-ordered DAG, failing closed on a dangling dependency
-	// (a depends_on target that is not a fellow child) or a dependency cycle.
-	assembly, err := campaign.Assemble(req.EpicRef, result)
+	// (a depends_on target outside the assembled set) or a dependency cycle. The
+	// no-epic branch assembles with an empty EpicRef, persisting a no-epic
+	// campaign (campaigns.epic_ref is TEXT NOT NULL with no CHECK, so "" is valid
+	// and denotes the items-only variant). Assemble on the TRIMMED epicRef, not
+	// raw req.EpicRef: a whitespace-only epic_ref routes to the no-epic branch
+	// above (epicRef == "") but must PERSIST the empty-string no-epic sentinel,
+	// not "   " — a future surface parsing Campaign.EpicRef expects "" for the
+	// items-only variant (README: empty-string EpicRef). For a well-formed epic
+	// ref TrimSpace is a no-op, so the epic path stays byte-identical.
+	assembly, err := campaign.Assemble(epicRef, result)
 	if err != nil {
 		switch {
 		case errors.Is(err, campaign.ErrDanglingDependency):
