@@ -433,6 +433,15 @@ type AcceptanceCriterion struct {
 	// validated (e.g. the integration/e2e test with a fake). Required when
 	// SkipExpected is true.
 	ExpectationBasis string `json:"expectation_basis,omitempty"`
+	// RequiresLiveValidation marks a criterion whose TRUE verification needs a
+	// LIVE forge/deploy/external target the default-deny sandbox lacks (not
+	// merely an external trigger event, which SkipExpected covers). When true,
+	// the criterion should ALSO be SkipExpected with an ExpectationBasis so
+	// acceptance short-circuits via all-skip-with-basis; on plan approval the
+	// system auto-files-or-links an operator-validation walk so the live check
+	// is tracked rather than shipped silently unvalidated. Additive-optional
+	// (#2045); LiveValidationCriteria selects the marked subset.
+	RequiresLiveValidation bool `json:"requires_live_validation,omitempty"`
 }
 
 // CriterionSource is the provenance of an acceptance criterion, drawn from a

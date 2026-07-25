@@ -1440,9 +1440,10 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // as a drift guard: any byte change (an unintended edit, or a docs/spec
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
-// standard_v1.x — most recently the #2055 top-level split_proposal over-cap
-// phase-split field (before that, the #2053 top-level over_cap planner
-// self-declaration hint, the #1748 acceptance-criterion
+// standard_v1.x — most recently the #2045 acceptance-criterion
+// requires_live_validation marker (before that, the #2055 top-level
+// split_proposal over-cap phase-split field, the #2053 top-level over_cap
+// planner self-declaration hint, the #1748 acceptance-criterion
 // skip_expected / expectation_basis marker, the #1544 top-level
 // surface_sweep_exemptions field, and the #1529
 // verification.acceptance_criteria / out_of_scope fields). A standard_v1 plan
@@ -1450,7 +1451,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "d637dff36b34f684477d647ea4f8870d958bd439b3db9f479cc0712c986ca7d3"
+	const wantHash = "400816c39537bc6273f39d36f06d9fffec8821f3ce95b9a693f351677ed6617a"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -1594,6 +1595,55 @@ func TestParse_AcceptanceCriteria_SkipExpectedWithBasis_RoundTrips(t *testing.T)
 	}
 	if got, want := ac[0].ExpectationBasis, "validated in webhook_integration_test.go with a fake"; got != want {
 		t.Errorf("criteria[0].ExpectationBasis = %q, want %q", got, want)
+	}
+}
+
+// --- acceptance-criterion requires_live_validation (#2045) ---
+
+// TestParse_AcceptanceCriteria_RequiresLiveValidation_RoundTrips proves the new
+// additive #2045 field ACCEPTS and decodes: a criterion carrying
+// requires_live_validation:true (paired, per the planner contract, with
+// skip_expected:true + expectation_basis) validates and round-trips through
+// Parse into the RequiresLiveValidation struct field.
+func TestParse_AcceptanceCriteria_RequiresLiveValidation_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{
+			"id":                       "live-forge-round-trip",
+			"statement":                "the GitHub issue is closed on merge",
+			"source":                   "inferred",
+			"rationale":                "needs a live forge round-trip the sandbox cannot make",
+			"requires_live_validation": true,
+			"skip_expected":            true,
+			"expectation_basis":        "validated in close_integration_test.go with a fake forge",
+		},
+	))
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ac := p.Verification.AcceptanceCriteria
+	if len(ac) != 1 {
+		t.Fatalf("acceptance_criteria len = %d, want 1", len(ac))
+	}
+	if !ac[0].RequiresLiveValidation {
+		t.Errorf("criteria[0].RequiresLiveValidation = false, want true")
+	}
+}
+
+// TestParse_AcceptanceCriteria_UnmarkedLiveValidation_StillValidates is the
+// #2045 additive proof: a criterion that omits requires_live_validation entirely
+// validates unchanged (the field is a plain optional boolean with no conditional
+// attached), so no legacy plan is affected.
+func TestParse_AcceptanceCriteria_UnmarkedLiveValidation_StillValidates(t *testing.T) {
+	m := planfixture.Valid(acceptanceCriteriaOption(
+		map[string]any{"id": "no-live", "statement": "GET returns 200", "source": "explicit", "source_ref": "#1"},
+	))
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: an unmarked criterion must validate, got %v", err)
+	}
+	if p.Verification.AcceptanceCriteria[0].RequiresLiveValidation {
+		t.Errorf("criteria[0].RequiresLiveValidation = true, want false (unmarked defaults false)")
 	}
 }
 
