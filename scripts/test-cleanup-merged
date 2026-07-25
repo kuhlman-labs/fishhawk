@@ -34,6 +34,14 @@ git -C "$tmpdir" commit -q -m "merged commit"
 git -C "$tmpdir" checkout -q main
 git -C "$tmpdir" merge --no-ff -q -m "merge merged-branch" merged-branch
 
+# Create a second merged branch that will be held by a worktree.
+git -C "$tmpdir" checkout -q -b worktree-held-branch
+echo "held" > "$tmpdir/held.txt"
+git -C "$tmpdir" add held.txt
+git -C "$tmpdir" commit -q -m "held commit"
+git -C "$tmpdir" checkout -q main
+git -C "$tmpdir" merge --no-ff -q -m "merge worktree-held-branch" worktree-held-branch
+
 # Create a branch with an unmerged commit.
 git -C "$tmpdir" checkout -q -b unmerged-branch
 echo "unmerged" > "$tmpdir/unmerged.txt"
@@ -41,12 +49,23 @@ git -C "$tmpdir" add unmerged.txt
 git -C "$tmpdir" commit -q -m "unmerged commit"
 git -C "$tmpdir" checkout -q main
 
+# Register a worktree that checks out the merged worktree-held-branch, so
+# `git branch -D` would refuse it ('used by worktree').
+git -C "$tmpdir" worktree add -q "$tmpdir/held-wt" worktree-held-branch
+# git worktree list --porcelain reports the RESOLVED realpath (on macOS mktemp's
+# /var/folders/... becomes /private/var/...), so capture the resolved path to
+# assert against rather than the raw $tmpdir prefix.
+held_wt_resolved="$(cd "$tmpdir/held-wt" && pwd -P)"
+
 # Point origin/main at the local main so merge-base checks work without a remote.
 git -C "$tmpdir" remote add origin "$tmpdir"
 git -C "$tmpdir" fetch -q origin main
 
 # Run the script inside the temp repo directory.
+set +e
 output=$(cd "$tmpdir" && bash "$REPO_ROOT/scripts/cleanup-merged" 2>&1)
+status=$?
+set -e
 
 # Case 1: merged-branch should have been deleted.
 if ! git -C "$tmpdir" show-ref --verify --quiet refs/heads/merged-branch; then
@@ -60,6 +79,29 @@ if git -C "$tmpdir" show-ref --verify --quiet refs/heads/unmerged-branch; then
   pass "unmerged-branch was preserved"
 else
   fail "unmerged-branch should have been preserved (output: $output)"
+fi
+
+# Case 3: a merged branch held by a worktree must be SKIPPED, not deleted.
+if git -C "$tmpdir" show-ref --verify --quiet refs/heads/worktree-held-branch; then
+  pass "worktree-held-branch was preserved (held by worktree)"
+else
+  fail "worktree-held-branch should have been preserved (output: $output)"
+fi
+
+# Case 4: the warning names the holding worktree path (resolved realpath) and
+# points at scripts/dev sweep.
+if printf '%s' "$output" | grep -qF "$held_wt_resolved" \
+  && printf '%s' "$output" | grep -qF "scripts/dev sweep"; then
+  pass "warning names the holding worktree path and scripts/dev sweep"
+else
+  fail "warning should name '$held_wt_resolved' and 'scripts/dev sweep' (output: $output)"
+fi
+
+# Case 5: despite the skip, the script exits 0 so post-merge reaches its reload.
+if [ "$status" -eq 0 ]; then
+  pass "script exited 0 despite the worktree-held skip"
+else
+  fail "script should exit 0 (got $status; output: $output)"
 fi
 
 echo ""
