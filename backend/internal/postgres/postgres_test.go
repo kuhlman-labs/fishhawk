@@ -1132,11 +1132,16 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0061 (#2109, E44.22) is now the latest migration (users.provider
-	// discriminator). Roll it back FIRST so this test's historical assertions —
-	// which pin 0060 as the one-step-rollback target — stay valid; 0061's own
-	// up/down reversal, including the gitlab-provider-row data state, is pinned
-	// by TestMigrateDown_UsersProviderReversal below.
+	// 0062 (#1983, E48.23) is now the latest migration (the
+	// audit_entries_merge_verdict_recorded_once_idx partial unique index). Roll
+	// it back FIRST — it is index-only, so its rollback drops just that index —
+	// then 0061 (users.provider), so this test's historical assertions, which
+	// pin 0060 as the one-step-rollback target, stay valid. 0062's own up/down
+	// reversal is pinned by TestMigrateDown_MergeVerdictUniqueReversal, and
+	// 0061's by TestMigrateDown_UsersProviderReversal below.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0062): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0061): %v", err)
 	}
@@ -1974,6 +1979,11 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 		t.Fatalf("seed gitlab user: %v", err)
 	}
 
+	// Roll back 0062 (the index-only merge-verdict uniqueness) first so the next
+	// one-step down targets 0061 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0062 to reach 0061): %v", err)
+	}
 	// The reversal must SUCCEED despite the collision.
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0061 with a github/gitlab id collision present) failed: %v", err)
@@ -2014,6 +2024,62 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 		uuid.New(),
 	); err == nil {
 		t.Error("duplicate github_user_id=900 insert succeeded after down, want the restored users_github_user_id_key conflict")
+	}
+}
+
+// TestMigrateDown_MergeVerdictUniqueReversal pins 0062 (#1983, E48.23): the
+// partial unique index audit_entries_merge_verdict_recorded_once_idx must be
+// PRESENT after MigrateUp and ABSENT after one MigrateDown (index-only, clean
+// DROP INDEX). Mirrors TestMigrateDown_UsersProviderReversal in shape.
+func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	// Present after MigrateUp, and partial on the merge_verdict_recorded category.
+	var idxDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT indexdef FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_merge_verdict_recorded_once_idx'`,
+	).Scan(&idxDef); err != nil {
+		t.Fatalf("query audit_entries_merge_verdict_recorded_once_idx after MigrateUp (missing?): %v", err)
+	}
+	if !strings.Contains(idxDef, "merge_verdict_recorded") {
+		t.Errorf("index def = %q, want partial WHERE category = 'merge_verdict_recorded' (0062)", idxDef)
+	}
+	if !strings.Contains(idxDef, "UNIQUE") {
+		t.Errorf("index def = %q, want a UNIQUE index (0062)", idxDef)
+	}
+
+	// One MigrateDown drops exactly that index (index-only rollback).
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0062): %v", err)
+	}
+	var idxCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_merge_verdict_recorded_once_idx'`,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after MigrateDown: %v", err)
+	}
+	if idxCount != 0 {
+		t.Errorf("audit_entries_merge_verdict_recorded_once_idx count after MigrateDown = %d, want 0 (0062 reverted)", idxCount)
+	}
+	// audit_entries itself survives (0062 is index-only; the table predates it).
+	var auditTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'audit_entries'`,
+	).Scan(&auditTable); err != nil {
+		t.Fatalf("query audit_entries table after MigrateDown: %v", err)
+	}
+	if auditTable != 1 {
+		t.Errorf("'audit_entries' table count after MigrateDown = %d, want 1 (0062 is index-only)", auditTable)
 	}
 }
 
@@ -2082,6 +2148,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0062 (drop merge-verdict unique index) failed): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0061 (drop users.provider) failed): %v", err)
 	}
@@ -2193,6 +2262,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0062 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0061 to reach 0053): %v", err)
@@ -2319,6 +2391,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
 	// inert re: stages) then 0053, and the flipped row returns to dispatched.
 	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0062 to reach 0053): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0061 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
@@ -2378,6 +2453,9 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0062 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0061 to reach 0054): %v", err)

@@ -35,6 +35,28 @@ Readers: `ListGlobal` returns the whole run-less set across partitions
 partition in append order — the view per-account verification walks and
 the JSON export emits per key.
 
+## At-most-one merge_verdict_recorded per run (0062 / #1983)
+
+The `merge_verdict_recorded` category (POST `/v0/runs/{run_id}/merge`) is
+gated to **at most one row per run** by migration 0062's partial unique
+index `audit_entries_merge_verdict_recorded_once_idx` (`ON audit_entries
+(run_id) WHERE category = 'merge_verdict_recorded'`). This closes the
+endpoint's read-then-append race: two genuinely concurrent merge POSTs for
+one run can no longer both observe zero rows and both append a verdict (and
+double-dispatch the merge). `AppendChainedTx`'s `SELECT … FOR UPDATE` on the
+run row serializes the two appends, so the race-loser's insert
+deterministically violates the index.
+
+Callers distinguish that benign collision from an unrelated integrity
+failure with the **constraint-specific** helpers in `postgres.go`:
+`IsMergeVerdictDuplicate(err)` matches ONLY a `unique_violation` (SQLSTATE
+23505) on `MergeVerdictRecordedOnceIndex` — or the `ErrMergeVerdictDuplicate`
+sentinel that fakes return — via `IsDuplicateOnConstraint(err, name)` over an
+`errors.As` unwrap (`AppendChained` `%w`-wraps the driver error). A 23505 on
+any OTHER constraint (hash-chain / entry-hash / `(run_id, sequence)`
+uniqueness) is deliberately NOT swallowed, so an unrelated failure stays a
+hard error rather than being mistaken for the concurrent-merge race.
+
 ## Frozen HashInputs (deliberate)
 
 `account_id` is **not** part of the canonical hash (`chain.go`

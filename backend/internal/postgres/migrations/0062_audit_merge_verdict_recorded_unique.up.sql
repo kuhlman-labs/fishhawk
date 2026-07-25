@@ -1,0 +1,33 @@
+-- 0062: at-most-one merge_verdict_recorded audit entry per run (E48.23 / #1983).
+--
+-- POST /v0/runs/{run_id}/merge records the operator's merge verdict as a
+-- chained merge_verdict_recorded audit entry and then queues the squash merge.
+-- Its idempotence was a read-then-append with no atomicity: two genuinely
+-- concurrent POSTs for the SAME run could both observe zero
+-- merge_verdict_recorded rows and both append a duplicate verdict row (and both
+-- dispatch the merge). This partial unique index makes that race
+-- impossible at the DB level — at most one merge_verdict_recorded row can exist
+-- per run.
+--
+-- The endpoint's existing per-run serialization funnels concurrent appends
+-- through AppendChainedTx's SELECT ... FOR UPDATE on the run row, so the
+-- race-loser's insert deterministically hits this index and returns a
+-- unique_violation (SQLSTATE 23505); the handler catches THAT constraint
+-- (audit_entries_merge_verdict_recorded_once_idx) as the benign concurrent-merge
+-- race, re-reads the winner's sequence, and still dispatches the merge.
+--
+-- Partial on category: run_id is nullable (run-less "global" chain rows set it
+-- NULL), but merge_verdict_recorded is a strictly per-run category so its rows
+-- always carry a non-null run_id, and the WHERE predicate excludes every other
+-- category and every run-less row — so the index over run_id is well-defined
+-- and constrains only the intended rows. IF NOT EXISTS keeps re-application
+-- idempotent (mirroring the migration harness's idempotence assertions).
+--
+-- Fail-loud on a pre-existing duplicate: if any run already holds two or more
+-- merge_verdict_recorded rows, CREATE UNIQUE INDEX fails at migrate time — the
+-- correct fail-closed surfacing. The audit_entries append-only no-delete
+-- triggers make silent de-duping impossible anyway, and the endpoint (#1954) is
+-- only days old, so pre-alpha environments carry no such durable data.
+CREATE UNIQUE INDEX IF NOT EXISTS audit_entries_merge_verdict_recorded_once_idx
+    ON audit_entries (run_id)
+    WHERE category = 'merge_verdict_recorded';

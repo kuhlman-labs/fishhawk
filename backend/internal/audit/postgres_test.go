@@ -7,12 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -1125,5 +1127,137 @@ func TestPostgres_ListAll_AccountFilter(t *testing.T) {
 	}
 	if m = ids(got); !m[entryA] || !m[entryB] || !m[entryU] {
 		t.Errorf("malformed-filter listing = %v; want all three entries (no constraint)", m)
+	}
+}
+
+// mergeVerdictParams builds a merge_verdict_recorded ChainAppendParams for the
+// given run — the per-run category the 0062 partial unique index gates to at
+// most one row.
+func mergeVerdictParams(runID uuid.UUID, verdict string) audit.ChainAppendParams {
+	kind := audit.ActorUser
+	subj := "github:ops"
+	p, _ := json.Marshal(map[string]any{"verdict": verdict, "delegated": false})
+	return audit.ChainAppendParams{
+		RunID:        runID,
+		Timestamp:    time.Now().UTC(),
+		Category:     "merge_verdict_recorded",
+		ActorKind:    &kind,
+		ActorSubject: &subj,
+		Payload:      p,
+	}
+}
+
+// TestIsMergeVerdictDuplicate pins each recognition branch of the
+// constraint-specific helper (binding condition 1, #1983): the sentinel and its
+// wrapped form, a real pgconn 23505 on the merge-verdict index (bare and
+// wrapped) → true; nil, an unrelated error, a 23505 on a DIFFERENT constraint,
+// and a non-23505 on the index → false. A pure unit test (no Postgres).
+func TestIsMergeVerdictDuplicate(t *testing.T) {
+	idx := audit.MergeVerdictRecordedOnceIndex
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unrelated error", errors.New("boom"), false},
+		{"sentinel", audit.ErrMergeVerdictDuplicate, true},
+		{"wrapped sentinel", fmt.Errorf("audit: append: %w", audit.ErrMergeVerdictDuplicate), true},
+		{"pg 23505 on the index", &pgconn.PgError{Code: "23505", ConstraintName: idx}, true},
+		{"wrapped pg 23505 on the index", fmt.Errorf("audit: append: %w", &pgconn.PgError{Code: "23505", ConstraintName: idx}), true},
+		{"pg 23505 on a different constraint", &pgconn.PgError{Code: "23505", ConstraintName: "audit_entries_run_id_sequence_key"}, false},
+		{"pg non-23505 on the index", &pgconn.PgError{Code: "23503", ConstraintName: idx}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := audit.IsMergeVerdictDuplicate(tt.err); got != tt.want {
+				t.Errorf("IsMergeVerdictDuplicate(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPostgres_AppendChained_MergeVerdictUniquePerRun is the done-means / real-DB
+// behavioral assertion of the shipped 0062 partial unique index (#1983): a
+// SECOND merge_verdict_recorded AppendChained for the same run is rejected with
+// an audit.IsMergeVerdictDuplicate-recognized error, and exactly one row
+// survives. A comment-only or no-op touch of the index cannot satisfy this.
+func TestPostgres_AppendChained_MergeVerdictUniquePerRun(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	first, err := repo.AppendChained(context.Background(), mergeVerdictParams(runID, "first"))
+	if err != nil {
+		t.Fatalf("first AppendChained: %v", err)
+	}
+	_, err = repo.AppendChained(context.Background(), mergeVerdictParams(runID, "second"))
+	if err == nil {
+		t.Fatal("second AppendChained for the same run succeeded, want a merge-verdict duplicate error")
+	}
+	if !audit.IsMergeVerdictDuplicate(err) {
+		t.Fatalf("second AppendChained error not recognized as a merge-verdict duplicate: %v", err)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "merge_verdict_recorded")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("surviving merge_verdict_recorded rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].Sequence != first.Sequence {
+		t.Errorf("surviving row sequence = %d, want the first append's %d", rows[0].Sequence, first.Sequence)
+	}
+}
+
+// TestPostgres_AppendChained_MergeVerdictConcurrent is binding condition 2: the
+// REAL concurrency proof. Two goroutines each AppendChained a
+// merge_verdict_recorded entry for the SAME run; the FOR-UPDATE run-row
+// serialization + the 0062 partial unique index make this deterministic —
+// exactly one wins, the loser hits the constraint-specific duplicate, and no
+// panic/deadlock. This pins the FOR-UPDATE-serialization assumption the
+// compositional handler coverage rests on.
+func TestPostgres_AppendChained_MergeVerdictConcurrent(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	const n = 2
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = repo.AppendChained(context.Background(), mergeVerdictParams(runID, fmt.Sprintf("g%d", i)))
+		}(i)
+	}
+	wg.Wait()
+
+	var success, dupes int
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			success++
+		case audit.IsMergeVerdictDuplicate(e):
+			dupes++
+		default:
+			t.Fatalf("unexpected AppendChained error (want nil or a merge-verdict duplicate): %v", e)
+		}
+	}
+	if success != 1 {
+		t.Errorf("successful concurrent appends = %d, want exactly 1", success)
+	}
+	if dupes != 1 {
+		t.Errorf("merge-verdict-duplicate losers = %d, want exactly 1", dupes)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "merge_verdict_recorded")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("surviving merge_verdict_recorded rows = %d, want exactly 1", len(rows))
 	}
 }

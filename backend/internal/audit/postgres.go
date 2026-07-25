@@ -9,12 +9,59 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	auditdb "github.com/kuhlman-labs/fishhawk/backend/internal/audit/db"
 	rundb "github.com/kuhlman-labs/fishhawk/backend/internal/run/db"
 )
+
+// MergeVerdictRecordedOnceIndex is the name of the partial unique index
+// (migration 0062, #1983) enforcing at most one merge_verdict_recorded audit
+// entry per run: CREATE UNIQUE INDEX ... ON audit_entries (run_id) WHERE
+// category = 'merge_verdict_recorded'. The merge endpoint scopes its benign
+// concurrent-race catch to a collision on THIS index specifically (see
+// IsMergeVerdictDuplicate), so an unrelated 23505 stays a hard error.
+const MergeVerdictRecordedOnceIndex = "audit_entries_merge_verdict_recorded_once_idx"
+
+// pgUniqueViolation is the PostgreSQL SQLSTATE for a unique_violation.
+const pgUniqueViolation = "23505"
+
+// ErrMergeVerdictDuplicate is a sentinel a fake Repository can return from
+// AppendChained to simulate losing the concurrent merge-verdict race (the
+// deterministic race-loser of the MergeVerdictRecordedOnceIndex collision).
+// IsMergeVerdictDuplicate recognizes it alongside a real driver-surfaced
+// unique_violation on that index, so the server handler's benign path can be
+// exercised without importing pgconn or standing up real Postgres.
+var ErrMergeVerdictDuplicate = errors.New("audit: duplicate merge_verdict_recorded entry")
+
+// IsDuplicateOnConstraint reports whether err (anywhere in its chain) is a
+// PostgreSQL unique_violation (SQLSTATE 23505) whose ConstraintName equals
+// name. AppendChained %w-wraps the driver error, so errors.As reaches the
+// underlying *pgconn.PgError. A unique-INDEX violation populates
+// PgError.ConstraintName with the index name, which is why matching on the
+// index name works for a CREATE UNIQUE INDEX (not just a table constraint).
+func IsDuplicateOnConstraint(err error, name string) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == name
+	}
+	return false
+}
+
+// IsMergeVerdictDuplicate reports whether err is the SPECIFIC benign
+// merge-verdict-race collision: a unique_violation on the
+// MergeVerdictRecordedOnceIndex partial unique index, or the
+// ErrMergeVerdictDuplicate sentinel (for fakes). It deliberately does NOT match
+// a 23505 on any OTHER constraint touched by the AppendChained insert (the
+// hash-chain / entry-hash / (run_id, sequence) uniqueness): swallowing those
+// would treat an unrelated integrity failure as the benign concurrent-merge
+// race and wrongly dispatch the merge (binding condition 1, #1983).
+func IsMergeVerdictDuplicate(err error) bool {
+	return errors.Is(err, ErrMergeVerdictDuplicate) ||
+		IsDuplicateOnConstraint(err, MergeVerdictRecordedOnceIndex)
+}
 
 type postgresRepo struct {
 	pool *pgxpool.Pool
