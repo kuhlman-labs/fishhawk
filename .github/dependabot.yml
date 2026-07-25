@@ -189,12 +189,23 @@ updates:
           - "react-router"
           - "@types/react"
           - "@types/react-dom"
+      # eslint-plugin-react-hooks is deliberately EXCLUDED from this group and
+      # given its own below. Its majors carry lint-policy changes, not just
+      # version bumps — 5.x → 7.x silently widens the `recommended` preset to
+      # include the React Compiler rule family — so grouping it meant one
+      # plugin major gated five routine updates in the same red PR (#2191).
       eslint:
         patterns:
           - "eslint"
           - "@eslint/*"
           - "eslint-plugin-*"
           - "typescript-eslint"
+        exclude-patterns:
+          - "eslint-plugin-react-hooks"
+      # Own group so a rule-policy change lands as its own reviewable PR.
+      react-hooks:
+        patterns:
+          - "eslint-plugin-react-hooks"
           - "globals"
       vite:
         patterns:
