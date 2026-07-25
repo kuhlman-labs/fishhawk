@@ -875,3 +875,116 @@ func TestAutoDriveRunGate_DecodesDecisionRequired(t *testing.T) {
 		t.Errorf("Action = %q, want route_fixup", out.Action)
 	}
 }
+
+// TestRunLiveValidation_WireShape pins the hand-maintained MCP wire mirror for
+// the run-status / gate-view live_validation block (#2045, E48.35): the backend
+// tags MUST byte-match Run.LiveValidation / GateView.LiveValidation or the
+// pointer silently decodes to nil (the #371-class trap). Each of the three
+// backend-emitted shapes decodes as sent — a healthy linked walk, a
+// filing-failure marker, and a stranded intent-only marker — and an old-backend
+// body that omits the field decodes to a nil pointer (the mixed-version degrade).
+func TestRunLiveValidation_WireShape(t *testing.T) {
+	runID := uuid.New()
+
+	// serveRun serves GET /v0/runs/{id} with the given body so GetRun's decode
+	// path (not a bespoke json.Unmarshal) is what is under test.
+	serveRun := func(t *testing.T, body string) *Run {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		r, err := c.GetRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		return r
+	}
+	// A minimal Run body carrying the given live_validation object literal (or
+	// none when lv == "").
+	runBody := func(lv string) string {
+		base := `{"id":"` + runID.String() + `","repo":"x/y","workflow_id":"feature_change","state":"succeeded"`
+		if lv != "" {
+			base += `,"live_validation":` + lv
+		}
+		return base + `}`
+	}
+
+	t.Run("healthy linked walk decodes", func(t *testing.T) {
+		r := serveRun(t, runBody(`{"pending_criteria_count":3,"walk_ref":"#123","filing_failed":false}`))
+		if r.LiveValidation == nil {
+			t.Fatal("LiveValidation is nil; the live_validation json tag does not byte-match the backend")
+		}
+		lv := r.LiveValidation
+		if lv.PendingCriteriaCount != 3 || lv.WalkRef != "#123" || lv.FilingFailed || lv.FilingIncomplete {
+			t.Errorf("LiveValidation = %+v, want {3 #123 false false}", *lv)
+		}
+	})
+
+	t.Run("filing-failure marker decodes", func(t *testing.T) {
+		r := serveRun(t, runBody(`{"pending_criteria_count":2,"filing_failed":true}`))
+		if r.LiveValidation == nil {
+			t.Fatal("LiveValidation is nil on a filing-failure body")
+		}
+		lv := r.LiveValidation
+		if lv.PendingCriteriaCount != 2 || lv.WalkRef != "" || !lv.FilingFailed || lv.FilingIncomplete {
+			t.Errorf("LiveValidation = %+v, want {2 \"\" true false}", *lv)
+		}
+	})
+
+	t.Run("stranded intent-only marker decodes", func(t *testing.T) {
+		r := serveRun(t, runBody(`{"pending_criteria_count":1,"filing_failed":true,"filing_incomplete":true}`))
+		if r.LiveValidation == nil {
+			t.Fatal("LiveValidation is nil on an intent-only body")
+		}
+		lv := r.LiveValidation
+		if lv.PendingCriteriaCount != 1 || lv.WalkRef != "" || !lv.FilingFailed || !lv.FilingIncomplete {
+			t.Errorf("LiveValidation = %+v, want {1 \"\" true true}", *lv)
+		}
+	})
+
+	t.Run("old-backend body omits the field -> nil", func(t *testing.T) {
+		r := serveRun(t, runBody(""))
+		if r.LiveValidation != nil {
+			t.Errorf("LiveValidation = %+v, want nil when the backend omits live_validation (the mixed-version degrade)", r.LiveValidation)
+		}
+	})
+
+	t.Run("gate-view mirrors the same block", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[],` +
+				`"live_validation":{"pending_criteria_count":4,"walk_ref":"#77","filing_failed":false}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		gv, err := c.GetGateView(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		if gv.LiveValidation == nil {
+			t.Fatal("GateView.LiveValidation is nil; the live_validation json tag does not byte-match the backend")
+		}
+		if gv.LiveValidation.PendingCriteriaCount != 4 || gv.LiveValidation.WalkRef != "#77" || gv.LiveValidation.FilingFailed {
+			t.Errorf("GateView.LiveValidation = %+v, want {4 #77 false ...}", *gv.LiveValidation)
+		}
+	})
+
+	t.Run("gate-view old-backend body omits the field -> nil", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[]}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		gv, err := c.GetGateView(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		if gv.LiveValidation != nil {
+			t.Errorf("GateView.LiveValidation = %+v, want nil when the backend omits live_validation", gv.LiveValidation)
+		}
+	})
+}

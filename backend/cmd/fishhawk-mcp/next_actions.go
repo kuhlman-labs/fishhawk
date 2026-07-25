@@ -82,6 +82,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		if drive.NextAction != nil {
 			na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 		}
+		foldLiveValidationAdvisory(run, na)
 		return na
 	}
 
@@ -92,13 +93,78 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	}
 
 	// Final structural guard: a non-terminal run must never read an empty
-	// actions list, even if a future table arm regresses to one.
+	// actions list, even if a future table arm regresses to one. Run this
+	// BEFORE the live-validation fold so the guard measures the classifier's own
+	// actions — an advisory note must never mask an otherwise-empty arm that owes
+	// the operator the unclassified fallback.
 	if !runStateIsTerminal(run.State) && len(na.Actions) == 0 {
 		fallback := unclassifiedNextActions(run, stages)
 		fallback.State = na.State
 		na = fallback
 	}
+	foldLiveValidationAdvisory(run, na)
 	return na
+}
+
+// liveValidationGuidance renders the operator live-validation guidance string
+// (#2045, E48.35) from a decoded Run.LiveValidation block, or "" when the run
+// carries no pending live-validation walk. Three variants, keyed off the
+// backend's filing_failed / filing_incomplete bits (binding condition A(1)):
+//
+//   - healthy walk (filing_failed=false, a non-empty walk_ref): "walk: #X"
+//   - filing failure (filing_failed=true, filing_incomplete=false): the
+//     file-manually variant "walk filing failed — file manually"
+//   - stranded intent marker (filing_failed=true, filing_incomplete=true — the
+//     crash window): "walk filing incomplete — file manually"
+//
+// The "walk: #X" branch is gated on a NON-EMPTY walk_ref so a malformed
+// linked marker (walk_ref empty yet filing_failed=false, which the backend never
+// writes) degrades to the file-manually wording rather than rendering a
+// nonsensical empty-ref "walk: " string (condition A(1): never a malformed
+// empty-ref string, never a healthy "walk: #X" for an un-filed walk).
+func liveValidationGuidance(lv *RunLiveValidation) string {
+	if lv == nil || lv.PendingCriteriaCount <= 0 {
+		return ""
+	}
+	n := lv.PendingCriteriaCount
+	switch {
+	case !lv.FilingFailed && lv.WalkRef != "":
+		return fmt.Sprintf("%d criteria pending operator live-validation (walk: %s)", n, lv.WalkRef)
+	case lv.FilingIncomplete:
+		return fmt.Sprintf("%d criteria pending operator live-validation (walk filing incomplete — file manually)", n)
+	default:
+		return fmt.Sprintf("%d criteria pending operator live-validation (walk filing failed — file manually)", n)
+	}
+}
+
+// foldLiveValidationAdvisory appends a DISPLAY-ONLY operator-live-validation
+// advisory to na when the run carries a pending live-validation walk (#2045).
+// It is folded in for EVERY run state — including a merged/terminal run — so an
+// un-filed or failed walk is never silently dropped once the PR ships; the walk
+// tracks a live check the operator still owes. Appended LAST (after the drive
+// fold and the structural guard) so it never reorders the primary next move and
+// never suppresses the unclassified fallback. A no-pending-walk run appends
+// nothing, leaving every existing surface byte-identical. na is mutated in
+// place; a nil na (only ever a nil-run early return upstream) is a no-op.
+func foldLiveValidationAdvisory(run *Run, na *NextActions) {
+	if na == nil {
+		return
+	}
+	guidance := liveValidationGuidance(run.LiveValidation)
+	if guidance == "" {
+		return
+	}
+	params := map[string]string{"run_id": run.ID}
+	if ref := run.LiveValidation.WalkRef; ref != "" {
+		params["walk_ref"] = ref
+	}
+	na.Actions = append(na.Actions, SuggestedAction{
+		Action:       "operator_live_validation",
+		Params:       params,
+		Precondition: "the approved plan carries requires_live_validation acceptance criteria — a live forge/deploy/external target the default-deny sandbox cannot reach, so the acceptance stage cannot validate them",
+		Consumes:     consumesNone,
+		Reason:       guidance + " — perform the live check yourself; when the walk was not durably filed (file manually) open the tracking work item by hand so the pending validation is not shipped silently unvalidated",
+	})
 }
 
 // classifyNextActions is the state table. Each arm returns a labeled
