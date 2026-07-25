@@ -45,6 +45,12 @@ type gateViewResponse struct {
 	// missing. HistoryGaps names each category that failed.
 	HistoryIncomplete bool     `json:"history_incomplete"`
 	HistoryGaps       []string `json:"history_gaps,omitempty"`
+	// LiveValidation mirrors the run-status surface (#2045, E48.35): the run's
+	// pending operator live-validation walk (count of requires_live_validation
+	// criteria + the filed walk ref, or a file-manually signal). Distilled from
+	// the newest live_validation walk marker; omitted (nil) when the run carried
+	// no marked criterion. Same best-effort read as the run-status surface.
+	LiveValidation *runLiveValidationPayload `json:"live_validation,omitempty"`
 }
 
 // gateViewConcern is one OPEN concern with its full decision context.
@@ -295,6 +301,11 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	}
 
 	resp.SuppressedRelitigations = history.suppressed
+	// Live-validation walk surface (#2045): same best-effort single-read as the
+	// run-status surface, so the gate view answers "is a live-validation walk
+	// still pending at this gate" in the one call. Omitted (nil) when the run
+	// carried no marked criterion or the read fails.
+	resp.LiveValidation = s.liveValidationForRun(ctx, runID)
 	return resp
 }
 

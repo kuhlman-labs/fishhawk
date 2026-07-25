@@ -154,6 +154,15 @@ type runResponse struct {
 	// its own fix-up pass. Omitted when the run has no findings (no scan yet,
 	// a clean scan, or a clean re-scan after a fix-up cleared them).
 	SecurityFindings []securityFindingPayload `json:"security_findings,omitempty"`
+	// LiveValidation is the run's pending operator live-validation walk (#2045,
+	// E48.35): the count of requires_live_validation acceptance criteria awaiting
+	// an operator live check, plus the filed walk ref (or a file-manually signal
+	// when the walk filing failed or is incomplete). Distilled from the newest
+	// live_validation walk marker. Populated by handleGetRun ONLY (a single audit
+	// read, same posture as Concerns / SecurityFindings) — so the list endpoint
+	// stays free of the extra read. Omitted (nil) when the run's approved plan
+	// carried no marked criterion (no marker recorded).
+	LiveValidation *runLiveValidationPayload `json:"live_validation,omitempty"`
 }
 
 // securityFindingPayload is one high-severity code-scanning finding on the
@@ -1203,6 +1212,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// fails (best-effort — warn and omit, never fail the read), or no audit
 	// repo is wired.
 	resp.SecurityFindings = s.securityFindingsForRun(r.Context(), runID)
+	// Live-validation walk surface (#2045): single-run read ONLY (same posture
+	// as Concerns / SecurityFindings — no per-row audit query on the list
+	// endpoint). Distilled from the run's newest live_validation walk marker;
+	// nil (field omitted) when the run's approved plan carried no marked
+	// criterion or the read fails (best-effort — warn and omit).
+	resp.LiveValidation = s.liveValidationForRun(r.Context(), runID)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

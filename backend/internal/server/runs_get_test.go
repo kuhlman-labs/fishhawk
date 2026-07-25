@@ -1955,3 +1955,92 @@ func TestGetRun_RepoVisibility(t *testing.T) {
 		})
 	}
 }
+
+// --- live-validation walk surface (#2045, E48.35) ------------------------
+
+// TestGetRun_SurfacesLiveValidation: the single-run read distills the newest
+// live_validation linked marker onto the run response, so a pending operator
+// live-validation walk surfaces at the run-status gate.
+func TestGetRun_SurfacesLiveValidation(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	seedLiveValidationMarker(au, seeded.ID, liveValidationWalkLinkedKind, liveValidationWalkMarker{
+		Phase: "linked", PendingCriteriaCount: 2, CriterionIDs: []string{"ac1", "ac2"}, WalkRef: "#4100",
+	})
+
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if resp.LiveValidation == nil {
+		t.Fatalf("live_validation = nil, want the pending walk")
+	}
+	lv := resp.LiveValidation
+	if lv.PendingCriteriaCount != 2 || lv.WalkRef != "#4100" || lv.FilingFailed || lv.FilingIncomplete {
+		t.Errorf("live_validation = %+v, want count 2, walk #4100, healthy", lv)
+	}
+	if _, ok := raw["live_validation"]; !ok {
+		t.Errorf("body should carry live_validation: %v", raw)
+	}
+}
+
+// TestGetRun_LiveValidation_LinkedWinsOverIntent pins the marker precedence
+// (risk-assumption): a linked marker recorded after an earlier intent marker
+// wins, so the surface reflects the linked walk_ref, not the stranded-intent
+// file-manually variant.
+func TestGetRun_LiveValidation_LinkedWinsOverIntent(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	seedLiveValidationMarker(au, seeded.ID, liveValidationWalkIntentKind, liveValidationWalkMarker{
+		Phase: "intent", PendingCriteriaCount: 1, CriterionIDs: []string{"ac1"},
+	})
+	seedLiveValidationMarker(au, seeded.ID, liveValidationWalkLinkedKind, liveValidationWalkMarker{
+		Phase: "linked", PendingCriteriaCount: 1, CriterionIDs: []string{"ac1"}, WalkRef: "#4200",
+	})
+
+	resp, _ := getRunResponse(t, s, seeded.ID)
+	if resp.LiveValidation == nil || resp.LiveValidation.WalkRef != "#4200" ||
+		resp.LiveValidation.FilingFailed || resp.LiveValidation.FilingIncomplete {
+		t.Errorf("live_validation = %+v, want the linked walk #4200 (linked wins over intent)", resp.LiveValidation)
+	}
+}
+
+// TestGetRun_LiveValidation_FilingFailedVariant: a filing-failure linked marker
+// surfaces filing_failed with no walk ref (the file-manually variant).
+func TestGetRun_LiveValidation_FilingFailedVariant(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	seedLiveValidationMarker(au, seeded.ID, liveValidationWalkLinkedKind, liveValidationWalkMarker{
+		Phase: "linked", PendingCriteriaCount: 1, CriterionIDs: []string{"ac1"}, FilingFailed: true,
+	})
+
+	resp, _ := getRunResponse(t, s, seeded.ID)
+	if resp.LiveValidation == nil || !resp.LiveValidation.FilingFailed ||
+		resp.LiveValidation.FilingIncomplete || resp.LiveValidation.WalkRef != "" {
+		t.Errorf("live_validation = %+v, want filing_failed with no ref", resp.LiveValidation)
+	}
+}
+
+// TestGetRun_LiveValidation_StrandedIntent: a bare intent marker (no linked
+// marker) surfaces the file-manually incomplete variant — never a healthy
+// walk_ref and never a malformed empty ref (binding condition A(1)).
+func TestGetRun_LiveValidation_StrandedIntent(t *testing.T) {
+	s, au, seeded := newSecurityGetServer(t)
+	seedLiveValidationMarker(au, seeded.ID, liveValidationWalkIntentKind, liveValidationWalkMarker{
+		Phase: "intent", PendingCriteriaCount: 3, CriterionIDs: []string{"a", "b", "c"},
+	})
+
+	resp, _ := getRunResponse(t, s, seeded.ID)
+	if resp.LiveValidation == nil || !resp.LiveValidation.FilingFailed ||
+		!resp.LiveValidation.FilingIncomplete || resp.LiveValidation.WalkRef != "" ||
+		resp.LiveValidation.PendingCriteriaCount != 3 {
+		t.Errorf("live_validation = %+v, want file-manually incomplete (count 3, no ref)", resp.LiveValidation)
+	}
+}
+
+// TestGetRun_NoLiveValidation_OmitsBlock: a run with no live_validation marker
+// carries no live_validation field (additive — byte-identical to pre-#2045).
+func TestGetRun_NoLiveValidation_OmitsBlock(t *testing.T) {
+	s, _, seeded := newSecurityGetServer(t)
+	resp, raw := getRunResponse(t, s, seeded.ID)
+	if resp.LiveValidation != nil {
+		t.Errorf("live_validation = %+v, want nil when no marker landed", resp.LiveValidation)
+	}
+	if _, ok := raw["live_validation"]; ok {
+		t.Errorf("no marker should omit live_validation: %v", raw)
+	}
+}
