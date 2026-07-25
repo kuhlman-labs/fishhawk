@@ -3780,3 +3780,161 @@ func TestDriveRun_AcceptanceAdmissionAuthzRejection_FailsClosed(t *testing.T) {
 		}
 	}
 }
+
+// --- #1970: bind the host runner-liveness pgrep pattern to the spawn argv ---
+
+// TestProbeRunnerLiveness drives the real `pgrep -f` exec seam so the probe
+// invocation is covered end to end (not just the pure classifyPgrepResult). A
+// freshly minted stage id matches no live process, so a working pgrep returns
+// exit 1 -> runnerDead; a host without pgrep on PATH degrades to runnerUnknown.
+// Both are acceptable: the point is to exercise the exec path, not to assert a
+// host-specific verdict. The one direction that must never occur — a LIVE verdict
+// for an id no process carries — is excluded.
+func TestProbeRunnerLiveness(t *testing.T) {
+	got := probeRunnerLiveness(context.Background(), uuid.New().String())
+	if got != runnerDead && got != runnerUnknown {
+		t.Errorf("probeRunnerLiveness(unmatched id) = %v, want runnerDead or runnerUnknown", got)
+	}
+}
+
+// TestStageIDPgrepPattern pins the pure derivation of the probe pattern from the
+// shared stageIDArgFlag constant: the value is "stage-id <uuid>", it carries no
+// leading '-' (so BSD/procps flag parsing never eats it as an option), and it is
+// derived from stageIDArgFlag by trimming the leading '--'. This is the pattern
+// probeRunnerLiveness feeds to `pgrep -f`; the direction it protects is the
+// false-DEAD one — a LIVE runner must never be classified DEAD, because a
+// false-DEAD auto-recovers by spawning a SECOND runner into the same lineage lock
+// (drive_run.go classifyPgrepResult: exit 1 -> runnerDead).
+func TestStageIDPgrepPattern(t *testing.T) {
+	const id = "9da4b47e-87b6-4def-bff6-debb9f3ba856"
+	got := stageIDPgrepPattern(id)
+	if want := "stage-id " + id; got != want {
+		t.Errorf("stageIDPgrepPattern(%q) = %q, want %q", id, got, want)
+	}
+	if strings.HasPrefix(got, "-") {
+		t.Errorf("pattern %q must not begin with '-' (BSD/procps flag-parse safety)", got)
+	}
+	// Derived from the shared spawn-flag constant, not an independent literal:
+	// trimming the flag's leading '--' and appending " <id>" reproduces it, so a
+	// rename of stageIDArgFlag moves the pattern in lockstep.
+	if want := strings.TrimPrefix(stageIDArgFlag, "--") + " " + id; got != want {
+		t.Errorf("pattern %q is not derived from stageIDArgFlag %q", got, stageIDArgFlag)
+	}
+}
+
+// TestProbePatternMatchesSpawnArgv is the load-bearing binding for the
+// composeRunnerArgv (run_stage.go) spawn site: it drives r.runStage for an
+// implement stage through the recording runStageCommand seam, joins the captured
+// argv with single spaces the way pgrep -f reads /proc cmdline, and asserts the
+// derived probe pattern is a substring. A future switch of composeRunnerArgv to
+// the `=`-joined single-token `--stage-id=<uuid>` form renders "...--stage-id=<uuid>..."
+// which the space-separated pattern no longer matches, turning this RED — the
+// false-DEAD direction the probe must never silently take. The two-token
+// adjacency (stageIDArgFlag immediately followed by the stage id) is asserted
+// directly so the intended token shape is pinned explicitly.
+func TestProbePatternMatchesSpawnArgv(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	var capturedArgs []string
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, args ...string) *exec.Cmd {
+		capturedArgs = args
+		return exec.Command("sh", "-c", "exit 0")
+	}
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() {
+		runStageCommand = origCmd
+		runStageLookPath = exec.LookPath
+	})
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "succeeded")
+
+	if _, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		StageID:    stageID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	}); err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	assertProbeMatchesArgv(t, "composeRunnerArgv", capturedArgs, stageID.String())
+}
+
+// TestProbePatternMatchesChildSpawnArgv is the load-bearing binding for the
+// SECOND spawn site — the run_children.go inline child argv producer. The shared
+// stageIDArgFlag constant binds only the flag SPELLING (a rename compile-breaks),
+// NOT its two-token SHAPE: a future CHILD-ONLY change to
+// `stageIDArgFlag + "=" + d.stageID` (single token) would still compile and
+// silently produce the same false-DEAD verdict for child runners. Capturing the
+// child argv via the run_children spawn seam and asserting both the pattern
+// substring and the two-token adjacency turns that child-only drift RED.
+func TestProbePatternMatchesChildSpawnArgv(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	child := uuid.New()
+	seedChildRun(fb, child, "pending")
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 1)
+
+	fb.mu.Lock()
+	childStageID := fb.stagesByRun[child][0].ID
+	fb.mu.Unlock()
+
+	var (
+		captured []string
+		mu       sync.Mutex
+	)
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		mu.Lock()
+		captured = append([]string(nil), argv...)
+		mu.Unlock()
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	if _, _, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID:        parent.String(),
+		Workflow:     "wf",
+		GitHubRepo:   "x/y",
+		RunnerBinary: "/fake/fishhawk-runner",
+	}); err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	mu.Lock()
+	argv := captured
+	mu.Unlock()
+	if len(argv) == 0 {
+		t.Fatal("child spawn recorded no argv")
+	}
+	assertProbeMatchesArgv(t, "run_children child argv", argv, childStageID)
+}
+
+// assertProbeMatchesArgv renders argv the way pgrep -f reads /proc cmdline
+// (space-joined) and asserts stageIDPgrepPattern(stageID) is a substring, then
+// asserts the two-token adjacency: stageIDArgFlag immediately followed by the
+// stage id token. Shared by both spawn-site binding tests so a shape drift at
+// EITHER producer turns its test RED.
+func assertProbeMatchesArgv(t *testing.T, site string, argv []string, stageID string) {
+	t.Helper()
+	joined := strings.Join(argv, " ")
+	if pat := stageIDPgrepPattern(stageID); !strings.Contains(joined, pat) {
+		t.Errorf("%s: probe pattern %q is not a substring of the space-joined spawn argv\nargv: %s", site, pat, joined)
+	}
+	idx := -1
+	for i, tok := range argv {
+		if tok == stageIDArgFlag {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("%s: spawn argv does not contain the shared %q flag token\nargv: %v", site, stageIDArgFlag, argv)
+	}
+	if idx+1 >= len(argv) || argv[idx+1] != stageID {
+		t.Errorf("%s: expected %q to be immediately followed by the stage id %q (two-token shape); argv: %v", site, stageIDArgFlag, stageID, argv)
+	}
+}

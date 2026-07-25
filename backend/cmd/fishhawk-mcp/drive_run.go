@@ -44,19 +44,45 @@ const (
 // read can never hang the drive loop.
 const driveLivenessProbeTimeout = 5 * time.Second
 
+// stageIDArgFlag is the single source of truth for the runner-spawn flag token
+// that carries the stage id. BOTH runner-spawn argv producers — composeRunnerArgv
+// (run_stage.go) and the inline child argv (run_children.go) — emit it, and the
+// host runner-liveness probe derives its pgrep pattern from it via
+// stageIDPgrepPattern. Threading all three through this one constant makes a
+// rename a COMPILE break at every site rather than a silent drift between the
+// spawn argv and the probe pattern (#1970).
+const stageIDArgFlag = "--stage-id"
+
+// stageIDPgrepPattern derives the host runner-liveness probe pattern from
+// stageIDArgFlag: the leading '--' is trimmed (so BSD/procps flag parsing never
+// eats the pattern as an option) and a single-space separator is preserved,
+// yielding "stage-id <uuid>". pgrep -f matches against the full argument list
+// joined by single spaces, so this matches the rendered `--stage-id <uuid>`
+// two-token pair every spawn site emits — binding the probe to the spawn argv
+// SHAPE by construction. A future switch to the `=`-joined single-token
+// `--stage-id=<uuid>` form would no longer match; the binding test in
+// drive_run_test.go turns RED on that drift, because a live runner classified
+// DEAD is the one direction the probe must never silently take (a false-DEAD
+// auto-recovers by spawning a SECOND runner into the same lineage lock).
+func stageIDPgrepPattern(stageID string) string {
+	return strings.TrimPrefix(stageIDArgFlag, "--") + " " + stageID
+}
+
 // probeRunnerLiveness execs `pgrep -f` scoped to the stale stage's id to decide
 // whether a runner process for it is still alive on this host (#1955). The
-// pattern is "stage-id <uuid>" — no leading '-', so BSD/procps flag parsing
-// never eats it as an option — which matches the runner argv's `--stage-id
-// <uuid>` token pair (pgrep -f matches against the full argument list) regardless
-// of the runner binary's path or name. Stage ids are UUIDs (hex + dashes), so the
-// pattern is ERE-safe, and pgrep never reports itself as a match. Classification
-// is delegated to the pure classifyPgrepResult so the exit-code contract is
+// pattern is DERIVED from stageIDArgFlag via stageIDPgrepPattern (#1970), so the
+// probe and the runner spawn argv stay in lockstep by construction: it is
+// "stage-id <uuid>" — no leading '-', so BSD/procps flag parsing never eats it
+// as an option — which matches the runner argv's `--stage-id <uuid>` token pair
+// (pgrep -f matches against the full argument list) regardless of the runner
+// binary's path or name. Stage ids are UUIDs (hex + dashes), so the pattern is
+// ERE-safe, and pgrep never reports itself as a match. Classification is
+// delegated to the pure classifyPgrepResult so the exit-code contract is
 // unit-testable without a live process.
 func probeRunnerLiveness(ctx context.Context, stageID string) runnerLivenessVerdict {
 	pctx, cancel := context.WithTimeout(ctx, driveLivenessProbeTimeout)
 	defer cancel()
-	err := exec.CommandContext(pctx, "pgrep", "-f", "stage-id "+stageID).Run()
+	err := exec.CommandContext(pctx, "pgrep", "-f", stageIDPgrepPattern(stageID)).Run()
 	return classifyPgrepResult(err)
 }
 
