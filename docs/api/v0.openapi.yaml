@@ -777,12 +777,60 @@ components:
             posture as `concerns`); omitted on the list endpoint and when the
             run has no findings (no scan yet, a clean scan, or a clean re-scan
             after a fix-up cleared them).
+        live_validation:
+          $ref: '#/components/schemas/LiveValidation'
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    LiveValidation:
+      type: object
+      description: |
+        The run's pending operator live-validation walk (#2045, E48.35). When an
+        approved plan carries acceptance criteria marked `requires_live_validation`
+        — criteria whose true verification needs a live forge/deploy/external
+        target the default-deny acceptance sandbox cannot reach — plan approval
+        auto-files a `chore`-type operator-validation walk and records a durable
+        marker. This surface distils the newest such marker so the pending live
+        check is visible rather than shipped silently unvalidated. Distilled from
+        the newest `live_validation_walk_linked` marker (else a stranded
+        `live_validation_walk_intent` marker). Surfaced on `GET /v0/runs/{run_id}`
+        and `GET /v0/runs/{run_id}/gate-view` ONLY (a single audit read, same
+        posture as `security_findings`); omitted when the run's approved plan
+        carried no marked criterion.
+      required: [pending_criteria_count, filing_failed]
+      properties:
+        pending_criteria_count:
+          type: integer
+          minimum: 0
+          description: |
+            The number of `requires_live_validation` acceptance criteria on the
+            approved plan awaiting an operator live check.
+        walk_ref:
+          type: string
+          description: |
+            The filed walk work-item ref (`#N`). Present only when the walk was
+            durably filed (`filing_failed=false`); omitted on a filing failure
+            or an incomplete filing.
+        filing_failed:
+          type: boolean
+          description: |
+            The "file the walk by hand" signal: true when the walk filing failed
+            (no `walk_ref`) OR when the newest marker is a stranded intent marker
+            (see `filing_incomplete`). A consumer that reads only this field never
+            renders a healthy `walk: #N` for a run whose walk is not durably
+            filed — both are "pending, file manually".
+        filing_incomplete:
+          type: boolean
+          description: |
+            True when the newest marker is a bare intent marker with no linked
+            marker following it (the crash-window residual: the process died
+            between the intent-marker append and the forge call). Rendered as
+            "walk filing incomplete — file manually" versus a filing-failure's
+            "walk filing failed — file manually". Omitted (false) otherwise.
 
     RunFixupModel:
       type: object
@@ -962,6 +1010,8 @@ components:
           type: array
           items: { type: string }
           description: The audit categories that failed to read, when `history_incomplete` is true.
+        live_validation:
+          $ref: '#/components/schemas/LiveValidation'
 
     GateViewConcern:
       type: object

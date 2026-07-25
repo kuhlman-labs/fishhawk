@@ -290,6 +290,67 @@ func TestAcceptanceSkippableAllSkipWithBasis_TruthTable(t *testing.T) {
 	}
 }
 
+// (selector: LiveValidationCriteria) The truth table of the #2045 live-validation
+// selector: it returns EXACTLY the subset of criteria marked
+// requires_live_validation, in order, and a non-nil empty slice when none is
+// marked or the criteria set is empty. It keys ONLY on RequiresLiveValidation —
+// skip_expected/expectation_basis are orthogonal (a criterion can be
+// live-validation-marked whether or not it is also skip-marked).
+func TestLiveValidationCriteria_TruthTable(t *testing.T) {
+	live := func(id string) AcceptanceCriterion {
+		return AcceptanceCriterion{ID: id, Statement: "live target", Source: CriterionSourceInferred, Rationale: "needs a live forge", RequiresLiveValidation: true, SkipExpected: true, ExpectationBasis: "validated in integration_test.go"}
+	}
+	plain := func(id string) AcceptanceCriterion {
+		return AcceptanceCriterion{ID: id, Statement: "drivable", Source: CriterionSourceExplicit, SourceRef: "#1"}
+	}
+	cases := []struct {
+		name    string
+		v       Verification
+		wantIDs []string
+	}{
+		{
+			name:    "none marked -> empty selection",
+			v:       Verification{AcceptanceCriteria: []AcceptanceCriterion{plain("a1"), plain("a2")}},
+			wantIDs: []string{},
+		},
+		{
+			name:    "all marked -> all selected in order",
+			v:       Verification{AcceptanceCriteria: []AcceptanceCriterion{live("a1"), live("a2")}},
+			wantIDs: []string{"a1", "a2"},
+		},
+		{
+			name:    "mixed -> only the marked subset, order preserved",
+			v:       Verification{AcceptanceCriteria: []AcceptanceCriterion{plain("a1"), live("a2"), plain("a3"), live("a4")}},
+			wantIDs: []string{"a2", "a4"},
+		},
+		{
+			name:    "empty criteria -> empty selection",
+			v:       Verification{},
+			wantIDs: []string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := LiveValidationCriteria(tc.v)
+			if got == nil {
+				t.Fatal("LiveValidationCriteria must return a non-nil slice")
+			}
+			gotIDs := make([]string, len(got))
+			for i, c := range got {
+				gotIDs[i] = c.ID
+			}
+			if len(gotIDs) != len(tc.wantIDs) {
+				t.Fatalf("selected ids = %v, want %v", gotIDs, tc.wantIDs)
+			}
+			for i := range gotIDs {
+				if gotIDs[i] != tc.wantIDs[i] {
+					t.Fatalf("selected ids = %v, want %v", gotIDs, tc.wantIDs)
+				}
+			}
+		})
+	}
+}
+
 // (clean contract) A fully clean criteria set returns a NON-NIL empty slice, so
 // a payload can distinguish "checked and clean" ([]) from "never checked".
 func TestEvaluateAcceptanceCriteria_CleanReturnsNonNilEmpty(t *testing.T) {

@@ -2291,6 +2291,12 @@ func buildPlan(t Trigger) string {
 		"then `expectation_basis` (REQUIRED when `skip_expected` is `true`) MUST cite where the behavior is actually validated (the " +
 		"integration/e2e test with a fake). Omit both on a drivable criterion — a legacy criterion without `skip_expected` is " +
 		"unaffected.\n")
+	b.WriteString("- `requires_live_validation` is OPTIONAL (see the Live-validation criteria rule below): set it to `true` on a " +
+		"criterion whose TRUE verification needs a LIVE forge/deploy/external target the default-deny sandbox lacks (not merely an " +
+		"external trigger event, which `skip_expected` already covers). A criterion you mark `requires_live_validation` you MUST ALSO " +
+		"mark `skip_expected: true` with an `expectation_basis` — the two travel together so acceptance short-circuits via " +
+		"all-skip-with-basis rather than dispatching an unvalidatable live-target criterion to the acceptance agent. Omit it on a " +
+		"drivable criterion.\n")
 	b.WriteString("verification.out_of_scope escape hatch: an OPTIONAL array of non-empty strings stating what the change deliberately " +
 		"does NOT cover. It is the mechanism a test-only or doc-only change uses to declare it intentionally authors no " +
 		"acceptance_criteria — populate out_of_scope with the reason instead of leaving the intent unstated. Author " +
@@ -2306,6 +2312,13 @@ func buildPlan(t Trigger) string {
 		"the orchestrator short-circuits acceptance dispatch straight to a passed verdict (basis `all-skip-with-basis`) with no " +
 		"runner spawn — there is nothing the sandboxed agent could observe. The marker is OPTIONAL and the plan gate does not reject " +
 		"a legacy unmarked plan.\n")
+	b.WriteString("Live-validation criteria rule: a NARROWER case of the above — when a criterion's true verification needs a LIVE " +
+		"forge/deploy/external target (a real GitHub API round-trip, a deployed environment, a third-party surface), not merely an " +
+		"external event, the sandbox can never stand that target up. Classify it up front by setting `requires_live_validation: true`. " +
+		"A criterion you mark `requires_live_validation` you MUST ALSO mark `skip_expected: true` with an `expectation_basis` citing " +
+		"the integration/e2e test with a fake — the pairing keeps the all-skip-with-basis short-circuit intact so the live-target " +
+		"criterion never dispatches to the acceptance agent. On plan approval the system auto-files-or-links an operator-validation " +
+		"walk for every `requires_live_validation` criterion so the live check is tracked and nothing ships silently unvalidated.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +

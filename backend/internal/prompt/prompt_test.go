@@ -698,6 +698,14 @@ func TestBuild_Plan_ExternallyTriggeredCriteriaGuidance(t *testing.T) {
 		"expectation_basis",
 		"short-circuit",
 		"all-skip-with-basis",
+		// #2045: the live-validation classification rule, its live-target
+		// framing, the auto-filed operator-validation walk, and (Condition B)
+		// the mandatory pairing with skip_expected so the short-circuit holds.
+		"Live-validation criteria rule",
+		"requires_live_validation",
+		"LIVE",
+		"operator-validation walk",
+		"MUST ALSO mark `skip_expected: true`",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

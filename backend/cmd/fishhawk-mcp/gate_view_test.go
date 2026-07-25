@@ -216,3 +216,80 @@ func TestGetGateView_InvalidStageKind(t *testing.T) {
 		t.Errorf("backend was called %d times; a bad stage_kind must fail before the round-trip", probe.calls)
 	}
 }
+
+// TestGetGateView_LiveValidationRoundTrips (#2045, E48.35) drives the tool
+// end-to-end over the in-memory MCP transport and asserts the live_validation
+// block survives the client -> tool -> output seam. Two shapes: a healthy linked
+// walk (walk_ref present) and a stranded intent-only marker (filing_failed +
+// filing_incomplete, no walk_ref). A backend that omits the block leaves the
+// mirrored field nil (the mixed-version degrade), asserted in the third case.
+func TestGetGateView_LiveValidationRoundTrips(t *testing.T) {
+	newPayload := func(runID uuid.UUID, lv *RunLiveValidation) GateView {
+		return GateView{
+			RunID:                   runID.String(),
+			Open:                    []GateViewConcern{},
+			Settled:                 []GateViewSettledConcern{},
+			SuppressedRelitigations: []GateViewSuppressedRelitig{},
+			LiveValidation:          lv,
+		}
+	}
+
+	decode := func(t *testing.T, res *mcp.CallToolResult) *GateView {
+		t.Helper()
+		if res.IsError {
+			t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+		}
+		if res.StructuredContent == nil {
+			t.Fatal("StructuredContent is nil; the typed output did not serialize")
+		}
+		raw, err := json.Marshal(res.StructuredContent)
+		if err != nil {
+			t.Fatalf("marshal StructuredContent: %v", err)
+		}
+		var out GetGateViewOutput
+		if uerr := json.Unmarshal(raw, &out); uerr != nil {
+			t.Fatalf("decode GetGateViewOutput from wire: %v", uerr)
+		}
+		if out.GateView == nil {
+			t.Fatal("gate_view did not round-trip")
+		}
+		return out.GateView
+	}
+
+	t.Run("healthy linked walk survives the seam", func(t *testing.T) {
+		runID := uuid.New()
+		srv, _ := newGateViewBackend(t, http.StatusOK, newPayload(runID, &RunLiveValidation{
+			PendingCriteriaCount: 3, WalkRef: "#123", FilingFailed: false,
+		}))
+		gv := decode(t, callGateView(t, srv, map[string]any{"run_id": runID.String()}))
+		if gv.LiveValidation == nil {
+			t.Fatal("gate_view.live_validation did not round-trip through the seam")
+		}
+		if lv := gv.LiveValidation; lv.PendingCriteriaCount != 3 || lv.WalkRef != "#123" || lv.FilingFailed || lv.FilingIncomplete {
+			t.Errorf("live_validation = %+v, want {3 #123 false false}", *lv)
+		}
+	})
+
+	t.Run("stranded intent-only marker survives the seam", func(t *testing.T) {
+		runID := uuid.New()
+		srv, _ := newGateViewBackend(t, http.StatusOK, newPayload(runID, &RunLiveValidation{
+			PendingCriteriaCount: 1, FilingFailed: true, FilingIncomplete: true,
+		}))
+		gv := decode(t, callGateView(t, srv, map[string]any{"run_id": runID.String()}))
+		if gv.LiveValidation == nil {
+			t.Fatal("gate_view.live_validation did not round-trip through the seam")
+		}
+		if lv := gv.LiveValidation; lv.PendingCriteriaCount != 1 || lv.WalkRef != "" || !lv.FilingFailed || !lv.FilingIncomplete {
+			t.Errorf("live_validation = %+v, want {1 \"\" true true}", *lv)
+		}
+	})
+
+	t.Run("omitted block leaves the mirror nil", func(t *testing.T) {
+		runID := uuid.New()
+		srv, _ := newGateViewBackend(t, http.StatusOK, newPayload(runID, nil))
+		gv := decode(t, callGateView(t, srv, map[string]any{"run_id": runID.String()}))
+		if gv.LiveValidation != nil {
+			t.Errorf("gate_view.live_validation = %+v, want nil when the backend omits it", gv.LiveValidation)
+		}
+	})
+}

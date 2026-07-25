@@ -196,3 +196,22 @@ func AcceptanceSkippableAllSkipWithBasis(v Verification) bool {
 	}
 	return true
 }
+
+// LiveValidationCriteria returns exactly the acceptance criteria a plan marks
+// RequiresLiveValidation — those whose true verification needs a LIVE
+// forge/deploy/external target the default-deny sandbox lacks (#2045). It is the
+// single selector both the approval side-effect (which files-or-links an
+// operator-validation walk when the result is non-empty) and the run/gate-view
+// surface dispatch through, mirroring AcceptanceSkippableAllSkipWithBasis as the
+// shared source of truth. Returns a non-nil empty slice when nothing is marked
+// (a plan with no live-validation criterion), so the approval hook no-ops via a
+// len==0 check with no nil special-casing.
+func LiveValidationCriteria(v Verification) []AcceptanceCriterion {
+	out := []AcceptanceCriterion{}
+	for _, c := range v.AcceptanceCriteria {
+		if c.RequiresLiveValidation {
+			out = append(out, c)
+		}
+	}
+	return out
+}

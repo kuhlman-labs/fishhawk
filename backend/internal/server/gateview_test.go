@@ -710,3 +710,51 @@ func bytesContains(t *testing.T, resp gateViewResponse, id, needle string) bool 
 	}
 	return false
 }
+
+// --- live-validation walk surface (#2045, E48.35) ------------------------
+
+// TestGateView_SurfacesLiveValidation: the gate view mirrors the run-status
+// live-validation surface, so the gate view answers "is a live-validation walk
+// still pending at this gate" in the one call.
+func TestGateView_SurfacesLiveValidation(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedLiveValidationMarker(au, runID, liveValidationWalkLinkedKind, liveValidationWalkMarker{
+		Phase: "linked", PendingCriteriaCount: 2, CriterionIDs: []string{"ac1", "ac2"}, WalkRef: "#4300",
+	})
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if resp.LiveValidation == nil {
+		t.Fatalf("live_validation = nil, want the pending walk")
+	}
+	if resp.LiveValidation.WalkRef != "#4300" || resp.LiveValidation.PendingCriteriaCount != 2 ||
+		resp.LiveValidation.FilingFailed || resp.LiveValidation.FilingIncomplete {
+		t.Errorf("live_validation = %+v, want count 2, walk #4300, healthy", resp.LiveValidation)
+	}
+}
+
+// TestGateView_LiveValidation_StrandedIntent: a bare intent marker surfaces the
+// file-manually incomplete variant on the gate view (binding condition A(1)).
+func TestGateView_LiveValidation_StrandedIntent(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedLiveValidationMarker(au, runID, liveValidationWalkIntentKind, liveValidationWalkMarker{
+		Phase: "intent", PendingCriteriaCount: 1, CriterionIDs: []string{"ac1"},
+	})
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if resp.LiveValidation == nil || !resp.LiveValidation.FilingFailed ||
+		!resp.LiveValidation.FilingIncomplete || resp.LiveValidation.WalkRef != "" {
+		t.Errorf("live_validation = %+v, want file-manually incomplete", resp.LiveValidation)
+	}
+}
+
+// TestGateView_NoLiveValidation_OmitsBlock: no marker → the field is omitted.
+func TestGateView_NoLiveValidation_OmitsBlock(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if resp.LiveValidation != nil {
+		t.Errorf("live_validation = %+v, want nil when no marker landed", resp.LiveValidation)
+	}
+}
