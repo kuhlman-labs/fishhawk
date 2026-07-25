@@ -11,12 +11,15 @@ worktrees="$(git worktree list --porcelain 2>/dev/null || true)"
 # Print the worktree path that currently checks out the given branch, or nothing.
 # Parses the porcelain snapshot with awk (NOT a bash associative array — macOS
 # bash 3.2 has none). Matches the FULL ref (refs/heads/<name>) to avoid substring
-# collisions between similarly-named branches.
+# collisions between similarly-named branches. Feeds awk via a here-string rather
+# than a `printf | awk` pipe: awk `exit`s on first match, and under `pipefail` a
+# SIGPIPE'd printf would make the pipeline non-zero and abort the script under
+# `set -e` — the exact abort class this script exists to avoid.
 holding_worktree() {
-  printf '%s\n' "$worktrees" | awk -v target="refs/heads/$1" '
+  awk -v target="refs/heads/$1" '
     /^worktree / { path = substr($0, 10); next }
     $0 == "branch " target { print path; exit }
-  '
+  ' <<<"$worktrees"
 }
 
 count=0

@@ -9,7 +9,8 @@ PASS=0
 FAIL=0
 
 tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT
+tmpdir2=$(mktemp -d)
+trap 'rm -rf "$tmpdir" "$tmpdir2"' EXIT
 
 git -C "$tmpdir" init -q
 git -C "$tmpdir" config user.email "test@example.com"
@@ -102,6 +103,65 @@ if [ "$status" -eq 0 ]; then
   pass "script exited 0 despite the worktree-held skip"
 else
   fail "script should exit 0 (got $status; output: $output)"
+fi
+
+# ---------------------------------------------------------------------------
+# Fail-open: when `git worktree list --porcelain` errors, the snapshot degrades
+# to an empty string and the script preserves its prior delete behavior (a
+# merged branch is still deleted, no branch is treated as held, exit 0). This
+# exercises the `|| true` fallback on the snapshot line, which the main scenario
+# above (where the command succeeds) cannot reach.
+git -C "$tmpdir2" init -q
+git -C "$tmpdir2" config user.email "test@example.com"
+git -C "$tmpdir2" config user.name "Test"
+touch "$tmpdir2/README"
+git -C "$tmpdir2" add README
+git -C "$tmpdir2" commit -q -m "init"
+git -C "$tmpdir2" branch -m main
+
+git -C "$tmpdir2" checkout -q -b merged-branch-2
+echo "merged2" > "$tmpdir2/merged2.txt"
+git -C "$tmpdir2" add merged2.txt
+git -C "$tmpdir2" commit -q -m "merged commit 2"
+git -C "$tmpdir2" checkout -q main
+git -C "$tmpdir2" merge --no-ff -q -m "merge merged-branch-2" merged-branch-2
+
+git -C "$tmpdir2" remote add origin "$tmpdir2"
+git -C "$tmpdir2" fetch -q origin main
+
+# Shim `git` so `git worktree list …` fails, forcing the fail-open snapshot
+# path; every other git subcommand delegates to the real binary by absolute
+# path (no PATH recursion).
+shimdir="$tmpdir2/shim"
+mkdir -p "$shimdir"
+real_git="$(command -v git)"
+cat > "$shimdir/git" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "worktree" ] && [ "\$2" = "list" ]; then
+  echo "simulated git worktree failure" >&2
+  exit 1
+fi
+exec "$real_git" "\$@"
+EOF
+chmod +x "$shimdir/git"
+
+set +e
+output2=$(cd "$tmpdir2" && PATH="$shimdir:$PATH" bash "$REPO_ROOT/scripts/cleanup-merged" 2>&1)
+status2=$?
+set -e
+
+# Case 6: fail-open — a merged branch is still deleted when the snapshot fails.
+if ! git -C "$tmpdir2" show-ref --verify --quiet refs/heads/merged-branch-2; then
+  pass "fail-open: merged branch deleted despite worktree-list failure"
+else
+  fail "fail-open: merged-branch-2 should have been deleted (status $status2; output: $output2)"
+fi
+
+# Case 7: fail-open — the script still exits 0.
+if [ "$status2" -eq 0 ]; then
+  pass "fail-open: script exited 0 despite the worktree-list failure"
+else
+  fail "fail-open: script should exit 0 (got $status2; output: $output2)"
 fi
 
 echo ""
