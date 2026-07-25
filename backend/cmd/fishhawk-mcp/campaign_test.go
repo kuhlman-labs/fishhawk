@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -912,7 +914,27 @@ func TestStartCampaign_NoEpic_E2E_ThroughRealServer(t *testing.T) {
 	// GitHub nil: the runless install resolution is skipped, so scope stays zero
 	// and the fake resolver (which ignores scope) still runs.
 	s := server.New(server.Config{CampaignRepo: repo, APITokenRepo: tokRepo})
-	httpSrv := httptest.NewServer(s.Handler())
+	// Interpose a capturing middleware so the test can inspect the RAW request
+	// body the real MCP client serialized. Routing to the no-epic branch alone is
+	// vacuous for the load-bearing serialization claim: the server trims and
+	// branches identically whether epic_ref is "" or absent, so only the raw wire
+	// body proves the client emitted epic_ref as "" (non-omitempty) rather than
+	// dropping the key. If a future refactor re-adds omitempty and drops the key,
+	// this assertion — not the routing check — turns the test RED.
+	handler := s.Handler()
+	var capturedBody []byte
+	capture := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v0/campaigns" {
+			b, rerr := io.ReadAll(req.Body)
+			if rerr != nil {
+				t.Errorf("read captured request body: %v", rerr)
+			}
+			capturedBody = b
+			req.Body = io.NopCloser(bytes.NewReader(b))
+		}
+		handler.ServeHTTP(w, req)
+	})
+	httpSrv := httptest.NewServer(capture)
 	t.Cleanup(httpSrv.Close)
 
 	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
@@ -924,6 +946,13 @@ func TestStartCampaign_NoEpic_E2E_ThroughRealServer(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("startCampaign (no-epic E2E): %v", err)
+	}
+	// The REAL client emitted epic_ref as "" on the wire (not omitted): the
+	// load-bearing no-epic serialization binding condition 1 requires. This is the
+	// non-vacuous assertion — routing works whether the key is "" or absent, so the
+	// raw body is the only proof the client kept the key and serialized "".
+	if !bytes.Contains(capturedBody, []byte(`"epic_ref":""`)) {
+		t.Errorf("request body = %s, want it to carry \"epic_ref\":\"\" (client must serialize the no-epic sentinel, not drop the key)", capturedBody)
 	}
 	// The server routed to the no-epic branch and forwarded the named items.
 	if got := prov.captured.Items; len(got) != 2 || got[0] != "issue:101" || got[1] != "issue:102" {

@@ -67,6 +67,9 @@ type fakeAPI struct {
 	// when set, is returned for every GetIssue call (the fetch-fails branch).
 	getIssues   map[int]*githubclient.Issue
 	getIssueErr error
+	// getIssueCalls records how many times GetIssue was called per number, so a
+	// test can assert the duplicate-ref dedup fetches each named issue exactly once.
+	getIssueCalls map[int]int
 
 	searchQuery   string
 	searchResults []githubclient.IssueTitleResult
@@ -151,6 +154,10 @@ func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ forge.CredentialScope
 }
 
 func (f *fakeAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	if f.getIssueCalls == nil {
+		f.getIssueCalls = map[int]int{}
+	}
+	f.getIssueCalls[number]++
 	if f.getIssueErr != nil {
 		return nil, f.getIssueErr
 	}
@@ -728,6 +735,24 @@ func TestProvider_ResolveDependencies(t *testing.T) {
 		}
 		if byNum[102].Complete {
 			t.Errorf("#102 Complete = true, want false (open)")
+		}
+	})
+
+	t.Run("duplicate ref resolves the issue once", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			101: {Number: 101, Title: "dup", Body: "no deps", State: "open"},
+		}}
+		// The same issue named twice, once bare and once issue:-prefixed — both
+		// resolve to 101, exercising the inSet dedup branch.
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("101", "issue:101"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		if len(res.Children) != 1 || res.Children[0].Number != 101 {
+			t.Fatalf("children = %+v, want exactly one child #101 (duplicate deduped)", res.Children)
+		}
+		if got := api.getIssueCalls[101]; got != 1 {
+			t.Errorf("GetIssue(#101) called %d times, want exactly 1 (each named issue fetched once)", got)
 		}
 	})
 }

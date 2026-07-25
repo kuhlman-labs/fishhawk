@@ -945,6 +945,33 @@ func TestCreateCampaign_NoEpic_ServerBranch(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_WhitespaceEpicRef_PersistsEmptySentinel proves a
+// whitespace-only epic_ref with items present routes to the no-epic branch (the
+// handler branches on the TRIMMED value) AND persists Campaign.EpicRef == ""
+// (the documented items-only sentinel), not the raw "   " — so a future surface
+// parsing Campaign.EpicRef never sees a non-empty, non-ref value.
+func TestCreateCampaign_WhitespaceEpicRef_PersistsEmptySentinel(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: noEpicDAG()}
+	registerIssueSetProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"   ","items":["issue:101","issue:102"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !fp.resolveCalled {
+		t.Fatal("ResolveDependencies was not called: whitespace-only epic_ref must route to the no-epic branch")
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	if created.EpicRef != "" {
+		t.Errorf("epic_ref = %q, want empty (the no-epic sentinel, not the raw whitespace)", created.EpicRef)
+	}
+}
+
 // TestCreateCampaign_NoEpic_DanglingEdge_422 is the fail-closed dangling branch:
 // a resolver result whose edge targets an issue OUTSIDE the named set surfaces
 // 422 campaign_dangling_dependency (the same Assemble contract the epic path

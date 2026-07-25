@@ -515,8 +515,13 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// (a depends_on target outside the assembled set) or a dependency cycle. The
 	// no-epic branch assembles with an empty EpicRef, persisting a no-epic
 	// campaign (campaigns.epic_ref is TEXT NOT NULL with no CHECK, so "" is valid
-	// and denotes the items-only variant).
-	assembly, err := campaign.Assemble(req.EpicRef, result)
+	// and denotes the items-only variant). Assemble on the TRIMMED epicRef, not
+	// raw req.EpicRef: a whitespace-only epic_ref routes to the no-epic branch
+	// above (epicRef == "") but must PERSIST the empty-string no-epic sentinel,
+	// not "   " — a future surface parsing Campaign.EpicRef expects "" for the
+	// items-only variant (README: empty-string EpicRef). For a well-formed epic
+	// ref TrimSpace is a no-op, so the epic path stays byte-identical.
+	assembly, err := campaign.Assemble(epicRef, result)
 	if err != nil {
 		switch {
 		case errors.Is(err, campaign.ErrDanglingDependency):
