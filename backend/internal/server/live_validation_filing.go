@@ -204,6 +204,13 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	owner, name, ok := splitRepoFullName(runRow.Repo)
 	if !ok {
 		s.logLiveValidationWarn(ctx, runID, "malformed run repo", runRow.Repo)
+		// The walk cannot be filed (no owner/name), but marked criteria exist —
+		// record a filing-failure marker so those pending criteria surface as
+		// file-manually rather than advancing silently unvalidated (implement-
+		// review high/correctness). crits is guaranteed non-empty here (the
+		// no-marked-criterion case returned above), so this never marks a
+		// no-op approval as failed.
+		s.writeLiveValidationFilingFailedMarker(ctx, runRow, crits)
 		return
 	}
 	parentIssue := 0
@@ -213,8 +220,12 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 		}
 	}
 	if parentIssue == 0 {
-		// No originating issue to companion-link / parent against; the whole
-		// hook is issue-scoped, so skip rather than file an orphan walk.
+		// No originating issue to companion-link / parent against; the walk
+		// cannot be filed. Marked criteria exist, so record a filing-failure
+		// marker rather than advancing the run with pending live-validation
+		// criteria silently accepted (implement-review high/correctness) — the
+		// same failure-marker path a post-File error takes.
+		s.writeLiveValidationFilingFailedMarker(ctx, runRow, crits)
 		return
 	}
 
@@ -257,6 +268,32 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 		// the surface renders the file-manually variant from the stranded intent
 		// marker (liveValidationForRun). Best-effort: warn, never unwind.
 		s.logLiveValidationWarn(ctx, runID, "append linked marker failed", err.Error())
+	}
+}
+
+// writeLiveValidationFilingFailedMarker records a filing-failure LINKED marker
+// (filing_failed=true, empty walk_ref, the pending count + criterion ids) for a
+// walk that CANNOT be filed because a structural prerequisite is invalid before
+// the forge call is ever reached — a malformed run repo or a non-issue trigger —
+// even though the approved plan carries live-validation criteria. It is the same
+// failure-marker the post-File error path writes, so run-status / gate_view /
+// next_actions render "N criteria pending operator live-validation (walk filing
+// failed — file manually)" and the run never advances with pending criteria
+// silently accepted (implement-review high/correctness, #2045). Callers must
+// invoke it ONLY when len(crits) > 0. Best-effort: a write failure WARNs and
+// does not unwind the approval the gate already recorded.
+func (s *Server) writeLiveValidationFilingFailedMarker(ctx context.Context, runRow *run.Run, crits []plan.AcceptanceCriterion) {
+	ids := make([]string, 0, len(crits))
+	for _, c := range crits {
+		ids = append(ids, c.ID)
+	}
+	if err := s.appendLiveValidationMarker(ctx, runRow, liveValidationWalkLinkedKind, liveValidationWalkMarker{
+		Phase:                "linked",
+		PendingCriteriaCount: len(crits),
+		CriterionIDs:         ids,
+		FilingFailed:         true,
+	}); err != nil {
+		s.logLiveValidationWarn(ctx, runRow.ID, "append filing-failed marker (unfileable walk) failed", err.Error())
 	}
 }
 

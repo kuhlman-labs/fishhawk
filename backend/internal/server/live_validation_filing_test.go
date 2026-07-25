@@ -520,9 +520,13 @@ func TestFileOrLinkLiveValidationWalk_NilRepos(t *testing.T) {
 	s.fileOrLinkLiveValidationWalk(context.Background(), stage) // must not panic
 }
 
-// TestFileOrLinkLiveValidationWalk_NonIssueTrigger: a run whose trigger ref is
-// not an issue has no originating issue to companion-link against, so the hook
-// files no walk and records no marker (skips rather than filing an orphan).
+// TestFileOrLinkLiveValidationWalk_NonIssueTrigger (implement-review
+// high/correctness): a run whose trigger ref is not an issue has no originating
+// issue to companion-link against, so the hook files no walk (provider.File is
+// never called). But because marked criteria EXIST, it STILL records a
+// filing_failed linked marker (empty walk_ref, pending count + criterion ids) so
+// the pending criteria surface as file-manually rather than advancing silently
+// unvalidated — never a healthy walk ref, never an intent marker.
 func TestFileOrLinkLiveValidationWalk_NonIssueTrigger(t *testing.T) {
 	inst := int64(77)
 	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst})
@@ -535,6 +539,66 @@ func TestFileOrLinkLiveValidationWalk_NonIssueTrigger(t *testing.T) {
 	}
 	if h.markerCount(liveValidationWalkIntentKind) != 0 {
 		t.Errorf("intent markers written, want 0 for a non-issue trigger")
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || !linked.FilingFailed || linked.WalkRef != "" || linked.PendingCriteriaCount != 1 {
+		t.Errorf("linked marker = %+v (ok=%v), want filing_failed, empty ref, count 1", linked, ok)
+	}
+	surface := h.s.liveValidationForRun(context.Background(), h.runID)
+	if surface == nil || !surface.FilingFailed || surface.FilingIncomplete || surface.WalkRef != "" {
+		t.Errorf("surface = %+v, want file-manually (filing_failed, not incomplete, no ref)", surface)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_MalformedRepo (implement-review
+// high/correctness): a run whose repo full name cannot be split into owner/name
+// cannot file a walk, but with marked criteria present it STILL records the
+// filing_failed linked marker (no forge call) so the pending criteria surface as
+// file-manually rather than advancing silently unvalidated.
+func TestFileOrLinkLiveValidationWalk_MalformedRepo(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst})
+	h.rr.getRuns[h.runID].Repo = "malformed-no-slash"
+
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+	if h.provider.calls != 0 {
+		t.Errorf("provider File called %d times, want 0 (malformed repo)", h.provider.calls)
+	}
+	if h.markerCount(liveValidationWalkIntentKind) != 0 {
+		t.Errorf("intent markers written, want 0 for a malformed repo")
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || !linked.FilingFailed || linked.WalkRef != "" || linked.PendingCriteriaCount != 1 {
+		t.Errorf("linked marker = %+v (ok=%v), want filing_failed, empty ref, count 1", linked, ok)
+	}
+	surface := h.s.liveValidationForRun(context.Background(), h.runID)
+	if surface == nil || !surface.FilingFailed || surface.FilingIncomplete || surface.WalkRef != "" {
+		t.Errorf("surface = %+v, want file-manually (filing_failed, not incomplete, no ref)", surface)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_UnfileableNoMarkedCriterion_NoOp confirms the
+// new filing-failure marker in the unfileable early-return branches is gated on
+// marked criteria: a non-issue trigger (or malformed repo) with NO marked
+// criterion still writes NOTHING — the hook returns before those branches.
+func TestFileOrLinkLiveValidationWalk_UnfileableNoMarkedCriterion_NoOp(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: false, installID: &inst})
+	trigger := "push:refs/heads/main"
+	h.rr.getRuns[h.runID].TriggerRef = &trigger
+
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+	if h.provider.calls != 0 {
+		t.Errorf("provider File called %d times, want 0", h.provider.calls)
+	}
+	if got := h.markerCount(liveValidationWalkLinkedKind); got != 0 {
+		t.Errorf("linked markers = %d, want 0 (no marked criterion → no marker even when unfileable)", got)
+	}
+	if got := h.markerCount(liveValidationWalkIntentKind); got != 0 {
+		t.Errorf("intent markers = %d, want 0", got)
+	}
+	if surface := h.s.liveValidationForRun(context.Background(), h.runID); surface != nil {
+		t.Errorf("surface = %+v, want nil (no marked criterion)", surface)
 	}
 }
 
