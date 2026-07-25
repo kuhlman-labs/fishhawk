@@ -3,14 +3,48 @@ set -euo pipefail
 
 git fetch origin main --quiet
 
+# Snapshot the worktree map ONCE before the loop. A git failure yields an empty
+# string, so no branch is ever treated as held and the prior delete behavior is
+# preserved (fail-open, matching this script's best-effort posture).
+worktrees="$(git worktree list --porcelain 2>/dev/null || true)"
+
+# Print the worktree path that currently checks out the given branch, or nothing.
+# Parses the porcelain snapshot with awk (NOT a bash associative array — macOS
+# bash 3.2 has none). Matches the FULL ref (refs/heads/<name>) to avoid substring
+# collisions between similarly-named branches. Feeds awk via a here-string rather
+# than a `printf | awk` pipe: awk `exit`s on first match, and under `pipefail` a
+# SIGPIPE'd printf would make the pipeline non-zero and abort the script under
+# `set -e` — the exact abort class this script exists to avoid.
+holding_worktree() {
+  awk -v target="refs/heads/$1" '
+    /^worktree / { path = substr($0, 10); next }
+    $0 == "branch " target { print path; exit }
+  ' <<<"$worktrees"
+}
+
 count=0
+skipped=0
 while IFS= read -r branch; do
   [ "$branch" = "main" ] && continue
   if git merge-base --is-ancestor "$branch" origin/main 2>/dev/null; then
+    wt="$(holding_worktree "$branch")"
+    if [ -n "$wt" ]; then
+      # A worktree still holds this merged branch; `git branch -D` would fail
+      # ('used by worktree') and abort the script. Skip + warn + continue so the
+      # caller (scripts/dev post-merge) reaches its reload. Removal is owned by
+      # `scripts/dev sweep` (#1917).
+      echo "skipped (merged, held by worktree $wt): $branch — remove it with scripts/dev sweep" >&2
+      skipped=$((skipped + 1))
+      continue
+    fi
     git branch -D "$branch" >/dev/null
     echo "deleted (merged): $branch"
     count=$((count + 1))
   fi
 done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
 
-echo "cleaned $count branch(es)"
+if [ "$skipped" -ne 0 ]; then
+  echo "cleaned $count branch(es), skipped $skipped held by worktree(s)"
+else
+  echo "cleaned $count branch(es)"
+fi
