@@ -124,9 +124,39 @@ type Run struct {
 	// stable concern IDs fishhawk_fixup_stage's concern_ids addressing
 	// needs. The backend emits it on the single-run read only; omitted
 	// when the run has no open concerns.
-	Concerns  *RunConcerns `json:"concerns,omitempty" jsonschema:"OPEN review concerns for the run: open count, by_state breakdown, and items carrying the stable concern IDs fishhawk_fixup_stage's concern_ids parameter addresses. Omitted when nothing is open"`
-	CreatedAt time.Time    `json:"created_at"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	Concerns *RunConcerns `json:"concerns,omitempty" jsonschema:"OPEN review concerns for the run: open count, by_state breakdown, and items carrying the stable concern IDs fishhawk_fixup_stage's concern_ids parameter addresses. Omitted when nothing is open"`
+	// LiveValidation mirrors the backend run-status surface (#2045, E48.35):
+	// the run's pending operator live-validation walk — the count of
+	// requires_live_validation acceptance criteria awaiting an operator's live
+	// check plus the walk work item that tracks it. The backend emits it on the
+	// single-run read only (handleGetRun); omitted (nil) when the run carried no
+	// requires_live_validation criterion. An OLDER backend omits it entirely, so
+	// it decodes to nil and next_actions renders nothing — the mixed-version
+	// degrade. The json tag MUST byte-match the backend's runLiveValidationPayload
+	// or the field silently decodes to nil.
+	LiveValidation *RunLiveValidation `json:"live_validation,omitempty" jsonschema:"the run's pending operator live-validation walk (count of requires_live_validation criteria + the tracking walk ref). Omitted when the run carries no such criterion"`
+	CreatedAt      time.Time          `json:"created_at"`
+	UpdatedAt      time.Time          `json:"updated_at"`
+}
+
+// RunLiveValidation mirrors the backend's run-status / gate-view live_validation
+// block (#2045, E48.35 — backend/internal/server/live_validation_filing.go's
+// runLiveValidationPayload): the run's pending operator live-validation walk.
+// The json tags MUST stay byte-identical with the backend field or the mirror
+// decodes to nil silently (the #371-class hand-maintained-wire-mirror trap).
+//
+// Rendering (binding condition A(1)): a consumer that reads only FilingFailed
+// must NEVER render the healthy "walk: #X" variant for a run whose walk is not
+// durably filed. FilingFailed is true for BOTH a linked-marker filing failure
+// AND a stranded intent-only marker (the crash-window case); FilingIncomplete
+// additionally flags the stranded-intent sub-case so the wording is "walk filing
+// incomplete" vs "walk filing failed". A healthy walk has FilingFailed=false and
+// a non-empty WalkRef.
+type RunLiveValidation struct {
+	PendingCriteriaCount int    `json:"pending_criteria_count" jsonschema:"number of requires_live_validation acceptance criteria awaiting an operator live check"`
+	WalkRef              string `json:"walk_ref,omitempty" jsonschema:"the filed operator-validation walk ref (e.g. #123); empty when filing failed or is incomplete"`
+	FilingFailed         bool   `json:"filing_failed" jsonschema:"true when the walk is not durably filed (a filing failure OR a stranded intent marker) — the operator files it by hand"`
+	FilingIncomplete     bool   `json:"filing_incomplete,omitempty" jsonschema:"true for the stranded-intent crash-window sub-case, so the wording is 'walk filing incomplete' vs 'walk filing failed'"`
 }
 
 // RunConcerns mirrors the backend's run-status concerns block (#964):
@@ -218,6 +248,12 @@ type GateView struct {
 	SuppressedRelitigations []GateViewSuppressedRelitig `json:"suppressed_relitigations"`
 	HistoryIncomplete       bool                        `json:"history_incomplete"`
 	HistoryGaps             []string                    `json:"history_gaps,omitempty"`
+	// LiveValidation mirrors the run-status surface (#2045, E48.35): the run's
+	// pending operator live-validation walk, populated by buildGateView from the
+	// newest live_validation walk marker. Omitted (nil) when the run carried no
+	// requires_live_validation criterion or against an older backend. Same wire
+	// contract as Run.LiveValidation — the json tag MUST byte-match the backend.
+	LiveValidation *RunLiveValidation `json:"live_validation,omitempty"`
 }
 
 // GateViewConcern is one OPEN concern with full decision context. Note carries

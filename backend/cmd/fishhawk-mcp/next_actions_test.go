@@ -2247,3 +2247,110 @@ func TestNextActions_QuotaReasonSurvivesPersistAndRead(t *testing.T) {
 		t.Errorf("retry reason should distinguish quota from a transient crash; got %q", retry.Reason)
 	}
 }
+
+// TestNextActions_LiveValidationGuidance (#2045, E48.35) pins the operator
+// live-validation guidance the classifier folds in from a decoded
+// Run.LiveValidation block. Three rendered variants (binding condition A(1)):
+// a healthy linked walk ("walk: #X"), a filing failure ("walk filing failed"),
+// and a stranded intent-only marker ("walk filing incomplete" — condition
+// A(3)). A run with no pending walk folds nothing in, and the pure renderer's
+// degenerate inputs (nil / zero count / empty-ref-yet-healthy) are pinned
+// directly.
+func TestNextActions_LiveValidationGuidance(t *testing.T) {
+	// The advisory folds in regardless of run state; use a settled succeeded run
+	// with an open PR so the classifier also produces the ordinary merge ritual —
+	// proving the advisory is APPENDED, never a replacement.
+	prURL := "https://github.com/x/y/pull/42"
+	baseRun := func(lv *RunLiveValidation) *Run {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		r.LiveValidation = lv
+		return r
+	}
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	implComplete := naReviewStatus("implement", "complete")
+
+	cases := []struct {
+		name string
+		lv   *RunLiveValidation
+		want string
+	}{
+		{
+			name: "healthy linked walk",
+			lv:   &RunLiveValidation{PendingCriteriaCount: 3, WalkRef: "#123", FilingFailed: false},
+			want: "3 criteria pending operator live-validation (walk: #123)",
+		},
+		{
+			name: "filing failure",
+			lv:   &RunLiveValidation{PendingCriteriaCount: 2, FilingFailed: true},
+			want: "2 criteria pending operator live-validation (walk filing failed — file manually)",
+		},
+		{
+			name: "stranded intent-only marker",
+			lv:   &RunLiveValidation{PendingCriteriaCount: 1, FilingFailed: true, FilingIncomplete: true},
+			want: "1 criteria pending operator live-validation (walk filing incomplete — file manually)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			na := nextActionsFor(baseRun(tc.lv), stages, nil, implComplete, nil, nil, false, false, "", "", releaseSignals{})
+			act := findAction(t, na, "operator_live_validation")
+			if !strings.Contains(act.Reason, tc.want) {
+				t.Errorf("operator_live_validation reason = %q, want it to contain %q", act.Reason, tc.want)
+			}
+			if act.Consumes != consumesNone {
+				t.Errorf("operator_live_validation consumes = %q, want none (display-only advisory)", act.Consumes)
+			}
+			// The advisory is APPENDED — the merge ritual is still present and
+			// still leads (fishhawk_merge_run is not displaced by the advisory).
+			names := actionNames(na)
+			if !strings.Contains(strings.Join(names, ","), "fishhawk_merge_run") {
+				t.Errorf("actions = %v, want the merge ritual retained alongside the advisory", names)
+			}
+			if names[len(names)-1] != "operator_live_validation" {
+				t.Errorf("operator_live_validation should be appended LAST; actions = %v", names)
+			}
+		})
+	}
+
+	t.Run("healthy walk_ref reaches the action params", func(t *testing.T) {
+		na := nextActionsFor(baseRun(&RunLiveValidation{PendingCriteriaCount: 3, WalkRef: "#123"}), stages, nil, implComplete, nil, nil, false, false, "", "", releaseSignals{})
+		act := findAction(t, na, "operator_live_validation")
+		if act.Params["walk_ref"] != "#123" {
+			t.Errorf("params[walk_ref] = %q, want #123", act.Params["walk_ref"])
+		}
+	})
+
+	t.Run("no pending walk folds nothing in", func(t *testing.T) {
+		na := nextActionsFor(baseRun(nil), stages, nil, implComplete, nil, nil, false, false, "", "", releaseSignals{})
+		for _, name := range actionNames(na) {
+			if name == "operator_live_validation" {
+				t.Fatalf("operator_live_validation must not appear when the run carries no live_validation block; actions = %v", actionNames(na))
+			}
+		}
+	})
+
+	// The pure renderer's degenerate inputs. A nil block, a zero pending count,
+	// and a "healthy-yet-empty-ref" block (which the backend never writes) all
+	// avoid a malformed "walk: " string — the empty-ref case degrades to the
+	// file-manually wording (condition A(1): never a malformed empty-ref string).
+	t.Run("renderer edge cases", func(t *testing.T) {
+		if g := liveValidationGuidance(nil); g != "" {
+			t.Errorf("nil block guidance = %q, want empty", g)
+		}
+		if g := liveValidationGuidance(&RunLiveValidation{PendingCriteriaCount: 0, WalkRef: "#1"}); g != "" {
+			t.Errorf("zero-count guidance = %q, want empty", g)
+		}
+		g := liveValidationGuidance(&RunLiveValidation{PendingCriteriaCount: 2, FilingFailed: false, WalkRef: ""})
+		if strings.Contains(g, "walk: ") {
+			t.Errorf("empty-ref healthy block rendered a malformed walk-ref string: %q", g)
+		}
+		if !strings.Contains(g, "file manually") {
+			t.Errorf("empty-ref healthy block should degrade to the file-manually wording; got %q", g)
+		}
+		// Defensive nil-na guard: never reached from nextActionsFor (na is always
+		// non-nil at the fold call sites), but the guard must not panic if a
+		// future caller passes nil.
+		foldLiveValidationAdvisory(baseRun(&RunLiveValidation{PendingCriteriaCount: 1, WalkRef: "#1"}), nil)
+	})
+}
