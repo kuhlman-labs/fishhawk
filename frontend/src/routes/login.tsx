@@ -1,6 +1,6 @@
-import { Github } from 'lucide-react';
 import { Navigate, useSearchParams } from 'react-router';
 import { Button } from '@/components/ui/button';
+import { GithubIcon } from '@/components/github-icon';
 import { useAuth } from '@/auth/use-auth';
 
 /*
@@ -43,7 +43,7 @@ export function Login() {
         </div>
         <Button asChild className="w-full">
           <a href={oauthStart}>
-            <Github className="size-4" aria-hidden />
+            <GithubIcon className="size-4" aria-hidden />
             <span>Continue with GitHub</span>
           </a>
         </Button>
