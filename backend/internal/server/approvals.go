@@ -862,6 +862,15 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 		// failure logs and never unwinds the approval the gate already recorded;
 		// a plan without a split_proposal no-ops.
 		s.fileSplitProposalChildren(ctx, advanced)
+		// On-approval live-validation walk filing (#2045, E48.35): when the
+		// approved plan carries any requires_live_validation acceptance
+		// criterion, auto-file (or, on a re-approval, idempotently no-op on) a
+		// chore-type operator-validation walk and record a durable marker so the
+		// pending live check is surfaced rather than shipped silently
+		// unvalidated. Best-effort like fileSplitProposalChildren above — a
+		// failure logs and never unwinds the approval; a plan with no marked
+		// criterion no-ops.
+		s.fileOrLinkLiveValidationWalk(ctx, advanced)
 	}
 
 	// Plan-comment re-render (#377): a plan-stage approve or reject re-fires
