@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -97,6 +98,39 @@ type runLiveValidationPayload struct {
 // subsystem the walk-filing machinery lives in.
 const liveValidationWalkArea = "area:backend"
 
+// liveValWalkLocks serializes the intent-check → intent-append → file critical
+// section of fileOrLinkLiveValidationWalk PER RUN. The intent-marker idempotency
+// guard is a non-atomic list-then-append: without serialization two concurrent
+// approvals of the SAME run could both observe no intent marker, both append
+// one, and both file a walk (the implement-review concurrency fix). The per-run
+// in-process mutex makes them serialize so the second observes the first's
+// intent marker and no-ops. This is sufficient for the single-daemon v0
+// deployment; a hosted MULTI-INSTANCE deployment (multiple fishhawkd processes)
+// would need a Postgres advisory lock instead — the in-process map is invisible
+// across processes, mirroring the childNumberLocks note in workitems.go. The map
+// is never pruned (one small mutex per run for the process lifetime), bounded by
+// the number of runs whose approved plan carried a live-validation criterion.
+var (
+	liveValWalkLocksMu sync.Mutex
+	liveValWalkLocks   = map[uuid.UUID]*sync.Mutex{}
+)
+
+// lockLiveValWalk acquires (creating on first use) the per-run mutex and returns
+// its unlock func. The caller holds it across the list-intent → append-intent →
+// file → append-linked window so the whole idempotency-and-file section is
+// serialized against a concurrent approval of the same run.
+func lockLiveValWalk(runID uuid.UUID) func() {
+	liveValWalkLocksMu.Lock()
+	m := liveValWalkLocks[runID]
+	if m == nil {
+		m = &sync.Mutex{}
+		liveValWalkLocks[runID] = m
+	}
+	liveValWalkLocksMu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
 // fileOrLinkLiveValidationWalk is the best-effort on-approval hook (#2045,
 // E48.35): when an operator approves a plan carrying any requires_live_validation
 // acceptance criterion, it auto-files (or, on a re-approval, no-ops on) a
@@ -142,6 +176,13 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	if len(crits) == 0 {
 		return // no marked criterion → no forge call, no marker
 	}
+
+	// Serialize the intent-check → intent-append → file → linked-append section
+	// per run so two CONCURRENT approvals of the same run cannot both pass the
+	// (non-atomic) list-then-append idempotency guard below and file duplicate
+	// walks. The second holder observes the first's intent marker and no-ops.
+	unlockWalk := lockLiveValWalk(runID)
+	defer unlockWalk()
 
 	// Idempotency anchor: the intent marker is the durable "walk attempt started"
 	// record. Its presence — from ANY prior approval — means this hook already
@@ -194,11 +235,11 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 		return
 	}
 
-	// (c) File the chore walk (best-effort epic-parenting with a companion-link
-	// fallback). (d) Append the LINKED marker in BOTH outcomes — on success with
-	// the walk ref, on ANY filing failure with filing_failed=true and an empty
-	// ref — so approval never advances leaving pending live-validation criteria
-	// with zero surfaced indication (replan directive 1).
+	// (c) File the chore walk (a SINGLE companion-linked filing — see
+	// fileLiveValidationChore). (d) Append the LINKED marker in BOTH outcomes —
+	// on success with the walk ref, on ANY filing failure with filing_failed=true
+	// and an empty ref — so approval never advances leaving pending
+	// live-validation criteria with zero surfaced indication (replan directive 1).
 	walkRef, filed := s.fileLiveValidationChore(ctx, runRow, owner, name, parentIssue, crits)
 	linked := liveValidationWalkMarker{
 		Phase:                "linked",
@@ -220,21 +261,33 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 }
 
 // fileLiveValidationChore files the `chore`-type operator-validation walk work
-// item (replan directives 3 & 4). It returns ("#N", true) on a successful
-// filing and ("", false) on any failure (the caller then writes a filing-failure
-// linked marker).
+// item and returns ("#N", true) on a successful filing and ("", false) on any
+// failure (the caller then writes a filing-failure linked marker).
 //
-// Best-effort epic-parenting: it first attempts a parent-epic-derived filing —
-// Relations.ParentEpic set to the triggering issue, so applyAndFileWorkItem's
-// deriveEpicTitleVar resolves the {epic} title placeholder from the issue's
-// leading [E<n>] token (and the explicit n avoids the child-number forge query).
-// When that derivation is unavailable (no forge client, an unreachable issue, or
-// an issue whose title carries no [E<n>] token) the chore title_format's {epic}
-// placeholder cannot resolve and Apply returns a missing_placeholders 422; the
-// walk then falls back to an explicit {epic}/{n} title_vars filing that always
-// renders and companion-links to the triggering issue instead. The parent-epic
-// attempt fails at Apply BEFORE any provider.File call, so the fallback files
-// exactly one walk.
+// COMPANION-LINK, not parent-epic. The originating issue (#2045) asks for the
+// walk filed "under the epic", but this hook only knows the TRIGGERING issue —
+// an E48.35 CHILD, not the E48 epic. Parenting the walk to that child is the
+// wrong hierarchy (a child cannot be the walk's epic — the implement-review
+// concern), and resolving the child's OWN parent-epic issue number would need a
+// sub-issue-PARENT forge query githubclient does not expose (only children-
+// direction ListSubIssues exists) — out of this hook's scope. So the walk
+// COMPANION-LINKS to the triggering issue with an explicit {epic}=<issue>/{n}=1
+// title that always renders ([E<issue>.1], mirroring split_filing.go's
+// best-effort child titles for exactly this triggering-issue-as-parent case). A
+// self-consistent [E<issue>.1] companion (rather than an [E48.1] title parented
+// to #2045) neither mis-parents nor collides with the real epic's child
+// numbering. Filing the walk under the TRUE epic is a follow-up (it needs the
+// sub-issue-parent query above); see backend/internal/server/README.md.
+//
+// A SINGLE filing (no epic-parented-then-companion-fallback pair): the earlier
+// two-attempt design opened a same-approval DOUBLE-FILE window — a provider 502
+// AFTER attempt 1's provider.File had already created the issue server-side would
+// still trigger attempt 2, filing a second walk (the intent-marker guard only
+// dedupes ACROSS approvals, not within one). One deterministic filing closes
+// that window: any error (a pre-File 422 or a post-File 502 alike) routes to the
+// filing_failure linked marker, never to a second differently-shaped walk. The
+// explicit {epic}/{n} title vars also mean applyAndFileWorkItem's deriveEpicTitleVar
+// and child-number discovery both short-circuit — no forge round-trip, no lock.
 func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, crits []plan.AcceptanceCriterion) (string, bool) {
 	conv, err := conventionsLoader(ctx, runRow.Repo)
 	if err != nil {
@@ -258,27 +311,7 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 	parentRef := "#" + strconv.Itoa(parentIssue)
 	summary := "Operator live-validation walk for " + parentRef
 
-	// Attempt 1: parent-epic-derived filing.
-	epicReq := workmgmt.FilingRequest{
-		Type:      "chore",
-		Summary:   summary,
-		Body:      liveValidationWalkBody(parentRef, crits, false),
-		Labels:    []string{liveValidationWalkArea},
-		TitleVars: map[string]string{"n": "1"},
-		Relations: workmgmt.Relations{
-			ParentEpic:   parentRef,
-			EvidenceRuns: []string{runRow.ID.String()},
-		},
-	}
-	if _, created, werr := s.applyAndFileWorkItem(ctx, epicReq, conv, target, owner, name); werr == nil {
-		return fmt.Sprintf("#%d", created.Number), true
-	} else {
-		s.logLiveValidationWarn(ctx, runRow.ID, "epic-parented walk filing failed; trying companion-link fallback", werr.msg)
-	}
-
-	// Attempt 2: companion-link fallback with explicit title vars (always
-	// renders). Companion-links to the triggering issue in the relation + body.
-	fallbackReq := workmgmt.FilingRequest{
+	req := workmgmt.FilingRequest{
 		Type:      "chore",
 		Summary:   summary,
 		Body:      liveValidationWalkBody(parentRef, crits, true),
@@ -289,10 +322,10 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 			EvidenceRuns: []string{runRow.ID.String()},
 		},
 	}
-	if _, created, werr := s.applyAndFileWorkItem(ctx, fallbackReq, conv, target, owner, name); werr == nil {
+	if _, created, werr := s.applyAndFileWorkItem(ctx, req, conv, target, owner, name); werr == nil {
 		return fmt.Sprintf("#%d", created.Number), true
 	} else {
-		s.logLiveValidationWarn(ctx, runRow.ID, "companion-link fallback walk filing failed", werr.msg)
+		s.logLiveValidationWarn(ctx, runRow.ID, "live-validation walk filing failed", werr.msg)
 		return "", false
 	}
 }

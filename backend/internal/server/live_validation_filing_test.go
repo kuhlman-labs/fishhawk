@@ -365,59 +365,113 @@ func TestFileOrLinkLiveValidationWalk_NoMarkedCriterion_NoOp(t *testing.T) {
 	}
 }
 
-// TestFileOrLinkLiveValidationWalk_EpicParenting (replan directives 3 & 4): the
-// best-effort epic-parenting has two branches — the epic is derivable (the walk
-// parents to it) or it is not (the walk companion-links to the triggering issue
-// via a title_vars fallback).
-func TestFileOrLinkLiveValidationWalk_EpicParenting(t *testing.T) {
+// TestFileOrLinkLiveValidationWalk_CompanionLink (implement-review
+// high/correctness — the walk must not parent to the triggering E48.35 CHILD):
+// the walk is filed as a SINGLE companion-link to the triggering issue — never
+// parented to it — with a self-consistent [E<issue>.1] title. This holds whether
+// or not a GitHub client is wired: the old "derivable" epic-parented branch is
+// gone (true epic-parenting needs an out-of-scope sub-issue-parent query), so a
+// resolvable [E48.35] title no longer produces an [E48.1]-titled walk parented to
+// #2045. Exactly one walk is filed either way.
+func TestFileOrLinkLiveValidationWalk_CompanionLink(t *testing.T) {
 	parentRef := "#" + strconv.Itoa(liveValParentIssue)
+	wantTitlePrefix := "[E" + strconv.Itoa(liveValParentIssue) + ".1]"
 
-	t.Run("derivable_parents_to_epic", func(t *testing.T) {
-		inst := int64(77)
-		gh := newLiveValIssueGitHub(t, "[E48.35] first-class live-validation criteria")
-		h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst, github: gh})
-		h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+	cases := []struct {
+		name       string
+		withGitHub bool
+	}{
+		{"no_github_client", false},
+		{"with_github_client", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := int64(77)
+			cfg := liveValConfig{marked: true, installID: &inst}
+			if tc.withGitHub {
+				// Even when the triggering issue's [E48.35] title WOULD have
+				// resolved {epic}=48 for the old parent-epic branch, the walk still
+				// companion-links — it is never parented to the #2045 child.
+				cfg.github = newLiveValIssueGitHub(t, "[E48.35] first-class live-validation criteria")
+			}
+			h := newLiveValHarness(t, cfg)
+			h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
 
-		if len(h.provider.reqs) != 1 {
-			t.Fatalf("filed %d walks, want 1", len(h.provider.reqs))
-		}
-		req := h.provider.reqs[0]
-		if req.Item.Relations.ParentEpic != parentRef {
-			t.Errorf("walk parent_epic = %q, want %q (parented to the epic)", req.Item.Relations.ParentEpic, parentRef)
-		}
-		if len(req.Item.Relations.CompanionTo) != 0 {
-			t.Errorf("derivable walk must not companion-link: %v", req.Item.Relations.CompanionTo)
-		}
-		// The [E48.35] title token derived {epic}=48; with the explicit n the
-		// chore title renders under the epic.
-		if req.Item.Title == "" || req.Item.Title[:3] != "[E4" {
-			t.Errorf("walk title = %q, want an [E48.<n>] epic-parented title", req.Item.Title)
-		}
-	})
+			if len(h.provider.reqs) != 1 {
+				t.Fatalf("filed %d walks, want exactly 1", len(h.provider.reqs))
+			}
+			req := h.provider.reqs[0]
+			if req.Item.Relations.ParentEpic != "" {
+				t.Errorf("walk must not parent to the triggering child: parent_epic = %q", req.Item.Relations.ParentEpic)
+			}
+			if len(req.Item.Relations.CompanionTo) != 1 || req.Item.Relations.CompanionTo[0] != parentRef {
+				t.Errorf("walk companion_to = %v, want [%s]", req.Item.Relations.CompanionTo, parentRef)
+			}
+			// Self-consistent [E<issue>.1] title: the triggering issue number is
+			// the {epic} component, so the title never collides with the real
+			// E48 epic's child numbering.
+			if len(req.Item.Title) < len(wantTitlePrefix) || req.Item.Title[:len(wantTitlePrefix)] != wantTitlePrefix {
+				t.Errorf("walk title = %q, want prefix %q (self-consistent companion title)", req.Item.Title, wantTitlePrefix)
+			}
+		})
+	}
+}
 
-	t.Run("underivable_companion_links", func(t *testing.T) {
-		inst := int64(77)
-		// No GitHub client: deriveEpicTitleVar cannot resolve {epic}, so the
-		// epic attempt 422s at Apply and the fallback files.
-		h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst})
-		h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+// TestFileOrLinkLiveValidationWalk_SingleFilingNoDoubleFile (implement-review
+// high/correctness — the fallback fired after ANY attempt-1 error, double-filing
+// on a post-File 502): a provider File failure files the walk EXACTLY ONCE and
+// records filing_failed — it never triggers a second, differently-shaped filing.
+// A GitHub client is wired so that under the OLD two-attempt design attempt 1
+// would have reached provider.File (its [E48.35] title resolving {epic}); a
+// File-stage 502 there would have fallen through to attempt 2. The single-filing
+// design must call File exactly once regardless.
+func TestFileOrLinkLiveValidationWalk_SingleFilingNoDoubleFile(t *testing.T) {
+	inst := int64(77)
+	gh := newLiveValIssueGitHub(t, "[E48.35] first-class live-validation criteria")
+	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst, github: gh, providerFail: true})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
 
-		if len(h.provider.reqs) != 1 {
-			t.Fatalf("filed %d walks, want 1 (fallback)", len(h.provider.reqs))
-		}
-		req := h.provider.reqs[0]
-		if len(req.Item.Relations.CompanionTo) != 1 || req.Item.Relations.CompanionTo[0] != parentRef {
-			t.Errorf("walk companion_to = %v, want [%s]", req.Item.Relations.CompanionTo, parentRef)
-		}
-		if req.Item.Relations.ParentEpic != "" {
-			t.Errorf("fallback walk must not set parent_epic: %q", req.Item.Relations.ParentEpic)
-		}
-		// The title_vars fallback used the triggering issue number as {epic}.
-		wantTitleEpic := "[E" + strconv.Itoa(liveValParentIssue) + ".1]"
-		if len(req.Item.Title) < len(wantTitleEpic) || req.Item.Title[:len(wantTitleEpic)] != wantTitleEpic {
-			t.Errorf("walk title = %q, want prefix %q (title_vars fallback)", req.Item.Title, wantTitleEpic)
-		}
-	})
+	if h.provider.calls != 1 {
+		t.Errorf("provider File called %d times, want exactly 1 (no second filing after a File-stage failure)", h.provider.calls)
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || !linked.FilingFailed || linked.WalkRef != "" {
+		t.Errorf("linked marker = %+v (ok=%v), want filing_failed with an empty ref", linked, ok)
+	}
+	surface := h.s.liveValidationForRun(context.Background(), h.runID)
+	if surface == nil || !surface.FilingFailed || surface.WalkRef != "" {
+		t.Errorf("surface = %+v, want file-manually (filing_failed, no ref)", surface)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_ConcurrentApprovals (implement-review
+// high/concurrency — the non-atomic list-then-append intent-marker guard): two
+// concurrent approvals of the same run serialize on the per-run lock, so the
+// idempotency guard holds — exactly one intent marker, one linked marker, and one
+// provider File across both.
+func TestFileOrLinkLiveValidationWalk_ConcurrentApprovals(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+		}()
+	}
+	wg.Wait()
+
+	if h.provider.calls != 1 {
+		t.Errorf("provider File called %d times across concurrent approvals, want 1", h.provider.calls)
+	}
+	if got := h.markerCount(liveValidationWalkIntentKind); got != 1 {
+		t.Errorf("intent markers = %d, want 1 (per-run lock serializes the guard)", got)
+	}
+	if got := h.markerCount(liveValidationWalkLinkedKind); got != 1 {
+		t.Errorf("linked markers = %d, want 1", got)
+	}
 }
 
 // --- defensive fail-open branches ----------------------------------------
