@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -821,6 +822,259 @@ func TestCreateCampaign_SubsetExcludesCrossEpicDepChild_201(t *testing.T) {
 	}
 	if !refs["issue:100"] || !refs["issue:101"] || refs["issue:102"] {
 		t.Errorf("item refs = %v, want exactly {issue:100, issue:101}", refs)
+	}
+}
+
+// --- no-epic (items-without-epic_ref) create tests (E48.36 / #2051) ---
+
+// fakeIssueSetProvider is a workmgmt.Provider that implements
+// IssueSetDependencyResolver (the no-epic campaign source) — and NOTHING else,
+// so the handler's items-without-epic_ref branch + resolver-capability assertion
+// is exercised. It records the request it received and returns a canned result
+// (or a configured error).
+type fakeIssueSetProvider struct {
+	name          string
+	result        *workmgmt.EpicChildrenResult
+	resolveErr    error
+	resolveCalled bool
+	captured      workmgmt.IssueSetRequest
+}
+
+func (f *fakeIssueSetProvider) Name() string { return f.name }
+
+func (f *fakeIssueSetProvider) File(_ context.Context, _ workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	return &workmgmt.CreatedItem{Provider: f.name}, nil
+}
+
+func (f *fakeIssueSetProvider) ResolveDependencies(_ context.Context, req workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.resolveCalled = true
+	f.captured = req
+	if f.resolveErr != nil {
+		return nil, f.resolveErr
+	}
+	return f.result, nil
+}
+
+func registerIssueSetProvider(t *testing.T, p *fakeIssueSetProvider) {
+	t.Helper()
+	if p.name == "" {
+		p.name = workmgmt.Default().Provider
+	}
+	workmgmt.Register(p)
+}
+
+// fakeDualProvider implements BOTH EpicChildrenQuerier and
+// IssueSetDependencyResolver, so a single fixture can prove which branch the
+// handler dispatches on: with epic_ref present the epic sweep must run and the
+// resolver must NOT (the epic_ref-present regression pin).
+type fakeDualProvider struct {
+	name          string
+	epicResult    *workmgmt.EpicChildrenResult
+	resolveResult *workmgmt.EpicChildrenResult
+	epicCalled    bool
+	resolveCalled bool
+}
+
+func (f *fakeDualProvider) Name() string { return f.name }
+
+func (f *fakeDualProvider) File(_ context.Context, _ workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	return &workmgmt.CreatedItem{Provider: f.name}, nil
+}
+
+func (f *fakeDualProvider) EpicChildren(_ context.Context, _ workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.epicCalled = true
+	return f.epicResult, nil
+}
+
+func (f *fakeDualProvider) ResolveDependencies(_ context.Context, _ workmgmt.IssueSetRequest) (*workmgmt.EpicChildrenResult, error) {
+	f.resolveCalled = true
+	return f.resolveResult, nil
+}
+
+// noEpicDAG is the canonical no-epic fixture: 101 has no deps (wave 0), 102
+// depends on 101 (wave 1) — the resolver's edges are over exactly the named set.
+func noEpicDAG() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 101, Title: "first"}, {Number: 102, Title: "second"}},
+		Edges:    []workmgmt.DependsEdge{{From: 102, To: 101}},
+	}
+}
+
+// TestCreateCampaign_NoEpic_ServerBranch is the server-handler complement: an
+// items-only POST (epic_ref absent) routes to the IssueSetDependencyResolver,
+// forwards the named items, and assembles + persists over EXACTLY those issues.
+func TestCreateCampaign_NoEpic_ServerBranch(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: noEpicDAG()}
+	registerIssueSetProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !fp.resolveCalled {
+		t.Fatal("ResolveDependencies was not called on the no-epic branch")
+	}
+	// The named items are forwarded verbatim to the resolver.
+	if got := fp.captured.Items; len(got) != 2 || got[0] != "issue:101" || got[1] != "issue:102" {
+		t.Errorf("resolver got items = %v, want [issue:101 issue:102]", got)
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	// A no-epic campaign persists an empty epic_ref (the items-only sentinel) and
+	// the response renders it verbatim without panic/mis-render.
+	if created.EpicRef != "" {
+		t.Errorf("epic_ref = %q, want empty (no-epic variant)", created.EpicRef)
+	}
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("persisted items = %+v, want exactly {101,102}", items)
+	}
+	refs := map[string]bool{}
+	for _, it := range items {
+		refs[it.IssueRef] = true
+	}
+	if !refs["issue:101"] || !refs["issue:102"] {
+		t.Errorf("item refs = %v, want {issue:101, issue:102}", refs)
+	}
+}
+
+// TestCreateCampaign_NoEpic_DanglingEdge_422 is the fail-closed dangling branch:
+// a resolver result whose edge targets an issue OUTSIDE the named set surfaces
+// 422 campaign_dangling_dependency (the same Assemble contract the epic path
+// gives).
+func TestCreateCampaign_NoEpic_DanglingEdge_422(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: &workmgmt.EpicChildrenResult{
+		Children:     []workmgmt.EpicChild{{Number: 101, Title: "a"}},
+		DroppedEdges: []workmgmt.DependsEdge{{From: 101, To: 999, Reason: workmgmt.DropNotChild}},
+	}}
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_dangling_dependency" {
+		t.Errorf("error code = %q, want campaign_dangling_dependency", code)
+	}
+	if _, ok := details["dangling_not_child"]; !ok {
+		t.Errorf("details = %+v, want a dangling_not_child key", details)
+	}
+}
+
+// TestCreateCampaign_NoEpic_ResolverError_502 is the resolver-transport-failure
+// branch: a resolver that returns an error surfaces 502 issue_set_resolution_failed
+// (mirroring the epic path's epic_children_query_failed).
+func TestCreateCampaign_NoEpic_ResolverError_502(t *testing.T) {
+	fp := &fakeIssueSetProvider{resolveErr: errors.New("github rejected the request")}
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "issue_set_resolution_failed" {
+		t.Errorf("error code = %q, want issue_set_resolution_failed", code)
+	}
+}
+
+// TestCreateCampaign_NoEpic_Cycle_400 is the cycle branch: a resolver result
+// whose edges form a cycle among the named set surfaces 400 validation_failed —
+// determinately 400, NOT 422 (binding condition 2).
+func TestCreateCampaign_NoEpic_Cycle_400(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{{Number: 101, Title: "a"}, {Number: 102, Title: "b"}},
+		Edges:    []workmgmt.DependsEdge{{From: 101, To: 102}, {From: 102, To: 101}},
+	}}
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed (cycle is 400, never 422)", code)
+	}
+}
+
+// TestCreateCampaign_NeitherEpicRefNorItems_400 is the empty-request guard:
+// neither epic_ref nor items → 400 validation_failed on the epic_ref field.
+func TestCreateCampaign_NeitherEpicRefNorItems_400(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", code)
+	}
+}
+
+// TestCreateCampaign_NoEpic_ProviderNotResolver_501 is the capability-missing
+// branch: an items-only POST against a provider that does NOT implement
+// IssueSetDependencyResolver (fakeEpicProvider implements EpicChildrenQuerier
+// only) surfaces 501 issue_set_resolution_unsupported.
+func TestCreateCampaign_NoEpic_ProviderNotResolver_501(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()} // EpicChildrenQuerier, NOT a resolver
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", w.Code, w.Body.String())
+	}
+	if code := decodeCampaignError(t, w); code != "issue_set_resolution_unsupported" {
+		t.Errorf("error code = %q, want issue_set_resolution_unsupported", code)
+	}
+}
+
+// TestCreateCampaign_EpicRefPresent_UsesEpicPathNotResolver is the
+// epic_ref-present regression pin: with epic_ref present the handler dispatches
+// the EpicChildrenQuerier sweep and NOT the resolver, even on a provider that
+// implements both — the epic path stays byte-identical.
+func TestCreateCampaign_EpicRefPresent_UsesEpicPathNotResolver(t *testing.T) {
+	fp := &fakeDualProvider{name: workmgmt.Default().Provider, epicResult: smallDAG(), resolveResult: noEpicDAG()}
+	workmgmt.Register(fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if !fp.epicCalled {
+		t.Error("EpicChildren was not called on the epic_ref-present path")
+	}
+	if fp.resolveCalled {
+		t.Error("ResolveDependencies was called on the epic_ref-present path (must use the epic sweep)")
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	// smallDAG (epic path) yields {100,101}; noEpicDAG (resolver) would yield
+	// {101,102} — asserting the epic set proves the epic branch ran.
+	refs := map[string]bool{}
+	for _, it := range items {
+		refs[it.IssueRef] = true
+	}
+	if !refs["issue:100"] || !refs["issue:101"] || refs["issue:102"] {
+		t.Errorf("item refs = %v, want the epic-path set {issue:100, issue:101}", refs)
 	}
 }
 

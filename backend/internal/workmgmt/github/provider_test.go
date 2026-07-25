@@ -62,6 +62,12 @@ type fakeAPI struct {
 	listSubResults []githubclient.SubIssue
 	listSubErr     error
 
+	// getIssues maps issue number -> the canned issue GetIssue returns, so the
+	// no-epic ResolveDependencies path can be driven per named issue. getIssueErr,
+	// when set, is returned for every GetIssue call (the fetch-fails branch).
+	getIssues   map[int]*githubclient.Issue
+	getIssueErr error
+
 	searchQuery   string
 	searchResults []githubclient.IssueTitleResult
 	// searchResultsFn, when set, computes the results from the composed query so
@@ -142,6 +148,16 @@ func (f *fakeAPI) SearchIssuesByTitle(_ context.Context, _ forge.CredentialScope
 		return f.searchResultsFn(query), nil
 	}
 	return f.searchResults, nil
+}
+
+func (f *fakeAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, number int) (*githubclient.Issue, error) {
+	if f.getIssueErr != nil {
+		return nil, f.getIssueErr
+	}
+	if iss, ok := f.getIssues[number]; ok {
+		return iss, nil
+	}
+	return nil, errors.New("githubclient: not found")
 }
 
 func (f *fakeAPI) ProjectsTokenConfigured() bool { return f.projectsTokenConfigured }
@@ -608,6 +624,147 @@ func TestProvider_EpicChildren_FailClosed(t *testing.T) {
 		api := &fakeAPI{nodeIDErr: errors.New("issue not found")}
 		if _, err := New(api).EpicChildren(context.Background(), good); err == nil || !strings.Contains(err.Error(), "resolve epic #1005") {
 			t.Fatalf("want node-id error, got %v", err)
+		}
+	})
+}
+
+// resolveReq builds an IssueSetRequest with a valid target + the given items.
+func resolveReq(items ...string) workmgmt.IssueSetRequest {
+	return workmgmt.IssueSetRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Items:  items,
+	}
+}
+
+// TestProvider_ResolveDependencies covers the no-epic issue-set source (#2051):
+// each named issue's depends_on marker is resolved directly, an in-set ref
+// becomes an Edge, an out-of-set ref becomes a DroppedEdge stamped DropNotChild,
+// the autonomy label is parsed, and Complete is CLOSED+COMPLETED (case-insensitive
+// on GetIssue's lowercase REST enums). It also asserts children come back
+// ascending and both edge slices are deterministically sorted.
+func TestProvider_ResolveDependencies(t *testing.T) {
+	t.Run("single marker in-set is an edge", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			100: {Number: 100, Title: "root", Body: "no deps", State: "open"},
+			101: {Number: 101, Title: "leaf", Body: "Depends on: #100", State: "open"},
+		}}
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("issue:101", "100"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		// Children ascending: 100 then 101 (regardless of item order).
+		if len(res.Children) != 2 || res.Children[0].Number != 100 || res.Children[1].Number != 101 {
+			t.Fatalf("children = %+v, want [100 101] ascending", res.Children)
+		}
+		want := []workmgmt.DependsEdge{{From: 101, To: 100}}
+		if len(res.Edges) != 1 || res.Edges[0] != want[0] {
+			t.Fatalf("edges = %+v, want %+v", res.Edges, want)
+		}
+		if len(res.DroppedEdges) != 0 {
+			t.Errorf("dropped = %+v, want none (100 is in the named set)", res.DroppedEdges)
+		}
+	})
+
+	t.Run("multiple markers, some in-set some out-of-set", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			100: {Number: 100, Title: "a", Body: "no deps", State: "open"},
+			101: {Number: 101, Title: "b", Body: "no deps", State: "open"},
+			102: {Number: 102, Title: "c", Body: "Depends on: #100, #101, #999", State: "open"},
+		}}
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("issue:100", "issue:101", "issue:102"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		// In-set edges 102->100 and 102->101, sorted by (From,To).
+		wantEdges := []workmgmt.DependsEdge{{From: 102, To: 100}, {From: 102, To: 101}}
+		if len(res.Edges) != len(wantEdges) || res.Edges[0] != wantEdges[0] || res.Edges[1] != wantEdges[1] {
+			t.Fatalf("edges = %+v, want %+v", res.Edges, wantEdges)
+		}
+		// #999 is not in the named set -> dropped, stamped DropNotChild.
+		wantDropped := []workmgmt.DependsEdge{{From: 102, To: 999, Reason: workmgmt.DropNotChild}}
+		if len(res.DroppedEdges) != 1 || res.DroppedEdges[0] != wantDropped[0] {
+			t.Fatalf("dropped = %+v, want %+v", res.DroppedEdges, wantDropped)
+		}
+	})
+
+	t.Run("no marker yields no edges", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			100: {Number: 100, Title: "a", Body: "## Summary\n\nplain body\n", State: "open"},
+		}}
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("100"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		if len(res.Children) != 1 || len(res.Edges) != 0 || len(res.DroppedEdges) != 0 {
+			t.Fatalf("res = %+v, want one child no edges", res)
+		}
+	})
+
+	t.Run("autonomy label parsed and Complete from closed+completed", func(t *testing.T) {
+		api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+			// closed+completed (lowercase REST enums) -> Complete; autonomy:low label parsed.
+			100: {Number: 100, Title: "done", Body: "no deps", State: "closed", StateReason: "completed", Labels: []string{"type:feature", "autonomy:low"}},
+			// closed as not_planned -> NOT complete.
+			101: {Number: 101, Title: "abandoned", Body: "no deps", State: "closed", StateReason: "not_planned"},
+			// open, no autonomy label.
+			102: {Number: 102, Title: "open", Body: "no deps", State: "open"},
+		}}
+		res, err := New(api).ResolveDependencies(context.Background(), resolveReq("100", "101", "102"))
+		if err != nil {
+			t.Fatalf("ResolveDependencies: %v", err)
+		}
+		byNum := map[int]workmgmt.EpicChild{}
+		for _, c := range res.Children {
+			byNum[c.Number] = c
+		}
+		if !byNum[100].Complete {
+			t.Errorf("#100 Complete = false, want true (closed+completed)")
+		}
+		if byNum[100].Autonomy != "low" {
+			t.Errorf("#100 Autonomy = %q, want low", byNum[100].Autonomy)
+		}
+		if byNum[101].Complete {
+			t.Errorf("#101 Complete = true, want false (closed as not_planned)")
+		}
+		if byNum[102].Complete {
+			t.Errorf("#102 Complete = true, want false (open)")
+		}
+	})
+}
+
+// TestProvider_ResolveDependencies_FailClosed covers the defensive branches: a
+// nil API, a missing repo, a zero installation, an unparseable item ref, and a
+// GetIssue error each return an error rather than a partial result.
+func TestProvider_ResolveDependencies_FailClosed(t *testing.T) {
+	good := resolveReq("issue:100")
+	t.Run("nil api", func(t *testing.T) {
+		if _, err := (&Provider{}).ResolveDependencies(context.Background(), good); err == nil || !strings.Contains(err.Error(), "missing API client") {
+			t.Fatalf("want missing-API error, got %v", err)
+		}
+	})
+	t.Run("missing repo", func(t *testing.T) {
+		req := good
+		req.Target.Repo = workmgmt.Repo{}
+		if _, err := New(&fakeAPI{}).ResolveDependencies(context.Background(), req); err == nil || !strings.Contains(err.Error(), "repo owner and name required") {
+			t.Fatalf("want repo-required error, got %v", err)
+		}
+	})
+	t.Run("zero installation", func(t *testing.T) {
+		req := good
+		req.Target.Scope = forge.CredentialScope{}
+		if _, err := New(&fakeAPI{}).ResolveDependencies(context.Background(), req); err == nil || !strings.Contains(err.Error(), "no installation id available") {
+			t.Fatalf("want missing-installation error, got %v", err)
+		}
+	})
+	t.Run("unparseable item ref", func(t *testing.T) {
+		if _, err := New(&fakeAPI{}).ResolveDependencies(context.Background(), resolveReq("not-a-ref")); err == nil || !strings.Contains(err.Error(), "not a numeric issue reference") {
+			t.Fatalf("want malformed-item error, got %v", err)
+		}
+	})
+	t.Run("get issue error", func(t *testing.T) {
+		api := &fakeAPI{getIssueErr: errors.New("github rejected the request")}
+		if _, err := New(api).ResolveDependencies(context.Background(), good); err == nil || !strings.Contains(err.Error(), "get issue #100") {
+			t.Fatalf("want get-issue error, got %v", err)
 		}
 	})
 }

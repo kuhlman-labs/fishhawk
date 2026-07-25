@@ -13,12 +13,13 @@ import (
 
 // --- fishhawk_start_campaign (E25.8 / #1447) ---
 
-// StartCampaignInput is the fishhawk_start_campaign tool's input schema. repo +
-// epic_ref are required; pause_policy is optional (empty normalizes to
-// pause_campaign server-side).
+// StartCampaignInput is the fishhawk_start_campaign tool's input schema. repo is
+// required; ONE of epic_ref / items must be present (epic_ref decomposes an epic,
+// items assembles a no-epic campaign over an explicit issue list — #2051).
+// pause_policy is optional (empty normalizes to pause_campaign server-side).
 type StartCampaignInput struct {
 	Repo        string `json:"repo" jsonschema:"GitHub repo as owner/name to assemble the campaign in"`
-	EpicRef     string `json:"epic_ref" jsonschema:"the epic reference to decompose into the campaign DAG (e.g. an issue ref like '#25' or 'owner/name#25')"`
+	EpicRef     string `json:"epic_ref,omitempty" jsonschema:"OPTIONAL the epic reference to decompose into the campaign DAG (e.g. an issue ref like '#25' or 'owner/name#25'). Omit it and pass items to assemble a no-epic campaign over an explicit issue list instead; one of epic_ref / items is required"`
 	PausePolicy string `json:"pause_policy,omitempty" jsonschema:"OPTIONAL pause behavior on a gate hand-off: 'pause_campaign' (block the whole campaign, the default) or 'pause_item' (continue-others). Omit to take the conservative pause_campaign default"`
 	// OperatorAgent is the OPTIONAL campaign-level operator_agent override. Typed
 	// map[string]any so the MCP SDK's reflection-built tool input schema sees an
@@ -29,9 +30,11 @@ type StartCampaignInput struct {
 	// wholesale override with no delegated knobs — page on every action. Omit
 	// (nil map) to leave every issue-run on its workflow default.
 	OperatorAgent map[string]any `json:"operator_agent,omitempty" jsonschema:"OPTIONAL campaign-level operator_agent delegation override. A JSON object with the operator_agent knobs (may_approve, may_route_fixup, may_waive, may_retry, may_merge, must_page_human, model_policy). When set it REPLACES (wins wholesale over) every issue-run's per-workflow operator_agent contract for the whole campaign — it is never merged. An explicit empty {} is a valid wholesale override with no delegated knobs (page on every action). Omit to leave each issue-run on its workflow default"`
-	// Items is the OPTIONAL subset filter (#2003): scope the campaign to a named
-	// subset of the epic's children instead of all of them.
-	Items []string `json:"items,omitempty" jsonschema:"OPTIONAL subset of the epic's child issues to scope the campaign to, as issue refs (a bare number like '101' or 'issue:101'). epic_ref is still required — every item must be a child of it. The campaign DAG is built over just these items; an included item whose depends_on points at an EXCLUDED item fails campaign_dangling_dependency (that dependency must run within the batch). A ref that is not a child of the epic fails campaign_item_not_child. Omit to sweep every child (the default)"`
+	// Items is the OPTIONAL subset filter (#2003) / no-epic item list (#2051):
+	// WITH epic_ref it scopes the campaign to a named subset of the epic's
+	// children; WITHOUT epic_ref it is the authoritative issue set the no-epic
+	// campaign assembles over.
+	Items []string `json:"items,omitempty" jsonschema:"OPTIONAL issue refs (a bare number like '101' or 'issue:101'). WITH epic_ref: the subset of the epic's children to scope the campaign to — every item must be a child of the epic (a non-child fails campaign_item_not_child); omit to sweep every child. WITHOUT epic_ref: the authoritative issue set a no-epic campaign assembles over, resolving each issue's depends_on directly (#2051). In both modes an included item whose depends_on points at an issue OUTSIDE the set fails campaign_dangling_dependency (that dependency must run within the batch). One of epic_ref / items is required"`
 }
 
 // StartCampaignOutput carries the created campaign row.
@@ -83,14 +86,17 @@ wave-orders them into a DAG, and persists the campaign; poll it afterwards with
 fishhawk_get_campaign_status and hand a paused campaign back with
 fishhawk_resume_campaign.
 
-repo (owner/name) and epic_ref are required. pause_policy is optional —
-pause_campaign (the default, block the whole campaign at a gate hand-off) or
-pause_item (continue the other items). items is optional — a subset of the
-epic's child issue refs (bare number or issue:N) to scope the campaign to
-instead of all children; epic_ref stays required and every item must be a child
-of it, the DAG is built over just those items, and an included item whose
-depends_on points at an excluded item fails campaign_dangling_dependency (omit
-items to sweep every child). operator_agent is optional — a
+repo (owner/name) is required, plus ONE of epic_ref / items. pause_policy is
+optional — pause_campaign (the default, block the whole campaign at a gate
+hand-off) or pause_item (continue the other items). Two ways to scope the batch:
+pass epic_ref to decompose an epic's children, optionally narrowed by items (a
+subset of the epic's child issue refs — every item must be a child of the epic,
+the DAG is built over just those items); OR omit epic_ref and pass items alone to
+assemble a NO-EPIC campaign over exactly that issue list (#2051), resolving each
+issue's depends_on directly with no shared epic parent. In both modes an included
+item whose depends_on points at an issue outside the set fails
+campaign_dangling_dependency (that dependency must run within the batch); with
+epic_ref, a non-child item fails campaign_item_not_child. operator_agent is optional — a
 campaign-level operator_agent delegation block that REPLACES (wins wholesale
 over) every issue-run's per-workflow operator_agent contract for the whole
 campaign; an explicit empty {} is a valid wholesale override with no delegated
@@ -112,8 +118,11 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 	if repo == "" {
 		return nil, StartCampaignOutput{}, errors.New("repo is required (owner/name)")
 	}
-	if strings.TrimSpace(in.EpicRef) == "" {
-		return nil, StartCampaignOutput{}, errors.New("epic_ref is required")
+	// epic_ref is OPTIONAL as of #2051; require epic_ref OR a non-empty items
+	// list (pass epic_ref to decompose an epic, or items alone for the no-epic
+	// variant). The server owns the branch decision — the client forwards both.
+	if strings.TrimSpace(in.EpicRef) == "" && len(in.Items) == 0 {
+		return nil, StartCampaignOutput{}, errors.New("one of epic_ref or items is required: pass epic_ref to decompose an epic, or items alone to assemble a no-epic campaign over an explicit issue list")
 	}
 
 	// Marshal the OPTIONAL campaign-level operator_agent override back to opaque

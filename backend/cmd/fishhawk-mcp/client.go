@@ -1905,7 +1905,13 @@ type CampaignStatus struct {
 // (`backend/internal/server/campaigns.go::createCampaignRequest`). Repeated
 // here for the same thin-local-copy reason as createRunRequest.
 type campaignCreateRequest struct {
-	Repo        string `json:"repo"`
+	Repo string `json:"repo"`
+	// EpicRef has NO omitempty deliberately (#2051): the no-epic variant sends an
+	// empty epic_ref, and the server treats an empty-string epic_ref as ABSENT
+	// (routing to the items-only branch). omitempty would DROP the key when the
+	// caller omits epic_ref — indistinguishable on the wire from sending "", so
+	// keeping it non-omitempty is load-bearing but harmless (the server trims and
+	// branches identically whether the key is "" or absent).
 	EpicRef     string `json:"epic_ref"`
 	PausePolicy string `json:"pause_policy,omitempty"`
 	// OperatorAgent is the OPTIONAL campaign-level operator_agent override
@@ -1921,25 +1927,34 @@ type campaignCreateRequest struct {
 	Items []string `json:"items,omitempty"`
 }
 
-// CreateCampaign assembles a campaign from an epic ref via
-// `POST /v0/campaigns` (E25.4) and returns the created campaign (201 fresh).
-// pausePolicy is optional — empty normalizes to pause_campaign server-side.
-// operatorAgent is the OPTIONAL campaign-level operator_agent override (E25.12 /
-// #1451) carried as opaque JSON; empty/nil omits the field so the campaign
-// inherits each issue-run's workflow contract. A write tool: requires an
-// operator token with write:campaigns scope. 4xx/5xx surfaces as *apiError; the
-// tool layer reads the code:
-//   - 400 validation_failed (repo not owner/name, empty epic_ref, bad
-//     pause_policy, a malformed/unknown-field operator_agent, or a dependency
+// CreateCampaign assembles a campaign via `POST /v0/campaigns` (E25.4) and
+// returns the created campaign (201 fresh). epicRef is OPTIONAL as of #2051: pass
+// it to decompose an epic's children (optionally narrowed by items), OR leave it
+// empty and pass items alone to assemble a NO-EPIC campaign over exactly that
+// issue list (the server resolves each issue's depends_on directly). epicRef is
+// serialized WITHOUT omitempty so an empty ref reaches the server, which treats
+// an empty-string epic_ref as absent and routes to the no-epic branch. An empty
+// request (neither epic_ref nor items) fails 400 validation_failed. pausePolicy
+// is optional — empty normalizes to pause_campaign server-side. operatorAgent is
+// the OPTIONAL campaign-level operator_agent override (E25.12 / #1451) carried as
+// opaque JSON; empty/nil omits the field so the campaign inherits each issue-run's
+// workflow contract. A write tool: requires an operator token with
+// write:campaigns scope. 4xx/5xx surfaces as *apiError; the tool layer reads the
+// code:
+//   - 400 validation_failed (repo not owner/name, neither epic_ref nor items,
+//     bad pause_policy, a malformed/unknown-field operator_agent, or a dependency
 //     cycle)
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 422 repo_not_installed (the GitHub App is not on the target repo)
-//   - 422 campaign_dangling_dependency (a depends_on target is not a fellow child)
+//   - 422 campaign_dangling_dependency (a depends_on target is outside the assembled set)
 //   - 422 campaign_item_not_child (a requested items ref is not a child of the epic)
+//   - 501 issue_set_resolution_unsupported (no-epic variant on a provider that
+//     cannot resolve an arbitrary issue set)
 //   - 503 campaign_repo_unconfigured (no campaign repository wired on the deploy)
 //
-// items is the OPTIONAL subset filter (#2003): issue refs naming the subset of
-// the epic's children to scope the campaign to; empty/nil sweeps every child.
+// items is the OPTIONAL subset filter (#2003) WITH epicRef (issue refs naming the
+// subset of the epic's children; empty/nil sweeps every child) or the
+// AUTHORITATIVE issue set WITHOUT epicRef (the no-epic variant, #2051).
 func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage, items []string) (*Campaign, error) {
 	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent, Items: items})
 	if err != nil {

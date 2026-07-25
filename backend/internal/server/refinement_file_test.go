@@ -157,6 +157,20 @@ func (f *fakeGHAPI) SearchIssuesByTitle(_ context.Context, _ forge.CredentialSco
 	return f.searchResults, nil
 }
 
+// GetIssue satisfies the widened github.API (#2051): the no-epic
+// ResolveDependencies path reads each named issue via GetIssue. Minimal stub —
+// these tests do not exercise the no-epic path — serving the in-memory issue by
+// number so an accidental call still returns coherent data rather than panicking.
+func (f *fakeGHAPI) GetIssue(_ context.Context, _ forge.CredentialScope, _ forge.RepoRef, number int) (*githubclient.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	iss, ok := f.byNumber[number]
+	if !ok {
+		return nil, githubclient.ErrNotFound
+	}
+	return &githubclient.Issue{Number: iss.number, Title: iss.title, Body: iss.body, Labels: iss.labels}, nil
+}
+
 // issueTitle returns the stored title for an issue number under the API lock,
 // so the GetIssue-serving integration stub can read titles concurrently.
 func (f *fakeGHAPI) issueTitle(number int) (string, bool) {
