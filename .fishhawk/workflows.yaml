@@ -74,14 +74,14 @@ workflows:
         type: plan
         executor:
           agent: claude-code
-          # Planner runs on Opus 4.8 rather than the deployment default.
+          # Planner runs on Opus 5 rather than the deployment default.
           # The plan stage is the cheapest agent stage (~$1.4/run of the
           # ~$3.9/run implement) and higher plan quality is the lever most
           # likely to cut downstream implement rework, so it pins the most
           # capable model. executor.model is the #1013 override rung
           # (deployment default < this < plan model_recommendation <
           # operator gate).
-          model: claude-opus-4-8
+          model: claude-opus-5
         # Advisory plan review (ADR-027): agent reviewers surface verdicts
         # before the human gate; effective agent count >0 + human>0 →
         # advisory, so the founder approval below stays authoritative.
