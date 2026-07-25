@@ -5,10 +5,10 @@
 # The labels below feed Project #7's filters so bump PRs slot into the
 # right Component/Autonomy buckets automatically.
 #
-# Add new entries as new modules land:
-#   /runner under E5.1 (#52)
-#   /cli    under E6.1 (#55)
-#   /frontend under E7.1 (#37)
+# Every module in go.work needs its own entry, plus the pnpm frontend —
+# security alerts fire for an uncovered path but no bump PR is ever opened,
+# so the alerts just accumulate until someone audits the Security tab by hand
+# (E48.50 / #2183). Add a new entry whenever a module lands in go.work.
 
 version: 2
 
@@ -42,6 +42,178 @@ updates:
       golang-migrate:
         patterns:
           - "github.com/golang-migrate/*"
+
+  # Runner Go module. Tagged and consumed by customers as
+  # `uses: kuhlman-labs/fishhawk/runner@vX.Y`, so stale deps here ship
+  # outward — the worst module to leave uncovered.
+  - package-ecosystem: gomod
+    directory: /runner
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:runner
+      - autonomy:high
+    commit-message:
+      prefix: deps(runner)
+      include: scope
+    groups:
+      otel:
+        patterns:
+          - "go.opentelemetry.io/*"
+
+  # CLI Go module.
+  - package-ecosystem: gomod
+    directory: /cli
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:cli
+      - autonomy:high
+    commit-message:
+      prefix: deps(cli)
+      include: scope
+
+  # Directory Go module (regional-cells control plane, ADR-062). Same
+  # pgx/migrate/testcontainers shape as /backend.
+  - package-ecosystem: gomod
+    directory: /directory
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:backend
+      - autonomy:high
+    commit-message:
+      prefix: deps(directory)
+      include: scope
+    groups:
+      pgx:
+        patterns:
+          - "github.com/jackc/pgx/*"
+      testcontainers:
+        patterns:
+          - "github.com/testcontainers/*"
+      golang-migrate:
+        patterns:
+          - "github.com/golang-migrate/*"
+
+  # Pricing Go module. No direct dependencies today — registered so a
+  # future one is covered on arrival rather than silently unwatched.
+  - package-ecosystem: gomod
+    directory: /pricing
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:backend
+      - autonomy:high
+    commit-message:
+      prefix: deps(pricing)
+      include: scope
+
+  # Redaction Go module. No direct dependencies today — see /pricing.
+  - package-ecosystem: gomod
+    directory: /redaction
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:backend
+      - autonomy:high
+    commit-message:
+      prefix: deps(redaction)
+      include: scope
+
+  # Verifier Go module.
+  - package-ecosystem: gomod
+    directory: /verifier
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:backend
+      - autonomy:high
+    commit-message:
+      prefix: deps(verifier)
+      include: scope
+
+  # Frontend pnpm workspace. Grouped aggressively: an ungrouped weekly run
+  # against ~35 dependencies would blow past open-pull-requests-limit and
+  # silently drop the remainder.
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:frontend
+      - autonomy:high
+    commit-message:
+      prefix: deps(frontend)
+      include: scope
+    groups:
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "react-router"
+          - "@types/react"
+          - "@types/react-dom"
+      eslint:
+        patterns:
+          - "eslint"
+          - "@eslint/*"
+          - "eslint-plugin-*"
+          - "typescript-eslint"
+          - "globals"
+      vite:
+        patterns:
+          - "vite"
+          - "@vitejs/*"
+          - "vitest"
+      tailwind:
+        patterns:
+          - "tailwindcss"
+          - "@tailwindcss/*"
+          - "tailwind-merge"
+          - "prettier-plugin-tailwindcss"
+      testing-library:
+        patterns:
+          - "@testing-library/*"
+          - "jsdom"
+      radix:
+        patterns:
+          - "@radix-ui/*"
 
   # GitHub Actions workflows. Especially load-bearing given the
   # September-2026 deprecation of Node-20-based actions warned about
