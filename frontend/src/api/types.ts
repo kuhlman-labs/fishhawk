@@ -184,13 +184,7 @@ export interface AuditEntry {
 export type CampaignState = 'pending' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
 
 export type CampaignItemState =
-  | 'pending'
-  | 'blocked'
-  | 'running'
-  | 'paused'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled';
+  'pending' | 'blocked' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
 
 export type PausePolicy = 'pause_campaign' | 'pause_item';
 

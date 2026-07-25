@@ -16,9 +16,7 @@ import { useEffect, useState } from 'react';
  * cancellation if they want; today nobody does.
  */
 export type AsyncState<T> =
-  | { status: 'loading' }
-  | { status: 'error'; error: Error }
-  | { status: 'ok'; data: T };
+  { status: 'loading' } | { status: 'error'; error: Error } | { status: 'ok'; data: T };
 
 export function useAsync<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,

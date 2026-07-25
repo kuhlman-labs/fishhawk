@@ -108,9 +108,10 @@ describe('usePaginated + <Pagination>', () => {
   });
 
   it('disables Next on the first page when next_cursor is null', async () => {
-    const fetcher = vi.fn(
-      async (): Promise<PaginatedList<Item>> => ({ items: [{ id: 'only' }], next_cursor: null }),
-    );
+    const fetcher = vi.fn(async (): Promise<PaginatedList<Item>> => ({
+      items: [{ id: 'only' }],
+      next_cursor: null,
+    }));
     render(<Probe fetcher={fetcher} />);
     await expectItems('only');
     expect(screen.getByRole('button', { name: /next page/i })).toBeDisabled();
