@@ -207,17 +207,17 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// verdict; do NOT append a duplicate. Either way the merge helper is
 	// dispatched below, so a 502-then-reinvoke re-queues the merge.
 	//
-	// This read-then-append is deliberately NOT serialized against a
-	// concurrent POST for the same run (no advisory lock / unique
-	// (run_id, category) constraint): the realistic retry flow is SEQUENTIAL
-	// (a 502-then-reinvoke, or a timed-out re-invoke), which this guard covers
-	// exactly. A genuinely concurrent double-POST (e.g. two operator sessions
-	// racing) can have both observe zero rows and both append — an accepted,
-	// bounded trade-off: the worst case is one duplicate audit row and a
-	// double merge-dispatch, and GitHub tolerates a re-merge of an
-	// already-merged PR as a no-op. Hardening this to a DB-level serialization
-	// is deferred (it would need a schema/constraint change outside this
-	// endpoint's surface).
+	// The read-then-append fast-path covers the SEQUENTIAL retry flow (a
+	// 502-then-reinvoke, or a timed-out re-invoke). A genuinely CONCURRENT
+	// double-POST for the same run — where both observe zero rows and both
+	// append — is closed at the DB level by the 0062 partial unique index
+	// audit_entries_merge_verdict_recorded_once_idx (#1983): AppendChainedTx's
+	// SELECT ... FOR UPDATE on the run row serializes the two appends, so the
+	// race-loser's insert deterministically violates that index and returns a
+	// unique_violation. audit.IsMergeVerdictDuplicate catches ONLY that
+	// index's collision (not an unrelated 23505 on the hash-chain / entry-hash
+	// / (run_id, sequence) uniqueness); the loser re-reads the winner's
+	// sequence, responds already_recorded, and still dispatches the merge.
 	existing, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -228,12 +228,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	alreadyRecorded := len(existing) > 0
 	if alreadyRecorded {
 		// Reuse the earliest recorded verdict's sequence (chain-stable).
-		verdictSequence = existing[0].Sequence
-		for _, e := range existing {
-			if e.Sequence < verdictSequence {
-				verdictSequence = e.Sequence
-			}
-		}
+		verdictSequence = earliestMergeVerdictSequence(existing)
 	} else {
 		subject := id.Subject
 		if subject == "" {
@@ -254,7 +249,37 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			ActorSubject: &subject,
 			Payload:      payload,
 		})
-		if aerr != nil {
+		switch {
+		case aerr == nil:
+			verdictSequence = entry.Sequence
+		case audit.IsMergeVerdictDuplicate(aerr):
+			// Lost the concurrent merge-verdict race: another POST's insert
+			// won the partial-unique-index slot. Re-read to recover the
+			// winner's sequence, then fall through to the merge dispatch (a
+			// benign idempotent outcome, NOT a 500).
+			winner, rerr := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
+			if rerr != nil {
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"re-read merge verdict after concurrent-race conflict failed",
+					map[string]any{"error": rerr.Error()})
+				return
+			}
+			if len(winner) == 0 {
+				// Defensive fail-closed: the index guarantees the winner's row
+				// is committed before the loser's insert can conflict, so this
+				// is unreachable — but never fabricate a verdict_sequence on a
+				// phantom winner. Surface a 500 rather than dispatch.
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+					"merge: merge-verdict duplicate caught but re-read found no winner row",
+					slog.String("run_id", runID.String()))
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"record merge verdict failed: duplicate conflict but no recorded verdict found on re-read",
+					map[string]any{"run_id": runID.String()})
+				return
+			}
+			alreadyRecorded = true
+			verdictSequence = earliestMergeVerdictSequence(winner)
+		default:
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 				"merge: append merge_verdict_recorded audit entry failed",
 				slog.String("run_id", runID.String()),
@@ -263,7 +288,6 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 				"record merge verdict failed", map[string]any{"error": aerr.Error()})
 			return
 		}
-		verdictSequence = entry.Sequence
 	}
 
 	// Dispatch the shared merge helper. The verdict row is already durable, so a
@@ -287,4 +311,19 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		AlreadyRecorded: alreadyRecorded,
 		PRURL:           prURL,
 	})
+}
+
+// earliestMergeVerdictSequence returns the smallest Sequence among the given
+// merge_verdict_recorded entries (chain-stable: the winning append's row). The
+// 0062 partial unique index guarantees at most one such row per run, so this is
+// almost always a single-element scan; the loop is retained for defensiveness.
+// Callers must pass a non-empty slice.
+func earliestMergeVerdictSequence(entries []*audit.Entry) int64 {
+	seq := entries[0].Sequence
+	for _, e := range entries {
+		if e.Sequence < seq {
+			seq = e.Sequence
+		}
+	}
+	return seq
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -643,6 +644,177 @@ func TestMergeRun_Idempotent_RepeatedPost(t *testing.T) {
 	}
 	if merger.called != 2 {
 		t.Errorf("merger called %d times, want 2 (re-dispatch on every POST)", merger.called)
+	}
+}
+
+// TestEarliestMergeVerdictSequence pins the chain-stable min: the earliest
+// (smallest) sequence wins regardless of slice order (the reassignment branch).
+func TestEarliestMergeVerdictSequence(t *testing.T) {
+	entries := []*audit.Entry{{Sequence: 9}, {Sequence: 3}, {Sequence: 7}}
+	if got := earliestMergeVerdictSequence(entries); got != 3 {
+		t.Errorf("earliestMergeVerdictSequence = %d, want 3", got)
+	}
+	if got := earliestMergeVerdictSequence([]*audit.Entry{{Sequence: 42}}); got != 42 {
+		t.Errorf("earliestMergeVerdictSequence(single) = %d, want 42", got)
+	}
+}
+
+// mergeAppendAudit wraps auditFake to drive the concurrent-merge-race branch of
+// handleMergeRun without real Postgres. AppendChained returns appendErr for the
+// merge_verdict_recorded category (letting a test inject audit.ErrMergeVerdictDuplicate
+// or a foreign-constraint 23505); ListForRunByCategory returns empty on the FIRST
+// merge-verdict read when firstMergeListEmpty is set, so the handler reaches the
+// append branch even though the winner's row is already seeded (recovered by the
+// re-read).
+type mergeAppendAudit struct {
+	*auditFake
+	appendErr           error
+	firstMergeListEmpty bool
+	mergeListCalls      int
+}
+
+func (a *mergeAppendAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryMergeVerdictRecorded && a.appendErr != nil {
+		return nil, a.appendErr
+	}
+	return a.auditFake.AppendChained(ctx, p)
+}
+
+func (a *mergeAppendAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == CategoryMergeVerdictRecorded {
+		a.mergeListCalls++
+		if a.firstMergeListEmpty && a.mergeListCalls == 1 {
+			return nil, nil
+		}
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// seedMergeVerdict seeds a committed merge_verdict_recorded row (the race
+// winner) into the fake's history so the loser's re-read can recover it.
+func seedMergeVerdict(au *auditFake, runID uuid.UUID, seq int64) {
+	rid := runID
+	p, _ := json.Marshal(map[string]any{"verdict": "winner", "pr_url": mergePR, "delegated": false})
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Category: CategoryMergeVerdictRecorded, Sequence: seq, Payload: p,
+	})
+	au.mu.Unlock()
+}
+
+// TestMergeRun_ConcurrentRaceLoser_Benign is binding condition 1's benign path:
+// AppendChained loses the partial-unique-index race (returns the
+// merge-verdict-index duplicate). The handler re-reads the winner's row,
+// responds 200 already_recorded with the WINNER's sequence, appends NO duplicate,
+// and STILL dispatches the merge.
+func TestMergeRun_ConcurrentRaceLoser_Benign(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+	seedMergeVerdict(au, runID, 77) // the winner's committed row
+	s.cfg.AuditRepo = &mergeAppendAudit{
+		auditFake:           au,
+		appendErr:           audit.ErrMergeVerdictDuplicate,
+		firstMergeListEmpty: true,
+	}
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (benign concurrent-race loser):\n%s", w.Code, w.Body.String())
+	}
+	var resp mergeRunResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !resp.AlreadyRecorded {
+		t.Error("already_recorded = false, want true (race loser recovers the winner's verdict)")
+	}
+	if resp.VerdictSequence != 77 {
+		t.Errorf("verdict_sequence = %d, want 77 (the winner's sequence)", resp.VerdictSequence)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (race loser still dispatches the merge)", merger.called)
+	}
+	// No duplicate appended — the winner is the seeded row, the loser's append
+	// was rejected.
+	if rows := mergeVerdictRows(au); len(rows) != 0 {
+		t.Errorf("merge_verdict_recorded appended rows = %d, want 0 (no duplicate on the race loser)", len(rows))
+	}
+}
+
+// TestMergeRun_DuplicateOnDifferentConstraint_500 is binding condition 1's
+// scoping guard: a 23505 on a DIFFERENT constraint (e.g. the (run_id, sequence)
+// / hash-chain uniqueness) is NOT the benign merge-verdict race and must stay a
+// 500 — never swallowed, never dispatched.
+func TestMergeRun_DuplicateOnDifferentConstraint_500(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+	s.cfg.AuditRepo = &mergeAppendAudit{
+		auditFake: au,
+		// A unique_violation on an unrelated constraint — not the merge-verdict index.
+		appendErr: &pgconn.PgError{Code: "23505", ConstraintName: "audit_entries_run_id_sequence_key"},
+	}
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (foreign-constraint 23505 must not be swallowed):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times on an unrelated integrity failure, want 0", merger.called)
+	}
+}
+
+// TestMergeRun_RaceLoserNoWinnerOnReread_500 is binding condition 1's defensive
+// fail-closed branch: the merge-verdict duplicate is caught but the re-read
+// finds NO winner row (unreachable in practice — the index guarantees the
+// winner is committed — but the handler must fail closed rather than fabricate a
+// verdict_sequence and dispatch on a phantom winner).
+func TestMergeRun_RaceLoserNoWinnerOnReread_500(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+	// No winner seeded: both the first read and the re-read come back empty.
+	s.cfg.AuditRepo = &mergeAppendAudit{
+		auditFake: au,
+		appendErr: audit.ErrMergeVerdictDuplicate,
+	}
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (duplicate caught but no winner on re-read → fail closed):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times on a phantom-winner re-read, want 0 (no dispatch)", merger.called)
+	}
+}
+
+// TestMergeRun_RaceLoserRereadError_500 covers the re-read failure branch: the
+// merge-verdict duplicate is caught, but the re-read of ListForRunByCategory
+// itself errors. The handler surfaces a 500 and does NOT dispatch the merge.
+func TestMergeRun_RaceLoserRereadError_500(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+	// The first merge-verdict read is short-circuited to empty; the re-read
+	// delegates to auditFake, which now fails.
+	au.listByCategoryErr = errBoom
+	s.cfg.AuditRepo = &mergeAppendAudit{
+		auditFake:           au,
+		appendErr:           audit.ErrMergeVerdictDuplicate,
+		firstMergeListEmpty: true,
+	}
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (re-read after duplicate failed):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times on a failed re-read, want 0 (no dispatch)", merger.called)
 	}
 }
 
