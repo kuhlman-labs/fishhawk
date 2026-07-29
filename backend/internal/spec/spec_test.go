@@ -1,13 +1,12 @@
 package spec_test
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -3795,213 +3794,194 @@ workflows:
 	}
 }
 
-// licensedDelta is one deliberate v1 -> v2 grammar divergence, licensed by
-// the E52 child that introduced it. Path is the normalized JSON path
-// collectSchemaDiffs reports; Issue names the owning issue so a reader can
-// tell an intended removal from an accidental drop without archaeology.
-type licensedDelta struct {
-	Path  string
-	Issue string
-	Why   string
-}
-
-// licensedV2Deltas is the allow-list TestV2DivergesFromV1OnlyByLicensedDeltas
-// asserts set-equality against. Each E52 grammar child appends its own
-// entries here as it lands.
-var licensedV2Deltas = []licensedDelta{
-	{
-		Path:  "$/$defs/operator_agent/properties/must_page_human/items/enum",
-		Issue: "#2215 (E52.3)",
-		Why:   "the legacy bare reviewer_reject page-event token is removed from v2; advisory_reviewer_reject / gating_reviewer_reject express the taxonomy explicitly",
-	},
-	{
-		Path:  "$/$defs/reviewers_config/properties/agent",
-		Issue: "#2215 (E52.3)",
-		Why:   "the bare reviewers.agent integer count is removed from v2; reviewers.agents[] is the sole agent-reviewer declaration and len(agents) is the effective count",
-	},
-	// E52.6 / #2218 — the three legibility reshapes. `constraints` reports
-	// as three paths because the property's whole body is rewritten from an
-	// array-of-$ref to a bare $ref.
-	{
-		Path:  "$/$defs/stage/properties/constraints/type",
-		Issue: "#2218 (E52.6)",
-		Why:   "v2 spells a stage's constraints as ONE object keyed by kind, not an array of single-kind objects; the array type is gone",
-	},
-	{
-		Path:  "$/$defs/stage/properties/constraints/items",
-		Issue: "#2218 (E52.6)",
-		Why:   "with the array gone there is no items schema; the property $refs the constraint object directly",
-	},
-	{
-		Path:  "$/$defs/stage/properties/constraints/$ref",
-		Issue: "#2218 (E52.6)",
-		Why:   "the constraints property now $refs $defs/constraint directly, which the parser normalizes into a one-element list so no consumer changed",
-	},
-	{
-		Path:  "$/$defs/constraint/maxProperties",
-		Issue: "#2218 (E52.6)",
-		Why:   "an object's keys are naturally unique, so v2 drops the one-kind-per-entry cap; minProperties:1 stays so `constraints: {}` is still a rejected no-op",
-	},
-	{
-		Path:  "$/$defs/workflow/properties/drive",
-		Issue: "#2218 (E52.6)",
-		Why:   "v2 spells the auto-advance flag `auto_advance`; the parser rewrites it to the drive key, so the Go field, DB column and read sites are unchanged",
-	},
-	{
-		Path:  "$/$defs/workflow/properties/auto_advance",
-		Issue: "#2218 (E52.6)",
-		Why:   "the v2 spelling of v0/v1's `drive` — a spec-surface rename with byte-identical semantics",
-	},
-	{
-		Path:  "$/$defs/stage/properties/needs",
-		Issue: "#2218 (E52.6)",
-		Why:   "needs: [<stage_id>] is v2 shorthand for the common artifact-wiring case, expanded at parse time into the equivalent inputs entries",
-	},
-	// E52.5 / #2217 — the stage-budget unit unification. max_runtime_minutes
-	// is removed in favour of the Go-duration max_runtime, and limit_usd is
-	// added as the primary USD ceiling.
-	{
-		Path:  "$/$defs/budget/properties/max_runtime_minutes",
-		Issue: "#2217 (E52.5)",
-		Why:   "removed — v2 spells every duration as a Go duration string, so the bare-integer minutes form is gone (15 becomes 15m via max_runtime)",
-	},
-	{
-		Path:  "$/$defs/budget/properties/max_runtime",
-		Issue: "#2217 (E52.5)",
-		Why:   "added — the v2 spelling of the runtime cap, a Go duration string parsed by time.ParseDuration, matching policy.max_stage_runtime / executor.timeout / verify.timeout",
-	},
-	{
-		Path:  "$/$defs/budget/properties/limit_usd",
-		Issue: "#2217 (E52.5)",
-		Why:   "added — the primary per-stage USD ceiling, aligned in unit with the workflow-level periodic_budget.limit_usd",
-	},
-	// E52.4 / #2216 adds the two same-document reuse primitives v2 never
-	// had. Exactly THREE new schema paths, and the `defaults` block is
-	// INLINED at both sites rather than factored into a shared $defs entry
-	// precisely to keep the count at three: a fourth divergent path would
-	// trip the ~15 guardrail below and drag the #2320 retire-the-test
-	// decision into this child.
-	{
-		Path:  "$/properties/defaults",
-		Issue: "#2216 (E52.4)",
-		Why:   "added — file-level reuse defaults (executor / reviewers / budget), the lowest rung of the same-document resolution ladder",
-	},
-	{
-		Path:  "$/$defs/workflow/properties/defaults",
-		Issue: "#2216 (E52.4)",
-		Why:   "added — workflow-level reuse defaults, the rung above an extends base and below the stage's own declaration",
-	},
-	{
-		Path:  "$/$defs/workflow/properties/extends",
-		Issue: "#2216 (E52.4)",
-		Why:   "added — same-document workflow inheritance, naming another workflow key in this document as the base",
-	},
-}
-
-// TestV2DivergesFromV1OnlyByLicensedDeltas is the re-scoped successor to
-// TestV2StructurallyMatchesV1 (ADR-067 / #2213 binding condition 2), under
-// the #2320 disposition: option 2, an allow-list diff. #2213 bought a
-// regression net against an ACCIDENTAL drop anywhere in the v1 -> v2 copy —
-// a mistyped key in a stage type, executor branch, constraint kind, or gate
-// shape that no fixture exercises. E52 then diverges v2 deliberately, so
-// strict deep-equality would fail by design. The allow-list keeps the net
-// while licensing the intended divergence, and the assertion is
-// TWO-DIRECTIONAL so it cannot rot: an UNLISTED divergent path fails (the
-// accidental-drop net), and a LISTED path that no longer diverges also
-// fails (a stale entry is a lie about the schema).
+// frozenMajorSchemaHashes pins the canonical-JSON SHA-256 of every FROZEN
+// workflow schema major — the digest the production accessors compute in
+// computeSchemaHashes and /healthz advertises.
 //
-// The deliberate non-deltas — description ANNOTATION strings at every
-// depth, the top-level $id and title, and the properties.version entry —
-// are still normalized away. Position-aware normalization (the blind spot
-// #2320 §2 names) means a `description` key is stripped only when it is a
-// schema annotation, never when it is a PROPERTY NAME inside a properties
-// or $defs map, so a divergence at e.g. $defs/workflow/properties/description
-// stays visible to the diff. See TestNormalizeSchemaTree_DescriptionAsPropertyName.
+// These literals are DERIVED, never hand-written: each was read off a run of
+// the accessor it pins, and TestFrozenMajorPinDetectsContentChange/control
+// re-derives them from the shipped schema bytes so a transcription slip
+// cannot pass. A mistyped constant here is red on a green tree and reads
+// exactly like a genuine frozen-major regression, which is why the control
+// case exists rather than trust in careful typing.
 //
-// GUARDRAIL (#2320): this disposition is provisional on the table staying
-// legible. If a later E52 child would push licensedV2Deltas past roughly 15
-// entries, the correct move is to revisit #2320 and RETIRE this test rather
-// than keep appending — past that size the allow-list stops being a readable
-// statement of intent and becomes a second copy of the schema.
-func TestV2DivergesFromV1OnlyByLicensedDeltas(t *testing.T) {
-	v1 := decodeSchemaMirror(t, "schemas/workflow-v1.schema.json")
-	v2 := decodeSchemaMirror(t, "schemas/workflow-v2.schema.json")
-
-	// Drop the deliberate top-level deltas before the structural walk.
-	for _, m := range []map[string]any{v1, v2} {
-		delete(m, "$id")
-		delete(m, "title")
-		if props, ok := m["properties"].(map[string]any); ok {
-			delete(props, "version")
-		}
-	}
-
-	var diffs []schemaDiff
-	collectSchemaDiffs(normalizeSchemaTree(v1), normalizeSchemaTree(v2), "$", &diffs)
-
-	got := make(map[string]string, len(diffs))
-	for _, d := range diffs {
-		got[d.Path] = d.Detail
-	}
-	want := make(map[string]licensedDelta, len(licensedV2Deltas))
-	for _, d := range licensedV2Deltas {
-		want[d.Path] = d
-	}
-
-	// Direction 1 — an UNLISTED divergence is an accidental drop.
-	for _, d := range diffs {
-		if _, ok := want[d.Path]; !ok {
-			t.Errorf("unlicensed v1->v2 divergence at %s (%s); if deliberate, add it to licensedV2Deltas with its owning issue", d.Path, d.Detail)
-		}
-	}
-	// Direction 2 — a LISTED path that no longer diverges is a stale entry.
-	for _, d := range licensedV2Deltas {
-		if _, ok := got[d.Path]; !ok {
-			t.Errorf("licensedV2Deltas entry %s (%s) no longer diverges; remove the stale entry", d.Path, d.Issue)
-		}
-	}
-	if n := len(licensedV2Deltas); n > 15 {
-		t.Errorf("licensedV2Deltas has %d entries; past ~15 the allow-list is a second copy of the schema — revisit #2320 and retire this test instead of appending", n)
-	}
+// v2 is deliberately ABSENT: it is the LIVE major the E52 children are still
+// editing, so pinning it would be a changelog, not an invariant.
+var frozenMajorSchemaHashes = map[int]string{
+	0: "8573453693a052f6375cef454310e455d6ffc93f0eb650f624c58562d4d3ff73",
+	1: "26848b2499c67863ef9948f669aa88bfa7aeb27165537187188e0ec82eef648c",
 }
 
-// TestNormalizeSchemaTree_DescriptionAsPropertyName closes the blind spot
-// #2320 §2 names: the old normalizer stripped every "description" key at
-// every depth, so a schema whose PROPERTY is literally named `description`
-// had that property normalized away — a drop of it between majors would
-// have been invisible to the copy-fidelity diff. The normalizer is now
-// position-aware, so the divergence is reported.
-func TestNormalizeSchemaTree_DescriptionAsPropertyName(t *testing.T) {
-	withProp := map[string]any{
-		"$defs": map[string]any{
-			"workflow": map[string]any{
-				"description": "an annotation that must still be stripped",
-				"properties": map[string]any{
-					"description": map[string]any{"type": "string"},
-					"stages":      map[string]any{"type": "array"},
-				},
+// frozenMajors is the pin table: one entry per frozen major, pairing the
+// pinned digest above with the production accessor that serves it, so the
+// pin and the advertised value cannot drift apart.
+var frozenMajors = []struct {
+	Name     string
+	Major    int
+	Accessor func() string
+}{
+	{"v0", 0, spec.EmbeddedSchemaHash},
+	{"v1", 1, spec.EmbeddedSchemaHashV1},
+}
+
+// TestFrozenMajorsV0AndV1AreImmutable pins the workflow-v0 and workflow-v1
+// embedded schemas by content digest. v0 and v1 are SHIPPED majors: nothing
+// may edit them, and until #2320 that invariant was asserted only in prose by
+// each E52 child and enforced by nothing.
+//
+// It replaces TestV2DivergesFromV1OnlyByLicensedDeltas (and the licensedV2Deltas
+// allow-list, the normalizer and the diff walker that existed only to serve it),
+// retired under the #2320 option-1 disposition. That test bought a net against
+// an ACCIDENTAL drop during the v1 -> v2 COPY at #2213. The copy is long past —
+// five E52 children have deliberately edited v2 — so a 15-entry table of
+// intentional divergences had become a changelog rather than an invariant, and
+// the guardrail in its own body said to retire it rather than keep appending.
+// v0/v1 immutability, by contrast, is permanent. This swaps a decaying check
+// for a lasting one at a fraction of the code.
+//
+// The digest is over CANONICAL JSON (decode then re-marshal, so map keys are
+// sorted — see encoding/json.Marshal), which is exactly computeSchemaHashes'
+// canonicalization: reformatting or reordering a frozen schema does not fire
+// the pin, changing what it SAYS does.
+//
+// v2's own grammar keeps its direct coverage in the version-gated
+// TestParseV2_* / v2removed / v2reuse / v2shape suites, which assert what v2
+// SHIPS rather than how closely it still resembles a frozen ancestor.
+func TestFrozenMajorsV0AndV1AreImmutable(t *testing.T) {
+	for _, fm := range frozenMajors {
+		t.Run(fm.Name, func(t *testing.T) {
+			want, ok := frozenMajorSchemaHashes[fm.Major]
+			if !ok {
+				t.Fatalf("no pinned digest for frozen major %d", fm.Major)
+			}
+			if got := fm.Accessor(); got != want {
+				t.Errorf("workflow-%s embedded schema digest = %s, want %s\n"+
+					"workflow-%s is a FROZEN major (#2320); run `git diff -- docs/spec/workflow-%s.schema.json` to see what moved, "+
+					"justify editing a shipped major in the PR body, then update the pin in frozenMajorSchemaHashes",
+					fm.Name, got, want, fm.Name, fm.Name)
+			}
+		})
+	}
+
+	// The copy-pasted-constant mode: pinning one digest twice, or pinning a
+	// frozen major to the LIVE v2 digest, would make every assertion above
+	// vacuously green.
+	t.Run("distinct", func(t *testing.T) {
+		v2 := spec.EmbeddedSchemaHashV2()
+		seen := make(map[string]string, len(frozenMajors)+1)
+		seen[v2] = "v2 (live)"
+		for _, fm := range frozenMajors {
+			pinned := frozenMajorSchemaHashes[fm.Major]
+			if owner, dup := seen[pinned]; dup {
+				t.Errorf("pinned digest for %s equals %s (%s); each major has its own schema, so a shared digest means a copy-pasted constant",
+					fm.Name, owner, pinned)
+				continue
+			}
+			seen[pinned] = fm.Name
+		}
+	})
+}
+
+// TestFrozenMajorPinDetectsContentChange proves the pins above have TEETH.
+// They are magic constants whose correctness compilation cannot enforce, so
+// without this test a no-op edit could ship a pin that detects nothing.
+//
+// Each case re-derives a frozen major's digest from the package's own on-disk
+// mirror through the SAME canonicalization the production accessor uses
+// (json.Marshal of the decoded tree -> sha256 -> hex, mirroring
+// computeSchemaHashes in parse.go), after applying a hermetic IN-MEMORY
+// mutation. Nothing on disk is touched.
+func TestFrozenMajorPinDetectsContentChange(t *testing.T) {
+	cases := []struct {
+		name string
+		// mutate edits the decoded tree in place. nil is the control.
+		mutate func(t *testing.T, tree map[string]any)
+		// wantEqual says whether the re-derived digest must MATCH the pin.
+		wantEqual bool
+	}{
+		{
+			// A new $defs entry — the "someone grew a frozen schema" mode.
+			name: "added_def",
+			mutate: func(t *testing.T, tree map[string]any) {
+				defs := schemaDefs(t, tree)
+				defs["fishhawk_frozen_pin_probe"] = map[string]any{"type": "string"}
 			},
 		},
-	}
-	withoutProp := map[string]any{
-		"$defs": map[string]any{
-			"workflow": map[string]any{
-				"description": "a DIFFERENT annotation, still stripped",
-				"properties": map[string]any{
-					"stages": map[string]any{"type": "array"},
-				},
+		{
+			// A dropped $defs entry — the ACCIDENTAL-DROP mode the retired
+			// copy-fidelity test originally bought, re-asserted where a drop
+			// actually matters: inside a shipped, frozen major.
+			name: "removed_def",
+			mutate: func(t *testing.T, tree map[string]any) {
+				defs := schemaDefs(t, tree)
+				if _, ok := defs["stage"]; !ok {
+					t.Fatalf("$defs/stage absent; pick another key present in every frozen major")
+				}
+				delete(defs, "stage")
 			},
+		},
+		{
+			// No mutation. This is what proves the pinned constants were
+			// DERIVED from the shipped schema bytes rather than invented, and
+			// it is the case that fires if a future edit changes a frozen
+			// schema and updates only one of the pin or the schema.
+			name:      "control",
+			wantEqual: true,
 		},
 	}
 
-	var diffs []schemaDiff
-	collectSchemaDiffs(normalizeSchemaTree(withProp), normalizeSchemaTree(withoutProp), "$", &diffs)
-	if len(diffs) != 1 {
-		t.Fatalf("diffs = %+v, want exactly the dropped description PROPERTY", diffs)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, fm := range frozenMajors {
+				t.Run(fm.Name, func(t *testing.T) {
+					tree := decodeSchemaMirror(t, "schemas/workflow-"+fm.Name+".schema.json")
+					if tc.mutate != nil {
+						tc.mutate(t, tree)
+					}
+					got := canonicalSchemaDigest(t, tree)
+					pinned := frozenMajorSchemaHashes[fm.Major]
+
+					if !tc.wantEqual {
+						if got == pinned {
+							t.Errorf("re-derived digest after %s = %s, same as the pin; the pin does not detect this content change", tc.name, got)
+						}
+						return
+					}
+					if got != pinned {
+						t.Errorf("re-derived digest for workflow-%s = %s, pinned %s; the pinned constant was not derived from the shipped schema bytes", fm.Name, got, pinned)
+					}
+					if live := fm.Accessor(); got != live {
+						t.Errorf("re-derived digest for workflow-%s = %s, live accessor %s; the mirror and the embedded copy disagree", fm.Name, got, live)
+					}
+				})
+			}
+		})
 	}
-	if diffs[0].Path != "$/$defs/workflow/properties/description" {
-		t.Errorf("diff path = %q, want $/$defs/workflow/properties/description", diffs[0].Path)
+}
+
+// schemaDefs returns a decoded schema's $defs map, failing the test if it is
+// missing or not an object — a mutation applied to the wrong node would make
+// the mutation cases pass for the wrong reason.
+func schemaDefs(t *testing.T, tree map[string]any) map[string]any {
+	t.Helper()
+	defs, ok := tree["$defs"].(map[string]any)
+	if !ok {
+		t.Fatalf("$defs missing or not an object in decoded schema")
 	}
+	return defs
+}
+
+// canonicalSchemaDigest re-derives a schema tree's content digest exactly as
+// computeSchemaHashes in parse.go does: marshal the decoded value (which sorts
+// map keys) and SHA-256 the result, hex-encoded.
+func canonicalSchemaDigest(t *testing.T, tree map[string]any) string {
+	t.Helper()
+	canonical, err := json.Marshal(tree)
+	if err != nil {
+		t.Fatalf("marshal canonical schema JSON: %v", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:])
 }
 
 // decodeSchemaMirror reads and JSON-decodes an embedded schema mirror
@@ -4017,166 +3997,6 @@ func decodeSchemaMirror(t *testing.T, path string) map[string]any {
 		t.Fatalf("decode schema mirror %q: %v", path, err)
 	}
 	return out
-}
-
-// TestCollectSchemaDiffs_ReportsEveryDivergenceShape exercises the diff
-// collector's remaining report branches on synthetic trees, so the
-// allow-list assertion above rests on a walker whose every divergence shape
-// is pinned — not just the one the current schema pair happens to produce.
-// It also proves the collector COLLECTS rather than stopping at the first
-// divergence, which is what makes the two-directional set comparison work.
-func TestCollectSchemaDiffs_ReportsEveryDivergenceShape(t *testing.T) {
-	a := map[string]any{
-		"onlyInA":     1,
-		"typeSwapped": map[string]any{"k": "v"},
-		"arraySwapped": []any{
-			map[string]any{"x": 1},
-		},
-		"shorterInB": []any{1.0, 2.0},
-		"scalar":     "left",
-	}
-	b := map[string]any{
-		"onlyInB":      1,
-		"typeSwapped":  "now a scalar",
-		"arraySwapped": map[string]any{"no": "longer an array"},
-		"shorterInB":   []any{1.0},
-		"scalar":       "right",
-	}
-
-	var diffs []schemaDiff
-	collectSchemaDiffs(a, b, "$", &diffs)
-
-	got := make(map[string]string, len(diffs))
-	for _, d := range diffs {
-		got[d.Path] = d.Detail
-	}
-	want := map[string]string{
-		"$/onlyInA":      "present in v1, absent in v2",
-		"$/onlyInB":      "present in v2, absent in v1",
-		"$/typeSwapped":  "type mismatch: object vs non-object",
-		"$/arraySwapped": "type mismatch: array vs non-array",
-		"$/shorterInB":   "array length 2 vs 1",
-		"$/scalar":       "left vs right",
-	}
-	if len(got) != len(want) {
-		t.Fatalf("collected %d diffs, want %d: %+v", len(got), len(want), diffs)
-	}
-	for path, detail := range want {
-		if got[path] != detail {
-			t.Errorf("diff at %s = %q, want %q", path, got[path], detail)
-		}
-	}
-}
-
-// schemaNameMapKeywords are the JSON Schema keywords whose value is a map
-// of NAMES to subschemas rather than a schema object. Inside one of these,
-// a key is an author-chosen name — including, legitimately, "description"
-// — and must never be mistaken for the description ANNOTATION keyword.
-var schemaNameMapKeywords = map[string]bool{
-	"properties":        true,
-	"$defs":             true,
-	"definitions":       true,
-	"patternProperties": true,
-	"dependentSchemas":  true,
-}
-
-// normalizeSchemaTree returns a deep copy of v with every description
-// ANNOTATION removed at every depth — a structural walk, not a string
-// replace over raw bytes. It is POSITION-AWARE (#2320 §2): a "description"
-// key is stripped only where it is a schema annotation, never where it is
-// a property NAME inside a properties / $defs / patternProperties /
-// dependentSchemas map, so dropping a property literally named
-// `description` between majors stays visible to the diff.
-func normalizeSchemaTree(v any) any { return normalizeSchemaNode(v, false) }
-
-// normalizeSchemaNode is normalizeSchemaTree's recursion. isNameMap says
-// whether the node under inspection is a name->subschema map (so its keys
-// are names, not keywords).
-func normalizeSchemaNode(v any, isNameMap bool) any {
-	switch t := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(t))
-		for k, val := range t {
-			if !isNameMap && k == "description" {
-				continue // the annotation keyword
-			}
-			out[k] = normalizeSchemaNode(val, !isNameMap && schemaNameMapKeywords[k])
-		}
-		return out
-	case []any:
-		out := make([]any, len(t))
-		for i, val := range t {
-			out[i] = normalizeSchemaNode(val, false)
-		}
-		return out
-	default:
-		return v
-	}
-}
-
-// schemaDiff is one divergence between two normalized schema trees. Path
-// is the stable JSON path used for allow-list matching; Detail carries the
-// human-readable shape of the difference and is never matched on.
-type schemaDiff struct {
-	Path   string
-	Detail string
-}
-
-// collectSchemaDiffs walks two normalized schema trees and appends EVERY
-// divergence to out (the allow-list diff needs the whole set, not just the
-// first). A subtree that diverges at its own root — a missing key, a type
-// mismatch, an array-length mismatch — is reported once and not descended
-// into: below such a point paths no longer align, and the child noise would
-// bury the real finding.
-func collectSchemaDiffs(a, b any, path string, out *[]schemaDiff) {
-	switch av := a.(type) {
-	case map[string]any:
-		bv, ok := b.(map[string]any)
-		if !ok {
-			*out = append(*out, schemaDiff{path, "type mismatch: object vs non-object"})
-			return
-		}
-		keys := make([]string, 0, len(av))
-		for k := range av {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			bvv, present := bv[k]
-			if !present {
-				*out = append(*out, schemaDiff{path + "/" + k, "present in v1, absent in v2"})
-				continue
-			}
-			collectSchemaDiffs(av[k], bvv, path+"/"+k, out)
-		}
-		extra := make([]string, 0)
-		for k := range bv {
-			if _, present := av[k]; !present {
-				extra = append(extra, k)
-			}
-		}
-		sort.Strings(extra)
-		for _, k := range extra {
-			*out = append(*out, schemaDiff{path + "/" + k, "present in v2, absent in v1"})
-		}
-	case []any:
-		bv, ok := b.([]any)
-		if !ok {
-			*out = append(*out, schemaDiff{path, "type mismatch: array vs non-array"})
-			return
-		}
-		if len(av) != len(bv) {
-			*out = append(*out, schemaDiff{path, fmt.Sprintf("array length %d vs %d", len(av), len(bv))})
-			return
-		}
-		for i := range av {
-			collectSchemaDiffs(av[i], bv[i], fmt.Sprintf("%s[%d]", path, i), out)
-		}
-	default:
-		if !reflect.DeepEqual(a, b) {
-			*out = append(*out, schemaDiff{path, fmt.Sprintf("%v vs %v", a, b)})
-		}
-	}
 }
 
 // --- Layer A: legacy duplicate-kind constraint characterization (#2218) ------
