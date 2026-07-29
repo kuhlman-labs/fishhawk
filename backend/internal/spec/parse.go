@@ -17,7 +17,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed schemas/workflow-v0.schema.json schemas/workflow-v1.schema.json
+//go:embed schemas/workflow-v0.schema.json schemas/workflow-v1.schema.json schemas/workflow-v2.schema.json
 var schemaFS embed.FS
 
 // embeddedSchema names one embedded canonical schema and the major
@@ -36,6 +36,7 @@ type embeddedSchema struct {
 var embeddedSchemas = []embeddedSchema{
 	{Major: 0, Path: "schemas/workflow-v0.schema.json"},
 	{Major: 1, Path: "schemas/workflow-v1.schema.json"},
+	{Major: 2, Path: "schemas/workflow-v2.schema.json"},
 }
 
 // compiledSchemas maps a version major to its compiled JSON Schema.
@@ -92,6 +93,12 @@ func EmbeddedSchemaHash() string { return embeddedSchemaHashes[0] }
 // JSON bytes of the embedded workflow-v1 schema (ADR-046). /healthz
 // advertises it next to the v0 hash so a component can detect v1 drift.
 func EmbeddedSchemaHashV1() string { return embeddedSchemaHashes[1] }
+
+// EmbeddedSchemaHashV2 returns the hex-encoded SHA-256 of the canonical
+// JSON bytes of the embedded workflow-v2 schema (ADR-067 / #2213).
+// /healthz advertises it next to the v0 and v1 hashes so a component can
+// detect v2 drift.
+func EmbeddedSchemaHashV2() string { return embeddedSchemaHashes[2] }
 
 func mustCompileSchemas() map[int]*jsonschema.Schema {
 	out := make(map[int]*jsonschema.Schema, len(embeddedSchemas))

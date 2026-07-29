@@ -3343,13 +3343,15 @@ paths:
                     description: |
                       Map of schema name to hex-encoded SHA-256 of the backend's
                       embedded canonical schema bytes. Keys: "plan-standard-v1",
-                      "workflow-v0". Callers compare against their own embedded
-                      hashes to detect schema drift.
+                      "workflow-v0", "workflow-v1", "workflow-v2". Callers compare
+                      against their own embedded hashes to detect schema drift.
                     additionalProperties:
                       type: string
                     example:
                       plan-standard-v1: "abc123..."
                       workflow-v0: "def456..."
+                      workflow-v1: "0123ab..."
+                      workflow-v2: "4567cd..."
                   start_nonce:
                     type: string
                     description: |

@@ -48,6 +48,18 @@ func TestHandleHealth(t *testing.T) {
 	if body.Schemas["workflow-v1"] == "" {
 		t.Error("schemas[workflow-v1] must not be empty")
 	}
+	// workflow-v2 (ADR-067 / #2213) exercises the full cross-boundary
+	// seam: schema file -> go:embed -> embeddedSchemas table ->
+	// computeSchemaHashes -> EmbeddedSchemaHashV2() -> handleHealth JSON.
+	// It must be present, non-empty, and distinct from the v0 and v1
+	// hashes (a forgotten embed directive or mistyped map key would
+	// otherwise pass every unit test).
+	if body.Schemas["workflow-v2"] == "" {
+		t.Error("schemas[workflow-v2] must not be empty")
+	}
+	if v2 := body.Schemas["workflow-v2"]; v2 == body.Schemas["workflow-v0"] || v2 == body.Schemas["workflow-v1"] {
+		t.Errorf("schemas[workflow-v2] = %q must differ from the v0 and v1 hashes", v2)
+	}
 
 	// Wire-level omission pin (#1018): with no StartNonce configured, the
 	// RAW body must not carry the key at all (omitempty), so a pre-nonce

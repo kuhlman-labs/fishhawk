@@ -6,7 +6,7 @@ Cross-binary version coordination: `git_sha`, `min_runner_version`, and embedded
 
 `version.go` exports `GitSHA` and `MinRunnerVersion` alongside the existing `Version` — all three stamped at link time via `-X` ldflags.
 
-`/healthz` advertises all three plus a `schemas` map (`plan-standard-v1` → sha256, `workflow-v0` → sha256, `workflow-v1` → sha256); hash is the canonical form: unmarshal JSON → re-marshal (strip whitespace) → sha256 → hex.
+`/healthz` advertises all three plus a `schemas` map (`plan-standard-v1` → sha256, `workflow-v0` → sha256, `workflow-v1` → sha256, `workflow-v2` → sha256); hash is the canonical form: unmarshal JSON → re-marshal (strip whitespace) → sha256 → hex.
 
 Canonical hash functions live in `backend/internal/plan/validate.go::EmbeddedSchemaHash` and `backend/internal/spec/parse.go::EmbeddedSchemaHash` / `EmbeddedSchemaHashV1` (ADR-046, the per-major v0/v1 hashes). The same hash is available on the runner side via `runner/internal/plan/plan.go::EmbeddedSchemaHash`.
 
