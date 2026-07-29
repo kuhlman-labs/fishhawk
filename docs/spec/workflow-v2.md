@@ -236,6 +236,36 @@ Without the first half the file-level `agent` default would graft an `agent` key
 
 The second half exists because that same rejection returns one case over for a **branchless** default, which the first half cannot see. A file-level `defaults: {executor: {timeout: 30m}}` declares no branch, so it would merge key-wise into `{human: true}` and produce `{human: true, timeout: 30m}` — which the human arm rejects exactly as it rejects a grafted `agent`. Essentially every real workflow carries a human gate stage, so without the closed-branch half the bare-`timeout` default would reject nearly every realistic document. Both halves fail the same way — the default is dropped, never reinterpreted — so a bare `{timeout: 30m}` reaches every agent stage and silently skips every human gate and delegating deploy stage.
 
+### A bare key is an error — not "inherit" and not "blank"
+
+A block written with **no value** — `reviewers:`, `executor:`, `budget:`, or a stage's `type:` with nothing after the colon — is an **error**, reported at the stage's **own path**. It is neither a way to inherit a default nor a way to blank a block:
+
+- To **inherit** the file- or workflow-level default, **OMIT the key** entirely.
+- To **state a value**, write it explicitly.
+
+A bare `reviewers:` means neither "no reviewers" nor "take the file default" — it is a null, and `$defs/reviewers_config` (like `$defs/executor` and `$defs/budget`) is `type: object`, so the schema rejects it. Crucially, the rejection does **not** depend on whether a `defaults` block exists elsewhere: the null is preserved as authored and fails at its own path either way, with no action at a distance.
+
+```yaml
+defaults:
+  reviewers:
+    human: 1
+
+workflows:
+  feature_change:
+    stages:
+      - id: apply
+        type: implement
+        # reviewers OMITTED -> inherits {human: 1} from the file defaults
+
+      - id: gate
+        type: review
+        reviewers:      # ERROR: a bare key is null, rejected at
+                        # /workflows/feature_change/stages/1/reviewers —
+                        # NOT silently replaced by the file default
+```
+
+The same holds for a `defaults` block whose own key is bare (`defaults: {reviewers:}`): nothing is applied to any stage and the null is rejected at the defaults path, rather than being fabricated onto every stage.
+
 ### Rejections
 
 Two authoring errors are rejected before schema validation, with messages naming the offender:
