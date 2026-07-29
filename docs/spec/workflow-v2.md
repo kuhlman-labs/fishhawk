@@ -17,13 +17,13 @@ Reference for `.fishhawk/workflows.yaml` at major version 2. The canonical schem
 
 ## Removed from v1
 
-v2 drops five back-compat duplicate surfaces. Four had an explicit successor already shipped in v0/v1, so the removal deletes a second way to say the same thing rather than a capability; the fifth (`operator_agent`) is REPLACED by a new grammar that says strictly more. **v0 and v1 are unchanged** — the old forms remain valid there, and the shared Go types still carry them, so an existing spec keeps working until it is migrated to v2 (migration codemod: #2220).
+v2 drops five back-compat duplicate surfaces. Four had an explicit successor already shipped in v0/v1, so the removal deletes a second way to say the same thing rather than a capability; the fifth (`operator_agent`) is REPLACED by a new grammar that says strictly more. **v0 and v1 are unchanged** — the old forms remain valid there, and the shared Go types still carry them, so an existing spec keeps working until it is migrated to v2 (migration codemod: `fishhawk migrate-spec`, E52.8 / #2220 — see [`workflow-migration.md`](workflow-migration.md)).
 
 | Removed in v2 | Replacement | Why |
 |---|---|---|
 | `operator_agent.must_page_human: [reviewer_reject]` | `gating_reviewer_reject` (and its sibling `advisory_reviewer_reject`) | The bare token was the pre-#1378 form and always resolved to the *gating* sense. The two explicit classes state the review authority at the declaration site instead of leaving it to be resolved. |
 | `reviewers.agent: <N>` | `reviewers.agents: [{provider, model?}, …]` | The heterogeneous list (#955) already superseded the bare count — the effective agent count is `len(agents)`. Keeping both left two inputs feeding one ADR-027 authority decision. |
-| gate `approvers: {any_of \| all_of: [role, …]}` (E52.2 / #2214) | gate `approvals: {count, members \| member_of \| min_permission}` | The forge-neutral `approvals` block (ADR-055 / #1707) already superseded the GitHub-handle role allow-list. Keeping both left two mutually-exclusive predicates on one gate. The translation is **not mechanical** — `min_permission` / `member_of` have no source in the old form — so it belongs to the codemod (#2220), which must emit a before/after approval-eligibility diff rather than rewriting blind. See *Approval gate predicate (v2)*. |
+| gate `approvers: {any_of \| all_of: [role, …]}` (E52.2 / #2214) | gate `approvals: {count, members \| member_of \| min_permission}` | The forge-neutral `approvals` block (ADR-055 / #1707) already superseded the GitHub-handle role allow-list. Keeping both left two mutually-exclusive predicates on one gate. The translation is **not mechanical** — `min_permission` / `member_of` have no source in the old form — so it belongs to the `fishhawk migrate-spec` codemod (E52.8 / #2220; see [`workflow-migration.md`](workflow-migration.md)), which emits a before/after approval-eligibility diff rather than rewriting blind. See *Approval gate predicate (v2)*. |
 | top-level `roles: {name: {members: […]}}` (E52.2 / #2214) | `approvals.member_of` / `approvals.members` | The `roles` map existed only to be named by `approvers`; with `approvers` gone it has nothing left to reference. Forge-neutral membership moves onto the gate's `approvals` block. |
 | `operator_agent: {may_*, route_fixup_min_severity, must_page_human, model_policy}` (E52.10 / #2222) | `actions: {<class>: {mode, when}}` + the `autonomy: low \| medium \| high` shorthand | Five boolean-ish `may_*` knobs could say only *delegated* or *not*, with no way to express "propose it and let me decide", no name for the thing being delegated, and no shorthand for the three tiers every workflow actually picks from. The matrix names each action class once and gives it a `mode`; the tier expands to a matrix. See *Autonomy: tier shorthand and action matrix*. |
 
@@ -55,7 +55,7 @@ gates:
 - `not` excludes relationship classes (`author`, `agent`) from satisfying the gate.
 - `min_permission` (forge-neutral repository permission tier) and `member_of` (a forge-neutral org/team) are **optional** and are annotated `x-intended-required` — intended to become required in a future major. They were **deliberately NOT promoted to required here**; that promotion is a separate decision.
 
-Because `min_permission` / `member_of` have no source in the legacy `approvers` role allow-list, translating an old gate is **not mechanical**: migration belongs to the codemod (#2220), which must emit a before/after approval-eligibility diff rather than rewriting blind.
+Because `min_permission` / `member_of` have no source in the legacy `approvers` role allow-list, translating an old gate is **not mechanical**: migration belongs to the `fishhawk migrate-spec` codemod (E52.8 / #2220; see [`workflow-migration.md`](workflow-migration.md)), which emits a before/after approval-eligibility diff rather than rewriting blind.
 
 For the two-form v0/v1 grammar (the legacy `approvers` allow-list alongside `approvals`, mutually exclusive), see [`workflow-v1.md`](workflow-v1.md)'s *Approval gate predicate (v1)* — that page is unchanged, as v1 is frozen and still accepts both forms.
 
@@ -146,7 +146,7 @@ Resolution records, per class, **which input decided it**: `explicit` (an `actio
 
 ## Reshaped from v1
 
-Three surfaces change SHAPE in v2 (E52.6 / #2218). None changes what it MEANS: each is rewritten at parse time into the representation v0/v1 already use, so no consumer, no Go type, no DB column and no API field changed. **v0 and v1 are unchanged** — the old spellings remain valid there (migration codemod: #2220).
+Three surfaces change SHAPE in v2 (E52.6 / #2218). None changes what it MEANS: each is rewritten at parse time into the representation v0/v1 already use, so no consumer, no Go type, no DB column and no API field changed. **v0 and v1 are unchanged** — the old spellings remain valid there (migration codemod: `fishhawk migrate-spec`, E52.8 / #2220 — see [`workflow-migration.md`](workflow-migration.md)).
 
 ### `constraints` is an object
 
@@ -243,7 +243,7 @@ budget:
 - **`limit_usd` is primary but NOT required (AC-4).** A budget declaring only `max_tokens`, only `limit_usd`, only `max_runtime`, any combination, or nothing at all is valid. ADR-067 ratified unifying the units, not mandating a cost model, so the choice is stated in the schema description rather than enforced by a required field.
 - **`enforcement` semantics are UNCHANGED by this slice.** This change unifies the *grammar* only — no runtime check reads a stage budget on any major. Stage-budget enforcement (spending against the `limit_usd` ceiling, cost accounting) is tracked on **#2328**.
 
-**v0 and v1 are unchanged** — both keep the `max_runtime_minutes` spelling and reject the v2 forms (each major's `$defs/budget` is `additionalProperties: false`), so an existing spec keeps working until it is migrated to v2 (migration codemod: #2220). A v2 document using `max_runtime_minutes` is rejected with a message naming `max_runtime` and showing the equivalence (`max_runtime_minutes: 15` → `max_runtime: 15m`).
+**v0 and v1 are unchanged** — both keep the `max_runtime_minutes` spelling and reject the v2 forms (each major's `$defs/budget` is `additionalProperties: false`), so an existing spec keeps working until it is migrated to v2 (migration codemod: `fishhawk migrate-spec`, E52.8 / #2220 — see [`workflow-migration.md`](workflow-migration.md)). A v2 document using `max_runtime_minutes` is rejected with a message naming `max_runtime` and showing the equivalence (`max_runtime_minutes: 15` → `max_runtime: 15m`).
 
 ## Grammar
 
@@ -445,7 +445,7 @@ Declare produces: [{artifact: pull_request}] on this stage, or remove the constr
 
 > **An absent or empty `produces` list reads as "produces no diff."** Omitting `produces` does not exempt a stage — that is what gives the rule teeth. The permissive alternative ("absent means unknown, so allow it") would let any stage keep a diff constraint simply by staying silent, which is exactly the case this rule exists to reject. This is a real behaviour change for a v2 author, and the fix is one line: declare the artifact, or drop the constraint.
 
-**v0 and v1 are unchanged** — there the binding stays type-keyed (a post-hoc constraint is valid on any non-deploy stage). This is not an oversight: v0/v1 documents legitimately declare these constraints on an `implement` stage with no `produces` list at all, and applying the artifact-keyed rule below major 2 would newly reject valid specs. The generalization is licensed only from v2 forward (migration codemod: #2220).
+**v0 and v1 are unchanged** — there the binding stays type-keyed (a post-hoc constraint is valid on any non-deploy stage). This is not an oversight: v0/v1 documents legitimately declare these constraints on an `implement` stage with no `produces` list at all, and applying the artifact-keyed rule below major 2 would newly reject valid specs. The generalization is licensed only from v2 forward (migration codemod: `fishhawk migrate-spec`, E52.8 / #2220 — see [`workflow-migration.md`](workflow-migration.md)).
 
 Two orderings are worth knowing, both contracts rather than accidents:
 
