@@ -621,6 +621,64 @@ workflows:
 `,
 			path: "/workflows/derived/stages",
 		},
+		// E52.14 / #2331: a stage block written with NO value is PRESENT-but-
+		// null, is PRESERVED by the resolver rather than overwritten by a
+		// defaults block or an inherited base value, and the schema rejects it
+		// at the AUTHORED path — the whole point of the change is that this
+		// document no longer validates by having its null silently replaced.
+		{
+			name: "present-null reviewers rejected at the stage's own path",
+			doc: `
+version: "2"
+defaults:
+  reviewers:
+    human: 1
+workflows:
+  wf:
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+`,
+			path: "/workflows/wf/stages/0/reviewers",
+		},
+		{
+			name: "present-null executor rejected at the stage's own path",
+			doc: `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+workflows:
+  wf:
+    stages:
+      - id: a
+        type: plan
+        executor:
+`,
+			path: "/workflows/wf/stages/0/executor",
+		},
+		{
+			name: "deriving present-null type rejected at the stage's own path",
+			doc: `
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+  derived:
+    extends: base
+    stages:
+      - id: a
+        type:
+`,
+			path: "/workflows/derived/stages/0/type",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -633,6 +691,46 @@ workflows:
 				t.Errorf("Path = %q, want %q", se.Path, tc.path)
 			}
 		})
+	}
+}
+
+// TestParseV2_AbsentKeyStillInheritsDefaults is the POSITIVE control the
+// present-null work turns on (E52.14 / #2331, Condition 3): over-broadening the
+// preserve from PRESENT-null to key-ABSENT would silently disable defaults
+// inheritance for every v2 document, and every rejection test above would
+// still pass while doing it. A stage OMITTING each of reviewers, executor and
+// budget must still inherit the file-level defaults block and parse clean, with
+// the resolved values checked — so absent is proven NOT to have been turned
+// into present-null.
+func TestParseV2_AbsentKeyStillInheritsDefaults(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+    timeout: 30m
+  reviewers:
+    human: 1
+    agents:
+      - provider: claudecode
+  budget:
+    max_runtime: 45m
+workflows:
+  wf:
+    stages:
+      - id: a
+        type: plan
+`
+	s := mustParseV2(t, doc)
+	st := s.Workflows["wf"].Stages[0]
+	if st.Executor.Agent != "claude-code" || st.Executor.Timeout.Duration != 30*time.Minute {
+		t.Errorf("executor = %+v, want the inherited file default {claude-code, 30m}", st.Executor)
+	}
+	if st.Reviewers == nil || st.Reviewers.Human != 1 || st.Reviewers.AgentCount() != 1 {
+		t.Errorf("reviewers = %+v, want the inherited file default {human:1, agents:[claudecode]}", st.Reviewers)
+	}
+	if st.Budget == nil || st.Budget.MaxRuntime.Duration != 45*time.Minute {
+		t.Errorf("budget = %+v, want the inherited file default {max_runtime:45m}", st.Budget)
 	}
 }
 
@@ -1114,6 +1212,11 @@ func TestResolveV2Reuse_MalformedShapesAreSkippedNotCrashes(t *testing.T) {
 		// preserved is a JSON fragment of the malformed shape that must
 		// survive resolution verbatim.
 		preserved string
+		// absent is a JSON fragment that must NOT appear after resolution —
+		// the negative-assertion form the null-INSIDE-defaults and
+		// workflow-rung-null cases need, since they prove a fragment was NOT
+		// fabricated rather than that one survived.
+		absent string
 	}{
 		{name: "root is a scalar", doc: `just-a-string`, preserved: `"just-a-string"`},
 		{name: "root is a list", doc: "- a\n- b\n", preserved: `["a","b"]`},
@@ -1132,6 +1235,36 @@ func TestResolveV2Reuse_MalformedShapesAreSkippedNotCrashes(t *testing.T) {
 		// skip could have silently REPLACED it with a valid inherited list.
 		{name: "extends with a scalar stages list", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: plan\n  derived:\n    extends: base\n    stages: nope\n", preserved: `"derived":{"extends":"base","stages":"nope"}`},
 		{name: "extends with a null stages list", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: plan\n  derived:\n    extends: base\n    stages:\n", preserved: `"derived":{"extends":"base","stages":null}`},
+		// E52.14 / #2331: a key written with NO value is PRESENT-but-null and
+		// must be PRESERVED, never overwritten by a defaults block or an
+		// inherited base value, and never FABRICATED onto a stage from a null
+		// INSIDE a defaults block. Same principle as the malformed-`stages`
+		// cases above, one level down — the schema owns the rejection at the
+		// authored path, so the resolver must leave the null in place.
+		//
+		// (a) present-null reviewers under a file-level defaults.reviewers.
+		{name: "present-null reviewers preserved under file defaults", doc: "version: \"2\"\ndefaults:\n  reviewers:\n    human: 1\nworkflows:\n  wf:\n    stages:\n      - id: a\n        type: plan\n        reviewers:\n", preserved: `"reviewers":null`},
+		// (b) present-null executor under a file-level defaults.executor.
+		{name: "present-null executor preserved under file defaults", doc: "version: \"2\"\ndefaults:\n  executor:\n    agent: claude-code\nworkflows:\n  wf:\n    stages:\n      - id: a\n        type: plan\n        executor:\n", preserved: `"executor":null`},
+		// (c) present-null budget under a file-level defaults.budget.
+		{name: "present-null budget preserved under file defaults", doc: "version: \"2\"\ndefaults:\n  budget:\n    tokens: 5\nworkflows:\n  wf:\n    stages:\n      - id: a\n        type: plan\n        budget:\n", preserved: `"budget":null`},
+		// (d) a deriving stage matched by id declaring type: null against a
+		//     base declaring type: plan — the deriving present-null WINS.
+		{name: "deriving present-null type wins over base type", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: plan\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type:\n", preserved: `"type":null`},
+		// (e) a deriving stage's executor: null and reviewers: null over a base
+		//     that declares them — both present-nulls win and are preserved.
+		{name: "deriving present-null executor and reviewers win over base", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: implement\n        executor:\n          agent: claude-code\n        reviewers:\n          human: 1\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: implement\n        executor:\n        reviewers:\n", preserved: `"executor":null,"id":"a","reviewers":null`},
+		// (f) nested null: a deriving budget: {tokens: null} over a base
+		//     budget: {tokens: 5} — the nested null wins in mergeKeyWise.
+		{name: "nested present-null wins in mergeKeyWise", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: implement\n        budget:\n          tokens: 5\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: implement\n        budget:\n          tokens:\n", preserved: `"tokens":null`},
+		// (g) NEGATIVE: a null INSIDE a defaults block is NOT fabricated onto a
+		//     stage that declares no executor. The stage keeps exactly the keys
+		//     its author wrote; no "executor":null is grafted before its id.
+		{name: "null inside defaults not fabricated onto stage", doc: "version: \"2\"\ndefaults:\n  executor:\nworkflows:\n  wf:\n    stages:\n      - id: a\n        type: plan\n", preserved: `"stages":[{"id":"a","type":"plan"}]`, absent: `"executor":null,"id":"a"`},
+		// (h) NEGATIVE: a workflow-rung null defaults.reviewers suppresses the
+		//     file-rung fallback — the file block {human:1} is NOT applied to
+		//     the stage, and the null survives at the workflow defaults path.
+		{name: "workflow-rung null suppresses file-rung fallback", doc: "version: \"2\"\ndefaults:\n  reviewers:\n    human: 1\nworkflows:\n  wf:\n    defaults:\n      reviewers:\n    stages:\n      - id: a\n        type: plan\n", preserved: `"defaults":{"reviewers":null}`, absent: `"reviewers":{"human":1},"type"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1143,12 +1276,50 @@ func TestResolveV2Reuse_MalformedShapesAreSkippedNotCrashes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal resolved: %v", err)
 			}
-			if !strings.Contains(string(resolved), tc.preserved) {
-				t.Errorf("resolved document = %s\nwant it to still contain %s — an unrecognized shape must be LEFT IN PLACE for the schema to report, never overwritten", resolved, tc.preserved)
+			if tc.preserved != "" && !strings.Contains(string(resolved), tc.preserved) {
+				t.Errorf("resolved document = %s\nwant it to still contain %s — an authored value must be LEFT IN PLACE for the schema to report, never overwritten", resolved, tc.preserved)
+			}
+			if tc.absent != "" && strings.Contains(string(resolved), tc.absent) {
+				t.Errorf("resolved document = %s\nwant it to NOT contain %s — a null must never be FABRICATED onto a stage the author did not write it on", resolved, tc.absent)
 			}
 			// The strip must tolerate the identical shapes.
 			stripV2Reuse(raw)
 		})
+	}
+}
+
+// TestResolveV2Reuse_DottedVersionDeterministicOffender pins the pre-schema
+// version gate: a dotted minor form ("2.0") routes to v2 by MAJOR but is
+// invalid against the single-token enum. resolveV2Reuse reports it as a
+// *SchemaError at /version BEFORE schema.Validate, so a document that ALSO
+// trips another top-level rule — here an empty `workflows` — surfaces the
+// /version offender deterministically. schema.Validate would emit /version and
+// /workflows as unordered sibling causes, flipping the reported first offender
+// run to run and intermittently dropping the /version path a stale
+// fishhawk-mcp self-diagnoses on (#1422).
+func TestResolveV2Reuse_DottedVersionDeterministicOffender(t *testing.T) {
+	for _, doc := range []string{
+		// The flaky /version-vs-/workflows combo, plus a dotted form that
+		// resolves cleanly apart from the version.
+		"version: \"2.0\"\nworkflows: {}\n",
+		"version: \"2.1\"\nworkflows:\n  wf:\n    stages:\n      - id: a\n        type: plan\n",
+	} {
+		raw := mustDecodeYAML(t, doc)
+		err := resolveV2Reuse(raw)
+		var se *SchemaError
+		if !errors.As(err, &se) {
+			t.Fatalf("resolveV2Reuse(%q) = %v, want a *SchemaError", doc, err)
+		}
+		if se.Path != "/version" {
+			t.Errorf("SchemaError.Path = %q, want /version", se.Path)
+		}
+	}
+
+	// The valid single token "2" is untouched: the gate does not fire, and the
+	// document resolves as before.
+	raw := mustDecodeYAML(t, "version: \"2\"\nworkflows:\n  wf:\n    stages:\n      - id: a\n        type: plan\n")
+	if err := resolveV2Reuse(raw); err != nil {
+		t.Fatalf("resolveV2Reuse(version 2) = %v, want nil", err)
 	}
 }
 

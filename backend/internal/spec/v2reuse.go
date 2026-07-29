@@ -39,6 +39,19 @@ import (
 //   - an executor default is DROPPED WHOLESALE for a stage selecting a
 //     different oneOf branch, and for ANY stage on the `human` or `delegate`
 //     branch, which admit no key beyond their own. See mergeExecutor.
+//   - a key written with NO value (PRESENT-but-null) is PRESERVED, never
+//     overwritten by a `defaults` block or an inherited base value, and never
+//     FABRICATED onto a stage from a null INSIDE a `defaults` block. It is a
+//     distinct input from an ABSENT key, whose behaviour is bit-for-bit
+//     unchanged. This is the malformed-`stages` principle one level down
+//     (#2216 -> E52.14 / #2331): skipping a shape this pass will not touch must
+//     never mean overwriting it. It removes the action-at-a-distance whereby
+//     the same stage text validates or fails depending on an unrelated
+//     `defaults` block elsewhere in the file — so the schema rejects a bare
+//     `reviewers:` / `executor:` / `budget:` / `type:` at the author's own
+//     path. For `reviewers` specifically, silently handing an author who wrote
+//     a bare `reviewers:` the file-level block is the accumulate-a-reviewer-
+//     the-author-did-not-write hazard arriving through the null door.
 //
 // ORDERING (see ParseBytes, and backend/internal/spec/README.md):
 //
@@ -93,6 +106,20 @@ func resolveV2Reuse(raw any) error {
 	root, ok := raw.(map[string]any)
 	if !ok {
 		return nil
+	}
+	// The v2 `version` enum is the single token "2" (no minor chain): a dotted
+	// minor form ("2.0", "2.1", …) routes here by MAJOR but is invalid. Report
+	// it deterministically HERE, before schema.Validate, so a spec that ALSO
+	// trips another top-level rule — an empty `workflows`, say — still surfaces
+	// the /version offender instead of flipping between /version and /workflows
+	// run to run: schema.Validate emits the two as UNORDERED sibling causes and
+	// Go randomizes their order, so deepestLeaf's reported first offender is a
+	// coin flip. A stable first offender is the same determinism contract the
+	// sorted workflow-name walk below keeps, and the /version path is the one a
+	// stale fishhawk-mcp self-diagnoses on (#1422) — a non-deterministic
+	// /workflows win silently drops that staleness hint.
+	if v, isStr := root["version"].(string); isStr && v != "2" {
+		return &SchemaError{Path: "/version", Message: "value must be '2'"}
 	}
 	workflows, ok := root["workflows"].(map[string]any)
 	if !ok {
@@ -371,6 +398,15 @@ func mergeStage(base, own map[string]any) map[string]any {
 		out[k] = v
 	}
 	for k, v := range own {
+		if v == nil {
+			// A deriving stage's PRESENT-null block (`type: null`,
+			// `executor: null`, `budget: null`, `inputs: null`, `reviewers:
+			// null`) WINS over the base's value and is preserved, so the
+			// schema rejects it at the authored path rather than mergeKeyWise's
+			// `over == nil` guard silently retaining the base's value.
+			out[k] = nil
+			continue
+		}
 		switch k {
 		case "reviewers":
 			// Block-level: the deriving side declared it, so it is taken
@@ -416,33 +452,75 @@ func mergeStage(base, own map[string]any) map[string]any {
 // defaults.executor.timeout useless for every stage that declares an
 // executor — which is nearly all of them — gutting the de-duplication this
 // change exists to enable. The asymmetry is deliberate, not an oversight.
+//
+// PRESENCE, NOT VALUE, decides whether a block is applied (E52.14 / #2331): a
+// stage key that is ABSENT and one that is PRESENT with a null value are
+// different inputs, so each block is guarded by a comma-ok presence test, not
+// a `== nil` value test. The full per-block decision table, exhaustive over
+// the default's presence/value and the stage's key state — identical for all
+// three blocks (`reviewers`, `executor`, `budget`):
+//
+//	default ABSENT, stage key ABSENT             -> nothing happens; no key is
+//	                                                fabricated on the stage.
+//	default ABSENT, stage key PRESENT (null|not) -> nothing happens; the
+//	                                                authored value stands untouched.
+//	default PRESENT & non-null, stage key ABSENT -> the default applies, exactly
+//	                                                as before this change.
+//	default PRESENT & non-null, stage key PRESENT:
+//	    - PRESENT & null     -> the authored null is PRESERVED; nothing is
+//	                            applied over it, in BOTH ladder directions, so
+//	                            the schema rejects it at the stage's own path.
+//	    - PRESENT & non-null -> the existing per-block rule: `reviewers` taken
+//	                            whole (default applied only when defaultsWin),
+//	                            `executor` and `budget` merged key-wise.
+//	default PRESENT but NULL, ANY stage state    -> nothing is applied and NO
+//	                                                key is fabricated on the
+//	                                                stage; the null stays at its
+//	                                                own authored path under
+//	                                                `defaults` for the schema.
+//
+// The EARLY EXIT when the default is absent (`hasDefault && dv != nil` false)
+// is the clearest expression of the two default-ABSENT and the default-NULL
+// rows; the present-null skip (`declared && sv == nil`) expresses the
+// preserved-null row. It is the malformed-`stages` principle one level down
+// (#2216): skipping a shape this pass will not touch must never mean
+// overwriting it.
 func applyDefaults(stage map[string]any, defaults map[string]any, defaultsWin bool) {
 	if len(defaults) == 0 {
 		return
 	}
-	if dv, ok := defaults["reviewers"]; ok {
-		// Block-level: replaced whole when the defaults rung wins, inherited
-		// whole when the stage declared none, never merged either way.
-		if defaultsWin || stage["reviewers"] == nil {
+	// A default that is ABSENT, or PRESENT-but-null, applies nothing and
+	// fabricates no key — the guard on each block is `hasDefault && dv != nil`.
+	// A stage key PRESENT with a null value is preserved — `declared && sv ==
+	// nil` skips the block so the authored null survives for the schema.
+	if dv, hasDefault := defaults["reviewers"]; hasDefault && dv != nil {
+		// Block-level: replaced whole when the defaults rung wins over a
+		// declared non-null block, inherited whole when the stage declared no
+		// reviewers, never merged either way; a present-null block is left
+		// exactly as authored.
+		if sv, declared := stage["reviewers"]; !declared || (sv != nil && defaultsWin) {
 			stage[reviewersKey] = deepCopyAny(dv)
 		}
 	}
-	if dv, ok := defaults["executor"]; ok {
+	if dv, hasDefault := defaults["executor"]; hasDefault && dv != nil {
 		// The STAGE's own executor is the authoritative branch in both
 		// directions: a default must never re-brand the executor its author
 		// wrote, which is the whole point of the branch rule.
-		own := stage["executor"]
-		if defaultsWin {
-			stage["executor"] = mergeExecutor(own, deepCopyAny(dv), own)
-		} else {
-			stage["executor"] = mergeExecutor(deepCopyAny(dv), own, own)
+		if sv, declared := stage["executor"]; !declared || sv != nil {
+			if defaultsWin {
+				stage["executor"] = mergeExecutor(sv, deepCopyAny(dv), sv)
+			} else {
+				stage["executor"] = mergeExecutor(deepCopyAny(dv), sv, sv)
+			}
 		}
 	}
-	if dv, ok := defaults["budget"]; ok {
-		if defaultsWin {
-			stage["budget"] = mergeKeyWise(stage["budget"], deepCopyAny(dv))
-		} else {
-			stage["budget"] = mergeKeyWise(deepCopyAny(dv), stage["budget"])
+	if dv, hasDefault := defaults["budget"]; hasDefault && dv != nil {
+		if sv, declared := stage["budget"]; !declared || sv != nil {
+			if defaultsWin {
+				stage["budget"] = mergeKeyWise(sv, deepCopyAny(dv))
+			} else {
+				stage["budget"] = mergeKeyWise(deepCopyAny(dv), sv)
+			}
 		}
 	}
 }
@@ -543,6 +621,14 @@ func executorBranch(m map[string]any) string {
 // concatenating a `reviewers.agents` or `approvals` list would let a
 // governance file accumulate a reviewer or an approver by inheritance that
 // the author never wrote.
+//
+// PRESENCE CONTRACT: the top-level `over == nil` guard means the over side is
+// ABSENT — callers establish key presence before calling (applyDefaults and
+// the resolve loops do). A null value that is PRESENT under a key is handled
+// one level in, inside the recursive loop, where it WINS and is preserved
+// (`budget: {tokens: null}` over `budget: {tokens: 5}` resolves to
+// `{tokens: null}`, not `{tokens: 5}`); only a wholly-absent over side falls
+// back to `under`.
 func mergeKeyWise(under, over any) any {
 	um, uok := under.(map[string]any)
 	om, ook := over.(map[string]any)
@@ -557,6 +643,13 @@ func mergeKeyWise(under, over any) any {
 		out[k] = v
 	}
 	for k, v := range om {
+		if v == nil {
+			// A nested null under a PRESENT key on the over side WINS: the
+			// over side authored it, so it is preserved rather than falling
+			// back to the under value through the top-level guard above.
+			out[k] = nil
+			continue
+		}
 		out[k] = mergeKeyWise(out[k], v)
 	}
 	return out
@@ -569,6 +662,13 @@ func mergeKeyWise(under, over any) any {
 // (workflow first, never blended), `executor` and `budget` merge key-wise,
 // and the workflow rung is the authoritative executor branch — it is the more
 // specific of the two declarations.
+//
+// A null at the WORKFLOW rung WINS and does NOT fall back to the file rung: it
+// is carried through as the effective value (E52.14 / #2331), so combined with
+// applyDefaults' null-default skip a workflow-level `defaults: {reviewers:
+// null}` applies nothing at all rather than silently inheriting the file-level
+// block, and its null stays at /workflows/<wf>/defaults/reviewers for the
+// schema.
 func mergeDefaultsBlocks(file, workflow map[string]any) map[string]any {
 	if len(workflow) == 0 {
 		return file
@@ -580,6 +680,12 @@ func mergeDefaultsBlocks(file, workflow map[string]any) map[string]any {
 	for _, key := range reuseDefaultKeys {
 		fv, fok := file[key]
 		wv, wok := workflow[key]
+		if wok && wv == nil {
+			// Workflow-rung null wins over the file rung and is carried through
+			// as the effective value, rather than dropping to the file block.
+			out[key] = nil
+			continue
+		}
 		switch {
 		case fok && wok:
 			f, w := deepCopyAny(fv), deepCopyAny(wv)
