@@ -114,8 +114,11 @@
             "$ref": "#/$defs/periodic_budget"
           }
         },
-        "operator_agent": {
-          "$ref": "#/$defs/operator_agent"
+        "autonomy": {
+          "$ref": "#/$defs/autonomy_tier"
+        },
+        "actions": {
+          "$ref": "#/$defs/action_matrix"
         },
         "decomposition": {
           "$ref": "#/$defs/decomposition"
@@ -705,8 +708,11 @@
               "type": "string",
               "description": "SLA before timeout fires a category-D failure (e.g. '4_business_hours', '24_hours')."
             },
-            "operator_agent": {
-              "$ref": "#/$defs/operator_agent"
+            "autonomy": {
+              "$ref": "#/$defs/autonomy_tier"
+            },
+            "actions": {
+              "$ref": "#/$defs/action_matrix"
             }
           }
         },
@@ -723,59 +729,65 @@
         }
       ]
     },
-    "operator_agent": {
+    "autonomy_tier": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "description": "Autonomy TIER SHORTHAND (ADR-066 / E52.10 / #2222) — one word that expands to a full action matrix, replacing v0/v1's five may_* knobs. low = every action class at `mode: gated`: nothing is delegated, every judgment pages the human, and no page_human_on list is implied (there is nothing to except). medium = approve, fixup and retry at `mode: auto` under their named conditions, waive and merge gated. high = medium plus waive and merge at `mode: auto`. medium and high both expand to the same seven-event page_human_on list (gating_reviewer_reject, plan_rejection, scope_amendment, budget_override, policy_override, exception_request, requirement_arbitration). The three tiers are METHODOLOGY.md's low/medium/high and reproduce the shipped workflow-preset-<tier>.yaml delegation blocks exactly, with the v2 `gating_reviewer_reject` spelling in place of the bare `reviewer_reject` v2 removed. An explicit `actions` entry OVERRIDES the tier for THAT CLASS ONLY — unlisted classes keep the tier's value, and a class no tier names resolves to the fail-closed `mode: gated`. Declarable at workflow level (default for every gate) and on an approval gate; a gate declaring EITHER `autonomy` or `actions` supplies the WHOLE block and inherits nothing from the workflow level. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+    },
+    "action_entry": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Delegation knobs for the operator agent (ADR-040 / #1026). Each may_* knob names the single backend-evaluable condition under which the operator agent may take that action without paging the human; the per-knob enums are a closed set \u2014 the backend must be able to answer every condition from run state. Absent block (and absent knob) = fail-closed: nothing is delegated, every judgment pages the human. Declarable at workflow level (default for all gates) and on an approval gate (per-gate override; a gate-level block wins WHOLESALE over the workflow block \u2014 knobs are not merged). Authority semantics (ADR-027) are unchanged: delegation changes who may act, not what gates exist. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor).",
+      "required": [
+        "mode"
+      ],
+      "description": "One action class's delegation setting (ADR-066 / E52.10 / #2222). `mode` says WHO acts: `gated` — the human acts (the fail-closed default, and what an absent entry resolves to); `auto` — the operator agent may act without paging; `report` — the operator agent surfaces a PROPOSAL for the human and does NOT act. Only `auto` widens agent authority, and it is the only mode that requires a condition: `mode: auto` REQUIRES a `when` naming that class's single backend-evaluable condition, because the backend must be able to answer the predicate from run state. An auto entry with no `when`, an auto entry naming another class's condition, and an auto entry on an EXTENSION class (a class name this schema does not enumerate, which therefore has no backend-evaluable condition at all) are each REJECTED by the backend with a message naming the class and its legal condition. That per-class binding is deliberately NOT expressed as JSON Schema: the class-name set is OPEN (see action_matrix), so no keyword can bind a condition to a class that is not enumerated, and a raw check-jsonschema run therefore accepts a document the backend rejects. `mode: report` fires when the gate is LIVE and, when a `when` is declared, additionally requires that condition to be met — a bare `report` entry surfaces whenever the gate is reachable.",
       "properties": {
-        "may_approve": {
+        "mode": {
           "type": "string",
           "enum": [
-            "clean_dual_approval"
+            "report",
+            "gated",
+            "auto"
           ],
-          "description": "The operator agent may approve a gate when every configured reviewer for the gated stage returned an approve verdict and zero concerns are open."
+          "description": "report = surface a proposal, never act. gated = the human acts; this is what knob-absence meant in v0/v1 and what an unlisted class resolves to. auto = the operator agent may act, and `when` is then REQUIRED."
         },
-        "may_route_fixup": {
+        "when": {
           "type": "string",
           "enum": [
-            "convergent_concerns"
+            "clean_dual_approval",
+            "convergent_concerns",
+            "solo_low",
+            "infra_flake",
+            "gates_resolved_ci_green"
           ],
-          "description": "The operator agent may route review concerns to a fixup when all reviewer verdicts are in, at least one concern is open, and no reviewer rejected. When every verdict is approve-class the auto-route additionally requires an open concern at or above route_fixup_min_severity (default medium); see that field."
+          "description": "The backend-evaluable condition under which the class's mode applies — the closed union of the five v0 delegation conditions (ADR-040 / #1026). Each is legal for exactly ONE class: clean_dual_approval→approve, convergent_concerns→fixup, solo_low→waive, infra_flake→retry, gates_resolved_ci_green→merge. That per-class binding is enforced by the backend (which names the class and its legal condition), not here, because the class-name set is open. REQUIRED for `mode: auto`; optional for `mode: report` (absent means fire on gate-live); carries no meaning for `mode: gated`."
         },
-        "route_fixup_min_severity": {
+        "min_severity": {
           "type": "string",
           "enum": [
             "low",
             "medium",
             "high"
           ],
-          "description": "Minimum open-concern severity that satisfies may_route_fixup's convergent_concerns condition when EVERY implement-review verdict is approve-class (approve / approve_with_concerns). Absent defaults to medium: a dual-approve round whose only open concern is low-severity parks for the operator instead of auto-routing a full fix-up pass (#1964). Set to low to restore the legacy route-on-any-concern behavior. A reject verdict BYPASSES the threshold — advisory arbitration and the gating-reject page are unchanged. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
-        },
-        "may_waive": {
-          "type": "string",
-          "enum": [
-            "solo_low"
-          ],
-          "description": "The operator agent may waive a concern when it is the only open concern and its severity is low."
-        },
-        "may_retry": {
-          "type": "string",
-          "enum": [
-            "infra_flake"
-          ],
-          "description": "The operator agent may retry a failed stage when the latest stage failure is classified as an infrastructure flake."
-        },
-        "may_merge": {
-          "type": "string",
-          "enum": [
-            "gates_resolved_ci_green"
-          ],
-          "description": "The operator agent may merge when no gate approvals are pending, zero concerns are open, the PR is open, and required checks are green. Evaluated and surfaced in v0; merge itself happens on GitHub, so backend enforcement attaches once a merge action surface exists."
-        },
-        "must_page_human": {
+          "description": "Accepted on the `fixup` class ONLY (backend-enforced — the open class-name set puts this out of schema's reach). Minimum open-concern severity that satisfies convergent_concerns when EVERY implement-review verdict is approve-class (approve / approve_with_concerns; #1964). Absent defaults to medium: a dual-approve round whose only open concern is low-severity parks for the operator instead of auto-routing a full fix-up pass. Set to low to restore route-on-any-concern. A reject verdict BYPASSES the threshold. This is v0/v1's operator_agent.route_fixup_min_severity, moved onto the class it governs."
+        }
+      }
+    },
+    "action_matrix": {
+      "type": "object",
+      "description": "The ACTION MATRIX (ADR-066 / E52.10 / #2222) — workflow-v2's replacement for the v0/v1 `operator_agent` block, which v2 REMOVED. Every property other than the two RESERVED keys below is an ACTION CLASS mapped to an action_entry: `approve`, `fixup`, `waive`, `retry` and `merge` are the five classes the backend knows how to evaluate (they carry v0/v1's may_approve, may_route_fixup + route_fixup_min_severity, may_waive, may_retry and may_merge respectively). The class-name set is deliberately OPEN and per-workflow-type extensible (ADR-065): a workflow type may declare its own class, e.g. `promote` or `rollback`. An unknown class is SAFE BY CONSTRUCTION — it is accepted at `mode: gated` and `mode: report`, where it delegates nothing, and REJECTED at `mode: auto`, where it would need a backend-evaluable condition that does not exist. Absence is fail-closed at every level: an absent matrix, an absent class entry and `mode: gated` all mean the human acts, exactly as an absent may_* knob did. Declarable at workflow level (default for every gate) and on an approval gate; a gate declaring EITHER `autonomy` or `actions` supplies the WHOLE block — entries are NEVER merged across levels, matching the wholesale override semantics the operator_agent block had. Authority semantics (ADR-027) are unchanged: delegation changes who may act, not what gates exist. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor).",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "properties": {
+        "page_human_on": {
           "type": "array",
           "uniqueItems": true,
-          "description": "Events that always page the human regardless of the may_* knobs. Closed set; an event listed here is never absorbed by a delegation. The reviewer-reject taxonomy carries exactly TWO tokens in v2: advisory_reviewer_reject (an agent reject under advisory review authority \u2014 arbitrable / auto-routed) and gating_reviewer_reject (an agent reject under gating authority \u2014 pages the human). The legacy bare reviewer_reject token, which v0/v1 accept and resolve to the gating class, is REMOVED in v2 (E52.3 / #2215): declare gating_reviewer_reject for the same effect. Both tokens are accepted whenever present \u2014 v2 has no minor chain, so a field is accepted because the schema declares it, not because the document declared a high enough minor.",
+          "description": "RESERVED KEY (not an action class). Events that always page the human regardless of any class's mode — v0/v1's operator_agent.must_page_human, renamed onto the matrix. Closed set; an event listed here is never absorbed by a delegation. The reviewer-reject taxonomy carries exactly TWO tokens in v2: advisory_reviewer_reject (an agent reject under advisory review authority — arbitrable / auto-routed) and gating_reviewer_reject (an agent reject under gating authority — pages the human). The legacy bare reviewer_reject token, which v0/v1 accept and resolve to the gating class, is REMOVED in v2 (E52.3 / #2215): declare gating_reviewer_reject for the same effect. When the block declares no page_human_on, the `autonomy` tier's list applies (medium and high expand to the seven-event list; low expands to none).",
           "items": {
             "type": "string",
             "enum": [
@@ -794,11 +806,14 @@
         "model_policy": {
           "type": "object",
           "additionalProperties": false,
-          "description": "Scenario-A operator-agent model-selection contract (#1421): declares how the operator agent picks each stage's model, spec-declared and per-repo configurable rather than left to ad-hoc per-gate overrides. Declarative only — the operator agent reads the resolved policy from the run-status delegation block and applies it through the existing per-stage model override channels (#1416), bounded by — never widening — the deployment per-adapter allow-list; this contract adds no new backend resolution code. Part of the operator_agent block, so inherited under the SAME wholesale-override semantics as the may_* knobs (a gate-level operator_agent block replaces the workflow-level one entirely — model_policy is never merged across levels). All sub-fields optional; an absent model_policy is byte-identical to today. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor).",
+          "description": "RESERVED KEY (not an action class). Scenario-A operator-agent model-selection contract (#1421), moved here from the removed operator_agent block: declares how the operator agent picks each stage's model, spec-declared and per-repo configurable rather than left to ad-hoc per-gate overrides. Declarative only — the operator agent reads the resolved policy from the run-status delegation block and applies it through the existing per-stage model override channels (#1416), bounded by — never widening — the deployment per-adapter allow-list; this contract adds no new backend resolution code. Part of the matrix, so inherited under the SAME wholesale-override semantics as the class entries (a gate-level block replaces the workflow-level one entirely — model_policy is never merged across levels). All sub-fields optional; an absent model_policy is byte-identical to today.",
           "properties": {
             "strategy": {
               "type": "string",
-              "enum": ["follow_plan_recommendation", "explicit_defaults"],
+              "enum": [
+                "follow_plan_recommendation",
+                "explicit_defaults"
+              ],
               "description": "follow_plan_recommendation: the operator agent follows the plan artifact's per-stage model recommendation. explicit_defaults: the operator agent applies the defaults map, falling back to the deployment default for any unset stage."
             },
             "defaults": {
@@ -819,6 +834,9 @@
             }
           }
         }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/action_entry"
       }
     },
     "approvals": {

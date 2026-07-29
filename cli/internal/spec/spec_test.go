@@ -630,10 +630,41 @@ workflows:
 // The messages are byte-identical to the backend's; these assertions and
 // their backend counterparts are what keep the two copies in lockstep.
 
-// v2SpecWithPageEvent renders a v2 document listing the given page event
-// under a workflow-level operator_agent block.
+// v2SpecWithPageEvent renders a v2 document listing the given page event in
+// a workflow-level `must_page_human` array.
+//
+// The array is deliberately NOT nested under an `operator_agent` block: at v2
+// that block is itself removed (E52.10 / #2222) and the sweep reports the
+// outer removal first (see
+// TestValidateBytes_V2OperatorAgentRemovalPrecedesInnerForms). A bare
+// `must_page_human` at a level the v2 schema does not declare it is exactly
+// what a hand migration of the removed block leaves behind, and it is what
+// the sweep's deliberately-over-triggering, NOT-position-aware contract
+// exists to catch. The below-major-2 non-firing case uses
+// legacySpecWithPageEvent instead, which keeps the operator_agent wrapper
+// v0/v1 still declare.
 func v2SpecWithPageEvent(event string) string {
 	return `version: "2"
+workflows:
+  feature_change:
+    must_page_human:
+      - ` + event + `
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+}
+
+// legacySpecWithPageEvent renders a v0/v1 document listing the given page
+// event under the workflow-level operator_agent block those majors still
+// declare. It is the below-major-2 counterpart to v2SpecWithPageEvent, which
+// cannot be reused there: v2 removed operator_agent, so the v2 fixture puts
+// must_page_human at workflow level, where v0/v1 reject it as an undeclared
+// property before any sweep runs.
+func legacySpecWithPageEvent(version, event string) string {
+	return `version: "` + version + `"
 workflows:
   feature_change:
     operator_agent:
@@ -706,7 +737,7 @@ func TestValidateBytes_V2RejectsReviewersAgentCount(t *testing.T) {
 func TestValidateBytes_LegacyFormsAcceptedBelowMajor2(t *testing.T) {
 	for _, version := range []string{"0.7", "1.6"} {
 		t.Run("page event at "+version, func(t *testing.T) {
-			yml := strings.Replace(v2SpecWithPageEvent("reviewer_reject"), `version: "2"`, `version: "`+version+`"`, 1)
+			yml := legacySpecWithPageEvent(version, "reviewer_reject")
 			if err := spec.ValidateBytes([]byte(yml)); err != nil {
 				t.Errorf("ValidateBytes(version %s) = %v, want nil", version, err)
 			}
@@ -720,13 +751,14 @@ func TestValidateBytes_LegacyFormsAcceptedBelowMajor2(t *testing.T) {
 }
 
 // TestValidateBytes_V2AcceptsReplacementSurfaces is the v2-accepts branch:
-// the explicit reject tokens plus an agents[] list validate cleanly.
+// the explicit reject tokens (now on the `actions` matrix's page_human_on
+// reserved key, E52.10 / #2222) plus an agents[] list validate cleanly.
 func TestValidateBytes_V2AcceptsReplacementSurfaces(t *testing.T) {
 	yml := `version: "2"
 workflows:
   feature_change:
-    operator_agent:
-      must_page_human:
+    actions:
+      page_human_on:
         - advisory_reviewer_reject
         - gating_reviewer_reject
     stages:
@@ -845,8 +877,7 @@ func TestValidateBytes_V2SweepSkipsNonMatchingShapes(t *testing.T) {
 		"must_page_human is not an array": `version: "2"
 workflows:
   feature_change:
-    operator_agent:
-      must_page_human: reviewer_reject
+    must_page_human: reviewer_reject
     stages:
       - id: implement
         type: implement
@@ -1330,6 +1361,179 @@ workflows:
 	}
 	if !strings.Contains(joined, "/roles") {
 		t.Errorf("error %q does not name the offending path", joined)
+	}
+}
+
+// --- workflow-v2 removed operator_agent block (E52.10 / #2222) --------------
+
+// TestValidateBytes_V2RejectsOperatorAgentBlock is F7's CLI half: the removed
+// delegation block is rejected at v2 with a message BYTE-IDENTICAL to the
+// backend's, at both placement levels. The content assertion is the only
+// lockstep mechanism — the two Go modules share no constant.
+func TestValidateBytes_V2RejectsOperatorAgentBlock(t *testing.T) {
+	const wantMsg = `the "operator_agent" block was removed in workflow-v2: declare the action matrix (actions: {approve: {mode: auto, when: clean_dual_approval}, …}) or the tier shorthand (autonomy: low | medium | high) instead; may_approve -> actions.approve, may_route_fixup -> actions.fixup, route_fixup_min_severity -> actions.fixup.min_severity, may_waive -> actions.waive, may_retry -> actions.retry, may_merge -> actions.merge, must_page_human -> actions.page_human_on, model_policy -> actions.model_policy, and knob-absence -> mode: gated`
+	cases := map[string]struct{ yml, wantPath string }{
+		"workflow level": {`version: "2"
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: clean_dual_approval
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`, "/workflows/feature_change/operator_agent"},
+		"gate level": {`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+            operator_agent:
+              may_merge: gates_resolved_ci_green
+`, "/gates/0/operator_agent"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := spec.ValidateBytes([]byte(tc.yml))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			joined := strings.Join(messageStrings(ve), "\n")
+			if !strings.Contains(joined, wantMsg) {
+				t.Errorf("error %q does not carry the backend's verbatim message %q", joined, wantMsg)
+			}
+			if !strings.Contains(joined, tc.wantPath) {
+				t.Errorf("error %q does not name the offending path %q", joined, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_V2OperatorAgentRemovalPrecedesInnerForms documents the
+// precedence the walk produces: a node is checked BEFORE its children are
+// visited, so a removed operator_agent block that also carries a bare
+// reviewer_reject reports the OUTER removal.
+func TestValidateBytes_V2OperatorAgentRemovalPrecedesInnerForms(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human:
+        - reviewer_reject
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	if !strings.Contains(joined, `the "operator_agent" block was removed in workflow-v2`) {
+		t.Errorf("error %q is not the outer removed-operator_agent message", joined)
+	}
+}
+
+// TestValidateBytes_OperatorAgentStillAcceptedBelowMajor2 is the non-firing
+// branch of the version gate for this form: v0 and v1 still declare the block.
+func TestValidateBytes_OperatorAgentStillAcceptedBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run(version, func(t *testing.T) {
+			yml := `version: "` + version + `"
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: clean_dual_approval
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+			if err := spec.ValidateBytes([]byte(yml)); err != nil {
+				t.Errorf("ValidateBytes(version %s) = %v, want nil", version, err)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_V2AcceptsAutonomyGrammar is the v2-accepts branch for the
+// replacement surfaces: the tier shorthand, an explicit class override, an
+// extension class and both reserved keys all validate cleanly.
+func TestValidateBytes_V2AcceptsAutonomyGrammar(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    autonomy: medium
+    actions:
+      approve:
+        mode: gated
+      fixup:
+        mode: auto
+        when: convergent_concerns
+        min_severity: high
+      promote:
+        mode: report
+      page_human_on:
+        - gating_reviewer_reject
+      model_policy:
+        strategy: follow_plan_recommendation
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+            actions:
+              merge:
+                mode: auto
+                when: gates_resolved_ci_green
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("ValidateBytes(v2 autonomy grammar) = %v, want nil", err)
+	}
+}
+
+// TestValidateBytes_V2RejectsUnknownAutonomyTier pins F9 on the CLI side: the
+// tier enum is a SCHEMA rejection naming the three legal tiers. The CLI is
+// schema-only (no typed decode), so this and the removed-form sweep are the
+// whole of its autonomy coverage — the `mode: auto` condition rules are
+// enforced in the backend's typed layer by design (see the schema's
+// action_entry description).
+func TestValidateBytes_V2RejectsUnknownAutonomyTier(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    autonomy: aggressive
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	for _, want := range []string{"low", "medium", "high"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("error %q does not name the legal tier %q", joined, want)
+		}
 	}
 }
 

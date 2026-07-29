@@ -159,7 +159,26 @@ type Workflow struct {
 	// operator agent (ADR-040 / #1026). Nil means nothing is delegated
 	// — fail-closed, every judgment pages the human. A gate-level
 	// block overrides it wholesale; see EffectiveOperatorAgent.
+	//
+	// SPEC SURFACE vs FIELD (ADR-066 / E52.10 / #2222): v0 and v1 declare
+	// this block directly. workflow-v2 REMOVED it — on a v2 document this
+	// field is DERIVED, never author-declared: the parser resolves the
+	// `autonomy` / `actions` grammar below and projects the result here
+	// (see v2autonomy.go's DerivedOperatorAgent), so every enforcement
+	// site keeps reading this one field on every major.
 	OperatorAgent *OperatorAgent `json:"operator_agent,omitempty" yaml:"operator_agent,omitempty"`
+	// Autonomy is workflow-v2's tier shorthand (ADR-066 / E52.10 / #2222):
+	// low | medium | high, expanding to a full action matrix. v2-only —
+	// v0/v1 documents never populate it. Empty means the workflow declared
+	// no tier.
+	Autonomy AutonomyTier `json:"autonomy,omitempty" yaml:"autonomy,omitempty"`
+	// Actions is workflow-v2's per-action-class matrix (ADR-066 / E52.10 /
+	// #2222). v2-only. Nil means the workflow declared no matrix; declaring
+	// EITHER this or Autonomy declares the block, which a gate then
+	// overrides WHOLESALE. Round-trips through ParseBytes'
+	// DisallowUnknownFields decode via ActionMatrix's custom unmarshaller,
+	// which is what lets the class-name set stay open.
+	Actions *ActionMatrix `json:"actions,omitempty" yaml:"actions,omitempty"`
 	// Decomposition holds the per-workflow decomposition controls
 	// (E24.6 / #1146). Nil means the block was absent — no per-workflow
 	// override, so EffectiveMaxParallel falls through to the global
@@ -1014,7 +1033,21 @@ type Gate struct {
 	// #1026, approval gates only — the schema rejects it on check
 	// gates). When non-nil it wins wholesale over the workflow-level
 	// block; resolve via Workflow.EffectiveOperatorAgent.
+	//
+	// As at workflow level, on a workflow-v2 document this field is
+	// DERIVED from the gate's own Autonomy / Actions block rather than
+	// author-declared (ADR-066 / E52.10 / #2222); v2 removed the gate
+	// `operator_agent` property.
 	OperatorAgent *OperatorAgent `json:"operator_agent,omitempty" yaml:"operator_agent,omitempty"`
+	// Autonomy is workflow-v2's per-gate tier shorthand (ADR-066 / E52.10 /
+	// #2222; approval gates only). v2-only.
+	Autonomy AutonomyTier `json:"autonomy,omitempty" yaml:"autonomy,omitempty"`
+	// Actions is workflow-v2's per-gate action matrix (ADR-066 / E52.10 /
+	// #2222; approval gates only). v2-only. Declaring EITHER this or
+	// Autonomy makes the gate supply the WHOLE block — nothing is
+	// inherited from the workflow level, matching the wholesale-override
+	// semantics the gate operator_agent block had.
+	Actions *ActionMatrix `json:"actions,omitempty" yaml:"actions,omitempty"`
 }
 
 // GateType is approval or check.
