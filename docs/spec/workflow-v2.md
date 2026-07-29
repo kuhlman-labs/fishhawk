@@ -150,7 +150,110 @@ workflows:
           agent: claude-code
 ```
 
-Sibling E52 children grow this page as they change the v2 grammar; for every member not listed under *Removed from v1*, *Reshaped from v1*, or *Stage types: propose / apply / gate*, the v1 reference is authoritative.
+Sibling E52 children grow this page as they change the v2 grammar; for every member not listed under *Removed from v1*, *Reshaped from v1*, *Reuse: `defaults` and `extends`*, or *Stage types: propose / apply / gate*, the v1 reference is authoritative.
+
+## Reuse: `defaults` and `extends`
+
+v2 adds the two SAME-DOCUMENT reuse primitives earlier majors never had (E52.4 / #2216):
+
+- **`defaults:`** — declarable at **file** level and at **workflow** level, scoped to the `executor`, `reviewers` and `budget` blocks.
+- **`extends:`** — on a workflow, naming another workflow key **in the same document** as its base.
+
+Cross-**file** inclusion (`include:`) is deliberately **out of scope** — see ADR-067 (and ADR-057 for the multi-tenant context in which a cross-file surface would have to be designed). Everything below resolves within one `.fishhawk/workflows.yaml`.
+
+Worked example: [`examples/workflow-v2-reuse.yaml`](examples/workflow-v2-reuse.yaml), with its resolved form beside it at [`examples/workflow-v2-reuse.resolved.json`](examples/workflow-v2-reuse.resolved.json).
+
+### Resolution order
+
+For every defaultable block on every stage, the effective value folds in exactly this order, **later winning**:
+
+1. the **file**-level `defaults`
+2. the value the **`extends` base stage** declared
+3. the **workflow**-level `defaults`
+4. the **stage's own declaration**
+
+Rung 3 sits above rung 2 deliberately: a workflow-level default **overrides a value the inherited base stage declared explicitly**, which is what makes *"extend the base but swap the agent everywhere"* expressible. A stage declared on the deriving workflow still wins over all of it.
+
+Chains resolve transitively (`c` extends `b` extends `a`), and a deriving workflow may omit `stages` entirely — it inherits the base's set whole.
+
+### Merge semantics
+
+| Value | Rule |
+|---|---|
+| object | merges **key-wise**, recursively; the winning rung takes each key |
+| array | **REPLACES wholesale** — never concatenated |
+| `stages` | the ONE keyed array: merged **by stage `id`** |
+| `reviewers` | taken **WHOLE** from exactly one rung — never blended |
+| `executor` | key-wise, **except** the branch rule below |
+
+**Arrays replace, they never concatenate.** This is a governance rule, not a convenience: a `reviewers.agents` or `approvals` list that accumulated entries by inheritance would give a stage an approver or a reviewer **its author did not write**. Declaring one agent reviewer where the base declared two resolves to exactly one — the deriving one.
+
+**`stages` is the keyed exception.** Base stages keep their order and positions; a deriving stage whose `id` matches merges onto the base stage **in the base's position**; a deriving stage with a new id is **appended** in declaration order. Reordering is deliberately not expressible. Declaring the same `id` twice in one workflow is **rejected**, because two entries targeting one base stage have no defined merge order.
+
+### `reviewers` is taken whole; `executor` and `budget` merge key-wise
+
+The asymmetry is deliberate. **A block that determines review AUTHORITY is taken as authored or not at all; blocks that carry only execution parameters merge key-wise.**
+
+Consider file defaults `reviewers: {human: 1, agents: [a, b]}` and a stage declaring `reviewers: {agents: [c]}`. A key-wise merge resolves to `{human: 1, agents: [c]}` — the stage's agents correctly replace the default's, but `human: 1` is **supplemented from a block the author never wrote on that stage**. That is not cosmetic: the ADR-027 authority table reads `len(agents) > 0 && human == 0` as **gating** and `len(agents) > 0 && human > 0` as **advisory**, so the supplemented human silently converts a gating review into an arbitrable one, and nothing in the document says so.
+
+So a stage (or workflow) that **declares** `reviewers` gets that block exactly as authored, with no merge from any defaults rung. Declared or inherited — never blended.
+
+`executor` and `budget` keep the key-wise merge: they carry no authority semantics, and block-level replacement would make a file-level `defaults.executor.timeout` useless for every stage that declares an executor, which is nearly all of them.
+
+### The executor branch rule
+
+`$defs/executor` is a `oneOf` over three mutually exclusive branches — `agent`, `human`, `delegate`. The rule has two halves, and both drop the incoming fragment **WHOLESALE** for that stage, branchless keys such as `timeout` included:
+
+1. **Different branch.** A defaults (or base) executor selecting a different branch than the stage's own executor is dropped.
+2. **Closed branch.** A defaults (or base) executor of **any** shape — including a branchless `{timeout: 30m}` — is dropped for a stage on the `human` or `delegate` branch. Those two `oneOf` arms declare no property beyond their own branch key.
+
+```yaml
+defaults:
+  executor:
+    agent: claude-code # applies to every agent-executed stage below
+    timeout: 30m
+
+workflows:
+  feature_change:
+    stages:
+      - id: apply
+        type: implement # inherits {agent: claude-code, timeout: 30m} whole
+
+      - id: gate
+        type: review
+        executor:
+          human: true # resolves to {human: true} — NO agent, NO timeout
+
+      - id: ship
+        type: deploy
+        executor:
+          delegate: # resolves to the delegate block alone
+            target: github_actions
+            workflow_ref: deploy.yml
+```
+
+Without the first half the file-level `agent` default would graft an `agent` key — and every agent-branch-only key — onto each `human: true` gate stage and each delegating deploy stage, and the schema's `oneOf` would then reject a document whose author wrote nothing wrong. The drop is *wholesale* rather than branch-key-only because the `human` and `delegate` branches set `unevaluatedProperties: false`, so even a stray surviving `timeout` fails the branch.
+
+The second half exists because that same rejection returns one case over for a **branchless** default, which the first half cannot see. A file-level `defaults: {executor: {timeout: 30m}}` declares no branch, so it would merge key-wise into `{human: true}` and produce `{human: true, timeout: 30m}` — which the human arm rejects exactly as it rejects a grafted `agent`. Essentially every real workflow carries a human gate stage, so without the closed-branch half the bare-`timeout` default would reject nearly every realistic document. Both halves fail the same way — the default is dropped, never reinterpreted — so a bare `{timeout: 30m}` reaches every agent stage and silently skips every human gate and delegating deploy stage.
+
+### Rejections
+
+Two authoring errors are rejected before schema validation, with messages naming the offender:
+
+```
+extends names workflow "nope", which this document does not define; defined workflows: alpha, zebra
+extends forms a cycle: alpha -> beta -> alpha; a workflow cannot inherit from itself, directly or transitively
+```
+
+A self-reference (`solo` extending `solo`) reports as the same cycle. A duplicate stage id inside one workflow's own `stages` list is rejected the same way, naming the id and both positions.
+
+### Where errors point
+
+**Resolution runs BEFORE schema validation**, so the schema (and every semantic rule after it) validates the **resolved** document. That is what lets a stage inherit its `executor` and still satisfy `$defs/stage`'s `required: [id, type, executor]` with no schema relaxation, and lets `inputs[].from_stage` reference a stage that exists only in the inherited base.
+
+The cost is the same tradeoff `needs:` expansion accepted (#2218): a reported error **path** points at a position in the resolved document, which for a deriving workflow may not be a position its author wrote. Read the path against the resolved form, not the source.
+
+The `defaults` and `extends` keys are stripped after validation, before the typed decode. No Go struct, database column, API field or consumer read site changed.
 
 ## Stage types: propose / apply / gate
 

@@ -14,6 +14,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -3874,6 +3875,27 @@ var licensedV2Deltas = []licensedDelta{
 		Issue: "#2217 (E52.5)",
 		Why:   "added — the primary per-stage USD ceiling, aligned in unit with the workflow-level periodic_budget.limit_usd",
 	},
+	// E52.4 / #2216 adds the two same-document reuse primitives v2 never
+	// had. Exactly THREE new schema paths, and the `defaults` block is
+	// INLINED at both sites rather than factored into a shared $defs entry
+	// precisely to keep the count at three: a fourth divergent path would
+	// trip the ~15 guardrail below and drag the #2320 retire-the-test
+	// decision into this child.
+	{
+		Path:  "$/properties/defaults",
+		Issue: "#2216 (E52.4)",
+		Why:   "added — file-level reuse defaults (executor / reviewers / budget), the lowest rung of the same-document resolution ladder",
+	},
+	{
+		Path:  "$/$defs/workflow/properties/defaults",
+		Issue: "#2216 (E52.4)",
+		Why:   "added — workflow-level reuse defaults, the rung above an extends base and below the stage's own declaration",
+	},
+	{
+		Path:  "$/$defs/workflow/properties/extends",
+		Issue: "#2216 (E52.4)",
+		Why:   "added — same-document workflow inheritance, naming another workflow key in this document as the base",
+	},
 }
 
 // TestV2DivergesFromV1OnlyByLicensedDeltas is the re-scoped successor to
@@ -5243,5 +5265,105 @@ workflows:
 				}
 			})
 		}
+	}
+}
+
+// --- workflow-v2 same-document reuse (E52.4 / #2216) -----------------------
+
+// TestParseV2_DeclaredReviewersBlockTakenWhole is the governance-critical
+// direction of the block-level reviewers rule, and it lives in the EXTERNAL
+// test package because it asserts the AUTHORITY, not just the field:
+// planreview imports spec, so only spec_test can import it back.
+//
+// The hazard a key-wise merge would create: file defaults declaring
+// {human: 1, agents: [a, b]} merged into a stage declaring {agents: [c]}
+// resolves to {human: 1, agents: [c]}. The stage's agents correctly replace
+// the default's, but `human: 1` is SUPPLEMENTED from a block the author never
+// wrote on that stage — and planreview.ResolveAuthority keys on
+// AgentCount() > 0 && Human == 0, so the supplemented human silently converts
+// a GATING review into an arbitrable ADVISORY one. Nothing in the document
+// the author wrote would say so.
+//
+// So a declared `reviewers` block is taken WHOLE from exactly one rung:
+// declared or inherited, never blended. The authority is what an operator is
+// governed by; the field is only the mechanism, which is why both are
+// asserted and the authority is the point.
+func TestParseV2_DeclaredReviewersBlockTakenWhole(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+  reviewers:
+    human: 1
+    agents:
+      - provider: claudecode
+      - provider: anthropic
+workflows:
+  wf:
+    stages:
+      - id: propose
+        type: plan
+        reviewers:
+          agents:
+            - provider: codex
+`
+	s, err := spec.ParseBytes([]byte(doc))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	rev := s.Workflows["wf"].Stages[0].Reviewers
+	if rev == nil {
+		t.Fatal("propose.reviewers = nil, want the authored block")
+	}
+	if rev.Human != 0 {
+		t.Errorf("propose.reviewers.human = %d, want 0 — NO human key supplemented from the file default", rev.Human)
+	}
+	if got := rev.AgentCount(); got != 1 {
+		t.Fatalf("propose.reviewers agent count = %d (%+v), want exactly the one authored agent", got, rev.Agents)
+	}
+	if got := string(rev.Agents[0].Provider); got != "codex" {
+		t.Errorf("propose.reviewers.agents[0].provider = %q, want codex", got)
+	}
+	// THE ASSERTION THAT MATTERS: the review authority the operator is
+	// governed by. A key-wise regression flips this to AuthorityAdvisory.
+	if got := planreview.ResolveAuthority(*rev); got != planreview.AuthorityGating {
+		t.Errorf("planreview.ResolveAuthority = %v, want %v — a supplemented human would silently make this gating stage advisory",
+			got, planreview.AuthorityGating)
+	}
+}
+
+// TestParseV2_DefaultsCarryingDocumentDecodesWithNoStructChange proves the
+// reuse keys are a GRAMMAR-only addition: a document declaring `defaults` and
+// `extends` decodes into the unchanged Spec / Workflow / Stage structs, under
+// DisallowUnknownFields, with no field added for either key.
+func TestParseV2_DefaultsCarryingDocumentDecodesWithNoStructChange(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+    timeout: 20m
+workflows:
+  base:
+    stages:
+      - id: propose
+        type: plan
+  derived:
+    extends: base
+    defaults:
+      executor:
+        timeout: 40m
+`
+	s, err := spec.ParseBytes([]byte(doc))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	st := s.Workflows["derived"].Stages[0]
+	if st.Executor.Agent != "claude-code" {
+		t.Errorf("executor.agent = %q, want the file default claude-code", st.Executor.Agent)
+	}
+	if got := st.Executor.Timeout.Duration; got != 40*time.Minute {
+		t.Errorf("executor.timeout = %v, want the workflow default 40m over the file default 20m", got)
 	}
 }

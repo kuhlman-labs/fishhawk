@@ -238,6 +238,17 @@ func ValidateBytes(data []byte) error {
 		}
 	}
 
+	// Resolve workflow-v2's same-document reuse primitives (E52.4 / #2216) —
+	// file/workflow `defaults` and a workflow's `extends` base — BEFORE
+	// schema validation, mirroring the backend's ordering byte for byte, so
+	// the schema validates the RESOLVED document and an inherited executor
+	// satisfies $defs/stage's required list with no schema relaxation.
+	if major >= 2 {
+		if err := resolveV2Reuse(raw); err != nil {
+			return err
+		}
+	}
+
 	if err := schema.Validate(raw); err != nil {
 		var verr *jsonschema.ValidationError
 		if errors.As(err, &verr) {
@@ -250,7 +261,9 @@ func ValidateBytes(data []byte) error {
 	// Semantic sweep the schema can't express: agent_version compatibility
 	// ranges (#1743) are plain strings to the schema, so a malformed range
 	// is caught here (the CLI's sole semantic check; richer graph-shape
-	// checks stay on the backend).
+	// checks stay on the backend). At major >= 2 it now sweeps the RESOLVED
+	// document, so a defaults.executor.agent_version range is validated on
+	// every stage that inherits it.
 	return validateAgentVersions(raw)
 }
 

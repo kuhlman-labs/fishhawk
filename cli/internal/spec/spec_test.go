@@ -1267,3 +1267,191 @@ workflows:
 		}
 	}
 }
+
+// --- workflow-v2 same-document reuse (E52.4 / #2216) -----------------------
+
+// TestValidateBytes_V2Reuse_HappyPath is the CLI-side end-to-end case: a
+// document exercising every rung of the ladder validates cleanly, with the
+// schema seeing the RESOLVED document (so the stage that declares no executor
+// of its own still satisfies $defs/stage's required list).
+func TestValidateBytes_V2Reuse_HappyPath(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+    timeout: 30m
+  reviewers:
+    human: 1
+  budget:
+    max_runtime: 45m
+workflows:
+  base:
+    stages:
+      - id: propose
+        type: plan
+      - id: apply
+        type: implement
+        produces:
+          - artifact: pull_request
+  derived:
+    extends: base
+    defaults:
+      executor:
+        agent: codex
+    stages:
+      - id: apply
+        type: implement
+        budget:
+          max_runtime: 90m
+      - id: gate
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: apply
+`
+	if err := spec.ValidateBytes([]byte(doc)); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil", err)
+	}
+}
+
+// TestValidateBytes_V2Reuse_RejectionMessagesMatchBackendVerbatim is the
+// byte-parity assertion. The backend and CLI resolvers are duplicated across
+// two Go modules with NO shared constant, so a divergent edit compiles fine
+// on both sides; the identical literals asserted here and in
+// backend/internal/spec/v2reuse_test.go are what hold them in lockstep.
+func TestValidateBytes_V2Reuse_RejectionMessagesMatchBackendVerbatim(t *testing.T) {
+	cases := []struct {
+		name    string
+		doc     string
+		path    string
+		message string
+	}{
+		{
+			name: "unknown base",
+			doc: `
+version: "2"
+workflows:
+  zebra:
+    extends: nope
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+  alpha:
+    stages:
+      - id: b
+        type: plan
+        executor:
+          agent: claude-code
+`,
+			path:    "/workflows/zebra/extends",
+			message: `extends names workflow "nope", which this document does not define; defined workflows: alpha, zebra`,
+		},
+		{
+			name: "two-workflow cycle",
+			doc: `
+version: "2"
+workflows:
+  alpha:
+    extends: beta
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+  beta:
+    extends: alpha
+    stages:
+      - id: b
+        type: plan
+        executor:
+          agent: claude-code
+`,
+			path:    "/workflows/alpha/extends",
+			message: `extends forms a cycle: alpha -> beta -> alpha; a workflow cannot inherit from itself, directly or transitively`,
+		},
+		{
+			name: "self extends",
+			doc: `
+version: "2"
+workflows:
+  solo:
+    extends: solo
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+`,
+			path:    "/workflows/solo/extends",
+			message: `extends forms a cycle: solo -> solo; a workflow cannot inherit from itself, directly or transitively`,
+		},
+		{
+			name: "duplicate stage id in a standalone workflow",
+			doc: `
+version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+      - id: apply
+        type: implement
+        executor:
+          agent: codex
+`,
+			path:    "/workflows/wf/stages",
+			message: `duplicate stage id "apply" declared at positions 0 and 1; two entries targeting one stage have no defined merge order under extends, so the document is rejected rather than resolved`,
+		},
+		{
+			name: "duplicate stage id in a DERIVING workflow",
+			doc: `
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+  derived:
+    extends: base
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: codex
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`,
+			path:    "/workflows/derived/stages",
+			message: `duplicate stage id "apply" declared at positions 0 and 1; two entries targeting one stage have no defined merge order under extends, so the document is rejected rather than resolved`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := spec.ValidateBytes([]byte(tc.doc))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v (%T), want *spec.ValidationError", err, err)
+			}
+			if len(ve.Errors) != 1 {
+				t.Fatalf("errors = %+v, want exactly one", ve.Errors)
+			}
+			if ve.Errors[0].Path != tc.path {
+				t.Errorf("Path = %q, want %q", ve.Errors[0].Path, tc.path)
+			}
+			if ve.Errors[0].Message != tc.message {
+				t.Errorf("Message = %q, want the backend-identical %q", ve.Errors[0].Message, tc.message)
+			}
+		})
+	}
+}

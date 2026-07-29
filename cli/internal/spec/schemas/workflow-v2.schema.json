@@ -38,6 +38,24 @@
         }
       }
     },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "FILE-LEVEL reuse defaults (E52.4 / #2216): the lowest rung of the same-document resolution ladder — file defaults -> extends base -> workflow defaults -> the stage's own declaration, later winning. Applied to every stage of every workflow in this document before schema validation, so an inherited executor satisfies $defs/stage's required list with no schema relaxation. MERGE SEMANTICS: `executor` and `budget` merge KEY-WISE (the receiving side wins per key) because they carry only execution parameters; `reviewers` is taken WHOLE from exactly one rung and is NEVER blended, because it determines review AUTHORITY (ADR-027) and a supplemented `human` key would silently convert a gating stage into an advisory one. Arrays REPLACE wholesale everywhere — a governance file never accumulates an approver or reviewer its author did not write. Cross-FILE inclusion (`include:`) is deliberately out of scope (ADR-067). This block is INLINED here and on $defs/workflow rather than factored into a shared $defs entry: the v1->v2 copy-fidelity allow-list (TestV2DivergesFromV1OnlyByLicensedDeltas) is capped at ~15 licensed divergent paths and a shared $def would spend a fourth.",
+      "properties": {
+        "executor": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "PARTIAL executor defaults, e.g. {agent: claude-code, timeout: 30m} or a bare {timeout: 30m}. Deliberately NOT $ref'd to #/$defs/executor: a partial fragment cannot satisfy that definition's agent/human/delegate oneOf, and it does not need to — the merged result is validated strictly at each RECEIVING stage, where the real branch oneOf and unevaluatedProperties rules apply. BRANCH RULE, in two halves, both dropping the default WHOLESALE (branchless keys and all): (1) a default declaring one of agent/human/delegate is dropped for a stage whose own executor selects a DIFFERENT branch, so a file-level {agent: …} default never grafts an `agent` key onto a `human: true` gate stage or a delegating deploy stage; (2) a default of ANY shape — including a bare {timeout: 30m} — is dropped for a stage on the `human` or `delegate` branch, because those two oneOf arms declare no property beyond their own branch key, so even a lone inherited `timeout` would fail the oneOf under unevaluatedProperties: false. A bare {timeout: 30m} default therefore reaches every agent stage and silently skips every human gate and delegating deploy stage, rather than rejecting the document."
+        },
+        "reviewers": {
+          "$ref": "#/$defs/reviewers_config"
+        },
+        "budget": {
+          "$ref": "#/$defs/budget"
+        }
+      }
+    },
     "test_conventions": {
       "type": "array",
       "description": "Optional per-repo test-location conventions that generalize the plan-gate test sweep (#1004) beyond the built-in Go (name.go -> name_test.go) and colocated-TypeScript defaults. Each entry maps production files matching a glob to candidate test-file path templates. Declared entries are ADDITIVE to the built-in defaults (Go + colocated TS stay covered regardless), so a repo typically declares only its Python / Ruby / parallel-tree conventions. Advisory-only and fail-open: the sweep never blocks a plan. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor).",
@@ -132,6 +150,29 @@
         },
         "decomposition": {
           "$ref": "#/$defs/decomposition"
+        },
+        "extends": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "SAME-DOCUMENT inheritance (E52.4 / #2216): names another workflow key in this document as this workflow's base. The base's resolved stages are inherited in their declared ORDER; a stage this workflow declares with a matching `id` merges onto the base stage IN THE BASE'S POSITION, and a stage with a new id is appended in declaration order (reordering is deliberately not expressible). Chains resolve transitively. An `extends` naming a workflow this document does not define, and an `extends` cycle (including a self-reference), are both rejected before schema validation with a message naming the offender. Resolution runs BEFORE schema validation, so a deriving workflow may omit `stages` entirely and still satisfy this definition's required list. Cross-FILE inclusion (`include:`) is deliberately out of scope (ADR-067)."
+        },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "WORKFLOW-LEVEL reuse defaults (E52.4 / #2216): the rung ABOVE the extends base and BELOW this workflow's own stage declarations — file defaults -> extends base -> workflow defaults -> the stage's own declaration. A workflow-level default therefore OVERRIDES a value an inherited base stage declared explicitly, which is what makes \"extend the base but swap the agent everywhere\" expressible; a stage declared on THIS workflow still wins over it. Same merge semantics as the file-level block: `executor` and `budget` merge KEY-WISE, `reviewers` is taken WHOLE from exactly one rung and never blended (it determines review AUTHORITY), and arrays REPLACE wholesale.",
+          "properties": {
+            "executor": {
+              "type": "object",
+              "minProperties": 1,
+              "description": "PARTIAL executor defaults for every stage of this workflow. Deliberately NOT $ref'd to #/$defs/executor: a partial fragment cannot satisfy that definition's agent/human/delegate oneOf, and the merged result is validated strictly at each receiving stage instead. The same two-half BRANCH RULE applies — a default declaring one of agent/human/delegate is dropped wholesale for a stage whose own executor selects a different branch, and a default of any shape (a bare {timeout: 30m} included) is dropped wholesale for a stage on the `human` or `delegate` branch, which admit no key beyond their own."
+            },
+            "reviewers": {
+              "$ref": "#/$defs/reviewers_config"
+            },
+            "budget": {
+              "$ref": "#/$defs/budget"
+            }
+          }
         }
       }
     },
