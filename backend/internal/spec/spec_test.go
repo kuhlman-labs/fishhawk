@@ -1707,6 +1707,67 @@ workflows:
 
 // --- operator_agent delegation knobs (ADR-040 / #1026) ---
 
+// TestParse_V2Autonomy_DerivedBlockFlowsThroughEffectiveOperatorAgent is the
+// derivation bridge seen from OUTSIDE the package, through the one resolver
+// every enforcement site actually calls (ADR-066 / E52.10 / #2222). The
+// derived blocks must satisfy EffectiveOperatorAgent's existing gate-wins-
+// wholesale ladder exactly as author-declared v0/v1 blocks do — that ladder
+// is untouched by this change, and this asserts it did not need to be.
+func TestParse_V2Autonomy_DerivedBlockFlowsThroughEffectiveOperatorAgent(t *testing.T) {
+	s, err := spec.ParseBytes(readFixture(t, "valid/autonomy-v2.yaml"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.Version != "2" {
+		t.Errorf("version = %q, want 2", s.Version)
+	}
+	wf, ok := s.Workflows["feature_change"]
+	if !ok {
+		t.Fatal(`workflows["feature_change"] missing`)
+	}
+
+	// Workflow level: `autonomy: medium` with approve explicitly tightened.
+	wfBlock := wf.EffectiveOperatorAgent(nil)
+	if wfBlock == nil {
+		t.Fatal("workflow-level derived OperatorAgent = nil, want the medium-tier block")
+	}
+	if wfBlock.MayApprove != "" {
+		t.Errorf("MayApprove = %q, want empty — the explicit `approve: {mode: gated}` tightens the tier", wfBlock.MayApprove)
+	}
+	if wfBlock.MayRetry != spec.ConditionInfraFlake {
+		t.Errorf("MayRetry = %q, want infra_flake from the medium tier", wfBlock.MayRetry)
+	}
+	if wfBlock.RouteFixupMinSeverity != "high" {
+		t.Errorf("RouteFixupMinSeverity = %q, want high", wfBlock.RouteFixupMinSeverity)
+	}
+	if wfBlock.ModelPolicy == nil || wfBlock.ModelPolicy.Strategy != spec.ModelPolicyExplicitDefaults {
+		t.Errorf("ModelPolicy = %+v, want the matrix's reserved model_policy key", wfBlock.ModelPolicy)
+	}
+
+	// Gate level: the plan gate declares its own block, which wins wholesale.
+	planGate := &wf.Stages[0].Gates[0]
+	gateBlock := wf.EffectiveOperatorAgent(planGate)
+	if gateBlock == nil {
+		t.Fatal("gate-level derived OperatorAgent = nil, want the gate's own block")
+	}
+	if gateBlock.MayMerge != spec.ConditionGatesResolvedCIGreen {
+		t.Errorf("gate MayMerge = %q, want gates_resolved_ci_green", gateBlock.MayMerge)
+	}
+	if gateBlock.MayRetry != "" {
+		t.Errorf("gate MayRetry = %q, want empty — the gate block is wholesale, nothing is inherited", gateBlock.MayRetry)
+	}
+	if gateBlock.ModelPolicy != nil {
+		t.Errorf("gate ModelPolicy = %+v, want nil — never merged across levels", gateBlock.ModelPolicy)
+	}
+
+	// The implement gate declares no block, so the ladder falls through to
+	// the workflow's derived block — the pre-existing precedence, unchanged.
+	implGate := &wf.Stages[1].Gates[0]
+	if got := wf.EffectiveOperatorAgent(implGate); got != wfBlock {
+		t.Errorf("implement-gate resolution = %+v, want the workflow-level derived block", got)
+	}
+}
+
 func TestParse_OperatorAgent_RoundTrip(t *testing.T) {
 	// The fixture declares a workflow-level block and a per-gate
 	// override on the plan stage's approval gate; the implement

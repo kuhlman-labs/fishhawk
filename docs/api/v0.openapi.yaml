@@ -1257,6 +1257,97 @@ components:
           example: gating_reviewer_reject
         model_policy:
           $ref: '#/components/schemas/RunDelegationModelPolicy'
+        autonomy:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            The workflow-v2 autonomy TIER the effective block declared
+            (ADR-066 / #2222), omitted when the block declared only
+            `actions`. **workflow-v2 only**: populated solely for a run
+            whose cached workflow spec routes to major >= 2. A
+            campaign-level `operator_agent` override is a delegation
+            INPUT, not a grammar version, so a v0/v1 run driven by one
+            still surfaces through `actions` / `must_page_human` /
+            `reviewer_reject_class` exactly as before — its response is
+            byte-identical to a v0/v1 run with no override.
+          example: medium
+        matrix:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunDelegationMatrixEntry'
+          description: |
+            The RESOLVED action matrix (ADR-066 / #2222): every action
+            class with its mode and the provenance of that mode. This is
+            the legibility surface — an operator reading
+            `approve: gated (tier)` sees WHY an action is not delegated
+            — and is independent of `actions`, which still lists only the
+            classes the block actually delegates. An all-`gated` matrix
+            therefore carries five entries and ZERO actions, exactly as a
+            knob-absent v0 block did. workflow-v2 only, per `autonomy`.
+
+    RunDelegationMatrixEntry:
+      type: object
+      description: |
+        One resolved action CLASS (ADR-066 / #2222). The class vocabulary
+        is the spec's (`fixup`, not the `route_fixup` verb the evaluated
+        `actions` list uses) because this is the declared matrix reflected
+        back, not an evaluation. Extension classes (ADR-065) appear here
+        too, after the five known classes.
+      required: [action, mode, source]
+      properties:
+        action:
+          type: string
+          description: |
+            The action class name. The five backend-evaluable classes are
+            `approve`, `fixup`, `waive`, `retry`, `merge`; the set is open
+            and per-workflow-type extensible.
+          example: approve
+        mode:
+          type: string
+          enum: [report, gated, auto]
+          description: |
+            `gated` — the human acts (the fail-closed default an unlisted
+            class resolves to, and exactly what knob-absence meant in
+            v0/v1). `auto` — the operator agent may act under `condition`.
+            `report` — the operator agent surfaces a PROPOSAL without
+            acting: a `run_auto_driven` `act:"report"` audit row is
+            emitted at a live gate (at most once per gate occurrence) and
+            no gate action is dispatched.
+          example: gated
+        condition:
+          type: string
+          enum:
+            - clean_dual_approval
+            - convergent_concerns
+            - solo_low
+            - infra_flake
+            - gates_resolved_ci_green
+          description: |
+            The backend-evaluable condition the class acts under. Required
+            by the grammar for `mode: auto`; optional on `mode: report`,
+            where it narrows firing (a report entry fires when the gate is
+            live and, when a condition is declared, additionally requires
+            it to be met). Omitted for `mode: gated`.
+        min_severity:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            The `fixup` class's open-concern threshold (v0/v1's
+            `route_fixup_min_severity`, moved onto the class it governs).
+            Omitted elsewhere.
+        source:
+          type: string
+          enum: [explicit, tier, default]
+          description: |
+            PROVENANCE — which input decided this class's mode:
+            `explicit` (an `actions` entry named the class, or a campaign
+            override supplied the whole block), `tier` (the `autonomy`
+            shorthand expansion), or `default` (nothing named it, so it
+            fell to the fail-closed `gated` default). The value set is
+            open-ended so a later composition rung (#2267's min(workflow
+            tier, issue label, escalation ceiling)) can record its clamp
+            without reshaping the field.
+          example: tier
 
     RunDelegationModelPolicy:
       type: object
@@ -1337,6 +1428,20 @@ components:
             The exact failed predicate when `met` is false, prefixed
             with the condition name. Omitted when met.
           example: "clean_dual_approval: 1 of 2 reviewer verdicts received"
+        mode:
+          type: string
+          enum: [report, gated, auto]
+          description: |
+            The workflow-v2 mode the class resolved to (ADR-066 / #2222).
+            Always `auto` here — an evaluated action is by definition a
+            delegated one. workflow-v2 only: omitted below major 2, where
+            there is no matrix, keeping v0/v1 responses byte-identical.
+        source:
+          type: string
+          enum: [explicit, tier, default]
+          description: |
+            The provenance of this class's mode, per
+            `RunDelegationMatrixEntry.source`. workflow-v2 only.
 
     Campaign:
       type: object
@@ -5309,15 +5414,19 @@ paths:
         '200':
           description: |
             The gate outcome. A non-observe-only outcome is exactly one of
-            three kinds — `acted`, `paged`, or `decision_required` (an
+            four kinds — `acted`, `paged`, `decision_required` (an
             exhausted fix-up budget/ceiling on the delegated `route_fixup`
-            arm the driver must STOP on and hand to the operator, #2091);
-            observe-only has all three false.
+            arm the driver must STOP on and hand to the operator, #2091),
+            or `reported` (a workflow-v2 `mode: report` class surfaced a
+            proposal without acting, #2222); observe-only has all four
+            false. A driver that switches only on the first three keeps
+            polling through a `reported` outcome, which is the intent — a
+            report is a proposal, not a hand-off.
           content:
             application/json:
               schema:
                 type: object
-                required: [acted, paged, decision_required, note]
+                required: [acted, paged, decision_required, reported, note]
                 properties:
                   acted: { type: boolean, description: 'True when a delegated gate action was dispatched.' }
                   action: { type: string, description: 'The delegation verb taken (approve|route_fixup|retry|merge), set when acted or when decision_required surfaced from that arm.' }
@@ -5325,6 +5434,7 @@ paths:
                   page_event: { type: string, description: 'The page event name, set when paged.' }
                   decision_required: { type: boolean, description: 'True when the actor could not auto-act on a well-defined, expected gate state and hands it to the operator (distinct from observe-only, which keeps polling). #2091.' }
                   decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required (e.g. fixup_budget_exhausted, fixup_ceiling_reached).' }
+                  reported: { type: boolean, description: 'True when a workflow-v2 `mode: report` class surfaced a proposal at a live gate (#2222): a run_auto_driven act:report row was appended (at most once per gate occurrence), `action` names the verb the class governs, and nothing was dispatched or paged. The driver keeps polling.' }
                   note: { type: string, description: 'Short human-readable summary of the outcome.' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':

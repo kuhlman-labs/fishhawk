@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // CategoryRunAutoDriven is the audit-log category for the SUPPLEMENTARY
@@ -38,6 +39,17 @@ const CategoryRunAutoDriven = "run_auto_driven"
 const (
 	autoDriveActGate     = "gate"
 	autoDriveActDispatch = "dispatch"
+	// autoDriveActReport tags the workflow-v2 `mode: report` row (ADR-066 /
+	// #2222): the driver surfaced a PROPOSAL at a live gate and acted on
+	// nothing. It reuses the run_auto_driven category deliberately — a new
+	// act value, not a new audit kind, so the category completeness table and
+	// docs/issue-comment-surfaces.md are untouched.
+	autoDriveActReport = "report"
+
+	// autoDriveSourceGate tags the report row: the act came from the
+	// in-process gate actor (AutoDriveRunGate), which both the endpoint and
+	// the campaign driver call.
+	autoDriveSourceGate = "auto_drive_gate"
 
 	// autoDriveSourceEndpoint tags the gate-act row: the act was dispatched
 	// by the POST /v0/runs/{run_id}/auto-drive endpoint.
@@ -69,6 +81,11 @@ var autoDriveDispatchStages = map[string]struct{}{
 // (an exhausted fix-up budget / ceiling on the delegated route_fixup arm): the
 // driver STOPS and hands the gate to the operator rather than the endpoint
 // returning a 500.
+// reported carries the workflow-v2 `mode: report` outcome (#2222): a
+// proposal was surfaced as a run_auto_driven act:report row and nothing was
+// acted on. acted / paged / decision_required all stay false, so a driver
+// that switches only on those keeps polling — no client change is needed to
+// consume it.
 type autoDriveResponse struct {
 	Acted            bool   `json:"acted"`
 	Action           string `json:"action,omitempty"`
@@ -76,6 +93,7 @@ type autoDriveResponse struct {
 	PageEvent        string `json:"page_event,omitempty"`
 	DecisionRequired bool   `json:"decision_required"`
 	DecisionState    string `json:"decision_state,omitempty"`
+	Reported         bool   `json:"reported"`
 	Note             string `json:"note"`
 }
 
@@ -356,6 +374,74 @@ func (s *Server) appendRunAutoDrivenGate(ctx context.Context, runRow *run.Run, i
 		Payload:      payload,
 	})
 	return err
+}
+
+// appendRunAutoDrivenReport appends the run_auto_driven act:"report" row for
+// a workflow-v2 `mode: report` class that surfaced a proposal at a live gate
+// (ADR-066 / #2222). NOTHING was acted on, so the row IS the whole output —
+// unlike the gate row, which supplements the action's own audit record.
+//
+// The occurrence key is recorded on the row because it is what
+// reportAlreadyEmitted matches on: the dedupe state lives in the audit chain
+// itself rather than in driver memory, so a restarted / re-elected driver
+// cannot re-flood a gate it already reported.
+func (s *Server) appendRunAutoDrivenReport(ctx context.Context, runRow *run.Run, id Identity, action string, entry spec.ResolvedAction, occurrence, note string) error {
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	kind := actorKindForSubject(subject)
+	fields := map[string]any{
+		"act":        autoDriveActReport,
+		"action":     action,
+		"class":      entry.Action,
+		"occurrence": occurrence,
+		"source":     autoDriveSourceGate,
+		"note":       note,
+	}
+	if entry.Condition != "" {
+		fields["condition"] = string(entry.Condition)
+	}
+	payload, _ := json.Marshal(fields)
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runRow.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryRunAutoDriven,
+		ActorKind:    &kind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	})
+	return err
+}
+
+// autoDrivenReportPayload is the subset of a run_auto_driven payload the
+// report dedupe reads back.
+type autoDrivenReportPayload struct {
+	Act        string `json:"act"`
+	Action     string `json:"action"`
+	Occurrence string `json:"occurrence"`
+}
+
+// reportAlreadyEmitted reports whether an act:"report" row already exists for
+// this (run, gate occurrence, action) — the idempotency key that holds the
+// report to AT MOST ONCE per gate occurrence. A read error is returned, never
+// swallowed: the caller must skip the report rather than emit a row it could
+// not prove is the first.
+func (s *Server) reportAlreadyEmitted(ctx context.Context, runRow *run.Run, action, occurrence string) (bool, error) {
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryRunAutoDriven)
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		var p autoDrivenReportPayload
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if p.Act == autoDriveActReport && p.Action == action && p.Occurrence == occurrence {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // appendRunAutoDrivenDispatch appends the run_auto_driven act:"dispatch"

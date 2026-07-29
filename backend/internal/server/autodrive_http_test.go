@@ -589,3 +589,46 @@ func seedMergeReadyRun(t *testing.T, s *Server, repo *autoDriveRepo, au *auditFa
 	seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
 	return runID
 }
+
+// --- (11) reported: workflow-v2 mode: report (ADR-066 / #2222) --------------
+
+// TestAutoDrive_Reported_EndToEnd drives a `mode: report` class through the
+// endpoint: the response carries reported:true with acted / paged /
+// decision_required all false — so a driver switching only on those keeps
+// polling, no client change required — and exactly ONE run_auto_driven row
+// landed, carrying act:report and the gate-actor source (the endpoint appends
+// no second, act:gate row: nothing was acted on).
+func TestAutoDrive_Reported_EndToEnd(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+
+	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveOperatorIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var out autoDriveResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Reported || out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want reported approve", out)
+	}
+	if out.Acted || out.Paged || out.DecisionRequired {
+		t.Errorf("outcome = %+v; a report neither acts, pages nor parks", out)
+	}
+	row, fields := autoDrivenActRow(t, au)
+	assertOperatorActor(t, row)
+	if fields["act"] != autoDriveActReport {
+		t.Errorf("run_auto_driven act = %v, want %q", fields["act"], autoDriveActReport)
+	}
+	if fields["source"] != autoDriveSourceGate {
+		t.Errorf("run_auto_driven source = %v, want %q", fields["source"], autoDriveSourceGate)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 0 {
+		t.Errorf("approval_submitted rows = %d, want 0", n)
+	}
+}

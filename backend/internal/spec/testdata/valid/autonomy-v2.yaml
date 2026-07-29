@@ -1,0 +1,70 @@
+# workflow-v2 unified autonomy grammar (ADR-066 / E52.10 / #2222).
+#
+# Exercises both placement levels and the open class-name set:
+#
+#   * workflow level: the `autonomy: medium` tier shorthand PLUS an
+#     explicit `actions` block that TIGHTENS one class the tier delegates
+#     (approve -> gated) and tunes another (fixup.min_severity), leaving
+#     retry at the tier's auto. Both reserved keys are declared alongside
+#     the class entries, so the schema's properties-vs-additionalProperties
+#     split and the Go partitioning unmarshaller are both exercised.
+#   * gate level: the plan gate declares its OWN block, which wins
+#     WHOLESALE — merge is auto there, and every class the gate does not
+#     name falls to the fail-closed `mode: gated` default rather than
+#     inheriting the workflow's medium tier.
+#   * an EXTENSION class (`promote`) at `mode: report` — accepted by the
+#     open class-name set, delegating nothing.
+version: "2"
+workflows:
+  feature_change:
+    description: "Autonomy tier shorthand with per-class overrides and a wholesale gate block."
+    autonomy: medium
+    actions:
+      approve:
+        mode: gated
+      fixup:
+        mode: auto
+        when: convergent_concerns
+        min_severity: high
+      promote:
+        mode: report
+      page_human_on:
+        - gating_reviewer_reject
+        - budget_override
+      model_policy:
+        strategy: explicit_defaults
+        defaults:
+          plan: claude-opus-4-8
+          implement: claude-sonnet-4-6
+          review: gpt-5.5
+        allowed:
+          - claude-opus-4-8
+          - claude-sonnet-4-6
+          - gpt-5.5
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+            actions:
+              merge:
+                mode: auto
+                when: gates_resolved_ci_green
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvals:
+              count: 1

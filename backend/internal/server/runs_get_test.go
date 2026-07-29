@@ -18,11 +18,13 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 func TestGetRun_HappyPath(t *testing.T) {
@@ -2043,4 +2045,302 @@ func TestGetRun_NoLiveValidation_OmitsBlock(t *testing.T) {
 	if _, ok := raw["live_validation"]; ok {
 		t.Errorf("no marker should omit live_validation: %v", raw)
 	}
+}
+
+// --- workflow-v2 autonomy matrix on the wire (ADR-066 / E52.10 / #2222) -----
+
+// v2AutonomySpecYAML is a workflow-v2 document declaring `autonomy: medium`
+// PLUS one explicit entry that CONTRADICTS the tier (approve -> gated). The
+// contradiction is the point: a seam that dropped the explicit entry (the
+// partitioning-unmarshaller defect class) would resolve approve back to the
+// tier's `auto` and the assertions below would catch it end to end.
+const v2AutonomySpecYAML = `version: "2"
+workflows:
+  feature_change:
+    autonomy: medium
+    actions:
+      approve:
+        mode: gated
+      fixup:
+        mode: auto
+        when: convergent_concerns
+        min_severity: high
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// rawDelegation returns the delegation block from a raw response body.
+func rawDelegation(t *testing.T, raw map[string]any) map[string]any {
+	t.Helper()
+	deleg, ok := raw["delegation"].(map[string]any)
+	if !ok {
+		t.Fatalf("delegation block not an object in raw body: %v", raw["delegation"])
+	}
+	return deleg
+}
+
+// TestGetRun_Delegation_V2AutonomyMatrix_SpecToWire is the cross-boundary
+// seam test for the v2 autonomy grammar: a REAL workflow-v2 document goes
+// through spec.ParseBytes (deriving the OperatorAgent) -> delegation.Evaluate
+// -> buildDelegationPayload, and the response's autonomy / matrix / actions
+// must all agree with what the document declared — including the explicit
+// entry that contradicts the tier. A delegated approve is then asserted
+// REFUSED, because a `mode: gated` class delegates nothing.
+func TestGetRun_Delegation_V2AutonomyMatrix_SpecToWire(t *testing.T) {
+	s, repo, _, _, ar := newDelegatedApprovalServer(t)
+	runID, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": v2AutonomySpecYAML,
+	})
+
+	resp, raw := getRunResponse(t, s, runID)
+	if resp.Delegation == nil {
+		t.Fatal("delegation block missing")
+	}
+	if resp.Delegation.Autonomy != "medium" {
+		t.Errorf("autonomy = %q, want medium", resp.Delegation.Autonomy)
+	}
+	if deleg := rawDelegation(t, raw); deleg["autonomy"] != "medium" {
+		t.Errorf("raw autonomy = %v, want medium", deleg["autonomy"])
+	}
+
+	wantMatrix := map[string]struct{ mode, source, condition string }{
+		"approve": {"gated", "explicit", ""},
+		"fixup":   {"auto", "explicit", "convergent_concerns"},
+		"retry":   {"auto", "tier", "infra_flake"},
+		"waive":   {"gated", "tier", ""},
+		"merge":   {"gated", "tier", ""},
+	}
+	got := map[string]runDelegationMatrixPayload{}
+	for _, m := range resp.Delegation.Matrix {
+		got[m.Action] = m
+	}
+	if len(got) != len(wantMatrix) {
+		t.Fatalf("matrix = %+v, want %d classes", resp.Delegation.Matrix, len(wantMatrix))
+	}
+	for class, want := range wantMatrix {
+		m, ok := got[class]
+		if !ok {
+			t.Errorf("matrix entry for %q missing", class)
+			continue
+		}
+		if m.Mode != want.mode || m.Source != want.source || m.Condition != want.condition {
+			t.Errorf("matrix[%s] = mode %q source %q condition %q, want %q/%q/%q",
+				class, m.Mode, m.Source, m.Condition, want.mode, want.source, want.condition)
+		}
+	}
+	if got["fixup"].MinSeverity != "high" {
+		t.Errorf("matrix[fixup].min_severity = %q, want high", got["fixup"].MinSeverity)
+	}
+
+	// The EVALUATED action list carries only what is delegated: approve is
+	// explicitly gated, so it is absent; route_fixup and retry ride the tier.
+	for _, a := range resp.Delegation.Actions {
+		if a.Action == "approve" {
+			t.Errorf("approve present in actions (%+v); explicit `mode: gated` delegates nothing", a)
+		}
+	}
+	fixup := delegationAction(t, resp, "route_fixup")
+	if fixup.Mode != "auto" || fixup.Source != "explicit" {
+		t.Errorf("route_fixup mode/source = %q/%q, want auto/explicit", fixup.Mode, fixup.Source)
+	}
+	if retry := delegationAction(t, resp, "retry"); retry.Mode != "auto" || retry.Source != "tier" {
+		t.Errorf("retry mode/source = %q/%q, want auto/tier", retry.Mode, retry.Source)
+	}
+
+	// End of the seam: a delegated approve on the gated class is REFUSED.
+	w := submitApproval(t, s, planStage.ID, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("delegated approve status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
+		t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+	}
+	if rows, _ := ar.ListForStage(context.Background(), planStage.ID); len(rows) != 0 {
+		t.Errorf("approval rows = %d after refusal, want 0", len(rows))
+	}
+}
+
+// v2AllGatedSpecYAML is an all-gated v2 workflow (`autonomy: low`): every
+// action class resolves to `mode: gated`, so the derived OperatorAgent carries
+// an EMPTY knob for all five verbs — the all-gated-equals-knob-absence case.
+const v2AllGatedSpecYAML = `version: "2"
+workflows:
+  feature_change:
+    autonomy: low
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestCheckDelegation_AllGatedV2_RefusesEveryPath is AC5's missing per-path
+// refusal assertion. The plan claimed each of the five enforcement paths is
+// asserted to refuse when its class is gated, but only the delegated approve
+// path was driven end-to-end; the other four (route_fixup, waive, retry,
+// merge) were covered only transitively. All five funnel through
+// checkDelegation, so this drives it directly for every verb against an
+// all-gated (`autonomy: low`) v2 run and asserts each REFUSES with 403
+// delegation_not_configured — the derived empty knob delegating nothing.
+func TestCheckDelegation_AllGatedV2_RefusesEveryPath(t *testing.T) {
+	s, repo, _, _, _ := newDelegatedApprovalServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": v2AllGatedSpecYAML,
+	})
+
+	for _, action := range []string{
+		delegation.ActionApprove,
+		delegation.ActionRouteFixup,
+		delegation.ActionWaive,
+		delegation.ActionRetry,
+		delegation.ActionMerge,
+	} {
+		t.Run(action, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/", nil)
+			rule, ok := s.checkDelegation(w, r, runID, action)
+			if ok || rule != "" {
+				t.Fatalf("checkDelegation(%s) = (%q, %v), want refused", action, rule, ok)
+			}
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+			}
+			if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
+				t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+			}
+		})
+	}
+}
+
+// TestDelegationPayload_V0CampaignOverride_ByteIdentical is the binding
+// approval condition 3 assertion: a v0/v1 run DRIVEN BY A CAMPAIGN OVERRIDE
+// must serialize byte-identically to the same run driven by the same block
+// declared on the workflow. The override resolves a populated matrix on the
+// Result — a campaign override is a delegation INPUT, not a grammar version —
+// so the major gate, not an empty matrix, is what keeps the response
+// unchanged. The v2 arm proves the gate is the only thing suppressing it.
+func TestDelegationPayload_V0CampaignOverride_ByteIdentical(t *testing.T) {
+	block := &spec.OperatorAgent{
+		MayApprove:    spec.ConditionCleanDualApproval,
+		MayWaive:      spec.ConditionSoloLow,
+		MustPageHuman: []string{spec.PageEventPlanRejection},
+	}
+	parsed, err := spec.ParseBytes([]byte(delegationSpecYAML))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	wf := parsed.Workflows["feature_change"]
+	// The workflow already declares the same block, so the two Results differ
+	// only in HOW the block was resolved.
+	wf.OperatorAgent = block
+
+	runRow := &run.Run{ID: uuid.New(), State: run.StateRunning}
+	stages := []*run.Stage{{ID: uuid.New(), Sequence: 0, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}}
+	ev := &delegation.Evaluator{
+		Stages:   &staticStageLister{stages: stages},
+		Concerns: &staticConcernLister{},
+		Audit:    &staticAuditLister{},
+	}
+	withOverride, err := ev.Evaluate(context.Background(), runRow, &wf, block)
+	if err != nil {
+		t.Fatalf("Evaluate with override: %v", err)
+	}
+	withoutOverride, err := ev.Evaluate(context.Background(), runRow, &wf, nil)
+	if err != nil {
+		t.Fatalf("Evaluate without override: %v", err)
+	}
+	if withOverride.Matrix == nil {
+		t.Fatal("override Result carries no matrix; the condition-3 case would be vacuous")
+	}
+	if withoutOverride.Matrix != nil {
+		t.Fatalf("v0 workflow block resolved a matrix (%+v); v0/v1 has no matrix grammar", withoutOverride.Matrix)
+	}
+
+	marshal := func(p *runDelegationPayload) string {
+		b, merr := json.Marshal(p)
+		if merr != nil {
+			t.Fatalf("marshal payload: %v", merr)
+		}
+		return string(b)
+	}
+	for _, major := range []int{0, 1} {
+		gotOverride := marshal(delegationPayloadFrom(withOverride, major))
+		gotPlain := marshal(delegationPayloadFrom(withoutOverride, major))
+		if gotOverride != gotPlain {
+			t.Errorf("major %d: campaign-override payload differs from the plain one:\n override = %s\n plain    = %s",
+				major, gotOverride, gotPlain)
+		}
+		for _, key := range []string{`"autonomy"`, `"matrix"`, `"mode"`, `"source"`} {
+			if strings.Contains(gotOverride, key) {
+				t.Errorf("major %d: %s present in a v0/v1 response: %s", major, key, gotOverride)
+			}
+		}
+	}
+	// Same Result at major 2: the matrix DOES surface, proving the gate is
+	// what suppressed it above.
+	if v2 := marshal(delegationPayloadFrom(withOverride, 2)); !strings.Contains(v2, `"matrix"`) {
+		t.Errorf("major 2 payload carries no matrix: %s", v2)
+	}
+}
+
+// staticStageLister / staticConcernLister / staticAuditLister are the
+// minimal delegation.Evaluator dependencies the payload-projection test
+// needs; it exercises serialization, not condition evaluation.
+type staticStageLister struct{ stages []*run.Stage }
+
+func (s *staticStageLister) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
+	return s.stages, nil
+}
+
+type staticConcernLister struct{}
+
+func (staticConcernLister) ListOpenByRun(context.Context, uuid.UUID) ([]*concern.Concern, error) {
+	return nil, nil
+}
+
+type staticAuditLister struct{}
+
+func (staticAuditLister) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
+	return nil, nil
 }

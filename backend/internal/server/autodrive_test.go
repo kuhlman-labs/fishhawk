@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -1158,3 +1159,511 @@ func TestFixupEligibleState(t *testing.T) {
 }
 
 var errBoom = errors.New("boom")
+
+// --- mode: report (ADR-066 / E52.10 / #2222) --------------------------------
+
+// v2ReportSpecYAML renders a workflow-v2 document whose workflow-level
+// autonomy block is the caller's, so each report test declares exactly the
+// grammar under test and the DERIVED delegation contract comes from the real
+// parse pipeline.
+func v2ReportSpecYAML(autonomyBlock string) string {
+	return `version: "2"
+workflows:
+  feature_change:
+` + autonomyBlock + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+`
+}
+
+// startAutoDriveRunWithSpec is startAutoDriveRun over an explicit spec
+// document.
+func startAutoDriveRunWithSpec(t *testing.T, s *Server, repo *autoDriveRepo, specYAML string) (uuid.UUID, []*run.Stage) {
+	t.Helper()
+	runID, _ := startDriveE2ERun(t, s, repo.driveE2ERepo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": specYAML,
+	})
+	return runID, repo.stagesFor(runID)
+}
+
+// seedCleanPlanApproval seeds a settled, clean two-agent plan review round —
+// the state `approve` would auto-act on if the class were at mode: auto.
+func seedCleanPlanApproval(t *testing.T, au *auditFake, runID uuid.UUID) {
+	t.Helper()
+	seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+}
+
+// autoDrivenActs returns the act values of every appended run_auto_driven
+// row, in order.
+func autoDrivenActs(t *testing.T, au *auditFake) []string {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []string
+	for i := range au.appended {
+		if au.appended[i].Category != CategoryRunAutoDriven {
+			continue
+		}
+		var p struct {
+			Act string `json:"act"`
+		}
+		if err := json.Unmarshal(au.appended[i].Payload, &p); err != nil {
+			t.Fatalf("unmarshal run_auto_driven payload: %v", err)
+		}
+		out = append(out, p.Act)
+	}
+	return out
+}
+
+// countReportRows counts appended run_auto_driven rows carrying act:report.
+func countReportRows(t *testing.T, au *auditFake) int {
+	t.Helper()
+	n := 0
+	for _, act := range autoDrivenActs(t, au) {
+		if act == autoDriveActReport {
+			n++
+		}
+	}
+	return n
+}
+
+// TestAutoDriveRunGate_ReportMode_SurfacesProposalWithoutActing is the AC4 /
+// F10 behavioural test: `approve: {mode: report}` on an otherwise medium-tier
+// workflow, at a gate whose clean_dual_approval state WOULD have satisfied an
+// auto approve. The actor emits the run_auto_driven act:report attribution
+// row, dispatches nothing, pages nothing, and leaves the run parked exactly
+// where it was — the driver keeps polling.
+func TestAutoDriveRunGate_ReportMode_SurfacesProposalWithoutActing(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	plan := stages[0]
+	seedCleanPlanApproval(t, au, runID)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Reported || out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want reported approve", out)
+	}
+	if out.Acted || out.Paged || out.DecisionRequired {
+		t.Errorf("outcome = %+v; a report acts on nothing and parks nothing", out)
+	}
+	if plan.State != run.StageStateAwaitingApproval {
+		t.Errorf("plan stage = %q, want awaiting_approval (unchanged by a report)", plan.State)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 0 {
+		t.Errorf("approval_submitted rows = %d, want 0", n)
+	}
+	if n := countAudit(au, CategoryCampaignGatePaged); n != 0 {
+		t.Errorf("campaign_gate_paged rows = %d, want 0 (a report is not a page)", n)
+	}
+	e := auditEntry(t, au, CategoryRunAutoDriven)
+	assertOperatorActor(t, e)
+	var p struct {
+		Act        string `json:"act"`
+		Action     string `json:"action"`
+		Class      string `json:"class"`
+		Occurrence string `json:"occurrence"`
+	}
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		t.Fatalf("unmarshal report payload: %v", err)
+	}
+	if p.Act != autoDriveActReport || p.Action != delegation.ActionApprove || p.Class != spec.ActionApprove {
+		t.Errorf("report payload = %+v, want act report / action approve / class approve", p)
+	}
+	if p.Occurrence == "" {
+		t.Error("report payload carries no occurrence key; the dedupe has nothing to match on")
+	}
+}
+
+// TestAutoDrive_ReportMode_EmitsAtMostOncePerGateOccurrence is binding
+// approval condition 2: the driver keeps POLLING a live gate, so an
+// unguarded report arm would append a row on every pass and flood the audit
+// trail. Three passes over the same live gate must leave exactly ONE
+// act:report row. A single-invocation test cannot catch this.
+func TestAutoDrive_ReportMode_EmitsAtMostOncePerGateOccurrence(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+
+	reported := 0
+	for i := 0; i < 3; i++ {
+		out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+		if err != nil {
+			t.Fatalf("AutoDriveRunGate pass %d: %v", i+1, err)
+		}
+		if out.Reported {
+			reported++
+		}
+		if out.Acted || out.Paged {
+			t.Fatalf("pass %d outcome = %+v; a report gate must not act or page", i+1, out)
+		}
+	}
+	if reported != 1 {
+		t.Errorf("reported outcomes = %d over 3 passes, want 1", reported)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows = %d after 3 passes, want exactly 1 (acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestAutoDrive_ReportMode_ReopenedGateResurfaces is binding condition 2's
+// counterpart to the flooding guard: the idempotency key holds ONE row per
+// gate OCCURRENCE, not one for the life of the stage. A gate that closes and
+// re-opens on a FRESH review round (a fix-up round trip) is a NEW occurrence
+// and MUST re-surface the proposal — otherwise an operator relying on report
+// mode never sees the proposal for the materially-changed round.
+func TestAutoDrive_ReportMode_ReopenedGateResurfaces(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+
+	// First occurrence: the plan gate is live on its first review round.
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 1 outcome = %+v, want reported", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+	// A re-poll of the SAME occurrence adds nothing (the flooding guard).
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no second report on the same occurrence", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after re-poll = %d, want still 1", n)
+	}
+
+	// The gate closes and RE-OPENS on a fresh review round (a fix-up round
+	// trip). The new round is a DISTINCT occurrence: the proposal re-surfaces.
+	seedReviewEntry(t, au, runID, 4, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 2: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 2 outcome = %+v, want the proposal re-surfaced on the new occurrence", out)
+	}
+	if n := countReportRows(t, au); n != 2 {
+		t.Errorf("act:report rows after re-open = %d, want 2 (one per occurrence; acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestReportMatrixProposals_ConcurrentEmitsOnce is binding condition 2 under
+// CONCURRENCY (the POST /auto-drive endpoint and the campaign driver are both
+// in-process callers): many concurrent report evaluations of the same live
+// gate must still leave exactly ONE act:report row. A read-then-append with no
+// serialization lets two callers both observe "no row yet" and both append;
+// the dedupe-check -> append section is stripe-locked per run, so the race
+// resolves to a single row and a single Reported outcome.
+func TestReportMatrixProposals_ConcurrentEmitsOnce(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+	runRow := getRun(t, repo, runID)
+	res, _, ok := s.evaluateRunDelegation(context.Background(), runRow, nil)
+	if !ok || res == nil {
+		t.Fatalf("evaluateRunDelegation ok=%v res=%v", ok, res)
+	}
+
+	const drivers = 12
+	var wg sync.WaitGroup
+	reported := make([]bool, drivers)
+	wg.Add(drivers)
+	for i := 0; i < drivers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			out, _ := s.reportMatrixProposals(context.Background(), runRow, campaignOperatorIdentity(), res, stages, nil)
+			reported[i] = out.Reported
+		}(i)
+	}
+	wg.Wait()
+
+	got := 0
+	for _, r := range reported {
+		if r {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Errorf("reported outcomes = %d across %d concurrent drivers, want 1", got, drivers)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows = %d after concurrent drivers, want exactly 1 (acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestAutoDriveRunGate_ReportMode_ExtensionClassNeverReports: an extension
+// class has no backend-observable gate, so it can never be live and never
+// reports — the same fail-closed-by-construction posture that rejects
+// `mode: auto` on it at parse time.
+func TestAutoDriveRunGate_ReportMode_ExtensionClassNeverReports(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      promote:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Reported {
+		t.Errorf("outcome = %+v, want no report for an extension class", out)
+	}
+	if n := countReportRows(t, au); n != 0 {
+		t.Errorf("act:report rows = %d, want 0", n)
+	}
+}
+
+// TestAutoDriveRunGate_ReportMode_GateNotLive: the firing rule is gate-LIVE,
+// so a report class whose gate is not reachable surfaces nothing. Here the
+// plan gate has been cleared, leaving no stage awaiting approval.
+func TestAutoDriveRunGate_ReportMode_GateNotLive(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      approve:
+        mode: report`))
+	stages[0].State = run.StageStateSucceeded
+	seedCleanPlanApproval(t, au, runID)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Reported {
+		t.Errorf("outcome = %+v, want no report with no live gate", out)
+	}
+	if n := countReportRows(t, au); n != 0 {
+		t.Errorf("act:report rows = %d, want 0", n)
+	}
+}
+
+// TestAutoDriveRunGate_ReportMode_DeclaredConditionUnmet: when a report entry
+// DOES declare a `when`, the condition must additionally be met. Here the
+// gate is live but no reviewer verdicts landed, so clean_dual_approval is
+// unmet and nothing is surfaced.
+func TestAutoDriveRunGate_ReportMode_DeclaredConditionUnmet(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      approve:
+        mode: report
+        when: clean_dual_approval`))
+	_ = runID
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Reported {
+		t.Errorf("outcome = %+v, want no report while the declared condition is unmet", out)
+	}
+	if n := countReportRows(t, au); n != 0 {
+		t.Errorf("act:report rows = %d, want 0", n)
+	}
+}
+
+// reportDedupeErrAudit fails ONLY the run_auto_driven category read the
+// report dedupe performs, leaving the review-round reads the evaluator makes
+// intact — so the test exercises the dedupe's read-failure branch and not an
+// evaluation failure upstream of it.
+type reportDedupeErrAudit struct {
+	*auditFake
+	err error
+}
+
+func (a *reportDedupeErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == CategoryRunAutoDriven {
+		return nil, a.err
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestAutoDriveRunGate_ReportMode_DedupeReadErrorSkips: an unreadable audit
+// chain makes "have I already reported this occurrence" unanswerable, so the
+// actor skips the report rather than risk flooding the trail — fail-closed
+// toward silence, since a report grants no authority to begin with.
+func TestAutoDriveRunGate_ReportMode_DedupeReadErrorSkips(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+	s.cfg.AuditRepo = &reportDedupeErrAudit{auditFake: au, err: errors.New("boom")}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Reported {
+		t.Errorf("outcome = %+v, want no report when the dedupe read failed", out)
+	}
+	if n := countReportRows(t, au); n != 0 {
+		t.Errorf("act:report rows = %d, want 0", n)
+	}
+}
+
+// TestAutoDriveRunGate_ReportMode_AppendFailureNotReported: a failed append
+// must not be reported as if the row had landed — the outcome falls through
+// to observe-only, so the driver's next pass retries the proposal.
+func TestAutoDriveRunGate_ReportMode_AppendFailureNotReported(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+	au.appendErrCategory = CategoryRunAutoDriven
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Reported {
+		t.Errorf("outcome = %+v, want no report when the append failed", out)
+	}
+	if n := countReportRows(t, au); n != 0 {
+		t.Errorf("act:report rows = %d, want 0", n)
+	}
+}
+
+// TestReportGateOccurrence_PerClassLiveness pins the report arm's liveness
+// derivation for EVERY class, not just the approve path the end-to-end tests
+// drive: each class is live only where the corresponding action could
+// actually be taken, the occurrence key identifies THAT gate, and a class
+// with no live gate reports nothing.
+func TestReportGateOccurrence_PerClassLiveness(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New()}
+	pr := "https://github.com/x/y/pull/7"
+	planGated := mkAutoDriveStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)
+	implGated := mkAutoDriveStage(1, run.StageTypeImplement, run.StageStateAwaitingApproval)
+	implFailed := mkAutoDriveStage(1, run.StageTypeImplement, run.StageStateFailed)
+	catA := run.FailureCategory("A")
+	reason := "verify_infra_flake_retry"
+	implFailed.FailureCategory = &catA
+	implFailed.FailureReason = &reason
+	someConcern := []*concern.Concern{{ID: uuid.New(), Severity: "low"}}
+
+	cases := []struct {
+		name       string
+		action     string
+		runRow     *run.Run
+		stages     []*run.Stage
+		open       []*concern.Concern
+		wantLive   bool
+		wantAnchor *run.Stage
+	}{
+		{"approve at a gated review stage", delegation.ActionApprove, runRow, []*run.Stage{planGated}, nil, true, planGated},
+		{"approve with no gate", delegation.ActionApprove, runRow, []*run.Stage{implFailed}, nil, false, nil},
+		{"fixup with an eligible implement stage and a concern", delegation.ActionRouteFixup, runRow, []*run.Stage{implGated}, someConcern, true, implGated},
+		{"fixup with no open concern", delegation.ActionRouteFixup, runRow, []*run.Stage{implGated}, nil, false, nil},
+		{"waive at the approval gate with a concern", delegation.ActionWaive, runRow, []*run.Stage{planGated}, someConcern, true, planGated},
+		{"waive with no concern", delegation.ActionWaive, runRow, []*run.Stage{planGated}, nil, false, nil},
+		{"retry with a retryable failure", delegation.ActionRetry, runRow, []*run.Stage{implFailed}, nil, true, implFailed},
+		{"retry with no failed stage", delegation.ActionRetry, runRow, []*run.Stage{planGated}, nil, false, nil},
+		{"merge with an open PR and no pending gate", delegation.ActionMerge,
+			&run.Run{ID: runRow.ID, PullRequestURL: &pr}, []*run.Stage{mkAutoDriveStage(0, run.StageTypePlan, run.StageStateSucceeded)}, nil, true, nil},
+		{"merge with a gate still open", delegation.ActionMerge,
+			&run.Run{ID: runRow.ID, PullRequestURL: &pr}, []*run.Stage{planGated}, nil, false, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			occ, anchor, live := reportGateOccurrence(tc.action, tc.runRow, tc.stages, tc.open)
+			if live != tc.wantLive {
+				t.Fatalf("live = %v, want %v (occurrence %q)", live, tc.wantLive, occ)
+			}
+			if !live {
+				if occ != "" {
+					t.Errorf("occurrence = %q on a non-live gate, want empty", occ)
+				}
+				if anchor != nil {
+					t.Errorf("anchor = %+v on a non-live gate, want nil", anchor)
+				}
+				return
+			}
+			if anchor != tc.wantAnchor {
+				t.Errorf("anchor = %+v, want %+v", anchor, tc.wantAnchor)
+			}
+			want := "run:" + tc.runRow.ID.String() + ":merge_ready"
+			if tc.wantAnchor != nil {
+				want = stageOccurrence(tc.wantAnchor)
+			}
+			if occ != want {
+				t.Errorf("occurrence = %q, want %q", occ, want)
+			}
+		})
+	}
+}
+
+// mkAutoDriveStage builds a stage row for the pure liveness table above.
+func mkAutoDriveStage(seq int, typ run.StageType, state run.StageState) *run.Stage {
+	return &run.Stage{ID: uuid.New(), Sequence: seq, Type: typ, State: state}
+}
+
+// TestReportMatrixProposals_NoAuditRepo: with no audit repository there is
+// nowhere to record a proposal, so the arm reports nothing rather than
+// claiming an unrecorded one.
+func TestReportMatrixProposals_NoAuditRepo(t *testing.T) {
+	s, repo, _, _ := newAutoDriveServer(t)
+	s.cfg.AuditRepo = nil
+	res := &delegation.Result{Matrix: []spec.ResolvedAction{{Action: spec.ActionApprove, Mode: spec.ModeReport, Source: spec.SourceExplicit}}}
+	stages := []*run.Stage{mkAutoDriveStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+	_ = repo
+
+	out, reported := s.reportMatrixProposals(context.Background(), &run.Run{ID: uuid.New()},
+		campaignOperatorIdentity(), res, stages, nil)
+	if reported || out.Reported {
+		t.Errorf("out = %+v reported = %v, want no report with no audit repository", out, reported)
+	}
+}

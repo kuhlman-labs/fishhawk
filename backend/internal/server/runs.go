@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -268,15 +269,49 @@ type runDelegationPayload struct {
 	// Omitted when the block declares no model_policy, keeping
 	// unconfigured responses byte-identical to today.
 	ModelPolicy *runDelegationModelPolicyPayload `json:"model_policy,omitempty"`
+	// Autonomy is the workflow-v2 autonomy TIER the effective block declared
+	// (ADR-066 / #2222), omitted when the block declared only `actions`.
+	//
+	// Autonomy and Matrix are populated ONLY for a run whose cached workflow
+	// spec routes to major >= 2. A campaign-level operator_agent override is
+	// a delegation INPUT, not a grammar version, so a v0/v1 run driven by one
+	// keeps surfacing through actions / must_page_human / reviewer_reject_class
+	// exactly as today — its response stays byte-identical.
+	Autonomy string `json:"autonomy,omitempty"`
+	// Matrix is the resolved action matrix: every action class with its mode
+	// and the provenance of that mode. It is the LEGIBILITY surface — an
+	// operator reading `approve: gated (tier)` sees why an action is not
+	// delegated — and is independent of actions, which still carries only
+	// the classes the block actually delegates.
+	Matrix []runDelegationMatrixPayload `json:"matrix,omitempty"`
 }
 
 // runDelegationActionPayload is one knob's evaluation on the wire.
 // unmet_reason names the exact failed predicate when met is false.
+//
+// mode/source carry the workflow-v2 provenance of the class the knob came
+// from and, like the payload's autonomy/matrix fields, are populated only
+// for a routed major >= 2 — a v0/v1 knob block has no matrix, and its
+// response stays byte-identical to today.
 type runDelegationActionPayload struct {
 	Action      string `json:"action"`
 	Condition   string `json:"condition"`
 	Met         bool   `json:"met"`
 	UnmetReason string `json:"unmet_reason,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+	Source      string `json:"source,omitempty"`
+}
+
+// runDelegationMatrixPayload is one resolved action CLASS on the wire
+// (ADR-066 / #2222). The class vocabulary is the spec's (fixup, not the
+// route_fixup verb the evaluated actions list uses) because this is the
+// declared matrix reflected back, not an evaluation.
+type runDelegationMatrixPayload struct {
+	Action      string `json:"action"`
+	Mode        string `json:"mode"`
+	Condition   string `json:"condition,omitempty"`
+	MinSeverity string `json:"min_severity,omitempty"`
+	Source      string `json:"source"`
 }
 
 // runDelegationModelPolicyPayload mirrors spec.ModelPolicy on the wire
@@ -1404,6 +1439,40 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 	if res == nil {
 		return nil
 	}
+	return delegationPayloadFrom(res, specVersionMajor(parsed.Version))
+}
+
+// specVersionMajor parses a workflow spec version string's major component
+// the way spec.ParseBytes' schema routing does. A missing / unparseable
+// version yields 0 — the v0 answer, which is also the fail-closed one here:
+// the workflow-v2-only payload fields stay omitted.
+func specVersionMajor(version string) int {
+	majorPart := version
+	if idx := strings.IndexByte(majorPart, '.'); idx >= 0 {
+		majorPart = majorPart[:idx]
+	}
+	major, err := strconv.Atoi(majorPart)
+	if err != nil {
+		return 0
+	}
+	return major
+}
+
+// delegationPayloadFrom projects an evaluated delegation.Result onto the
+// wire payload, gating the workflow-v2 autonomy surface (autonomy, matrix,
+// and each action's mode/source) on major >= 2.
+//
+// That gate is the point: delegation.Result carries a resolved matrix for a
+// v0/v1 run driven by a campaign-level operator_agent override too (the
+// override is projected onto one), and serializing it would change a v0/v1
+// response the moment a campaign drove the run. A campaign override is a
+// delegation INPUT, not a grammar version — so below major 2 the response
+// stays byte-identical to today, override or not.
+func delegationPayloadFrom(res *delegation.Result, major int) *runDelegationPayload {
+	if res == nil {
+		return nil
+	}
+	v2 := major >= 2
 	out := &runDelegationPayload{
 		Actions:             make([]runDelegationActionPayload, 0, len(res.Actions)),
 		MustPageHuman:       res.MustPageHuman,
@@ -1424,11 +1493,29 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 		out.ModelPolicy = mp
 	}
 	for _, d := range res.Actions {
-		out.Actions = append(out.Actions, runDelegationActionPayload{
+		a := runDelegationActionPayload{
 			Action:      d.Action,
 			Condition:   string(d.Condition),
 			Met:         d.Met,
 			UnmetReason: d.UnmetReason,
+		}
+		if v2 {
+			a.Mode = string(d.Mode)
+			a.Source = string(d.Source)
+		}
+		out.Actions = append(out.Actions, a)
+	}
+	if !v2 {
+		return out
+	}
+	out.Autonomy = string(res.Tier)
+	for _, m := range res.Matrix {
+		out.Matrix = append(out.Matrix, runDelegationMatrixPayload{
+			Action:      m.Action,
+			Mode:        string(m.Mode),
+			Condition:   string(m.Condition),
+			MinSeverity: m.MinSeverity,
+			Source:      string(m.Source),
 		})
 	}
 	return out

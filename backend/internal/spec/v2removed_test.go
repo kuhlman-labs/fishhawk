@@ -17,14 +17,23 @@ import (
 // left the generic message in place fails here.
 
 // v2SpecWorkflowLevelPageEvent is a v2 document carrying the legacy bare
-// token in a WORKFLOW-level operator_agent block.
+// token in a WORKFLOW-level `must_page_human` array.
+//
+// The array is NOT nested under an `operator_agent` block, because at v2
+// that block is itself removed (E52.10 / #2222) and the sweep reports the
+// outer removal first — see
+// TestParseV2_OperatorAgentRemovalPrecedesItsInnerLegacyForms. A bare
+// `must_page_human` at a level the v2 schema does not declare it is exactly
+// the shape the sweep's deliberately-over-triggering, NOT-position-aware
+// contract exists to catch: it is what a hand migration of the removed block
+// most often leaves behind, and the schema alone would report it as a generic
+// additionalProperties failure naming no replacement token.
 const v2SpecWorkflowLevelPageEvent = `version: "2"
 workflows:
   feature_change:
-    operator_agent:
-      must_page_human:
-        - budget_override
-        - reviewer_reject
+    must_page_human:
+      - budget_override
+      - reviewer_reject
     stages:
       - id: implement
         type: implement
@@ -33,11 +42,11 @@ workflows:
 `
 
 // v2SpecGateLevelPageEvent is a v2 document carrying the legacy bare token
-// in a PER-GATE operator_agent block — a different nesting site, which the
-// generic walk must reach just as well. The gate uses the forge-neutral
-// `approvals` predicate (the legacy `approvers` allow-list and top-level
-// `roles` map are themselves removed at v2, E52.2 / #2214), so `reviewer_reject`
-// is the ONLY removed form here and the sweep must report it.
+// on a GATE — a different nesting site, which the generic walk must reach
+// just as well. The gate uses the forge-neutral `approvals` predicate (the
+// legacy `approvers` allow-list and top-level `roles` map are themselves
+// removed at v2, E52.2 / #2214), so `reviewer_reject` is the ONLY removed
+// form here and the sweep must report it.
 const v2SpecGateLevelPageEvent = `version: "2"
 workflows:
   feature_change:
@@ -51,9 +60,40 @@ workflows:
             approvals:
               count: 1
               not: [author, agent]
+            must_page_human:
+              - reviewer_reject
+`
+
+// v2SpecOperatorAgentBlock is a v2 document still declaring the REMOVED
+// operator_agent delegation block (E52.10 / #2222) at workflow level.
+const v2SpecOperatorAgentBlock = `version: "2"
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: clean_dual_approval
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// v2SpecGateOperatorAgentBlock declares the removed block on a GATE, the
+// other placement level v0/v1 permitted.
+const v2SpecGateOperatorAgentBlock = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        gates:
+          - type: approval
+            approvals:
+              count: 1
             operator_agent:
-              must_page_human:
-                - reviewer_reject
+              may_merge: gates_resolved_ci_green
 `
 
 // v2SpecReviewersAgentCount is a v2 document carrying the removed bare
@@ -101,6 +141,95 @@ func TestParseV2_RejectsBareReviewerRejectAtGateLevel(t *testing.T) {
 	assertNamesRejectReplacements(t, se.Message)
 	if !strings.Contains(se.Path, "gates") || !strings.Contains(se.Path, "must_page_human") {
 		t.Errorf("Path = %q, want it to locate the gate-level must_page_human member", se.Path)
+	}
+}
+
+// --- E52.10 / #2222: the REMOVED operator_agent delegation block -------------
+//
+// v2 replaces operator_agent.may_* with the `actions` matrix and the
+// `autonomy` tier shorthand. The schema alone rejects the block as an
+// undeclared property of an additionalProperties:false workflow (and an
+// unevaluated property on a gate), naming no replacement — so the sweep
+// reports it with the knob->class mapping instead. F7 in the plan's
+// failure-mode set; the CLI carries the byte-identical message and is
+// asserted in cli/internal/spec.
+
+// TestParseV2_RejectsOperatorAgentBlock asserts a v2 document still
+// declaring the removed block is rejected with a message naming BOTH
+// replacement surfaces and the per-knob mapping, at both placement levels.
+func TestParseV2_RejectsOperatorAgentBlock(t *testing.T) {
+	for name, doc := range map[string]string{
+		"workflow level": v2SpecOperatorAgentBlock,
+		"gate level":     v2SpecGateOperatorAgentBlock,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseBytes([]byte(doc))
+			se := requireSchemaError(t, err)
+			if se.Message != msgV2RemovedOperatorAgent {
+				t.Errorf("Message = %q, want the removed-operator_agent message", se.Message)
+			}
+			for _, want := range []string{"actions", "autonomy", "may_approve -> actions.approve", "mode: gated"} {
+				if !strings.Contains(se.Message, want) {
+					t.Errorf("Message = %q, want it to name %q", se.Message, want)
+				}
+			}
+			if !strings.HasSuffix(se.Path, "/operator_agent") {
+				t.Errorf("Path = %q, want it to end at /operator_agent", se.Path)
+			}
+		})
+	}
+}
+
+// TestParseV2_OperatorAgentRemovalPrecedesItsInnerLegacyForms documents the
+// precedence the walk produces: checkV2RemovedAtNode runs on a node BEFORE
+// recursing into its children, so a v2 document whose removed
+// operator_agent block also carries a bare reviewer_reject reports the
+// OUTER removal. That is the right answer — the block itself has no v2
+// home, so fixing the inner token would leave the document just as invalid.
+func TestParseV2_OperatorAgentRemovalPrecedesItsInnerLegacyForms(t *testing.T) {
+	_, err := ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human:
+        - reviewer_reject
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`))
+	se := requireSchemaError(t, err)
+	if se.Message != msgV2RemovedOperatorAgent {
+		t.Errorf("Message = %q, want the outer removed-operator_agent message", se.Message)
+	}
+}
+
+// TestParse_OperatorAgentStillAcceptedBelowMajor2 is the non-firing branch
+// of the version gate for this form: v0 and v1 still declare the block, and
+// it must still populate the typed struct exactly as before.
+func TestParse_OperatorAgentStillAcceptedBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run(version, func(t *testing.T) {
+			s, err := ParseBytes([]byte(`version: "` + version + `"
+workflows:
+  feature_change:
+    operator_agent:
+      may_approve: clean_dual_approval
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`))
+			if err != nil {
+				t.Fatalf("ParseBytes(v%s operator_agent): %v", version, err)
+			}
+			oa := s.Workflows["feature_change"].OperatorAgent
+			if oa == nil || oa.MayApprove != ConditionCleanDualApproval {
+				t.Errorf("OperatorAgent = %+v, want the declared may_approve knob", oa)
+			}
+		})
 	}
 }
 
@@ -301,16 +430,19 @@ func TestCheckV2RemovedForms_SkipsNonMatchingShapes(t *testing.T) {
 }
 
 // TestParseV2_AcceptsReplacementSurfaces is the v2-accepts branch: the
-// explicit reject tokens plus an agents[] list parse cleanly and populate
-// the typed struct. This is also the DisallowUnknownFields pin — a v2
-// document must still decode into the shared Spec type, which retains the
-// removed fields for v0/v1.
+// explicit reject tokens (now on the `actions` matrix's page_human_on
+// reserved key, E52.10 / #2222) plus an agents[] list parse cleanly and
+// populate the typed struct. This is also the DisallowUnknownFields pin — a
+// v2 document must still decode into the shared Spec type, which retains the
+// removed fields for v0/v1. The MustPageHuman assertion below reads the
+// DERIVED operator_agent block, which is what makes the derivation bridge
+// part of this pin.
 func TestParseV2_AcceptsReplacementSurfaces(t *testing.T) {
 	s, err := ParseBytes([]byte(`version: "2"
 workflows:
   feature_change:
-    operator_agent:
-      must_page_human:
+    actions:
+      page_human_on:
         - advisory_reviewer_reject
         - gating_reviewer_reject
     stages:
@@ -659,6 +791,7 @@ func TestCheckV2RemovedAtNode_FixedOrder(t *testing.T) {
 		"budget":          map[string]any{"max_runtime_minutes": 15},
 		"approvers":       map[string]any{"any_of": []any{"tech_lead"}},
 		"roles":           map[string]any{"tech_lead": map[string]any{"members": []any{"@octocat"}}},
+		"operator_agent":  map[string]any{"may_approve": "clean_dual_approval"},
 	}
 	order := []string{
 		msgV2RemovedReviewerReject,
@@ -668,8 +801,9 @@ func TestCheckV2RemovedAtNode_FixedOrder(t *testing.T) {
 		msgV2RenamedBudgetMaxRuntimeMinutes,
 		msgV2RemovedApprovers,
 		msgV2RemovedRolesMap,
+		msgV2RemovedOperatorAgent,
 	}
-	keys := []string{"must_page_human", "reviewers", "drive", "constraints", "budget", "approvers", "roles"}
+	keys := []string{"must_page_human", "reviewers", "drive", "constraints", "budget", "approvers", "roles", "operator_agent"}
 	for i, want := range order {
 		got := checkV2RemovedAtNode(node, "")
 		if got == nil {

@@ -13,10 +13,11 @@ Reference for `.fishhawk/workflows.yaml` at major version 2. The canonical schem
 - **The legacy `approvers` allow-list and the top-level `roles` map are removed (E52.2 / #2214):** the forge-neutral `approvals` block becomes the sole approval predicate. See *Removed from v1* and *Approval gate predicate (v2)* below.
 - **Three surfaces are reshaped for legibility (E52.6 / #2218):** `constraints` becomes an object, `drive` becomes `auto_advance`, and `needs:` is added as shorthand for artifact wiring. See *Reshaped from v1* below.
 - **Stage-budget units are unified (E52.5 / #2217):** the runtime cap `max_runtime_minutes` becomes the Go-duration `max_runtime`, and `limit_usd` is added as the primary cost lever with `max_tokens` demoted to optional secondary. See *Units* below.
+- **The `operator_agent` delegation block is replaced by the unified autonomy grammar (ADR-066 / E52.10 / #2222):** an `actions` matrix of action classes at `mode: report | gated | auto`, plus an `autonomy: low | medium | high` tier shorthand. See *Autonomy: tier shorthand and action matrix* below.
 
 ## Removed from v1
 
-v2 drops four back-compat duplicate surfaces. Each had an explicit successor already shipped in v0/v1, so the removal deletes a second way to say the same thing rather than a capability. **v0 and v1 are unchanged** — both forms remain valid there, and the shared Go types still carry them, so an existing spec keeps working until it is migrated to v2 (migration codemod: #2220).
+v2 drops five back-compat duplicate surfaces. Four had an explicit successor already shipped in v0/v1, so the removal deletes a second way to say the same thing rather than a capability; the fifth (`operator_agent`) is REPLACED by a new grammar that says strictly more. **v0 and v1 are unchanged** — the old forms remain valid there, and the shared Go types still carry them, so an existing spec keeps working until it is migrated to v2 (migration codemod: #2220).
 
 | Removed in v2 | Replacement | Why |
 |---|---|---|
@@ -24,6 +25,7 @@ v2 drops four back-compat duplicate surfaces. Each had an explicit successor alr
 | `reviewers.agent: <N>` | `reviewers.agents: [{provider, model?}, …]` | The heterogeneous list (#955) already superseded the bare count — the effective agent count is `len(agents)`. Keeping both left two inputs feeding one ADR-027 authority decision. |
 | gate `approvers: {any_of \| all_of: [role, …]}` (E52.2 / #2214) | gate `approvals: {count, members \| member_of \| min_permission}` | The forge-neutral `approvals` block (ADR-055 / #1707) already superseded the GitHub-handle role allow-list. Keeping both left two mutually-exclusive predicates on one gate. The translation is **not mechanical** — `min_permission` / `member_of` have no source in the old form — so it belongs to the codemod (#2220), which must emit a before/after approval-eligibility diff rather than rewriting blind. See *Approval gate predicate (v2)*. |
 | top-level `roles: {name: {members: […]}}` (E52.2 / #2214) | `approvals.member_of` / `approvals.members` | The `roles` map existed only to be named by `approvers`; with `approvers` gone it has nothing left to reference. Forge-neutral membership moves onto the gate's `approvals` block. |
+| `operator_agent: {may_*, route_fixup_min_severity, must_page_human, model_policy}` (E52.10 / #2222) | `actions: {<class>: {mode, when}}` + the `autonomy: low \| medium \| high` shorthand | Five boolean-ish `may_*` knobs could say only *delegated* or *not*, with no way to express "propose it and let me decide", no name for the thing being delegated, and no shorthand for the three tiers every workflow actually picks from. The matrix names each action class once and gives it a `mode`; the tier expands to a matrix. See *Autonomy: tier shorthand and action matrix*. |
 
 A v2 document using any of these forms is rejected with a message naming the replacement, not the generic enum / `additional properties` message: the backend (`backend/internal/spec/v2removed.go`) and the CLI (`cli/internal/spec/validate.go`) each sweep the raw document for a routed major `>= 2` *before* schema validation. The sweep matches by **key name at any depth** — deliberately over-triggering rather than risk missing a legacy form — so in an already-invalid document the legacy-form message may precede a structural error.
 
@@ -56,6 +58,91 @@ gates:
 Because `min_permission` / `member_of` have no source in the legacy `approvers` role allow-list, translating an old gate is **not mechanical**: migration belongs to the codemod (#2220), which must emit a before/after approval-eligibility diff rather than rewriting blind.
 
 For the two-form v0/v1 grammar (the legacy `approvers` allow-list alongside `approvals`, mutually exclusive), see [`workflow-v1.md`](workflow-v1.md)'s *Approval gate predicate (v1)* — that page is unchanged, as v1 is frozen and still accepts both forms.
+
+## Autonomy: tier shorthand and action matrix
+
+v2 replaces the `operator_agent` block with two surfaces (ADR-066 / E52.10 / #2222):
+
+```yaml
+workflows:
+  feature_change:
+    autonomy: medium          # tier shorthand — expands to a full matrix
+    actions:                  # per-class overrides, each winning for that class ONLY
+      approve:
+        mode: gated           # tighten one class the tier delegates
+      fixup:
+        mode: auto
+        when: convergent_concerns
+        min_severity: high
+      page_human_on:          # RESERVED key — v0/v1's must_page_human
+        - gating_reviewer_reject
+```
+
+### The three modes
+
+`mode` says **who acts**:
+
+| `mode` | Meaning |
+|---|---|
+| `gated` | The human acts. This is the **fail-closed default**: it is what an absent matrix, an absent class entry and an unrecognized class all resolve to, and it is byte-identical to v0/v1 knob-absence. |
+| `report` | The operator agent surfaces a **proposal** and does not act. It records a `run_auto_driven` attribution row with `act: report`; the run does **not** park on it and no gate action is dispatched. |
+| `auto` | The operator agent may act without paging — the only mode that widens authority, and the only one that requires a condition. |
+
+**When a `report` entry fires:** when the gate is **live**, and — only when the entry declares a `when` — additionally when that condition is met. A bare `report` entry with no `when` therefore surfaces whenever the gate is reachable; requiring a condition that need not exist would make the mode inert. A `when` declared on a `report` entry is subject to the **same per-class binding** as `mode: auto`: it must name that class's own condition (a foreign or extension-class `when` is rejected — see below). The row is emitted **at most once per gate occurrence per class**. A gate occurrence spans one opening of the gate: a gate a human takes an hour to reach produces one row, not one per poll cycle, while a gate that **closes and re-opens on a fresh review round** (a fix-up round trip) is a new occurrence and re-surfaces the proposal.
+
+### `mode: auto` requires a condition
+
+Each known action class has exactly **one** backend-evaluable condition — the backend has to be able to answer the predicate from run state:
+
+| Class | `when` | v0/v1 knob it replaces |
+|---|---|---|
+| `approve` | `clean_dual_approval` | `may_approve` |
+| `fixup` | `convergent_concerns` (+ `min_severity`) | `may_route_fixup` (+ `route_fixup_min_severity`) |
+| `waive` | `solo_low` | `may_waive` |
+| `retry` | `infra_flake` | `may_retry` |
+| `merge` | `gates_resolved_ci_green` | `may_merge` |
+
+Four documents are rejected with a message naming the class:
+
+- `mode: auto` with **no** `when`,
+- `mode: auto` whose `when` is another class's condition,
+- `mode: auto` on an **extension** class (below), which has no backend-evaluable condition at all,
+- `mode: report` that declares a `when` which is **not that class's own condition** (a foreign condition, or any `when` on an extension class). A bare `report` with no `when` is always accepted (it fires on gate-live); a declared `when` must name the class's own condition, so a proposal the report arm cannot evaluate is refused at validation rather than silently dropped at fire time.
+
+These rules are enforced by the **backend**, not by JSON Schema: the class-name set is open, so no schema keyword can bind a condition to a class the schema does not enumerate. A raw `check-jsonschema` run therefore accepts a document the backend rejects. `min_severity` is likewise accepted on the `fixup` class only.
+
+### Extension classes
+
+The class-name set is deliberately **open** and per-workflow-type extensible (ADR-065): a workflow type may declare its own class, e.g. `promote` or `rollback`. An unknown class is safe **by construction** — accepted at `mode: gated` and `mode: report`, where it delegates nothing, and rejected at `mode: auto`, where it would need a condition that does not exist.
+
+### The tiers
+
+`autonomy` expands to a matrix. The three tiers are METHODOLOGY.md's autonomy tiers and reproduce the shipped `workflow-preset-<tier>.yaml` delegation blocks:
+
+| Class | `low` | `medium` | `high` |
+|---|---|---|---|
+| `approve` | `gated` | `auto` / `clean_dual_approval` | `auto` / `clean_dual_approval` |
+| `fixup` | `gated` | `auto` / `convergent_concerns` | `auto` / `convergent_concerns` |
+| `retry` | `gated` | `auto` / `infra_flake` | `auto` / `infra_flake` |
+| `waive` | `gated` | `gated` | `auto` / `solo_low` |
+| `merge` | `gated` | `gated` | `auto` / `gates_resolved_ci_green` |
+| `page_human_on` | *(none)* | the seven events below | the seven events below |
+
+The medium/high page list is `gating_reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`. Note the **v2 spelling**: a tier emits `gating_reviewer_reject`, never the bare `reviewer_reject` v2 removed — a tier must not expand to a value undeclarable under the grammar it belongs to.
+
+An explicit `actions` entry **overrides the tier for that class only**; unlisted classes keep the tier's value, and a class no tier names resolves to `gated`.
+
+### Placement, and the wholesale gate override
+
+Both surfaces are declarable at **workflow** level (the default for every gate) and on an **approval gate**. A gate declaring **either** `autonomy` or `actions` supplies the WHOLE block — nothing is inherited from the workflow level, matching the wholesale-override semantics `operator_agent` had. So a gate declaring only `actions: {merge: {mode: auto, when: gates_resolved_ci_green}}` on an `autonomy: high` workflow has **no tier**: `merge` is auto and every other class falls to `gated`, not to high's value. `page_human_on` and `model_policy` are part of the block and are likewise never merged across levels.
+
+### Provenance
+
+Resolution records, per class, **which input decided it**: `explicit` (an `actions` entry), `tier` (the shorthand expansion), or `default` (the fail-closed fallback). The resolved tier and matrix are surfaced on the run-status `delegation` block alongside the existing evaluated-action list, so an operator can read `approve: gated (tier)` rather than infer it from a missing knob.
+
+### `model_policy` moved onto the matrix
+
+`model_policy` (#1421) is a **reserved key** of `actions` rather than a new top-level block, so it keeps the wholesale gate-override semantics it already had as part of `operator_agent`. `page_human_on` is the other reserved key — it is v0/v1's `must_page_human` under its new name. Neither is an action class, and a property named like one of them is never treated as one.
 
 ## Reshaped from v1
 
