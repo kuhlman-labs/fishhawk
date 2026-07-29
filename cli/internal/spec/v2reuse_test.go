@@ -320,6 +320,45 @@ workflows:
 `,
 			path: "/workflows/derived/stages/0/type",
 		},
+		// E52.14 / #2331: a bare key INSIDE a defaults block is null, is not
+		// fabricated onto any stage (resolver cases g/h), and — because the
+		// reuse keys survive through schema.Validate and are stripped only
+		// after — is rejected by the schema at its OWN defaults path. This is
+		// the end-to-end seam the resolver-level (g)/(h) cases do not reach:
+		// resolver output reaching schema.Validate. Both rungs are pinned.
+		// Byte-parity twin of the backend table.
+		{
+			name: "file-rung null inside defaults rejected at the defaults path",
+			doc: `
+version: "2"
+defaults:
+  reviewers:
+workflows:
+  wf:
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+`,
+			path: "/defaults/reviewers",
+		},
+		{
+			name: "workflow-rung null inside defaults rejected at the defaults path",
+			doc: `
+version: "2"
+workflows:
+  wf:
+    defaults:
+      reviewers:
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+`,
+			path: "/workflows/wf/defaults/reviewers",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -617,6 +656,13 @@ func TestResolveV2Reuse_MalformedShapesAreSkippedNotCrashes(t *testing.T) {
 		// (e) a deriving stage's executor: null and reviewers: null over a base
 		//     that declares them — both present-nulls win and are preserved.
 		{name: "deriving present-null executor and reviewers win over base", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: implement\n        executor:\n          agent: claude-code\n        reviewers:\n          human: 1\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: implement\n        executor:\n        reviewers:\n", preserved: `"executor":null,"id":"a","reviewers":null`},
+		// (e2) a deriving stage's inputs: null over a base declaring inputs —
+		//     the deriving present-null WINS and is preserved. Condition 2 names
+		//     `inputs` alongside executor and reviewers; (e) covers those two.
+		//     mergeStage's guard is key-agnostic so the mechanical risk is low,
+		//     but a future key-specific refactor could regress `inputs` with no
+		//     other case failing, so it gets its own named pin. Byte-parity twin.
+		{name: "deriving present-null inputs wins over base", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: implement\n        inputs:\n          - artifact: pull_request\n            from_stage: b\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: implement\n        inputs:\n", preserved: `"inputs":null`},
 		// (f) nested null: a deriving budget: {tokens: null} over a base
 		//     budget: {tokens: 5} — the nested null wins in mergeKeyWise.
 		{name: "nested present-null wins in mergeKeyWise", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: implement\n        budget:\n          tokens: 5\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: implement\n        budget:\n          tokens:\n", preserved: `"tokens":null`},
