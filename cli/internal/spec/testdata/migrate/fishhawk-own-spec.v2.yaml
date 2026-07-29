@@ -1,0 +1,326 @@
+# Fishhawk's own development workflow.
+#
+# This file exists from day one as a public commitment to the methodology
+# described in docs/METHODOLOGY.md: Fishhawk is built using Fishhawk.
+#
+# It is not yet executed. The Fishhawk runtime that interprets this file is
+# the product being built in this repository. Per docs/MVP_SPEC.md §8, the
+# target for self-execution is day 21 of the v0 build. Until then, this is
+# a placeholder and a public commitment, not a running system.
+#
+# When the product can execute this spec, the syntax may be revised to
+# match the frozen v0 schema. The intent expressed here will not change.
+
+version: "2"
+workflows:
+  # Medium autonomy — the default for most product work.
+  # Agent implements; human approves the plan; human approves the PR; the
+  # acceptance agent validates the merged-candidate against the plan's
+  # acceptance_criteria before the human-gated merge (ADR-049, E31).
+  feature_change:
+    description: >-
+      Default workflow for feature work and non-trivial changes, extended with a runner-hosted advisory acceptance stage (ADR-049). Human approves plan and PR; agent implements; the acceptance agent validates the running instance against the approved plan's acceptance_criteria.
+    # Drive mode (#1023): fishhawkd auto-advances mechanical transitions
+    # (review settlement, fixup re-park, derived awaiting_merge) and
+    # surfaces next_action; judgment points still park for the human.
+    auto_advance: true
+    # Operator-agent delegation (ADR-040 D2 / #1026, dogfood #1028):
+    # the medium autonomy preset per METHODOLOGY.md — approve/fixup/retry
+    # delegated under their named conditions; waive and merge stay human.
+    autonomy: medium
+    policy:
+      max_stage_runtime: "30m"
+    # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a
+    # budget_alert audit entry + originating-issue comment at warn_at
+    # (80%) and the 100% crossing; never blocks a run. Calibrated from
+    # recorded feature_change run costs (avg ~$3.4, max ~$8.4 over the
+    # first 29 costed runs). Weekly reset so the alert re-exercises
+    # during active dogfooding. Flip enforcement to `blocking` to also
+    # dogfood admission-time refusal once the period limit is exhausted.
+    budgets:
+      - period: weekly
+        limit_usd: 1000
+        warn_at: 0.8
+        enforcement: advisory
+    # Auto-retry once on CI failure (#276). The human approves the
+    # plan; the agent should self-heal on a routine test or lint
+    # regression without forcing the reviewer back into the loop.
+    on_ci_failure:
+      max_retries: 1
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          # Planner runs on Opus 5 rather than the deployment default.
+          # The plan stage is the cheapest agent stage (~$1.4/run of the
+          # ~$3.9/run implement) and higher plan quality is the lever most
+          # likely to cut downstream implement rework, so it pins the most
+          # capable model. executor.model is the #1013 override rung
+          # (deployment default < this < plan model_recommendation <
+          # operator gate).
+          model: claude-opus-5
+        # Advisory plan review (ADR-027): agent reviewers surface verdicts
+        # before the human gate; effective agent count >0 + human>0 →
+        # advisory, so the founder approval below stays authoritative.
+        # Heterogeneous topology (#955): Claude (claudecode subprocess,
+        # #575) and Codex (codex CLI, #844) review concurrently. Codex
+        # reasoning effort stays the deployment-level knob
+        # FISHHAWKD_CODEX_REASONING_EFFORT.
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-fable-5
+            - provider: codex
+              model: gpt-5.6-sol
+              reasoning_effort: high
+          human: 1
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        budget:
+          max_tokens: 200000
+          max_runtime: 15m
+          enforcement: advisory
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          # #651 execution-grounded verifier (KEPT 2026-06-06, after the
+          # dogfood caught a real drift-excluded test failure and the fix loop
+          # converged it before the PR opened). After the agent exits, run the
+          # project test command against the COMMITTED scope-only tree (the
+          # #800/#766 worktree), NOT the working tree; on a test failure, feed
+          # the captured output back to the agent for a bounded fix loop, then
+          # re-verify, before the PR opens. max_iterations=1 = one fix attempt;
+          # 0 (or removing this block) restores the prior single-shot behavior.
+          # scripts/test is hermetic — integration tests use testcontainers.
+          # Accepted cost: a full scripts/test verify (golangci-lint + -race +
+          # testcontainers) runs on every feature_change implement stage. See
+          # #651; robustness #804.
+          # `scripts/test verify` (#1064) runs golangci-lint run ./... per module
+          # (CI's exact lint invocation; v2 gofmt/goimports formatters included)
+          # BEFORE the -race test loop, so a gofmt/lint-only defect fails the
+          # gate in-loop — where the agent can still fix it — instead of
+          # red-lining the PR in CI after the agent is terminal (the #1060
+          # recurrence). Timeout bumped 12m→15m to absorb the per-module lint.
+          verify:
+            command: "scripts/test verify"
+            timeout: "15m"
+            max_iterations: 1
+        # Advisory implement-review (ADR-027 impl 2/2, #561): agent
+        # reviewers read the diff against the approved plan and surface
+        # verdicts (incl. scope-drift flag). Effective agent count >0 +
+        # human>0 → advisory, so it never blocks; the review stage's
+        # founder approval stays the gate. Runs async server-side
+        # post-#584; verdicts land ~60-90s+ after the implement trace
+        # upload (poll the audit / get_run_status). Heterogeneous
+        # topology (#955): same Codex reviewer as the plan stage; the Claude
+        # reviewer runs on Fable 5 — the implement review is the last
+        # quality gate before merge, so the most capable model reviewing the
+        # diff is the highest-leverage place to catch escaped defects.
+        reviewers:
+          agents:
+            - provider: claudecode
+              model: claude-fable-5
+            - provider: codex
+              model: gpt-5.6-sol
+              reasoning_effort: high
+          human: 1
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          # Raised 30 -> 45 (2026-06-10): run 575e6a74 (#964/PR #982) failed
+          # category-B at 32 files on a plan the gate had approved with a
+          # 32-file scope — the cap lagged real feature sizes. Plan-gate
+          # coherence pre-check (scope.files vs this cap) tracked separately.
+          max_files_changed: 45
+          forbidden_paths:
+            - ".github/workflows/**"
+            - ".fishhawk/**"
+            - "LICENSE"
+            - "NOTICE"
+          required_outcomes:
+            - tests_added_or_updated
+            - ci_green
+        budget:
+          max_tokens: 500000
+          max_runtime: 30m
+          enforcement: advisory
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+      # Runner-hosted advisory acceptance stage (ADR-049 / #1519, E31). It
+      # rides the ordinary agent executor branch — never `delegate` (deploy-
+      # only) — and carries no pre-flight deploy constraint or `deployment`
+      # artifact. The acceptance agent validates the RUNNING preview instance
+      # against the approved plan's `verification.acceptance_criteria` and ships
+      # a signed verdict to POST /v0/runs/{run_id}/acceptance. A failed verdict
+      # leaves the stage `succeeded` and routes through deterministic server-
+      # side triage (class 1 → fix-up, class 2 → acceptance re-run, class 3/4 →
+      # paged); the merge stays gated on the acceptance_passed condition
+      # (ADR-049 decision #6, operator-loop next_actions — not a hard spec gate).
+      # Verbatim from docs/spec/examples/workflow-v1-acceptance.yaml (E31.10).
+      - id: acceptance
+        type: acceptance
+        executor:
+          # An acceptance stage MUST use an agent (or human) executor.
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+          - artifact: pull_request
+            from_stage: implement
+        # Egress allowance (v1.3, ADR-050 / #1532): the single customer-declared
+        # slot of the acceptance agent's default-deny egress allow-list. Points
+        # at the local dogfood preview (scripts/dev k8s / docker-compose). The
+        # runner adds the model API endpoint and the Fishhawk backend itself;
+        # they are not declarable here. Hosts, not URLs — no scheme, no path.
+        egress:
+          target_hosts:
+            - localhost:8090
+        # Durable acceptance-evidence record (v1.2, ADR-049 / #1531): the
+        # verdict + per-criterion results + content-hash refs to evidence blobs.
+        # Valid ONLY on an acceptance stage.
+        produces:
+          - artifact: acceptance
+        budget:
+          max_tokens: 200000
+          max_runtime: 20m
+          enforcement: advisory
+  # Low autonomy — human-led work.
+  # Used for cryptographic, policy, and audit-integrity surfaces.
+  # The workflow exists to record the work in the audit log; the agent
+  # is not the author. See docs/METHODOLOGY.md for what falls under this.
+  human_led_change:
+    description: >-
+      Workflow for human-authored changes to load-bearing surfaces (crypto, policy engine, audit integrity, GitHub App auth). The audit log records what was changed and who approved it.
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - source: pull_request
+            required: true
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+  # High autonomy — agent implements and merges if gates pass.
+  # Reserved for low-risk, high-volume work where the cost of a mistake
+  # is contained and CI is a sufficient check.
+  routine_change:
+    description: >-
+      Workflow for documentation, dependency bumps, lint/format fixes, and tests for existing behavior. Agent may merge if all gates pass.
+    # High-autonomy auto-retry (#276). Routine_change is the
+    # canonical case for self-healing: the human never approved
+    # anything; the agent's job is to keep the change merging
+    # cleanly. One retry strikes the balance between resilience to
+    # flaky CI and not spinning forever on a real bug.
+    on_ci_failure:
+      max_retries: 1
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        constraints:
+          max_files_changed: 20
+          allowed_paths:
+            - "docs/**"
+            - "**/*.md"
+            - "go.mod"
+            - "go.sum"
+            - "**/*_test.go"
+          required_outcomes:
+            - ci_green
+      - id: review
+        type: review
+        executor:
+          agent: claude-code
+        gates:
+          # ADR-017 (#249): GitHub branch protection (and a future
+          # gh pr merge --auto on the runner side, #255) own the
+          # merge-readiness gate for routine_change. The Fishhawk-
+          # side gate is degenerate now — it just lets the run
+          # advance once branch protection clears.
+          - type: check
+  # Delegating deploy (ADR-038 / E23, workflow-v1). Operator-triggered
+  # after the corresponding feature_change run merges. Fishhawk holds no
+  # deploy logic or credentials: the deploy stage TRIGGERS an external
+  # pipeline (.github/workflows/deploy.yml via workflow_dispatch, passing
+  # the fishhawk_run_id + fishhawk_stage_id correlation inputs the
+  # deployreconciler re-resolves the run by) and MONITORS it to terminal,
+  # recording a `deployment` artifact + audit trail.
+  #
+  # `required_upstream` is intentionally OMITTED here: it evaluates the
+  # CURRENT run's own implement/review state, which a deploy-only release
+  # run lacks, so it would fail closed. Declarative cross-workflow gating
+  # on the feature_change run is tracked in #1417; until it lands, the
+  # fail-closed approval gate below is the control point and the operator
+  # confirms the change merged before triggering the release.
+  #
+  # deploy.yml is an echo/no-op validation stub for now (echo-now-real-later,
+  # #1418) — it exercises the full dispatch -> poll -> deployment-artifact
+  # loop without touching real infrastructure.
+  release:
+    description: >-
+      Delegating deploy workflow (ADR-038): triggers an external release pipeline via workflow_dispatch and monitors it to terminal. Fishhawk holds no deploy logic or credentials. Operator-triggered after the feature_change run merges.
+    # Drive mode (#1023): surface next_action and auto-advance mechanical
+    # transitions; the deploy approval below still parks for the human (no
+    # operator_agent delegation is configured, so a production deploy always
+    # pages rather than auto-approving).
+    auto_advance: true
+    policy:
+      max_stage_runtime: "30m"
+    stages:
+      - id: deploy
+        type: deploy
+        # A deploy stage MUST delegate (ADR-038): no agent/human executor.
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+            git_ref: main
+        # Pre-flight deploy constraints (evaluated BEFORE execution at the
+        # gate). change_freeze:false declares the surface without blocking.
+        constraints:
+          allowed_environments: [staging, production]
+          change_freeze: false
+        produces:
+          - artifact: deployment
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: [kuhlman-labs]

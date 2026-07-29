@@ -48,6 +48,7 @@ fishhawk report-issue <run-id> [--kind bug|feature] [--description T] [--include
 fishhawk export       [--from RFC3339] [--to RFC3339] [--repo owner/name] [--run UUID]... [--limit N] [--csv] [--out PATH]
 fishhawk init         [--preset low|medium|high] [--working-dir D] [--budget-usd N] [--single-reviewer] [--human-gates ids] [--force] [--repo owner/name]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
+fishhawk migrate-spec [path] [--out PATH | --in-place | --report-only]   # workflow-v1 -> v2 codemod
 fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only]
 fishhawk version
 ```
@@ -98,6 +99,34 @@ The credential store is a single JSON file at `$XDG_CONFIG_HOME/fishhawk/credent
 `audit list` outputs NDJSON (one entry per line) when `--output json` is set so a long page can be piped through `head`/`tail` without breaking the parser.
 
 `audit tail` polls the audit endpoint on a configurable interval (default 2s, minimum 500ms) and prints new entries as they land. It exits cleanly on Ctrl-C. There's no server-side SSE today — if streaming demand grows we'd add one and migrate the client.
+
+## Spec migration internals (`fishhawk migrate-spec`, E52.8 / #2220)
+
+`migrate-spec` translates a workflow-v1 `.fishhawk/workflows.yaml` into workflow-v2 and prints an
+**approval-eligibility report** — a per-gate before/after of who can approve what. The report, not
+the migrated bytes, is the product: a spec migration is an authorization change, so the operator
+reads the diff first and opts into the write second.
+
+The translation edits **yaml.v3 nodes** (`cli/internal/spec/migrate.go`), never round-tripping
+through a typed struct, so comments and key ordering survive. It **refuses rather than guessing**
+across ten named branches — an `all_of` over a multi-member role, a team-valued role, a bare
+`reviewers.agent` count, a duplicated constraint kind, a version-major-0 source, and five more —
+and every refusal aborts the whole migration, writing nothing under any flag. `limit_usd`,
+`min_permission`, `member_of` and `not:` are never fabricated; where dropping `not:` widens a
+gate's eligible set, the report says so per gate.
+
+Output matrix — stdout carries the report in every cell, never the migrated YAML:
+
+| Invocation | Effect |
+|---|---|
+| (no output flag) / `--report-only` | report only; writes nothing |
+| `--out PATH` | write there; refuses to clobber an existing PATH (exit 1) |
+| `--in-place` | rewrite the source file |
+| `--out` with `--in-place`, or `--report-only` with either | usage error (exit 2) |
+
+Exit codes: `0` migrated or already-v2 no-op, `1` refusal / output-validation failure / refused
+overwrite, `2` usage or I/O. Full contract, translation table and refusal taxonomy:
+`docs/spec/workflow-migration.md`.
 
 ## Local-runner spawn (`fishhawk runner start`, E22.9 / #407)
 

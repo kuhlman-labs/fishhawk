@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,37 @@ func TestRun_Help_ListsReportIssue(t *testing.T) {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("usage missing %q verb:\n%s", want, stdout.String())
 		}
+	}
+}
+
+// TestRun_Help_ListsMigrateSpec pins the E52.8 / #2220 codemod into the
+// usage listing and the dispatch table, matching the ListsReportIssue
+// (#1006) / ListsExport (#1607) convention. A subcommand registered in
+// one but not the other is the silent-omission failure these guard.
+func TestRun_Help_ListsMigrateSpec(t *testing.T) {
+	var stdout strings.Builder
+	if got := run([]string{"help"}, &stdout, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	if !strings.Contains(stdout.String(), "migrate-spec") {
+		t.Errorf("usage missing 'migrate-spec' verb:\n%s", stdout.String())
+	}
+}
+
+func TestRun_Dispatch_MigrateSpec(t *testing.T) {
+	// Dispatch reaches the subcommand rather than falling through to the
+	// unknown-subcommand path: a missing default spec file is the
+	// subcommand's own I/O error (exit 2), not "unknown subcommand".
+	var stdout, stderr strings.Builder
+	got := run([]string{"migrate-spec", filepath.Join(t.TempDir(), "absent.yaml")}, &stdout, &stderr)
+	if got != exitUsage {
+		t.Fatalf("status = %d, want exitUsage", got)
+	}
+	if strings.Contains(stderr.String(), "unknown subcommand") {
+		t.Errorf("migrate-spec is not wired into the dispatch table:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "fishhawk migrate-spec:") {
+		t.Errorf("expected the subcommand's own error, got:\n%s", stderr.String())
 	}
 }
 
