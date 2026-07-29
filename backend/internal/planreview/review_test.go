@@ -67,6 +67,111 @@ func TestResolveAuthority_AgentsList(t *testing.T) {
 	}
 }
 
+// --- ResolveAuthority over a genuinely v2-parsed spec (E52.3 / #2215) ---
+
+// v2SpecWithReviewers renders a workflow-v2 document whose plan stage
+// carries the given reviewers YAML block (indented to the stage), so the
+// authority rows below are driven from real schema-validated bytes rather
+// than a hand-built struct.
+func v2SpecWithReviewers(reviewersBlock string) []byte {
+	return []byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+` + reviewersBlock + `        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+}
+
+// parseV2Reviewers parses a v2 document through spec.ParseBytes and returns
+// its plan stage's reviewers block (possibly nil).
+func parseV2Reviewers(t *testing.T, reviewersBlock string) *spec.ReviewersConfig {
+	t.Helper()
+	s, err := spec.ParseBytes(v2SpecWithReviewers(reviewersBlock))
+	if err != nil {
+		t.Fatalf("spec.ParseBytes(v2): %v", err)
+	}
+	return s.Workflows["feature_change"].Stages[0].Reviewers
+}
+
+// TestResolveAuthority_V2ParsedSpec is the cross-boundary seam test for
+// E52.3 / #2215. workflow-v2 removed the bare `reviewers.agent` integer —
+// an INPUT this resolver reads through AgentCount() — so per-layer units
+// over hand-built structs would all still pass even if the schema change
+// had severed the schema -> typed-struct -> authority-resolution path.
+// This drives all three ADR-027 rows from real v2 YAML end to end.
+func TestResolveAuthority_V2ParsedSpec(t *testing.T) {
+	cases := []struct {
+		name      string
+		reviewers string
+		want      planreview.AuthorityMode
+	}{
+		{
+			name: "gating: one agent, no human",
+			reviewers: `        reviewers:
+          agents:
+            - provider: anthropic
+`,
+			want: planreview.AuthorityGating,
+		},
+		{
+			name: "advisory: two agents plus a human",
+			reviewers: `        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+`,
+			want: planreview.AuthorityAdvisory,
+		},
+		{
+			name: "gateless: no agents, one human",
+			reviewers: `        reviewers:
+          human: 1
+`,
+			want: planreview.AuthorityGateless,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rv := parseV2Reviewers(t, tc.reviewers)
+			if rv == nil {
+				t.Fatal("parsed Reviewers = nil, want the declared block")
+			}
+			if got := planreview.ResolveAuthority(*rv); got != tc.want {
+				t.Errorf("ResolveAuthority(%+v) = %q, want %q", *rv, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveAuthority_V2ParsedSpec_NilReviewersBlock is the RESOLVED half
+// of the unchanged-default claim (#2215 acceptance criterion 4). The docs
+// say an absent reviewers block "defaults to {human:1}", but no consumer
+// materializes that literal — Stage.Reviewers stays nil and each consumer
+// interprets nil itself. What is actually true, and what this asserts, is
+// that nil and {Human:1} are OBSERVATIONALLY EQUIVALENT at the resolver:
+// both are gateless, because with zero agent reviewers the human count
+// cannot change the mode. That equivalence is why the documented default
+// has never been visible, and it is unchanged by this slice.
+func TestResolveAuthority_V2ParsedSpec_NilReviewersBlock(t *testing.T) {
+	if rv := parseV2Reviewers(t, ""); rv != nil {
+		t.Fatalf("parsed Reviewers = %+v, want nil for an absent block", rv)
+	}
+	documentedDefault := spec.ReviewersConfig{Human: 1}
+	if got := planreview.ResolveAuthority(documentedDefault); got != planreview.AuthorityGateless {
+		t.Errorf("ResolveAuthority(documented {human:1} default) = %q, want %q", got, planreview.AuthorityGateless)
+	}
+	if got := planreview.ResolveAuthority(spec.ReviewersConfig{}); got != planreview.AuthorityGateless {
+		t.Errorf("ResolveAuthority(zero value, the nil substitute) = %q, want %q — nil and {human:1} must stay indistinguishable", got, planreview.AuthorityGateless)
+	}
+}
+
 // --- Verdict JSON round-trip ---
 
 func TestReviewVerdict_JSONRoundTrip_Approve(t *testing.T) {

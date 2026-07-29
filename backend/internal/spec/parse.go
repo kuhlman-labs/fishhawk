@@ -136,19 +136,21 @@ func mustCompileSchema(path string) *jsonschema.Schema {
 }
 
 // schemaForVersion routes a spec's raw version string to its compiled
-// schema by major component. A missing / non-string / unparseable
-// version falls through to the v0 schema, which then emits the existing
-// required-version / enum SchemaError — so a malformed version never
-// silently passes. A well-formed but unsupported major (>= 2) fails
-// closed with a *SchemaError naming the supported majors.
-func schemaForVersion(raw any) (*jsonschema.Schema, error) {
+// schema by major component, returning the schema AND the routed major.
+// A missing / non-string / unparseable version falls through to the v0
+// schema — returning major 0, so the version-gated sweeps below never
+// fire on that path — which then emits the existing required-version /
+// enum SchemaError, so a malformed version never silently passes. A
+// well-formed but unsupported major (>= 3) fails closed with a
+// *SchemaError naming the supported majors.
+func schemaForVersion(raw any) (*jsonschema.Schema, int, error) {
 	m, ok := raw.(map[string]any)
 	if !ok {
-		return compiledSchemas[0], nil
+		return compiledSchemas[0], 0, nil
 	}
 	vs, ok := m["version"].(string)
 	if !ok {
-		return compiledSchemas[0], nil
+		return compiledSchemas[0], 0, nil
 	}
 	majorPart := vs
 	if idx := strings.IndexByte(majorPart, '.'); idx >= 0 {
@@ -156,16 +158,16 @@ func schemaForVersion(raw any) (*jsonschema.Schema, error) {
 	}
 	major, err := strconv.Atoi(majorPart)
 	if err != nil {
-		return compiledSchemas[0], nil
+		return compiledSchemas[0], 0, nil
 	}
 	s, ok := compiledSchemas[major]
 	if !ok {
-		return nil, &SchemaError{
+		return nil, 0, &SchemaError{
 			Path:    "/version",
 			Message: fmt.Sprintf("unsupported spec version %q: major %d is not recognized (supported majors: %s)", vs, major, formatMajors(supportedMajors)),
 		}
 	}
-	return s, nil
+	return s, major, nil
 }
 
 // formatMajors renders the supported-majors list as a comma-separated
@@ -215,10 +217,24 @@ func ParseBytes(data []byte) (*Spec, error) {
 	// missing/unparseable version falls through to v0 so the existing
 	// required-version error is preserved; an unsupported major fails
 	// closed naming the supported majors.
-	schema, err := schemaForVersion(raw)
+	schema, major, err := schemaForVersion(raw)
 	if err != nil {
 		return nil, err
 	}
+
+	// workflow-v2 removed two back-compat surfaces (E52.3 / #2215): the
+	// bare reviewer_reject page-event token and the reviewers.agent
+	// integer count. The schema rejects both, but with a generic enum /
+	// additionalProperties message that names no replacement — so sweep
+	// the raw document FIRST, for a routed major >= 2 only, and return
+	// the actionable message instead. Below major 2 the sweep never runs
+	// and both forms parse exactly as before.
+	if major >= 2 {
+		if serr := checkV2RemovedForms(raw); serr != nil {
+			return nil, serr
+		}
+	}
+
 	if err := schema.Validate(raw); err != nil {
 		var verr *jsonschema.ValidationError
 		if errors.As(err, &verr) {
