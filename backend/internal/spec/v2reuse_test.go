@@ -581,6 +581,46 @@ workflows:
 `,
 			path: "/workflows/wf/extends",
 		},
+		// The two cases below are the ones where skipping a malformed shape
+		// could have meant OVERWRITING it. `stages` is the ONE key resolution
+		// writes, so a deriving workflow's invalid declaration would otherwise
+		// be replaced by the resolved base stages and parse as though the key
+		// had been omitted — an invalid document turned into an executable
+		// inherited workflow, the schema bypassed rather than deferred to.
+		{
+			name: "extends with a scalar stages list",
+			doc: `
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+  derived:
+    extends: base
+    stages: nope
+`,
+			path: "/workflows/derived/stages",
+		},
+		{
+			name: "extends with a null stages list",
+			doc: `
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+  derived:
+    extends: base
+    stages:
+`,
+			path: "/workflows/derived/stages",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -857,6 +897,15 @@ workflows:
 // v0.x / v1.x, so a resolver leaking below the major gate would touch every
 // spec that actually runs today. Both lower majors are asserted: the reuse
 // keys are rejected by their own schema and are NEVER resolved.
+//
+// The document declares `extends: nope` — an UNKNOWN base — deliberately. A
+// document that merely carries well-formed reuse keys cannot distinguish "the
+// resolver was gated off" from "the resolver ran and the old schema rejected
+// the keys afterwards", because both end at the same additional-properties
+// error. resolveV2Reuse runs BEFORE schema.Validate and rejects an unknown
+// base with its OWN *ValidationError, so had it been invoked for a lower
+// major that error would have PREEMPTED the schema's. Reaching the schema's
+// message instead is only possible if the resolver never ran.
 func TestParseV2_VersionGate_ReuseKeysRejectedBelowMajor2(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -880,7 +929,7 @@ workflows:
         executor:
           agent: claude-code
   derived:
-    extends: base
+    extends: nope
     stages:
       - id: b
         type: review
@@ -888,6 +937,10 @@ workflows:
           human: true
 `
 			err := parseV2Err(t, doc)
+			var ve *ValidationError
+			if errors.As(err, &ve) {
+				t.Fatalf("err = %v, want the v%s schema's rejection — a resolver *ValidationError proves resolveV2Reuse ran below major 2", ve, tc.version)
+			}
 			var se *SchemaError
 			if !errors.As(err, &se) {
 				t.Fatalf("err = %v (%T), want a *SchemaError from the v%s schema", err, err, tc.version)
@@ -897,6 +950,12 @@ workflows:
 			if !strings.Contains(se.Message, "additional") {
 				t.Errorf("Message = %q, want the additional-properties rejection", se.Message)
 			}
+			// And the same document DOES trip the resolver when it is run,
+			// so the assertion above discriminates rather than passing
+			// because the resolver has nothing to say about this input.
+			if err := resolveV2Reuse(mustDecodeYAML(t, doc)); err == nil {
+				t.Error("resolveV2Reuse = nil on the gate document; it must reject the unknown base, or the gate assertion above proves nothing")
+			}
 			// Proof the resolver never ran: `derived` declares its own
 			// stage and no executor default could have been folded in.
 			raw := mustDecodeYAML(t, doc)
@@ -904,6 +963,99 @@ workflows:
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// TestParseV2_ExecutorBranchRule_BranchlessDefaultDroppedOnClosedBranches is
+// the SECOND half of the branch rule, and the case the first half cannot see:
+// a BRANCHLESS file-level default — the bare {timeout: 30m} the schema's own
+// defaults.executor description advertises — against `human: true` and
+// `delegate` stages.
+//
+// The different-branch half fires only when BOTH fragments declare a branch,
+// so a branchless default slips past it and merges key-wise, producing
+// {human: true, timeout: 30m}. The human oneOf arm declares ONLY `human` and
+// $defs/executor sets unevaluatedProperties: false, so that fails the oneOf —
+// the same "author wrote nothing wrong" rejection the branch rule exists to
+// prevent, one case over. Essentially every real workflow carries a human gate
+// stage, so this rejects nearly every realistic document.
+func TestParseV2_ExecutorBranchRule_BranchlessDefaultDroppedOnClosedBranches(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    timeout: 30m
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+      - id: gate
+        type: review
+        executor:
+          human: true
+      - id: ship
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+`
+	s := mustParseV2(t, doc)
+	stages := s.Workflows["wf"].Stages
+
+	// The agent stage is the whole point of a bare timeout default: it still
+	// receives it, so the drop is scoped to the closed branches rather than
+	// disabling branchless defaults outright.
+	if got := stages[0].Executor.Timeout.Duration; got != 30*time.Minute {
+		t.Errorf("apply.executor.timeout = %v, want the branchless file default 30m", got)
+	}
+	if !stages[1].Executor.Human {
+		t.Errorf("gate.executor.human = %v, want the authored human branch preserved", stages[1].Executor.Human)
+	}
+	if got := stages[1].Executor.Timeout.Duration; got != 0 {
+		t.Errorf("gate.executor.timeout = %v, want the branchless default dropped WHOLESALE (the human arm declares only `human`)", got)
+	}
+	if stages[2].Executor.Delegate == nil {
+		t.Fatal("ship.executor.delegate = nil, want the delegate branch intact")
+	}
+	if got := stages[2].Executor.Timeout.Duration; got != 0 {
+		t.Errorf("ship.executor.timeout = %v, want the branchless default dropped wholesale on the delegate branch too", got)
+	}
+}
+
+// TestParseV2_InvalidAgentVersionFromDefaultsRejected pins the error path
+// resolution CREATES. agent_version is a plain string to the JSON Schema, so
+// a malformed comparator range survives validation and is caught by the
+// semantic validator — which reads the TYPED stage, i.e. the RESOLVED one.
+// A bad range declared only in a `defaults` block therefore has no authored
+// position of its own: it is reported at each stage it was folded into. That
+// path exists only because defaults exist, and nothing else covers it.
+func TestParseV2_InvalidAgentVersionFromDefaultsRejected(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+    agent_version: ">=abc"
+workflows:
+  wf:
+    stages:
+      - id: a
+        type: plan
+`
+	err := parseV2Err(t, doc)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v (%T), want a *ValidationError — a malformed range inherited from defaults must still be rejected", err, err)
+	}
+	if want := "/workflows/wf/stages/0/executor/agent_version"; ve.Path != want {
+		t.Errorf("Path = %q, want %q — the resolved stage position, since the defaults block has none of its own", ve.Path, want)
+	}
+	if !strings.Contains(ve.Message, "agent_version") {
+		t.Errorf("Message = %q, want the comparator-range error", ve.Message)
 	}
 }
 
@@ -946,26 +1098,40 @@ func mustDecodeYAML(t *testing.T, doc string) any {
 //
 // These branches are the BOUND on running before schema.Validate: the pass
 // sees an unvalidated document, so it must never panic and never invent an
-// error the schema owns. Each case asserts the observable contract — resolve
-// returns nil, the document survives, and stripV2Reuse tolerates the same
-// shape — rather than merely that nothing exploded.
+// error the schema owns — and, load-bearingly, it must LEAVE THE MALFORMED
+// VALUE IN PLACE for the schema to report. Skipping a shape it cannot read
+// while OVERWRITING that same key would bypass validation outright rather
+// than defer to it, which is exactly what `stages` under `extends` did.
+//
+// So every case carries `preserved`: a JSON fragment of the malformed shape
+// that must still be present in the document AFTER resolution. A checked-in
+// `raw == nil` guard is not that assertion — `raw` is an interface value
+// passed by value, so no code path in resolveV2Reuse could ever nil it.
 func TestResolveV2Reuse_MalformedShapesAreSkippedNotCrashes(t *testing.T) {
 	cases := []struct {
 		name string
 		doc  string
+		// preserved is a JSON fragment of the malformed shape that must
+		// survive resolution verbatim.
+		preserved string
 	}{
-		{name: "root is a scalar", doc: `just-a-string`},
-		{name: "root is a list", doc: "- a\n- b\n"},
-		{name: "workflows is a scalar", doc: "version: \"2\"\nworkflows: nope\n"},
-		{name: "workflows is a list", doc: "version: \"2\"\nworkflows: [a, b]\n"},
-		{name: "a workflow is a scalar", doc: "version: \"2\"\nworkflows:\n  wf: nope\n"},
-		{name: "extends names a non-object workflow", doc: "version: \"2\"\nworkflows:\n  base: nope\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: plan\n"},
-		{name: "stages is a scalar", doc: "version: \"2\"\nworkflows:\n  wf:\n    stages: nope\n"},
-		{name: "a stage is a scalar", doc: "version: \"2\"\nworkflows:\n  wf:\n    stages: [nope, 7]\n"},
-		{name: "a stage id is not a string", doc: "version: \"2\"\nworkflows:\n  wf:\n    stages:\n      - id: 7\n        type: plan\n"},
-		{name: "a base stage is a scalar", doc: "version: \"2\"\nworkflows:\n  base:\n    stages: [nope]\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: plan\n"},
-		{name: "a deriving stage is a scalar", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: plan\n  derived:\n    extends: base\n    stages: [nope]\n"},
-		{name: "defaults blocks are scalars", doc: "version: \"2\"\ndefaults: 7\nworkflows:\n  wf:\n    defaults: 7\n    stages:\n      - id: a\n        type: plan\n"},
+		{name: "root is a scalar", doc: `just-a-string`, preserved: `"just-a-string"`},
+		{name: "root is a list", doc: "- a\n- b\n", preserved: `["a","b"]`},
+		{name: "workflows is a scalar", doc: "version: \"2\"\nworkflows: nope\n", preserved: `"workflows":"nope"`},
+		{name: "workflows is a list", doc: "version: \"2\"\nworkflows: [a, b]\n", preserved: `"workflows":["a","b"]`},
+		{name: "a workflow is a scalar", doc: "version: \"2\"\nworkflows:\n  wf: nope\n", preserved: `"wf":"nope"`},
+		{name: "extends names a non-object workflow", doc: "version: \"2\"\nworkflows:\n  base: nope\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: plan\n", preserved: `"base":"nope"`},
+		{name: "stages is a scalar", doc: "version: \"2\"\nworkflows:\n  wf:\n    stages: nope\n", preserved: `"stages":"nope"`},
+		{name: "a stage is a scalar", doc: "version: \"2\"\nworkflows:\n  wf:\n    stages: [nope, 7]\n", preserved: `"stages":["nope",7]`},
+		{name: "a stage id is not a string", doc: "version: \"2\"\nworkflows:\n  wf:\n    stages:\n      - id: 7\n        type: plan\n", preserved: `"id":7`},
+		{name: "a base stage is a scalar", doc: "version: \"2\"\nworkflows:\n  base:\n    stages: [nope]\n  derived:\n    extends: base\n    stages:\n      - id: a\n        type: plan\n", preserved: `"base":{"stages":["nope"]}`},
+		{name: "a deriving stage is a scalar", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: plan\n  derived:\n    extends: base\n    stages: [nope]\n", preserved: `"stages":[{"id":"a","type":"plan"},"nope"]`},
+		{name: "defaults blocks are scalars", doc: "version: \"2\"\ndefaults: 7\nworkflows:\n  wf:\n    defaults: 7\n    stages:\n      - id: a\n        type: plan\n", preserved: `"defaults":7`},
+		// The two write-not-just-read cases: `extends` supplies stages, so a
+		// malformed `stages` on the deriving workflow is the one shape whose
+		// skip could have silently REPLACED it with a valid inherited list.
+		{name: "extends with a scalar stages list", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: plan\n  derived:\n    extends: base\n    stages: nope\n", preserved: `"derived":{"extends":"base","stages":"nope"}`},
+		{name: "extends with a null stages list", doc: "version: \"2\"\nworkflows:\n  base:\n    stages:\n      - id: a\n        type: plan\n  derived:\n    extends: base\n    stages:\n", preserved: `"derived":{"extends":"base","stages":null}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -973,8 +1139,12 @@ func TestResolveV2Reuse_MalformedShapesAreSkippedNotCrashes(t *testing.T) {
 			if err := resolveV2Reuse(raw); err != nil {
 				t.Fatalf("resolveV2Reuse = %v, want nil — an unvalidated shape is the SCHEMA's error, never this pass's", err)
 			}
-			if raw == nil {
-				t.Fatal("resolver dropped the document; it must leave an unrecognized shape in place for the schema to report")
+			resolved, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatalf("marshal resolved: %v", err)
+			}
+			if !strings.Contains(string(resolved), tc.preserved) {
+				t.Errorf("resolved document = %s\nwant it to still contain %s — an unrecognized shape must be LEFT IN PLACE for the schema to report, never overwritten", resolved, tc.preserved)
 			}
 			// The strip must tolerate the identical shapes.
 			stripV2Reuse(raw)

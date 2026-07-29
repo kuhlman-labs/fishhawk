@@ -37,7 +37,8 @@ import (
 //   - `reviewers` is taken WHOLE from exactly ONE rung and is NEVER blended.
 //     See applyDefaults' doc comment for why this asymmetry is deliberate.
 //   - an executor default is DROPPED WHOLESALE for a stage selecting a
-//     different oneOf branch. See mergeExecutor.
+//     different oneOf branch, and for ANY stage on the `human` or `delegate`
+//     branch, which admit no key beyond their own. See mergeExecutor.
 //
 // ORDERING (see ParseBytes, and backend/internal/spec/README.md):
 //
@@ -168,7 +169,19 @@ func (r *reuseResolver) resolve(name string, chain []string) (map[string]any, er
 	defer delete(r.onStack, name)
 
 	wfDefaults, _ := wf["defaults"].(map[string]any)
-	ownStages, _ := wf["stages"].([]any)
+	stagesRaw, declaresStages := wf["stages"]
+	ownStages, stagesWellFormed := stagesRaw.([]any)
+
+	// A `stages` key that is PRESENT but not a list is a shape mismatch this
+	// pass skips like every other — but skipping it must not also mean
+	// OVERWRITING it. Under `extends` the resolved base stages would be
+	// written into this key, replacing the author's invalid declaration with
+	// a valid inherited list, so `stages: nope` / `stages: null` would parse
+	// as though the key had been omitted entirely and an invalid document
+	// would execute. The malformed value is left exactly as authored instead,
+	// and the schema — which validates the resolved document immediately
+	// afterwards — reports it at /workflows/<name>/stages.
+	malformedStages := declaresStages && !stagesWellFormed
 
 	var stages []any
 	if baseName, ok := wf["extends"].(string); ok {
@@ -176,20 +189,22 @@ func (r *reuseResolver) resolve(name string, chain []string) (map[string]any, er
 		if err != nil {
 			return nil, err
 		}
-		baseStages, _ := base["stages"].([]any)
-		// The base's stages already carry the file defaults and the BASE's
-		// own workflow defaults. This workflow's defaults sit ABOVE them on
-		// the ladder, so they are applied OVER each inherited stage.
-		inherited := make([]any, 0, len(baseStages))
-		for _, bs := range baseStages {
-			st := deepCopyAny(bs)
-			if m, ok := st.(map[string]any); ok {
-				applyDefaults(m, wfDefaults, true /* defaults win */)
+		if !malformedStages {
+			baseStages, _ := base["stages"].([]any)
+			// The base's stages already carry the file defaults and the BASE's
+			// own workflow defaults. This workflow's defaults sit ABOVE them on
+			// the ladder, so they are applied OVER each inherited stage.
+			inherited := make([]any, 0, len(baseStages))
+			for _, bs := range baseStages {
+				st := deepCopyAny(bs)
+				if m, ok := st.(map[string]any); ok {
+					applyDefaults(m, wfDefaults, true /* defaults win */)
+				}
+				inherited = append(inherited, st)
 			}
-			inherited = append(inherited, st)
+			// This workflow's own stage declarations are highest of all.
+			stages = mergeStagesByID(inherited, ownStages, mergeDefaultsBlocks(r.fileDefaults, wfDefaults))
 		}
-		// This workflow's own stage declarations are highest of all.
-		stages = mergeStagesByID(inherited, ownStages, mergeDefaultsBlocks(r.fileDefaults, wfDefaults))
 	} else if ownStages != nil {
 		effective := mergeDefaultsBlocks(r.fileDefaults, wfDefaults)
 		stages = make([]any, 0, len(ownStages))
@@ -208,7 +223,9 @@ func (r *reuseResolver) resolve(name string, chain []string) (map[string]any, er
 	}
 	// A workflow that declared no `stages` and extends nothing keeps the key
 	// ABSENT, so the schema reports its own required-property error rather
-	// than a fabricated empty list failing minItems.
+	// than a fabricated empty list failing minItems. A workflow whose
+	// `stages` is present but malformed keeps that value verbatim, per
+	// malformedStages above.
 	if stages != nil {
 		out["stages"] = stages
 	}
@@ -435,18 +452,24 @@ func applyDefaults(stage map[string]any, defaults map[string]any, defaultsWin bo
 const reviewersKey = "reviewers"
 
 // mergeExecutor merges two executor fragments key-wise with `over` winning
-// per key, and carries the BRANCH RULE: when both sides select one of the
-// three $defs/executor oneOf branches (agent / human / delegate) and those
-// branches DIFFER, the merge collapses WHOLESALE to `authored` — the fragment
-// whose branch the resolved stage must keep — and the other side is dropped
-// entirely, branchless keys and all.
+// per key, and carries the BRANCH RULE. The rule has two halves, and both
+// collapse the merge WHOLESALE to `authored` — the fragment whose shape the
+// resolved stage must keep — dropping the other side entirely, branchless
+// keys and all:
+//
+//  1. DIFFERENT BRANCH. Both sides select one of the three $defs/executor
+//     oneOf branches (agent / human / delegate) and those branches DIFFER.
+//  2. CLOSED BRANCH. `authored` selects `human` or `delegate` and the merge
+//     would introduce ANY key beyond that branch key. Those two oneOf arms
+//     declare only their own property, so anything else fails the oneOf —
+//     including a BRANCHLESS default the first half does not catch.
 //
 // `authored` is the stage's own executor when a `defaults` block is being
 // folded in (from either ladder direction), and the DERIVING stage's executor
 // when a deriving stage merges onto its base. In both cases it is the most
 // specific thing the author wrote about that stage.
 //
-// Without this rule a file-level defaults.executor {agent: claude-code,
+// Without the first half a file-level defaults.executor {agent: claude-code,
 // timeout: 30m} grafts `agent` — plus every agent-branch-only key — onto each
 // `human: true` gate stage and each DELEGATING deploy stage. Draft 2020-12
 // collects unevaluatedProperties against every successfully-evaluated
@@ -454,9 +477,17 @@ const reviewersKey = "reviewers"
 // $defs/executor's oneOf and the document is rejected though its author wrote
 // nothing wrong. That would make file-level executor defaults unusable in
 // exactly the preset-shaped workflows this change exists to de-duplicate.
-// The drop is WHOLESALE rather than branch-key-only because the human and
-// delegate branches set unevaluatedProperties: false, so even a surviving
-// stray `timeout` would fail the oneOf.
+//
+// Without the SECOND half the identical failure returns one case over, for the
+// bare {timeout: 30m} default the schema's own `defaults.executor` description
+// advertises: it declares no branch, so the first half never fires, and it
+// merges key-wise into a `human: true` gate stage to produce
+// {human: true, timeout: 30m} — which the human arm rejects just as surely.
+// Essentially every real workflow carries a human gate stage, so the
+// advertised branchless default would reject nearly every realistic document
+// with an opaque oneOf error. Both halves fail the same way (the default is
+// dropped, never reinterpreted) and for the same reason: an execution-parameter
+// default must never change what a stage's authored executor IS.
 func mergeExecutor(under, over, authored any) any {
 	um, uok := under.(map[string]any)
 	om, ook := over.(map[string]any)
@@ -466,7 +497,31 @@ func mergeExecutor(under, over, authored any) any {
 	if ub, ob := executorBranch(um), executorBranch(om); ub != "" && ob != "" && ub != ob {
 		return authored
 	}
+	if am, ok := authored.(map[string]any); ok {
+		if ab := executorBranch(am); executorClosedBranches[ab] && mergeWidensBeyond(ab, um, om) {
+			return authored
+		}
+	}
 	return mergeKeyWise(um, om)
+}
+
+// executorClosedBranches are the two $defs/executor oneOf arms that declare
+// NO property beyond their own branch key. With unevaluatedProperties: false
+// at the executor root, a stage on one of these branches admits exactly one
+// key, so ANY fragment merged into it — branchless or not — breaks the oneOf.
+var executorClosedBranches = map[string]bool{"human": true, "delegate": true}
+
+// mergeWidensBeyond reports whether merging the two fragments would yield any
+// key other than branch.
+func mergeWidensBeyond(branch string, fragments ...map[string]any) bool {
+	for _, m := range fragments {
+		for k := range m {
+			if k != branch {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // executorBranch reports which of the three oneOf branches an executor

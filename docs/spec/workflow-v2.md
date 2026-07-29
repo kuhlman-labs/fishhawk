@@ -202,7 +202,10 @@ So a stage (or workflow) that **declares** `reviewers` gets that block exactly a
 
 ### The executor branch rule
 
-`$defs/executor` is a `oneOf` over three mutually exclusive branches — `agent`, `human`, `delegate`. **When a defaults (or base) executor selects a different branch than the stage's own executor, it is dropped WHOLESALE for that stage** — branchless keys such as `timeout` included.
+`$defs/executor` is a `oneOf` over three mutually exclusive branches — `agent`, `human`, `delegate`. The rule has two halves, and both drop the incoming fragment **WHOLESALE** for that stage, branchless keys such as `timeout` included:
+
+1. **Different branch.** A defaults (or base) executor selecting a different branch than the stage's own executor is dropped.
+2. **Closed branch.** A defaults (or base) executor of **any** shape — including a branchless `{timeout: 30m}` — is dropped for a stage on the `human` or `delegate` branch. Those two `oneOf` arms declare no property beyond their own branch key.
 
 ```yaml
 defaults:
@@ -229,7 +232,9 @@ workflows:
             workflow_ref: deploy.yml
 ```
 
-Without this rule the file-level `agent` default would graft an `agent` key — and every agent-branch-only key — onto each `human: true` gate stage and each delegating deploy stage, and the schema's `oneOf` would then reject a document whose author wrote nothing wrong. The drop is *wholesale* rather than branch-key-only because the `human` and `delegate` branches set `unevaluatedProperties: false`, so even a stray surviving `timeout` fails the branch.
+Without the first half the file-level `agent` default would graft an `agent` key — and every agent-branch-only key — onto each `human: true` gate stage and each delegating deploy stage, and the schema's `oneOf` would then reject a document whose author wrote nothing wrong. The drop is *wholesale* rather than branch-key-only because the `human` and `delegate` branches set `unevaluatedProperties: false`, so even a stray surviving `timeout` fails the branch.
+
+The second half exists because that same rejection returns one case over for a **branchless** default, which the first half cannot see. A file-level `defaults: {executor: {timeout: 30m}}` declares no branch, so it would merge key-wise into `{human: true}` and produce `{human: true, timeout: 30m}` — which the human arm rejects exactly as it rejects a grafted `agent`. Essentially every real workflow carries a human gate stage, so without the closed-branch half the bare-`timeout` default would reject nearly every realistic document. Both halves fail the same way — the default is dropped, never reinterpreted — so a bare `{timeout: 30m}` reaches every agent stage and silently skips every human gate and delegating deploy stage.
 
 ### Rejections
 

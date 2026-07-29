@@ -46,7 +46,7 @@
         "executor": {
           "type": "object",
           "minProperties": 1,
-          "description": "PARTIAL executor defaults, e.g. {agent: claude-code, timeout: 30m} or a bare {timeout: 30m}. Deliberately NOT $ref'd to #/$defs/executor: a partial fragment cannot satisfy that definition's agent/human/delegate oneOf, and it does not need to — the merged result is validated strictly at each RECEIVING stage, where the real branch oneOf and unevaluatedProperties rules apply. BRANCH RULE: a default declaring one of agent/human/delegate is DROPPED WHOLESALE for a stage whose own executor selects a different branch, so a file-level {agent: …} default never grafts an `agent` key onto a `human: true` gate stage or a delegating deploy stage."
+          "description": "PARTIAL executor defaults, e.g. {agent: claude-code, timeout: 30m} or a bare {timeout: 30m}. Deliberately NOT $ref'd to #/$defs/executor: a partial fragment cannot satisfy that definition's agent/human/delegate oneOf, and it does not need to — the merged result is validated strictly at each RECEIVING stage, where the real branch oneOf and unevaluatedProperties rules apply. BRANCH RULE, in two halves, both dropping the default WHOLESALE (branchless keys and all): (1) a default declaring one of agent/human/delegate is dropped for a stage whose own executor selects a DIFFERENT branch, so a file-level {agent: …} default never grafts an `agent` key onto a `human: true` gate stage or a delegating deploy stage; (2) a default of ANY shape — including a bare {timeout: 30m} — is dropped for a stage on the `human` or `delegate` branch, because those two oneOf arms declare no property beyond their own branch key, so even a lone inherited `timeout` would fail the oneOf under unevaluatedProperties: false. A bare {timeout: 30m} default therefore reaches every agent stage and silently skips every human gate and delegating deploy stage, rather than rejecting the document."
         },
         "reviewers": {
           "$ref": "#/$defs/reviewers_config"
@@ -164,7 +164,7 @@
             "executor": {
               "type": "object",
               "minProperties": 1,
-              "description": "PARTIAL executor defaults for every stage of this workflow. Deliberately NOT $ref'd to #/$defs/executor: a partial fragment cannot satisfy that definition's agent/human/delegate oneOf, and the merged result is validated strictly at each receiving stage instead. The same BRANCH RULE applies — a default declaring one of agent/human/delegate is dropped wholesale for a stage whose own executor selects a different branch."
+              "description": "PARTIAL executor defaults for every stage of this workflow. Deliberately NOT $ref'd to #/$defs/executor: a partial fragment cannot satisfy that definition's agent/human/delegate oneOf, and the merged result is validated strictly at each receiving stage instead. The same two-half BRANCH RULE applies — a default declaring one of agent/human/delegate is dropped wholesale for a stage whose own executor selects a different branch, and a default of any shape (a bare {timeout: 30m} included) is dropped wholesale for a stage on the `human` or `delegate` branch, which admit no key beyond their own."
             },
             "reviewers": {
               "$ref": "#/$defs/reviewers_config"
