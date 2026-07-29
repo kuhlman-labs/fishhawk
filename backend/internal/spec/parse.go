@@ -296,6 +296,19 @@ func ParseBytes(data []byte) (*Spec, error) {
 		return nil, fmt.Errorf("internal: decode to Spec: %w", err)
 	}
 
+	// Resolve workflow-v2's unified autonomy grammar (ADR-066 / E52.10 /
+	// #2222) and project it onto the derived OperatorAgent field every
+	// enforcement site already reads. Ordering is load-bearing and pinned
+	// in v2autonomy.go's header — AFTER the typed decode (this pass needs
+	// ActionMatrix's custom unmarshaller's partitioned output, not the raw
+	// map) and BEFORE Validate. A v2 workflow declaring neither `autonomy`
+	// nor `actions` derives nil, so it stays byte-identical to today.
+	if major >= 2 {
+		if err := deriveV2Autonomy(&spec); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := Validate(&spec); err != nil {
 		return nil, err
 	}

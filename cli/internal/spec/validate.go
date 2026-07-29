@@ -95,8 +95,9 @@ func appendRangeError(node any, path string, errs *[]ValidationErrorEntry) {
 	}
 }
 
-// Messages for the seven back-compat surfaces workflow-v2 REMOVES (E52.3 /
-// #2215, E52.2 / #2214), RESHAPES (E52.6 / #2218) or RENAMES (E52.5 / #2217).
+// Messages for the eight back-compat surfaces workflow-v2 REMOVES (E52.3 /
+// #2215, E52.2 / #2214, E52.10 / #2222), RESHAPES (E52.6 / #2218) or RENAMES
+// (E52.5 / #2217).
 // Byte-identical to backend/internal/spec/v2removed.go's set: `fishhawk
 // validate` is where a spec author most often meets these errors, so the CLI
 // must not degrade to the generic schema message, and the two surfaces must
@@ -111,6 +112,7 @@ const (
 	msgV2RenamedBudgetMaxRuntimeMinutes = `budget.max_runtime_minutes was renamed to budget.max_runtime in workflow-v2: write the same value as a Go duration string parsed by time.ParseDuration — max_runtime_minutes: 15 becomes max_runtime: 15m; v0/v1 keep the max_runtime_minutes spelling`
 	msgV2RemovedApprovers               = `the gate "approvers" role allow-list was removed in workflow-v2: declare the forge-neutral "approvals" block instead (a role allow-list becomes approvals: {count, members | member_of | min_permission}); the mapping is NOT mechanical, so review the translation rather than applying it blind`
 	msgV2RemovedRolesMap                = `the top-level "roles" map was removed in workflow-v2: forge-neutral membership moves onto a gate's "approvals" block (approvals.member_of / approvals.members); there is no top-level role map at major 2`
+	msgV2RemovedOperatorAgent           = `the "operator_agent" block was removed in workflow-v2: declare the action matrix (actions: {approve: {mode: auto, when: clean_dual_approval}, …}) or the tier shorthand (autonomy: low | medium | high) instead; may_approve -> actions.approve, may_route_fixup -> actions.fixup, route_fixup_min_severity -> actions.fixup.min_severity, may_waive -> actions.waive, may_retry -> actions.retry, may_merge -> actions.merge, must_page_human -> actions.page_human_on, model_policy -> actions.model_policy, and knob-absence -> mode: gated`
 )
 
 // legacyPageEventReviewerReject is the bare page-event token workflow-v2
@@ -118,7 +120,7 @@ const (
 const legacyPageEventReviewerReject = "reviewer_reject"
 
 // validateV2RemovedForms sweeps a yaml.v3-decoded generic document for the
-// seven forms workflow-v2 removed, reshaped or renamed and returns the first
+// eight forms workflow-v2 removed, reshaped or renamed and returns the first
 // match as a *ValidationError naming the replacement surface, or nil. It
 // mirrors the backend's checkV2RemovedForms exactly, including the ordering
 // contract: it runs ONLY for a routed major >= 2 and BEFORE schema validation,
@@ -130,8 +132,9 @@ const legacyPageEventReviewerReject = "reviewer_reject"
 // "reviewer_reject", any `reviewers` map carrying an `agent` key, any
 // `drive` key, any `constraints` value that is a LIST, any `budget`
 // map carrying a `max_runtime_minutes` key, any `approvers` map (the
-// removed gate role allow-list, E52.2 / #2214), and any `roles` map (the
-// removed top-level role map). It is
+// removed gate role allow-list, E52.2 / #2214), any `roles` map (the
+// removed top-level role map), and any `operator_agent` key whatever its
+// value shape (the removed delegation block, E52.10 / #2222). It is
 // deliberately NOT position-aware and deliberately OVER-TRIGGERS in
 // exchange for never missing a legacy form, so in an already-invalid
 // document the legacy-form message may PRECEDE the genuine structural
@@ -179,12 +182,12 @@ func walkV2RemovedForms(node any, ptr string) *ValidationErrorEntry {
 }
 
 // checkV2RemovedAtNode reports a legacy form declared directly on this map
-// node. The seven forms are checked in a FIXED order — page event,
+// node. The eight forms are checked in a FIXED order — page event,
 // reviewers.agent, the two E52.6 reshapes (drive, list-form constraints),
 // the E52.5 budget.max_runtime_minutes rename, then the two E52.2 removals
-// (gate `approvers`, top-level `roles`) LAST, `approvers` before `roles` —
-// so a document carrying several always reports the same one. The two E52.2
-// branches are appended LAST so the existing five-form report order is
+// (gate `approvers`, top-level `roles`), then the E52.10 `operator_agent`
+// removal — so a document carrying several always reports the same one.
+// Each new branch is appended LAST so the preceding report order stays
 // byte-preserved.
 func checkV2RemovedAtNode(m map[string]any, ptr string) *ValidationErrorEntry {
 	if events, ok := m["must_page_human"].([]any); ok {
@@ -240,6 +243,18 @@ func checkV2RemovedAtNode(m map[string]any, ptr string) *ValidationErrorEntry {
 		return &ValidationErrorEntry{
 			Path:    ptr + "/roles",
 			Message: msgV2RemovedRolesMap,
+		}
+	}
+	// ADR-066 / E52.10 / #2222: the `operator_agent` delegation block was
+	// removed — the `actions` matrix and the `autonomy` tier shorthand
+	// replace it. Appended LAST so the seven-form order above is
+	// byte-preserved. Matched on KEY PRESENCE regardless of value shape
+	// (like `drive`, unlike the map-typed `approvers`/`roles` checks): the
+	// key itself is gone at major 2, whatever it holds.
+	if _, ok := m["operator_agent"]; ok {
+		return &ValidationErrorEntry{
+			Path:    ptr + "/operator_agent",
+			Message: msgV2RemovedOperatorAgent,
 		}
 	}
 	return nil
