@@ -2,8 +2,11 @@ package spec_test
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -2414,17 +2417,20 @@ func TestParse_RoutesV0Spec(t *testing.T) {
 }
 
 // TestParse_UnsupportedMajorFailsClosed proves a well-formed but
-// unrecognized major (2.0) fails closed with a *SchemaError naming the
-// supported majors (the fail-closed-on-unknown-major branch).
+// unrecognized major (3.0, now that major 2 is routable) fails closed
+// with a *SchemaError naming the supported majors (the
+// fail-closed-on-unknown-major branch). Anchored on 3.0 because major 2
+// left the fail-closed set with workflow-v2 (ADR-067 / #2213).
 func TestParse_UnsupportedMajorFailsClosed(t *testing.T) {
-	_, err := spec.ParseBytes(minimalSpecAtVersion("2.0"))
+	_, err := spec.ParseBytes(minimalSpecAtVersion("3.0"))
 	var se *spec.SchemaError
 	if !errors.As(err, &se) {
 		t.Fatalf("err = %v, want *SchemaError", err)
 	}
-	// The message must name the supported majors so an operator knows
-	// what is routable.
-	for _, want := range []string{"0", "1"} {
+	// The message must name every supported major so an operator knows
+	// what is routable — proving the list is derived from the routing
+	// table (0, 1, AND 2).
+	for _, want := range []string{"0", "1", "2"} {
 		if !strings.Contains(se.Message, want) {
 			t.Errorf("message %q does not name supported major %q", se.Message, want)
 		}
@@ -3610,5 +3616,224 @@ workflows:
 		if c.DiffCoverage != nil {
 			t.Errorf("constraint %d DiffCoverage = %+v, want nil", i, c.DiffCoverage)
 		}
+	}
+}
+
+// --- workflow-v2 (ADR-067 / #2213) ---
+
+// TestParse_RoutesV2Spec proves a version: "2" spec that is otherwise a
+// valid v1-grammar document routes to the v2 schema and is accepted (the
+// v2-accepts branch — the embed directive + routing-table entry actually
+// dispatch to v2 instead of failing closed).
+func TestParse_RoutesV2Spec(t *testing.T) {
+	s, err := spec.ParseBytes(minimalSpecAtVersion("2"))
+	if err != nil {
+		t.Fatalf("ParseBytes(version 2): %v", err)
+	}
+	if s.Version != "2" {
+		t.Errorf("version = %q, want 2", s.Version)
+	}
+}
+
+// TestParse_V2RejectsUndeclaredField proves additionalProperties:false
+// survived the v1->v2 copy: a version: "2" spec carrying a top-level
+// field the schema does not declare is rejected with a *SchemaError
+// naming the offending field. This is the "acceptance is by declaration"
+// done-means.
+func TestParse_V2RejectsUndeclaredField(t *testing.T) {
+	yml := []byte("version: \"2\"\n" + `
+bogus_undeclared_field: 1
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError", err)
+	}
+	if !strings.Contains(se.Message, "bogus_undeclared_field") &&
+		!strings.Contains(se.Path, "bogus_undeclared_field") {
+		t.Errorf("error (path %q, message %q) does not name the offending field", se.Path, se.Message)
+	}
+}
+
+// TestParse_V2RejectsMinorForm proves the collapsed enum: "2.0" routes to
+// the v2 schema by major but is REJECTED by the single-token enum. This
+// is the test that fails on a no-op copy — had the v1 minor chain been
+// carried over, "2.0" would pass.
+func TestParse_V2RejectsMinorForm(t *testing.T) {
+	_, err := spec.ParseBytes(minimalSpecAtVersion("2.0"))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for the collapsed-enum rejection", err)
+	}
+	// The failure must be the version enum, not the unsupported-major
+	// fail-closed path (major 2 IS routable).
+	if strings.Contains(se.Message, "not recognized") {
+		t.Errorf("message %q reads as an unsupported-major failure; want a version enum rejection", se.Message)
+	}
+}
+
+// TestEmbeddedSchemaHashV2 proves the v2 hash accessor returns non-empty
+// lowercase hex, stable across calls, and distinct from BOTH the v0 and
+// v1 hashes — a copy that forgot the $id/title/version edits would
+// collide with v1's hash and fail here.
+func TestEmbeddedSchemaHashV2(t *testing.T) {
+	h := spec.EmbeddedSchemaHashV2()
+	if h == "" {
+		t.Fatal("EmbeddedSchemaHashV2() is empty")
+	}
+	if h != strings.ToLower(h) {
+		t.Errorf("EmbeddedSchemaHashV2() = %q is not lowercase", h)
+	}
+	if _, err := hex.DecodeString(h); err != nil {
+		t.Errorf("EmbeddedSchemaHashV2() = %q is not hex: %v", h, err)
+	}
+	if again := spec.EmbeddedSchemaHashV2(); again != h {
+		t.Errorf("EmbeddedSchemaHashV2() not stable: %q then %q", h, again)
+	}
+	if h == spec.EmbeddedSchemaHash() {
+		t.Error("v2 hash equals v0 hash; the schemas must differ")
+	}
+	if h == spec.EmbeddedSchemaHashV1() {
+		t.Error("v2 hash equals v1 hash; the structural-copy schemas must still differ by $id/title/version/descriptions")
+	}
+}
+
+// TestParse_RoutesV16Spec is the v1 no-change pin: a version "1.6" spec
+// (the current latest v1 minor) still parses to its declared version,
+// asserting the new v2 routing-table entry did not perturb v1 dispatch.
+func TestParse_RoutesV16Spec(t *testing.T) {
+	s, err := spec.ParseBytes(minimalSpecAtVersion("1.6"))
+	if err != nil {
+		t.Fatalf("ParseBytes(version 1.6): %v", err)
+	}
+	if s.Version != "1.6" {
+		t.Errorf("version = %q, want 1.6", s.Version)
+	}
+}
+
+// TestV2StructurallyMatchesV1 mechanically proves the invariant (ADR-067
+// / #2213 binding condition 2): v2 is STRUCTURALLY / VALIDATION identical
+// to v1 — every key, type, enum, required list, additionalProperties
+// setting, and oneOf/anyOf/allOf branch under $defs and under the
+// non-version properties matches — while the deliberate deltas
+// (description strings at every depth, the top-level $id and title, and
+// the properties.version entry) are normalized away. It decodes both
+// embedded mirrors from the package's own schemas dir, walks both trees,
+// and names the JSON path at any surviving divergence. This is the check
+// the single minimal-document parse cannot make: it catches a dropped or
+// mistyped key anywhere in the copy — stage types, executor branches,
+// constraint kinds, gate shapes, reviewers — that no fixture exercises.
+func TestV2StructurallyMatchesV1(t *testing.T) {
+	v1 := decodeSchemaMirror(t, "schemas/workflow-v1.schema.json")
+	v2 := decodeSchemaMirror(t, "schemas/workflow-v2.schema.json")
+
+	// Drop the deliberate top-level deltas before the structural walk.
+	for _, m := range []map[string]any{v1, v2} {
+		delete(m, "$id")
+		delete(m, "title")
+		if props, ok := m["properties"].(map[string]any); ok {
+			delete(props, "version")
+		}
+	}
+
+	// Normalize away every description key at every depth, then diff.
+	na := normalizeSchemaTree(v1)
+	nb := normalizeSchemaTree(v2)
+	if path, diff := firstSchemaDiff(na, nb, "$"); diff {
+		t.Fatalf("v2 diverges from v1 structurally at %s", path)
+	}
+}
+
+// decodeSchemaMirror reads and JSON-decodes an embedded schema mirror
+// from the package's own schemas dir.
+func decodeSchemaMirror(t *testing.T, path string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read schema mirror %q: %v", path, err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("decode schema mirror %q: %v", path, err)
+	}
+	return out
+}
+
+// normalizeSchemaTree returns a deep copy of v with every "description"
+// map key removed at every depth — a structural walk, not a string
+// replace over raw bytes.
+func normalizeSchemaTree(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, val := range t {
+			if k == "description" {
+				continue
+			}
+			out[k] = normalizeSchemaTree(val)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, val := range t {
+			out[i] = normalizeSchemaTree(val)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// firstSchemaDiff walks two normalized schema trees and returns the JSON
+// path of the first divergence (and true), or ("", false) if they are
+// deeply equal.
+func firstSchemaDiff(a, b any, path string) (string, bool) {
+	switch av := a.(type) {
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok {
+			return path + " (type mismatch: object vs non-object)", true
+		}
+		for k, avv := range av {
+			bvv, present := bv[k]
+			if !present {
+				return path + "/" + k + " (present in v1, absent in v2)", true
+			}
+			if p, d := firstSchemaDiff(avv, bvv, path+"/"+k); d {
+				return p, true
+			}
+		}
+		for k := range bv {
+			if _, present := av[k]; !present {
+				return path + "/" + k + " (present in v2, absent in v1)", true
+			}
+		}
+		return "", false
+	case []any:
+		bv, ok := b.([]any)
+		if !ok {
+			return path + " (type mismatch: array vs non-array)", true
+		}
+		if len(av) != len(bv) {
+			return fmt.Sprintf("%s (array length %d vs %d)", path, len(av), len(bv)), true
+		}
+		for i := range av {
+			if p, d := firstSchemaDiff(av[i], bv[i], fmt.Sprintf("%s[%d]", path, i)); d {
+				return p, true
+			}
+		}
+		return "", false
+	default:
+		if !reflect.DeepEqual(a, b) {
+			return fmt.Sprintf("%s (%v vs %v)", path, a, b), true
+		}
+		return "", false
 	}
 }

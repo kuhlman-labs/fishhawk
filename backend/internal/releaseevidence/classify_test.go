@@ -62,6 +62,14 @@ func TestClassifyBumpPerSignalClass(t *testing.T) {
 			wantPR:    105,
 		},
 		{
+			// ADR-067 / #2213: the schema-major matcher is keyed on major
+			// names, so a v2 release must classify as BumpMajor too.
+			name:      "breaking workflow-v2 schema-major bump is major",
+			change:    change(108, "Cut the skeleton", "Land the workflow-v2 schema as a structural copy of its predecessor."),
+			wantLevel: releaseevidence.BumpMajor,
+			wantPR:    108,
+		},
+		{
 			name:      "breaking removed OpenAPI path is major",
 			change:    change(106, "Retire the legacy runs listing", "Removed endpoint /v0/legacy-runs from the OpenAPI surface."),
 			wantLevel: releaseevidence.BumpMajor,

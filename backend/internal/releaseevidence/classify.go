@@ -110,6 +110,8 @@ var bumpMatchers = []bumpMatcher{
 			"schema major",
 			"workflow-v1",
 			"workflow v1",
+			"workflow-v2",
+			"workflow v2",
 			"standard_v2",
 			"major version bump",
 			"breaking change",

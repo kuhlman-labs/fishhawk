@@ -373,16 +373,67 @@ workflows:
 // unrecognized major (2.0) fails closed with a *ValidationError naming
 // the supported majors (the fail-closed-on-unknown-major branch).
 func TestValidateBytes_UnsupportedMajorFailsClosed(t *testing.T) {
-	err := spec.ValidateBytes([]byte(minimalSpecAtVersion("2.0")))
+	// Anchored on 3.0 because major 2 left the fail-closed set with
+	// workflow-v2 (ADR-067 / #2213).
+	err := spec.ValidateBytes([]byte(minimalSpecAtVersion("3.0")))
 	var ve *spec.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("err = %v, want *ValidationError", err)
 	}
 	joined := strings.Join(messageStrings(ve), "\n")
-	for _, want := range []string{"0", "1"} {
+	for _, want := range []string{"0", "1", "2"} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("error %q does not name supported major %q", joined, want)
 		}
+	}
+}
+
+// TestValidateBytes_RoutesV2Spec proves a version: "2" spec routes to the
+// cli's embedded v2 schema mirror and validates (the v2-accepts branch —
+// the embed directive + routing-table entry dispatch to v2).
+func TestValidateBytes_RoutesV2Spec(t *testing.T) {
+	if err := spec.ValidateBytes([]byte(minimalSpecAtVersion("2"))); err != nil {
+		t.Errorf("expected v2 spec to validate, got: %v", err)
+	}
+}
+
+// TestValidateBytes_V2RejectsUndeclaredField proves additionalProperties:
+// false survived the v1->v2 copy in the cli mirror: a version: "2" spec
+// carrying an undeclared top-level field is rejected naming the field.
+func TestValidateBytes_V2RejectsUndeclaredField(t *testing.T) {
+	yml := "version: \"2\"\n" + `
+bogus_undeclared_field: 1
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	if !strings.Contains(joined, "bogus_undeclared_field") {
+		t.Errorf("error %q does not name the offending field", joined)
+	}
+}
+
+// TestValidateBytes_V2RejectsMinorForm proves the collapsed enum in the
+// cli mirror: "2.0" routes to v2 by major but is rejected by the single-
+// token enum (the test that fails on a no-op copy of the v1 minor chain).
+func TestValidateBytes_V2RejectsMinorForm(t *testing.T) {
+	err := spec.ValidateBytes([]byte(minimalSpecAtVersion("2.0")))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for the collapsed-enum rejection", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	if strings.Contains(joined, "not recognized") {
+		t.Errorf("error %q reads as an unsupported-major failure; want a version enum rejection", joined)
 	}
 }
 

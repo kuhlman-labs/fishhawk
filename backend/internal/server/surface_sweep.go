@@ -210,6 +210,24 @@ var surfacePatterns = []surfacePattern{
 		},
 	},
 	{
+		// ADR-067 / #2213: workflow-v2 fans out to the same backend + cli
+		// mirror set as v0/v1 (scripts/sync-schemas' workflow-v* case). A v2
+		// canonical edit without its mirrors red-lines CI's schema-sync gate;
+		// self-referential (Triggers == Siblings) so touching any member —
+		// including a mirror without the canonical — flags the missing peers.
+		Name: "workflow-v2 schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/workflow-v2.schema.json",
+			"backend/internal/spec/schemas/workflow-v2.schema.json",
+			"cli/internal/spec/schemas/workflow-v2.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/workflow-v2.schema.json",
+			"backend/internal/spec/schemas/workflow-v2.schema.json",
+			"cli/internal/spec/schemas/workflow-v2.schema.json",
+		},
+	},
+	{
 		Name: "operator-role schema requires every mirror",
 		Triggers: []string{
 			"docs/spec/operator-role.schema.json",

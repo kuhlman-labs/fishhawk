@@ -3,13 +3,14 @@
 // docs/spec/workflow-v*.schema.json files CI enforces in sync with
 // the backend's copies).
 //
-// Version routing (ADR-046): both the workflow-v0 and workflow-v1
-// schemas are embedded and compiled at init. ValidateBytes reads the
-// spec's version, parses its major component, and validates against
-// the schema for that major (0.x -> v0, 1.x -> v1). A
-// missing/unparseable version falls through to the v0 schema so the
-// existing required-version error is preserved; a well-formed but
-// unsupported major (>= 2) fails closed naming the supported majors.
+// Version routing (ADR-046 / ADR-067): the workflow-v0, workflow-v1,
+// and workflow-v2 schemas are embedded and compiled at init.
+// ValidateBytes reads the spec's version, parses its major component,
+// and validates against the schema for that major (0.x -> v0, 1.x ->
+// v1, 2.x -> v2). A missing/unparseable version falls through to the
+// v0 schema so the existing required-version error is preserved; a
+// well-formed but unsupported major (>= 3) fails closed naming the
+// supported majors.
 //
 // Why this lives in cli/ and not backend/internal/spec: the Go
 // modules are separate, and a cross-module import would couple
@@ -41,7 +42,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed schemas/workflow-v0.schema.json schemas/workflow-v1.schema.json
+//go:embed schemas/workflow-v0.schema.json schemas/workflow-v1.schema.json schemas/workflow-v2.schema.json
 var schemaFS embed.FS
 
 // embeddedSchema names one embedded canonical schema and the spec
@@ -57,6 +58,7 @@ type embeddedSchema struct {
 var embeddedSchemas = []embeddedSchema{
 	{Major: 0, Path: "schemas/workflow-v0.schema.json"},
 	{Major: 1, Path: "schemas/workflow-v1.schema.json"},
+	{Major: 2, Path: "schemas/workflow-v2.schema.json"},
 }
 
 // compiledSchemas maps a version major to its compiled JSON Schema.
