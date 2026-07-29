@@ -1,0 +1,83 @@
+# Workflow-v2 example — a NON-CODE-CHANGE workflow on the standard stage types
+# (E52.7 / #2219, ADR-067 §2).
+#
+# Validates against ../workflow-v2.schema.json. Parsed end to end by
+# TestParseV2_BacklogGroomingExample_ValidatesAndProducesNoDiff in
+# backend/internal/spec, so a schema-invalid or drifted example fails that test
+# rather than only a manual check-jsonschema run.
+#
+# WHY THIS FILE EXISTS. The v0 stage-type names read as if every workflow ships
+# code. They do not: plan / implement / review are conceptually PROPOSE / APPLY
+# / GATE, and ADR-067 §2 settled that the names are RETAINED rather than
+# renamed. This workflow is the worked example — it proposes a grooming report,
+# gates it on a human approval, and applies the approved mutations. Nothing here
+# touches a line of source, and no stage declares the pull_request artifact.
+#
+# WHAT THAT NOW IMPLIES. At workflow-v2 the post-hoc diff constraints
+# (max_files_changed, forbidden_paths, allowed_paths, required_outcomes,
+# diff_coverage) bind to what a stage PRODUCES, not to its type name. Adding any
+# of them to any stage of this file would be REJECTED, because no stage here
+# declares `produces: [{artifact: pull_request}]` — an absent or empty produces
+# list reads as "produces no diff" at major >= 2. That is the point: a diff
+# constraint on a workflow with no diff can never be evaluated, and v2 says so
+# at parse time instead of at run time.
+#
+# The grooming_report artifact kind is ADR-065 §3's decision and is NOT part of
+# this change — it lands with E54.4 / #2236. Until then the propose stage
+# declares no `produces` at all, which is exactly the case this example needs.
+
+version: "2"
+
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+
+workflows:
+  backlog_grooming:
+    description: >-
+      Propose a backlog grooming report, gate it on a human approval, then apply
+      the approved mutations. Produces no code diff at any stage.
+    auto_advance: true
+
+    stages:
+      # PROPOSE. A `plan`-typed stage need not emit a plan artifact — it emits a
+      # proposal, and here the proposal is a grooming report (pending #2236).
+      - id: groom
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: 20m
+        inputs:
+          - source: github_issue
+            required: true
+        gates:
+          - type: approval
+            sla: 24_hours
+            # Forge-neutral approval predicate (E39.2 / #1707). v2 drops the
+            # legacy GitHub-handle `approvers` allow-list from new workflows.
+            approvals:
+              count: 1
+              not: [author, agent]
+
+      # APPLY. An `implement`-typed stage applies the approved mutations — here
+      # tracker updates, not source edits. It carries no diff constraints and
+      # produces no pull_request, which v2 accepts and evaluates accordingly.
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: 30m
+        needs: [groom]
+
+      # GATE. A `review`-typed stage is a gate on the applied result. Review
+      # stages emit no artifact in any major.
+      - id: confirm
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            sla: 24_hours
+            approvals:
+              count: 1
+              not: [agent]

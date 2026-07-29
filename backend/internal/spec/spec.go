@@ -538,7 +538,19 @@ func (r ReviewersConfig) AgentCount() int {
 }
 
 // Stage is one unit of work in a workflow. The closed set of types
-// (plan / implement / review) is enforced by the schema.
+// (plan / implement / review, plus the v1 deploy / acceptance additions) is
+// enforced by the schema.
+//
+// The v0 type names read as if every workflow ships code, but they are
+// GENERAL: plan / implement / review are conceptually propose / apply / gate
+// (ADR-067 §2 — the names are deliberately RETAINED, not renamed, so no
+// existing spec, DB row or API field churns). A workflow that proposes a
+// backlog grooming report, gates it on an approval, and applies the approved
+// mutations uses exactly these three types and produces no diff at all.
+//
+// What follows from that (E52.7 / #2219): at workflow-v2 the post-hoc diff
+// constraints bind to what a stage PRODUCES, not to its type name — see
+// producesDiff and the Constraint doc.
 type Stage struct {
 	ID       string    `json:"id" yaml:"id"`
 	Type     StageType `json:"type" yaml:"type"`
@@ -760,7 +772,13 @@ const (
 //
 //   - Post-hoc diff constraints (max_files_changed, forbidden_paths,
 //     allowed_paths, required_outcomes) — evaluated against a stage's
-//     produced diff. The v0 closed set; valid on non-deploy stages.
+//     produced diff. The v0 closed set. Valid on a non-deploy stage that
+//     actually PRODUCES a diff: at major >= 2 the binding is keyed on the
+//     stage's produced-artifact set (Stage.producesDiff, E52.7 / #2219), so a
+//     stage declaring no pull_request artifact cannot carry one. Below major 2
+//     the binding stays type-keyed (valid on any non-deploy stage), because
+//     v0/v1 documents legitimately declare these constraints on a stage with
+//     no `produces` list at all.
 //   - Pre-flight deploy constraints (allowed_environments, change_freeze,
 //     required_upstream; ADR-038 / #925) — evaluated BEFORE a delegating
 //     deploy stage executes. Valid only on a deploy stage.
@@ -847,6 +865,32 @@ func (c Constraint) preflightKindName() string {
 		return "required_upstream"
 	}
 	return ""
+}
+
+// producesDiff reports whether the stage declares the pull_request artifact —
+// the signal that it produces a reviewable code diff (E52.7 / #2219).
+//
+// pull_request is the diff signal because it is the only member of the closed
+// artifact set that DENOTES a code change: `deployment` is delegated to an
+// external pipeline (Fishhawk never sees its diff), `acceptance` is a verdict,
+// and `plan` is a proposal. So the produced-artifact set answers "does this
+// stage emit something the post-hoc diff constraints can be evaluated
+// against?" without consulting the stage's type name.
+//
+// An ABSENT or empty Produces list therefore reads as "produces no diff". That
+// reading is deliberate and is what gives the binding teeth: the permissive
+// "absent means unknown" alternative would leave a stage able to carry diff
+// constraints simply by omitting `produces`, which is the exact case #2219
+// wants rejected. It is a real behaviour change for a v2 author, so
+// validate.go applies it ONLY at major >= 2 — v0/v1 documents keep the
+// type-keyed binding, and the error message names both fixes.
+func (s Stage) producesDiff() bool {
+	for _, p := range s.Produces {
+		if p.Artifact == ArtifactPullRequest {
+			return true
+		}
+	}
+	return false
 }
 
 // postHocKindName is preflightKindName's post-hoc twin, in the same fixed

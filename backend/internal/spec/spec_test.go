@@ -4392,3 +4392,498 @@ func TestParseV2_SingleKindEquivalentToV1(t *testing.T) {
 		t.Errorf("parsed v2 spec differs from v1:\nv1 = %#v\nv2 = %#v", v1, v2)
 	}
 }
+
+// --- E52.7 / #2219: produced-artifact constraint binding ---
+
+// TestValidate_MixedPreflightPostHocConstraintObject_BindingOrderPinned pins
+// which binding rule wins when ONE v2 constraints OBJECT declares BOTH a
+// pre-flight and a post-hoc kind — a value only workflow-v2 can express, since
+// E52.6 / #2218 normalizes the object into a SINGLE Constraint that trips both
+// isPreflight() and isPostHoc() at once. The outcome was previously
+// deterministic only by accident of loop order; this test makes it a contract,
+// so inserting a rule into that loop cannot silently re-route the diagnosis.
+//
+// CHARACTERIZATION: cases (a) and (b) were written and run GREEN against the
+// loop as it stood BEFORE the produced-artifact rule (#2219) was added, so they
+// are a preservation proof, not a description of the new code.
+//
+// Case (c) is the interaction the new rule creates: a mixed object on a
+// non-deploy stage that produces NO diff now has TWO candidate rules. The
+// DELIBERATE choice is that the PRE-FLIGHT message wins — a pre-flight deploy
+// constraint on a non-deploy stage is wrong regardless of what the stage
+// produces, so the older and more specific diagnosis is the more useful one;
+// fixing it is a prerequisite for the produced-artifact question even arising.
+// The new rule is therefore positioned AFTER both ADR-038 checks, and this
+// ordering is a contract, not an artifact of where the branch happened to land.
+func TestValidate_MixedPreflightPostHocConstraintObject_BindingOrderPinned(t *testing.T) {
+	const preflightMsg = `pre-flight deploy constraint is valid only on a deploy stage, not a "implement" stage (ADR-038)`
+	const postHocMsg = "post-hoc diff constraint is not valid on a deploy stage; a delegating deploy produces no reviewable diff (ADR-038)"
+
+	tests := []struct {
+		name     string
+		doc      string
+		wantPath string
+		wantMsg  string
+	}{
+		{
+			// (a) non-deploy stage that DOES produce a diff: the
+			// pre-flight-off-deploy rule wins, naming the pre-flight kind.
+			name: "non_deploy_producing_pull_request",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          max_files_changed: 5
+          allowed_environments: ["prod"]
+        produces:
+          - artifact: pull_request
+`,
+			wantPath: "/workflows/wf/stages/0/constraints/allowed_environments",
+			wantMsg:  preflightMsg,
+		},
+		{
+			// (b) deploy stage: the post-hoc-on-deploy rule wins, naming the
+			// post-hoc kind. Proves the deploy branch still takes precedence
+			// over the produced-artifact rule, which never fires on a deploy
+			// stage.
+			name: "deploy_stage",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: release
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: https://example.com/deploy
+        constraints:
+          max_files_changed: 5
+          allowed_environments: ["prod"]
+`,
+			wantPath: "/workflows/wf/stages/0/constraints/max_files_changed",
+			wantMsg:  postHocMsg,
+		},
+		{
+			// (c) non-deploy stage producing NO diff — the new rule's own
+			// territory. The pre-flight message wins by deliberate ordering
+			// (see the doc comment).
+			name: "non_deploy_producing_no_diff",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          max_files_changed: 5
+          allowed_environments: ["prod"]
+`,
+			wantPath: "/workflows/wf/stages/0/constraints/allowed_environments",
+			wantMsg:  preflightMsg,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(tt.doc))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if ve.Path != tt.wantPath {
+				t.Errorf("ValidationError.Path = %q, want %q", ve.Path, tt.wantPath)
+			}
+			if ve.Message != tt.wantMsg {
+				t.Errorf("ValidationError.Message = %q, want %q", ve.Message, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// v2NonDiffStage renders a workflow-v2 document whose single stage carries the
+// given constraints object and, optionally, a produces list. It is the shared
+// fixture for the produced-artifact binding: the stage type is a parameter
+// because the binding must NOT read it.
+func v2ConstraintStage(stageType, constraints, produces string) []byte {
+	doc := `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: ` + stageType + `
+        executor:
+          agent: claude-code
+        constraints:
+` + constraints
+	if produces != "" {
+		doc += `        produces:
+` + produces
+	}
+	return []byte(doc)
+}
+
+// TestValidate_V2PostHocConstraintOffDiffProducingStage_Rejected is the AC1
+// done-means test: at workflow-v2 EVERY post-hoc diff constraint kind is
+// rejected on a stage that declares no pull_request artifact, and the error
+// names THAT kind in both the path (/constraints/<kind>) and the message.
+//
+// One case per kind rather than one representative: the reported kind comes
+// from Constraint.postHocKindName's fixed switch, so a kind dropped from that
+// switch — or from isPostHoc — would leave a hole a single-kind test misses.
+func TestValidate_V2PostHocConstraintOffDiffProducingStage_Rejected(t *testing.T) {
+	kinds := []struct {
+		kind        string
+		constraints string
+	}{
+		{"max_files_changed", "          max_files_changed: 5\n"},
+		{"forbidden_paths", "          forbidden_paths: [\"infra/**\"]\n"},
+		{"allowed_paths", "          allowed_paths: [\"docs/**\"]\n"},
+		{"required_outcomes", "          required_outcomes: [\"ci_green\"]\n"},
+		{"diff_coverage", "          diff_coverage:\n            command: \"make cov\"\n            report_path: \"cov.info\"\n            min_new_line_coverage: 80\n"},
+	}
+	for _, k := range kinds {
+		t.Run(k.kind, func(t *testing.T) {
+			// type implement so the #1888 implement-only rule cannot be the
+			// one firing for the diff_coverage case — the produced-artifact
+			// rule is the only candidate.
+			_, err := spec.ParseBytes(v2ConstraintStage("implement", k.constraints, ""))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			wantPath := "/workflows/wf/stages/0/constraints/" + k.kind
+			if ve.Path != wantPath {
+				t.Errorf("ValidationError.Path = %q, want %q", ve.Path, wantPath)
+			}
+			for _, want := range []string{
+				`post-hoc diff constraint "` + k.kind + `"`,
+				"valid only on a stage that produces a diff",
+				`stage "apply" declares no pull_request artifact (ADR-067)`,
+				"Declare produces: [{artifact: pull_request}] on this stage, or remove the constraint.",
+			} {
+				if !strings.Contains(ve.Message, want) {
+					t.Errorf("ValidationError.Message = %q, want it to contain %q", ve.Message, want)
+				}
+			}
+		})
+	}
+}
+
+// TestValidate_V2PostHocConstraint_NonEmptyProducesWithoutPullRequest_Rejected
+// covers producesDiff's other false path: a produces list that is PRESENT and
+// non-empty but carries no pull_request entry. The rejection table above
+// exercises the absent-list path; this one walks the loop body and finds no
+// match, which is the case a `len(Produces) == 0` shortcut would have missed.
+func TestValidate_V2PostHocConstraint_NonEmptyProducesWithoutPullRequest_Rejected(t *testing.T) {
+	doc := v2ConstraintStage("plan",
+		"          max_files_changed: 5\n",
+		"          - artifact: plan\n            schema: standard_v1\n")
+	_, err := spec.ParseBytes(doc)
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if !strings.Contains(ve.Message, "declares no pull_request artifact") {
+		t.Errorf("ValidationError.Message = %q, want the produced-artifact message", ve.Message)
+	}
+}
+
+// TestValidate_V2PostHocConstraintOnDiffProducingStage_Accepted is the
+// over-breadth guard: the SAME constraints on a stage that declares the
+// pull_request artifact parse clean. Without this, a rule that rejected every
+// post-hoc constraint at v2 would pass the rejection table above.
+func TestValidate_V2PostHocConstraintOnDiffProducingStage_Accepted(t *testing.T) {
+	doc := v2ConstraintStage("implement",
+		"          max_files_changed: 5\n          forbidden_paths: [\"infra/**\"]\n",
+		"          - artifact: pull_request\n")
+	if _, err := spec.ParseBytes(doc); err != nil {
+		t.Fatalf("ParseBytes: %v, want the constraint accepted on a diff-producing stage", err)
+	}
+}
+
+// TestValidate_V2ExistingBindingMessagesUnchanged is the AC2 regression block:
+// all five pre-existing bindings still fire at version "2" with their message
+// text UNCHANGED. The deploy case is the load-bearing one — it proves the
+// ADR-038 post-hoc branch still wins on a deploy stage and the new
+// produced-artifact message never reaches it (a deploy stage declares no
+// pull_request artifact either, so an unguarded new rule would shadow it).
+func TestValidate_V2ExistingBindingMessagesUnchanged(t *testing.T) {
+	cases := []struct {
+		name     string
+		doc      string
+		wantPath string
+		wantMsg  string
+	}{
+		{
+			name: "preflight_off_deploy",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          allowed_environments: ["prod"]
+`,
+			wantPath: "/workflows/wf/stages/0/constraints/allowed_environments",
+			wantMsg:  `pre-flight deploy constraint is valid only on a deploy stage, not a "implement" stage (ADR-038)`,
+		},
+		{
+			name: "posthoc_on_deploy",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: release
+        type: deploy
+        executor:
+          delegate:
+            target: webhook
+            url: https://example.com/deploy
+        constraints:
+          max_files_changed: 5
+`,
+			wantPath: "/workflows/wf/stages/0/constraints/max_files_changed",
+			wantMsg:  "post-hoc diff constraint is not valid on a deploy stage; a delegating deploy produces no reviewable diff (ADR-038)",
+		},
+		{
+			name: "deployment_artifact_off_deploy",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: deployment
+`,
+			wantPath: "/workflows/wf/stages/0/produces/0/artifact",
+			wantMsg:  `deployment artifact is valid only on a deploy stage, not a "implement" stage (ADR-038)`,
+		},
+		{
+			name: "acceptance_artifact_off_acceptance",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: acceptance
+`,
+			wantPath: "/workflows/wf/stages/0/produces/0/artifact",
+			wantMsg:  `acceptance artifact is valid only on an acceptance stage, not a "implement" stage (ADR-049)`,
+		},
+		{
+			name: "egress_off_acceptance",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts: ["staging.example.com"]
+`,
+			wantPath: "/workflows/wf/stages/0/egress",
+			wantMsg:  `egress allowance is valid only on an acceptance stage, not a "implement" stage (ADR-050)`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(tc.doc))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if ve.Path != tc.wantPath {
+				t.Errorf("ValidationError.Path = %q, want %q", ve.Path, tc.wantPath)
+			}
+			if ve.Message != tc.wantMsg {
+				t.Errorf("ValidationError.Message = %q, want the UNCHANGED %q", ve.Message, tc.wantMsg)
+			}
+		})
+	}
+}
+
+// TestValidate_ProducedArtifactBinding_NotAppliedBelowMajor2 is the AC3 pin
+// for the VERSION GATE. v0/v1 documents legitimately declare post-hoc
+// constraints on a stage with no `produces` list at all, so applying the
+// artifact-keyed rule below major 2 would newly reject valid specs. The two
+// sub-cases are the two majors that must stay type-keyed.
+func TestValidate_ProducedArtifactBinding_NotAppliedBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run(version, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 20
+          - required_outcomes:
+              - tests_added_or_updated
+`))
+			if err != nil {
+				t.Fatalf("ParseBytes(version %s): %v, want a post-hoc constraint with no produces list to stay VALID below major 2", version, err)
+			}
+		})
+	}
+}
+
+// TestValidate_V2FeatureChangeWithAllPostHocKinds_ValidatesClean is the other
+// half of AC3: the shape every real workflow already uses — a plan -> implement
+// -> review -> acceptance document whose implement stage declares
+// pull_request alongside all four v0 post-hoc kinds — is unaffected. This is
+// the assertion that would fail if the "every in-repo workflow already declares
+// produces: pull_request" premise were wrong.
+func TestValidate_V2FeatureChangeWithAllPostHocKinds_ValidatesClean(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    auto_advance: true
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        needs: [plan]
+        constraints:
+          max_files_changed: 45
+          forbidden_paths: [".github/workflows/**"]
+          allowed_paths: ["backend/**", "docs/**"]
+          required_outcomes: ["tests_added_or_updated", "ci_green"]
+        produces:
+          - artifact: pull_request
+      - id: review
+        type: review
+        executor:
+          human: true
+      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: acceptance
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v, want a diff-producing v2 feature_change to validate clean", err)
+	}
+	if got := len(s.Workflows["feature_change"].Stages); got != 4 {
+		t.Errorf("stages = %d, want 4", got)
+	}
+}
+
+// TestValidate_V2DiffCoverageOrdering_NeitherRuleShadowsTheOther pins the new
+// rule's position against the #1888 diff_coverage block in BOTH directions.
+// Only asserting one direction would leave the other rule silently
+// unreachable at v2.
+func TestValidate_V2DiffCoverageOrdering_NeitherRuleShadowsTheOther(t *testing.T) {
+	const diffCov = "          diff_coverage:\n            command: \"make cov\"\n            report_path: \"cov.info\"\n            min_new_line_coverage: 80\n"
+
+	// A non-implement stage producing NO diff: the new, more general
+	// produced-artifact message wins. Retyping the stage to `implement` would
+	// NOT fix it, which is why the general diagnosis is the useful one here.
+	t.Run("no_diff_produced_yields_new_message", func(t *testing.T) {
+		_, err := spec.ParseBytes(v2ConstraintStage("review", diffCov, ""))
+		var ve *spec.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("err = %v, want *ValidationError", err)
+		}
+		if ve.Path != "/workflows/wf/stages/0/constraints/diff_coverage" {
+			t.Errorf("ValidationError.Path = %q, want the v2 kind form", ve.Path)
+		}
+		if !strings.Contains(ve.Message, "valid only on a stage that produces a diff") {
+			t.Errorf("ValidationError.Message = %q, want the produced-artifact message", ve.Message)
+		}
+	})
+
+	// A stage that DOES produce pull_request but is typed other than
+	// implement: the pre-existing #1888 implement-only message still fires,
+	// verbatim. This is the direction that proves the new rule did not make
+	// the older one unreachable at v2.
+	t.Run("diff_produced_wrong_type_yields_1888_message", func(t *testing.T) {
+		_, err := spec.ParseBytes(v2ConstraintStage("review", diffCov, "          - artifact: pull_request\n"))
+		var ve *spec.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("err = %v, want *ValidationError", err)
+		}
+		if ve.Path != "/workflows/wf/stages/0/constraints/diff_coverage" {
+			t.Errorf("ValidationError.Path = %q, want the v2 kind form", ve.Path)
+		}
+		const want = `diff_coverage is valid only on an implement stage, not a "review" stage (#1888): the measurement is emitted by the implement runner, and a declared constraint with no measurement is a violation`
+		if ve.Message != want {
+			t.Errorf("ValidationError.Message = %q, want the UNCHANGED %q", ve.Message, want)
+		}
+	})
+}
+
+// groomingExampleRelPath is the AC4 fixture, read from disk so the test
+// exercises the SHIPPED example rather than a copy that can drift from it.
+const groomingExampleRelPath = "../../../docs/spec/examples/workflow-v2-backlog-grooming.yaml"
+
+// TestParseV2_BacklogGroomingExample_ValidatesAndProducesNoDiff is the AC4
+// cross-boundary test. It drives the real published example through the whole
+// chain — YAML -> version routing -> the v2removed sweep -> schema validation
+// -> normalizeV2Shapes -> typed decode -> Validate — proving a workflow built
+// on plan/implement/review that produces NO code diff is valid at v2.
+//
+// It also asserts that no stage declares the pull_request artifact. Without
+// that guard the example could silently acquire one in a later edit and stop
+// exercising the generalization while still passing.
+func TestParseV2_BacklogGroomingExample_ValidatesAndProducesNoDiff(t *testing.T) {
+	raw, err := os.ReadFile(groomingExampleRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", groomingExampleRelPath, err)
+	}
+	s, err := spec.ParseBytes(raw)
+	if err != nil {
+		t.Fatalf("ParseBytes(%s): %v", groomingExampleRelPath, err)
+	}
+	if s.Version != "2" {
+		t.Errorf("version = %q, want 2", s.Version)
+	}
+	wf, ok := s.Workflows["backlog_grooming"]
+	if !ok {
+		t.Fatalf("workflows = %v, want a backlog_grooming workflow", s.Workflows)
+	}
+	if len(wf.Stages) == 0 {
+		t.Fatal("backlog_grooming declares no stages")
+	}
+	for _, stage := range wf.Stages {
+		for _, p := range stage.Produces {
+			if p.Artifact == spec.ArtifactPullRequest {
+				t.Errorf("stage %q declares the pull_request artifact; the example must stay a NON-code-change workflow or it stops exercising the produced-artifact binding", stage.ID)
+			}
+		}
+	}
+}

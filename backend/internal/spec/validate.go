@@ -31,6 +31,11 @@ import (
 //     constraint, or the deployment artifact on an acceptance stage each
 //     falls into the isDeploy==false else-branch below and is rejected
 //     exactly as on any other non-deploy stage.
+//   - post-hoc-constraint<->produced-artifact binding at major >= 2 (E52.7 /
+//     #2219): a v2 stage carrying a post-hoc diff constraint must declare the
+//     pull_request artifact. The stage TYPES are general (plan / implement /
+//     review read as propose / apply / gate, ADR-067 §2), so validity binds to
+//     what a stage produces, not to its name. v0/v1 keep the type-keyed rule.
 //
 // Validate is exported so tests and Spec-builder code can exercise
 // the semantic layer without the YAML→schema round trip.
@@ -147,6 +152,40 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 		// object normalizes to. Only the reported PATH is version-aware
 		// (constraintPath); the three binding MESSAGES below are verbatim
 		// unchanged, which #2219 depends on.
+		//
+		// A FOURTH rule joins them at major >= 2 (E52.7 / #2219): a post-hoc
+		// diff constraint is valid only on a stage that actually PRODUCES a
+		// diff, i.e. declares the pull_request artifact. The stage types are
+		// general — plan / implement / review are conceptually propose / apply
+		// / gate (ADR-067 §2, names deliberately retained) — so a grooming-
+		// shaped workflow runs on those same types and produces no diff at
+		// all; keying diff-constraint validity on the type name would have
+		// silently accepted a constraint that can never be evaluated.
+		//
+		// ORDER within the loop is a CONTRACT, not an accident (both
+		// directions pinned by tests):
+		//
+		//  1. pre-flight-off-deploy and post-hoc-on-deploy (ADR-038) run
+		//     FIRST, so a deploy stage keeps its existing message and never
+		//     sees the new one, and a mixed v2 constraints OBJECT declaring
+		//     both families keeps reporting the pre-flight diagnosis — that
+		//     constraint is wrong regardless of what the stage produces
+		//     (TestValidate_MixedPreflightPostHocConstraintObject_BindingOrderPinned).
+		//  2. The produced-artifact rule runs NEXT, so a non-diff-producing
+		//     stage gets the general "declare produces / drop the constraint"
+		//     message rather than the narrower diff_coverage one.
+		//  3. The #1888 diff_coverage block runs LAST, staying reachable at v2
+		//     for a stage that DOES produce pull_request but is typed other
+		//     than implement.
+		//
+		// VERSION GATE: the produced-artifact rule fires only at major >= 2.
+		// v0/v1 documents legitimately declare post-hoc constraints on an
+		// implement stage with NO `produces` list at all (the v1.5 document in
+		// TestParse_DiffCoverage_NoRegression is the concrete case), so
+		// applying it below major 2 would newly reject valid specs. v2 is
+		// where the generalization is licensed — and there, an absent or empty
+		// `produces` list reads as "produces no diff" (see Stage.producesDiff
+		// for why the permissive reading was rejected).
 		for j, c := range stage.Constraints {
 			if c.isPreflight() && !isDeploy {
 				return &ValidationError{
@@ -158,6 +197,16 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 				return &ValidationError{
 					Path:    stagePath(i, constraintPath(major, j, c.postHocKindName())),
 					Message: "post-hoc diff constraint is not valid on a deploy stage; a delegating deploy produces no reviewable diff (ADR-038)",
+				}
+			}
+			if major >= 2 && c.isPostHoc() && !isDeploy && !stage.producesDiff() {
+				kind := c.postHocKindName()
+				return &ValidationError{
+					Path: stagePath(i, constraintPath(major, j, kind)),
+					Message: fmt.Sprintf(
+						"post-hoc diff constraint %q is valid only on a stage that produces a diff; stage %q declares no pull_request artifact (ADR-067). Declare produces: [{artifact: pull_request}] on this stage, or remove the constraint.",
+						kind, stage.ID,
+					),
 				}
 			}
 			// diff_coverage.report_path must stay inside the checkout
