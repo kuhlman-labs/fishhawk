@@ -83,31 +83,56 @@ func delegatedKnobs(oa *OperatorAgent) []string {
 	return out
 }
 
-// normalizeV1PageEvents rewrites the v1 presets' bare `reviewer_reject`
-// token to the v2 spelling `gating_reviewer_reject`, so an
-// expandTier-derived block (which emits only v2 vocabulary) can be compared
-// against a v1-authored preset block. Returns the normalized list and
-// whether anything was rewritten — the AC8 test asserts the `changed` flag
-// so the comparison can never pass by comparing two UNnormalized lists.
-func normalizeV1PageEvents(events []string) ([]string, bool) {
-	if events == nil {
-		return nil, false
-	}
-	out := make([]string, len(events))
-	changed := false
-	for i, e := range events {
-		if e == PageEventReviewerReject {
-			out[i] = PageEventGatingReviewerReject
-			changed = true
-			continue
-		}
-		out[i] = e
-	}
-	return out, changed
+// tierPageList is the seven-event page list medium and high both expand
+// to, spelled out ONCE here and shared by the frozen blocks below. It is
+// a literal, not a call into the code under test.
+var tierPageList = []string{
+	"gating_reviewer_reject",
+	"plan_rejection",
+	"scope_amendment",
+	"budget_override",
+	"policy_override",
+	"exception_request",
+	"requirement_arbitration",
 }
 
-// presetOperatorAgent parses a shipped preset and returns its authored
-// operator_agent block (nil for low, which declares none).
+// frozenTierBlocks is the FROZEN literal expectation for each tier's
+// derived operator_agent block, written out longhand.
+//
+// It deliberately does NOT read the shipped presets. Since E52.8 the
+// presets declare `autonomy: <tier>` and the parser DERIVES their block
+// via expandTier, so comparing a preset-derived block against expandTier
+// would compare the function under test against itself and prove nothing.
+// This table is the independent answer; TestShippedPresetsDeclareTheirTier
+// is its byte-level companion, pinning WHICH tier each preset chose. The
+// two together prove the presets and the tier expansions agree without
+// either side supplying the other's answer.
+var frozenTierBlocks = map[AutonomyTier]*OperatorAgent{
+	// Human-led: nothing delegated, and no page list — the low tier
+	// excepts nothing because it absorbs nothing.
+	TierLow: {},
+	// Approve, fixup and retry delegated under their named conditions;
+	// waive and merge stay human.
+	TierMedium: {
+		MayApprove:    "clean_dual_approval",
+		MayRouteFixup: "convergent_concerns",
+		MayRetry:      "infra_flake",
+		MustPageHuman: tierPageList,
+	},
+	// Medium plus waive and merge, so the agent can carry a clean change
+	// through to merge.
+	TierHigh: {
+		MayApprove:    "clean_dual_approval",
+		MayRouteFixup: "convergent_concerns",
+		MayWaive:      "solo_low",
+		MayRetry:      "infra_flake",
+		MayMerge:      "gates_resolved_ci_green",
+		MustPageHuman: tierPageList,
+	},
+}
+
+// presetOperatorAgent parses a shipped preset and returns the
+// operator_agent block its `autonomy:` line derives.
 func presetOperatorAgent(t *testing.T, p Preset) *OperatorAgent {
 	t.Helper()
 	b, err := PresetBytes(p)
@@ -333,63 +358,51 @@ func TestParseV2_ExplicitEntrySurvivesTheTypedDecode(t *testing.T) {
 
 // TestParseV2_AutonomyMediumDerivesMediumPresetBlock is AC1: a v2 document
 // declaring ONLY `autonomy: medium` derives an OperatorAgent deep-equal to
-// the shipped medium preset's block, with the v1 bare token normalized to the
-// v2 spelling.
+// the FROZEN medium block, and the shipped medium preset — which now
+// declares that same one-word tier — derives the very same block end to end.
 func TestParseV2_AutonomyMediumDerivesMediumPresetBlock(t *testing.T) {
-	s := mustParse(t, v2Doc("    autonomy: medium\n"))
-	got := s.Workflows["feature_change"].OperatorAgent
+	want := frozenTierBlocks[TierMedium]
 
-	want := presetOperatorAgent(t, PresetMedium)
-	if want == nil {
-		t.Fatal("medium preset declares no operator_agent block")
-	}
-	normalized, changed := normalizeV1PageEvents(want.MustPageHuman)
-	if !changed {
-		t.Fatal("the medium preset's page list was not rewritten — the comparison would be between two unnormalized lists")
-	}
-	want.MustPageHuman = normalized
-
+	got := mustParse(t, v2Doc("    autonomy: medium\n")).Workflows["feature_change"].OperatorAgent
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("derived block = %+v, want the medium preset block %+v", got, want)
+		t.Errorf("derived block = %+v, want the frozen medium block %+v", got, want)
+	}
+	if fromPreset := presetOperatorAgent(t, PresetMedium); !reflect.DeepEqual(fromPreset, want) {
+		t.Errorf("shipped medium preset derived %+v, want the frozen medium block %+v", fromPreset, want)
 	}
 }
 
-// TestExpandTier_RoundTripsShippedPresets is AC8: for EACH tier the
-// tier-derived block equals the shipped preset's authored block, after the
-// v1 page-event normalizer. Low compares against an EMPTY block (the low
-// preset declares none) and additionally asserts a nil block and the derived
-// empty block delegate the same (nothing) — the input that makes both
-// produce zero delegation decisions.
-func TestExpandTier_RoundTripsShippedPresets(t *testing.T) {
+// TestExpandTier_MatchesFrozenTierTable is AC8: for EACH tier the
+// tier-derived block equals the FROZEN literal block, and the shipped
+// preset for that tier derives the same thing end to end.
+//
+// The expectation is a longhand literal rather than the shipped preset's
+// authored block, because since E52.8 the presets declare `autonomy:
+// <tier>` and the parser derives their block via expandTier — comparing
+// against them would compare expandTier against itself. Low compares
+// against an EMPTY block and additionally asserts a nil block and the
+// derived empty block delegate the same (nothing) — the input that makes
+// both produce zero delegation decisions.
+func TestExpandTier_MatchesFrozenTierTable(t *testing.T) {
 	for _, tc := range []struct {
 		tier   AutonomyTier
 		preset Preset
-		// wantNormalized is whether the preset's page list carries the v1 bare
-		// token, i.e. whether the normalizer must actually rewrite something.
-		wantNormalized bool
 	}{
-		{TierLow, PresetLow, false},
-		{TierMedium, PresetMedium, true},
-		{TierHigh, PresetHigh, true},
+		{TierLow, PresetLow},
+		{TierMedium, PresetMedium},
+		{TierHigh, PresetHigh},
 	} {
 		t.Run(string(tc.tier), func(t *testing.T) {
-			wf := Workflow{Autonomy: tc.tier}
-			got := DerivedOperatorAgent(ResolveAutonomy(&wf, nil))
-
-			want := presetOperatorAgent(t, tc.preset)
+			want := frozenTierBlocks[tc.tier]
 			if want == nil {
-				// Low: the preset declares no block at all, so the tier must
-				// derive a block that delegates nothing.
-				want = &OperatorAgent{}
+				t.Fatalf("no frozen block for tier %s", tc.tier)
 			}
-			normalized, changed := normalizeV1PageEvents(want.MustPageHuman)
-			if changed != tc.wantNormalized {
-				t.Fatalf("normalizer rewrote = %v, want %v — if false for a tier that carries the bare token, the comparison below is between two unnormalized lists", changed, tc.wantNormalized)
+			wf := Workflow{Autonomy: tc.tier}
+			if got := DerivedOperatorAgent(ResolveAutonomy(&wf, nil)); !reflect.DeepEqual(got, want) {
+				t.Errorf("tier %s derived %+v, want the frozen block %+v", tc.tier, got, want)
 			}
-			want.MustPageHuman = normalized
-
-			if !reflect.DeepEqual(got, want) {
-				t.Errorf("tier %s derived %+v, want the %s preset block %+v", tc.tier, got, tc.preset, want)
+			if got := presetOperatorAgent(t, tc.preset); !reflect.DeepEqual(got, want) {
+				t.Errorf("shipped %s preset derived %+v, want the frozen %s block %+v", tc.preset, got, tc.tier, want)
 			}
 		})
 	}
@@ -401,24 +414,6 @@ func TestExpandTier_RoundTripsShippedPresets(t *testing.T) {
 	}
 	if got := delegatedKnobs(nil); len(got) != 0 {
 		t.Errorf("a nil block delegates %v, want nothing", got)
-	}
-}
-
-// TestNormalizeV1PageEvents_RewritesOnlyTheBareToken pins the normalizer
-// itself, so AC8's `changed` guard is anchored to real behaviour.
-func TestNormalizeV1PageEvents_RewritesOnlyTheBareToken(t *testing.T) {
-	got, changed := normalizeV1PageEvents([]string{PageEventReviewerReject, PageEventPlanRejection})
-	if !changed {
-		t.Error("changed = false, want true for a list carrying the bare token")
-	}
-	if want := []string{PageEventGatingReviewerReject, PageEventPlanRejection}; !reflect.DeepEqual(got, want) {
-		t.Errorf("normalized = %v, want %v", got, want)
-	}
-	if _, changed := normalizeV1PageEvents([]string{PageEventPlanRejection}); changed {
-		t.Error("changed = true for a list with no bare token, want false")
-	}
-	if got, changed := normalizeV1PageEvents(nil); got != nil || changed {
-		t.Errorf("normalizeV1PageEvents(nil) = (%v, %v), want (nil, false)", got, changed)
 	}
 }
 
