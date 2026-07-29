@@ -879,3 +879,273 @@ workflows:
 		})
 	}
 }
+
+// --- E52.6 / #2218: the three v2 reshapes ------------------------------------
+//
+// The CLI is schema-only by design: cli/internal/spec performs no typed decode
+// and no graph-shape pass (that asymmetry is ratified as out of scope for
+// #2218 — see docs/spec/workflow-v2.md). So these assert what the CLI CAN
+// decide: the v2 forms validate, the legacy forms are rejected with the
+// byte-identical actionable messages the backend emits, and both stay valid
+// below major 2.
+
+// v2ReshapedSpec is a v2 document using all three reshaped surfaces: the
+// object form of constraints, auto_advance, and the needs shorthand.
+const v2ReshapedSpec = `version: "2"
+workflows:
+  feature_change:
+    auto_advance: true
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        needs: [plan]
+        constraints:
+          max_files_changed: 45
+          forbidden_paths: ["infra/**"]
+        produces:
+          - artifact: pull_request
+`
+
+func TestValidateBytes_V2AcceptsReshapedSurfaces(t *testing.T) {
+	if err := spec.ValidateBytes([]byte(v2ReshapedSpec)); err != nil {
+		t.Errorf("ValidateBytes(v2 reshaped surfaces) = %v, want nil", err)
+	}
+}
+
+// TestValidateBytes_V2RejectsListConstraints asserts the CLI's message is
+// byte-identical to the backend's — the content assertion is what keeps the
+// two deliberately-separate modules' strings in lockstep.
+func TestValidateBytes_V2RejectsListConstraints(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 45
+        produces:
+          - artifact: pull_request
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	const wantMsg = `constraints is an OBJECT in workflow-v2, not a list: write the kinds as one object, e.g. constraints: {max_files_changed: 45, forbidden_paths: ["infra/**"]}; keys are unique, so the one-kind-per-entry list form is gone`
+	if !strings.Contains(joined, wantMsg) {
+		t.Errorf("error %q does not carry the backend's verbatim message %q", joined, wantMsg)
+	}
+	if !strings.Contains(joined, "/stages/0/constraints") {
+		t.Errorf("error %q does not name the offending path", joined)
+	}
+}
+
+// TestValidateBytes_V2RejectsDriveKey is the same lockstep assertion for the
+// auto_advance rename.
+func TestValidateBytes_V2RejectsDriveKey(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    drive: true
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	const wantMsg = `the workflow flag "drive" is spelled "auto_advance" in workflow-v2: rename the key; the semantics are unchanged (fishhawkd auto-advances mechanical transitions, judgment points still park), and v0/v1 keep the "drive" spelling`
+	if !strings.Contains(joined, wantMsg) {
+		t.Errorf("error %q does not carry the backend's verbatim message %q", joined, wantMsg)
+	}
+	if !strings.Contains(joined, "/workflows/feature_change/drive") {
+		t.Errorf("error %q does not name the offending path", joined)
+	}
+}
+
+// TestValidateBytes_ReshapedLegacyFormsAcceptedBelowMajor2 is the version
+// gate's non-firing branch: `drive` and the list form of `constraints` are
+// how v0 and v1 spell these, so neither sweep may fire there.
+func TestValidateBytes_ReshapedLegacyFormsAcceptedBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run(version, func(t *testing.T) {
+			yml := `version: "` + version + `"
+workflows:
+  feature_change:
+    drive: true
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 45
+        produces:
+          - artifact: pull_request
+`
+			if err := spec.ValidateBytes([]byte(yml)); err != nil {
+				t.Errorf("ValidateBytes(version %s) = %v, want nil", version, err)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_V2RejectsEmptyConstraintsObject: minProperties survives
+// the dropped maxProperties in the CLI mirror too.
+func TestValidateBytes_V2RejectsEmptyConstraintsObject(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints: {}
+        produces:
+          - artifact: pull_request
+`
+	if err := spec.ValidateBytes([]byte(yml)); err == nil {
+		t.Error("ValidateBytes(constraints: {}) = nil, want the minProperties rejection")
+	}
+}
+
+// TestValidateBytes_MultipleLegacyFormsReportDeterministically mirrors the
+// backend's TestCheckV2RemovedForms_MultipleLegacyFormsReportDeterministically
+// (approval condition 5), pinning the CLI walk to the SAME order. The CLI
+// package is schema-only and its walk is unexported, so the cases are driven
+// through ValidateBytes — the sweep runs before schema validation, so a
+// document that is structurally invalid still reports the sweep's match.
+//
+// Both ordering claims are exercised: the fixed within-node check order, and
+// the sorted-key walk that decides between sibling subtrees. Each document is
+// swept repeatedly so Go's randomized map iteration cannot flaky-pass it.
+func TestValidateBytes_MultipleLegacyFormsReportDeterministically(t *testing.T) {
+	const repeats = 32
+
+	cases := []struct {
+		name     string
+		yml      string
+		wantMsg  string
+		wantPath string
+	}{
+		{
+			// SAME-NODE contention: the fixed check order decides.
+			name: "page_event_beats_drive_and_constraints",
+			yml: `version: "2"
+workflows:
+  feature_change:
+    drive: true
+    must_page_human: [reviewer_reject]
+    constraints:
+      - max_files_changed: 45
+`,
+			wantMsg:  `page event "reviewer_reject" was removed in workflow-v2`,
+			wantPath: "/workflows/feature_change/must_page_human/0",
+		},
+		{
+			name: "drive_beats_constraints_on_one_node",
+			yml: `version: "2"
+workflows:
+  feature_change:
+    drive: true
+    constraints:
+      - max_files_changed: 45
+`,
+			wantMsg:  `the workflow flag "drive" is spelled "auto_advance" in workflow-v2`,
+			wantPath: "/workflows/feature_change/drive",
+		},
+		{
+			// CROSS-NODE contention: `alpha` sorts before `zulu`, so its
+			// form wins even though constraints is checked LAST per node.
+			name: "sibling_subtrees_sorted_key_decides_alpha_constraints",
+			yml: `version: "2"
+workflows:
+  alpha:
+    constraints:
+      - max_files_changed: 45
+  zulu:
+    drive: true
+`,
+			wantMsg:  `constraints is an OBJECT in workflow-v2, not a list`,
+			wantPath: "/workflows/alpha/constraints",
+		},
+		{
+			// Mirror image: swapping the forms swaps the winner. Without a
+			// sorted walk one of this pair would fail.
+			name: "sibling_subtrees_sorted_key_decides_alpha_drive",
+			yml: `version: "2"
+workflows:
+  alpha:
+    drive: true
+  zulu:
+    constraints:
+      - max_files_changed: 45
+`,
+			wantMsg:  `the workflow flag "drive" is spelled "auto_advance" in workflow-v2`,
+			wantPath: "/workflows/alpha/drive",
+		},
+		{
+			// A realistic document carrying three legacy forms at their
+			// natural positions: the workflow node is checked before the
+			// walk descends, so `drive` beats both nested forms.
+			name: "realistic_document_workflow_drive_wins",
+			yml: `version: "2"
+workflows:
+  feature_change:
+    drive: true
+    operator_agent:
+      must_page_human: [reviewer_reject]
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 45
+`,
+			wantMsg:  `the workflow flag "drive" is spelled "auto_advance" in workflow-v2`,
+			wantPath: "/workflows/feature_change/drive",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < repeats; i++ {
+				err := spec.ValidateBytes([]byte(tc.yml))
+				var ve *spec.ValidationError
+				if !errors.As(err, &ve) {
+					t.Fatalf("sweep %d: err = %v, want *ValidationError", i, err)
+				}
+				if len(ve.Errors) != 1 {
+					t.Fatalf("sweep %d: %d entries, want exactly the one sweep match: %+v", i, len(ve.Errors), ve.Errors)
+				}
+				got := ve.Errors[0]
+				if got.Path != tc.wantPath || !strings.Contains(got.Message, tc.wantMsg) {
+					t.Fatalf("sweep %d reported {path=%q msg=%q}, want the deterministic {path=%q msg containing %q}",
+						i, got.Path, got.Message, tc.wantPath, tc.wantMsg)
+				}
+			}
+		})
+	}
+}

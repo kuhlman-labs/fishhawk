@@ -140,6 +140,14 @@ type Workflow struct {
 	// The workflow-level value is the per-run default; POST /v0/runs
 	// accepts a per-run override that wins, and the resolved flag is
 	// snapshotted onto the run row at create time.
+	//
+	// SPEC SURFACE vs FIELD NAME (E52.6 / #2218): v0 and v1 spell this
+	// `drive`; workflow-v2 spells it `auto_advance`. The rename is a spec
+	// surface rename ONLY — the parser rewrites `auto_advance` to the
+	// `drive` key before the typed decode, so this field, the runs.drive
+	// column, the POST /v0/runs override and every auto-advance /
+	// next_action read site are untouched and see the identical value
+	// whichever spelling the document used.
 	Drive bool `json:"drive,omitempty" yaml:"drive,omitempty"`
 	// OperatorAgent is the workflow-level delegation default for the
 	// operator agent (ADR-040 / #1026). Nil means nothing is delegated
@@ -532,11 +540,23 @@ func (r ReviewersConfig) AgentCount() int {
 // Stage is one unit of work in a workflow. The closed set of types
 // (plan / implement / review) is enforced by the schema.
 type Stage struct {
-	ID          string           `json:"id" yaml:"id"`
-	Type        StageType        `json:"type" yaml:"type"`
-	Executor    Executor         `json:"executor" yaml:"executor"`
-	Inputs      []Input          `json:"inputs,omitempty" yaml:"inputs,omitempty"`
-	Produces    []Produces       `json:"produces,omitempty" yaml:"produces,omitempty"`
+	ID       string    `json:"id" yaml:"id"`
+	Type     StageType `json:"type" yaml:"type"`
+	Executor Executor  `json:"executor" yaml:"executor"`
+	// Inputs are the stage's declared inputs. A workflow-v2 stage may
+	// spell artifact wiring with the `needs: [<stage_id>]` shorthand
+	// (E52.6 / #2218), which the parser expands into the equivalent
+	// entries here BEFORE this struct is populated — so a parsed Stage may
+	// carry needs-derived inputs, appended after any longhand-declared
+	// ones in `needs` order, and the resolved set is identical however the
+	// author spelled it. There is no `needs` field: the shorthand does not
+	// survive parsing.
+	Inputs   []Input    `json:"inputs,omitempty" yaml:"inputs,omitempty"`
+	Produces []Produces `json:"produces,omitempty" yaml:"produces,omitempty"`
+	// Constraints is always the LIST representation, on every major. A
+	// workflow-v2 stage spells its constraints as one OBJECT, which the
+	// parser normalizes into a ONE-ELEMENT slice here (see the Constraint
+	// doc); v0/v1 lists are carried through verbatim.
 	Constraints []Constraint     `json:"constraints,omitempty" yaml:"constraints,omitempty"`
 	Budget      *Budget          `json:"budget,omitempty" yaml:"budget,omitempty"`
 	Gates       []Gate           `json:"gates,omitempty" yaml:"gates,omitempty"`
@@ -721,8 +741,22 @@ const (
 	ModeCanonical       PersistenceMode = "canonical"
 )
 
-// Constraint is exactly one constraint kind per object; the schema
-// enforces this with maxProperties: 1. Two families:
+// Constraint carries constraint kinds for a stage. SURFACE vs
+// REPRESENTATION (E52.6 / #2218): v0 and v1 spell a stage's constraints as
+// a LIST of objects each pinned to exactly one kind (maxProperties:1), which
+// is what this type models one-for-one. workflow-v2 spells them as ONE
+// object keyed by kind — and the parser normalizes that object into a
+// ONE-ELEMENT []Constraint carrying every declared kind, because an object
+// has unique keys and so denotes exactly one Constraint value. The Go type,
+// the field set and every consumer are therefore UNCHANGED by v2, and a
+// v0/v1 document's list is never re-resolved: the five consumer folds
+// disagree with each other on a duplicate-kind document (concat, min-wins,
+// max-wins, last-wins, first-wins), so preserving them meant declining a
+// canonical merge rule entirely. A v2-parsed Constraint may set SEVERAL
+// kinds at once; use preflightKindName / postHocKindName when a message
+// needs to name one deterministically.
+//
+// Two families:
 //
 //   - Post-hoc diff constraints (max_files_changed, forbidden_paths,
 //     allowed_paths, required_outcomes) — evaluated against a stage's
@@ -732,12 +766,12 @@ const (
 //     deploy stage executes. Valid only on a deploy stage.
 //
 // Validate enforces the type<->constraint binding. ChangeFreeze is a
-// presence-aware *bool, NOT a plain bool: because each constraint object
-// carries exactly one key, `{change_freeze: false}` is a VALID shape
-// whose key is PRESENT, and the "pre-flight constraints are deploy-only"
-// rule must reject it on a non-deploy stage. A plain bool zero-value
-// cannot distinguish "present and false" from "absent"; the pointer
-// makes presence (ChangeFreeze != nil) detectable.
+// presence-aware *bool, NOT a plain bool: `{change_freeze: false}` is a
+// VALID declaration whose key is PRESENT — in v0/v1 as a single-key list
+// entry, in v2 as one key of the constraints object — and the "pre-flight
+// constraints are deploy-only" rule must reject it on a non-deploy stage. A
+// plain bool zero-value cannot distinguish "present and false" from
+// "absent"; the pointer makes presence (ChangeFreeze != nil) detectable.
 type Constraint struct {
 	MaxFilesChanged  int      `json:"max_files_changed,omitempty" yaml:"max_files_changed,omitempty"`
 	ForbiddenPaths   []string `json:"forbidden_paths,omitempty" yaml:"forbidden_paths,omitempty"`
@@ -794,6 +828,43 @@ func (c Constraint) isPostHoc() bool {
 	return c.MaxFilesChanged != 0 || len(c.ForbiddenPaths) > 0 ||
 		len(c.AllowedPaths) > 0 || len(c.RequiredOutcomes) > 0 ||
 		c.DiffCoverage != nil
+}
+
+// preflightKindName names the first pre-flight kind this Constraint sets, in
+// a FIXED declaration order, or "" when it sets none. Used by validate.go to
+// report a workflow-v2 binding violation at `/constraints/<kind>` (E52.6 /
+// #2218) — an index into the one-element slice a v2 object normalizes to
+// names nothing the author wrote. The fixed order makes the reported kind
+// deterministic for a v2 object that mixes several kinds. Presence detection
+// mirrors isPreflight exactly, including ChangeFreeze's pointer.
+func (c Constraint) preflightKindName() string {
+	switch {
+	case len(c.AllowedEnvironments) > 0:
+		return "allowed_environments"
+	case c.ChangeFreeze != nil:
+		return "change_freeze"
+	case len(c.RequiredUpstream) > 0:
+		return "required_upstream"
+	}
+	return ""
+}
+
+// postHocKindName is preflightKindName's post-hoc twin, in the same fixed
+// declaration order the type declares its fields.
+func (c Constraint) postHocKindName() string {
+	switch {
+	case c.MaxFilesChanged != 0:
+		return "max_files_changed"
+	case len(c.ForbiddenPaths) > 0:
+		return "forbidden_paths"
+	case len(c.AllowedPaths) > 0:
+		return "allowed_paths"
+	case len(c.RequiredOutcomes) > 0:
+		return "required_outcomes"
+	case c.DiffCoverage != nil:
+		return "diff_coverage"
+	}
+	return ""
 }
 
 // Budget caps token / runtime usage for a stage.

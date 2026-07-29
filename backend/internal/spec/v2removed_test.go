@@ -405,3 +405,301 @@ func assertNamesRejectReplacements(t *testing.T, msg string) {
 		}
 	}
 }
+
+// --- E52.6 / #2218: the two RESHAPED forms -----------------------------------
+//
+// `drive` and the list form of `constraints` are both rejected by the v2
+// schema (an undeclared property of an additionalProperties:false block, and
+// an array where an object is required), but with generic messages naming no
+// replacement. These pin the SHIPPED actionable message and its path.
+
+func TestCheckV2RemovedForms_DriveRenamedToAutoAdvance(t *testing.T) {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    drive: true
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	_, err := ParseBytes([]byte(doc))
+	if err == nil {
+		t.Fatal("ParseBytes: want an error for a v2 `drive` key")
+	}
+	var serr *SchemaError
+	if !errors.As(err, &serr) {
+		t.Fatalf("error = %T (%v), want *SchemaError", err, err)
+	}
+	if serr.Path != "/workflows/feature_change/drive" {
+		t.Errorf("path = %q, want /workflows/feature_change/drive", serr.Path)
+	}
+	if serr.Message != msgV2RenamedDrive {
+		t.Errorf("message = %q, want the actionable %q", serr.Message, msgV2RenamedDrive)
+	}
+	if !strings.Contains(serr.Message, "auto_advance") {
+		t.Errorf("message %q must name auto_advance", serr.Message)
+	}
+}
+
+func TestCheckV2RemovedForms_ConstraintsListReshapedToObject(t *testing.T) {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 45
+          - forbidden_paths: ["infra/**"]
+        produces:
+          - artifact: pull_request
+`
+	_, err := ParseBytes([]byte(doc))
+	if err == nil {
+		t.Fatal("ParseBytes: want an error for a v2 list-form `constraints`")
+	}
+	var serr *SchemaError
+	if !errors.As(err, &serr) {
+		t.Fatalf("error = %T (%v), want *SchemaError", err, err)
+	}
+	if serr.Path != "/workflows/feature_change/stages/0/constraints" {
+		t.Errorf("path = %q, want the stage's constraints", serr.Path)
+	}
+	if serr.Message != msgV2ReshapedConstraints {
+		t.Errorf("message = %q, want the actionable %q", serr.Message, msgV2ReshapedConstraints)
+	}
+	// The message must SHOW the object form, not merely assert a type.
+	if !strings.Contains(serr.Message, "max_files_changed: 45") {
+		t.Errorf("message %q should show the object form", serr.Message)
+	}
+}
+
+// TestCheckV2RemovedForms_ReshapedFormsNeverFireBelowMajor2 is the version
+// gate: v0 and v1 documents spell both forms legally, so the sweep must not
+// fire on them.
+func TestCheckV2RemovedForms_ReshapedFormsNeverFireBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		doc := `version: "` + version + `"
+workflows:
+  feature_change:
+    drive: true
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 45
+        produces:
+          - artifact: pull_request
+`
+		s, err := ParseBytes([]byte(doc))
+		if err != nil {
+			t.Fatalf("version %s: ParseBytes: %v", version, err)
+		}
+		if !s.Workflows["feature_change"].Drive {
+			t.Errorf("version %s: drive: true did not reach Workflow.Drive", version)
+		}
+		if n := len(s.Workflows["feature_change"].Stages[0].Constraints); n != 1 {
+			t.Errorf("version %s: constraints = %d entries, want the list form preserved", version, n)
+		}
+	}
+}
+
+// TestCheckV2RemovedAtNode_FixedOrder pins the report order across all four
+// forms, so a document carrying several always reports the same one.
+func TestCheckV2RemovedAtNode_FixedOrder(t *testing.T) {
+	node := map[string]any{
+		"must_page_human": []any{PageEventReviewerReject},
+		"reviewers":       map[string]any{"agent": 1},
+		"drive":           true,
+		"constraints":     []any{map[string]any{"max_files_changed": 1}},
+	}
+	order := []string{
+		msgV2RemovedReviewerReject,
+		msgV2RemovedReviewersAgent,
+		msgV2RenamedDrive,
+		msgV2ReshapedConstraints,
+	}
+	keys := []string{"must_page_human", "reviewers", "drive", "constraints"}
+	for i, want := range order {
+		got := checkV2RemovedAtNode(node, "")
+		if got == nil {
+			t.Fatalf("step %d: checkV2RemovedAtNode = nil, want %q", i, want)
+		}
+		if got.Message != want {
+			t.Fatalf("step %d: message = %q, want %q", i, got.Message, want)
+		}
+		delete(node, keys[i])
+	}
+	if got := checkV2RemovedAtNode(node, ""); got != nil {
+		t.Errorf("checkV2RemovedAtNode on a clean node = %+v, want nil", got)
+	}
+}
+
+// TestCheckV2RemovedAtNode_ConstraintsObjectNotReported: only the LIST form is
+// a legacy form; the v2 object must pass the sweep untouched.
+func TestCheckV2RemovedAtNode_ConstraintsObjectNotReported(t *testing.T) {
+	node := map[string]any{"constraints": map[string]any{"max_files_changed": 1}}
+	if got := checkV2RemovedAtNode(node, ""); got != nil {
+		t.Errorf("checkV2RemovedAtNode on the v2 object form = %+v, want nil", got)
+	}
+}
+
+// TestCheckV2RemovedForms_MultipleLegacyFormsReportDeterministically closes
+// the gap waived on #2215 on the explicit condition that the next sibling
+// extending this sweep would close it (approval condition 5). This is that
+// sibling: E52.6 takes the sweep from two legacy forms to four, which is
+// precisely when ordering starts to matter.
+//
+// Two claims were previously asserted only in comments, and BOTH are load
+// bearing for a document carrying several legacy forms at once:
+//
+//   - checkV2RemovedAtNode checks the four forms in a FIXED order, so which
+//     form wins on ONE node is decided by that order.
+//   - walkV2RemovedForms visits map keys in SORTED order, so which NODE wins
+//     is decided by the key names — Go's map iteration order is randomized,
+//     and without the sort the reported match would vary run to run.
+//
+// Every case is therefore built by a FACTORY that returns a freshly
+// constructed equivalent map, and swept REPEATEDLY: a randomized iteration
+// order that happened to agree once cannot flaky-pass this.
+func TestCheckV2RemovedForms_MultipleLegacyFormsReportDeterministically(t *testing.T) {
+	const repeats = 32
+
+	cases := []struct {
+		name    string
+		build   func() any
+		wantMsg string
+		// wantPath is asserted exactly; it is what tells a reader WHICH of
+		// the competing forms won, not merely that one did.
+		wantPath string
+	}{
+		{
+			// SAME-NODE contention: all four forms on one node, so
+			// checkV2RemovedAtNode's fixed order alone decides.
+			name: "four_forms_on_one_node_page_event_wins",
+			build: func() any {
+				return map[string]any{
+					"must_page_human": []any{"budget_override", PageEventReviewerReject},
+					"reviewers":       map[string]any{"agent": 2},
+					"drive":           true,
+					"constraints":     []any{map[string]any{"max_files_changed": 45}},
+				}
+			},
+			wantMsg:  msgV2RemovedReviewerReject,
+			wantPath: "/must_page_human/1",
+		},
+		{
+			name: "three_forms_on_one_node_reviewers_agent_wins",
+			build: func() any {
+				return map[string]any{
+					"reviewers":   map[string]any{"agent": 2},
+					"drive":       true,
+					"constraints": []any{map[string]any{"max_files_changed": 45}},
+				}
+			},
+			wantMsg:  msgV2RemovedReviewersAgent,
+			wantPath: "/reviewers/agent",
+		},
+		{
+			name: "two_forms_on_one_node_drive_wins",
+			build: func() any {
+				return map[string]any{
+					"drive":       true,
+					"constraints": []any{map[string]any{"max_files_changed": 45}},
+				}
+			},
+			wantMsg:  msgV2RenamedDrive,
+			wantPath: "/drive",
+		},
+		{
+			// CROSS-NODE contention: the two forms sit on SIBLING subtrees,
+			// so the sorted-key walk — not the node check order — decides.
+			// `alpha` sorts before `zulu`, so alpha's form wins even though
+			// its form (constraints) is checked LAST within a node.
+			name: "sibling_subtrees_sorted_key_decides_alpha_constraints",
+			build: func() any {
+				return map[string]any{
+					"alpha": map[string]any{"constraints": []any{map[string]any{"max_files_changed": 45}}},
+					"zulu":  map[string]any{"drive": true},
+				}
+			},
+			wantMsg:  msgV2ReshapedConstraints,
+			wantPath: "/alpha/constraints",
+		},
+		{
+			// The mirror image: swapping which sibling carries which form
+			// swaps the winner. If the walk were not sorted, one of this
+			// pair would fail.
+			name: "sibling_subtrees_sorted_key_decides_alpha_drive",
+			build: func() any {
+				return map[string]any{
+					"alpha": map[string]any{"drive": true},
+					"zulu":  map[string]any{"constraints": []any{map[string]any{"max_files_changed": 45}}},
+				}
+			},
+			wantMsg:  msgV2RenamedDrive,
+			wantPath: "/alpha/drive",
+		},
+		{
+			// A REALISTIC document carrying three legacy forms at their
+			// natural positions: a workflow-level `drive`, a
+			// must_page_human token nested under operator_agent, and a
+			// list-form `constraints` inside a stage. The workflow node is
+			// checked BEFORE the walk descends into operator_agent or
+			// stages, so `drive` beats both nested forms — pinning the
+			// whole-document outcome, not just a single node's.
+			name:     "realistic_document_workflow_drive_wins",
+			build:    buildMultiLegacyFormDocument,
+			wantMsg:  msgV2RenamedDrive,
+			wantPath: "/workflows/feature_change/drive",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < repeats; i++ {
+				got := checkV2RemovedForms(tc.build())
+				if got == nil {
+					t.Fatalf("sweep %d: checkV2RemovedForms = nil, want a match", i)
+				}
+				if got.Message != tc.wantMsg || got.Path != tc.wantPath {
+					t.Fatalf("sweep %d reported {path=%q msg=%q}, want the deterministic {path=%q msg=%q}",
+						i, got.Path, got.Message, tc.wantPath, tc.wantMsg)
+				}
+			}
+		})
+	}
+}
+
+// buildMultiLegacyFormDocument returns a FRESH raw document carrying three
+// legacy forms simultaneously, at the positions a real v2 spec would put
+// them: a workflow-level `drive`, `must_page_human: [reviewer_reject]` under
+// operator_agent, and a list-form `constraints` inside a stage.
+func buildMultiLegacyFormDocument() any {
+	return map[string]any{
+		"version": "2",
+		"workflows": map[string]any{
+			"feature_change": map[string]any{
+				"drive": true,
+				"operator_agent": map[string]any{
+					"must_page_human": []any{PageEventReviewerReject},
+				},
+				"stages": []any{
+					map[string]any{
+						"id":          "implement",
+						"type":        "implement",
+						"constraints": []any{map[string]any{"max_files_changed": 45}},
+					},
+				},
+			},
+		},
+	}
+}

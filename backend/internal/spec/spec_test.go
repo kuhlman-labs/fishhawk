@@ -3818,6 +3818,44 @@ var licensedV2Deltas = []licensedDelta{
 		Issue: "#2215 (E52.3)",
 		Why:   "the bare reviewers.agent integer count is removed from v2; reviewers.agents[] is the sole agent-reviewer declaration and len(agents) is the effective count",
 	},
+	// E52.6 / #2218 — the three legibility reshapes. `constraints` reports
+	// as three paths because the property's whole body is rewritten from an
+	// array-of-$ref to a bare $ref.
+	{
+		Path:  "$/$defs/stage/properties/constraints/type",
+		Issue: "#2218 (E52.6)",
+		Why:   "v2 spells a stage's constraints as ONE object keyed by kind, not an array of single-kind objects; the array type is gone",
+	},
+	{
+		Path:  "$/$defs/stage/properties/constraints/items",
+		Issue: "#2218 (E52.6)",
+		Why:   "with the array gone there is no items schema; the property $refs the constraint object directly",
+	},
+	{
+		Path:  "$/$defs/stage/properties/constraints/$ref",
+		Issue: "#2218 (E52.6)",
+		Why:   "the constraints property now $refs $defs/constraint directly, which the parser normalizes into a one-element list so no consumer changed",
+	},
+	{
+		Path:  "$/$defs/constraint/maxProperties",
+		Issue: "#2218 (E52.6)",
+		Why:   "an object's keys are naturally unique, so v2 drops the one-kind-per-entry cap; minProperties:1 stays so `constraints: {}` is still a rejected no-op",
+	},
+	{
+		Path:  "$/$defs/workflow/properties/drive",
+		Issue: "#2218 (E52.6)",
+		Why:   "v2 spells the auto-advance flag `auto_advance`; the parser rewrites it to the drive key, so the Go field, DB column and read sites are unchanged",
+	},
+	{
+		Path:  "$/$defs/workflow/properties/auto_advance",
+		Issue: "#2218 (E52.6)",
+		Why:   "the v2 spelling of v0/v1's `drive` — a spec-surface rename with byte-identical semantics",
+	},
+	{
+		Path:  "$/$defs/stage/properties/needs",
+		Issue: "#2218 (E52.6)",
+		Why:   "needs: [<stage_id>] is v2 shorthand for the common artifact-wiring case, expanded at parse time into the equivalent inputs entries",
+	},
 }
 
 // TestV2DivergesFromV1OnlyByLicensedDeltas is the re-scoped successor to
@@ -4098,5 +4136,259 @@ func collectSchemaDiffs(a, b any, path string, out *[]schemaDiff) {
 		if !reflect.DeepEqual(a, b) {
 			*out = append(*out, schemaDiff{path, fmt.Sprintf("%v vs %v", a, b)})
 		}
+	}
+}
+
+// --- Layer A: legacy duplicate-kind constraint characterization (#2218) ------
+//
+// These are CHARACTERIZATION tests. They were written and run GREEN against
+// unmodified HEAD BEFORE the workflow-v2 reshape (#2218 / E52.6) touched any
+// production file, and their values are GOLDEN VALUES read off the code as it
+// stood — not values predicted from the new design. #2218 normalizes a v2
+// `constraints` OBJECT into a ONE-ELEMENT []spec.Constraint and edits ZERO
+// constraint consumers, so the v0/v1 path must keep its legacy list
+// representation byte-for-byte. The parsed slice is the SOLE input every
+// consumer receives, so pinning it exactly — element count, per-element field
+// values, and DOCUMENT ORDER — bounds the change's blast radius on the legacy
+// path to nothing.
+//
+// The five consumer folds disagree with each other on a duplicate-kind
+// document (concat, min-wins, max-wins, last-wins, first-wins), which is why
+// no canonical merge rule could preserve them; see
+// backend/internal/server/deploy_legacy_constraints_test.go for the two deploy
+// sites' mutually inconsistent answers driven end to end.
+
+func boolPtr(b bool) *bool { return &b }
+
+// legacyDuplicateV1Spec duplicates SIX constraint kinds across an implement
+// and a deploy stage: max_files_changed, forbidden_paths and diff_coverage on
+// the implement stage; allowed_environments, change_freeze and
+// required_upstream on the deploy stage.
+const legacyDuplicateV1Spec = `version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 45
+          - max_files_changed: 12
+          - forbidden_paths: ["infra/**"]
+          - forbidden_paths: [".github/workflows/**"]
+          - diff_coverage:
+              command: "make cov-a"
+              report_path: "cov-a.info"
+              min_new_line_coverage: 70
+          - diff_coverage:
+              command: "make cov-b"
+              report_path: "cov-b.info"
+              min_new_line_coverage: 85
+        produces:
+          - artifact: pull_request
+      - id: deploy
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        constraints:
+          - allowed_environments: [staging]
+          - allowed_environments: [prod]
+          - change_freeze: true
+          - change_freeze: false
+          - required_upstream: [review_merged]
+          - required_upstream: [ci_green]
+        produces:
+          - artifact: deployment
+`
+
+// legacyDuplicateV0Spec is the v0 sibling. v0 has no deploy stage type and no
+// diff_coverage kind, so it duplicates the four post-hoc kinds v0 declares.
+const legacyDuplicateV0Spec = `version: "0.7"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 45
+          - max_files_changed: 12
+          - forbidden_paths: ["infra/**"]
+          - forbidden_paths: [".github/workflows/**"]
+          - allowed_paths: ["backend/**"]
+          - allowed_paths: ["cli/**"]
+          - required_outcomes: [tests_added_or_updated]
+          - required_outcomes: [ci_green]
+        produces:
+          - artifact: pull_request
+`
+
+func TestParse_LegacyDuplicateConstraintKinds_PreservedVerbatim(t *testing.T) {
+	t.Run("v1", func(t *testing.T) {
+		s, err := spec.ParseBytes([]byte(legacyDuplicateV1Spec))
+		if err != nil {
+			t.Fatalf("ParseBytes: %v", err)
+		}
+		stages := s.Workflows["feature_change"].Stages
+		if len(stages) != 2 {
+			t.Fatalf("stages = %d, want 2", len(stages))
+		}
+
+		wantImplement := []spec.Constraint{
+			{MaxFilesChanged: 45},
+			{MaxFilesChanged: 12},
+			{ForbiddenPaths: []string{"infra/**"}},
+			{ForbiddenPaths: []string{".github/workflows/**"}},
+			{DiffCoverage: &spec.DiffCoverageConstraint{
+				Command: "make cov-a", ReportPath: "cov-a.info", MinNewLineCoverage: 70,
+			}},
+			{DiffCoverage: &spec.DiffCoverageConstraint{
+				Command: "make cov-b", ReportPath: "cov-b.info", MinNewLineCoverage: 85,
+			}},
+		}
+		if got := stages[0].Constraints; !reflect.DeepEqual(got, wantImplement) {
+			t.Errorf("implement constraints =\n%#v\nwant\n%#v", got, wantImplement)
+		}
+
+		wantDeploy := []spec.Constraint{
+			{AllowedEnvironments: []string{"staging"}},
+			{AllowedEnvironments: []string{"prod"}},
+			{ChangeFreeze: boolPtr(true)},
+			{ChangeFreeze: boolPtr(false)},
+			{RequiredUpstream: []string{"review_merged"}},
+			{RequiredUpstream: []string{"ci_green"}},
+		}
+		got := stages[1].Constraints
+		if len(got) != len(wantDeploy) {
+			t.Fatalf("deploy constraints = %d entries, want %d", len(got), len(wantDeploy))
+		}
+		for i := range wantDeploy {
+			// ChangeFreeze is a *bool; compare the pointee so the
+			// document-order assertion is on VALUES, not addresses.
+			if (got[i].ChangeFreeze == nil) != (wantDeploy[i].ChangeFreeze == nil) ||
+				(got[i].ChangeFreeze != nil && *got[i].ChangeFreeze != *wantDeploy[i].ChangeFreeze) {
+				t.Errorf("deploy constraints[%d].ChangeFreeze mismatch: got %v", i, got[i].ChangeFreeze)
+			}
+			if !reflect.DeepEqual(got[i].AllowedEnvironments, wantDeploy[i].AllowedEnvironments) {
+				t.Errorf("deploy constraints[%d].AllowedEnvironments = %v, want %v",
+					i, got[i].AllowedEnvironments, wantDeploy[i].AllowedEnvironments)
+			}
+			if !reflect.DeepEqual(got[i].RequiredUpstream, wantDeploy[i].RequiredUpstream) {
+				t.Errorf("deploy constraints[%d].RequiredUpstream = %v, want %v",
+					i, got[i].RequiredUpstream, wantDeploy[i].RequiredUpstream)
+			}
+		}
+	})
+
+	t.Run("v0", func(t *testing.T) {
+		s, err := spec.ParseBytes([]byte(legacyDuplicateV0Spec))
+		if err != nil {
+			t.Fatalf("ParseBytes: %v", err)
+		}
+		want := []spec.Constraint{
+			{MaxFilesChanged: 45},
+			{MaxFilesChanged: 12},
+			{ForbiddenPaths: []string{"infra/**"}},
+			{ForbiddenPaths: []string{".github/workflows/**"}},
+			{AllowedPaths: []string{"backend/**"}},
+			{AllowedPaths: []string{"cli/**"}},
+			{RequiredOutcomes: []string{"tests_added_or_updated"}},
+			{RequiredOutcomes: []string{"ci_green"}},
+		}
+		if got := s.Workflows["feature_change"].Stages[0].Constraints; !reflect.DeepEqual(got, want) {
+			t.Errorf("v0 implement constraints =\n%#v\nwant\n%#v", got, want)
+		}
+	})
+}
+
+// --- Layer B: v2 ≡ v1 equivalence, single-kind (#2218, condition 1a) --------
+//
+// LAYER B, and deliberately NOT evidence for Layer A: both sides pass through
+// the new v2 normalization, so this proves "v2 means what v1 means" and
+// nothing about whether the v0/v1 path was preserved.
+//
+// The parsed-representation deep-equality assertion is valid HERE because the
+// fixture declares a SINGLE constraint kind, which both spellings represent as
+// a one-element slice. It is deliberately NOT asserted for a MULTI-kind
+// fixture: a v1 document expressing several kinds must write them as a list of
+// single-key maps (the v0/v1 constraint $def is maxProperties:1) and so parses
+// to an N-element slice, while the v2 object denotes exactly one Constraint and
+// normalizes to a ONE-element slice. That difference is expected rather than a
+// defect, so the multi-kind case asserts equivalence at the ENFORCEMENT level
+// instead — see TestV2MultiKindConstraints_EnforcementEquivalentToV1 in
+// backend/internal/server/deploy_legacy_constraints_test.go, which drives both
+// parsed specs through mergeConstraints, flattenPathConstraints,
+// resolveDiffCoverageConfig, the deploy pre-flight gate and
+// deployEnvironmentForRun.
+
+const singleKindV1Spec = `version: "1.6"
+workflows:
+  feature_change:
+    drive: true
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        constraints:
+          - max_files_changed: 45
+        produces:
+          - artifact: pull_request
+`
+
+const singleKindV2Spec = `version: "2"
+workflows:
+  feature_change:
+    auto_advance: true
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        needs: [plan]
+        constraints:
+          max_files_changed: 45
+        produces:
+          - artifact: pull_request
+`
+
+func TestParseV2_SingleKindEquivalentToV1(t *testing.T) {
+	v1, err := spec.ParseBytes([]byte(singleKindV1Spec))
+	if err != nil {
+		t.Fatalf("ParseBytes(v1): %v", err)
+	}
+	v2, err := spec.ParseBytes([]byte(singleKindV2Spec))
+	if err != nil {
+		t.Fatalf("ParseBytes(v2): %v", err)
+	}
+	if !v2.Workflows["feature_change"].Drive {
+		t.Error("v2 auto_advance: true did not reach Workflow.Drive")
+	}
+	// Normalize ONLY the version, the one field the documents legitimately
+	// differ in.
+	v2.Version = v1.Version
+	if !reflect.DeepEqual(v1, v2) {
+		t.Errorf("parsed v2 spec differs from v1:\nv1 = %#v\nv2 = %#v", v1, v2)
 	}
 }

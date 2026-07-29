@@ -3,6 +3,7 @@ package spec
 import (
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -37,15 +38,48 @@ func Validate(s *Spec) error {
 	if s == nil {
 		return &ValidationError{Path: "/", Message: "nil spec"}
 	}
+	major := specVersionMajor(s.Version)
 	for wfName, wf := range s.Workflows {
-		if err := validateWorkflow(s, wfName, &wf); err != nil {
+		if err := validateWorkflow(s, wfName, &wf, major); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateWorkflow(s *Spec, name string, wf *Workflow) error {
+// specVersionMajor parses a spec version string's major component, the way
+// ParseBytes' schemaForVersion routes. It is used ONLY to select the FORM of
+// a reported constraint path (see constraintPath), never to gate a rule. A
+// missing / unparseable version returns 0 — which is also what a
+// programmatically built *Spec with an empty Version yields, so the legacy
+// index form is preserved for the Validate-only callers that rely on it.
+func specVersionMajor(version string) int {
+	majorPart := version
+	if idx := strings.IndexByte(majorPart, '.'); idx >= 0 {
+		majorPart = majorPart[:idx]
+	}
+	major, err := strconv.Atoi(majorPart)
+	if err != nil {
+		return 0
+	}
+	return major
+}
+
+// constraintPath renders the path segment naming a constraint in a
+// validation error. Below major 2 that is the LIST INDEX the author wrote
+// (`/constraints/0`). At major 2 and above a v2 document spells constraints
+// as a single OBJECT that normalizes to a one-element slice, so an index
+// names nothing the author wrote — the KIND does (`/constraints/change_freeze`).
+// An empty kind (defensive: a Constraint with no field set) falls back to the
+// index form rather than emitting a dangling `/constraints/`.
+func constraintPath(major, idx int, kind string) string {
+	if major >= 2 && kind != "" {
+		return "/constraints/" + kind
+	}
+	return fmt.Sprintf("/constraints/%d", idx)
+}
+
+func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 	stagePath := func(i int, suffix string) string {
 		return fmt.Sprintf("/workflows/%s/stages/%d%s", name, i, suffix)
 	}
@@ -107,16 +141,22 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 		// stage is correctly rejected; diff_coverage presence (#1888) is
 		// detected the same way, so it is rejected on a deploy stage
 		// identically to its four post-hoc siblings.
+		//
+		// The loop stays a slice walk: it is correct for BOTH shapes — a
+		// v0/v1 list of single-kind entries and the one-element slice a v2
+		// object normalizes to. Only the reported PATH is version-aware
+		// (constraintPath); the three binding MESSAGES below are verbatim
+		// unchanged, which #2219 depends on.
 		for j, c := range stage.Constraints {
 			if c.isPreflight() && !isDeploy {
 				return &ValidationError{
-					Path:    stagePath(i, fmt.Sprintf("/constraints/%d", j)),
+					Path:    stagePath(i, constraintPath(major, j, c.preflightKindName())),
 					Message: fmt.Sprintf("pre-flight deploy constraint is valid only on a deploy stage, not a %q stage (ADR-038)", stage.Type),
 				}
 			}
 			if c.isPostHoc() && isDeploy {
 				return &ValidationError{
-					Path:    stagePath(i, fmt.Sprintf("/constraints/%d", j)),
+					Path:    stagePath(i, constraintPath(major, j, c.postHocKindName())),
 					Message: "post-hoc diff constraint is not valid on a deploy stage; a delegating deploy produces no reviewable diff (ADR-038)",
 				}
 			}
@@ -128,6 +168,10 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 			// outside the tree the measurement claims to describe. Reject
 			// at parse time rather than as an opaque measurement failure.
 			if c.DiffCoverage != nil {
+				dcPath := constraintPath(major, j, "diff_coverage")
+				if major < 2 {
+					dcPath += "/diff_coverage"
+				}
 				// diff_coverage is an IMPLEMENT-stage constraint (#1888).
 				// Only the implement path measures it: the runner's
 				// measurement needs the staged, committed scope-only tree
@@ -141,13 +185,13 @@ func validateWorkflow(s *Spec, name string, wf *Workflow) error {
 				// rather than at evaluation time on a real run.
 				if stage.Type != "implement" {
 					return &ValidationError{
-						Path:    stagePath(i, fmt.Sprintf("/constraints/%d/diff_coverage", j)),
+						Path:    stagePath(i, dcPath),
 						Message: fmt.Sprintf("diff_coverage is valid only on an implement stage, not a %q stage (#1888): the measurement is emitted by the implement runner, and a declared constraint with no measurement is a violation", stage.Type),
 					}
 				}
 				if err := validRepoRelativePath(c.DiffCoverage.ReportPath); err != nil {
 					return &ValidationError{
-						Path:    stagePath(i, fmt.Sprintf("/constraints/%d/diff_coverage/report_path", j)),
+						Path:    stagePath(i, dcPath+"/report_path"),
 						Message: err.Error(),
 					}
 				}

@@ -95,17 +95,19 @@ func appendRangeError(node any, path string, errs *[]ValidationErrorEntry) {
 	}
 }
 
-// Messages for the two back-compat surfaces workflow-v2 removes (E52.3 /
-// #2215). Byte-identical to backend/internal/spec/v2removed.go's pair:
-// `fishhawk validate` is where a spec author most often meets these
-// errors, so the CLI must not degrade to the generic schema message, and
-// the two surfaces must not drift. The Go modules are deliberately
-// separate (see this package's doc comment), so the duplication is by
-// design; the message-content assertions on both sides are what keep the
-// strings in lockstep.
+// Messages for the four back-compat surfaces workflow-v2 REMOVES (E52.3 /
+// #2215) or RESHAPES (E52.6 / #2218). Byte-identical to
+// backend/internal/spec/v2removed.go's set: `fishhawk validate` is where a
+// spec author most often meets these errors, so the CLI must not degrade to
+// the generic schema message, and the two surfaces must not drift. The Go
+// modules are deliberately separate (see this package's doc comment), so
+// the duplication is by design; the message-content assertions on both
+// sides are what keep the strings in lockstep.
 const (
 	msgV2RemovedReviewerReject = `page event "reviewer_reject" was removed in workflow-v2: use "advisory_reviewer_reject" (an agent reject under advisory review authority) or "gating_reviewer_reject" (under gating authority)`
 	msgV2RemovedReviewersAgent = `reviewers.agent was removed in workflow-v2: declare agent reviewers with reviewers.agents[] (one {provider, model?} entry per reviewer); the effective agent count is len(agents)`
+	msgV2RenamedDrive          = `the workflow flag "drive" is spelled "auto_advance" in workflow-v2: rename the key; the semantics are unchanged (fishhawkd auto-advances mechanical transitions, judgment points still park), and v0/v1 keep the "drive" spelling`
+	msgV2ReshapedConstraints   = `constraints is an OBJECT in workflow-v2, not a list: write the kinds as one object, e.g. constraints: {max_files_changed: 45, forbidden_paths: ["infra/**"]}; keys are unique, so the one-kind-per-entry list form is gone`
 )
 
 // legacyPageEventReviewerReject is the bare page-event token workflow-v2
@@ -113,24 +115,26 @@ const (
 const legacyPageEventReviewerReject = "reviewer_reject"
 
 // validateV2RemovedForms sweeps a yaml.v3-decoded generic document for the
-// two forms workflow-v2 removed and returns the first match as a
-// *ValidationError naming the replacement surface, or nil. It mirrors the
+// four forms workflow-v2 removed or reshaped and returns the first match as
+// a *ValidationError naming the replacement surface, or nil. It mirrors the
 // backend's checkV2RemovedForms exactly, including the ordering contract:
 // it runs ONLY for a routed major >= 2 and BEFORE schema validation, so
 // the actionable message wins over the generic
-// `additional properties 'agent' not allowed` / enum message.
+// `additional properties 'agent' not allowed` / enum / type message.
 //
 // Matching contract — read this before changing the walk. The sweep
 // matches by KEY NAME at any depth: any `must_page_human` array carrying
-// "reviewer_reject", and any `reviewers` map carrying an `agent` key. It
-// is deliberately NOT position-aware and deliberately OVER-TRIGGERS in
+// "reviewer_reject", any `reviewers` map carrying an `agent` key, any
+// `drive` key, and any `constraints` value that is a LIST. It is
+// deliberately NOT position-aware and deliberately OVER-TRIGGERS in
 // exchange for never missing a legacy form, so in an already-invalid
 // document the legacy-form message may PRECEDE the genuine structural
 // error. A position-aware sweep would re-encode the schema's structural
 // knowledge in Go, which E52 is actively restructuring. Nodes that are
 // neither maps nor arrays are skipped, as is a non-array
-// `must_page_human` or a non-map `reviewers` — those are not legacy
-// forms, and schema validation (which runs next) reports them.
+// `must_page_human`, a non-map `reviewers`, or a `constraints` that is
+// neither a list nor an object — those are not legacy forms, and schema
+// validation (which runs next) reports them.
 func validateV2RemovedForms(raw any) error {
 	if e := walkV2RemovedForms(raw, ""); e != nil {
 		return &ValidationError{Errors: []ValidationErrorEntry{*e}}
@@ -168,8 +172,9 @@ func walkV2RemovedForms(node any, ptr string) *ValidationErrorEntry {
 }
 
 // checkV2RemovedAtNode reports a legacy form declared directly on this map
-// node. The two forms are checked in a fixed order (page event, then
-// reviewers.agent) so a document carrying both always reports the same one.
+// node. The four forms are checked in a FIXED order — page event,
+// reviewers.agent, then the two E52.6 reshapes (drive, list-form
+// constraints) — so a document carrying several always reports the same one.
 func checkV2RemovedAtNode(m map[string]any, ptr string) *ValidationErrorEntry {
 	if events, ok := m["must_page_human"].([]any); ok {
 		for i, ev := range events {
@@ -187,6 +192,18 @@ func checkV2RemovedAtNode(m map[string]any, ptr string) *ValidationErrorEntry {
 				Path:    ptr + "/reviewers/agent",
 				Message: msgV2RemovedReviewersAgent,
 			}
+		}
+	}
+	if _, ok := m["drive"]; ok {
+		return &ValidationErrorEntry{
+			Path:    ptr + "/drive",
+			Message: msgV2RenamedDrive,
+		}
+	}
+	if _, ok := m["constraints"].([]any); ok {
+		return &ValidationErrorEntry{
+			Path:    ptr + "/constraints",
+			Message: msgV2ReshapedConstraints,
 		}
 	}
 	return nil
