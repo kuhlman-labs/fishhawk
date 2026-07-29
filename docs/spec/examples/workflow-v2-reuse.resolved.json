@@ -1,0 +1,389 @@
+{
+  "$comment": [
+    "GOLDEN RESOLVED DOCUMENT for workflow-v2 same-document reuse (E52.4 / #2216).",
+    "GENERATED, not hand-authored: it is workflow-v2-reuse.yaml after resolveV2Reuse and BEFORE any v2shape normalization \u2014 the one point in the pipeline the backend and CLI resolvers reach identically.",
+    "Consumed by TestV2Reuse_SharedFixtureResolvesIdenticallyAcrossValidators in BOTH backend/internal/spec and cli/internal/spec. Each module runs its OWN resolution over the sibling YAML and asserts the result canonicalizes byte-for-byte to this file, so this golden is a THIRD PARTY to the comparison and a backend-only or CLI-only change to the algorithm fails the other module's test.",
+    "The `defaults` and `extends` keys are DELIBERATELY still present: they are stripped later, backend-only, before its typed decode.",
+    "This $comment key is the file's header (JSON has no comments) and is the ONE key both tests delete before comparing. If the algorithm changes intentionally, REGENERATE this file rather than hand-editing it."
+  ],
+  "defaults": {
+    "budget": {
+      "max_runtime": "45m"
+    },
+    "executor": {
+      "agent": "claude-code",
+      "timeout": "30m"
+    },
+    "reviewers": {
+      "agents": [
+        {
+          "provider": "claudecode"
+        },
+        {
+          "provider": "codex"
+        }
+      ],
+      "human": 1
+    }
+  },
+  "roles": {
+    "founder": {
+      "members": [
+        "@kuhlman-labs"
+      ]
+    }
+  },
+  "version": "2",
+  "workflows": {
+    "base_change": {
+      "description": "The base workflow. Every stage here inherits its executor, reviewers and budget from the file-level defaults unless it says otherwise.",
+      "stages": [
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "agent": "claude-code",
+            "timeout": "30m"
+          },
+          "id": "propose",
+          "inputs": [
+            {
+              "required": true,
+              "source": "github_issue"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "plan"
+        },
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "constraints": {
+            "max_files_changed": 40
+          },
+          "executor": {
+            "agent": "claude-code",
+            "timeout": "60m"
+          },
+          "id": "apply",
+          "needs": [
+            "propose"
+          ],
+          "produces": [
+            {
+              "artifact": "pull_request"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "implement"
+        },
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "human": true
+          },
+          "id": "gate",
+          "reviewers": {
+            "human": 1
+          },
+          "type": "review"
+        }
+      ]
+    },
+    "feature_change": {
+      "defaults": {
+        "executor": {
+          "agent": "codex"
+        }
+      },
+      "description": "Extends base_change. Its own defaults swap the agent for every inherited stage; its own stage declarations still win over that.",
+      "extends": "base_change",
+      "stages": [
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "agent": "codex",
+            "timeout": "30m"
+          },
+          "id": "propose",
+          "inputs": [
+            {
+              "required": true,
+              "source": "github_issue"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "plan"
+        },
+        {
+          "budget": {
+            "max_runtime": "90m"
+          },
+          "constraints": {
+            "max_files_changed": 40
+          },
+          "executor": {
+            "agent": "codex",
+            "timeout": "60m"
+          },
+          "id": "apply",
+          "needs": [
+            "propose"
+          ],
+          "produces": [
+            {
+              "artifact": "pull_request"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "codex"
+              }
+            ]
+          },
+          "type": "implement"
+        },
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "human": true
+          },
+          "id": "gate",
+          "reviewers": {
+            "human": 1
+          },
+          "type": "review"
+        },
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "human": true
+          },
+          "id": "verify",
+          "inputs": [
+            {
+              "artifact": "pull_request",
+              "from_stage": "apply"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "review"
+        },
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "delegate": {
+              "target": "github_actions",
+              "workflow_ref": "deploy.yml"
+            }
+          },
+          "id": "ship",
+          "inputs": [
+            {
+              "artifact": "pull_request",
+              "from_stage": "apply"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "deploy"
+        }
+      ]
+    },
+    "hotfix_change": {
+      "description": "Extends the DERIVING workflow, so its stages resolve through the whole chain: file defaults -> base_change -> feature_change -> here.",
+      "extends": "feature_change",
+      "stages": [
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "agent": "codex",
+            "timeout": "30m"
+          },
+          "id": "propose",
+          "inputs": [
+            {
+              "required": true,
+              "source": "github_issue"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "plan"
+        },
+        {
+          "budget": {
+            "max_runtime": "90m"
+          },
+          "constraints": {
+            "max_files_changed": 40
+          },
+          "executor": {
+            "agent": "codex",
+            "timeout": "60m"
+          },
+          "id": "apply",
+          "needs": [
+            "propose"
+          ],
+          "produces": [
+            {
+              "artifact": "pull_request"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "codex"
+              }
+            ]
+          },
+          "type": "implement"
+        },
+        {
+          "budget": {
+            "max_runtime": "10m"
+          },
+          "executor": {
+            "human": true
+          },
+          "id": "gate",
+          "reviewers": {
+            "human": 1
+          },
+          "type": "review"
+        },
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "human": true
+          },
+          "id": "verify",
+          "inputs": [
+            {
+              "artifact": "pull_request",
+              "from_stage": "apply"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "review"
+        },
+        {
+          "budget": {
+            "max_runtime": "45m"
+          },
+          "executor": {
+            "delegate": {
+              "target": "github_actions",
+              "workflow_ref": "deploy.yml"
+            }
+          },
+          "id": "ship",
+          "inputs": [
+            {
+              "artifact": "pull_request",
+              "from_stage": "apply"
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "claudecode"
+              },
+              {
+                "provider": "codex"
+              }
+            ],
+            "human": 1
+          },
+          "type": "deploy"
+        }
+      ]
+    }
+  }
+}

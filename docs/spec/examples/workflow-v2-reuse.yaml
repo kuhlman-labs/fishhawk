@@ -1,0 +1,185 @@
+# Workflow-v2 example — same-document reuse: `defaults` and `extends`
+# (E52.4 / #2216).
+#
+# Validates against ../workflow-v2.schema.json. This file is the SHARED
+# CROSS-VALIDATOR FIXTURE: it is read over the module wall by
+#
+#   TestV2Reuse_SharedFixtureResolvesIdenticallyAcrossValidators
+#     in backend/internal/spec  AND  in cli/internal/spec
+#
+# Each module runs its OWN resolution over this document and asserts the
+# result canonicalizes byte-for-byte to ../examples/workflow-v2-reuse.resolved.json,
+# the golden resolved document beside it. The golden is a THIRD PARTY to that
+# comparison — the two modules are never compared to each other — so a
+# backend-only or CLI-only change to the algorithm fails the other module's
+# test instead of silently diverging. The backend additionally drives this
+# file through the FULL chain (schema validation, v2shape normalization, the
+# typed decode and the semantic validator).
+#
+# THE `defaults:` AND `extends:` KEYS ARE DELIBERATELY PRESENT IN THE GOLDEN.
+# The golden captures the document immediately AFTER resolution and BEFORE any
+# v2shape normalization — the one point in the pipeline both modules reach
+# identically. The reuse keys are stripped later (backend only, before its
+# typed decode), so they still appear in the golden by design, not by omission.
+#
+# WHAT THIS DOCUMENT EXERCISES, rung by rung and rule by rule:
+#
+#   - file-level defaults.executor + defaults.reviewers + defaults.budget
+#   - a base workflow (`base_change`) inheriting all three
+#   - a deriving workflow (`feature_change`) with `extends` PLUS its own
+#     `defaults`, overriding a file-level key everywhere
+#   - a stage overridden BY ID (`apply`), keeping the base's position
+#   - a stage declaring its own reviewers (defaults do NOT override it)
+#   - a deriving stage declaring ONE agent reviewer where the base declared
+#     TWO — the array-replace proof (never concatenate)
+#   - a stage whose inputs[].from_stage references a stage existing ONLY in
+#     the base (`propose`)
+#   - a `human: true` gate stage under a file-level defaults.executor.agent —
+#     the executor BRANCH RULE (the agent default is dropped wholesale)
+#   - a DELEGATING deploy stage under that same agent default — the branch
+#     rule on the highest-consequence branch, where a grafted `agent` key
+#     would both break the oneOf and misrepresent who executes a deploy
+#   - a base stage carrying the v2 `constraints` OBJECT and the `needs:`
+#     shorthand, inherited verbatim and normalized afterwards in its resolved
+#     position (the ordering pin: resolution precedes normalization)
+#   - a third workflow (`hotfix_change`) extending the deriving one — the
+#     TRANSITIVE chain
+
+version: "2"
+
+roles:
+  founder:
+    members: ["@kuhlman-labs"]
+
+# THE LOWEST RUNG. Applied to every stage of every workflow below.
+defaults:
+  executor:
+    agent: claude-code
+    timeout: 30m
+  reviewers:
+    human: 1
+    agents:
+      - provider: claudecode
+      - provider: codex
+  budget:
+    max_runtime: 45m
+
+workflows:
+  # ---------------------------------------------------------------- base ---
+  base_change:
+    description: >-
+      The base workflow. Every stage here inherits its executor, reviewers and
+      budget from the file-level defaults unless it says otherwise.
+
+    stages:
+      # Inherits executor {agent: claude-code, timeout: 30m} wholesale — it
+      # declares NO executor of its own, and still satisfies $defs/stage's
+      # required [id, type, executor] because resolution runs before schema
+      # validation.
+      - id: propose
+        type: plan
+        inputs:
+          - source: github_issue
+            required: true
+
+      # Declares its own executor KEY-WISE: the file default's agent survives,
+      # this stage's longer timeout wins. Carries the v2 constraints OBJECT
+      # and the needs: shorthand, both inherited verbatim by every deriving
+      # workflow and normalized afterwards in their resolved positions.
+      - id: apply
+        type: implement
+        executor:
+          timeout: 60m
+        produces:
+          - artifact: pull_request
+        needs: [propose]
+        constraints:
+          max_files_changed: 40
+
+      # Declares its own reviewers block. The file default declares BOTH human
+      # and agents; this stage declares ONLY human, and the block is taken
+      # WHOLE — no agents are supplemented from a rung the author did not
+      # write on this stage.
+      - id: gate
+        type: review
+        executor:
+          human: true
+        reviewers:
+          human: 1
+
+  # ------------------------------------------------------------ deriving ---
+  feature_change:
+    description: >-
+      Extends base_change. Its own defaults swap the agent for every inherited
+      stage; its own stage declarations still win over that.
+    extends: base_change
+
+    # THE MIDDLE RUNG. Above the base's stages, below this workflow's own
+    # stage declarations.
+    defaults:
+      executor:
+        agent: codex
+
+    stages:
+      # Overrides the base `apply` stage BY ID: it keeps the base's POSITION
+      # (second, after the inherited `propose`), the base's constraints
+      # object, its produces list and its needs: shorthand, while this
+      # declaration's budget wins key-wise over the file default.
+      #
+      # Its reviewers block declares ONE agent where the file default declares
+      # TWO — the array-replace proof. The resolved stage has exactly one
+      # agent reviewer, and no `human` key supplemented from the file default.
+      - id: apply
+        type: implement
+        budget:
+          max_runtime: 90m
+        reviewers:
+          agents:
+            - provider: codex
+
+      # A NEW stage appended in declaration order. Its from_stage references
+      # `propose`, which exists ONLY in the base — the graph-shape check runs
+      # post-resolution, so it resolves.
+      - id: verify
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: apply
+
+      # THE BRANCH RULE, delegate side. A deploy stage delegating to an
+      # external pipeline, under a file-level defaults.executor.agent AND a
+      # workflow-level defaults.executor.agent. Both are dropped WHOLESALE —
+      # the branchless `timeout` goes with them — so the resolved executor
+      # carries the delegate branch alone, with no `agent` key grafted on. It
+      # has to be wholesale: $defs/executor's delegate and human branches set
+      # unevaluatedProperties: false, so even a surviving stray `timeout`
+      # would fail the oneOf on a document whose author wrote nothing wrong.
+      - id: ship
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        inputs:
+          - artifact: pull_request
+            from_stage: apply
+
+  # ---------------------------------------------------------- transitive ---
+  hotfix_change:
+    description: >-
+      Extends the DERIVING workflow, so its stages resolve through the whole
+      chain: file defaults -> base_change -> feature_change -> here.
+    extends: feature_change
+
+    stages:
+      # Overrides the inherited `gate` stage by id. Its `human: true` executor
+      # survives every agent default on every rung — the branch rule, human
+      # side.
+      - id: gate
+        type: review
+        executor:
+          human: true
+        budget:
+          max_runtime: 10m

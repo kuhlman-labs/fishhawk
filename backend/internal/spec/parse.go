@@ -236,6 +236,23 @@ func ParseBytes(data []byte) (*Spec, error) {
 		}
 	}
 
+	// Resolve workflow-v2's same-document reuse primitives (E52.4 / #2216):
+	// the file- and workflow-level `defaults` blocks and a workflow's
+	// `extends` base, folded into every stage per the documented ladder.
+	// Ordering is load-bearing and pinned in v2reuse.go's header — BEFORE
+	// schema.Validate, so the schema sees the RESOLVED document: an inherited
+	// executor satisfies $defs/stage's required list with no schema
+	// relaxation, a merged executor is checked against the real branch oneOf,
+	// and an extends-only workflow satisfies $defs/workflow's required
+	// [stages]. It is also before normalizeV2Shapes, so a base stage carrying
+	// the v2 `constraints` object or the `needs:` shorthand is inherited
+	// verbatim and normalized once, afterwards, in its resolved position.
+	if major >= 2 {
+		if err := resolveV2Reuse(raw); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := schema.Validate(raw); err != nil {
 		var verr *jsonschema.ValidationError
 		if errors.As(err, &verr) {
@@ -256,6 +273,11 @@ func ParseBytes(data []byte) (*Spec, error) {
 		if err := normalizeV2Shapes(raw); err != nil {
 			return nil, err
 		}
+		// The reuse keys are left in place THROUGH schema validation, so the
+		// author's own `defaults` / `extends` declarations are validated too;
+		// they are deleted here, before the typed decode below runs under
+		// DisallowUnknownFields.
+		stripV2Reuse(raw)
 	}
 
 	// Round-trip through JSON to populate the typed struct. The
