@@ -33,6 +33,7 @@
 //	fishhawk diagnose     <run-id> [--output text|json]
 //	fishhawk report-issue <run-id> [--kind bug|feature] [--description T] [--include-free-text] [--output text|json]
 //	fishhawk export       [--from RFC3339] [--to RFC3339] [--repo owner/name] [--run UUID]... [--limit N] [--csv] [--out PATH]
+//	fishhawk migrate-spec [path] [--out PATH | --in-place | --report-only]
 //
 // Auth is the same `bearerToken` scheme defined in the OpenAPI:
 // CLI sends `Authorization: Bearer <token>` from --token /
@@ -93,6 +94,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runInit(rest, stdout, stderr)
 	case "validate":
 		return runValidate(rest, stdout, stderr)
+	case "migrate-spec":
+		return runMigrateSpec(rest, stdout, stderr)
 	case "runner":
 		return runRunner(rest, stdout, stderr)
 	case "doctor":
@@ -167,6 +170,7 @@ func printUsage(w io.Writer) {
 		"  audit tail   Follow the audit log of a run in real time.",
 		"  init         Scaffold a repo for Fishhawk (workflow spec + agent docs + preflight).",
 		"  validate     Validate a workflow spec file locally.",
+		"  migrate-spec Migrate a workflow-v1 spec to workflow-v2 with an approval-eligibility report.",
 		"  doctor       Run local-loop install checks.",
 		"  file-issue   File a work item (issue/bug/chore/adr) via repo conventions.",
 		"  diagnose     Show a run's product-facts diagnostic bundle.",

@@ -38,7 +38,7 @@ type InitInput struct {
 // delta-applying generator lives only in cli/internal/spec).
 type InitOutput struct {
 	Preset       string `json:"preset" jsonschema:"the resolved preset (echoes the default when the input was omitted)"`
-	WorkflowYAML string `json:"workflow_yaml" jsonschema:"the canonical workflow-v1 preset spec bytes to write to the repo"`
+	WorkflowYAML string `json:"workflow_yaml" jsonschema:"the canonical workflow-v2 preset spec bytes to write to the repo"`
 	TargetPath   string `json:"target_path" jsonschema:"the repo-relative path the scaffold should be committed to (.fishhawk/workflows.yaml)"`
 }
 
@@ -89,16 +89,17 @@ func registerInit(srv *mcp.Server, resolver *runResolver) {
 		Description: strings.TrimSpace(`
 Use this when onboarding a repository that has no .fishhawk/workflows.yaml yet
 and you need a starter workflow spec to commit — the in-band counterpart to the
-CLI ` + "`fishhawk init`" + ` (E29.6). It returns the canonical workflow-v1 preset
+CLI ` + "`fishhawk init`" + ` (E29.6). It returns the canonical workflow-v2 preset
 scaffold for the chosen autonomy tier, generated IN-PROCESS from the backend's
-embedded preset library (there is no HTTP generation endpoint):
+embedded preset library (there is no HTTP generation endpoint). The three
+scaffolds are one shared base plus a single ` + "`autonomy:`" + ` line:
 
-  - low    — human-led: no operator_agent block, every judgment point pages the
+  - low    — human-led: nothing delegated, every judgment point pages the
              human.
   - medium — the recommended default: the operator agent may approve / route
              fixup / retry under named conditions; waive and merge stay human.
-  - high   — adds may_waive: solo_low and may_merge: gates_resolved_ci_green on
-             top of medium.
+  - high   — adds waive (solo low-severity concern) and merge (gates resolved,
+             CI green) on top of medium.
 
 preset defaults to medium when omitted. This tool is PRESET-ONLY: it returns the
 scaffold bytes for the conversational agent to write to target_path

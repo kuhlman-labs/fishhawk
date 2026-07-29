@@ -19,20 +19,24 @@ import (
 var presetFS embed.FS
 
 // Preset names an autonomy tier in the preset library. Each maps to a
-// canonical workflow-v1 document under docs/spec/, mirrored into
-// presets/ (see docs/spec/workflow-preset.md).
+// canonical workflow-v2 document under docs/spec/, mirrored into
+// presets/ (see docs/spec/workflow-preset.md). The three documents are
+// one shared base plus a single `autonomy:` line; the constant's value IS
+// that line's tier, and the parser derives the OperatorAgent block from
+// it via expandTier.
 type Preset string
 
 const (
-	// PresetLow is human-led: no operator_agent block, every judgment
-	// point pages the human.
+	// PresetLow is human-led (`autonomy: low`): nothing is delegated,
+	// every judgment point pages the human.
 	PresetLow Preset = "low"
-	// PresetMedium is the default: operator agent may approve/route
-	// fixup/retry under their named conditions; waive and merge stay
-	// human.
+	// PresetMedium is the default (`autonomy: medium`): the operator
+	// agent may approve, route fix-ups and retry under their named
+	// conditions; waive and merge stay human.
 	PresetMedium Preset = "medium"
-	// PresetHigh adds may_waive: solo_low and may_merge:
-	// gates_resolved_ci_green on top of medium.
+	// PresetHigh (`autonomy: high`) adds waive (the sole open
+	// low-severity concern) and merge (gates resolved, CI green) on top
+	// of medium.
 	PresetHigh Preset = "high"
 )
 
