@@ -116,9 +116,9 @@
         "policy": {
           "$ref": "#/$defs/policy"
         },
-        "drive": {
+        "auto_advance": {
           "type": "boolean",
-          "description": "Opt-in drive mode (#1023 / #996 theme 1): when true, fishhawkd auto-advances the run's mechanical transitions (plan-approved dispatch, review-verdict settlement, fixup re-park, checks-green awaiting_merge) and records a run_auto_advanced audit entry per advance. Judgment points (gate approvals, concern routing, merge) always park. Default false preserves operator-driven advancement. Overridable per-run via POST /v0/runs `drive`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+          "description": "Opt-in auto-advance mode (#1023 / #996 theme 1; renamed from v0/v1's `drive` by E52.6 / #2218): when true, fishhawkd auto-advances the run's mechanical transitions (plan-approved dispatch, review-verdict settlement, fixup re-park, checks-green awaiting_merge) and records a run_auto_advanced audit entry per advance. Judgment points (gate approvals, concern routing, merge) always park. Default false preserves operator-driven advancement. Overridable per-run via POST /v0/runs `drive`. This is a SPEC-SURFACE rename only — the semantics are byte-identical to v0/v1's `drive`, which spelling v0 and v1 keep unchanged; the parser rewrites `auto_advance` to the `drive` key before the typed decode, so the Go field, the runs.drive column, the per-run API override and every read site are untouched. A v2 document declaring `drive` is rejected with a message naming `auto_advance`."
         },
         "budgets": {
           "type": "array",
@@ -212,11 +212,18 @@
             "$ref": "#/$defs/produces"
           }
         },
-        "constraints": {
+        "needs": {
           "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Shorthand for the common artifact-wiring case (E52.6 / #2218): each entry names an EARLIER stage in the same workflow whose default artifact this stage consumes, and expands at parse time to the equivalent `inputs` entry {artifact: <derived>, from_stage: <id>}. The artifact is derived from the REFERENCED stage's type — a `plan` stage yields the `plan` artifact and an `implement` stage yields `pull_request`, the only two members of $defs/input's artifact enum. A referent of any other type (review / deploy / acceptance) has no default input artifact and is REJECTED, naming longhand `inputs:` as the way to express it. `needs` MAY be combined with longhand `inputs:` on the same stage: the declared inputs come first and the derived entries follow in `needs` order, and a derived entry whose (artifact, from_stage) pair already appears verbatim among the declared inputs is dropped, so the resolved input set is identical however the author spelled it. The referent must exist and must be EARLIER in the workflow; both are enforced by the same from_stage graph-shape rules the longhand form goes through, with their existing messages.",
           "items": {
-            "$ref": "#/$defs/constraint"
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
           }
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraint"
         },
         "budget": {
           "$ref": "#/$defs/budget"
@@ -487,10 +494,9 @@
     },
     "constraint": {
       "type": "object",
-      "description": "Exactly one constraint kind per object. Two families: the post-hoc diff constraints (max_files_changed, forbidden_paths, allowed_paths, required_outcomes, diff_coverage) evaluated against a stage's produced diff \u2014 closed set per MVP_SPEC \u00a74.1, valid on non-deploy stages \u2014 and the v1 PRE-FLIGHT deploy constraints (allowed_environments, change_freeze, required_upstream; ADR-038 / #925) evaluated BEFORE a delegating deploy stage executes. ADR-038 makes the post-hoc diff constraints meaningless for a delegating deploy and the pre-flight kinds meaningless off a deploy stage; the type<->constraint binding is enforced semantically by the validator.",
+      "description": "A stage's constraints, as ONE object keyed by constraint kind (E52.6 / #2218). v0 and v1 spell this as a LIST of single-kind objects, each pinned to exactly one key by maxProperties:1; v2 drops maxProperties because an object's keys are naturally unique, so one object states every kind the stage declares and the exactly-one-kind-per-entry rule is gone. minProperties:1 stays, so `constraints: {}` is rejected as a no-op. The v2 object normalizes at parse time to a ONE-ELEMENT list of the legacy representation \u2014 it denotes exactly one constraint value \u2014 so no constraint consumer changed and v0/v1 documents are never re-resolved. Two families: the post-hoc diff constraints (max_files_changed, forbidden_paths, allowed_paths, required_outcomes, diff_coverage) evaluated against a stage's produced diff \u2014 closed set per MVP_SPEC \u00a74.1, valid on non-deploy stages \u2014 and the PRE-FLIGHT deploy constraints (allowed_environments, change_freeze, required_upstream; ADR-038 / #925) evaluated BEFORE a delegating deploy stage executes. ADR-038 makes the post-hoc diff constraints meaningless for a delegating deploy and the pre-flight kinds meaningless off a deploy stage; the type<->constraint binding is still enforced semantically by the validator, which reports a v2 violation at /constraints/<kind> rather than at a list index that names nothing the author wrote.",
       "additionalProperties": false,
       "minProperties": 1,
-      "maxProperties": 1,
       "properties": {
         "max_files_changed": {
           "type": "integer",

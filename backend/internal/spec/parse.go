@@ -222,13 +222,14 @@ func ParseBytes(data []byte) (*Spec, error) {
 		return nil, err
 	}
 
-	// workflow-v2 removed two back-compat surfaces (E52.3 / #2215): the
-	// bare reviewer_reject page-event token and the reviewers.agent
-	// integer count. The schema rejects both, but with a generic enum /
-	// additionalProperties message that names no replacement — so sweep
-	// the raw document FIRST, for a routed major >= 2 only, and return
-	// the actionable message instead. Below major 2 the sweep never runs
-	// and both forms parse exactly as before.
+	// workflow-v2 removed or reshaped four back-compat surfaces (E52.3 /
+	// #2215, E52.6 / #2218): the bare reviewer_reject page-event token,
+	// the reviewers.agent integer count, the `drive` workflow flag and the
+	// list form of `constraints`. The schema rejects all four, but with a
+	// generic enum / additionalProperties / type message that names no
+	// replacement — so sweep the raw document FIRST, for a routed major >=
+	// 2 only, and return the actionable message instead. Below major 2 the
+	// sweep never runs and every legacy form parses exactly as before.
 	if major >= 2 {
 		if serr := checkV2RemovedForms(raw); serr != nil {
 			return nil, serr
@@ -241,6 +242,20 @@ func ParseBytes(data []byte) (*Spec, error) {
 			return nil, schemaErrorFrom(verr)
 		}
 		return nil, &SchemaError{Path: "/", Message: err.Error()}
+	}
+
+	// Normalize workflow-v2's reshaped surfaces (E52.6 / #2218) into the
+	// v0/v1 representation the typed struct and every consumer expect: a
+	// `constraints` object becomes a one-element list, `auto_advance`
+	// becomes `drive`, and `needs:` expands to the equivalent `inputs`
+	// entries. Ordering is load-bearing and pinned in v2shape.go's doc
+	// comment — AFTER schema validation (so this never sees an unvalidated
+	// shape) and BEFORE the typed decode (which runs under
+	// DisallowUnknownFields, so the v2-only keys must be gone).
+	if major >= 2 {
+		if err := normalizeV2Shapes(raw); err != nil {
+			return nil, err
+		}
 	}
 
 	// Round-trip through JSON to populate the typed struct. The

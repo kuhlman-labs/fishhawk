@@ -481,3 +481,76 @@ func TestCreateRun_Drive_Resolution(t *testing.T) {
 		})
 	}
 }
+
+// v2AutoAdvanceSpecYAML and v1DriveSpecYAML are a matched pair differing only
+// in the version and the flag's SPELLING. workflow-v2 renames v0/v1's `drive`
+// to `auto_advance` (E52.6 / #2218); the parser rewrites it back to the
+// `drive` key before the typed decode, so every downstream consumer — the Go
+// field, the runs.drive column, the read sites that surface next_action — sees
+// the identical value.
+const v2AutoAdvanceSpecYAML = `version: "2"
+workflows:
+  trivial:
+    auto_advance: true
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+const v1DriveSpecYAML = `version: "1.6"
+workflows:
+  trivial:
+    drive: true
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestCreateRun_V2AutoAdvanceParityWithV1Drive is defense-in-depth for the
+// rename (binding approval condition 2). Routing auto_advance to the existing
+// drive key at parse time makes the parse-level assertion Workflow.Drive ==
+// true close to a proof by construction, but acceptance criterion 4 names
+// next_action surfacing explicitly, so this pins that the v2 SPELLING reaches
+// the same created-run flag through the REAL run-create path: a normalization
+// that silently stopped firing would leave the v2 run un-driven while the v1
+// run advanced. It deliberately does NOT re-test v1's downstream next_action
+// behaviour, which is pre-existing and unchanged.
+func TestCreateRun_V2AutoAdvanceParityWithV1Drive(t *testing.T) {
+	createWithSpec := func(t *testing.T, specYAML string) bool {
+		t.Helper()
+		repo := newFakeRepo()
+		s := newServer(t, repo)
+		raw, _ := json.Marshal(map[string]any{
+			"repo":           "x/y",
+			"workflow_id":    "trivial",
+			"workflow_sha":   "abc",
+			"trigger_source": "cli",
+			"workflow_spec":  specYAML,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(string(raw)))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.handleCreateRun(w, withAuth(req))
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		return repo.lastCreateRunParams.Drive
+	}
+
+	v1Drive := createWithSpec(t, v1DriveSpecYAML)
+	v2Drive := createWithSpec(t, v2AutoAdvanceSpecYAML)
+	if !v1Drive {
+		t.Fatalf("v1 `drive: true` produced Drive=false; the pair is not exercising the flag")
+	}
+	if v2Drive != v1Drive {
+		t.Errorf("v2 `auto_advance: true` produced Drive=%v, want the same %v as v1 `drive: true`", v2Drive, v1Drive)
+	}
+}
