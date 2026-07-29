@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -25,7 +26,7 @@ func parsePreset(t *testing.T, p Preset) *Spec {
 
 // TestPresetsParseAndValidate is the drift-proof gate mirroring the CLI
 // one: every mirrored preset must pass ParseBytes (schema + semantic)
-// through the backend's embedded workflow-v1 schema. The same bytes
+// through the backend's embedded workflow-v2 schema. The same bytes
 // validating through both the CLI and backend embed copies is the
 // cross-boundary check that the docs/spec canonical and both mirrors
 // stay in lockstep.
@@ -57,68 +58,67 @@ func operatorAgentOf(t *testing.T, s *Spec) *OperatorAgent {
 }
 
 // TestPresetOperatorAgentPerTier is the done-means assertion (per
-// #1169): it pins the SHIPPED operator_agent knobs of each parsed
-// preset, so a no-op / comment-only preset edit fails even though the
-// scope path was touched.
+// #1169): it pins the delegation block each parsed preset resolves to,
+// so a no-op / comment-only preset edit fails even though the scope path
+// was touched.
+//
+// Since E52.8 the presets declare `autonomy: <tier>` and the parser
+// DERIVES the block via expandTier, so the expectation is the FROZEN
+// literal table (frozenTierBlocks, written out longhand in
+// v2autonomy_test.go) rather than anything the parser computed. Its
+// byte-level companion is TestShippedPresetsDeclareTheirTier, which pins
+// WHICH tier each preset chose; neither side supplies the other's answer.
 func TestPresetOperatorAgentPerTier(t *testing.T) {
-	t.Run("low has no operator_agent block", func(t *testing.T) {
-		if oa := operatorAgentOf(t, parsePreset(t, PresetLow)); oa != nil {
-			t.Fatalf("low preset must have no operator_agent block, got %+v", oa)
+	t.Run("low delegates nothing", func(t *testing.T) {
+		oa := operatorAgentOf(t, parsePreset(t, PresetLow))
+		assertFrozenTierBlock(t, TierLow, oa)
+		if len(oa.MustPageHuman) != 0 {
+			t.Errorf("low must page on nothing, got %v — it absorbs nothing to except", oa.MustPageHuman)
 		}
 	})
 
-	t.Run("medium has three knobs + 7 page events, no waive/merge", func(t *testing.T) {
+	t.Run("medium delegates approve/fixup/retry, not waive/merge", func(t *testing.T) {
 		oa := operatorAgentOf(t, parsePreset(t, PresetMedium))
-		if oa == nil {
-			t.Fatal("medium preset must have an operator_agent block")
-		}
-		if oa.MayApprove != ConditionCleanDualApproval {
-			t.Errorf("may_approve = %q, want %q", oa.MayApprove, ConditionCleanDualApproval)
-		}
-		if oa.MayRouteFixup != ConditionConvergentConcerns {
-			t.Errorf("may_route_fixup = %q, want %q", oa.MayRouteFixup, ConditionConvergentConcerns)
-		}
-		if oa.MayRetry != ConditionInfraFlake {
-			t.Errorf("may_retry = %q, want %q", oa.MayRetry, ConditionInfraFlake)
-		}
-		if oa.MayWaive != "" {
-			t.Errorf("medium must NOT set may_waive, got %q", oa.MayWaive)
-		}
-		if oa.MayMerge != "" {
-			t.Errorf("medium must NOT set may_merge, got %q", oa.MayMerge)
+		assertFrozenTierBlock(t, TierMedium, oa)
+		if oa.MayWaive != "" || oa.MayMerge != "" {
+			t.Errorf("medium must NOT delegate waive/merge, got %q/%q", oa.MayWaive, oa.MayMerge)
 		}
 		assertPageEvents(t, oa)
 	})
 
-	t.Run("high adds may_waive and may_merge", func(t *testing.T) {
+	t.Run("high adds waive and merge", func(t *testing.T) {
 		oa := operatorAgentOf(t, parsePreset(t, PresetHigh))
-		if oa == nil {
-			t.Fatal("high preset must have an operator_agent block")
-		}
-		if oa.MayApprove != ConditionCleanDualApproval {
-			t.Errorf("may_approve = %q, want %q", oa.MayApprove, ConditionCleanDualApproval)
-		}
-		if oa.MayRouteFixup != ConditionConvergentConcerns {
-			t.Errorf("may_route_fixup = %q, want %q", oa.MayRouteFixup, ConditionConvergentConcerns)
-		}
-		if oa.MayRetry != ConditionInfraFlake {
-			t.Errorf("may_retry = %q, want %q", oa.MayRetry, ConditionInfraFlake)
-		}
-		if oa.MayWaive != ConditionSoloLow {
-			t.Errorf("may_waive = %q, want %q", oa.MayWaive, ConditionSoloLow)
-		}
-		if oa.MayMerge != ConditionGatesResolvedCIGreen {
-			t.Errorf("may_merge = %q, want %q", oa.MayMerge, ConditionGatesResolvedCIGreen)
+		assertFrozenTierBlock(t, TierHigh, oa)
+		if oa.MayWaive != ConditionSoloLow || oa.MayMerge != ConditionGatesResolvedCIGreen {
+			t.Errorf("high must delegate waive/merge, got %q/%q", oa.MayWaive, oa.MayMerge)
 		}
 		assertPageEvents(t, oa)
 	})
 }
 
-// assertPageEvents pins the shared 7-event must_page_human list.
+// assertFrozenTierBlock compares a parsed preset's derived block against
+// the frozen literal expectation for its tier.
+func assertFrozenTierBlock(t *testing.T, tier AutonomyTier, got *OperatorAgent) {
+	t.Helper()
+	want, ok := frozenTierBlocks[tier]
+	if !ok {
+		t.Fatalf("no frozen block for tier %s", tier)
+	}
+	if got == nil {
+		t.Fatalf("preset derived a nil operator_agent block, want %+v", want)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("tier %s derived %+v, want the frozen block %+v", tier, got, want)
+	}
+}
+
+// assertPageEvents pins the shared 7-event page list, in the v2 spelling
+// (`gating_reviewer_reject`; the bare `reviewer_reject` token v0/v1 used
+// is not declarable at major 2).
 func assertPageEvents(t *testing.T, oa *OperatorAgent) {
 	t.Helper()
 	want := []string{
-		"reviewer_reject", "plan_rejection", "scope_amendment",
+		"gating_reviewer_reject", "plan_rejection", "scope_amendment",
 		"budget_override", "policy_override", "exception_request",
 		"requirement_arbitration",
 	}
@@ -130,6 +130,127 @@ func assertPageEvents(t *testing.T, oa *OperatorAgent) {
 			t.Errorf("must_page_human[%d] = %q, want %q", i, oa.MustPageHuman[i], w)
 		}
 	}
+}
+
+// --- the shipped workflow-v2 preset bytes (E52.8 / #2220) --------------------
+
+// TestShippedPresetsDeclareTheirTier is the byte-level companion to the
+// frozen tier table: each shipped preset declares `version: "2"`, carries
+// the one-word tier shorthand `autonomy: <its own tier>`, and declares NO
+// `operator_agent` key — the v0/v1 block workflow-v2 removed. It also
+// pins that the v0/v1 spellings v2 renamed are gone.
+func TestShippedPresetsDeclareTheirTier(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			text := string(presetText(t, p))
+			if !strings.Contains(text, "version: \"2\"\n") {
+				t.Errorf("preset %q does not declare version: \"2\":\n%s", p, text)
+			}
+			if strings.Contains(text, "operator_agent:") {
+				t.Errorf("preset %q still declares an operator_agent block (removed at workflow-v2):\n%s", p, text)
+			}
+			if want := "\n    autonomy: " + string(p) + "\n"; !strings.Contains(text, want) {
+				t.Errorf("preset %q does not declare %q:\n%s", p, strings.TrimSpace(want), text)
+			}
+			for _, legacy := range []string{"drive:", "max_runtime_minutes:", "must_page_human:"} {
+				if strings.Contains(text, legacy) {
+					t.Errorf("preset %q still uses the v0/v1 spelling %q:\n%s", p, legacy, text)
+				}
+			}
+		})
+	}
+}
+
+// TestPresetsAreLockstepBaseAndTierDelta is the machine-enforced
+// statement of the base-plus-deltas invariant, mirrored from
+// cli/internal/spec so BOTH embedded mirror sets are held to it.
+//
+// Cross-FILE inclusion is deliberately out of ADR-067 scope, so each
+// preset must remain a standalone document `fishhawk init` writes whole;
+// this test — not a generator — is what keeps the three in lockstep.
+// It strips ONLY the leading header comment block (the one deliberately
+// tier-specific prose block) and the single `autonomy:` line, then
+// compares the remainders BYTE FOR BYTE. Every other comment
+// participates: stripping all comments would leave the test unable to
+// detect exactly the tier-specific drift it exists to prevent.
+//
+// The vacuity guard is that the line it stripped from each preset must
+// have been that preset's OWN autonomy line, so the test cannot pass on
+// three files that share no autonomy key at all.
+func TestPresetsAreLockstepBaseAndTierDelta(t *testing.T) {
+	normalized := make(map[Preset]string, len(allPresets))
+	for _, p := range allPresets {
+		body, headerLines := stripLeadingCommentBlock(string(presetText(t, p)))
+		if headerLines == 0 {
+			t.Fatalf("preset %q has no leading header comment block to strip", p)
+		}
+		rest, tier, n := stripAutonomyLine(body)
+		if n != 1 {
+			t.Fatalf("preset %q declares %d autonomy lines, want exactly 1", p, n)
+		}
+		if tier != string(p) {
+			t.Fatalf("preset %q stripped `autonomy: %s`, want its own tier — the comparison below would be vacuous", p, tier)
+		}
+		normalized[p] = rest
+	}
+	base := normalized[PresetMedium]
+	for _, p := range []Preset{PresetLow, PresetHigh} {
+		if normalized[p] != base {
+			t.Errorf("preset %q is not the medium base plus its one autonomy line.\n--- %s ---\n%s\n--- medium ---\n%s", p, p, normalized[p], base)
+		}
+	}
+	// Load-bearing guard: the shared base must be substantial, so an
+	// accidental over-strip cannot make three empty strings compare equal.
+	if len(base) < 1000 {
+		t.Fatalf("normalized base is only %d bytes — the lockstep comparison is not load-bearing", len(base))
+	}
+}
+
+// stripLeadingCommentBlock removes the contiguous run of comment and
+// blank lines at the top of a document, returning the remainder and how
+// many lines it dropped.
+func stripLeadingCommentBlock(text string) (string, int) {
+	lines := strings.Split(text, "\n")
+	i := 0
+	for i < len(lines) {
+		trimmed := strings.TrimSpace(lines[i])
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			break
+		}
+		i++
+	}
+	return strings.Join(lines[i:], "\n"), i
+}
+
+// stripAutonomyLine removes every `autonomy: <tier>` line, returning the
+// remainder, the last tier value seen, and how many lines matched.
+func stripAutonomyLine(text string) (string, string, int) {
+	lines := strings.Split(text, "\n")
+	kept := make([]string, 0, len(lines))
+	tier := ""
+	n := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "autonomy:") {
+			tier = strings.TrimSpace(strings.TrimPrefix(trimmed, "autonomy:"))
+			n++
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n"), tier, n
+}
+
+// presetText returns a preset's shipped bytes, failing the test on a read
+// error.
+func presetText(t *testing.T, p Preset) []byte {
+	t.Helper()
+	data, err := PresetBytes(p)
+	if err != nil {
+		t.Fatalf("PresetBytes(%q): %v", p, err)
+	}
+	return data
 }
 
 // TestPresetApprovalsGateHandleFree is the E39.2 / #1707 done-means: every
