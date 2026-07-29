@@ -208,15 +208,20 @@ const (
 	ConditionGatesResolvedCIGreen DelegationCondition = "gates_resolved_ci_green"
 )
 
-// must_page_human events — the closed v0 set of events that always
-// page the human regardless of the may_* knobs. The reviewer-reject
-// taxonomy now carries the explicit advisory/gating classes (#1378,
-// workflow-v0.7) alongside the preserved legacy bare token.
+// must_page_human events — the closed set of events that always page
+// the human regardless of the may_* knobs. The reviewer-reject taxonomy
+// carries the explicit advisory/gating classes (#1378, workflow-v0.7);
+// workflow-v0 and workflow-v1 additionally accept the legacy bare token,
+// which workflow-v2 removed (E52.3 / #2215).
 const (
-	// PageEventReviewerReject is the legacy bare reviewer-reject token.
-	// Preserved for back-compat; it resolves to the gating sense
-	// (PageEventGatingReviewerReject), so a bare reviewer_reject still
-	// pages the human exactly as before #1378.
+	// PageEventReviewerReject is the legacy bare reviewer-reject token,
+	// accepted by workflow-v0 and workflow-v1 ONLY — workflow-v2 removed
+	// it from the must_page_human enum (E52.3 / #2215), where
+	// PageEventGatingReviewerReject expresses the same intent. The
+	// constant is RETAINED because v0/v1 documents still parse into this
+	// type: on those majors a bare reviewer_reject still resolves to the
+	// gating sense (PageEventGatingReviewerReject) and pages the human
+	// exactly as before #1378.
 	PageEventReviewerReject = "reviewer_reject"
 	// PageEventAdvisoryReviewerReject (#1378, workflow-v0.7): an agent
 	// reject under advisory review authority (agent + human reviewers).
@@ -427,6 +432,11 @@ const DefaultMaxRetries = 1
 // AgentCount is the single source of truth for the effective count and
 // must be used wherever authority or invocation counts are derived.
 type ReviewersConfig struct {
+	// Agent is the bare agent-reviewer count accepted by workflow-v0 and
+	// workflow-v1 ONLY — workflow-v2 removed the `agent` property from its
+	// reviewers block (E52.3 / #2215), where Agents is the sole agent-reviewer
+	// declaration. The field is RETAINED because v0/v1 documents still parse
+	// into this shared type; a v2-parsed spec never populates it.
 	Agent  int             `json:"agent,omitempty" yaml:"agent,omitempty"`
 	Agents []AgentReviewer `json:"agents,omitempty" yaml:"agents,omitempty"`
 	Human  int             `json:"human,omitempty" yaml:"human,omitempty"`
@@ -508,7 +518,10 @@ type AgentReviewer struct {
 
 // AgentCount returns the effective number of agent reviewers: len(Agents)
 // when the heterogeneous list is present and non-empty (it supersedes the
-// bare count), else Agent.
+// bare count), else Agent. The Agent fallback branch is retained for v0/v1
+// documents and is UNREACHABLE for a spec parsed at major 2 or above —
+// workflow-v2 removed the `agent` property (E52.3 / #2215), so a v2 spec
+// always resolves through len(Agents).
 func (r ReviewersConfig) AgentCount() int {
 	if len(r.Agents) > 0 {
 		return len(r.Agents)

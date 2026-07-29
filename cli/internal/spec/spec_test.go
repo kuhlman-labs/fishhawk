@@ -622,3 +622,260 @@ workflows:
 		})
 	}
 }
+
+// --- workflow-v2 removed back-compat forms (E52.3 / #2215) ---
+//
+// `fishhawk validate` is where a spec author most often meets these two
+// rejections, so the CLI must not degrade to the generic schema message.
+// The messages are byte-identical to the backend's; these assertions and
+// their backend counterparts are what keep the two copies in lockstep.
+
+// v2SpecWithPageEvent renders a v2 document listing the given page event
+// under a workflow-level operator_agent block.
+func v2SpecWithPageEvent(event string) string {
+	return `version: "2"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human:
+        - ` + event + `
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+}
+
+// specWithReviewersAgentCount renders a document at the given version whose
+// plan stage carries the bare `reviewers.agent` integer.
+func specWithReviewersAgentCount(version string) string {
+	return `version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 2
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+}
+
+// TestValidateBytes_V2RejectsBareReviewerReject asserts the CLI rejects the
+// removed page-event token at v2 with a message naming BOTH replacements —
+// not the generic "value must be one of" enum message.
+func TestValidateBytes_V2RejectsBareReviewerReject(t *testing.T) {
+	err := spec.ValidateBytes([]byte(v2SpecWithPageEvent("reviewer_reject")))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	for _, want := range []string{"advisory_reviewer_reject", "gating_reviewer_reject", "must_page_human/0"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("error %q does not name %q", joined, want)
+		}
+	}
+}
+
+// TestValidateBytes_V2RejectsReviewersAgentCount asserts the CLI rejects the
+// removed bare integer at v2 with a message naming reviewers.agents[].
+func TestValidateBytes_V2RejectsReviewersAgentCount(t *testing.T) {
+	err := spec.ValidateBytes([]byte(specWithReviewersAgentCount("2")))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	for _, want := range []string{"reviewers.agents", "len(agents)", "/reviewers/agent"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("error %q does not name %q", joined, want)
+		}
+	}
+}
+
+// TestValidateBytes_LegacyFormsAcceptedBelowMajor2 is the non-firing branch
+// of the CLI's version gate: both removed forms are still valid at 1.6 and
+// 0.7, so the sweep must not fire below major 2.
+func TestValidateBytes_LegacyFormsAcceptedBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run("page event at "+version, func(t *testing.T) {
+			yml := strings.Replace(v2SpecWithPageEvent("reviewer_reject"), `version: "2"`, `version: "`+version+`"`, 1)
+			if err := spec.ValidateBytes([]byte(yml)); err != nil {
+				t.Errorf("ValidateBytes(version %s) = %v, want nil", version, err)
+			}
+		})
+		t.Run("reviewers.agent at "+version, func(t *testing.T) {
+			if err := spec.ValidateBytes([]byte(specWithReviewersAgentCount(version))); err != nil {
+				t.Errorf("ValidateBytes(version %s) = %v, want nil", version, err)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_V2AcceptsReplacementSurfaces is the v2-accepts branch:
+// the explicit reject tokens plus an agents[] list validate cleanly.
+func TestValidateBytes_V2AcceptsReplacementSurfaces(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human:
+        - advisory_reviewer_reject
+        - gating_reviewer_reject
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("ValidateBytes(v2 replacement surfaces) = %v, want nil", err)
+	}
+}
+
+// TestValidateBytes_V2SweepSkippedOnMalformedVersion covers the
+// fall-through-to-v0 routing branches: a missing / non-string / unparseable
+// version routes to v0 (major 0), so the sweep never runs and the
+// pre-existing required-version error is preserved even for a document that
+// also carries a legacy form.
+func TestValidateBytes_V2SweepSkippedOnMalformedVersion(t *testing.T) {
+	bodies := map[string]string{
+		"missing version": `workflows:
+  feature_change:
+    operator_agent:
+      must_page_human: [reviewer_reject]
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`,
+		"non-string version": `version: 2
+` + `workflows:
+  feature_change:
+    operator_agent:
+      must_page_human: [reviewer_reject]
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`,
+		"unparseable version": `version: "vNext"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human: [reviewer_reject]
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`,
+	}
+	for name, yml := range bodies {
+		t.Run(name, func(t *testing.T) {
+			err := spec.ValidateBytes([]byte(yml))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			joined := strings.Join(messageStrings(ve), "\n")
+			if strings.Contains(joined, "workflow-v2") {
+				t.Errorf("error %q ran the sweep; the fall-through-to-v0 path must not", joined)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_V2SweepMatchesByKeyNameNotPosition is the CLI parity
+// pin for the backend's TestCheckV2RemovedForms_MatchesByKeyNameNotPosition:
+// the sweep matches by key name at any depth and deliberately over-triggers,
+// so a legacy form in a position the v2 schema does not permit still reports
+// the removed-form message rather than the structural error. Both copies
+// must behave identically or a spec author gets different advice from
+// `fishhawk validate` than from the backend.
+func TestValidateBytes_V2SweepMatchesByKeyNameNotPosition(t *testing.T) {
+	yml := `version: "2"
+must_page_human:
+  - reviewer_reject
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	if !strings.Contains(joined, "removed in workflow-v2") {
+		t.Errorf("error %q is not the removed-form message; the sweep must over-trigger rather than defer to the structural error", joined)
+	}
+}
+
+// TestValidateBytes_V2SweepSkipsNonMatchingShapes covers the CLI sweep's
+// skip branches — a non-array `must_page_human` and a non-map `reviewers`
+// are not legacy forms, so the sweep must stay silent and leave the report
+// to schema validation. Mirrors the backend's
+// TestCheckV2RemovedForms_SkipsNonMatchingShapes, which can call the
+// unexported sweep directly; here the observable proof is that the error
+// is the schema's type complaint rather than the removed-form message.
+func TestValidateBytes_V2SweepSkipsNonMatchingShapes(t *testing.T) {
+	bodies := map[string]string{
+		"must_page_human is not an array": `version: "2"
+workflows:
+  feature_change:
+    operator_agent:
+      must_page_human: reviewer_reject
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`,
+		"reviewers is not a map": `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          - agent
+`,
+	}
+	for name, yml := range bodies {
+		t.Run(name, func(t *testing.T) {
+			err := spec.ValidateBytes([]byte(yml))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError from the schema layer", err)
+			}
+			joined := strings.Join(messageStrings(ve), "\n")
+			if strings.Contains(joined, "removed in workflow-v2") {
+				t.Errorf("error %q is the removed-form message; these shapes are not legacy forms", joined)
+			}
+		})
+	}
+}

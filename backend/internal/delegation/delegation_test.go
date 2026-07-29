@@ -872,6 +872,134 @@ func TestReviewerRejectClass_LegacyTokenBackCompat(t *testing.T) {
 	}
 }
 
+// TestReviewerRejectClass_LegacyV1TokenThroughDelegation is the end-to-end
+// preservation proof for E52.3 / #2215. workflow-v2 REMOVED the bare
+// reviewer_reject page-event token, but workflow-v0 and workflow-v1 still
+// accept it and the shared Go constant is retained for exactly that reason
+// — so the claim that needs proving is not "the constant still exists" but
+// "a real v1 DOCUMENT carrying the bare token still resolves to the gating
+// class through the delegation consumer".
+//
+// It closes the gap the previous coverage left open by splitting the claim
+// across two half-proofs: a parse-only assertion in the spec package (the
+// token survives ParseBytes) and a hand-built-struct assertion here (the
+// mapping is gating). Neither alone shows the two halves still meet. This
+// drives real v1 YAML through spec.ParseBytes and hands the PARSED workflow
+// to the Evaluator.
+func TestReviewerRejectClass_LegacyV1TokenThroughDelegation(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "1.6"
+workflows:
+  feature_change:
+    operator_agent:
+      may_route_fixup: convergent_concerns
+      must_page_human:
+        - reviewer_reject
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 0
+`))
+	if err != nil {
+		t.Fatalf("spec.ParseBytes(v1 with the legacy bare token): %v", err)
+	}
+	wfv := s.Workflows["feature_change"]
+	wf := &wfv
+
+	// The legacy token must survive the parse into the shared type — a v1
+	// document is still entitled to it.
+	if wf.OperatorAgent == nil {
+		t.Fatal("parsed OperatorAgent = nil, want the declared block")
+	}
+	if got := wf.OperatorAgent.MustPageHuman; len(got) != 1 || got[0] != spec.PageEventReviewerReject {
+		t.Fatalf("parsed MustPageHuman = %v, want [%s]", got, spec.PageEventReviewerReject)
+	}
+	// And the reviewers block must still carry the bare integer count that
+	// v2 removed — the input implementReviewAuthority resolves on.
+	st := implementStageOf(t, wf)
+	if st.Reviewers == nil || st.Reviewers.Agent != 1 || st.Reviewers.Human != 0 {
+		t.Fatalf("parsed implement Reviewers = %+v, want {Agent:1, Human:0}", st.Reviewers)
+	}
+
+	ev := cleanDualEvaluator(nil, []*concern.Concern{openConcern("medium")}, &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 1)},
+		"implement_reviewed":       {verdictEntry(2, planreview.VerdictReject)},
+	}})
+	res := evaluate(t, ev, wf, newRun())
+
+	if res.ReviewerRejectClass != spec.PageEventGatingReviewerReject {
+		t.Errorf("ReviewerRejectClass = %q, want %q (a v1 bare reviewer_reject still resolves to the gating sense)",
+			res.ReviewerRejectClass, spec.PageEventGatingReviewerReject)
+	}
+	if len(res.MustPageHuman) != 1 || res.MustPageHuman[0] != spec.PageEventReviewerReject {
+		t.Errorf("MustPageHuman = %v, want the legacy token surfaced verbatim", res.MustPageHuman)
+	}
+	if d := decisionFor(t, res, ActionRouteFixup); d.Met {
+		t.Errorf("route_fixup Met = true, want false: a gating reject pages the human")
+	}
+}
+
+// TestImplementReviewAuthority_NilReviewersBlockFromV2Spec is the RESOLVED
+// half of #2215 acceptance criterion 4, which says a spec with no reviewers
+// block "still defaults to {human: 1}". No consumer materializes that
+// literal: Stage.Reviewers stays nil and implementReviewAuthority maps nil
+// straight to gateless. What is TRUE — and what this asserts — is that nil
+// and {Human:1} are OBSERVATIONALLY EQUIVALENT here, because with zero agent
+// reviewers the human count cannot change the resolved mode. So the
+// documented default is unobservable rather than applied, and this slice
+// does not change that either way.
+func TestImplementReviewAuthority_NilReviewersBlockFromV2Spec(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`))
+	if err != nil {
+		t.Fatalf("spec.ParseBytes(v2 without a reviewers block): %v", err)
+	}
+	wfv := s.Workflows["feature_change"]
+	wf := &wfv
+	if st := implementStageOf(t, wf); st.Reviewers != nil {
+		t.Fatalf("parsed implement Reviewers = %+v, want nil for an absent block", st.Reviewers)
+	}
+	if got := implementReviewAuthority(wf); got != planreview.AuthorityGateless {
+		t.Errorf("implementReviewAuthority(nil block) = %q, want %q", got, planreview.AuthorityGateless)
+	}
+	// The documented {human:1} default resolves identically, which is why
+	// the discrepancy has never been observable.
+	withDefault := wfv
+	withDefault.Stages = append([]spec.Stage(nil), wf.Stages...)
+	implementStageOf(t, &withDefault).Reviewers = &spec.ReviewersConfig{Human: 1}
+	if got := implementReviewAuthority(&withDefault); got != planreview.AuthorityGateless {
+		t.Errorf("implementReviewAuthority({human:1}) = %q, want %q — it must stay indistinguishable from nil", got, planreview.AuthorityGateless)
+	}
+	if reviewerRejectClass(wf) != reviewerRejectClass(&withDefault) {
+		t.Errorf("reviewerRejectClass differs between nil (%q) and {human:1} (%q)",
+			reviewerRejectClass(wf), reviewerRejectClass(&withDefault))
+	}
+}
+
+// implementStageOf returns the workflow's implement stage, failing the test
+// if there is none. Unlike implementStage it takes a parsed workflow, so a
+// fixture that drifts fails loudly instead of panicking.
+func implementStageOf(t *testing.T, wf *spec.Workflow) *spec.Stage {
+	t.Helper()
+	for i := range wf.Stages {
+		if wf.Stages[i].Type == spec.StageTypeImplement {
+			return &wf.Stages[i]
+		}
+	}
+	t.Fatal("parsed workflow has no implement stage")
+	return nil
+}
+
 // TestConvergentConcerns_GatingRejectReasonNamesClass asserts the gating
 // unmet-reason names the explicit gating_reviewer_reject class so a reader
 // need not cross-reference the authority resolver.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -3718,19 +3719,133 @@ func TestParse_RoutesV16Spec(t *testing.T) {
 	}
 }
 
-// TestV2StructurallyMatchesV1 mechanically proves the invariant (ADR-067
-// / #2213 binding condition 2): v2 is STRUCTURALLY / VALIDATION identical
-// to v1 — every key, type, enum, required list, additionalProperties
-// setting, and oneOf/anyOf/allOf branch under $defs and under the
-// non-version properties matches — while the deliberate deltas
-// (description strings at every depth, the top-level $id and title, and
-// the properties.version entry) are normalized away. It decodes both
-// embedded mirrors from the package's own schemas dir, walks both trees,
-// and names the JSON path at any surviving divergence. This is the check
-// the single minimal-document parse cannot make: it catches a dropped or
-// mistyped key anywhere in the copy — stage types, executor branches,
-// constraint kinds, gate shapes, reviewers — that no fixture exercises.
-func TestV2StructurallyMatchesV1(t *testing.T) {
+// TestParse_V2ReviewersAgentsRoundTrip pins the replacement surface for the
+// removed bare count (E52.3 / #2215): a v2 reviewers block declaring
+// `agents` round-trips to an effective count of len(agents), with the
+// retained-for-v0/v1 Agent field left at zero — a v2 document can no longer
+// populate it, so AgentCount()'s bare-count fallback is unreachable here.
+func TestParse_V2ReviewersAgentsRoundTrip(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+            - provider: claudecode
+          human: 2
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	rv := s.Workflows["feature_change"].Stages[0].Reviewers
+	if rv == nil {
+		t.Fatal("Stage.Reviewers = nil, want the declared block")
+	}
+	if got := rv.AgentCount(); got != 3 {
+		t.Errorf("AgentCount() = %d, want 3 (len(agents))", got)
+	}
+	if rv.Agent != 0 {
+		t.Errorf("Reviewers.Agent = %d, want 0 (the removed field is unreachable from a v2 document)", rv.Agent)
+	}
+	if rv.Human != 2 {
+		t.Errorf("Reviewers.Human = %d, want 2", rv.Human)
+	}
+}
+
+// TestParse_V2NoReviewersBlockLeavesNil pins the parse-layer half of the
+// unchanged-default claim: a v2 stage with no reviewers block leaves
+// Stage.Reviewers nil, exactly as on v0/v1. The RESOLVED half — what a nil
+// block actually means to the consumers — is asserted end to end in
+// planreview (TestResolveAuthority_V2ParsedSpec_NilReviewersBlock) and in
+// delegation (TestImplementReviewAuthority_NilReviewersBlockFromV2Spec),
+// because a nil check here establishes nothing about resolved behavior.
+// Note the finding recorded there: no consumer materializes a literal
+// {human:1} for a nil block; nil and {human:1} are OBSERVATIONALLY
+// EQUIVALENT (both resolve gateless), which is why the documented default
+// has never been visible.
+func TestParse_V2NoReviewersBlockLeavesNil(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	if rv := s.Workflows["feature_change"].Stages[0].Reviewers; rv != nil {
+		t.Errorf("Stage.Reviewers = %+v, want nil for an absent reviewers block", rv)
+	}
+}
+
+// licensedDelta is one deliberate v1 -> v2 grammar divergence, licensed by
+// the E52 child that introduced it. Path is the normalized JSON path
+// collectSchemaDiffs reports; Issue names the owning issue so a reader can
+// tell an intended removal from an accidental drop without archaeology.
+type licensedDelta struct {
+	Path  string
+	Issue string
+	Why   string
+}
+
+// licensedV2Deltas is the allow-list TestV2DivergesFromV1OnlyByLicensedDeltas
+// asserts set-equality against. Each E52 grammar child appends its own
+// entries here as it lands.
+var licensedV2Deltas = []licensedDelta{
+	{
+		Path:  "$/$defs/operator_agent/properties/must_page_human/items/enum",
+		Issue: "#2215 (E52.3)",
+		Why:   "the legacy bare reviewer_reject page-event token is removed from v2; advisory_reviewer_reject / gating_reviewer_reject express the taxonomy explicitly",
+	},
+	{
+		Path:  "$/$defs/reviewers_config/properties/agent",
+		Issue: "#2215 (E52.3)",
+		Why:   "the bare reviewers.agent integer count is removed from v2; reviewers.agents[] is the sole agent-reviewer declaration and len(agents) is the effective count",
+	},
+}
+
+// TestV2DivergesFromV1OnlyByLicensedDeltas is the re-scoped successor to
+// TestV2StructurallyMatchesV1 (ADR-067 / #2213 binding condition 2), under
+// the #2320 disposition: option 2, an allow-list diff. #2213 bought a
+// regression net against an ACCIDENTAL drop anywhere in the v1 -> v2 copy —
+// a mistyped key in a stage type, executor branch, constraint kind, or gate
+// shape that no fixture exercises. E52 then diverges v2 deliberately, so
+// strict deep-equality would fail by design. The allow-list keeps the net
+// while licensing the intended divergence, and the assertion is
+// TWO-DIRECTIONAL so it cannot rot: an UNLISTED divergent path fails (the
+// accidental-drop net), and a LISTED path that no longer diverges also
+// fails (a stale entry is a lie about the schema).
+//
+// The deliberate non-deltas — description ANNOTATION strings at every
+// depth, the top-level $id and title, and the properties.version entry —
+// are still normalized away. Position-aware normalization (the blind spot
+// #2320 §2 names) means a `description` key is stripped only when it is a
+// schema annotation, never when it is a PROPERTY NAME inside a properties
+// or $defs map, so a divergence at e.g. $defs/workflow/properties/description
+// stays visible to the diff. See TestNormalizeSchemaTree_DescriptionAsPropertyName.
+//
+// GUARDRAIL (#2320): this disposition is provisional on the table staying
+// legible. If a later E52 child would push licensedV2Deltas past roughly 15
+// entries, the correct move is to revisit #2320 and RETIRE this test rather
+// than keep appending — past that size the allow-list stops being a readable
+// statement of intent and becomes a second copy of the schema.
+func TestV2DivergesFromV1OnlyByLicensedDeltas(t *testing.T) {
 	v1 := decodeSchemaMirror(t, "schemas/workflow-v1.schema.json")
 	v2 := decodeSchemaMirror(t, "schemas/workflow-v2.schema.json")
 
@@ -3743,11 +3858,71 @@ func TestV2StructurallyMatchesV1(t *testing.T) {
 		}
 	}
 
-	// Normalize away every description key at every depth, then diff.
-	na := normalizeSchemaTree(v1)
-	nb := normalizeSchemaTree(v2)
-	if path, diff := firstSchemaDiff(na, nb, "$"); diff {
-		t.Fatalf("v2 diverges from v1 structurally at %s", path)
+	var diffs []schemaDiff
+	collectSchemaDiffs(normalizeSchemaTree(v1), normalizeSchemaTree(v2), "$", &diffs)
+
+	got := make(map[string]string, len(diffs))
+	for _, d := range diffs {
+		got[d.Path] = d.Detail
+	}
+	want := make(map[string]licensedDelta, len(licensedV2Deltas))
+	for _, d := range licensedV2Deltas {
+		want[d.Path] = d
+	}
+
+	// Direction 1 — an UNLISTED divergence is an accidental drop.
+	for _, d := range diffs {
+		if _, ok := want[d.Path]; !ok {
+			t.Errorf("unlicensed v1->v2 divergence at %s (%s); if deliberate, add it to licensedV2Deltas with its owning issue", d.Path, d.Detail)
+		}
+	}
+	// Direction 2 — a LISTED path that no longer diverges is a stale entry.
+	for _, d := range licensedV2Deltas {
+		if _, ok := got[d.Path]; !ok {
+			t.Errorf("licensedV2Deltas entry %s (%s) no longer diverges; remove the stale entry", d.Path, d.Issue)
+		}
+	}
+	if n := len(licensedV2Deltas); n > 15 {
+		t.Errorf("licensedV2Deltas has %d entries; past ~15 the allow-list is a second copy of the schema — revisit #2320 and retire this test instead of appending", n)
+	}
+}
+
+// TestNormalizeSchemaTree_DescriptionAsPropertyName closes the blind spot
+// #2320 §2 names: the old normalizer stripped every "description" key at
+// every depth, so a schema whose PROPERTY is literally named `description`
+// had that property normalized away — a drop of it between majors would
+// have been invisible to the copy-fidelity diff. The normalizer is now
+// position-aware, so the divergence is reported.
+func TestNormalizeSchemaTree_DescriptionAsPropertyName(t *testing.T) {
+	withProp := map[string]any{
+		"$defs": map[string]any{
+			"workflow": map[string]any{
+				"description": "an annotation that must still be stripped",
+				"properties": map[string]any{
+					"description": map[string]any{"type": "string"},
+					"stages":      map[string]any{"type": "array"},
+				},
+			},
+		},
+	}
+	withoutProp := map[string]any{
+		"$defs": map[string]any{
+			"workflow": map[string]any{
+				"description": "a DIFFERENT annotation, still stripped",
+				"properties": map[string]any{
+					"stages": map[string]any{"type": "array"},
+				},
+			},
+		},
+	}
+
+	var diffs []schemaDiff
+	collectSchemaDiffs(normalizeSchemaTree(withProp), normalizeSchemaTree(withoutProp), "$", &diffs)
+	if len(diffs) != 1 {
+		t.Fatalf("diffs = %+v, want exactly the dropped description PROPERTY", diffs)
+	}
+	if diffs[0].Path != "$/$defs/workflow/properties/description" {
+		t.Errorf("diff path = %q, want $/$defs/workflow/properties/description", diffs[0].Path)
 	}
 }
 
@@ -3766,24 +3941,94 @@ func decodeSchemaMirror(t *testing.T, path string) map[string]any {
 	return out
 }
 
-// normalizeSchemaTree returns a deep copy of v with every "description"
-// map key removed at every depth — a structural walk, not a string
-// replace over raw bytes.
-func normalizeSchemaTree(v any) any {
+// TestCollectSchemaDiffs_ReportsEveryDivergenceShape exercises the diff
+// collector's remaining report branches on synthetic trees, so the
+// allow-list assertion above rests on a walker whose every divergence shape
+// is pinned — not just the one the current schema pair happens to produce.
+// It also proves the collector COLLECTS rather than stopping at the first
+// divergence, which is what makes the two-directional set comparison work.
+func TestCollectSchemaDiffs_ReportsEveryDivergenceShape(t *testing.T) {
+	a := map[string]any{
+		"onlyInA":     1,
+		"typeSwapped": map[string]any{"k": "v"},
+		"arraySwapped": []any{
+			map[string]any{"x": 1},
+		},
+		"shorterInB": []any{1.0, 2.0},
+		"scalar":     "left",
+	}
+	b := map[string]any{
+		"onlyInB":      1,
+		"typeSwapped":  "now a scalar",
+		"arraySwapped": map[string]any{"no": "longer an array"},
+		"shorterInB":   []any{1.0},
+		"scalar":       "right",
+	}
+
+	var diffs []schemaDiff
+	collectSchemaDiffs(a, b, "$", &diffs)
+
+	got := make(map[string]string, len(diffs))
+	for _, d := range diffs {
+		got[d.Path] = d.Detail
+	}
+	want := map[string]string{
+		"$/onlyInA":      "present in v1, absent in v2",
+		"$/onlyInB":      "present in v2, absent in v1",
+		"$/typeSwapped":  "type mismatch: object vs non-object",
+		"$/arraySwapped": "type mismatch: array vs non-array",
+		"$/shorterInB":   "array length 2 vs 1",
+		"$/scalar":       "left vs right",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("collected %d diffs, want %d: %+v", len(got), len(want), diffs)
+	}
+	for path, detail := range want {
+		if got[path] != detail {
+			t.Errorf("diff at %s = %q, want %q", path, got[path], detail)
+		}
+	}
+}
+
+// schemaNameMapKeywords are the JSON Schema keywords whose value is a map
+// of NAMES to subschemas rather than a schema object. Inside one of these,
+// a key is an author-chosen name — including, legitimately, "description"
+// — and must never be mistaken for the description ANNOTATION keyword.
+var schemaNameMapKeywords = map[string]bool{
+	"properties":        true,
+	"$defs":             true,
+	"definitions":       true,
+	"patternProperties": true,
+	"dependentSchemas":  true,
+}
+
+// normalizeSchemaTree returns a deep copy of v with every description
+// ANNOTATION removed at every depth — a structural walk, not a string
+// replace over raw bytes. It is POSITION-AWARE (#2320 §2): a "description"
+// key is stripped only where it is a schema annotation, never where it is
+// a property NAME inside a properties / $defs / patternProperties /
+// dependentSchemas map, so dropping a property literally named
+// `description` between majors stays visible to the diff.
+func normalizeSchemaTree(v any) any { return normalizeSchemaNode(v, false) }
+
+// normalizeSchemaNode is normalizeSchemaTree's recursion. isNameMap says
+// whether the node under inspection is a name->subschema map (so its keys
+// are names, not keywords).
+func normalizeSchemaNode(v any, isNameMap bool) any {
 	switch t := v.(type) {
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for k, val := range t {
-			if k == "description" {
-				continue
+			if !isNameMap && k == "description" {
+				continue // the annotation keyword
 			}
-			out[k] = normalizeSchemaTree(val)
+			out[k] = normalizeSchemaNode(val, !isNameMap && schemaNameMapKeywords[k])
 		}
 		return out
 	case []any:
 		out := make([]any, len(t))
 		for i, val := range t {
-			out[i] = normalizeSchemaTree(val)
+			out[i] = normalizeSchemaNode(val, false)
 		}
 		return out
 	default:
@@ -3791,49 +4036,67 @@ func normalizeSchemaTree(v any) any {
 	}
 }
 
-// firstSchemaDiff walks two normalized schema trees and returns the JSON
-// path of the first divergence (and true), or ("", false) if they are
-// deeply equal.
-func firstSchemaDiff(a, b any, path string) (string, bool) {
+// schemaDiff is one divergence between two normalized schema trees. Path
+// is the stable JSON path used for allow-list matching; Detail carries the
+// human-readable shape of the difference and is never matched on.
+type schemaDiff struct {
+	Path   string
+	Detail string
+}
+
+// collectSchemaDiffs walks two normalized schema trees and appends EVERY
+// divergence to out (the allow-list diff needs the whole set, not just the
+// first). A subtree that diverges at its own root — a missing key, a type
+// mismatch, an array-length mismatch — is reported once and not descended
+// into: below such a point paths no longer align, and the child noise would
+// bury the real finding.
+func collectSchemaDiffs(a, b any, path string, out *[]schemaDiff) {
 	switch av := a.(type) {
 	case map[string]any:
 		bv, ok := b.(map[string]any)
 		if !ok {
-			return path + " (type mismatch: object vs non-object)", true
+			*out = append(*out, schemaDiff{path, "type mismatch: object vs non-object"})
+			return
 		}
-		for k, avv := range av {
+		keys := make([]string, 0, len(av))
+		for k := range av {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
 			bvv, present := bv[k]
 			if !present {
-				return path + "/" + k + " (present in v1, absent in v2)", true
+				*out = append(*out, schemaDiff{path + "/" + k, "present in v1, absent in v2"})
+				continue
 			}
-			if p, d := firstSchemaDiff(avv, bvv, path+"/"+k); d {
-				return p, true
-			}
+			collectSchemaDiffs(av[k], bvv, path+"/"+k, out)
 		}
+		extra := make([]string, 0)
 		for k := range bv {
 			if _, present := av[k]; !present {
-				return path + "/" + k + " (present in v2, absent in v1)", true
+				extra = append(extra, k)
 			}
 		}
-		return "", false
+		sort.Strings(extra)
+		for _, k := range extra {
+			*out = append(*out, schemaDiff{path + "/" + k, "present in v2, absent in v1"})
+		}
 	case []any:
 		bv, ok := b.([]any)
 		if !ok {
-			return path + " (type mismatch: array vs non-array)", true
+			*out = append(*out, schemaDiff{path, "type mismatch: array vs non-array"})
+			return
 		}
 		if len(av) != len(bv) {
-			return fmt.Sprintf("%s (array length %d vs %d)", path, len(av), len(bv)), true
+			*out = append(*out, schemaDiff{path, fmt.Sprintf("array length %d vs %d", len(av), len(bv))})
+			return
 		}
 		for i := range av {
-			if p, d := firstSchemaDiff(av[i], bv[i], fmt.Sprintf("%s[%d]", path, i)); d {
-				return p, true
-			}
+			collectSchemaDiffs(av[i], bv[i], fmt.Sprintf("%s[%d]", path, i), out)
 		}
-		return "", false
 	default:
 		if !reflect.DeepEqual(a, b) {
-			return fmt.Sprintf("%s (%v vs %v)", path, a, b), true
+			*out = append(*out, schemaDiff{path, fmt.Sprintf("%v vs %v", a, b)})
 		}
-		return "", false
 	}
 }
