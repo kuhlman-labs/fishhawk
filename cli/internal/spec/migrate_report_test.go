@@ -137,6 +137,51 @@ func TestReport_EmittedOnRefusalAndNoOpPaths(t *testing.T) {
 	})
 }
 
+// TestReport_RefusalStillNamesSourceEligiblePrincipals: a gate whose
+// translation refused still lists the principals resolvable from the roles
+// map on the source side, so the mandatory report names who could approve
+// on each side even on a refusal path.
+func TestReport_RefusalStillNamesSourceEligiblePrincipals(t *testing.T) {
+	// R1: all_of over a multi-member role refuses, but the source-side
+	// union resolves fully from the roles map.
+	src := strings.NewReplacer(
+		"  founder:\n    members: [\"@kuhlman-labs\"]\n",
+		"  role_a:\n    members: [\"@x\", \"@y\"]\n  role_b:\n    members: [\"@z\"]\n",
+		"              any_of: [founder]", "              all_of: [role_a, role_b]",
+	).Replace(minimalV1)
+	got := reportFor(t, src)
+	if !strings.Contains(got, "not computed") {
+		t.Fatalf("the gate must be marked refused\n---\n%s", got)
+	}
+	for _, want := range []string{"      - x", "      - y", "      - z"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("a refusal report must enumerate the source-side eligible principals, missing %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestReport_BudgetStageUSDNote: the report notes per budget-bearing stage
+// that no limit_usd ceiling was derivable and one must be added by hand.
+// The codemod never fabricates a USD figure — no token-to-USD rate exists.
+func TestReport_BudgetStageUSDNote(t *testing.T) {
+	src := strings.Replace(minimalV1, "        produces:\n",
+		"        budget:\n          max_tokens: 200000\n          max_runtime_minutes: 15\n        produces:\n", 1)
+	got := reportFor(t, src)
+	if !strings.Contains(got, "limit_usd") {
+		t.Errorf("the report must note the missing USD ceiling\n---\n%s", got)
+	}
+	if !strings.Contains(got, "  - plan") {
+		t.Errorf("the note must name the budget-bearing stage (plan)\n---\n%s", got)
+	}
+	if strings.Contains(got, "$") {
+		t.Errorf("the report must not fabricate a USD figure\n---\n%s", got)
+	}
+	// A document with no budget block emits no note.
+	if noBudget := reportFor(t, minimalV1); strings.Contains(noBudget, "limit_usd") {
+		t.Errorf("a document with no budget stage must emit no USD note\n---\n%s", noBudget)
+	}
+}
+
 // TestReport_NoApprovalGates covers the degenerate document.
 func TestReport_NoApprovalGates(t *testing.T) {
 	r := &EligibilityReport{}

@@ -18,7 +18,7 @@ The codemod edits **yaml.v3 nodes**, never round-tripping through a typed struct
 |---|---|
 | 0 | **REFUSED** (branch R9). What parses and what is faithfully translatable are different questions: the v0 and v1 constraint folds diverge, and no v0 golden exists, so a v0 collapse to `"2"` would be a mistranslation shipped as a success. Migrate to v1 first, or ask for a v0 path. |
 | 1 | Migrated. |
-| 2 | **No-op**, exit 0. Nothing to migrate is not an error; the report is still printed. |
+| 2 | **No-op**, exit 0 — but only for a document that VALIDATES as workflow-v2. An invalid v2 source (including `version: "2.0"`, which the v2 enum rejects) is refused as R0 rather than falsely certified as already-migrated. The report is still printed. |
 | absent / ≥ 3 | Refused as R0 — the source-validation gate reports the schema's own error. |
 
 ## Translation table
@@ -29,7 +29,7 @@ The codemod edits **yaml.v3 nodes**, never round-tripping through a typed struct
 | workflow `drive: true` | `auto_advance: true` | Renamed in place — the key's leading comment and position survive. |
 | stage `budget.max_runtime_minutes: 15` | `budget.max_runtime: 15m` | Same value, spelled as the Go duration string the other three v2 duration fields use. |
 | stage `budget.max_tokens: N` | carried forward unchanged | v2 keeps it as an optional secondary lever. |
-| — | `budget.limit_usd` | **Never fabricated.** No token-to-USD rate exists anywhere in this repo. The report notes per stage that a USD ceiling was not derivable and should be added by hand. |
+| — | `budget.limit_usd` | **Never fabricated.** No token-to-USD rate exists anywhere in this repo. The report notes per budget-bearing stage that a USD ceiling was not derivable and should be added by hand. |
 | stage `constraints:` LIST of single-key maps | one `constraints:` OBJECT | Declaration order and each entry's comments are preserved; a comment written above a `- kind:` entry moves onto the key it documents. |
 | `operator_agent.must_page_human: [reviewer_reject, …]` | `actions.page_human_on: [gating_reviewer_reject, …]` | The bare `reviewer_reject` token is rewritten to `gating_reviewer_reject` — the sense v0/v1 always resolved it to. |
 | `operator_agent.may_approve` | `actions.approve: {mode: auto, when: clean_dual_approval}` | |

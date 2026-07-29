@@ -94,6 +94,7 @@ workflows:
         gates:
           - type: approval
             approvals:
+              # The founder is the sole approver of the plan gate.
               count: 1
               members: [kuhlman-labs]
       - id: implement

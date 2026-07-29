@@ -133,6 +133,69 @@ func TestMigrateSpec_OutRefusesToClobber(t *testing.T) {
 	}
 }
 
+// TestMigrateSpec_OutRefusesSymlink: the --out no-clobber contract holds
+// against a symlink planted at the destination. O_CREATE|O_EXCL refuses to
+// create through it, closing the time-of-check/time-of-use window a
+// stat-then-write pair left open.
+func TestMigrateSpec_OutRefusesSymlink(t *testing.T) {
+	path := writeFixture(t, v1Fixture)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.yaml")
+	const sentinel = "# do not touch me\n"
+	if err := os.WriteFile(target, []byte(sentinel), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	link := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	code, _, stderr := runMigrate(t, path, "--out", link)
+	if code == exitOK {
+		t.Fatalf("writing through a symlink must not succeed (stderr: %s)", stderr)
+	}
+	got, _ := os.ReadFile(target) //nolint:gosec // test-controlled path
+	if string(got) != sentinel {
+		t.Error("the symlink target must be left byte-unchanged")
+	}
+}
+
+// TestMigrateSpec_WriteFailureExitsUsage: an I/O failure on the write path
+// (an unwritable destination directory) is reported as a usage/I/O error,
+// and the atomic in-place rewrite leaves the source byte-unchanged.
+func TestMigrateSpec_WriteFailureExitsUsage(t *testing.T) {
+	t.Run("out into an unwritable dir", func(t *testing.T) {
+		path := writeFixture(t, v1Fixture)
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		code, _, stderr := runMigrate(t, path, "--out", filepath.Join(dir, "out.yaml"))
+		if code != exitUsage {
+			t.Fatalf("exit = %d, want 2 (stderr: %s)", code, stderr)
+		}
+	})
+	t.Run("in-place under an unwritable dir leaves the source intact", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "workflows.yaml")
+		if err := os.WriteFile(path, []byte(v1Fixture), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		code, _, _ := runMigrate(t, path, "--in-place")
+		if code != exitUsage {
+			t.Fatalf("exit = %d, want 2", code)
+		}
+		got, _ := os.ReadFile(path) //nolint:gosec // test-controlled path
+		if string(got) != v1Fixture {
+			t.Error("a failed in-place rewrite must leave the source byte-unchanged")
+		}
+	})
+}
+
 // --- Cell (4): --in-place ---------------------------------------------
 
 func TestMigrateSpec_InPlaceRewritesSource(t *testing.T) {

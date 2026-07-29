@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 )
@@ -106,22 +107,41 @@ func runMigrateSpec(args []string, stdout, stderr io.Writer) int {
 	switch {
 	case *out != "":
 		// Cell (3): --in-place is NOT overloaded as permission to
-		// overwrite, so a typo'd --out can never destroy a file.
-		if _, statErr := os.Stat(*out); statErr == nil {
-			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s already exists; refusing to overwrite (it is byte-unchanged)\n", *out)
-			return exitFailure
-		} else if !errors.Is(statErr, os.ErrNotExist) {
-			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", *out, statErr)
+		// overwrite, so a typo'd --out can never destroy a file. The
+		// no-clobber refusal and the create are ONE atomic syscall
+		// (O_CREATE|O_EXCL): a stat-then-write pair leaves a
+		// time-of-check/time-of-use window in which a file or symlink
+		// planted after the check is overwritten by the write. O_EXCL
+		// closes that window and additionally refuses to follow a symlink
+		// landed at the path.
+		f, openErr := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if openErr != nil {
+			if errors.Is(openErr, os.ErrExist) {
+				_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s already exists; refusing to overwrite (it is byte-unchanged)\n", *out)
+				return exitFailure
+			}
+			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", *out, openErr)
 			return exitUsage
 		}
-		if err := os.WriteFile(*out, res.Migrated, 0o600); err != nil {
+		if _, err := f.Write(res.Migrated); err != nil {
+			_ = f.Close()
+			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", *out, err)
+			return exitUsage
+		}
+		if err := f.Close(); err != nil {
 			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", *out, err)
 			return exitUsage
 		}
 		_, _ = fmt.Fprintf(stdout, "\n%s: migrated to workflow-v2, written to %s\n", path, *out)
 	case *inPlace:
-		// Cell (4).
-		if err := os.WriteFile(path, res.Migrated, 0o600); err != nil {
+		// Cell (4). Rewrite via a same-directory temp file + atomic
+		// rename, never an in-place truncate-then-write: a short write or
+		// a close failure part-way through os.WriteFile would leave the
+		// validated GOVERNANCE source truncated or half-replaced. The
+		// rename either fully lands the migrated bytes or leaves the
+		// original intact — the fail-closed behavior a governance rewrite
+		// demands.
+		if err := writeFileAtomic(path, res.Migrated); err != nil {
 			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", path, err)
 			return exitUsage
 		}
@@ -131,6 +151,42 @@ func runMigrateSpec(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stdout, "\n%s: migrates cleanly to workflow-v2. Nothing was written — re-run with --in-place or --out PATH.\n", path)
 	}
 	return exitOK
+}
+
+// writeFileAtomic writes data to path by creating a temp file in the same
+// directory, writing and closing it, then renaming it over path. Any
+// failure before the rename leaves path untouched and removes the temp, so
+// an interrupted in-place rewrite never truncates or partially replaces the
+// source. The original file's permission bits are preserved when it exists.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".migrate-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Remove the temp on every failure path before the rename lands it.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if fi, statErr := os.Stat(path); statErr == nil {
+		_ = tmp.Chmod(fi.Mode().Perm())
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func printMigrateSpecUsage(w io.Writer) {

@@ -356,6 +356,53 @@ func TestMigrateBytes_AlreadyV2IsNoOp(t *testing.T) {
 	}
 }
 
+// TestMigrateBytes_AlreadyV2ValidatesBeforeNoOp: the no-op path must not
+// certify a MALFORMED version-2 document as already-migrated. `version:
+// "2.0"` (the v2 enum has no minor chain) and an otherwise schema-invalid
+// `version: "2"` both route to the version-2 branch; each must refuse as R0
+// rather than printing "already at workflow-v2".
+func TestMigrateBytes_AlreadyV2ValidatesBeforeNoOp(t *testing.T) {
+	v2, err := os.ReadFile(goldenV2)
+	if err != nil {
+		t.Fatalf("read v2 golden: %v", err)
+	}
+	// Control: a VALID v2 document is a no-op.
+	if res, err := MigrateBytes(v2); err != nil || !res.NoOp {
+		t.Fatalf("a valid v2 document must be a no-op: err=%v res=%+v", err, res)
+	}
+	// version "2.0": rejected by the v2 enum, so NOT a valid v2 spec.
+	dotted := strings.Replace(string(v2), `version: "2"`, `version: "2.0"`, 1)
+	if r := migrateRefused(t, dotted, RefusalSourceInvalid); !strings.Contains(r.Message, "does not validate") {
+		t.Errorf(`a "2.0" document must refuse with the source-validation message: %s`, r.Message)
+	}
+	// version "2" but structurally invalid (an unknown stage type).
+	broken := strings.Replace(string(v2), "type: plan", "type: teleport", 1)
+	migrateRefused(t, broken, RefusalSourceInvalid)
+}
+
+// TestMigrateBytes_ActionsMatrixPreservesKnobComments: a comment on a may_*
+// knob key (and on must_page_human) survives the reconstruction into the
+// explicit actions matrix. Comment preservation is a blocking codemod
+// behavior; a tier collapse has no per-class key to carry these onto, so
+// this exercises the may_approve-only block that does NOT collapse.
+func TestMigrateBytes_ActionsMatrixPreservesKnobComments(t *testing.T) {
+	block := "    operator_agent:\n" +
+		"      # approve only on a clean dual approval\n" +
+		"      may_approve: clean_dual_approval\n" +
+		"      # page a human on these events\n" +
+		"      must_page_human:\n        - reviewer_reject\n"
+	src := strings.Replace(minimalV1, "  feature_change:\n", "  feature_change:\n"+block, 1)
+	got := string(migrateOK(t, src).Migrated)
+	if !strings.Contains(got, "actions:") {
+		t.Fatalf("a may_approve-only block must emit the explicit matrix:\n%s", got)
+	}
+	for _, want := range []string{"# approve only on a clean dual approval", "# page a human on these events"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("a comment inside operator_agent was discarded: missing %q\n%s", want, got)
+		}
+	}
+}
+
 func TestMigrateBytes_ParseErrors(t *testing.T) {
 	for _, tc := range []struct{ name, src string }{
 		{"empty", "   \n"},

@@ -76,6 +76,12 @@ type GateEligibility struct {
 // EligibilityReport is the whole document's report.
 type EligibilityReport struct {
 	Gates []GateEligibility
+	// BudgetStages names the budget-bearing stages (stage id, or a path
+	// when unnamed) for which no `limit_usd` ceiling was derivable. There
+	// is no token-to-USD rate anywhere in this repo, so the codemod never
+	// fabricates one; the report notes per such stage that a ceiling must
+	// be added by hand.
+	BudgetStages []string
 }
 
 // forgeResolvedMarker labels every symbolically-rendered predicate, so a
@@ -116,9 +122,27 @@ func (r *EligibilityReport) Render() string {
 		}
 		fmt.Fprintf(&b, "  change: %s\n", g.Change)
 	}
+	r.renderBudgetNote(&b)
 	b.WriteString("\nServer-side validation remains the authority for cross-stage wiring: this report and the\n")
 	b.WriteString("codemod's schema gate cover the spec document, not `needs` / `from_stage` referent resolution.\n")
 	return b.String()
+}
+
+// renderBudgetNote emits the per-stage limit_usd note the migration is
+// required to produce: for every budget-bearing stage it states that no USD
+// ceiling was derivable (no token-to-USD rate exists in this repo) and that
+// one should be added by hand. Nothing is fabricated — this is advisory
+// prose, not a guessed number.
+func (r *EligibilityReport) renderBudgetNote(b *strings.Builder) {
+	if r == nil || len(r.BudgetStages) == 0 {
+		return
+	}
+	b.WriteString("\nbudget: no `limit_usd` ceiling was derivable — there is no token-to-USD rate in this\n")
+	b.WriteString("repository, so none was fabricated. Add `budget.limit_usd` by hand to these\n")
+	b.WriteString("budget-bearing stages if you want a spend ceiling:\n")
+	for _, s := range r.BudgetStages {
+		fmt.Fprintf(b, "  - %s\n", s)
+	}
 }
 
 func displayStageID(id string) string {

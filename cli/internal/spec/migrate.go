@@ -232,6 +232,26 @@ func MigrateBytes(src []byte) (*MigrationResult, error) {
 	if major, ok := sourceVersionMajor(root); ok {
 		switch major {
 		case 2:
+			// A no-op is only legitimate for a document that IS a valid
+			// workflow-v2 spec. Validate before certifying it as
+			// already-migrated: `sourceVersionMajor` truncates at the first
+			// dot, so `version: "2.0"` — which the v2 enum rejects, v2
+			// carrying no minor chain — and an otherwise schema-invalid
+			// `version: "2"` document would both otherwise print "already at
+			// workflow-v2; nothing to migrate" and exit 0, falsely certifying
+			// a malformed governance document. An invalid v2 source is an R0
+			// refusal, the same gate a major-1 source passes through.
+			if err := ValidateBytes(src); err != nil {
+				return &MigrationResult{
+					Report: reportForV2(root),
+					Refusals: []Refusal{{
+						Branch: RefusalSourceInvalid,
+						Path:   "/",
+						Message: "source declares version major 2 but does not validate against the workflow-v2 schema, " +
+							"so it cannot be certified as already-migrated (run `fishhawk validate` to see the errors):\n" + err.Error(),
+					}},
+				}, nil
+			}
 			return &MigrationResult{NoOp: true, Report: reportForV2(root)}, nil
 		case 0:
 			return &MigrationResult{
@@ -435,6 +455,17 @@ func (an *analysis) analyzeStage(st *yaml.Node, stPath string, roles map[string]
 		stageID = id.Value
 	}
 
+	// A budget-bearing stage carries no limit_usd source, and none is
+	// fabricated — record it so the report notes per stage that a USD
+	// ceiling was not derivable and should be added by hand.
+	if mapValue(st, "budget") != nil {
+		label := stageID
+		if label == "" {
+			label = stPath
+		}
+		an.report.BudgetStages = append(an.report.BudgetStages, label)
+	}
+
 	// R4: the bare reviewers.agent count.
 	if reviewers := mappingNode(mapValue(st, "reviewers")); reviewers != nil {
 		if agent := mapValue(reviewers, "agent"); agent != nil {
@@ -515,8 +546,15 @@ func (an *analysis) analyzeGate(gate *yaml.Node, gatePath, stageID string, roles
 			StageID: stageID,
 			Before:  before,
 			After:   "(refused — see the refusal above; nothing was written)",
-			Refused: true,
-			Change:  changeRefused,
+			// A refusal still reports the eligible principals it CAN
+			// resolve from the roles map. R1 (an all_of over a multi-member
+			// role) resolves every named member; R2 (an undefined role)
+			// resolves the defined subset. The mandatory report names who
+			// could approve on the source side even where the translation
+			// itself refused.
+			Enumerable: sourceEnumerable(approvers, roles),
+			Refused:    true,
+			Change:     changeRefused,
 		})
 		return
 	}
@@ -593,6 +631,28 @@ func translateApprovers(approvers *yaml.Node, roles map[string][]string, gatePat
 	return approvalPredicate{Count: count, Members: union}, before, nil
 }
 
+// sourceEnumerable resolves the source approvers block's eligible
+// principals from the roles map — deduped, in first-seen order — ignoring
+// the cardinality constraints that made a gate refuse, so a refusal report
+// still names who could approve on the source side. An undefined role
+// contributes nothing (there is nothing to resolve), and team refs are
+// already absent from `roles` (collectRoles refuses R3 on them).
+func sourceEnumerable(approvers *yaml.Node, roles map[string][]string) []string {
+	_, names := approversForm(approvers)
+	var union []string
+	seen := map[string]bool{}
+	for _, name := range names {
+		for _, m := range roles[name] {
+			if seen[m] {
+				continue
+			}
+			seen[m] = true
+			union = append(union, m)
+		}
+	}
+	return union
+}
+
 // approversForm reports which of any_of / all_of a legacy approvers block
 // declares and the role names it lists. The v0/v1 schema pins the block
 // to exactly one of the two keys.
@@ -652,6 +712,9 @@ type delegationBlock struct {
 	// PageEvents is the rewritten must_page_human list (nil when the
 	// source declared none).
 	PageEvents []string
+	// PageKey{Head,Line,Foot} carry the comments on the source
+	// `must_page_human` KEY onto the emitted `page_human_on` key.
+	PageKeyHead, PageKeyLine, PageKeyFoot string
 	// ModelPolicy is the source's model_policy node, carried verbatim.
 	ModelPolicy *yaml.Node
 }
@@ -662,6 +725,13 @@ type actionEntry struct {
 	Mode        string
 	When        string
 	MinSeverity string
+	// Key{Head,Line,Foot} carry the comments on the source may_* KNOB key
+	// onto the emitted action-class key, so a rationale comment written on
+	// e.g. `may_approve:` survives the reconstruction into the actions
+	// matrix. (An operator_agent block that collapses to a tier shorthand
+	// has no per-class key to carry them onto — that loss is inherent to
+	// the collapse, not a bug this preserves against.)
+	KeyHead, KeyLine, KeyFoot string
 }
 
 // analyzeDelegation translates a level's operator_agent block, recording
@@ -725,10 +795,16 @@ func translateOperatorAgent(oa *yaml.Node, path string) (*delegationBlock, []Ref
 		if kc.Class == "fixup" {
 			entry.MinSeverity = minSeverity
 		}
+		if kn := mapKeyNode(oa, kc.Knob); kn != nil {
+			entry.KeyHead, entry.KeyLine, entry.KeyFoot = kn.HeadComment, kn.LineComment, kn.FootComment
+		}
 		block.Entries = append(block.Entries, entry)
 	}
 
 	if events := mapValue(oa, "must_page_human"); events != nil && events.Kind == yaml.SequenceNode {
+		if kn := mapKeyNode(oa, "must_page_human"); kn != nil {
+			block.PageKeyHead, block.PageKeyLine, block.PageKeyFoot = kn.HeadComment, kn.LineComment, kn.FootComment
+		}
 		block.PageEvents = make([]string, 0, len(events.Content))
 		for i, ev := range events.Content {
 			token, ok := translatePageEvent(ev.Value)
@@ -944,9 +1020,13 @@ func transformStage(st *yaml.Node, an *analysis) {
 			continue
 		}
 		// (g) approvers -> approvals, renamed in place so the gate's key
-		// order and any comment on the approvers key survive.
+		// order and any comment on the approvers key survive. A comment on
+		// the inner any_of / all_of key is carried onto the reconstructed
+		// block's first key, since the source form key itself is gone.
 		renameKey(gate, "approvers", "approvals")
-		replaceValue(gate, "approvals", approvalsNode(pred))
+		node := approvalsNode(pred)
+		carryFormComments(mapValue(gate, "approvals"), node)
+		replaceValue(gate, "approvals", node)
 	}
 }
 
@@ -1008,14 +1088,18 @@ func actionsNode(block *delegationBlock) *yaml.Node {
 		if e.MinSeverity != "" {
 			entry.Content = append(entry.Content, scalar("min_severity"), scalar(e.MinSeverity))
 		}
-		out.Content = append(out.Content, scalar(e.Class), entry)
+		classKey := scalar(e.Class)
+		classKey.HeadComment, classKey.LineComment, classKey.FootComment = e.KeyHead, e.KeyLine, e.KeyFoot
+		out.Content = append(out.Content, classKey, entry)
 	}
 	if len(block.PageEvents) > 0 {
 		seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
 		for _, ev := range block.PageEvents {
 			seq.Content = append(seq.Content, scalar(ev))
 		}
-		out.Content = append(out.Content, scalar("page_human_on"), seq)
+		pageKey := scalar("page_human_on")
+		pageKey.HeadComment, pageKey.LineComment, pageKey.FootComment = block.PageKeyHead, block.PageKeyLine, block.PageKeyFoot
+		out.Content = append(out.Content, pageKey, seq)
 	}
 	if block.ModelPolicy != nil {
 		out.Content = append(out.Content, scalar("model_policy"), block.ModelPolicy)
@@ -1047,6 +1131,48 @@ func approvalsNode(p approvalPredicate) *yaml.Node {
 
 func scalar(v string) *yaml.Node {
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+}
+
+// mapKeyNode returns the KEY node for a mapping key (not its value), so a
+// caller can read the comments attached to the key itself.
+func mapKeyNode(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i]
+		}
+	}
+	return nil
+}
+
+// carryFormComments moves the comments on a source approvers block's inner
+// any_of / all_of KEY onto the reconstructed approvals block's first key
+// (count), so a rationale comment written above `any_of:` survives the
+// rewrite into the count/members shape. The block-level comment on the
+// approvers VALUE is carried separately by replaceValue.
+func carryFormComments(oldApprovers, approvals *yaml.Node) {
+	if oldApprovers == nil || approvals == nil || len(approvals.Content) == 0 {
+		return
+	}
+	for _, form := range []string{"any_of", "all_of"} {
+		k := mapKeyNode(oldApprovers, form)
+		if k == nil {
+			continue
+		}
+		dst := approvals.Content[0] // the count key
+		if k.HeadComment != "" {
+			dst.HeadComment = k.HeadComment
+		}
+		if k.LineComment != "" {
+			dst.LineComment = k.LineComment
+		}
+		if k.FootComment != "" {
+			dst.FootComment = k.FootComment
+		}
+		return
+	}
 }
 
 // mapPairs returns a mapping node's [key, value] pairs in document order.
