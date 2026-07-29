@@ -606,14 +606,22 @@
     "budget": {
       "type": "object",
       "additionalProperties": false,
+      "description": "Per-stage resource ceiling (token/runtime/cost caps on ONE stage execution; distinct from the workflow-level periodic_budget). AC-4 decision (E52.5 / #2217): limit_usd is the PRIMARY cost lever but is NOT required — a budget declaring only max_tokens, only limit_usd, only max_runtime, any combination, or nothing at all is valid. ADR-067 ratified unifying the units, not mandating a cost model, so the choice lives here in the schema text rather than in a required-field rule. Fields are DECODED ONLY in this slice: no reader of a stage budget exists in the repo, and wiring stage-budget enforcement is #2328's (E48.55) work.",
       "properties": {
         "max_tokens": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 1,
+          "description": "OPTIONAL SECONDARY lever (E52.5 / #2217): a per-stage token ceiling, retained for operators who want a token cap in addition to (or instead of) the primary limit_usd USD ceiling. Not required — see this budget's own description for the AC-4 primary-not-required decision."
         },
-        "max_runtime_minutes": {
-          "type": "integer",
-          "minimum": 1
+        "max_runtime": {
+          "type": "string",
+          "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
+          "description": "Per-stage wall-clock cap as a Go duration string parsed by time.ParseDuration (E52.5 / #2217). This REPLACES v0/v1's bare-integer max_runtime_minutes: the v0/v1 value 15 becomes 15m, so a stage budget now spells its runtime cap in the SAME form as policy.max_stage_runtime, executor.timeout and executor.verify.timeout. The pattern is a strict SUBSET of what time.ParseDuration accepts (it also parses fractional / signed / micro-sign forms the pattern rejects), matching the convention of those three existing v2 duration fields byte-for-byte."
+        },
+        "limit_usd": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "The stage's PRIMARY cost ceiling in USD (E52.5 / #2217), in the same unit as the workflow-level budgets[].limit_usd. Primary but NOT required (AC-4) — see this budget's own description. Enforcement of this ceiling is #2328's (E48.55) work; declared here it is decoded only."
         },
         "enforcement": {
           "type": "string",

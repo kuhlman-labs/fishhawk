@@ -11,6 +11,7 @@ Reference for `.fishhawk/workflows.yaml` at major version 2. The canonical schem
 - **The bare `reviewer_reject` page-event token is removed (E52.3 / #2215).** See *Removed from v1* below.
 - **The `reviewers.agent` integer count is removed (E52.3 / #2215).** See *Removed from v1* below.
 - **Three surfaces are reshaped for legibility (E52.6 / #2218):** `constraints` becomes an object, `drive` becomes `auto_advance`, and `needs:` is added as shorthand for artifact wiring. See *Reshaped from v1* below.
+- **Stage-budget units are unified (E52.5 / #2217):** the runtime cap `max_runtime_minutes` becomes the Go-duration `max_runtime`, and `limit_usd` is added as the primary cost lever with `max_tokens` demoted to optional secondary. See *Units* below.
 
 ## Removed from v1
 
@@ -105,6 +106,34 @@ So the resolved input set is identical however the author spelled it.
 Referent errors reuse the existing `from_stage` graph-shape rules with their unchanged messages: a referent that does not exist reports `from_stage "…" does not match any stage id`, and a self or later reference reports the must-be-earlier error. One tradeoff follows from that choice: the report names the post-expansion `inputs` index rather than the `needs` entry the author wrote. That is deliberate — one canonical error beats two competing ones — and it is recorded in `backend/internal/spec/README.md`.
 
 > **`fishhawk validate` does NOT check `needs` referents.** `cli/internal/spec` is a deliberately separate, **schema-only** module: it performs no typed decode and no graph-shape pass at all, so it already accepts a longhand `inputs[].from_stage` naming a nonexistent stage. Both `needs`-referent errors — a nonexistent stage, and a `review` / `deploy` / `acceptance` referent with no default input artifact — therefore surface **only server-side, at run creation**, not from `fishhawk validate`. The CLI does validate the `needs` **shape** (array of stage-id-patterned strings) and rejects the two legacy spellings above with messages byte-identical to the backend's. Closing the general asymmetry needs its own decision about duplication versus coupling and is tracked on **#2323**.
+
+### Units
+
+The per-stage `budget` now spells its units the way the rest of v2 does (E52.5 / #2217): one duration form throughout, and cost in USD.
+
+| v0 / v1 | v2 |
+|---|---|
+| `max_runtime_minutes: 15` (bare integer minutes) | `max_runtime: 15m` (Go duration string) |
+| `max_tokens` the primary lever; no stage-level USD ceiling | `limit_usd` the **primary** cost lever; `max_tokens` an **optional secondary** lever |
+
+```yaml
+# v0 / v1
+budget:
+  max_tokens: 200000
+  max_runtime_minutes: 15
+
+# v2
+budget:
+  limit_usd: 8.5        # primary cost ceiling, same unit as budgets[].limit_usd
+  max_runtime: 15m      # 15 becomes 15m; sub-minute values (e.g. 90s) are now expressible
+  max_tokens: 200000    # optional secondary lever
+```
+
+- **`max_runtime` is the same form as every other v2 duration.** It uses the identical pattern (`^([0-9]+(ns|us|ms|s|m|h))+$`) as `policy.max_stage_runtime`, `executor.timeout` and `executor.verify.timeout`, and is parsed by the same `time.ParseDuration` code path. The pattern is a **strict subset** of what `time.ParseDuration` accepts (the parser also accepts fractional `1.5h`, signed, and micro-sign forms the pattern rejects), **matching the convention of the three existing v2 duration fields** byte-for-byte rather than the parser's full grammar. Because minutes was a lossless integer, `15` becomes `15m`; unlike the integer form, `max_runtime` can express sub-minute caps such as `90s`.
+- **`limit_usd` is primary but NOT required (AC-4).** A budget declaring only `max_tokens`, only `limit_usd`, only `max_runtime`, any combination, or nothing at all is valid. ADR-067 ratified unifying the units, not mandating a cost model, so the choice is stated in the schema description rather than enforced by a required field.
+- **`enforcement` semantics are UNCHANGED by this slice.** This change unifies the *grammar* only — no runtime check reads a stage budget on any major. Stage-budget enforcement (spending against the `limit_usd` ceiling, cost accounting) is tracked on **#2328**.
+
+**v0 and v1 are unchanged** — both keep the `max_runtime_minutes` spelling and reject the v2 forms (each major's `$defs/budget` is `additionalProperties: false`), so an existing spec keeps working until it is migrated to v2 (migration codemod: #2220). A v2 document using `max_runtime_minutes` is rejected with a message naming `max_runtime` and showing the equivalence (`max_runtime_minutes: 15` → `max_runtime: 15m`).
 
 ## Grammar
 

@@ -911,11 +911,55 @@ func (c Constraint) postHocKindName() string {
 	return ""
 }
 
-// Budget caps token / runtime usage for a stage.
+// Budget caps token / runtime / cost usage for a stage.
+//
+// SPELLINGS ACROSS MAJORS (E52.5 / #2217). v0 and v1 spell the runtime cap as
+// the bare-integer MaxRuntimeMinutes; workflow-v2 spells it as the Go-duration
+// MaxRuntime and adds the primary USD ceiling LimitUSD. All four fields live on
+// this ONE shared type because the typed decode is shared across majors — it is
+// the per-major JSON Schemas, not Go, that partition the spellings: each major's
+// $defs/budget is additionalProperties:false, so a v0/v1 document can never
+// declare max_runtime / limit_usd and a v2 document can never declare
+// max_runtime_minutes. Use Runtime() to read the runtime cap without caring
+// which spelling a document used.
+//
+// DECODED ONLY (no consumer). No reader of Stage.Budget exists anywhere in the
+// repo today, and this slice adds none: it unifies the GRAMMAR only. Wiring a
+// consumer — stage-budget enforcement at the limit_usd ceiling — is #2328's
+// (E48.55) work. A future reader should learn that here rather than by grepping.
 type Budget struct {
-	MaxTokens         int               `json:"max_tokens,omitempty" yaml:"max_tokens,omitempty"`
-	MaxRuntimeMinutes int               `json:"max_runtime_minutes,omitempty" yaml:"max_runtime_minutes,omitempty"`
-	Enforcement       BudgetEnforcement `json:"enforcement,omitempty" yaml:"enforcement,omitempty"`
+	MaxTokens         int `json:"max_tokens,omitempty" yaml:"max_tokens,omitempty"`
+	MaxRuntimeMinutes int `json:"max_runtime_minutes,omitempty" yaml:"max_runtime_minutes,omitempty"`
+	// MaxRuntime is the workflow-v2 runtime cap as a Go duration (#2217),
+	// parsed by time.ParseDuration exactly as executor.timeout,
+	// verify.timeout and policy.max_stage_runtime are — the single code path
+	// that makes AC-1's "one duration form throughout" literal. Zero on a
+	// v0/v1 document, which spells the cap as MaxRuntimeMinutes instead.
+	MaxRuntime Duration `json:"max_runtime,omitempty" yaml:"max_runtime,omitempty"`
+	// LimitUSD is the workflow-v2 primary per-stage cost ceiling in USD
+	// (#2217), in the same unit as PeriodicBudget.LimitUSD. Zero on a v0/v1
+	// document, which has no stage-level USD ceiling.
+	LimitUSD    float64           `json:"limit_usd,omitempty" yaml:"limit_usd,omitempty"`
+	Enforcement BudgetEnforcement `json:"enforcement,omitempty" yaml:"enforcement,omitempty"`
+}
+
+// Runtime resolves the stage's runtime cap through a SINGLE time.ParseDuration
+// code path regardless of spelling (E52.5 / #2217): the workflow-v2 Go-duration
+// MaxRuntime when non-zero, else the legacy v0/v1 integer MaxRuntimeMinutes
+// converted to a Duration, else zero meaning "not set". MaxRuntime already
+// carries a time.ParseDuration'd value (spec.Duration decodes via
+// time.ParseDuration), so its parse is byte-identical to the one
+// ResolveStageTimeout reads for executor.timeout / verify.timeout /
+// policy.max_stage_runtime. DECODED ONLY — see the Budget doc; no consumer
+// reads this yet.
+func (b Budget) Runtime() time.Duration {
+	if b.MaxRuntime.Duration != 0 {
+		return b.MaxRuntime.Duration
+	}
+	if b.MaxRuntimeMinutes != 0 {
+		return time.Duration(b.MaxRuntimeMinutes) * time.Minute
+	}
+	return 0
 }
 
 // BudgetEnforcement says whether overruns are reported (advisory) or

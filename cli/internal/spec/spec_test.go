@@ -1149,3 +1149,121 @@ workflows:
 		})
 	}
 }
+
+// --- E52.5 / #2217: stage-budget unit unification ----------------------------
+//
+// The CLI is schema-only, so it asserts what `fishhawk validate` CAN decide:
+// the v2 duration/USD forms validate, the legacy minutes form is rejected with
+// the byte-identical actionable message the backend emits, and the spellings
+// stay partitioned by major (v0/v1 keep minutes and reject the v2 forms).
+
+// TestValidateBytes_V2RejectsBudgetMaxRuntimeMinutes asserts the CLI's message
+// is byte-identical to the backend's — the content assertion is what keeps the
+// two deliberately-separate modules' strings in lockstep.
+func TestValidateBytes_V2RejectsBudgetMaxRuntimeMinutes(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          max_runtime_minutes: 15
+        produces:
+          - artifact: pull_request
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	const wantMsg = `budget.max_runtime_minutes was renamed to budget.max_runtime in workflow-v2: write the same value as a Go duration string parsed by time.ParseDuration — max_runtime_minutes: 15 becomes max_runtime: 15m; v0/v1 keep the max_runtime_minutes spelling`
+	if !strings.Contains(joined, wantMsg) {
+		t.Errorf("error %q does not carry the backend's verbatim message %q", joined, wantMsg)
+	}
+	if !strings.Contains(joined, "/stages/0/budget/max_runtime_minutes") {
+		t.Errorf("error %q does not name the offending path", joined)
+	}
+}
+
+// TestValidateBytes_V2AcceptsBudgetDurationAndUSD is the v2-accepts branch: a
+// stage budget spelling the runtime cap as a Go duration and declaring the USD
+// ceiling validates cleanly.
+func TestValidateBytes_V2AcceptsBudgetDurationAndUSD(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          limit_usd: 8.5
+          max_runtime: 90s
+          max_tokens: 200000
+          enforcement: advisory
+        produces:
+          - artifact: pull_request
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("ValidateBytes(v2 budget duration + USD) = %v, want nil", err)
+	}
+}
+
+// TestValidateBytes_BudgetMaxRuntimeMinutesAcceptedBelowMajor2 is the version
+// gate's non-firing branch: minutes is how v0 and v1 spell the runtime cap, so
+// the sweep must not fire there.
+func TestValidateBytes_BudgetMaxRuntimeMinutesAcceptedBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run(version, func(t *testing.T) {
+			yml := `version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          max_runtime_minutes: 15
+        produces:
+          - artifact: pull_request
+`
+			if err := spec.ValidateBytes([]byte(yml)); err != nil {
+				t.Errorf("ValidateBytes(version %s) = %v, want nil", version, err)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_V0V1RejectBudgetV2Spellings proves the v2 spellings do not
+// leak below major 2: each major's $defs/budget is additionalProperties:false,
+// so a v0/v1 stage budget declaring max_runtime or limit_usd is rejected.
+func TestValidateBytes_V0V1RejectBudgetV2Spellings(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		for _, field := range []string{"max_runtime: 90s", "limit_usd: 8.5"} {
+			t.Run(version+"/"+field, func(t *testing.T) {
+				yml := `version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          ` + field + `
+        produces:
+          - artifact: pull_request
+`
+				if err := spec.ValidateBytes([]byte(yml)); err == nil {
+					t.Errorf("ValidateBytes(version %s, %s) = nil, want rejection by additionalProperties:false", version, field)
+				}
+			})
+		}
+	}
+}
