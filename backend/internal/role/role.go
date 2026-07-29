@@ -158,6 +158,14 @@ func (r *Resolver) ExpandRole(ctx context.Context, scope forge.CredentialScope, 
 // The schema enforces exactly one of any_of/all_of is set; nil
 // approvers (gate type=check) returns (false, nil) — the caller
 // should treat that as "not an approval gate; reject."
+//
+// LEGACY v0/v1 PATH (E52.2 / #2214). This resolver is reached only for a gate
+// carrying the GitHub-handle `approvers` allow-list, which workflow-v2 removed
+// along with the top-level `roles` map — so for a cached v2 spec the caller's
+// gate.Approvers is always nil and CanApprove is never invoked; v2 eligibility
+// is decided by the forge-neutral approvals predicate path instead. The
+// nil-approvers and default (no any_of / no all_of) branches remain the
+// defence-in-depth posture for v0/v1 gates.
 func (r *Resolver) CanApprove(ctx context.Context, scope forge.CredentialScope, approvers *spec.Approvers, roles map[string]spec.Role, subject string) (bool, error) {
 	if approvers == nil {
 		return false, nil

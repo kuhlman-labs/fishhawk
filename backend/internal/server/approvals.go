@@ -1208,6 +1208,14 @@ func (s *Server) checkApproverAuthorization(w http.ResponseWriter, r *http.Reque
 // gateContext carries the bits of the workflow spec the role
 // check needs: the gate's approvers, the spec's roles map, and
 // the run's credential scope (so the resolver can reach the forge).
+//
+// LEGACY v0/v1 PATH (E52.2 / #2214). The `approvers` role allow-list and the
+// top-level `roles` map it resolves against were removed from workflow-v2, so
+// for a cached v2 spec fetchGateForStage's gate.Approvers != nil branch is
+// structurally UNREACHABLE — a v2 run always returns the no-approvers context,
+// and eligibility is decided solely by fetchApprovalsForStage + the quorum /
+// resolvePredicates path. The role-check plumbing is retained for v0/v1 runs,
+// whose gates still carry both surfaces.
 type gateContext struct {
 	approvers *spec.Approvers
 	roles     map[string]spec.Role
@@ -1218,6 +1226,12 @@ type gateContext struct {
 // cached bytes (#283) and returns the gate context. Returns
 // (nil, nil) when the stage exists in the spec but has no
 // approval gate.
+//
+// For a cached workflow-v2 spec the gate.Approvers != nil branch below never
+// fires (E52.2 / #2214 removed the gate `approvers` allow-list), so a v2 run
+// always returns the no-approvers context and the legacy role check is never
+// consulted — v2 eligibility flows entirely through fetchApprovalsForStage +
+// resolvePredicates.
 //
 // Pre-#283 this called GitHub directly using `runRow.WorkflowSHA`
 // as the contents-API ref, but that's a blob SHA, not a commit

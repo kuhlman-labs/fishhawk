@@ -15,7 +15,15 @@ import (
 //   - inputs[].from_stage references an existing stage in the same
 //     workflow.
 //   - approvers.any_of / approvers.all_of reference roles defined at
-//     the top level.
+//     the top level. This rule is version-agnostic in code but
+//     UNREACHABLE for a routed major >= 2 (E52.2 / #2214): workflow-v2
+//     removed both the gate `approvers` allow-list and the top-level
+//     `roles` map, so the v2removed sweep rejects either raw key before
+//     a v2 document ever reaches Validate, leaving Gate.Approvers nil.
+//     validateApproverRefs is RETAINED because Validate and the Spec
+//     struct are shared across every major and v0/v1 documents still
+//     carry both surfaces (deleting it would break the existing
+//     TestParse_UndefinedApproverRole and the v0/v1 legacy-form pins).
 //   - Plan-producing stages declare schema: standard_v1.
 //   - type<->executor<->constraint binding (ADR-038 / #925): a deploy
 //     stage must use a delegating executor and may carry only pre-flight
@@ -361,7 +369,11 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 			}
 		}
 
-		// Approver role refs must resolve.
+		// Approver role refs must resolve. Version-agnostic in code but
+		// unreachable for major >= 2: a v2 gate can never carry Approvers
+		// (the v2removed sweep rejects the raw `approvers` key upstream), so
+		// this loop only ever fires for v0/v1 gates. Retained deliberately —
+		// see the Validate header (E52.2 / #2214).
 		for j, g := range stage.Gates {
 			if g.Approvers == nil {
 				continue

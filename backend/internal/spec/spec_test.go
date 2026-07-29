@@ -3794,6 +3794,93 @@ workflows:
 	}
 }
 
+// --- workflow-v2 approval predicate consolidation (E52.2 / #2214) ---
+
+// TestParseV2_ApprovalsOnlyGate_RoundTrips is acceptance criterion 1: a v2
+// approval gate declaring only the forge-neutral `approvals` block parses,
+// validates and round-trips with Gate.Approvals populated and Gate.Approvers
+// nil — `approvals` is the sole approval predicate at major 2.
+func TestParseV2_ApprovalsOnlyGate_RoundTrips(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(v2 approvals-only gate): %v", err)
+	}
+	g := s.Workflows["feature_change"].Stages[0].Gates[0]
+	if g.Type != spec.GateTypeApproval {
+		t.Errorf("gate type = %q, want approval", g.Type)
+	}
+	if g.Approvers != nil {
+		t.Errorf("Approvers = %+v, want nil — v2 removed the legacy allow-list", g.Approvers)
+	}
+	if g.Approvals == nil {
+		t.Fatal("Approvals = nil, want the forge-neutral block")
+	}
+	if g.Approvals.Count == nil || *g.Approvals.Count != 1 {
+		t.Errorf("Approvals.Count = %v, want 1", g.Approvals.Count)
+	}
+	if len(g.Approvals.Not) != 2 || g.Approvals.Not[0] != "author" || g.Approvals.Not[1] != "agent" {
+		t.Errorf("Approvals.Not = %v, want [author agent]", g.Approvals.Not)
+	}
+}
+
+// TestParse_V2ApprovalGate_NeitherPredicate_Rejected pins the property the
+// deleted inner oneOf used to guarantee (acceptance criterion 4): with
+// `approvers` gone, the branch's `required: [type, approvals]` is what keeps a
+// v2 approval gate from becoming a no-op — a gate declaring only `type:
+// approval` is rejected at the schema layer.
+func TestParse_V2ApprovalGate_NeitherPredicate_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for a v2 approval gate with no predicate", err)
+	}
+}
+
+// TestParse_V2ApprovalGate_EmptyApprovals_Rejected pins that count stays
+// REQUIRED at v2: `approvals: {}` is a no-op empty predicate and fails
+// validation.
+func TestParse_V2ApprovalGate_EmptyApprovals_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals: {}
+`))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for approvals:{} (missing required count)", err)
+	}
+}
+
 // frozenMajorSchemaHashes pins the canonical-JSON SHA-256 of every FROZEN
 // workflow schema major — the digest the production accessors compute in
 // computeSchemaHashes and /healthz advertises.

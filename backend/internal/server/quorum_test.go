@@ -438,11 +438,120 @@ workflows:
 	return st
 }
 
+// seedQuorumRunStageV2 is seedQuorumRunStage's workflow-v2 twin: it caches a
+// version "2" spec whose plan-stage approval gate declares only the
+// forge-neutral `approvals` block (the sole approval predicate at major 2,
+// E52.2 / #2214) with the given distinct-approver count and not: [author,
+// agent]. Used by the v2 eligibility-decision tests.
+func seedQuorumRunStageV2(t *testing.T, rr *approvalRunRepo, count int, state run.StageState) *run.Stage {
+	t.Helper()
+	st := rr.seedStage(state)
+	workflowSpec := []byte(fmt.Sprintf(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        gates:
+          - type: approval
+            approvals:
+              count: %d
+              not: [author, agent]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`, count))
+	rr.seedRun(&run.Run{ID: st.RunID, WorkflowID: "feature_change", WorkflowSpec: workflowSpec})
+	return st
+}
+
 // eligibleApproverIdentity builds a token identity (TokenID non-empty so the
 // write-scope check actually runs) that carries write:approvals and is a
 // distinct human subject — an eligible quorum voter.
 func eligibleApproverIdentity(subject string) Identity {
 	return Identity{Subject: subject, TokenID: "tok-" + subject, Scopes: []string{"write:approvals"}}
+}
+
+// TestFetchApprovalsForStage_V2ApprovalsGate is the quorum-side half of the
+// cross-boundary proof (acceptance criterion 6): a run row caching a v2
+// approvals-only spec resolves through fetchApprovalsForStage to the gate's
+// forge-neutral Approvals block, so a v2 run's eligibility is decided entirely
+// by the predicate path — the deleted legacy Approvers form is never involved.
+func TestFetchApprovalsForStage_V2ApprovalsGate(t *testing.T) {
+	s, _, rr, _ := newApprovalServer(t)
+	stage := seedQuorumRunStageV2(t, rr, 1, run.StageStateAwaitingApproval)
+
+	approvals, err := s.fetchApprovalsForStage(context.Background(), stage)
+	if err != nil {
+		t.Fatalf("fetchApprovalsForStage: %v", err)
+	}
+	if approvals == nil {
+		t.Fatal("Approvals = nil, want the v2 gate's forge-neutral block")
+	}
+	if approvals.Count == nil || *approvals.Count != 1 {
+		t.Errorf("Approvals.Count = %v, want 1", approvals.Count)
+	}
+	if len(approvals.Not) != 2 || approvals.Not[0] != "author" || approvals.Not[1] != "agent" {
+		t.Errorf("Approvals.Not = %v, want [author agent]", approvals.Not)
+	}
+}
+
+// TestV2ApprovalsPredicateDecidesEligibility is the operator's binding
+// CONDITION 1: it drives a REAL v2 spec cached on a run row through to an
+// actual eligibility DECISION and asserts BOTH directions of the
+// approvals: {count: 1, not: [author, agent]} predicate. A permissive bug
+// shows up only in the refusal case; a broken/bypassed eligibility path shows
+// up only in the permit case, so both halves are load-bearing. It asserts the
+// decision the resolver path returns (the advanced stage state), not an
+// intermediate struct — the retrieval assertions live in
+// TestFetchApprovalsForStage_V2ApprovalsGate and the fetchGateForStage twin.
+func TestV2ApprovalsPredicateDecidesEligibility(t *testing.T) {
+	const author = "github:author"
+	s, _, rr, au := newApprovalServer(t)
+	stage := seedQuorumRunStageV2(t, rr, 1, run.StageStateAwaitingApproval)
+	// Seed the run's change author so resolveChangeAuthor identifies it — the
+	// `not: [author]` exclusion turns on this.
+	au.seedRunEntries(stage.RunID, userEntry(author))
+
+	// Sanity: the forge-neutral predicate path is the one consulted — the v2
+	// gate's approvals block resolves for this stage (not the deleted legacy
+	// Approvers path).
+	if approvals, err := s.fetchApprovalsForStage(context.Background(), stage); err != nil || approvals == nil {
+		t.Fatalf("fetchApprovalsForStage = (%v, %v), want the v2 approvals block", approvals, err)
+	}
+
+	// DIRECTION 1 — the PR author is REFUSED. The author's own approve is
+	// recorded, but the author is not an eligible approver, so the count:1
+	// quorum is NOT reached and the stage stays awaiting_approval (no advance).
+	resAuthor, err := s.approveStageAs(context.Background(), eligibleApproverIdentity(author),
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err != nil {
+		t.Fatalf("author approve: %v", err)
+	}
+	if resAuthor.Stage == nil || resAuthor.Stage.State != run.StageStateAwaitingApproval {
+		t.Fatalf("after author approve state = %v, want awaiting_approval (author REFUSED, quorum not reached)", resAuthor.Stage)
+	}
+	if len(rr.transitions) != 0 {
+		t.Fatalf("author approve recorded %d stage transitions, want 0 (the author does not count toward the quorum)", len(rr.transitions))
+	}
+
+	// DIRECTION 2 — a non-author human is PERMITTED. Their approve is an
+	// eligible vote that reaches the count:1 quorum and advances the stage to
+	// succeeded.
+	resHuman, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:reviewer"),
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err != nil {
+		t.Fatalf("non-author approve: %v", err)
+	}
+	if resHuman.Stage == nil || resHuman.Stage.State != run.StageStateSucceeded {
+		t.Fatalf("after non-author approve state = %v, want succeeded (non-author PERMITTED, quorum reached)", resHuman.Stage)
+	}
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %+v, want exactly one → succeeded", rr.transitions)
+	}
 }
 
 // lastPredicateSnapshot decodes the predicate_snapshot from the most recent

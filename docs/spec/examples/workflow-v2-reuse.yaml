@@ -47,10 +47,6 @@
 
 version: "2"
 
-roles:
-  founder:
-    members: ["@kuhlman-labs"]
-
 # THE LOWEST RUNG. Applied to every stage of every workflow below.
 defaults:
   executor:

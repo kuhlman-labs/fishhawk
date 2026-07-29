@@ -28,10 +28,6 @@
 
 version: "2"
 
-roles:
-  founder:
-    members: ["@kuhlman-labs"]
-
 workflows:
   backlog_grooming:
     description: >-
@@ -53,8 +49,9 @@ workflows:
         gates:
           - type: approval
             sla: 24_hours
-            # Forge-neutral approval predicate (E39.2 / #1707). v2 drops the
-            # legacy GitHub-handle `approvers` allow-list from new workflows.
+            # Forge-neutral approval predicate (E39.2 / #1707). At v2 `approvals`
+            # is the ONLY approval form: the legacy GitHub-handle `approvers`
+            # allow-list and top-level `roles` map were removed (E52.2 / #2214).
             approvals:
               count: 1
               not: [author, agent]

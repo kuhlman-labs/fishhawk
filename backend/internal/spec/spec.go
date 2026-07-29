@@ -96,7 +96,13 @@ func ResolveStageTimeout(wf Workflow, st Stage, def time.Duration) time.Duration
 
 // Spec is a parsed and validated workflow specification document.
 type Spec struct {
-	Version   string              `json:"version" yaml:"version"`
+	Version string `json:"version" yaml:"version"`
+	// Roles is the top-level role map that gate approvers resolve against. It
+	// is a v0/v1-ONLY surface: workflow-v2 removed the top-level `roles` map
+	// (E52.2 / #2214), so a routed major >= 2 document can never populate it —
+	// the v2removed sweep rejects a raw `roles` key before the typed decode
+	// runs. The field is RETAINED because the Spec struct is shared across
+	// every major and v0/v1 documents still carry it.
 	Roles     map[string]Role     `json:"roles,omitempty" yaml:"roles,omitempty"`
 	Workflows map[string]Workflow `json:"workflows" yaml:"workflows"`
 	// TestConventions are optional per-repo test-location conventions
@@ -981,16 +987,27 @@ const (
 // is effectively a no-op until #255 wires routine_change to
 // `gh pr merge --auto`.
 type Gate struct {
-	Type      GateType   `json:"type" yaml:"type"`
+	Type GateType `json:"type" yaml:"type"`
+	// Approvers is the legacy GitHub-handle role allow-list. It is a v0/v1-ONLY
+	// surface: workflow-v2 removed the gate `approvers` property (E52.2 /
+	// #2214), so a routed major >= 2 gate can never populate it — the
+	// v2removed sweep rejects a raw `approvers` key before the typed decode
+	// runs, and at major 2 an approval gate always carries Approvals (the
+	// schema lists it in the branch's required set) with Approvers always nil.
+	// The field is RETAINED because the Gate struct is shared across every
+	// major and v0/v1 gates still carry it.
 	Approvers *Approvers `json:"approvers,omitempty" yaml:"approvers,omitempty"`
-	// Approvals is the forge-neutral approval predicate (E39.2 / #1707),
-	// the additive alternative to the GitHub-handle Approvers allow-list.
-	// An approval gate declares EXACTLY ONE of Approvers or Approvals; the
-	// schema's inner oneOf enforces the mutual exclusion, so both-nil or
-	// both-set never reaches a validated Spec. Nil when the gate uses the
-	// legacy Approvers form. The re-decode into Spec uses
-	// DisallowUnknownFields, so this field MUST stay in lockstep with the
-	// schema's gate approval-branch `approvals` property.
+	// Approvals is the forge-neutral approval predicate (E39.2 / #1707). On v0
+	// and v1 it is the additive alternative to the GitHub-handle Approvers
+	// allow-list — an approval gate declares EXACTLY ONE of Approvers or
+	// Approvals, enforced by the schema's inner oneOf, so both-nil or both-set
+	// never reaches a validated Spec, and this is nil when the gate uses the
+	// legacy Approvers form. At workflow-v2 the inner oneOf is GONE (E52.2 /
+	// #2214): Approvals is the SOLE predicate and is REQUIRED on an approval
+	// gate, so a v2-parsed approval gate always sets Approvals and always
+	// leaves Approvers nil. The re-decode into Spec uses DisallowUnknownFields,
+	// so this field MUST stay in lockstep with the schema's gate
+	// approval-branch `approvals` property.
 	Approvals *Approvals `json:"approvals,omitempty" yaml:"approvals,omitempty"`
 	SLA       string     `json:"sla,omitempty" yaml:"sla,omitempty"`
 	// OperatorAgent is the per-gate delegation override (ADR-040 /
@@ -1012,6 +1029,12 @@ const (
 // Approvers names roles whose members can satisfy the gate. Exactly
 // one of AnyOf or AllOf is set; the schema enforces the mutual
 // exclusion.
+//
+// v0/v1-ONLY surface: workflow-v2 removed the gate `approvers` allow-list and
+// the top-level `roles` map it references (E52.2 / #2214), so a routed major
+// >= 2 gate never populates this type — the v2removed sweep rejects the raw
+// key before the typed decode. RETAINED because the shared Gate struct still
+// carries it for v0/v1 gates.
 type Approvers struct {
 	AnyOf []string `json:"any_of,omitempty" yaml:"any_of,omitempty"`
 	AllOf []string `json:"all_of,omitempty" yaml:"all_of,omitempty"`
