@@ -34,11 +34,11 @@ workflows:
 
 // v2SpecGateLevelPageEvent is a v2 document carrying the legacy bare token
 // in a PER-GATE operator_agent block — a different nesting site, which the
-// generic walk must reach just as well.
+// generic walk must reach just as well. The gate uses the forge-neutral
+// `approvals` predicate (the legacy `approvers` allow-list and top-level
+// `roles` map are themselves removed at v2, E52.2 / #2214), so `reviewer_reject`
+// is the ONLY removed form here and the sweep must report it.
 const v2SpecGateLevelPageEvent = `version: "2"
-roles:
-  tech_lead:
-    github: [octocat]
 workflows:
   feature_change:
     stages:
@@ -48,8 +48,9 @@ workflows:
           agent: claude-code
         gates:
           - type: approval
-            approvers:
-              any_of: [tech_lead]
+            approvals:
+              count: 1
+              not: [author, agent]
             operator_agent:
               must_page_human:
                 - reviewer_reject
@@ -121,6 +122,78 @@ func TestParseV2_RejectsReviewersAgentCount(t *testing.T) {
 	}
 }
 
+// --- E52.2 / #2214: the two REMOVED approval surfaces -----------------------
+//
+// workflow-v2 removes the gate `approvers` role allow-list and the top-level
+// `roles` map — `approvals` becomes the sole approval predicate. The schema
+// rejects both as undeclared properties of additionalProperties:false blocks,
+// but with a generic message naming no replacement, so the sweep names it.
+// These pin the SHIPPED actionable message (content, not merely that an error
+// occurred) and its path.
+
+// TestParseV2_RejectsApproversAllowList asserts a v2 gate carrying the removed
+// `approvers` allow-list is rejected with a *SchemaError naming `approvals` as
+// the replacement, at the offending gate path.
+func TestParseV2_RejectsApproversAllowList(t *testing.T) {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+`
+	_, err := ParseBytes([]byte(doc))
+	se := requireSchemaError(t, err)
+	if se.Message != msgV2RemovedApprovers {
+		t.Errorf("Message = %q, want the actionable %q", se.Message, msgV2RemovedApprovers)
+	}
+	if !strings.Contains(se.Message, "approvals") {
+		t.Errorf("Message = %q, want it to name approvals as the replacement", se.Message)
+	}
+	if !strings.HasSuffix(se.Path, "/gates/0/approvers") {
+		t.Errorf("Path = %q, want it to end at /gates/0/approvers", se.Path)
+	}
+	// The generic additionalProperties message must NOT win.
+	if strings.Contains(se.Message, "additional propert") {
+		t.Errorf("Message = %q, want the sweep's actionable message, not the generic additionalProperties one", se.Message)
+	}
+}
+
+// TestParseV2_RejectsTopLevelRolesMap asserts a v2 document carrying the removed
+// top-level `roles` map is rejected with a *SchemaError naming
+// approvals.member_of / approvals.members as the replacement.
+func TestParseV2_RejectsTopLevelRolesMap(t *testing.T) {
+	doc := `version: "2"
+roles:
+  tech_lead:
+    members: ["@octocat"]
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	_, err := ParseBytes([]byte(doc))
+	se := requireSchemaError(t, err)
+	if se.Message != msgV2RemovedRolesMap {
+		t.Errorf("Message = %q, want the actionable %q", se.Message, msgV2RemovedRolesMap)
+	}
+	if !strings.Contains(se.Message, "approvals.member_of") || !strings.Contains(se.Message, "approvals.members") {
+		t.Errorf("Message = %q, want it to name approvals.member_of / approvals.members", se.Message)
+	}
+	if se.Path != "/roles" {
+		t.Errorf("Path = %q, want /roles", se.Path)
+	}
+}
+
 // TestCheckV2RemovedForms_MatchesByKeyNameNotPosition pins the sweep's
 // deliberate over-trigger as INTENDED behavior (approval condition 2). The
 // sweep matches by key name at ANY depth, so a legacy form sitting in a
@@ -168,6 +241,20 @@ func TestCheckV2RemovedForms_MatchesByKeyNameNotPosition(t *testing.T) {
 			wantMsg:  msgV2RenamedBudgetMaxRuntimeMinutes,
 			wantPath: "/totally_unknown_block/budget/max_runtime_minutes",
 		},
+		{
+			// An `approvers` map hung in a position v2 does not permit — the
+			// sweep still reports the removed-form message rather than deferring
+			// to the structural error (E52.2 / #2214).
+			name: "approvers under an unknown subtree",
+			raw: map[string]any{
+				"version": "2",
+				"totally_unknown_block": map[string]any{
+					"approvers": map[string]any{"any_of": []any{"tech_lead"}},
+				},
+			},
+			wantMsg:  msgV2RemovedApprovers,
+			wantPath: "/totally_unknown_block/approvers",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -201,6 +288,8 @@ func TestCheckV2RemovedForms_SkipsNonMatchingShapes(t *testing.T) {
 		{"must_page_human without the legacy token", map[string]any{"must_page_human": []any{"gating_reviewer_reject"}}},
 		{"reviewers is not a map", map[string]any{"reviewers": []any{"agent"}}},
 		{"reviewers without the agent key", map[string]any{"reviewers": map[string]any{"human": 1}}},
+		{"roles is not a map", map[string]any{"roles": []any{"tech_lead"}}},
+		{"approvers is not a map", map[string]any{"approvers": []any{"any_of"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -312,6 +401,39 @@ workflows:
 			}
 			if got := rv.AgentCount(); got != 2 {
 				t.Errorf("AgentCount() = %d, want 2 (the bare-count fallback is retained for v0/v1)", got)
+			}
+		})
+		// E52.2 / #2214 acceptance criterion 5: a v0/v1 spec carrying the gate
+		// `approvers` allow-list AND the top-level `roles` map it references
+		// still parses clean AND resolves its role refs — validateApproverRefs
+		// is retained and reached for v0/v1. (A dangling ref would fail Validate;
+		// a clean parse proves it resolved.)
+		t.Run("approvers+roles at "+version, func(t *testing.T) {
+			s, err := ParseBytes([]byte(`version: "` + version + `"
+roles:
+  tech_lead:
+    members: ["@octocat"]
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+`))
+			if err != nil {
+				t.Fatalf("ParseBytes(version %s): %v", version, err)
+			}
+			if _, ok := s.Roles["tech_lead"]; !ok {
+				t.Errorf("Roles = %v, want the tech_lead role retained for v0/v1", s.Roles)
+			}
+			g := s.Workflows["feature_change"].Stages[0].Gates[0]
+			if g.Approvers == nil || len(g.Approvers.AnyOf) != 1 || g.Approvers.AnyOf[0] != "tech_lead" {
+				t.Errorf("Approvers = %+v, want any_of=[tech_lead] (the resolved v0/v1 role ref)", g.Approvers)
 			}
 		})
 	}
@@ -523,10 +645,11 @@ workflows:
 	}
 }
 
-// TestCheckV2RemovedAtNode_FixedOrder pins the report order across all five
-// forms, so a document carrying several always reports the same one. The
-// E52.5 budget rename is appended LAST, so a node also carrying drive still
-// reports drive — proving the order contract did not shift.
+// TestCheckV2RemovedAtNode_FixedOrder pins the report order across all seven
+// forms, so a document carrying several always reports the same one. The two
+// E52.2 removals (approvers, then roles) are appended LAST, after the E52.5
+// budget rename — so a node also carrying the earlier forms still reports them
+// first, proving the existing five-form order was byte-preserved.
 func TestCheckV2RemovedAtNode_FixedOrder(t *testing.T) {
 	node := map[string]any{
 		"must_page_human": []any{PageEventReviewerReject},
@@ -534,6 +657,8 @@ func TestCheckV2RemovedAtNode_FixedOrder(t *testing.T) {
 		"drive":           true,
 		"constraints":     []any{map[string]any{"max_files_changed": 1}},
 		"budget":          map[string]any{"max_runtime_minutes": 15},
+		"approvers":       map[string]any{"any_of": []any{"tech_lead"}},
+		"roles":           map[string]any{"tech_lead": map[string]any{"members": []any{"@octocat"}}},
 	}
 	order := []string{
 		msgV2RemovedReviewerReject,
@@ -541,8 +666,10 @@ func TestCheckV2RemovedAtNode_FixedOrder(t *testing.T) {
 		msgV2RenamedDrive,
 		msgV2ReshapedConstraints,
 		msgV2RenamedBudgetMaxRuntimeMinutes,
+		msgV2RemovedApprovers,
+		msgV2RemovedRolesMap,
 	}
-	keys := []string{"must_page_human", "reviewers", "drive", "constraints", "budget"}
+	keys := []string{"must_page_human", "reviewers", "drive", "constraints", "budget", "approvers", "roles"}
 	for i, want := range order {
 		got := checkV2RemovedAtNode(node, "")
 		if got == nil {

@@ -395,6 +395,51 @@ func TestApproval_DeployAllOf_AdmitsSubjectInAllRoles(t *testing.T) {
 	}
 }
 
+// v2ApprovalsOnlyRoleSpec is a workflow-v2 document whose implement-stage
+// approval gate carries ONLY the forge-neutral `approvals` block — the sole
+// approval predicate at major 2 (E52.2 / #2214). It has no top-level `roles`
+// map and no gate `approvers` allow-list, both removed from v2.
+const v2ApprovalsOnlyRoleSpec = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+`
+
+// TestFetchGateForStage_V2ApprovalsGate_NoLegacyContext is the cross-boundary
+// proof (acceptance criterion 6, schema -> ParseBytes -> cached-spec gate
+// context) that the legacy role check is structurally UNREACHABLE for a v2
+// run. A run row caching a v2 approvals-only spec resolves through
+// fetchGateForStage to a context whose approvers is nil and whose roles map is
+// empty — so checkApproverAuthorization never consults CanApprove, and
+// eligibility is decided solely by the forge-neutral approvals path.
+func TestFetchGateForStage_V2ApprovalsGate_NoLegacyContext(t *testing.T) {
+	s, rr, _, _, _ := newRoleApprovalServer(t, nil)
+	rr.runRow.WorkflowSpec = []byte(v2ApprovalsOnlyRoleSpec)
+
+	gate, err := s.fetchGateForStage(context.Background(), rr.stage)
+	if err != nil {
+		t.Fatalf("fetchGateForStage: %v", err)
+	}
+	if gate == nil {
+		t.Fatal("gate context = nil, want the no-approvers context for a v2 run")
+	}
+	if gate.approvers != nil {
+		t.Errorf("gate.approvers = %+v, want nil — v2 removed the legacy allow-list, so the role check is never consulted", gate.approvers)
+	}
+	if len(gate.roles) != 0 {
+		t.Errorf("gate.roles = %v, want empty — v2 removed the top-level roles map", gate.roles)
+	}
+}
+
 // GetRunAccountID satisfies the REQUIRED run.AccountGetter portion of
 // run.Repository (E44.11 / #2074). Untenanted: this fake's runs carry no
 // tenant account, matching its pre-promotion effective behavior.

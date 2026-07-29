@@ -1268,6 +1268,124 @@ workflows:
 	}
 }
 
+// --- workflow-v2 removed approval surfaces (E52.2 / #2214) ------------------
+
+// TestValidateBytes_V2RejectsApproversAllowList asserts the CLI rejects the
+// removed gate `approvers` allow-list at v2 with a message BYTE-IDENTICAL to
+// the backend's — the content assertion is the only lockstep mechanism, since
+// the two Go modules share no constant.
+func TestValidateBytes_V2RejectsApproversAllowList(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	const wantMsg = `the gate "approvers" role allow-list was removed in workflow-v2: declare the forge-neutral "approvals" block instead (a role allow-list becomes approvals: {count, members | member_of | min_permission}); the mapping is NOT mechanical, so review the translation rather than applying it blind`
+	if !strings.Contains(joined, wantMsg) {
+		t.Errorf("error %q does not carry the backend's verbatim message %q", joined, wantMsg)
+	}
+	if !strings.Contains(joined, "/gates/0/approvers") {
+		t.Errorf("error %q does not name the offending path", joined)
+	}
+}
+
+// TestValidateBytes_V2RejectsTopLevelRolesMap asserts the CLI rejects the
+// removed top-level `roles` map at v2 with the backend's verbatim message.
+func TestValidateBytes_V2RejectsTopLevelRolesMap(t *testing.T) {
+	yml := `version: "2"
+roles:
+  tech_lead:
+    members: ["@octocat"]
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+	err := spec.ValidateBytes([]byte(yml))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	joined := strings.Join(messageStrings(ve), "\n")
+	const wantMsg = `the top-level "roles" map was removed in workflow-v2: forge-neutral membership moves onto a gate's "approvals" block (approvals.member_of / approvals.members); there is no top-level role map at major 2`
+	if !strings.Contains(joined, wantMsg) {
+		t.Errorf("error %q does not carry the backend's verbatim message %q", joined, wantMsg)
+	}
+	if !strings.Contains(joined, "/roles") {
+		t.Errorf("error %q does not name the offending path", joined)
+	}
+}
+
+// TestValidateBytes_V2AcceptsApprovalsOnlyGate is the v2-accepts branch: a
+// forge-neutral `approvals` gate — the sole approval predicate at major 2 —
+// validates cleanly.
+func TestValidateBytes_V2AcceptsApprovalsOnlyGate(t *testing.T) {
+	yml := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              not: [author, agent]
+`
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("ValidateBytes(v2 approvals-only gate) = %v, want nil", err)
+	}
+}
+
+// TestValidateBytes_ApproversAndRolesAcceptedBelowMajor2 is the version gate's
+// non-firing branch: v0 and v1 documents legitimately carry both the gate
+// `approvers` allow-list and the top-level `roles` map, so the sweep must not
+// fire and the CLI (schema-only — it never resolves role refs) accepts them.
+func TestValidateBytes_ApproversAndRolesAcceptedBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run(version, func(t *testing.T) {
+			yml := `version: "` + version + `"
+roles:
+  tech_lead:
+    members: ["@octocat"]
+workflows:
+  feature_change:
+    stages:
+      - id: review
+        type: review
+        executor:
+          human: true
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+`
+			if err := spec.ValidateBytes([]byte(yml)); err != nil {
+				t.Errorf("ValidateBytes(version %s) = %v, want nil", version, err)
+			}
+		})
+	}
+}
+
 // --- workflow-v2 same-document reuse (E52.4 / #2216) -----------------------
 
 // TestValidateBytes_V2Reuse_HappyPath is the CLI-side end-to-end case: a

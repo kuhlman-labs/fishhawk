@@ -10,19 +10,22 @@ Reference for `.fishhawk/workflows.yaml` at major version 2. The canonical schem
 - **Field acceptance is by schema declaration (ADR-067 scope item 4).** A field is accepted because this schema declares it — not because the document declared a high enough minor. The inherited minor-gating prose (`Requires version 0.N+`, `accepted at every advertised version`) has been rewritten to field-presence language throughout the v2 descriptions.
 - **The bare `reviewer_reject` page-event token is removed (E52.3 / #2215).** See *Removed from v1* below.
 - **The `reviewers.agent` integer count is removed (E52.3 / #2215).** See *Removed from v1* below.
+- **The legacy `approvers` allow-list and the top-level `roles` map are removed (E52.2 / #2214):** the forge-neutral `approvals` block becomes the sole approval predicate. See *Removed from v1* and *Approval gate predicate (v2)* below.
 - **Three surfaces are reshaped for legibility (E52.6 / #2218):** `constraints` becomes an object, `drive` becomes `auto_advance`, and `needs:` is added as shorthand for artifact wiring. See *Reshaped from v1* below.
 - **Stage-budget units are unified (E52.5 / #2217):** the runtime cap `max_runtime_minutes` becomes the Go-duration `max_runtime`, and `limit_usd` is added as the primary cost lever with `max_tokens` demoted to optional secondary. See *Units* below.
 
 ## Removed from v1
 
-v2 drops two back-compat duplicate surfaces. Each had an explicit successor already shipped in v0/v1, so the removal deletes a second way to say the same thing rather than a capability. **v0 and v1 are unchanged** — both forms remain valid there, and the shared Go types still carry them, so an existing spec keeps working until it is migrated to v2 (migration codemod: #2220).
+v2 drops four back-compat duplicate surfaces. Each had an explicit successor already shipped in v0/v1, so the removal deletes a second way to say the same thing rather than a capability. **v0 and v1 are unchanged** — both forms remain valid there, and the shared Go types still carry them, so an existing spec keeps working until it is migrated to v2 (migration codemod: #2220).
 
 | Removed in v2 | Replacement | Why |
 |---|---|---|
 | `operator_agent.must_page_human: [reviewer_reject]` | `gating_reviewer_reject` (and its sibling `advisory_reviewer_reject`) | The bare token was the pre-#1378 form and always resolved to the *gating* sense. The two explicit classes state the review authority at the declaration site instead of leaving it to be resolved. |
 | `reviewers.agent: <N>` | `reviewers.agents: [{provider, model?}, …]` | The heterogeneous list (#955) already superseded the bare count — the effective agent count is `len(agents)`. Keeping both left two inputs feeding one ADR-027 authority decision. |
+| gate `approvers: {any_of \| all_of: [role, …]}` (E52.2 / #2214) | gate `approvals: {count, members \| member_of \| min_permission}` | The forge-neutral `approvals` block (ADR-055 / #1707) already superseded the GitHub-handle role allow-list. Keeping both left two mutually-exclusive predicates on one gate. The translation is **not mechanical** — `min_permission` / `member_of` have no source in the old form — so it belongs to the codemod (#2220), which must emit a before/after approval-eligibility diff rather than rewriting blind. See *Approval gate predicate (v2)*. |
+| top-level `roles: {name: {members: […]}}` (E52.2 / #2214) | `approvals.member_of` / `approvals.members` | The `roles` map existed only to be named by `approvers`; with `approvers` gone it has nothing left to reference. Forge-neutral membership moves onto the gate's `approvals` block. |
 
-A v2 document using either form is rejected with a message naming the replacement, not the generic enum / `additional properties` message: the backend (`backend/internal/spec/v2removed.go`) and the CLI (`cli/internal/spec/validate.go`) each sweep the raw document for a routed major `>= 2` *before* schema validation. The sweep matches by **key name at any depth** — deliberately over-triggering rather than risk missing a legacy form — so in an already-invalid document the legacy-form message may precede a structural error.
+A v2 document using any of these forms is rejected with a message naming the replacement, not the generic enum / `additional properties` message: the backend (`backend/internal/spec/v2removed.go`) and the CLI (`cli/internal/spec/validate.go`) each sweep the raw document for a routed major `>= 2` *before* schema validation. The sweep matches by **key name at any depth** — deliberately over-triggering rather than risk missing a legacy form — so in an already-invalid document the legacy-form message may precede a structural error.
 
 The ADR-027 authority table now reads on `len(agents)`:
 
@@ -33,6 +36,26 @@ The ADR-027 authority table now reads on `len(agents)`:
 | `len(agents) == 0` | gateless |
 
 An absent `reviewers` block is unchanged by this slice.
+
+## Approval gate predicate (v2)
+
+At v2 the forge-neutral `approvals` block is the **sole** approval predicate (E52.2 / #2214). The gate approval branch lists `approvals` in its `required` set, so an approval gate **always** declares it and can never be a no-op — this is the property the removed inner `oneOf` (which chose between `approvers` and `approvals`) used to guarantee. A gate declaring `type: approval` with no `approvals` block, or `approvals: {}` (missing the required `count`), is rejected.
+
+```yaml
+gates:
+  - type: approval
+    approvals:
+      count: 1
+      not: [author, agent]
+```
+
+- `count` is **required** (an integer `>= 1`, always explicit per ADR-055), so an empty predicate fails validation.
+- `not` excludes relationship classes (`author`, `agent`) from satisfying the gate.
+- `min_permission` (forge-neutral repository permission tier) and `member_of` (a forge-neutral org/team) are **optional** and are annotated `x-intended-required` — intended to become required in a future major. They were **deliberately NOT promoted to required here**; that promotion is a separate decision.
+
+Because `min_permission` / `member_of` have no source in the legacy `approvers` role allow-list, translating an old gate is **not mechanical**: migration belongs to the codemod (#2220), which must emit a before/after approval-eligibility diff rather than rewriting blind.
+
+For the two-form v0/v1 grammar (the legacy `approvers` allow-list alongside `approvals`, mutually exclusive), see [`workflow-v1.md`](workflow-v1.md)'s *Approval gate predicate (v1)* — that page is unchanged, as v1 is frozen and still accepts both forms.
 
 ## Reshaped from v1
 

@@ -26,13 +26,6 @@
       "human": 1
     }
   },
-  "roles": {
-    "founder": {
-      "members": [
-        "@kuhlman-labs"
-      ]
-    }
-  },
   "version": "2",
   "workflows": {
     "base_change": {

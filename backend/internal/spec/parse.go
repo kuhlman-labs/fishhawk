@@ -222,14 +222,16 @@ func ParseBytes(data []byte) (*Spec, error) {
 		return nil, err
 	}
 
-	// workflow-v2 removed or reshaped four back-compat surfaces (E52.3 /
-	// #2215, E52.6 / #2218): the bare reviewer_reject page-event token,
-	// the reviewers.agent integer count, the `drive` workflow flag and the
-	// list form of `constraints`. The schema rejects all four, but with a
-	// generic enum / additionalProperties / type message that names no
-	// replacement — so sweep the raw document FIRST, for a routed major >=
-	// 2 only, and return the actionable message instead. Below major 2 the
-	// sweep never runs and every legacy form parses exactly as before.
+	// workflow-v2 removed, reshaped or renamed seven back-compat surfaces
+	// (E52.3 / #2215, E52.6 / #2218, E52.5 / #2217, E52.2 / #2214): the bare
+	// reviewer_reject page-event token, the reviewers.agent integer count, the
+	// `drive` workflow flag, the list form of `constraints`, the
+	// budget.max_runtime_minutes bare-integer runtime cap, the gate `approvers`
+	// role allow-list, and the top-level `roles` map. The schema rejects all
+	// seven, but with a generic enum / additionalProperties / type message that
+	// names no replacement — so sweep the raw document FIRST, for a routed
+	// major >= 2 only, and return the actionable message instead. Below major 2
+	// the sweep never runs and every legacy form parses exactly as before.
 	if major >= 2 {
 		if serr := checkV2RemovedForms(raw); serr != nil {
 			return nil, serr

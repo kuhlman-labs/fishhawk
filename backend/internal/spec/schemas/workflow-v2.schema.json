@@ -17,16 +17,6 @@
       ],
       "description": "Spec syntax version. workflow-v2 advertises the single token \"2\" and has NO minor chain (unlike v0's additive 0.3…0.7 and v1's 1.0…1.6 minor chains). Declare exactly \"2\": the validator routes a spec to this schema when its version major is 2, and the dotted minor forms (\"2.0\", \"2.1\", …) are REJECTED by this enum. Field acceptance under v2 is by schema declaration, not by a declared minor. Old specs in the audit log remain readable forever via their historical schemas; this enum gates *new* v2 specs only."
     },
-    "roles": {
-      "type": "object",
-      "description": "Named roles referenced by gate approvers. Keys are snake_case identifiers; values list GitHub user/team refs.",
-      "additionalProperties": false,
-      "patternProperties": {
-        "^[a-z][a-z0-9_]*$": {
-          "$ref": "#/$defs/role"
-        }
-      }
-    },
     "workflows": {
       "type": "object",
       "description": "Named workflows. Keys are snake_case identifiers (e.g. feature_change). At least one workflow must be defined.",
@@ -89,27 +79,6 @@
           "description": "Candidate test-file path templates for a matched production file. Template variables: `{dir}` (the production file's directory), `{name}` (basename without its final extension), `{ext}` (final extension without the leading dot), `{relpath}` (full repo-relative path without its final extension). Examples: `{dir}/{name}_test.go`, `tests/test_{name}.py`, `spec/{relpath}_spec.rb`. The sweep reports a candidate that exists on the base ref but is missing from scope.files."
         }
       }
-    },
-    "role": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "members"
-      ],
-      "properties": {
-        "members": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/member-ref"
-          }
-        }
-      }
-    },
-    "member-ref": {
-      "type": "string",
-      "pattern": "^@[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)?$",
-      "description": "GitHub user (@user) or team (@org/team) reference. Resolved against the GitHub App installation at run time."
     },
     "workflow": {
       "type": "object",
@@ -720,16 +689,14 @@
       ],
       "oneOf": [
         {
-          "description": "Approval gate \u2014 blocks until an approver acts. It declares EXACTLY ONE approval predicate: either the legacy `approvers` role allow-list (GitHub-handle based) or the forge-neutral `approvals` block (E39.2 / #1707). The inner oneOf enforces the mutual exclusion in the schema itself \u2014 a gate carrying both, or neither, is rejected \u2014 so an approval gate is never a no-op and never ambiguously double-declared.",
+          "description": "Approval gate \u2014 blocks until an approver acts. It declares EXACTLY ONE approval predicate: the forge-neutral `approvals` block (E39.2 / #1707), which `approvals` appears in this branch's `required` list so an approval gate is never a no-op. The legacy GitHub-handle `approvers` role allow-list was REMOVED in workflow-v2 (E52.2 / #2214) \u2014 `approvals` is the sole approval predicate at major 2. v0 and v1 still accept both forms; see workflow-v1.md's 'Approval gate predicate (v1)' for the two-form v0/v1 grammar.",
           "required": [
-            "type"
+            "type",
+            "approvals"
           ],
           "properties": {
             "type": {
               "const": "approval"
-            },
-            "approvers": {
-              "$ref": "#/$defs/approvers"
             },
             "approvals": {
               "$ref": "#/$defs/approvals"
@@ -741,19 +708,7 @@
             "operator_agent": {
               "$ref": "#/$defs/operator_agent"
             }
-          },
-          "oneOf": [
-            {
-              "required": [
-                "approvers"
-              ]
-            },
-            {
-              "required": [
-                "approvals"
-              ]
-            }
-          ]
+          }
         },
         {
           "description": "Check gate \u2014 placeholder for workflows that delegate to GitHub branch protection (ADR-017 / #249). Carries no fields in v0.2; the merge-readiness signal lives in branch protection / rulesets, not in the spec.",
@@ -866,40 +821,13 @@
         }
       }
     },
-    "approvers": {
-      "type": "object",
-      "description": "Either any_of (one approver suffices) or all_of (every named role must approve).",
-      "additionalProperties": false,
-      "minProperties": 1,
-      "maxProperties": 1,
-      "properties": {
-        "any_of": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "pattern": "^[a-z][a-z0-9_]*$"
-          }
-        },
-        "all_of": {
-          "type": "array",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "pattern": "^[a-z][a-z0-9_]*$"
-          }
-        }
-      }
-    },
     "approvals": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "count"
       ],
-      "description": "Forge-neutral approval predicate for an approval gate (E39.2 / #1707). An additive, optional alternative to the legacy GitHub-handle `approvers` allow-list: a gate declares EXACTLY ONE of the two (the gate's inner oneOf enforces the mutual exclusion), so every existing approvers-only gate stays valid. `count` is REQUIRED (matching ADR-055's ratified preset default `approvals: {count: 1, not: [author, agent]}`, where count is always explicit) so an empty `approvals: {}` is a no-op and fails validation. The predicate fields carry no repo-specific @-handle, keeping the block forge-neutral; `min_permission` and `member_of` are annotated `x-intended-required` (optional now, intended to become required in a future major). Accepted whenever present under workflow-v2.",
+      "description": "Forge-neutral approval predicate for an approval gate (E39.2 / #1707). At workflow-v2 it is the SOLE approval predicate (E52.2 / #2214): the legacy GitHub-handle `approvers` role allow-list was removed, so the gate approval branch lists `approvals` in its `required` set — an approval gate always declares exactly this block and is never a no-op. (v0 and v1 still accept both forms and enforce mutual exclusion via an inner oneOf.) `count` is REQUIRED (matching ADR-055's ratified preset default `approvals: {count: 1, not: [author, agent]}`, where count is always explicit) so an empty `approvals: {}` is a no-op and fails validation. The predicate fields carry no repo-specific @-handle, keeping the block forge-neutral; `min_permission` and `member_of` are annotated `x-intended-required` (optional now, intended to become required in a future major). Accepted whenever present under workflow-v2.",
       "properties": {
         "count": {
           "type": "integer",
@@ -942,7 +870,7 @@
             "type": "string",
             "minLength": 1
           },
-          "description": "Explicit approver subjects as plain forge-neutral strings (NOT the GitHub-specific @-prefixed member-ref used by the legacy roles.members path), keeping the approvals block forge-neutral."
+          "description": "Explicit approver subjects as plain forge-neutral strings (plain identifiers, NOT GitHub-specific @-prefixed handles), keeping the approvals block forge-neutral."
         }
       }
     },
