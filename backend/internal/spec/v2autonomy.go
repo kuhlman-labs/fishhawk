@@ -212,7 +212,13 @@ func (m ActionMatrix) MarshalJSON() ([]byte, error) {
 		}
 		out[k] = v
 	}
-	if len(m.PageHumanOn) > 0 {
+	// Emit an explicit EMPTY page list too: nil vs non-nil-empty is
+	// load-bearing. A non-nil empty page_human_on is a deliberate "page on
+	// NOTHING" override that resolveBlock honours (it overrides the tier's
+	// list); guarding on len() > 0 would drop it, so a round trip would decode
+	// back to nil and silently fall through to the tier's page list — losing
+	// the override. Guard on nil so the round trip is symmetric.
+	if m.PageHumanOn != nil {
 		out["page_human_on"] = m.PageHumanOn
 	}
 	if m.ModelPolicy != nil {
@@ -530,9 +536,17 @@ func deriveV2Autonomy(s *Spec) error {
 // Plus one placement rule: min_severity governs the fixup threshold and is
 // accepted on that class only.
 //
-// `mode: gated` and `mode: report` on an unknown class are ACCEPTED
-// (ADR-065 extensibility) and are fail-closed by construction: neither
-// maps to a knob, so neither delegates anything.
+// And one report rule: a `mode: report` entry that declares a `when` must
+// name THIS class's own condition (a foreign or extension-class `when` is
+// rejected) — the same per-class binding auto enforces, so a report entry
+// the firing arm cannot evaluate is refused at validation rather than
+// silently dropped at fire time. A `mode: report` entry with NO `when` is
+// always accepted: it fires on gate-live.
+//
+// `mode: gated` on an unknown class, and a bare `mode: report` (no `when`)
+// on an unknown class, are ACCEPTED (ADR-065 extensibility) and are
+// fail-closed by construction: neither maps to a knob, so neither delegates
+// anything.
 func validateAutonomy(m *ActionMatrix, path string) *ValidationError {
 	if m == nil {
 		return nil
@@ -548,6 +562,30 @@ func validateAutonomy(m *ActionMatrix, path string) *ValidationError {
 			return &ValidationError{
 				Path:    fmt.Sprintf("%s/actions/%s/min_severity", path, name),
 				Message: fmt.Sprintf("min_severity is accepted on the %q action class only (it tunes convergent_concerns' open-concern threshold); %q declares it", ActionFixup, name),
+			}
+		}
+		// mode: report MAY omit `when` (it fires on gate-live). When it
+		// declares one, the per-class binding the schema documents as
+		// backend-enforced applies to report as well: the `when` must name
+		// THIS class's own condition. A foreign or extension-class `when`
+		// names a predicate the report-firing arm cannot evaluate against
+		// this gate, and would otherwise be accepted here but silently
+		// DROPPED at firing time (never surfacing a proposal). Reject it at
+		// validation so report-mode firing is correct for every schema-valid
+		// `when` value a document can carry.
+		if e.Mode == ModeReport && e.When != "" {
+			want, known := classConditions[name]
+			if !known {
+				return &ValidationError{
+					Path:    fmt.Sprintf("%s/actions/%s/when", path, name),
+					Message: fmt.Sprintf("action class %q is an extension class with no backend-evaluable condition, so it cannot declare a `when` at mode: report; drop the `when` (a bare mode: report fires on gate-live), or use one of the known classes: %s", name, formatKnownActions()),
+				}
+			}
+			if e.When != want {
+				return &ValidationError{
+					Path:    fmt.Sprintf("%s/actions/%s/when", path, name),
+					Message: fmt.Sprintf("action class %q declares mode: report with when: %s, which is not its condition; %q accepts only when: %s (or no `when`, to fire on gate-live)", name, e.When, name, want),
+				}
 			}
 		}
 		if e.Mode != ModeAuto {

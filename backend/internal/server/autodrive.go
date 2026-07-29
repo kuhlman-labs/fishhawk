@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -629,10 +631,17 @@ func (s *Server) reportMatrixProposals(ctx context.Context, runRow *run.Run, id 
 		if !known {
 			continue
 		}
-		occurrence, live := reportGateOccurrence(action, runRow, stages, open)
+		occurrence, anchor, live := reportGateOccurrence(action, runRow, stages, open)
 		if !live {
 			continue
 		}
+		// Fold a re-open discriminator into the occurrence key so a gate that
+		// CLOSED and RE-OPENED on a fresh review round (a fix-up round trip) is
+		// a DISTINCT occurrence and re-surfaces the proposal, while a gate that
+		// stays continuously live keeps ONE key across polls (at most once per
+		// genuine occurrence). This is what keeps a required proposal from being
+		// suppressed on a later, materially-changed occurrence of the same gate.
+		occurrence = s.reportOccurrenceKey(ctx, runRow, anchor, occurrence)
 		// A declared `when` must be MET. A report entry whose `when` names
 		// another class's condition produces no Reports decision at all, so the
 		// not-found branch is the same fail-closed skip.
@@ -642,19 +651,42 @@ func (s *Server) reportMatrixProposals(ctx context.Context, runRow *run.Run, id 
 				continue
 			}
 		}
-		emitted, err := s.reportAlreadyEmitted(ctx, runRow, action, occurrence)
-		if err != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: read run_auto_driven for report dedupe failed; skipping report",
-				slog.String("run_id", runRow.ID.String()), slog.String("action", action), slog.String("error", err.Error()))
-			continue
-		}
-		if emitted {
-			continue
-		}
 		note := "mode: report — " + action + " proposed at a live gate (no action taken)"
-		if err := s.appendRunAutoDrivenReport(ctx, runRow, id, action, entry, occurrence, note); err != nil {
+		// Serialize the dedupe-check -> append critical section per run so two
+		// concurrent AutoDriveRunGate callers in THIS process (the POST
+		// /auto-drive endpoint and the campaign driver) cannot both observe "no
+		// row yet" for the same (run, occurrence, class) and both append,
+		// duplicating the act:report row (binding condition 2 under concurrency).
+		// A cross-PROCESS guarantee needs a DB uniqueness constraint on the row;
+		// this closes the realistic single-process race.
+		appended, readErr, appendErr := func() (bool, error, error) {
+			lock := reportEmitLockFor(runRow.ID)
+			lock.Lock()
+			defer lock.Unlock()
+			emitted, err := s.reportAlreadyEmitted(ctx, runRow, action, occurrence)
+			if err != nil {
+				return false, err, nil
+			}
+			if emitted {
+				return false, nil, nil
+			}
+			if err := s.appendRunAutoDrivenReport(ctx, runRow, id, action, entry, occurrence, note); err != nil {
+				return false, nil, err
+			}
+			return true, nil, nil
+		}()
+		if readErr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: read run_auto_driven for report dedupe failed; skipping report",
+				slog.String("run_id", runRow.ID.String()), slog.String("action", action), slog.String("error", readErr.Error()))
+			continue
+		}
+		if appendErr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelError, "auto-drive: append run_auto_driven report row failed",
-				slog.String("run_id", runRow.ID.String()), slog.String("action", action), slog.String("error", err.Error()))
+				slog.String("run_id", runRow.ID.String()), slog.String("action", action), slog.String("error", appendErr.Error()))
+			continue
+		}
+		if !appended {
+			// Already reported this occurrence — fall through to the next class.
 			continue
 		}
 		return AutoDriveOutcome{Reported: true, Action: action, Note: note}, true
@@ -662,51 +694,117 @@ func (s *Server) reportMatrixProposals(ctx context.Context, runRow *run.Run, id 
 	return AutoDriveOutcome{}, false
 }
 
-// reportGateOccurrence answers "is this action's gate live right now, and
-// WHICH occurrence of it is this" — the identity the report row is deduped
-// on. The occurrence is the gate-bearing stage plus its state (or the run,
-// for the run-level merge gate), so one live gate reports once while a later
-// gate of the same class reports again.
+// reportGateOccurrence answers "is this action's gate live right now, WHICH
+// occurrence of it is this, and which STAGE anchors it" — the base identity
+// the report row is deduped on. The base occurrence is the gate-bearing stage
+// plus its state (or the run, for the run-level merge gate), so one live gate
+// reports once while a later gate of the same class reports again. The
+// returned anchor stage (nil for the run-level merge gate) lets the caller
+// fold a re-open discriminator into the key (reportOccurrenceKey).
 //
 // Liveness reuses the same evaluator-independent double-gate derivations the
 // delegated arms use, so a proposal is only ever surfaced where the
 // corresponding action could actually be taken. waive is anchored to the
 // stage parked at the approval gate where a waive decision is taken, which
 // is also why a run parked at awaiting_input surfaces nothing.
-func reportGateOccurrence(action string, runRow *run.Run, stages []*run.Stage, open []*concern.Concern) (string, bool) {
+func reportGateOccurrence(action string, runRow *run.Run, stages []*run.Stage, open []*concern.Concern) (string, *run.Stage, bool) {
 	switch action {
 	case delegation.ActionApprove:
 		if gated := gatedReviewStage(stages); gated != nil {
-			return stageOccurrence(gated), true
+			return stageOccurrence(gated), gated, true
 		}
 	case delegation.ActionRouteFixup:
 		if impl := implementStage(stages); impl != nil && fixupEligibleState(impl, stages) && len(open) > 0 {
-			return stageOccurrence(impl), true
+			return stageOccurrence(impl), impl, true
 		}
 	case delegation.ActionWaive:
 		if gated := currentApprovalGateStage(stages); gated != nil && len(open) > 0 {
-			return stageOccurrence(gated), true
+			return stageOccurrence(gated), gated, true
 		}
 	case delegation.ActionRetry:
 		if failed := retryableFailedStage(stages); failed != nil {
-			return stageOccurrence(failed), true
+			return stageOccurrence(failed), failed, true
 		}
 	case delegation.ActionMerge:
 		if mergeGateReady(runRow, stages) {
-			return "run:" + runRow.ID.String() + ":merge_ready", true
+			return "run:" + runRow.ID.String() + ":merge_ready", nil, true
 		}
 	}
-	return "", false
+	return "", nil, false
 }
 
-// stageOccurrence names one occurrence of a stage-anchored gate: the stage
-// plus the state it is parked in. A gate that closes and re-opens into the
-// same state on the same stage (a fix-up round trip) is deliberately treated
-// as the SAME occurrence — duplicate suppression is the point of the
-// idempotency rule, and a second identical proposal tells the operator
-// nothing the first did not.
+// stageOccurrence names the BASE identity of a stage-anchored gate: the stage
+// plus the state it is parked in. On its own this key treats a gate that
+// closes and re-opens into the same state on the same stage (a fix-up round
+// trip) as the SAME occurrence — which would suppress a fresh proposal even
+// after the gate's evidence (the review round) materially changed. That is
+// why reportOccurrenceKey folds the review-round count on top of this base:
+// the base holds duplicate poll cycles to one row; the round makes a genuine
+// re-opening a distinct occurrence.
 func stageOccurrence(st *run.Stage) string {
 	return "stage:" + st.ID.String() + ":" + string(st.State)
+}
+
+// reportOccurrenceKey folds a re-open discriminator into a REVIEW-anchored
+// gate's base occurrence key. A gate that closes and re-opens on a fresh
+// review round (a fix-up round trip that produced a new *_review_started
+// round) advances the round count and is therefore a DISTINCT occurrence, so
+// the proposal re-surfaces — while a gate that stays continuously live keeps
+// ONE key across polls, so a report is still emitted at most once per genuine
+// occurrence. Non-review gates (a run-level merge, a failed-stage retry with
+// no review surface) have no round to fold and keep the base key.
+func (s *Server) reportOccurrenceKey(ctx context.Context, runRow *run.Run, anchor *run.Stage, base string) string {
+	round, ok := s.reviewRoundCount(ctx, runRow.ID, anchor)
+	if !ok {
+		return base
+	}
+	return base + ":round:" + strconv.Itoa(round)
+}
+
+// reviewRoundCount returns the number of review rounds started for the anchor
+// stage (the count of its *_review_started audit entries), and ok=false when
+// the anchor is nil, its stage type carries no review surface (only plan and
+// implement stages do), no round has started, or the audit read fails. A read
+// failure returning ok=false keeps the BASE key, which at worst under-emits a
+// re-surfaced proposal — the safe direction (silence, never a flood).
+func (s *Server) reviewRoundCount(ctx context.Context, runID uuid.UUID, anchor *run.Stage) (int, bool) {
+	if anchor == nil {
+		return 0, false
+	}
+	var startedCat string
+	switch anchor.Type {
+	case run.StageTypePlan:
+		startedCat = "plan_review_started"
+	case run.StageTypeImplement:
+		startedCat = "implement_review_started"
+	default:
+		return 0, false
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, startedCat)
+	if err != nil || len(entries) == 0 {
+		return 0, false
+	}
+	return len(entries), true
+}
+
+// reportEmitStripes bounds the report-emission lock set. A fixed stripe count
+// (rather than a per-run map that grows without bound) keeps the lock memory
+// constant regardless of how many runs the process ever drives; two unrelated
+// runs colliding on a stripe only briefly serialize their (rare) report
+// emission, which is harmless.
+const reportEmitStripes = 64
+
+var reportEmitMu [reportEmitStripes]sync.Mutex
+
+// reportEmitLockFor returns the stripe mutex guarding a run's report
+// dedupe-check -> append critical section. See reportMatrixProposals for why
+// the section is serialized.
+func reportEmitLockFor(runID uuid.UUID) *sync.Mutex {
+	var h uint32
+	for _, b := range runID {
+		h = h*31 + uint32(b)
+	}
+	return &reportEmitMu[h%reportEmitStripes]
 }
 
 // currentApprovalGateStage returns the lowest-sequence stage parked at an

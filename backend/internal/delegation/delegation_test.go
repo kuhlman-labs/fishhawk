@@ -1507,11 +1507,22 @@ func TestEvaluate_ReportMode_Evaluated(t *testing.T) {
 // ANOTHER class's condition produces no report decision — fail-closed,
 // because this evaluator answers the class's own predicate, not the one the
 // author named.
+//
+// This is now DEFENSE IN DEPTH: parse-time validation rejects a foreign-`when`
+// report entry outright (pinned in backend/internal/spec by
+// TestParseV2_RejectsReportEntryWithForeignWhen), so a foreign-`when` report
+// entry can no longer reach the evaluator through ParseBytes. The matrix here
+// is therefore constructed DIRECTLY, bypassing validation, to keep the
+// evaluator's own fail-closed branch covered.
 func TestEvaluate_ReportMode_ForeignConditionRefused(t *testing.T) {
-	wf := parseV2Workflow(t, `    actions:
-      waive:
-        mode: report
-        when: infra_flake`)
+	wf := &spec.Workflow{
+		Actions: &spec.ActionMatrix{Classes: map[string]spec.ActionEntry{
+			spec.ActionWaive: {Mode: spec.ModeReport, When: spec.ConditionInfraFlake},
+		}},
+	}
+	// A non-nil derived block makes the workflow delegation-configured so the
+	// evaluator resolves the matrix rather than short-circuiting.
+	wf.OperatorAgent = spec.DerivedOperatorAgent(spec.ResolveAutonomy(wf, nil))
 	ev := &Evaluator{
 		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
 		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -1345,6 +1346,105 @@ func TestAutoDrive_ReportMode_EmitsAtMostOncePerGateOccurrence(t *testing.T) {
 	}
 }
 
+// TestAutoDrive_ReportMode_ReopenedGateResurfaces is binding condition 2's
+// counterpart to the flooding guard: the idempotency key holds ONE row per
+// gate OCCURRENCE, not one for the life of the stage. A gate that closes and
+// re-opens on a FRESH review round (a fix-up round trip) is a NEW occurrence
+// and MUST re-surface the proposal — otherwise an operator relying on report
+// mode never sees the proposal for the materially-changed round.
+func TestAutoDrive_ReportMode_ReopenedGateResurfaces(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+
+	// First occurrence: the plan gate is live on its first review round.
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 1: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 1 outcome = %+v, want reported", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after pass 1 = %d, want 1", n)
+	}
+	// A re-poll of the SAME occurrence adds nothing (the flooding guard).
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate re-poll: %v", err)
+	}
+	if out.Reported {
+		t.Fatalf("re-poll outcome = %+v, want no second report on the same occurrence", out)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Fatalf("act:report rows after re-poll = %d, want still 1", n)
+	}
+
+	// The gate closes and RE-OPENS on a fresh review round (a fix-up round
+	// trip). The new round is a DISTINCT occurrence: the proposal re-surfaces.
+	seedReviewEntry(t, au, runID, 4, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	out, err = s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate pass 2: %v", err)
+	}
+	if !out.Reported {
+		t.Fatalf("pass 2 outcome = %+v, want the proposal re-surfaced on the new occurrence", out)
+	}
+	if n := countReportRows(t, au); n != 2 {
+		t.Errorf("act:report rows after re-open = %d, want 2 (one per occurrence; acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
+// TestReportMatrixProposals_ConcurrentEmitsOnce is binding condition 2 under
+// CONCURRENCY (the POST /auto-drive endpoint and the campaign driver are both
+// in-process callers): many concurrent report evaluations of the same live
+// gate must still leave exactly ONE act:report row. A read-then-append with no
+// serialization lets two callers both observe "no row yet" and both append;
+// the dedupe-check -> append section is stripe-locked per run, so the race
+// resolves to a single row and a single Reported outcome.
+func TestReportMatrixProposals_ConcurrentEmitsOnce(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, v2ReportSpecYAML(`    autonomy: medium
+    actions:
+      approve:
+        mode: report`))
+	seedCleanPlanApproval(t, au, runID)
+	runRow := getRun(t, repo, runID)
+	res, _, ok := s.evaluateRunDelegation(context.Background(), runRow, nil)
+	if !ok || res == nil {
+		t.Fatalf("evaluateRunDelegation ok=%v res=%v", ok, res)
+	}
+
+	const drivers = 12
+	var wg sync.WaitGroup
+	reported := make([]bool, drivers)
+	wg.Add(drivers)
+	for i := 0; i < drivers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			out, _ := s.reportMatrixProposals(context.Background(), runRow, campaignOperatorIdentity(), res, stages, nil)
+			reported[i] = out.Reported
+		}(i)
+	}
+	wg.Wait()
+
+	got := 0
+	for _, r := range reported {
+		if r {
+			got++
+		}
+	}
+	if got != 1 {
+		t.Errorf("reported outcomes = %d across %d concurrent drivers, want 1", got, drivers)
+	}
+	if n := countReportRows(t, au); n != 1 {
+		t.Errorf("act:report rows = %d after concurrent drivers, want exactly 1 (acts = %v)", n, autoDrivenActs(t, au))
+	}
+}
+
 // TestAutoDriveRunGate_ReportMode_ExtensionClassNeverReports: an extension
 // class has no backend-observable gate, so it can never be live and never
 // reports — the same fail-closed-by-construction posture that rejects
@@ -1519,7 +1619,7 @@ func TestReportGateOccurrence_PerClassLiveness(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			occ, live := reportGateOccurrence(tc.action, tc.runRow, tc.stages, tc.open)
+			occ, anchor, live := reportGateOccurrence(tc.action, tc.runRow, tc.stages, tc.open)
 			if live != tc.wantLive {
 				t.Fatalf("live = %v, want %v (occurrence %q)", live, tc.wantLive, occ)
 			}
@@ -1527,7 +1627,13 @@ func TestReportGateOccurrence_PerClassLiveness(t *testing.T) {
 				if occ != "" {
 					t.Errorf("occurrence = %q on a non-live gate, want empty", occ)
 				}
+				if anchor != nil {
+					t.Errorf("anchor = %+v on a non-live gate, want nil", anchor)
+				}
 				return
+			}
+			if anchor != tc.wantAnchor {
+				t.Errorf("anchor = %+v, want %+v", anchor, tc.wantAnchor)
 			}
 			want := "run:" + tc.runRow.ID.String() + ":merge_ready"
 			if tc.wantAnchor != nil {

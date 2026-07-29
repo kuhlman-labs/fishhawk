@@ -196,6 +196,50 @@ func TestActionMatrix_MarshalDropsReservedKeyCollision(t *testing.T) {
 	}
 }
 
+// TestActionMatrix_MarshalPreservesExplicitEmptyPageList pins the nil-vs-empty
+// distinction the symmetric round-trip turns on. A NON-nil empty
+// page_human_on is a deliberate "page on NOTHING" override that resolveBlock
+// honours (it overrides the tier's list); guarding the marshaller on len() > 0
+// would drop it, and the round trip would decode back to nil — silently
+// falling through to the tier's page list and losing the override. A nil page
+// list is still omitted (absence, not an override).
+func TestActionMatrix_MarshalPreservesExplicitEmptyPageList(t *testing.T) {
+	explicitEmpty := ActionMatrix{
+		Classes:     map[string]ActionEntry{ActionMerge: {Mode: ModeAuto, When: ConditionGatesResolvedCIGreen}},
+		PageHumanOn: []string{},
+	}
+	out, err := json.Marshal(explicitEmpty)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "page_human_on") {
+		t.Errorf("marshalled matrix = %s, want an explicit empty page_human_on emitted", out)
+	}
+	var back ActionMatrix
+	if err := json.Unmarshal(out, &back); err != nil {
+		t.Fatalf("Unmarshal(round-trip): %v", err)
+	}
+	if back.PageHumanOn == nil {
+		t.Error("round-trip PageHumanOn = nil, want a non-nil empty slice — the explicit override was lost")
+	}
+	if len(back.PageHumanOn) != 0 {
+		t.Errorf("round-trip PageHumanOn = %v, want empty", back.PageHumanOn)
+	}
+	if !reflect.DeepEqual(back, explicitEmpty) {
+		t.Errorf("round-trip = %+v, want %+v", back, explicitEmpty)
+	}
+
+	// A nil page list is absence, not an override, and stays omitted.
+	nilList := ActionMatrix{Classes: map[string]ActionEntry{ActionApprove: {Mode: ModeGated}}}
+	nilOut, err := json.Marshal(nilList)
+	if err != nil {
+		t.Fatalf("Marshal(nil list): %v", err)
+	}
+	if strings.Contains(string(nilOut), "page_human_on") {
+		t.Errorf("marshalled matrix = %s, want no page_human_on for a nil list", nilOut)
+	}
+}
+
 // TestActionMatrix_UnmarshalRejectsMalformed covers the three error branches
 // of the partitioning decoder: a non-object matrix, a malformed reserved key
 // and a malformed class entry, each reported naming the offending property.
@@ -591,6 +635,79 @@ func TestParseV2_RejectsInvalidAutoEntries(t *testing.T) {
 			}
 			if !strings.Contains(ve.Path, "/actions/") {
 				t.Errorf("path = %q, want it to locate the offending class entry", ve.Path)
+			}
+		})
+	}
+}
+
+// TestParseV2_RejectsReportEntryWithForeignWhen pins the report-firing
+// correctness rule: a `mode: report` entry MAY omit `when` (it fires on
+// gate-live), but when it declares one the per-class binding applies — the
+// `when` must name THIS class's own condition. A foreign or extension-class
+// `when` is a predicate the report arm cannot evaluate against this gate;
+// accepting it and silently dropping it at fire time would make the proposal
+// never surface, so it is rejected at validation instead.
+func TestParseV2_RejectsReportEntryWithForeignWhen(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body      string
+		wantParts []string
+	}{
+		"known class at report with the wrong when": {
+			body: `    actions:
+      approve:
+        mode: report
+        when: infra_flake
+`,
+			wantParts: []string{`"approve"`, "mode: report", "infra_flake", "clean_dual_approval"},
+		},
+		"extension class at report with a when": {
+			body: `    actions:
+      promote:
+        mode: report
+        when: clean_dual_approval
+`,
+			wantParts: []string{`"promote"`, "extension class", "no backend-evaluable condition", "gate-live"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseBytes(v2Doc(tc.body))
+			if err == nil {
+				t.Fatal("ParseBytes = nil error, want a rejection")
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("error = %T (%v), want *ValidationError", err, err)
+			}
+			for _, want := range tc.wantParts {
+				if !strings.Contains(ve.Message, want) {
+					t.Errorf("message = %q, want it to contain %q", ve.Message, want)
+				}
+			}
+			if !strings.Contains(ve.Path, "/actions/") || !strings.Contains(ve.Path, "/when") {
+				t.Errorf("path = %q, want it to locate the offending report `when`", ve.Path)
+			}
+		})
+	}
+}
+
+// TestParseV2_AcceptsReportEntryWithOwnWhen is the positive companion: a
+// report entry naming its class's OWN condition is legal (it fires on gate-live
+// AND the condition met), and a bare report entry with no `when` is legal too.
+func TestParseV2_AcceptsReportEntryWithOwnWhen(t *testing.T) {
+	for name, body := range map[string]string{
+		"own condition": `    actions:
+      approve:
+        mode: report
+        when: clean_dual_approval
+`,
+		"no when": `    actions:
+      approve:
+        mode: report
+`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseBytes(v2Doc(body)); err != nil {
+				t.Fatalf("ParseBytes = %v, want the report entry accepted", err)
 			}
 		})
 	}

@@ -88,7 +88,7 @@ workflows:
 | `report` | The operator agent surfaces a **proposal** and does not act. It records a `run_auto_driven` attribution row with `act: report`; the run does **not** park on it and no gate action is dispatched. |
 | `auto` | The operator agent may act without paging — the only mode that widens authority, and the only one that requires a condition. |
 
-**When a `report` entry fires:** when the gate is **live**, and — only when the entry declares a `when` — additionally when that condition is met. A bare `report` entry with no `when` therefore surfaces whenever the gate is reachable; requiring a condition that need not exist would make the mode inert. The row is emitted **at most once per gate occurrence per class**, so a gate a human takes an hour to reach produces one row, not one per poll cycle.
+**When a `report` entry fires:** when the gate is **live**, and — only when the entry declares a `when` — additionally when that condition is met. A bare `report` entry with no `when` therefore surfaces whenever the gate is reachable; requiring a condition that need not exist would make the mode inert. A `when` declared on a `report` entry is subject to the **same per-class binding** as `mode: auto`: it must name that class's own condition (a foreign or extension-class `when` is rejected — see below). The row is emitted **at most once per gate occurrence per class**. A gate occurrence spans one opening of the gate: a gate a human takes an hour to reach produces one row, not one per poll cycle, while a gate that **closes and re-opens on a fresh review round** (a fix-up round trip) is a new occurrence and re-surfaces the proposal.
 
 ### `mode: auto` requires a condition
 
@@ -102,11 +102,12 @@ Each known action class has exactly **one** backend-evaluable condition — the 
 | `retry` | `infra_flake` | `may_retry` |
 | `merge` | `gates_resolved_ci_green` | `may_merge` |
 
-Three documents are rejected with a message naming the class:
+Four documents are rejected with a message naming the class:
 
 - `mode: auto` with **no** `when`,
 - `mode: auto` whose `when` is another class's condition,
-- `mode: auto` on an **extension** class (below), which has no backend-evaluable condition at all.
+- `mode: auto` on an **extension** class (below), which has no backend-evaluable condition at all,
+- `mode: report` that declares a `when` which is **not that class's own condition** (a foreign condition, or any `when` on an extension class). A bare `report` with no `when` is always accepted (it fires on gate-live); a declared `when` must name the class's own condition, so a proposal the report arm cannot evaluate is refused at validation rather than silently dropped at fire time.
 
 These rules are enforced by the **backend**, not by JSON Schema: the class-name set is open, so no schema keyword can bind a condition to a class the schema does not enumerate. A raw `check-jsonschema` run therefore accepts a document the backend rejects. `min_severity` is likewise accepted on the `fixup` class only.
 

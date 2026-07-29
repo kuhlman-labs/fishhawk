@@ -2182,6 +2182,77 @@ func TestGetRun_Delegation_V2AutonomyMatrix_SpecToWire(t *testing.T) {
 	}
 }
 
+// v2AllGatedSpecYAML is an all-gated v2 workflow (`autonomy: low`): every
+// action class resolves to `mode: gated`, so the derived OperatorAgent carries
+// an EMPTY knob for all five verbs — the all-gated-equals-knob-absence case.
+const v2AllGatedSpecYAML = `version: "2"
+workflows:
+  feature_change:
+    autonomy: low
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestCheckDelegation_AllGatedV2_RefusesEveryPath is AC5's missing per-path
+// refusal assertion. The plan claimed each of the five enforcement paths is
+// asserted to refuse when its class is gated, but only the delegated approve
+// path was driven end-to-end; the other four (route_fixup, waive, retry,
+// merge) were covered only transitively. All five funnel through
+// checkDelegation, so this drives it directly for every verb against an
+// all-gated (`autonomy: low`) v2 run and asserts each REFUSES with 403
+// delegation_not_configured — the derived empty knob delegating nothing.
+func TestCheckDelegation_AllGatedV2_RefusesEveryPath(t *testing.T) {
+	s, repo, _, _, _ := newDelegatedApprovalServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": v2AllGatedSpecYAML,
+	})
+
+	for _, action := range []string{
+		delegation.ActionApprove,
+		delegation.ActionRouteFixup,
+		delegation.ActionWaive,
+		delegation.ActionRetry,
+		delegation.ActionMerge,
+	} {
+		t.Run(action, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest(http.MethodPost, "/", nil)
+			rule, ok := s.checkDelegation(w, r, runID, action)
+			if ok || rule != "" {
+				t.Fatalf("checkDelegation(%s) = (%q, %v), want refused", action, rule, ok)
+			}
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+			}
+			if errBody := decodeErrorEnvelope(t, w); errBody.Code != "delegation_not_configured" {
+				t.Errorf("code = %q, want delegation_not_configured", errBody.Code)
+			}
+		})
+	}
+}
+
 // TestDelegationPayload_V0CampaignOverride_ByteIdentical is the binding
 // approval condition 3 assertion: a v0/v1 run DRIVEN BY A CAMPAIGN OVERRIDE
 // must serialize byte-identically to the same run driven by the same block

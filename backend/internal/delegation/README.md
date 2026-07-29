@@ -18,7 +18,7 @@ A workflow-v2 document declares delegation as an `autonomy` tier plus an `action
 
 - `Result.Tier` — the declared tier, empty when only `actions` was declared, under a campaign override, and for every v0/v1 knob block.
 - `Result.Matrix` — the RESOLVED matrix: every class with its mode (`report | gated | auto`), condition, `min_severity` and provenance `Source` (`explicit | tier | default`). `Decision.Mode` / `Decision.Source` carry the same provenance onto each evaluated action.
-- `Result.Reports` — the evaluation of `mode: report` classes that declared a `when`. Kept OUT of the decision set because report delegates nothing; a `when` naming ANOTHER class's condition produces no entry at all (fail-closed — this package would otherwise answer a predicate the author did not name).
+- `Result.Reports` — the evaluation of `mode: report` classes that declared a `when`. Kept OUT of the decision set because report delegates nothing; a `when` naming ANOTHER class's condition produces no entry at all (fail-closed — this package would otherwise answer a predicate the author did not name). Parse-time validation now REJECTS a foreign-`when` report entry outright (`backend/internal/spec` `validateAutonomy`), so this evaluator branch is defense-in-depth: a validated v2 spec never reaches it.
 
 **The DECISION SET is deliberately unchanged**: `Actions` still carries one entry per class the effective block actually delegates, so an all-`gated` matrix yields ZERO decisions exactly as a knob-absent v0 block does. The matrix changed; what is delegated did not.
 
