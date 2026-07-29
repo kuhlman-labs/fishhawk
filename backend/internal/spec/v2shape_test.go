@@ -622,10 +622,18 @@ workflows:
 // TestValidate_DiffCoveragePathsAreVersionAware pins the #1888 messages
 // verbatim at both path forms.
 func TestValidate_DiffCoveragePathsAreVersionAware(t *testing.T) {
+	// Every fixture declares the pull_request artifact — including the
+	// acceptance-stage one, which also keeps its own acceptance artifact.
+	// E52.7 / #2219 binds post-hoc diff constraints to the PRODUCED artifact
+	// at major >= 2 and reports that violation BEFORE the #1888 stage-type
+	// check, so a v2 stage declaring no pull_request never reaches the
+	// implement-only message these cases pin. Declaring it is what routes each
+	// case to the #1888 branch it was written to exercise; the asserted paths
+	// and messages are unchanged.
 	v2Stage := func(stageType, reportPath string) string {
-		produces := "pull_request"
+		produces := "          - artifact: pull_request\n"
 		if stageType == "acceptance" {
-			produces = "acceptance"
+			produces += "          - artifact: acceptance\n"
 		}
 		return `version: "2"
 workflows:
@@ -641,8 +649,7 @@ workflows:
             report_path: "` + reportPath + `"
             min_new_line_coverage: 80
         produces:
-          - artifact: ` + produces + `
-`
+` + produces
 	}
 	cases := []struct {
 		name     string

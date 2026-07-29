@@ -121,7 +121,66 @@ workflows:
           agent: claude-code
 ```
 
-Sibling E52 children grow this page as they change the v2 grammar; for every member not listed under *Removed from v1* or *Reshaped from v1*, the v1 reference is authoritative.
+Sibling E52 children grow this page as they change the v2 grammar; for every member not listed under *Removed from v1*, *Reshaped from v1*, or *Stage types: propose / apply / gate*, the v1 reference is authoritative.
+
+## Stage types: propose / apply / gate
+
+The stage-type enum is **unchanged** in v2 — `plan`, `implement`, `review`, `deploy`, `acceptance`, same five tokens. What changes is what the validator reads them as (E52.7 / #2219).
+
+The v0 names were coined for code-change workflows and read as if every workflow ships a diff. They do not. **The names are retained deliberately** (ADR-067 §2 — *do not rename*: renaming would churn every existing spec, the `stages.type` column, the API and the runner for a cosmetic gain), so each type carries both readings:
+
+| Type | Code-change reading | General reading | Produces a diff? |
+|---|---|---|---|
+| `plan` | propose an implementation plan | **propose** — emit a proposal of any kind (a plan, a grooming report, a migration inventory) | no |
+| `implement` | write the code | **apply** — apply the proposed change, whether that is source edits or tracker mutations | only if it says so |
+| `review` | review the diff | **gate** — a decision point on the result | no |
+| `deploy` | delegate a release (ADR-038) | unchanged — always delegating | no (delegated) |
+| `acceptance` | validate a running instance (ADR-049) | unchanged — emits a verdict | no |
+
+A workflow that grooms a backlog — propose a report, gate it on an approval, apply the approved mutations — is spelled with `plan` → `implement` → `review` and produces no code at any stage. Worked example: [`examples/workflow-v2-backlog-grooming.yaml`](examples/workflow-v2-backlog-grooming.yaml).
+
+### Post-hoc diff constraints bind to the produced artifact
+
+Because the type names are general, **constraint validity keys on what a stage PRODUCES, not on its type name.** At v2, a stage carrying any post-hoc diff constraint — `max_files_changed`, `forbidden_paths`, `allowed_paths`, `required_outcomes`, `diff_coverage` — must declare the `pull_request` artifact:
+
+```yaml
+# rejected at v2 — nothing to evaluate the constraint against
+- id: apply
+  type: implement
+  executor: { agent: claude-code }
+  constraints:
+    max_files_changed: 5
+
+# accepted — the stage says it produces a diff
+- id: apply
+  type: implement
+  executor: { agent: claude-code }
+  constraints:
+    max_files_changed: 5
+  produces:
+    - artifact: pull_request
+```
+
+The message names the kind and both fixes:
+
+```
+post-hoc diff constraint "max_files_changed" is valid only on a stage that produces a diff;
+stage "apply" declares no pull_request artifact (ADR-067).
+Declare produces: [{artifact: pull_request}] on this stage, or remove the constraint.
+```
+
+`pull_request` is the diff signal because it is the only artifact in the closed set that **denotes a code change**: `deployment` is delegated to an external pipeline, `acceptance` is a verdict, and `plan` is a proposal.
+
+> **An absent or empty `produces` list reads as "produces no diff."** Omitting `produces` does not exempt a stage — that is what gives the rule teeth. The permissive alternative ("absent means unknown, so allow it") would let any stage keep a diff constraint simply by staying silent, which is exactly the case this rule exists to reject. This is a real behaviour change for a v2 author, and the fix is one line: declare the artifact, or drop the constraint.
+
+**v0 and v1 are unchanged** — there the binding stays type-keyed (a post-hoc constraint is valid on any non-deploy stage). This is not an oversight: v0/v1 documents legitimately declare these constraints on an `implement` stage with no `produces` list at all, and applying the artifact-keyed rule below major 2 would newly reject valid specs. The generalization is licensed only from v2 forward (migration codemod: #2220).
+
+Two orderings are worth knowing, both contracts rather than accidents:
+
+- A **deploy** stage still gets its existing ADR-038 message (`post-hoc diff constraint is not valid on a deploy stage`), never this one.
+- A stage that DOES produce `pull_request` but is typed other than `implement` still gets the existing `diff_coverage is valid only on an implement stage` message (#1888).
+
+> **`fishhawk validate` does NOT report this binding.** `cli/internal/spec` is schema-only — no typed decode, no graph-shape pass — so like the `needs`-referent errors above, this surfaces **only server-side, at run creation**. The CLI accepts a document this rule rejects. Same asymmetry, tracked on **#2323**.
 
 ## Version routing
 
