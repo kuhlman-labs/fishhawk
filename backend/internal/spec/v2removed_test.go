@@ -157,6 +157,17 @@ func TestCheckV2RemovedForms_MatchesByKeyNameNotPosition(t *testing.T) {
 			wantMsg:  msgV2RemovedReviewersAgent,
 			wantPath: "/totally_unknown_block/reviewers/agent",
 		},
+		{
+			name: "budget.max_runtime_minutes under an unknown subtree",
+			raw: map[string]any{
+				"version": "2",
+				"totally_unknown_block": map[string]any{
+					"budget": map[string]any{"max_runtime_minutes": 15},
+				},
+			},
+			wantMsg:  msgV2RenamedBudgetMaxRuntimeMinutes,
+			wantPath: "/totally_unknown_block/budget/max_runtime_minutes",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -512,22 +523,26 @@ workflows:
 	}
 }
 
-// TestCheckV2RemovedAtNode_FixedOrder pins the report order across all four
-// forms, so a document carrying several always reports the same one.
+// TestCheckV2RemovedAtNode_FixedOrder pins the report order across all five
+// forms, so a document carrying several always reports the same one. The
+// E52.5 budget rename is appended LAST, so a node also carrying drive still
+// reports drive — proving the order contract did not shift.
 func TestCheckV2RemovedAtNode_FixedOrder(t *testing.T) {
 	node := map[string]any{
 		"must_page_human": []any{PageEventReviewerReject},
 		"reviewers":       map[string]any{"agent": 1},
 		"drive":           true,
 		"constraints":     []any{map[string]any{"max_files_changed": 1}},
+		"budget":          map[string]any{"max_runtime_minutes": 15},
 	}
 	order := []string{
 		msgV2RemovedReviewerReject,
 		msgV2RemovedReviewersAgent,
 		msgV2RenamedDrive,
 		msgV2ReshapedConstraints,
+		msgV2RenamedBudgetMaxRuntimeMinutes,
 	}
-	keys := []string{"must_page_human", "reviewers", "drive", "constraints"}
+	keys := []string{"must_page_human", "reviewers", "drive", "constraints", "budget"}
 	for i, want := range order {
 		got := checkV2RemovedAtNode(node, "")
 		if got == nil {
@@ -549,6 +564,85 @@ func TestCheckV2RemovedAtNode_ConstraintsObjectNotReported(t *testing.T) {
 	node := map[string]any{"constraints": map[string]any{"max_files_changed": 1}}
 	if got := checkV2RemovedAtNode(node, ""); got != nil {
 		t.Errorf("checkV2RemovedAtNode on the v2 object form = %+v, want nil", got)
+	}
+}
+
+// --- E52.5 / #2217: the RENAMED budget.max_runtime_minutes form --------------
+//
+// v2 renames budget.max_runtime_minutes to budget.max_runtime (a Go duration).
+// The schema alone rejects the legacy key as an undeclared property of an
+// additionalProperties:false block, but with a generic message naming no
+// replacement — so the sweep names it. These pin the SHIPPED actionable
+// message and its path, and the version gate that keeps v0/v1 silent.
+
+// TestCheckV2RemovedForms_BudgetMaxRuntimeMinutesRenamed asserts a v2 document
+// declaring the legacy minutes key on a stage budget is rejected with EXACTLY
+// msgV2RenamedBudgetMaxRuntimeMinutes at the offending path — not the generic
+// additionalProperties message.
+func TestCheckV2RemovedForms_BudgetMaxRuntimeMinutesRenamed(t *testing.T) {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          max_runtime_minutes: 15
+        produces:
+          - artifact: pull_request
+`
+	_, err := ParseBytes([]byte(doc))
+	if err == nil {
+		t.Fatal("ParseBytes: want an error for a v2 `budget.max_runtime_minutes` key")
+	}
+	var serr *SchemaError
+	if !errors.As(err, &serr) {
+		t.Fatalf("error = %T (%v), want *SchemaError", err, err)
+	}
+	if serr.Path != "/workflows/feature_change/stages/0/budget/max_runtime_minutes" {
+		t.Errorf("path = %q, want the stage's budget/max_runtime_minutes", serr.Path)
+	}
+	if serr.Message != msgV2RenamedBudgetMaxRuntimeMinutes {
+		t.Errorf("message = %q, want the actionable %q", serr.Message, msgV2RenamedBudgetMaxRuntimeMinutes)
+	}
+	// The generic additionalProperties message must NOT win.
+	if strings.Contains(serr.Message, "additional propert") {
+		t.Errorf("message = %q, want the sweep's actionable message, not the generic additionalProperties one", serr.Message)
+	}
+	// The message must SHOW the minutes-to-duration equivalence.
+	if !strings.Contains(serr.Message, "max_runtime: 15m") || !strings.Contains(serr.Message, "max_runtime_minutes: 15") {
+		t.Errorf("message %q should show the minutes-to-duration equivalence", serr.Message)
+	}
+}
+
+// TestCheckV2RemovedForms_BudgetRenameNeverFiresBelowMajor2 is the version
+// gate: v0 and v1 spell the runtime cap as max_runtime_minutes, so the sweep
+// must not fire on them and the value must still decode.
+func TestCheckV2RemovedForms_BudgetRenameNeverFiresBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		doc := `version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          max_runtime_minutes: 15
+        produces:
+          - artifact: pull_request
+`
+		s, err := ParseBytes([]byte(doc))
+		if err != nil {
+			t.Fatalf("version %s: ParseBytes: %v", version, err)
+		}
+		b := s.Workflows["feature_change"].Stages[0].Budget
+		if b == nil || b.MaxRuntimeMinutes != 15 {
+			t.Errorf("version %s: budget.max_runtime_minutes did not decode to 15 (%+v)", version, b)
+		}
 	}
 }
 

@@ -3856,6 +3856,24 @@ var licensedV2Deltas = []licensedDelta{
 		Issue: "#2218 (E52.6)",
 		Why:   "needs: [<stage_id>] is v2 shorthand for the common artifact-wiring case, expanded at parse time into the equivalent inputs entries",
 	},
+	// E52.5 / #2217 — the stage-budget unit unification. max_runtime_minutes
+	// is removed in favour of the Go-duration max_runtime, and limit_usd is
+	// added as the primary USD ceiling.
+	{
+		Path:  "$/$defs/budget/properties/max_runtime_minutes",
+		Issue: "#2217 (E52.5)",
+		Why:   "removed — v2 spells every duration as a Go duration string, so the bare-integer minutes form is gone (15 becomes 15m via max_runtime)",
+	},
+	{
+		Path:  "$/$defs/budget/properties/max_runtime",
+		Issue: "#2217 (E52.5)",
+		Why:   "added — the v2 spelling of the runtime cap, a Go duration string parsed by time.ParseDuration, matching policy.max_stage_runtime / executor.timeout / verify.timeout",
+	},
+	{
+		Path:  "$/$defs/budget/properties/limit_usd",
+		Issue: "#2217 (E52.5)",
+		Why:   "added — the primary per-stage USD ceiling, aligned in unit with the workflow-level periodic_budget.limit_usd",
+	},
 }
 
 // TestV2DivergesFromV1OnlyByLicensedDeltas is the re-scoped successor to
@@ -4884,6 +4902,346 @@ func TestParseV2_BacklogGroomingExample_ValidatesAndProducesNoDiff(t *testing.T)
 			if p.Artifact == spec.ArtifactPullRequest {
 				t.Errorf("stage %q declares the pull_request artifact; the example must stay a NON-code-change workflow or it stops exercising the produced-artifact binding", stage.ID)
 			}
+		}
+	}
+}
+
+// --- E52.5 / #2217: workflow-v2 budget-unit unification ----------------------
+//
+// The two tests below are the HEAD-GREEN PRESERVATION BASELINE (approval
+// condition 1). They assert ONLY behaviour that exists at unmodified HEAD —
+// that a v0/v1 stage budget still parses and that its decoded MaxTokens,
+// MaxRuntimeMinutes and Enforcement are carried verbatim — so they compile and
+// pass BEFORE any production edit in this slice. Every Budget.Runtime()
+// assertion (the new accessor) lives in TestParseV2_BudgetUnitsRoundTrip /
+// TestRuntimePrecedence / TestParseV2_AllDurationFieldsShareOneForm, added
+// after the accessor exists and making no green-before claim.
+//
+// The change under #2217 touches only the workflow-v2 GRAMMAR — no runtime
+// check reads Stage.Budget on any major — so these v0/v1 documents must keep
+// parsing byte-identically. Running them green against HEAD first is what makes
+// a later green run a preservation PROOF rather than a fresh assertion.
+
+// TestParseBytes_V0V1StageBudgetUnchanged pins that a v0.7 and a v1.6 stage
+// budget declaring the legacy integer-minutes form still parse and decode
+// their fields verbatim. HEAD-green: no Runtime() call.
+func TestParseBytes_V0V1StageBudgetUnchanged(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run("budget at "+version, func(t *testing.T) {
+			s, err := spec.ParseBytes([]byte(`version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 15
+          enforcement: advisory
+        produces:
+          - artifact: pull_request
+`))
+			if err != nil {
+				t.Fatalf("ParseBytes(version %s): %v", version, err)
+			}
+			b := s.Workflows["feature_change"].Stages[0].Budget
+			if b == nil {
+				t.Fatal("Stage.Budget = nil, want the declared block")
+			}
+			if b.MaxTokens != 200000 {
+				t.Errorf("MaxTokens = %d, want 200000", b.MaxTokens)
+			}
+			if b.MaxRuntimeMinutes != 15 {
+				t.Errorf("MaxRuntimeMinutes = %d, want 15", b.MaxRuntimeMinutes)
+			}
+			if b.Enforcement != spec.EnforcementAdvisory {
+				t.Errorf("Enforcement = %q, want %q", b.Enforcement, spec.EnforcementAdvisory)
+			}
+		})
+	}
+}
+
+// shippedBudgetDocs are the repo's own v0.x/v1.x specs that declare stage
+// budgets — the exact documents #2217's operator identified as at risk. All
+// declare max_tokens on their agent stages; none declares the v2 spellings.
+var shippedBudgetDocs = []struct {
+	name string
+	path string
+}{
+	{"workflows.yaml", "../../../.fishhawk/workflows.yaml"},
+}
+
+// TestParseBytes_ShippedSpecsAndPresetsStillParse pins that this repo's own
+// version-1.3 .fishhawk/workflows.yaml and the three embedded presets still
+// parse with their stage budgets decoded (MaxTokens / MaxRuntimeMinutes
+// populated). HEAD-green: no Runtime() call.
+func TestParseBytes_ShippedSpecsAndPresetsStillParse(t *testing.T) {
+	assertBudgetsDecoded := func(t *testing.T, name string, raw []byte) {
+		t.Helper()
+		s, err := spec.ParseBytes(raw)
+		if err != nil {
+			t.Fatalf("ParseBytes(%s): %v", name, err)
+		}
+		budgets := 0
+		for _, wf := range s.Workflows {
+			for _, st := range wf.Stages {
+				if st.Budget == nil {
+					continue
+				}
+				budgets++
+				if st.Budget.MaxTokens < 1 {
+					t.Errorf("%s stage %q: MaxTokens = %d, want the declared value decoded (>=1)", name, st.ID, st.Budget.MaxTokens)
+				}
+				if st.Budget.MaxRuntimeMinutes < 1 {
+					t.Errorf("%s stage %q: MaxRuntimeMinutes = %d, want the declared value decoded (>=1)", name, st.ID, st.Budget.MaxRuntimeMinutes)
+				}
+			}
+		}
+		if budgets == 0 {
+			t.Errorf("%s: no stage budgets decoded; the preservation test asserts nothing", name)
+		}
+	}
+
+	for _, doc := range shippedBudgetDocs {
+		t.Run(doc.name, func(t *testing.T) {
+			raw, err := os.ReadFile(doc.path)
+			if err != nil {
+				t.Fatalf("read %s: %v", doc.path, err)
+			}
+			assertBudgetsDecoded(t, doc.name, raw)
+		})
+	}
+	for _, p := range []spec.Preset{spec.PresetLow, spec.PresetMedium, spec.PresetHigh} {
+		t.Run("preset "+string(p), func(t *testing.T) {
+			raw, err := spec.PresetBytes(p)
+			if err != nil {
+				t.Fatalf("PresetBytes(%q): %v", p, err)
+			}
+			assertBudgetsDecoded(t, "preset "+string(p), raw)
+		})
+	}
+}
+
+// TestParseV2_BudgetUnitsRoundTrip is the DONE-MEANS behavioural test: a v2
+// stage budget spelling limit_usd, the Go-duration max_runtime and max_tokens
+// parses and decodes each field, with Runtime() resolving the duration. The
+// 90s value is chosen deliberately — it is INEXPRESSIBLE in the old
+// integer-minutes form, so a green result proves the parser genuinely changed
+// rather than merely still working.
+func TestParseV2_BudgetUnitsRoundTrip(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          limit_usd: 8.5
+          max_runtime: 90s
+          max_tokens: 200000
+          enforcement: advisory
+        produces:
+          - artifact: pull_request
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(v2 budget): %v", err)
+	}
+	b := s.Workflows["feature_change"].Stages[0].Budget
+	if b == nil {
+		t.Fatal("Stage.Budget = nil, want the declared block")
+	}
+	if b.LimitUSD != 8.5 {
+		t.Errorf("LimitUSD = %v, want 8.5", b.LimitUSD)
+	}
+	if b.MaxRuntime.Duration != 90*time.Second {
+		t.Errorf("MaxRuntime = %v, want 90s", b.MaxRuntime.Duration)
+	}
+	if b.MaxTokens != 200000 {
+		t.Errorf("MaxTokens = %d, want 200000", b.MaxTokens)
+	}
+	if b.Runtime() != 90*time.Second {
+		t.Errorf("Runtime() = %v, want 90s", b.Runtime())
+	}
+	if b.Enforcement != spec.EnforcementAdvisory {
+		t.Errorf("Enforcement = %q, want %q", b.Enforcement, spec.EnforcementAdvisory)
+	}
+	// The v2 spelling must NOT populate the legacy minutes field.
+	if b.MaxRuntimeMinutes != 0 {
+		t.Errorf("MaxRuntimeMinutes = %d, want 0 — a v2 document spells the runtime cap as max_runtime", b.MaxRuntimeMinutes)
+	}
+}
+
+// TestParseV2_AllDurationFieldsShareOneForm is approval CONDITION 2: acceptance
+// criterion 1 is a CROSS-FIELD claim, so ONE v2 document declares all four
+// duration surfaces — policy.max_stage_runtime, executor.timeout,
+// executor.verify.timeout and budget.max_runtime — with DISTINCT values, and
+// each must decode to its exact time.Duration through the one
+// time.ParseDuration code path. budget.max_runtime keeps a sub-minute value,
+// inexpressible in the integer-minutes form, so it proves the parser changed.
+func TestParseV2_AllDurationFieldsShareOneForm(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  feature_change:
+    policy:
+      max_stage_runtime: 30m
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: 1h
+          verify:
+            command: "make test"
+            timeout: 10m
+        budget:
+          max_runtime: 90s
+        produces:
+          - artifact: pull_request
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes(all duration fields): %v", err)
+	}
+	wf := s.Workflows["feature_change"]
+	if wf.Policy == nil || wf.Policy.MaxStageRuntime.Duration != 30*time.Minute {
+		t.Errorf("policy.max_stage_runtime = %v, want 30m", wf.Policy)
+	}
+	st := wf.Stages[0]
+	if st.Executor.Timeout.Duration != time.Hour {
+		t.Errorf("executor.timeout = %v, want 1h", st.Executor.Timeout.Duration)
+	}
+	if st.Executor.Verify == nil || st.Executor.Verify.Timeout.Duration != 10*time.Minute {
+		t.Errorf("executor.verify.timeout = %v, want 10m", st.Executor.Verify)
+	}
+	if st.Budget == nil || st.Budget.MaxRuntime.Duration != 90*time.Second {
+		t.Errorf("budget.max_runtime = %v, want 90s", st.Budget)
+	}
+	if st.Budget.Runtime() != 90*time.Second {
+		t.Errorf("budget.Runtime() = %v, want 90s", st.Budget.Runtime())
+	}
+}
+
+// TestRuntimePrecedence pins Budget.Runtime()'s resolution order: the v2
+// Go-duration MaxRuntime wins when set, else the legacy minutes convert, else
+// zero means unset.
+func TestRuntimePrecedence(t *testing.T) {
+	cases := []struct {
+		name string
+		b    spec.Budget
+		want time.Duration
+	}{
+		{"max_runtime wins over minutes", spec.Budget{MaxRuntime: spec.Duration{Duration: 90 * time.Second}, MaxRuntimeMinutes: 5}, 90 * time.Second},
+		{"minutes-only converts", spec.Budget{MaxRuntimeMinutes: 15}, 15 * time.Minute},
+		{"neither set is zero", spec.Budget{}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.b.Runtime(); got != tc.want {
+				t.Errorf("Runtime() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestParseV2_BudgetAC4PrimaryNotRequired pins the AC-4 decision behaviourally:
+// a v2 budget declaring ONLY max_tokens is valid, and one declaring ONLY
+// limit_usd is valid — limit_usd is primary but NOT required.
+func TestParseV2_BudgetAC4PrimaryNotRequired(t *testing.T) {
+	docFor := func(budget string) string {
+		return `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          ` + budget + `
+        produces:
+          - artifact: pull_request
+`
+	}
+	for _, budget := range []string{"max_tokens: 200000", "limit_usd: 8.5"} {
+		t.Run(budget, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(docFor(budget))); err != nil {
+				t.Errorf("ParseBytes(budget only %s) = %v, want nil", budget, err)
+			}
+		})
+	}
+}
+
+// TestParseV2_BudgetMaxTokensDescriptionStatesSecondaryLever is approval
+// CONDITION / AC-4: the choice must be explicit IN the shipped schema text, so
+// the assertion reads the embedded mirror rather than trusting behaviour alone.
+func TestParseV2_BudgetMaxTokensDescriptionStatesSecondaryLever(t *testing.T) {
+	v2 := decodeSchemaMirror(t, "schemas/workflow-v2.schema.json")
+	defs, _ := v2["$defs"].(map[string]any)
+	budget, _ := defs["budget"].(map[string]any)
+	props, _ := budget["properties"].(map[string]any)
+	maxTokens, _ := props["max_tokens"].(map[string]any)
+	desc, _ := maxTokens["description"].(string)
+	if !strings.Contains(desc, "SECONDARY") {
+		t.Errorf("max_tokens.description = %q, want it to state the OPTIONAL SECONDARY-lever decision", desc)
+	}
+	if !strings.Contains(desc, "limit_usd") {
+		t.Errorf("max_tokens.description = %q, want it to name limit_usd as the primary lever", desc)
+	}
+}
+
+// TestParseV2_BudgetMaxRuntimeRejectsNonDuration proves the schema pattern
+// rejects a max_runtime that is not a Go duration string — a bare integer and
+// a spaced form time.ParseDuration would reject.
+func TestParseV2_BudgetMaxRuntimeRejectsNonDuration(t *testing.T) {
+	for _, bad := range []string{`"15"`, `"30 minutes"`} {
+		t.Run(bad, func(t *testing.T) {
+			doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          max_runtime: ` + bad + `
+        produces:
+          - artifact: pull_request
+`
+			if _, err := spec.ParseBytes([]byte(doc)); err == nil {
+				t.Errorf("ParseBytes(max_runtime %s) = nil, want the schema pattern rejection", bad)
+			}
+		})
+	}
+}
+
+// TestParseV2_BudgetSpellingsDoNotLeakBelowMajor2 proves the v2 spellings are
+// partitioned by major: a v0/v1 stage budget declaring max_runtime or limit_usd
+// is rejected by those schemas' additionalProperties:false.
+func TestParseV2_BudgetSpellingsDoNotLeakBelowMajor2(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		for _, field := range []string{"max_runtime: 90s", "limit_usd: 8.5"} {
+			t.Run(version+"/"+field, func(t *testing.T) {
+				doc := `version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        budget:
+          ` + field + `
+        produces:
+          - artifact: pull_request
+`
+				if _, err := spec.ParseBytes([]byte(doc)); err == nil {
+					t.Errorf("ParseBytes(version %s, %s) = nil, want rejection by additionalProperties:false", version, field)
+				}
+			})
 		}
 	}
 }
