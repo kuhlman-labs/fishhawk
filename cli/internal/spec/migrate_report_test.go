@@ -131,8 +131,14 @@ func TestReport_EmittedOnRefusalAndNoOpPaths(t *testing.T) {
 
 	t.Run("version major 0 refusal", func(t *testing.T) {
 		src := strings.Replace(minimalV1, `version: "1.6"`, `version: "0.7"`, 1)
-		if got := reportFor(t, src); !strings.Contains(got, "stage: plan") {
+		got := reportFor(t, src)
+		if !strings.Contains(got, "stage: plan") {
 			t.Errorf("the R9 path must still render the document's gates\n---\n%s", got)
+		}
+		// Even where no translation ran, the report names who could approve
+		// on the source side when it is resolvable from the roles map.
+		if !strings.Contains(got, "      - kuhlman-labs") {
+			t.Errorf("the R9 path must enumerate source-side eligible principals\n---\n%s", got)
 		}
 	})
 }

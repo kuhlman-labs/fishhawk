@@ -123,12 +123,23 @@ func runMigrateSpec(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", *out, openErr)
 			return exitUsage
 		}
+		// A write or close failure AFTER the O_EXCL create leaves a
+		// truncated fragment at PATH. Remove it: because the no-clobber
+		// refusal above keys off the file's mere existence, a leftover
+		// fragment would turn a transient I/O error (a full disk mid-write)
+		// into a persistent "already exists; refusing to overwrite" the
+		// operator has to resolve by hand. This mirrors the temp-file
+		// cleanup writeFileAtomic gives the --in-place cell; here the
+		// O_EXCL create is kept so the atomic no-clobber guarantee stands,
+		// and only the destination the command itself created is removed.
 		if _, err := f.Write(res.Migrated); err != nil {
 			_ = f.Close()
+			_ = os.Remove(*out)
 			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", *out, err)
 			return exitUsage
 		}
 		if err := f.Close(); err != nil {
+			_ = os.Remove(*out)
 			_, _ = fmt.Fprintf(stderr, "fishhawk migrate-spec: %s: %v\n", *out, err)
 			return exitUsage
 		}

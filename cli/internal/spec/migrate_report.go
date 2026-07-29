@@ -199,6 +199,13 @@ func unresolvedOf(p approvalPredicate) []UnresolvedPredicate {
 // predicate, since no translation was computed for it.
 func reportForV2(root *yaml.Node) *EligibilityReport {
 	report := &EligibilityReport{}
+	// Resolve the roles map best-effort so a gate still carrying the legacy
+	// `approvers` form (an R0 / R9 refusal path routes here) names the
+	// principals resolvable FROM THIS DOCUMENT on the source side, not an
+	// empty set. This is a READ of a document no translation ran on, so it
+	// never refuses — a team reference, which has no per-subject encoding,
+	// is simply omitted from the enumerable set.
+	roles := collectRolesForReport(root)
 	workflows := mappingNode(mapValue(root, "workflows"))
 	for _, pair := range mapPairs(workflows) {
 		wf := mappingNode(pair[1])
@@ -224,7 +231,7 @@ func reportForV2(root *yaml.Node) *EligibilityReport {
 					continue
 				}
 				path := fmt.Sprintf("/workflows/%s/stages/%d/gates/%d", pair[0].Value, i, j)
-				report.Gates = append(report.Gates, untranslatedGate(gate, path, stageID))
+				report.Gates = append(report.Gates, untranslatedGate(gate, path, stageID, roles))
 			}
 		}
 	}
@@ -232,7 +239,7 @@ func reportForV2(root *yaml.Node) *EligibilityReport {
 }
 
 // untranslatedGate renders one gate of a document no translation ran on.
-func untranslatedGate(gate *yaml.Node, path, stageID string) GateEligibility {
+func untranslatedGate(gate *yaml.Node, path, stageID string, roles map[string][]string) GateEligibility {
 	if existing := mappingNode(mapValue(gate, "approvals")); existing != nil {
 		p := readApprovals(existing)
 		return GateEligibility{
@@ -245,13 +252,45 @@ func untranslatedGate(gate *yaml.Node, path, stageID string) GateEligibility {
 			Change:     changeNone,
 		}
 	}
-	form, names := approversForm(mappingNode(mapValue(gate, "approvers")))
+	approvers := mappingNode(mapValue(gate, "approvers"))
+	form, names := approversForm(approvers)
 	return GateEligibility{
 		Path:    path,
 		StageID: stageID,
 		Before:  fmt.Sprintf("approvers: {%s: [%s]}", form, strings.Join(names, ", ")),
 		After:   "(not translated — the migration did not run on this document)",
-		Refused: true,
-		Change:  changeRefused,
+		// Even on a path where no translation ran, the mandatory report
+		// names who could approve on the source side when it is resolvable
+		// from the roles map.
+		Enumerable: sourceEnumerable(approvers, roles),
+		Refused:    true,
+		Change:     changeRefused,
 	}
+}
+
+// collectRolesForReport resolves the top-level roles map to @-stripped
+// per-subject members for reportForV2's best-effort source-side
+// enumeration. Unlike (*analysis).collectRoles it never refuses — it is a
+// read of a document no translation ran on — so a team reference (which
+// has no faithful per-subject encoding) is omitted rather than raising R3.
+func collectRolesForReport(root *yaml.Node) map[string][]string {
+	out := map[string][]string{}
+	roles := mappingNode(mapValue(root, "roles"))
+	for _, pair := range mapPairs(roles) {
+		name, body := pair[0].Value, mappingNode(pair[1])
+		members := mapValue(body, "members")
+		if members == nil || members.Kind != yaml.SequenceNode {
+			continue
+		}
+		resolved := make([]string, 0, len(members.Content))
+		for _, m := range members.Content {
+			ref := strings.TrimPrefix(m.Value, "@")
+			if strings.Contains(ref, "/") {
+				continue // team ref: not an enumerable per-subject principal
+			}
+			resolved = append(resolved, ref)
+		}
+		out[name] = resolved
+	}
+	return out
 }
