@@ -68,21 +68,46 @@ Applies to:
 
 ---
 
-## Autonomy tiers as operator_agent knob presets
+## Autonomy tiers in the workflow spec
 
-The tiers above map onto the workflow spec's `operator_agent` delegation
-block (ADR-040 / #1026; `docs/spec/workflow-v0.md`). Each `may_*` knob
-delegates one operator verb under one named, backend-evaluable
-condition; everything not delegated pages the human (fail-closed). The
+The tiers above are **declared in the workflow spec**, and the tier name
+is the declaration: `autonomy: low | medium | high` (ADR-066 / #2222;
+`docs/spec/workflow-v2.md`). The tier expands to the **action matrix** —
+one entry per action class, each naming a `mode`:
+
+| Mode | Who acts |
+|---|---|
+| `gated` | The human acts. The fail-closed default: an unlisted class, an absent matrix and an absent `autonomy` all mean this. |
+| `auto` | The operator agent may act, and only then is a `when` condition required — one named, backend-evaluable predicate the backend can answer from run state. |
+| `report` | The operator agent surfaces a **proposal** and does not act: it records a `run_auto_driven` `act:report` row at a live gate (once per gate occurrence) for a human to act on. |
+
+An explicit `actions` entry overrides the tier **for that class only**;
+an approval gate declaring `autonomy` or `actions` supplies the whole
+block for that gate and inherits nothing. The class-name set is open
+(ADR-065), so a workflow type may declare its own class — an unknown
+class is safe by construction: accepted at `gated` and `report`, where
+it delegates nothing, and rejected at `auto`, where it would need a
+backend-evaluable condition that does not exist.
+
+| Tier | Preset | Expands to |
+|---|---|---|
+| Low | `low` | Every class `gated`. Nothing is delegated; every judgment — approval, fix-up routing, waiver, retry, merge — pages the human. This is also what a spec declaring no autonomy block resolves to. |
+| Medium | `medium` | `approve: auto (clean_dual_approval)`, `fixup: auto (convergent_concerns)`, `retry: auto (infra_flake)`; `waive` and `merge` stay `gated`. Carries the full `page_human_on` event list (`gating_reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). The operator agent advances mechanical judgments whose evidence is unambiguous; waivers and merges stay human. |
+| High | `high` | Medium plus `waive: auto (solo_low)` and `merge: auto (gates_resolved_ci_green)`. `page_human_on` still carries the full event list — high autonomy delegates clean-path verbs, never disagreement arbitration. |
+
+Every class resolution carries its **provenance** — whether an explicit
+entry, the tier expansion, or the fail-closed default decided it —
+surfaced on `GET /v0/runs/{id}`'s `delegation.matrix` so an operator
+reading `approve: gated (tier)` sees why an action was not taken.
+
+Below workflow-v2 the same three tiers are declared as the `operator_agent`
+block's `may_*` knobs (ADR-040 / #1026; `docs/spec/workflow-v0.md`), which
+v2 replaced: knob-absence is `mode: gated`, `may_approve` is
+`actions.approve`, `may_route_fixup` + `route_fixup_min_severity` is
+`actions.fixup`, and `must_page_human` is `actions.page_human_on`. The
 preset names align with the operator-role overlay's reserved
 `knob_presets` key (#1025 / #1042 — soft dependency; the overlay may
 reference these presets once it ships).
-
-| Tier | Preset | `operator_agent` block |
-|---|---|---|
-| Low | `low` | No block at all. Nothing is delegated; every judgment — approval, fix-up routing, waiver, retry, merge — pages the human. This is also the default for any spec that predates the block. |
-| Medium | `medium` | `may_approve: clean_dual_approval`, `may_retry: infra_flake`, `may_route_fixup: convergent_concerns`, with the full v0 `must_page_human` event list (`reviewer_reject` — or the explicit v0.7+ `gating_reviewer_reject` / `advisory_reviewer_reject` classes — `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). The operator agent advances mechanical judgments whose evidence is unambiguous; waivers and merges stay human. |
-| High | `high` | All five knobs delegated: the medium set plus `may_waive: solo_low` and `may_merge: gates_resolved_ci_green`. `must_page_human` still carries the full event list — high autonomy delegates clean-path verbs, never disagreement arbitration. |
 
 Two invariants hold at every tier (ADR-027 authority unchanged):
 
@@ -90,10 +115,12 @@ Two invariants hold at every tier (ADR-027 authority unchanged):
   backend re-evaluates the named condition against current run state at
   action time and refuses with the exact failed predicate otherwise.
   The delegation never widens what the action itself may do.
-- `must_page_human` events are non-delegable. A reviewer reject, a plan
-  rejection, a scope amendment, any budget/policy override, an
-  exception request, or a requirement arbitration always reaches the
-  human, regardless of preset.
+- `page_human_on` events (v0/v1: `must_page_human`) are non-delegable. A
+  reviewer reject, a plan rejection, a scope amendment, any
+  budget/policy override, an exception request, or a requirement
+  arbitration always reaches the human, regardless of tier — and wins
+  over a `report` proposal too: an event that must page is not a
+  suggestion.
 
 ---
 

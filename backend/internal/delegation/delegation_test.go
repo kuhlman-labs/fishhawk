@@ -1320,3 +1320,275 @@ func TestMergeCondition(t *testing.T) {
 		t.Errorf("MergeCondition() = %q, want %q", got, spec.ConditionGatesResolvedCIGreen)
 	}
 }
+
+// --- workflow-v2 autonomy matrix (ADR-066 / E52.10 / #2222) -----------------
+
+// v2WorkflowYAML renders a workflow-v2 document whose workflow-level
+// autonomy block is the caller's, so each test declares exactly the grammar
+// it is about and the DERIVED OperatorAgent under test comes from the real
+// parse pipeline rather than a hand-built struct.
+func v2WorkflowYAML(autonomyBlock string) string {
+	return `version: "2"
+workflows:
+  feature_change:
+` + autonomyBlock + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+`
+}
+
+// parseV2Workflow parses the rendered v2 document and returns the derived
+// feature_change workflow.
+func parseV2Workflow(t *testing.T, autonomyBlock string) *spec.Workflow {
+	t.Helper()
+	parsed, err := spec.ParseBytes([]byte(v2WorkflowYAML(autonomyBlock)))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	wf, ok := parsed.Workflows["feature_change"]
+	if !ok {
+		t.Fatal("feature_change absent from parsed spec")
+	}
+	return &wf
+}
+
+// matrixEntry returns the resolved matrix entry for a class, failing when
+// absent.
+func matrixEntry(t *testing.T, res *Result, class string) spec.ResolvedAction {
+	t.Helper()
+	e, ok := res.MatrixEntry(class)
+	if !ok {
+		t.Fatalf("no matrix entry for class %q in %+v", class, res.Matrix)
+	}
+	return e
+}
+
+// TestEvaluate_V2Matrix_TierAndProvenance: a v2 workflow's resolved tier and
+// per-class provenance ride the Result, and the DECISION SET stays keyed to
+// what is actually delegated — the explicitly gated `approve` class
+// contributes a matrix entry but NO decision.
+func TestEvaluate_V2Matrix_TierAndProvenance(t *testing.T) {
+	wf := parseV2Workflow(t, `    autonomy: medium
+    actions:
+      approve:
+        mode: gated`)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
+		Audit:    &fakeAudit{},
+	}
+	res := evaluate(t, ev, wf, newRun())
+
+	if res.Tier != spec.TierMedium {
+		t.Errorf("Tier = %q, want %q", res.Tier, spec.TierMedium)
+	}
+	want := map[string]struct {
+		mode   spec.ActionMode
+		source spec.ResolutionSource
+	}{
+		spec.ActionApprove: {spec.ModeGated, spec.SourceExplicit},
+		spec.ActionFixup:   {spec.ModeAuto, spec.SourceTier},
+		spec.ActionRetry:   {spec.ModeAuto, spec.SourceTier},
+		spec.ActionWaive:   {spec.ModeGated, spec.SourceTier},
+		spec.ActionMerge:   {spec.ModeGated, spec.SourceTier},
+	}
+	for class, w := range want {
+		got := matrixEntry(t, res, class)
+		if got.Mode != w.mode || got.Source != w.source {
+			t.Errorf("matrix[%s] = mode %q source %q, want mode %q source %q",
+				class, got.Mode, got.Source, w.mode, w.source)
+		}
+	}
+
+	// The decision set is what is DELEGATED: approve is explicitly gated, so
+	// it must not appear even though the tier would have delegated it.
+	if _, ok := res.Decision(ActionApprove); ok {
+		t.Errorf("approve has a decision; explicit `mode: gated` must delegate nothing (actions = %+v)", res.Actions)
+	}
+	d, ok := res.Decision(ActionRouteFixup)
+	if !ok {
+		t.Fatalf("no route_fixup decision; medium delegates fixup (actions = %+v)", res.Actions)
+	}
+	if d.Mode != spec.ModeAuto || d.Source != spec.SourceTier {
+		t.Errorf("route_fixup decision mode/source = %q/%q, want auto/tier", d.Mode, d.Source)
+	}
+}
+
+// TestEvaluate_CampaignOverride_MatrixProjection: a campaign-level
+// operator_agent override is projected onto a matrix with NO tier and every
+// class Source=explicit — the campaign named the whole block itself.
+func TestEvaluate_CampaignOverride_MatrixProjection(t *testing.T) {
+	wf := testWorkflow(nil, nil)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
+		Audit:    &fakeAudit{},
+	}
+	override := &spec.OperatorAgent{MayWaive: spec.ConditionSoloLow, MustPageHuman: []string{spec.PageEventPlanRejection}}
+	res, err := ev.Evaluate(context.Background(), newRun(), wf, override)
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if res.Tier != "" {
+		t.Errorf("Tier = %q, want empty (an override is a delegation input, not a grammar version)", res.Tier)
+	}
+	for _, class := range []string{spec.ActionApprove, spec.ActionFixup, spec.ActionWaive, spec.ActionRetry, spec.ActionMerge} {
+		e := matrixEntry(t, res, class)
+		if e.Source != spec.SourceExplicit {
+			t.Errorf("matrix[%s].Source = %q, want explicit", class, e.Source)
+		}
+		wantMode := spec.ModeGated
+		if class == spec.ActionWaive {
+			wantMode = spec.ModeAuto
+		}
+		if e.Mode != wantMode {
+			t.Errorf("matrix[%s].Mode = %q, want %q", class, e.Mode, wantMode)
+		}
+	}
+}
+
+// TestEvaluate_ReportMode_Evaluated: a `mode: report` class declaring its own
+// `when` is EVALUATED into Reports — and stays out of the decision set,
+// because report delegates nothing.
+func TestEvaluate_ReportMode_Evaluated(t *testing.T) {
+	wf := parseV2Workflow(t, `    actions:
+      waive:
+        mode: report
+        when: solo_low`)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
+		Audit:    &fakeAudit{},
+	}
+	res := evaluate(t, ev, wf, newRun())
+
+	d, ok := res.Report(ActionWaive)
+	if !ok {
+		t.Fatalf("no waive report decision (reports = %+v)", res.Reports)
+	}
+	if !d.Met || d.Condition != spec.ConditionSoloLow || d.Mode != spec.ModeReport {
+		t.Errorf("waive report = %+v, want met solo_low at mode report", d)
+	}
+	if _, ok := res.Decision(ActionWaive); ok {
+		t.Errorf("waive has a DECISION; report must delegate nothing (actions = %+v)", res.Actions)
+	}
+}
+
+// TestEvaluate_ReportMode_ForeignConditionRefused: a report entry naming
+// ANOTHER class's condition produces no report decision — fail-closed,
+// because this evaluator answers the class's own predicate, not the one the
+// author named.
+func TestEvaluate_ReportMode_ForeignConditionRefused(t *testing.T) {
+	wf := parseV2Workflow(t, `    actions:
+      waive:
+        mode: report
+        when: infra_flake`)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
+		Audit:    &fakeAudit{},
+	}
+	res := evaluate(t, ev, wf, newRun())
+
+	if d, ok := res.Report(ActionWaive); ok {
+		t.Errorf("waive report decision = %+v, want none (foreign condition is refused)", d)
+	}
+	if e := matrixEntry(t, res, spec.ActionWaive); e.Mode != spec.ModeReport {
+		t.Errorf("matrix[waive].Mode = %q, want report (the entry is still surfaced)", e.Mode)
+	}
+}
+
+// TestEvaluate_ReportMode_BareEntryHasNoReportDecision: a bare `report`
+// entry declares no condition, so there is nothing to evaluate — it fires on
+// gate-live alone (the auto-driver's rule), which is why Reports is empty
+// while the matrix still carries the entry.
+func TestEvaluate_ReportMode_BareEntryHasNoReportDecision(t *testing.T) {
+	wf := parseV2Workflow(t, `    actions:
+      approve:
+        mode: report`)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		Concerns: &fakeConcerns{},
+		Audit:    &fakeAudit{},
+	}
+	res := evaluate(t, ev, wf, newRun())
+
+	if len(res.Reports) != 0 {
+		t.Errorf("Reports = %+v, want empty for a bare report entry", res.Reports)
+	}
+	if e := matrixEntry(t, res, spec.ActionApprove); e.Mode != spec.ModeReport || e.Condition != "" {
+		t.Errorf("matrix[approve] = %+v, want mode report with no condition", e)
+	}
+}
+
+// TestEvaluate_ParkedAwaitingInput_NoMatrix: a run parked for human
+// direction delegates nothing AND proposes nothing — the matrix is
+// deliberately omitted so the auto-driver's report arm cannot surface a
+// proposal to a human the run is already blocked on.
+func TestEvaluate_ParkedAwaitingInput_NoMatrix(t *testing.T) {
+	wf := parseV2Workflow(t, `    autonomy: high`)
+	ev := &Evaluator{
+		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
+		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
+		Audit:    &fakeAudit{},
+	}
+	res := evaluate(t, ev, wf, newRun())
+
+	if res.Matrix != nil || res.Reports != nil || res.Actions != nil {
+		t.Errorf("parked result = %+v, want no matrix, no reports and no decisions", res)
+	}
+	if len(res.MustPageHuman) == 0 {
+		t.Error("MustPageHuman is empty; the page envelope is still surfaced while parked")
+	}
+}
+
+// TestActionForClass: the verb<->class mapping is total over the five known
+// classes (route_fixup is the one place the vocabularies differ) and reports
+// false for an extension class.
+func TestActionForClass(t *testing.T) {
+	want := map[string]string{
+		spec.ActionApprove: ActionApprove,
+		spec.ActionFixup:   ActionRouteFixup,
+		spec.ActionWaive:   ActionWaive,
+		spec.ActionRetry:   ActionRetry,
+		spec.ActionMerge:   ActionMerge,
+	}
+	for class, action := range want {
+		got, ok := ActionForClass(class)
+		if !ok || got != action {
+			t.Errorf("ActionForClass(%q) = %q, %v; want %q, true", class, got, ok, action)
+		}
+	}
+	if got, ok := ActionForClass("promote"); ok {
+		t.Errorf("ActionForClass(\"promote\") = %q, true; want false (extension class)", got)
+	}
+}
