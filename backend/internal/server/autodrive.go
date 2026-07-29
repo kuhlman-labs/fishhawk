@@ -77,6 +77,15 @@ type AutoDriveOutcome struct {
 	// real next moves instead of bubbling to an HTTP 500.
 	DecisionRequired bool
 	DecisionState    string
+	// Reported is true when a workflow-v2 `mode: report` class surfaced a
+	// PROPOSAL at a live gate (ADR-066 / #2222): a run_auto_driven act:report
+	// attribution row was appended, Action names the delegation verb the
+	// class governs, and NOTHING else happened — no gate action was
+	// dispatched, no campaign_gate_paged was emitted, and the run did not
+	// park. Acted / Paged / DecisionRequired all stay false precisely so the
+	// driver KEEPS POLLING: a report is something an operator may act on, not
+	// a hand-off that stops the loop.
+	Reported bool
 	// Note is a short human-readable summary for the driver log /
 	// observe-only audit. Always set.
 	Note string
@@ -142,6 +151,17 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 	if pe := s.activePageEvent(ctx, runRow, &wf, res, open); pe != "" {
 		s.emitCampaignGatePaged(ctx, runRow, id, pe)
 		return AutoDriveOutcome{Paged: true, PageEvent: pe, Note: "must_page_human: " + pe}, nil
+	}
+
+	// `mode: report` SURFACES a proposal without acting (ADR-066 / #2222).
+	// Checked after the page refusal (a paging condition still wins — an
+	// event that must page the human is not a proposal) and before the
+	// delegated dispatch, so the operator sees the proposal on the same pass
+	// the gate became reachable. A report never suppresses an auto action for
+	// longer than one poll cycle: the row is emitted at most once per gate
+	// occurrence, so the next pass falls through to the dispatch below.
+	if out, reported := s.reportMatrixProposals(ctx, runRow, id, res, stages, open); reported {
+		return out, nil
 	}
 
 	// Dispatch the first met + state-matched delegated knob. The knobs are
@@ -565,6 +585,143 @@ func (s *Server) autoFixup(ctx context.Context, id Identity, runRow *run.Run, st
 		return false, err
 	}
 	return true, nil
+}
+
+// --- mode: report (ADR-066 / #2222) -----------------------------------------
+
+// reportMatrixProposals walks the resolved action matrix for classes at
+// `mode: report` and surfaces the FIRST one whose gate is live as a
+// run_auto_driven act:"report" attribution row, acting on nothing.
+//
+// FIRING RULE (the operator's binding ruling on #2222): a report entry fires
+// when the gate is LIVE, and additionally requires its condition to be met
+// only WHEN A `when` IS DECLARED. A bare `report` entry — which is legal,
+// since validation requires `when` for `mode: auto` only — therefore
+// surfaces whenever the gate is reachable. That is what report is for:
+// naming a proposal the operator may act on. Gating a bare entry behind a
+// condition that need not exist would make the mode inert.
+//
+// IDEMPOTENCY (binding condition 2): the driver keeps polling rather than
+// parking, so an unguarded arm would append a row on EVERY poll for as long
+// as the gate stayed live — flooding the evidentiary surface operators and
+// the verifier read. Emission is therefore keyed on (run, gate occurrence,
+// class) and happens AT MOST ONCE per gate occurrence; a subsequent pass
+// falls through to the delegated dispatch below.
+//
+// Every uncertainty skips the class rather than emitting: an extension class
+// (no backend-observable gate), a gate that is not live, a declared
+// condition that is unmet or not evaluable, an unreadable audit chain (which
+// would make the dedupe unanswerable), and an append failure — the last
+// logged, never reported as if it had landed.
+func (s *Server) reportMatrixProposals(ctx context.Context, runRow *run.Run, id Identity, res *delegation.Result, stages []*run.Stage, open []*concern.Concern) (AutoDriveOutcome, bool) {
+	if s.cfg.AuditRepo == nil {
+		return AutoDriveOutcome{}, false
+	}
+	for _, entry := range res.Matrix {
+		if entry.Mode != spec.ModeReport {
+			continue
+		}
+		// An EXTENSION class maps to no delegation verb, so no gate state
+		// identifies it — it can never be live and never reports. Same
+		// fail-closed-by-construction posture the grammar takes at parse time,
+		// where `mode: auto` on an extension class is rejected outright.
+		action, known := delegation.ActionForClass(entry.Action)
+		if !known {
+			continue
+		}
+		occurrence, live := reportGateOccurrence(action, runRow, stages, open)
+		if !live {
+			continue
+		}
+		// A declared `when` must be MET. A report entry whose `when` names
+		// another class's condition produces no Reports decision at all, so the
+		// not-found branch is the same fail-closed skip.
+		if entry.Condition != "" {
+			d, found := res.Report(action)
+			if !found || !d.Met {
+				continue
+			}
+		}
+		emitted, err := s.reportAlreadyEmitted(ctx, runRow, action, occurrence)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: read run_auto_driven for report dedupe failed; skipping report",
+				slog.String("run_id", runRow.ID.String()), slog.String("action", action), slog.String("error", err.Error()))
+			continue
+		}
+		if emitted {
+			continue
+		}
+		note := "mode: report — " + action + " proposed at a live gate (no action taken)"
+		if err := s.appendRunAutoDrivenReport(ctx, runRow, id, action, entry, occurrence, note); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelError, "auto-drive: append run_auto_driven report row failed",
+				slog.String("run_id", runRow.ID.String()), slog.String("action", action), slog.String("error", err.Error()))
+			continue
+		}
+		return AutoDriveOutcome{Reported: true, Action: action, Note: note}, true
+	}
+	return AutoDriveOutcome{}, false
+}
+
+// reportGateOccurrence answers "is this action's gate live right now, and
+// WHICH occurrence of it is this" — the identity the report row is deduped
+// on. The occurrence is the gate-bearing stage plus its state (or the run,
+// for the run-level merge gate), so one live gate reports once while a later
+// gate of the same class reports again.
+//
+// Liveness reuses the same evaluator-independent double-gate derivations the
+// delegated arms use, so a proposal is only ever surfaced where the
+// corresponding action could actually be taken. waive is anchored to the
+// stage parked at the approval gate where a waive decision is taken, which
+// is also why a run parked at awaiting_input surfaces nothing.
+func reportGateOccurrence(action string, runRow *run.Run, stages []*run.Stage, open []*concern.Concern) (string, bool) {
+	switch action {
+	case delegation.ActionApprove:
+		if gated := gatedReviewStage(stages); gated != nil {
+			return stageOccurrence(gated), true
+		}
+	case delegation.ActionRouteFixup:
+		if impl := implementStage(stages); impl != nil && fixupEligibleState(impl, stages) && len(open) > 0 {
+			return stageOccurrence(impl), true
+		}
+	case delegation.ActionWaive:
+		if gated := currentApprovalGateStage(stages); gated != nil && len(open) > 0 {
+			return stageOccurrence(gated), true
+		}
+	case delegation.ActionRetry:
+		if failed := retryableFailedStage(stages); failed != nil {
+			return stageOccurrence(failed), true
+		}
+	case delegation.ActionMerge:
+		if mergeGateReady(runRow, stages) {
+			return "run:" + runRow.ID.String() + ":merge_ready", true
+		}
+	}
+	return "", false
+}
+
+// stageOccurrence names one occurrence of a stage-anchored gate: the stage
+// plus the state it is parked in. A gate that closes and re-opens into the
+// same state on the same stage (a fix-up round trip) is deliberately treated
+// as the SAME occurrence — duplicate suppression is the point of the
+// idempotency rule, and a second identical proposal tells the operator
+// nothing the first did not.
+func stageOccurrence(st *run.Stage) string {
+	return "stage:" + st.ID.String() + ":" + string(st.State)
+}
+
+// currentApprovalGateStage returns the lowest-sequence stage parked at an
+// approval gate, of any type — the gate at which a waive decision is taken.
+func currentApprovalGateStage(stages []*run.Stage) *run.Stage {
+	var gated *run.Stage
+	for _, st := range stages {
+		if st.State != run.StageStateAwaitingApproval {
+			continue
+		}
+		if gated == nil || st.Sequence < gated.Sequence {
+			gated = st
+		}
+	}
+	return gated
 }
 
 // --- double-gate state derivations (independent of the evaluator) -----------

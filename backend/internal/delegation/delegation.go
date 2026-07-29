@@ -57,15 +57,63 @@ type AuditLister interface {
 	ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error)
 }
 
+// actionClasses maps each delegable action verb to the workflow-v2 action
+// CLASS that governs it (ADR-066 / #2222). The two vocabularies differ in
+// exactly one place — the verb is route_fixup, the class is fixup — so the
+// mapping is explicit rather than implied by string equality.
+var actionClasses = map[string]string{
+	ActionApprove:    spec.ActionApprove,
+	ActionRouteFixup: spec.ActionFixup,
+	ActionWaive:      spec.ActionWaive,
+	ActionRetry:      spec.ActionRetry,
+	ActionMerge:      spec.ActionMerge,
+}
+
+// actionConditions is each action verb's single backend-evaluable
+// condition — the same registry spec.classConditions holds class-side. It
+// is what lets a `mode: report` entry's declared `when` be CHECKED against
+// the class it sits on: an entry naming another class's condition names a
+// predicate this evaluator would not be answering, so it is refused rather
+// than silently answered with the wrong one.
+var actionConditions = map[string]spec.DelegationCondition{
+	ActionApprove:    spec.ConditionCleanDualApproval,
+	ActionRouteFixup: spec.ConditionConvergentConcerns,
+	ActionWaive:      spec.ConditionSoloLow,
+	ActionRetry:      spec.ConditionInfraFlake,
+	ActionMerge:      spec.ConditionGatesResolvedCIGreen,
+}
+
+// ActionForClass maps a workflow-v2 action CLASS name back to the
+// delegation action verb it governs, reporting false for an extension
+// class — a class name no known verb backs, which therefore has no
+// backend-observable gate and no evaluable condition. Exposed so the
+// auto-driver's `mode: report` arm speaks one vocabulary (the verb) while
+// reading the matrix, without re-deriving the mapping.
+func ActionForClass(class string) (string, bool) {
+	for action, c := range actionClasses {
+		if c == class {
+			return action, true
+		}
+	}
+	return "", false
+}
+
 // Decision is one knob's evaluation: whether the named condition is
 // satisfied by current run state, and — when it is not — the exact
 // failed predicate, prefixed with the condition name (e.g.
 // "clean_dual_approval: 1 of 2 reviewer verdicts received").
+//
+// Mode and Source carry the workflow-v2 provenance of the class this
+// decision came from (ADR-066 / #2222): which mode resolved it and which
+// input decided that mode. Both are EMPTY for a v0/v1 knob block, which has
+// no matrix — the decision itself is unchanged.
 type Decision struct {
 	Action      string
 	Condition   spec.DelegationCondition
 	Met         bool
 	UnmetReason string
+	Mode        spec.ActionMode
+	Source      spec.ResolutionSource
 }
 
 // Result carries every configured knob's Decision plus the effective
@@ -75,6 +123,37 @@ type Decision struct {
 type Result struct {
 	Actions       []Decision
 	MustPageHuman []string
+	// Tier is the workflow-v2 autonomy tier the effective block declared
+	// (ADR-066 / #2222), empty when the block declared only `actions`, when
+	// the effective block is a campaign override, and for every v0/v1 knob
+	// block (which has no tier).
+	Tier spec.AutonomyTier
+	// Matrix is the RESOLVED action matrix: every action class with its
+	// mode, condition, min_severity and per-class provenance source — the
+	// legibility surface AC9 wants, and the input the auto-driver's
+	// `mode: report` arm walks.
+	//
+	// The DECISION SET (Actions) is deliberately INDEPENDENT of it: Actions
+	// still carries one entry per class the effective block actually
+	// DELEGATES, so an all-`gated` matrix yields ZERO decisions exactly as a
+	// knob-absent v0 block does. The matrix is what changed; what is
+	// delegated did not.
+	//
+	// nil when no matrix governs the run — a v0/v1 workflow knob block with
+	// no campaign override, and (deliberately) a run parked at
+	// awaiting_input, which delegates and reports nothing.
+	Matrix []spec.ResolvedAction
+	// Reports carries the evaluation of every `mode: report` class that
+	// declared a `when` condition. It is kept OUT of Actions because a
+	// report class delegates nothing — it is a proposal surface, not
+	// authority — so folding it into the decision set would make an
+	// all-report matrix look delegated. A report class with no `when` has no
+	// entry here: per the report-firing rule it surfaces on gate-live alone.
+	//
+	// A `when` that is not the class's own condition produces NO entry
+	// either (fail-closed): this evaluator would be answering a different
+	// predicate than the one the author named.
+	Reports []Decision
 	// ReviewerRejectClass names the reviewer-reject page-event class the
 	// run's implement review currently resolves to (#1378): the explicit
 	// spec.PageEventGatingReviewerReject when implement review authority is
@@ -127,6 +206,37 @@ func (r *Result) Decision(action string) (Decision, bool) {
 		}
 	}
 	return Decision{}, false
+}
+
+// Report returns the already-computed report-mode evaluation for the named
+// action verb and true, or a zero Decision and false when the resolved
+// matrix declares no evaluable `mode: report` entry for it (including a
+// nil Result). Read-only over one Evaluate, like Decision.
+func (r *Result) Report(action string) (Decision, bool) {
+	if r == nil {
+		return Decision{}, false
+	}
+	for _, d := range r.Reports {
+		if d.Action == action {
+			return d, true
+		}
+	}
+	return Decision{}, false
+}
+
+// MatrixEntry returns the resolved matrix entry for a workflow-v2 action
+// CLASS name and true, or false when the run resolves no matrix or the
+// class is absent from it.
+func (r *Result) MatrixEntry(class string) (spec.ResolvedAction, bool) {
+	if r == nil {
+		return spec.ResolvedAction{}, false
+	}
+	for _, a := range r.Matrix {
+		if a.Action == class {
+			return a, true
+		}
+	}
+	return spec.ResolvedAction{}, false
 }
 
 // MergeCondition is the delegation condition the may_merge knob names
@@ -185,10 +295,12 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return nil, fmt.Errorf("list stages: %w", err)
 	}
 	gated := currentGatedStage(stages)
-	effective := spec.ResolveOperatorAgent(campaignOverride, wf, approvalGateForStage(wf, gated))
+	gate := approvalGateForStage(wf, gated)
+	effective := spec.ResolveOperatorAgent(campaignOverride, wf, gate)
 	if effective == nil {
 		return nil, nil
 	}
+	matrix := resolveMatrix(campaignOverride, wf, gate)
 
 	// A stage parked at awaiting_input (#1057) is waiting on a human to
 	// answer the planner's clarification_request — a parked D-category
@@ -199,6 +311,12 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 	// This is fail-closed by intent — without it a stale open concern
 	// could still satisfy a knob (e.g. solo_low) while the run is
 	// genuinely blocked on operator answers.
+	//
+	// The resolved MATRIX is deliberately omitted on this path too: while the
+	// run is parked for direction nothing is delegated AND nothing is
+	// proposed, and the matrix is what the auto-driver's report arm walks —
+	// leaving it nil is what keeps a report proposal from surfacing on a run
+	// that is blocked on the human it would be proposing to.
 	rejectClass := reviewerRejectClass(wf)
 	if parkedAwaitingInput(stages) {
 		return &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass, ModelPolicy: effective.ModelPolicy}, nil
@@ -210,6 +328,10 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 	}
 
 	res := &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass, ModelPolicy: effective.ModelPolicy}
+	if matrix != nil {
+		res.Tier = matrix.Tier
+		res.Matrix = matrix.Actions
+	}
 	type knob struct {
 		action    string
 		condition spec.DelegationCondition
@@ -234,20 +356,99 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		}},
 	}
 	for _, k := range knobs {
-		if k.condition == "" {
+		entry, hasEntry := res.MatrixEntry(actionClasses[k.action])
+		reportCond := reportCondition(k.action, entry, hasEntry)
+		if k.condition == "" && reportCond == "" {
 			continue
+		}
+		cond := k.condition
+		if cond == "" {
+			cond = reportCond
 		}
 		met, reason, err := k.eval()
 		if err != nil {
-			return nil, fmt.Errorf("evaluate %s: %w", k.condition, err)
+			return nil, fmt.Errorf("evaluate %s: %w", cond, err)
 		}
-		d := Decision{Action: k.action, Condition: k.condition, Met: met}
+		d := Decision{Action: k.action, Condition: cond, Met: met, Mode: entry.Mode, Source: entry.Source}
 		if !met {
 			d.UnmetReason = reason
 		}
-		res.Actions = append(res.Actions, d)
+		if k.condition != "" {
+			res.Actions = append(res.Actions, d)
+			continue
+		}
+		// A report class delegates nothing, so its evaluation lands in
+		// Reports and NEVER in the decision set.
+		res.Reports = append(res.Reports, d)
 	}
 	return res, nil
+}
+
+// reportCondition returns the condition a `mode: report` entry declared for
+// the action, or "" when the class is not at report mode, declared no
+// `when` (it fires on gate-live alone), or named a condition that is not
+// this class's own — the last case fail-closed, because the evaluator would
+// otherwise answer a predicate the author did not name.
+func reportCondition(action string, entry spec.ResolvedAction, hasEntry bool) spec.DelegationCondition {
+	if !hasEntry || entry.Mode != spec.ModeReport || entry.Condition == "" {
+		return ""
+	}
+	if entry.Condition != actionConditions[action] {
+		return ""
+	}
+	return entry.Condition
+}
+
+// resolveMatrix resolves the action matrix governing the run's gate, on the
+// same outermost-wins ladder the effective block resolves on.
+//
+// A campaign-level override (E25.12) is an operator_agent-shaped blob, not a
+// grammar version, so it is PROJECTED into a matrix: every knob it sets
+// reads as `mode: auto` and every knob it leaves empty as `mode: gated`,
+// with no tier and every class Source=explicit (the campaign named the whole
+// block itself). Below that rung the workflow/gate blocks resolve through
+// the SAME spec.ResolveAutonomy ladder parse time used, so the surfaced
+// matrix cannot drift from the derived block the enforcement sites read.
+//
+// nil means no matrix governs the run: a v0/v1 knob block with no override
+// (which has no matrix to resolve — its knobs are the whole grammar).
+func resolveMatrix(campaignOverride *spec.OperatorAgent, wf *spec.Workflow, gate *spec.Gate) *spec.ResolvedMatrix {
+	if campaignOverride != nil {
+		return matrixFromOperatorAgent(campaignOverride)
+	}
+	return spec.ResolveAutonomy(wf, gate)
+}
+
+// matrixFromOperatorAgent projects a v0/v1-shaped operator_agent block onto
+// a resolved matrix — DerivedOperatorAgent's inverse, used for the campaign
+// override rung.
+func matrixFromOperatorAgent(oa *spec.OperatorAgent) *spec.ResolvedMatrix {
+	if oa == nil {
+		return nil
+	}
+	out := &spec.ResolvedMatrix{PageHumanOn: oa.MustPageHuman, ModelPolicy: oa.ModelPolicy}
+	knobs := []struct {
+		class     string
+		condition spec.DelegationCondition
+	}{
+		{spec.ActionApprove, oa.MayApprove},
+		{spec.ActionFixup, oa.MayRouteFixup},
+		{spec.ActionWaive, oa.MayWaive},
+		{spec.ActionRetry, oa.MayRetry},
+		{spec.ActionMerge, oa.MayMerge},
+	}
+	for _, k := range knobs {
+		a := spec.ResolvedAction{Action: k.class, Mode: spec.ModeGated, Source: spec.SourceExplicit}
+		if k.condition != "" {
+			a.Mode = spec.ModeAuto
+			a.Condition = k.condition
+		}
+		if k.class == spec.ActionFixup {
+			a.MinSeverity = oa.RouteFixupMinSeverity
+		}
+		out.Actions = append(out.Actions, a)
+	}
+	return out
 }
 
 // parkedAwaitingInput reports whether any stage is parked at
