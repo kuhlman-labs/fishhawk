@@ -88,14 +88,40 @@ type EligibilityReport struct {
 // reader never mistakes one for an enumerated principal.
 const forgeResolvedMarker = "(forge-resolved at run time)"
 
+// noApprovalGatesLine reports the GATE SET of a degenerate document. It
+// describes the gates and nothing else, so it never gates another section.
+const noApprovalGatesLine = "\nThis document declares no approval gates.\n"
+
+// serverSideAuthorityFooter states the limit of the codemod's own authority.
+// It describes the DOCUMENT, so every report shape emits it — including the
+// zero-gate and nil-receiver ones.
+const serverSideAuthorityFooter = "\nServer-side validation remains the authority for cross-stage wiring: this report and the\n" +
+	"codemod's schema gate cover the spec document, not `needs` / `from_stage` referent resolution.\n"
+
 // Render writes the report as plain text for stdout.
+//
+// THE SECTION ORDERING HERE IS LOAD-BEARING (#2342, deferred from #2339's
+// implement review). Every section renders on its OWN condition and none
+// short-circuits another, because the budget note and the authority footer
+// describe the DOCUMENT, not the gate set — neither may sit behind a
+// gate-count early return. One did, and a fully-automated workflow
+// (budget-bearing stages, zero approval gates) silently lost BOTH the
+// `limit_usd` advisory the migration docs promise and the authority footer.
+// Two prior fixup passes each landed a partial fix here, so the invariant is
+// stated next to the code. The nil-receiver guard below is the only early
+// return, and it exists solely because a field read through a nil pointer
+// panics (Go spec, Selectors) — not because a nil report has less to say.
 func (r *EligibilityReport) Render() string {
 	var b strings.Builder
 	b.WriteString("Approval-eligibility report\n")
 	b.WriteString("===========================\n")
-	if r == nil || len(r.Gates) == 0 {
-		b.WriteString("\nThis document declares no approval gates.\n")
+	if r == nil {
+		b.WriteString(noApprovalGatesLine)
+		b.WriteString(serverSideAuthorityFooter)
 		return b.String()
+	}
+	if len(r.Gates) == 0 {
+		b.WriteString(noApprovalGatesLine)
 	}
 	for _, g := range r.Gates {
 		b.WriteString("\n")
@@ -123,8 +149,7 @@ func (r *EligibilityReport) Render() string {
 		fmt.Fprintf(&b, "  change: %s\n", g.Change)
 	}
 	r.renderBudgetNote(&b)
-	b.WriteString("\nServer-side validation remains the authority for cross-stage wiring: this report and the\n")
-	b.WriteString("codemod's schema gate cover the spec document, not `needs` / `from_stage` referent resolution.\n")
+	b.WriteString(serverSideAuthorityFooter)
 	return b.String()
 }
 
