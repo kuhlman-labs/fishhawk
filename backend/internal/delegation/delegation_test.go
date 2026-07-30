@@ -1030,28 +1030,59 @@ func TestConvergentConcerns_GatingRejectReasonNamesClass(t *testing.T) {
 // evaluate identically under declared advisory, declared gating, and no
 // declaration. Declaring authority must not silently change what
 // `actions.approve: {mode: auto, when: clean_dual_approval}` waits for.
+//
+// It exercises BOTH sides of the gate topology, not only the fully-approved
+// happy path: with 2 of 2 verdicts in, the gate is met; with only 1 of 2 in,
+// the gate is UNMET naming the 1-of-2 boundary. A full verdict set alone cannot
+// pin the required COUNT — a regression that made clean_dual_approval require
+// fewer verdicts for one authority (e.g. gating needing a single verdict) passes
+// every 2-of-2 case yet flips the incomplete-verdict case to met. The partial
+// boundary is what makes "authority does not change the required count" real.
 func TestAuthorityDeclaration_DoesNotChangeCleanDualApprovalCount(t *testing.T) {
 	planGated := []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
 	bothApprove := &fakeAudit{entries: map[string][]*audit.Entry{
 		"plan_review_started": {startedEntry(1, 2)},
 		"plan_reviewed":       {verdictEntry(2, planreview.VerdictApprove), verdictEntry(3, planreview.VerdictApprove)},
 	}}
+	// One of two verdicts in — the incomplete-verdict boundary. The condition
+	// requires ALL AgentCount()==2 reviewers to have returned; a regression that
+	// keyed the required count off the authority declaration would flip this to
+	// met for that value.
+	partialVerdict := &fakeAudit{entries: map[string][]*audit.Entry{
+		"plan_review_started": {startedEntry(1, 2)},
+		"plan_reviewed":       {verdictEntry(2, planreview.VerdictApprove)},
+	}}
+	boundaries := []struct {
+		name       string
+		audit      *fakeAudit
+		wantMet    bool
+		wantReason string
+	}{
+		{name: "full-verdicts-met", audit: bothApprove, wantMet: true},
+		{name: "incomplete-verdicts-unmet", audit: partialVerdict, wantReason: "1 of 2 reviewer verdicts received"},
+	}
 	agents := []spec.AgentReviewer{{Provider: "claudecode"}, {Provider: "codex"}}
 	for _, authority := range []string{"", "advisory", "gating"} {
 		name := authority
 		if name == "" {
 			name = "no-declaration"
 		}
-		t.Run(name, func(t *testing.T) {
-			wf := testWorkflow(&spec.OperatorAgent{MayApprove: spec.ConditionCleanDualApproval}, nil)
-			wf.Stages[0].Reviewers = &spec.ReviewersConfig{Agents: agents, Human: 1, Authority: authority}
-			ev := cleanDualEvaluator(planGated, nil, bothApprove)
-			d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionApprove)
-			if !d.Met {
-				t.Errorf("clean_dual_approval Met = false (reason %q), want true regardless of authority declaration %q — the condition counts AgentCount(), not the declaration",
-					d.UnmetReason, authority)
-			}
-		})
+		for _, b := range boundaries {
+			t.Run(name+"/"+b.name, func(t *testing.T) {
+				wf := testWorkflow(&spec.OperatorAgent{MayApprove: spec.ConditionCleanDualApproval}, nil)
+				wf.Stages[0].Reviewers = &spec.ReviewersConfig{Agents: agents, Human: 1, Authority: authority}
+				ev := cleanDualEvaluator(planGated, nil, b.audit)
+				d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionApprove)
+				if d.Met != b.wantMet {
+					t.Errorf("clean_dual_approval Met = %v (reason %q), want %v regardless of authority declaration %q — the condition counts AgentCount(), not the declaration",
+						d.Met, d.UnmetReason, b.wantMet, authority)
+				}
+				if !b.wantMet && !strings.Contains(d.UnmetReason, b.wantReason) {
+					t.Errorf("UnmetReason = %q, want it to contain %q — the required count must be independent of authority %q",
+						d.UnmetReason, b.wantReason, authority)
+				}
+			})
+		}
 	}
 }
 

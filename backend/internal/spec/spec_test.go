@@ -1525,6 +1525,51 @@ workflows:
 	}
 }
 
+// TestParse_Reviewers_Authority_NoAgents_Inherited_Rejected is the INHERITED
+// mirror of TestParse_Reviewers_Authority_NoAgents_Rejected (E53.2 / #2225): the
+// zero-agent form arrives not on a stage-declared block but via a
+// defaults.reviewers block carrying `authority` and no `agents`, folded WHOLE
+// onto an inheriting stage. Reuse resolution precedes the semantic walk, so
+// post-resolution the stage is indistinguishable from the directly-declared
+// case — this makes that by-construction argument machine-enforced rather than
+// reasoned, and pins that the reject reaches the inherited form too.
+func TestParse_Reviewers_Authority_NoAgents_Inherited_Rejected(t *testing.T) {
+	for _, authority := range []string{"advisory", "gating"} {
+		t.Run(authority, func(t *testing.T) {
+			yml := []byte(`
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+  reviewers:
+    authority: ` + authority + `
+workflows:
+  wf:
+    stages:
+      - id: inherits
+        type: plan
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+			_, err := spec.ParseBytes(yml)
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError for an inherited authority with no agents", err)
+			}
+			if !strings.Contains(ve.Message, `stage "inherits"`) {
+				t.Errorf("message = %q, want it to name the inheriting stage", ve.Message)
+			}
+			if !strings.Contains(ve.Message, authority) {
+				t.Errorf("message = %q, want it to name the declared value %q", ve.Message, authority)
+			}
+			if !strings.Contains(ve.Message, "reviewers.agents") {
+				t.Errorf("message = %q, want it to name the fix (reviewers.agents)", ve.Message)
+			}
+		})
+	}
+}
+
 func TestParse_Reviewers_AgentsList_ReasoningEffort_InvalidEnum_Rejected(t *testing.T) {
 	// #1493: the schema enum (low|medium|high|xhigh|max) is the sole guard
 	// before the value reaches the codex CLI as -c model_reasoning_effort, so
@@ -5516,10 +5561,17 @@ workflows:
 // TestPresetsDeclaredAuthorityMatchesResolved is criterion 6 (E53.2 / #2225),
 // machine-enforced rather than asserted in prose: every shipped preset's plan
 // and implement stage DECLARES reviewers.authority explicitly, and the declared
-// value equals what planreview.ResolveAuthority resolves for that stage's
-// counts — so a preset can never declare an authority that contradicts its own
-// reviewer counts. It lives in the EXTERNAL test package for the same reason as
-// TestParseV2_DeclaredReviewersBlockTakenWhole: planreview imports spec.
+// value equals what the COUNT-DERIVED ADR-027 rule resolves for that stage's
+// reviewer counts — so a preset can never declare an authority that contradicts
+// its own reviewer counts. It lives in the EXTERNAL test package for the same
+// reason as TestParseV2_DeclaredReviewersBlockTakenWhole: planreview imports spec.
+//
+// Vacuity guard: ResolveAuthority now HONOURS a declared authority (returns it
+// verbatim), so resolving the stage's config as-is would compare the declaration
+// to itself and pass for ANY preset — including one that declared `gating` on a
+// human-gated stage the counts derive to advisory. The comparison is therefore
+// made against the config with Authority STRIPPED, forcing ResolveAuthority down
+// its count-derived branch; a declaration that contradicts the counts now fails.
 func TestPresetsDeclaredAuthorityMatchesResolved(t *testing.T) {
 	for _, p := range []spec.Preset{spec.PresetLow, spec.PresetMedium, spec.PresetHigh} {
 		p := p
@@ -5549,10 +5601,15 @@ func TestPresetsDeclaredAuthorityMatchesResolved(t *testing.T) {
 					t.Errorf("preset %q stage %q does not DECLARE reviewers.authority", p, st.ID)
 					continue
 				}
-				resolved := planreview.ResolveAuthority(*st.Reviewers)
-				if st.Reviewers.Authority != string(resolved) {
-					t.Errorf("preset %q stage %q declares authority %q but its counts resolve to %q — a declared authority must not contradict the counts",
-						p, st.ID, st.Reviewers.Authority, resolved)
+				// Resolve from the COUNTS ALONE: strip the declared field so
+				// ResolveAuthority takes its count-derived branch instead of
+				// echoing the declaration back (which would make this vacuous).
+				countsOnly := *st.Reviewers
+				countsOnly.Authority = ""
+				derived := planreview.ResolveAuthority(countsOnly)
+				if st.Reviewers.Authority != string(derived) {
+					t.Errorf("preset %q stage %q declares authority %q but its counts derive to %q — a declared authority must not contradict the counts",
+						p, st.ID, st.Reviewers.Authority, derived)
 				}
 				checked++
 			}

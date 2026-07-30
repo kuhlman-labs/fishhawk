@@ -462,7 +462,7 @@ func TestCreateRun_DeclaredGating_NilReviewer_Rejected(t *testing.T) {
 	}
 
 	// (a) Declared gating is rejected — no PlanReviewer wired.
-	w, repo, _ := postCreate(t, declaredGatingV2SpecYAML)
+	w, repo, au := postCreate(t, declaredGatingV2SpecYAML)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("declared-gating status = %d, want 400:\n%s", w.Code, w.Body.String())
 	}
@@ -471,6 +471,31 @@ func TestCreateRun_DeclaredGating_NilReviewer_Rejected(t *testing.T) {
 	}
 	if len(repo.runs) != 0 {
 		t.Errorf("expected zero runs created for the rejected declared-gating spec, got %d", len(repo.runs))
+	}
+	// The operational audit trail must record the rejection: a
+	// run_rejected_misconfigured global entry whose payload carries the
+	// plan_reviewer_unconfigured reason. Asserting only the HTTP code would let a
+	// regression that dropped this audit (losing the operator-visible record of
+	// why the run was refused) still pass.
+	var foundReject bool
+	for _, e := range au.globalAppended {
+		if e.Category != "run_rejected_misconfigured" {
+			continue
+		}
+		foundReject = true
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("run_rejected_misconfigured payload not JSON: %v", err)
+		}
+		if p["reason"] != "plan_reviewer_unconfigured" {
+			t.Errorf("run_rejected_misconfigured reason = %v, want plan_reviewer_unconfigured", p["reason"])
+		}
+		if p["stage"] != "plan" {
+			t.Errorf("run_rejected_misconfigured stage = %v, want plan", p["stage"])
+		}
+	}
+	if !foundReject {
+		t.Errorf("expected a run_rejected_misconfigured audit entry, got %+v", au.globalAppended)
 	}
 
 	// (b) The SAME stage WITHOUT the declaration derives to advisory and is

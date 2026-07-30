@@ -602,6 +602,54 @@ workflows:
 	}
 }
 
+// TestValidateBytes_Authority_NoAgents_Inherited_Rejected is the CLI parity
+// mirror of TestValidateBytes_Authority_NoAgents_Rejected for the INHERITED form
+// (E53.2 / #2225): a defaults.reviewers block carrying `authority` and no
+// `agents`, folded WHOLE onto an inheriting stage, is rejected with the SAME
+// actionable message. decodeAndResolve resolves same-document reuse BEFORE the
+// semantic walk, so the inherited case must reject exactly as the stage-declared
+// case does — this pins that by-construction claim instead of leaving it reasoned.
+func TestValidateBytes_Authority_NoAgents_Inherited_Rejected(t *testing.T) {
+	for _, authority := range []string{"advisory", "gating"} {
+		t.Run(authority, func(t *testing.T) {
+			yml := `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+  reviewers:
+    authority: ` + authority + `
+workflows:
+  feature_change:
+    stages:
+      - id: inherits
+        type: plan
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+			err := spec.ValidateBytes([]byte(yml))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError for an inherited authority with no agents", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "/reviewers/authority") {
+				t.Errorf("error = %q, want it to name /reviewers/authority", msg)
+			}
+			if !strings.Contains(msg, `stage "inherits"`) {
+				t.Errorf("error = %q, want it to name the inheriting stage", msg)
+			}
+			if !strings.Contains(msg, authority) {
+				t.Errorf("error = %q, want it to name the declared value %q", msg, authority)
+			}
+			if !strings.Contains(msg, "reviewers.agents") {
+				t.Errorf("error = %q, want it to name the fix (reviewers.agents)", msg)
+			}
+		})
+	}
+}
+
 // TestValidate_RequiredOutcomes_VerificationReported pins the
 // workflow-v1 enum member added in v1.5 (#1886 / ADR-059) against the
 // CLI's embedded mirror — the two mirrors must agree, or a spec the
