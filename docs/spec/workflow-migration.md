@@ -143,8 +143,18 @@ A gate with neither enumerable members nor unresolved predicates prints the expl
 (cd cli && go test ./internal/spec -run TestMigrate_OwnSpecGolden -update-golden)
 ```
 
+## Migrating this repo's own spec (operator walk)
+
+Fishhawk's own `.fishhawk/workflows.yaml` still declares `version: "1.3"`. **No agent stage can migrate it**: the `feature_change` implement stage declares `forbidden_paths` including `".fishhawk/**"` (`.fishhawk/workflows.yaml:177-181`), so an implement commit touching that path fails the constraint — for any run on this workflow, not just this one. The migration is therefore an **operator base commit**, walked in this order:
+
+1. **Dry-run the codemod.** `fishhawk migrate-spec .fishhawk/workflows.yaml --report-only` writes nothing (verify with `git status --porcelain`) and prints the eligibility report. Against the live v1.3 spec it reports that the document *migrates cleanly to workflow-v2*.
+2. **Read the report's four WIDENED gates.** All four approval gates — `feature_change` plan, `feature_change` review, `human_led_change` review, and `release` deploy — are flagged **WIDENED**, because the legacy `approvers: {any_of: [founder]}` form carries no source for a `not:` exclusion (see [What is never fabricated](#what-is-never-fabricated)). The migrated `approvals: {count: 1, members: [kuhlman-labs]}` would let the change's own author or an agent identity satisfy the gate. **Restore `not: [author, agent]` by hand on all four gates**, matching the shipped presets, before committing. Skipping this step ships an observably self-approvable gate — which is why the report, not the migrated bytes, is the product.
+3. **Leave `limit_usd` alone unless you want it.** No USD ceiling is fabricated for the three budget-bearing stages (plan, implement, acceptance), and no runtime check reads a stage budget on any major (**#2328** tracks stage-budget enforcement), so adding one is optional and advisory today.
+4. **Hoist `reviewers`, not `executor`, if you want to exercise the reuse resolver.** The `feature_change` **plan** and **implement** stages declare byte-identical `reviewers` blocks (the two heterogeneous-reviewer declarations at `.fishhawk/workflows.yaml:92` and `:158`), so a `defaults.reviewers` hoist is a safe, real use of [`defaults`](workflow-v2.md#reuse-defaults-and-extends). Do **not** hoist `executor` yet: `fishhawk doctor`'s client-side *execution path configured* rung checks each stage for a literal executor and false-fails a valid v2 spec that relies on `defaults.executor` — filed as **#2340**, still open. (The three shipped presets keep a per-stage `executor` for the same reason.)
+5. **Commit the migrated file to the BASE branch**, never through a run. Then expect a schema-major MCP reconnect on the first `scripts/dev up` / `reload` afterwards: a `version:` major bump fires the louder schema-major banner (**#1422**) because the live stdio `fishhawk-mcp` validates the spec on its own embedded schema.
+
 ## See also
 
-- [`workflow-v2.md`](workflow-v2.md) — the v2 grammar, per-E52-child.
+- [`workflow-v2.md`](workflow-v2.md) — the complete standalone reference for the target grammar.
 - [`workflow-v1.md`](workflow-v1.md) — the source grammar.
 - `cli/README.md` — the CLI surface.

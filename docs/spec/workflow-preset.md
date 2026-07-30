@@ -29,7 +29,8 @@ sense it always resolved to.
 
 `autonomy:` is a *shorthand*. An explicit `actions:` entry overrides the
 tier for that class only; see
-[the action matrix](workflow-v2.md) for the full grammar. The presets
+[the action matrix](workflow-v2.md#autonomy-tier-shorthand-and-action-matrix)
+for the full grammar. The presets
 declare the tier and nothing else, because a preset is a starting point,
 not a policy statement about one class.
 
