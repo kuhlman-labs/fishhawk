@@ -174,6 +174,8 @@ The `defaults` and `extends` keys are stripped after validation, before the type
 workflows:
   feature_change:
     description: "..."      # optional; free-form
+    applies_to:             # optional; the changes this workflow may be used for
+      labels: [dependencies]
     extends: base_change    # optional; another workflow key in this document
     autonomy: medium        # optional; tier shorthand (low | medium | high)
     actions: {...}          # optional; per-action-class delegation matrix
@@ -192,6 +194,7 @@ workflows:
 | Member | Meaning |
 |---|---|
 | `description` | Free-form prose. Carried, never interpreted. |
+| `applies_to` | A [path predicate](#path-predicate) declaring which changes may use this workflow — see [Workflow routing](#workflow-routing-applies_to). Absent means *any* change. |
 | `extends` | Names another workflow in this document as this one's base — see [Reuse](#reuse-defaults-and-extends). |
 | `autonomy` | Tier shorthand expanding to a full action matrix — see [Autonomy](#autonomy-tier-shorthand-and-action-matrix). |
 | `actions` | The per-action-class delegation matrix, and the home of the two reserved keys `page_human_on` and `model_policy`. |
@@ -261,6 +264,43 @@ decomposition:
 ```
 
 The maximum number of decomposed child runs that may dispatch **concurrently** for a run of this workflow. `0` — and an absent block — means unlimited. It is a per-workflow override of the global `FISHHAWKD_MAX_PARALLEL_CHILDREN` operator default: when `max_parallel > 0` the knob wins, otherwise the global default applies.
+
+### Workflow routing (`applies_to`)
+
+```yaml
+applies_to: # optional; a $defs/predicate — see "Path predicate" below
+  labels: [dependencies, documentation]
+  paths: ["docs/**"]
+  trigger: [diff]
+```
+
+`applies_to` declares **which changes this workflow may be used for**. It is a [path predicate](#path-predicate) — the same match rule `escalations` and the review-conventions consume — deliberately not a second matcher with its own subtly different semantics, so match semantics here are the predicate's: AND across declared criteria types, OR within a list, and an undeclared type does not constrain.
+
+A workflow declaring **no** `applies_to` accepts any change. That is what leaves every document written before this property existed unaffected, and it is why the absent case is *not* an empty predicate (an empty predicate is an authoring error, never match-all).
+
+**Enforcement is fail-closed, in two phases.** Each criterion is evaluated at the earliest point in a run where something actually *produces* the value it matches against:
+
+| Criterion | Evaluated at | Against |
+|---|---|---|
+| `labels` | run admission (`POST /v0/runs`) | the run's issue-context label snapshot |
+| `trigger` | run admission | the run's trigger form |
+| `paths` | the **plan gate** | the approved plan's `scope.files` |
+
+The `paths` deferral is not a weakening. At admission a code-change run has no paths yet — nothing has proposed a diff — so evaluating `paths` there could only match against zero paths, which the AND-across-types rule turns into a blanket refusal. The plan gate is the first point where a path set exists, and the set it checks is `scope.files`, which is **binding rather than descriptive**: the existing scope gate confines the implement stage to it. A run admitted under a workflow declaring `paths: ["docs/**"]` is therefore *confined* to `docs/**`, not merely claimed to be. Both rejection points fire before any implement work, so a refusal costs a re-run and never half-applied work.
+
+**The trust boundary is caller-attested, and that is a deliberate limit.** Issue labels are fetched by the caller and shipped inline on the create request, so a caller determined to route a change through the wrong workflow can attest whatever labels it likes. `applies_to` prevents **misrouting**, not a determined authorized caller. The sanctioned exception is the audited override on the create request (`applies_to_override` plus a required reason), which admits the run and records why — an escape hatch that leaves a trail, rather than the alternative of permanently widening the declaration. Server-side label fetching is the named hardening path, not something this grammar already gives you.
+
+**An issue-less run resolves to an empty label set and is refused.** A `cli` or `ui` run carries no issue context, so a workflow declaring `labels` cannot be satisfied by it. This is fail-closed by design; the refusal names the absent issue context specifically, rather than reporting a generic predicate mismatch that would send the operator looking for a label that was never going to be there.
+
+**`change_kind` is rejected inside `applies_to`.** The shared predicate grammar carries the criterion for its other consumers, but nothing populates a change kind today, so a workflow declaring it would be selectable by no run at all — a state indistinguishable, from the operator's side, from the routing control being broken. Both the backend and `fishhawk validate` refuse it at parse time with a message naming the missing producer.
+
+**The non-diff `trigger` forms have no producer either, but are accepted.** Unlike `change_kind` they are *partially* usable: `trigger: [diff, scheduled]` still matches real runs today, and the `scheduled` / `on_demand` arms route correctly the moment a scheduled groomer or an on-demand intake starts producing them. A predicate declaring **only** `scheduled` or **only** `on_demand` therefore matches nothing today — that is expected, not a bug.
+
+**Overlap is benign by construction.** `applies_to` *filters* a workflow the operator named; it never *selects* one. Two workflows whose predicates both match a change is not a coin flip — the requested `workflow_id` is admitted if its own predicate is satisfied, and the other workflow is simply another one that would also have been legal.
+
+`extends` folds **stages** only, so a deriving workflow does not inherit its base's `applies_to`; declare the routing predicate on each workflow that needs one. This matches every other non-stage member (`budgets`, `policy`, `decomposition`, `autonomy` are likewise not inherited).
+
+> As of the slice that introduced it, `applies_to` is **declared but not yet enforced**: the schema accepts it, the parser round-trips it and both validators check it, and no run consults it. The two enforcement points above land in the sibling slices of the same change.
 
 ## Stages
 
@@ -1004,7 +1044,7 @@ The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile 
 
 ## Path predicate
 
-`$defs/predicate` is one declarative match rule over a change — the SINGLE matcher that `applies_to` routing (E53.3 / #2226), `escalations` (E53.4 / #2227) and the review-conventions of ADR-068 (#2211) will each `$ref` rather than each growing a subtly different matcher. It is declared **but not yet referenced**: no property points at it and no run consults it until those three children wire it (E53.1 / #2224 ships the primitive plus its proof). An unreferenced `$defs` entry is inert under JSON Schema Draft 2020-12, so its presence changes no existing document's validity.
+`$defs/predicate` is one declarative match rule over a change — the SINGLE matcher that a workflow's [`applies_to`](#workflow-routing-applies_to) routing (E53.3 / #2226), `escalations` (E53.4 / #2227) and the review-conventions of ADR-068 (#2211) each `$ref` rather than each growing a subtly different matcher. `applies_to` is its **first consumer**; the other two children wire the rest. The definition is deliberately left **unchanged by its consumers**: a consumer needing a narrower grammar refuses the criterion at its own declaration site — as `applies_to` does for `change_kind` — rather than editing the shared shape out from under the others.
 
 A predicate carries four optional criteria, each a non-empty list:
 

@@ -2,6 +2,8 @@ package spec_test
 
 import (
 	"errors"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -2207,4 +2209,201 @@ workflows:
 	// Entry point 2: ValidateBytes (the sweep still precedes resolution, and
 	// both precede schema.Validate).
 	assertRemovedFormWins(t, spec.ValidateBytes([]byte(doc)))
+}
+
+// --- applies_to workflow routing (E53.3 / #2226) ---
+//
+// `fishhawk validate` must not accept a spec the backend refuses at dispatch,
+// so the backend's two semantic checks on a workflow's `applies_to` are
+// mirrored here over the raw yaml tree. The implementations are independent
+// (the two Go modules share no package); the tests below assert the SHIPPED
+// message text on both sides, and TestAppliesToChangeKindMessageParity reads
+// both source files and fails on any drift in the one hand-duplicated string.
+
+// appliesToCLIDoc renders a minimal v2 document whose single workflow carries
+// the given `applies_to` YAML block (already indented four spaces).
+func appliesToCLIDoc(appliesTo string) []byte {
+	return []byte(`
+version: "2"
+workflows:
+  docs_change:
+` + appliesTo + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+}
+
+// TestValidateBytes_AppliesTo_Valid is the positive control: a well-formed
+// routing predicate — and a workflow declaring none at all — both validate
+// clean, so the check cannot pass by rejecting everything.
+func TestValidateBytes_AppliesTo_Valid(t *testing.T) {
+	cases := []struct {
+		name      string
+		appliesTo string
+	}{
+		{
+			name: "declared predicate across every accepted criterion",
+			appliesTo: `    applies_to:
+      paths:
+        - "docs/**"
+      labels:
+        - documentation
+      trigger:
+        - diff
+        - scheduled`,
+		},
+		{
+			name:      "no applies_to at all",
+			appliesTo: `    description: "accepts any change"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := spec.ValidateBytes(appliesToCLIDoc(tc.appliesTo)); err != nil {
+				t.Errorf("ValidateBytes = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_AppliesTo_ChangeKind_Rejected is the CLI parity check for
+// the backend's no-producer rejection. The document is SCHEMA-valid — the
+// shared predicate grammar keeps `change_kind` for its other consumers — so
+// this proves the CLI's own semantic layer owns the refusal, and it asserts
+// the full message plus the pointer.
+func TestValidateBytes_AppliesTo_ChangeKind_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(appliesToCLIDoc(`    applies_to:
+      change_kind:
+        - refactor`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for a change_kind criterion in applies_to", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/applies_to/change_kind") {
+		t.Errorf("error = %q, want it to name /workflows/docs_change/applies_to/change_kind", msg)
+	}
+	if !strings.Contains(msg, spec.MsgAppliesToChangeKindUnsupported) {
+		t.Errorf("error = %q, want it to carry MsgAppliesToChangeKindUnsupported", msg)
+	}
+}
+
+// TestValidateBytes_AppliesTo_MalformedGlob_Rejected covers the one predicate
+// grammar rule the schema cannot express (a glob is just a string to JSON
+// Schema), so it reaches the SHARED Predicate.Validate through the CLI's raw
+// projection and reports at the workflow's own pointer.
+func TestValidateBytes_AppliesTo_MalformedGlob_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(appliesToCLIDoc(`    applies_to:
+      paths:
+        - "docs/[unclosed"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for a malformed applies_to glob", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/applies_to") {
+		t.Errorf("error = %q, want it to name /workflows/docs_change/applies_to", msg)
+	}
+	if !strings.Contains(msg, "docs/[unclosed") {
+		t.Errorf("error = %q, want it to name the offending glob", msg)
+	}
+}
+
+// TestValidateBytes_AppliesTo_SchemaCaughtForms pins the grammar rules the
+// SCHEMA owns, so `fishhawk validate` rejects them locally rather than
+// deferring to the backend — including the empty predicate, which must never
+// read as match-all.
+func TestValidateBytes_AppliesTo_SchemaCaughtForms(t *testing.T) {
+	cases := []struct {
+		name      string
+		appliesTo string
+	}{
+		{name: "empty predicate is not match-all", appliesTo: `    applies_to: {}`},
+		{name: "unknown trigger form", appliesTo: `    applies_to:
+      trigger:
+        - webhook`},
+		{name: "empty label", appliesTo: `    applies_to:
+      labels:
+        - ""`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := spec.ValidateBytes(appliesToCLIDoc(tc.appliesTo))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if !strings.Contains(err.Error(), "applies_to") {
+				t.Errorf("error = %q, want it to name applies_to", err.Error())
+			}
+		})
+	}
+}
+
+// TestValidateBytes_AppliesTo_ExtendsDoesNotInherit pins the resolution
+// interaction: `extends` folds only STAGES, so a deriving workflow does NOT
+// inherit its base's routing declaration. The base's unsupported change_kind
+// is therefore reported against the BASE and never attributed to the deriving
+// workflow — every workflow in the document is validated in its own right.
+func TestValidateBytes_AppliesTo_ExtendsDoesNotInherit(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    applies_to:
+      change_kind:
+        - refactor
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+  derived:
+    extends: base
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError naming the base's applies_to", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/base/applies_to/change_kind") {
+		t.Errorf("error = %q, want it reported against the declaring workflow (base)", msg)
+	}
+	if strings.Contains(msg, "/workflows/derived/applies_to") {
+		t.Errorf("error = %q, want no applies_to error against derived; extends folds stages only", msg)
+	}
+}
+
+// TestAppliesToChangeKindMessageParity is the MECHANICAL drift guard for the
+// one hand-duplicated string in this change. The two spec packages live in
+// separate Go modules and cannot share a constant, so parity is asserted by
+// reading both source files over the repo root and requiring the identical
+// declaration line in each — the same posture
+// TestPredicateSourceParityAcrossModules takes for predicate.go, scaled to
+// the single constant rather than the whole file (the two validate.go files
+// are NOT byte-identical and are not meant to be).
+func TestAppliesToChangeKindMessageParity(t *testing.T) {
+	want := `const MsgAppliesToChangeKindUnsupported = ` + strconv.Quote(spec.MsgAppliesToChangeKindUnsupported)
+	for _, path := range []string{
+		"../../../backend/internal/spec/validate.go",
+		"../../../cli/internal/spec/validate.go",
+	} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(src), want) {
+			t.Errorf("%s does not declare the applies_to change_kind message verbatim;\nwant the line: %s\n"+
+				"The two modules cannot share a constant, so the backend and CLI copies must stay byte-identical or `fishhawk validate` and the backend will report different text for the same spec error.", path, want)
+		}
+	}
 }
