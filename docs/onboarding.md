@@ -60,13 +60,17 @@ A fifth rung is checked **client-side** against the discovered
 
 | Rung | Fails when | Remediation |
 |---|---|---|
-| **execution path configured** | *any* stage in the spec declares no executor (a spec that looks onboarded but wedges on the first unconfigured stage) | add an executor to each named stage (see `docs/spec/workflows-v0.md`) |
+| **execution path configured** | *any* stage in the **resolved** spec declares no executor (a spec that looks onboarded but wedges on the first unconfigured stage) | add an executor to each named stage (see `docs/spec/workflows-v0.md`) |
 
 The execution-path rung reports `ok` **only** when *every* stage declares a
-non-empty executor (`agent`, `human`, or a `delegate`). A mixed workflow —
-some stages configured, at least one not — **fails**, and the remediation names
-the unconfigured stage(s). It warns (rather than fails) when no spec is found;
-the local-loop **workflow spec present** rung is the authority on a
+non-empty executor (`agent`, `human`, or a `delegate`). It checks the
+**resolved** document (same-document reuse resolved first, #2340), so a
+workflow-v2 stage that omits its own executor and inherits one from a
+`defaults` block or an `extends` base counts as configured — the rung sees the
+same document the validator does. A mixed workflow — some stages configured, at
+least one not — **fails**, and the remediation names the unconfigured stage(s).
+It warns (rather than fails) when no spec is found or the spec cannot be
+resolved; the local-loop **workflow spec present** rung is the authority on a
 hard-missing or schema-invalid spec.
 
 ### Degradation

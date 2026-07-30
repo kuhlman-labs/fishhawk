@@ -76,16 +76,16 @@ on every stage:
 Both Go validators resolve reuse *before* schema validation, so a
 file-level `defaults.executor` would validate — an inherited executor
 satisfies `$defs/stage`'s `required: [id, type, executor]` with no schema
-relaxation. The reason not to ship one is the OTHER readers: a governance
-document is also read by tooling that does no reuse resolution.
-`fishhawk doctor`'s `execution path configured` rung parses the discovered
-`.fishhawk/workflows.yaml` directly and reports **fail**, naming the
-stages, when a stage carries no executor — so a freshly-scaffolded repo
-whose preset relied on inheritance would fail its own readiness check. A
-bare `check-jsonschema` run has the same blind spot. Per-stage executors
-cost three lines and keep every reader in agreement;
-`TestPresetsDeclarePerStageExecutors` pins them and fails a future edit
-that hoists the block.
+relaxation. `fishhawk doctor`'s `execution path configured` rung also
+resolves reuse before checking, so it too accepts a hoisted executor
+(#2340). The reason not to ship one is the remaining reader: a governance
+document is also read by tooling that does **no** reuse resolution, and a
+bare `check-jsonschema --schemafile` run is exactly that — it validates
+the raw bytes against `$defs/stage` and reports an executor-less stage as
+missing a required property. A freshly-scaffolded repo should be readable
+by that reader too, so per-stage executors cost three lines and keep every
+reader in agreement; `TestPresetsDeclarePerStageExecutors` pins them and
+fails a future edit that hoists the block.
 
 `reviewers` is **deliberately NOT hoisted** for a second, stronger
 reason, and stays declared per stage.

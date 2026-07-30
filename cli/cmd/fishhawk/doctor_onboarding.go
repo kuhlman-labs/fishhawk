@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 )
 
 // onboardingReadiness mirrors the backend's onboardingReadinessResponse
@@ -190,6 +192,16 @@ func checkOnboardingReadiness(backendURL, token, repo string) []checkResult {
 // ANY stage lacks one, so a mixed spec (some stages configured, at least one
 // not) is flagged rather than passing. It warns when no spec is found;
 // checkSpec is the authority on a missing / schema-invalid spec.
+//
+// The check runs on the RESOLVED document (spec.ResolveReuse), not the raw
+// author bytes (#2340): a workflow-v2 stage may legitimately omit its own
+// executor and inherit one from a file- or workflow-level `defaults` block or
+// an `extends` base, and the product accepts such a stage because both Go
+// validators resolve reuse before schema validation. Checking the raw bytes
+// would false-fail that stage. A spec that cannot be resolved degrades to
+// warn pointing at `fishhawk validate`, mirroring the parse-error rung —
+// checkSpec remains the authority on a broken or schema-invalid spec, so a
+// doctor rung must never be the thing that reports one as a hard fail.
 func checkExecutionPath(workingDir string) checkResult {
 	const label = "execution path configured"
 	ds, err := discoverSpec(workingDir, "")
@@ -200,6 +212,12 @@ func checkExecutionPath(workingDir string) checkResult {
 	if ds == nil {
 		return checkResult{label: label, detail: "no spec found", status: "warn",
 			remediate: "create .fishhawk/workflows.yaml (see docs/spec/workflows-v0.md)"}
+	}
+
+	resolved, err := spec.ResolveReuse(ds.Contents)
+	if err != nil {
+		return checkResult{label: label, detail: "spec resolve error", status: "warn",
+			remediate: "run `fishhawk validate` for details"}
 	}
 
 	var parsed struct {
@@ -214,7 +232,7 @@ func checkExecutionPath(workingDir string) checkResult {
 			} `yaml:"stages"`
 		} `yaml:"workflows"`
 	}
-	if err := yaml.Unmarshal(ds.Contents, &parsed); err != nil {
+	if err := yaml.Unmarshal(resolved, &parsed); err != nil {
 		return checkResult{label: label, detail: "spec parse error", status: "warn",
 			remediate: "run `fishhawk validate` for details"}
 	}

@@ -312,3 +312,182 @@ func TestCheckExecutionPath_NoSpec(t *testing.T) {
 		t.Errorf("status = %q, want warn when no spec is found", r.status)
 	}
 }
+
+// --- #2340: the rung checks the RESOLVED document ---------------------------
+//
+// A workflow-v2 stage may legitimately omit its own executor and inherit one
+// from a `defaults` block or an `extends` base; the product accepts such a
+// stage because both Go validators resolve reuse before schema validation.
+// The rung must resolve reuse (spec.ResolveReuse) before checking, or it
+// false-fails a valid spec. Every case drives the real cmd -> internal/spec
+// seam via a spec file on disk.
+
+// TestCheckExecutionPath_V2InheritsExecutorFromFileDefaults is the #2340
+// regression / done-means: a version "2" spec whose ONLY executor is a
+// file-level defaults.executor.agent returns ok. It fails on the pre-fix code
+// ("N of M stage(s) without an executor"), so no comment-only touch of
+// checkExecutionPath satisfies it (#1169).
+func TestCheckExecutionPath_V2InheritsExecutorFromFileDefaults(t *testing.T) {
+	dir := writeExecPathSpec(t, `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+      - id: implement
+        type: implement
+`)
+	r := checkExecutionPath(dir)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (a v2 stage may inherit its executor from file defaults) (detail: %s, remediate: %s)", r.status, r.detail, r.remediate)
+	}
+}
+
+// TestCheckExecutionPath_V2InheritsExecutorFromWorkflowDefaults is the same
+// for a workflow-level defaults block.
+func TestCheckExecutionPath_V2InheritsExecutorFromWorkflowDefaults(t *testing.T) {
+	dir := writeExecPathSpec(t, `
+version: "2"
+workflows:
+  feature_change:
+    defaults:
+      executor:
+        agent: claude-code
+    stages:
+      - id: plan
+        type: plan
+      - id: implement
+        type: implement
+`)
+	r := checkExecutionPath(dir)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (a v2 stage may inherit its executor from workflow defaults) (detail: %s)", r.status, r.detail)
+	}
+}
+
+// TestCheckExecutionPath_V2InheritsExecutorViaExtends: a v2 workflow that
+// inherits its stages via `extends` from a base whose stages declare
+// executors returns ok.
+func TestCheckExecutionPath_V2InheritsExecutorViaExtends(t *testing.T) {
+	dir := writeExecPathSpec(t, `
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+  derived:
+    extends: base
+`)
+	r := checkExecutionPath(dir)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok (derived inherits executor-carrying stages via extends) (detail: %s)", r.status, r.detail)
+	}
+}
+
+// TestCheckExecutionPath_V2StageWithNoExecutorAnywhere: a v2 stage with no
+// executor from ANY rung — no defaults, no base — still fails and names that
+// stage, so resolving reuse does not blind the rung.
+func TestCheckExecutionPath_V2StageWithNoExecutorAnywhere(t *testing.T) {
+	dir := writeExecPathSpec(t, `
+version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: implement
+        type: implement
+`)
+	r := checkExecutionPath(dir)
+	if r.status != "fail" {
+		t.Fatalf("status = %q, want fail (implement has no executor from any rung) (detail: %s)", r.status, r.detail)
+	}
+	if !strings.Contains(r.remediate, "implement") {
+		t.Errorf("remediate = %q, want the unconfigured stage 'implement' named", r.remediate)
+	}
+}
+
+// TestCheckExecutionPath_V2BareTimeoutDefaultDoesNotConfigureHumanlessStage:
+// a bare {timeout: 30m} default is DROPPED for a stage that selects no branch
+// key, so nothing supplies that stage an executor and the rung still fails.
+// This proves the branch rule's closed-branch half survives the doctor seam.
+func TestCheckExecutionPath_V2BareTimeoutDefaultDoesNotConfigureBranchlessStage(t *testing.T) {
+	dir := writeExecPathSpec(t, `
+version: "2"
+defaults:
+  executor:
+    timeout: 30m
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: review
+        type: review
+        executor:
+          human: true
+      - id: implement
+        type: implement
+        executor:
+          timeout: 30m
+`)
+	r := checkExecutionPath(dir)
+	if r.status != "fail" {
+		t.Fatalf("status = %q, want fail (the branchless implement executor names no agent/human/delegate) (detail: %s)", r.status, r.detail)
+	}
+	if !strings.Contains(r.remediate, "implement") {
+		t.Errorf("remediate = %q, want the branchless stage 'implement' named", r.remediate)
+	}
+}
+
+// TestCheckExecutionPath_UnresolvableSpec: an `extends` naming an absent
+// workflow cannot be resolved, so the rung degrades to warn pointing at
+// `fishhawk validate` rather than hard-failing (checkSpec is the authority).
+func TestCheckExecutionPath_UnresolvableSpec(t *testing.T) {
+	dir := writeExecPathSpec(t, `
+version: "2"
+workflows:
+  derived:
+    extends: nope
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`)
+	r := checkExecutionPath(dir)
+	if r.status != "warn" {
+		t.Fatalf("status = %q, want warn on an unresolvable spec (detail: %s)", r.status, r.detail)
+	}
+	if !strings.Contains(r.remediate, "fishhawk validate") {
+		t.Errorf("remediate = %q, want a `fishhawk validate` hint", r.remediate)
+	}
+}
+
+// TestCheckExecutionPath_MalformedYAML: malformed YAML cannot be decoded, so
+// the rung degrades to warn pointing at `fishhawk validate`.
+func TestCheckExecutionPath_MalformedYAML(t *testing.T) {
+	dir := writeExecPathSpec(t, "workflows: [unclosed\n")
+	r := checkExecutionPath(dir)
+	if r.status != "warn" {
+		t.Fatalf("status = %q, want warn on malformed YAML (detail: %s)", r.status, r.detail)
+	}
+	if !strings.Contains(r.remediate, "fishhawk validate") {
+		t.Errorf("remediate = %q, want a `fishhawk validate` hint", r.remediate)
+	}
+}

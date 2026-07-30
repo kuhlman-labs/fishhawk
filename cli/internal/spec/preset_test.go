@@ -128,9 +128,10 @@ func TestPresetsAreWorkflowV2(t *testing.T) {
 // `defaults` block. Both Go validators resolve same-document reuse before
 // schema validation, so a hoisted executor validates — but a shipped
 // governance document is also read by tooling that does no reuse
-// resolution (`fishhawk doctor`'s execution-path check, which reports a
-// stage with no executor as a fail; a bare check-jsonschema run), and
-// such a reader must see an executor on every stage. So: every agent
+// resolution (a bare check-jsonschema run), and such a reader must see
+// an executor on every stage (`fishhawk doctor`'s execution-path check
+// now resolves reuse first, #2340, so it is no longer such a reader).
+// So: every agent
 // stage names its own `agent: claude-code`, the implement stage keeps its
 // `verify:` sub-block, and the review stage declares `human: true`.
 func TestPresetsDeclarePerStageExecutors(t *testing.T) {

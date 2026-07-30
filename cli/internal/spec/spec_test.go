@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 )
 
@@ -1776,4 +1778,307 @@ workflows:
 			}
 		})
 	}
+}
+
+// --- ResolveReuse (#2340) --------------------------------------------------
+//
+// ResolveReuse shares decodeAndResolve with ValidateBytes, so a reader that
+// decodes its output (e.g. `fishhawk doctor`'s execution-path rung) sees the
+// same resolved document the validator validates and can never disagree with
+// it about which stages carry an executor.
+
+// stageExecutorAgents decodes a resolved document and returns, per workflow,
+// the executor.agent of each stage by id (empty string when the stage's
+// executor declares no agent branch).
+func stageExecutorAgents(t *testing.T, resolved []byte) map[string]map[string]string {
+	t.Helper()
+	var doc struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID       string `yaml:"id"`
+				Executor struct {
+					Agent string `yaml:"agent"`
+					Human bool   `yaml:"human"`
+				} `yaml:"executor"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(resolved, &doc); err != nil {
+		t.Fatalf("unmarshal resolved doc: %v\n%s", err, resolved)
+	}
+	out := map[string]map[string]string{}
+	for name, wf := range doc.Workflows {
+		out[name] = map[string]string{}
+		for _, st := range wf.Stages {
+			out[name][st.ID] = st.Executor.Agent
+		}
+	}
+	return out
+}
+
+// TestResolveReuse_FileDefaultsExecutorFoldedIntoEveryStage: a v2 document
+// whose ONLY executor is a file-level defaults.executor.agent resolves to
+// stages that each carry it.
+func TestResolveReuse_FileDefaultsExecutorFoldedIntoEveryStage(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+      - id: implement
+        type: implement
+`
+	resolved, err := spec.ResolveReuse([]byte(doc))
+	if err != nil {
+		t.Fatalf("ResolveReuse = %v, want nil", err)
+	}
+	agents := stageExecutorAgents(t, resolved)["feature_change"]
+	for _, id := range []string{"plan", "implement"} {
+		if agents[id] != "claude-code" {
+			t.Errorf("stage %q executor.agent = %q, want claude-code (inherited from file defaults)", id, agents[id])
+		}
+	}
+	// Faithfulness: the resolved output must still validate.
+	if err := spec.ValidateBytes(resolved); err != nil {
+		t.Errorf("ValidateBytes(ResolveReuse output) = %v, want nil", err)
+	}
+}
+
+// TestResolveReuse_WorkflowDefaultsExecutorFoldedIntoEveryStage: the same for
+// a workflow-level defaults block.
+func TestResolveReuse_WorkflowDefaultsExecutorFoldedIntoEveryStage(t *testing.T) {
+	const doc = `
+version: "2"
+workflows:
+  feature_change:
+    defaults:
+      executor:
+        agent: claude-code
+    stages:
+      - id: plan
+        type: plan
+      - id: implement
+        type: implement
+`
+	resolved, err := spec.ResolveReuse([]byte(doc))
+	if err != nil {
+		t.Fatalf("ResolveReuse = %v, want nil", err)
+	}
+	agents := stageExecutorAgents(t, resolved)["feature_change"]
+	for _, id := range []string{"plan", "implement"} {
+		if agents[id] != "claude-code" {
+			t.Errorf("stage %q executor.agent = %q, want claude-code (inherited from workflow defaults)", id, agents[id])
+		}
+	}
+	if err := spec.ValidateBytes(resolved); err != nil {
+		t.Errorf("ValidateBytes(ResolveReuse output) = %v, want nil", err)
+	}
+}
+
+// TestResolveReuse_ExtendsInheritsStages: a workflow that omits `stages`
+// entirely inherits them from its `extends` base.
+func TestResolveReuse_ExtendsInheritsStages(t *testing.T) {
+	const doc = `
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+  derived:
+    extends: base
+`
+	resolved, err := spec.ResolveReuse([]byte(doc))
+	if err != nil {
+		t.Fatalf("ResolveReuse = %v, want nil", err)
+	}
+	derived := stageExecutorAgents(t, resolved)["derived"]
+	for _, id := range []string{"plan", "implement"} {
+		if derived[id] != "claude-code" {
+			t.Errorf("derived stage %q executor.agent = %q, want claude-code (inherited via extends)", id, derived[id])
+		}
+	}
+	if err := spec.ValidateBytes(resolved); err != nil {
+		t.Errorf("ValidateBytes(ResolveReuse output) = %v, want nil", err)
+	}
+}
+
+// TestResolveReuse_BareTimeoutDefaultLeavesHumanStageUntouched: a bare
+// {timeout: 30m} executor default is DROPPED for a `human: true` stage (the
+// closed-branch half of the branch rule), so the human stage survives the new
+// entry point without an agent grafted onto it.
+func TestResolveReuse_BareTimeoutDefaultLeavesHumanStageUntouched(t *testing.T) {
+	const doc = `
+version: "2"
+defaults:
+  executor:
+    timeout: 30m
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: review
+        type: review
+        executor:
+          human: true
+`
+	resolved, err := spec.ResolveReuse([]byte(doc))
+	if err != nil {
+		t.Fatalf("ResolveReuse = %v, want nil", err)
+	}
+	// The human stage must not have gained an agent (or any other key).
+	var doc2 struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID       string         `yaml:"id"`
+				Executor map[string]any `yaml:"executor"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(resolved, &doc2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, st := range doc2.Workflows["feature_change"].Stages {
+		if st.ID != "review" {
+			continue
+		}
+		if got := st.Executor["human"]; got != true {
+			t.Errorf("review executor.human = %v, want true", got)
+		}
+		if len(st.Executor) != 1 {
+			t.Errorf("review executor = %v, want the bare {human: true} untouched by the dropped timeout default", st.Executor)
+		}
+	}
+	if err := spec.ValidateBytes(resolved); err != nil {
+		t.Errorf("ValidateBytes(ResolveReuse output) = %v, want nil", err)
+	}
+}
+
+// TestResolveReuse_LowerMajorsPassThrough: a v0 and a v1 document carry no
+// reuse primitives, so they come back with their stages and executors intact
+// and still validate.
+func TestResolveReuse_LowerMajorsPassThrough(t *testing.T) {
+	for _, version := range []string{"0.7", "1.0"} {
+		t.Run(version, func(t *testing.T) {
+			resolved, err := spec.ResolveReuse([]byte(minimalSpecAtVersion(version)))
+			if err != nil {
+				t.Fatalf("ResolveReuse = %v, want nil", err)
+			}
+			if agents := stageExecutorAgents(t, resolved)["trivial"]; agents["implement"] != "claude-code" {
+				t.Errorf("implement executor.agent = %q, want claude-code (unchanged)", agents["implement"])
+			}
+			if err := spec.ValidateBytes(resolved); err != nil {
+				t.Errorf("ValidateBytes(ResolveReuse output) = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestResolveReuse_ParseErrors: malformed YAML and an empty document each
+// return *ParseError.
+func TestResolveReuse_ParseErrors(t *testing.T) {
+	for name, in := range map[string]string{
+		"malformed YAML":  "key: [unclosed\n",
+		"empty document":  "",
+		"whitespace only": "   \n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := spec.ResolveReuse([]byte(in))
+			var pe *spec.ParseError
+			if !errors.As(err, &pe) {
+				t.Fatalf("err = %v (%T), want *ParseError", err, err)
+			}
+		})
+	}
+}
+
+// TestResolveReuse_ValidationErrors: an unsupported version major and an
+// `extends` naming an absent workflow each return *ValidationError, proving
+// the whole shared prefix (routing + resolution) surfaces through this entry
+// point too.
+func TestResolveReuse_ValidationErrors(t *testing.T) {
+	cases := map[string]string{
+		"unsupported major": minimalSpecAtVersion("3.0"),
+		"unknown extends base": `
+version: "2"
+workflows:
+  derived:
+    extends: nope
+    stages:
+      - id: a
+        type: plan
+        executor:
+          agent: claude-code
+`,
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := spec.ResolveReuse([]byte(doc))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v (%T), want *ValidationError", err, err)
+			}
+		})
+	}
+}
+
+// TestResolveReuse_SweepPrecedesResolution is the binding-condition assertion
+// that the shared prefix runs the removed-forms sweep BEFORE reuse
+// resolution. The document carries a removed v2 form (`drive`) AND a
+// resolution failure (`extends` naming an absent base) in the SAME workflow.
+// Under the correct order the sweep's removed-form message wins; under a
+// swapped order the unknown-base resolution error would win instead. Both
+// entry points to decodeAndResolve are exercised so neither can drift.
+func TestResolveReuse_SweepPrecedesResolution(t *testing.T) {
+	const doc = `
+version: "2"
+workflows:
+  wf:
+    drive: true
+    extends: nope
+    stages:
+      - id: a
+        type: implement
+        executor:
+          agent: claude-code
+`
+	const wantDriveMsg = `the workflow flag "drive" is spelled "auto_advance" in workflow-v2`
+	const unknownBaseFrag = `does not define`
+
+	assertRemovedFormWins := func(t *testing.T, err error) {
+		t.Helper()
+		var ve *spec.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("err = %v (%T), want *ValidationError", err, err)
+		}
+		joined := strings.Join(messageStrings(ve), "\n")
+		if !strings.Contains(joined, wantDriveMsg) {
+			t.Errorf("error %q is not the removed-form message; the sweep must run BEFORE resolution", joined)
+		}
+		if strings.Contains(joined, unknownBaseFrag) {
+			t.Errorf("error %q is the resolution failure; a swapped order reported it instead of the removed form", joined)
+		}
+	}
+
+	// Entry point 1: ResolveReuse.
+	_, err := spec.ResolveReuse([]byte(doc))
+	assertRemovedFormWins(t, err)
+
+	// Entry point 2: ValidateBytes (the sweep still precedes resolution, and
+	// both precede schema.Validate).
+	assertRemovedFormWins(t, spec.ValidateBytes([]byte(doc)))
 }
