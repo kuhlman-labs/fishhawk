@@ -197,33 +197,48 @@ type ParseError struct {
 
 func (e *ParseError) Error() string { return "spec: " + e.Msg }
 
-// ValidateBytes parses data as YAML and validates the resulting
-// document against the version-routed workflow schema (v0 or v1, by
-// the spec's version major; ADR-046). Returns a *ParseError for
-// empty / malformed YAML, a *ValidationError for schema failures
-// (including an unsupported version major), and nil on success.
-func ValidateBytes(data []byte) error {
+// decodeAndResolve runs the shared prefix of every validating/resolving
+// read: it decodes data as YAML, routes it to its version-major schema, and
+// (for a routed major >= 2 only) runs the removed-forms sweep and then the
+// same-document reuse resolution, IN THAT ORDER.
+//
+// THE ORDER IS LOAD-BEARING and mirrors backend/internal/spec/parse.go byte
+// for byte (see v2reuse.go's ORDERING block):
+//
+//	decode -> schemaForVersion -> validateV2RemovedForms -> resolveV2Reuse
+//
+// Both ValidateBytes and ResolveReuse call this so they can never disagree
+// about which document the schema sees. The removed-forms sweep runs BEFORE
+// resolution so its actionable message beats a resolution failure on the same
+// document; resolution runs BEFORE the caller's schema.Validate so an
+// inherited executor satisfies $defs/stage's required list with no schema
+// relaxation. raw is mutated in place by resolveV2Reuse.
+//
+// Returns a *ParseError for empty / malformed YAML and a *ValidationError for
+// an unsupported version major, a dotted v2 minor, a removed v2 form, or a
+// reuse error (unknown/cyclic extends base, duplicate stage id). The returned
+// schema is nil only alongside a non-nil error.
+func decodeAndResolve(data []byte) (raw any, schema *jsonschema.Schema, major int, err error) {
 	if len(bytes.TrimSpace(data)) == 0 {
-		return &ParseError{Msg: "empty document"}
+		return nil, nil, 0, &ParseError{Msg: "empty document"}
 	}
 
 	// yaml.v3 decodes into Go-native maps with string keys, which
 	// the JSON Schema validator can consume directly without a
 	// JSON round-trip.
-	var raw any
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(false) // permissive at YAML layer; schema is the gate
-	if err := dec.Decode(&raw); err != nil {
-		if errors.Is(err, io.EOF) {
-			return &ParseError{Msg: "empty document"}
+	if decErr := dec.Decode(&raw); decErr != nil {
+		if errors.Is(decErr, io.EOF) {
+			return nil, nil, 0, &ParseError{Msg: "empty document"}
 		}
-		return &ParseError{Msg: err.Error()}
+		return nil, nil, 0, &ParseError{Msg: decErr.Error()}
 	}
 
 	// Route to the schema for the spec's version major (ADR-046).
-	schema, major, err := schemaForVersion(raw)
+	schema, major, err = schemaForVersion(raw)
 	if err != nil {
-		return err
+		return nil, nil, 0, err
 	}
 
 	// workflow-v2 removed two back-compat surfaces (E52.3 / #2215): the
@@ -234,7 +249,7 @@ func ValidateBytes(data []byte) error {
 	// backend's ordering. Below major 2 the sweep never runs.
 	if major >= 2 {
 		if err := validateV2RemovedForms(raw); err != nil {
-			return err
+			return nil, nil, 0, err
 		}
 	}
 
@@ -245,8 +260,22 @@ func ValidateBytes(data []byte) error {
 	// satisfies $defs/stage's required list with no schema relaxation.
 	if major >= 2 {
 		if err := resolveV2Reuse(raw); err != nil {
-			return err
+			return nil, nil, 0, err
 		}
+	}
+
+	return raw, schema, major, nil
+}
+
+// ValidateBytes parses data as YAML and validates the resulting
+// document against the version-routed workflow schema (v0 or v1, by
+// the spec's version major; ADR-046). Returns a *ParseError for
+// empty / malformed YAML, a *ValidationError for schema failures
+// (including an unsupported version major), and nil on success.
+func ValidateBytes(data []byte) error {
+	raw, schema, _, err := decodeAndResolve(data)
+	if err != nil {
+		return err
 	}
 
 	if err := schema.Validate(raw); err != nil {
@@ -265,6 +294,47 @@ func ValidateBytes(data []byte) error {
 	// document, so a defaults.executor.agent_version range is validated on
 	// every stage that inherits it.
 	return validateAgentVersions(raw)
+}
+
+// ResolveReuse decodes data as a workflow spec, runs the same
+// decode -> version-route -> removed-forms-sweep -> reuse-resolution prefix
+// ValidateBytes runs, and returns the RESOLVED document re-marshalled as
+// YAML. It exists so a reader that must reason about resolved stages — e.g.
+// `fishhawk doctor`'s execution-path check — can decode the SAME document the
+// validator sees, and therefore can never disagree with it about which stages
+// carry an executor.
+//
+// Contract:
+//
+//   - It resolves workflow-v2 same-document reuse — file/workflow `defaults`
+//     and a workflow's `extends` base — exactly as ValidateBytes does, because
+//     it shares decodeAndResolve. A stage that inherits its executor from a
+//     `defaults` block or an `extends` base comes back with that executor
+//     folded in.
+//   - For a routed major < 2 the document carries no reuse primitives and
+//     comes back semantically unchanged.
+//   - Comments, key order and anchors are NOT preserved (yaml.Marshal of a
+//     decoded `any`), so this is a MACHINE-READABLE form only — callers must
+//     never write it back to disk.
+//   - It is NOT a validator: it deliberately does not run schema.Validate, so
+//     a nil error means 'resolvable', not 'valid'. Validity stays with
+//     ValidateBytes / `fishhawk validate`.
+//   - Errors are the package's existing types: *ParseError for empty /
+//     malformed YAML, *ValidationError for an unsupported version major, a
+//     dotted v2 minor, an `extends` naming an absent workflow, an `extends`
+//     cycle, a duplicate stage id, or a removed v2 form (the whole prefix is
+//     shared, so every error ValidateBytes raises before schema.Validate is
+//     raised here too).
+func ResolveReuse(data []byte) ([]byte, error) {
+	raw, _, _, err := decodeAndResolve(data)
+	if err != nil {
+		return nil, err
+	}
+	out, err := yaml.Marshal(raw)
+	if err != nil {
+		return nil, &ParseError{Msg: err.Error()}
+	}
+	return out, nil
 }
 
 // validationErrorFrom collapses the validator's nested error tree

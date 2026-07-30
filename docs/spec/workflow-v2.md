@@ -164,6 +164,8 @@ A self-reference (`solo` extending `solo`) reports as the same cycle. A duplicat
 
 The cost is the same tradeoff `needs:` expansion accepts: a reported error **path** points at a position in the resolved document, which for a deriving workflow may not be a position its author wrote. Read the path against the resolved form, not the source.
 
+Post-resolution enforcement has one operator-facing consequence: a **bare `check-jsonschema` run resolves no reuse**, so it rejects a valid reuse-bearing document — a stage that inherits its `executor` trips `$defs/stage`'s `required` list when the raw bytes are validated directly. Use `fishhawk validate` (or let the backend validate), which resolves first. This is the same asymmetry the action-class rules note the other way round (a raw run *accepts* a document the backend *rejects*): the bare schema is neither a superset nor a subset of what the product accepts, so it is not the authority for a reuse-bearing spec.
+
 The `defaults` and `extends` keys are stripped after validation, before the typed decode. No Go struct, database column, API field or consumer read site sees either key.
 
 ## Workflow members

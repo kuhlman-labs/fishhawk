@@ -55,9 +55,8 @@ workflows:
         # Coding-agent executor, declared per stage rather than hoisted
         # into a file-level `defaults` block: a governance document is
         # also read by tooling that does not resolve same-document reuse
-        # (`fishhawk doctor`'s execution-path check, a bare
-        # check-jsonschema run), and such a reader must see an executor
-        # on every stage.
+        # (a bare check-jsonschema run), and such a reader must see an
+        # executor on every stage.
         executor:
           agent: claude-code
           # Optionally pin the coding-agent CLI versions these stages were
