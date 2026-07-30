@@ -9446,12 +9446,28 @@ paths:
         arm `orchestrator.Advance` runs on the retry path.
 
         On a hit the acceptance stage is walked straight to `succeeded`
-        (a passed verdict / skip marker recorded, NO runner dispatched)
-        and the run rolls forward, so the caller returns without spawning
+        (a **not-validated** verdict / skip marker recorded, NO runner
+        dispatched) and the run rolls forward, so the caller returns
+        without spawning
         a runner that would only fail category-C
         `acceptance_target_unreachable`. The response is
         `short_circuited: true` plus the fired predicate and the refreshed
         stage.
+
+        The two verdict-recording predicates record verdict
+        `not_validated` (outcome `not_validated`), NOT `passed` (#2347):
+        the stage verified ZERO criteria — no runner, no preview, no
+        observation — so recording the same word a validator-shipped pass
+        records made an absence of verification read as certification. The
+        outcome is merge-ELIGIBLE (a change with no live target is not
+        stranded) but distinguishable at every consumer: the merge gate's
+        `acceptance_not_validated` state, the MCP `next_actions` state of
+        the same name, and a distinct status-comment row. The payload also
+        carries `criteria_live_validation`, the count of criteria marked
+        `requires_live_validation`. This verdict is SERVER-INTERNAL: the
+        ship-acceptance endpoint (`POST /v0/runs/{run_id}/acceptance`)
+        deliberately still admits only `passed`/`failed`, so a validator
+        can never forge it.
 
         The admissible stage states are `pending` and
         `awaiting_host_dispatch`. A `dispatched` acceptance stage is NOT

@@ -66,6 +66,12 @@ func TestOnboarding_InstructionsDeliveredOnInitialize(t *testing.T) {
 		// E31.9: the acceptance happy-path line + gate-semantics bullet.
 		"acceptance_passed",
 		"acceptance stage",
+		// #2347: the happy-path line must name the not-validated merge-eligible
+		// state too, and carry the acknowledgement ask — otherwise an operator
+		// reading the onboarding guide is told to merge only on acceptance_passed
+		// and treats a short-circuited run as blocked (or as a pass).
+		"acceptance_not_validated",
+		"acknowledge that in your merge verdict",
 		// E34.4: the refinement intake one-liner names the tool.
 		"fishhawk_draft_epic",
 		runbookURI,
@@ -126,6 +132,11 @@ func TestOnboarding_RunbookResourceListedAndReadable(t *testing.T) {
 		"Acceptance stage",
 		"acceptance_passed",
 		"retry_dispatched",
+		// #2347: the runbook's merge-eligible-state list + the not-validated
+		// section (zero criteria verified, say so in the merge verdict).
+		"acceptance_not_validated",
+		"succeeded_acceptance_not_validated",
+		"say so in your merge verdict",
 		// E34.4 refinement intake loop anchors (incl. the rejection/re-draft path).
 		"Refinement intake loop",
 		"Rejection / re-draft path",

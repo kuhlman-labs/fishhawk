@@ -496,6 +496,36 @@ func TestObserveParkedReview_AcceptancePassed_StampsAwaitingMerge(t *testing.T) 
 	}
 }
 
+// TestObserveParkedReview_AcceptanceNotValidated_StampsAwaitingMerge pins the
+// #2347 DEFAULT-ARM fall-through: acceptanceGateNotValidated is not one of the
+// switch's parking cases, so it must reach RuleChecksGreenAwaitingMerge and
+// stamp awaiting_merge / merge_pr — NOT park in acceptance_settled_outcome_unknown
+// (which is where an unhandled verdict would have landed before the gate learned
+// the state, wedging every no-live-target run). The derived status is
+// deliberately identical to a pass here; the operator-visible distinction is
+// carried by the MCP next_actions state, not by this presentation stamp.
+func TestObserveParkedReview_AcceptanceNotValidated_StampsAwaitingMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	seedAcceptanceOutcome(h.au, h.runID, 30, acceptanceVerdictNotValidated)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("run_auto_advanced = %+v, want settled + checks_green_awaiting_merge on a not-validated acceptance", advances)
+	}
+	if advances[1].NextAction == nil || advances[1].NextAction.Action != "merge_pr" {
+		t.Errorf("NextAction = %+v, want merge_pr", advances[1].NextAction)
+	}
+	for _, a := range advances {
+		if a.To == "acceptance_settled_outcome_unknown" {
+			t.Error("a not_validated verdict must NOT park in acceptance_settled_outcome_unknown (#2347)")
+		}
+	}
+}
+
 // TestObserveParkedReview_AcceptancePending_ParksNoMerge pins the pending arm:
 // review evidence green but the acceptance stage has not settled → the run
 // parks with await_acceptance, NEVER merge_pr.

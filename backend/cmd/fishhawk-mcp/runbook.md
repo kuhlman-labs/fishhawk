@@ -369,8 +369,21 @@ reviewers; its settle signal is the audit trail.
 leaves the STAGE `succeeded` — the stage settles through the ordinary agent
 trace-bundle path regardless of pass/fail. Read the `verdict` from the
 `acceptance_outcome_recorded` audit entry, never from the stage state. Merge only
-on the `acceptance_passed` next-actions state (ADR-049 decision #6: the merge is
-gated on the acceptance_passed evidence condition).
+on a merge-eligible next-actions state: `acceptance_passed` (ADR-049 decision #6:
+the merge is gated on the acceptance_passed evidence condition),
+`acceptance_skipped_out_of_scope`, or `acceptance_not_validated`.
+
+**`acceptance_not_validated` (#2347) is merge-eligible but is NOT a pass.** The
+orchestrator short-circuited the stage pre-spawn — every criterion was
+`skip_expected` with a basis, or the plan declared none — so it verified ZERO
+criteria with no runner and no preview. The verdict recorded is `not_validated`,
+and the terminal-run twin state is `succeeded_acceptance_not_validated`. Merging
+is permitted (a change with no live target must not be stranded) and the gate does
+NOT block on your wording, but **say so in your merge verdict**: state that
+acceptance validated nothing. The status comment carries the same distinction
+("Acceptance not validated — 0/N criteria verified"), and the payload's
+`criteria_live_validation` count tells you whether a tracked operator-validation
+walk (#2338 / #2345) is outstanding.
 
 **Deterministic triage of a failure** (ADR-049 decision #2, server-side, bounded
 at **2 auto re-runs** per run):

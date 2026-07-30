@@ -107,3 +107,17 @@ The #1806 false positive predated #1775 (which only changed the consolidated PR 
 It pages `ListRuns(State=running)` and, for any run whose stages are ALL terminal (`StageState.IsTerminal()`) but is itself non-terminal, calls `Advance` → `completeRun` to resolve it to `succeeded`/`failed`/`cancelled`. Skips any run with a non-terminal stage so a genuinely in-flight run is never force-completed; idempotent (an already-terminal run is a `completeRun` no-op, a re-run finds nothing).
 
 Reuses existing repo methods only (no new query) — the recovery for the `{all stages terminal, run non-terminal}` class the merge-resolution bug produced.
+
+## Pre-spawn acceptance short-circuit verdict (#1728 / #1748, verdict corrected by #2347)
+
+`tryShortCircuitAcceptanceCore` evaluates three disjoint approved-plan predicates before an acceptance stage ever spawns a runner: the out-of-scope skip (`verification.out_of_scope` with zero `acceptance_criteria`), empty-criteria (zero of both), and all-skip-with-basis (every criterion `skip_expected` with an `expectation_basis`). On a hit it walks the stage straight to `succeeded` with no runner, no preview, and no observation.
+
+The out-of-scope predicate records a skip MARKER (`acceptance_skipped_out_of_scope`) and no verdict; it is untouched by #2347 and already reads as "no verdict by design". The other two record a real `acceptance_outcome_recorded` verdict via `emitAcceptanceOutcomeShortCircuit` — and that verdict is **`not_validated`, never `passed`**.
+
+Both bases verified exactly ZERO criteria. Recording the same `passed`/`accepted` words a validator-shipped pass records made an ABSENCE of verification render as certification at every consumer downstream: the merge gate (ADR-049 decision #6 gates on that word), the operator's status comment, and release evidence (which passes the verdict string through verbatim). `plan.AcceptanceVerdictNotValidated` / `plan.AcceptanceOutcomeNotValidated` are defined in the **plan** package — imported by orchestrator, server, and auditcomplete, importing no project package itself — so a producer/consumer drift is a compile error rather than a silent runtime miss.
+
+The payload additionally carries `criteria_live_validation` (`plan.LiveValidationCriteriaCount`), the count of criteria marked `requires_live_validation`, so a skip that carries a tracked operator-validation walk (#2338 / #2345) is distinguishable from one skipped on any other basis. `criteria_passed` / `criteria_failed` stay 0 and `criteria_skipped` / `criteria_total` are unchanged.
+
+The outcome stays **merge-eligible** (`server.acceptanceGateNotValidated`): a change with no live target must not be stranded, and a merge block that text-matched operator prose would trade a dishonest pass for a wedge. The honesty is carried by the distinct verdict, gate state, `next_actions` state + reason, and status-comment row — a prompt to acknowledge, not an enforcement.
+
+`auditcomplete`'s trace-required exemption keys on the payload **basis**, never on the verdict, so it is unaffected by the verdict change (pinned by a regression test there).

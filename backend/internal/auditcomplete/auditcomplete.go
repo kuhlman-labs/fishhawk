@@ -302,10 +302,16 @@ func Compute(ctx context.Context, runID uuid.UUID, deps Deps) (stagecheck.State,
 	}
 
 	// #1728 (E41.5) / #1748 (E41.6): an acceptance stage the orchestrator
-	// SHORT-CIRCUITED records a verdict=passed acceptance_outcome_recorded entry
-	// at dispatch time and ships NO trace bundle — yet is legitimately succeeded.
-	// Exempt it from the trace-required rule the same way the E38.3 skip marker
-	// is exempted. The exemption accepts ONLY the two known basis values —
+	// SHORT-CIRCUITED records an acceptance_outcome_recorded entry at dispatch
+	// time and ships NO trace bundle — yet is legitimately succeeded. Exempt it
+	// from the trace-required rule the same way the E38.3 skip marker is
+	// exempted.
+	//
+	// The exemption is keyed on the payload BASIS, never on the verdict, so
+	// #2347's change of that verdict from "passed" to plan.AcceptanceVerdictNotValidated
+	// leaves it firing exactly as before — pinned by a regression test asserting
+	// the exemption still applies to a not_validated entry. The exemption accepts
+	// ONLY the two known basis values —
 	// "empty-criteria" (zero acceptance_criteria / zero out_of_scope) and
 	// "all-skip-with-basis" (every criterion skip_expected with basis), the
 	// shared plan.AcceptanceBasisEmptyCriteria / plan.AcceptanceBasisAllSkipWithBasis

@@ -149,18 +149,63 @@ const (
 	// honors for the trace exemption (#1748): an approved plan whose EVERY
 	// acceptance criterion carries skip_expected with a non-empty
 	// expectation_basis — so there is nothing the sandboxed acceptance agent
-	// could observe and the stage short-circuits to a passed verdict with no
-	// runner spawn. Any basis value OTHER than these two is NOT exempted.
+	// could observe and the stage short-circuits with no runner spawn. Any basis
+	// value OTHER than these two is NOT exempted.
 	AcceptanceBasisAllSkipWithBasis = "all-skip-with-basis"
 )
+
+// Acceptance short-circuit verdict vocabulary (#2347). The pre-spawn
+// short-circuit verified exactly ZERO criteria — no runner, no preview, no
+// observation — yet it used to record the same `passed`/`accepted` words a
+// validator-shipped pass records. Downstream that word gates the merge (ADR-049
+// decision #6) and is what an operator reads in the status comment, so an
+// ABSENCE of verification rendered as certification. These two constants are the
+// third, honest disposition the short-circuit emits instead.
+//
+// SERVER-INTERNAL ONLY — no WIRE producer may ship this verdict. The acceptance
+// ship endpoint (POST /v0/runs/{run_id}/acceptance) deliberately still rejects
+// any verdict other than passed/failed (acceptanceBody.validate), so
+// not_validated can ONLY originate server-side from the orchestrator
+// short-circuit. That keeps it unforgeable by a validator and keeps an existing
+// recorded `passed` verdict at its exact prior meaning (no migration).
+//
+// Defining them HERE — the plan package imports no project packages and is
+// already imported by orchestrator, server, and auditcomplete — makes a
+// producer/consumer drift a compile error rather than a silent runtime miss.
+const (
+	// AcceptanceVerdictNotValidated is the acceptance_outcome_recorded `verdict`
+	// value for a short-circuited stage: merge-eligible, but recorded as having
+	// verified nothing.
+	AcceptanceVerdictNotValidated = "not_validated"
+	// AcceptanceOutcomeNotValidated is the render-vocabulary twin of
+	// accepted/rejected — the `outcome` field the issue-comment and PR-comment
+	// status templates read.
+	AcceptanceOutcomeNotValidated = "not_validated"
+	// AcceptanceCriteriaLiveValidationKey is the acceptance_outcome_recorded
+	// payload key carrying how many of the plan's acceptance criteria are marked
+	// requires_live_validation. It distinguishes a skip with a TRACKED
+	// operator-validation walk (#2338 / #2345) from one skipped on any other
+	// basis — the part of a not-validated outcome an operator actually acts on.
+	AcceptanceCriteriaLiveValidationKey = "criteria_live_validation"
+)
+
+// LiveValidationCriteriaCount counts the acceptance criteria a plan marks
+// RequiresLiveValidation. A thin count wrapper over LiveValidationCriteria so
+// the short-circuit emit site records the criteria_live_validation payload field
+// without re-walking the criteria itself — one selector, no second copy to
+// drift.
+func LiveValidationCriteriaCount(v Verification) int {
+	return len(LiveValidationCriteria(v))
+}
 
 // AcceptanceSkippableEmptyCriteria reports whether a plan's verification carries
 // ZERO acceptance_criteria AND ZERO verification.out_of_scope — the sole
 // canonical #1728 condition under which the acceptance stage has no observable
 // criterion to validate AND no out_of_scope justification, so the orchestrator
-// short-circuits it straight to succeeded with a deterministic verdict=passed
-// entry (basis AcceptanceBasisEmptyCriteria) instead of spawning a runner for a
-// no-op stage.
+// short-circuits it straight to succeeded with a deterministic
+// verdict=AcceptanceVerdictNotValidated entry (basis
+// AcceptanceBasisEmptyCriteria) instead of spawning a runner for a no-op stage.
+// Zero criteria were verified, so the recorded verdict says so (#2347).
 //
 // It is deliberately DISJOINT from AcceptanceSkippableOutOfScope, which fires
 // when out_of_scope is present with zero acceptance_criteria (the E38.3 domain):
@@ -176,8 +221,10 @@ func AcceptanceSkippableEmptyCriteria(v Verification) bool {
 // carries at least one acceptance criterion AND EVERY criterion is marked
 // skip_expected with a non-empty expectation_basis — the #1748 condition under
 // which no criterion can be validated against the localhost preview, so the
-// orchestrator short-circuits the acceptance stage straight to a passed verdict
-// (basis AcceptanceBasisAllSkipWithBasis) with no runner spawn and no preview.
+// orchestrator short-circuits the acceptance stage straight to a
+// AcceptanceVerdictNotValidated verdict (basis AcceptanceBasisAllSkipWithBasis)
+// with no runner spawn and no preview — zero criteria were verified, and the
+// recorded verdict says so rather than certifying a pass (#2347).
 //
 // It requires len(AcceptanceCriteria) > 0, so it is disjoint from
 // AcceptanceSkippableEmptyCriteria (which requires zero criteria): at most one

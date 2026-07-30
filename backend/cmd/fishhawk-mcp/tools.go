@@ -1414,7 +1414,10 @@ implement review settles and poll it to terminal. A FAILED acceptance VERDICT
 leaves the stage 'succeeded', so read the verdict + the deterministic-triage
 disposition from the acceptance_outcome_recorded / acceptance_triage_decided
 audit entries (surfaced through next_actions), never from the stage state; merge
-only on the acceptance_passed state.
+only on a merge-eligible acceptance state — acceptance_passed (a validated pass),
+acceptance_not_validated (#2347: the stage short-circuited having verified ZERO
+criteria — mergeable, but say so in your merge verdict), or
+acceptance_skipped_out_of_scope.
 
 Also returns plan_review_status + implement_review_status — each a
 ReviewStatus whose status is one of none/pending/complete/skipped/failed.

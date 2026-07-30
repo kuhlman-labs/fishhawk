@@ -3423,13 +3423,24 @@ func TestAdvance_AcceptanceShortCircuitEmptyCriteria(t *testing.T) {
 			t.Errorf("verdict stage_id = %v, want the acceptance stage %s", verdict.StageID, stages[3].ID)
 		}
 		for _, want := range []string{
-			`"verdict":"passed"`,
-			`"outcome":"accepted"`,
+			// #2347: INVERTED from the pre-change `"verdict":"passed"` /
+			// `"outcome":"accepted"`. An empty-criteria short-circuit verified
+			// exactly zero criteria — recording a pass certified nothing.
+			fmt.Sprintf(`"verdict":%q`, plan.AcceptanceVerdictNotValidated),
+			fmt.Sprintf(`"outcome":%q`, plan.AcceptanceOutcomeNotValidated),
 			`"criteria_total":0`,
 			fmt.Sprintf("%q:%q", plan.AcceptanceBasisKey, plan.AcceptanceBasisEmptyCriteria),
+			fmt.Sprintf("%q:0", plan.AcceptanceCriteriaLiveValidationKey),
 		} {
 			if !strings.Contains(string(verdict.Payload), want) {
 				t.Errorf("acceptance_outcome_recorded payload missing %s: %s", want, verdict.Payload)
+			}
+		}
+		// Regression pin for the exact defect #2347 closes: the short-circuit must
+		// NEVER emit the validator-shipped pass vocabulary.
+		for _, forbidden := range []string{`"verdict":"passed"`, `"outcome":"accepted"`} {
+			if strings.Contains(string(verdict.Payload), forbidden) {
+				t.Errorf("acceptance_outcome_recorded payload contains %s — a short-circuit that verified ZERO criteria must not record a pass (#2347): %s", forbidden, verdict.Payload)
 			}
 		}
 	})
@@ -3504,8 +3515,11 @@ func TestAdvance_AcceptanceShortCircuitAllSkipWithBasis(t *testing.T) {
 			t.Errorf("verdict stage_id = %v, want the acceptance stage %s", verdict.StageID, stages[3].ID)
 		}
 		for _, want := range []string{
-			`"verdict":"passed"`,
-			`"outcome":"accepted"`,
+			// #2347: INVERTED from the pre-change `"verdict":"passed"` /
+			// `"outcome":"accepted"`. Every criterion was skip-expected, so the
+			// stage verified zero of the two — the recorded verdict says so.
+			fmt.Sprintf(`"verdict":%q`, plan.AcceptanceVerdictNotValidated),
+			fmt.Sprintf(`"outcome":%q`, plan.AcceptanceOutcomeNotValidated),
 			`"criteria_total":2`,
 			`"criteria_skipped":2`,
 			`"criteria_passed":0`,
@@ -3515,6 +3529,48 @@ func TestAdvance_AcceptanceShortCircuitAllSkipWithBasis(t *testing.T) {
 			if !strings.Contains(string(verdict.Payload), want) {
 				t.Errorf("acceptance_outcome_recorded payload missing %s: %s", want, verdict.Payload)
 			}
+		}
+		for _, forbidden := range []string{`"verdict":"passed"`, `"outcome":"accepted"`} {
+			if strings.Contains(string(verdict.Payload), forbidden) {
+				t.Errorf("acceptance_outcome_recorded payload contains %s — a short-circuit that verified ZERO criteria must not record a pass (#2347): %s", forbidden, verdict.Payload)
+			}
+		}
+	})
+
+	// #2347 / binding condition 2: criteria_live_validation is what distinguishes
+	// a skip carrying a TRACKED operator-validation walk (#2338 / #2345) from one
+	// skipped on any other basis — the part of a not-validated outcome an operator
+	// actually acts on. Two otherwise-identical all-skip plans differing ONLY in
+	// requires_live_validation must record different counts.
+	t.Run("criteria_live_validation counts requires_live_validation criteria", func(t *testing.T) {
+		withLive := []map[string]any{
+			{"id": "webhook-fires", "statement": "webhook fires on close", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in webhook_integration_test.go with a fake", "requires_live_validation": true},
+			{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
+		}
+		for _, tc := range []struct {
+			name     string
+			criteria []map[string]any
+			want     string
+		}{
+			{"one requires_live_validation", withLive, fmt.Sprintf("%q:1", plan.AcceptanceCriteriaLiveValidationKey)},
+			{"none require live validation", allSkip, fmt.Sprintf("%q:0", plan.AcceptanceCriteriaLiveValidationKey)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				planBytes := acceptanceSkipPlanBytes(t, nil, tc.criteria)
+				r, _, _, ra, o := seedAcceptanceSkipRun(t, planBytes)
+				if _, err := o.Advance(context.Background(), r.ID); err != nil {
+					t.Fatalf("Advance: %v", err)
+				}
+				var verdict audit.ChainAppendParams
+				for _, p := range ra.appended {
+					if p.Category == "acceptance_outcome_recorded" {
+						verdict = p
+					}
+				}
+				if !strings.Contains(string(verdict.Payload), tc.want) {
+					t.Errorf("acceptance_outcome_recorded payload missing %s: %s", tc.want, verdict.Payload)
+				}
+			})
 		}
 	})
 

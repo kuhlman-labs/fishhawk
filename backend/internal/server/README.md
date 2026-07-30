@@ -318,8 +318,28 @@ unnecessary.
   park degrades to the normal operator-dispatched spawn path (pre-#1928 behavior,
   safe) instead. On a hit the stage is walked straight to `succeeded`, the
   matching audit lands (skip marker for out-of-scope, an
-  `acceptance_outcome_recorded` passed verdict for the other two), and `Advance`
-  is re-entered so the run rolls forward.
+  `acceptance_outcome_recorded` **not-validated** verdict for the other two —
+  see below), and `Advance` is re-entered so the run rolls forward.
+- **The short-circuit records `not_validated`, never `passed` (#2347).** Both
+  verdict-recording predicates settle a stage that verified exactly ZERO criteria
+  — no runner, no preview, no observation. Emitting the same `passed`/`accepted`
+  words a validator-shipped pass emits made an ABSENCE of verification render as
+  certification at every consumer: the merge gate (ADR-049 decision #6), the
+  operator's status comment, release evidence. The short-circuit now emits
+  `plan.AcceptanceVerdictNotValidated` / `plan.AcceptanceOutcomeNotValidated`
+  plus a `criteria_live_validation` count (how many criteria are marked
+  `requires_live_validation`, so a skip carrying a tracked operator-validation
+  walk — #2338 / #2345 — is distinguishable from one skipped on any other basis).
+  `acceptanceGateState` resolves that verdict to the merge-ELIGIBLE
+  `acceptance_not_validated` state: eligibility is deliberate, because a change
+  with no live target must not be stranded, and a text-matching merge block would
+  trade a dishonest pass for a wedge. The distinction is carried by the state
+  string, the MCP `next_actions` reason (which asks the operator to acknowledge
+  the non-validation in their merge verdict), and a distinct status-comment row —
+  a PROMPT, not an enforcement. The verdict is **server-internal only**:
+  `acceptanceBody.validate` still rejects any wire verdict other than
+  `passed`/`failed`, so a validator cannot forge it, and an already-recorded
+  `passed` keeps its exact prior meaning (no migration, no in-flight breakage).
 - **Admission ↔ host-dispatch fence (#1936):** the whole read → admissibility-check
   → walk in `TryShortCircuitAcceptance` runs under a per-stage in-process mutex
   (`orchestrator.LockStageAdmission`) that `host_dispatch.go::handleHostDispatchStage`

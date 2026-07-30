@@ -24,7 +24,7 @@ Happy-path loop (one issue, one run):
 3. fishhawk_approve_plan — read the plan AND its advisory reviews first; approve, or fishhawk_reject_plan with a reason to replan.
 4. fishhawk_dispatch_stage (implement) — execute the approved plan. On the local runner this is what spawns the runner; it does not auto-start.
 5. fishhawk_await_review — wait for the implement review to reach a terminal verdict.
-6. When the workflow declares an acceptance stage: fishhawk_dispatch_stage (acceptance) after the review settles, await the verdict (fishhawk_get_run_status acceptance_stage_wait_status, or fishhawk_await_audit on acceptance_outcome_recorded), and merge only on the acceptance_passed state.
+6. When the workflow declares an acceptance stage: fishhawk_dispatch_stage (acceptance) after the review settles, await the verdict (fishhawk_get_run_status acceptance_stage_wait_status, or fishhawk_await_audit on acceptance_outcome_recorded), and merge only on a merge-eligible acceptance state: acceptance_passed (a validated pass), acceptance_not_validated (the stage short-circuited having verified ZERO criteria — mergeable, but acknowledge that in your merge verdict, #2347), or acceptance_skipped_out_of_scope.
 7. Approve the PR (gh pr review --approve, under your own GitHub identity), then fishhawk_merge_run — one verb that records your merge verdict, queues the squash merge, awaits the terminal run state, and surfaces your post-merge step.
 
 Gate semantics (these decide when a verb is legal):

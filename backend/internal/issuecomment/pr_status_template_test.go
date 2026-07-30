@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -117,6 +118,91 @@ func TestRenderPRStatusBody_HeaderAndWhatNow(t *testing.T) {
 		})
 		if !strings.Contains(body, "triage before merging") {
 			t.Errorf("what-now missing rejected phrasing:\n%s", body)
+		}
+	})
+}
+
+// TestRenderPRStatusBody_AcceptanceNotValidated pins the #2347 PR-comment
+// headline on the SHIPPED string. Like the issue-anchor twin, this is a
+// rendered-vocabulary change compilation cannot enforce, so both the honest
+// wording AND the absence of the certification wording are asserted. The
+// outcome value is taken from the plan-package constant the orchestrator emits,
+// so this doubles as the byte-identity pin for the package-local mirror.
+func TestRenderPRStatusBody_AcceptanceNotValidated(t *testing.T) {
+	t.Run("full fidelity", func(t *testing.T) {
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 2,
+			})},
+			Now: time.Unix(1000, 0).UTC(),
+		})
+		want := "**Acceptance** — ❓ not validated — 0/2 criteria verified (all criteria skip-expected)"
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q:\n%s", want, body)
+		}
+		for _, forbidden := range []string{"✅ accepted", "criteria passed"} {
+			if strings.Contains(body, forbidden) {
+				t.Errorf("body still contains %q — a short-circuited stage verified ZERO criteria (#2347):\n%s", forbidden, body)
+			}
+		}
+	})
+
+	t.Run("zero total names the empty-criteria plan", func(t *testing.T) {
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 0,
+			})},
+			Now: time.Unix(1000, 0).UTC(),
+		})
+		want := "**Acceptance** — ❓ not validated — 0 criteria verified (the plan declared none)"
+		if !strings.Contains(body, want) {
+			t.Errorf("missing %q:\n%s", want, body)
+		}
+	})
+
+	t.Run("live-validation clause", func(t *testing.T) {
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 3,
+				"criteria_live_validation": 1,
+			})},
+			Now: time.Unix(1000, 0).UTC(),
+		})
+		if !strings.Contains(body, "0/3 criteria verified (all criteria skip-expected); 1 require live validation") {
+			t.Errorf("missing the live-validation clause:\n%s", body)
+		}
+	})
+
+	// The COLLAPSED fidelity (degradation ladder drops the per-criterion table)
+	// shares renderPRAcceptanceHeadline, so the surviving tally line must be
+	// honest too — this is the line an operator reads on an oversize comment.
+	t.Run("collapsed fidelity keeps the honest tally", func(t *testing.T) {
+		basis := strings.Repeat("x", 180)
+		criteria := make([]map[string]any, 0, 500)
+		for i := 0; i < 500; i++ {
+			criteria = append(criteria, map[string]any{"id": "AC", "result": "skipped", "expectation_basis": basis})
+		}
+		body := RenderPRStatusBody(PRStatusInput{
+			Run: prStatusRun(),
+			Audit: []*audit.Entry{prAuditEntry(5, "acceptance_outcome_recorded", map[string]any{
+				"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 500,
+			})},
+			AcceptanceArtifact: acceptanceArtifactJSON(t, "passed", criteria),
+			ExternalURL:        "https://app.example",
+			Now:                time.Unix(1000, 0).UTC(),
+		})
+		if len(body) > MaxIssueCommentBodyBytes {
+			t.Fatalf("body exceeds GitHub cap after degradation: %d > %d", len(body), MaxIssueCommentBodyBytes)
+		}
+		if strings.Contains(body, "| Criterion | Result | Basis |") {
+			t.Errorf("oversize body should have dropped the criteria table")
+		}
+		want := "**Acceptance** — ❓ not validated — 0/500 criteria verified (all criteria skip-expected)"
+		if !strings.Contains(body, want) {
+			t.Errorf("collapsed tally line is not the honest one; missing %q", want)
 		}
 	})
 }

@@ -730,6 +730,31 @@ func TestAutoDriveRunGate_Merge_AcceptanceSkippedOutOfScope_Merges(t *testing.T)
 	}
 }
 
+// TestAutoDriveRunGate_Merge_AcceptanceNotValidated_Merges pins the #2347 admit
+// on the DELEGATED merge path (the operator endpoint has its own pin in
+// merge_run_test.go): a short-circuited acceptance stage that verified ZERO
+// criteria resolves to acceptanceGateNotValidated, which is merge-eligible, so
+// the delegated may_merge reaches the seam exactly like a passed verdict. The
+// two sites are asserted separately because each enumerates the admissible
+// gate-state set independently — adding the state to one and not the other is
+// precisely the drift this pair catches.
+func TestAutoDriveRunGate_Merge_AcceptanceNotValidated_Merges(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, acceptanceVerdictNotValidated)
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionMerge {
+		t.Fatalf("outcome = %+v, want acted merge on a not-validated acceptance", out)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 — a not-validated acceptance must not block the merge (#2347)", merger.called)
+	}
+}
+
 // TestAutoDriveRunGate_Merge_AcceptanceReadError_ObserveOnly pins the
 // fail-closed posture: an acceptance/audit read error never merges (the
 // acceptanceGateState error and the evaluator error both resolve to

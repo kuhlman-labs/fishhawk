@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -110,10 +111,19 @@ var allSkipWithBasisCriteria = []map[string]any{
 	{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
 }
 
+// allSkipWithLiveValidationCriteria is allSkipWithBasisCriteria with the FIRST
+// criterion additionally marked requires_live_validation, so the short-circuit
+// records criteria_live_validation:1 (#2338 / #2345 — a skip carrying a tracked
+// operator-validation walk).
+var allSkipWithLiveValidationCriteria = []map[string]any{
+	{"id": "webhook-fires", "statement": "webhook fires on close", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in webhook_integration_test.go with a fake", "requires_live_validation": true},
+	{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
+}
+
 // TestAcceptanceAdmission_AllSkipWithBasis_ShortCircuits is Mode 1 (the issue's
 // done-means): POSTing admission on the acceptance stage of an all-skip-with-
 // basis plan settles it succeeded, records an acceptance_outcome_recorded entry
-// (accepted / passed / basis all-skip-with-basis), and fires NO acceptance
+// (not_validated / basis all-skip-with-basis, #2347), and fires NO acceptance
 // dispatch — the no-runner-dispatch-evidence pin.
 func TestAcceptanceAdmission_AllSkipWithBasis_ShortCircuits(t *testing.T) {
 	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithBasisCriteria))
@@ -148,10 +158,123 @@ func TestAcceptanceAdmission_AllSkipWithBasis_ShortCircuits(t *testing.T) {
 		t.Errorf("acceptance_dispatched = %d, want 0 (no runner dispatch evidence)", n)
 	}
 	outcome := findAppendedByCategory(t, seam.au, CategoryAcceptanceOutcomeRecorded)
-	for _, want := range []string{`"verdict":"passed"`, `"outcome":"accepted"`, `"basis":"all-skip-with-basis"`} {
+	for _, want := range []string{
+		`"verdict":"not_validated"`,
+		`"outcome":"not_validated"`,
+		`"basis":"all-skip-with-basis"`,
+	} {
 		if !strings.Contains(string(outcome.Payload), want) {
 			t.Errorf("outcome payload missing %s:\n%s", want, outcome.Payload)
 		}
+	}
+	for _, forbidden := range []string{`"verdict":"passed"`, `"outcome":"accepted"`} {
+		if strings.Contains(string(outcome.Payload), forbidden) {
+			t.Errorf("outcome payload contains %s — a short-circuit that verified ZERO criteria must not record a pass (#2347):\n%s", forbidden, outcome.Payload)
+		}
+	}
+}
+
+// TestAcceptanceAdmission_NotValidated_CrossesToGateAndRender is the #2347
+// cross-boundary seam test. Scope spans orchestrator producer -> audit
+// persistence -> server gate decode -> issue-comment render, and per-layer units
+// cannot catch a serialization or constant drift BETWEEN those layers: the
+// producer test asserts what was emitted, the gate test asserts a hand-seeded
+// verdict, and the render test asserts a hand-built payload — all three stay
+// green while the real bytes fail to line up.
+//
+// Binding condition 2 extends the crossing to criteria_live_validation
+// specifically. That field is brand new, is the part of a not-validated outcome
+// an operator actually acts on (it distinguishes a skip with a TRACKED
+// operator-validation walk, #2338 / #2345, from one skipped on any other basis),
+// and it crosses producer, payload, persistence, decode and render — so it is
+// followed on the STORED entry and all the way to the RENDERED line, not just
+// the verdict.
+func TestAcceptanceAdmission_NotValidated_CrossesToGateAndRender(t *testing.T) {
+	seam := buildAdmissionSeam(t, run.StageStatePending, admissionPlanBytes(t, nil, allSkipWithLiveValidationCriteria))
+
+	w := postAdmission(t, seam.s, seam.acceptanceID, testOperatorIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// (i) the stage settled succeeded with NO runner dispatched.
+	if got := seam.rr.stagesByID[seam.acceptanceID].State; got != run.StageStateSucceeded {
+		t.Errorf("acceptance stage = %q, want succeeded", got)
+	}
+	if n := countByCategory(seam.au, CategoryAcceptanceDispatched); n != 0 {
+		t.Errorf("acceptance_dispatched = %d, want 0 (no runner dispatch evidence)", n)
+	}
+
+	// (ii) the PERSISTED entry — read back through the repo the gate reads, not
+	// off a mock — carries the verdict AND the live-validation count.
+	stored, err := seam.au.ListForRunByCategory(context.Background(), seam.runID, CategoryAcceptanceOutcomeRecorded)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("stored acceptance_outcome_recorded entries = %d, want 1", len(stored))
+	}
+	var storedPayload struct {
+		Verdict                string `json:"verdict"`
+		Outcome                string `json:"outcome"`
+		CriteriaTotal          int    `json:"criteria_total"`
+		CriteriaPassed         int    `json:"criteria_passed"`
+		CriteriaLiveValidation int    `json:"criteria_live_validation"`
+	}
+	if err := json.Unmarshal(stored[0].Payload, &storedPayload); err != nil {
+		t.Fatalf("decode stored payload: %v (%s)", err, stored[0].Payload)
+	}
+	if storedPayload.Verdict != plan.AcceptanceVerdictNotValidated {
+		t.Errorf("stored verdict = %q, want %q", storedPayload.Verdict, plan.AcceptanceVerdictNotValidated)
+	}
+	if storedPayload.Outcome != plan.AcceptanceOutcomeNotValidated {
+		t.Errorf("stored outcome = %q, want %q", storedPayload.Outcome, plan.AcceptanceOutcomeNotValidated)
+	}
+	if storedPayload.CriteriaLiveValidation != 1 {
+		t.Errorf("stored criteria_live_validation = %d, want 1 (one criterion is requires_live_validation)", storedPayload.CriteriaLiveValidation)
+	}
+	if storedPayload.CriteriaTotal != 2 || storedPayload.CriteriaPassed != 0 {
+		t.Errorf("stored tally = %d/%d passed/total, want 0/2", storedPayload.CriteriaPassed, storedPayload.CriteriaTotal)
+	}
+
+	// (iii) the GATE, decoding that same stored entry, resolves the merge-eligible
+	// not-validated state — never the outcome-unknown hole (which 409s) and never
+	// acceptance_passed (which would re-hide the non-validation). The gate is
+	// stage-conditional on the workflow spec, so the run row carries the same
+	// acceptance-declaring spec the gate unit tests use.
+	gateRun := seam.rr.runs[seam.runID]
+	gateRun.WorkflowSpec = specWithAcceptanceStage
+	gateState, gerr := seam.s.acceptanceGateState(context.Background(),
+		gateRun, seam.rr.stagesByRunID[seam.runID])
+	if gerr != nil {
+		t.Fatalf("acceptanceGateState: %v", gerr)
+	}
+	if gateState != acceptanceGateNotValidated {
+		t.Fatalf("gate state = %q, want %q (the merge handler admits this state — see TestMergeRun_AcceptanceNotValidated_Proceeds)", gateState, acceptanceGateNotValidated)
+	}
+	for _, blocking := range []string{acceptanceGateOutcomeUnknown, acceptanceGateTriage, acceptanceGatePending} {
+		if gateState == blocking {
+			t.Errorf("gate state resolved to the merge-BLOCKING %q", blocking)
+		}
+	}
+
+	// (iv) the RENDER, fed that same stored entry, produces the honest line —
+	// including the live-validation clause. A decode drift on
+	// criteria_live_validation between the producer's key and the render's tag
+	// fails HERE while every per-layer unit stays green.
+	body := issuecomment.RenderStatusBody(gateRun, seam.rr.stagesByRunID[seam.runID],
+		stored, "https://fishhawk.example", time.Now().UTC())
+	if !strings.Contains(body, "not validated") {
+		t.Errorf("rendered status body missing the not-validated line:\n%s", body)
+	}
+	if !strings.Contains(body, "0/2 criteria verified") {
+		t.Errorf("rendered status body missing the 0/2 tally:\n%s", body)
+	}
+	if !strings.Contains(body, "1 require live validation") {
+		t.Errorf("rendered status body missing the live-validation clause (criteria_live_validation lost between persistence and render):\n%s", body)
+	}
+	if strings.Contains(body, "Acceptance recorded — accepted") {
+		t.Errorf("rendered status body still certifies an accepted outcome (#2347):\n%s", body)
 	}
 }
 

@@ -1085,14 +1085,21 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		return
 	default:
 		// acceptanceGatePassed / acceptanceGateNotDeclared /
-		// acceptanceGateSkippedOutOfScope: the merge is not (or no longer)
-		// acceptance-gated — fall through to the RuleChecksGreenAwaitingMerge
-		// stamp below (derived status awaiting_merge, merge_pr next_action). An
-		// out-of-scope skip (E38.3 / #1877) is a legitimate terminal disposition
-		// equivalent to a recorded pass, so it intentionally lands here rather
-		// than parking in acceptance_settled_outcome_unknown. The latest-entry
-		// supersession in applyDriveSurfaces upgrades a prior acceptance_pending
-		// stamp to awaiting_merge once acceptance passes or is skipped.
+		// acceptanceGateSkippedOutOfScope / acceptanceGateNotValidated: the merge
+		// is not (or no longer) acceptance-gated — fall through to the
+		// RuleChecksGreenAwaitingMerge stamp below (derived status awaiting_merge,
+		// merge_pr next_action). An out-of-scope skip (E38.3 / #1877) is a
+		// legitimate terminal disposition equivalent to a recorded pass, so it
+		// intentionally lands here rather than parking in
+		// acceptance_settled_outcome_unknown; a not_validated short-circuit verdict
+		// (#2347) lands here for the same reason — it verified zero criteria, but
+		// it is a RECORDED outcome and merge-eligible, so parking it would wedge
+		// every no-live-target run. Both are enumerated deliberately: this
+		// fall-through is the documented arm, not an incidental default. The
+		// distinguishing operator signal is the MCP next_actions state, not this
+		// derived status. The latest-entry supersession in applyDriveSurfaces
+		// upgrades a prior acceptance_pending stamp to awaiting_merge once
+		// acceptance passes, is skipped, or settles not-validated.
 	}
 	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) {
 		return

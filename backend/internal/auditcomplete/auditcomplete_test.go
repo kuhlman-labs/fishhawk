@@ -152,11 +152,15 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 	// exempt cases reference the SAME shared constants the orchestrator emit
 	// helper and the auditcomplete reader use, so a producer/consumer drift is a
 	// compile error, not a silent test miss.
-	shortCircuitPayload := func(t *testing.T, basis string) json.RawMessage {
+	// The verdict is parameterized because #2347 changed it: a short-circuited
+	// stage now records not_validated where it used to record passed. The
+	// exemption keys on the BASIS, never on the verdict, so both must be exempt —
+	// verdictShortCircuitCases below drives that explicitly.
+	shortCircuitPayloadWithVerdict := func(t *testing.T, basis, verdict, outcome string) json.RawMessage {
 		t.Helper()
 		m := map[string]any{
-			"verdict":        "passed",
-			"outcome":        "accepted",
+			"verdict":        verdict,
+			"outcome":        outcome,
 			"criteria_total": 0,
 		}
 		if basis != "" {
@@ -168,8 +172,15 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 		}
 		return b
 	}
+	// shortCircuitPayload records what the orchestrator ACTUALLY emits today
+	// (#2347): a not_validated verdict.
+	shortCircuitPayload := func(t *testing.T, basis string) json.RawMessage {
+		t.Helper()
+		return shortCircuitPayloadWithVerdict(t, basis,
+			plan.AcceptanceVerdictNotValidated, plan.AcceptanceOutcomeNotValidated)
+	}
 
-	build := func(t *testing.T, basis string) (uuid.UUID, uuid.UUID, auditcomplete.Deps) {
+	buildWithPayload := func(t *testing.T, payload json.RawMessage) (uuid.UUID, uuid.UUID, auditcomplete.Deps) {
 		t.Helper()
 		runID := uuid.New()
 		planS := mkStage(runID, 1, run.StageTypePlan, run.StageStateSucceeded)
@@ -189,8 +200,33 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 		au.appendChained(t, runID, &impl.ID, "trace_uploaded", traceVariantPayload("redacted"))
 		// The short-circuited acceptance stage ships NO trace; it records only the
 		// acceptance_outcome_recorded verdict (with or without an exempt basis).
-		au.appendChained(t, runID, &acc.ID, "acceptance_outcome_recorded", shortCircuitPayload(t, basis))
+		au.appendChained(t, runID, &acc.ID, "acceptance_outcome_recorded", payload)
 		return runID, acc.ID, deps(runs, arts, au)
+	}
+	build := func(t *testing.T, basis string) (uuid.UUID, uuid.UUID, auditcomplete.Deps) {
+		t.Helper()
+		return buildWithPayload(t, shortCircuitPayload(t, basis))
+	}
+
+	// #2347 REGRESSION PIN: the exemption is BASIS-keyed, not verdict-keyed. The
+	// short-circuit's verdict changed from "passed" to "not_validated"; the
+	// exemption must fire identically for BOTH, or a short-circuited run would
+	// start red-lining the audit-complete gate on a missing trace it never had.
+	for _, tc := range []struct{ name, verdict, outcome string }{
+		{"post-#2347 not_validated verdict", plan.AcceptanceVerdictNotValidated, plan.AcceptanceOutcomeNotValidated},
+		{"pre-#2347 passed verdict (already-written rows)", "passed", "accepted"},
+	} {
+		t.Run("exemption is verdict-independent: "+tc.name, func(t *testing.T) {
+			runID, _, d := buildWithPayload(t, shortCircuitPayloadWithVerdict(t,
+				plan.AcceptanceBasisAllSkipWithBasis, tc.verdict, tc.outcome))
+			state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if state != stagecheck.StatePass {
+				t.Fatalf("state = %s, want pass — the trace exemption keys on basis, not verdict; missing=%+v", state, missing)
+			}
+		})
 	}
 
 	// Exempt basis values -> pass despite no acceptance trace.
@@ -211,17 +247,21 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 	}
 
 	// Non-exempt cases -> trace_missing for the acceptance stage. A foreign basis
-	// is NOT one of the two honored values; a normal verdict carries no basis at
-	// all. Both still require the trace.
+	// is NOT one of the two honored values; a normal validator-shipped verdict
+	// carries no basis at all. Both still require the trace — the exemption must
+	// never widen to a stage that really did run an agent. The last case is the
+	// #2347 boundary from the other side: even the new not_validated verdict does
+	// NOT self-exempt without a recognized basis.
 	for _, tc := range []struct {
-		name  string
-		basis string
+		name    string
+		payload json.RawMessage
 	}{
-		{name: "foreign basis (not honored) -> trace_missing", basis: "bogus-basis"},
-		{name: "no basis (normal verdict) -> trace_missing", basis: ""},
+		{name: "foreign basis (not honored) -> trace_missing", payload: shortCircuitPayload(t, "bogus-basis")},
+		{name: "no basis, normal passed verdict -> trace_missing", payload: shortCircuitPayloadWithVerdict(t, "", "passed", "accepted")},
+		{name: "no basis, not_validated verdict -> trace_missing", payload: shortCircuitPayload(t, "")},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			runID, accID, d := build(t, tc.basis)
+			runID, accID, d := buildWithPayload(t, tc.payload)
 			state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
 			if err != nil {
 				t.Fatalf("Compute: %v", err)

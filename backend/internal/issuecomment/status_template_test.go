@@ -10,6 +10,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -386,6 +387,28 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 			payload:  map[string]any{"class": "3", "disposition": "waived"},
 			want:     "Acceptance triage — class-3: waived",
 		},
+		// #2347: the short-circuit's not_validated outcome renders its OWN row.
+		// The outcome value is taken from the plan-package constant the
+		// orchestrator emits, so this doubles as the byte-identity pin for the
+		// package-local mirror: a drift on either side stops this row rendering.
+		{
+			name:     "not-validated outcome renders the honest row, not a tally under 'accepted'",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 4},
+			want:     "Acceptance not validated — 0/4 criteria verified (all criteria skip-expected)",
+		},
+		{
+			name:     "not-validated with zero total names the empty-criteria plan",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 0},
+			want:     "Acceptance not validated — 0 criteria verified (the plan declared none)",
+		},
+		{
+			name:     "not-validated appends the live-validation clause",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "criteria_passed": 0, "criteria_total": 4, "criteria_live_validation": 2},
+			want:     "Acceptance not validated — 0/4 criteria verified (all criteria skip-expected); 2 require live validation",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -397,6 +420,38 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 				t.Errorf("expected %q in the activity section\n---\n%s", tc.want, body)
 			}
 		})
+	}
+}
+
+// TestRenderStatusBody_AcceptanceNotValidated_NeverReadsAsCertification is the
+// #2347 done-means assertion on the SHIPPED string. This is a rendered-vocabulary
+// change whose correctness compilation cannot enforce — a comment-only or no-op
+// touch of the renderer would leave "Acceptance recorded — accepted (0/4
+// criteria passed)" on the anchor, which is the exact line that made an absence
+// of verification read as certification. So the negative is asserted directly.
+func TestRenderStatusBody_AcceptanceNotValidated_NeverReadsAsCertification(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 1, "acceptance_outcome_recorded", "system", now.Add(-1*time.Minute),
+			map[string]any{
+				"outcome":         plan.AcceptanceOutcomeNotValidated,
+				"criteria_passed": 0,
+				"criteria_total":  4,
+			}),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if !strings.Contains(body, "not validated") {
+		t.Errorf("body missing the not-validated wording\n---\n%s", body)
+	}
+	if !strings.Contains(body, "0/4") {
+		t.Errorf("body missing the 0/4 tally\n---\n%s", body)
+	}
+	for _, forbidden := range []string{"accepted", "criteria passed"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("body still contains %q — a short-circuited stage verified ZERO criteria and must not render as a certification (#2347)\n---\n%s", forbidden, body)
+		}
 	}
 }
 

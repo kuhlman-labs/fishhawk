@@ -240,6 +240,17 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 				return &NextActions{State: "succeeded_acceptance_skipped_out_of_scope", Actions: mergeRitualActions(run,
 					"the run succeeded with its PR open; the acceptance stage was auto-terminated because the approved plan declared verification.out_of_scope with no acceptance_criteria (E38.3 / #1657) — still merge-eligible")}
 			}
+			// #2347: the acceptance stage short-circuited to a not_validated
+			// verdict — it verified ZERO criteria. Merge-eligible like the arm
+			// above (same merge ritual), but the state label and reason say what
+			// actually happened so a terminal-run read does not report a pass that
+			// never occurred. Same degradation: a verdict aged out of the
+			// recent-audit window leaves the flag empty and falls back to plain
+			// succeeded_pr_open, itself merge-eligible.
+			if acceptanceVerdict == acceptanceVerdictNotValidated {
+				return &NextActions{State: "succeeded_acceptance_not_validated", Actions: mergeRitualActions(run,
+					"the run succeeded with its PR open; the acceptance stage verified ZERO acceptance criteria (short-circuited with no runner and no preview, #2347) — merge-eligible, but NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
+			}
 			return &NextActions{State: "succeeded_pr_open", Actions: mergeRitualActions(run, "the run succeeded with its PR open")}
 		}
 		return &NextActions{State: run.State}
@@ -1081,6 +1092,24 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope b
 		// evidence condition. The stage passed — the PR is the next surface.
 		return &NextActions{State: "acceptance_passed", Actions: mergeRitualActions(run,
 			"the acceptance stage passed (ADR-049 decision #6: the merge is gated on the acceptance_passed evidence condition)")}
+	case acceptanceVerdictNotValidated:
+		// #2347: the pre-spawn short-circuit settled the stage having verified
+		// ZERO criteria — every criterion was skip_expected with an
+		// expectation_basis, or the plan declared none at all. No runner spawned,
+		// no preview came up, nothing was observed. The run is MERGE-ELIGIBLE (a
+		// change with no live target must not be stranded), so this returns the
+		// merge ritual — but the state string and this reason are what stop the
+		// outcome reading as a certification it is not.
+		//
+		// The acknowledgement ask is DELIBERATELY a prompt, not a gate: enforcing
+		// it would mean text-matching operator prose to decide whether a merge may
+		// proceed, and stranding a run over verdict wording is a worse failure
+		// than the dishonest word this change removes. The reason text below is
+		// therefore the only mechanism carrying that ask — next_actions_test.go
+		// pins its two load-bearing claims (zero criteria verified; say so in the
+		// merge verdict) so a refactor cannot silently drop them.
+		return &NextActions{State: "acceptance_not_validated", Actions: mergeRitualActions(run,
+			"the acceptance stage verified ZERO acceptance criteria — it was short-circuited with no runner and no preview because every criterion was skip-expected with a basis, or the plan declared none (#2347). The run is merge-eligible, but this is NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
 	case acceptanceVerdictFailed:
 		if isAcceptancePagedDisposition(disposition) {
 			return &NextActions{State: "acceptance_triage_paged", Actions: acceptanceTriagePagedActions(run)}
@@ -1388,6 +1417,14 @@ const (
 
 	acceptanceVerdictPassed = "passed"
 	acceptanceVerdictFailed = "failed"
+	// acceptanceVerdictNotValidated is the SERVER-INTERNAL third verdict (#2347)
+	// the orchestrator's pre-spawn short-circuit records for an acceptance stage
+	// that verified ZERO criteria — no runner, no preview, no observation. It
+	// never arrives over the wire (the ship endpoint still admits passed/failed
+	// only), so this classifier only ever sees it on a short-circuited run. MUST
+	// match backend/internal/plan.AcceptanceVerdictNotValidated (mirrored, not
+	// imported — the #875 compile trap) and is pinned by the literal-table test.
+	acceptanceVerdictNotValidated = "not_validated"
 
 	// Auto-routed dispositions (a state transition fired): NOT paged.
 	acceptanceDispositionFixupDispatched = "fixup_dispatched"
