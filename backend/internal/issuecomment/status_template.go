@@ -448,8 +448,28 @@ func renderAcceptanceLine(verb string) string {
 // renderDeployOutcomeLine: a missing outcome or an absent/zero criteria total
 // drops the corresponding clause, and an empty/undecodable payload degrades to
 // the bare verb.
+//
+// The not_validated outcome (#2347) gets its OWN row rather than flowing through
+// the "Acceptance recorded — <outcome>" shape. That shape is the exact line an
+// operator reads as certification, and a short-circuited stage verified ZERO
+// criteria: "Acceptance recorded — accepted (0/4 criteria passed)" is the
+// dishonesty this change exists to remove, and merely swapping the word into the
+// same sentence would keep the "recorded/accepted" framing. The row names the
+// non-validation first, then the 0/N tally, and appends the live-validation count
+// when the plan tracks an operator-validation walk (#2338 / #2345) so the
+// operator can tell a skip they owe a manual walk from one they do not.
 func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 	a := decodeAcceptanceActivity(payload)
+	if a.outcome == acceptanceOutcomeNotValidated {
+		line := "Acceptance not validated — 0 criteria verified (the plan declared none)"
+		if a.criteriaTotal > 0 {
+			line = fmt.Sprintf("Acceptance not validated — %d/%d criteria verified (all criteria skip-expected)", a.criteriaPassed, a.criteriaTotal)
+		}
+		if a.criteriaLiveValidation > 0 {
+			line += fmt.Sprintf("; %d require live validation", a.criteriaLiveValidation)
+		}
+		return line
+	}
 	switch {
 	case a.outcome != "" && a.criteriaTotal > 0:
 		return fmt.Sprintf("Acceptance recorded — %s (%d/%d criteria passed)", a.outcome, a.criteriaPassed, a.criteriaTotal)
@@ -460,6 +480,16 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 	}
 	return "Acceptance recorded"
 }
+
+// acceptanceOutcomeNotValidated is the `outcome` value the orchestrator's
+// pre-spawn acceptance short-circuit records for a stage that verified ZERO
+// criteria (#2347). Mirrored here rather than imported: issuecomment is a pure
+// render package that depends on no backend package, matching how the rest of
+// this file treats the audit-payload vocabulary. The mirror is pinned by
+// status_template_test.go / pr_status_template_test.go, which build their
+// payloads FROM plan.AcceptanceOutcomeNotValidated — so a drift on either side
+// stops rendering the not-validated row and fails there.
+const acceptanceOutcomeNotValidated = "not_validated"
 
 // renderAcceptanceTriageLine renders an acceptance_triage_decided row with the
 // finding class and its disposition, e.g. "Acceptance triage — class-3:
@@ -486,6 +516,11 @@ type acceptanceActivity struct {
 	criteriaTotal  int
 	class          string
 	disposition    string
+	// criteriaLiveValidation is how many acceptance criteria the approved plan
+	// marks requires_live_validation (#2347). Only the orchestrator's
+	// short-circuit payload sets it; a validator-recorded outcome leaves it zero
+	// and every existing render path is unaffected.
+	criteriaLiveValidation int
 }
 
 // decodeAcceptanceActivity reads the {outcome, criteria_passed, criteria_total,
@@ -503,16 +538,20 @@ func decodeAcceptanceActivity(payload json.RawMessage) acceptanceActivity {
 		CriteriaTotal  int    `json:"criteria_total"`
 		Class          string `json:"class"`
 		Disposition    string `json:"disposition"`
+		// criteria_live_validation (#2347) is additive and short-circuit-only;
+		// every pre-change payload simply lacks it and decodes to zero.
+		CriteriaLiveValidation int `json:"criteria_live_validation"`
 	}
 	if err := json.Unmarshal(payload, &p); err != nil {
 		return acceptanceActivity{}
 	}
 	return acceptanceActivity{
-		outcome:        p.Outcome,
-		criteriaPassed: p.CriteriaPassed,
-		criteriaTotal:  p.CriteriaTotal,
-		class:          p.Class,
-		disposition:    p.Disposition,
+		outcome:                p.Outcome,
+		criteriaPassed:         p.CriteriaPassed,
+		criteriaTotal:          p.CriteriaTotal,
+		class:                  p.Class,
+		disposition:            p.Disposition,
+		criteriaLiveValidation: p.CriteriaLiveValidation,
 	}
 }
 

@@ -7629,6 +7629,62 @@ func TestGetRunStatus_AcceptancePassed_ThreadsRecentAudit(t *testing.T) {
 	}
 }
 
+// TestGetRunStatus_AcceptanceNotValidated_ThreadsRecentAudit is the #2347 twin
+// of the test above, over the SAME real getRunStatus path (wire JSON -> payload
+// parse -> classifier -> next_actions). It proves the new server-internal
+// verdict survives the whole MCP crossing — which is exactly where the #875
+// mirrored-not-imported seam could silently drop it into the defensive
+// acceptance_settled_outcome_unknown arm — and that the operator-facing
+// acknowledgement prompt reaches the wire output, not just the classifier unit.
+func TestGetRunStatus_AcceptanceNotValidated_ThreadsRecentAudit(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	prURL := "https://github.com/x/y/pull/78"
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change",
+		State: "running", PullRequestURL: &prURL,
+	}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "succeeded"},
+		{ID: uuid.NewString(), RunID: runID.String(), Sequence: 3, Type: "acceptance", State: "succeeded"},
+	}
+	fb.auditByRun[runID] = []AuditEntry{
+		{
+			ID: uuid.New().String(), Sequence: 2, RunID: runID.String(),
+			Category: "acceptance_outcome_recorded",
+			Payload: map[string]any{
+				"verdict": "not_validated", "outcome": "not_validated",
+				"criteria_passed": 0, "criteria_total": 3,
+				"criteria_live_validation": 1,
+				"basis":                    "all-skip-with-basis",
+			},
+			EntryHash: "h",
+		},
+	}
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.NextActions == nil || out.NextActions.State != "acceptance_not_validated" {
+		t.Fatalf("next_actions = %+v, want state acceptance_not_validated", out.NextActions)
+	}
+	names := make([]string, 0, len(out.NextActions.Actions))
+	for _, a := range out.NextActions.Actions {
+		names = append(names, a.Action)
+	}
+	if len(names) != 2 || names[0] != "approve_pr" || names[1] != "fishhawk_merge_run" {
+		t.Errorf("acceptance_not_validated actions = %v, want [approve_pr fishhawk_merge_run] (merge-eligible)", names)
+	}
+	// The acknowledgement prompt (binding condition 1) must survive to the wire.
+	reason := out.NextActions.Actions[0].Reason
+	if !strings.Contains(reason, "ZERO") || !strings.Contains(reason, "merge verdict") {
+		t.Errorf("wire next_actions reason lost the zero-criteria / merge-verdict acknowledgement prompt:\n%s", reason)
+	}
+}
+
 // releaseNotesFake is a minimal mux over the two release-notes endpoints the
 // fishhawk_release_notes handler calls (E33.5 / #1590). It records the request
 // coordinates and counts hits so a validation-branch test can assert the

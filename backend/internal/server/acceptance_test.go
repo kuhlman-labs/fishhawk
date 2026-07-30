@@ -384,6 +384,49 @@ func TestShipAcceptance_IdempotentHeal_ListError_500(t *testing.T) {
 	}
 }
 
+// TestShipAcceptance_NotValidatedVerdictUnforgeable_400 is the #2347 invariant
+// test: the new not_validated verdict is merge-ELIGIBLE at the gate, so the ONLY
+// thing keeping a validator from certifying-by-not-certifying is that the wire
+// endpoint refuses the word. It asserts the exact rejection message (not just
+// the 400) so a future 'completion' of the verdict enum — which would look like
+// a harmless tidy-up — fails loudly here. Paired with a control proving
+// passed/failed still 201, so this cannot pass by rejecting everything.
+func TestShipAcceptance_NotValidatedVerdictUnforgeable_400(t *testing.T) {
+	t.Run("not_validated is rejected on the wire", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, sf, ar, _, _ := newAcceptanceServer(t, runID, stageID)
+		priv, _ := sf.issue(t, runID)
+		body := []byte(`{"verdict":"` + acceptanceVerdictNotValidated + `"}`)
+		w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 — a wire-shipped not_validated verdict must fail closed:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "verdict must be passed or failed") {
+			t.Errorf("body missing the `verdict must be passed or failed` message:\n%s", w.Body.String())
+		}
+		if len(ar.all) != 0 {
+			t.Errorf("artifacts = %d, want 0 (no persistence on a rejected verdict)", len(ar.all))
+		}
+	})
+
+	// Control: the endpoint still ACCEPTS the two legal wire verdicts, so the
+	// rejection above is specific to not_validated rather than a blanket refusal.
+	for _, body := range [][]byte{
+		[]byte(`{"verdict":"passed"}`),
+		[]byte(`{"verdict":"failed","failure_mode":"assertion_fail"}`),
+	} {
+		t.Run("control: "+string(body), func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			s, sf, _, _, _ := newAcceptanceServer(t, runID, stageID)
+			priv, _ := sf.issue(t, runID)
+			w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, "")
+			if w.Code != http.StatusCreated {
+				t.Errorf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 // TestShipAcceptance_InvalidPayload_400 pins the per-field validation branches:
 // each malformed field (and an unknown field) is a 400 acceptance_invalid with
 // no artifact created.
@@ -411,6 +454,12 @@ func TestShipAcceptance_InvalidPayload_400(t *testing.T) {
 		"trailing object":             []byte(`{"verdict":"passed"}{"verdict":"failed","failure_mode":"error"}`),
 		"trailing garbage":            []byte(`{"verdict":"passed"} garbage`),
 	}
+	// #2347 fail-closed: not_validated is SERVER-INTERNAL. A wire producer must
+	// never be able to ship it — otherwise a validator could forge a
+	// zero-criteria-verified outcome and walk it straight past the merge gate,
+	// which admits that state. Built from the constant so a rename cannot make
+	// this case silently test a different (already-rejected) string.
+	cases["server-internal not_validated verdict"] = []byte(`{"verdict":"` + acceptanceVerdictNotValidated + `"}`)
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
 			runID, stageID := uuid.New(), uuid.New()
@@ -2046,6 +2095,59 @@ func TestAcceptanceGateState_VerdictFailed_Triage(t *testing.T) {
 	}
 	if got != acceptanceGateTriage {
 		t.Errorf("state = %q, want %q", got, acceptanceGateTriage)
+	}
+}
+
+// TestAcceptanceGateState_VerdictNotValidated pins the #2347 gate branch: the
+// orchestrator's short-circuit verdict resolves to its OWN merge-eligible state,
+// NOT to acceptanceGatePassed (which would re-hide the non-validation) and NOT
+// by falling through to the settled-outcome-unknown hole (which would 409 every
+// no-live-target run at the merge).
+func TestAcceptanceGateState_VerdictNotValidated(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictNotValidated)
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateNotValidated {
+		t.Errorf("state = %q, want %q", got, acceptanceGateNotValidated)
+	}
+	if got == acceptanceGatePassed {
+		t.Error("a not_validated verdict must NOT resolve to acceptance_passed (#2347)")
+	}
+}
+
+// TestAcceptanceVerdictNotValidated_PinnedToPlanConstant pins the server mirror
+// byte-identically to the plan-package producer constant. The orchestrator emits
+// plan.AcceptanceVerdictNotValidated; this gate reads it. A rename on one side
+// with no mirror would silently route every short-circuited run into the
+// outcome-unknown hole.
+func TestAcceptanceVerdictNotValidated_PinnedToPlanConstant(t *testing.T) {
+	if acceptanceVerdictNotValidated != plan.AcceptanceVerdictNotValidated {
+		t.Errorf("acceptanceVerdictNotValidated = %q, want plan.AcceptanceVerdictNotValidated %q",
+			acceptanceVerdictNotValidated, plan.AcceptanceVerdictNotValidated)
+	}
+	if acceptanceVerdictNotValidated == acceptanceVerdictPassed || acceptanceVerdictNotValidated == acceptanceVerdictFailed {
+		t.Error("the not-validated verdict must be a THIRD distinct value, never an alias of passed/failed")
+	}
+}
+
+// TestAcceptanceOutcomeLabel_NotValidated pins the render-vocabulary mapping:
+// not_validated maps to its own outcome word rather than falling into the binary
+// accepted/rejected default (which would render a zero-criteria short-circuit as
+// a rejection — as dishonest in the other direction as the pass it replaces).
+func TestAcceptanceOutcomeLabel_NotValidated(t *testing.T) {
+	for _, tc := range []struct{ verdict, want string }{
+		{acceptanceVerdictPassed, "accepted"},
+		{acceptanceVerdictFailed, "rejected"},
+		{acceptanceVerdictNotValidated, plan.AcceptanceOutcomeNotValidated},
+	} {
+		if got := acceptanceOutcomeLabel(tc.verdict); got != tc.want {
+			t.Errorf("acceptanceOutcomeLabel(%q) = %q, want %q", tc.verdict, got, tc.want)
+		}
 	}
 }
 

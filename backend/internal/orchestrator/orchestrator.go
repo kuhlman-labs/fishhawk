@@ -1131,44 +1131,57 @@ func (o *Orchestrator) emitAcceptanceSkippedOutOfScope(ctx context.Context, runI
 // criterion is skip_expected-with-basis (basis all-skip-with-basis, #1748 /
 // E41.6). The basis and the criteria total are parametrized: empty-criteria
 // passes total=0 (no criterion existed); all-skip-with-basis passes total=N and
-// records all N as skipped. Unlike emitAcceptanceSkippedOutOfScope (which
-// records a skip MARKER), this records a real passed verdict so downstream
-// next_actions surfaces acceptance_passed and auto-close/merge proceed
-// identically to a validator-shipped pass. Best-effort, mirroring the other
-// emit helpers: nil-Audit guard with a WARN log, WARN-on-error, never unwinds
-// the walk.
+// records all N as skipped.
+//
+// Unlike emitAcceptanceSkippedOutOfScope (which records a skip MARKER), this
+// records a real VERDICT — but a NOT-VALIDATED one (#2347), never a passed one.
+// Both bases verified exactly zero criteria: no runner, no preview, no
+// observation. Emitting the same `passed`/`accepted` words a validator-shipped
+// pass emits made an ABSENCE of verification render as certification everywhere
+// downstream (the merge gate, the operator's status comment, release evidence).
+// plan.AcceptanceVerdictNotValidated is merge-ELIGIBLE — a change with no live
+// target must not be stranded — but it is a distinct word at every consumer, so
+// the outcome is honest end to end. Best-effort, mirroring the other emit
+// helpers: nil-Audit guard with a WARN log, WARN-on-error, never unwinds the
+// walk.
 //
 // The category literal is byte-identical to server.CategoryAcceptanceOutcomeRecorded
 // so the same audit shape the validator ships is what auditcomplete and the MCP
 // next_actions classifier read. The payload mirrors the server's
 // buildOutcomePayload verdict/outcome/criteria_* render contract (no criterion
 // was actually validated — passed/failed stay zero) and additionally carries the
-// basis field (plan.AcceptanceBasisKey → the passed basis). A normal
-// server-recorded verdict never sets basis, so its presence cleanly marks this
-// entry as the pre-spawn short-circuit — the discriminator auditcomplete reads
-// to exempt the no-trace acceptance stage from the trace-required rule. Appended
-// with AppendChained (ActorKind system) so Rule 4 chain-verify stays intact.
-func (o *Orchestrator) emitAcceptanceOutcomeShortCircuit(ctx context.Context, runID, stageID uuid.UUID, sequence int, basis string, criteriaTotal int) {
+// basis field (plan.AcceptanceBasisKey → the short-circuit basis) plus
+// criteria_live_validation, the count of criteria marked
+// requires_live_validation, so a skip carrying a TRACKED operator-validation
+// walk (#2338 / #2345) is distinguishable from one skipped on any other basis. A
+// normal server-recorded verdict never sets basis, so its presence cleanly marks
+// this entry as the pre-spawn short-circuit — the discriminator auditcomplete
+// reads to exempt the no-trace acceptance stage from the trace-required rule
+// (auditcomplete keys on BASIS, not on the verdict, so the exemption is
+// unaffected by the verdict change). Appended with AppendChained (ActorKind
+// system) so Rule 4 chain-verify stays intact.
+func (o *Orchestrator) emitAcceptanceOutcomeShortCircuit(ctx context.Context, runID, stageID uuid.UUID, sequence int, basis string, criteriaTotal, liveValidationCount int) {
 	if o.Audit == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; skipping acceptance_outcome_recorded short-circuit entry",
 			slog.String("run_id", runID.String()))
 		return
 	}
-	reason := "approved plan declares zero acceptance_criteria and zero verification.out_of_scope; acceptance stage short-circuited to a passed verdict with no runner spawn and no preview"
+	reason := "approved plan declares zero acceptance_criteria and zero verification.out_of_scope; acceptance stage short-circuited to a NOT-VALIDATED verdict with no runner spawn and no preview — zero criteria were verified"
 	if basis == plan.AcceptanceBasisAllSkipWithBasis {
-		reason = "approved plan's acceptance criteria are all skip_expected with an expectation_basis; acceptance stage short-circuited to a passed verdict with no runner spawn and no preview"
+		reason = "approved plan's acceptance criteria are all skip_expected with an expectation_basis; acceptance stage short-circuited to a NOT-VALIDATED verdict with no runner spawn and no preview — zero criteria were verified"
 	}
 	payload, err := json.Marshal(map[string]any{
-		"stage_id":              stageID.String(),
-		"sequence":              sequence,
-		"verdict":               "passed",
-		"outcome":               "accepted",
-		"criteria_passed":       0,
-		"criteria_failed":       0,
-		"criteria_skipped":      criteriaTotal,
-		"criteria_total":        criteriaTotal,
-		plan.AcceptanceBasisKey: basis,
-		"reason":                reason,
+		"stage_id":                               stageID.String(),
+		"sequence":                               sequence,
+		"verdict":                                plan.AcceptanceVerdictNotValidated,
+		"outcome":                                plan.AcceptanceOutcomeNotValidated,
+		"criteria_passed":                        0,
+		"criteria_failed":                        0,
+		"criteria_skipped":                       criteriaTotal,
+		"criteria_total":                         criteriaTotal,
+		plan.AcceptanceCriteriaLiveValidationKey: liveValidationCount,
+		plan.AcceptanceBasisKey:                  basis,
+		"reason":                                 reason,
 	})
 	if err != nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal acceptance_outcome_recorded short-circuit payload failed",
@@ -1264,7 +1277,8 @@ func (o *Orchestrator) walkAcceptanceToSucceededFrom(ctx context.Context, stageI
 // (#1928): it evaluates the three disjoint approved-plan predicates
 // (out-of-scope skip, empty-criteria, all-skip-with-basis), and on a hit walks
 // the target acceptance stage straight to succeeded and emits the matching audit
-// (the skip marker for out-of-scope, a passed verdict for the other two). It
+// (the skip marker for out-of-scope, a NOT-VALIDATED verdict for the other two —
+// both verified zero criteria, so neither records a pass, #2347). It
 // does NOT re-enter Advance — the caller owns that so the retry-path inline arm
 // stays byte-identical. Returns a non-nil *AcceptanceShortCircuit on a hit, and
 // (nil, _, nil) for a nil approved plan, a false predicate, a non-acceptance
@@ -1321,8 +1335,9 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "empty-criteria short-circuit"); err != nil {
 			return nil, false, err
 		}
-		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisEmptyCriteria, 0)
-		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (zero acceptance_criteria, zero out_of_scope) to a passed verdict",
+		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisEmptyCriteria, 0,
+			plan.LiveValidationCriteriaCount(approvedPlan.Verification))
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (zero acceptance_criteria, zero out_of_scope) to a NOT-VALIDATED verdict",
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", target.ID.String()),
 			slog.Int("sequence", target.Sequence),
@@ -1334,8 +1349,9 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 			return nil, false, err
 		}
 		total := len(approvedPlan.Verification.AcceptanceCriteria)
-		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisAllSkipWithBasis, total)
-		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (every acceptance criterion skip_expected with basis) to a passed verdict",
+		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisAllSkipWithBasis, total,
+			plan.LiveValidationCriteriaCount(approvedPlan.Verification))
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (every acceptance criterion skip_expected with basis) to a NOT-VALIDATED verdict",
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", target.ID.String()),
 			slog.Int("sequence", target.Sequence),

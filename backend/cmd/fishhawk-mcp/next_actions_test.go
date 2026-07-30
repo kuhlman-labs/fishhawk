@@ -1220,6 +1220,96 @@ func TestNextActions_SucceededPROpenUnchangedWhenMergeNotObserved(t *testing.T) 
 	}
 }
 
+// TestNextActions_AcceptanceNotValidated_AcknowledgementPrompt is the #2347
+// BINDING-CONDITION-1 pin. The operator ruled that the acknowledgement is a
+// PROMPT, not an enforcement — no merge block, no text-matching of operator
+// prose (a gate that strands a run over verdict wording is a worse failure than
+// the dishonest word being fixed). That ruling leaves the reason string in this
+// arm as the ONE mechanism standing in for enforcement, and prose in a reason
+// field can be silently deleted by a refactor with neither reviewer nor gate
+// noticing. So the reason's two load-bearing claims are asserted directly:
+//
+//	(a) that ZERO criteria were verified, and
+//	(b) that the operator's merge verdict should say so.
+//
+// If either claim stops being told to the operator, this test fails.
+func TestNextActions_AcceptanceNotValidated_AcknowledgementPrompt(t *testing.T) {
+	assertPrompt := func(t *testing.T, na *NextActions, wantState string) {
+		t.Helper()
+		if na == nil || na.State != wantState {
+			t.Fatalf("state = %+v, want %s", na, wantState)
+		}
+		if got := actionNames(na); len(got) != 2 || got[0] != "approve_pr" || got[1] != "fishhawk_merge_run" {
+			t.Fatalf("actions = %v, want the merge ritual [approve_pr fishhawk_merge_run] — not-validated is merge-ELIGIBLE", got)
+		}
+		reason := na.Actions[0].Reason
+		// (a) zero criteria were verified.
+		if !strings.Contains(reason, "ZERO") {
+			t.Errorf("reason no longer tells the operator ZERO criteria were verified (#2347 condition 1):\n%s", reason)
+		}
+		// (b) the merge verdict should acknowledge it.
+		if !strings.Contains(reason, "merge verdict") {
+			t.Errorf("reason no longer asks the operator to acknowledge the non-validation in their merge verdict (#2347 condition 1):\n%s", reason)
+		}
+		if !strings.Contains(reason, "acknowledge") {
+			t.Errorf("reason dropped the acknowledgement ask (#2347 condition 1):\n%s", reason)
+		}
+		// The prompt must not read as a pass.
+		if strings.Contains(reason, "the acceptance stage passed") {
+			t.Errorf("reason still reads as a validated pass:\n%s", reason)
+		}
+	}
+
+	prURL := "https://github.com/x/y/pull/42"
+
+	t.Run("running-run acceptance arm", func(t *testing.T) {
+		r := naLocalRun("running")
+		r.PullRequestURL = &prURL
+		na := nextActionsFor(r, naAcceptanceStages("succeeded"), nil,
+			naReviewStatus("implement", "complete"), nil, nil, false, false,
+			acceptanceVerdictNotValidated, "", releaseSignals{})
+		assertPrompt(t, na, "acceptance_not_validated")
+	})
+
+	t.Run("terminal-run arm", func(t *testing.T) {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil,
+			false, false, acceptanceVerdictNotValidated, "", releaseSignals{})
+		assertPrompt(t, na, "succeeded_acceptance_not_validated")
+	})
+
+	// Degradation control: a verdict aged out of the recent-audit window (empty
+	// string) leaves the terminal run on plain succeeded_pr_open — merge-eligible,
+	// same as today. The label is what the signal gates, never the eligibility.
+	t.Run("verdict aged out -> succeeded_pr_open", func(t *testing.T) {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil,
+			false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "succeeded_pr_open" {
+			t.Fatalf("state = %+v, want succeeded_pr_open (graceful degradation)", na)
+		}
+	})
+
+	// Precedence control: the out-of-scope skip flag is checked FIRST, so a run
+	// carrying both signals keeps the skip label. The two short-circuit
+	// predicates are disjoint in the orchestrator, so this only pins that the
+	// new arm did not disturb the existing one.
+	t.Run("skip flag still wins over the verdict signal", func(t *testing.T) {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil,
+			false, true, acceptanceVerdictNotValidated, "", releaseSignals{})
+		if na == nil || na.State != "succeeded_acceptance_skipped_out_of_scope" {
+			t.Fatalf("state = %+v, want succeeded_acceptance_skipped_out_of_scope", na)
+		}
+	})
+}
+
 // TestNextActions_SucceededAcceptanceSkippedOutOfScope pins the E38.3 (#1657)
 // arm: a succeeded run with an open PR AND the acceptanceSkippedOutOfScope flag
 // set classifies succeeded_acceptance_skipped_out_of_scope and STILL returns the
@@ -1553,6 +1643,17 @@ func TestNextActions_AcceptanceStateTable(t *testing.T) {
 			stages:      naAcceptanceStages("succeeded"),
 			verdict:     "passed",
 			wantState:   "acceptance_passed",
+			wantActions: []string{"approve_pr", "fishhawk_merge_run"},
+		},
+		{
+			// (4b, #2347) acceptance succeeded + verdict not_validated ->
+			// acceptance_not_validated + the SAME merge ritual. Merge-eligible by
+			// design: the change makes the outcome honest, not obstructive.
+			name:        "4b_acceptance_not_validated_merge_ritual",
+			run:         withPR(naLocalRun("running")),
+			stages:      naAcceptanceStages("succeeded"),
+			verdict:     "not_validated",
+			wantState:   "acceptance_not_validated",
 			wantActions: []string{"approve_pr", "fishhawk_merge_run"},
 		},
 		{
@@ -1906,6 +2007,7 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"CategoryAcceptanceTriageDecided":   auditCategoryAcceptanceTriageDecided,
 		"acceptanceVerdictPassed":           acceptanceVerdictPassed,
 		"acceptanceVerdictFailed":           acceptanceVerdictFailed,
+		"acceptanceVerdictNotValidated":     acceptanceVerdictNotValidated,
 		"fixup_dispatched":                  acceptanceDispositionFixupDispatched,
 		"retry_dispatched":                  acceptanceDispositionRetryDispatched,
 		"paged":                             acceptanceDispositionPaged,
@@ -1920,14 +2022,19 @@ func TestAcceptanceVocabularyMatchesBackend(t *testing.T) {
 		"CategoryAcceptanceTriageDecided":   "acceptance_triage_decided",
 		"acceptanceVerdictPassed":           "passed",
 		"acceptanceVerdictFailed":           "failed",
-		"fixup_dispatched":                  "fixup_dispatched",
-		"retry_dispatched":                  "retry_dispatched",
-		"paged":                             "paged",
-		"rerun_budget_exhausted":            "rerun_budget_exhausted",
-		"fixup_unavailable_paged":           "fixup_unavailable_paged",
-		"retry_unavailable_paged":           "retry_unavailable_paged",
-		"unsettled_paged":                   "unsettled_paged",
-		"externally_unvalidatable_paged":    "externally_unvalidatable_paged",
+		// #2347: the SERVER-INTERNAL third verdict. Pinned here because the MCP
+		// mirrors rather than imports it (#875) — a rename on the plan/server side
+		// with no mirror silently routes every short-circuited run into the
+		// defensive acceptance_settled_outcome_unknown arm.
+		"acceptanceVerdictNotValidated":  "not_validated",
+		"fixup_dispatched":               "fixup_dispatched",
+		"retry_dispatched":               "retry_dispatched",
+		"paged":                          "paged",
+		"rerun_budget_exhausted":         "rerun_budget_exhausted",
+		"fixup_unavailable_paged":        "fixup_unavailable_paged",
+		"retry_unavailable_paged":        "retry_unavailable_paged",
+		"unsettled_paged":                "unsettled_paged",
+		"externally_unvalidatable_paged": "externally_unvalidatable_paged",
 	}
 	for k, wantVal := range expect {
 		if want[k] != wantVal {

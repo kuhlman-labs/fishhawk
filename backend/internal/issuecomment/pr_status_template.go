@@ -230,6 +230,10 @@ type prAcceptanceView struct {
 	triageClass       string
 	triageDisposition string
 	criteria          []prAcceptanceCriterion
+	// criteriaLiveValidation carries the short-circuit payload's
+	// requires_live_validation count (#2347); zero for every validator-recorded
+	// outcome.
+	criteriaLiveValidation int
 }
 
 // prAcceptanceCriterion mirrors the server package's acceptanceCriterionResult
@@ -268,9 +272,10 @@ func buildPRAcceptance(entries []*audit.Entry, artifactBody []byte) *prAcceptanc
 	}
 	a := decodeAcceptanceActivity(outcome.Payload)
 	v := &prAcceptanceView{
-		outcome:        a.outcome,
-		criteriaPassed: a.criteriaPassed,
-		criteriaTotal:  a.criteriaTotal,
+		outcome:                a.outcome,
+		criteriaPassed:         a.criteriaPassed,
+		criteriaTotal:          a.criteriaTotal,
+		criteriaLiveValidation: a.criteriaLiveValidation,
 	}
 	v.targetURL, v.headSHA = decodePRAcceptanceOutcome(outcome.Payload)
 	if triage != nil {
@@ -307,6 +312,17 @@ func renderPRAcceptance(v *prAcceptanceView, withTable bool) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// renderPRAcceptanceHeadline renders the acceptance section's headline. Shared
+// by BOTH fidelities of renderPRAcceptance (with and without the per-criterion
+// table), so the collapsed tally line the degradation ladder falls back to
+// carries the same words as the full section.
+//
+// The not_validated outcome (#2347) renders its own sentence rather than the
+// "<icon> <outcome> (P/N criteria passed)" shape: a short-circuited stage
+// verified ZERO criteria, and reporting that as a tally under a ✅/❌ icon is the
+// certification-of-nothing this change removes. It takes the neutral ❓ icon (it
+// is neither an acceptance nor a rejection) and states the non-validation before
+// the count.
 func renderPRAcceptanceHeadline(v *prAcceptanceView) string {
 	icon := "❓"
 	switch v.outcome {
@@ -314,6 +330,16 @@ func renderPRAcceptanceHeadline(v *prAcceptanceView) string {
 		icon = "✅"
 	case "rejected":
 		icon = "❌"
+	case acceptanceOutcomeNotValidated:
+		line := fmt.Sprintf("**Acceptance** — %s not validated — 0 criteria verified (the plan declared none)", icon)
+		if v.criteriaTotal > 0 {
+			line = fmt.Sprintf("**Acceptance** — %s not validated — %d/%d criteria verified (all criteria skip-expected)",
+				icon, v.criteriaPassed, v.criteriaTotal)
+		}
+		if v.criteriaLiveValidation > 0 {
+			line += fmt.Sprintf("; %d require live validation", v.criteriaLiveValidation)
+		}
+		return line
 	}
 	outcome := v.outcome
 	if outcome == "" {

@@ -147,6 +147,13 @@ const acceptanceTriageSystemSubject = "system:acceptance-triage"
 const (
 	acceptanceVerdictPassed = "passed"
 	acceptanceVerdictFailed = "failed"
+	// acceptanceVerdictNotValidated is the SERVER-INTERNAL-ONLY third verdict
+	// (#2347) the orchestrator's pre-spawn short-circuit records for a stage that
+	// verified ZERO criteria. It is pinned to the plan-package constant so the
+	// producer and this gate cannot drift. It is deliberately NOT admissible on
+	// the wire — acceptanceBody.validate still rejects it — so it can only ever
+	// originate server-side.
+	acceptanceVerdictNotValidated = plan.AcceptanceVerdictNotValidated
 
 	acceptanceFailureError         = "error"
 	acceptanceFailureAssertionFail = "assertion_fail"
@@ -262,6 +269,13 @@ func (a *acceptanceBody) validate(ctx context.Context, logger *slog.Logger) erro
 	case "":
 		return errors.New("verdict is required")
 	default:
+		// INVARIANT (#2347): this switch is deliberately INCOMPLETE with respect
+		// to the acceptanceVerdict* constant set. acceptanceVerdictNotValidated is
+		// SERVER-INTERNAL ONLY — it is recorded exclusively by the orchestrator's
+		// pre-spawn short-circuit, which never travels through this endpoint. A
+		// wire producer that ships it must be rejected here, so do NOT 'complete'
+		// the enum by adding a not_validated case: doing so would let a validator
+		// forge a zero-criteria-verified outcome and walk it past the merge gate.
 		return fmt.Errorf("verdict must be passed or failed, got %q", a.Verdict)
 	}
 	// Coerce criteria before the per-criterion fail-closed checks: an object
@@ -482,12 +496,22 @@ func acceptanceCriteriaTally(criteria []acceptanceCriterionResult) (passed, fail
 	return passed, failed, skipped, len(criteria)
 }
 
-// acceptanceOutcomeLabel maps the wire verdict to the issue-comment render
-// vocabulary (accepted | rejected) — the `outcome` field
+// acceptanceOutcomeLabel maps a verdict to the issue-comment render vocabulary
+// (accepted | not_validated | rejected) — the `outcome` field
 // issuecomment/status_template.go's renderAcceptanceOutcomeLine reads.
+//
+// not_validated (#2347) is mapped explicitly rather than falling into the
+// binary default: a short-circuited stage that verified zero criteria is
+// neither an acceptance nor a rejection, and rendering it as "rejected" would be
+// as dishonest in the other direction as the "accepted" it replaces. Only a
+// server-internal short-circuit can produce that verdict — the wire endpoint
+// still admits passed/failed only.
 func acceptanceOutcomeLabel(verdict string) string {
-	if verdict == acceptanceVerdictPassed {
+	switch verdict {
+	case acceptanceVerdictPassed:
 		return "accepted"
+	case acceptanceVerdictNotValidated:
+		return plan.AcceptanceOutcomeNotValidated
 	}
 	return "rejected"
 }
@@ -889,6 +913,21 @@ const (
 	// parking in acceptance_settled_outcome_unknown. Value is the audit category
 	// itself so the marker string and the gate state cannot diverge.
 	acceptanceGateSkippedOutOfScope = CategoryAcceptanceSkippedOutOfScope
+	// acceptanceGateNotValidated is the second merge-eligible terminal
+	// disposition (#2347): the acceptance stage settled with a recorded
+	// not_validated verdict — the orchestrator short-circuited it because the
+	// approved plan carried zero acceptance criteria, or every criterion was
+	// skip_expected with an expectation_basis. ZERO criteria were verified.
+	//
+	// It is merge-ELIGIBLE on purpose: a change with no live target must not be
+	// stranded, and blocking here would trade a dishonest pass for a wedge. The
+	// distinguishing signal is carried instead by the state STRING — the MCP
+	// next_actions surface renders acceptance_not_validated with a reason telling
+	// the operator zero criteria were verified and asking them to say so in their
+	// merge verdict. It is deliberately NOT acceptanceGatePassed: a consumer that
+	// wants to treat the two differently can, and a future gate that must
+	// distinguish them does not have to re-derive the basis from the payload.
+	acceptanceGateNotValidated = "acceptance_not_validated"
 )
 
 // latestAcceptanceVerdict returns the verdict on the newest (highest-Sequence)
@@ -938,6 +977,10 @@ func (s *Server) latestAcceptanceVerdict(ctx context.Context, runID uuid.UUID) (
 //
 // Returns, for a run whose workflow declares an acceptance stage:
 //   - acceptanceGatePassed        — newest recorded verdict is passed (merge OK).
+//   - acceptanceGateNotValidated  — newest recorded verdict is not_validated
+//     (#2347: the pre-spawn short-circuit settled the stage having verified ZERO
+//     criteria). Merge-eligible, but a distinct state so the operator surface can
+//     say so rather than reporting a pass.
 //   - acceptanceGateTriage        — newest recorded verdict is failed.
 //   - acceptanceGateSkippedOutOfScope — no readable verdict, the acceptance
 //     stage is terminal, AND it carries a stage-scoped
@@ -969,6 +1012,12 @@ func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stage
 			return acceptanceGatePassed, nil
 		case acceptanceVerdictFailed:
 			return acceptanceGateTriage, nil
+		case acceptanceVerdictNotValidated:
+			// #2347: a short-circuited stage that verified zero criteria. Merge-
+			// eligible, but NOT acceptanceGatePassed — and explicitly handled here
+			// rather than falling through to the settled-outcome-unknown hole
+			// below, which would wedge every no-live-target run at a 409.
+			return acceptanceGateNotValidated, nil
 		}
 		// Recorded but unreadable/empty verdict falls through to the
 		// stage-terminality distinction below (outcome unknown vs pending).

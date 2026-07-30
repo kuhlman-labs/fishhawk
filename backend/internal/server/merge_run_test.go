@@ -536,6 +536,29 @@ func TestMergeRun_AcceptanceSkippedOutOfScope_Proceeds(t *testing.T) {
 	}
 }
 
+// TestMergeRun_AcceptanceNotValidated_Proceeds pins the #2347 merge-admission
+// branch: a short-circuited acceptance stage that verified ZERO criteria is
+// merge-ELIGIBLE. This is the deliberate scope boundary of #2347 — the change
+// makes the outcome HONEST (a distinct verdict, gate state, next_actions state
+// and status-comment row), it does NOT make it obstructive. Blocking here would
+// strand every no-live-target run at a 409 with no verb to clear it.
+func TestMergeRun_AcceptanceNotValidated_Proceeds(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR,
+		[]byte(autoDriveAcceptanceSpecYAML), acceptanceMergeStages(runID, run.StageStateSucceeded))
+	seedAcceptanceOutcome(au, runID, 6, acceptanceVerdictNotValidated)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — a not_validated verdict is merge-eligible (#2347):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (not-validated acceptance proceeds)", merger.called)
+	}
+}
+
 // TestMergeRun_ReviewAwaitingApprovalDoesNotBlock is the deliberate divergence
 // from the delegated arm: a review stage parked at awaiting_approval does NOT
 // block the human merge (resolveReviewStageOnMerge settles it ON merge; blocking

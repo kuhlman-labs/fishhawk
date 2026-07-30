@@ -706,6 +706,14 @@ func TestBuild_Plan_ExternallyTriggeredCriteriaGuidance(t *testing.T) {
 		"LIVE",
 		"operator-validation walk",
 		"MUST ALSO mark `skip_expected: true`",
+		// #2347: the planner must be told the all-skip short-circuit records a
+		// NOT-VALIDATED verdict, not a pass — otherwise an all-skip plan reads as
+		// a cheap green and the guidance actively encourages the behavior the
+		// issue is about.
+		"NOT-VALIDATED verdict",
+		"verified NOTHING",
+		"Do not treat an all-skip plan as a cheap green",
+		"records a NOT-VALIDATED verdict, never a passed one",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {

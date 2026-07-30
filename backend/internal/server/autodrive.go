@@ -331,9 +331,13 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
 	// #1877: an out-of-scope skip (acceptanceGateSkippedOutOfScope) is a
 	// legitimate terminal disposition equivalent to a recorded outcome for the
-	// merge gate. A read error (gerr != nil) admits nothing — fail-closed.
+	// merge gate. #2347: so is a not_validated verdict (acceptanceGateNotValidated)
+	// — the short-circuit settled the stage having verified zero criteria, which
+	// is honest-but-mergeable, not a block. A read error (gerr != nil) admits
+	// nothing — fail-closed.
 	acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared ||
-		gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope)
+		gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope ||
+		gateState == acceptanceGateNotValidated)
 	if !acceptanceMergeOK {
 		return mergeDispatchAcceptanceNotReady, gateState, gerr
 	}

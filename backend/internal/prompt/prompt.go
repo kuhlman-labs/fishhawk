@@ -2309,16 +2309,20 @@ func buildPlan(t Trigger) string {
 		"covered by verification.out_of_scope with that reason — so it never enters the failed/retry path. Do NOT author it as a " +
 		"live-service criterion: the acceptance agent will correctly skip it (posture-A can't-exhibit) and, absent this guidance, " +
 		"that skip can wedge the merge gate. When EVERY criterion in the plan is marked `skip_expected` with an `expectation_basis`, " +
-		"the orchestrator short-circuits acceptance dispatch straight to a passed verdict (basis `all-skip-with-basis`) with no " +
-		"runner spawn — there is nothing the sandboxed agent could observe. The marker is OPTIONAL and the plan gate does not reject " +
+		"the orchestrator short-circuits acceptance dispatch straight to a NOT-VALIDATED verdict (basis `all-skip-with-basis`) with " +
+		"no runner spawn — there is nothing the sandboxed agent could observe. That outcome is merge-eligible, but it is recorded as " +
+		"having verified NOTHING (#2347): it is not a pass, and the operator is told so. Do not treat an all-skip plan as a cheap " +
+		"green — author a drivable criterion whenever one genuinely exists. The marker is OPTIONAL and the plan gate does not reject " +
 		"a legacy unmarked plan.\n")
 	b.WriteString("Live-validation criteria rule: a NARROWER case of the above — when a criterion's true verification needs a LIVE " +
 		"forge/deploy/external target (a real GitHub API round-trip, a deployed environment, a third-party surface), not merely an " +
 		"external event, the sandbox can never stand that target up. Classify it up front by setting `requires_live_validation: true`. " +
 		"A criterion you mark `requires_live_validation` you MUST ALSO mark `skip_expected: true` with an `expectation_basis` citing " +
 		"the integration/e2e test with a fake — the pairing keeps the all-skip-with-basis short-circuit intact so the live-target " +
-		"criterion never dispatches to the acceptance agent. On plan approval the system auto-files-or-links an operator-validation " +
-		"walk for every `requires_live_validation` criterion so the live check is tracked and nothing ships silently unvalidated.\n")
+		"criterion never dispatches to the acceptance agent. That short-circuit records a NOT-VALIDATED verdict, never a passed one " +
+		"(#2347), and the recorded count of `requires_live_validation` criteria is what tells the operator the skip carries a tracked " +
+		"live check rather than none. On plan approval the system auto-files-or-links an operator-validation walk for every " +
+		"`requires_live_validation` criterion so the live check is tracked and nothing ships silently unvalidated.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +

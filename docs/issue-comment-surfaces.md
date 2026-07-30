@@ -812,9 +812,10 @@ Notes:
   notifier surface-sweep: adding a system-actor render-only audit kind adds no
   Notifier method (the change that added the deploy kinds, PR #1395 / commit
   f227dbb, likewise never touched the notifier source). The payload tags
-  (`{outcome, criteria_passed, criteria_total, class, disposition}`) DEFINE the
-  contract the writers emit to: the E31.6 acceptance-outcome handler writes
-  `acceptance_dispatched` / `acceptance_outcome_recorded`, and the E31.8 triage
+  (`{outcome, criteria_passed, criteria_total, criteria_live_validation, class,
+  disposition}`) DEFINE the contract the writers emit to: the E31.6
+  acceptance-outcome handler writes `acceptance_dispatched` /
+  `acceptance_outcome_recorded`, and the E31.8 triage
   (`server/acceptance.go::triageAcceptanceFailure`, #1536) writes
   `acceptance_triage_decided`. **`acceptance_triage_decided` is now WRITTEN by
   E31.8** — one chained entry per triaged failed verdict, payload
@@ -830,6 +831,24 @@ Notes:
   render-only edit surfaces; the paged variants ALSO fire the page-class ping
   registered above. The class-3 entry keyed by `criterion_ids` is the durable
   per-criterion disposition record E31.11 consumes.
+- **The `not_validated` outcome renders its OWN row (#2347).** When the
+  orchestrator's pre-spawn short-circuit settles an acceptance stage it records
+  `outcome: not_validated` — the stage verified ZERO criteria (no runner, no
+  preview, no observation). `renderAcceptanceOutcomeLine` gives it a distinct
+  row: "Acceptance not validated — `<passed>`/`<total>` criteria verified (all
+  criteria skip-expected)", or "Acceptance not validated — 0 criteria verified
+  (the plan declared none)" when the total is zero, with
+  "; `<n>` require live validation" appended when the additive
+  `criteria_live_validation` payload field is non-zero (a skip carrying a tracked
+  operator-validation walk, #2338 / #2345). It deliberately does NOT reuse the
+  "Acceptance recorded — `<outcome>` (`<passed>`/`<total>` criteria passed)"
+  shape: that sentence is the one an operator reads as certification, and merely
+  swapping the word into it would keep the framing. The **PR-comment** surface
+  (`pr_status_template.go`'s `renderPRAcceptanceHeadline`, shared by BOTH
+  fidelities, so the degradation ladder's collapsed tally line is honest too)
+  carries the same wording under the neutral ❓ icon — it is neither an
+  acceptance nor a rejection. Every pre-#2347 payload simply lacks
+  `criteria_live_validation` and decodes to zero, so no existing render changes.
 - The operator-gated acceptance re-open audit kind — `acceptance_reopened`
   (E31.16 / #1567) — is a **system-/user-actor audit kind with NO dedicated
   Notifier method and NO dedicated timeline render**, following the same

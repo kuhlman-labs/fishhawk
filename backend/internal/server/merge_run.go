@@ -172,8 +172,12 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// Fail-closed guard: the acceptance gate must admit the merge (ADR-049
 	// decision #6). Read the stages once and classify. Any pending / failed /
 	// outcome-unknown / read-error state → 409; passed / not-declared /
-	// skipped-out-of-scope proceed. Deliberately does NOT block on a review
-	// stage awaiting approval (resolveReviewStageOnMerge settles it ON merge).
+	// skipped-out-of-scope / not-validated proceed. not-validated (#2347) is the
+	// short-circuited zero-criteria-verified outcome: merge-ELIGIBLE by design,
+	// because a change with no live target must not be stranded — the operator
+	// reads the distinction from the run's next_actions state and status comment,
+	// not from a block here. Deliberately does NOT block on a review stage
+	// awaiting approval (resolveReviewStageOnMerge settles it ON merge).
 	stages, err := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -182,14 +186,15 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	}
 	gateState, gerr := s.acceptanceGateState(r.Context(), runRow, stages)
 	acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared ||
-		gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope)
+		gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope ||
+		gateState == acceptanceGateNotValidated)
 	if !acceptanceMergeOK {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: acceptance gate does not admit the merge",
 			slog.String("run_id", runID.String()),
 			slog.String("acceptance_gate_state", gateState),
 			slog.Bool("acceptance_read_error", gerr != nil))
 		s.writeError(w, r, http.StatusConflict, "acceptance_gate_not_passed",
-			"the acceptance gate does not admit a merge (must be passed, not-declared, or skipped-out-of-scope)",
+			"the acceptance gate does not admit a merge (must be passed, not-declared, skipped-out-of-scope, or not-validated)",
 			map[string]any{"run_id": runID.String(), "acceptance_gate_state": gateState})
 		return
 	}

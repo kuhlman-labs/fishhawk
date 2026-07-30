@@ -347,7 +347,48 @@ func TestLiveValidationCriteria_TruthTable(t *testing.T) {
 					t.Fatalf("selected ids = %v, want %v", gotIDs, tc.wantIDs)
 				}
 			}
+			// #2347: the count wrapper the short-circuit emit site uses must agree
+			// with the selector over the SAME table — it exists so the emit site
+			// does not re-walk the criteria itself, so a divergence between the two
+			// would put a wrong criteria_live_validation into the audit payload
+			// while the selector's own tests stayed green.
+			if n := LiveValidationCriteriaCount(tc.v); n != len(tc.wantIDs) {
+				t.Errorf("LiveValidationCriteriaCount = %d, want %d (must agree with LiveValidationCriteria)", n, len(tc.wantIDs))
+			}
 		})
+	}
+}
+
+// TestAcceptanceNotValidatedVocabulary pins the #2347 constant set. These values
+// travel through an audit payload into the server gate, the MCP classifier, and
+// two render surfaces — several of which MIRROR rather than import them (the
+// #875 no-import seam) — so their literal bytes are the contract, not an
+// implementation detail. A silent rename here would degrade every short-circuited
+// run to the defensive settled-outcome-unknown arm rather than failing to compile.
+func TestAcceptanceNotValidatedVocabulary(t *testing.T) {
+	if AcceptanceVerdictNotValidated != "not_validated" {
+		t.Errorf("AcceptanceVerdictNotValidated = %q, want %q", AcceptanceVerdictNotValidated, "not_validated")
+	}
+	if AcceptanceOutcomeNotValidated != "not_validated" {
+		t.Errorf("AcceptanceOutcomeNotValidated = %q, want %q", AcceptanceOutcomeNotValidated, "not_validated")
+	}
+	if AcceptanceCriteriaLiveValidationKey != "criteria_live_validation" {
+		t.Errorf("AcceptanceCriteriaLiveValidationKey = %q, want %q", AcceptanceCriteriaLiveValidationKey, "criteria_live_validation")
+	}
+	// The verdict must be a THIRD value, never colliding with the two wire
+	// verdicts — the gate switches on it, and a collision would make a
+	// short-circuit indistinguishable from a validator-shipped pass.
+	for _, wire := range []string{"passed", "failed"} {
+		if AcceptanceVerdictNotValidated == wire {
+			t.Errorf("AcceptanceVerdictNotValidated collides with the wire verdict %q", wire)
+		}
+	}
+	// Likewise the outcome word must not collide with the binary render
+	// vocabulary the status templates already switch on.
+	for _, render := range []string{"accepted", "rejected"} {
+		if AcceptanceOutcomeNotValidated == render {
+			t.Errorf("AcceptanceOutcomeNotValidated collides with the render word %q", render)
+		}
 	}
 }
 

@@ -20,3 +20,11 @@ Rule 6 makes the ADR-027 advisory implement-review a pre-merge **presence** gate
 The present/in-flight decision (`auditcomplete.ReviewPresent`) is shared single-source with the ADR-036 merge-resolution hold (`server.checkImplementReviewSettled`), reusing the same `planReviewBackstop` so a dead reviewer can't wedge the gate; the advisory verdict stays non-blocking (any terminal kind clears it).
 
 The MCP `fishhawk_get_run_status` surfaces a display-only `implement_review_merge_hint` mirroring the same pending condition for the local loop.
+
+## Acceptance short-circuit trace exemption (#1728 / #1748) is BASIS-keyed, not verdict-keyed
+
+An acceptance stage the orchestrator short-circuited pre-spawn ships NO trace bundle yet is legitimately `succeeded`, so `Compute` exempts it from Rule 4's trace-required check. The exemption is keyed on the `acceptance_outcome_recorded` payload's **`basis`** field (`plan.AcceptanceBasisEmptyCriteria` / `plan.AcceptanceBasisAllSkipWithBasis`) — any other basis, or a normal validator-recorded verdict (which never sets `basis` at all), is NOT exempted and still requires its trace.
+
+Because the key is the basis and not the verdict, #2347's change of that short-circuit verdict from `passed` to `not_validated` leaves the exemption firing exactly as before. That independence is a pinned regression test, not an assumption: `auditcomplete_test.go` asserts the exemption still applies to a `verdict: not_validated` entry carrying a known basis, and still does NOT apply to a validator-recorded verdict with no basis field.
+
+A read failure on either the skip-marker or the outcome-entry query is transient and returned to the caller, so the gate never silently under- or over-gates.
