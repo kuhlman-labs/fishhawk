@@ -445,6 +445,55 @@ func TestPredicateMatchFailsClosedOnBadPattern(t *testing.T) {
 	}
 }
 
+// TestPredicateMatchFailsClosedOnEmptyPredicate proves Match does NOT treat an
+// empty predicate as match-all for a caller that bypassed Validate: it returns
+// an error rather than (true, nil), so a governance control can never silently
+// match everything.
+func TestPredicateMatchFailsClosedOnEmptyPredicate(t *testing.T) {
+	ok, err := Predicate{}.Match(Change{Paths: []string{"a.go"}, Labels: []string{"x"}})
+	if err == nil {
+		t.Fatal("empty predicate must fail closed in Match, not match all")
+	}
+	if ok {
+		t.Error("empty predicate returned true (match-all)")
+	}
+}
+
+// TestPredicateMatchFailsClosedOnMalformedGlobAfterMatch proves a malformed glob
+// LATER in the list still fails closed even when a valid glob EARLIER in the
+// list already matches the change path — the match short-circuit must not hide a
+// malformed declaration (glob validation is order-independent).
+func TestPredicateMatchFailsClosedOnMalformedGlobAfterMatch(t *testing.T) {
+	p := Predicate{Paths: []string{"**", "["}}
+	ok, err := p.Match(Change{Paths: []string{"a.go"}})
+	if err == nil {
+		t.Fatal("malformed glob after a matching valid glob must fail closed")
+	}
+	if ok {
+		t.Error("Match returned true despite a malformed glob in the list")
+	}
+	if !strings.Contains(err.Error(), "[") {
+		t.Errorf("error must name the offending glob, got %q", err)
+	}
+}
+
+// TestDecodeGitPathOctalOutOfByteRange proves an octal escape whose value
+// exceeds one byte (\400=256 .. \777=511) fails closed rather than truncating
+// via byte(v) to a different byte than written. Unreachable from genuine git
+// output (which emits only per-byte escapes <= \377) but the contract forbids a
+// silent mis-decode of a hand-crafted or corrupted input.
+func TestDecodeGitPathOctalOutOfByteRange(t *testing.T) {
+	for _, raw := range []string{`"\400"`, `"\777"`} {
+		_, err := DecodeGitPath(raw)
+		if err == nil {
+			t.Fatalf("octal escape > \\377 (%q) must fail closed, not truncate via byte()", raw)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("%q", raw)) {
+			t.Errorf("error must name the raw path, got %q", err)
+		}
+	}
+}
+
 // --- semantics: AND across types, OR within a list --------------------------
 
 func TestPredicateMultiCriteriaSemantics(t *testing.T) {

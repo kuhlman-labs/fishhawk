@@ -28,6 +28,8 @@
     { "raw": "\"a\\377b\"", "decoded": { "hex": "61ff62" } },
     { "raw": "\"ab\\\"", "error": true },
     { "raw": "\"\\39\"", "error": true },
+    { "raw": "\"\\400\"", "error": true },
+    { "raw": "\"\\777\"", "error": true },
     { "raw": "\"a\\zb\"", "error": true }
   ],
   "predicate_match": [

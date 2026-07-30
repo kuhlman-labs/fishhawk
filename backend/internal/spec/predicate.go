@@ -138,12 +138,17 @@ func (p Predicate) Validate(ptr string) error {
 
 // Match reports whether c satisfies p under the ratified semantics: AND
 // across DECLARED criteria types, OR within each list; an undeclared type
-// does not constrain. It FAILS CLOSED: a doublestar.Match error (reachable
-// only if a caller skipped Validate) returns (false, error) naming the
-// offending pattern rather than being swallowed as a non-match — the
+// does not constrain. It FAILS CLOSED for a caller that skipped Validate: an
+// empty predicate (no criterion at all) returns (false, error) rather than
+// matching everything, and a malformed `paths` glob returns (false, error)
+// naming the offending pattern rather than being swallowed as a non-match —
+// even when a valid glob earlier in the list already matched. This is the
 // deliberate divergence from the test-sweep's advisory fail-open, which is
 // correct for a sweep and wrong for a governance control.
 func (p Predicate) Match(c Change) (bool, error) {
+	if len(p.Paths) == 0 && len(p.Labels) == 0 && len(p.ChangeKinds) == 0 && len(p.Triggers) == 0 {
+		return false, fmt.Errorf("predicate declares no criterion; an empty predicate is not match-all (call Validate before Match)")
+	}
 	if len(p.Paths) > 0 {
 		ok, err := matchAnyPath(p.Paths, c.Paths)
 		if err != nil {
@@ -175,11 +180,18 @@ func (p Predicate) Match(c Change) (bool, error) {
 }
 
 // matchAnyPath reports whether ANY change path matches ANY glob via
-// doublestar.Match. It fails closed on a malformed glob (returns the error);
-// against zero change paths it returns (false, nil) without evaluating a
-// glob, so a paths-declaring predicate correctly does NOT match a no-diff
-// change.
+// doublestar.Match. It fails closed on a malformed glob (returns the error),
+// validating EVERY glob up front so the error is order-independent: a valid
+// glob earlier in the list that matches a path cannot short-circuit a true
+// return past a malformed glob later. Against zero change paths a well-formed
+// predicate returns (false, nil) without evaluating a glob, so a
+// paths-declaring predicate correctly does NOT match a no-diff change.
 func matchAnyPath(globs, paths []string) (bool, error) {
+	for _, g := range globs {
+		if g == "" || !doublestar.ValidatePattern(g) {
+			return false, fmt.Errorf("path predicate: malformed glob %q", g)
+		}
+	}
 	for _, g := range globs {
 		for _, path := range paths {
 			ok, err := doublestar.Match(g, path)
@@ -212,11 +224,14 @@ func SplitNULPaths(b []byte) []string {
 // wrapping it in double quotes and escaping the offending bytes; the non-`-z`
 // forms a caller may hand in carry this quoting. An unquoted value is
 // returned verbatim. It FAILS CLOSED with an actionable error NAMING raw on a
-// trailing backslash, a short or non-octal octal escape, or an unknown escape
-// — the exact three modes scripts/check-coverage.py's decode_git_path raises
-// PathDecodeError for — so a decode failure can never degrade to a silent
-// non-match. Go strings are byte slices, so a non-UTF-8 path needs no
-// surrogateescape round-trip.
+// trailing backslash, a short or non-octal octal escape, an octal escape
+// whose value exceeds one byte (> \377), or an unknown escape — so a decode
+// failure can never degrade to a silent non-match. The first, second and last
+// mirror scripts/check-coverage.py's decode_git_path PathDecodeError modes;
+// the byte-range guard is stricter than genuine git output (which emits only
+// per-byte escapes <= \377) so a hand-crafted >\377 escape is rejected rather
+// than truncated via byte(v) to a different byte than written. Go strings are
+// byte slices, so a non-UTF-8 path needs no surrogateescape round-trip.
 func DecodeGitPath(raw string) (string, error) {
 	if len(raw) < 2 || raw[0] != '"' || raw[len(raw)-1] != '"' {
 		return raw, nil
@@ -240,6 +255,9 @@ func DecodeGitPath(raw string) (string, error) {
 				return "", fmt.Errorf("bad octal escape in quoted git path %q", raw)
 			}
 			v, _ := strconv.ParseUint(body[i:i+3], 8, 16)
+			if v > 0xFF {
+				return "", fmt.Errorf("octal escape \\%s exceeds one byte (> \\377) in quoted git path %q", body[i:i+3], raw)
+			}
 			out = append(out, byte(v))
 			i += 3
 			continue
