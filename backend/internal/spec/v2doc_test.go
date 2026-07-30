@@ -63,14 +63,89 @@ var v2DocDelegationPhrases = []string{
 var v2StageTypes = []string{"plan", "implement", "review", "deploy", "acceptance"}
 
 var (
-	fencedBlockRE = regexp.MustCompile("(?ms)^[ \t]*```.*?^[ \t]*```[ \t]*$")
-	headingRE     = regexp.MustCompile(`(?m)^(#{1,6})[ \t]+(.*)$`)
+	headingRE = regexp.MustCompile(`(?m)^(#{1,6})[ \t]+(.*)$`)
+
+	// htmlCommentRE matches a closed HTML comment (possibly multi-line) and,
+	// via the second branch, an UNTERMINATED one — CommonMark runs an HTML
+	// block opened by `<!--` to the end of the document when no `-->` closes
+	// it, so the remainder is comment, not prose.
+	htmlCommentRE = regexp.MustCompile(`(?s)<!--.*?-->|<!--.*`)
+
+	// linkDestRE matches the `(dest)` target of an inline `[text](dest)` link.
+	// The link TEXT is prose and survives; the destination is a URL or path.
+	linkDestRE = regexp.MustCompile(`\]\([^)]*\)`)
+
+	// linkRefDefRE matches a link reference-definition line (`[label]: dest`).
+	// Neither the label nor the destination is prose.
+	linkRefDefRE = regexp.MustCompile(`(?m)^[ \t]*\[[^\]\n]+\]:[ \t]*\S.*$`)
 )
 
 // stripFencedBlocks removes every fenced code block. A field name that appears
 // only inside an example does not count as documented.
+//
+// Fences are matched per CommonMark rather than by a regex that saw only
+// exactly-three-backtick fences: an opener is a run of THREE OR MORE backticks
+// or tildes, and it closes only on a run of the SAME character at least as
+// long, so a four-backtick block is not closed by a three-backtick line and a
+// four-tilde block is not closed by three tildes. An unclosed fence runs to the
+// end of the text. A backtick opener's info string may not contain a backtick.
 func stripFencedBlocks(text string) string {
-	return fencedBlockRE.ReplaceAllString(text, "\n")
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	var openChar byte
+	openLen := 0
+	for _, line := range lines {
+		trimmed := strings.TrimLeft(line, " \t")
+		char, runLen := fenceRun(trimmed)
+		if openLen > 0 {
+			// Inside a fence: the body and the closing fence are both dropped.
+			if char == openChar && runLen >= openLen && strings.TrimRight(trimmed[runLen:], " \t") == "" {
+				openChar, openLen = 0, 0
+			}
+			continue
+		}
+		if runLen > 0 && (char == '~' || !strings.Contains(trimmed[runLen:], "`")) {
+			openChar, openLen = char, runLen
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// fenceRun returns the fence character and length of the leading backtick or
+// tilde run of a left-trimmed line, or (0, 0) when the line opens no fence.
+func fenceRun(trimmed string) (byte, int) {
+	if trimmed == "" {
+		return 0, 0
+	}
+	char := trimmed[0]
+	if char != '`' && char != '~' {
+		return 0, 0
+	}
+	runLen := 0
+	for runLen < len(trimmed) && trimmed[runLen] == char {
+		runLen++
+	}
+	if runLen < 3 {
+		return 0, 0
+	}
+	return char, runLen
+}
+
+// v2DocProse reduces text to what a human WROTE as prose, so that a field name
+// surviving into the result is one the reference actually explains. Every
+// construct a reader sees as an example, a comment, or a URL is removed:
+// fenced blocks of either fence character and any length, HTML comments, and
+// link destinations (inline and reference-definition). Fences are stripped
+// FIRST — CommonMark gives a fence opened before a comment precedence, and it
+// also keeps a stray `<!--` inside an example from swallowing the rest of the
+// document.
+func v2DocProse(text string) string {
+	text = stripFencedBlocks(text)
+	text = htmlCommentRE.ReplaceAllString(text, "")
+	text = linkRefDefRE.ReplaceAllString(text, "")
+	return linkDestRE.ReplaceAllString(text, "]")
 }
 
 // v2ReferenceBody returns the text above the historical appendix heading. When
@@ -166,16 +241,17 @@ func schemaDeclaredFieldNames(schemaJSON []byte) ([]string, error) {
 }
 
 // missingSchemaFieldNames returns every field name the schema declares that the
-// doc's REFERENCE BODY never mentions in prose (fenced examples and the
-// historical appendix both excluded). It is a completeness FLOOR, not proof of
-// quality: names like `mode` and `count` are common words, so a green result
-// means "a sentence mentions this field", not "this field is documented well".
+// doc's REFERENCE BODY never mentions in prose (the historical appendix, fenced
+// examples of any fence syntax, HTML comments and link destinations are all
+// excluded — see v2DocProse). It is a completeness FLOOR, not proof of quality:
+// names like `mode` and `count` are common words, so a green result means "a
+// sentence mentions this field", not "this field is documented well".
 func missingSchemaFieldNames(schemaJSON []byte, docText string) ([]string, error) {
 	names, err := schemaDeclaredFieldNames(schemaJSON)
 	if err != nil {
 		return nil, err
 	}
-	prose := stripFencedBlocks(v2ReferenceBody(docText))
+	prose := v2DocProse(v2ReferenceBody(docText))
 	var missing []string
 	for _, name := range names {
 		if !mentionsIdentifier(prose, name) {
@@ -283,6 +359,40 @@ func TestMissingSchemaFieldNames(t *testing.T) {
 		{
 			name: "mention only inside a fenced example does not count",
 			doc:  "# Doc\n\n`version`, `workflows`, `deep_field`.\n\n```yaml\nzonk: true\n```\n",
+			want: []string{"zonk"},
+		},
+		{
+			name: "mention only inside a tilde fence does not count",
+			doc:  "# Doc\n\n`version`, `workflows`, `deep_field`.\n\n~~~yaml\nzonk: true\n~~~\n",
+			want: []string{"zonk"},
+		},
+		{
+			name: "a shorter tilde run does not close a longer tilde fence",
+			doc: "# Doc\n\n`version`, `workflows`, `deep_field`.\n\n" +
+				"~~~~yaml\nstage: x\n~~~\nzonk: true\n~~~~\n",
+			want: []string{"zonk"},
+		},
+		{
+			name: "mention only inside a four-backtick fence does not count",
+			doc: "# Doc\n\n`version`, `workflows`, `deep_field`.\n\n" +
+				"````markdown\n```yaml\nzonk: true\n```\n````\n",
+			want: []string{"zonk"},
+		},
+		{
+			name: "mention only inside a multi-line HTML comment does not count",
+			doc: "# Doc\n\n`version`, `workflows`, `deep_field`.\n\n" +
+				"<!-- TODO: document\n`zonk` here.\n-->\n\nCarry on.\n",
+			want: []string{"zonk"},
+		},
+		{
+			name: "mention only in an inline link destination does not count",
+			doc:  "# Doc\n\n`version`, `workflows`, `deep_field`. See [the reuse block](../zonk.md#zonk).\n",
+			want: []string{"zonk"},
+		},
+		{
+			name: "mention only in a link reference definition does not count",
+			doc: "# Doc\n\n`version`, `workflows`, `deep_field`. See [the reuse block][ref].\n\n" +
+				"[ref]: https://example.test/zonk.md\n",
 			want: []string{"zonk"},
 		},
 		{
