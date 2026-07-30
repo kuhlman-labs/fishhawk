@@ -124,6 +124,61 @@ Two invariants hold at every tier (ADR-027 authority unchanged):
 
 ---
 
+## Which changes may use which workflow (`applies_to`, machine-enforced)
+
+The tier lists above say which *kinds of change* belong at which autonomy
+tier — documentation and dependency bumps at high autonomy, the spec
+parser and anything cryptographic at low. Until E53.3 that mapping was a
+**convention**: the tier was a property of the workflow, and nothing
+checked that the change routed through a workflow was the kind of change
+that workflow was written for. An operator could start a run against the
+parser under a high-autonomy docs workflow, and the run would proceed at
+that workflow's tier.
+
+A workflow's optional `applies_to` predicate (ADR-066 / #2226;
+`docs/spec/workflow-v2.md`) closes that gap by making the mapping
+**declared and enforced**. It states which changes a workflow may be used
+for — by issue `labels`, by `trigger` form, and by `paths` — and the
+backend refuses a run that does not satisfy the declaration of the
+workflow it named. So "documentation is high autonomy" can stop being a
+sentence in this file that a human is trusted to honour, and become
+`applies_to: {paths: ["docs/**"]}` on the high-autonomy workflow, which a
+run touching the parser cannot satisfy.
+
+Enforcement is **fail-closed at two points**, each the earliest at which
+the criterion has a producer: `labels` and `trigger` at run admission,
+`paths` at the plan gate against the plan's `scope.files`. Both fire
+before any implement work, so a refusal costs a re-run and never
+half-applied work — and because `scope.files` is binding rather than
+descriptive, a run cleared under a `docs/**` declaration is *confined* to
+docs for the rest of the run, not merely claimed to be.
+
+**The override is post-hoc-justified, not pre-authorized, and that is the
+point.** The sanctioned exception is `applies_to_override` plus a
+**required** reason on the create request, recorded as a run-scoped audit
+entry that names what was bypassed and why. It is deliberately not a
+permission an operator holds in advance and not a knob in the workflow
+spec: nothing is checked *before* the override is used, and everything
+about it is legible *after*. That places it with the other overrides in
+this methodology rather than with the delegated actions — it does not
+widen what any tier may do, it records a human stepping outside the
+declaration for one run.
+
+The first adoption of an `applies_to` declaration **will refuse a run
+someone wanted**. That is the control working, and the intended responses
+are, in order: amend the declaration (a reviewable change to the
+governance file), or use the audited override for the single run.
+Downgrading enforcement to warn-only was considered and rejected in
+ADR-066 — a routing control nobody is refused by is a comment.
+
+The trust boundary is worth stating plainly, because a governance control
+that oversells itself is worse than one that doesn't exist: labels are
+fetched by the caller and shipped inline on the create request, so
+`applies_to` prevents **misrouting**, not a determined authorized caller.
+Server-side label fetching is the named hardening path.
+
+---
+
 ## The acceptance agent (medium autonomy, advisory validator)
 
 The acceptance stage (ADR-049 / ADR-050; `docs/spec/workflow-v1.md`) runs under
