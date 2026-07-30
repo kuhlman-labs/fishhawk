@@ -186,6 +186,23 @@ type Workflow struct {
 	// decode, so this field MUST stay in lockstep with the schema's
 	// workflow.decomposition property.
 	Decomposition *Decomposition `json:"decomposition,omitempty" yaml:"decomposition,omitempty"`
+	// AppliesTo is the workflow's routing declaration (E53.3 / #2226):
+	// the changes this workflow may be used for, expressed as the shared
+	// Predicate (E53.1 / #2224) rather than a second matcher. Nil means
+	// the workflow declared no `applies_to` and therefore accepts any
+	// change — the back-compat reading every pre-#2226 document gets.
+	//
+	// The field is REQUIRED for the schema-permitted property to survive
+	// ParseBytes: the typed decode runs with DisallowUnknownFields, so a
+	// key the schema accepts but the struct omits fails the decode.
+	//
+	// This package owns the field, its validation (see validateWorkflow)
+	// and its round-trip; the two fail-closed enforcement points that
+	// CONSUME it — the `labels`/`trigger` admission check at POST /v0/runs
+	// and the `paths` check at the plan gate — live in
+	// backend/internal/server (applies_to.go, applies_to_plan_gate.go) and
+	// are live as of #2226.
+	AppliesTo *Predicate `json:"applies_to,omitempty" yaml:"applies_to,omitempty"`
 }
 
 // Decomposition is the per-workflow decomposition control block (E24.6 /

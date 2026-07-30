@@ -586,13 +586,68 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// schema-valid bytes is an internal inconsistency: skip the gate (fail open).
 	gatingRejected := false
 	var parsedForCap plan.Plan
-	if uerr := json.Unmarshal(body, &parsedForCap); uerr == nil {
+	capDecoded := json.Unmarshal(body, &parsedForCap) == nil
+	if capDecoded {
 		if reason := s.overCapSplitRejection(r.Context(), runID, &parsedForCap); reason != "" {
 			s.emitReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
 			cat := run.FailureB
 			if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, "plan_review_failed: "+reason); ferr != nil {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 					"plan upload: transition to failed-B after over-cap split reject failed",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.String("error", ferr.Error()))
+			}
+			s.advanceAfterFailure(r, runID, stageID)
+			gatingRejected = true
+		}
+	}
+
+	// applies_to `paths` plan gate (E53.3 / #2226, ADR-066 fork 4 as
+	// refined by the operator's 2026-07-30 ruling §1) — PHASE TWO of the
+	// fail-closed routing control whose phase one runs at run admission
+	// (applies_to.go::checkAppliesTo). `paths` has no producer at
+	// start_run, so it is evaluated here against the plan's scope.files
+	// UNION every sub-plan and split-phase scope: scope.files is BINDING,
+	// so a run cleared here is CONFINED to the declaration rather than
+	// merely claimed to be, and the union is what stops a decomposition
+	// slice escaping it.
+	//
+	// Routed through the IDENTICAL terminal path as the over-cap reject
+	// above — plan_review_failed + FailureB + advanceAfterFailure — so it
+	// reuses the existing category and adds none. Skipped when the
+	// over-cap reject already failed the stage: a stage is failed once,
+	// and a second emitReviewFailed would report a rejection the operator
+	// cannot act on until the first is resolved.
+	//
+	// Unlike the over-cap reject and the four advisory sweeps above, this
+	// gate fails CLOSED once a declaration is in hand (an unevaluable
+	// predicate or an unconfirmable override refuses); see the posture
+	// note on appliesToPlanGateRejection.
+	//
+	// IT SITS OUTSIDE THE DECODE GUARD ABOVE, AND THAT PLACEMENT IS PART OF
+	// THE CONTROL. A json.Unmarshal failure is a documented fail-OPEN for the
+	// ADVISORY over-cap gate; nesting this call inside it would silently give
+	// a FAIL-CLOSED governance control a fail-open leg that is not among its
+	// own enumerated ones (nil RunRepo, run not found, nil/unparseable spec
+	// snapshot, workflow absent from the spec). An undecodable body
+	// demonstrates NO scope, so the gate is handed a nil plan: zero paths,
+	// which it refuses under a `paths` declaration for exactly the reason it
+	// refuses an empty scope.files, and which still clears a workflow
+	// declaring no `paths` criterion. The PARTIALLY decoded struct is
+	// deliberately not reused — a half-populated scope would let a truncated
+	// body attest a confinement it never demonstrated.
+	if !gatingRejected {
+		gatePlan := &parsedForCap
+		if !capDecoded {
+			gatePlan = nil
+		}
+		if reason := s.appliesToPlanGateRejection(r.Context(), runID, gatePlan); reason != "" {
+			s.emitReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
+			cat := run.FailureB
+			if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, "plan_review_failed: "+reason); ferr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"plan upload: transition to failed-B after applies_to plan-gate reject failed",
 					slog.String("run_id", runID.String()),
 					slog.String("stage_id", stageID.String()),
 					slog.String("error", ferr.Error()))

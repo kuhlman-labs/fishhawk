@@ -100,6 +100,14 @@ type IssueContext struct {
 	URL      string         `json:"url"`
 	Number   int            `json:"number"`
 	Comments []IssueComment `json:"comments,omitempty"`
+	// Labels are the issue's label NAMES, projected from `gh issue
+	// view --json labels`'s label objects (E53.3 / #2226). They are
+	// the producer for the `applies_to` predicate's `labels`
+	// criterion, evaluated fail-closed at POST /v0/runs. The json tag
+	// MUST byte-match the backend's issueContextPayload or the field
+	// is silently dropped on the wire and every labels-declaring
+	// workflow rejects (the #371-class wire-mirror trap).
+	Labels []string `json:"labels,omitempty"`
 }
 
 // IssueComment is one issue comment carried alongside the body in
@@ -144,6 +152,26 @@ type CreateRunInput struct {
 	// ADR-030). Ignored when no blocking budget is over. Set by the
 	// CLI's `--override-budget` flag.
 	BudgetOverride bool `json:"budget_override,omitempty"`
+	// AppliesToOverride forces the run past the workflow's
+	// `applies_to` routing declaration (E53.3 / #2226) when the
+	// change does not satisfy it. AppliesToOverrideReason is
+	// REQUIRED alongside it — the backend 400s an override carrying
+	// an empty or whitespace-only reason, so the bypass is never
+	// unexplained in the audit trail.
+	//
+	// NO `fishhawk run start` FLAG SETS THIS YET. The wire field and
+	// its marshalling are here so a caller of this package can set
+	// it, but `run start` exposes no `--applies-to-override` pair, so
+	// a CLI operator refused by the routing declaration has no
+	// sanctioned way past it and must use the MCP `fishhawk_start_run`
+	// tool or POST /v0/runs directly. Wiring the flags is the tracked
+	// follow-up; do not describe the flags as shipped until they are.
+	AppliesToOverride bool `json:"applies_to_override,omitempty"`
+	// AppliesToOverrideReason is the operator's justification for
+	// AppliesToOverride, recorded verbatim on the
+	// `run_admitted_applies_to_override` audit entry that is the
+	// override's source of truth.
+	AppliesToOverrideReason string `json:"applies_to_override_reason,omitempty"`
 	// UpstreamRunID names the upstream feature_change run whose
 	// ci_green / review_merged a standalone deploy-only release
 	// run's required_upstream pre-flight gate evaluates (E23.11 /

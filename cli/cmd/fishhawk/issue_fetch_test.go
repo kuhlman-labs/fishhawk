@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
 )
@@ -349,3 +355,143 @@ func TestIssueContext_RoundTrip(t *testing.T) {
 		t.Error("trivial sanity")
 	}
 }
+
+// --- issue labels: the applies_to `labels` criterion's only producer (#2226) ---
+//
+// Deliberately a DUPLICATE of backend/cmd/fishhawk-mcp/issue_fetch_test.go's
+// three cases. The two binaries are separate Go modules carrying their own
+// ghIssue decode, so parity is held by paired assertions rather than shared
+// code — changing only one leaves CLI-started runs with an empty label set and
+// therefore fail-closed against every labels-declaring workflow.
+
+// TestFetchIssueViaGh_RequestsLabelsField locks the `--json` argv: without
+// `labels` in the field list gh omits the key entirely.
+func TestFetchIssueViaGh_RequestsLabelsField(t *testing.T) {
+	var gotArgs []string
+	orig := ghIssueCommand
+	ghIssueCommand = func(name string, args ...string) *exec.Cmd {
+		gotArgs = append([]string{name}, args...)
+		return exec.Command("sh", "-c", `printf '{"title":"t","number":1}'`)
+	}
+	t.Cleanup(func() { ghIssueCommand = orig })
+
+	if _, err := fetchIssueViaGh("x/y", 42); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	joined := strings.Join(gotArgs, " ")
+	if !strings.Contains(joined, "--json title,body,url,number,comments,labels") {
+		t.Errorf("gh invoked as %q; want the --json field list to include labels", joined)
+	}
+}
+
+// TestFetchIssueViaGh_ProjectsLabelObjectsToNames pins the decode shape: gh
+// emits labels as OBJECTS carrying a `name` key, not as strings.
+func TestFetchIssueViaGh_ProjectsLabelObjectsToNames(t *testing.T) {
+	withFakeGh(t, `{"title":"Bump dep","body":"b","url":"https://github.com/x/y/issues/9","number":9,"labels":[{"id":"LA_1","name":"dependencies","color":"0366d6"},{"id":"LA_2","name":"area:backend","color":"d73a4a"}]}`)
+	got, err := fetchIssueViaGh("x/y", 9)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if want := "dependencies,area:backend"; strings.Join(got.Labels, ",") != want {
+		t.Errorf("Labels = %v, want [%s] projected from the label objects' name key", got.Labels, want)
+	}
+}
+
+// TestFetchIssueViaGh_ToleratesAbsentLabels covers the degrade: an unlabelled
+// issue decodes to a nil slice rather than erroring. The empty set is then
+// fail-closed at admission — documented behaviour, not a fetch failure.
+func TestFetchIssueViaGh_ToleratesAbsentLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"key absent", `{"title":"t","body":"b","url":"u","number":1}`},
+		{"empty array", `{"title":"t","body":"b","url":"u","number":1,"labels":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFakeGh(t, tc.body)
+			got, err := fetchIssueViaGh("x/y", 1)
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if len(got.Labels) != 0 {
+				t.Errorf("Labels = %v, want empty", got.Labels)
+			}
+		})
+	}
+}
+
+// TestRunStart_IssueLabels_ReachTheRequestBody is the CLI half of the
+// client-drops-the-field seam (binding CONDITION 1, second consequence).
+//
+// The gap it closes: the fetch tests above end at the DECODE and
+// httpclient's W2 tests begin at an already-populated CreateRunInput, so the
+// ORCHESTRATION between them — run.go's `in.IssueContext = ic` hand-off —
+// could drop labels entirely while every other CLI test passes. Every
+// legitimate label-constrained CLI run would then fail closed against a
+// labels-declaring workflow, which reads as a control bug rather than a
+// plumbing omission.
+//
+// This drives fake `gh` output through the real `fishhawk run start` call
+// site into a real HTTP request and asserts on the body the backend RECEIVES.
+func TestRunStart_IssueLabels_ReachTheRequestBody(t *testing.T) {
+	withFakeGh(t, `{"title":"Bump dep","body":"b","url":"https://github.com/x/y/issues/9","number":9,"labels":[{"name":"dependencies"},{"name":"area:backend"}]}`)
+
+	var received map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &received); err != nil {
+			t.Errorf("backend received a body that is not JSON: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"` + uuid.NewString() + `","repo":"x/y","workflow_id":"trivial","state":"pending","runner_kind":"github_actions"}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".fishhawk"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".fishhawk", "workflows.yaml"), []byte(runStartSpecYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runStart([]string{
+		"--repo", "x/y", "--workflow", "trivial",
+		"--issue", "9",
+		"--working-dir", dir,
+		"--backend-url", srv.URL,
+		"--token", "tok-test",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("runStart exit = %d, want 0\nstderr: %s", code, stderr.String())
+	}
+
+	ic, _ := received["issue_context"].(map[string]any)
+	if ic == nil {
+		t.Fatalf("request body carried no issue_context: %+v (stderr: %s)", received, stderr.String())
+	}
+	labels, _ := ic["labels"].([]any)
+	if len(labels) != 2 || labels[0] != "dependencies" || labels[1] != "area:backend" {
+		t.Errorf("issue_context.labels on the wire = %+v, want the two fetched names — a drop here fails closed on EVERY labels-declaring CLI run", ic["labels"])
+	}
+	// The run must still be issue-triggered: labels ride on the issue path.
+	if received["trigger_source"] != "github_issue" {
+		t.Errorf("trigger_source = %v, want github_issue", received["trigger_source"])
+	}
+}
+
+// runStartSpecYAML is a minimal valid workflow spec for the orchestration
+// test above; runStart refuses to proceed without one.
+const runStartSpecYAML = `version: "0.5"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`

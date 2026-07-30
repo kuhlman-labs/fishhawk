@@ -368,6 +368,14 @@ type issueContextPayload struct {
 	URL      string                `json:"url"`
 	Number   int                   `json:"number"`
 	Comments []issueCommentPayload `json:"comments,omitempty"`
+	// Labels are the issue's label NAMES (E53.3 / #2226) — the producer
+	// for the `applies_to` predicate's `labels` criterion. Because the
+	// POST /v0/runs decoder uses DisallowUnknownFields, this tag must
+	// stay exactly `labels` or a label-carrying create request 400s;
+	// and because the same struct is the RESPONSE shape, dropping it
+	// here would make the persisted snapshot unreadable to the operator
+	// even though the gate evaluated it.
+	Labels []string `json:"labels,omitempty"`
 }
 
 // issueCommentPayload mirrors run.IssueComment on the wire. Field
@@ -410,6 +418,7 @@ func toRunResponse(r *run.Run) runResponse {
 			Body:   r.IssueContext.Body,
 			URL:    r.IssueContext.URL,
 			Number: r.IssueContext.Number,
+			Labels: r.IssueContext.Labels,
 		}
 		if len(r.IssueContext.Comments) > 0 {
 			comments := make([]issueCommentPayload, len(r.IssueContext.Comments))
@@ -479,6 +488,20 @@ type createRunRequest struct {
 	// recorded. Ignored when no blocking budget is over — the field
 	// only matters at the moment a budget would block.
 	BudgetOverride bool `json:"budget_override,omitempty"`
+	// AppliesToOverride lets an operator force a run past the requested
+	// workflow's `applies_to` routing declaration (E53.3 / #2226) when
+	// the change does not satisfy it. When true and the declaration
+	// would otherwise refuse the run with 422 workflow_not_applicable,
+	// the run is admitted and a RUN-SCOPED
+	// run_admitted_applies_to_override audit entry is recorded — that
+	// entry, not this field, is the override's source of truth, and the
+	// plan gate looks it up to suppress its own deferred rejection.
+	// Ignored when the declaration already accepts the change.
+	AppliesToOverride bool `json:"applies_to_override,omitempty"`
+	// AppliesToOverrideReason is REQUIRED whenever AppliesToOverride is
+	// true: an empty or whitespace-only reason is a 400 and admits
+	// nothing, so a bypass of a governance control is never unexplained.
+	AppliesToOverrideReason string `json:"applies_to_override_reason,omitempty"`
 	// UpstreamRunID, when set, names the upstream feature_change run whose
 	// ci_green / review_merged a standalone deploy-only release run's
 	// required_upstream pre-flight gate evaluates (E23.11 / #1417). Optional;
@@ -561,6 +584,19 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"issue_context is only valid with trigger_source=github_issue",
 			map[string]any{"field": "issue_context", "trigger_source": req.TriggerSource})
+		return
+	}
+
+	// The applies_to override's reason is REQUIRED (E53.3 / #2226).
+	// Checked here, alongside the other field-shape validation and
+	// BEFORE any spec resolution, so a reasonless override is a 400 that
+	// admits nothing whether or not the workflow declares applies_to at
+	// all — a governance bypass that reaches the audit log unexplained
+	// is worse than one that never happens.
+	if req.AppliesToOverride && strings.TrimSpace(req.AppliesToOverrideReason) == "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"applies_to_override_reason is required when applies_to_override is true",
+			map[string]any{"field": "applies_to_override_reason"})
 		return
 	}
 
@@ -807,6 +843,22 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// applies_to routing admission gate (E53.3 / #2226 / ADR-066 fork 4).
+	// Sits beside checkBlockingBudget and pre-insert for the same reason:
+	// a refusal must leave no run row behind. It fires identically on
+	// BOTH spec-resolution paths above (inline workflow_spec and the
+	// GitHub fetch) because both converge on workflowDef/parsed before
+	// reaching here. Fail-CLOSED, deliberately unlike the advisory
+	// sweeps elsewhere in this package — see applies_to.go's header.
+	var appliesToOverride *appliesToOverrideRecord
+	if haveStageDefs {
+		var admit bool
+		admit, appliesToOverride = s.checkAppliesTo(w, r, &req, parsed, workflowDef)
+		if !admit {
+			return
+		}
+	}
+
 	// Idempotency-Key (E8.2 / #40). When set, a previously-created
 	// run with the same (repo, key) is returned 200 instead of
 	// fresh-creating + dispatching a duplicate. Empty header is
@@ -843,6 +895,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			Body:   req.IssueContext.Body,
 			URL:    req.IssueContext.URL,
 			Number: req.IssueContext.Number,
+			Labels: req.IssueContext.Labels,
 		}
 		if len(req.IssueContext.Comments) > 0 {
 			comments := make([]run.IssueComment, len(req.IssueContext.Comments))
@@ -886,6 +939,20 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		// existing diagnostic contract is preserved.
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"create run failed", map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Record the applies_to override RUN-SCOPED, now that a run id
+	// exists. This entry — not the request field — is the override's
+	// source of truth: the plan gate looks it up to suppress its own
+	// deferred rejection, and it is the only record a RUN-SCOPED audit
+	// read ever returns. An append failure therefore ABANDONS the run
+	// (cancel + 503) rather than being warn-logged: for an
+	// admission-only (labels/trigger) violation there is no second
+	// evaluation point, so proceeding would run the change to completion
+	// on a bypass the run's own audit chain does not carry.
+	if oerr := s.recordAppliesToOverride(r.Context(), created.ID, appliesToOverride); oerr != nil {
+		s.abandonUnauditedOverrideRun(w, r, created.ID, appliesToOverride, oerr)
 		return
 	}
 

@@ -2061,6 +2061,18 @@ type StartRunInput struct {
 	// refuse the run with 402 budget_exhausted.
 	BudgetOverride bool `json:"budget_override,omitempty" jsonschema:"force the run past a blocking periodic cost budget that is over its limit for the current period; ignored when no blocking budget is over"`
 
+	// AppliesToOverride forces the run past the requested workflow's
+	// `applies_to` routing declaration (E53.3 / #2226) when the change
+	// does not satisfy it. AppliesToOverrideReason is REQUIRED
+	// alongside it — the backend 400s a reasonless override — and is
+	// recorded on the run-scoped run_admitted_applies_to_override audit
+	// entry that carries the override forward to the plan gate.
+	AppliesToOverride bool `json:"applies_to_override,omitempty" jsonschema:"force the run past the workflow's applies_to routing declaration when the change does not satisfy it; requires applies_to_override_reason. Prefer amending the declaration or choosing a workflow that accepts the change — this bypass is audited"`
+
+	// AppliesToOverrideReason is the operator's justification, recorded
+	// verbatim in the audit log.
+	AppliesToOverrideReason string `json:"applies_to_override_reason,omitempty" jsonschema:"REQUIRED when applies_to_override is true: why this change may be routed through a workflow whose applies_to declaration refuses it. Recorded verbatim on the run_admitted_applies_to_override audit entry"`
+
 	// UpstreamRunID names the upstream feature_change run whose
 	// ci_green / review_merged a standalone deploy-only release
 	// run's required_upstream pre-flight gate evaluates (E23.11 /
@@ -2337,6 +2349,9 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		IssueContext:   issueContext,
 		BudgetOverride: in.BudgetOverride,
 		UpstreamRunID:  in.UpstreamRunID,
+
+		AppliesToOverride:       in.AppliesToOverride,
+		AppliesToOverrideReason: in.AppliesToOverrideReason,
 	})
 	if err != nil {
 		return nil, StartRunOutput{}, fmt.Errorf("start run: %w", err)

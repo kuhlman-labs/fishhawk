@@ -5654,3 +5654,368 @@ workflows:
 		t.Errorf("executor.timeout = %v, want the workflow default 40m over the file default 20m", got)
 	}
 }
+
+// --- applies_to workflow routing (E53.3 / #2226) ---
+//
+// `applies_to` is ENFORCED at both fail-closed points — the labels/trigger
+// admission check at POST /v0/runs (backend/internal/server/applies_to.go) and
+// the paths check at the plan gate (applies_to_plan_gate.go) — which ship in
+// the same change as this file. The tests below are nonetheless about the SPEC
+// SURFACE only: that the property parses onto a real, working Predicate, and
+// that every rejection branch reports actionably. The enforcement behaviour is
+// pinned next to the enforcement points, not here.
+//
+// Where a rejection is caught by the SCHEMA (an empty predicate, an unknown
+// trigger form, an empty label) the test asserts a *SchemaError through
+// ParseBytes AND the Go rung is exercised separately through the exported
+// spec.Validate over a hand-built Spec — the schema masks those branches from
+// the parse path, so asserting only through ParseBytes would leave the
+// fail-closed Go code untested.
+
+// appliesToWorkflowV2 renders a minimal v2 document whose single workflow
+// carries the given `applies_to` YAML block (already indented four spaces).
+func appliesToWorkflowV2(appliesTo string) []byte {
+	return []byte(`
+version: "2"
+workflows:
+  trivial:
+` + appliesTo + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+}
+
+// TestParse_AppliesTo_V2RoundTrip is the positive control: a v2 workflow
+// declaring `applies_to` round-trips onto Workflow.AppliesTo as the SHARED
+// Predicate, with every criterion the routing consumer accepts preserved. It
+// is also the DisallowUnknownFields proof — a schema-permitted property the
+// struct omitted would fail the typed decode outright.
+func TestParse_AppliesTo_V2RoundTrip(t *testing.T) {
+	s, err := spec.ParseBytes(appliesToWorkflowV2(`    applies_to:
+      paths:
+        - "docs/**"
+        - "**/*.md"
+      labels:
+        - documentation
+        - dependencies
+      trigger:
+        - diff
+        - scheduled`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	got := s.Workflows["trivial"].AppliesTo
+	if got == nil {
+		t.Fatal("Workflow.AppliesTo is nil, want the declared predicate")
+	}
+	if !reflect.DeepEqual(got.Paths, []string{"docs/**", "**/*.md"}) {
+		t.Errorf("AppliesTo.Paths = %v, want the two declared globs", got.Paths)
+	}
+	if !reflect.DeepEqual(got.Labels, []string{"documentation", "dependencies"}) {
+		t.Errorf("AppliesTo.Labels = %v, want the two declared labels", got.Labels)
+	}
+	if !reflect.DeepEqual(got.Triggers, []spec.TriggerForm{spec.TriggerDiff, spec.TriggerScheduled}) {
+		t.Errorf("AppliesTo.Triggers = %v, want [diff scheduled]", got.Triggers)
+	}
+}
+
+// TestParse_AppliesTo_Absent_IsNil pins the back-compat reading: a workflow
+// declaring no `applies_to` parses to a NIL predicate, which the enforcement
+// slices read as "accepts any change". Every pre-#2226 document is this case,
+// so a non-nil zero value here would silently make an empty predicate — a
+// Match error, never match-all — the default for the whole corpus.
+func TestParse_AppliesTo_Absent_IsNil(t *testing.T) {
+	s, err := spec.ParseBytes(appliesToWorkflowV2(`    description: "no routing declaration"`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	if got := s.Workflows["trivial"].AppliesTo; got != nil {
+		t.Errorf("AppliesTo = %+v, want nil for a workflow declaring no applies_to", got)
+	}
+}
+
+// TestParse_AppliesTo_ParsedPredicateRoutes is the done-means test for this
+// slice (D1): it proves the parsed `applies_to` is a WORKING predicate that
+// routes the shipped way, not an inert field that merely survives the decode.
+// A comment-only or otherwise no-op touch of spec.go / validate.go leaves
+// this failing.
+//
+// Two workflows declare different predicates; the assertions are the routing
+// outcomes the enforcement slices will consume — a docs-only change satisfies
+// the narrow declaration while a backend/**.go change does not, and the
+// undeclared workflow accepts both.
+func TestParse_AppliesTo_ParsedPredicateRoutes(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "2"
+workflows:
+  docs_change:
+    applies_to:
+      paths:
+        - "docs/**"
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+  any_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+
+	docsOnly := spec.Change{Paths: []string{"docs/spec/workflow-v2.md"}}
+	codeChange := spec.Change{Paths: []string{"backend/internal/spec/spec.go"}}
+
+	p := s.Workflows["docs_change"].AppliesTo
+	if p == nil {
+		t.Fatal("docs_change.AppliesTo is nil, want the declared predicate")
+	}
+	ok, err := p.Match(docsOnly)
+	if err != nil || !ok {
+		t.Errorf("docs_change predicate vs a docs-only change = (%v, %v), want (true, nil)", ok, err)
+	}
+	ok, err = p.Match(codeChange)
+	if err != nil {
+		t.Errorf("docs_change predicate vs a code change returned an error: %v", err)
+	}
+	if ok {
+		t.Error("docs_change predicate matched a backend/**.go change; the declaration is meant to confine it to docs/**")
+	}
+
+	if got := s.Workflows["any_change"].AppliesTo; got != nil {
+		t.Errorf("any_change.AppliesTo = %+v, want nil (accepts any change)", got)
+	}
+}
+
+// TestParse_AppliesTo_ChangeKind_Rejected is the no-producer rejection: an
+// `applies_to` declaring `change_kind` is a validation error even though the
+// SHARED predicate grammar accepts the criterion (the document passes schema
+// validation), and the message names the missing producer and the fix. The
+// assertion is on the shipped constant, so a reworded message that stopped
+// naming the producer fails here.
+func TestParse_AppliesTo_ChangeKind_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes(appliesToWorkflowV2(`    applies_to:
+      change_kind:
+        - refactor`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for a change_kind criterion in applies_to", err)
+	}
+	if ve.Path != "/workflows/trivial/applies_to/change_kind" {
+		t.Errorf("Path = %q, want /workflows/trivial/applies_to/change_kind", ve.Path)
+	}
+	if ve.Message != spec.MsgAppliesToChangeKindUnsupported {
+		t.Errorf("Message = %q, want the shipped MsgAppliesToChangeKindUnsupported", ve.Message)
+	}
+	for _, want := range []string{"nothing produces a change kind", "paths, labels or trigger"} {
+		if !strings.Contains(ve.Message, want) {
+			t.Errorf("Message = %q, want it to contain %q", ve.Message, want)
+		}
+	}
+}
+
+// TestParse_AppliesTo_MalformedGlob_Rejected is the one predicate-grammar
+// branch the schema cannot catch (a glob is just a string to JSON Schema), so
+// it reaches the shared Predicate.Validate through the parse path and reports
+// at this workflow's own pointer.
+func TestParse_AppliesTo_MalformedGlob_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes(appliesToWorkflowV2(`    applies_to:
+      paths:
+        - "docs/[unclosed"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for a malformed applies_to glob", err)
+	}
+	if ve.Path != "/workflows/trivial/applies_to" {
+		t.Errorf("Path = %q, want /workflows/trivial/applies_to", ve.Path)
+	}
+	if !strings.Contains(ve.Message, "docs/[unclosed") {
+		t.Errorf("Message = %q, want it to name the offending glob", ve.Message)
+	}
+}
+
+// TestParse_AppliesTo_SchemaCaughtForms pins the three grammar rules the
+// SCHEMA owns for `applies_to`, each asserted as a *SchemaError so a schema
+// edit that dropped minProperties / the trigger enum / minLength shows up
+// here rather than silently deferring to the Go layer.
+func TestParse_AppliesTo_SchemaCaughtForms(t *testing.T) {
+	cases := []struct {
+		name      string
+		appliesTo string
+	}{
+		{
+			name:      "empty predicate is not match-all",
+			appliesTo: `    applies_to: {}`,
+		},
+		{
+			name: "unknown trigger form",
+			appliesTo: `    applies_to:
+      trigger:
+        - webhook`,
+		},
+		{
+			name: "empty label",
+			appliesTo: `    applies_to:
+      labels:
+        - ""`,
+		},
+		{
+			name: "empty paths list",
+			appliesTo: `    applies_to:
+      paths: []`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes(appliesToWorkflowV2(tc.appliesTo))
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SchemaError", err)
+			}
+			if !strings.Contains(se.Error(), "applies_to") {
+				t.Errorf("error = %q, want it to name applies_to", se.Error())
+			}
+		})
+	}
+}
+
+// TestValidate_AppliesTo_GoLayerBranches exercises the fail-closed branches
+// the schema MASKS on the parse path. Each is reached through the exported
+// spec.Validate over a hand-built Spec — the same door Validate's header
+// documents for Spec-builder callers — so the Go rung is proved rather than
+// assumed to be dead code behind the schema.
+func TestValidate_AppliesTo_GoLayerBranches(t *testing.T) {
+	cases := []struct {
+		name      string
+		predicate spec.Predicate
+		wantIn    string
+	}{
+		{
+			name:      "no criterion at all",
+			predicate: spec.Predicate{},
+			wantIn:    "declares no criterion",
+		},
+		{
+			name:      "empty label",
+			predicate: spec.Predicate{Labels: []string{""}},
+			wantIn:    "label is empty",
+		},
+		{
+			name:      "unknown trigger form",
+			predicate: spec.Predicate{Triggers: []spec.TriggerForm{"webhook"}},
+			wantIn:    "unknown trigger form",
+		},
+		{
+			name:      "malformed glob",
+			predicate: spec.Predicate{Paths: []string{"docs/[unclosed"}},
+			wantIn:    "malformed path glob",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := tc.predicate
+			s := &spec.Spec{
+				Version:   "2",
+				Workflows: map[string]spec.Workflow{"routed": {AppliesTo: &p}},
+			}
+			err := spec.Validate(s)
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if ve.Path != "/workflows/routed/applies_to" {
+				t.Errorf("Path = %q, want /workflows/routed/applies_to", ve.Path)
+			}
+			if !strings.Contains(ve.Message, tc.wantIn) {
+				t.Errorf("Message = %q, want it to contain %q", ve.Message, tc.wantIn)
+			}
+			if !strings.Contains(ve.Message, "/workflows/routed/applies_to") {
+				t.Errorf("Message = %q, want the predicate's own message to carry the declaration pointer", ve.Message)
+			}
+		})
+	}
+}
+
+// TestValidate_AppliesTo_ChangeKindWinsOverGlob pins the ORDER contract: a
+// predicate that is wrong in two ways at once reports the change_kind
+// diagnosis, because that message names a fix (route on paths/labels/trigger)
+// the generic malformed-glob message cannot.
+func TestValidate_AppliesTo_ChangeKindWinsOverGlob(t *testing.T) {
+	s := &spec.Spec{
+		Version: "2",
+		Workflows: map[string]spec.Workflow{"routed": {AppliesTo: &spec.Predicate{
+			ChangeKinds: []string{"refactor"},
+			Paths:       []string{"docs/[unclosed"},
+		}}},
+	}
+	err := spec.Validate(s)
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if ve.Message != spec.MsgAppliesToChangeKindUnsupported {
+		t.Errorf("Message = %q, want the change_kind rejection to win over the malformed glob", ve.Message)
+	}
+}
+
+// TestValidate_AppliesTo_Nil_Accepted is the nil-guard branch: a workflow
+// with no routing declaration validates clean and is never handed to the
+// predicate validator (which would reject the zero Predicate as empty).
+func TestValidate_AppliesTo_Nil_Accepted(t *testing.T) {
+	s := &spec.Spec{
+		Version:   "2",
+		Workflows: map[string]spec.Workflow{"routed": {}},
+	}
+	if err := spec.Validate(s); err != nil {
+		t.Fatalf("Validate = %v, want nil for a workflow declaring no applies_to", err)
+	}
+}
+
+// TestParse_AppliesTo_V0AndV1Rejected pins that `applies_to` is v2-only by
+// construction: neither the v0 nor the v1 workflow definition declares the
+// property and both are additionalProperties:false, so a v0/v1 document
+// carrying it is a SCHEMA error rather than a silently ignored key.
+func TestParse_AppliesTo_V0AndV1Rejected(t *testing.T) {
+	for _, version := range []string{"0.3", "1.0"} {
+		t.Run(version, func(t *testing.T) {
+			yml := []byte(`
+version: "` + version + `"
+workflows:
+  trivial:
+    applies_to:
+      labels:
+        - dependencies
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+			_, err := spec.ParseBytes(yml)
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SchemaError rejecting applies_to under v%s", err, version)
+			}
+		})
+	}
+}

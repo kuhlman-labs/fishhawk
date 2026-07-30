@@ -8538,3 +8538,47 @@ func TestGetPlan_SplitFiling_EndToEndRoundTrip(t *testing.T) {
 		t.Errorf("spec_diff should raise the cap to the derived count %d; got %q", contractDerived, out.SplitFiling.CapException.SpecDiff)
 	}
 }
+
+// TestStartRun_AppliesToOverride_ForwardedToBackend is the registry-coupling
+// half of E53.3 / #2226: the two new fishhawk_start_run parameters must cross
+// the MCP input → StartRunParams → createRunRequest → JSON body seam. The
+// escape hatch past a fail-closed routing control is only an escape hatch if
+// it actually reaches the backend.
+func TestStartRun_AppliesToOverride_ForwardedToBackend(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo:                    "x/y",
+		WorkflowID:              "trivial",
+		WorkflowSpec:            validTrivialSpec,
+		AppliesToOverride:       true,
+		AppliesToOverrideReason: "one-off backport; widening tracked separately",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if !fb.createRunBody.AppliesToOverride {
+		t.Error("AppliesToOverride = false, want true")
+	}
+	if fb.createRunBody.AppliesToOverrideReason != "one-off backport; widening tracked separately" {
+		t.Errorf("AppliesToOverrideReason = %q, want the operator's verbatim reason", fb.createRunBody.AppliesToOverrideReason)
+	}
+}
+
+// TestStartRun_AppliesToOverride_DefaultsOff keeps an ordinary start_run byte-
+// identical to a pre-#2226 one: an agent that never mentions the override must
+// not silently send one.
+func TestStartRun_AppliesToOverride_DefaultsOff(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	if _, _, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "x/y", WorkflowID: "trivial", WorkflowSpec: validTrivialSpec,
+	}); err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	if fb.createRunBody.AppliesToOverride || fb.createRunBody.AppliesToOverrideReason != "" {
+		t.Errorf("override defaulted on: %+v", fb.createRunBody)
+	}
+}
