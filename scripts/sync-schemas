@@ -53,4 +53,15 @@ for preset in "$REPO_ROOT"/docs/spec/workflow-preset-*.yaml; do
   cp "$preset" "$REPO_ROOT/backend/internal/spec/presets/$base"
 done
 
+# The shared path-predicate fixture corpus (E53.1 / #2224) is the canonical
+# proof surface for the byte-duplicated predicate matcher, mirrored into both
+# module sides so the backend and cli suites run the SAME rows — CI's
+# schema-sync gate red-lines if the two ever diverge. It is named
+# predicate-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json
+# loop above never globs it and never emits its unrecognized-file warning.
+cp "$REPO_ROOT/docs/spec/predicate-fixtures.json" \
+  "$REPO_ROOT/backend/internal/spec/testdata/predicate-fixtures.json"
+cp "$REPO_ROOT/docs/spec/predicate-fixtures.json" \
+  "$REPO_ROOT/cli/internal/spec/testdata/predicate-fixtures.json"
+
 echo "schemas synced from docs/spec/"

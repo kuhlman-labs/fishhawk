@@ -982,6 +982,29 @@ The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile 
 - A new spec on v0 or v1 is nonetheless **discouraged**. `fishhawk init` emits v2 presets; the reuse, legibility and autonomy work exists only at v2; and `fishhawk migrate-spec` translates an existing v1 document, printing an approval-eligibility report rather than rewriting blind. See [`workflow-migration.md`](workflow-migration.md).
 - No removal date is set, and none is planned.
 
+## Path predicate
+
+`$defs/predicate` is one declarative match rule over a change — the SINGLE matcher that `applies_to` routing (E53.3 / #2226), `escalations` (E53.4 / #2227) and the review-conventions of ADR-068 (#2211) will each `$ref` rather than each growing a subtly different matcher. It is declared **but not yet referenced**: no property points at it and no run consults it until those three children wire it (E53.1 / #2224 ships the primitive plus its proof). An unreferenced `$defs` entry is inert under JSON Schema Draft 2020-12, so its presence changes no existing document's validity.
+
+A predicate carries four optional criteria, each a non-empty list:
+
+- `paths` — doublestar globs matched against the change's paths, with `**` crossing `/`. Repo-relative and slash-separated, matched with the same `doublestar.Match` call the plan-gate test sweep already makes.
+- `labels` — issue/PR label names.
+- `change_kind` — change-kind tokens.
+- `trigger` — the run shapes this predicate accepts: `diff` (a code-diff run), `scheduled` and `on_demand`. The last two are the **non-diff** forms: ADR-067 decoupled stage types from "produces a diff", so a scheduled backlog groomer (ADR-065) or an on-demand incident intake (ADR-053) must be routable by the same mechanism as a diff run. A change carrying no trigger normalizes to `diff`, so an existing diff-shaped caller need not set it.
+
+**Match semantics are AND across criteria types, OR within a list.** Every *declared* criteria type must be satisfied (the AND); a type is satisfied when *any one* of its entries matches (the OR). An *undeclared* type does not constrain the match.
+
+| A predicate declaring… | matches a change when… |
+|---|---|
+| `paths` only | any change path matches any glob |
+| `paths` and `labels` | a path matches **and** a label matches (both types) |
+| `labels: [a, b]` | the change carries `a` **or** `b` (either entry) |
+| `trigger: [scheduled]` and nothing else | the change's trigger is `scheduled` (a no-path change matches) |
+| `paths` (against a `scheduled`, no-path change) | never — the paths type is declared and unsatisfiable against zero paths |
+
+**An empty predicate — no criterion at all — is a validation error, never match-all.** It is rejected both at the schema layer (`minProperties: 1`) and by the Go validator, so "match everything" can never be written by accident. Path handling is binary-safe and fail-closed: the matcher decodes git's C-quoted path form and reports an undecodable path by name rather than leaving it silently unmatched.
+
 ## Appendix: what changed from v0/v1
 
 Historical record. This appendix documents how v2 came to differ from v1 and what each E52 child licensed; it is **not** the reference — every member v2 declares is documented above.

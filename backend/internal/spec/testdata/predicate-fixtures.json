@@ -1,0 +1,63 @@
+{
+  "_comment": "Canonical shared fixture corpus for the workflow-v2 path predicate (E53.1 / #2224). scripts/sync-schemas mirrors this file byte-for-byte into backend/internal/spec/testdata/ and cli/internal/spec/testdata/, so CI's schema-sync gate red-lines if the two modules ever run different fixtures. String values may be a bare JSON string OR an object carrying a byte-exact encoding: {\"hex\": \"...\"} or {\"b64\": \"...\"} or {\"str\": \"...\"}. This exists because a JSON string cannot carry arbitrary invalid UTF-8 (encoding/json replaces invalid bytes with U+FFFD), so an adversarial path such as 0xFF 0xFE must be carried as hex. Decode PRECEDENCE when more than one field is present: hex > b64 > str. The `encoding` section proves the loader honours that precedence and round-trips byte-exactly.",
+  "encoding": [
+    { "value": { "hex": "fffe" }, "bytes_hex": "fffe" },
+    { "value": { "b64": "/g==" }, "bytes_hex": "fe" },
+    { "value": "plain", "bytes_hex": "706c61696e" },
+    { "value": { "hex": "6162", "str": "zz" }, "bytes_hex": "6162" },
+    { "value": { "hex": "6162", "b64": "enp6" }, "bytes_hex": "6162" },
+    { "value": { "b64": "YWI=", "str": "zz" }, "bytes_hex": "6162" }
+  ],
+  "path_match": [
+    { "glob": "**/*.go", "path": "a/b/c.go", "expected": true },
+    { "glob": "**/*.go", "path": "a/b/c.py", "expected": false },
+    { "glob": "src/**", "path": "src/x/y.go", "expected": true },
+    { "glob": "src/*", "path": "src/x/y.go", "expected": false },
+    { "glob": "**/{a,b}.go", "path": "x/a.go", "expected": true },
+    { "glob": "**/{a,b}.go", "path": "x/c.go", "expected": false },
+    { "glob": "**/.env", "path": "cfg/.env", "expected": true },
+    { "glob": "*.go", "path": { "str": "a\"b.go" }, "expected": true },
+    { "glob": "**", "path": { "hex": "610a622e676f" }, "expected": true },
+    { "glob": "**", "path": { "hex": "fffe" }, "expected": true },
+    { "glob": "docs/**", "path": { "hex": "fffe" }, "expected": false }
+  ],
+  "decode": [
+    { "raw": "plain/path.go", "decoded": "plain/path.go" },
+    { "raw": "\"a\\tb.go\"", "decoded": { "hex": "6109622e676f" } },
+    { "raw": "\"caf\\303\\251.go\"", "decoded": { "hex": "636166c3a92e676f" } },
+    { "raw": "\"a\\377b\"", "decoded": { "hex": "61ff62" } },
+    { "raw": "\"ab\\\"", "error": true },
+    { "raw": "\"\\39\"", "error": true },
+    { "raw": "\"\\400\"", "error": true },
+    { "raw": "\"\\777\"", "error": true },
+    { "raw": "\"a\\zb\"", "error": true }
+  ],
+  "predicate_match": [
+    { "predicate": { "paths": ["**/*.go"], "labels": ["urgent"] }, "change": { "paths": ["a.go"], "labels": ["urgent"] }, "expected": true },
+    { "predicate": { "paths": ["**/*.go"], "labels": ["urgent"] }, "change": { "paths": ["a.go"], "labels": ["cold"] }, "expected": false },
+    { "predicate": { "labels": ["a", "b"] }, "change": { "labels": ["b"] }, "expected": true },
+    { "predicate": { "labels": ["a", "b"] }, "change": { "labels": ["c"] }, "expected": false },
+    { "predicate": { "change_kind": ["feature"] }, "change": { "change_kind": "feature" }, "expected": true },
+    { "predicate": { "change_kind": ["feature"] }, "change": { "change_kind": "bugfix" }, "expected": false },
+    { "predicate": { "trigger": ["scheduled"] }, "change": { "trigger": "scheduled" }, "expected": true },
+    { "predicate": { "trigger": ["on_demand"] }, "change": { "trigger": "on_demand" }, "expected": true },
+    { "predicate": { "trigger": ["diff"] }, "change": {}, "expected": true },
+    { "predicate": { "paths": ["**/*.go"] }, "change": { "trigger": "scheduled" }, "expected": false }
+  ],
+  "validate": [
+    { "predicate": {}, "error": true },
+    { "predicate": { "paths": ["["] }, "error": true },
+    { "predicate": { "labels": [""] }, "error": true },
+    { "predicate": { "change_kind": [""] }, "error": true },
+    { "predicate": { "trigger": ["weekly"] }, "error": true },
+    { "predicate": { "paths": ["**/*.go"] }, "error": false },
+    { "predicate": { "paths": ["a/**"], "labels": ["x"], "change_kind": ["feat"], "trigger": ["diff", "scheduled"] }, "error": false }
+  ],
+  "split_nul": [
+    { "input_hex": "612f622e676f00", "expected": ["a/b.go"] },
+    { "input_hex": "612e676f00622e676f00", "expected": ["a.go", "b.go"] },
+    { "input_hex": "", "expected": [] },
+    { "input_hex": "610a622e676f00", "expected": [{ "hex": "610a622e676f" }] },
+    { "input_hex": "612e676f", "expected": ["a.go"] }
+  ]
+}
