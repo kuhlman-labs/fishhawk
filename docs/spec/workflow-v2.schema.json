@@ -957,6 +957,54 @@
           "description": "Per-stage review-budget floor (#1494). The stage's review_timeout OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default — it sets the Floor rung of the size-aware review-wait budget (Floor + PerKB*ceil(promptKB), clamped to [Floor,Cap]) for this stage's agent reviews; the deployment-level PerKB and Cap are unchanged. Parsed by time.ParseDuration; an unparseable or absent value falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. Resolved by spec.ResolveReviewTimeout on the backend. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
         }
       }
+    },
+    "predicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "One declarative path predicate (E53.1 / #2224): the SINGLE match rule that E53.3's applies_to routing (#2226), E53.4's escalations (#2227) and ADR-068's review-conventions (#2211) each $ref rather than re-declaring a shape. Match semantics are RATIFIED (ADR-066 / #2209): AND across criteria TYPES (every declared type must be satisfied) and OR WITHIN a list (any one entry satisfies its type); an undeclared type does not constrain. An empty predicate is an ERROR, never match-all — enforced here by minProperties 1 and again by spec.Predicate.Validate. Matching is byte-safe and fail-closed (the Go matcher decodes git's C-quoted paths and names an undecodable path rather than silently not matching). NOTHING references this definition yet: it ships declared-but-unreferenced, and the three sibling children wire it. See docs/spec/workflow-v2.md § 'Path predicate'.",
+      "properties": {
+        "paths": {
+          "type": "array",
+          "minItems": 1,
+          "description": "doublestar path globs matched against a change's paths, `**` crossing `/`. Satisfied when ANY change path matches ANY glob (spec.Predicate uses the same doublestar.Match call the plan-gate test sweep makes). Repo-relative, slash-separated.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "labels": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Issue/PR label names. Satisfied when the change carries ANY of them.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "change_kind": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Change-kind tokens. Satisfied when the change's kind is ANY of them.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "trigger": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Trigger forms this predicate accepts. `diff` is a code-diff run; `scheduled` and `on_demand` are the non-diff forms (ADR-067 decoupled stage types from producing a diff, so a scheduled groomer or on-demand incident intake is routable by the same mechanism). A change with no trigger normalizes to `diff`. Satisfied when the change's trigger is ANY listed form.",
+          "items": {
+            "type": "string",
+            "enum": [
+              "diff",
+              "scheduled",
+              "on_demand"
+            ]
+          }
+        }
+      }
     }
   }
 }
