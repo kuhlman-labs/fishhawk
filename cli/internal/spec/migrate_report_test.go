@@ -188,11 +188,105 @@ func TestReport_BudgetStageUSDNote(t *testing.T) {
 	}
 }
 
-// TestReport_NoApprovalGates covers the degenerate document.
+// zeroGateBudgetV1 is a schema-valid v1 document declaring a budget-bearing
+// stage and NO `gates` key at all — the fully-automated workflow shape.
+// workflow-v1's $defs/stage requires only id/type/executor, so this passes
+// the codemod's R0 pre-translation validation gate.
+const zeroGateBudgetV1 = `version: "1.6"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        budget:
+          max_tokens: 200000
+          max_runtime_minutes: 15
+        produces:
+          - artifact: plan
+`
+
+// budgetBlock is the exact text the no-budget negative case strips, so the
+// two fixtures are provably identical except for the budget declaration.
+const budgetBlock = "        budget:\n          max_tokens: 200000\n          max_runtime_minutes: 15\n"
+
+// TestReport_BudgetNoteRendersWithoutApprovalGates is the done-means test for
+// #2342, driven end to end through MigrateBytes rather than a hand-built
+// report: the per-stage limit_usd advisory and the authority footer describe
+// the DOCUMENT, so a fully-automated workflow — budget-bearing stages, zero
+// approval gates — must emit both. The gate-count early return in Render used
+// to swallow them, and the two prior partial fixes each verified a layer
+// either side of that seam (analyzeStage recorded BudgetStages; Render never
+// reached the note), so this asserts the real path from source bytes to
+// rendered text.
+func TestReport_BudgetNoteRendersWithoutApprovalGates(t *testing.T) {
+	got := reportFor(t, zeroGateBudgetV1)
+	for _, want := range []string{
+		"limit_usd",
+		"  - plan",
+		"declares no approval gates",
+		"Server-side validation remains the authority",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("a zero-gate budget-bearing document must render %q\n---\n%s", want, got)
+		}
+	}
+	// The note stays advisory on this newly-reachable path: no USD figure is
+	// fabricated, because no token-to-USD rate exists in this repo.
+	if strings.Contains(got, "$") {
+		t.Errorf("the report must not fabricate a USD figure\n---\n%s", got)
+	}
+}
+
+// TestReport_ZeroGatesNoBudgetEmitsNoNote pins the other half of the fix: the
+// budget prose became independent of the gate count, NOT unconditional. A
+// document with no budget-bearing stage still emits no budget note.
+func TestReport_ZeroGatesNoBudgetEmitsNoNote(t *testing.T) {
+	src := strings.Replace(zeroGateBudgetV1, budgetBlock, "", 1)
+	if src == zeroGateBudgetV1 {
+		t.Fatal("the budget block did not strip; the fixture and budgetBlock have drifted apart")
+	}
+	got := reportFor(t, src)
+	if strings.Contains(got, "limit_usd") {
+		t.Errorf("a document with no budget-bearing stage must emit no USD note\n---\n%s", got)
+	}
+	for _, want := range []string{"declares no approval gates", "Server-side validation remains the authority"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the document-level section %q must still render\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestReport_NilReceiverRenders covers Render's one remaining early return.
+// The nil guard exists only because reading len(r.Gates) through a nil
+// pointer panics — not because a nil report has less to say — so it must emit
+// the same header, no-gates line and footer as the zero-gate path.
+func TestReport_NilReceiverRenders(t *testing.T) {
+	var r *EligibilityReport
+	got := r.Render()
+	for _, want := range []string{
+		"Approval-eligibility report",
+		"declares no approval gates",
+		"Server-side validation remains the authority",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the nil-receiver report must render %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// TestReport_NoApprovalGates covers the degenerate document. It asserts the
+// footer too: the footer describes the document, and asserting only the
+// no-gates line here is exactly why its absence on this path went unnoticed.
 func TestReport_NoApprovalGates(t *testing.T) {
 	r := &EligibilityReport{}
-	if got := r.Render(); !strings.Contains(got, "declares no approval gates") {
+	got := r.Render()
+	if !strings.Contains(got, "declares no approval gates") {
 		t.Errorf("want the no-gates line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "Server-side validation remains the authority") {
+		t.Errorf("a zero-gate report must still state the limit of its own authority, got:\n%s", got)
 	}
 }
 
