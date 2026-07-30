@@ -282,6 +282,25 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 					}
 				}
 			}
+			// An explicit reviewers.authority (E53.2 / #2225) declares a
+			// policy about AGENT verdicts, so it is incoherent with zero
+			// agent reviewers — there is no verdict to gate on or to
+			// surface. Reject a declared authority (EITHER value) when the
+			// stage configures no agent reviewers, naming the stage and the
+			// fix. `gateless` is the zero-agent outcome, never a declarable
+			// policy. The schema enforces agents minItems:1, so the literal
+			// `agents: []` form is already a schema error; this layer owns
+			// the ABSENT-agents form. Version-agnostic in code but
+			// unreachable below major 2 — no v0/v1 schema accepts the
+			// property — matching this file's convention for such rules.
+			if stage.Reviewers.Authority != "" && stage.Reviewers.AgentCount() == 0 {
+				return &ValidationError{
+					Path: stagePath(i, "/reviewers/authority"),
+					Message: fmt.Sprintf(
+						"stage %q: reviewers.authority: %q declares agent-reviewer authority but the stage configures no agent reviewers; declare at least one entry under reviewers.agents, or remove reviewers.authority to fall back to the count-derived ADR-027 default",
+						stage.ID, stage.Reviewers.Authority),
+				}
+			}
 		}
 
 		// inputs[].from_stage cross-references must resolve.

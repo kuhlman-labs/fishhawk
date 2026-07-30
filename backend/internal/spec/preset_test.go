@@ -162,6 +162,23 @@ func TestShippedPresetsDeclareTheirTier(t *testing.T) {
 	}
 }
 
+// TestShippedPresetsDeclareReviewAuthority is criterion 6's text half
+// (E53.2 / #2225): every preset spells `authority: advisory` explicitly on
+// its plan and implement reviewers blocks (two occurrences), making visible
+// what the counts already resolve to. The parsed-value-vs-ResolveAuthority
+// half lives in the external spec_test package (planreview imports spec).
+func TestShippedPresetsDeclareReviewAuthority(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			text := string(presetText(t, p))
+			if got := strings.Count(text, "authority: advisory"); got != 2 {
+				t.Errorf("preset %q declares `authority: advisory` %d times, want 2 (plan + implement):\n%s", p, got, text)
+			}
+		})
+	}
+}
+
 // TestPresetsAreLockstepBaseAndTierDelta is the machine-enforced
 // statement of the base-plus-deltas invariant, mirrored from
 // cli/internal/spec so BOTH embedded mirror sets are held to it.

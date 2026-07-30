@@ -157,6 +157,8 @@ reviewers:
 
 **Default behavior (absent `reviewers` block):** When the `reviewers` field is omitted, the backend treats the stage as `{human: 1}` — preserving the existing one-human-approver behavior from before ADR-027. Callers reading `Stage.Reviewers == nil` must apply this default.
 
+> The count-derived rule above is the **v0/v1 contract** and is unchanged. **workflow-v2** makes the same decision **declarable** via a `reviewers.authority` (`advisory | gating`) field that wins over the counts when they disagree, with the count-derived rule retained as the default when the field is absent (E53.2 / #2225). See docs/spec/workflow-v2.md § Authority. v0 and v1 do not accept an `authority` key.
+
 **Self-review guard:** If the review agent's model identifier matches the plan's `generated_by.model`, the server logs a WARN but does not block. ADR-027 treats this as an advisory signal only.
 
 **`plan_reviewed` audit category:** Each agent review invocation appends a `plan_reviewed` entry to the run's audit log with `reviewer_kind: "agent"`, the structured verdict (`approve`, `approve_with_concerns`, `reject`), and any concerns. The verdict is surfaced via `fishhawk_get_plan` in the `Reviews` field.

@@ -72,6 +72,11 @@ workflows:
         # block would be inherited by the review stage, which declares
         # none on purpose.
         reviewers:
+          # Explicit review authority: makes visible what `agents` +
+          # `human: 1` already resolve to — advisory, so agent verdicts
+          # surface but the human gate decides. An explicit `authority`
+          # wins over the reviewer counts.
+          authority: advisory
           agents:
             - provider: claudecode
               model: claude-opus-4-8
@@ -129,6 +134,11 @@ workflows:
         # scope-drift flag). Same Claude+Codex pair as the plan stage,
         # and declared per stage for the same reason.
         reviewers:
+          # Explicit review authority: makes visible what `agents` +
+          # `human: 1` already resolve to — advisory, so agent verdicts
+          # surface but the human gate decides. An explicit `authority`
+          # wins over the reviewer counts.
+          authority: advisory
           agents:
             - provider: claudecode
               model: claude-opus-4-8

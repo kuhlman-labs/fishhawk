@@ -123,6 +123,24 @@ func TestPresetsAreWorkflowV2(t *testing.T) {
 	}
 }
 
+// TestPresetsDeclareReviewAuthority is criterion 6's CLI-mirror text half
+// (E53.2 / #2225): every preset spells `authority: advisory` on its plan and
+// implement reviewers blocks (two occurrences), so the embedded CLI mirror and
+// the backend presets stay in step. The parsed-value-vs-ResolveAuthority half
+// lives on the backend (planreview imports spec; the CLI spec package has no
+// typed reviewers struct).
+func TestPresetsDeclareReviewAuthority(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			text := string(presetText(t, p))
+			if got := strings.Count(text, "authority: advisory"); got != 2 {
+				t.Errorf("preset %q declares `authority: advisory` %d times, want 2 (plan + implement):\n%s", p, got, text)
+			}
+		})
+	}
+}
+
 // TestPresetsDeclarePerStageExecutors asserts the executor stays declared
 // ON EACH STAGE and is NOT hoisted into a file- or workflow-level
 // `defaults` block. Both Go validators resolve same-document reuse before

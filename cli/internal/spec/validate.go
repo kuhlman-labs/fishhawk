@@ -45,6 +45,7 @@ func validateAgentVersions(raw any) error {
 			base := fmt.Sprintf("/workflows/%s/stages/%d", wfName, i)
 			checkExecutorAgentVersion(st, base, &errs)
 			checkReviewerAgentVersions(st, base, &errs)
+			checkReviewerAuthority(st, base, &errs)
 		}
 	}
 	if len(errs) > 0 {
@@ -79,6 +80,38 @@ func checkReviewerAgentVersions(stage map[string]any, base string, errs *[]Valid
 		}
 		appendRangeError(agent["agent_version"], fmt.Sprintf("%s/reviewers/agents/%d/agent_version", base, j), errs)
 	}
+}
+
+// checkReviewerAuthority mirrors the backend's step-5 semantic check
+// (E53.2 / #2225, backend/internal/spec/validate.go): a declared
+// reviewers.authority (EITHER "advisory" or "gating") is incoherent with
+// zero agent reviewers — there is no agent verdict to gate on or to
+// surface — so it is rejected naming the stage and the fix. Independent
+// implementation over the raw yaml.v3 map (this package shares no code
+// with the backend spec module); the paired spec_test.go assertions on
+// both sides are what keep the two message strings from drifting. The
+// schema enforces agents minItems:1, so `agents: []` is already a schema
+// error; this layer owns the ABSENT-agents form. `authority` exists only
+// in the v2 schema, so a v0/v1 document declaring it never reaches here.
+func checkReviewerAuthority(stage map[string]any, base string, errs *[]ValidationErrorEntry) {
+	reviewers, ok := stage["reviewers"].(map[string]any)
+	if !ok {
+		return
+	}
+	authority, ok := reviewers["authority"].(string)
+	if !ok || authority == "" {
+		return
+	}
+	if agents, ok := reviewers["agents"].([]any); ok && len(agents) > 0 {
+		return
+	}
+	stageID, _ := stage["id"].(string)
+	*errs = append(*errs, ValidationErrorEntry{
+		Path: base + "/reviewers/authority",
+		Message: fmt.Sprintf(
+			"stage %q: reviewers.authority: %q declares agent-reviewer authority but the stage configures no agent reviewers; declare at least one entry under reviewers.agents, or remove reviewers.authority to fall back to the count-derived ADR-027 default",
+			stageID, authority),
+	})
 }
 
 // appendRangeError validates a single agent_version node when it is a

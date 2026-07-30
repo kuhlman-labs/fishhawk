@@ -450,11 +450,15 @@ type OnCIFailure struct {
 const DefaultMaxRetries = 1
 
 // ReviewersConfig holds the plan-review reviewer counts for a plan stage
-// (ADR-027). Authority is resolved by planreview.ResolveAuthority:
+// (ADR-027). Authority is resolved by planreview.ResolveAuthority. When the
+// Authority field is EMPTY, the count-derived DEFAULT applies:
 //
 //   - agent>0 && human==0 → gating (agent rejections block stage advancement)
 //   - agent>0 && human>0  → advisory (agent verdicts surfaced; cannot block)
 //   - agent==0            → gateless
+//
+// A non-empty Authority (E53.2 / #2225) WINS over that default — see the
+// Authority field doc.
 //
 // A nil pointer on Stage.Reviewers means the field was absent in the spec;
 // callers should treat nil as {Human:1} to preserve pre-ADR-027 behavior.
@@ -473,6 +477,23 @@ type ReviewersConfig struct {
 	Agent  int             `json:"agent,omitempty" yaml:"agent,omitempty"`
 	Agents []AgentReviewer `json:"agents,omitempty" yaml:"agents,omitempty"`
 	Human  int             `json:"human,omitempty" yaml:"human,omitempty"`
+	// Authority is the OPTIONAL explicit review-authority declaration
+	// (E53.2 / #2225): "advisory" or "gating". When empty (the common
+	// case, and every pre-#2225 spec), authority falls back to the
+	// count-derived ADR-027 DEFAULT (see the type doc). When non-empty it
+	// WINS over the counts, so "gating" alongside Human>0 gates and
+	// "advisory" alongside Human==0 stays advisory. "gateless" is NOT
+	// declarable — it is the zero-agent outcome, not a policy; a
+	// declaration with no agent reviewers is rejected at semantic
+	// validation (Validate) in both the backend and the CLI. Resolution
+	// stays behind planreview.ResolveAuthority / ResolveAuthorityWithSource
+	// — no reader re-derives it. The field lives on this shared cross-major
+	// struct, but only a v2-parsed document can populate it: v0/v1 schemas
+	// are additionalProperties:false with no `authority` property. The
+	// schema's reviewers_config is additionalProperties:false, so this
+	// field MUST stay in lockstep with the schema's authority property (the
+	// same lockstep note ReviewTimeout carries).
+	Authority string `json:"authority,omitempty" yaml:"authority,omitempty"`
 	// ReviewTimeout is the optional per-stage review-budget floor (#1494). A
 	// non-empty value OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment
 	// default — it sets the Floor rung of the size-aware review-wait budget

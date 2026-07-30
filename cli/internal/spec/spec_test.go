@@ -524,6 +524,84 @@ workflows:
 	}
 }
 
+// TestValidateBytes_Authority_Valid is the positive control (E53.2 / #2225):
+// a v2 document declaring reviewers.authority with at least one agent reviewer
+// passes `fishhawk validate`.
+func TestValidateBytes_Authority_Valid(t *testing.T) {
+	for _, authority := range []string{"advisory", "gating"} {
+		t.Run(authority, func(t *testing.T) {
+			yml := `
+version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: ` + authority + `
+          agents:
+            - provider: claudecode
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+			if err := spec.ValidateBytes([]byte(yml)); err != nil {
+				t.Errorf("expected valid authority spec to pass, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_Authority_NoAgents_Rejected is the CLI parity check for
+// the backend's step-5 semantic rule (E53.2 / #2225): a declared authority
+// (EITHER value) with no agent reviewers is rejected with the SAME actionable
+// message the backend produces, so `fishhawk validate` and the backend cannot
+// diverge. Asserts the message text — stage name and fix — not just a non-nil
+// error.
+func TestValidateBytes_Authority_NoAgents_Rejected(t *testing.T) {
+	for _, authority := range []string{"advisory", "gating"} {
+		t.Run(authority, func(t *testing.T) {
+			yml := `
+version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: ` + authority + `
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+			err := spec.ValidateBytes([]byte(yml))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError for a declared authority with no agents", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "/reviewers/authority") {
+				t.Errorf("error = %q, want it to name /reviewers/authority", msg)
+			}
+			if !strings.Contains(msg, `stage "plan"`) {
+				t.Errorf("error = %q, want it to name the stage \"plan\"", msg)
+			}
+			if !strings.Contains(msg, authority) {
+				t.Errorf("error = %q, want it to name the declared value %q", msg, authority)
+			}
+			if !strings.Contains(msg, "reviewers.agents") {
+				t.Errorf("error = %q, want it to name the fix (reviewers.agents)", msg)
+			}
+		})
+	}
+}
+
 // TestValidate_RequiredOutcomes_VerificationReported pins the
 // workflow-v1 enum member added in v1.5 (#1886 / ADR-059) against the
 // CLI's embedded mirror — the two mirrors must agree, or a spec the

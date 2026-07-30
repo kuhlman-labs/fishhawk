@@ -876,6 +876,57 @@ func TestAutoDriveRunGate_DecodesDecisionRequired(t *testing.T) {
 	}
 }
 
+// TestRunReviewAuthority_WireShape pins the hand-maintained MCP wire mirror for
+// the run-status review_authority block (E53.2 / #2225): the backend tags MUST
+// byte-match Run.ReviewAuthority / RunReviewAuthority or the slice silently
+// decodes to nil (the #371-class trap). A populated body decodes as sent, and
+// an old-backend body that omits the field decodes to nil (the mixed-version
+// degrade).
+func TestRunReviewAuthority_WireShape(t *testing.T) {
+	runID := uuid.New()
+	serveRun := func(t *testing.T, body string) *Run {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		r, err := c.GetRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		return r
+	}
+	runBody := func(ra string) string {
+		base := `{"id":"` + runID.String() + `","repo":"x/y","workflow_id":"feature_change","state":"running"`
+		if ra != "" {
+			base += `,"review_authority":` + ra
+		}
+		return base + `}`
+	}
+
+	t.Run("populated body decodes", func(t *testing.T) {
+		r := serveRun(t, runBody(`[{"stage":"plan","stage_type":"plan","authority":"gating","source":"declared"},{"stage":"implement","stage_type":"implement","authority":"advisory","source":"derived"}]`))
+		if len(r.ReviewAuthority) != 2 {
+			t.Fatalf("ReviewAuthority = %+v, want 2 entries; the review_authority json tag may not byte-match the backend", r.ReviewAuthority)
+		}
+		if got := r.ReviewAuthority[0]; got.Stage != "plan" || got.StageType != "plan" || got.Authority != "gating" || got.Source != "declared" {
+			t.Errorf("ReviewAuthority[0] = %+v, want {plan plan gating declared}", got)
+		}
+		if got := r.ReviewAuthority[1]; got.Stage != "implement" || got.Authority != "advisory" || got.Source != "derived" {
+			t.Errorf("ReviewAuthority[1] = %+v, want {implement advisory derived}", got)
+		}
+	})
+
+	t.Run("old-backend body omits the field -> nil", func(t *testing.T) {
+		r := serveRun(t, runBody(""))
+		if r.ReviewAuthority != nil {
+			t.Errorf("ReviewAuthority = %+v, want nil when the backend omits review_authority (the mixed-version degrade)", r.ReviewAuthority)
+		}
+	})
+}
+
 // TestRunLiveValidation_WireShape pins the hand-maintained MCP wire mirror for
 // the run-status / gate-view live_validation block (#2045, E48.35): the backend
 // tags MUST byte-match Run.LiveValidation / GateView.LiveValidation or the

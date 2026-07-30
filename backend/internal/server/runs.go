@@ -164,6 +164,31 @@ type runResponse struct {
 	// stays free of the extra read. Omitted (nil) when the run's approved plan
 	// carried no marked criterion (no marker recorded).
 	LiveValidation *runLiveValidationPayload `json:"live_validation,omitempty"`
+	// ReviewAuthority is the per-stage resolved review authority (E53.2 /
+	// #2225): for each stage of the run's workflow that declares a reviewers
+	// block, the resolved mode (advisory | gating | gateless) and its
+	// provenance (declared | derived), so an operator reads the mode instead
+	// of re-deriving it from the reviewer counts. Populated by handleGetRun
+	// ONLY (same single-read posture as Concerns / Delegation — a pure
+	// projection of the run's cached workflow spec, no repositories wired and
+	// NOT suppressed for a terminal run). Omitted (nil) when the run carries
+	// no cached spec, the spec fails to parse (warn-logged), the workflow is
+	// missing from the cached spec, or the spec declares no reviewers block
+	// anywhere — so a run whose spec declares none keeps a byte-identical
+	// response.
+	ReviewAuthority []runReviewAuthorityPayload `json:"review_authority,omitempty"`
+}
+
+// runReviewAuthorityPayload is one stage's resolved review authority on
+// the wire (E53.2 / #2225). Kept distinct from the domain types so a
+// resolver-shape change can't silently leak through the API surface. The
+// json tags MUST byte-match the MCP mirror (RunReviewAuthority in
+// backend/cmd/fishhawk-mcp/client.go) or the field decodes to nil there.
+type runReviewAuthorityPayload struct {
+	Stage     string `json:"stage"`
+	StageType string `json:"stage_type"`
+	Authority string `json:"authority"`
+	Source    string `json:"source"`
 }
 
 // securityFindingPayload is one high-severity code-scanning finding on the
@@ -1253,6 +1278,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// nil (field omitted) when the run's approved plan carried no marked
 	// criterion or the read fails (best-effort — warn and omit).
 	resp.LiveValidation = s.liveValidationForRun(r.Context(), runID)
+	// Review-authority surface (E53.2 / #2225): single-run read ONLY (same
+	// posture as Concerns / Delegation — no per-row spec parse on the list
+	// endpoint). A pure projection of the run's cached workflow spec; nil
+	// (field omitted) when the run carries no cached spec, the spec fails to
+	// parse, or it declares no reviewers block anywhere.
+	resp.ReviewAuthority = s.buildReviewAuthorityPayload(got)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -1440,6 +1471,48 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 		return nil
 	}
 	return delegationPayloadFrom(res, specVersionMajor(parsed.Version))
+}
+
+// buildReviewAuthorityPayload projects the run's cached workflow spec onto
+// the per-stage review-authority surface (E53.2 / #2225): one entry per stage
+// that declares a reviewers block, carrying the resolved mode and provenance
+// from planreview.ResolveAuthorityWithSource. Unlike buildDelegationPayload it
+// is a PURE spec projection — it wires no repositories and is NOT suppressed on
+// a terminal run (an operator still reads which mode governed). Returns nil —
+// the field is omitted — when the run carries no cached spec (legacy rows), the
+// spec fails to parse (warn-logged, best-effort, never fails the read), the
+// workflow is missing from the cached spec, or no stage declares a reviewers
+// block (so a run whose spec declares none keeps a byte-identical response).
+func (s *Server) buildReviewAuthorityPayload(runRow *run.Run) []runReviewAuthorityPayload {
+	if len(runRow.WorkflowSpec) == 0 {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.Warn("review_authority: parse workflow spec failed; omitting review_authority block",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		return nil
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		s.cfg.Logger.Warn("review_authority: workflow not in cached spec; omitting review_authority block",
+			"run_id", runRow.ID.String(), "workflow_id", runRow.WorkflowID)
+		return nil
+	}
+	var out []runReviewAuthorityPayload
+	for _, st := range wf.Stages {
+		if st.Reviewers == nil {
+			continue
+		}
+		mode, source := planreview.ResolveAuthorityWithSource(*st.Reviewers)
+		out = append(out, runReviewAuthorityPayload{
+			Stage:     st.ID,
+			StageType: string(st.Type),
+			Authority: string(mode),
+			Source:    string(source),
+		})
+	}
+	return out
 }
 
 // specVersionMajor parses a workflow spec version string's major component

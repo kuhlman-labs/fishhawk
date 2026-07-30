@@ -67,6 +67,91 @@ func TestResolveAuthority_AgentsList(t *testing.T) {
 	}
 }
 
+// TestResolveAuthorityWithSource_Declared is the E53.2 (#2225) table: an
+// explicit reviewers.authority WINS over the count-derived rule and reports
+// SourceDeclared, the zero-agent defence branch always yields
+// gateless/derived even for a declared value (unreachable for a validated
+// spec — spec.Validate rejects it — but defended for campaign-override
+// bytes), an out-of-enum Authority string falls THROUGH to the count table
+// (never honoured) and reports SourceDerived, and ResolveAuthority agrees
+// with ResolveAuthorityWithSource's mode on every row.
+func TestResolveAuthorityWithSource_Declared(t *testing.T) {
+	oneAgent := []spec.AgentReviewer{{Provider: "anthropic"}}
+	threeAgents := []spec.AgentReviewer{{Provider: "anthropic"}, {Provider: "codex"}, {Provider: "claudecode"}}
+	cases := []struct {
+		name       string
+		r          spec.ReviewersConfig
+		wantMode   planreview.AuthorityMode
+		wantSource planreview.AuthoritySource
+	}{
+		{
+			"declared gating wins over human>0",
+			spec.ReviewersConfig{Agents: oneAgent, Human: 1, Authority: "gating"},
+			planreview.AuthorityGating, planreview.SourceDeclared,
+		},
+		{
+			"declared advisory wins over human==0",
+			spec.ReviewersConfig{Agents: oneAgent, Human: 0, Authority: "advisory"},
+			planreview.AuthorityAdvisory, planreview.SourceDeclared,
+		},
+		{
+			"declared gating, single agent",
+			spec.ReviewersConfig{Agents: oneAgent, Authority: "gating"},
+			planreview.AuthorityGating, planreview.SourceDeclared,
+		},
+		{
+			"declared advisory, many agents",
+			spec.ReviewersConfig{Agents: threeAgents, Authority: "advisory"},
+			planreview.AuthorityAdvisory, planreview.SourceDeclared,
+		},
+		{
+			"zero agents + declared gating -> gateless/derived (defence branch)",
+			spec.ReviewersConfig{Human: 1, Authority: "gating"},
+			planreview.AuthorityGateless, planreview.SourceDerived,
+		},
+		{
+			"zero agents + declared advisory -> gateless/derived (defence branch)",
+			spec.ReviewersConfig{Human: 0, Authority: "advisory"},
+			planreview.AuthorityGateless, planreview.SourceDerived,
+		},
+		{
+			"out-of-enum authority falls through to count table (gating)",
+			spec.ReviewersConfig{Agents: oneAgent, Human: 0, Authority: "sometimes"},
+			planreview.AuthorityGating, planreview.SourceDerived,
+		},
+		{
+			"out-of-enum authority falls through to count table (advisory)",
+			spec.ReviewersConfig{Agents: oneAgent, Human: 1, Authority: "sometimes"},
+			planreview.AuthorityAdvisory, planreview.SourceDerived,
+		},
+		{
+			"empty authority + counts -> gating/derived (unchanged default)",
+			spec.ReviewersConfig{Agents: oneAgent, Human: 0},
+			planreview.AuthorityGating, planreview.SourceDerived,
+		},
+		{
+			"empty authority + counts -> advisory/derived (unchanged default)",
+			spec.ReviewersConfig{Agents: oneAgent, Human: 1},
+			planreview.AuthorityAdvisory, planreview.SourceDerived,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mode, source := planreview.ResolveAuthorityWithSource(tc.r)
+			if mode != tc.wantMode {
+				t.Errorf("ResolveAuthorityWithSource(%+v) mode = %q, want %q", tc.r, mode, tc.wantMode)
+			}
+			if source != tc.wantSource {
+				t.Errorf("ResolveAuthorityWithSource(%+v) source = %q, want %q", tc.r, source, tc.wantSource)
+			}
+			// ResolveAuthority must agree with the sibling's mode on every row.
+			if got := planreview.ResolveAuthority(tc.r); got != mode {
+				t.Errorf("ResolveAuthority(%+v) = %q, want %q (must agree with ResolveAuthorityWithSource)", tc.r, got, mode)
+			}
+		})
+	}
+}
+
 // --- ResolveAuthority over a genuinely v2-parsed spec (E52.3 / #2215) ---
 
 // v2SpecWithReviewers renders a workflow-v2 document whose plan stage

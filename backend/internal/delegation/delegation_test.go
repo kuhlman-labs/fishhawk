@@ -1020,6 +1020,91 @@ func TestConvergentConcerns_GatingRejectReasonNamesClass(t *testing.T) {
 	}
 }
 
+// --- reviewers.authority seam with the unified autonomy grammar (E53.2 /
+//     #2225, the E52.10 clean_dual_approval seam the issue calls out) --------
+
+// TestAuthorityDeclaration_DoesNotChangeCleanDualApprovalCount is HALF A of the
+// seam (E53.2 / #2225): declaring reviewers.authority does NOT change what
+// clean_dual_approval counts as a configured reviewer — the condition reads
+// AgentCount(), so identical verdicts against an otherwise identical stage
+// evaluate identically under declared advisory, declared gating, and no
+// declaration. Declaring authority must not silently change what
+// `actions.approve: {mode: auto, when: clean_dual_approval}` waits for.
+func TestAuthorityDeclaration_DoesNotChangeCleanDualApprovalCount(t *testing.T) {
+	planGated := []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+	bothApprove := &fakeAudit{entries: map[string][]*audit.Entry{
+		"plan_review_started": {startedEntry(1, 2)},
+		"plan_reviewed":       {verdictEntry(2, planreview.VerdictApprove), verdictEntry(3, planreview.VerdictApprove)},
+	}}
+	agents := []spec.AgentReviewer{{Provider: "claudecode"}, {Provider: "codex"}}
+	for _, authority := range []string{"", "advisory", "gating"} {
+		name := authority
+		if name == "" {
+			name = "no-declaration"
+		}
+		t.Run(name, func(t *testing.T) {
+			wf := testWorkflow(&spec.OperatorAgent{MayApprove: spec.ConditionCleanDualApproval}, nil)
+			wf.Stages[0].Reviewers = &spec.ReviewersConfig{Agents: agents, Human: 1, Authority: authority}
+			ev := cleanDualEvaluator(planGated, nil, bothApprove)
+			d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionApprove)
+			if !d.Met {
+				t.Errorf("clean_dual_approval Met = false (reason %q), want true regardless of authority declaration %q — the condition counts AgentCount(), not the declaration",
+					d.UnmetReason, authority)
+			}
+		})
+	}
+}
+
+// TestAuthorityDeclaration_FlipsGatingSurfaces is HALF B of the seam (E53.2 /
+// #2225): a DECLARED authority DOES flip the surfaces that are authority-keyed.
+// reviewerRejectClass resolves gating_reviewer_reject for a stage declaring
+// authority: gating even with human: 1 (where the derived rule would have said
+// advisory), and evalConvergentConcerns treats a reject on that stage as a
+// gating reject that pages rather than an arbitrable advisory one. The mirror
+// case — the same stage WITHOUT the declaration — stays derived-advisory and
+// arbitrates. This is the pair that keeps two individually-correct features
+// from combining into a surprise.
+func TestAuthorityDeclaration_FlipsGatingSurfaces(t *testing.T) {
+	agents := []spec.AgentReviewer{{Provider: "claudecode"}, {Provider: "codex"}}
+	rejectAudit := &fakeAudit{entries: map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 2)},
+		"implement_reviewed":       {verdictEntry(2, planreview.VerdictApprove), verdictEntry(3, planreview.VerdictReject)},
+	}}
+	open := []*concern.Concern{openConcern("medium")}
+
+	// Declared gating with human: 1 — the count-derived rule would say advisory.
+	t.Run("declared gating flips the class and pages", func(t *testing.T) {
+		wf := testWorkflow(&spec.OperatorAgent{MayRouteFixup: spec.ConditionConvergentConcerns}, nil)
+		implementStage(wf).Reviewers = &spec.ReviewersConfig{Agents: agents, Human: 1, Authority: "gating"}
+		if got := reviewerRejectClass(wf); got != spec.PageEventGatingReviewerReject {
+			t.Errorf("reviewerRejectClass = %q, want %q for a declared-gating stage with human:1", got, spec.PageEventGatingReviewerReject)
+		}
+		ev := cleanDualEvaluator(nil, open, rejectAudit)
+		d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionRouteFixup)
+		if d.Met {
+			t.Errorf("route_fixup Met = true, want false: a declared-gating reject pages the human")
+		}
+		if !strings.Contains(d.UnmetReason, spec.PageEventGatingReviewerReject) {
+			t.Errorf("UnmetReason = %q, want it to name %q", d.UnmetReason, spec.PageEventGatingReviewerReject)
+		}
+	})
+
+	// The SAME stage WITHOUT the declaration — derived advisory: the reject is
+	// arbitrable and route_fixup stays met with an open concern.
+	t.Run("no declaration stays advisory and arbitrates", func(t *testing.T) {
+		wf := testWorkflow(&spec.OperatorAgent{MayRouteFixup: spec.ConditionConvergentConcerns}, nil)
+		implementStage(wf).Reviewers = &spec.ReviewersConfig{Agents: agents, Human: 1}
+		if got := reviewerRejectClass(wf); got != spec.PageEventAdvisoryReviewerReject {
+			t.Errorf("reviewerRejectClass = %q, want %q for a derived-advisory stage", got, spec.PageEventAdvisoryReviewerReject)
+		}
+		ev := cleanDualEvaluator(nil, open, rejectAudit)
+		d := decisionFor(t, evaluate(t, ev, wf, newRun()), ActionRouteFixup)
+		if !d.Met {
+			t.Errorf("route_fixup Met = false (reason %q), want true: a derived-advisory reject is arbitrable", d.UnmetReason)
+		}
+	})
+}
+
 // --- solo_low ----------------------------------------------------------------
 
 func TestSoloLow(t *testing.T) {

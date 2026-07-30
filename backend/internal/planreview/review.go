@@ -268,25 +268,76 @@ const (
 	AuthorityGateless AuthorityMode = "gateless"
 )
 
+// AuthoritySource records HOW an AuthorityMode was arrived at (E53.2 /
+// #2225): SourceDeclared when the spec's reviewers.authority field spelled
+// it out, SourceDerived when it fell back to the ADR-027 count-derived rule.
+// It is surfaced per stage on GET /v0/runs/{id} so an operator reads the
+// mode and its provenance instead of re-deriving either.
+type AuthoritySource string
+
+// Authority provenance markers (E53.2 / #2225).
+const (
+	// SourceDeclared marks an authority resolved from an explicit
+	// reviewers.authority declaration in the spec.
+	SourceDeclared AuthoritySource = "declared"
+
+	// SourceDerived marks an authority resolved from the ADR-027
+	// count-derived default (reviewers.authority was absent or, on the
+	// zero-agent defence branch, could not be honoured).
+	SourceDerived AuthoritySource = "derived"
+)
+
 // ResolveAuthority maps a ReviewersConfig to the applicable authority
-// mode using the ADR-027 §3 decision table:
+// mode. It is the single-value entry point every existing call site uses;
+// its behaviour is UNCHANGED for any Authority-empty config — the
+// count-derived ADR-027 §3 decision table:
 //
 //	agent>0 && human==0 → gating
 //	agent>0 && human>0  → advisory
 //	agent==0            → gateless
 //
+// An explicit reviewers.authority (E53.2 / #2225) WINS over that table.
 // The agent count is the effective count (ReviewersConfig.AgentCount):
 // a heterogeneous `agents` list (#955) supersedes the bare integer, so
 // heterogeneity changes who reviews, never the gating semantics.
+//
+// This is a thin wrapper over ResolveAuthorityWithSource so authority
+// resolution stays behind ONE chokepoint — nothing downstream re-derives
+// the mode a second way.
 func ResolveAuthority(r spec.ReviewersConfig) AuthorityMode {
-	switch {
-	case r.AgentCount() > 0 && r.Human == 0:
-		return AuthorityGating
-	case r.AgentCount() > 0 && r.Human > 0:
-		return AuthorityAdvisory
-	default:
-		return AuthorityGateless
+	mode, _ := ResolveAuthorityWithSource(r)
+	return mode
+}
+
+// ResolveAuthorityWithSource resolves the authority mode AND its provenance
+// (E53.2 / #2225). Resolution order:
+//
+//  1. AgentCount()==0 → (gateless, derived). With zero agent reviewers there
+//     is nothing to gate on or to surface, so a declared authority cannot be
+//     honoured; authority governs whether a verdict blocks, never which gates
+//     exist. This branch is UNREACHABLE for a schema+semantically-validated
+//     spec (spec.Validate rejects a declaration with no agents in both the
+//     backend and the CLI); it is defence in depth for campaign-override bytes
+//     that bypass validation.
+//  2. Authority is exactly "gating" or "advisory" → (that mode, declared).
+//  3. Any other non-empty Authority (out-of-enum; reachable only by bypassing
+//     the schema) falls through to (4) rather than being honoured.
+//  4. The ADR-027 count-derived table → (mode, derived).
+func ResolveAuthorityWithSource(r spec.ReviewersConfig) (AuthorityMode, AuthoritySource) {
+	if r.AgentCount() == 0 {
+		return AuthorityGateless, SourceDerived
 	}
+	switch AuthorityMode(r.Authority) {
+	case AuthorityGating:
+		return AuthorityGating, SourceDeclared
+	case AuthorityAdvisory:
+		return AuthorityAdvisory, SourceDeclared
+	}
+	// Authority empty or out-of-enum: fall back to the count-derived rule.
+	if r.Human == 0 {
+		return AuthorityGating, SourceDerived
+	}
+	return AuthorityAdvisory, SourceDerived
 }
 
 // Settled reports whether a stage's configured agent reviews have all
