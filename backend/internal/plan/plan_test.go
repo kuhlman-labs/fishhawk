@@ -1440,18 +1440,22 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // as a drift guard: any byte change (an unintended edit, or a docs/spec
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
-// standard_v1.x — most recently the #2045 acceptance-criterion
-// requires_live_validation marker (before that, the #2055 top-level
+// standard_v1.x, or for an ANNOTATION-only description correction that changes
+// no validation behavior — most recently the #2347 skip_expected /
+// requires_live_validation description fix (their prose still promised the
+// all-skip short-circuit produced a "passed" verdict after it began recording
+// not_validated; no property, type, or conditional changed). Before that: the
+// #2045 acceptance-criterion requires_live_validation marker, the #2055 top-level
 // split_proposal over-cap phase-split field, the #2053 top-level over_cap
 // planner self-declaration hint, the #1748 acceptance-criterion
 // skip_expected / expectation_basis marker, the #1544 top-level
 // surface_sweep_exemptions field, and the #1529
-// verification.acceptance_criteria / out_of_scope fields). A standard_v1 plan
+// verification.acceptance_criteria / out_of_scope fields. A standard_v1 plan
 // that omits the new optional fields must still
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "400816c39537bc6273f39d36f06d9fffec8821f3ce95b9a693f351677ed6617a"
+	const wantHash = "ad6c5677e2f6ba71d176bbe7d21928c7e3dafbc76d95b300833a186d65328fae"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)

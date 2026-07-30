@@ -303,7 +303,7 @@
         },
         "skip_expected": {
           "type": "boolean",
-          "description": "Optional (#1748). Marks a criterion the acceptance agent cannot validate against the localhost preview — its trigger needs an external event the default-deny egress sandbox cannot produce. When true, expectation_basis is required (enforced by the presence-aware if/then conditional). A plan whose EVERY criterion is so marked short-circuits acceptance dispatch to a passed verdict (basis all-skip-with-basis). Omitted on a legacy criterion never triggers the then-branch."
+          "description": "Optional (#1748). Marks a criterion the acceptance agent cannot validate against the localhost preview — its trigger needs an external event the default-deny egress sandbox cannot produce. When true, expectation_basis is required (enforced by the presence-aware if/then conditional). A plan whose EVERY criterion is so marked short-circuits acceptance dispatch to a not_validated verdict (basis all-skip-with-basis), NEVER a passed one (#2347): the short-circuit verified ZERO criteria, so the recorded verdict says so — merge-eligible, but not certified. Omitted on a legacy criterion never triggers the then-branch."
         },
         "expectation_basis": {
           "type": "string",
@@ -312,7 +312,7 @@
         },
         "requires_live_validation": {
           "type": "boolean",
-          "description": "Optional (#2045). Marks a criterion whose TRUE verification needs a LIVE forge/deploy/external target the default-deny sandbox lacks (not merely an external trigger event, which skip_expected covers). When true, the criterion should ALSO be marked skip_expected with an expectation_basis so acceptance short-circuits via all-skip-with-basis instead of dispatching an unvalidatable live-target criterion to the acceptance agent. On plan approval the system auto-files-or-links an operator-validation walk so the live check is tracked rather than shipped silently unvalidated. Strictly additive: omitted on a legacy criterion changes nothing."
+          "description": "Optional (#2045). Marks a criterion whose TRUE verification needs a LIVE forge/deploy/external target the default-deny sandbox lacks (not merely an external trigger event, which skip_expected covers). When true, the criterion should ALSO be marked skip_expected with an expectation_basis so acceptance short-circuits via all-skip-with-basis — recording a not_validated verdict, never a passed one (#2347) — instead of dispatching an unvalidatable live-target criterion to the acceptance agent. That short-circuit's acceptance_outcome_recorded payload carries criteria_live_validation, the count of criteria marked here, so a skip with a tracked operator-validation walk is distinguishable from one skipped on any other basis. On plan approval the system auto-files-or-links an operator-validation walk so the live check is tracked rather than shipped silently unvalidated. Strictly additive: omitted on a legacy criterion changes nothing."
         }
       }
     },
