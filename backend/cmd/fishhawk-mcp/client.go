@@ -135,8 +135,31 @@ type Run struct {
 	// degrade. The json tag MUST byte-match the backend's runLiveValidationPayload
 	// or the field silently decodes to nil.
 	LiveValidation *RunLiveValidation `json:"live_validation,omitempty" jsonschema:"the run's pending operator live-validation walk (count of requires_live_validation criteria + the tracking walk ref). Omitted when the run carries no such criterion"`
-	CreatedAt      time.Time          `json:"created_at"`
-	UpdatedAt      time.Time          `json:"updated_at"`
+	// ReviewAuthority mirrors the backend run-status surface (E53.2 / #2225):
+	// for each stage of the run's workflow that declares a reviewers block, the
+	// resolved review authority mode (advisory | gating | gateless) and its
+	// provenance (declared | derived), so the operator reads the mode instead
+	// of re-deriving it from the reviewer counts. The backend emits it on the
+	// single-run read only (handleGetRun); omitted (nil) when the run carries
+	// no cached spec or declares no reviewers block. An OLDER backend omits it
+	// entirely, so it decodes to nil — the mixed-version degrade. The json tags
+	// MUST byte-match the backend's runReviewAuthorityPayload or the field
+	// silently decodes to nil.
+	ReviewAuthority []RunReviewAuthority `json:"review_authority,omitempty" jsonschema:"per-stage resolved review authority: each entry carries the stage id, its type, the resolved mode (advisory | gating | gateless) and its provenance (declared | derived). Omitted when the run's spec declares no reviewers block"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
+}
+
+// RunReviewAuthority mirrors the backend's run-status review_authority entry
+// (E53.2 / #2225 — backend/internal/server/runs.go's runReviewAuthorityPayload):
+// one stage's resolved review authority and its provenance. The json tags MUST
+// stay byte-identical with the backend field or the mirror decodes to nil
+// silently (the #371-class hand-maintained-wire-mirror trap).
+type RunReviewAuthority struct {
+	Stage     string `json:"stage" jsonschema:"the stage id"`
+	StageType string `json:"stage_type" jsonschema:"the stage type (plan | implement | review | deploy | acceptance)"`
+	Authority string `json:"authority" jsonschema:"the resolved review authority: advisory (agent verdicts surfaced, cannot block), gating (an agent reject blocks advancement), or gateless (no agent reviewers)"`
+	Source    string `json:"source" jsonschema:"how the authority was resolved: declared (spelled out via reviewers.authority) or derived (the count-derived ADR-027 default)"`
 }
 
 // RunLiveValidation mirrors the backend's run-status / gate-view live_validation

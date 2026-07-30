@@ -1342,6 +1342,234 @@ workflows:
 	}
 }
 
+// --- reviewers.authority (E53.2 / #2225) ---
+
+// TestParse_Reviewers_Authority_V2RoundTrip is the positive control: a
+// genuinely v2-parsed spec declaring reviewers.authority round-trips onto
+// ReviewersConfig.Authority for BOTH enum values.
+func TestParse_Reviewers_Authority_V2RoundTrip(t *testing.T) {
+	for _, authority := range []string{"advisory", "gating"} {
+		t.Run(authority, func(t *testing.T) {
+			yml := []byte(`
+version: "2"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: ` + authority + `
+          agents:
+            - provider: claudecode
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+			s, err := spec.ParseBytes(yml)
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			rv := s.Workflows["trivial"].Stages[0].Reviewers
+			if rv == nil {
+				t.Fatal("Reviewers should be non-nil")
+			}
+			if rv.Authority != authority {
+				t.Errorf("Reviewers.Authority = %q, want %q", rv.Authority, authority)
+			}
+		})
+	}
+}
+
+// TestParse_Reviewers_Authority_V0Rejected pins that a v0 document declaring
+// reviewers.authority is rejected by the SCHEMA (v0 reviewers block is
+// additionalProperties:false with no authority property), so the field is
+// v2-only by construction.
+func TestParse_Reviewers_Authority_V0Rejected(t *testing.T) {
+	yml := []byte(`
+version: "0.3"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          authority: advisory
+          agent: 1
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError rejecting authority under v0", err)
+	}
+}
+
+// TestParse_Reviewers_Authority_V1Rejected is the v1 mirror of the v0 case:
+// v1's reviewers block adds review_timeout but no authority, so a v1 document
+// declaring authority is likewise rejected by the schema.
+func TestParse_Reviewers_Authority_V1Rejected(t *testing.T) {
+	yml := []byte(`
+version: "1.0"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          authority: gating
+          agents:
+            - provider: claudecode
+`)
+	_, err := spec.ParseBytes(yml)
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError rejecting authority under v1", err)
+	}
+}
+
+// TestParse_Reviewers_Authority_NoAgents_Rejected is criterion 3: a declared
+// authority (EITHER value) with no agent reviewers is rejected at semantic
+// validation, and the message NAMES the stage and the fix (asserting the text,
+// not just a non-nil error). The document passes SCHEMA validation (authority
+// is a valid enum, agents is optional), so this proves the semantic layer owns
+// the ABSENT-agents form.
+func TestParse_Reviewers_Authority_NoAgents_Rejected(t *testing.T) {
+	for _, authority := range []string{"advisory", "gating"} {
+		t.Run(authority, func(t *testing.T) {
+			yml := []byte(`
+version: "2"
+workflows:
+  trivial:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: ` + authority + `
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+			_, err := spec.ParseBytes(yml)
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError for a declared authority with no agents", err)
+			}
+			if !strings.Contains(ve.Message, `stage "plan"`) {
+				t.Errorf("message = %q, want it to name the stage \"plan\"", ve.Message)
+			}
+			if !strings.Contains(ve.Message, authority) {
+				t.Errorf("message = %q, want it to name the declared value %q", ve.Message, authority)
+			}
+			if !strings.Contains(ve.Message, "reviewers.agents") {
+				t.Errorf("message = %q, want it to name the fix (reviewers.agents)", ve.Message)
+			}
+		})
+	}
+}
+
+// TestParse_Reviewers_Authority_DefaultsTakenWhole is the reuse interaction: a
+// file-level defaults.reviewers block carrying `authority` is taken WHOLE onto
+// an inheriting stage (authority travels with the block), and a stage
+// declaring its OWN reviewers block does not inherit the default's authority.
+func TestParse_Reviewers_Authority_DefaultsTakenWhole(t *testing.T) {
+	yml := []byte(`
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+  reviewers:
+    authority: gating
+    agents:
+      - provider: claudecode
+workflows:
+  wf:
+    stages:
+      - id: inherits
+        type: plan
+      - id: declares
+        type: implement
+        reviewers:
+          agents:
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: pull_request
+`)
+	s, err := spec.ParseBytes(yml)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	stages := s.Workflows["wf"].Stages
+	// The inheriting stage takes the default block WHOLE, authority included.
+	if got := stages[0].Reviewers; got == nil || got.Authority != "gating" {
+		t.Errorf("inherits.reviewers = %+v, want the default's authority: gating", got)
+	}
+	// The declaring stage keeps ONLY what it wrote — no authority supplemented.
+	if got := stages[1].Reviewers; got == nil || got.Authority != "" {
+		t.Errorf("declares.reviewers = %+v, want NO authority supplemented from the default", got)
+	}
+}
+
+// TestParse_Reviewers_Authority_NoAgents_Inherited_Rejected is the INHERITED
+// mirror of TestParse_Reviewers_Authority_NoAgents_Rejected (E53.2 / #2225): the
+// zero-agent form arrives not on a stage-declared block but via a
+// defaults.reviewers block carrying `authority` and no `agents`, folded WHOLE
+// onto an inheriting stage. Reuse resolution precedes the semantic walk, so
+// post-resolution the stage is indistinguishable from the directly-declared
+// case — this makes that by-construction argument machine-enforced rather than
+// reasoned, and pins that the reject reaches the inherited form too.
+func TestParse_Reviewers_Authority_NoAgents_Inherited_Rejected(t *testing.T) {
+	for _, authority := range []string{"advisory", "gating"} {
+		t.Run(authority, func(t *testing.T) {
+			yml := []byte(`
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+  reviewers:
+    authority: ` + authority + `
+workflows:
+  wf:
+    stages:
+      - id: inherits
+        type: plan
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+			_, err := spec.ParseBytes(yml)
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError for an inherited authority with no agents", err)
+			}
+			if !strings.Contains(ve.Message, `stage "inherits"`) {
+				t.Errorf("message = %q, want it to name the inheriting stage", ve.Message)
+			}
+			if !strings.Contains(ve.Message, authority) {
+				t.Errorf("message = %q, want it to name the declared value %q", ve.Message, authority)
+			}
+			if !strings.Contains(ve.Message, "reviewers.agents") {
+				t.Errorf("message = %q, want it to name the fix (reviewers.agents)", ve.Message)
+			}
+		})
+	}
+}
+
 func TestParse_Reviewers_AgentsList_ReasoningEffort_InvalidEnum_Rejected(t *testing.T) {
 	// #1493: the schema enum (low|medium|high|xhigh|max) is the sole guard
 	// before the value reaches the codex CLI as -c model_reasoning_effort, so
@@ -5327,6 +5555,68 @@ workflows:
 	if got := planreview.ResolveAuthority(*rev); got != planreview.AuthorityGating {
 		t.Errorf("planreview.ResolveAuthority = %v, want %v — a supplemented human would silently make this gating stage advisory",
 			got, planreview.AuthorityGating)
+	}
+}
+
+// TestPresetsDeclaredAuthorityMatchesResolved is criterion 6 (E53.2 / #2225),
+// machine-enforced rather than asserted in prose: every shipped preset's plan
+// and implement stage DECLARES reviewers.authority explicitly, and the declared
+// value equals what the COUNT-DERIVED ADR-027 rule resolves for that stage's
+// reviewer counts — so a preset can never declare an authority that contradicts
+// its own reviewer counts. It lives in the EXTERNAL test package for the same
+// reason as TestParseV2_DeclaredReviewersBlockTakenWhole: planreview imports spec.
+//
+// Vacuity guard: ResolveAuthority now HONOURS a declared authority (returns it
+// verbatim), so resolving the stage's config as-is would compare the declaration
+// to itself and pass for ANY preset — including one that declared `gating` on a
+// human-gated stage the counts derive to advisory. The comparison is therefore
+// made against the config with Authority STRIPPED, forcing ResolveAuthority down
+// its count-derived branch; a declaration that contradicts the counts now fails.
+func TestPresetsDeclaredAuthorityMatchesResolved(t *testing.T) {
+	for _, p := range []spec.Preset{spec.PresetLow, spec.PresetMedium, spec.PresetHigh} {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			data, err := spec.PresetBytes(p)
+			if err != nil {
+				t.Fatalf("PresetBytes(%q): %v", p, err)
+			}
+			s, err := spec.ParseBytes(data)
+			if err != nil {
+				t.Fatalf("ParseBytes(%q): %v", p, err)
+			}
+			wf, ok := s.Workflows["feature_change"]
+			if !ok {
+				t.Fatalf("preset %q has no feature_change workflow", p)
+			}
+			var checked int
+			for _, st := range wf.Stages {
+				if st.Type != spec.StageTypePlan && st.Type != spec.StageTypeImplement {
+					continue
+				}
+				if st.Reviewers == nil {
+					t.Errorf("preset %q stage %q declares no reviewers block", p, st.ID)
+					continue
+				}
+				if st.Reviewers.Authority == "" {
+					t.Errorf("preset %q stage %q does not DECLARE reviewers.authority", p, st.ID)
+					continue
+				}
+				// Resolve from the COUNTS ALONE: strip the declared field so
+				// ResolveAuthority takes its count-derived branch instead of
+				// echoing the declaration back (which would make this vacuous).
+				countsOnly := *st.Reviewers
+				countsOnly.Authority = ""
+				derived := planreview.ResolveAuthority(countsOnly)
+				if st.Reviewers.Authority != string(derived) {
+					t.Errorf("preset %q stage %q declares authority %q but its counts derive to %q — a declared authority must not contradict the counts",
+						p, st.ID, st.Reviewers.Authority, derived)
+				}
+				checked++
+			}
+			if checked != 2 {
+				t.Errorf("preset %q: checked %d plan/implement stages, want 2 (plan + implement)", p, checked)
+			}
+		})
 	}
 }
 

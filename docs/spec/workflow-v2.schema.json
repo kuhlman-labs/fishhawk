@@ -896,8 +896,16 @@
     "reviewers_config": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Plan-review reviewer counts for plan stages (ADR-027). Authority table, read on len(agents): len(agents)>0 && human==0 \u2192 gating (agent rejections block stage advancement); len(agents)>0 && human>0 \u2192 advisory (agent verdicts surfaced, cannot block human approval); len(agents)==0 \u2192 gateless. The bare `agent` integer count that v0/v1 accept is REMOVED in v2 (E52.3 / #2215) \u2014 `agents` is the sole agent-reviewer declaration and the effective agent count is len(agents). When the reviewers block is absent entirely, the backend defaults to {human:1} \u2014 preserving pre-ADR-027 behavior.",
+      "description": "Plan-review reviewers for plan stages (ADR-027). The `authority` property DECLARES whether agent reviewers can block; when it is ABSENT the count-derived DEFAULT governs, read on len(agents): len(agents)>0 && human==0 \u2192 gating (agent rejections block stage advancement); len(agents)>0 && human>0 \u2192 advisory (agent verdicts surfaced, cannot block human approval); len(agents)==0 \u2192 gateless. An explicit `authority` WINS over the counts. The bare `agent` integer count that v0/v1 accept is REMOVED in v2 (E52.3 / #2215) \u2014 `agents` is the sole agent-reviewer declaration and the effective agent count is len(agents). When the reviewers block is absent entirely, the backend defaults to {human:1} \u2014 preserving pre-ADR-027 behavior.",
       "properties": {
+        "authority": {
+          "type": "string",
+          "enum": [
+            "advisory",
+            "gating"
+          ],
+          "description": "Explicit review-authority declaration (E53.2 / #2225): states whether this stage's AGENT reviewers can BLOCK stage advancement, instead of leaving it inferred from the reviewer counts. `gating` \u2014 an agent reject blocks advancement (no human approver overrides). `advisory` \u2014 agent verdicts are surfaced but cannot block; the human gate is authoritative. ABSENT reproduces the ADR-027 count-derived rule EXACTLY: len(agents)>0 && human==0 \u2192 gating; len(agents)>0 && human>0 \u2192 advisory; len(agents)==0 \u2192 gateless \u2014 so every existing spec keeps byte-identical gating behavior. An explicit value WINS over the counts: `gating` alongside `human: 1` gates, and `advisory` alongside `human: 0` stays advisory. `gateless` is NOT declarable \u2014 it is the zero-agent OUTCOME, not a policy; a declaration (either value) with no agent reviewers (an absent/empty `agents` list) is REJECTED at semantic validation in both the backend and the CLI with a message naming the stage and the fix. Declaring `gating` engages the run-creation reviewer-availability check, so a stage naming an unconfigured reviewer provider fails run creation up front. Declared by workflow-v2; accepted whenever present (v2 has no minor chain \u2014 a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+        },
         "agents": {
           "type": "array",
           "minItems": 1,

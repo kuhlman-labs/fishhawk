@@ -1809,3 +1809,97 @@ func TestModelGate_E2E_CrossBoundary(t *testing.T) {
 		}
 	})
 }
+
+// TestReviewAuthority_E2E_SpecToAPI is the cross-boundary projection proof for
+// E53.2 (#2225) over a real Postgres database: a run whose cached v2 workflow
+// DECLARES reviewers.authority: gating on its plan stage is created, and
+// GET /v0/runs/{id} reports review_authority = gating/declared for that stage —
+// crossing the cached-spec -> spec.ParseBytes -> planreview.ResolveAuthorityWithSource
+// -> wire seam end to end. The count-derived rule (agents + human:1) would read
+// ADVISORY, so this fails on a no-op touch of the schema or a resolver that
+// ignores the declared field. The review-loop BLOCKING half of the same seam is
+// proven in the server package (TestShipPlan_DeclaredAuthority_FlipsReviewLoopBlocking),
+// which owns the ship-plan review harness; together they cover the spec ->
+// resolver -> review-loop -> API done-means.
+func TestReviewAuthority_E2E_SpecToAPI(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+	runRepo := runpkg.NewPostgresRepository(pool)
+
+	const declaredGatingV2 = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: gating
+          agents:
+            - provider: claudecode
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	r, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec:  []byte(declaredGatingV2),
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+
+	srv := server.New(server.Config{Addr: "127.0.0.1:0", RunRepo: runRepo})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	resp, err := http.Get(httpSrv.URL + "/v0/runs/" + r.ID.String())
+	if err != nil {
+		t.Fatalf("GET run: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("GET status = %d, want 200:\n%s", resp.StatusCode, b)
+	}
+
+	var body struct {
+		ReviewAuthority []struct {
+			Stage     string `json:"stage"`
+			StageType string `json:"stage_type"`
+			Authority string `json:"authority"`
+			Source    string `json:"source"`
+		} `json:"review_authority"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode run response: %v", err)
+	}
+
+	var found bool
+	for _, e := range body.ReviewAuthority {
+		if e.Stage != "plan" {
+			continue
+		}
+		found = true
+		if e.Authority != string(planreview.AuthorityGating) || e.Source != "declared" {
+			t.Errorf("plan review_authority = %+v, want {authority:gating source:declared}", e)
+		}
+		if e.StageType != "plan" {
+			t.Errorf("plan review_authority stage_type = %q, want plan", e.StageType)
+		}
+	}
+	if !found {
+		t.Errorf("GET /v0/runs response carried no plan review_authority entry: %+v", body.ReviewAuthority)
+	}
+}

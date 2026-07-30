@@ -779,12 +779,53 @@ components:
             after a fix-up cleared them).
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
+        review_authority:
+          type: array
+          description: |
+            Per-stage resolved review authority (E53.2 / #2225). For each stage of
+            the run's workflow that declares a `reviewers` block, the resolved mode
+            (`advisory` | `gating` | `gateless`) and its provenance (`declared` |
+            `derived`), so an operator reads the mode instead of re-deriving it from
+            the reviewer counts. A stage declares `reviewers.authority` explicitly
+            (`declared`) or the count-derived ADR-027 rule applies (`derived`).
+            Surfaced on `GET /v0/runs/{run_id}` ONLY (a pure projection of the run's
+            cached workflow spec, same single-read posture as `delegation`); omitted
+            when the run carries no cached spec or declares no `reviewers` block
+            anywhere — so a run whose spec declares none keeps a byte-identical
+            response.
+          items:
+            $ref: '#/components/schemas/RunReviewAuthority'
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunReviewAuthority:
+      type: object
+      description: One stage's resolved review authority (E53.2 / #2225).
+      required: [stage, stage_type, authority, source]
+      properties:
+        stage:
+          type: string
+          description: The stage id.
+        stage_type:
+          type: string
+          description: The stage type (`plan` | `implement` | `review` | `deploy` | `acceptance`).
+        authority:
+          type: string
+          enum: [advisory, gating, gateless]
+          description: |
+            The resolved review authority: `advisory` (agent verdicts surfaced,
+            cannot block), `gating` (an agent reject blocks advancement), or
+            `gateless` (no agent reviewers).
+        source:
+          type: string
+          enum: [declared, derived]
+          description: |
+            How the authority was resolved: `declared` (spelled out via
+            `reviewers.authority`) or `derived` (the count-derived ADR-027 default).
 
     LiveValidation:
       type: object

@@ -6,6 +6,15 @@ Verdict/authority types and audit payloads for the plan-review and implement-rev
 
 `review.go` — `Verdict` type (approve / approve_with_concerns / reject), `AuthorityMode` enum, `ResolveAuthority(ReviewersConfig) AuthorityMode`, `PlanReviewedPayload` audit struct.
 
+**Authority resolution ladder (declared > derived; E53.2 / #2225).** `ResolveAuthorityWithSource(ReviewersConfig) (AuthorityMode, AuthoritySource)` is the single chokepoint; `ResolveAuthority` is a thin `mode, _ :=` wrapper over it, so every existing call site is unchanged and nothing downstream re-derives authority a second way. Resolution order:
+
+1. `AgentCount() == 0` → `(gateless, derived)` — with zero agent reviewers there is nothing to gate on or to surface, so a declared authority cannot be honoured. Unreachable for a schema+semantically-validated spec (`spec.Validate` rejects a declaration with no agents in both the backend and the CLI); kept as defence in depth for campaign-override bytes that bypass validation.
+2. `Authority` is exactly `"gating"` or `"advisory"` → `(that mode, declared)` — an explicit declaration **wins** over the counts, so `gating` + `human>0` gates and `advisory` + `human==0` stays advisory.
+3. Any other non-empty `Authority` (out-of-enum; reachable only by bypassing the schema) falls through to (4) rather than being honoured.
+4. The count-derived ADR-027 table (`agent>0 && human==0` → gating; `agent>0 && human>0` → advisory) → `(mode, derived)`. This is the behaviour of every `Authority`-empty config, unchanged.
+
+The resolved mode + `AuthoritySource` (`declared` | `derived`) is surfaced per stage on `GET /v0/runs/{id}` as `review_authority[]` (`backend/internal/server/runs.go::buildReviewAuthorityPayload`) and mirrored on the MCP run-status `Run` struct.
+
 - Prompt: `backend/internal/prompt/prompt.go::buildPlanReview` — review-agent prompt template (structured verdict JSON, re-planning forbidden).
 - Invocation: `backend/internal/server/plan.go::handleShipPlan` invokes review agents after artifact validation when `reviewers.agent>0`; appends `plan_reviewed` audit entries; gates stage advancement when authority is gating and any verdict is reject.
 - MCP surface: `fishhawk_get_plan` surfaces `Reviews[]` in `GetPlanOutput` decoded from those audit entries (including synthesized `verdict: "skipped"` entries from `plan_review_skipped`), plus a `plan_review_status` lifecycle summary (#600) backed by the `plan_review_started` dispatch proxy.

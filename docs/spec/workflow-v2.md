@@ -77,7 +77,7 @@ The asymmetry is deliberate. **A block that determines review AUTHORITY is taken
 
 Consider file defaults `reviewers: {human: 1, agents: [a, b]}` and a stage declaring `reviewers: {agents: [c]}`. A key-wise merge resolves to `{human: 1, agents: [c]}` — the stage's agents correctly replace the default's, but `human: 1` is **supplemented from a block the author never wrote on that stage**. That is not cosmetic: the ADR-027 authority table reads `len(agents) > 0 && human == 0` as **gating** and `len(agents) > 0 && human > 0` as **advisory**, so the supplemented human converts a gating review into an arbitrable one, and nothing in the document says so.
 
-So a stage (or workflow) that **declares** `reviewers` gets that block exactly as authored, with no merge from any defaults rung. Declared or inherited — never blended.
+So a stage (or workflow) that **declares** `reviewers` gets that block exactly as authored, with no merge from any defaults rung. Declared or inherited — never blended. A block-level `reviewers.authority` (the explicit authority declaration) travels **with** the block for the same reason: it is authority, so it is taken whole from exactly one rung and is never supplemented onto a stage that declared its own `reviewers`.
 
 `executor` and `budget` keep the key-wise merge: they carry no authority semantics, and block-level replacement would make a file-level `defaults.executor.timeout` useless for every stage that declares an executor, which is nearly all of them.
 
@@ -450,6 +450,7 @@ The `reviewers` block declares who must weigh in before a stage advances (ADR-02
 
 ```yaml
 reviewers:
+  authority: advisory             # optional; advisory | gating; absent -> count-derived default
   agents:
     - provider: anthropic         # anthropic | claudecode | codex
       model: claude-opus-4-8      # optional; empty -> the provider's deployment default
@@ -467,10 +468,13 @@ reviewers:
 - **`model`** — the reviewer's model; empty means the provider's deployment-configured default. The self-review guard runs per invocation against each reviewer's returned model: if it matches the plan's own generating model the server logs a warning and does not block.
 - **`reasoning_effort`** — `low | medium | high | xhigh | max`, **codex-only** (the anthropic and claudecode adapters take no reasoning-effort parameter and ignore it). Resolved through a two-rung ladder: the deployment default (`FISHHAWKD_CODEX_REASONING_EFFORT`) < this value. A non-empty spec value is passed to the codex adapter as a CLI override; the schema enum is the sole guard before it reaches the CLI.
 - **`optional`** — the per-reviewer degradation policy when the provider is **unavailable on this deployment**. `false` (default) surfaces the gap loudly (an `ERROR` log naming the env knob plus a capability audit) but does not block; `true` is a quiet advisory skip. Either way the gap is recorded as a `reviewer_capability_unavailable` audit at run-create time and as a capability-framed `*_review_skipped` audit when the loop runs — deliberately distinct from a genuine reviewer error, because the reviewer never ran. A deployment with **no** reviewer backend wired at all is still a hard run-create failure: that is a deployment-wide misconfiguration, and `optional` does not apply to it.
+- **`authority`** — `advisory | gating`; optional. Declares **explicitly** whether this stage's agent reviewers can block, instead of leaving it inferred from the counts. See **[Authority](#authority)** below.
 - **`human`** — how many human approvals the stage's review requires.
 - **`review_timeout`** — a Go duration string setting the **floor** rung of the size-aware review-wait budget (`Floor + PerKB × ceil(promptKB)`, clamped to `[Floor, Cap]`) for **this stage's** agent reviews, so plan and implement stages can carry different review timeouts. Two-rung ladder: the deployment default (`FISHHAWKD_PLAN_REVIEW_TIMEOUT`) < this value. Only the floor is per-stage; the `PerKB` and `Cap` rungs stay deployment-level.
 
-**Authority is count-derived**, so heterogeneity changes *who* reviews, not the gating semantics:
+### Authority
+
+**When `authority` is absent, authority is count-derived** (the ADR-027 default), so heterogeneity changes *who* reviews, not the gating semantics:
 
 | Reviewers | Authority | Effect |
 |---|---|---|
@@ -478,7 +482,23 @@ reviewers:
 | `len(agents) > 0` and `human > 0` | **advisory** | Agent verdicts are surfaced and recorded as `plan_reviewed` / `implement_reviewed` audit entries, but cannot block human approval. |
 | `len(agents) == 0` | **gateless** | No agent review. Human approval, if any, proceeds unchanged. |
 
-A **gating** stage naming an unconfigured provider fails dispatch up front at run create. In **advisory** mode an unresolvable provider degrades per reviewer: a `*_review_failed` audit carries the resolve error and the loop continues with the remaining reviewers.
+**An explicit `authority` WINS over the counts.** Declare it when the count-derived reading is not the one you want: `authority: gating` alongside `human: 1` gates (agent rejections block, even though a human approver is present), and `authority: advisory` alongside `human: 0` stays advisory (agent verdicts surface but never block). Absent, the field reproduces the table above exactly, so every spec that omits it keeps byte-identical gating behavior.
+
+```yaml
+# A human approves the plan, but an agent reject still blocks it — the
+# count-derived rule would have read this as advisory.
+reviewers:
+  authority: gating
+  agents:
+    - provider: anthropic
+  human: 1
+```
+
+`gateless` is **not declarable** — it is the zero-agent outcome, not a policy. A declaration (either value) on a stage with **no agent reviewers** is rejected at validation in both the backend and `fishhawk validate`, e.g. `stage "plan": reviewers.authority: "gating" declares agent-reviewer authority but the stage configures no agent reviewers; declare at least one entry under reviewers.agents, or remove reviewers.authority to fall back to the count-derived ADR-027 default`.
+
+Declaring `authority: gating` engages the **run-creation reviewer-availability check**: a gating stage naming a provider the deployment has not configured fails **run creation** up front with `plan_reviewer_unconfigured`, rather than dispatching and degrading later. So adding `authority: gating` to an existing spec whose reviewers name an unconfigured provider will make new runs fail to start until the provider is configured (or the declaration is removed). In **advisory** mode an unresolvable provider instead degrades per reviewer: a `*_review_failed` audit carries the resolve error and the loop continues with the remaining reviewers.
+
+The resolved mode and its provenance (`declared` | `derived`) are surfaced per stage on `GET /v0/runs/{id}` as `review_authority[]`, so an operator reads the mode instead of re-deriving it.
 
 **Absent `reviewers` block:** the backend treats the stage as `{human: 1}` — one human approver. A caller reading a nil block applies that default.
 

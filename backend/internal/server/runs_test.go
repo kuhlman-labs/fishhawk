@@ -17,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -138,6 +139,376 @@ func TestGetRun_Delegation_ModelPolicy_AbsentOmitted(t *testing.T) {
 	}
 	if _, present := deleg["model_policy"]; present {
 		t.Errorf("model_policy key present on a spec with no model_policy: %v", deleg)
+	}
+}
+
+// declaredAdvisoryV2SpecYAML is a v2 spec whose plan stage DECLARES
+// reviewers.authority: advisory over agents+human:1 (E53.2 / #2225). Advisory
+// does not engage the gating run-creation reviewer-availability gate, so the
+// run is created with no PlanReviewer wired. Only the plan stage declares a
+// reviewers block, so review_authority carries exactly one entry.
+const declaredAdvisoryV2SpecYAML = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: advisory
+          agents:
+            - provider: claudecode
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// reviewAuthorityFor returns the review_authority entry for the named stage.
+func reviewAuthorityFor(t *testing.T, resp runResponse, stage string) runReviewAuthorityPayload {
+	t.Helper()
+	for _, e := range resp.ReviewAuthority {
+		if e.Stage == stage {
+			return e
+		}
+	}
+	t.Fatalf("no review_authority entry for stage %q in %+v", stage, resp.ReviewAuthority)
+	return runReviewAuthorityPayload{}
+}
+
+// TestGetRun_ReviewAuthority_Declared is the wire seam for E53.2 (#2225): a
+// run whose cached v2 spec DECLARES reviewers.authority surfaces that mode on
+// GET /v0/runs/{id} with source "declared" — the operator reads the mode
+// instead of re-deriving it.
+func TestGetRun_ReviewAuthority_Declared(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredAdvisoryV2SpecYAML,
+	})
+
+	resp, raw := getRunResponse(t, s, runID)
+	got := reviewAuthorityFor(t, resp, "plan")
+	if got.Authority != "advisory" || got.Source != "declared" {
+		t.Errorf("plan review_authority = %+v, want {authority:advisory source:declared}", got)
+	}
+	if got.StageType != "plan" {
+		t.Errorf("plan review_authority stage_type = %q, want plan", got.StageType)
+	}
+	// Only the plan stage declares reviewers, so exactly one entry is present.
+	if len(resp.ReviewAuthority) != 1 {
+		t.Errorf("review_authority = %+v, want exactly the plan entry", resp.ReviewAuthority)
+	}
+	if _, present := raw["review_authority"]; !present {
+		t.Errorf("review_authority key absent from the raw body: %v", raw)
+	}
+}
+
+// TestGetRun_ReviewAuthority_Derived is the derived-provenance mirror: a spec
+// that declares reviewers but NOT authority surfaces the count-derived mode
+// with source "derived" (ruling 1 — the response is emitted for derived stages
+// too, so an operator never re-derives).
+func TestGetRun_ReviewAuthority_Derived(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	// Same spec minus the explicit authority line — the counts (agents+human:1)
+	// derive to advisory.
+	derived := strings.Replace(declaredAdvisoryV2SpecYAML, "          authority: advisory\n", "", 1)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": derived,
+	})
+
+	resp, _ := getRunResponse(t, s, runID)
+	got := reviewAuthorityFor(t, resp, "plan")
+	if got.Authority != "advisory" || got.Source != "derived" {
+		t.Errorf("plan review_authority = %+v, want {authority:advisory source:derived}", got)
+	}
+}
+
+// TestGetRun_ReviewAuthority_OmittedNoReviewers is condition 1's byte-identical
+// scope: a run whose spec declares NO reviewers block anywhere omits the
+// review_authority field entirely (nil + key absent), keeping the response
+// byte-identical to a pre-#2225 response.
+func TestGetRun_ReviewAuthority_OmittedNoReviewers(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	// A minimal v2 spec: plan + implement, no reviewers block on either.
+	const noReviewersSpec = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": noReviewersSpec,
+	})
+
+	resp, raw := getRunResponse(t, s, runID)
+	if resp.ReviewAuthority != nil {
+		t.Errorf("review_authority = %+v, want nil when no stage declares reviewers", resp.ReviewAuthority)
+	}
+	if _, present := raw["review_authority"]; present {
+		t.Errorf("review_authority key present on a spec with no reviewers block: %v", raw)
+	}
+}
+
+// TestShipPlan_DeclaredAuthority_FlipsReviewLoopBlocking is the cross-boundary
+// proof for E53.2 (#2225) at the spec -> resolver -> review-loop seam: a
+// DECLARED reviewers.authority flips the plan-review loop's blocking decision
+// AWAY from the count-derived default. Half A: authority: gating with human: 1
+// (which the count rule would read as ADVISORY) BLOCKS on an agent reject —
+// the stage is transitioned to failed-B and the plan_reviewed payload carries
+// gating authority. Half B: authority: advisory with human: 0 (which the count
+// rule would read as GATING) does NOT block — the reject is recorded but the
+// stage is never failed. This uses the shared package-server ship-plan harness
+// (newPlanServerWithReviewer / shipPlanRequest, defined in plan_test.go).
+func TestShipPlan_DeclaredAuthority_FlipsReviewLoopBlocking(t *testing.T) {
+	// Declared gating over agents+human:1 — count-derived would be advisory.
+	const declaredGatingV2 = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: gating
+          agents:
+            - provider: claudecode
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+	// Declared advisory over agents+human:0 — count-derived would be gating.
+	const declaredAdvisoryV2 = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: advisory
+          agents:
+            - provider: claudecode
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+	planReviewedAuthority := func(t *testing.T, au *auditFake) planreview.AuthorityMode {
+		t.Helper()
+		for _, e := range au.appended {
+			if e.Category != "plan_reviewed" {
+				continue
+			}
+			var p planreview.PlanReviewedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode plan_reviewed: %v", err)
+			}
+			return p.Authority
+		}
+		t.Fatal("no plan_reviewed audit entry")
+		return ""
+	}
+	stageFailed := func(rr *promptRunRepo, stageID uuid.UUID) bool {
+		for _, call := range rr.transitionStageCalls {
+			if call.StageID == stageID && call.To == run.StageStateFailed {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("declared gating blocks a reject despite human:1", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, FreeForm: "incomplete"},
+			model:   "claude-sonnet-4-6",
+		}
+		s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, []byte(declaredGatingV2))
+		priv, _ := sf.issue(t, runID)
+		w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		if got := planReviewedAuthority(t, au); got != planreview.AuthorityGating {
+			t.Errorf("authority = %q, want gating (declared wins over the advisory count rule)", got)
+		}
+		if !stageFailed(rr, stageID) {
+			t.Errorf("declared gating: stage was not blocked (failed) on reject; transitions = %+v", rr.transitionStageCalls)
+		}
+	})
+
+	t.Run("declared advisory does not block a reject despite human:0", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		reviewer := &fakePlanReviewer{
+			verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, FreeForm: "incomplete"},
+			model:   "claude-sonnet-4-6",
+		}
+		s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, []byte(declaredAdvisoryV2))
+		priv, _ := sf.issue(t, runID)
+		w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), "")
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		// Advisory review runs detached; drain it before asserting.
+		s.waitBackgroundReviews()
+		if got := planReviewedAuthority(t, au); got != planreview.AuthorityAdvisory {
+			t.Errorf("authority = %q, want advisory (declared wins over the gating count rule)", got)
+		}
+		if stageFailed(rr, stageID) {
+			t.Errorf("declared advisory: stage must NOT be blocked (failed) on reject; transitions = %+v", rr.transitionStageCalls)
+		}
+	})
+}
+
+// TestBuildReviewAuthorityPayload_Degrades exercises the fail-closed branches
+// of buildReviewAuthorityPayload directly (E53.2 / #2225): a run with no cached
+// spec, an unparseable cached spec, and a spec missing the run's workflow each
+// degrade to nil (field omitted) rather than failing the read.
+func TestBuildReviewAuthorityPayload_Degrades(t *testing.T) {
+	s := newServer(t, newFakeRepo())
+	cases := []struct {
+		name string
+		run  *run.Run
+	}{
+		{"no cached spec", &run.Run{ID: uuid.New(), WorkflowID: "feature_change"}},
+		{"unparseable spec", &run.Run{ID: uuid.New(), WorkflowID: "feature_change", WorkflowSpec: []byte("::: not yaml :::")}},
+		{"workflow missing from spec", &run.Run{ID: uuid.New(), WorkflowID: "absent", WorkflowSpec: []byte(declaredAdvisoryV2SpecYAML)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := s.buildReviewAuthorityPayload(tc.run); got != nil {
+				t.Errorf("buildReviewAuthorityPayload = %+v, want nil (degrade)", got)
+			}
+		})
+	}
+}
+
+// declaredGatingV2SpecYAML is a v2 plan stage whose reviewers DECLARE
+// authority: gating over agents+human:1 (E53.2 / #2225). The count-derived rule
+// would read agents+human:1 as ADVISORY, so the declaration is what engages the
+// run-creation reviewer-availability gate.
+const declaredGatingV2SpecYAML = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          authority: gating
+          agents:
+            - provider: claudecode
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestCreateRun_DeclaredGating_NilReviewer_Rejected is condition 2 (E53.2 /
+// #2225): declaring authority: gating newly engages the run-creation
+// reviewer-availability hard-fail at runs.go:739, so a declared-gating plan
+// stage on a deployment with NO reviewer backend wired is rejected with 400 +
+// plan_reviewer_unconfigured, while the SAME stage WITHOUT the declaration
+// (agents+human:1, derived advisory) is still created. This proves the
+// behaviour change the plan flagged in risk prose is real and correct.
+func TestCreateRun_DeclaredGating_NilReviewer_Rejected(t *testing.T) {
+	postCreate := func(t *testing.T, spec string) (*httptest.ResponseRecorder, *fakeRepo, *auditFake) {
+		t.Helper()
+		repo := newFakeRepo()
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au})
+		body, _ := json.Marshal(map[string]any{
+			"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+			"trigger_source": "cli", "workflow_spec": spec,
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		s.handleCreateRun(w, withAuth(req))
+		return w, repo, au
+	}
+
+	// (a) Declared gating is rejected — no PlanReviewer wired.
+	w, repo, au := postCreate(t, declaredGatingV2SpecYAML)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("declared-gating status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_reviewer_unconfigured"`) {
+		t.Errorf("body missing plan_reviewer_unconfigured code: %s", w.Body.String())
+	}
+	if len(repo.runs) != 0 {
+		t.Errorf("expected zero runs created for the rejected declared-gating spec, got %d", len(repo.runs))
+	}
+	// The operational audit trail must record the rejection: a
+	// run_rejected_misconfigured global entry whose payload carries the
+	// plan_reviewer_unconfigured reason. Asserting only the HTTP code would let a
+	// regression that dropped this audit (losing the operator-visible record of
+	// why the run was refused) still pass.
+	var foundReject bool
+	for _, e := range au.globalAppended {
+		if e.Category != "run_rejected_misconfigured" {
+			continue
+		}
+		foundReject = true
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("run_rejected_misconfigured payload not JSON: %v", err)
+		}
+		if p["reason"] != "plan_reviewer_unconfigured" {
+			t.Errorf("run_rejected_misconfigured reason = %v, want plan_reviewer_unconfigured", p["reason"])
+		}
+		if p["stage"] != "plan" {
+			t.Errorf("run_rejected_misconfigured stage = %v, want plan", p["stage"])
+		}
+	}
+	if !foundReject {
+		t.Errorf("expected a run_rejected_misconfigured audit entry, got %+v", au.globalAppended)
+	}
+
+	// (b) The SAME stage WITHOUT the declaration derives to advisory and is
+	// created — the reviewer-availability gate only fires for gating.
+	derived := strings.Replace(declaredGatingV2SpecYAML, "          authority: gating\n", "", 1)
+	w2, _, au2 := postCreate(t, derived)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("un-declared (derived advisory) status = %d, want 201:\n%s", w2.Code, w2.Body.String())
+	}
+	for _, e := range au2.globalAppended {
+		if e.Category == "run_rejected_misconfigured" {
+			t.Errorf("derived-advisory run must not emit run_rejected_misconfigured")
+		}
 	}
 }
 
