@@ -3887,3 +3887,108 @@ func TestShipPlan_OverCapSplitReject_EndToEnd(t *testing.T) {
 		}
 	})
 }
+
+// --- applies_to `paths` plan gate, wired end to end (E53.3 / #2226) -------
+//
+// The unit-level branch matrix lives in applies_to_plan_gate_test.go. These
+// two drive the REAL handler so the wiring itself is pinned: a gate that is
+// correct but unreachable from handleShipPlan enforces nothing, and every
+// unit test would still pass.
+
+// appliesToPlanGateRun seeds a run whose workflow-spec snapshot declares a
+// docs-only applies_to and whose gated plan stage is already `running` — the
+// post-trace state of the #603 sequence, which is what lets a cleared plan
+// advance to the approval gate.
+func appliesToPlanGateRun(t *testing.T, rr *recordingOrchestratorRepo, sf *signingFake) (*run.Run, *run.Stage, ed25519.PrivateKey) {
+	t.Helper()
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "guarded"
+	runRow.WorkflowSpec = []byte(pathsAppliesToSpec(`"docs/**"`))
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	return runRow, planStage, priv
+}
+
+// TestShipPlan_AppliesToPathsViolation_FailsB is E2E-2: a plan whose
+// scope.files violates the workflow's applies_to `paths` criterion is refused
+// at the plan gate through the SAME terminal path the over-cap reject uses —
+// a plan_review_failed entry, the stage in failed (category-B) and the run
+// advanced to terminal failed rather than stranded, with the stage never
+// reaching the approval gate.
+//
+// The plan ARTIFACT must still be stored: the gate runs after the artifact is
+// persisted and audited precisely so the operator can inspect the rejected
+// plan via fishhawk_get_plan rather than being told "no" with nothing to read.
+func TestShipPlan_AppliesToPathsViolation_FailsB(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow, planStage, priv := appliesToPlanGateRun(t, rr, sf)
+
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/server/runs.go", Operation: plan.FileOpModify},
+	})
+	w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201 (the artifact is stored; the gate rejects after):\n%s", w.Code, w.Body.String())
+	}
+
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", got)
+	}
+	if got := rr.runs[runRow.ID].State; got != run.StateFailed {
+		t.Errorf("run state = %q, want failed (the run must not strand)", got)
+	}
+	if rr.sawTransitionTo(run.StageStateAwaitingApproval) {
+		t.Errorf("a plan refused by applies_to must never reach the approval gate\ntransitions: %+v", rr.stageTransitions)
+	}
+	if len(art.all) != 1 {
+		t.Errorf("artifacts = %d, want the rejected plan still stored and readable", len(art.all))
+	}
+
+	var failed *audit.ChainAppendParams
+	au.mu.Lock()
+	for i, e := range au.appended {
+		if e.Category == "plan_review_failed" {
+			failed = &au.appended[i]
+		}
+	}
+	au.mu.Unlock()
+	if failed == nil {
+		t.Fatal("want a plan_review_failed audit entry (the reused category — this control adds none)")
+	}
+	for _, want := range []string{"guarded", "paths", "docs/**", "backend/internal/server/runs.go"} {
+		if !strings.Contains(string(failed.Payload), want) {
+			t.Errorf("plan_review_failed payload missing %q\ngot: %s", want, failed.Payload)
+		}
+	}
+}
+
+// TestShipPlan_AppliesToPathsSatisfied_AdvancesToGate is the positive control
+// for the wiring, and it is the assertion that would catch a gate which
+// refuses everything: a docs-only plan under the same docs-only declaration
+// clears the gate and the stage advances to the approval gate exactly as it
+// would with no applies_to declared at all.
+func TestShipPlan_AppliesToPathsSatisfied_AdvancesToGate(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow, planStage, priv := appliesToPlanGateRun(t, rr, sf)
+
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "docs/ARCHITECTURE.md", Operation: plan.FileOpModify},
+		{Path: "docs/METHODOLOGY.md", Operation: plan.FileOpModify},
+	})
+	w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (a satisfying plan must clear the gate)", got)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == "plan_review_failed" {
+			t.Fatalf("a satisfying plan must not produce a plan_review_failed entry: %s", e.Payload)
+		}
+	}
+}
