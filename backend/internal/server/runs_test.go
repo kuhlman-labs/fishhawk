@@ -990,3 +990,102 @@ func TestEmitReviewerCapabilityUnavailable_StampsIdentityAccount(t *testing.T) {
 		t.Fatalf("AccountID = %v, want %s", got.AccountID, acct)
 	}
 }
+
+// --- W3: issue_context.labels survives the create → persist → read round-trip ---
+//
+// The seam test the operator named: labels are fetched by a client, shipped
+// inline on POST /v0/runs, marshalled into the runs.issue_context JSONB
+// snapshot, and read back by BOTH applies_to evaluation points. A field
+// dropped anywhere along that path leaves every labels-declaring workflow
+// rejecting every legitimate run, while per-layer unit tests all pass.
+
+// appliesToLabelsSpecYAML is a v2 spec whose workflow declares no applies_to,
+// so this test isolates the PLUMBING from the gate: labels must round-trip
+// whether or not anything evaluates them.
+const appliesToLabelsSpecYAML = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+func TestCreateRun_W3_IssueContextLabels_RoundTripThroughPersistedRun(t *testing.T) {
+	s, _, _, _ := newDelegationServer(t)
+	w := createRunViaHandler(t, s, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "github_issue", "workflow_spec": appliesToLabelsSpecYAML,
+		"issue_context": map[string]any{
+			"title": "t", "body": "b", "url": "https://example.invalid/i/7", "number": 7,
+			"labels": []string{"dependencies", "area:backend"},
+		},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the run back through GET /v0/runs/{id} — the PERSISTED row, not
+	// the create response — so the assertion covers the store round-trip the
+	// two evaluation points depend on.
+	resp, raw := getRunResponse(t, s, created.ID)
+	if resp.IssueContext == nil {
+		t.Fatal("issue_context missing from the persisted run")
+	}
+	if got := strings.Join(resp.IssueContext.Labels, ","); got != "dependencies,area:backend" {
+		t.Errorf("issue_context.labels = %q, want the two posted labels in order", got)
+	}
+	// And on the raw wire, under exactly the key both clients marshal.
+	ic, _ := raw["issue_context"].(map[string]any)
+	if ic == nil || ic["labels"] == nil {
+		t.Errorf("raw issue_context = %+v, want a `labels` key — a renamed tag silently drops the field", ic)
+	}
+}
+
+// TestCreateRun_W3_LegacyIssueContext_LoadsAsNilLabels is the back-compat
+// half: a pre-#2226 payload carrying NO `labels` key must still load. This is
+// what makes the claim "additive, no migration" checkable rather than
+// asserted — the same shape #618 relied on for `comments`.
+func TestCreateRun_W3_LegacyIssueContext_LoadsAsNilLabels(t *testing.T) {
+	s, _, _, _ := newDelegationServer(t)
+	w := createRunViaHandler(t, s, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "github_issue", "workflow_spec": appliesToLabelsSpecYAML,
+		"issue_context": map[string]any{
+			"title": "t", "body": "b", "url": "https://example.invalid/i/7", "number": 7,
+		},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a labels-less legacy payload must still create a run:\n%s", w.Code, w.Body.String())
+	}
+	var created runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	resp, raw := getRunResponse(t, s, created.ID)
+	if resp.IssueContext == nil {
+		t.Fatal("issue_context missing")
+	}
+	if resp.IssueContext.Labels != nil {
+		t.Errorf("labels = %+v, want nil for a payload that never carried the key", resp.IssueContext.Labels)
+	}
+	if ic, _ := raw["issue_context"].(map[string]any); ic != nil {
+		if _, present := ic["labels"]; present {
+			t.Error("an empty label set serialized a `labels` key; omitempty keeps legacy payloads byte-identical")
+		}
+	}
+}

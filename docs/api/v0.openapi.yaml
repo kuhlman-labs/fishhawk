@@ -1827,13 +1827,15 @@ components:
     IssueContext:
       type: object
       description: |
-        Cached GitHub issue payload — title, body, url, number, and
-        comments — fetched by the operator's `gh issue view` at
-        run-create time so the backend's prompt builder doesn't
-        need an installation_id to look up the issue (#415). The
-        optional `comments` array carries the issue's comments so the
-        plan agent sees refinements/decisions posted as comments, not
-        just the title+body snapshot (#618).
+        Cached GitHub issue payload — title, body, url, number,
+        comments and labels — fetched by the operator's
+        `gh issue view` at run-create time so the backend's prompt
+        builder doesn't need an installation_id to look up the issue
+        (#415). The optional `comments` array carries the issue's
+        comments so the plan agent sees refinements/decisions posted
+        as comments, not just the title+body snapshot (#618). The
+        optional `labels` array is the sole producer for a workflow's
+        `applies_to` `labels` criterion (E53.3 / #2226).
       required: [title, body, url, number]
       properties:
         title:
@@ -1864,6 +1866,24 @@ components:
               created_at:
                 type: string
                 format: date-time
+        labels:
+          type: array
+          description: |
+            The issue's label NAMES, captured at run-create time from
+            `gh issue view --json labels` (E53.3 / #2226). Optional
+            and additive — runs whose issue_context predates #2226
+            omit the field, and it is persisted inside the existing
+            `runs.issue_context` JSONB snapshot with no migration.
+
+            This is the ONLY producer for a workflow's `applies_to`
+            `labels` criterion, and the snapshot is IMMUTABLE for the
+            life of the run: both `applies_to` evaluation points read
+            this one value rather than re-reading mutable forge
+            state. An absent or empty array is an EMPTY label set,
+            which FAILS CLOSED against a labels-declaring workflow —
+            it is never read as match-all.
+          items:
+            type: string
 
     Stage:
       type: object
@@ -4313,6 +4333,35 @@ paths:
                     matters at the moment a budget would block. There
                     is no override on the webhook-dispatch path
                     (webhook triggers can't carry one).
+                applies_to_override:
+                  type: boolean
+                  description: |
+                    Optional. Operator force-past for the requested
+                    workflow's `applies_to` routing declaration
+                    (E53.3 / #2226 / ADR-066 fork 4). When the
+                    workflow declares an `applies_to` predicate the
+                    change does not satisfy, the run is normally
+                    refused with `422 workflow_not_applicable` and no
+                    run row is created. Setting this `true` admits
+                    the run anyway and records a RUN-SCOPED
+                    `run_admitted_applies_to_override` audit entry —
+                    that entry, not this field, is the override's
+                    source of truth, and the deferred plan-gate check
+                    looks it up to suppress its own rejection.
+                    `applies_to_override_reason` is REQUIRED
+                    alongside it. Ignored when the declaration
+                    already accepts the change.
+                applies_to_override_reason:
+                  type: string
+                  description: |
+                    REQUIRED when `applies_to_override` is true: the
+                    operator's justification for routing a change
+                    through a workflow whose `applies_to` declaration
+                    refuses it. An empty or whitespace-only value is
+                    a `400 validation_failed` and admits nothing, so
+                    a bypass of a governance control is never
+                    unexplained. Recorded verbatim on the
+                    `run_admitted_applies_to_override` audit entry.
                 upstream_run_id:
                   type: [string, "null"]
                   format: uuid
@@ -4368,6 +4417,22 @@ paths:
             the spec (#413). `repo_not_installed` when the App is
             absent from the target repo; `spec_not_found` when the
             file doesn't exist at the requested `workflow_sha`.
+
+            Also `workflow_not_applicable` (E53.3 / #2226) when the
+            requested workflow declares an `applies_to` predicate the
+            change does not satisfy. No run row is created. The
+            message names the workflow, the criterion that failed,
+            the value observed, and which workflows the change WOULD
+            satisfy; `details` carries `criterion`, `required`,
+            `observed`, `satisfying_workflows` and
+            `absent_issue_context`. Clear it by amending the
+            workflow's `applies_to` declaration, starting the run
+            under a workflow that accepts the change, or retrying
+            with `applies_to_override` plus a reason. An issue-less
+            run (`trigger_source` `cli` / `ui`) carries an EMPTY
+            label set and is refused by any labels-declaring
+            workflow — this is by design, and the message says so
+            explicitly rather than reporting a generic mismatch.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

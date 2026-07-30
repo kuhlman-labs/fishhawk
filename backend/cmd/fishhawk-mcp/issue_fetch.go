@@ -54,10 +54,18 @@ func resolveIssueRef(raw string) (int, error) {
 }
 
 // ghIssue is the subset of `gh issue view --json
-// title,body,url,number,comments` output the MCP server consumes. gh
-// emits camelCase; mirror it verbatim so the JSON decoder picks the
-// right keys. Each comment carries a nested `author` object (we read
-// its `login`), plus `body` and `createdAt`.
+// title,body,url,number,comments,labels` output the MCP server
+// consumes. gh emits camelCase; mirror it verbatim so the JSON decoder
+// picks the right keys. Each comment carries a nested `author` object
+// (we read its `login`), plus `body` and `createdAt`.
+//
+// Labels are likewise nested OBJECTS, not strings — `gh issue view
+// --json labels` emits `[{"id":…,"name":"dependencies","color":…}]`,
+// the same shape as the sibling `comments[].author` decode above — so
+// the projection to names happens here (E53.3 / #2226). A payload with
+// no `labels` key decodes to a nil slice and the run carries an EMPTY
+// label set, which the applies_to admission gate treats as fail-closed
+// against a labels-declaring workflow rather than as match-all.
 type ghIssue struct {
 	Title    string `json:"title"`
 	Body     string `json:"body"`
@@ -70,11 +78,14 @@ type ghIssue struct {
 		Body      string `json:"body"`
 		CreatedAt string `json:"createdAt"`
 	} `json:"comments"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
 }
 
 // fetchIssueViaGh shells to `gh issue view N --repo owner/name
-// --json title,body,url,number,comments` and returns the parsed
-// result.
+// --json title,body,url,number,comments,labels` and returns the
+// parsed result.
 //
 // Best-effort by design — when `gh` is missing, unauthed, or the
 // repo blocks the operator, the startRun handler logs a warning to
@@ -91,7 +102,7 @@ func fetchIssueViaGh(repo string, issueNumber int) (*IssueContext, error) {
 		return nil, ErrGhNotInstalled
 	}
 	cmd := ghIssueCommand("gh", "issue", "view", strconv.Itoa(issueNumber),
-		"--repo", repo, "--json", "title,body,url,number,comments")
+		"--repo", repo, "--json", "title,body,url,number,comments,labels")
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -117,6 +128,9 @@ func fetchIssueViaGh(repo string, issueNumber int) (*IssueContext, error) {
 			Body:      c.Body,
 			CreatedAt: c.CreatedAt,
 		})
+	}
+	for _, l := range iss.Labels {
+		ic.Labels = append(ic.Labels, l.Name)
 	}
 	return ic, nil
 }

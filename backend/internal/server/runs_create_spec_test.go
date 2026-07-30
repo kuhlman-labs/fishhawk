@@ -1359,3 +1359,93 @@ func TestCreateRun_ModelValidity_FailOpen(t *testing.T) {
 		})
 	}
 }
+
+// --- M14: the applies_to gate fires on BOTH spec-resolution paths (#2226) ---
+//
+// The gate is wired once, after the inline-spec and GitHub-fetch branches
+// converge on workflowDef — but "converge" is a claim about control flow, and
+// a future refactor that resolves the fetched spec later (or returns early
+// from it) would silently leave every GitHub-fetched run ungated. These two
+// cases assert the SAME refusal reaches an operator whichever way the spec was
+// resolved.
+
+// appliesToGuardedSpecYAML is gatedSpecYAML's shape at workflow-v2 with a
+// labels declaration on the requested workflow, so the change under test does
+// not satisfy it.
+const appliesToGuardedSpecYAML = `version: "2"
+workflows:
+  feature_change:
+    applies_to:
+      labels:
+        - dependencies
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+func TestCreateRun_AppliesTo_M14_FiresOnGitHubFetchPath(t *testing.T) {
+	repo := newFakeRepo()
+	fake := newFakeGitHubForRuns(appliesToGuardedSpecYAML)
+	ghSrv := fake.server(t)
+	s := newServerWithGitHub(t, repo, ghSrv)
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "deadbeef",
+		"trigger_source": "cli",
+		// workflow_spec omitted — the GitHub-fetch resolution path.
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 — the fetched spec's applies_to must gate exactly as an inline one does:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeErrorEnvelope(t, w).Code; got != "workflow_not_applicable" {
+		t.Errorf("code = %q, want workflow_not_applicable", got)
+	}
+	if n := len(repo.runs); n != 0 {
+		t.Errorf("created %d run rows; the refusal is pre-insert and must leave none", n)
+	}
+}
+
+func TestCreateRun_AppliesTo_M14_FiresOnInlineSpecPath(t *testing.T) {
+	repo := newFakeRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "deadbeef",
+		"trigger_source": "cli",
+		"workflow_spec":  appliesToGuardedSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if got := decodeErrorEnvelope(t, w).Code; got != "workflow_not_applicable" {
+		t.Errorf("code = %q, want workflow_not_applicable", got)
+	}
+	if n := len(repo.runs); n != 0 {
+		t.Errorf("created %d run rows; the refusal is pre-insert and must leave none", n)
+	}
+}
