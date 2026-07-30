@@ -11,44 +11,23 @@
 # When the product can execute this spec, the syntax may be revised to
 # match the frozen v0 schema. The intent expressed here will not change.
 
-version: "1.3"
-
-roles:
-  founder:
-    members: ["@kuhlman-labs"]
-  # Additional roles will be added as the team grows.
-
+version: "2"
 workflows:
-
   # Medium autonomy — the default for most product work.
   # Agent implements; human approves the plan; human approves the PR; the
   # acceptance agent validates the merged-candidate against the plan's
   # acceptance_criteria before the human-gated merge (ADR-049, E31).
   feature_change:
     description: >-
-      Default workflow for feature work and non-trivial changes, extended with
-      a runner-hosted advisory acceptance stage (ADR-049). Human approves plan
-      and PR; agent implements; the acceptance agent validates the running
-      instance against the approved plan's acceptance_criteria.
+      Default workflow for feature work and non-trivial changes, extended with a runner-hosted advisory acceptance stage (ADR-049). Human approves plan and PR; agent implements; the acceptance agent validates the running instance against the approved plan's acceptance_criteria.
     # Drive mode (#1023): fishhawkd auto-advances mechanical transitions
     # (review settlement, fixup re-park, derived awaiting_merge) and
     # surfaces next_action; judgment points still park for the human.
-    drive: true
+    auto_advance: true
     # Operator-agent delegation (ADR-040 D2 / #1026, dogfood #1028):
     # the medium autonomy preset per METHODOLOGY.md — approve/fixup/retry
     # delegated under their named conditions; waive and merge stay human.
-    operator_agent:
-      may_approve: clean_dual_approval
-      may_route_fixup: convergent_concerns
-      may_retry: infra_flake
-      must_page_human:
-        - reviewer_reject
-        - plan_rejection
-        - scope_amendment
-        - budget_override
-        - policy_override
-        - exception_request
-        - requirement_arbitration
+    autonomy: medium
     policy:
       max_stage_runtime: "30m"
     # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a
@@ -68,7 +47,6 @@ workflows:
     # regression without forcing the reviewer back into the loop.
     on_ci_failure:
       max_retries: 1
-
     stages:
       - id: plan
         type: plan
@@ -111,13 +89,18 @@ workflows:
                 mode: canonical
         budget:
           max_tokens: 200000
-          max_runtime_minutes: 15
+          max_runtime: 15m
           enforcement: advisory
         gates:
           - type: approval
-            approvers:
-              any_of: [founder]
-
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              # Restored by hand at the v1->v2 migration: the legacy `approvers`
+              # form carried no source for an exclusion, so the codemod reported
+              # this gate as WIDENED rather than inventing one. Matches the
+              # shipped presets' ADR-055 default.
+              not: [author, agent]
       - id: implement
         type: implement
         executor:
@@ -173,20 +156,19 @@ workflows:
           # category-B at 32 files on a plan the gate had approved with a
           # 32-file scope — the cap lagged real feature sizes. Plan-gate
           # coherence pre-check (scope.files vs this cap) tracked separately.
-          - max_files_changed: 45
-          - forbidden_paths:
-              - ".github/workflows/**"
-              - ".fishhawk/**"
-              - "LICENSE"
-              - "NOTICE"
-          - required_outcomes:
-              - tests_added_or_updated
-              - ci_green
+          max_files_changed: 45
+          forbidden_paths:
+            - ".github/workflows/**"
+            - ".fishhawk/**"
+            - "LICENSE"
+            - "NOTICE"
+          required_outcomes:
+            - tests_added_or_updated
+            - ci_green
         budget:
           max_tokens: 500000
-          max_runtime_minutes: 30
+          max_runtime: 30m
           enforcement: advisory
-
       - id: review
         type: review
         executor:
@@ -196,9 +178,14 @@ workflows:
             from_stage: implement
         gates:
           - type: approval
-            approvers:
-              any_of: [founder]
-
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              # Restored by hand at the v1->v2 migration: the legacy `approvers`
+              # form carried no source for an exclusion, so the codemod reported
+              # this gate as WIDENED rather than inventing one. Matches the
+              # shipped presets' ADR-055 default.
+              not: [author, agent]
       # Runner-hosted advisory acceptance stage (ADR-049 / #1519, E31). It
       # rides the ordinary agent executor branch — never `delegate` (deploy-
       # only) — and carries no pre-flight deploy constraint or `deployment`
@@ -235,19 +222,15 @@ workflows:
           - artifact: acceptance
         budget:
           max_tokens: 200000
-          max_runtime_minutes: 20
+          max_runtime: 20m
           enforcement: advisory
-
   # Low autonomy — human-led work.
   # Used for cryptographic, policy, and audit-integrity surfaces.
   # The workflow exists to record the work in the audit log; the agent
   # is not the author. See docs/METHODOLOGY.md for what falls under this.
   human_led_change:
     description: >-
-      Workflow for human-authored changes to load-bearing surfaces
-      (crypto, policy engine, audit integrity, GitHub App auth).
-      The audit log records what was changed and who approved it.
-
+      Workflow for human-authored changes to load-bearing surfaces (crypto, policy engine, audit integrity, GitHub App auth). The audit log records what was changed and who approved it.
     stages:
       - id: review
         type: review
@@ -258,16 +241,20 @@ workflows:
             required: true
         gates:
           - type: approval
-            approvers:
-              any_of: [founder]
-
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              # Restored by hand at the v1->v2 migration: the legacy `approvers`
+              # form carried no source for an exclusion, so the codemod reported
+              # this gate as WIDENED rather than inventing one. Matches the
+              # shipped presets' ADR-055 default.
+              not: [author, agent]
   # High autonomy — agent implements and merges if gates pass.
   # Reserved for low-risk, high-volume work where the cost of a mistake
   # is contained and CI is a sufficient check.
   routine_change:
     description: >-
-      Workflow for documentation, dependency bumps, lint/format fixes,
-      and tests for existing behavior. Agent may merge if all gates pass.
+      Workflow for documentation, dependency bumps, lint/format fixes, and tests for existing behavior. Agent may merge if all gates pass.
     # High-autonomy auto-retry (#276). Routine_change is the
     # canonical case for self-healing: the human never approved
     # anything; the agent's job is to keep the change merging
@@ -275,7 +262,6 @@ workflows:
     # flaky CI and not spinning forever on a real bug.
     on_ci_failure:
       max_retries: 1
-
     stages:
       - id: implement
         type: implement
@@ -284,16 +270,15 @@ workflows:
         produces:
           - artifact: pull_request
         constraints:
-          - max_files_changed: 20
-          - allowed_paths:
-              - "docs/**"
-              - "**/*.md"
-              - "go.mod"
-              - "go.sum"
-              - "**/*_test.go"
-          - required_outcomes:
-              - ci_green
-
+          max_files_changed: 20
+          allowed_paths:
+            - "docs/**"
+            - "**/*.md"
+            - "go.mod"
+            - "go.sum"
+            - "**/*_test.go"
+          required_outcomes:
+            - ci_green
       - id: review
         type: review
         executor:
@@ -305,7 +290,6 @@ workflows:
           # side gate is degenerate now — it just lets the run
           # advance once branch protection clears.
           - type: check
-
   # Delegating deploy (ADR-038 / E23, workflow-v1). Operator-triggered
   # after the corresponding feature_change run merges. Fishhawk holds no
   # deploy logic or credentials: the deploy stage TRIGGERS an external
@@ -326,18 +310,14 @@ workflows:
   # loop without touching real infrastructure.
   release:
     description: >-
-      Delegating deploy workflow (ADR-038): triggers an external release
-      pipeline via workflow_dispatch and monitors it to terminal. Fishhawk
-      holds no deploy logic or credentials. Operator-triggered after the
-      feature_change run merges.
+      Delegating deploy workflow (ADR-038): triggers an external release pipeline via workflow_dispatch and monitors it to terminal. Fishhawk holds no deploy logic or credentials. Operator-triggered after the feature_change run merges.
     # Drive mode (#1023): surface next_action and auto-advance mechanical
     # transitions; the deploy approval below still parks for the human (no
     # operator_agent delegation is configured, so a production deploy always
     # pages rather than auto-approving).
-    drive: true
+    auto_advance: true
     policy:
       max_stage_runtime: "30m"
-
     stages:
       - id: deploy
         type: deploy
@@ -350,11 +330,17 @@ workflows:
         # Pre-flight deploy constraints (evaluated BEFORE execution at the
         # gate). change_freeze:false declares the surface without blocking.
         constraints:
-          - allowed_environments: [staging, production]
-          - change_freeze: false
+          allowed_environments: [staging, production]
+          change_freeze: false
         produces:
           - artifact: deployment
         gates:
           - type: approval
-            approvers:
-              any_of: [founder]
+            approvals:
+              count: 1
+              members: [kuhlman-labs]
+              # Restored by hand at the v1->v2 migration: the legacy `approvers`
+              # form carried no source for an exclusion, so the codemod reported
+              # this gate as WIDENED rather than inventing one. Matches the
+              # shipped presets' ADR-055 default.
+              not: [author, agent]
