@@ -147,7 +147,7 @@ v2 deletes the legacy GitHub-handle gate `approvers` role allow-list and the top
 
 ## Workflow routing declaration — `applies_to` (E53.3 / #2226)
 
-`$defs/workflow` gains an optional `applies_to` that `$ref`s `$defs/predicate` unchanged, decoding onto `Workflow.AppliesTo *Predicate`. It declares which changes a workflow may be used for. **This package ships the SPEC SURFACE only** — the property parses, round-trips and validates, and nothing consults it; the two fail-closed enforcement points (`labels`/`trigger` at run admission, `paths` at the plan gate) live in `backend/internal/server` and land in the sibling slices of #2226.
+`$defs/workflow` gains an optional `applies_to` that `$ref`s `$defs/predicate` unchanged, decoding onto `Workflow.AppliesTo *Predicate`. It declares which changes a workflow may be used for. **This package owns the SPEC SURFACE** — the property parses, round-trips and validates here; the two fail-closed enforcement points that consume it are LIVE and live in `backend/internal/server` (`labels`/`trigger` at run admission in `applies_to.go`, `paths` at the plan gate in `applies_to_plan_gate.go`), with the audited `applies_to_override` as the one sanctioned way past either.
 
 - **`$ref`, not a second matcher.** The consumer points at the shared definition and leaves it untouched. Where `applies_to` needs a narrower grammar than the predicate offers it refuses the criterion at ITS OWN declaration site rather than editing the shared shape — which is what keeps #2227 and #2211 able to use the full grammar. Nothing in `predicate.go` changed for this consumer.
 

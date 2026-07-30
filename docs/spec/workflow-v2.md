@@ -300,7 +300,7 @@ The `paths` deferral is not a weakening. At admission a code-change run has no p
 
 `extends` folds **stages** only, so a deriving workflow does not inherit its base's `applies_to`; declare the routing predicate on each workflow that needs one. This matches every other non-stage member (`budgets`, `policy`, `decomposition`, `autonomy` are likewise not inherited).
 
-> As of the slice that introduced it, `applies_to` is **declared but not yet enforced**: the schema accepts it, the parser round-trips it and both validators check it, and no run consults it. The two enforcement points above land in the sibling slices of the same change.
+> `applies_to` is **enforced**, at both points above: the schema accepts it, the parser round-trips it, both validators check it, and every run consults it. A run whose labels or trigger do not satisfy the declaration is refused at `POST /v0/runs`, and a plan whose `scope.files` reaches outside a declared `paths` is refused at the plan gate. The one sanctioned way past either is the audited `applies_to_override` (with its required reason) described above.
 
 ## Stages
 

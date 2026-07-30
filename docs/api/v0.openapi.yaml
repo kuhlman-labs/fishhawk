@@ -4349,8 +4349,16 @@ paths:
                     source of truth, and the deferred plan-gate check
                     looks it up to suppress its own rejection.
                     `applies_to_override_reason` is REQUIRED
-                    alongside it. Ignored when the declaration
-                    already accepts the change.
+                    alongside it. The override is recorded even when
+                    ADMISSION accepts the change, because `paths` is
+                    enforced later at the plan gate: an override that
+                    only existed when admission refused would be
+                    unreachable in the common case of satisfied
+                    labels plus an out-of-declaration plan scope.
+                    Auditing the bypass is a PRECONDITION of granting
+                    it — if the audit entry cannot be written the run
+                    is refused with `503 audit_unavailable` rather
+                    than admitted unaudited.
                 applies_to_override_reason:
                   type: string
                   description: |
@@ -4436,7 +4444,18 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '503':
+          description: |
+            Also `audit_unavailable` (E53.3 / #2226) when
+            `applies_to_override` is set but the bypass could not be
+            written to the audit log (append failure, or no audit
+            store configured). Auditing the bypass is a PRECONDITION
+            of granting it, so the run is refused and no run row is
+            created rather than admitted unaudited. Transient —
+            retry once the audit store is reachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/runs/{run_id}:
     get:

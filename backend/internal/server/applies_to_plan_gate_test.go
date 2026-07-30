@@ -424,7 +424,7 @@ func TestAppliesToPlanGate_UnresolvableDeclaration_FailsOpen(t *testing.T) {
 	t.Run("run not found", func(t *testing.T) {
 		s, _, _ := newAppliesToPlanGateServer(t, pathsAppliesToSpec(`"docs/**"`), "guarded")
 		if reason := s.appliesToPlanGateRejection(context.Background(), uuid.New(), violating); reason != "" {
-			t.Errorf("want fail-open when the run cannot be read; got %q", reason)
+			t.Errorf("want fail-open when the run genuinely does not exist; got %q", reason)
 		}
 	})
 
@@ -449,6 +449,72 @@ func TestAppliesToPlanGate_UnresolvableDeclaration_FailsOpen(t *testing.T) {
 		runRow.WorkflowID = "no_such_workflow"
 		if reason := s.appliesToPlanGateRejection(context.Background(), runRow.ID, violating); reason != "" {
 			t.Errorf("want fail-open when the workflow is absent from the spec; got %q", reason)
+		}
+	})
+}
+
+// transientGetRunRepo is a run.Repository whose GetRun fails with a NON-
+// not-found error — a database blip, a timeout, a reset connection. Only GetRun
+// is reached on the gate's resolution path, so the embedded interface stays nil.
+type transientGetRunRepo struct {
+	run.Repository
+	err error
+}
+
+func (f transientGetRunRepo) GetRun(context.Context, uuid.UUID) (*run.Run, error) {
+	return nil, f.err
+}
+
+// TestAppliesToPlanGate_TransientReadFailure_FailsClosed draws the line the
+// fail-open legs above must not cross. "There is no declaration" (run not
+// found, no snapshot, workflow absent) is a FACT about the workflow and admits.
+// "The store did not answer" is an ABSENCE OF KNOWLEDGE, and admitting on it
+// would leave a governance control that any repository hiccup silently switches
+// off — at exactly the moment the plan being gated is the one that would have
+// been refused, since a plan that satisfies the declaration is admitted either
+// way. The refusal is retry-shaped: the failure is transient, so re-shipping
+// the plan recovers, whereas a silent admission never does.
+func TestAppliesToPlanGate_TransientReadFailure_FailsClosed(t *testing.T) {
+	s := New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   transientGetRunRepo{err: errors.New("dial tcp: connection reset by peer")},
+		AuditRepo: newStoringAuditFake(),
+	})
+	reason := s.appliesToPlanGateRejection(context.Background(), uuid.New(),
+		planWithScope("backend/internal/server/plan.go"))
+	if reason == "" {
+		t.Fatal("a transient run-store read failure was treated as 'no declaration to enforce' and admitted the plan; a repository blip must not switch a governance gate off")
+	}
+	for _, want := range []string{"could not be read", "connection reset", "transient"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("reason %q is missing %q — the message must say what failed and that a retry recovers", reason, want)
+		}
+	}
+}
+
+// TestResolveRunWorkflowDef_SeparatesAbsenceFromUnreadability pins the
+// distinction at its source, so a future caller cannot collapse the two by
+// reading only the ok flag.
+func TestResolveRunWorkflowDef_SeparatesAbsenceFromUnreadability(t *testing.T) {
+	t.Run("transient error", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: transientGetRunRepo{err: errors.New("db down")}})
+		_, _, _, ok, err := s.resolveRunWorkflowDef(context.Background(), uuid.New())
+		if err == nil {
+			t.Fatal("a repository read failure was reported as a clean 'no declaration' answer")
+		}
+		if ok {
+			t.Error("ok = true on a read failure")
+		}
+	})
+
+	t.Run("run not found", func(t *testing.T) {
+		s, _, _ := newAppliesToPlanGateServer(t, pathsAppliesToSpec(`"docs/**"`), "guarded")
+		_, _, _, ok, err := s.resolveRunWorkflowDef(context.Background(), uuid.New())
+		if err != nil {
+			t.Fatalf("run-not-found must be an ABSENCE, not an outage; got err = %v", err)
+		}
+		if ok {
+			t.Error("ok = true for a run that does not exist")
 		}
 	})
 }

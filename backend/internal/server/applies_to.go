@@ -155,12 +155,20 @@ type appliesToRejection struct {
 	Required      []string
 	Observed      []string
 	ObservedLabel string
-	// AbsentIssueContext marks the issue-less run: the change carries no
-	// issue context at all, so its label set is EMPTY rather than merely
-	// non-matching. This gets its own sentence — "your labels don't match"
-	// is actively misleading when there are no labels to match with.
+	// AbsentIssueContext marks the EMPTY-label-set run: the change's label
+	// set is empty rather than merely non-matching. This gets its own
+	// sentence — "your labels don't match" is actively misleading when
+	// there are no labels to match with.
 	AbsentIssueContext bool
-	TriggerSource      string
+	// IssueContextPresent discriminates the TWO ways a label set comes out
+	// empty, which have different fixes and must not be described with one
+	// sentence: an issue-LESS run (false — trigger_source=cli/ui, no issue
+	// context at all) versus an UNLABELLED issue (true — issue context is
+	// present and carries zero labels). Telling the operator of an
+	// issue-triggered run that it "carries NO issue context" sends them
+	// looking for a trigger problem they do not have.
+	IssueContextPresent bool
+	TriggerSource       string
 	// Satisfying is the workflows that WOULD accept this change.
 	Satisfying []string
 	// MatchErr is the fail-closed-on-error branch: the predicate could not be
@@ -181,21 +189,27 @@ type appliesToRejection struct {
 func renderAppliesToRejection(rj appliesToRejection) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "workflow %q does not accept this change", rj.WorkflowID)
+	label := rj.ObservedLabel
+	if label == "" {
+		label = rj.Criterion
+	}
+	observed := "[]"
+	if len(rj.Observed) > 0 {
+		observed = "[" + strings.Join(rj.Observed, ", ") + "]"
+	}
 	switch {
 	case rj.MatchErr != nil:
 		fmt.Fprintf(&b, ": its applies_to declaration could not be evaluated (%s), so the run is refused rather than admitted — a routing declaration that cannot be evaluated is never treated as match-all", rj.MatchErr.Error())
+	case rj.AbsentIssueContext && rj.IssueContextPresent:
+		// The issue exists and carries no labels. The observed value is
+		// still reported — the shape is binding on EVERY rejection path,
+		// and "[]" is the actionable fact here, not a detail to elide.
+		fmt.Fprintf(&b, ": its applies_to %s criterion requires one of [%s], but the change's %s is %s — the run's issue context carries no labels at all; an unlabelled issue cannot satisfy a labels criterion",
+			rj.Criterion, strings.Join(rj.Required, ", "), label, observed)
 	case rj.AbsentIssueContext:
-		fmt.Fprintf(&b, ": its applies_to %s criterion requires one of [%s], but this run carries NO issue context (trigger_source=%s) so its label set is EMPTY; an issue-less run cannot satisfy a labels criterion",
-			rj.Criterion, strings.Join(rj.Required, ", "), rj.TriggerSource)
+		fmt.Fprintf(&b, ": its applies_to %s criterion requires one of [%s], but the change's %s is %s because this run carries NO issue context (trigger_source=%s); an issue-less run cannot satisfy a labels criterion",
+			rj.Criterion, strings.Join(rj.Required, ", "), label, observed, rj.TriggerSource)
 	default:
-		label := rj.ObservedLabel
-		if label == "" {
-			label = rj.Criterion
-		}
-		observed := "[]"
-		if len(rj.Observed) > 0 {
-			observed = "[" + strings.Join(rj.Observed, ", ") + "]"
-		}
 		fmt.Fprintf(&b, ": its applies_to %s criterion requires one of [%s], but the change's %s is %s",
 			rj.Criterion, strings.Join(rj.Required, ", "), label, observed)
 	}
@@ -313,59 +327,78 @@ type appliesToOverrideRecord struct {
 // Returns (admit, overrideRecord). On refusal it writes the 422 response AND a
 // global-chain run_rejected_applies_to audit entry (there is no run id to scope
 // it to yet) and returns false — the caller must return immediately. When an
-// override force-admits a would-be refusal, the returned record is non-nil and
-// the caller must append the run-scoped entry once the run exists.
+// override is in play the returned record is non-nil and the caller must append
+// the run-scoped entry once the run exists.
+//
+// THE OVERRIDE IS EVALUATED INDEPENDENTLY OF WHETHER ADMISSION REFUSES, which
+// is what makes it reachable for the DEFERRED `paths` criterion. Deriving the
+// record from the refusal — the obvious reading, since this is where the
+// refusal happens — would produce an override that exists only when admission
+// itself refuses, and so is unavailable in the COMMON case: a workflow whose
+// labels/trigger the run satisfies (or which declares neither) and whose
+// `paths` the plan will not. That operator's only recourse would be widening
+// the declaration permanently, which is exactly the behaviour the override
+// exists to avoid.
 func (s *Server) checkAppliesTo(w http.ResponseWriter, r *http.Request, req *createRunRequest, parsed *spec.Spec, workflowDef spec.Workflow) (bool, *appliesToOverrideRecord) {
 	if workflowDef.AppliesTo == nil {
-		return true, nil
-	}
-	sub, constrains := appliesToPhasePredicate(*workflowDef.AppliesTo, appliesToPhaseAdmission)
-	if !constrains {
-		// A paths-only declaration does not constrain admission — the
-		// positive proof that `paths` is DEFERRED to the plan gate rather
-		// than silently evaluated against zero paths (which would reject
-		// every run).
+		// No declaration at all: nothing to enforce and nothing to
+		// override, at either phase.
 		return true, nil
 	}
 
-	c := admissionChange(req.TriggerSource, req.IssueContext)
-	matched, matchErr := sub.Match(c)
-	if matchErr == nil && matched {
-		return true, nil
-	}
-
-	rj := appliesToRejection{
-		WorkflowID:    req.WorkflowID,
-		TriggerSource: req.TriggerSource,
-		Satisfying:    satisfyingWorkflows(parsed, c, appliesToPhaseAdmission),
-		MatchErr:      matchErr,
-		Phase:         appliesToPhaseAdmission,
-	}
-	if matchErr == nil {
-		crit, required, observed, ok := firstFailingCriterion(sub, c)
-		if ok {
-			rj.Criterion = crit
-			rj.Required = required
-			rj.Observed = observed
-			rj.ObservedLabel = crit
-			// The issue-less run gets its own sentence: an empty label set
-			// is not a mismatched label set, and saying so is what tells the
-			// operator the fix is an issue-triggered run (or the override),
-			// not different labels.
-			rj.AbsentIssueContext = crit == "labels" && (req.IssueContext == nil || len(req.IssueContext.Labels) == 0)
+	// message is the admission refusal, or "" when admission is satisfied
+	// (including the paths-only declaration, which does not constrain this
+	// phase at all — the positive proof that `paths` is DEFERRED to the plan
+	// gate rather than silently evaluated against zero paths, which would
+	// reject every run).
+	var message string
+	var rj appliesToRejection
+	if sub, constrains := appliesToPhasePredicate(*workflowDef.AppliesTo, appliesToPhaseAdmission); constrains {
+		c := admissionChange(req.TriggerSource, req.IssueContext)
+		matched, matchErr := sub.Match(c)
+		if matchErr != nil || !matched {
+			rj = appliesToRejection{
+				WorkflowID:    req.WorkflowID,
+				TriggerSource: req.TriggerSource,
+				Satisfying:    satisfyingWorkflows(parsed, c, appliesToPhaseAdmission),
+				MatchErr:      matchErr,
+				Phase:         appliesToPhaseAdmission,
+			}
+			if matchErr == nil {
+				crit, required, observed, ok := firstFailingCriterion(sub, c)
+				if ok {
+					rj.Criterion = crit
+					rj.Required = required
+					rj.Observed = observed
+					rj.ObservedLabel = crit
+					// An empty label set is not a mismatched label set, and
+					// saying so is what tells the operator the fix is an
+					// issue-triggered (or differently-labelled) issue rather
+					// than different labels on this one.
+					rj.AbsentIssueContext = crit == "labels" && (req.IssueContext == nil || len(req.IssueContext.Labels) == 0)
+					rj.IssueContextPresent = req.IssueContext != nil
+				}
+			}
+			message = renderAppliesToRejection(rj)
 		}
 	}
-	message := renderAppliesToRejection(rj)
 
 	if req.AppliesToOverride {
-		// Audited force-past. The run is admitted; the run-scoped entry is
-		// appended by the caller once the row exists.
+		// Audited force-past. The bypass is audited BEFORE it takes effect;
+		// an override that cannot be recorded refuses the run.
+		if !s.grantAppliesToOverride(w, r, req, message) {
+			return false, nil
+		}
 		return true, &appliesToOverrideRecord{
 			WorkflowID: req.WorkflowID,
 			Repo:       req.Repo,
 			Reason:     strings.TrimSpace(req.AppliesToOverrideReason),
 			Rejection:  message,
 		}
+	}
+
+	if message == "" {
+		return true, nil
 	}
 
 	s.appendAppliesToRejectedAudit(r, req, rj, message)
@@ -380,6 +413,65 @@ func (s *Server) checkAppliesTo(w http.ResponseWriter, r *http.Request, req *cre
 			"applies_to_evaluation": "start_run",
 		})
 	return false, nil
+}
+
+// grantAppliesToOverride audits the override BEFORE it takes effect and reports
+// whether the run may be admitted. It writes the 503 response itself on refusal.
+//
+// THE AUDIT ENTRY IS THE OVERRIDE'S SOURCE OF TRUTH, and a source of truth that
+// is written best-effort AFTER the bypass has already been granted is not one.
+// The run-scoped entry cannot be written here — it needs a run id that does not
+// exist until the insert — so the grant is recorded on the GLOBAL chain, the
+// same chain the refusal uses and for the same reason, and an append failure
+// (or an absent audit repository) REFUSES the run.
+//
+// Warn-logging this failure instead would be a governance bypass with no record
+// at all, and for an ADMISSION-ONLY violation nothing downstream would ever
+// catch it: `paths` is re-evaluated at the plan gate, so a lost override there
+// merely costs the operator a re-run, but a `labels` or `trigger` violation has
+// no second evaluation point — the run would proceed to completion having
+// bypassed the declaration with nothing in the log saying so. This is the
+// asymmetry to the REFUSAL audit, whose append failure is correctly best-effort:
+// there the decision already went the safe way, so an audit problem must not
+// soften it. Here the decision goes the UNSAFE way, so the audit is a
+// precondition of it.
+//
+// suppressed is the admission refusal the override forces past, or "" when
+// admission was satisfied and the override is being carried forward for the
+// plan gate's deferred `paths` check.
+func (s *Server) grantAppliesToOverride(w http.ResponseWriter, r *http.Request, req *createRunRequest, suppressed string) bool {
+	const unauditable = "applies_to_override cannot be granted: the bypass could not be recorded in the audit log, and an unaudited governance bypass is refused rather than admitted. Retry once the audit store is reachable, or start the run under a workflow that accepts this change"
+	if s.cfg.AuditRepo == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "audit_unavailable", unauditable,
+			map[string]any{"workflow_id": req.WorkflowID, "reason": "no audit repository configured"})
+		return false
+	}
+	if suppressed == "" {
+		suppressed = "none at admission; the override was requested up front and carries forward to the plan gate's deferred paths check"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"workflow_id":          req.WorkflowID,
+		"repo":                 req.Repo,
+		"trigger_source":       req.TriggerSource,
+		"reason":               strings.TrimSpace(req.AppliesToOverrideReason),
+		"suppressed_rejection": suppressed,
+		"phase":                "start_run",
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(r.Context(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "run_admitted_applies_to_override",
+		ActorKind: &systemKind,
+		Payload:   payload,
+		AccountID: identityAccountID(r.Context()),
+	}); aerr != nil {
+		s.cfg.Logger.Warn("append run_admitted_applies_to_override audit entry failed; refusing the override (fail-closed)",
+			"repo", req.Repo, "workflow_id", req.WorkflowID, "error", aerr.Error())
+		s.writeError(w, r, http.StatusServiceUnavailable, "audit_unavailable", unauditable,
+			map[string]any{"workflow_id": req.WorkflowID, "error": aerr.Error()})
+		return false
+	}
+	return true
 }
 
 // appendAppliesToRejectedAudit records the refusal on the GLOBAL chain: the
@@ -424,8 +516,14 @@ func (s *Server) appendAppliesToRejectedAudit(r *http.Request, req *createRunReq
 // suppresses its own rejection by LOOKING THIS UP, never by re-reading request
 // state.
 //
+// It is the CARRY-FORWARD half of a two-entry grant: grantAppliesToOverride has
+// already recorded the bypass on the global chain as a PRECONDITION of
+// admission, so the bypass itself is never unaudited. This entry is what the
+// plan gate can look up by run id.
+//
 // Residual failure mode, stated rather than hidden: if this append fails the
-// run is admitted but the plan gate will re-reject it. That is fail-closed by
+// run is admitted (the bypass is already audited globally) but the plan gate
+// will re-reject it on a deferred `paths` violation. That is fail-closed by
 // construction and recoverable (re-start with the override, or widen the
 // declaration), and it is the price of surfacing the override in the audit log
 // with no run column and no migration.

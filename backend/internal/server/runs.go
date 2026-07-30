@@ -945,9 +945,12 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// Record the applies_to override RUN-SCOPED, now that a run id
 	// exists. This entry — not the request field — is the override's
 	// carry-forward source of truth: the plan gate looks it up to
-	// suppress its own deferred rejection. An append failure is
-	// warn-logged inside; the run is admitted but the plan gate will
-	// re-reject it, which is fail-closed by construction and recoverable.
+	// suppress its own deferred rejection. The bypass ITSELF was already
+	// audited on the global chain as a precondition of admission
+	// (grantAppliesToOverride), so it is never unrecorded; an append
+	// failure here is warn-logged and costs only the carry-forward — the
+	// plan gate re-rejects a deferred `paths` violation, which is
+	// fail-closed by construction and recoverable.
 	s.recordAppliesToOverride(r.Context(), created.ID, appliesToOverride)
 
 	s.writeJSON(w, r, http.StatusCreated, toRunResponse(created))

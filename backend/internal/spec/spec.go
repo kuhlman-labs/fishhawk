@@ -196,11 +196,12 @@ type Workflow struct {
 	// ParseBytes: the typed decode runs with DisallowUnknownFields, so a
 	// key the schema accepts but the struct omits fails the decode.
 	//
-	// AS SHIPPED BY THIS SLICE the field is DECLARED-BUT-UNENFORCED: it
-	// parses, validates (see validateWorkflow) and round-trips, and
-	// nothing consults it. The two fail-closed enforcement points — the
-	// `labels`/`trigger` admission check at POST /v0/runs and the `paths`
-	// check at the plan gate — land in the sibling slices of #2226.
+	// This package owns the field, its validation (see validateWorkflow)
+	// and its round-trip; the two fail-closed enforcement points that
+	// CONSUME it — the `labels`/`trigger` admission check at POST /v0/runs
+	// and the `paths` check at the plan gate — live in
+	// backend/internal/server (applies_to.go, applies_to_plan_gate.go) and
+	// are live as of #2226.
 	AppliesTo *Predicate `json:"applies_to,omitempty" yaml:"applies_to,omitempty"`
 }
 

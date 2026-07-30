@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -212,35 +214,51 @@ func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string) []string {
 // snapshot is what keeps the two enforcement points from reaching two answers
 // about one run.
 //
-// Returns ok=false on every leg where no declaration can be resolved. Mirrors
-// resolveImplementConstraints (scope_precheck.go) so the plan-time gates agree
-// on how a run's workflow is resolved.
-func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*spec.Spec, spec.Workflow, string, bool) {
+// Returns ok=false on every leg where no declaration EXISTS to resolve, and a
+// non-nil error on the one leg where a declaration may well exist but could not
+// be READ. Mirrors resolveImplementConstraints (scope_precheck.go) so the
+// plan-time gates agree on how a run's workflow is resolved.
+//
+// THE TWO OUTCOMES ARE NOT INTERCHANGEABLE and the caller must not collapse
+// them. "There is no declaration" is a fact about the workflow and fails OPEN.
+// "The store did not answer" is an absence of knowledge — a transient database
+// blip, a timeout, a connection reset — and folding it into the first would
+// make a governance control that any repository hiccup silently switches off,
+// at exactly the moment the plan being gated is the one that would have been
+// refused. That leg fails CLOSED at the call site.
+//
+// run.ErrNotFound is deliberately on the fail-OPEN side: a run id with no row
+// is a genuine "nothing to enforce", not an outage, and the plan gate only ever
+// runs for a run handleShipPlan already loaded.
+func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*spec.Spec, spec.Workflow, string, bool, error) {
 	if s.cfg.RunRepo == nil {
-		return nil, spec.Workflow{}, "", false
+		return nil, spec.Workflow{}, "", false, nil
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "applies_to plan gate: get run failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
-		return nil, spec.Workflow{}, "", false
+		if errors.Is(err, run.ErrNotFound) {
+			return nil, spec.Workflow{}, "", false, nil
+		}
+		return nil, spec.Workflow{}, "", false, fmt.Errorf("read run %s: %w", runID, err)
 	}
 	if runRow.WorkflowSpec == nil {
-		return nil, spec.Workflow{}, "", false
+		return nil, spec.Workflow{}, "", false, nil
 	}
 	parsed, perr := spec.ParseBytes(runRow.WorkflowSpec)
 	if perr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "applies_to plan gate: parse workflow spec failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", perr.Error()))
-		return nil, spec.Workflow{}, "", false
+		return nil, spec.Workflow{}, "", false, nil
 	}
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
-		return nil, spec.Workflow{}, "", false
+		return nil, spec.Workflow{}, "", false, nil
 	}
-	return parsed, wf, runRow.WorkflowID, true
+	return parsed, wf, runRow.WorkflowID, true, nil
 }
 
 // appliesToPlanGateRejection is the fail-closed `paths` enforcement point. It
@@ -269,17 +287,34 @@ func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*s
 //     case is an unenforced routing declaration. Writing `if err != nil {
 //     return "" }` here by analogy with the four neighbours sitting in the
 //     same handler is the tempting bug this comment exists to name.
-//   - Where NO declaration can be resolved at all (nil RunRepo, GetRun error,
-//     nil workflow spec, unparseable spec, workflow absent from the spec)
-//     the gate fails OPEN, because there is no declaration to enforce and
-//     refusing every plan in a deployment that cannot resolve one would be a
-//     denial of service, not a control. That leg is narrow by construction:
-//     the bytes parsed here are the SNAPSHOT admission already parsed
-//     successfully to reach checkAppliesTo, so a parse failure at plan time is
-//     an internal inconsistency rather than a reachable bypass. It is warn-
-//     logged so it is visible if it ever does occur.
+//   - Where NO declaration EXISTS to resolve (nil RunRepo, run not found, nil
+//     workflow spec, unparseable spec, workflow absent from the spec) the gate
+//     fails OPEN, because there is no declaration to enforce and refusing every
+//     plan in a deployment that cannot resolve one would be a denial of
+//     service, not a control. That leg is narrow by construction: the bytes
+//     parsed here are the SNAPSHOT admission already parsed successfully to
+//     reach checkAppliesTo, so a parse failure at plan time is an internal
+//     inconsistency rather than a reachable bypass. It is warn-logged so it is
+//     visible if it ever does occur.
+//   - Where the declaration could not be READ — a repository error that is NOT
+//     run-not-found: a transient database failure, a timeout, a reset
+//     connection — the gate fails CLOSED. This is the line between "there is
+//     nothing to enforce" and "we do not know what to enforce", and only the
+//     first is a safe reason to admit. Collapsing the second into it would
+//     leave a governance control that a repository blip switches off, and a
+//     retry-shaped one at that: the failure is transient, so re-shipping the
+//     plan recovers, whereas a silent admission does not.
 func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
-	parsed, wf, workflowID, ok := s.resolveRunWorkflowDef(ctx, runID)
+	parsed, wf, workflowID, ok, rerr := s.resolveRunWorkflowDef(ctx, runID)
+	if rerr != nil {
+		// Fail CLOSED. Rendered as its own message rather than through
+		// renderAppliesToRejection: nothing that renderer reports —
+		// criterion, observed value, satisfying workflows — is knowable
+		// when the declaration itself could not be read, and inventing
+		// empty values for them would be a less actionable message, not a
+		// more consistent one.
+		return fmt.Sprintf("the applies_to routing declaration for this run could not be read (%s), so the plan is refused rather than admitted — a governance declaration we cannot read is never treated as absent. This failure is transient: ship the plan again once the backend's run store is reachable", rerr.Error())
+	}
 	if !ok {
 		return ""
 	}

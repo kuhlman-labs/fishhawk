@@ -200,6 +200,61 @@ func TestAppliesTo_M4_IssuelessRun_RejectsOnEmptyLabelSet(t *testing.T) {
 	}
 }
 
+// TestAppliesTo_M4b_UnlabelledIssue_ReportsTheObservedValue covers the OTHER
+// way a label set comes out empty: the run DOES carry issue context, and that
+// issue carries no labels. It shares M4's empty-label-set branch and must not
+// share M4's sentence — telling the operator of an issue-triggered run that it
+// "carries NO issue context" sends them hunting a trigger problem they do not
+// have, when the fix is to label the issue.
+//
+// It must also still report the OBSERVED VALUE. The message shape is binding on
+// every rejection path (workflow, failed criterion, observed value, satisfying
+// workflows); the empty-label-set branch is where it is most tempting to drop
+// the observed value as uninteresting, and "[]" is precisely the actionable
+// fact there.
+func TestAppliesTo_M4b_UnlabelledIssue_ReportsTheObservedValue(t *testing.T) {
+	s, _, _, _ := newDelegationServer(t)
+	body := guardedRunBody(labelsGuard)
+	body["issue_context"] = issueCtx() // present, zero labels
+	w := createRunViaHandler(t, s, body)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	env := decodeErrorEnvelope(t, w)
+	msg := env.Message
+	if strings.Contains(msg, "NO issue context") {
+		t.Errorf("message %q claims the run has NO issue context, but it carries one with zero labels; the two have different fixes", msg)
+	}
+	if !strings.Contains(msg, "the change's labels is []") {
+		t.Errorf("message %q must report the OBSERVED value ([]) like every other rejection path, not only the required one", msg)
+	}
+	for _, want := range []string{`"guarded"`, "labels", "dependencies", "no labels", "open"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q is missing %q", msg, want)
+		}
+	}
+	if env.Details["absent_issue_context"] != true {
+		t.Errorf("details.absent_issue_context = %v, want true — the label set IS empty", env.Details["absent_issue_context"])
+	}
+}
+
+// TestAppliesTo_M4_IssuelessMessage_AlsoReportsObserved is M4's shape half:
+// the issue-LESS sentence carries the observed value too, so neither empty-set
+// branch is a hole in the binding message shape.
+func TestAppliesTo_M4_IssuelessMessage_AlsoReportsObserved(t *testing.T) {
+	got := renderAppliesToRejection(appliesToRejection{
+		WorkflowID: "guarded", Criterion: "labels", ObservedLabel: "labels",
+		Required: []string{"dependencies"}, AbsentIssueContext: true,
+		IssueContextPresent: false, TriggerSource: "cli",
+	})
+	if !strings.Contains(got, "the change's labels is []") {
+		t.Errorf("message %q must report the observed value", got)
+	}
+	if !strings.Contains(got, "NO issue context") || !strings.Contains(got, "trigger_source=cli") {
+		t.Errorf("message %q must still name the absent issue context and its trigger_source", got)
+	}
+}
+
 // --- M5: the trigger criterion routes by trigger_source ---
 
 func TestAppliesTo_M5_TriggerCriterion(t *testing.T) {
@@ -342,34 +397,150 @@ func TestAppliesTo_M10_Override_AdmitsAndAudits(t *testing.T) {
 
 // --- M11b: the AUDIT ENTRY, not the request, is the source of truth ---
 //
-// A run whose creation carried an override but whose entry is ABSENT has no
-// override. This is what makes the carry-forward lookup fail-closed: the
-// audit-append failure path admits the run but leaves the plan gate free to
-// re-reject it.
+// A run whose creation carried an override but whose RUN-SCOPED entry is
+// ABSENT has no override to carry forward. This is what makes the
+// carry-forward lookup fail-closed: the run-scoped append failure admits the
+// run (the bypass is already audited globally — see M11c) but leaves the plan
+// gate free to re-reject it on a deferred `paths` violation.
 
 func TestAppliesTo_M11b_OverrideLookup_IsAuditEntryNotRequest(t *testing.T) {
 	s, _, au, _ := newDelegationServer(t)
-	// Creation carried an override, but the append fails.
-	au.appendErr = errors.New("audit down")
+	// The GRANT (global chain) succeeds — the bypass is audited — but the
+	// run-scoped carry-forward append fails.
+	au.appendErrCategory = "run_admitted_applies_to_override"
 	body := guardedRunBody(labelsGuard)
 	body["issue_context"] = issueCtx("bug")
 	body["applies_to_override"] = true
 	body["applies_to_override_reason"] = "forced"
 	w := createRunViaHandler(t, s, body)
 	if w.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 — an audit-append failure must not unwind the admission:\n%s", w.Code, w.Body.String())
+		t.Fatalf("status = %d, want 201 — a CARRY-FORWARD append failure must not unwind an already-audited admission:\n%s", w.Code, w.Body.String())
 	}
 	var created runResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	au.appendErr = nil
+	au.appendErrCategory = ""
 	has, err := s.runHasAppliesToOverride(context.Background(), created.ID)
 	if err != nil {
 		t.Fatalf("runHasAppliesToOverride: %v", err)
 	}
 	if has {
 		t.Error("runHasAppliesToOverride returned true for a run with NO recorded entry; the override would carry forward on the strength of the request alone")
+	}
+}
+
+// --- M11c: an override that CANNOT BE AUDITED is refused, not granted ---
+//
+// The audit entry being the override's source of truth means the entry is a
+// PRECONDITION of the bypass, not a best-effort record written after it. The
+// asymmetry to the REFUSAL audit (TestAppliesTo_RefusalAuditFailure_StillRefuses,
+// correctly best-effort) is the whole point: there the decision already went the
+// safe way, so an audit outage must not soften it; here the decision goes the
+// UNSAFE way, so an audit outage must not permit it.
+//
+// This matters most for an ADMISSION-ONLY violation, which is what this case
+// uses (a labels-only declaration): `paths` gets a second evaluation at the plan
+// gate, so a lost override there merely costs a re-run, but a labels or trigger
+// bypass has NO downstream evaluation point. Warn-logging the failure and
+// admitting anyway would run the change to completion having bypassed the
+// declaration with nothing in the log saying so.
+
+func TestAppliesTo_M11c_OverrideGrantAuditFailure_RefusesTheRun(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	au.appendErr = errors.New("audit down")
+	body := guardedRunBody(labelsGuard)
+	body["issue_context"] = issueCtx("bug")
+	body["applies_to_override"] = true
+	body["applies_to_override_reason"] = "forced"
+	w := createRunViaHandler(t, s, body)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 — an override the audit log did not record is an UNAUDITED governance bypass:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(repo.runs); n != 0 {
+		t.Errorf("created %d run rows for an override that could not be audited, want 0", n)
+	}
+	if env := decodeErrorEnvelope(t, w); env.Code != "audit_unavailable" {
+		t.Errorf("code = %q, want audit_unavailable", env.Code)
+	}
+}
+
+// TestAppliesTo_OverrideWithNoAuditRepo_Refuses is M11c's capability-absent
+// twin: with no audit repository wired there is nowhere to record the bypass,
+// so the override is refused rather than silently granted. An override is only
+// sanctioned because it leaves a trail; a deployment that cannot leave one does
+// not get the escape hatch.
+func TestAppliesTo_OverrideWithNoAuditRepo_Refuses(t *testing.T) {
+	repo := newFakeRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo}) // AuditRepo intentionally nil
+	body := guardedRunBody(labelsGuard)
+	body["issue_context"] = issueCtx("bug")
+	body["applies_to_override"] = true
+	body["applies_to_override_reason"] = "forced"
+	w := createRunViaHandler(t, s, body)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 with no audit repo wired:\n%s", w.Code, w.Body.String())
+	}
+	if n := len(repo.runs); n != 0 {
+		t.Errorf("created %d run rows, want 0", n)
+	}
+}
+
+// --- M11d: the override reaches the DEFERRED paths criterion --------------
+//
+// `paths` is enforced at the plan gate, not at admission, so the common
+// override case is a run whose labels/trigger are fine (or unconstrained) and
+// whose planned scope is not. Recording the override only when ADMISSION
+// refuses would make the escape hatch unreachable in exactly that case, leaving
+// the operator to widen the declaration permanently — the behaviour the
+// override exists to avoid.
+
+func TestAppliesTo_M11d_Override_CarriesForwardWhenAdmissionPasses(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		guard string
+		// labels the run's issue context carries; nil means an
+		// issue-less run.
+		labels []string
+	}{
+		{
+			// A paths-ONLY declaration does not constrain admission at
+			// all: nothing here can refuse, and the only rejection this
+			// run will ever meet is the plan gate's.
+			name:   "paths-only declaration, admission unconstrained",
+			guard:  "    applies_to:\n      paths: [\"docs/**\"]\n",
+			labels: []string{"bug"},
+		},
+		{
+			// Admission is constrained and SATISFIED; the paths half is
+			// still deferred and may still refuse.
+			name:   "admission criteria satisfied, paths still deferred",
+			guard:  "    applies_to:\n      labels: [dependencies]\n      paths: [\"docs/**\"]\n",
+			labels: []string{"dependencies"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, au, _ := newDelegationServer(t)
+			body := guardedRunBody(tc.guard)
+			body["issue_context"] = issueCtx(tc.labels...)
+			body["applies_to_override"] = true
+			body["applies_to_override_reason"] = "scope reaches outside docs/ this once; widening tracked separately"
+			w := createRunViaHandler(t, s, body)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			var created runResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+				t.Fatal(err)
+			}
+			if findRunScopedAppend(au, created.ID, "run_admitted_applies_to_override") == nil {
+				t.Fatal("no run-scoped override entry for a run admitted on its merits but carrying an override; the plan gate's deferred paths refusal would then be unoverridable")
+			}
+			has, err := s.runHasAppliesToOverride(context.Background(), created.ID)
+			if err != nil || !has {
+				t.Fatalf("runHasAppliesToOverride = (%v, %v), want (true, nil) — the plan gate reads THIS", has, err)
+			}
+		})
 	}
 }
 

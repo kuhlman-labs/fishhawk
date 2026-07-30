@@ -799,11 +799,16 @@ Two inputs feed this from the MCP surface:
   `trigger` criteria are evaluated here; `paths` is deferred to the plan gate, where the approved plan's `scope.files`
   is the first authoritative (and *binding*) path set.
 - **`applies_to_override` + `applies_to_override_reason`.** The sanctioned exception. The reason is **required** — a
-  reasonless override is a `400`, and admits nothing. An accepted override records a **run-scoped**
-  `run_admitted_applies_to_override` audit entry carrying the reason verbatim; that **entry, not the request, is the
-  override's source of truth**, and the plan gate looks it up to suppress its own deferred rejection. If the audit
-  append fails, the run is admitted but the plan gate re-rejects it — fail-closed by construction, and recoverable by
-  re-starting with the override or widening the declaration.
+  reasonless override is a `400`, and admits nothing. An accepted override records a `run_admitted_applies_to_override`
+  audit entry carrying the reason verbatim; that **entry, not the request, is the override's source of truth**, and the
+  plan gate looks it up to suppress its own deferred rejection. Set it whenever you intend to force the run through,
+  **including when the labels/trigger criteria already pass**: `paths` is enforced later at the plan gate, so an
+  override recorded only on an admission refusal would be unreachable in the common case of satisfied labels plus an
+  out-of-declaration plan scope. Auditing the bypass is a **precondition** of granting it — if the entry cannot be
+  written the run is refused with `503 audit_unavailable` and no run row is created, rather than admitted unaudited.
+  (The later run-scoped carry-forward append is the one best-effort half: if *it* fails the run is admitted, already
+  audited, and the plan gate re-rejects a deferred `paths` violation — recoverable by re-starting with the override or
+  widening the declaration.)
 
 Prefer amending the workflow's declaration (a reviewable change) over the override. The control prevents **misrouting**,
 not a determined authorized caller: labels are fetched by the caller's `gh` and attested inline, so a server-side fetch
