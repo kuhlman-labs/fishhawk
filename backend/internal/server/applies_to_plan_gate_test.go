@@ -291,6 +291,42 @@ func TestAppliesToPlanGate_EmptyScope_Rejects(t *testing.T) {
 	}
 }
 
+// TestAppliesToPlanGate_NilPlan_Rejects pins the UNDECODABLE-BODY leg. The
+// call site in handleShipPlan hands the gate a nil plan when json.Unmarshal of
+// the plan body fails, instead of skipping the gate the way the ADVISORY
+// over-cap sweep in the same block does — a fail-open leg on a fail-closed
+// control would not be among the ones the posture enumerates (nil RunRepo, run
+// not found, nil/unparseable spec snapshot, workflow absent), and this is the
+// assertion that a "simplification" back inside that decode guard would have to
+// delete. A nil plan is a ZERO-PATH plan: refused under a paths declaration for
+// the same reason an empty scope.files is.
+//
+// REACHABILITY, stated rather than implied (as for the malformed-glob leg
+// below): the body has already passed plan.Validate against the closed
+// standard_v1 schema by the time the decode runs, so schema-valid bytes failing
+// json.Unmarshal is an internal inconsistency and no end-to-end test can
+// produce one. The assertion is therefore made where the contract lives — the
+// gate's own treatment of the input that leg supplies.
+func TestAppliesToPlanGate_NilPlan_Rejects(t *testing.T) {
+	s, _, runRow := newAppliesToPlanGateServer(t, pathsAppliesToSpec(`"docs/**"`), "guarded")
+
+	reason := s.appliesToPlanGateRejection(context.Background(), runRow.ID, nil)
+	if reason == "" {
+		t.Fatal("want a nil (undecodable) plan refused, not admitted — nil is a zero-path plan, not a skip")
+	}
+	if !strings.Contains(reason, "scope.files") {
+		t.Errorf("reject reason should name scope.files when there is no offending entry to name; got: %s", reason)
+	}
+
+	// The refusal is scoped to a declaration that actually constrains this
+	// phase: a workflow declaring no paths criterion still clears, so an
+	// undecodable body cannot turn into a blanket plan-ship outage.
+	sOpen, _, openRun := newAppliesToPlanGateServer(t, pathsAppliesToSpec(`"docs/**"`), "open")
+	if reason := sOpen.appliesToPlanGateRejection(context.Background(), openRun.ID, nil); reason != "" {
+		t.Errorf("want a workflow with no paths criterion to clear a nil plan; got %q", reason)
+	}
+}
+
 // TestPlanGateUnmatchedPaths_MalformedGlob_FailsClosed is M13's plan-gate
 // half: a glob that makes spec.Predicate.Match return an error is PROPAGATED,
 // never swallowed into "nothing unmatched" (which the caller would read as a

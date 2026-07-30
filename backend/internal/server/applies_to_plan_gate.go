@@ -334,6 +334,13 @@ func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*s
 //     reach checkAppliesTo, so a parse failure at plan time is an internal
 //     inconsistency rather than a reachable bypass. It is warn-logged so it is
 //     visible if it ever does occur.
+//   - A nil parsedPlan is a ZERO-PATH plan, not a skip. handleShipPlan hands
+//     nil when the plan body could not be decoded — an internal inconsistency
+//     (the bytes already passed plan.Validate), but one whose safe reading is
+//     the same as an empty scope.files: a plan that demonstrates no paths has
+//     not demonstrated it falls inside the declaration, so it is refused.
+//     Reading nil as "nothing to check" would hand this fail-closed control a
+//     fail-open leg the enumeration below does not carry.
 //   - Where the declaration could not be READ — a repository error that is NOT
 //     run-not-found: a transient database failure, a timeout, a reset
 //     connection — the gate fails CLOSED. This is the line between "there is

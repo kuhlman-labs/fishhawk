@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -357,6 +358,46 @@ func TestAppliesTo_PhaseSplit_IsExhaustive(t *testing.T) {
 	}
 	if len(gate.Labels) != 0 || len(gate.Triggers) != 0 || len(gate.ChangeKinds) != 0 {
 		t.Errorf("plan-gate half = %+v, want paths ONLY (the rest are decided at admission)", gate)
+	}
+
+	// TRIPWIRE for a criterion the grammar gains LATER. The assertions above
+	// pin today's four; appliesToPhasePredicate is a hand-maintained
+	// field-by-field copy of spec.Predicate and its `constrains` check
+	// enumerates the same four by name. A fifth criterion added by a sibling
+	// slice (#2227 escalations, #2211 review conventions) is picked up by the
+	// applies_to $ref automatically, but would be copied into NEITHER half and
+	// counted by NEITHER `constrains` — declared and silently never enforced,
+	// which is the exact failure mode this function's own comment names for
+	// change_kind. So the "exhaustive over the predicate grammar" claim is
+	// enforced against the STRUCT rather than against a list restated here.
+	//
+	// The field COUNT is the cheap half: it fails on the specific edit that
+	// opens the gap and on nothing else.
+	predT := reflect.TypeOf(spec.Predicate{})
+	if n := predT.NumField(); n != 4 {
+		t.Fatalf("spec.Predicate has %d fields, want 4 (paths, labels, change_kind, trigger). "+
+			"A criterion was added or removed: route it in appliesToPhasePredicate (into a phase half AND its `constrains` check), "+
+			"extend firstFailingCriterion so the rejection can name it, then update this count.", n)
+	}
+
+	// The load-bearing half: EVERY declared criterion must survive the split
+	// into at least one phase. Populating `full` above is what feeds this, so a
+	// new field left out of `full` fails here too — the author is pushed to
+	// decide which phase owns it rather than to bump a number.
+	fullV, admV, gateV := reflect.ValueOf(full), reflect.ValueOf(adm), reflect.ValueOf(gate)
+	for i := range predT.NumField() {
+		name := predT.Field(i).Name
+		if predT.Field(i).Type.Kind() != reflect.Slice {
+			t.Errorf("spec.Predicate.%s is not a slice; this tripwire assumes every criterion is a list — re-check the split by hand", name)
+			continue
+		}
+		if fullV.Field(i).Len() == 0 {
+			t.Errorf("the `full` fixture leaves %s unset, so the split is untested for it; populate it and route the criterion", name)
+			continue
+		}
+		if admV.Field(i).Len() == 0 && gateV.Field(i).Len() == 0 {
+			t.Errorf("spec.Predicate.%s is carried by NEITHER phase half: a declared criterion that is silently never enforced", name)
+		}
 	}
 }
 
