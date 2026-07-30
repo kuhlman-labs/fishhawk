@@ -39,6 +39,12 @@ import (
 //     constraint, or the deployment artifact on an acceptance stage each
 //     falls into the isDeploy==false else-branch below and is rejected
 //     exactly as on any other non-deploy stage.
+//   - workflow `applies_to` well-formedness (E53.3 / #2226): the routing
+//     predicate is checked at its declaration site — `change_kind` is
+//     rejected outright (no producer emits one), then the shared
+//     Predicate.Validate runs at /workflows/<name>/applies_to. Both rules
+//     are version-agnostic in code but unreachable below major 2, because
+//     no v0/v1 schema declares the property.
 //   - post-hoc-constraint<->produced-artifact binding at major >= 2 (E52.7 /
 //     #2219): a v2 stage carrying a post-hoc diff constraint must declare the
 //     pull_request artifact. The stage TYPES are general (plan / implement /
@@ -95,6 +101,10 @@ func constraintPath(major, idx int, kind string) string {
 func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 	stagePath := func(i int, suffix string) string {
 		return fmt.Sprintf("/workflows/%s/stages/%d%s", name, i, suffix)
+	}
+
+	if err := validateAppliesTo(name, wf.AppliesTo); err != nil {
+		return err
 	}
 
 	seen := make(map[string]int, len(wf.Stages))
@@ -405,6 +415,57 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// MsgAppliesToChangeKindUnsupported is the rejection for a `change_kind`
+// criterion inside a workflow's `applies_to` (E53.3 / #2226). It is
+// exported so a test can assert the shipped text rather than a paraphrase,
+// and it is duplicated BYTE-FOR-BYTE in cli/internal/spec/validate.go —
+// the two Go modules cannot share a package, so parity is held by the
+// paired message assertions in both spec_test.go files, exactly as the
+// reviewers.authority message (E53.2 / #2225) and the v2removed set are.
+//
+// The rejection is narrow on purpose. `change_kind` stays in the shared
+// $defs/predicate for #2227 and #2211; only THIS consumer refuses it,
+// because no producer populates Change.ChangeKind today. A workflow
+// declaring it would therefore match nothing and be selectable by no run
+// — a state indistinguishable, from the operator's side, from the routing
+// control being broken. Rejecting at declaration time turns that silent
+// unusability into an authoring error naming the missing producer.
+const MsgAppliesToChangeKindUnsupported = "applies_to does not accept the change_kind criterion: nothing produces a change kind today, so the criterion can never be satisfied and this workflow would be selectable by no run; route on paths, labels or trigger instead (the shared predicate keeps change_kind for its other consumers)"
+
+// validateAppliesTo checks a workflow's routing predicate at its own
+// declaration site (E53.3 / #2226). A nil predicate — the workflow declared
+// no `applies_to` — is valid and means "accepts any change", which is what
+// leaves every pre-#2226 document unaffected.
+//
+// ORDER IS A CONTRACT (pinned by TestValidate_AppliesTo_ChangeKindWinsOverGlob):
+// the change_kind rejection runs FIRST, so a predicate declaring both an
+// unsupported change_kind and some other malformed criterion reports the
+// change_kind diagnosis — that criterion is wrong regardless of what else
+// the predicate says, and its message names a fix the generic predicate
+// error cannot.
+//
+// The second rung is the SHARED Predicate.Validate, called at this
+// workflow's pointer so the empty-predicate, malformed-glob, empty-label
+// and unknown-trigger-form rules are the predicate's own rather than a
+// re-implementation that could drift from #2227's and #2211's reading of
+// the same grammar.
+func validateAppliesTo(name string, p *Predicate) error {
+	if p == nil {
+		return nil
+	}
+	ptr := fmt.Sprintf("/workflows/%s/applies_to", name)
+	if len(p.ChangeKinds) > 0 {
+		return &ValidationError{
+			Path:    ptr + "/change_kind",
+			Message: MsgAppliesToChangeKindUnsupported,
+		}
+	}
+	if err := p.Validate(ptr); err != nil {
+		return &ValidationError{Path: ptr, Message: err.Error()}
 	}
 	return nil
 }

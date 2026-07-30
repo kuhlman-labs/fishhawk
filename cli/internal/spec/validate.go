@@ -5,19 +5,26 @@ import (
 	"sort"
 )
 
-// validateAgentVersions is the CLI's one semantic check beyond JSON Schema
-// (E32.13 / #1743): the agent_version compatibility range is a plain string
-// to the schema, so a malformed range like ">=abc" passes schema validation
-// but is a spec authoring error. This sweep walks the raw decoded document —
-// workflows -> stages -> executor.agent_version and reviewers.agents[].agent_version
-// — and validates each declared range via ValidAgentVersionRange, so
-// `fishhawk validate` catches a bad range locally instead of deferring it to
-// the backend at dispatch (the same first-line-of-defense role the schema
-// validation plays). It operates on the yaml.v3-decoded map[string]any /
-// []any tree (never structs — this package is schema-only), tolerating any
-// shape mismatch by skipping: the schema layer already rejected genuinely
-// malformed structure, so a non-map/non-string node here is simply not an
-// agent_version to check.
+// validateAgentVersions is the CLI's semantic sweep beyond JSON Schema — the
+// checks the schema cannot express, run so `fishhawk validate` catches them
+// locally instead of deferring them to the backend at dispatch (the same
+// first-line-of-defense role the schema validation plays). The name is
+// historical: the sweep began (E32.13 / #1743) as the agent_version check
+// alone and has since taken the workflow- and stage-level semantic rules the
+// backend enforces.
+//
+// It covers:
+//
+//   - agent_version compatibility ranges (#1743) — a plain string to the
+//     schema, so a malformed range like ">=abc" passes schema validation but
+//     is a spec authoring error;
+//   - reviewers.authority with no agent reviewers (E53.2 / #2225);
+//   - a workflow's applies_to routing predicate (E53.3 / #2226).
+//
+// It operates on the yaml.v3-decoded map[string]any / []any tree (never
+// structs — this package is schema-only), tolerating any shape mismatch by
+// skipping: the schema layer already rejected genuinely malformed structure,
+// so a non-map/non-string node here is simply not a value to check.
 func validateAgentVersions(raw any) error {
 	var errs []ValidationErrorEntry
 	root, ok := raw.(map[string]any)
@@ -33,6 +40,11 @@ func validateAgentVersions(raw any) error {
 		if !ok {
 			continue
 		}
+		// applies_to is a WORKFLOW member, not a stage member, so it is
+		// checked before the stage-shaped guard below rather than inside
+		// the stage loop — a stages-less workflow must still have its
+		// routing predicate reported.
+		checkAppliesTo(wf, wfName, &errs)
 		stages, ok := wf["stages"].([]any)
 		if !ok {
 			continue
@@ -112,6 +124,99 @@ func checkReviewerAuthority(stage map[string]any, base string, errs *[]Validatio
 			"stage %q: reviewers.authority: %q declares agent-reviewer authority but the stage configures no agent reviewers; declare at least one entry under reviewers.agents, or remove reviewers.authority to fall back to the count-derived ADR-027 default",
 			stageID, authority),
 	})
+}
+
+// MsgAppliesToChangeKindUnsupported is the rejection for a `change_kind`
+// criterion inside a workflow's `applies_to` (E53.3 / #2226). Byte-identical
+// to backend/internal/spec/validate.go's constant of the same name: the two
+// Go modules are deliberately separate (see this package's doc comment), so
+// the duplication is by design and the paired message assertions in both
+// spec_test.go files are what keep the strings in lockstep — the same
+// arrangement the eight v2removed messages and the reviewers.authority
+// message (E53.2 / #2225) already use.
+const MsgAppliesToChangeKindUnsupported = "applies_to does not accept the change_kind criterion: nothing produces a change kind today, so the criterion can never be satisfied and this workflow would be selectable by no run; route on paths, labels or trigger instead (the shared predicate keeps change_kind for its other consumers)"
+
+// checkAppliesTo mirrors the backend's semantic check on a workflow's
+// `applies_to` routing predicate (E53.3 / #2226,
+// backend/internal/spec/validate.go), so `fishhawk validate` does not accept
+// a spec the backend refuses at dispatch. Two rungs, in a FIXED order that
+// matches the backend's:
+//
+//  1. a `change_kind` criterion is rejected outright, naming the missing
+//     producer — it is wrong regardless of what else the predicate declares,
+//     and its message names a fix the generic predicate error cannot;
+//  2. the SHARED Predicate.Validate runs at /workflows/<name>/applies_to, so
+//     the empty-predicate, malformed-glob, empty-label and unknown-trigger
+//     rules are the predicate's own rather than a re-implementation. This
+//     package carries a byte-identical copy of predicate.go, so rung 2's
+//     messages match the backend's by construction; only rung 1's constant
+//     is hand-duplicated.
+//
+// A workflow declaring no `applies_to` is untouched — that is the
+// accepts-any-change reading every pre-#2226 document gets. The projection
+// below is shape-tolerant like every other check in this file: this sweep
+// runs AFTER schema validation, so a criterion that is not the list of
+// strings the schema requires was already rejected upstream.
+func checkAppliesTo(wf map[string]any, wfName string, errs *[]ValidationErrorEntry) {
+	appliesTo, ok := wf["applies_to"].(map[string]any)
+	if !ok {
+		return
+	}
+	ptr := fmt.Sprintf("/workflows/%s/applies_to", wfName)
+	p := predicateFromRaw(appliesTo)
+	if len(p.ChangeKinds) > 0 {
+		*errs = append(*errs, ValidationErrorEntry{
+			Path:    ptr + "/change_kind",
+			Message: MsgAppliesToChangeKindUnsupported,
+		})
+		return
+	}
+	if err := p.Validate(ptr); err != nil {
+		*errs = append(*errs, ValidationErrorEntry{Path: ptr, Message: err.Error()})
+	}
+}
+
+// predicateFromRaw projects a yaml.v3-decoded predicate node onto the typed
+// Predicate so the shared validator can run over it. A criterion whose value
+// is not a list, or a list entry that is not a string, is skipped rather than
+// coerced — the schema already rejected those shapes, and a coercion here
+// would invent a criterion the author never wrote.
+func predicateFromRaw(m map[string]any) Predicate {
+	var p Predicate
+	p.Paths = rawStringList(m["paths"])
+	p.Labels = rawStringList(m["labels"])
+	p.ChangeKinds = rawStringList(m["change_kind"])
+	for _, s := range rawStringList(m["trigger"]) {
+		p.Triggers = append(p.Triggers, TriggerForm(s))
+	}
+	return p
+}
+
+// rawStringList projects a decoded YAML node onto []string, returning nil for
+// anything that is not a non-empty list of strings — including a list that is
+// only PARTLY strings, which is projected as undeclared rather than half
+// converted, so a criterion can never be evaluated against a subset of what
+// the author wrote.
+//
+// Only the absent-key case is reachable through ValidateBytes: the schema
+// runs first and enforces `minItems: 1` plus `items.type: string` on every
+// predicate criterion, so a non-list value and a non-string entry are both
+// rejected before this sweep. The guards stay as the file's shape-tolerant
+// convention and to keep the projection total.
+func rawStringList(node any) []string {
+	list, ok := node.([]any)
+	if !ok || len(list) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		s, ok := item.(string)
+		if !ok {
+			return nil
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // appendRangeError validates a single agent_version node when it is a

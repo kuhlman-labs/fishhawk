@@ -90,6 +90,10 @@
         "description": {
           "type": "string"
         },
+        "applies_to": {
+          "$ref": "#/$defs/predicate",
+          "description": "Optional routing declaration (E53.3 / #2226): the changes this workflow may be used for. It is a $defs/predicate (E53.1 / #2224) — the SAME match rule `escalations` and the review-conventions consume, deliberately not a second matcher. A workflow declaring no `applies_to` accepts any change, which is what keeps every pre-#2226 document unaffected. Enforcement is fail-closed and runs in TWO PHASES, each at the earliest point its criterion has a PRODUCER: `labels` and `trigger` are evaluated at run admission (POST /v0/runs), `paths` at the PLAN GATE against the approved plan's scope.files. `change_kind` is REJECTED inside `applies_to` by the backend and by `fishhawk validate` — no producer emits a change kind, so a workflow declaring it could never be selected, which is indistinguishable from the feature being broken; $defs/predicate itself keeps the criterion for its other consumers. `applies_to` FILTERS an operator-named workflow_id, it never selects one, so two workflows with overlapping predicates is benign rather than a coin flip. THIS PROPERTY IS DECLARED-BUT-UNENFORCED AS SHIPPED BY THIS SLICE: the parser accepts and validates it, and the two enforcement points land in the sibling slices of #2226. See docs/spec/workflow-v2.md § 'Workflow routing (applies_to)'."
+        },
         "stages": {
           "type": "array",
           "minItems": 1,
@@ -970,7 +974,7 @@
       "type": "object",
       "additionalProperties": false,
       "minProperties": 1,
-      "description": "One declarative path predicate (E53.1 / #2224): the SINGLE match rule that E53.3's applies_to routing (#2226), E53.4's escalations (#2227) and ADR-068's review-conventions (#2211) each $ref rather than re-declaring a shape. Match semantics are RATIFIED (ADR-066 / #2209): AND across criteria TYPES (every declared type must be satisfied) and OR WITHIN a list (any one entry satisfies its type); an undeclared type does not constrain. An empty predicate is an ERROR, never match-all — enforced here by minProperties 1 and again by spec.Predicate.Validate. Matching is byte-safe and fail-closed (the Go matcher decodes git's C-quoted paths and names an undecodable path rather than silently not matching). NOTHING references this definition yet: it ships declared-but-unreferenced, and the three sibling children wire it. See docs/spec/workflow-v2.md § 'Path predicate'.",
+      "description": "One declarative path predicate (E53.1 / #2224): the SINGLE match rule that E53.3's applies_to routing (#2226), E53.4's escalations (#2227) and ADR-068's review-conventions (#2211) each $ref rather than re-declaring a shape. Match semantics are RATIFIED (ADR-066 / #2209): AND across criteria TYPES (every declared type must be satisfied) and OR WITHIN a list (any one entry satisfies its type); an undeclared type does not constrain. An empty predicate is an ERROR, never match-all — enforced here by minProperties 1 and again by spec.Predicate.Validate. Matching is byte-safe and fail-closed (the Go matcher decodes git's C-quoted paths and names an undecodable path rather than silently not matching). Its FIRST consumer is a workflow's `applies_to` (E53.3 / #2226), which $refs it unchanged; #2227 and #2211 wire the other two. This definition is deliberately UNTOUCHED by its consumers — a consumer that needs a narrower grammar rejects the criterion at its own declaration site (as `applies_to` does for `change_kind`) rather than editing the shared shape. See docs/spec/workflow-v2.md § 'Path predicate'.",
       "properties": {
         "paths": {
           "type": "array",
