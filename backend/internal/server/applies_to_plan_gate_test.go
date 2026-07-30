@@ -498,7 +498,7 @@ func TestAppliesToPlanGate_TransientReadFailure_FailsClosed(t *testing.T) {
 func TestResolveRunWorkflowDef_SeparatesAbsenceFromUnreadability(t *testing.T) {
 	t.Run("transient error", func(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0", RunRepo: transientGetRunRepo{err: errors.New("db down")}})
-		_, _, _, ok, err := s.resolveRunWorkflowDef(context.Background(), uuid.New())
+		_, _, _, _, ok, err := s.resolveRunWorkflowDef(context.Background(), uuid.New())
 		if err == nil {
 			t.Fatal("a repository read failure was reported as a clean 'no declaration' answer")
 		}
@@ -509,7 +509,7 @@ func TestResolveRunWorkflowDef_SeparatesAbsenceFromUnreadability(t *testing.T) {
 
 	t.Run("run not found", func(t *testing.T) {
 		s, _, _ := newAppliesToPlanGateServer(t, pathsAppliesToSpec(`"docs/**"`), "guarded")
-		_, _, _, ok, err := s.resolveRunWorkflowDef(context.Background(), uuid.New())
+		_, _, _, _, ok, err := s.resolveRunWorkflowDef(context.Background(), uuid.New())
 		if err != nil {
 			t.Fatalf("run-not-found must be an ABSENCE, not an outage; got err = %v", err)
 		}
@@ -556,7 +556,11 @@ func TestPlanGateSatisfyingWorkflows_QuantifiedLikeTheGate(t *testing.T) {
 		t.Fatalf("parse fixture spec: %v", err)
 	}
 
-	got := planGateSatisfyingWorkflows(parsed, []string{"docs/a.md", "backend/b.go"})
+	// The run's admission-phase change: a diff-form run carrying the labels
+	// the recommended workflows must also accept.
+	adm := spec.Change{Trigger: spec.TriggerDiff, Labels: []string{"bug"}}
+
+	got := planGateSatisfyingWorkflows(parsed, []string{"docs/a.md", "backend/b.go"}, adm)
 	for _, name := range got {
 		if name == "guarded" {
 			t.Errorf("a workflow that would REJECT this plan must not be recommended; got %v", got)
@@ -567,12 +571,139 @@ func TestPlanGateSatisfyingWorkflows_QuantifiedLikeTheGate(t *testing.T) {
 	}
 
 	// A wholly-satisfying path set lists both.
-	if both := planGateSatisfyingWorkflows(parsed, []string{"docs/a.md"}); len(both) != 2 {
+	if both := planGateSatisfyingWorkflows(parsed, []string{"docs/a.md"}, adm); len(both) != 2 {
 		t.Errorf("want both workflows for a docs-only plan; got %v", both)
 	}
 
 	// A zero-path plan cannot be accepted by a paths-declaring workflow.
-	if zero := planGateSatisfyingWorkflows(parsed, nil); len(zero) != 1 || zero[0] != "open" {
+	if zero := planGateSatisfyingWorkflows(parsed, nil, adm); len(zero) != 1 || zero[0] != "open" {
 		t.Errorf("want only the unconstrained workflow for a zero-path plan; got %v", zero)
+	}
+}
+
+// TestPlanGateSatisfyingWorkflows_AlsoFiltersOnAdmissionCriteria is the other
+// half of "the message must name workflows this change could actually use", and
+// the half a paths-only enumeration silently gets wrong.
+//
+// The operator's next move after a plan-gate refusal is to re-start the run
+// under one of the named alternatives — and that re-start goes through
+// ADMISSION first. A candidate filtered on `paths` alone therefore includes
+// every labels-only or trigger-only workflow unconditionally (they do not
+// constrain the plan gate at all), sending the operator from this refusal
+// straight into a second, fail-closed admission rejection. The run's labels and
+// trigger are immutable for its lifetime, so both are knowable here.
+//
+// The fixture covers the combined edge the concern named: `labelled` is
+// label-incompatible AND path-compatible (so only the admission check can
+// exclude it), `both` requires a label the run HAS and paths the plan
+// satisfies, and `paths_only` is the pure plan-gate case.
+func TestPlanGateSatisfyingWorkflows_AlsoFiltersOnAdmissionCriteria(t *testing.T) {
+	stages := `    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	doc := "version: \"2\"\nworkflows:\n" +
+		"  labelled:\n    applies_to:\n      labels: [dependencies]\n" + stages +
+		"  both:\n    applies_to:\n      labels: [documentation]\n      paths: [\"docs/**\"]\n" + stages +
+		"  paths_only:\n    applies_to:\n      paths: [\"docs/**\"]\n" + stages +
+		"  scheduled_only:\n    applies_to:\n      trigger: [scheduled]\n" + stages +
+		"  open:\n" + stages
+	parsed, err := spec.ParseBytes([]byte(doc))
+	if err != nil {
+		t.Fatalf("parse fixture spec: %v", err)
+	}
+
+	// A diff run carrying `documentation`, planning a docs-only change.
+	adm := spec.Change{Trigger: spec.TriggerDiff, Labels: []string{"documentation"}}
+	got := planGateSatisfyingWorkflows(parsed, []string{"docs/a.md"}, adm)
+
+	for _, unusable := range []string{"labelled", "scheduled_only"} {
+		for _, name := range got {
+			if name == unusable {
+				t.Errorf("workflow %q cannot ADMIT this run (its %s criterion is unsatisfiable by the run's immutable labels/trigger) yet was recommended as an alternative; got %v",
+					unusable, map[string]string{"labelled": "labels", "scheduled_only": "trigger"}[unusable], got)
+			}
+		}
+	}
+	want := []string{"both", "open", "paths_only"}
+	if len(got) != len(want) {
+		t.Fatalf("planGateSatisfyingWorkflows = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("planGateSatisfyingWorkflows = %v, want %v (name order)", got, want)
+		}
+	}
+
+	// The same plan under a run whose labels satisfy `labelled` instead:
+	// `labelled` becomes a usable alternative and `both` stops being one, so
+	// the filter is demonstrably reading the run's labels rather than a
+	// constant.
+	deps := spec.Change{Trigger: spec.TriggerDiff, Labels: []string{"dependencies"}}
+	got = planGateSatisfyingWorkflows(parsed, []string{"docs/a.md"}, deps)
+	wantDeps := []string{"labelled", "open", "paths_only"}
+	if len(got) != len(wantDeps) {
+		t.Fatalf("planGateSatisfyingWorkflows(deps) = %v, want %v", got, wantDeps)
+	}
+	for i := range wantDeps {
+		if got[i] != wantDeps[i] {
+			t.Fatalf("planGateSatisfyingWorkflows(deps) = %v, want %v", got, wantDeps)
+		}
+	}
+}
+
+// TestAppliesToPlanGate_RejectionNamesOnlyUsableAlternatives drives the same
+// invariant through the REAL gate — the run row's own labels and trigger, not a
+// hand-built spec.Change — because that wiring is where the observed values
+// would go missing. The blocking requirement is that the refusal names
+// workflows the change would satisfy; a message that names a workflow whose
+// admission this run cannot pass fails it.
+func TestAppliesToPlanGate_RejectionNamesOnlyUsableAlternatives(t *testing.T) {
+	stages := `    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	doc := "version: \"2\"\nworkflows:\n" +
+		"  guarded:\n    applies_to:\n      paths: [\"docs/**\"]\n" + stages +
+		"  needs_label:\n    applies_to:\n      labels: [dependencies]\n" + stages +
+		"  open:\n" + stages
+	s, _, runRow := newAppliesToPlanGateServer(t, doc, "guarded")
+	// The run is issue-triggered and carries a label `needs_label` does not
+	// accept — immutable for the life of the run.
+	runRow.TriggerSource = run.TriggerGitHubIssue
+	runRow.IssueContext = &run.IssueContext{Number: 1, Labels: []string{"bug"}}
+
+	reason := s.appliesToPlanGateRejection(context.Background(), runRow.ID,
+		planWithScope("backend/internal/server/plan.go"))
+	if reason == "" {
+		t.Fatal("an out-of-declaration scope cleared the gate")
+	}
+	if strings.Contains(reason, "needs_label") {
+		t.Errorf("the refusal recommends %q, which would reject this same run at ADMISSION on its labels criterion; the operator is sent from one fail-closed refusal into another:\n%s", "needs_label", reason)
+	}
+	if !strings.Contains(reason, "open") {
+		t.Errorf("the refusal must still name the alternative that WOULD accept this run:\n%s", reason)
 	}
 }

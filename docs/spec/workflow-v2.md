@@ -274,7 +274,7 @@ applies_to: # optional; a $defs/predicate — see "Path predicate" below
   trigger: [diff]
 ```
 
-`applies_to` declares **which changes this workflow may be used for**. It is a [path predicate](#path-predicate) — the same match rule `escalations` and the review-conventions consume — deliberately not a second matcher with its own subtly different semantics, so match semantics here are the predicate's: AND across declared criteria types, OR within a list, and an undeclared type does not constrain.
+`applies_to` declares **which changes this workflow may be used for**. It is a [path predicate](#path-predicate) — the same match rule `escalations` and the review-conventions consume, used verbatim rather than reimplemented — so the criteria and their combination rules are the predicate's: AND across declared criteria types, OR within a list, and an undeclared type does not constrain. The one documented divergence is the **quantifier applied to `paths`**, described under "Enforcement" below: the predicate's `paths` rule is existential (*any* change path matching *any* glob), and a confinement control needs the universal reading (*every* path accepted). The quantifier is applied around the ratified matcher, not inside a second one.
 
 A workflow declaring **no** `applies_to` accepts any change. That is what leaves every document written before this property existed unaffected, and it is why the absent case is *not* an empty predicate (an empty predicate is an authoring error, never match-all).
 
@@ -284,9 +284,15 @@ A workflow declaring **no** `applies_to` accepts any change. That is what leaves
 |---|---|---|
 | `labels` | run admission (`POST /v0/runs`) | the run's issue-context label snapshot |
 | `trigger` | run admission | the run's trigger form |
-| `paths` | the **plan gate** | the approved plan's `scope.files` |
+| `paths` | the **plan gate** | the plan's `scope.files`, **unioned** with every `decomposition.sub_plans[].scope.files` and `split_proposal.phases[].scope.files` |
 
 The `paths` deferral is not a weakening. At admission a code-change run has no paths yet — nothing has proposed a diff — so evaluating `paths` there could only match against zero paths, which the AND-across-types rule turns into a blanket refusal. The plan gate is the first point where a path set exists, and the set it checks is `scope.files`, which is **binding rather than descriptive**: the existing scope gate confines the implement stage to it. A run admitted under a workflow declaring `paths: ["docs/**"]` is therefore *confined* to `docs/**`, not merely claimed to be. Both rejection points fire before any implement work, so a refusal costs a re-run and never half-applied work.
+
+Three properties of the `paths` evaluation follow from that, and none of them is the predicate's default reading:
+
+- **The quantifier is universal.** *Every* path in the set must be accepted by the declaration, not merely one of them. Under the predicate's own existential rule a plan scoping `[docs/x.md, backend/everything.go]` would satisfy `paths: ["docs/**"]` and the confinement guarantee above would be false. The rejection message names the offending paths (capped, with the elided count reported).
+- **The set is the union, not the top level.** A decomposition fan-out child runs bounded to its *slice* scope and a `split_proposal` phase carries its own, so a top-level-only check would let a slice reach outside the declaration.
+- **A plan committing to no files at all is refused**, not admitted on a vacuous "every one of zero paths matched". Nothing in an empty scope demonstrates the plan falls inside the declaration.
 
 **The trust boundary is caller-attested, and that is a deliberate limit.** Issue labels are fetched by the caller and shipped inline on the create request, so a caller determined to route a change through the wrong workflow can attest whatever labels it likes. `applies_to` prevents **misrouting**, not a determined authorized caller. The sanctioned exception is the audited override on the create request (`applies_to_override` plus a required reason), which admits the run and records why — an escape hatch that leaves a trail, rather than the alternative of permanently widening the declaration. Server-side label fetching is the named hardening path, not something this grammar already gives you.
 
@@ -300,7 +306,7 @@ The `paths` deferral is not a weakening. At admission a code-change run has no p
 
 `extends` folds **stages** only, so a deriving workflow does not inherit its base's `applies_to`; declare the routing predicate on each workflow that needs one. This matches every other non-stage member (`budgets`, `policy`, `decomposition`, `autonomy` are likewise not inherited).
 
-> `applies_to` is **enforced**, at both points above: the schema accepts it, the parser round-trips it, both validators check it, and every run consults it. A run whose labels or trigger do not satisfy the declaration is refused at `POST /v0/runs`, and a plan whose `scope.files` reaches outside a declared `paths` is refused at the plan gate. The one sanctioned way past either is the audited `applies_to_override` (with its required reason) described above.
+> `applies_to` is **enforced**, at both points above: the schema accepts it, the parser round-trips it, both validators check it, and every run consults it. A run whose labels or trigger do not satisfy the declaration is refused at `POST /v0/runs`, and a plan whose `scope.files` reaches outside a declared `paths` is refused at the plan gate. Either refusal names the workflows that *would* accept the change, evaluated at **both** phases — so a named alternative cannot turn out to reject the same run at admission. The one sanctioned way past either is the audited `applies_to_override` (with its required reason) described above.
 
 ## Stages
 

@@ -521,15 +521,29 @@ func (s *Server) appendAppliesToRejectedAudit(r *http.Request, req *createRunReq
 // admission, so the bypass itself is never unaudited. This entry is what the
 // plan gate can look up by run id.
 //
-// Residual failure mode, stated rather than hidden: if this append fails the
-// run is admitted (the bypass is already audited globally) but the plan gate
-// will re-reject it on a deferred `paths` violation. That is fail-closed by
-// construction and recoverable (re-start with the override, or widen the
-// declaration), and it is the price of surfacing the override in the audit log
-// with no run column and no migration.
-func (s *Server) recordAppliesToOverride(ctx context.Context, runID uuid.UUID, rec *appliesToOverrideRecord) {
-	if rec == nil || s.cfg.AuditRepo == nil {
-		return
+// AN APPEND FAILURE HERE IS RETURNED, NOT WARN-LOGGED, AND THE CALLER ABANDONS
+// THE RUN. Warn-logging it and proceeding was the earlier posture, justified by
+// "the plan gate will re-reject a deferred `paths` violation anyway" — which is
+// true for `paths` and FALSE for the violation this override most often forces
+// past. An ADMISSION-ONLY violation (labels, trigger) has no second evaluation
+// point: that run would proceed to completion on a bypass its OWN audit chain
+// does not carry, so every run-scoped read — the run's audit trail, the
+// operator reconstructing why a label-violating change was routed here — sees a
+// run that simply satisfied its declaration. A global-chain entry that no
+// run-scoped query returns is not the run's source of truth for the bypass. So
+// the entry is a precondition of the run SURVIVING, exactly as the grant entry
+// is a precondition of it being admitted, and the two failure modes get the one
+// answer: no entry, no run.
+func (s *Server) recordAppliesToOverride(ctx context.Context, runID uuid.UUID, rec *appliesToOverrideRecord) error {
+	if rec == nil {
+		return nil
+	}
+	if s.cfg.AuditRepo == nil {
+		// Unreachable in practice — grantAppliesToOverride refuses the run
+		// pre-insert when no audit repository is wired, so no record exists to
+		// carry forward. Fail closed rather than silently skipping, because the
+		// only way to reach here is an internal inconsistency.
+		return fmt.Errorf("record applies_to override for run %s: no audit repository configured", runID)
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"workflow_id":          rec.WorkflowID,
@@ -545,9 +559,36 @@ func (s *Server) recordAppliesToOverride(ctx context.Context, runID uuid.UUID, r
 		ActorKind: &systemKind,
 		Payload:   payload,
 	}); aerr != nil {
-		s.cfg.Logger.Warn("append run_admitted_applies_to_override audit entry failed; the plan gate will re-reject this run",
-			"run_id", runID.String(), "workflow_id", rec.WorkflowID, "error", aerr.Error())
+		return fmt.Errorf("append run-scoped run_admitted_applies_to_override for run %s: %w", runID, aerr)
 	}
+	return nil
+}
+
+// unauditedOverrideMessage is the operator-facing text for a run abandoned
+// because its override could not be recorded run-scoped. It says what happened,
+// what state the run is in, and that a retry recovers.
+const unauditedOverrideMessage = "applies_to_override was granted but its run-scoped audit entry could not be recorded, so the run has been cancelled rather than left running on a bypass its own audit chain does not carry. The bypass itself is recorded on the global chain; only the carry-forward entry the plan gate reads is missing. This failure is transient: start the run again once the audit store is reachable"
+
+// abandonUnauditedOverrideRun is the fail-closed answer to a carry-forward
+// append failure: the run row exists (the entry needs its id), so "refuse"
+// means CANCEL it and report 503, not leave it running.
+//
+// The cancel is best-effort — if it also fails there is nothing further this
+// handler can do — but the 503 is not conditional on it: the operator is told
+// the run is not usable either way, and a stuck run row is visible and
+// cancellable, whereas a 201 would report a healthy run carrying an unrecorded
+// governance bypass.
+func (s *Server) abandonUnauditedOverrideRun(w http.ResponseWriter, r *http.Request, runID uuid.UUID, rec *appliesToOverrideRecord, cause error) {
+	s.cfg.Logger.Warn("run-scoped applies_to override entry could not be recorded; cancelling the run (fail-closed)",
+		"run_id", runID.String(), "workflow_id", rec.WorkflowID, "error", cause.Error())
+	if s.cfg.RunRepo != nil {
+		if _, terr := s.cfg.RunRepo.TransitionRun(r.Context(), runID, run.StateCancelled); terr != nil {
+			s.cfg.Logger.Warn("cancelling the unaudited-override run failed; it is left for operator cancellation",
+				"run_id", runID.String(), "error", terr.Error())
+		}
+	}
+	s.writeError(w, r, http.StatusServiceUnavailable, "audit_unavailable", unauditedOverrideMessage,
+		map[string]any{"run_id": runID.String(), "workflow_id": rec.WorkflowID, "error": cause.Error()})
 }
 
 // runHasAppliesToOverride reports whether runID carries the admission-time

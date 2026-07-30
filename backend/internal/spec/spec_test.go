@@ -5657,13 +5657,13 @@ workflows:
 
 // --- applies_to workflow routing (E53.3 / #2226) ---
 //
-// This slice ships `applies_to` DECLARED-BUT-UNENFORCED: the schema declares
-// it, the parser round-trips it, and the validator checks it at its
-// declaration site. Nothing consults it yet — the two fail-closed enforcement
-// points (the labels/trigger admission check at POST /v0/runs and the paths
-// check at the plan gate) land in the sibling slices. The tests below are
-// therefore about the SPEC SURFACE: that the property parses onto a real,
-// working Predicate, and that every rejection branch reports actionably.
+// `applies_to` is ENFORCED at both fail-closed points — the labels/trigger
+// admission check at POST /v0/runs (backend/internal/server/applies_to.go) and
+// the paths check at the plan gate (applies_to_plan_gate.go) — which ship in
+// the same change as this file. The tests below are nonetheless about the SPEC
+// SURFACE only: that the property parses onto a real, working Predicate, and
+// that every rejection branch reports actionably. The enforcement behaviour is
+// pinned next to the enforcement points, not here.
 //
 // Where a rejection is caught by the SCHEMA (an empty predicate, an unknown
 // trigger form, an empty label) the test asserts a *SchemaError through

@@ -164,26 +164,45 @@ func renderUnmatchedPaths(unmatched []string) []string {
 }
 
 // planGateSatisfyingWorkflows enumerates, in name order, every workflow that
-// would accept this path set AT THE PLAN GATE — the "where can I take this
-// instead?" half of the rejection message.
+// would accept this run AT BOTH PHASES — the "where can I take this instead?"
+// half of the rejection message.
 //
-// It deliberately does NOT reuse satisfyingWorkflows (applies_to.go), which
-// evaluates via Predicate.Match and is therefore EXISTENTIAL on paths. Using
-// it here would let the message recommend a workflow that then refuses the
-// very same plan at this very same gate — advice that costs the operator a
-// second rejection. The enumeration must be quantified the same way the
-// decision is, so it goes through planGateUnmatchedPaths like the gate itself.
+// IT EVALUATES BOTH PHASES, NOT JUST paths, AND THAT IS THE WHOLE POINT OF THE
+// LIST. The operator's next move after this refusal is to re-start the run
+// under a named alternative, and that re-start goes through ADMISSION first.
+// A candidate filtered only on `paths` can therefore be a workflow whose
+// `labels` or `trigger` criterion the very same run cannot satisfy — a
+// labels-only workflow would be listed unconditionally, because it does not
+// constrain the plan gate at all — and the message would send the operator
+// straight into a second, fail-closed admission rejection. The run's labels and
+// trigger are IMMUTABLE for its lifetime (the issue-context snapshot on the run
+// row and its trigger_source), so both are knowable here and both are checked:
+// adm is the admission-phase change rebuilt from the run row.
 //
-// A workflow declaring no applies_to, or none that constrains this phase, is
-// included: at THIS phase it accepts. A workflow whose declaration cannot be
-// evaluated is excluded — a declaration we cannot evaluate must never be
+// It deliberately does NOT reuse satisfyingWorkflows (applies_to.go) for the
+// PATHS half, which evaluates via Predicate.Match and is therefore EXISTENTIAL
+// on paths. Using it there would let the message recommend a workflow that then
+// refuses the very same plan at this very same gate. The enumeration must be
+// quantified the same way each decision is, so the admission half goes through
+// evaluateAppliesTo (the admission gate's own core) and the plan-gate half
+// through planGateUnmatchedPaths (this gate's own ∀).
+//
+// A workflow declaring no applies_to, or none that constrains a phase, accepts
+// at that phase. A workflow whose declaration cannot be evaluated at EITHER
+// phase is excluded — a declaration we cannot evaluate must never be
 // recommended.
-func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string) []string {
+func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string, adm spec.Change) []string {
 	if parsed == nil {
 		return nil
 	}
 	var out []string
 	for name, wf := range parsed.Workflows {
+		// Phase one: would this run be ADMITTED under the candidate? A
+		// recommendation the operator cannot act on is worse than none.
+		admitted, _, aerr := evaluateAppliesTo(wf, adm, appliesToPhaseAdmission)
+		if aerr != nil || !admitted {
+			continue
+		}
 		if wf.AppliesTo == nil {
 			out = append(out, name)
 			continue
@@ -208,6 +227,20 @@ func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string) []string {
 	return out
 }
 
+// runAdmissionChange rebuilds the ADMISSION-phase spec.Change from a run row —
+// the same value checkAppliesTo evaluated at start_run, read back from the
+// immutable snapshot rather than re-derived from mutable forge state. It is the
+// run-row twin of admissionChange (applies_to.go), which reads the create
+// request; both must agree, which is why both go through triggerFormForSource
+// and treat a nil issue context as an EMPTY label set rather than as match-all.
+func runAdmissionChange(r *run.Run) spec.Change {
+	c := spec.Change{Trigger: triggerFormForSource(string(r.TriggerSource))}
+	if r.IssueContext != nil {
+		c.Labels = r.IssueContext.Labels
+	}
+	return c
+}
+
 // resolveRunWorkflowDef resolves the run's workflow definition from the
 // workflow-spec SNAPSHOT stored on the run row — the same bytes admission
 // parsed, not a re-read of the repo's current governance file. One immutable
@@ -230,9 +263,13 @@ func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string) []string {
 // run.ErrNotFound is deliberately on the fail-OPEN side: a run id with no row
 // is a genuine "nothing to enforce", not an outage, and the plan gate only ever
 // runs for a run handleShipPlan already loaded.
-func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*spec.Spec, spec.Workflow, string, bool, error) {
+// The fourth return is the ADMISSION-phase change rebuilt from the same row
+// (runAdmissionChange), so the alternatives the rejection message names are
+// filtered by the criteria a re-started run would meet FIRST rather than by
+// `paths` alone.
+func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*spec.Spec, spec.Workflow, string, spec.Change, bool, error) {
 	if s.cfg.RunRepo == nil {
-		return nil, spec.Workflow{}, "", false, nil
+		return nil, spec.Workflow{}, "", spec.Change{}, false, nil
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
 	if err != nil {
@@ -240,25 +277,26 @@ func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*s
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
 		if errors.Is(err, run.ErrNotFound) {
-			return nil, spec.Workflow{}, "", false, nil
+			return nil, spec.Workflow{}, "", spec.Change{}, false, nil
 		}
-		return nil, spec.Workflow{}, "", false, fmt.Errorf("read run %s: %w", runID, err)
+		return nil, spec.Workflow{}, "", spec.Change{}, false, fmt.Errorf("read run %s: %w", runID, err)
 	}
+	adm := runAdmissionChange(runRow)
 	if runRow.WorkflowSpec == nil {
-		return nil, spec.Workflow{}, "", false, nil
+		return nil, spec.Workflow{}, "", adm, false, nil
 	}
 	parsed, perr := spec.ParseBytes(runRow.WorkflowSpec)
 	if perr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "applies_to plan gate: parse workflow spec failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", perr.Error()))
-		return nil, spec.Workflow{}, "", false, nil
+		return nil, spec.Workflow{}, "", adm, false, nil
 	}
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
-		return nil, spec.Workflow{}, "", false, nil
+		return nil, spec.Workflow{}, "", adm, false, nil
 	}
-	return parsed, wf, runRow.WorkflowID, true, nil
+	return parsed, wf, runRow.WorkflowID, adm, true, nil
 }
 
 // appliesToPlanGateRejection is the fail-closed `paths` enforcement point. It
@@ -305,7 +343,7 @@ func (s *Server) resolveRunWorkflowDef(ctx context.Context, runID uuid.UUID) (*s
 //     retry-shaped one at that: the failure is transient, so re-shipping the
 //     plan recovers, whereas a silent admission does not.
 func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
-	parsed, wf, workflowID, ok, rerr := s.resolveRunWorkflowDef(ctx, runID)
+	parsed, wf, workflowID, adm, ok, rerr := s.resolveRunWorkflowDef(ctx, runID)
 	if rerr != nil {
 		// Fail CLOSED. Rendered as its own message rather than through
 		// renderAppliesToRejection: nothing that renderer reports —
@@ -341,7 +379,7 @@ func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID
 		Required:      sub.Paths,
 		Observed:      renderUnmatchedPaths(unmatched),
 		ObservedLabel: "out-of-declaration scope.files",
-		Satisfying:    planGateSatisfyingWorkflows(parsed, paths),
+		Satisfying:    planGateSatisfyingWorkflows(parsed, paths, adm),
 		MatchErr:      matchErr,
 		Phase:         appliesToPhasePlanGate,
 	}

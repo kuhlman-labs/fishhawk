@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -398,35 +399,52 @@ func TestAppliesTo_M10_Override_AdmitsAndAudits(t *testing.T) {
 // --- M11b: the AUDIT ENTRY, not the request, is the source of truth ---
 //
 // A run whose creation carried an override but whose RUN-SCOPED entry is
-// ABSENT has no override to carry forward. This is what makes the
-// carry-forward lookup fail-closed: the run-scoped append failure admits the
-// run (the bypass is already audited globally — see M11c) but leaves the plan
-// gate free to re-reject it on a deferred `paths` violation.
+// ABSENT has no override — and no run either. The entry is the only record a
+// run-scoped audit read returns, so a run that outlived its own entry would be
+// a governance bypass legible nowhere on the chain of the run it applies to.
+// That is not merely a lost carry-forward: for an ADMISSION-ONLY violation
+// (labels, trigger — the shape this case uses) there is no second evaluation
+// point, so the run would proceed to completion looking exactly like one that
+// satisfied its declaration.
+//
+// So the carry-forward append is a precondition of the run SURVIVING, just as
+// the grant append (M11c) is a precondition of it being admitted: the run is
+// CANCELLED and the caller gets 503, and the lookup still reports no override.
 
 func TestAppliesTo_M11b_OverrideLookup_IsAuditEntryNotRequest(t *testing.T) {
-	s, _, au, _ := newDelegationServer(t)
-	// The GRANT (global chain) succeeds — the bypass is audited — but the
-	// run-scoped carry-forward append fails.
+	s, repo, au, _ := newDelegationServer(t)
+	// The GRANT (global chain) succeeds — the bypass is audited there — but
+	// the run-scoped carry-forward append fails.
 	au.appendErrCategory = "run_admitted_applies_to_override"
 	body := guardedRunBody(labelsGuard)
 	body["issue_context"] = issueCtx("bug")
 	body["applies_to_override"] = true
 	body["applies_to_override_reason"] = "forced"
 	w := createRunViaHandler(t, s, body)
-	if w.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201 — a CARRY-FORWARD append failure must not unwind an already-audited admission:\n%s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 — a run whose override entry could not be recorded must not proceed on the request field alone:\n%s", w.Code, w.Body.String())
 	}
-	var created runResponse
-	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
-		t.Fatal(err)
+	if env := decodeErrorEnvelope(t, w); env.Code != "audit_unavailable" {
+		t.Errorf("code = %q, want audit_unavailable", env.Code)
 	}
+
+	// The run row exists (the entry needed its id) but is CANCELLED, so no
+	// stage of it can run on the unrecorded bypass.
 	au.appendErrCategory = ""
-	has, err := s.runHasAppliesToOverride(context.Background(), created.ID)
-	if err != nil {
-		t.Fatalf("runHasAppliesToOverride: %v", err)
+	if n := len(repo.runs); n != 1 {
+		t.Fatalf("run rows = %d, want the one row the entry needed an id from", n)
 	}
-	if has {
-		t.Error("runHasAppliesToOverride returned true for a run with NO recorded entry; the override would carry forward on the strength of the request alone")
+	for id, rr := range repo.runs {
+		if rr.State != run.StateCancelled {
+			t.Errorf("run %s state = %q, want cancelled — it carries a governance bypass its own audit chain does not record", id, rr.State)
+		}
+		has, err := s.runHasAppliesToOverride(context.Background(), id)
+		if err != nil {
+			t.Fatalf("runHasAppliesToOverride: %v", err)
+		}
+		if has {
+			t.Error("runHasAppliesToOverride returned true for a run with NO recorded entry; the override would carry forward on the strength of the request alone")
+		}
 	}
 }
 
@@ -669,17 +687,19 @@ func TestAppliesTo_M13_MatchError_FailsClosed(t *testing.T) {
 	}
 }
 
-// TestAppliesTo_M13_AdmissionMatchError_Rejects drives the same fail-closed
-// branch through the ADMISSION call site rather than the core, so a future
-// `if err != nil { return true, nil }` in checkAppliesTo is caught.
-func TestAppliesTo_M13_AdmissionMatchError_Rejects(t *testing.T) {
-	s, repo, au, _ := newDelegationServer(t)
+// TestAppliesTo_AdmissionRefusal_RejectsAtTheCallSite drives an ordinary
+// unsatisfied-criterion refusal through the ADMISSION call site rather than
+// through the core, so the 422 + refusal-audit wiring is pinned end to end.
+//
+// It deliberately does NOT claim to cover checkAppliesTo's matchErr branch: a
+// Match error is not reachable through that call site, and the previous name
+// (…_AdmissionMatchError_Rejects) said otherwise while its own body conceded
+// it. TestAppliesTo_AdmissionPhase_CannotProduceAMatchError below pins WHY it
+// is unreachable, which is the assertion that actually protects the branch.
+func TestAppliesTo_AdmissionRefusal_RejectsAtTheCallSite(t *testing.T) {
+	s, _, au, _ := newDelegationServer(t)
 	w := httptest.NewRecorder()
 	req := withAuth(httptest.NewRequest(http.MethodPost, "/v0/runs", nil))
-	// A labels criterion that Match rejects with an error is not reachable,
-	// so use the empty-ChangeKinds shape: a declared-but-unsatisfiable
-	// criterion list containing an empty string still evaluates, while a
-	// predicate whose only declared criterion is an empty glob errors.
 	crq := &createRunRequest{
 		Repo: "x/y", WorkflowID: "guarded", TriggerSource: "cli",
 	}
@@ -694,9 +714,53 @@ func TestAppliesTo_M13_AdmissionMatchError_Rejects(t *testing.T) {
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Errorf("status = %d, want 422", w.Code)
 	}
-	_ = repo
 	if n := countGlobalAppends(au, "run_rejected_applies_to"); n != 1 {
 		t.Errorf("global refusal entries = %d, want 1", n)
+	}
+}
+
+// TestAppliesTo_AdmissionPhase_CannotProduceAMatchError pins the structural
+// reason checkAppliesTo's matchErr branch cannot be driven from that call site,
+// which is the only honest way to guard it.
+//
+// Predicate.Match has exactly two error modes: an EMPTY predicate, and a
+// malformed `paths` glob. The admission sub-predicate never carries `paths` (it
+// is the plan gate's criterion), and the empty case is filtered ahead of Match
+// by the `constrains` guard — so no declaration reachable through the call site
+// can make Match error there. The branch is defense in depth behind parse-time
+// Predicate.Validate, and the plan-gate call site is where the same posture IS
+// exercised for real (TestPlanGateUnmatchedPaths_MalformedGlob_FailsClosed).
+//
+// This test is the tripwire on that reasoning rather than on the branch: if a
+// future phase split routes `paths` — or any error-capable criterion — into the
+// admission half, Match errors become reachable at admission and this fails,
+// forcing whoever made that change to cover the fail-closed branch for real.
+func TestAppliesTo_AdmissionPhase_CannotProduceAMatchError(t *testing.T) {
+	// Every shape a workflow can declare, including one whose PATHS half is
+	// malformed: the admission sub-predicate must still never error.
+	for _, p := range []spec.Predicate{
+		{Labels: []string{"dependencies"}},
+		{Triggers: []spec.TriggerForm{spec.TriggerScheduled}},
+		{ChangeKinds: []string{"feature"}},
+		{Labels: []string{"dependencies"}, Paths: []string{"docs/["}},
+		{Paths: []string{"docs/["}},
+		{},
+	} {
+		sub, constrains := appliesToPhasePredicate(p, appliesToPhaseAdmission)
+		if len(sub.Paths) > 0 {
+			t.Fatalf("the admission sub-predicate of %+v carries paths; Match can now error at admission and checkAppliesTo's matchErr branch needs a real test", p)
+		}
+		if !constrains {
+			// Match is never called — the caller admits without evaluating.
+			continue
+		}
+		for _, c := range []spec.Change{
+			{}, {Labels: []string{"bug"}, Trigger: spec.TriggerDiff},
+		} {
+			if _, err := sub.Match(c); err != nil {
+				t.Fatalf("admission sub-predicate %+v errored on %+v (%v); the matchErr branch is now reachable and must be driven through checkAppliesTo", sub, c, err)
+			}
+		}
 	}
 }
 

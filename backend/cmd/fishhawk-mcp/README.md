@@ -806,9 +806,11 @@ Two inputs feed this from the MCP surface:
   override recorded only on an admission refusal would be unreachable in the common case of satisfied labels plus an
   out-of-declaration plan scope. Auditing the bypass is a **precondition** of granting it — if the entry cannot be
   written the run is refused with `503 audit_unavailable` and no run row is created, rather than admitted unaudited.
-  (The later run-scoped carry-forward append is the one best-effort half: if *it* fails the run is admitted, already
-  audited, and the plan gate re-rejects a deferred `paths` violation — recoverable by re-starting with the override or
-  widening the declaration.)
+  That holds for **both** writes: the pre-insert grant creates no run row, and a failure of the post-insert
+  **run-scoped** entry (the one the plan gate reads) CANCELS the just-created run and returns the same `503`. A run
+  that outlived its own entry would carry a bypass no run-scoped audit read returns, and an admission-only
+  (`labels`/`trigger`) violation has no second evaluation point to catch it. Either way: retry once the audit store is
+  reachable.
 
 Prefer amending the workflow's declaration (a reviewable change) over the override. The control prevents **misrouting**,
 not a determined authorized caller: labels are fetched by the caller's `gh` and attested inline, so a server-side fetch

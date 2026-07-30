@@ -4356,9 +4356,15 @@ paths:
                     unreachable in the common case of satisfied
                     labels plus an out-of-declaration plan scope.
                     Auditing the bypass is a PRECONDITION of granting
-                    it — if the audit entry cannot be written the run
-                    is refused with `503 audit_unavailable` rather
-                    than admitted unaudited.
+                    it, at BOTH writes: a pre-insert grant-append
+                    failure refuses the run with `503
+                    audit_unavailable` and creates no run row, and a
+                    post-insert run-scoped append failure CANCELS the
+                    just-created run and returns the same `503`. A run
+                    that outlived its own entry would carry a bypass
+                    no run-scoped audit read returns, and an
+                    admission-only (`labels`/`trigger`) violation has
+                    no second evaluation point to catch it.
                 applies_to_override_reason:
                   type: string
                   description: |
@@ -4450,9 +4456,11 @@ paths:
             `applies_to_override` is set but the bypass could not be
             written to the audit log (append failure, or no audit
             store configured). Auditing the bypass is a PRECONDITION
-            of granting it, so the run is refused and no run row is
-            created rather than admitted unaudited. Transient —
-            retry once the audit store is reachable.
+            of granting it, so the run never proceeds on an
+            unrecorded bypass: a pre-insert grant-append failure
+            creates no run row, and a post-insert run-scoped append
+            failure cancels the created run (`details.run_id`).
+            Transient — retry once the audit store is reachable.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
