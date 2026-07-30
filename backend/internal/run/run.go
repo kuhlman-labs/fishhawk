@@ -475,6 +475,24 @@ type IssueContext struct {
 	URL      string         `json:"url"`
 	Number   int            `json:"number"`
 	Comments []IssueComment `json:"comments,omitempty"`
+	// Labels are the triggering issue's label NAMES, captured at
+	// run-create from `gh issue view --json labels` (E53.3 / #2226).
+	// They are the sole producer for the `applies_to` predicate's
+	// `labels` criterion.
+	//
+	// Persisted inside the existing runs.issue_context JSONB payload —
+	// ADDITIVE, no migration: migration 0025 added the column as JSONB
+	// and postgres.go marshals/unmarshals the whole IssueContext, so a
+	// new field round-trips and pre-#2226 rows unmarshal it to a nil
+	// slice. Exactly the shape #618 used for Comments.
+	//
+	// The snapshot is deliberately IMMUTABLE for the life of the run:
+	// both applies_to evaluation points (admission and the plan gate)
+	// read this one value rather than re-reading mutable forge state,
+	// so a control that fires twice cannot reach two answers about one
+	// run. A nil/empty slice is an EMPTY label set, which fails closed
+	// against a labels-declaring workflow — never match-all.
+	Labels []string `json:"labels,omitempty"`
 }
 
 // IssueComment is one issue comment captured alongside the body at

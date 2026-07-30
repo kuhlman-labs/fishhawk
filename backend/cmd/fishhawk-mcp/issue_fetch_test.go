@@ -204,3 +204,72 @@ func TestResolveGitHubLoginViaGh_CommandFails(t *testing.T) {
 		t.Errorf("err should NOT be ErrGhNotInstalled: %v", err)
 	}
 }
+
+// --- issue labels: the applies_to `labels` criterion's only producer (#2226) ---
+
+// TestFetchIssueViaGh_RequestsLabelsField locks the `--json` argv. `labels`
+// missing from the field list makes gh omit the key entirely, so every
+// labels-declaring workflow would fail closed against an empty label set —
+// a plumbing omission that reads as a control bug.
+func TestFetchIssueViaGh_RequestsLabelsField(t *testing.T) {
+	var gotArgs []string
+	origCmd := ghIssueCommand
+	origLook := ghLookPath
+	ghIssueCommand = func(name string, args ...string) *exec.Cmd {
+		gotArgs = append([]string{name}, args...)
+		return exec.Command("sh", "-c", `printf '{"title":"t","number":1}'`)
+	}
+	ghLookPath = func(string) (string, error) { return "/fake/gh", nil }
+	t.Cleanup(func() {
+		ghIssueCommand = origCmd
+		ghLookPath = origLook
+	})
+
+	if _, err := fetchIssueViaGh("x/y", 42); err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	joined := strings.Join(gotArgs, " ")
+	if !strings.Contains(joined, "--json title,body,url,number,comments,labels") {
+		t.Errorf("gh invoked as %q; want the --json field list to include labels", joined)
+	}
+}
+
+// TestFetchIssueViaGh_ProjectsLabelObjectsToNames pins the decode shape: gh
+// emits labels as OBJECTS carrying a `name` key (the same nested shape as
+// comments[].author), not as strings. Decoding them as strings would fail the
+// unmarshal outright; decoding into the object but reading the wrong key would
+// yield empty names and a silently unsatisfiable criterion.
+func TestFetchIssueViaGh_ProjectsLabelObjectsToNames(t *testing.T) {
+	withFakeGh(t, `{"title":"Bump dep","body":"b","url":"https://github.com/x/y/issues/9","number":9,"labels":[{"id":"LA_1","name":"dependencies","color":"0366d6"},{"id":"LA_2","name":"area:backend","color":"d73a4a"}]}`)
+	got, err := fetchIssueViaGh("x/y", 9)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if want := "dependencies,area:backend"; strings.Join(got.Labels, ",") != want {
+		t.Errorf("Labels = %v, want [%s] projected from the label objects' name key", got.Labels, want)
+	}
+}
+
+// TestFetchIssueViaGh_ToleratesAbsentLabels covers the degrade: an issue with
+// no labels (or an older gh that omits the key) decodes to a nil slice rather
+// than erroring. The empty set is then fail-closed at admission, which is the
+// documented behaviour — not a fetch failure.
+func TestFetchIssueViaGh_ToleratesAbsentLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+	}{
+		{"key absent", `{"title":"t","body":"b","url":"u","number":1}`},
+		{"empty array", `{"title":"t","body":"b","url":"u","number":1,"labels":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFakeGh(t, tc.body)
+			got, err := fetchIssueViaGh("x/y", 1)
+			if err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if len(got.Labels) != 0 {
+				t.Errorf("Labels = %v, want empty", got.Labels)
+			}
+		})
+	}
+}

@@ -1367,3 +1367,72 @@ func TestExportAudit_BadBaseURL(t *testing.T) {
 		t.Fatal("expected error for empty BaseURL")
 	}
 }
+
+// --- W2: the applies_to wire fields serialize onto the request body (#2226) ---
+
+// TestStartRun_W2_IssueLabels_Serialize asserts issue_context.labels reaches
+// the wire under exactly that key. The backend decodes POST /v0/runs with
+// DisallowUnknownFields and mirrors this struct by hand, so a renamed or
+// dropped tag is silent here and fails closed on every labels-declaring
+// workflow there (the #371-class wire-mirror trap).
+func TestStartRun_W2_IssueLabels_Serialize(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startResp = Run{ID: uuid.New(), State: "pending"}
+	c := New(srv.URL, "")
+
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "github_issue",
+		IssueContext: &IssueContext{
+			Title: "t", Body: "b", URL: "u", Number: 9,
+			Labels: []string{"dependencies", "area:backend"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(fb.gotStartBody), `"labels":["dependencies","area:backend"]`) {
+		t.Errorf("body missing issue_context.labels: %s", fb.gotStartBody)
+	}
+
+	// An unlabelled issue omits the key, keeping a legacy payload identical.
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "github_issue",
+		IssueContext: &IssueContext{Title: "t", Body: "b", URL: "u", Number: 9},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(fb.gotStartBody), "labels") {
+		t.Errorf("labels present for an unlabelled issue: %s", fb.gotStartBody)
+	}
+}
+
+// TestStartRun_W2_AppliesToOverride_Serializes asserts the escape hatch
+// reaches the wire, and is omitted when unset. An override the client drops
+// leaves a CLI operator with a rejection and no sanctioned way past it.
+func TestStartRun_W2_AppliesToOverride_Serializes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startResp = Run{ID: uuid.New(), State: "pending"}
+	c := New(srv.URL, "")
+
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "cli",
+		AppliesToOverride: true, AppliesToOverrideReason: "one-off backport",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := string(fb.gotStartBody)
+	if !strings.Contains(body, `"applies_to_override":true`) {
+		t.Errorf("body missing applies_to_override:true: %s", body)
+	}
+	if !strings.Contains(body, `"applies_to_override_reason":"one-off backport"`) {
+		t.Errorf("body missing applies_to_override_reason: %s", body)
+	}
+
+	if _, err := c.StartRun(context.Background(), CreateRunInput{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "abc", TriggerSource: "cli",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(fb.gotStartBody), "applies_to_override") {
+		t.Errorf("applies_to_override present when unset: %s", fb.gotStartBody)
+	}
+}

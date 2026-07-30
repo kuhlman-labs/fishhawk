@@ -213,6 +213,15 @@ type IssueContext struct {
 	URL      string         `json:"url"`
 	Number   int            `json:"number"`
 	Comments []IssueComment `json:"comments,omitempty"`
+	// Labels are the issue's label NAMES, projected from `gh issue
+	// view --json labels`'s label objects (E53.3 / #2226). They are
+	// the producer for the `applies_to` predicate's `labels`
+	// criterion, evaluated fail-closed at POST /v0/runs. The json tag
+	// MUST byte-match the backend's issueContextPayload or the field
+	// is silently dropped by the DisallowUnknownFields decoder's
+	// counterpart on the way out and every labels-declaring workflow
+	// rejects (the #371-class hand-maintained-wire-mirror trap).
+	Labels []string `json:"labels,omitempty"`
 }
 
 // IssueComment is one issue comment carried alongside the body in
@@ -644,6 +653,13 @@ type createRunRequest struct {
 	IssueContext   *IssueContext `json:"issue_context,omitempty"`
 	BudgetOverride bool          `json:"budget_override,omitempty"`
 	UpstreamRunID  string        `json:"upstream_run_id,omitempty"`
+	// AppliesToOverride + AppliesToOverrideReason are the audited
+	// escape hatch past the workflow's `applies_to` routing
+	// declaration (E53.3 / #2226). The reason is REQUIRED whenever the
+	// override is set — the backend 400s an empty or whitespace-only
+	// one — so the bypass is never unexplained.
+	AppliesToOverride       bool   `json:"applies_to_override,omitempty"`
+	AppliesToOverrideReason string `json:"applies_to_override_reason,omitempty"`
 }
 
 // StartRunParams is the typed input the apiClient takes for run
@@ -657,17 +673,19 @@ type createRunRequest struct {
 // fishhawk_start_run via MCP has the same composition reach the
 // CLI's `fishhawk run start` does.
 type StartRunParams struct {
-	Repo           string
-	WorkflowID     string
-	WorkflowSHA    string
-	TriggerSource  string
-	TriggerRef     string
-	IdempotencyKey string
-	RunnerKind     string
-	WorkflowSpec   string
-	IssueContext   *IssueContext
-	BudgetOverride bool
-	UpstreamRunID  string
+	Repo                    string
+	WorkflowID              string
+	WorkflowSHA             string
+	TriggerSource           string
+	TriggerRef              string
+	IdempotencyKey          string
+	RunnerKind              string
+	WorkflowSpec            string
+	IssueContext            *IssueContext
+	BudgetOverride          bool
+	UpstreamRunID           string
+	AppliesToOverride       bool
+	AppliesToOverrideReason string
 }
 
 // approvalRequest mirrors the backend's
@@ -1764,15 +1782,17 @@ func (c *apiClient) CancelRun(ctx context.Context, id uuid.UUID) (*Run, error) {
 // translate validation errors into clean tool errors.
 func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool, error) {
 	req := createRunRequest{
-		Repo:           p.Repo,
-		WorkflowID:     p.WorkflowID,
-		WorkflowSHA:    p.WorkflowSHA,
-		TriggerSource:  p.TriggerSource,
-		RunnerKind:     p.RunnerKind,
-		WorkflowSpec:   p.WorkflowSpec,
-		IssueContext:   p.IssueContext,
-		BudgetOverride: p.BudgetOverride,
-		UpstreamRunID:  p.UpstreamRunID,
+		Repo:                    p.Repo,
+		WorkflowID:              p.WorkflowID,
+		WorkflowSHA:             p.WorkflowSHA,
+		TriggerSource:           p.TriggerSource,
+		RunnerKind:              p.RunnerKind,
+		WorkflowSpec:            p.WorkflowSpec,
+		IssueContext:            p.IssueContext,
+		BudgetOverride:          p.BudgetOverride,
+		UpstreamRunID:           p.UpstreamRunID,
+		AppliesToOverride:       p.AppliesToOverride,
+		AppliesToOverrideReason: p.AppliesToOverrideReason,
 	}
 	if p.TriggerRef != "" {
 		ref := p.TriggerRef

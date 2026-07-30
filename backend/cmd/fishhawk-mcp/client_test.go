@@ -1039,3 +1039,105 @@ func TestRunLiveValidation_WireShape(t *testing.T) {
 		}
 	})
 }
+
+// --- W1: the WHOLE MCP wire, gh subprocess → request body (#2226) ---
+//
+// The gap the operator named: issue_fetch_test.go ends at the decode and the
+// StartRun tests begin at an already-populated IssueContext, so the
+// orchestration BETWEEN them could drop labels entirely while every unit test
+// passes — and every legitimate label-constrained run would then fail closed.
+// This drives a fake `gh issue view` through the real ghIssueCommand seam into
+// fetchIssueViaGh, hands the result to StartRun, and asserts on the JSON body
+// the backend actually RECEIVES.
+func TestStartRun_W1_IssueLabels_ReachTheRequestBody(t *testing.T) {
+	withFakeGh(t, `{"title":"Bump dep","body":"b","url":"https://github.com/x/y/issues/9","number":9,"labels":[{"name":"dependencies"},{"name":"area:backend"}]}`)
+
+	ic, err := fetchIssueViaGh("x/y", 9)
+	if err != nil {
+		t.Fatalf("fetchIssueViaGh: %v", err)
+	}
+
+	var received map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &received); err != nil {
+			t.Errorf("backend received a body that is not JSON: %v", err)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"` + uuid.NewString() + `","repo":"x/y","workflow_id":"feature_change","state":"pending"}`))
+	}))
+	defer ts.Close()
+
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	if _, _, err := c.StartRun(context.Background(), StartRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+		TriggerSource: "github_issue", IssueContext: ic,
+	}); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+
+	got, _ := received["issue_context"].(map[string]any)
+	if got == nil {
+		t.Fatalf("request body carried no issue_context: %+v", received)
+	}
+	labels, _ := got["labels"].([]any)
+	if len(labels) != 2 || labels[0] != "dependencies" || labels[1] != "area:backend" {
+		t.Errorf("issue_context.labels on the wire = %+v, want the two fetched names — a dropped field here fails closed on EVERY labels-declaring workflow", got["labels"])
+	}
+}
+
+// TestStartRun_W1_AppliesToOverride_ReachesTheRequestBody is the same
+// serialization proof for the escape hatch: an override the client silently
+// drops leaves the operator with a rejection and no way past it.
+func TestStartRun_W1_AppliesToOverride_ReachesTheRequestBody(t *testing.T) {
+	var received map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &received)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"` + uuid.NewString() + `","repo":"x/y","workflow_id":"feature_change","state":"pending"}`))
+	}))
+	defer ts.Close()
+
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	if _, _, err := c.StartRun(context.Background(), StartRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+		TriggerSource:     "cli",
+		AppliesToOverride: true, AppliesToOverrideReason: "one-off backport",
+	}); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if received["applies_to_override"] != true {
+		t.Errorf("applies_to_override on the wire = %v, want true", received["applies_to_override"])
+	}
+	if received["applies_to_override_reason"] != "one-off backport" {
+		t.Errorf("applies_to_override_reason on the wire = %v, want the operator's reason", received["applies_to_override_reason"])
+	}
+}
+
+// TestStartRun_W1_OverrideOmittedWhenUnset keeps the default request byte-
+// identical to a pre-#2226 one: omitempty means an ordinary run sends neither
+// key, so the backend's DisallowUnknownFields decoder and every recorded
+// fixture stay unaffected.
+func TestStartRun_W1_OverrideOmittedWhenUnset(t *testing.T) {
+	var received map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &received)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"` + uuid.NewString() + `","repo":"x/y","workflow_id":"feature_change","state":"pending"}`))
+	}))
+	defer ts.Close()
+
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	if _, _, err := c.StartRun(context.Background(), StartRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: "cli",
+	}); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	for _, k := range []string{"applies_to_override", "applies_to_override_reason"} {
+		if _, present := received[k]; present {
+			t.Errorf("%s present on an ordinary create request; omitempty must keep it off the wire", k)
+		}
+	}
+}

@@ -55,10 +55,19 @@ func resolveIssueRef(raw string) (int, error) {
 }
 
 // ghIssue is the subset of `gh issue view --json
-// title,body,url,number,comments` output the CLI consumes. gh emits
-// camelCase; mirror it verbatim so the JSON decoder picks the right
-// keys. Each comment carries a nested `author` object (we read its
-// `login`), plus `body` and `createdAt`.
+// title,body,url,number,comments,labels` output the CLI consumes. gh
+// emits camelCase; mirror it verbatim so the JSON decoder picks the
+// right keys. Each comment carries a nested `author` object (we read
+// its `login`), plus `body` and `createdAt`.
+//
+// Labels are likewise nested OBJECTS, not strings — `gh issue view
+// --json labels` emits `[{"id":…,"name":"dependencies","color":…}]`,
+// the same shape as the sibling `comments[].author` decode above — so
+// the projection to names happens here (E53.3 / #2226). This decode is
+// a deliberate DUPLICATE of backend/cmd/fishhawk-mcp/issue_fetch.go's:
+// the two binaries are separate Go modules with their own ghIssue, and
+// changing only one would leave CLI-started runs with an empty label
+// set and therefore fail-closed-reject every labels-declaring workflow.
 type ghIssue struct {
 	Title    string `json:"title"`
 	Body     string `json:"body"`
@@ -71,11 +80,14 @@ type ghIssue struct {
 		Body      string `json:"body"`
 		CreatedAt string `json:"createdAt"`
 	} `json:"comments"`
+	Labels []struct {
+		Name string `json:"name"`
+	} `json:"labels"`
 }
 
 // fetchIssueViaGh shells to `gh issue view N --repo owner/name
-// --json title,body,url,number,comments` and returns the parsed
-// result.
+// --json title,body,url,number,comments,labels` and returns the
+// parsed result.
 //
 // Best-effort by design — when `gh` is missing, unauthed, or the
 // repo blocks the operator, runStart warns to stderr and proceeds
@@ -93,7 +105,7 @@ func fetchIssueViaGh(repo string, issueNumber int) (*httpclient.IssueContext, er
 		return nil, ErrGhNotInstalled
 	}
 	cmd := ghIssueCommand("gh", "issue", "view", strconv.Itoa(issueNumber),
-		"--repo", repo, "--json", "title,body,url,number,comments")
+		"--repo", repo, "--json", "title,body,url,number,comments,labels")
 	out, err := cmd.Output()
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -119,6 +131,9 @@ func fetchIssueViaGh(repo string, issueNumber int) (*httpclient.IssueContext, er
 			Body:      c.Body,
 			CreatedAt: c.CreatedAt,
 		})
+	}
+	for _, l := range iss.Labels {
+		ic.Labels = append(ic.Labels, l.Name)
 	}
 	return ic, nil
 }
