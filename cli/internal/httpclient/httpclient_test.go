@@ -1407,7 +1407,8 @@ func TestStartRun_W2_IssueLabels_Serialize(t *testing.T) {
 
 // TestStartRun_W2_AppliesToOverride_Serializes asserts the escape hatch
 // reaches the wire, and is omitted when unset. An override the client drops
-// leaves a CLI operator with a rejection and no sanctioned way past it.
+// leaves `run start --applies-to-override` silently inert — the operator
+// believes they passed the escape hatch and the run is refused anyway.
 func TestStartRun_W2_AppliesToOverride_Serializes(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	fb.startResp = Run{ID: uuid.New(), State: "pending"}
