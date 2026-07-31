@@ -321,6 +321,16 @@ type predicateSnapshot struct {
 	ResolvedPermission string `json:"resolved_permission,omitempty"`
 	MemberResolved     *bool  `json:"member_resolved,omitempty"`
 	PredicateResult    string `json:"predicate_result,omitempty"`
+	// Escalation fields (E53.4 / #2227). CountRequired and MinPermission above
+	// already carry the EFFECTIVE (escalated) values, so a stricter gate is
+	// explainable from this row alone; these two record that an escalation is
+	// what made them stricter, and the full membership CONJUNCTION the gate
+	// enforced (MemberOf above stays the gate's own declared group, so the
+	// baseline remains readable next to the raise). Additive + omitempty: a
+	// run on a workflow declaring no escalations serialises byte-identically,
+	// keeping the E9 Export v1 hash chain and strict decode unaffected.
+	Escalated         bool     `json:"escalated,omitempty"`
+	EscalatedMemberOf []string `json:"escalated_member_of,omitempty"`
 }
 
 // submitterClass labels the submitter relative to the quorum: "author" when
@@ -425,16 +435,24 @@ type predicateResolution struct {
 // The returned predicate string names which predicate produced a
 // rejected/unavailable outcome ("min_permission" | "member_of"); it is empty
 // on satisfied.
-func (s *Server) resolvePredicates(ctx context.Context, repo, subject string, approvals *spec.Approvals) (predicateOutcome, *predicateResolution, string) {
+// The `approvals` argument is the ESCALATED requirement (escalatedApprovals),
+// not the raw spec block: a fired escalation (E53.4 / #2227) may have raised
+// the permission tier and ADDED groups. Membership is a CONJUNCTION — ALL
+// groups must resolve true — so two escalations naming disjoint groups produce
+// a gate no single approver can clear, which is the correct fail-closed reading
+// for a control that may only raise. Any membership error still yields
+// predicateUnavailable, so the conjunction inherits the fail-closed posture
+// unchanged.
+func (s *Server) resolvePredicates(ctx context.Context, repo, subject string, approvals escalatedApprovals) (predicateOutcome, *predicateResolution, string) {
 	res := &predicateResolution{}
-	if approvals.MinPermission != "" {
+	if approvals.minPermission != "" {
 		// A repo permission tier cannot be resolved without a repo (a
 		// non-GitHub / ad-hoc trigger leaves run.Repo empty). Fail closed
 		// rather than wave the approver through.
 		if repo == "" {
 			return predicateUnavailable, res, "min_permission"
 		}
-		required, ok := identity.ParsePermission(approvals.MinPermission)
+		required, ok := identity.ParsePermission(approvals.minPermission)
 		if !ok {
 			// Should not happen post-schema-validation (the enum is closed);
 			// treat an unparseable required tier as unavailable, never
@@ -450,11 +468,13 @@ func (s *Server) resolvePredicates(ctx context.Context, repo, subject string, ap
 			return predicateRejected, res, "min_permission"
 		}
 	}
-	if approvals.MemberOf != "" {
-		member, err := s.cfg.IdentityProvider.ResolveMembership(ctx, approvals.MemberOf, subject)
+	for _, group := range approvals.memberOf {
+		member, err := s.cfg.IdentityProvider.ResolveMembership(ctx, group, subject)
 		if err != nil {
 			return predicateUnavailable, res, "member_of"
 		}
+		// The LAST resolved membership is recorded on the snapshot; on a
+		// rejection that is the group that failed, which is the actionable one.
 		res.MemberResolved = &member
 		if !member {
 			return predicateRejected, res, "member_of"

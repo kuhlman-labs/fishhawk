@@ -795,12 +795,101 @@ components:
             response.
           items:
             $ref: '#/components/schemas/RunReviewAuthority'
+        escalations:
+          allOf:
+            - $ref: '#/components/schemas/RunEscalations'
+          description: |
+            The run's fired per-path escalations (E53.4 / #2227): which
+            `escalations` declarations matched this change and the STRICTEST
+            requirement they composed to, so an operator reads why a gate got
+            stricter instead of diffing the workflow against the plan by hand.
+            Surfaced on `GET /v0/runs/{run_id}` ONLY (same single-read posture as
+            `delegation`); omitted when the run's workflow declares no
+            escalations, when none fired, or when the evaluation could not run —
+            so a run on a workflow declaring none keeps a byte-identical
+            response. The `summary` renders through the same helper as the
+            `escalation_fired` audit entry, so the run read and the governance
+            chain cannot describe one firing differently.
         created_at:
           type: string
           format: date-time
         updated_at:
           type: string
           format: date-time
+
+    RunEscalations:
+      type: object
+      description: |
+        The fired per-path escalations for a run (E53.4 / #2227). An escalation
+        may only ever RAISE a requirement — the composition is max(count) /
+        union(member_of) / strictest(min_permission) / lowest(max_autonomy),
+        which is order-independent by construction.
+      required: [summary, fired, require]
+      properties:
+        summary:
+          type: string
+          description: |
+            The operator-facing summary naming each fired predicate and the
+            raised requirements. Rendered through the same helper as the
+            `escalation_fired` audit payload.
+        fired:
+          type: array
+          description: The declarations that matched, in declaration order.
+          items:
+            $ref: '#/components/schemas/RunEscalationFired'
+        require:
+          $ref: '#/components/schemas/RunEscalationRequire'
+
+    RunEscalationFired:
+      type: object
+      description: |
+        One fired declaration: its index in the workflow's `escalations` list
+        (the coordinate validation errors report at) and the criteria it
+        declared.
+      required: [index]
+      properties:
+        index:
+          type: integer
+          description: The declaration's index in the workflow's `escalations` list.
+        paths:
+          type: array
+          items: {type: string}
+        labels:
+          type: array
+          items: {type: string}
+        change_kind:
+          type: array
+          items: {type: string}
+        trigger:
+          type: array
+          items: {type: string}
+
+    RunEscalationRequire:
+      type: object
+      description: |
+        The COMPOSED requirement across every fired escalation, strictest per
+        dimension. Every field is omitted when no fired escalation declared it.
+      properties:
+        count:
+          type: integer
+          description: The raised number of distinct approvals the gate needs (the MAX across fired escalations).
+        member_of:
+          type: array
+          description: |
+            The sorted, de-duplicated UNION of every fired escalation's group. It
+            is a CONJUNCTION: an approver must belong to EVERY listed group.
+          items: {type: string}
+        min_permission:
+          type: string
+          enum: [read, triage, write, maintain, admin]
+          description: The strictest raised forge permission tier.
+        max_autonomy:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            The lowest (strictest) raised CEILING on AGENT autonomy, applied LAST
+            over the run's fully resolved action matrix — after the workflow tier
+            and after every explicit `actions` override.
 
     RunReviewAuthority:
       type: object

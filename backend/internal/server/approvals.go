@@ -784,9 +784,35 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	// and the count can never disagree on `not:`.
 	excludeAuthor := approvalsExcludeAuthor(approvals)
 	eligibleCount := s.countDistinctEligibleApprovers(ctx, p.Stage.RunID, p.Stage.ID, changeAuthor, excludeAuthor)
-	required := 1
-	if approvals.Count != nil {
-		required = *approvals.Count
+
+	// The escalation raise is applied at the COUNT as well as at the
+	// pre-Submit 403 (E53.4 / #2227), for the same #2358 reason `not:` had to
+	// be: raising only the 403 would record an approval the gate then declines
+	// to count, wedging it one short — a stuck gate is strictly harder to
+	// diagnose than a clean refusal. Both reads resolve from the same
+	// immutable cached spec bytes on the same run row within one request, so
+	// the two can never disagree about what fired.
+	//
+	// A resolver ERROR here is not a 503: this is the post-Submit path, where
+	// the approval row is already inserted, and the pre-Submit gate
+	// (checkApprovalPredicates) has already refused an unevaluable escalation
+	// with a retryable 503. Fail toward NOT ADVANCING — the escalated
+	// requirement is unknown, so an advance could clear a gate an escalation
+	// had raised.
+	escReq, escErr := s.resolveStageEscalations(ctx, p.Stage)
+	if escErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"approval: escalation resolution failed; not advancing the gate",
+			slog.String("stage_id", p.Stage.ID.String()),
+			slog.String("error", escErr.Error()),
+		)
+	}
+	effective := effectiveApprovals(approvals, escReq)
+	required := effective.count
+	if escErr != nil {
+		// Unknown requirement: make the gate unreachable this pass rather than
+		// advance it at a possibly-unescalated count.
+		required = eligibleCount + 1
 	}
 	// A delegated/agent submission never advances the gate even if the count
 	// otherwise suffices — it does not itself count and no human vote is
@@ -800,9 +826,17 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		SubmitterClass: submitterClass(res.Approval.ApproverSubject, changeAuthor, submitterAgent),
 		AuthMethod:     id.AuthMethod,
 		Channel:        channel,
-		MinPermission:  approvals.MinPermission,
+		MinPermission:  effective.minPermission,
 		MemberOf:       approvals.MemberOf,
 		QuorumReached:  reached,
+	}
+	// Record that an escalation is what made this gate stricter, and the full
+	// membership conjunction it enforced, so the raise is explainable from the
+	// audit row alone. Additive + omitempty — a run with no fired escalation
+	// serialises byte-identically to today.
+	if !escReq.IsZero() {
+		snapshot.Escalated = true
+		snapshot.EscalatedMemberOf = effective.memberOf
 	}
 	// Record the forge-resolved predicate outcome on the counted-approver
 	// row when the handler resolved it (E39.5 / #1710). The campaign
@@ -923,12 +957,39 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 // best-effort posture), NOT on the forge RESOLUTION, which fails closed.
 func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request, stage *run.Stage, subject string, delegated bool) (*predicateResolution, bool) {
 	approvals, err := s.fetchApprovalsForStage(r.Context(), stage)
-	if err != nil || approvals == nil {
+	if err != nil {
 		return nil, true
 	}
-	// Only the two forge predicates gate here. A count-only approvals block
-	// keeps the pure-quorum path.
-	if approvals.MinPermission == "" && approvals.MemberOf == "" {
+
+	// The escalation raise is resolved BEFORE the "is this gate predicate-
+	// guarded" test (E53.4 / #2227): an escalation can add a `member_of` or a
+	// `min_permission` to a gate that declares NEITHER, so testing the raw
+	// block first would skip the forge gate on exactly the gate an escalation
+	// just tightened. It is also resolved on a gate with no approvals block at
+	// all — a `paths`-matched escalation raises membership there too.
+	//
+	// FAIL CLOSED on a resolver error: a Match error (a malformed glob reaching
+	// the gate) or an unreadable plan while a paths-bearing escalation is
+	// declared returns a retryable 503, never an unescalated advance.
+	escReq, escErr := s.resolveStageEscalations(r.Context(), stage)
+	if escErr != nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "escalation_unevaluable",
+			"the workflow's escalations declaration could not be evaluated for this change; the approval gate failed closed rather than proceeding unescalated",
+			map[string]any{
+				"stage_id":  stage.ID.String(),
+				"retryable": true,
+				"error":     escErr.Error(),
+				"next_actions": []string{
+					"Retry the approval; if it persists, check the workflow's escalations `match` globs and that the run's plan artifact is readable",
+				},
+			})
+		return nil, false
+	}
+	effective := effectiveApprovals(approvals, escReq)
+
+	// Only the two forge predicates gate here. A count-only requirement keeps
+	// the pure-quorum path.
+	if effective.minPermission == "" && len(effective.memberOf) == 0 {
 		return nil, true
 	}
 	// A delegated / agent-kind submission is recorded but never counted
@@ -945,23 +1006,24 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 		repo = runRow.Repo
 	}
 
-	outcome, resolution, predicate := s.resolvePredicates(r.Context(), repo, subject, approvals)
+	outcome, resolution, predicate := s.resolvePredicates(r.Context(), repo, subject, effective)
 	switch outcome {
 	case predicateSatisfied:
 		return resolution, true
 	case predicateRejected:
 		// Durably record the rejection in a predicate_snapshot audit entry
 		// even though no approval row is inserted.
-		s.writePredicateRejectionAudit(r.Context(), stage, subject, approvals, resolution)
+		s.writePredicateRejectionAudit(r.Context(), stage, subject, effective, resolution)
 		s.writeError(w, r, http.StatusForbidden, "approver_predicate_unmet",
 			"the approver does not meet the gate's forge predicate (permission tier or membership)",
 			map[string]any{
 				"stage_id":            stage.ID.String(),
 				"subject":             subject,
-				"required_permission": approvals.MinPermission,
+				"required_permission": effective.minPermission,
 				"resolved_permission": resolution.ResolvedPermission,
-				"member_of":           approvals.MemberOf,
+				"member_of":           renderMemberOf(effective.memberOf),
 				"member_resolved":     resolution.MemberResolved,
+				"escalated":           !escReq.IsZero(),
 				"result":              "rejected",
 			})
 		return nil, false
@@ -972,7 +1034,7 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 				"stage_id":  stage.ID.String(),
 				"retryable": true,
 				"predicate": predicate,
-				"ref":       approvals.MemberOf,
+				"ref":       renderMemberOf(effective.memberOf),
 				"next_actions": []string{
 					"Retry the approval once the forge is reachable; the forge permission/membership API was unavailable",
 				},
@@ -987,19 +1049,19 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 // inserted. The category "approval_predicate_rejected" is a new string value
 // (no closed-set category validator exists in package server) and posts no
 // issue comment. Best-effort: a failure logs but never unwinds the 403.
-func (s *Server) writePredicateRejectionAudit(ctx context.Context, stage *run.Stage, subject string, approvals *spec.Approvals, resolution *predicateResolution) {
+func (s *Server) writePredicateRejectionAudit(ctx context.Context, stage *run.Stage, subject string, approvals escalatedApprovals, resolution *predicateResolution) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
 	snapshot := map[string]any{
 		"result": "rejected",
 	}
-	if approvals.MinPermission != "" {
-		snapshot["min_permission"] = approvals.MinPermission
+	if approvals.minPermission != "" {
+		snapshot["min_permission"] = approvals.minPermission
 		snapshot["resolved_permission"] = resolution.ResolvedPermission
 	}
-	if approvals.MemberOf != "" {
-		snapshot["member_of"] = approvals.MemberOf
+	if len(approvals.memberOf) > 0 {
+		snapshot["member_of"] = renderMemberOf(approvals.memberOf)
 		snapshot["member_resolved"] = resolution.MemberResolved
 	}
 	actorKind := actorKindForSubject(subject)
@@ -2612,10 +2674,16 @@ func (s *Server) checkDelegation(w http.ResponseWriter, r *http.Request, runID u
 			map[string]any{"action": action, "workflow_id": runRow.WorkflowID})
 		return "", false
 	}
-	ev := &delegation.Evaluator{
-		Stages:   s.cfg.RunRepo,
-		Concerns: s.cfg.ConcernRepo,
-		Audit:    s.cfg.AuditRepo,
+	// The escalation resolver is REQUIRED at construction (E53.4 / #2227): a
+	// delegated action must be refused when a fired escalation's
+	// `max_autonomy` ceiling clamps its class, and an evaluator without a
+	// resolver would act on the unclamped matrix. A constructor error reuses
+	// this function's existing fail-closed 500.
+	ev, err := delegation.NewEvaluator(s.cfg.RunRepo, s.cfg.ConcernRepo, s.cfg.AuditRepo, s.escalationResolver())
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"delegation evaluator could not be built", map[string]any{"action": action, "error": err.Error()})
+		return "", false
 	}
 	// Delegated-action enforcement runs outside any campaign context: pass a
 	// nil campaign override so resolution falls through to the workflow
