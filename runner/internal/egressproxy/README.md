@@ -14,6 +14,18 @@ host or host:port, schema-pattern-enforced (no scheme, path, or
 wildcard); they are the ONLY customer-controlled slot of the
 allow-list.
 
+**Enforcement boundary (E53.5 / #2228).** This proxy enforces the
+ACCEPTANCE stage's allow-list ONLY. workflow-v2 generalized the `egress`
+grammar (and its `permissions.network` spelling) off the acceptance-only
+binding, so a NON-acceptance stage may now DECLARE `egress` /
+`permissions.network` — but that declaration is declaration-only,
+surfaced and audited, and is **not routed to this proxy** (not enforced
+until E51 #2133). `permissions.network` is normalized into `Stage.Egress`
+at parse time, so an acceptance stage declaring either spelling reaches
+`BuildAllowlist` through the same `resolveAcceptanceEgressTargetHosts`
+seam and is enforced identically; a non-acceptance stage's declaration
+never reaches this package.
+
 ## Egress proxy
 
 - `Start(Config)` binds a default-deny filtering proxy on

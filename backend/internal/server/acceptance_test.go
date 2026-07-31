@@ -621,6 +621,86 @@ func TestResolveAcceptanceTargetURL_CoercesToHTTP(t *testing.T) {
 	}
 }
 
+// TestAcceptanceEgress_BothSpellings_ResolveIdentically is the E53.5 / #2228
+// ACCEPTANCE-CRITERION-2 anti-regression test: the test that must fail if the
+// egress generalization ever routes an acceptance stage onto the unenforced
+// declaration path. It drives REAL v2 specs through the server acceptance
+// resolvers and asserts (a) an acceptance stage declaring `egress:` and (b) one
+// declaring the new `permissions.network:` spelling BOTH resolve, through the
+// SAME resolveAcceptanceEgressTargetHosts / resolveAcceptanceTargetURL, to the
+// identical host slice and prefixed URL — proving the new spelling lands ON the
+// enforced path rather than beside it. The negative case proves a NON-acceptance
+// stage's permissions.network contributes ZERO hosts to acceptance resolution,
+// which would catch a future accidental widening of the proxy allow-list.
+func TestAcceptanceEgress_BothSpellings_ResolveIdentically(t *testing.T) {
+	ctx := context.Background()
+	s := New(Config{Addr: "127.0.0.1:0"})
+	const host = "staging.example.com:8443"
+
+	mk := func(specYAML string) *run.Run {
+		return &run.Run{ID: uuid.New(), WorkflowID: "wf", WorkflowSpec: []byte(specYAML)}
+	}
+	egRun := mk(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: accept
+        type: acceptance
+        executor: {agent: claude-code}
+        egress:
+          target_hosts: ["staging.example.com:8443"]
+`)
+	pmRun := mk(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: accept
+        type: acceptance
+        executor: {agent: claude-code}
+        permissions:
+          network:
+            target_hosts: ["staging.example.com:8443"]
+`)
+
+	egHosts := s.resolveAcceptanceEgressTargetHosts(ctx, egRun)
+	if !reflect.DeepEqual(egHosts, []string{host}) {
+		t.Fatalf("egress spelling hosts = %v, want [%s]", egHosts, host)
+	}
+	if pmHosts := s.resolveAcceptanceEgressTargetHosts(ctx, pmRun); !reflect.DeepEqual(pmHosts, egHosts) {
+		t.Errorf("permissions.network hosts = %v, want identical to egress %v — the new spelling must land ON the enforced path", pmHosts, egHosts)
+	}
+	wantURL := "http://" + host
+	if got := s.resolveAcceptanceTargetURL(ctx, egRun); got != wantURL {
+		t.Errorf("egress target URL = %q, want %q", got, wantURL)
+	}
+	if got := s.resolveAcceptanceTargetURL(ctx, pmRun); got != wantURL {
+		t.Errorf("permissions.network target URL = %q, want %q", got, wantURL)
+	}
+
+	// A NON-acceptance stage's permissions.network is inert for acceptance
+	// resolution: the acceptance stage declares no egress, so the implement
+	// stage's declaration contributes nothing.
+	inertRun := mk(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor: {agent: claude-code}
+        permissions:
+          network:
+            target_hosts: ["inert.example.com"]
+      - id: accept
+        type: acceptance
+        executor: {agent: claude-code}
+        produces:
+          - artifact: acceptance
+`)
+	if got := s.resolveAcceptanceEgressTargetHosts(ctx, inertRun); got != nil {
+		t.Errorf("non-acceptance permissions.network contributed %v to acceptance resolution, want nil (inert)", got)
+	}
+}
+
 // TestShipAcceptance_Notes_RoundTrip is a5 (#1567): a body carrying the
 // optional top-level notes overflow field is ACCEPTED (the handler decodes
 // with DisallowUnknownFields, so this would 400 without the struct field) and

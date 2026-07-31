@@ -2762,6 +2762,105 @@ workflows:
 	}
 }
 
+// --- permissions (E53.5 / #2228) ---
+
+// permissionsCLIDoc wraps a stage body (8-space indented) in a minimal v2
+// workflow with one agent implement stage.
+func permissionsCLIDoc(stageBody string) []byte {
+	return []byte(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+` + stageBody + `
+`)
+}
+
+// TestValidateBytes_Permissions_Valid is the positive control: a valid
+// permissions block validates clean, so the mirrored checks cannot pass by
+// rejecting everything.
+func TestValidateBytes_Permissions_Valid(t *testing.T) {
+	if err := spec.ValidateBytes(permissionsCLIDoc(`        permissions:
+          network:
+            target_hosts: ["staging.example.com"]
+          write: ["src/**/*.go"]
+          shell: restricted`)); err != nil {
+		t.Fatalf("ValidateBytes: %v, want a valid permissions block accepted", err)
+	}
+}
+
+// TestValidateBytes_Permissions_BothSpellings_Rejected is the CLI parity check
+// for the egress + permissions.network conflict.
+func TestValidateBytes_Permissions_BothSpellings_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(permissionsCLIDoc(`        egress:
+          target_hosts: ["a.example.com"]
+        permissions:
+          network:
+            target_hosts: ["b.example.com"]`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for both egress and permissions.network", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/wf/stages/0/permissions/network") {
+		t.Errorf("error = %q, want it to name the permissions/network pointer", msg)
+	}
+	if !strings.Contains(msg, fmt.Sprintf(spec.MsgFmtPermissionsEgressConflict, "wf", "apply")) {
+		t.Errorf("error = %q, want the byte-identical conflict message", msg)
+	}
+}
+
+// TestValidateBytes_Permissions_MalformedWriteGlob_Rejected covers the shared
+// Predicate.Validate rung for a write glob at the permissions pointer.
+func TestValidateBytes_Permissions_MalformedWriteGlob_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(permissionsCLIDoc(`        permissions:
+          write: ["src/["]`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for a malformed write glob", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/wf/stages/0/permissions/write") || !strings.Contains(msg, "malformed path glob") {
+		t.Errorf("error = %q, want it to name the write pointer and a malformed-glob message", msg)
+	}
+}
+
+// TestValidateBytes_Permissions_UnknownShell_Rejected: an unknown shell posture
+// is caught by the schema's enum before the semantic sweep, so `fishhawk
+// validate` still refuses it.
+func TestValidateBytes_Permissions_UnknownShell_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(permissionsCLIDoc(`        permissions:
+          shell: dangerous`))
+	if err == nil {
+		t.Fatal("want an error for an unknown shell posture, got nil")
+	}
+}
+
+// TestPermissionsMessageParity is the MECHANICAL drift guard for the one
+// hand-duplicated permissions constant, the same posture
+// TestAppliesToChangeKindMessageParity takes: the two modules cannot share a
+// constant, so parity is asserted by reading both source files and requiring
+// the identical declaration line in each.
+func TestPermissionsMessageParity(t *testing.T) {
+	want := `const MsgFmtPermissionsEgressConflict = ` + strconv.Quote(spec.MsgFmtPermissionsEgressConflict)
+	for _, path := range []string{
+		"../../../backend/internal/spec/permissions.go",
+		"../../../cli/internal/spec/validate.go",
+	} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(src), want) {
+			t.Errorf("%s does not declare the permissions conflict message verbatim;\nwant the line: %s\n"+
+				"The two modules cannot share a constant, so the backend and CLI copies must stay byte-identical or `fishhawk validate` and the backend will report different text for the same spec error.", path, want)
+		}
+	}
+}
+
 // TestEscalationMessageParity is the MECHANICAL drift guard for the three
 // hand-duplicated escalation strings, the same posture
 // TestAppliesToChangeKindMessageParity takes for its single constant: the two

@@ -50,6 +50,14 @@ import (
 //     pull_request artifact. The stage TYPES are general (plan / implement /
 //     review read as propose / apply / gate, ADR-067 §2), so validity binds to
 //     what a stage produces, not to its name. v0/v1 keep the type-keyed rule.
+//   - egress / permissions declaration binding (ADR-050 / #1532; generalized
+//     E53.5 / #2228): BELOW major 2 an `egress` allowance is acceptance-stage-
+//     only (frozen). AT major >= 2 an `egress` allowance (equivalently the
+//     normalized `permissions.network` spelling) or a `permissions` block is
+//     valid on any agent-executor stage and rejected on a human or delegate
+//     executor; the `permissions` block's `write` globs and `shell` posture are
+//     then validated. The block is DECLARATION-ONLY — validated, audited and
+//     surfaced but not enforced until E51 #2133.
 //
 // Validate is exported so tests and Spec-builder code can exercise
 // the semantic layer without the YAML→schema round trip.
@@ -393,19 +401,40 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 			}
 		}
 
-		// The egress allowance (ADR-050 / #1532, v1.3) declares the target
-		// host(s) an acceptance agent may reach through the runner's
-		// default-deny proxy; only an acceptance stage runs under that proxy,
-		// so declaring it elsewhere is a binding error. Mirror of the
-		// artifact bindings above — the stage $def is shared across every
-		// stage type, so this pairing is enforced here, not in the schema.
-		if stage.Egress != nil && stage.Type != StageTypeAcceptance {
-			return &ValidationError{
-				Path: stagePath(i, "/egress"),
-				Message: fmt.Sprintf(
-					"egress allowance is valid only on an acceptance stage, not a %q stage (ADR-050)",
-					stage.Type,
-				),
+		// Egress / permissions declaration binding (ADR-050 / #1532;
+		// generalized E53.5 / #2228). BELOW major 2 the acceptance-only egress
+		// rule is FROZEN exactly as shipped: egress is valid only on an
+		// acceptance stage — only an acceptance stage runs under the runner's
+		// default-deny proxy. AT major >= 2 the binding GENERALIZES — an
+		// `egress` allowance (equivalently the normalized `permissions.network`
+		// spelling) or a `permissions` block is valid on any stage whose
+		// executor is the AGENT branch, and rejected on a human or delegate
+		// executor, because a stage that runs no agent has no such declaration
+		// to make. permissions.network has already been folded into stage.Egress
+		// by normalizeStagePermissions, so both spellings reach the same check.
+		if major < 2 {
+			if stage.Egress != nil && stage.Type != StageTypeAcceptance {
+				return &ValidationError{
+					Path: stagePath(i, "/egress"),
+					Message: fmt.Sprintf(
+						"egress allowance is valid only on an acceptance stage, not a %q stage (ADR-050)",
+						stage.Type,
+					),
+				}
+			}
+		} else {
+			if (stage.Egress != nil || stage.Permissions != nil) && stage.Executor.Agent == "" {
+				ptr := "/egress"
+				if stage.Permissions != nil {
+					ptr = "/permissions"
+				}
+				return &ValidationError{
+					Path:    stagePath(i, ptr),
+					Message: fmt.Sprintf(MsgFmtPermissionsExecutorBinding, name, stage.ID, executorBranchName(stage.Executor)),
+				}
+			}
+			if err := validateStagePermissions(stagePath(i, "/permissions"), stage.Permissions); err != nil {
+				return err
 			}
 		}
 
@@ -504,6 +533,21 @@ func validRepoRelativePath(p string) error {
 		return fmt.Errorf("report_path %q must stay inside the repository (no `..` escape)", p)
 	}
 	return nil
+}
+
+// executorBranchName names the non-agent executor branch a stage selected, for
+// the E53.5 egress/permissions executor-binding rejection message. The agent
+// branch never reaches this (the caller guards on Executor.Agent == ""); an
+// executor-less stage is a schema error, so "non-agent" is defensive only.
+func executorBranchName(e Executor) string {
+	switch {
+	case e.Human:
+		return "human"
+	case e.Delegate != nil:
+		return "delegate"
+	default:
+		return "non-agent"
+	}
 }
 
 func validateApproverRefs(s *Spec, gatePath, key string, refs []string) error {

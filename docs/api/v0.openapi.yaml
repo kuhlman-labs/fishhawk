@@ -810,6 +810,24 @@ components:
             response. The `summary` renders through the same helper as the
             `escalation_fired` audit entry, so the run read and the governance
             chain cannot describe one firing differently.
+        permissions:
+          type: array
+          description: |
+            The run's declared per-stage permissions/egress (E53.5 / #2228): one
+            entry per stage of the run's workflow that declares a `permissions`
+            (`network`/`write`/`shell`) or `egress` block. DECLARATION-ONLY —
+            validated, audited and surfaced but NOT enforced until E51 (#2133);
+            do not read it as containment, sandboxing, isolation, or a security
+            control. Each entry's `enforced` flag is the honest per-entry
+            qualifier: true ONLY for an acceptance stage's network declaration
+            (whose allow-list the runner's default-deny egress proxy enforces
+            today), false everywhere else and for write/shell always. Surfaced on
+            `GET /v0/runs/{run_id}` ONLY (same single-read spec-projection posture
+            as `review_authority`); omitted when the run carries no cached spec or
+            no stage declares either block — so a run declaring none keeps a
+            byte-identical response.
+          items:
+            $ref: '#/components/schemas/RunStagePermissions'
         created_at:
           type: string
           format: date-time
@@ -890,6 +908,44 @@ components:
             The lowest (strictest) raised CEILING on AGENT autonomy, applied LAST
             over the run's fully resolved action matrix — after the workflow tier
             and after every explicit `actions` override.
+
+    RunStagePermissions:
+      type: object
+      description: |
+        One stage's declared permissions/egress (E53.5 / #2228). DECLARATION-ONLY:
+        validated, audited and surfaced but NOT enforced until E51 (#2133).
+      required: [stage_id, enforced, note]
+      properties:
+        stage_id:
+          type: string
+          description: The stage id.
+        stage_type:
+          type: string
+          description: The stage type (`plan` | `implement` | `review` | `deploy` | `acceptance`).
+        network:
+          type: array
+          description: |
+            The declared network destinations (host or host:port), from the
+            stage's `egress` allowance or the `permissions.network` spelling
+            (they normalize to one field).
+          items: {type: string}
+        write:
+          type: array
+          description: The declared write-path doublestar globs.
+          items: {type: string}
+        shell:
+          type: string
+          description: The declared shell posture (`none` | `restricted` | `unrestricted`).
+        enforced:
+          type: boolean
+          description: |
+            The honest per-entry enforcement qualifier: true ONLY for an
+            acceptance stage's network declaration (whose allow-list the runner's
+            default-deny egress proxy enforces today), false everywhere else and
+            for write/shell always.
+        note:
+          type: string
+          description: A human-readable note naming the enforcement tracker (#2133).
 
     RunReviewAuthority:
       type: object

@@ -159,3 +159,14 @@ func TestKnownCategories_EscalationFired(t *testing.T) {
 		t.Fatal("escalation_fired is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_StagePermissionsDeclared pins the E53.5 / #2228 category:
+// the run-creation emitter writes it once per run whose workflow declares any
+// stage `permissions`/`egress` block, and an unregistered category is
+// un-awaitable, which would leave the "surfaced" half of the acceptance
+// criterion untrue.
+func TestKnownCategories_StagePermissionsDeclared(t *testing.T) {
+	if !IsKnownCategory("stage_permissions_declared") {
+		t.Fatal("stage_permissions_declared is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

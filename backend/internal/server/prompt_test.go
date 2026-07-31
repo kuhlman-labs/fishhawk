@@ -373,6 +373,60 @@ func promptRenderRequest(t *testing.T, s *Server, stageID uuid.UUID) *httptest.R
 	return w
 }
 
+// TestAcceptancePromptPayload_CarriesEgressHosts_BothSpellings is the
+// prompt-seam half of the E53.5 / #2228 end-to-end egress proof (operator
+// condition 2a): the acceptance-stage prompt payload must literally carry the
+// resolved hosts in `egress_target_hosts` under BOTH the `egress` and
+// `permissions.network` spellings. It resolves the field the SAME way
+// handleGetStagePrompt does (resolveAcceptanceEgressTargetHosts, prompt.go),
+// then marshals the response to prove the wire tag carries the list rather than
+// asserting a function returned a slice — the module boundary is pinned on this
+// side of the seam; the runner's egressproxy allow-list is pinned on the other
+// (runner/internal/egressproxy/proxy_test.go).
+func TestAcceptancePromptPayload_CarriesEgressHosts_BothSpellings(t *testing.T) {
+	ctx := context.Background()
+	s := New(Config{Addr: "127.0.0.1:0"})
+	mk := func(specYAML string) *run.Run {
+		return &run.Run{ID: uuid.New(), WorkflowID: "wf", WorkflowSpec: []byte(specYAML)}
+	}
+	specs := map[string]string{
+		"egress": `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: accept
+        type: acceptance
+        executor: {agent: claude-code}
+        egress:
+          target_hosts: ["staging.example.com:8443"]
+`,
+		"permissions_network": `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: accept
+        type: acceptance
+        executor: {agent: claude-code}
+        permissions:
+          network:
+            target_hosts: ["staging.example.com:8443"]
+`,
+	}
+	for name, specYAML := range specs {
+		t.Run(name, func(t *testing.T) {
+			// Populate the field exactly as handleGetStagePrompt does.
+			resp := promptResponse{EgressTargetHosts: s.resolveAcceptanceEgressTargetHosts(ctx, mk(specYAML))}
+			raw, err := json.Marshal(resp)
+			if err != nil {
+				t.Fatalf("marshal promptResponse: %v", err)
+			}
+			if !strings.Contains(string(raw), `"egress_target_hosts":["staging.example.com:8443"]`) {
+				t.Errorf("prompt payload does not carry the resolved hosts on the wire under the %s spelling:\n%s", name, raw)
+			}
+		})
+	}
+}
+
 func TestGetStagePrompt_HappyPath_ImplementWithIssue(t *testing.T) {
 	s, rr, sf, gh := newPromptServer(t)
 	runID := uuid.New()

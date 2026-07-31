@@ -187,6 +187,48 @@ type runResponse struct {
 	// fired, or when the evaluation could not run — so a run on a workflow
 	// declaring none keeps a byte-identical response.
 	Escalations *runEscalationsPayload `json:"escalations,omitempty"`
+	// Permissions is the run's declared per-stage permissions/egress surface
+	// (E53.5 / #2228): one entry per stage of the run's workflow that declares a
+	// `permissions` or `egress` block. DECLARATION-ONLY — validated, audited and
+	// surfaced but NOT enforced until E51 #2133; each entry carries an honest
+	// per-entry `enforced` qualifier (true ONLY for an acceptance stage's
+	// network declaration, whose allow-list the runner's default-deny egress
+	// proxy enforces today; false everywhere else and for write/shell always).
+	// Populated by handleGetRun ONLY (same single-read posture as Concerns /
+	// Delegation — a pure projection of the run's cached workflow spec, not
+	// suppressed on a terminal run). Omitted (nil) when the run carries no
+	// cached spec, the spec fails to parse (warn-logged), the workflow is
+	// missing, or no stage declares either block — so a run whose spec declares
+	// none keeps a byte-identical response.
+	Permissions []runStagePermissionsPayload `json:"permissions,omitempty"`
+}
+
+// runStagePermissionsPayload is one stage's declared permissions/egress on the
+// wire (E53.5 / #2228). DECLARATION-ONLY. The Enforced flag is the HONEST
+// per-entry qualifier (operator condition 3): a blanket enforced:false would LIE
+// for the acceptance stage, whose network allow-list IS enforced today by the
+// runner's default-deny egress proxy — so Enforced is true only for an
+// acceptance stage's network declaration and false everywhere else and for
+// write/shell always. Note names E51 #2133 either way.
+type runStagePermissionsPayload struct {
+	StageID   string   `json:"stage_id"`
+	StageType string   `json:"stage_type,omitempty"`
+	Network   []string `json:"network,omitempty"`
+	Write     []string `json:"write,omitempty"`
+	Shell     string   `json:"shell,omitempty"`
+	Enforced  bool     `json:"enforced"`
+	Note      string   `json:"note"`
+}
+
+// stagePermissionsAuditPayload is the once-per-run stage_permissions_declared
+// audit payload (E53.5 / #2228). Enforced is the FEATURE-level marker — the
+// permissions block is declaration-only, so false — while EnforcementTrackedBy
+// names the enforcement epic and each per-stage entry carries its own honest
+// network-enforcement qualifier.
+type stagePermissionsAuditPayload struct {
+	Enforced             bool                         `json:"enforced"`
+	EnforcementTrackedBy string                       `json:"enforcement_tracked_by"`
+	Stages               []runStagePermissionsPayload `json:"stages"`
 }
 
 // runEscalationsPayload is the fired-escalation surface on the wire (E53.4 /
@@ -1306,6 +1348,14 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 	// unconfigured conventions, and board failures only WARN-log.
 	s.boardTransitionForRun(ctx, created, lifecycleRunStarted)
 
+	// Record the run's declared per-stage permissions/egress ONCE at creation
+	// (E53.5 / #2228) — the deterministic once-per-run point that both the HTTP
+	// handler and the campaign driver route through. Best-effort and
+	// declaration-only; no-op when the workflow declares no such block.
+	if p.HaveStageDefs {
+		s.emitStagePermissionsDeclared(ctx, created.ID, p.WorkflowDef)
+	}
+
 	return created, nil
 }
 
@@ -1443,6 +1493,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// (field omitted) when the run carries no cached spec, the spec fails to
 	// parse, or it declares no reviewers block anywhere.
 	resp.ReviewAuthority = s.buildReviewAuthorityPayload(got)
+	// Declared per-stage permissions surface (E53.5 / #2228): single-run read
+	// ONLY (same posture as ReviewAuthority — a pure projection of the run's
+	// cached workflow spec). DECLARATION-ONLY; nil (field omitted) when the run
+	// carries no cached spec, the spec fails to parse, or no stage declares a
+	// permissions/egress block.
+	resp.Permissions = s.buildStagePermissionsSurface(got)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
@@ -1678,6 +1734,110 @@ func (s *Server) buildReviewAuthorityPayload(runRow *run.Run) []runReviewAuthori
 		})
 	}
 	return out
+}
+
+// buildStagePermissionsPayloads projects a parsed workflow's stages onto the
+// per-stage permissions surface (E53.5 / #2228): one entry per stage declaring
+// a `permissions` or `egress` block (permissions.network is normalized INTO
+// Egress at parse time, so a stage declaring the new spelling has a non-nil
+// Egress here). DECLARATION-ONLY — validated, audited and surfaced but not
+// enforced until E51 #2133. Each entry's Enforced flag is the HONEST per-entry
+// qualifier (operator condition 3): true only for an acceptance stage's network
+// declaration, whose allow-list the runner's default-deny egress proxy enforces
+// today; false everywhere else and for write/shell always. Returns nil when no
+// stage declares either block, so a workflow declaring none produces a
+// byte-identical (absent) surface. Shared by the run-status read and the
+// once-per-run audit emit so the two cannot describe one declaration
+// differently.
+func buildStagePermissionsPayloads(wf spec.Workflow) []runStagePermissionsPayload {
+	var out []runStagePermissionsPayload
+	for _, st := range wf.Stages {
+		if st.Egress == nil && st.Permissions == nil {
+			continue
+		}
+		entry := runStagePermissionsPayload{
+			StageID:   st.ID,
+			StageType: string(st.Type),
+		}
+		if st.Egress != nil {
+			entry.Network = st.Egress.TargetHosts
+		}
+		if st.Permissions != nil {
+			entry.Write = st.Permissions.Write
+			entry.Shell = string(st.Permissions.Shell)
+		}
+		entry.Enforced = st.Type == spec.StageTypeAcceptance && st.Egress != nil
+		if entry.Enforced {
+			entry.Note = "network allow-list enforced today by the runner's default-deny egress proxy; write/shell are declaration-only, not enforced until E51 (#2133)"
+		} else {
+			entry.Note = "declaration-only; validated, audited and surfaced but not enforced until E51 (#2133)"
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// buildStagePermissionsSurface projects the run's cached workflow spec onto the
+// per-stage permissions read surface (E53.5 / #2228), same single-read posture
+// as buildReviewAuthorityPayload: a pure spec projection, not suppressed on a
+// terminal run. Returns nil — the field is omitted — when the run carries no
+// cached spec, the spec fails to parse (warn-logged, best-effort), the workflow
+// is missing, or no stage declares a permissions/egress block.
+func (s *Server) buildStagePermissionsSurface(runRow *run.Run) []runStagePermissionsPayload {
+	if len(runRow.WorkflowSpec) == 0 {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.Warn("permissions: parse workflow spec failed; omitting permissions block",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		return nil
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		s.cfg.Logger.Warn("permissions: workflow not in cached spec; omitting permissions block",
+			"run_id", runRow.ID.String(), "workflow_id", runRow.WorkflowID)
+		return nil
+	}
+	return buildStagePermissionsPayloads(wf)
+}
+
+// emitStagePermissionsDeclared records the run's declared per-stage
+// permissions/egress ONCE at creation (E53.5 / #2228) — the deterministic
+// once-per-run point. DECLARATION-ONLY (feature-level enforced:false) and
+// best-effort: a legibility surface must never fail run creation, so an
+// AppendChained failure warn-logs and returns. No-op when the workflow declares
+// no permissions/egress block anywhere, so a run whose spec declares none
+// appends nothing and its audit stream stays byte-identical.
+func (s *Server) emitStagePermissionsDeclared(ctx context.Context, runID uuid.UUID, wf spec.Workflow) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	stages := buildStagePermissionsPayloads(wf)
+	if len(stages) == 0 {
+		return
+	}
+	payload, err := json.Marshal(stagePermissionsAuditPayload{
+		Enforced:             false,
+		EnforcementTrackedBy: "#2133",
+		Stages:               stages,
+	})
+	if err != nil {
+		s.cfg.Logger.Warn("permissions: marshal stage_permissions_declared payload failed; audit entry omitted",
+			"run_id", runID.String(), "error", err.Error())
+		return
+	}
+	systemKind := audit.ActorSystem
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "stage_permissions_declared",
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.Warn("permissions: append stage_permissions_declared failed; legibility surface omitted",
+			"run_id", runID.String(), "error", aerr.Error())
+	}
 }
 
 // specVersionMajor parses a workflow spec version string's major component

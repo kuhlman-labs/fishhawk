@@ -789,6 +789,64 @@ func newDriveGetServer(t *testing.T) (*Server, *fakeRepo, *auditFake, *run.Run) 
 	return s, repo, au, seeded
 }
 
+// TestGetRun_Permissions_Declared is the run-status half of E53.5 / #2228's
+// done-means (verification 6): GET /v0/runs/{id} literally carries the per-stage
+// permissions block with enforced:false for a workflow declaring permissions.
+func TestGetRun_Permissions_Declared(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredPermissionsV2SpecYAML,
+	})
+
+	resp, raw := getRunResponse(t, s, runID)
+	if len(resp.Permissions) != 1 {
+		t.Fatalf("permissions = %+v, want exactly the implement entry", resp.Permissions)
+	}
+	e := resp.Permissions[0]
+	if e.StageID != "implement" || e.Shell != "restricted" {
+		t.Errorf("permissions[0] = %+v, want implement/restricted", e)
+	}
+	if len(e.Network) != 1 || e.Network[0] != "api.internal.example.com:8443" {
+		t.Errorf("network = %v, want the declared host (normalized from permissions.network)", e.Network)
+	}
+	if len(e.Write) != 1 || e.Write[0] != "src/**/*.go" {
+		t.Errorf("write = %v, want the declared glob", e.Write)
+	}
+	if e.Enforced {
+		t.Error("implement-stage permissions enforced = true, want false (only an acceptance stage's network is enforced today)")
+	}
+	if !strings.Contains(e.Note, "#2133") {
+		t.Errorf("note = %q, want it to name the enforcement tracker #2133", e.Note)
+	}
+	// Wire: the raw body literally carries the block with enforced:false.
+	permsRaw, ok := raw["permissions"].([]any)
+	if !ok || len(permsRaw) != 1 {
+		t.Fatalf("raw permissions = %v, want a one-element array", raw["permissions"])
+	}
+	if enforced, _ := permsRaw[0].(map[string]any)["enforced"].(bool); enforced {
+		t.Errorf("raw permissions[0].enforced = true, want false on the wire")
+	}
+}
+
+// TestGetRun_Permissions_OmittedWhenNone is the byte-identical control
+// (verification 10): a run whose spec declares no permissions/egress omits the
+// permissions field entirely (nil + key absent).
+func TestGetRun_Permissions_OmittedWhenNone(t *testing.T) {
+	s, repo, _, _ := newDelegationServer(t)
+	runID, _ := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredAdvisoryV2SpecYAML,
+	})
+	resp, raw := getRunResponse(t, s, runID)
+	if resp.Permissions != nil {
+		t.Errorf("permissions = %+v, want nil (no stage declares a block)", resp.Permissions)
+	}
+	if _, present := raw["permissions"]; present {
+		t.Errorf("permissions key present in raw body, want omitted: %v", raw)
+	}
+}
+
 func getRunResponse(t *testing.T, s *Server, runID uuid.UUID) (runResponse, map[string]any) {
 	t.Helper()
 	w := httptest.NewRecorder()

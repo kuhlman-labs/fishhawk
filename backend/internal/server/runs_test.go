@@ -171,6 +171,85 @@ workflows:
           - artifact: pull_request
 `
 
+// declaredPermissionsV2SpecYAML is a plan+implement v2 workflow whose implement
+// stage declares a full permissions block (E53.5 / #2228): network (normalized
+// into Egress), write globs, and a shell posture.
+const declaredPermissionsV2SpecYAML = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        permissions:
+          network:
+            target_hosts: ["api.internal.example.com:8443"]
+          write: ["src/**/*.go"]
+          shell: restricted
+        produces:
+          - artifact: pull_request
+`
+
+// TestCreateRun_EmitsStagePermissionsDeclared is the audit half of E53.5 /
+// #2228's done-means (verification 6): run creation appends EXACTLY ONE
+// stage_permissions_declared entry whose payload carries the feature-level
+// enforced:false and enforcement_tracked_by:"#2133". A comment-only or partial
+// edit fails this where a touched-the-file presence gate would pass (#1169).
+func TestCreateRun_EmitsStagePermissionsDeclared(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredPermissionsV2SpecYAML,
+	})
+
+	var found []audit.ChainAppendParams
+	for _, e := range au.appended {
+		if e.Category == "stage_permissions_declared" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("stage_permissions_declared entries = %d, want exactly 1", len(found))
+	}
+	var payload stagePermissionsAuditPayload
+	if err := json.Unmarshal(found[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.Enforced {
+		t.Error("feature-level enforced = true, want false (the permissions block is declaration-only)")
+	}
+	if payload.EnforcementTrackedBy != "#2133" {
+		t.Errorf("enforcement_tracked_by = %q, want #2133", payload.EnforcementTrackedBy)
+	}
+	if len(payload.Stages) != 1 || payload.Stages[0].StageID != "implement" {
+		t.Errorf("payload stages = %+v, want one implement entry", payload.Stages)
+	}
+}
+
+// TestCreateRun_NoPermissions_NoAuditEntry is the control (verification 6 / 10):
+// a workflow declaring no permissions/egress appends NO stage_permissions_declared
+// entry, keeping its audit stream byte-identical.
+func TestCreateRun_NoPermissions_NoAuditEntry(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredAdvisoryV2SpecYAML,
+	})
+	for _, e := range au.appended {
+		if e.Category == "stage_permissions_declared" {
+			t.Fatal("unexpected stage_permissions_declared entry for a spec declaring no permissions/egress")
+		}
+	}
+}
+
 // reviewAuthorityFor returns the review_authority entry for the named stage.
 func reviewAuthorityFor(t *testing.T, resp runResponse, stage string) runReviewAuthorityPayload {
 	t.Helper()

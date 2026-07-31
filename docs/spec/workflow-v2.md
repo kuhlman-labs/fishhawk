@@ -377,7 +377,8 @@ stages:
     budget: {...}             # optional; per-stage caps
     gates: [...]              # optional; approval / check gates
     reviewers: {...}          # optional; agent + human review policy
-    egress: {...}             # optional; acceptance-stage-only egress allowance
+    egress: {...}             # optional; egress allowance (enforced on an acceptance stage)
+    permissions: {...}        # optional; declared network/write/shell (declaration-only)
 ```
 
 Stage `id` is unique within the workflow and is what `inputs[].from_stage` and `needs` reference. `type` is the closed five-token enum below. `executor` names who runs the stage and is required on the **resolved** document — a stage may omit it and inherit one from a `defaults` block or an `extends` base.
@@ -448,7 +449,7 @@ General reading: an `acceptance` stage emits a **verdict** with evidence. It add
 - **Executor branches:** `agent` or `human`. Not `delegate`.
 - **Produces:** the `acceptance` artifact, valid on this type only — the durable evidence record (`{verdict, per-criterion results, content-hash references to evidence blobs}`).
 - **Constraints:** the pre-flight deploy kinds are not valid here.
-- **`egress`:** the acceptance-stage-only egress allowance below.
+- **`egress`:** the egress allowance below. On an acceptance stage it is **enforced** today by the runner's default-deny proxy; the same block is declarable on any other agent stage as a declaration only (see [Permissions](#permissions-network--write--shell)).
 
 #### `egress.target_hosts`
 
@@ -465,12 +466,38 @@ General reading: an `acceptance` stage emits a **verdict** with evidence. It add
     - artifact: acceptance
 ```
 
-The `egress` block (ADR-050) declares the **target-instance host(s)** the acceptance agent may reach. It is valid **only** on an acceptance stage.
+The `egress` block (ADR-050; generalized E53.5 / #2228) declares the **target-instance host(s)** a stage's agent may reach.
 
 - `egress.target_hosts` is required within the block and takes at least one entry. Each entry is `host` or `host:port` — never a URL; the schema pattern rejects a scheme, a path, and a wildcard. An entry without a port permits the default HTTP/HTTPS ports (80, 443) only; an entry with a port permits exactly that port.
-- These entries are the **single customer-controlled slot** of the acceptance agent's default-deny egress allow-list. The runner adds the model API endpoint and the Fishhawk backend itself; neither is declarable here.
-- Enforcement is the runner-embedded egress proxy: the acceptance invocation is forced through it, destinations outside the composed allow-list are refused `403`, hostname resolutions are DNS-pinned against rebinding, and a public hostname resolving into loopback or private space is refused outright.
-- The first `target_hosts` entry is also rendered into the acceptance prompt's target-instance section in full URL form — a schemeless `host:port` gains an `http://` prefix. That prefix applies to the **prompt seam only**; the allow-list itself keeps the verbatim `host:port` grammar. A spec with no `egress` block renders an explicit not-declared line.
+- On an **acceptance** stage these entries are the **single customer-controlled slot** of the acceptance agent's default-deny egress allow-list, and they are **enforced** today: the runner adds the model API endpoint and the Fishhawk backend itself (neither declarable here), the acceptance invocation is forced through the runner-embedded egress proxy, destinations outside the composed allow-list are refused `403`, hostname resolutions are DNS-pinned against rebinding, and a public hostname resolving into loopback or private space is refused outright.
+- On **any other** agent stage (v2 loosened the acceptance-only binding) an `egress` block — equivalently the `permissions.network` spelling below — is **declaration-only**: surfaced and audited but **not enforced until E51 (#2133)**. Below major 2 the block stays acceptance-stage-only.
+- The first acceptance-stage `target_hosts` entry is also rendered into the acceptance prompt's target-instance section in full URL form — a schemeless `host:port` gains an `http://` prefix. That prefix applies to the **prompt seam only**; the allow-list itself keeps the verbatim `host:port` grammar. A spec with no `egress` block renders an explicit not-declared line.
+
+## Permissions (`network` / `write` / `shell`)
+
+The optional per-stage `permissions` block (E53.5 / #2228) is a **declaration-only** record of what a stage's agent is expected to do: the network destinations it reaches, the paths it writes, and its shell posture. It is **validated, audited and surfaced but not enforced until E51 (#2133)** — do not rely on it as containment; enforcement is a separate epic. It is valid on any **agent-executor** stage and rejected on a `human` or `delegate` executor, because a stage that runs no agent has no such declaration to make.
+
+```yaml
+- id: apply
+  type: implement
+  executor:
+    agent: claude-code
+  permissions:
+    network:
+      target_hosts:
+        - api.internal.example.com:8443
+    write:
+      - "src/**/*.go"
+      - "docs/**"
+    shell: restricted
+```
+
+- **`permissions.network`** is a **spelling of `egress`**, not a parallel key: it carries the identical `target_hosts` grammar and is normalized into the stage's `egress` field at parse time, so an acceptance stage declaring `permissions.network` lands on the one enforced path exactly as `egress` does. Declaring **both** `egress` and `permissions.network` on one stage is a **validation error**, never a precedence rule — the quiet way to ship a silently-differing allow-list.
+- **`permissions.write`** is a list of doublestar globs (`**` crosses `/`) naming the paths the agent is expected to write. They are validated and matched through the **same shared predicate** as `applies_to` and `escalations`, so the write dialect cannot drift.
+- **`permissions.shell`** is a closed posture enum: `none`, `restricted`, or `unrestricted`.
+- An empty `permissions: {}` is an authoring error (the schema requires at least one of `network`, `write`, `shell`).
+
+The declaration is surfaced on the run-status read (`permissions[]`, each entry carrying an honest per-entry `enforced` flag — true only for an acceptance stage's network declaration) and recorded once per run as a `stage_permissions_declared` audit entry with an explicit `enforced: false` at the feature level.
 
 ## Executor
 

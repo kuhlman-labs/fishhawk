@@ -3,6 +3,7 @@ package spec
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // validateAgentVersions is the CLI's semantic sweep beyond JSON Schema — the
@@ -63,6 +64,7 @@ func validateAgentVersions(raw any) error {
 			checkExecutorAgentVersion(st, base, &errs)
 			checkReviewerAgentVersions(st, base, &errs)
 			checkReviewerAuthority(st, base, &errs)
+			checkStagePermissions(st, base, wfName, &errs)
 		}
 	}
 	if len(errs) > 0 {
@@ -129,6 +131,55 @@ func checkReviewerAuthority(stage map[string]any, base string, errs *[]Validatio
 			"stage %q: reviewers.authority: %q declares agent-reviewer authority but the stage configures no agent reviewers; declare at least one entry under reviewers.agents, or remove reviewers.authority to fall back to the count-derived ADR-027 default",
 			stageID, authority),
 	})
+}
+
+// MsgFmtPermissionsEgressConflict is the rejection for declaring BOTH `egress`
+// and `permissions.network` on one stage (E53.5 / #2228). Byte-identical to
+// backend/internal/spec/permissions.go's constant of the same name — the two Go
+// modules are deliberately separate (see this package's doc comment), so the
+// duplication is by design and the paired assertions in both spec_test.go files
+// (TestPermissionsMessageParity reads both source files) keep the strings in
+// lockstep. The `write` glob rejection reuses the shared Predicate.Validate
+// message from this package's byte-identical predicate.go, so it needs no
+// constant; the executor-binding and shell-posture rejections stay backend-only
+// (the schema enum catches shell, and the executor binding is a graph-shape
+// rule the CLI leaves to the backend, as it does the deploy executor binding).
+const MsgFmtPermissionsEgressConflict = "workflow %q stage %q: declares both `egress` and `permissions.network`; they are two spellings of one allowance, so declare exactly one — there is deliberately no precedence rule. permissions are validated, audited and surfaced but are NOT enforced until E51 (#2133); do not rely on this as containment"
+
+// checkStagePermissions mirrors the two E53.5 permissions checks the JSON
+// Schema cannot express (E53.5 / #2228, backend/internal/spec/permissions.go),
+// so `fishhawk validate` and `fishhawk doctor` reject them locally instead of
+// deferring to the backend at dispatch: the `egress` + `permissions.network`
+// conflict, and `write` glob validity through the SHARED predicate (this
+// package's byte-identical predicate.go). Shape mismatches are skipped, as
+// everywhere in this file — the schema already rejected genuinely malformed
+// structure. The unknown-shell posture is left to the schema's enum, and the
+// executor binding to the backend.
+func checkStagePermissions(stage map[string]any, base, wfName string, errs *[]ValidationErrorEntry) {
+	perms, ok := stage["permissions"].(map[string]any)
+	if !ok {
+		return
+	}
+	stageID, _ := stage["id"].(string)
+	if _, hasEgress := stage["egress"]; hasEgress {
+		if _, hasNetwork := perms["network"]; hasNetwork {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    base + "/permissions/network",
+				Message: fmt.Sprintf(MsgFmtPermissionsEgressConflict, wfName, stageID),
+			})
+			return
+		}
+	}
+	if writes := rawStringList(perms["write"]); len(writes) > 0 {
+		ptr := base + "/permissions"
+		p := Predicate{Paths: writes}
+		if err := p.Validate(ptr); err != nil {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    ptr + "/write",
+				Message: strings.Replace(err.Error(), ptr+"/paths/", ptr+"/write/", 1),
+			})
+		}
+	}
 }
 
 // MsgAppliesToChangeKindUnsupported is the rejection for a `change_kind`
