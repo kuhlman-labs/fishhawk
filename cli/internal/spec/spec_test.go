@@ -3338,7 +3338,10 @@ func TestValidateBytes_Escalations_MalformedGlobWinsOverNoPlanStage(t *testing.T
 	if !strings.Contains(msg, "malformed path glob") {
 		t.Errorf("error = %q, want the shared predicate grammar error to win over the plan-stage rule", msg)
 	}
-	if strings.Contains(msg, spec.MsgFmtEscalationPathsNoPlanStage[:40]) {
+	// Slice PAST the `%q`/`%d` format verbs (index 26 onward): the first 40
+	// bytes still carry the verbs, which rendering substitutes, so
+	// Contains(rendered, [:40]) is vacuously false and could never fire.
+	if strings.Contains(msg, spec.MsgFmtEscalationPathsNoPlanStage[26:]) {
 		t.Errorf("error = %q, want no plan-stage refusal; the grammar error runs before the paths rung", msg)
 	}
 }
@@ -3439,7 +3442,11 @@ workflows:
 	if err == nil {
 		t.Fatal("want a structural error for a non-list stages node, got nil")
 	}
-	if strings.Contains(err.Error(), spec.MsgFmtEscalationPathsNoPlanStage[:40]) {
+	// Slice PAST the `%q`/`%d` format verbs (index 26 onward): the first 40
+	// bytes still carry the verbs, so Contains([:40]) is vacuously false — and
+	// this is this test's ONLY discriminating assertion, so the vacuity would
+	// leave it proving nothing about the absence of a stacked diagnosis.
+	if strings.Contains(err.Error(), spec.MsgFmtEscalationPathsNoPlanStage[26:]) {
 		t.Errorf("error = %q, want the structural stages error, not a stacked no-plan-stage diagnosis", err.Error())
 	}
 }
