@@ -5703,6 +5703,14 @@ func TestAdvanceForDecision_AcceptanceStage_GenericGate(t *testing.T) {
 // path (not the plan/review/deploy special cases), isolating the quorum
 // behavior under test.
 func quorumApprovalsSpec(count int) []byte {
+	return quorumApprovalsSpecNot(count, "[author, agent]")
+}
+
+// quorumApprovalsSpecNot is quorumApprovalsSpec with a parameterizable `not`
+// list, so #2358's tests can drive gates that OMIT "author" (a resolved author
+// is then permitted and counted) or OMIT "agent" (the agent floor must hold
+// anyway — it is unconditional).
+func quorumApprovalsSpecNot(count int, not string) []byte {
 	return []byte(fmt.Sprintf(`version: "1.0"
 workflows:
   feature_change:
@@ -5715,17 +5723,15 @@ workflows:
           - type: approval
             approvals:
               count: %d
-              not: [author, agent]
+              not: %s
               min_permission: write
               member_of: acme/reviewers
-`, count))
+`, count, not))
 }
 
-// seedQuorumStage seeds an acceptance stage awaiting approval, a run carrying
-// the quorum spec (count) + WorkflowID feature_change, and (when author != "")
-// a user-kind audit entry naming the change author so resolveChangeAuthor
-// finds it.
-func seedQuorumStage(rr *approvalRunRepo, au *approvalAuditFake, count int, author string) *run.Stage {
+// seedQuorumStageSpec seeds an acceptance stage awaiting approval on a run
+// carrying the given workflow spec bytes plus the given run audit entries.
+func seedQuorumStageSpec(rr *approvalRunRepo, au *approvalAuditFake, workflowSpec []byte, entries ...*audit.Entry) *run.Stage {
 	stage := rr.seedStage(run.StageStateAwaitingApproval)
 	rr.mu.Lock()
 	stage.Type = run.StageTypeAcceptance
@@ -5734,14 +5740,26 @@ func seedQuorumStage(rr *approvalRunRepo, au *approvalAuditFake, count int, auth
 		ID:           stage.RunID,
 		Repo:         "acme/repo",
 		WorkflowID:   "feature_change",
-		WorkflowSpec: quorumApprovalsSpec(count),
+		WorkflowSpec: workflowSpec,
 	})
-	if author != "" {
-		k := audit.ActorUser
-		s := author
-		au.seedRunEntries(stage.RunID, &audit.Entry{ActorKind: &k, ActorSubject: &s})
+	if len(entries) > 0 {
+		au.seedRunEntries(stage.RunID, entries...)
 	}
 	return stage
+}
+
+// seedQuorumStage seeds an acceptance stage awaiting approval, a run carrying
+// the quorum spec (count) + WorkflowID feature_change, and (when author != "")
+// an operator_commit_vouched audit entry naming the change author so
+// resolveChangeAuthor finds it. The seed MUST carry an AUTHORSHIP category
+// (#2358): under the allow-list an arbitrary user-kind entry resolves no
+// author, so an author-refusal assertion seeded with one would pass vacuously.
+func seedQuorumStage(rr *approvalRunRepo, au *approvalAuditFake, count int, author string) *run.Stage {
+	var entries []*audit.Entry
+	if author != "" {
+		entries = append(entries, vouchEntry(author))
+	}
+	return seedQuorumStageSpec(rr, au, quorumApprovalsSpec(count), entries...)
 }
 
 // approvalPayloadFor returns the approval_submitted audit payload whose
@@ -5788,6 +5806,169 @@ func TestSubmitApproval_Quorum_AuthorRejected(t *testing.T) {
 	}
 	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
 		t.Errorf("stage state = %q, want awaiting_approval (no advance)", got)
+	}
+}
+
+// TestSubmitApproval_Quorum_AutoDrivenActorIsNotAuthor is the LIVE regression
+// from #2358 (run e288e92b, audit sequence 48558): the run's only user-kind
+// audit row is fishhawk_drive_run's mechanical record-before-dispatch
+// attribution row, which under the pre-#2358 earliest-user-kind-actor rule
+// named the operator the change author and 403'd their own approve. Driving a
+// run with fishhawk_drive_run — the documented post-E48 operator playbook and
+// therefore the default path — wedged every plan gate. Now that row resolves
+// NO author, so the approve is permitted AND counts: the count=1 gate ADVANCES.
+func TestSubmitApproval_Quorum_AutoDrivenActorIsNotAuthor(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	const operator = "github:operator"
+	stage := seedQuorumStageSpec(rr, au, quorumApprovalsSpec(1),
+		categoryUserEntry("run_auto_driven", operator))
+
+	w := submitApprovalAs(t, s, stage.ID, operator, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (run_auto_driven is not authorship):\n%s", w.Code, w.Body.String())
+	}
+	rows, _ := ar.ListForStage(context.Background(), stage.ID)
+	if len(rows) != 1 {
+		t.Errorf("approval rows = %d, want 1", len(rows))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Fatalf("stage state = %q, want succeeded (count=1 quorum reached)", got)
+	}
+	snap, _ := approvalPayloadFor(t, au, operator)["predicate_snapshot"].(map[string]any)
+	if snap["quorum_reached"] != true {
+		t.Errorf("quorum_reached = %v, want true", snap["quorum_reached"])
+	}
+	if snap["count_eligible"].(float64) != 1 {
+		t.Errorf("count_eligible = %v, want 1", snap["count_eligible"])
+	}
+}
+
+// TestSubmitApproval_Quorum_ClarificationAnswererIsNotAuthor is the case in
+// #2358's issue body: answering a clarification is operator GATE
+// PARTICIPATION, not authorship, so it must not lock the answerer out of the
+// gate they are steering.
+func TestSubmitApproval_Quorum_ClarificationAnswererIsNotAuthor(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	const operator = "github:operator"
+	stage := seedQuorumStageSpec(rr, au, quorumApprovalsSpec(1),
+		categoryUserEntry("clarification_answered", operator))
+
+	w := submitApprovalAs(t, s, stage.ID, operator, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (clarification_answered is not authorship):\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Fatalf("stage state = %q, want succeeded", got)
+	}
+}
+
+// TestSubmitApproval_Quorum_NotOmitsAuthor_AuthorAdvancesStage pins the second
+// half of #2358: `spec.Approvals.Not` was parsed, schema-closed and documented
+// but read by NO backend code, so the author-SoD 403 fired on "the gate has an
+// approvals block" and a declared `not:` was grammar rather than enforcement.
+// On a gate whose `not` is [agent] only, the RESOLVED author is now permitted
+// AND COUNTED. Asserting the ADVANCE — not merely a 200 — is what proves the
+// quorum-count threading: gating only the 403 would record the approval and
+// then refuse to count it, leaving quorum permanently one short.
+func TestSubmitApproval_Quorum_NotOmitsAuthor_AuthorAdvancesStage(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	const author = "github:author"
+	stage := seedQuorumStageSpec(rr, au, quorumApprovalsSpecNot(1, "[agent]"),
+		vouchEntry(author))
+
+	// Sanity: the author IS resolved here, so the permit below is a real
+	// permit rather than an unresolved-author fall-through.
+	if got, ok := s.resolveChangeAuthor(context.Background(), stage.RunID); !ok || got != author {
+		t.Fatalf("resolveChangeAuthor = (%q, %v), want (%s, true)", got, ok, author)
+	}
+
+	w := submitApprovalAs(t, s, stage.ID, author, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (not: omits author):\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Fatalf("stage state = %q, want succeeded (author counted toward quorum)", got)
+	}
+	snap, _ := approvalPayloadFor(t, au, author)["predicate_snapshot"].(map[string]any)
+	if snap["quorum_reached"] != true {
+		t.Errorf("quorum_reached = %v, want true", snap["quorum_reached"])
+	}
+	if snap["count_eligible"].(float64) != 1 {
+		t.Errorf("count_eligible = %v, want 1 (the author counts)", snap["count_eligible"])
+	}
+	// Provenance is preserved: a permitted author is still LABELED author
+	// (#2358 condition 3), a combination impossible before this change.
+	if snap["submitter_class"] != "author" {
+		t.Errorf("submitter_class = %v, want author (provenance preserved)", snap["submitter_class"])
+	}
+}
+
+// TestSubmitApproval_Quorum_AgentFloorIsUnconditional pins #1709's binding
+// acceptance criterion under #2358's `not:` reading. The gate's `not` is
+// [author] only — it OMITS "agent" — so a test run against a gate that DID
+// declare agent could not fail for the reason this test exists. An agent-kind
+// subject's approve is still recorded (200, channel delegated) but must NOT
+// count toward the human quorum and must NOT advance the count=1 gate.
+func TestSubmitApproval_Quorum_AgentFloorIsUnconditional(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	agent := operatorrole.CampaignActorSubject
+	stage := seedQuorumStageSpec(rr, au, quorumApprovalsSpecNot(1, "[author]"))
+
+	w := submitApprovalAs(t, s, stage.ID, agent, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (agent approval is RECORDED):\n%s", w.Code, w.Body.String())
+	}
+	rows, _ := ar.ListForStage(context.Background(), stage.ID)
+	if len(rows) != 1 {
+		t.Errorf("approval rows = %d, want 1 (recorded)", len(rows))
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Fatalf("stage state = %q, want awaiting_approval (agent never advances a human quorum)", got)
+	}
+	payload := approvalPayloadFor(t, au, agent)
+	if payload["channel"] != "delegated" {
+		t.Errorf("channel = %v, want delegated", payload["channel"])
+	}
+	snap, _ := payload["predicate_snapshot"].(map[string]any)
+	if snap["quorum_reached"] != false {
+		t.Errorf("quorum_reached = %v, want false", snap["quorum_reached"])
+	}
+	if snap["count_eligible"].(float64) != 0 {
+		t.Errorf("count_eligible = %v, want 0 (the agent does not count)", snap["count_eligible"])
+	}
+}
+
+// TestSubmitApproval_LegacyGate_NoAuthorResolution pins that a gate carrying
+// NO approvals block keeps first-vote-advances byte-for-byte: neither the
+// authorship allow-list nor the `not:` reading engages, so even a subject the
+// run vouched as its change author advances the stage on the first vote.
+func TestSubmitApproval_LegacyGate_NoAuthorResolution(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	const author = "github:author"
+	legacySpec := []byte(`version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: gate
+        type: acceptance
+        executor:
+          human: true
+        gates:
+          - type: approval
+            sla: 4_hours
+`)
+	stage := seedQuorumStageSpec(rr, au, legacySpec, vouchEntry(author))
+
+	w := submitApprovalAs(t, s, stage.ID, author, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (legacy gate):\n%s", w.Code, w.Body.String())
+	}
+	if got := rr.stages[stage.ID].State; got != run.StageStateSucceeded {
+		t.Fatalf("stage state = %q, want succeeded (first vote advances)", got)
+	}
+	// No approvals block → no predicate_snapshot (operator binding condition 2).
+	if _, ok := approvalPayloadFor(t, au, author)["predicate_snapshot"]; ok {
+		t.Errorf("legacy-gate payload carries a predicate_snapshot, want none")
 	}
 }
 
@@ -6021,24 +6202,14 @@ workflows:
 
 // seedPredicateStage seeds an acceptance stage awaiting approval on a run
 // carrying quorumPredicateSpec(count, minPerm, memberOf), a non-empty Repo,
-// and (when author != "") a user-kind change-author audit entry.
+// and (when author != "") an operator_commit_vouched change-author audit
+// entry — an arbitrary user-kind entry no longer resolves an author (#2358).
 func seedPredicateStage(rr *approvalRunRepo, au *approvalAuditFake, count int, minPerm, memberOf, author string) *run.Stage {
-	stage := rr.seedStage(run.StageStateAwaitingApproval)
-	rr.mu.Lock()
-	stage.Type = run.StageTypeAcceptance
-	rr.mu.Unlock()
-	rr.seedRun(&run.Run{
-		ID:           stage.RunID,
-		Repo:         "acme/repo",
-		WorkflowID:   "feature_change",
-		WorkflowSpec: quorumPredicateSpec(count, minPerm, memberOf),
-	})
+	var entries []*audit.Entry
 	if author != "" {
-		k := audit.ActorUser
-		s := author
-		au.seedRunEntries(stage.RunID, &audit.Entry{ActorKind: &k, ActorSubject: &s})
+		entries = append(entries, vouchEntry(author))
 	}
-	return stage
+	return seedQuorumStageSpec(rr, au, quorumPredicateSpec(count, minPerm, memberOf), entries...)
 }
 
 // predicateRejectionSnapshot returns the predicate_snapshot object of the
@@ -6331,9 +6502,9 @@ func TestSubmitApproval_Predicate_RealGitHubProvider_EndToEnd(t *testing.T) {
 		WorkflowID:   "feature_change",
 		WorkflowSpec: quorumPredicateSpec(1, "maintain", ""),
 	})
-	k := audit.ActorUser
-	author := "github:author"
-	au.seedRunEntries(stage.RunID, &audit.Entry{ActorKind: &k, ActorSubject: &author})
+	// An arbitrary user-kind entry no longer resolves an author (#2358), so
+	// the change-author seed must carry the authorship category.
+	au.seedRunEntries(stage.RunID, vouchEntry("github:author"))
 
 	w := submitApprovalAs(t, s, stage.ID, "github:octocat", `{"decision":"approve"}`)
 	if w.Code != http.StatusForbidden {

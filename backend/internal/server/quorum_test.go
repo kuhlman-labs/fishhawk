@@ -155,25 +155,86 @@ func TestApprovalChannel(t *testing.T) {
 
 func TestEligibleApprover(t *testing.T) {
 	const author = "github:author"
-	// The change author is excluded.
-	if eligibleApprover(author, author) {
+	// The change author is excluded when the gate declares not: [author].
+	if eligibleApprover(author, author, true) {
 		t.Errorf("change author must not be eligible")
 	}
 	// An agent-kind subject (operator-agent token prefix) is excluded.
 	agent := operatorrole.CampaignActorSubject
-	if eligibleApprover(agent, author) {
+	if eligibleApprover(agent, author, true) {
 		t.Errorf("agent-kind subject must not be eligible")
 	}
 	// A distinct human subject is eligible.
-	if !eligibleApprover("github:reviewer", author) {
+	if !eligibleApprover("github:reviewer", author, true) {
 		t.Errorf("distinct human must be eligible")
 	}
 	// With no resolved author, only the agent leg applies.
-	if !eligibleApprover("github:anyone", "") {
+	if !eligibleApprover("github:anyone", "", true) {
 		t.Errorf("with unresolved author, a human is eligible")
 	}
-	if eligibleApprover(agent, "") {
+	if eligibleApprover(agent, "", true) {
 		t.Errorf("agent stays ineligible even with unresolved author")
+	}
+}
+
+// TestEligibleApprover_AuthorLegConditional pins #2358's asymmetry: the AUTHOR
+// leg fires only when the gate's `not:` names "author" (excludeAuthor), while
+// the AGENT leg is an unconditional floor asserted in BOTH permutations.
+func TestEligibleApprover_AuthorLegConditional(t *testing.T) {
+	const author = "github:author"
+	agent := operatorrole.CampaignActorSubject
+
+	cases := []struct {
+		name          string
+		subject       string
+		changeAuthor  string
+		excludeAuthor bool
+		want          bool
+	}{
+		{"author refused when excluded", author, author, true, false},
+		{"author ELIGIBLE when not excluded", author, author, false, true},
+		{"non-author eligible when excluded", "github:reviewer", author, true, true},
+		{"non-author eligible when not excluded", "github:reviewer", author, false, true},
+		// The unconditional agent floor, asserted in both directions.
+		{"agent refused when author excluded", agent, author, true, false},
+		{"agent refused when author NOT excluded", agent, author, false, false},
+		{"agent refused with unresolved author, not excluded", agent, "", false, false},
+		// An unresolved author disables the author leg even when declared.
+		{"unresolved author → human eligible", "github:anyone", "", true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := eligibleApprover(tc.subject, tc.changeAuthor, tc.excludeAuthor); got != tc.want {
+				t.Errorf("eligibleApprover(%q, %q, %v) = %v, want %v",
+					tc.subject, tc.changeAuthor, tc.excludeAuthor, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestApprovalsExcludeAuthor pins the `not:` reader (#2358). Before this the
+// field was parsed, schema-closed and documented but read by no backend code,
+// so a declared `not:` was grammar rather than enforcement.
+func TestApprovalsExcludeAuthor(t *testing.T) {
+	cases := []struct {
+		name string
+		a    *spec.Approvals
+		want bool
+	}{
+		{"nil block", nil, false},
+		{"nil Not", &spec.Approvals{}, false},
+		{"empty Not", &spec.Approvals{Not: []string{}}, false},
+		{"agent only", &spec.Approvals{Not: []string{"agent"}}, false},
+		{"author only", &spec.Approvals{Not: []string{"author"}}, true},
+		{"author and agent", &spec.Approvals{Not: []string{"author", "agent"}}, true},
+		{"unrecognised member ignored", &spec.Approvals{Not: []string{"Author", "bot"}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := approvalsExcludeAuthor(tc.a); got != tc.want {
+				t.Errorf("approvalsExcludeAuthor = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -219,16 +280,30 @@ func agentEntry(subject string) *audit.Entry {
 	return &audit.Entry{ActorKind: &k, ActorSubject: &s}
 }
 
+// categoryUserEntry builds a user-kind entry carrying an explicit audit
+// category, so the authorship allow-list (#2358) can be exercised per category.
+func categoryUserEntry(category, subject string) *audit.Entry {
+	e := userEntry(subject)
+	e.Category = category
+	return e
+}
+
+// vouchEntry is the ONLY authorship-category entry today: the operator's
+// audited declaration that a hand-pushed commit belongs to this run's lineage.
+func vouchEntry(subject string) *audit.Entry {
+	return categoryUserEntry(CategoryOperatorCommitVouched, subject)
+}
+
 func TestResolveChangeAuthor(t *testing.T) {
 	newServer := func(f *resolveChangeAuthorFake) *Server {
 		return New(Config{AuditRepo: f})
 	}
 
-	t.Run("earliest user-kind actor wins", func(t *testing.T) {
+	t.Run("earliest authorship-category user actor wins", func(t *testing.T) {
 		f := &resolveChangeAuthorFake{entries: []*audit.Entry{
 			agentEntry("op:agent"), // agent first — skipped
-			userEntry("github:human"),
-			userEntry("github:other"),
+			vouchEntry("github:human"),
+			vouchEntry("github:other"),
 		}}
 		got, ok := newServer(f).resolveChangeAuthor(context.Background(), uuid.New())
 		if !ok || got != "github:human" {
@@ -236,10 +311,84 @@ func TestResolveChangeAuthor(t *testing.T) {
 		}
 	})
 
+	// The positive control. Without it every negative case below would pass
+	// vacuously — an allow-list that matched nothing would look identical.
+	t.Run("operator_commit_vouched alone → RESOLVED", func(t *testing.T) {
+		f := &resolveChangeAuthorFake{entries: []*audit.Entry{vouchEntry("github:op")}}
+		got, ok := newServer(f).resolveChangeAuthor(context.Background(), uuid.New())
+		if !ok || got != "github:op" {
+			t.Errorf("resolveChangeAuthor = (%q, %v), want (github:op, true)", got, ok)
+		}
+	})
+
+	// The governance categories: each is operator GATE PARTICIPATION, not
+	// authorship, and must resolve NO author (#2358).
+	governance := []struct {
+		name     string
+		category string
+	}{
+		// The live regression: run e288e92b, audit sequence 48558 — the
+		// driver's mechanical record-before-dispatch attribution row.
+		{"run_auto_driven", "run_auto_driven"},
+		// The case in the issue body.
+		{"clarification_answered", "clarification_answered"},
+		// Approving with binding conditions is governance, not authorship.
+		{"approval_submitted", "approval_submitted"},
+		{"scope_amendment_decided", "scope_amendment_decided"},
+	}
+	for _, g := range governance {
+		t.Run("earliest is "+g.name+" → UNRESOLVED", func(t *testing.T) {
+			f := &resolveChangeAuthorFake{entries: []*audit.Entry{
+				categoryUserEntry(g.category, "github:operator"),
+			}}
+			if got, ok := newServer(f).resolveChangeAuthor(context.Background(), uuid.New()); ok {
+				t.Errorf("resolveChangeAuthor = (%q, true), want unresolved for %s", got, g.category)
+			}
+		})
+	}
+
+	// Proves earliest-match runs over the FILTERED set: a naive "skip if
+	// governance but still return the first raw entry" implementation fails.
+	t.Run("governance row then vouch → the VOUCHED subject", func(t *testing.T) {
+		f := &resolveChangeAuthorFake{entries: []*audit.Entry{
+			categoryUserEntry("run_auto_driven", "github:operator"),
+			vouchEntry("github:pusher"),
+		}}
+		got, ok := newServer(f).resolveChangeAuthor(context.Background(), uuid.New())
+		if !ok || got != "github:pusher" {
+			t.Errorf("resolveChangeAuthor = (%q, %v), want (github:pusher, true)", got, ok)
+		}
+	})
+
+	// The ActorUser leg survives the category leg.
+	t.Run("agent-kind vouch row → UNRESOLVED", func(t *testing.T) {
+		e := agentEntry("op:agent")
+		e.Category = CategoryOperatorCommitVouched
+		f := &resolveChangeAuthorFake{entries: []*audit.Entry{e}}
+		if got, ok := newServer(f).resolveChangeAuthor(context.Background(), uuid.New()); ok {
+			t.Errorf("resolveChangeAuthor = (%q, true), want unresolved (agent-kind vouch)", got)
+		}
+	})
+
+	t.Run("empty ActorSubject skipped, later vouch wins", func(t *testing.T) {
+		blank := vouchEntry("")
+		f := &resolveChangeAuthorFake{entries: []*audit.Entry{blank, vouchEntry("github:real")}}
+		got, ok := newServer(f).resolveChangeAuthor(context.Background(), uuid.New())
+		if !ok || got != "github:real" {
+			t.Errorf("resolveChangeAuthor = (%q, %v), want (github:real, true)", got, ok)
+		}
+	})
+
 	t.Run("no user-kind actor → not found", func(t *testing.T) {
 		f := &resolveChangeAuthorFake{entries: []*audit.Entry{agentEntry("op:agent")}}
 		if _, ok := newServer(f).resolveChangeAuthor(context.Background(), uuid.New()); ok {
 			t.Errorf("resolveChangeAuthor ok = true, want false (no user actor)")
+		}
+	})
+
+	t.Run("nil audit repo → fail-open not found", func(t *testing.T) {
+		if _, ok := New(Config{}).resolveChangeAuthor(context.Background(), uuid.New()); ok {
+			t.Errorf("resolveChangeAuthor ok = true with nil AuditRepo, want false")
 		}
 	})
 
@@ -270,8 +419,15 @@ func TestCountDistinctEligibleApprovers(t *testing.T) {
 
 	s := New(Config{ApprovalRepo: repo})
 	// No AuditRepo wired → delegatedApproverSubjects fails open to empty.
-	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author); got != 2 {
+	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author, true); got != 2 {
 		t.Errorf("countDistinctEligibleApprovers = %d, want 2", got)
+	}
+	// #2358: on a gate whose `not:` omits "author" the author's row COUNTS.
+	// Gating only the 403 and not this count would record a permitted
+	// author's approval and then refuse to count it — quorum permanently one
+	// short.
+	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author, false); got != 3 {
+		t.Errorf("countDistinctEligibleApprovers(excludeAuthor=false) = %d, want 3 (author counted)", got)
 	}
 }
 
@@ -298,8 +454,12 @@ func TestCountDistinctEligibleApprovers_ExcludesDelegatedHuman(t *testing.T) {
 	}}
 
 	s := New(Config{ApprovalRepo: repo, AuditRepo: au})
-	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author); got != 1 {
+	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author, true); got != 1 {
 		t.Errorf("countDistinctEligibleApprovers = %d, want 1 (delegated github:r1 excluded)", got)
+	}
+	// The delegated exclusion holds regardless of the author leg (#2358).
+	if got := s.countDistinctEligibleApprovers(context.Background(), runID, stageID, author, false); got != 1 {
+		t.Errorf("countDistinctEligibleApprovers(excludeAuthor=false) = %d, want 1 (delegated github:r1 still excluded)", got)
 	}
 }
 
@@ -513,8 +673,11 @@ func TestV2ApprovalsPredicateDecidesEligibility(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stage := seedQuorumRunStageV2(t, rr, 1, run.StageStateAwaitingApproval)
 	// Seed the run's change author so resolveChangeAuthor identifies it — the
-	// `not: [author]` exclusion turns on this.
-	au.seedRunEntries(stage.RunID, userEntry(author))
+	// `not: [author]` exclusion turns on this. The seed MUST carry an
+	// AUTHORSHIP category (#2358): under the allow-list a bare user-kind entry
+	// resolves no author, so DIRECTION 1 below would pass vacuously — asserting
+	// a refusal that refuses nobody.
+	au.seedRunEntries(stage.RunID, vouchEntry(author))
 
 	// Sanity: the forge-neutral predicate path is the one consulted — the v2
 	// gate's approvals block resolves for this stage (not the deleted legacy

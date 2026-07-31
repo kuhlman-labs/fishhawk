@@ -112,11 +112,20 @@ freshly-scaffolded repo needs **no** top-level `roles` map and **no**
 GitHub handle to fill in before its first run.
 
 The `not: [author, agent]` exclusion is deliberate *here* because these
-are authored documents. The v1→v2 migration codemod
-(`fishhawk migrate-spec`) will never *invent* it when translating a
-legacy `approvers` gate — the legacy form carries no source for it — and
-reports that widening explicitly instead. See
-[the migration doc](workflow-migration.md).
+are authored documents. Be precise about what it buys (#2358): the
+`agent` half was **already unconditional** — an automated identity never
+satisfies a human quorum on any gate carrying an `approvals` block,
+declared or not — so writing it documents intent rather than turning
+anything on. The `author` half is what the declaration actually
+switches: it becomes enforcement wherever the run carries a human
+authorship signal (today an operator-vouched commit), and is inert where
+none does — notably at a plan gate, which is therefore **not**
+author-protected. See [workflow-v2](workflow-v2.md#what-not-means-at-runtime).
+
+The v1→v2 migration codemod (`fishhawk migrate-spec`) will never
+*invent* the exclusion when translating a legacy `approvers` gate — the
+legacy form carries no source for it — and reports that widening
+explicitly instead. See [the migration doc](workflow-migration.md).
 
 The repo's own `.fishhawk/workflows.yaml` is intentionally NOT a preset
 mirror: it keeps `@kuhlman-labs` and `scripts/test verify`.

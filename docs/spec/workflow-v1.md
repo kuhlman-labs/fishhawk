@@ -427,7 +427,7 @@ The change is **strictly additive**: every existing `approvers`-only gate stays 
 | Field | Required | Shape | Meaning |
 |---|---|---|---|
 | `count` | **yes** | integer ≥ 1 | Number of distinct approvals to collect before the gate clears. Always explicit (ADR-055), so `approvals: {}` is rejected as a no-op. |
-| `not` | no | array, unique, items `author` \| `agent` | Relationship classes barred from satisfying the gate — the change's own `author`, and any automated `agent` identity. Forge-neutral relationship classes, not handles. |
+| `not` | no | array, unique, items `author` \| `agent` | Relationship classes barred from satisfying the gate — the change's own `author`, and any automated `agent` identity. Forge-neutral relationship classes, not handles. The two legs enforce **asymmetrically** — see below. |
 | `min_permission` | no (`x-intended-required`) | string enum `read` \| `triage` \| `write` \| `maintain` \| `admin` | Minimum forge-neutral repository permission tier an approver must hold, mirroring `backend/internal/identity.Permission` (the `none` tier is omitted — a `min_permission` of none is meaningless). |
 | `member_of` | no (`x-intended-required`) | string (min 1) | A forge-neutral group (org or `org/team`) an approver must belong to. |
 | `members` | no | array of strings (min 1) | Explicit approver subjects as **plain** forge-neutral strings — **not** the `@`-prefixed GitHub member-ref used by the legacy `roles.members` path — keeping the block forge-neutral. |
@@ -435,6 +435,18 @@ The change is **strictly additive**: every existing `approvers`-only gate stays 
 `min_permission` and `member_of` are annotated [`x-intended-required`](../../AGENTS.md#schema-change-checklist): optional now, intended to become required in a future major. `approvals` is accepted at every advertised v1 version (an additive optional field).
 
 The three canonical presets (`docs/spec/workflow-preset-{low,medium,high}.yaml`) ship this handle-free form — their approval gates use `approvals: {count: 1, not: [author, agent]}` (ADR-055's ratified preset default), so a freshly-scaffolded repo has no `@your-github-handle` placeholder to replace.
+
+#### What `not` means at runtime
+
+The two members enforce asymmetrically, and the asymmetry is deliberate (#2358).
+
+**`author` — conditional, and narrower than it reads.** The author is the identity that produced change **content**, resolved from a closed allow-list of audit categories — today exactly one: `operator_commit_vouched`, the operator's audited declaration that a hand-pushed commit belongs to this run's lineage. Operator **governance** acts are explicitly *not* authorship and resolve no author: answering a clarification, driving a stage (`run_auto_driven`), approving with binding conditions, deciding a scope amendment, waiving or deferring a concern. So `not: [author]` refuses a self-approval only where such a signal exists on the run. Under the earlier rule — the earliest user-kind actor of *any* category — merely steering a run made the operator its "author" and locked them out of their own gate. An allow-list, rather than a deny-list of governance categories, is used so a future gate verb cannot silently re-open that wedge.
+
+At a **plan** gate no authorship signal exists yet, so `not: [author]` does not bite there at all. Do not read a plan gate as author-protected; its controls are the agent floor below and the distinct-human `count`.
+
+**`agent` — an unconditional floor.** An automated identity never satisfies a human quorum on any gate carrying an `approvals` block, whether or not `not` names `agent`. Its approval is recorded (audit `channel: delegated`) but never counted and never advances the gate. Declaring `agent` documents intent; omitting it does **not** permit an agent approver.
+
+**Deployment caveat.** Until the backend change that reads `not` is deployed, the field is parsed, schema-validated and documented but read by no enforcement code — on such a deployment a declared `not:` is grammar rather than enforcement, and the author leg fires on *any* gate carrying an `approvals` block.
 
 ```yaml
 version: "1.0"

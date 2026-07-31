@@ -55,13 +55,49 @@ func approvalChannel(id Identity, delegated bool) string {
 	return "api"
 }
 
+// authorshipCategories is the CLOSED ALLOW-LIST of audit categories whose
+// user-kind actor is the change AUTHOR (#2358). A user-kind audit row makes
+// its actor the author only when its category records the operator putting
+// change CONTENT into the run — today exactly one does: vouching a
+// hand-pushed commit into the run's lineage (CategoryOperatorCommitVouched),
+// which is the issue's own definition of authorship ("the identity that
+// pushed the commits").
+//
+// Every OTHER user-kind category is operator GATE PARTICIPATION, not
+// authorship: run_auto_driven (fishhawk_drive_run's mechanical
+// record-before-dispatch attribution row, autodrive_http.go / #1961 — the
+// least author-like event on a run), clarification_answered,
+// approval_submitted (an approval reason carrying binding conditions shapes
+// the implementation at least as much as a clarification answer does),
+// scope-amendment decisions, concern waivers/deferrals, merge verdicts,
+// retries and branch resets. Governance is not authorship.
+//
+// ALLOW-list, not a governance DENY-list, deliberately: the audit category
+// set grows with every verb added, so a deny-list re-opens this wedge on the
+// next one, while an allow-list's failure mode is "no author resolved" — the
+// already-supported, already-tested fail-open branch. The discipline that
+// implies: a future category recording operator-authored CONTENT must be
+// registered HERE; a new gate verb needs no change. Keyed to the exported
+// constant, never a string literal, so a rename that misses this map is a
+// compile error rather than a silent behavior change.
+var authorshipCategories = map[string]struct{}{
+	CategoryOperatorCommitVouched: {},
+}
+
 // resolveChangeAuthor returns the originating human's subject: the
-// ActorSubject of the run's earliest user-kind audit entry (ListForRun is
-// sequence-ascending). ok is false when no such actor exists yet — author
-// separation-of-duties is then skipped (logged) while agent-SoD and quorum
-// still apply. There is no run-level author field on run.Run, so the
-// earliest user actor is the deterministic, forge-neutral, stage-agnostic
-// stand-in ratified at the plan gate. Fail-open (ok=false) on a read error.
+// ActorSubject of the run's earliest user-kind audit entry whose category is
+// in authorshipCategories (ListForRun is sequence-ascending, so the earliest
+// match over the FILTERED set wins). ok is false when no such actor exists
+// yet — author separation-of-duties is then skipped (logged) while agent-SoD
+// and quorum still apply. There is no run-level author field on run.Run, so
+// the earliest authorship-category user actor is the deterministic,
+// forge-neutral, stage-agnostic stand-in. Fail-open (ok=false) on a read
+// error.
+//
+// Honest consequence: on a run that has reached only its PLAN gate, no
+// authorship-category entry exists yet, so author separation-of-duties does
+// not bite there at all. The plan-gate controls are the unconditional
+// agent floor in eligibleApprover and the distinct-human quorum count.
 func (s *Server) resolveChangeAuthor(ctx context.Context, runID uuid.UUID) (string, bool) {
 	if s.cfg.AuditRepo == nil {
 		return "", false
@@ -76,6 +112,9 @@ func (s *Server) resolveChangeAuthor(ctx context.Context, runID uuid.UUID) (stri
 		return "", false
 	}
 	for _, e := range entries {
+		if _, ok := authorshipCategories[e.Category]; !ok {
+			continue
+		}
 		if e.ActorKind != nil && *e.ActorKind == audit.ActorUser &&
 			e.ActorSubject != nil && *e.ActorSubject != "" {
 			return *e.ActorSubject, true
@@ -84,12 +123,43 @@ func (s *Server) resolveChangeAuthor(ctx context.Context, runID uuid.UUID) (stri
 	return "", false
 }
 
+// approvalsNotAuthor is the spec.Approvals.Not token that turns author
+// separation-of-duties ON for a gate. The schema closes Not to the lowercase
+// enum ["author", "agent"], so an exact match needs no case-folding.
+const approvalsNotAuthor = "author"
+
+// approvalsExcludeAuthor reports whether the gate's approvals block declares
+// `not:` including "author" (#2358). Before this, the author-SoD 403 fired on
+// "the gate has an approvals block" and never read Not, so a declared `not:`
+// was grammar rather than enforcement. A nil block, a nil/empty Not, or a Not
+// without "author" is false; an unrecognised member is ignored, not an error.
+//
+// There is deliberately NO agent counterpart that could turn the agent leg
+// OFF: agent exclusion is an UNCONDITIONAL floor enforced by eligibleApprover
+// via actorKindForSubject (actor.go), so `not: [agent]` merely restates the
+// floor and omitting it does not permit an automated identity to satisfy a
+// human quorum. That asymmetry is #1709's binding acceptance criterion, not
+// an oversight.
+func approvalsExcludeAuthor(a *spec.Approvals) bool {
+	if a == nil {
+		return false
+	}
+	for _, n := range a.Not {
+		if n == approvalsNotAuthor {
+			return true
+		}
+	}
+	return false
+}
+
 // eligibleApprover reports whether subject counts toward the human quorum:
-// it is neither the change author (separation of duties) nor an agent-kind
+// it is neither the change author (separation of duties, only when the gate
+// declares `not:` including "author" — excludeAuthor) nor an agent-kind
 // subject (operator-agent / delegated submissions are excluded from human
-// quorum). A "" changeAuthor (unresolved) disables only the author leg.
-func eligibleApprover(subject, changeAuthor string) bool {
-	if changeAuthor != "" && subject == changeAuthor {
+// quorum, UNCONDITIONALLY, whether or not `not:` names "agent"). A ""
+// changeAuthor (unresolved) disables only the author leg.
+func eligibleApprover(subject, changeAuthor string, excludeAuthor bool) bool {
+	if excludeAuthor && changeAuthor != "" && subject == changeAuthor {
 		return false
 	}
 	return actorKindForSubject(subject) != audit.ActorAgent
@@ -185,7 +255,7 @@ func (s *Server) delegatedApproverSubjects(ctx context.Context, runID uuid.UUID)
 // the last committer always sees full quorum under real Postgres commit
 // interleaving) and TestApproveStageAs_Quorum_* (server package — the happy
 // two-approver advance-once path and the InvalidTransition safety guard).
-func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stageID uuid.UUID, changeAuthor string) int {
+func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stageID uuid.UUID, changeAuthor string, excludeAuthor bool) int {
 	rows, err := s.cfg.ApprovalRepo.ListForStage(ctx, stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -201,7 +271,7 @@ func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stag
 		if a.Decision != approval.DecisionApprove {
 			continue
 		}
-		if !eligibleApprover(a.ApproverSubject, changeAuthor) {
+		if !eligibleApprover(a.ApproverSubject, changeAuthor, excludeAuthor) {
 			continue
 		}
 		if _, ok := delegated[a.ApproverSubject]; ok {
@@ -256,6 +326,12 @@ type predicateSnapshot struct {
 // submitterClass labels the submitter relative to the quorum: "author" when
 // it is the change author, "agent" for an agent-kind subject, otherwise
 // "eligible".
+//
+// This is DESCRIPTIVE PROVENANCE for predicate_snapshot, not an eligibility
+// verdict: on a gate whose `not:` omits "author" a resolved author is
+// PERMITTED and COUNTED yet still labeled "author" here (#2358), so
+// submitter_class:"author" can now co-occur with quorum_reached:true. Do not
+// infer eligibility from the label — eligibleApprover owns that decision.
 func submitterClass(subject, changeAuthor string, agent bool) string {
 	if changeAuthor != "" && subject == changeAuthor {
 		return "author"
