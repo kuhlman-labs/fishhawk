@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -985,6 +986,76 @@ func TestDriveRun_HumanQuorumRequired_StopsWithApproveAction(t *testing.T) {
 	if len(rec.list()) != 0 {
 		t.Errorf("a spawn happened on a human_quorum_required stop: %v", rec.list())
 	}
+}
+
+// TestAutoDriveOutcome_WireTagParity is the #2381 single test that spans the
+// server-emit → client-decode seam binding condition 1 asked for. A runtime
+// handler→client-model round trip in ONE process is architecturally
+// impossible here: the server's autoDriveResponse lives in package
+// internal/server, the client's AutoDriveOutcome lives in package main
+// (cmd/fishhawk-mcp) and so cannot be imported by a server test, and the
+// server's auto-drive harness is unexported test-only code over the large
+// run.Repository, so a mcp-side test cannot drive the real handler to a
+// human-quorum decline without reproducing it wholesale. The load-bearing
+// handoff is a json struct TAG, which Go cannot express as a shared const
+// symbol at all. So the two sides share the VALUE via the operatorrole
+// constants (referenced by the server emitter AND the driver's compare) and
+// share the FIELD NAME via this source-read parity test — condition 1's
+// stated fallback when the two sides genuinely cannot share a symbol.
+//
+// It reads both struct definitions from source and asserts the decision_state
+// and decision_required json field names are byte-identical across the two
+// structs AND equal the wire literals the constant round trip rides on. This
+// is the one failure the composition otherwise misses: population is already
+// pinned server-side (TestAutoDriveHTTP_HumanQuorumGate_DecisionRequired
+// decodes the REAL handler's body and asserts DecisionState ==
+// operatorrole.DecisionStateHumanQuorumRequired — the handler leaving it empty
+// fails there) and read is pinned client-side
+// (TestDriveRun_HumanQuorumRequired_StopsWithApproveAction), but each side
+// decodes through its OWN struct, so a tag rename on either side would ship
+// green. It fails HERE.
+func TestAutoDriveOutcome_WireTagParity(t *testing.T) {
+	const (
+		serverSrc = "../../internal/server/autodrive_http.go" // autoDriveResponse
+		clientSrc = "client.go"                               // AutoDriveOutcome
+	)
+	for _, tc := range []struct {
+		field     string
+		wireField string
+	}{
+		{"DecisionRequired", "decision_required"},
+		{"DecisionState", "decision_state"},
+	} {
+		serverTag := jsonFieldName(t, serverSrc, tc.field)
+		clientTag := jsonFieldName(t, clientSrc, tc.field)
+		if serverTag != clientTag {
+			t.Errorf("%s json field name diverged across the emit/decode seam: server=%q client=%q — a wire-tag split silently drops the outcome to the decoder's zero value and the driver never stops", tc.field, serverTag, clientTag)
+		}
+		if serverTag != tc.wireField {
+			t.Errorf("%s server json field name = %q, want wire literal %q", tc.field, serverTag, tc.wireField)
+		}
+		if clientTag != tc.wireField {
+			t.Errorf("%s client json field name = %q, want wire literal %q", tc.field, clientTag, tc.wireField)
+		}
+	}
+}
+
+// jsonFieldName reads goSrc and returns the json field NAME (the part before
+// any comma-separated option) declared on the struct field named field. It
+// fails the test if the field or its json tag is absent, so a field renamed or
+// stripped of its json tag surfaces here rather than as a silent empty string.
+func jsonFieldName(t *testing.T, goSrc, field string) string {
+	t.Helper()
+	src, err := os.ReadFile(goSrc)
+	if err != nil {
+		t.Fatalf("read %s: %v", goSrc, err)
+	}
+	re := regexp.MustCompile("(?m)^\\s*" + regexp.QuoteMeta(field) + "\\s+\\S+\\s+`json:\"([^\",]+)")
+	m := re.FindSubmatch(src)
+	if m == nil {
+		t.Fatalf("no json-tagged field %q found in %s", field, goSrc)
+	}
+	return string(m[1])
 }
 
 // TestDriveRun_RepeatedActedGate_BoundedByNoProgress pins FIX 2's driver leg: a
