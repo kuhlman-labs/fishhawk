@@ -6768,6 +6768,55 @@ func TestSubmitApproval_Escalation_PlanUnreadable_FailsClosed(t *testing.T) {
 	}
 }
 
+// TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced pins
+// the #2227 fixup (prior concern c7665be8): when fetchApprovalsForStage errors
+// but a paths/label/trigger escalation IS raised (escReq non-zero), the fetch
+// error must NOT short-circuit before resolveStageEscalations — the escalated
+// forge predicate is enforced against a nil baseline so a transient window
+// cannot let an out-of-group approval through. A regression restoring the
+// original early `if ferr != nil { return nil, true }` would wave the non-member
+// through and this 403 would vanish.
+//
+// The fetch error is forced by a stage whose Type is absent from the workflow
+// (fetchApprovalsForStage returns "stage_type … not in workflow"), while
+// escalationsForRun still reads the workflow's firing escalation off the same
+// cached spec bytes — the exact ferr != nil ∧ escReq non-zero divergence.
+func TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced(t *testing.T) {
+	s, _, rr, _, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+	stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+	// A stage type the workflow does not declare → fetchApprovalsForStage errors,
+	// but the workflow-level escalation still fires.
+	stage.Type = run.StageTypeAcceptance
+
+	// Sanity: the fetch genuinely errors on this stage.
+	if _, ferr := s.fetchApprovalsForStage(context.Background(), stage); ferr == nil {
+		t.Fatal("fetchApprovalsForStage did not error; the test would not exercise the fetch-error branch")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+	w := httptest.NewRecorder()
+	res, ok := s.checkApprovalPredicates(w, req, stage, "github:outsider", false)
+	if ok {
+		t.Fatalf("checkApprovalPredicates ok = true, want false — the escalated member_of must be enforced despite the fetch error")
+	}
+	if res != nil {
+		t.Errorf("resolution = %v, want nil on a rejection", res)
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "acme/security") {
+		t.Errorf("403 body does not name the escalated group: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"escalated":true`) {
+		t.Errorf("403 body does not mark the predicate as escalated: %s", w.Body.String())
+	}
+	if idp.memberCalls != 1 {
+		t.Errorf("memberCalls = %d, want 1 (the escalated member_of was resolved)", idp.memberCalls)
+	}
+}
+
 // withEscalationApprover injects a DISTINCT operator identity so the second
 // approval counts as a second distinct eligible approver toward the escalated
 // quorum. (withAuth's identity is fixed, and runs_fake_test.go is another

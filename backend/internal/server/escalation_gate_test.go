@@ -855,15 +855,17 @@ func TestResolveStageEscalations_TransientRunRowError_FailsClosed(t *testing.T) 
 // pre-Submit predicate check ran (no membership enforced, approval recorded)
 // can match by the time the quorum count reads the amended plan.
 //
-// Membership is enforced at INSERT time (checkApprovalPredicates), not
-// re-validated at count time (countDistinctEligibleApprovers counts distinct
-// approvers, not group membership), so an approval recorded during the
-// non-matching window is not retroactively re-checked. That residual cross-
-// request window is documented and accepted for this change (the design
-// explicitly supports a changed plan scope producing a changed fired set);
-// closing it fully would require re-resolving every counted approver's
-// membership at quorum time. This test exercises the divergence the concern
-// says the static-artifact tests did not.
+// Membership is enforced at INSERT time (checkApprovalPredicates), and the
+// count path CLOSES the residual cross-request window this divergence sits on
+// (#2227): when a fired escalation raises a forge predicate, approveStageAs
+// re-resolves it against the forge for every counted approver
+// (countEscalatedForgeApprovers), so an approval recorded during the
+// non-matching window — never membership-checked at Submit — is re-checked at
+// quorum time and excluded if it does not satisfy the raised requirement. This
+// test pins the resolver-level divergence (the same stage returns a different
+// fired set before and after a scope amendment); the count-time closure of the
+// window that divergence exposes is pinned end to end by
+// TestApproveStageAs_Escalation_CountTimeMembershipReValidation.
 func TestResolveStageEscalations_ChangedPlanScope_DivergesBetweenResolutions(t *testing.T) {
 	rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
 	s := escGateServer(rr, au, ar)

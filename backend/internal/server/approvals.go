@@ -783,7 +783,11 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	// spec bytes off the same run row within one request, so the 403 gate
 	// and the count can never disagree on `not:`.
 	excludeAuthor := approvalsExcludeAuthor(approvals)
-	eligibleCount := s.countDistinctEligibleApprovers(ctx, p.Stage.RunID, p.Stage.ID, changeAuthor, excludeAuthor)
+	// Enumerate (not just count) the distinct eligible approvers: the plain
+	// count feeds the common path, and the SUBJECT list feeds the escalation
+	// re-validation below (#2227).
+	subjects := s.distinctEligibleApproverSubjects(ctx, p.Stage.RunID, p.Stage.ID, changeAuthor, excludeAuthor)
+	eligibleCount := len(subjects)
 
 	// The escalation raise is applied at the COUNT as well as at the
 	// pre-Submit 403 (E53.4 / #2227), for the same #2358 reason `not:` had to
@@ -809,9 +813,41 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	effective := effectiveApprovals(approvals, escReq)
 	required := effective.count
-	if escErr != nil {
-		// Unknown requirement: make the gate unreachable this pass rather than
-		// advance it at a possibly-unescalated count.
+	gateUnreachable := escErr != nil
+
+	// Cross-request TOCTOU closure (#2227). The plan scope the escalation
+	// matches against is MUTABLE (a scope amendment can move the plan into an
+	// escalated path between two approvals), so an approval recorded while the
+	// escalation was NOT firing was never membership-checked at Submit
+	// (checkApprovalPredicates enforces the forge predicate at INSERT time) — yet
+	// the plain distinct-approver count would still credit it toward a quorum the
+	// escalation has since RAISED to require member_of / min_permission. That
+	// would let a matching change clear on an approval that never satisfied its
+	// current membership constraint. So when the fired escalation carries a forge
+	// predicate, re-resolve it against the forge for every counted approver and
+	// keep only those who satisfy it NOW. It runs ONLY when the ESCALATION raised
+	// a forge predicate, so a run with no escalation, a count-only escalation, or
+	// a purely BASELINE forge predicate (already enforced at every Submit, no
+	// TOCTOU) pays no count-time forge calls — the E39.5 native member_of path is
+	// byte-identical to today. A forge that cannot resolve a counted approver
+	// makes the gate unreachable this pass (fail closed), the same not-advancing
+	// posture the escErr branch takes, since the post-Submit path has no 503.
+	if !gateUnreachable && (escReq.MinPermission != "" || len(escReq.MemberOf) > 0) {
+		if satisfied, ok := s.countEscalatedForgeApprovers(ctx, p.Stage, subjects, effective); ok {
+			eligibleCount = satisfied
+		} else {
+			gateUnreachable = true
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"approval: escalated forge predicate unresolved for a counted approver; not advancing the gate",
+				slog.String("stage_id", p.Stage.ID.String()),
+			)
+		}
+	}
+
+	if gateUnreachable {
+		// Unknown or unverifiable requirement: make the gate unreachable this
+		// pass rather than advance it at a possibly-unescalated or unverified
+		// count.
 		required = eligibleCount + 1
 	}
 	// A delegated/agent submission never advances the gate even if the count

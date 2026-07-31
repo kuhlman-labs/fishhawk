@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -914,4 +915,155 @@ func (f *perGroupIdentityProvider) ResolveMembership(_ context.Context, ref, _ s
 		return false, err
 	}
 	return f.member[ref], nil
+}
+
+// perSubjectIdentityProvider resolves membership PER SUBJECT, which neither the
+// shared fakeIdentityProvider (one bool for every subject) nor
+// perGroupIdentityProvider (keyed on the group) can express. The count-time
+// TOCTOU re-validation (#2227) must COUNT a member approver while EXCLUDING a
+// non-member one recorded on the same stage, so the two subjects must resolve
+// differently.
+type perSubjectIdentityProvider struct {
+	fakeIdentityProvider
+	memberBySubject map[string]bool
+}
+
+func (f *perSubjectIdentityProvider) ResolveMembership(_ context.Context, _, subject string) (bool, error) {
+	f.memberCalls++
+	return f.memberBySubject[subject], nil
+}
+
+// TestApproveStageAs_Escalation_CountTimeMembershipReValidation is the #2227
+// high/security TOCTOU pin: an approval recorded while a member_of escalation
+// was NOT firing — and so never membership-checked at Submit — must NOT count
+// toward the raised quorum once the escalation fires. approveStageAs re-resolves
+// the escalated predicate against the forge for every counted approver
+// (countEscalatedForgeApprovers) and keeps only those who satisfy it now. The
+// mutable-plan divergence this closure sits on is pinned at the resolver by
+// TestResolveStageEscalations_ChangedPlanScope_DivergesBetweenResolutions;
+// calling approveStageAs directly (bypassing the HTTP pre-Submit 403) is what
+// simulates a row recorded in the non-matching window.
+func TestApproveStageAs_Escalation_CountTimeMembershipReValidation(t *testing.T) {
+	newSrv := func(idp identity.IdentityProvider) (*Server, *approvalRunRepo) {
+		ar := newFakeApprovalRepo()
+		rr := newApprovalRunRepo()
+		au := newApprovalAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au, IdentityProvider: idp})
+		return s, rr
+	}
+
+	t.Run("a non-member approval recorded off-escalation is excluded at count time", func(t *testing.T) {
+		// r1 is NOT in acme/security (its row stands in for one recorded while
+		// the escalation was not firing); r2 IS. The escalated quorum is 2, so a
+		// count that credited r1 would clear it — the fail-open. The re-validation
+		// excludes r1, holding the gate at one satisfying approver.
+		idp := &perSubjectIdentityProvider{memberBySubject: map[string]bool{
+			"github:r1": false,
+			"github:r2": true,
+		}}
+		s, rr := newSrv(idp)
+		stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+
+		res1, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("r1 approve: %v", err)
+		}
+		if res1.Stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("after r1 state = %q, want awaiting_approval", res1.Stage.State)
+		}
+
+		res2, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r2"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("r2 approve: %v", err)
+		}
+		if res2.Stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("after r2 state = %q, want awaiting_approval — the escalated quorum of 2 must not clear on a non-member (r1) plus a member (r2)", res2.Stage.State)
+		}
+	})
+
+	t.Run("two in-group approvals reach the escalated quorum", func(t *testing.T) {
+		idp := &perSubjectIdentityProvider{memberBySubject: map[string]bool{
+			"github:r1": true,
+			"github:r2": true,
+		}}
+		s, rr := newSrv(idp)
+		stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+
+		if _, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove}); err != nil {
+			t.Fatalf("r1 approve: %v", err)
+		}
+		res2, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r2"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("r2 approve: %v", err)
+		}
+		if res2.Stage.State != run.StageStateSucceeded {
+			t.Fatalf("after two members state = %q, want succeeded — the re-validation must COUNT members, not only exclude non-members", res2.Stage.State)
+		}
+	})
+}
+
+// TestApproveStageAs_Escalation_SnapshotRecordsEscalatedFields is the #2227
+// low/test-coverage pin for the predicate_snapshot escalation fields: a firing
+// escalation records escalated=true and the full membership conjunction on the
+// approval_submitted audit row, so the raised gate is explainable from the row
+// alone. The snapshot is written on EVERY approval (before advance), so one
+// below-quorum vote suffices to assert it.
+func TestApproveStageAs_Escalation_SnapshotRecordsEscalatedFields(t *testing.T) {
+	s, _, rr, au, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+	stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+
+	res, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// Below the escalated quorum of 2, so it records but does not advance.
+	if res.Stage.State != run.StageStateAwaitingApproval {
+		t.Fatalf("state = %q, want awaiting_approval", res.Stage.State)
+	}
+	snap := lastPredicateSnapshot(t, au)
+	if !snap.Escalated {
+		t.Errorf("snapshot.Escalated = false, want true on a firing escalation")
+	}
+	if len(snap.EscalatedMemberOf) != 1 || snap.EscalatedMemberOf[0] != "acme/security" {
+		t.Errorf("snapshot.EscalatedMemberOf = %v, want [acme/security]", snap.EscalatedMemberOf)
+	}
+	if snap.CountRequired != 2 {
+		t.Errorf("snapshot.CountRequired = %d, want the escalated 2", snap.CountRequired)
+	}
+}
+
+// TestApproveStageAs_Escalation_PostSubmitResolverError_FailsClosed is the #2227
+// low/test-coverage pin for the post-Submit fail-closed branch: when the
+// escalation resolver errors between the pre-Submit gate and the count
+// (unreachable by accident in HTTP — checkApprovalPredicates 503s first — so only
+// a direct approveStageAs call, or a resolver that fails on the second call,
+// exercises it), the gate is made unreachable this pass (required =
+// eligibleCount + 1) rather than advancing at the baseline count. Here a
+// paths-bearing escalation with no readable plan drives the resolver error, and
+// the single approval against a BASELINE count-1 gate — which would otherwise
+// advance — is held.
+func TestApproveStageAs_Escalation_PostSubmitResolverError_FailsClosed(t *testing.T) {
+	s, _, rr, _, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+	pathsSpec := strings.Replace(escalationApprovalSpecYAML,
+		"          trigger: [diff]", `          paths: ["backend/**"]`, 1)
+	stage := seedEscalationApprovalRun(t, rr, pathsSpec)
+
+	res, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+		approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+	if err != nil {
+		t.Fatalf("approve returned error; the resolver failure must be logged and fail closed, not surfaced: %v", err)
+	}
+	if res.Stage.State != run.StageStateAwaitingApproval {
+		t.Fatalf("state = %q, want awaiting_approval — an unreadable-plan resolver error must make the baseline count-1 gate unreachable, not advance it", res.Stage.State)
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("recorded %d stage transitions, want 0 (the gate was held closed)", len(rr.transitions))
+	}
 }

@@ -256,6 +256,18 @@ func (s *Server) delegatedApproverSubjects(ctx context.Context, runID uuid.UUID)
 // interleaving) and TestApproveStageAs_Quorum_* (server package — the happy
 // two-approver advance-once path and the InvalidTransition safety guard).
 func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stageID uuid.UUID, changeAuthor string, excludeAuthor bool) int {
+	return len(s.distinctEligibleApproverSubjects(ctx, runID, stageID, changeAuthor, excludeAuthor))
+}
+
+// distinctEligibleApproverSubjects is the enumeration countDistinctEligibleApprovers
+// counts and the escalation re-validation (#2227) re-resolves against the forge.
+// It applies the identical eligibility rules — approve decision only, the
+// author/agent exclusions of eligibleApprover, the delegated-subject exclusion —
+// and the same fail-open-to-empty posture on a list error, so a caller that only
+// needs the COUNT sees behavior byte-identical to before this split. See
+// countDistinctEligibleApprovers's doc comment for the read-after-write
+// serialization reasoning and the invariants a future change must preserve.
+func (s *Server) distinctEligibleApproverSubjects(ctx context.Context, runID, stageID uuid.UUID, changeAuthor string, excludeAuthor bool) []string {
 	rows, err := s.cfg.ApprovalRepo.ListForStage(ctx, stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -263,10 +275,11 @@ func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stag
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
-		return 0
+		return nil
 	}
 	delegated := s.delegatedApproverSubjects(ctx, runID)
 	seen := make(map[string]struct{})
+	var subjects []string
 	for _, a := range rows {
 		if a.Decision != approval.DecisionApprove {
 			continue
@@ -278,9 +291,61 @@ func (s *Server) countDistinctEligibleApprovers(ctx context.Context, runID, stag
 			// Delegated approval: recorded but never counted (#1709).
 			continue
 		}
+		if _, dup := seen[a.ApproverSubject]; dup {
+			continue
+		}
 		seen[a.ApproverSubject] = struct{}{}
+		subjects = append(subjects, a.ApproverSubject)
 	}
-	return len(seen)
+	return subjects
+}
+
+// countEscalatedForgeApprovers closes the cross-request TOCTOU (#2227) that a
+// distinct-approver count alone cannot. When a fired escalation RAISES a forge
+// predicate (member_of / min_permission), an approval recorded while the
+// escalation was NOT firing was never membership-checked at Submit
+// (checkApprovalPredicates enforces the forge predicate at INSERT time), yet the
+// plain count would still credit it toward the raised quorum — letting a matching
+// change clear on an approval that never satisfied its current membership
+// constraint. This re-resolves the ESCALATED predicate against the forge for
+// EACH distinct eligible approver and returns how many satisfy it NOW.
+//
+// The caller invokes it ONLY when the fired escalation itself carries a forge
+// predicate, so a run with no escalation, a count-only escalation, or a gate
+// whose forge predicate is purely BASELINE (already enforced at every Submit, no
+// TOCTOU) pays no count-time forge calls — the E39.5 native member_of path stays
+// byte-identical to today.
+//
+// FAIL CLOSED: any approver the forge cannot resolve (predicateUnavailable — a
+// forge error / rate-limit, an empty repo, a nil IdentityProvider) returns
+// ok=false, and the caller makes the gate unreachable this pass, the same
+// not-advancing posture the escErr branch takes (the post-Submit path has no 503
+// to return). A resolved-but-non-satisfying approver (predicateRejected) is
+// simply not counted — that is the TOCTOU closure, not a failure.
+func (s *Server) countEscalatedForgeApprovers(ctx context.Context, stage *run.Stage, subjects []string, effective escalatedApprovals) (int, bool) {
+	if s.cfg.IdentityProvider == nil {
+		return 0, false
+	}
+	var repo string
+	if s.cfg.RunRepo != nil {
+		if runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID); err == nil {
+			repo = runRow.Repo
+		}
+	}
+	n := 0
+	for _, subject := range subjects {
+		outcome, _, _ := s.resolvePredicates(ctx, repo, subject, effective)
+		switch outcome {
+		case predicateSatisfied:
+			n++
+		case predicateRejected:
+			// Recorded but does not satisfy the escalated predicate now —
+			// excluded from the raised quorum. This is the TOCTOU closure.
+		default: // predicateUnavailable
+			return 0, false
+		}
+	}
+	return n, true
 }
 
 // snapshotIdentity is the provider-qualified submitter identity recorded on
