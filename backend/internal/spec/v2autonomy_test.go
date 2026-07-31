@@ -983,3 +983,67 @@ func TestParseV2_AutonomyFixtureGoldenParse(t *testing.T) {
 		t.Errorf("gate fixup = %+v, want gated/default — the gate block is wholesale", got)
 	}
 }
+
+// --- the escalation ceiling's projection onto the derived knobs (#2227) -----
+
+// TestDerivedOperatorAgent_AfterClamp_EmptiesTheKnob is the assertion the
+// enforcement sites actually depend on. Every one of them — delegation's five
+// knob evaluators, the checkDelegation handlers, AutoDriveRunGate and the
+// campaign driver — reads the DERIVED *OperatorAgent, not the ResolvedMatrix.
+// So clamping the matrix is only half the control: the caller must RE-DERIVE
+// the knob block from the clamped matrix, or a run-status response would show
+// `gated` while the agent stayed authorized to act.
+//
+// The fixture is criterion 4's exact case: an EXPLICIT `actions` override
+// declaring merge at auto — which beats the tier — under a fired `low`
+// ceiling, asserted on the derived MayMerge knob.
+func TestDerivedOperatorAgent_AfterClamp_EmptiesTheKnob(t *testing.T) {
+	wf := &Workflow{
+		Autonomy: TierMedium,
+		Actions: &ActionMatrix{Classes: map[string]ActionEntry{
+			ActionMerge: {Mode: ModeAuto, When: ConditionGatesResolvedCIGreen},
+		}},
+	}
+	resolved := ResolveAutonomy(wf, nil)
+	if got := resolvedFor(t, resolved, ActionMerge); got.Mode != ModeAuto || got.Source != SourceExplicit {
+		t.Fatalf("pre-clamp merge = %+v, want the explicit auto override (the control this test rests on)", got)
+	}
+	if before := DerivedOperatorAgent(resolved); before.MayMerge != ConditionGatesResolvedCIGreen {
+		t.Fatalf("pre-clamp MayMerge = %q, want the explicit condition", before.MayMerge)
+	}
+
+	clamped := ClampResolvedMatrix(resolved, TierLow)
+	if got := resolvedFor(t, clamped, ActionMerge); got.Mode != ModeGated || got.Source != SourceEscalation {
+		t.Errorf("clamped merge = %+v, want gated with source escalation", got)
+	}
+	derived := DerivedOperatorAgent(clamped)
+	if derived.MayMerge != "" {
+		t.Errorf("MayMerge = %q, want EMPTY — the ceiling must reach the knob the enforcement sites read", derived.MayMerge)
+	}
+	if derived.MayApprove != "" {
+		t.Errorf("MayApprove = %q, want empty under a low ceiling", derived.MayApprove)
+	}
+	if derived.MayRetry != "" {
+		t.Errorf("MayRetry = %q, want empty under a low ceiling", derived.MayRetry)
+	}
+}
+
+// TestDerivedOperatorAgent_AfterMediumClamp_KeepsPermittedKnobs is the
+// paired control: a ceiling clamps only what it must, so `medium` leaves
+// approve/fixup/retry delegated while closing merge.
+func TestDerivedOperatorAgent_AfterMediumClamp_KeepsPermittedKnobs(t *testing.T) {
+	resolved := ResolveAutonomy(&Workflow{Autonomy: TierHigh}, nil)
+	derived := DerivedOperatorAgent(ClampResolvedMatrix(resolved, TierMedium))
+	if derived.MayMerge != "" {
+		t.Errorf("MayMerge = %q, want empty — medium gates merge", derived.MayMerge)
+	}
+	if derived.MayWaive != "" {
+		t.Errorf("MayWaive = %q, want empty — medium gates waive", derived.MayWaive)
+	}
+	if derived.MayApprove != ConditionCleanDualApproval {
+		t.Errorf("MayApprove = %q, want it preserved — medium holds approve at auto", derived.MayApprove)
+	}
+	if derived.MayRetry != ConditionInfraFlake {
+		t.Errorf("MayRetry = %q, want it preserved — medium holds retry at auto", derived.MayRetry)
+	}
+}

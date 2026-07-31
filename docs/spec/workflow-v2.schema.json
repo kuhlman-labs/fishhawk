@@ -127,6 +127,14 @@
         "decomposition": {
           "$ref": "#/$defs/decomposition"
         },
+        "escalations": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Per-path escalation rules (E53.4 / #2227): each entry RAISES the requirements that apply to a change matching its predicate. An escalation may only ever raise — a declared value that does not exceed the workflow's baseline, or that composes to the baseline unchanged, is a VALIDATION ERROR rather than a silently accepted no-op, so an operator reading the block can trust that every entry does something. When several entries match one change the composition is the STRICTEST per dimension and therefore ORDER-INDEPENDENT (max count, sorted de-duplicated UNION of member_of as a conjunction, strictest min_permission, lowest max_autonomy) — never last-match-wins. `max_autonomy` is a CEILING on AGENT autonomy (equivalently a floor on human involvement), applied LAST over the fully resolved action matrix, after the workflow tier and after every explicit `actions` override, so an explicit `actions: {merge: {mode: auto}}` cannot re-widen past it. NOT inherited through `extends` (which folds stages only), matching `applies_to`. See docs/spec/workflow-v2.md § 'Escalations'.",
+          "items": {
+            "$ref": "#/$defs/escalation"
+          }
+        },
         "extends": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_]*$",
@@ -967,6 +975,66 @@
           "type": "string",
           "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
           "description": "Per-stage review-budget floor (#1494). The stage's review_timeout OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default — it sets the Floor rung of the size-aware review-wait budget (Floor + PerKB*ceil(promptKB), clamped to [Floor,Cap]) for this stage's agent reviews; the deployment-level PerKB and Cap are unchanged. Parsed by time.ParseDuration; an unparseable or absent value falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. Resolved by spec.ResolveReviewTimeout on the backend. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+        }
+      }
+    },
+    "escalation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "match",
+        "require"
+      ],
+      "description": "One escalation rule (E53.4 / #2227): a `match` predicate plus the `require` block it RAISES for a change satisfying it. The `match:` WRAPPER IS STRUCTURALLY FORCED, not stylistic — $defs/predicate is additionalProperties:false, and JSON Schema Draft 2020-12 evaluates additionalProperties against the WHOLE instance object, so an escalation cannot $ref the predicate and carry a sibling `require` key. Hoisting `paths:` to the escalation level would mean re-declaring the predicate's properties inline, which is exactly the second-matcher drift E53.1 exists to prevent on a predicate that now backs applies_to across three seams. The predicate is used verbatim with ONE consumer-side refusal: `change_kind` is rejected inside `escalations` for the same reason applies_to rejects it — nothing produces a change kind, so the escalation could never fire, which is indistinguishable from the control being broken.",
+      "properties": {
+        "match": {
+          "$ref": "#/$defs/predicate",
+          "description": "The change this escalation applies to, as a $defs/predicate (E53.1 / #2224) — the SAME match rule `applies_to` and the review-conventions consume, deliberately not a second matcher. `paths` is evaluated against the UNION of the plan's top-level scope.files and every decomposition sub_plan / split_proposal phase scope, so a fan-out slice cannot reach an escalated path without escalating."
+        },
+        "require": {
+          "$ref": "#/$defs/escalation_requirements",
+          "description": "The requirements this escalation RAISES for a matching change. At least one dimension must be declared (minProperties 1) — an escalation that requires nothing is refused structurally rather than accepted as a no-op."
+        }
+      }
+    },
+    "escalation_requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "The raised requirements of one escalation (E53.4 / #2227). Every dimension is optional individually but the block may not be EMPTY (minProperties 1), so `require: {}` is a schema error. Composition across several matching escalations is the strictest per dimension and therefore order-independent. Each dimension is checked at validation time to prove it actually RAISES something: `count` and `min_permission` must exceed the workflow's least-restrictive baseline (the max count and the strictest tier over every approval gate, because a workflow-level escalation applies to every gate); `member_of` is refused when EVERY applicable approval gate already names the group (the conjunction de-duplicates it, so the composed set is identical to the baseline); and `max_autonomy` is refused when clamping the resolved matrix leaves it identical.",
+      "properties": {
+        "approvals": {
+          "type": "object",
+          "additionalProperties": false,
+          "minProperties": 1,
+          "description": "Raised approval-gate requirements. The NESTED minProperties 1 is load-bearing: without it `require: {approvals: {}}` would satisfy the outer minProperties while requiring nothing, so the claim that a no-op escalation is refused structurally would be only mostly true. A `require.approvals` block on a workflow declaring NO approval gate is refused by the validator — it raises nothing anywhere.",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Raised number of distinct approvals the gate needs. Composes as the MAX across matching escalations, and is refused unless it EXCEEDS the highest count any approval gate in the workflow declares."
+            },
+            "member_of": {
+              "type": "string",
+              "minLength": 1,
+              "description": "A forge-neutral group (org or org/team) an approver must additionally belong to. Composes as a sorted de-duplicated UNION which is a CONJUNCTION — an approver must belong to EVERY composed group — so membership can only ever narrow the eligible set, which is why there is no lowering check for it. It is refused only when it would be a NO-OP: a group every applicable approval gate already requires."
+            },
+            "min_permission": {
+              "type": "string",
+              "enum": [
+                "read",
+                "triage",
+                "write",
+                "maintain",
+                "admin"
+              ],
+              "description": "Raised minimum forge-neutral repository permission tier (backend/internal/identity.Permission vocabulary, sans `none`). Composes as the STRICTEST tier, and is refused unless it exceeds the strictest tier declared over the workflow's approval gates (an absent baseline is no constraint, so any declared tier raises)."
+            }
+          }
+        },
+        "max_autonomy": {
+          "$ref": "#/$defs/autonomy_tier",
+          "description": "A CEILING on AGENT autonomy for a matching change — equivalently a floor on human involvement. It is applied LAST, over the FULLY RESOLVED action matrix: after the workflow (or gate) tier expansion and after every explicit `actions` override, so an explicit `actions: {merge: {mode: auto}}` cannot re-widen past the ceiling. Every class at `mode: auto` that the ceiling tier does not also hold at `auto` is downgraded to `gated` (its condition dropped, provenance recorded as `escalation`); `gated` and `report` are untouched, and an extension class clamps to `gated`, fail-closed. Composes as the LOWEST tier. Because clamping only ever downgrades, a ceiling is monotone-decreasing BY CONSTRUCTION and cannot lower any requirement — so it carries a NO-OP check (a ceiling whose clamp leaves the resolved matrix identical is refused) rather than a raise-check."
         }
       }
     },

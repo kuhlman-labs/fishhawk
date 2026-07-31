@@ -243,6 +243,12 @@ const (
 	// SourceDefault means nothing named the class, so it fell to the
 	// fail-closed `mode: gated` default.
 	SourceDefault ResolutionSource = "default"
+	// SourceEscalation means a fired escalation's `max_autonomy` CEILING
+	// downgraded the class from `auto` to `gated` (E53.4 / #2227). It is
+	// stamped by ClampResolvedMatrix, which runs LAST — after the tier and
+	// after every explicit `actions` override — so this source always wins
+	// over the three above wherever it appears.
+	SourceEscalation ResolutionSource = "escalation"
 )
 
 // ResolvedAction is one action class after resolution, carrying its

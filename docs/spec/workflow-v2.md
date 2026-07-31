@@ -310,6 +310,59 @@ Three properties of the `paths` evaluation follow from that, and none of them is
 
 > `applies_to` is **enforced on every path that can start a run**: the schema accepts it, the parser round-trips it, both validators check it, and every run consults it. A run whose labels or trigger do not satisfy the declaration is refused at admission — on `POST /v0/runs` **and** on the webhook dispatch path (`issues.labeled`, `/fishhawk run`), both through the same shared evaluation core — and a plan whose `scope.files` reaches outside a declared `paths` is refused at the plan gate. Every refusal names the workflows that *would* accept the change, evaluated at **both** phases, so a named alternative cannot turn out to reject the same run at admission. The audited `applies_to_override` (with its required reason) is available on `POST /v0/runs`; a webhook trigger carries no override, so its refusal is unconditional.
 
+### Escalations
+
+```yaml
+escalations: # optional; each entry RAISES the requirements for a matching change
+  - match: # a $defs/predicate — see "Path predicate" below
+      paths: ["infra/**", "**/*.tf"]
+    require:
+      approvals:
+        count: 2 # the workflow's approval gates declare count: 1
+        min_permission: admin # they declare min_permission: write
+        member_of: platform/security # no gate requires this group
+      max_autonomy: low # the workflow declares autonomy: high
+```
+
+`escalations` declares **what gets stricter for a change matching a predicate**. Each entry pairs a `match` predicate with a `require` block, and a change satisfying the predicate has the block's requirements *raised* — a higher approval `count`, an additional `member_of` group, a stricter `min_permission`, a lower `max_autonomy` ceiling. A workflow declaring no `escalations` is on the unchanged path: nothing is raised, and the enforcement seams short-circuit before any extra read.
+
+**The `match:` wrapper is structurally forced, not stylistic.** `$defs/predicate` is `additionalProperties: false`, and JSON Schema Draft 2020-12 evaluates `additionalProperties` against the *whole instance object* rather than the referencing subschema's own scope. An escalation therefore **cannot** `$ref` the predicate and carry a sibling `require` key — the hoisted form
+
+```yaml
+escalations:
+  - paths: ["infra/**"] # NOT valid: the predicate is a closed object
+    require: { max_autonomy: low }
+```
+
+is rejected by the schema. Writing it that way would mean re-declaring the predicate's properties inline, which is the second-matcher drift the shared predicate exists to prevent now that it backs `applies_to` across three seams. The worked example at the top of this section is the implementable form.
+
+**An escalation may only ever RAISE**, and that is a validation error rather than a convention. A declared value that does not exceed the workflow's baseline — or that composes to the baseline unchanged — is refused at parse time by the backend *and* by `fishhawk validate`, so a block an operator reads as a control can be trusted to actually do something. The four dimensions are not all checked the same way:
+
+| Dimension | Check | Baseline it is measured against |
+|---|---|---|
+| `approvals.count` | **raise** — must exceed | the **highest** `count` any approval gate declares |
+| `approvals.min_permission` | **raise** — must be stricter | the **strictest** tier any approval gate declares (absent = no constraint, so any tier raises) |
+| `approvals.member_of` | **no-op** — refused only when every gate already names it | the group set every applicable approval gate already requires |
+| `max_autonomy` | **no-op** — refused when the clamp changes nothing | the workflow's resolved action matrix, plus each gate declaring its own `autonomy` / `actions` block |
+
+The baseline for the two raise-checks is the workflow's **least-restrictive** declaration, because a workflow-level escalation applies to *every* approval gate: one that raised gate A while leaving gate B untouched would not hold the invariant workflow-wide. The rejection names the baseline, so an author is not left guessing which gate they failed.
+
+**Neither no-op check is a lowering check**, and conflating the two misreads the control. Membership composes as a *conjunction* over a de-duplicated set, so adding a group can only ever narrow the eligible approver set — no lowering is expressible. The autonomy clamp only ever downgrades `auto` to `gated`, so a ceiling is monotone-decreasing by construction — again no lowering is expressible. What *is* expressible on both dimensions is an escalation that raises **nothing**: a `member_of` every approval gate already requires de-duplicates away to the identical set, and a ceiling no higher than what the workflow already resolves to leaves every action class exactly as it was. Those are what the two no-op checks refuse. A group named by *some* but not all approval gates is accepted — it genuinely raises the gates that omit it.
+
+A `require.approvals` block on a workflow declaring **no approval gate at all** is refused too: there is nothing anywhere for it to raise. Such a workflow may still declare `max_autonomy`, which acts through delegation rather than through a gate.
+
+**Composition across several matching escalations is the strictest per dimension, and therefore order-independent.** `count` composes as the max, `member_of` as the sorted de-duplicated union (a **conjunction** — an approver must belong to *every* composed group), `min_permission` as the strictest tier, `max_autonomy` as the lowest tier. Max, min and set union are commutative, so shuffling the declaration order cannot change the result: there is no last-match-wins to reason about. One consequence follows from the conjunction and is intended: two escalations naming disjoint groups produce a requirement no single approver can satisfy. For a control that may only raise, that surfaces as a gate which cannot clear — the fail-closed reading — rather than one silently weakened.
+
+**`max_autonomy` is a ceiling on AGENT autonomy** — equivalently a floor on human involvement. It is applied **last**, over the *fully resolved* action matrix: after the tier expansion and after every explicit `actions` override. Every class at `mode: auto` that the ceiling tier does not also hold at `auto` is downgraded to `gated`, its `when` condition dropped and its provenance recorded as `escalation`; `gated` and `report` classes are untouched (neither delegates), and an extension class the ceiling tier does not name clamps to `gated`, fail-closed. Applying the ceiling to the tier or to the declared entries instead would let an explicit `actions: {merge: {mode: auto}}` re-widen the class afterwards, which is exactly the failure the last-position rule exists to prevent. The clamp also re-derives the operator-agent knob block, because that — not the surfaced matrix — is what every enforcement site reads.
+
+**Enforcement is at both seams, and a fired escalation is audited at every seam it fires at.** The approval gate raises the required count, the membership conjunction and the minimum permission (at the quorum count *and* at the pre-submit authorization check, so the two can never disagree); delegation resolution applies the ceiling. A `max_autonomy`-only escalation on a workflow with no approval gate changes behaviour purely through delegation, and is audited there rather than going unrecorded.
+
+`paths` is evaluated against the **union** of the plan's `scope.files` and every `decomposition.sub_plans[].scope.files` and `split_proposal.phases[].scope.files`, the same union `applies_to` uses — a fan-out slice bounded to its own scope must not be able to reach an escalated path without escalating.
+
+**`change_kind` is rejected inside `match`**, for the same reason `applies_to` rejects it: nothing produces a change kind today, so the escalation could never fire, which is indistinguishable from the control being broken.
+
+`extends` folds **stages** only, so a deriving workflow does not inherit its base's `escalations`; declare them on each workflow that needs them, exactly as with `applies_to`.
+
 ## Stages
 
 ```yaml
@@ -1037,6 +1090,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`.
 - An `agent_version` range parses as a comparator list.
 - `extends` names a defined workflow and forms no cycle.
+- Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, and `max_autonomy` may not leave the resolved matrix identical. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
 
 `fishhawk validate` (the CLI) is **schema-only** — no typed decode, no graph-shape pass. It reports schema errors, the removed-form messages, and the reuse-resolution rejections, but not the graph-shape rules above, which surface server-side at run creation (**#2323**).
 

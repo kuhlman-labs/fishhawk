@@ -203,6 +203,24 @@ type Workflow struct {
 	// backend/internal/server (applies_to.go, applies_to_plan_gate.go) and
 	// are live as of #2226.
 	AppliesTo *Predicate `json:"applies_to,omitempty" yaml:"applies_to,omitempty"`
+	// Escalations are the workflow's per-path escalation rules (E53.4 /
+	// #2227): each entry RAISES the requirements applying to a change its
+	// `match` predicate matches. Nil means the workflow declares no
+	// escalation and behaves byte-identically to a pre-#2227 document —
+	// nothing is raised, and the enforcement seams short-circuit before
+	// any extra read.
+	//
+	// The field is REQUIRED for the schema-permitted property to survive
+	// ParseBytes, for the same reason AppliesTo's comment records: the
+	// typed decode runs with DisallowUnknownFields, so a key the schema
+	// accepts but the struct omits fails the decode.
+	//
+	// This package owns the grammar, its only-ever-raise validation and
+	// the pure autonomy clamp (see escalation.go); the two enforcement
+	// seams that consume them — the approval gate and delegation
+	// resolution — live in backend/internal/server and
+	// backend/internal/delegation.
+	Escalations []Escalation `json:"escalations,omitempty" yaml:"escalations,omitempty"`
 }
 
 // Decomposition is the per-workflow decomposition control block (E24.6 /
