@@ -281,7 +281,18 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// subject); fail-open on a read error because Submit's
 	// Inserted=false path is the race-safe second layer producing the
 	// identical labeled response.
-	if prior := s.findPriorApproval(r.Context(), stageID, subject); prior != nil {
+	//
+	// A DELEGATED submission is recorded under the distinct
+	// operatorrole.DelegatedApprovalActorSubject identity (#2381), so its
+	// duplicate pre-check must look up THAT subject — otherwise a repeated
+	// delegated submission would miss the pre-check (finding no row for the real
+	// subject) and re-run the pre-Submit gates before Submit's Inserted=false
+	// layer caught it. effectiveApprovalSubject is a read-only lookup, so running
+	// it here BEFORE checkDelegation re-evaluates the rule is safe. A
+	// non-delegated approve keeps looking up the real subject, byte-identical to
+	// today.
+	dupSubject := effectiveApprovalSubject(subject, req.Delegated)
+	if prior := s.findPriorApproval(r.Context(), stageID, dupSubject); prior != nil {
 		s.writeJSON(w, r, http.StatusOK, duplicateApprovalResponse(stage, prior))
 		return
 	}
@@ -709,9 +720,22 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	// "anonymous" fallback the handler applies, so the recorded
 	// ApproverSubject (and the actor kind derived from it) is byte-identical
 	// to the HTTP path.
-	subject := id.Subject
-	if subject == "" {
-		subject = "anonymous"
+	realSubject := id.Subject
+	if realSubject == "" {
+		realSubject = "anonymous"
+	}
+	// FIX 3 (#2381): a DELEGATED approval is recorded under the distinct
+	// operatorrole.DelegatedApprovalActorSubject identity so #1709's
+	// recorded-but-never-counted vote never occupies the operator's own approver
+	// slot — leaving their later real approve free to insert a fresh counting row
+	// instead of colliding as a #986 duplicate. effectiveApprovalSubject is the
+	// single mapping (an already-agent / non-delegated subject is unchanged);
+	// onBehalfOf preserves the real operator's subject on the audit row whenever
+	// the remap fired.
+	subject := effectiveApprovalSubject(realSubject, p.DelegatedRule != "")
+	onBehalfOf := ""
+	if subject != realSubject {
+		onBehalfOf = realSubject
 	}
 	res, err := s.cfg.ApprovalRepo.Submit(ctx, approval.SubmitParams{
 		StageID:         p.Stage.ID,
@@ -791,7 +815,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 				// vote), and the stage stays awaiting_approval until the
 				// baseline is readable again. No predicate_snapshot — nothing
 				// about the effective requirement is known to snapshot.
-				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, nil)
+				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
 				return &approveActionResult{Stage: p.Stage}, nil
 			}
@@ -801,7 +825,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -931,7 +955,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -1545,7 +1569,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, delegatedRule, authMethod, channel string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -1630,6 +1654,16 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	}
 	if delegatedRule != "" {
 		auditPayload["delegated"] = delegatedRule
+	}
+	// on_behalf_of names the REAL operator whose driver recorded a DELEGATED
+	// approval (#2381) when the row's subject was remapped to the distinct
+	// operator-agent delegated identity — so actor_subject/actor_kind become the
+	// agent identity while the row still names which operator acted. Additive key
+	// inside the existing hashed payload JSONB: no strict decoder reads audit
+	// payloads and the hash chain covers each row's own payload, so the E9 Export
+	// v1 chain and its verifier are unaffected.
+	if onBehalfOf != "" {
+		auditPayload["on_behalf_of"] = onBehalfOf
 	}
 	payload, _ := json.Marshal(auditPayload)
 

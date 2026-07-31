@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
@@ -294,6 +295,103 @@ func TestAutoDriveRunGate_Approve(t *testing.T) {
 	assertOperatorActor(t, e)
 	if rule := auditDelegatedRule(t, e); rule != "clean_dual_approval" {
 		t.Errorf("delegated rule = %q, want clean_dual_approval", rule)
+	}
+}
+
+// --- #2381: delegated-approval may_approve pre-check + no-progress -----------
+
+// TestAutoDriveRunGate_ApprovalsBlockGate_HumanQuorumRequired is FIX 1's F1: a
+// delegated approve on a gate carrying an approvals block (a human count a
+// delegated submission never satisfies) DECLINES with
+// decision_required:human_quorum_required and records NOTHING — no approval row,
+// no advance — rather than the pre-#2381 uncounted-vote-and-hold.
+func TestAutoDriveRunGate_ApprovalsBlockGate_HumanQuorumRequired(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, autoDriveEscalationSpecYAML(""))
+	plan := stages[0]
+	seedCleanPlanApproval(t, au, runID)
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted {
+		t.Fatalf("outcome = %+v, want NO action on a human-quorum gate", out)
+	}
+	if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateHumanQuorumRequired || out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want decision_required human_quorum_required approve", out)
+	}
+	if n := countAudit(au, "approval_submitted"); n != 0 {
+		t.Errorf("approval_submitted entries = %d, want 0 (the decline records no vote)", n)
+	}
+	if plan.State != run.StageStateAwaitingApproval {
+		t.Errorf("plan stage = %q, want still awaiting_approval", plan.State)
+	}
+}
+
+// TestAutoDriveRunGate_Approve_DuplicateIsNoProgress is FIX 2's server leg (F6):
+// on a LEGACY no-approvals gate (which a delegated approve DOES advance), a
+// SECOND delegated approve that comes back a duplicate reports
+// decision_required:delegated_approval_no_progress rather than a no-op acted:true
+// — so the endpoint appends no attribution row for the no-op.
+func TestAutoDriveRunGate_Approve_DuplicateIsNoProgress(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo) // autoDriveSpecYAML: legacy approvers gate
+	plan := stages[0]
+	seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+
+	// Pre-seed the approval row the campaign actor would insert, so this pass's
+	// Submit returns Inserted=false (a duplicate).
+	if _, err := s.cfg.ApprovalRepo.Submit(context.Background(), approval.SubmitParams{
+		StageID: plan.ID, ApproverSubject: operatorrole.CampaignActorSubject,
+		Decision: approval.DecisionApprove, Surface: approval.SurfaceAPI,
+	}); err != nil {
+		t.Fatalf("seed prior approval: %v", err)
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted {
+		t.Fatalf("outcome = %+v, want NO acted:true on a duplicate (no-progress)", out)
+	}
+	if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateDelegatedApprovalNoProgress {
+		t.Fatalf("outcome = %+v, want decision_required delegated_approval_no_progress", out)
+	}
+}
+
+// TestAutoDriveRunGate_Approve_CampaignSubjectNotRemapped is the campaign-identity
+// control (#2381): a delegated approve by the campaign auto-driver
+// (CampaignActorSubject, already agent-kind) is recorded under its OWN subject —
+// NOT remapped to the operator-agent delegated identity — and carries NO
+// on_behalf_of key, so the campaign attribution stays byte-identical to today.
+func TestAutoDriveRunGate_Approve_CampaignSubjectNotRemapped(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRun(t, s, repo) // legacy gate -> the approve advances
+	seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want acted approve (legacy gate)", out)
+	}
+	e := auditEntry(t, au, "approval_submitted")
+	if e.ActorSubject == nil || *e.ActorSubject != operatorrole.CampaignActorSubject {
+		t.Errorf("actor_subject = %v, want %q (NOT remapped)", e.ActorSubject, operatorrole.CampaignActorSubject)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if _, present := payload["on_behalf_of"]; present {
+		t.Errorf("on_behalf_of present on a campaign (non-remapped) approval: %v", payload)
 	}
 }
 
@@ -1815,20 +1913,27 @@ func TestAutoDriveRunGate_EscalationCeiling_NoAutoApprove(t *testing.T) {
 		return s, repo, au, runID
 	}
 
-	t.Run("control: no escalation declared, the explicit auto approve acts", func(t *testing.T) {
+	t.Run("control: no escalation declared, the auto approve arm is reached", func(t *testing.T) {
 		s, repo, au, runID := setup(t, autoDriveEscalationSpecYAML(""))
 		out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
 		if err != nil {
 			t.Fatalf("AutoDriveRunGate: %v", err)
 		}
-		if !out.Acted || out.Action != delegation.ActionApprove {
-			t.Fatalf("outcome = %+v, want acted approve", out)
+		// #2381 changed this arm's outcome: the plan gate carries an approvals
+		// block, so a delegated approve can never advance it (#1709
+		// recorded-but-never-counted) — the may_approve arm now DECLINES with
+		// decision_required:human_quorum_required instead of recording an uncounted
+		// vote. What this control still establishes for the #2227 ceiling assertion
+		// below is that the approve knob is MET / the arm is REACHED WITHOUT the
+		// escalation — distinct from the clamped observe-only the ceiling subtest
+		// asserts. The escalation's effect (clamp the knob so the arm is never
+		// entered) is therefore still demonstrable, and no vote is recorded either
+		// way, so the ceiling assertion is not vacuous.
+		if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateHumanQuorumRequired || out.Action != delegation.ActionApprove {
+			t.Fatalf("outcome = %+v, want decision_required human_quorum_required approve", out)
 		}
-		// The stage itself stays awaiting_approval: a delegated submission is
-		// recorded but never counts toward human quorum (#1709). What this
-		// control establishes is that the approve arm is REACHED and acts.
-		if countAudit(au, "approval_submitted") != 1 {
-			t.Errorf("approval_submitted entries = %d, want 1", countAudit(au, "approval_submitted"))
+		if countAudit(au, "approval_submitted") != 0 {
+			t.Errorf("approval_submitted entries = %d, want 0 (the #2381 decline records no vote)", countAudit(au, "approval_submitted"))
 		}
 	})
 
@@ -1840,6 +1945,14 @@ func TestAutoDriveRunGate_EscalationCeiling_NoAutoApprove(t *testing.T) {
 		}
 		if out.Acted {
 			t.Fatalf("outcome = %+v, want NO action under a fired max_autonomy: low ceiling", out)
+		}
+		// The escalation CLAMPS the knob so the may_approve arm is never entered —
+		// observe-only, NOT the human_quorum_required DECLINE the control reaches.
+		// Asserting !DecisionRequired keeps the #2227 clamp discrimination sharp now
+		// that both outcomes record 0 approvals (#2381): the escalation changes the
+		// observable outcome from a reached-arm decline to an unreached observe-only.
+		if out.DecisionRequired {
+			t.Fatalf("outcome = %+v, want observe-only (the ceiling clamps the knob), not a decision_required decline", out)
 		}
 		if n := countAudit(au, "approval_submitted"); n != 0 {
 			t.Errorf("approval_submitted entries = %d, want 0 — an approval was recorded through the ceiling", n)

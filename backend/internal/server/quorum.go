@@ -13,9 +13,94 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
+
+// effectiveApprovalSubject maps the recording subject for an approval: a
+// DELEGATED approval by a human-kind operator subject is recorded under the
+// distinct operatorrole.DelegatedApprovalActorSubject identity (#2381), so the
+// vote that #1709 records-but-never-counts no longer occupies the operator's own
+// approver slot — leaving their later, real, non-delegated approve free to insert
+// a fresh COUNTING row instead of colliding as a #986 duplicate against a gate
+// with no un-approve verb. It is the SINGLE source of truth for the mapping, so
+// the handler duplicate pre-check and the service Submit can never disagree.
+//
+// An already-agent subject (the campaign auto-driver's
+// operatorrole.CampaignActorSubject) is returned UNCHANGED: it already attributes
+// to an agent identity, keeps its own provenance, and stays byte-identical to
+// today. A non-delegated approval is likewise returned unchanged — the remap fires
+// only for delegated + human-kind.
+func effectiveApprovalSubject(subject string, delegated bool) string {
+	if delegated && actorKindForSubject(subject) != audit.ActorAgent {
+		return operatorrole.DelegatedApprovalActorSubject
+	}
+	return subject
+}
+
+// Consumers of the one-decision-per-subject invariant, walked (#2381) so the
+// distinct-identity remap is provably safe at each — NAMED, not asserted:
+//
+//   - findPriorApproval / the #986 duplicate pre-check — now keyed on the
+//     effective subject, so the operator's real approve is no longer a duplicate.
+//     That IS the fix.
+//   - ApprovalRepo.Submit's (stage_id, approver_subject) ON CONFLICT DO NOTHING —
+//     UNCHANGED, no migration; two delegated submissions still collapse to one
+//     idempotent row under the synthetic subject.
+//   - delegatedApproverSubjects — now records the SYNTHETIC subject, so the
+//     operator's own subject can never land in the delegated set, which is what
+//     lets countDistinctEligibleApprovers count their real vote once.
+//   - distinctEligibleApproverSubjects / countDistinctEligibleApprovers — the
+//     synthetic subject is excluded twice over (the unconditional agent floor in
+//     eligibleApprover AND the delegated set) while the human is deduped by the
+//     existing `seen` map — no double-count, no under-count.
+//   - predicate_snapshot — snapshotIdentityFor records the synthetic subject and
+//     submitterClass labels it "agent", the honest label for a delegated act.
+//   - resolveChangeAuthor — its authorshipCategories allow-list holds only
+//     CategoryOperatorCommitVouched, so an approval_submitted row never resolves
+//     an author; the remap cannot shift author attribution.
+//   - issuecomment renderApproverIdentity — already renders an operatorrole-
+//     prefixed subject as "the operator agent (`…`, delegated: `…`)" with no
+//     @-mention (notifier.go), so the synthetic subject surfaces mention-free.
+//
+// delegatedApproveWouldAdvance answers "could a delegated approve actually
+// advance THIS gate?" for the auto-drive may_approve arm (#2381). It deliberately
+// MIRRORS approveStageAs's own advance rule (reached := !delegated &&
+// eligibleCount >= required, approvals.go) so the pre-check and the post-Submit
+// path can never disagree, declining instead of recording a delegated vote that
+// can only ever wedge the gate. It returns true ONLY for a genuine legacy
+// no-approvals, no-escalation gate — the one gate a delegated approve still
+// advances byte-for-byte as today.
+//
+// The four DECLINE modes, each fail-toward-the-operator:
+//
+//	(a) fetchApprovalsForStage returns a non-nil approvals block — a delegated
+//	    submission is UNCONDITIONALLY uncounted (eligibleApprover's agent floor),
+//	    so `reached` is always false on such a gate; it can never be advanced by a
+//	    delegated vote.
+//	(b) fetchApprovalsForStage errors — the requirement is unknown; fail closed.
+//	(c) the gate declares no block but resolveStageEscalations reports a firing
+//	    escalation — the same not-advancing rule the post-Submit nil-block branch
+//	    applies (#2374).
+//	(d) resolveStageEscalations errors — unknowable; fail closed.
+func (s *Server) delegatedApproveWouldAdvance(ctx context.Context, stage *run.Stage) (bool, string) {
+	approvals, ferr := s.fetchApprovalsForStage(ctx, stage)
+	if ferr != nil {
+		return false, "the gate's approvals requirement could not be read, so a delegated approval cannot be shown to advance it; handing the gate to the operator (fail-closed)"
+	}
+	if approvals != nil {
+		return false, "the gate declares an approvals block requiring distinct human approvers; a delegated approval is recorded but never counted toward a human quorum, so it cannot advance this gate"
+	}
+	escReq, escErr := s.resolveStageEscalations(ctx, stage)
+	if escErr != nil {
+		return false, "the gate's escalation state could not be evaluated, so a delegated approval cannot be shown to advance it; handing the gate to the operator (fail-closed)"
+	}
+	if !escReq.IsZero() {
+		return false, "an escalation is firing on this gate; a delegated approval does not advance an escalated gate (the same not-advancing rule the post-Submit nil-block path applies)"
+	}
+	return true, ""
+}
 
 // quorum.go wires the forge-neutral spec.Approvals block (E39.2 / #1707)
 // into the approval endpoint (E39.4 / #1709). When a gate carries an

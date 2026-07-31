@@ -291,6 +291,40 @@ func TestCampaignActorIdentity(t *testing.T) {
 	}
 }
 
+func TestDelegatedApprovalActorSubject(t *testing.T) {
+	if DelegatedApprovalActorSubject != "operator-agent/delegated" {
+		t.Fatalf("DelegatedApprovalActorSubject = %q, want %q", DelegatedApprovalActorSubject, "operator-agent/delegated")
+	}
+	// It must carry the operator-agent prefix so a delegated approval recorded
+	// under it is classified ActorAgent (the #1709 recorded-but-never-counted
+	// vote), just like the campaign subject.
+	if !IsTokenSubject(DelegatedApprovalActorSubject) {
+		t.Errorf("IsTokenSubject(%q) = false, want true (a delegated approval must stamp ActorAgent)", DelegatedApprovalActorSubject)
+	}
+	// It is ATTRIBUTION only, never an issuable token subject: "delegated" is not
+	// a recognized role-spec version, so token issuance must still refuse it.
+	if err := ValidateTokenSubject(DelegatedApprovalActorSubject); err == nil {
+		t.Errorf("ValidateTokenSubject(%q) = nil, want a refusal (it is not an issuable token subject)", DelegatedApprovalActorSubject)
+	}
+	// It must be DISTINCT from the campaign subject: a delegated approval and a
+	// campaign auto-drive action are different identities and must not collide.
+	if DelegatedApprovalActorSubject == CampaignActorSubject {
+		t.Errorf("DelegatedApprovalActorSubject == CampaignActorSubject (%q); the two attribution identities must be distinct", DelegatedApprovalActorSubject)
+	}
+}
+
+func TestDelegatedApprovalDecisionStates(t *testing.T) {
+	// The two decision-state strings are the entire operator handoff of the
+	// delegated-approval path; both sides (server emitter + local driver)
+	// reference these symbols, so their VALUES are pinned here.
+	if DecisionStateHumanQuorumRequired != "human_quorum_required" {
+		t.Errorf("DecisionStateHumanQuorumRequired = %q, want %q", DecisionStateHumanQuorumRequired, "human_quorum_required")
+	}
+	if DecisionStateDelegatedApprovalNoProgress != "delegated_approval_no_progress" {
+		t.Errorf("DecisionStateDelegatedApprovalNoProgress = %q, want %q", DecisionStateDelegatedApprovalNoProgress, "delegated_approval_no_progress")
+	}
+}
+
 func TestValidateOverlayReadError(t *testing.T) {
 	readErr := errors.New("disk on fire")
 	err := ValidateOverlay(errReader{err: readErr})

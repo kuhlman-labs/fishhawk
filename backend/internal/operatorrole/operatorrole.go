@@ -174,6 +174,49 @@ func recognizedVersionList() string {
 // a recognized role-spec version). It is audit attribution only.
 const CampaignActorSubject = TokenSubjectPrefix + "campaign"
 
+// DelegatedApprovalActorSubject is the DISTINCT agent-kind subject a
+// fishhawk_drive_run / auto-drive DELEGATED approval is recorded under, rather
+// than the calling operator's own subject (#2381). It carries the operator-agent
+// token prefix, so IsTokenSubject (and the server's actorKindForSubject built on
+// it) classify it audit.ActorAgent — a delegated approval is #1709's
+// recorded-but-never-counted vote — while keeping the operator's own subject free
+// to cast a real, counting human approval afterward. Without the distinct
+// identity, a delegated vote would occupy the only eligible approver's slot and
+// the operator's later real approve would collide with it as a #986 duplicate,
+// wedging a human-quorum gate that has no un-approve verb.
+//
+// Like CampaignActorSubject it is approval/audit ATTRIBUTION ONLY, never an
+// issuable token subject: the suffix "delegated" names the recording identity,
+// not a role-spec version, so ValidateTokenSubject still refuses it at token
+// issuance ("delegated" is not in recognizedTokenVersions). The remap itself
+// lives in the server (effectiveApprovalSubject); this package owns only the
+// stable subject constant, beside CampaignActorSubject.
+const DelegatedApprovalActorSubject = TokenSubjectPrefix + "delegated"
+
+// DecisionStateHumanQuorumRequired and DecisionStateDelegatedApprovalNoProgress
+// are the two auto-drive decision-required states the delegated-approval path
+// (#2381) hands back to the operator. They are the ENTIRE operator handoff of
+// that path, so they are defined ONCE here — the leaf package that already owns
+// the delegated-approval identity above, that the server emitter
+// (backend/internal/server/autodrive.go) already imports, and that the local
+// driver's decode/compare (backend/cmd/fishhawk-mcp/drive_run.go) can import
+// cheaply. Both sides reference these symbols, so a spelling divergence across
+// the HTTP decode boundary — the failure mode where the server emits one string
+// and the driver decodes another, silently NOT stopping and re-firing the
+// livelock this issue closes — becomes a COMPILE error rather than a test's
+// responsibility (binding condition 1, the same eliminate-the-seam move as
+// requiring the escalation resolver at construction on #2227).
+//
+//   - human_quorum_required: the may_approve arm declined because a delegated
+//     approve could never advance THIS gate (a human-quorum block, or a firing /
+//     unevaluable escalation, or an unreadable block).
+//   - delegated_approval_no_progress: a delegated approve came back a duplicate,
+//     so the act made no progress; reported instead of a no-op acted:true.
+const (
+	DecisionStateHumanQuorumRequired         = "human_quorum_required"
+	DecisionStateDelegatedApprovalNoProgress = "delegated_approval_no_progress"
+)
+
 // CampaignActorScopes returns the write scopes the campaign auto-driver's
 // in-process gate actions require, matching the per-handler scope checks
 // the HTTP path enforces: write:approvals (the approve gate),

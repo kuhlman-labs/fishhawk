@@ -14,6 +14,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 )
 
 // drive_run_test.go pins the fishhawk_drive_run loop (#1700) per-stop-mode
@@ -929,6 +931,138 @@ func TestDriveRun_DecisionRequired_FixupBudgetExhausted(t *testing.T) {
 	}
 	if len(rec.list()) != 0 {
 		t.Errorf("a spawn happened on a decision_required stop: %v", rec.list())
+	}
+}
+
+// TestDriveRun_HumanQuorumRequired_StopsWithApproveAction is the #2381 driver
+// pin AND the client-decode + driver-stop half of the constant round trip: the
+// gate returns decision_required/human_quorum_required, and the loop STOPS with
+// that reason, carries a next_actions roster naming fishhawk_approve_plan
+// (consuming the operator's now-free approval slot), and spawns nothing.
+func TestDriveRun_HumanQuorumRequired_StopsWithApproveAction(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateHumanQuorumRequired,
+			Action:           "approve",
+			Note:             "human quorum required",
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+operatorrole.DecisionStateHumanQuorumRequired {
+		t.Fatalf("stopped_reason = %q, want decision_required:human_quorum_required", out.StoppedReason)
+	}
+	if out.StoppedReason == stoppedGateError {
+		t.Fatal("human_quorum_required must not collapse into gate_error")
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("human_quorum_required stop carried no next_actions")
+	}
+	// fishhawk_approve_plan must be present and consume the (now-free) approval slot.
+	var approve *SuggestedAction
+	for i := range out.NextActions.Actions {
+		if out.NextActions.Actions[i].Action == "fishhawk_approve_plan" {
+			approve = &out.NextActions.Actions[i]
+		}
+	}
+	if approve == nil {
+		t.Fatalf("next_actions did not name fishhawk_approve_plan: %v", actionNameList(out.NextActions.Actions))
+	}
+	if approve.Consumes != consumesApprovalSlot {
+		t.Errorf("fishhawk_approve_plan consumes = %q, want %q", approve.Consumes, consumesApprovalSlot)
+	}
+	if len(rec.list()) != 0 {
+		t.Errorf("a spawn happened on a human_quorum_required stop: %v", rec.list())
+	}
+}
+
+// TestDriveRun_RepeatedActedGate_BoundedByNoProgress pins FIX 2's driver leg: a
+// gate that keeps returning acted:true on an UNCHANGING run/stage fixture (a
+// repeated no-op act) is bounded — the loop stops at
+// decision_required:delegated_act_no_progress after EXACTLY
+// driveNoProgressThreshold gate calls, the direct pin on the ~160-act regression,
+// instead of running to max_minutes.
+func TestDriveRun_RepeatedActedGate_BoundedByNoProgress(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	// acted:true for the SAME action while the fixture never changes -> identical
+	// signature across gate calls -> no progress.
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Acted: true, Action: "route_fixup", Note: "no-op act"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+driveDelegatedActNoProgress {
+		t.Fatalf("stopped_reason = %q, want decision_required:delegated_act_no_progress", out.StoppedReason)
+	}
+	if f.gateCalls != driveNoProgressThreshold {
+		t.Errorf("gate calls = %d, want exactly %d (the ~160-act regression pin)", f.gateCalls, driveNoProgressThreshold)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("no-progress stop carried no next_actions")
+	}
+}
+
+// TestDriveRun_ActedGateThatChangesState_KeepsDriving is the non-firing control:
+// an acted gate that genuinely CHANGES the run/stage signature (a legitimate
+// route_fixup/retry) resets the no-progress counter and keeps driving past the
+// threshold — it is NOT mistaken for a no-op act.
+func TestDriveRun_ActedGateThatChangesState_KeepsDriving(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Acted: true, Action: "route_fixup", Note: "real progress"}
+	}
+	// Each poll flips the plan stage's recorded state (implement stays
+	// awaiting_approval so the gate is still reached), so consecutive acted-gate
+	// signatures DIFFER; after several acts the run settles terminal.
+	f.onStages = func(f *driveFakeBackend) {
+		// ALWAYS flip the plan stage's state by parity so consecutive acted-gate
+		// signatures differ (the no-progress guard must reset each time); settle
+		// the run terminal after several acts (seen at the next iteration's top).
+		if f.gateCalls >= 4 {
+			f.runState = "succeeded"
+		}
+		if f.gateCalls%2 == 1 {
+			f.stages[0].State = "blocked"
+		} else {
+			f.stages[0].State = "succeeded"
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason == "decision_required:"+driveDelegatedActNoProgress {
+		t.Fatalf("a state-changing acted gate was mislabeled no-progress after %d gate calls", f.gateCalls)
+	}
+	if f.gateCalls <= driveNoProgressThreshold {
+		t.Errorf("gate calls = %d, want > %d (the loop kept driving past the threshold on changing signatures)", f.gateCalls, driveNoProgressThreshold)
 	}
 }
 

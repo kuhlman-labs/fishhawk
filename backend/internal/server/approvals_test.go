@@ -1612,7 +1612,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, "", "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)
@@ -4675,6 +4675,160 @@ func TestSubmitApproval_Delegated_EndToEnd(t *testing.T) {
 	}
 }
 
+// delegatedQuorumSpecYAML carries BOTH a delegation contract (v2 autonomy +
+// `approve: {mode: auto, when: clean_dual_approval}`, so a delegated:true
+// submission passes checkDelegation) AND a forge-neutral approvals block
+// requiring 1 distinct human approver on the plan gate (so the #2381
+// recorded-but-never-counted / distinct-identity path is exercised). The
+// count-only block avoids any forge-predicate resolution on the non-delegated
+// approve. The approvals-only gate form is a v1+ feature (v0 requires
+// `approvers`), which is why the delegation is the v2 grammar here.
+const delegatedQuorumSpecYAML = `version: "2"
+workflows:
+  feature_change:
+    autonomy: high
+    actions:
+      approve:
+        mode: auto
+        when: clean_dual_approval
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// approvalAuditBySubject returns the approval_submitted audit entry + decoded
+// payload appended under the given actor subject (the wedge-breaker records TWO
+// approval rows under DIFFERENT subjects, so a category-only lookup is
+// ambiguous).
+func approvalAuditBySubject(t *testing.T, au *auditFake, subject string) (audit.ChainAppendParams, map[string]any) {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for i := range au.appended {
+		e := au.appended[i]
+		if e.Category != "approval_submitted" || e.ActorSubject == nil || *e.ActorSubject != subject {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal approval payload: %v", err)
+		}
+		return e, p
+	}
+	t.Fatalf("no approval_submitted entry for subject %q in %+v", subject, au.appended)
+	return audit.ChainAppendParams{}, nil
+}
+
+// TestSubmitApproval_DelegatedThenHumanApprove_ReachesQuorum is the #2381
+// CROSS-BOUNDARY wedge-breaker: it drives the REAL POST /v0/stages/{id}/approvals
+// handler twice against a count-1 quorum gate on the SAME stage — first a
+// delegated:true submission under an operator subject, then a plain
+// non-delegated approve under that SAME subject — and asserts end to end that
+// the delegated vote is recorded under the DISTINCT operator-agent delegated
+// identity (so it never occupies the operator's own slot) while the operator's
+// later real approve is a FIRST vote that reaches quorum, not a #986 duplicate.
+//
+// The second assertion is the regression pin: on the pre-fix code the second
+// submission returned duplicate_submission with prior_decision approve and the
+// gate stayed wedged one short.
+func TestSubmitApproval_DelegatedThenHumanApprove_ReachesQuorum(t *testing.T) {
+	s, repo, au, _, ar := newDelegatedApprovalServer(t)
+	runID, planStage := startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": delegatedQuorumSpecYAML,
+	})
+	// clean_dual_approval MET: two agent approve verdicts, no open concerns.
+	seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+
+	const operator = "brett@local-mcp"
+
+	// 1) Delegated approve.
+	w := submitApprovalAs(t, s, planStage.ID, operator, `{"decision":"approve","delegated":true}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delegated approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var first approvalSubmitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.DuplicateSubmission {
+		t.Fatalf("delegated approve returned duplicate_submission, want a fresh recording")
+	}
+	if first.State != string(run.StageStateAwaitingApproval) {
+		t.Errorf("stage after delegated approve = %q, want still awaiting_approval (a delegated vote never counts)", first.State)
+	}
+	// The recorded row is under the DISTINCT operator-agent delegated identity,
+	// NOT the operator's own subject.
+	rows, _ := ar.ListForStage(context.Background(), planStage.ID)
+	if len(rows) != 1 || rows[0].ApproverSubject != operatorrole.DelegatedApprovalActorSubject {
+		t.Fatalf("after delegated approve, rows = %+v, want exactly one under %q", rows, operatorrole.DelegatedApprovalActorSubject)
+	}
+	// Its audit row: actor_kind agent, delegated=<rule>, on_behalf_of=<operator>.
+	e, payload := approvalAuditBySubject(t, au, operatorrole.DelegatedApprovalActorSubject)
+	if e.ActorKind == nil || *e.ActorKind != audit.ActorAgent {
+		t.Errorf("delegated approval actor_kind = %v, want agent", e.ActorKind)
+	}
+	if payload["delegated"] != "clean_dual_approval" {
+		t.Errorf("delegated payload = %v, want clean_dual_approval", payload["delegated"])
+	}
+	if payload["on_behalf_of"] != operator {
+		t.Errorf("on_behalf_of = %v, want %q", payload["on_behalf_of"], operator)
+	}
+
+	// 2) The SAME operator now casts a plain, non-delegated approve. On the
+	// pre-fix code this returned duplicate_submission (the wedge); now it is a
+	// first, COUNTING vote that reaches the count-1 quorum and advances the stage.
+	w = submitApprovalAs(t, s, planStage.ID, operator, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("human approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var second approvalSubmitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.DuplicateSubmission {
+		t.Fatalf("REGRESSION: human approve after a delegated vote returned duplicate_submission (prior_decision %q) — the wedge #2381 fixes", second.PriorDecision)
+	}
+	if second.State != string(run.StageStateSucceeded) {
+		t.Fatalf("stage after human approve = %q, want succeeded (count-1 quorum reached)", second.State)
+	}
+	// The human's row counts once; the delegated row is excluded. quorum_reached
+	// is recorded true on the human's predicate_snapshot.
+	_, humanPayload := approvalAuditBySubject(t, au, operator)
+	snap, ok := humanPayload["predicate_snapshot"].(map[string]any)
+	if !ok {
+		t.Fatalf("human approval payload missing predicate_snapshot: %v", humanPayload)
+	}
+	if ce, _ := snap["count_eligible"].(float64); ce != 1 {
+		t.Errorf("count_eligible = %v, want 1 (human counted once, delegated row excluded)", snap["count_eligible"])
+	}
+	if qr, _ := snap["quorum_reached"].(bool); !qr {
+		t.Errorf("quorum_reached = %v, want true", snap["quorum_reached"])
+	}
+}
+
 // TestSubmitApproval_Delegated_NotConfigured pins fail-closed: a spec
 // with NO operator_agent block refuses a delegated approval outright
 // with delegation_not_configured, even though a plain human approval of
@@ -7171,8 +7325,16 @@ func TestAutoDriveRunGate_Approve_FetchError_EscalationFiring_HoldsGate(t *testi
 	// Half one: the driver genuinely routed through the may_approve arm. A
 	// regression that stopped dispatching approve here would leave the gate
 	// closed too, and every assertion below would pass for the wrong reason.
-	if !out.Acted || out.Action != delegation.ActionApprove {
-		t.Fatalf("outcome = %+v, want acted approve — the test must reach the approve arm to prove anything about it", out)
+	//
+	// #2381 changed HOW this arm holds the gate: FIX 1's delegatedApproveWouldAdvance
+	// mode (b) fails CLOSED on the unreadable baseline BEFORE submitting, so the arm
+	// now DECLINES with decision_required:human_quorum_required (the same
+	// not-advancing posture the earlier post-Submit nil-block branch took, one step
+	// earlier). The #2374 safety property — the auto-driver must not clear an
+	// escalated gate on an unreadable baseline — is preserved and strengthened: no
+	// vote is recorded at all, and the gate is handed to the operator.
+	if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateHumanQuorumRequired || out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want decision_required human_quorum_required approve — the test must reach the approve arm to prove anything about it", out)
 	}
 	// Half two: the gate is still closed, and nothing else moved either.
 	if plan.State != run.StageStateAwaitingApproval {
@@ -7184,9 +7346,12 @@ func TestAutoDriveRunGate_Approve_FetchError_EscalationFiring_HoldsGate(t *testi
 	if got := getRun(t, repo, runID); got.State != runStateBefore {
 		t.Errorf("run state = %q, want unchanged %q", got.State, runStateBefore)
 	}
-	// The vote is recorded and attributed to the campaign actor, so the
-	// held gate is auditable rather than silent.
-	assertOperatorActor(t, auditEntry(t, au, "approval_submitted"))
+	// The decline records NO approval row (fail-closed before Submit): the held
+	// gate's auditable trail is now the driver's decision_required stop + operator
+	// handoff, not an uncounted vote.
+	if n := countAudit(au, "approval_submitted"); n != 0 {
+		t.Errorf("approval_submitted entries = %d, want 0 — the #2381 fail-closed decline must record no vote", n)
+	}
 }
 
 // withEscalationApprover injects a DISTINCT operator identity so the second
