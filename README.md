@@ -115,28 +115,24 @@ go build -o bin/fishhawk-mcp ./backend/cmd/fishhawk-mcp
 go build -o bin/fishhawk-runner ./runner/cmd/fishhawk-runner
 ```
 
-**2. Issue an operator token** against your local backend and export it:
+**2. Store a credential** for your local backend — `fishhawk token login` mints one and writes it to the shared credential store (keyed by backend URL), so no secret needs to live in your MCP client config:
 
 ```sh
-go run ./backend/cmd/fishhawkd token issue \
-  --subject <your-login> \
-  --scopes read:runs,read:audit,write:runs,write:approvals,write:stages
-export FISHHAWK_API_TOKEN="<the fhk_ token printed above>"
 export FISHHAWK_BACKEND_URL="http://localhost:8080"   # default; override for hosted
+fishhawk token login --backend-url $FISHHAWK_BACKEND_URL
 ```
 
-`FISHHAWK_API_TOKEN` is required — every tool round-trips the API. There is no anonymous mode.
+`fishhawk-mcp` resolves its bearer at startup through a ladder: an explicit `FISHHAWK_API_TOKEN` wins; when empty, the stored credential for the backend URL is used; when neither is usable, startup fails with a precise error naming `fishhawk token login`. There is still no anonymous mode — every tool round-trips the API. To keep the token in the environment instead, `export FISHHAWK_API_TOKEN="<the fhk_ token>"` and it takes precedence.
 
-**3a. Register with Claude Code:**
+**3a. Register with Claude Code** (secret-free with a stored credential):
 
 ```sh
 claude mcp add fishhawk \
-  --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
   --env FISHHAWK_BACKEND_URL=$FISHHAWK_BACKEND_URL \
   -- "$(pwd)/bin/fishhawk-mcp"
 ```
 
-Verify with `claude mcp list`, then ask the agent for the status of a run — it should call `fishhawk_get_run_status`. The exact flag shape varies by version; `claude mcp add --help` is authoritative.
+Verify with `claude mcp list`, then ask the agent for the status of a run — it should call `fishhawk_get_run_status`. The exact flag shape varies by version; `claude mcp add --help` is authoritative. Add `--env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN` only if you chose the environment-token path above.
 
 **3b. Register with the Codex CLI** — add a `[mcp_servers.fishhawk]` block to `~/.codex/config.toml`:
 

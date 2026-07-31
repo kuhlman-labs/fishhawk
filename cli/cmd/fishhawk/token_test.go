@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kuhlman-labs/fishhawk/cli/internal/credstore"
+	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
 // tokenTestServer is a single httptest server that plays BOTH the

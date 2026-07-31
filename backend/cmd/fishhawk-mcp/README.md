@@ -63,10 +63,22 @@ Two env vars; both honored from the OS environment when the binary launches.
 
 | Variable                | Required | Default                 | Notes                                                                                                                                                                                                  |
 | ----------------------- | -------- | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `FISHHAWK_API_TOKEN`    | **yes**  | —                       | Bearer token. Generated via the backend's API-token surface. No "anonymous" mode — unlike the CLI's dev path, MCP tools always round-trip the API and running unauthenticated would be a silent permission bug. |
-| `FISHHAWK_BACKEND_URL`  | no       | `http://localhost:8080` | Same fallback as the CLI. Trailing slash is stripped.                                                                                                                                                  |
+| `FISHHAWK_API_TOKEN`    | no, when a credential is stored | — | Bearer token. Wins outright when set. When empty, the credential minted by `fishhawk token login` (the shared [`credstore`](../../../credstore/README.md) module, keyed by backend URL) is used instead — so the MCP server can be registered with no secret in any client config. There is still no "anonymous" mode: if neither an env token nor a usable stored credential is present, startup fails. |
+| `FISHHAWK_BACKEND_URL`  | no       | `http://localhost:8080` | Same fallback as the CLI. Trailing slash is stripped — and the trimmed value is the key the credential store is looked up under, matching `fishhawk token login --backend-url <url>`.                    |
 
-The binary exits non-zero on startup if `FISHHAWK_API_TOKEN` is missing.
+### Token-resolution ladder ([#2389](https://github.com/kuhlman-labs/fishhawk/issues/2389) / ADR-076)
+
+The bearer is resolved at startup through three rungs, mirroring the CLI:
+
+1. **`FISHHAWK_API_TOKEN` non-empty** → use it; the credential store is not touched at all. This is the rung the **in-runner agent** always hits — the runner stamps the per-run token onto the agent env — so the credstore rung never fires there.
+2. **Env empty** → load the credential stored (via [`credstore`](../../../credstore/README.md)) for the resolved backend URL.
+3. **Nothing usable** → fail at startup, never degrade to an empty bearer that becomes a mid-session 401 storm. Four distinct, precisely-worded errors, each naming the backend URL that was looked up and `fishhawk token login`:
+   - **no credential stored** for the backend URL;
+   - a stored credential whose **token is empty** (a truncated store);
+   - an **expired** credential (a non-nil `expires_at` in the past — a **nil** `expires_at` means non-expiring and is accepted, since v0 tokens do not expire);
+   - a **corrupt/unreadable store** (surfaced wrapped, worded distinctly from not-found so a corrupt store is loud rather than silently read as "no credential").
+
+The binary exits non-zero on startup when rung 3 is reached. On the loopback-HTTP transport the per-request bearer clients must send is the **resolved** token — so a credstore-sourced token is what `Authorization: Bearer …` must carry.
 
 ## Transport (`--transport` / `--addr`)
 
@@ -136,11 +148,13 @@ Short version for operators on Apple Silicon Macs:
 curl -fSL "https://github.com/kuhlman-labs/fishhawk/releases/download/mcp/vX.Y.Z/fishhawk-mcp-vX.Y.Z-darwin-arm64" \
   -o /usr/local/bin/fishhawk-mcp
 chmod +x /usr/local/bin/fishhawk-mcp
-export FISHHAWK_API_TOKEN="<token>"
-claude mcp add fishhawk \
-  -e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
-  -- /usr/local/bin/fishhawk-mcp
+# Mint a credential once; it lands in the shared credstore keyed by backend URL.
+fishhawk token login --backend-url http://localhost:8080
+# No secret in the client config — the server reads the stored credential at startup.
+claude mcp add fishhawk -- /usr/local/bin/fishhawk-mcp
 ```
+
+If you prefer to keep the token in the environment, the older form still works and wins over the store — `claude mcp add fishhawk -e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN -- /usr/local/bin/fishhawk-mcp`.
 
 ## Surviving rebuilds (`fishhawk-mcp-shim`)
 

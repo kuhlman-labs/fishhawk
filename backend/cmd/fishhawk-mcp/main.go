@@ -42,10 +42,12 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
+	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
 const (
@@ -130,7 +132,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
 		return exitFailure
 	}
-	cfg, err := loadConfig(os.Getenv)
+	cfg, err := loadConfig(os.Getenv, credstore.Load)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: %v\n", err)
 		return exitFailure
@@ -172,18 +174,39 @@ type config struct {
 	apiToken   string
 }
 
-// loadConfig validates the env. Mirrors the CLI's defaults so an
+// loadConfig validates the env and resolves the bearer token through
+// a three-rung ladder, so an operator can register fishhawk-mcp with
+// no secret in any client config. Mirrors the CLI's defaults so an
 // operator who already has FISHHAWK_BACKEND_URL exported can flip
 // between cli and mcp without re-configuring.
 //
 //   - FISHHAWK_BACKEND_URL: defaults to http://localhost:8080 (same
 //     fallback as the CLI). Trailing slashes are stripped to keep
-//     URL concatenation safe at request time.
-//   - FISHHAWK_API_TOKEN: required, no default. The MCP server has
-//     no notion of an anonymous backend (unlike the CLI's dev mode)
-//     because every tool round-trips the API; running without auth
-//     would be a silent permission bug, not a developer convenience.
-func loadConfig(getenv func(string) string) (config, error) {
+//     URL concatenation safe at request time AND to match the key
+//     the credential store is keyed under (credstore.normalizeURL
+//     trims the same way, so the two normalizations agree).
+//
+// Token resolution ladder:
+//
+//  1. FISHHAWK_API_TOKEN non-empty → use it and do NOT touch the
+//     store at all. An explicit env token always wins, so a stored
+//     credential can never shadow it. This is the rung the in-runner
+//     agent always hits (the runner stamps the per-run token onto
+//     the agent env), so the credstore rung never fires there.
+//  2. Env empty → load the credential keyed by the resolved backend
+//     URL via loadCred (credstore.Load in production; injected in
+//     tests to keep the table hermetic and parallel-safe).
+//  3. Nothing usable → return an error, NEVER an empty token. Every
+//     not-usable case (no credential stored, a stored-but-empty
+//     token, an expired credential, a corrupt/unreadable store) is a
+//     distinct, precisely-worded STARTUP failure naming both the
+//     backend URL that was looked up and `fishhawk token login`, so
+//     a mis-registration fails loudly at startup instead of
+//     degrading to an empty bearer that becomes a mid-session 401
+//     storm. A NIL ExpiresAt means non-expiring and IS accepted —
+//     v0 tokens do not expire (cli/README.md, E39.3 / #1708), so
+//     reading nil as expired would refuse every field credential.
+func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Credential, error)) (config, error) {
 	c := config{
 		backendURL: strings.TrimRight(getenv("FISHHAWK_BACKEND_URL"), "/"),
 		apiToken:   getenv("FISHHAWK_API_TOKEN"),
@@ -191,9 +214,38 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if c.backendURL == "" {
 		c.backendURL = "http://localhost:8080"
 	}
-	if c.apiToken == "" {
-		return config{}, errors.New("FISHHAWK_API_TOKEN is required (generate via the backend's API-token surface)")
+	// Rung 1: an explicit env token wins outright; the store is never
+	// consulted.
+	if c.apiToken != "" {
+		return c, nil
 	}
+
+	// Rung 2: fall back to the credential stored for this backend URL.
+	// The URL default + trailing-slash trim above are applied BEFORE
+	// the lookup so the key matches what `fishhawk token login
+	// --backend-url <url>` stored.
+	cred, err := loadCred(c.backendURL)
+	if err != nil {
+		if errors.Is(err, credstore.ErrNotFound) {
+			return config{}, fmt.Errorf("no Fishhawk credential stored for %s: run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, c.backendURL)
+		}
+		// Rung 3d: a corrupt or unreadable store (credstore.List wraps
+		// the read/parse error with the file path). Surface it wrapped,
+		// worded distinctly from not-found, so a corrupt store is loud
+		// rather than silently re-read as "no credential".
+		return config{}, fmt.Errorf("cannot read the Fishhawk credential store for %s: %w; fix or remove the store, then run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, err, c.backendURL)
+	}
+	// Rung 3b: a credential exists but carries no token (a truncated
+	// store) — never let that become a silent empty bearer.
+	if cred.Token == "" {
+		return config{}, fmt.Errorf("the stored Fishhawk credential for %s has an empty token: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, c.backendURL)
+	}
+	// Rung 3c: an expired credential. A nil ExpiresAt means non-
+	// expiring (v0 tokens do not expire) and is accepted.
+	if cred.ExpiresAt != nil && cred.ExpiresAt.Before(time.Now()) {
+		return config{}, fmt.Errorf("the stored Fishhawk credential for %s expired at %s: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, cred.ExpiresAt.Format(time.RFC3339), c.backendURL)
+	}
+	c.apiToken = cred.Token
 	return c, nil
 }
 

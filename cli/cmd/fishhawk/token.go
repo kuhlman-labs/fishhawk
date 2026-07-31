@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kuhlman-labs/fishhawk/cli/internal/credstore"
+	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
 // runToken dispatches `fishhawk token <subcommand>` (E39.3 / #1708).

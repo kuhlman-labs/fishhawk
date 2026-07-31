@@ -14,9 +14,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuhlman-labs/fishhawk/cli/internal/credstore"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/ghcomment"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/httpclient"
+	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
 // runRun dispatches to `fishhawk run <subcommand>`. Each
