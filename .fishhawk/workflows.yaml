@@ -18,6 +18,13 @@ workflows:
   # acceptance agent validates the merged-candidate against the plan's
   # acceptance_criteria before the human-gated merge (ADR-049, E31).
   feature_change:
+    # applies_to (E53.3 / #2226): DELIBERATELY UNDECLARED. feature_change is
+    # the broad default — it is where anything that does not fit a narrower
+    # workflow belongs, so any envelope here would either be so wide it says
+    # nothing or would reject legitimate work. An absent applies_to accepts
+    # any change, which is the accurate statement of intent. This is also the
+    # ONLY workflow in this file with a plan stage, and therefore the only one
+    # where a `paths` criterion would actually be evaluated (see #2377).
     description: >-
       Default workflow for feature work and non-trivial changes, extended with a runner-hosted advisory acceptance stage (ADR-049). Human approves plan and PR; agent implements; the acceptance agent validates the running instance against the approved plan's acceptance_criteria.
     # Drive mode (#1023): fishhawkd auto-advances mechanical transitions
@@ -235,6 +242,14 @@ workflows:
   # The workflow exists to record the work in the audit log; the agent
   # is not the author. See docs/METHODOLOGY.md for what falls under this.
   human_led_change:
+    # applies_to (E53.3 / #2226): DELIBERATELY UNDECLARED, for now. #2360's
+    # draft floated `labels: [autonomy:low]`, but this workflow is the escape
+    # hatch for load-bearing surfaces, and a labels envelope would refuse a
+    # human-led change filed on an issue that happens to lack the label —
+    # refusing the safest route is the wrong failure direction. A `paths`
+    # envelope naming the crypto / policy / audit surfaces would express the
+    # intent, but this workflow has no plan stage, so `paths` is never
+    # evaluated here (#2377). Revisit once that is resolved.
     description: >-
       Workflow for human-authored changes to load-bearing surfaces (crypto, policy engine, audit integrity, GitHub App auth). The audit log records what was changed and who approved it.
     stages:
@@ -262,6 +277,33 @@ workflows:
   # Reserved for low-risk, high-volume work where the cost of a mistake
   # is contained and CI is a sufficient check.
   routine_change:
+    # applies_to (E53.3 / #2226) — THE point of E53.9 (#2360). This is the
+    # workflow whose gate is a degenerate `type: check` and which permits agent
+    # merge, so what may be routed here is a real governance question rather
+    # than a habit.
+    #
+    # `labels` IS enforced, today, at admission — on the API path (#2226) and
+    # the webhook path (#2361) alike. A change must be filed as a chore to be
+    # routed here. Expect this to refuse something eventually; that is the
+    # control working, and the fix is amending this file, not reaching for
+    # --applies-to-override (#2364) out of habit.
+    #
+    # `paths` mirrors the implement stage's existing allowed_paths below, and
+    # is NOT enforced today: the `paths` criterion is deferred to the plan
+    # gate, routine_change has no plan stage, and nothing else evaluates it
+    # (#2377). It is declared as reviewable intent and becomes enforcement
+    # when #2377 closes. Until then the envelope is held post-hoc by
+    # allowed_paths, which catches a violation after the agent has run rather
+    # than refusing it at routing. Do not read this line as routing-time
+    # containment.
+    applies_to:
+      labels: ["type:chore"]
+      paths:
+        - "docs/**"
+        - "**/*.md"
+        - "go.mod"
+        - "go.sum"
+        - "**/*_test.go"
     description: >-
       Workflow for documentation, dependency bumps, lint/format fixes, and tests for existing behavior. Agent may merge if all gates pass.
     # High-autonomy auto-retry (#276). Routine_change is the
@@ -318,6 +360,13 @@ workflows:
   # #1418) — it exercises the full dispatch -> poll -> deployment-artifact
   # loop without touching real infrastructure.
   release:
+    # applies_to (E53.3 / #2226): DELIBERATELY UNDECLARED. The natural envelope
+    # is a `trigger` form, but all three trigger sources v0 mints (github_issue,
+    # cli, ui) map to `diff`, so a trigger declaration cannot distinguish an
+    # operator-triggered release from anything else today. Declaring
+    # `trigger: [scheduled]` or `[on_demand]` would match nothing and refuse
+    # every real run — a control that only ever says no. Revisit when ADR-065's
+    # groomer or ADR-053's incident intake gives those forms a producer.
     description: >-
       Delegating deploy workflow (ADR-038): triggers an external release pipeline via workflow_dispatch and monitors it to terminal. Fishhawk holds no deploy logic or credentials. Operator-triggered after the feature_change run merges.
     # Drive mode (#1023): surface next_action and auto-advance mechanical
