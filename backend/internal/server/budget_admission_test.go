@@ -98,6 +98,27 @@ func postCreateRun(t *testing.T, s *Server, specYAML string, budgetOverride bool
 	return w
 }
 
+// postCreateRunWithKey is postCreateRun carrying an Idempotency-Key header,
+// for the create + replay pairs that pin the gate's post-replay position
+// (#2366).
+func postCreateRunWithKey(t *testing.T, s *Server, specYAML string, budgetOverride bool, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"repo":            "x/y",
+		"workflow_id":     "feature_change",
+		"workflow_sha":    "abc",
+		"trigger_source":  "cli",
+		"workflow_spec":   specYAML,
+		"budget_override": budgetOverride,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+	return w
+}
+
 func countGlobalAudits(au *auditFake, category string) int {
 	au.mu.Lock()
 	defer au.mu.Unlock()
@@ -235,6 +256,74 @@ func TestCreateRun_BlockingBudget_SumError_FailOpen(t *testing.T) {
 	}
 	if n := countGlobalAudits(au, "run_rejected_budget"); n != 0 {
 		t.Errorf("run_rejected_budget audits = %d, want 0 on fail-open", n)
+	}
+}
+
+// --- #2366: the Idempotency-Key replay lookup precedes this gate ---
+
+// TestCreateRun_Replay_SkipsBlockingBudgetGate: the period is exhausted
+// BETWEEN the create and its replay. The replay returns the run it already
+// created rather than 402 budget_exhausted, and appends no run_rejected_budget
+// — a replay is a redelivery of one run, not new spend, so the gate must not
+// see it at all. Sibling of handleRecoverRun's "replay is not new spend".
+func TestCreateRun_Replay_SkipsBlockingBudgetGate(t *testing.T) {
+	au := newAuditFake()
+	rr := newBudgetRunRepo()
+	rr.spent = 10 // under the 50 limit
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+
+	w1 := postCreateRunWithKey(t, s, blockingBudgetSpec(50), false, "k-budget")
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+	var first runResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+
+	rr.spent = 100 // the budget trips between the two calls
+
+	w2 := postCreateRunWithKey(t, s, blockingBudgetSpec(50), false, "k-budget")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 with the existing run, not 402:\n%s", w2.Code, w2.Body.String())
+	}
+	var second runResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("replay returned run %s, want the existing %s", second.ID, first.ID)
+	}
+	if n := countGlobalAudits(au, "run_rejected_budget"); n != 0 {
+		t.Errorf("run_rejected_budget audits = %d, want 0 — the gate ran on a replay", n)
+	}
+	if n := runRowCount(rr.fakeRepo); n != 1 {
+		t.Errorf("run rows = %d, want 1 (the replay must not insert)", n)
+	}
+}
+
+// TestCreateRun_Replay_DoesNotReappendBudgetOverride: the override grant is a
+// governance record like the applies_to one, so a create + replay pair leaves
+// exactly ONE run_admitted_budget_override on the global chain.
+func TestCreateRun_Replay_DoesNotReappendBudgetOverride(t *testing.T) {
+	au := newAuditFake()
+	rr := newBudgetRunRepo()
+	rr.spent = 100 // over the 50 limit — the override is what admits it
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+
+	w1 := postCreateRunWithKey(t, s, blockingBudgetSpec(50), true, "k-budget-override")
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+	w2 := postCreateRunWithKey(t, s, blockingBudgetSpec(50), true, "k-budget-override")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	if n := countGlobalAudits(au, "run_admitted_budget_override"); n != 1 {
+		t.Errorf("run_admitted_budget_override audits = %d, want 1 across create+replay", n)
+	}
+	if n := runRowCount(rr.fakeRepo); n != 1 {
+		t.Errorf("run rows = %d, want 1", n)
 	}
 }
 

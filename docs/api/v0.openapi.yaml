@@ -4223,6 +4223,15 @@ paths:
         returned with a 200 instead of creating a fresh one. The
         scope is `(repo, key)` so two callers picking the same key
         for different repos don't collide.
+
+        Replay is honored BEFORE the admission gates, as on
+        `POST /v0/runs/{run_id}/recover`: a retry of a successful
+        create returns the existing run even when the blocking budget
+        tripped or the workflow's `applies_to` stopped accepting the
+        change between the two calls, and it appends no second
+        `run_admitted_applies_to_override` / `run_admitted_budget_override`
+        entry to the audit chain. Request and spec validation still
+        run first, so a replayed malformed body keeps its 400/422.
       tags: [runs]
       parameters:
         - in: header
