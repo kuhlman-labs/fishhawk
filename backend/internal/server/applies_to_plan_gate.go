@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/appliesto"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -179,12 +180,12 @@ func renderUnmatchedPaths(unmatched []string) []string {
 // row and its trigger_source), so both are knowable here and both are checked:
 // adm is the admission-phase change rebuilt from the run row.
 //
-// It deliberately does NOT reuse satisfyingWorkflows (applies_to.go) for the
+// It deliberately does NOT reuse appliesto.SatisfyingWorkflows for the
 // PATHS half, which evaluates via Predicate.Match and is therefore EXISTENTIAL
 // on paths. Using it there would let the message recommend a workflow that then
 // refuses the very same plan at this very same gate. The enumeration must be
 // quantified the same way each decision is, so the admission half goes through
-// evaluateAppliesTo (the admission gate's own core) and the plan-gate half
+// appliesto.Evaluate (the shared admission core) and the plan-gate half
 // through planGateUnmatchedPaths (this gate's own ∀).
 //
 // A workflow declaring no applies_to, or none that constrains a phase, accepts
@@ -199,7 +200,7 @@ func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string, adm spec.Cha
 	for name, wf := range parsed.Workflows {
 		// Phase one: would this run be ADMITTED under the candidate? A
 		// recommendation the operator cannot act on is worse than none.
-		admitted, _, aerr := evaluateAppliesTo(wf, adm, appliesToPhaseAdmission)
+		admitted, _, aerr := appliesto.Evaluate(wf, adm, appliesto.PhaseAdmission)
 		if aerr != nil || !admitted {
 			continue
 		}
@@ -207,7 +208,7 @@ func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string, adm spec.Cha
 			out = append(out, name)
 			continue
 		}
-		sub, constrains := appliesToPhasePredicate(*wf.AppliesTo, appliesToPhasePlanGate)
+		sub, constrains := appliesto.PhasePredicate(*wf.AppliesTo, appliesto.PhasePlanGate)
 		if !constrains {
 			out = append(out, name)
 			continue
@@ -230,15 +231,15 @@ func planGateSatisfyingWorkflows(parsed *spec.Spec, paths []string, adm spec.Cha
 // runAdmissionChange rebuilds the ADMISSION-phase spec.Change from a run row —
 // the same value checkAppliesTo evaluated at start_run, read back from the
 // immutable snapshot rather than re-derived from mutable forge state. It is the
-// run-row twin of admissionChange (applies_to.go), which reads the create
-// request; both must agree, which is why both go through triggerFormForSource
+// run-row twin of the server admission gate's Change, which reads the create
+// request; both must agree, which is why both go through appliesto.AdmissionChange
 // and treat a nil issue context as an EMPTY label set rather than as match-all.
 func runAdmissionChange(r *run.Run) spec.Change {
-	c := spec.Change{Trigger: triggerFormForSource(string(r.TriggerSource))}
+	var labels []string
 	if r.IssueContext != nil {
-		c.Labels = r.IssueContext.Labels
+		labels = r.IssueContext.Labels
 	}
-	return c
+	return appliesto.AdmissionChange(string(r.TriggerSource), labels)
 }
 
 // resolveRunWorkflowDef resolves the run's workflow definition from the
@@ -353,7 +354,7 @@ func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID
 	parsed, wf, workflowID, adm, ok, rerr := s.resolveRunWorkflowDef(ctx, runID)
 	if rerr != nil {
 		// Fail CLOSED. Rendered as its own message rather than through
-		// renderAppliesToRejection: nothing that renderer reports —
+		// appliesto.RenderRejection: nothing that renderer reports —
 		// criterion, observed value, satisfying workflows — is knowable
 		// when the declaration itself could not be read, and inventing
 		// empty values for them would be a less actionable message, not a
@@ -367,7 +368,7 @@ func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID
 		// No declaration: the workflow accepts any change (back-compat).
 		return ""
 	}
-	sub, constrains := appliesToPhasePredicate(*wf.AppliesTo, appliesToPhasePlanGate)
+	sub, constrains := appliesto.PhasePredicate(*wf.AppliesTo, appliesto.PhasePlanGate)
 	if !constrains {
 		// The declaration constrains only admission-phase criteria (labels /
 		// trigger), which checkAppliesTo already decided. Nothing to do here.
@@ -380,7 +381,7 @@ func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID
 		return ""
 	}
 
-	rj := appliesToRejection{
+	rj := appliesto.Rejection{
 		WorkflowID:    workflowID,
 		Criterion:     "paths",
 		Required:      sub.Paths,
@@ -388,7 +389,8 @@ func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID
 		ObservedLabel: "out-of-declaration scope.files",
 		Satisfying:    planGateSatisfyingWorkflows(parsed, paths, adm),
 		MatchErr:      matchErr,
-		Phase:         appliesToPhasePlanGate,
+		Phase:         appliesto.PhasePlanGate,
+		Seam:          appliesto.SeamPlanGate,
 	}
 	if matchErr == nil && len(paths) == 0 {
 		// The plan commits to no files at all, so nothing demonstrates it
@@ -396,7 +398,7 @@ func (s *Server) appliesToPlanGateRejection(ctx context.Context, runID uuid.UUID
 		// offending entry there is none of.
 		rj.ObservedLabel = "scope.files"
 	}
-	message := renderAppliesToRejection(rj)
+	message := appliesto.RenderRejection(rj)
 
 	// The audited admission-time override carries forward. Its source of truth
 	// is the RUN-SCOPED run_admitted_applies_to_override audit entry, never the

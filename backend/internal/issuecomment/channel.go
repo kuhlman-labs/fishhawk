@@ -52,6 +52,9 @@ type Channel interface {
 	// NotifyRunRejected posts the missing-plan-reviewer refusal comment
 	// (#577 / #599) before any run row exists.
 	NotifyRunRejected(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error
+	// NotifyRunNotApplicable posts the applies_to routing-refusal comment
+	// (E53.10 / #2361) before any run row exists.
+	NotifyRunNotApplicable(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, message string) error
 	// ArtifactListerWired reports whether this channel renders the living
 	// anchor's plan section (the #1069 constructor-seam introspector). It
 	// posts nothing; non-GitHub channels return false.
@@ -158,6 +161,14 @@ func (r *Router) NotifySlashApprovalReply(ctx context.Context, p SlashApprovalRe
 func (r *Router) NotifyRunRejected(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error {
 	return r.each(func(c Channel) error {
 		return c.NotifyRunRejected(ctx, repo, scope, issueNumber, workflowID, stageID)
+	})
+}
+
+// NotifyRunNotApplicable fans the applies_to routing-refusal comment out to
+// every channel.
+func (r *Router) NotifyRunNotApplicable(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, message string) error {
+	return r.each(func(c Channel) error {
+		return c.NotifyRunNotApplicable(ctx, repo, scope, issueNumber, workflowID, message)
 	})
 }
 

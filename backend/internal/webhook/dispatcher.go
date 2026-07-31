@@ -220,6 +220,16 @@ type CheckRunRef struct {
 type IssueRef struct {
 	Number int    `json:"number"`
 	Body   string `json:"body"`
+
+	// IssueLabels is the FORGE-authoritative label set on the triggering
+	// issue, captured at match time from the webhook payload's own
+	// `issue.labels[].name` (E53.10 / #2361). It is what the applies_to
+	// admission gate evaluates the `labels` criterion against — better
+	// provenance than the caller-attested labels the POST /v0/runs path
+	// receives, since it is the forge's own view of the issue rather than a
+	// self-report. Empty when the issue carries no labels (which the gate
+	// reads as an EMPTY, fail-closed label set, never match-all).
+	IssueLabels []string
 }
 
 // MatchEvent classifies an event into a Match. Pure: no I/O, no
@@ -274,6 +284,9 @@ func matchIssue(ev Event) Match {
 	var payload struct {
 		Issue struct {
 			Number int `json:"number"`
+			Labels []struct {
+				Name string `json:"name"`
+			} `json:"labels"`
 		} `json:"issue"`
 		Label struct {
 			Name string `json:"name"`
@@ -289,15 +302,51 @@ func matchIssue(ev Event) Match {
 	if payload.Issue.Number == 0 {
 		return Match{Skip: true, Reason: "issue payload missing number"}
 	}
+	// Capture the forge-authoritative label set (E53.10 / #2361) for the
+	// applies_to admission gate. UNION in the triggering label.name: a
+	// `labeled` payload's issue.labels[] should reflect post-label state, but
+	// the union makes the capture correct regardless — so the gate never
+	// misses the label that fired the run even if the payload's issue object
+	// is a snapshot from before the label landed.
 	return Match{
 		Action:        MatchActionRun,
 		WorkflowID:    DefaultWorkflowID,
 		TriggerSource: run.TriggerGitHubIssue,
 		TriggerRef:    fmt.Sprintf("issue:%d", payload.Issue.Number),
 		IssueRef: &IssueRef{
-			Number: payload.Issue.Number,
+			Number:      payload.Issue.Number,
+			IssueLabels: unionLabels(issueLabelNames(payload.Issue.Labels), payload.Label.Name),
 		},
 	}
+}
+
+// issueLabelNames extracts the `name` of each GitHub issue label object.
+func issueLabelNames(labels []struct {
+	Name string `json:"name"`
+}) []string {
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		if l.Name != "" {
+			out = append(out, l.Name)
+		}
+	}
+	return out
+}
+
+// unionLabels returns names plus extra when extra is non-empty and not already
+// present (case-insensitive). Used to fold the triggering `label.name` into the
+// captured `issue.labels[]` set so the capture is correct regardless of whether
+// the payload's issue object reflects post-label state.
+func unionLabels(names []string, extra string) []string {
+	if extra == "" {
+		return names
+	}
+	for _, n := range names {
+		if strings.EqualFold(n, extra) {
+			return names
+		}
+	}
+	return append(names, extra)
 }
 
 func matchIssueComment(ev Event) Match {
@@ -311,6 +360,9 @@ func matchIssueComment(ev Event) Match {
 		} `json:"comment"`
 		Issue struct {
 			Number int `json:"number"`
+			Labels []struct {
+				Name string `json:"name"`
+			} `json:"labels"`
 		} `json:"issue"`
 	}
 	if err := json.Unmarshal(ev.RawBody, &payload); err != nil {
@@ -331,8 +383,13 @@ func matchIssueComment(ev Event) Match {
 		ApprovalSource: cmd.ApprovalSource,
 		TriggerSource:  run.TriggerGitHubIssue,
 		TriggerRef:     fmt.Sprintf("issue:%d", payload.Issue.Number),
-		IssueRef:       &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body},
-		CommentBody:    cmd.CommentBody,
+		// Capture the forge-authoritative label set (E53.10 / #2361) for the
+		// applies_to admission gate. A `/fishhawk run` comment carries no
+		// triggering label, so there is nothing to union — the issue's own
+		// labels[] are the whole set (empty on an unlabelled issue, which the
+		// gate reads fail-closed).
+		IssueRef:    &IssueRef{Number: payload.Issue.Number, Body: payload.Comment.Body, IssueLabels: issueLabelNames(payload.Issue.Labels)},
+		CommentBody: cmd.CommentBody,
 	}
 	if cmd.Action == MatchActionRun {
 		m.WorkflowID = DefaultWorkflowID
@@ -908,6 +965,14 @@ type IssueNotifier interface {
 	// passed as flat primitives (matching NotifyCIRetry's convention).
 	// Best-effort: failures log but don't change the refusal outcome.
 	NotifyRunRejected(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error
+	// NotifyRunNotApplicable posts a comment on the triggering issue when
+	// the applies_to admission gate refuses a webhook-triggered run because
+	// the workflow's routing declaration does not accept this change
+	// (E53.10 / #2361). Like NotifyRunRejected the gate runs before CreateRun
+	// — there is no run UUID — so the issue coordinates are flat primitives
+	// and the pre-rendered message is passed through verbatim. Best-effort:
+	// a failure logs but does not soften the refusal.
+	NotifyRunNotApplicable(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, message string) error
 }
 
 // BoardSyncer drives the best-effort run-lifecycle board-state transition
@@ -1273,6 +1338,23 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 			}
 			return nil
 		}
+	}
+
+	// Step 3.45: applies_to routing admission gate (E53.10 / #2361). This is
+	// the webhook counterpart to the server's checkAppliesTo — the dispatcher
+	// creates runs directly, so without this gate an operator's `applies_to`
+	// declaration silently does not hold for webhook-triggered runs. Evaluated
+	// against the FORGE-authoritative issue labels captured on m.IssueRef.
+	//
+	// Placed BEFORE the branch-protection snapshot gate ON PURPOSE (E53.10
+	// condition 2): routing answers whether this run should exist AT ALL, which
+	// is more actionable than a protection complaint about a run that was never
+	// going to be admitted. A refusal leaves no run row and consumes no
+	// protection/budget query. The end-to-end test drives a spec that would
+	// trip both gates and asserts the applies_to entry is the one written,
+	// pinning this ordering.
+	if d.refusedByAppliesTo(ctx, ev, m, workflow, parsed, scope, specFile.SHA, now) {
+		return nil
 	}
 
 	// Step 3.5: snapshot required-status-check contexts from

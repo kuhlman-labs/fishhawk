@@ -7,12 +7,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/appliesto"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -261,7 +261,7 @@ func TestAppliesTo_M4b_UnlabelledIssue_ReportsTheObservedValue(t *testing.T) {
 // the issue-LESS sentence carries the observed value too, so neither empty-set
 // branch is a hole in the binding message shape.
 func TestAppliesTo_M4_IssuelessMessage_AlsoReportsObserved(t *testing.T) {
-	got := renderAppliesToRejection(appliesToRejection{
+	got := appliesto.RenderRejection(appliesto.Rejection{
 		WorkflowID: "guarded", Criterion: "labels", ObservedLabel: "labels",
 		Required: []string{"dependencies"}, AbsentIssueContext: true,
 		IssueContextPresent: false, TriggerSource: "cli",
@@ -311,12 +311,12 @@ func TestAppliesTo_M5b_NonDiffTriggerForms_RouteCorrectly(t *testing.T) {
 	}{{spec.TriggerScheduled}, {spec.TriggerOnDemand}} {
 		t.Run(string(tc.form), func(t *testing.T) {
 			wf := spec.Workflow{AppliesTo: &spec.Predicate{Triggers: []spec.TriggerForm{tc.form}}}
-			ok, evaluated, err := evaluateAppliesTo(wf, spec.Change{Trigger: tc.form}, appliesToPhaseAdmission)
+			ok, evaluated, err := appliesto.Evaluate(wf, spec.Change{Trigger: tc.form}, appliesto.PhaseAdmission)
 			if err != nil || !ok || !evaluated {
 				t.Fatalf("(%v, %v, %v) for a %s change vs a %s predicate, want (true, true, nil)", ok, evaluated, err, tc.form, tc.form)
 			}
 			// And the same predicate must NOT match a diff run.
-			ok, _, err = evaluateAppliesTo(wf, spec.Change{Trigger: spec.TriggerDiff}, appliesToPhaseAdmission)
+			ok, _, err = appliesto.Evaluate(wf, spec.Change{Trigger: spec.TriggerDiff}, appliesto.PhaseAdmission)
 			if err != nil {
 				t.Fatalf("unexpected error matching a diff change: %v", err)
 			}
@@ -343,78 +343,11 @@ func TestAppliesTo_M7_PathsOnly_AdmitsAtAdmission(t *testing.T) {
 	}
 	// And the phase split says so structurally.
 	p := spec.Predicate{Paths: []string{"docs/**"}}
-	if _, constrains := appliesToPhasePredicate(p, appliesToPhaseAdmission); constrains {
+	if _, constrains := appliesto.PhasePredicate(p, appliesto.PhaseAdmission); constrains {
 		t.Error("a paths-only predicate constrains ADMISSION; it must constrain only the plan gate")
 	}
-	if _, constrains := appliesToPhasePredicate(p, appliesToPhasePlanGate); !constrains {
+	if _, constrains := appliesto.PhasePredicate(p, appliesto.PhasePlanGate); !constrains {
 		t.Error("a paths-only predicate does not constrain the PLAN GATE; the deferred criterion would never be enforced")
-	}
-}
-
-// TestAppliesTo_PhaseSplit_IsExhaustive pins which criterion belongs to which
-// phase. A criterion silently landing in neither half is a criterion that is
-// declared and never enforced — the failure mode this whole control exists to
-// prevent.
-func TestAppliesTo_PhaseSplit_IsExhaustive(t *testing.T) {
-	full := spec.Predicate{
-		Paths:       []string{"docs/**"},
-		Labels:      []string{"chore"},
-		ChangeKinds: []string{"docs"},
-		Triggers:    []spec.TriggerForm{spec.TriggerDiff},
-	}
-	adm, _ := appliesToPhasePredicate(full, appliesToPhaseAdmission)
-	gate, _ := appliesToPhasePredicate(full, appliesToPhasePlanGate)
-	if len(adm.Labels) == 0 || len(adm.Triggers) == 0 || len(adm.ChangeKinds) == 0 {
-		t.Errorf("admission half = %+v, want labels + trigger + change_kind", adm)
-	}
-	if len(adm.Paths) != 0 {
-		t.Error("admission half carries paths; paths is the deferred criterion")
-	}
-	if len(gate.Paths) == 0 {
-		t.Errorf("plan-gate half = %+v, want paths", gate)
-	}
-	if len(gate.Labels) != 0 || len(gate.Triggers) != 0 || len(gate.ChangeKinds) != 0 {
-		t.Errorf("plan-gate half = %+v, want paths ONLY (the rest are decided at admission)", gate)
-	}
-
-	// TRIPWIRE for a criterion the grammar gains LATER. The assertions above
-	// pin today's four; appliesToPhasePredicate is a hand-maintained
-	// field-by-field copy of spec.Predicate and its `constrains` check
-	// enumerates the same four by name. A fifth criterion added by a sibling
-	// slice (#2227 escalations, #2211 review conventions) is picked up by the
-	// applies_to $ref automatically, but would be copied into NEITHER half and
-	// counted by NEITHER `constrains` — declared and silently never enforced,
-	// which is the exact failure mode this function's own comment names for
-	// change_kind. So the "exhaustive over the predicate grammar" claim is
-	// enforced against the STRUCT rather than against a list restated here.
-	//
-	// The field COUNT is the cheap half: it fails on the specific edit that
-	// opens the gap and on nothing else.
-	predT := reflect.TypeOf(spec.Predicate{})
-	if n := predT.NumField(); n != 4 {
-		t.Fatalf("spec.Predicate has %d fields, want 4 (paths, labels, change_kind, trigger). "+
-			"A criterion was added or removed: route it in appliesToPhasePredicate (into a phase half AND its `constrains` check), "+
-			"extend firstFailingCriterion so the rejection can name it, then update this count.", n)
-	}
-
-	// The load-bearing half: EVERY declared criterion must survive the split
-	// into at least one phase. Populating `full` above is what feeds this, so a
-	// new field left out of `full` fails here too — the author is pushed to
-	// decide which phase owns it rather than to bump a number.
-	fullV, admV, gateV := reflect.ValueOf(full), reflect.ValueOf(adm), reflect.ValueOf(gate)
-	for i := range predT.NumField() {
-		name := predT.Field(i).Name
-		if predT.Field(i).Type.Kind() != reflect.Slice {
-			t.Errorf("spec.Predicate.%s is not a slice; this tripwire assumes every criterion is a list — re-check the split by hand", name)
-			continue
-		}
-		if fullV.Field(i).Len() == 0 {
-			t.Errorf("the `full` fixture leaves %s unset, so the split is untested for it; populate it and route the criterion", name)
-			continue
-		}
-		if admV.Field(i).Len() == 0 && gateV.Field(i).Len() == 0 {
-			t.Errorf("spec.Predicate.%s is carried by NEITHER phase half: a declared criterion that is silently never enforced", name)
-		}
 	}
 }
 
@@ -718,27 +651,27 @@ func TestAppliesTo_M13_MatchError_FailsClosed(t *testing.T) {
 	// declaration at parse time — the branch exists precisely for a caller
 	// that got a predicate past validation.
 	wf := spec.Workflow{AppliesTo: &spec.Predicate{Paths: []string{"docs/["}}}
-	ok, _, err := evaluateAppliesTo(wf, spec.Change{Paths: []string{"docs/x.md"}}, appliesToPhasePlanGate)
+	ok, _, err := appliesto.Evaluate(wf, spec.Change{Paths: []string{"docs/x.md"}}, appliesto.PhasePlanGate)
 	if err == nil {
 		t.Fatal("a malformed glob did not error; the fail-closed branch is unreachable")
 	}
 	if ok {
-		t.Error("evaluateAppliesTo matched despite the error")
+		t.Error("appliesto.Evaluate matched despite the error")
 	}
 
 	// The empty-predicate error is the other Match error mode.
 	wf = spec.Workflow{AppliesTo: &spec.Predicate{}}
-	_, constrains := appliesToPhasePredicate(*wf.AppliesTo, appliesToPhaseAdmission)
+	_, constrains := appliesto.PhasePredicate(*wf.AppliesTo, appliesto.PhaseAdmission)
 	if constrains {
 		t.Fatal("an empty predicate reports as constraining; Match would then be called and error")
 	}
 
 	// And the renderer turns a Match error into a REJECTION message, not an
 	// admit — including at the admission point.
-	msg := renderAppliesToRejection(appliesToRejection{
+	msg := appliesto.RenderRejection(appliesto.Rejection{
 		WorkflowID: "guarded",
 		MatchErr:   errors.New("path predicate: malformed glob \"docs/[\""),
-		Phase:      appliesToPhaseAdmission,
+		Phase:      appliesto.PhaseAdmission,
 	})
 	if !strings.Contains(msg, "could not be evaluated") || !strings.Contains(msg, "never treated as match-all") {
 		t.Errorf("message %q must say the declaration could not be evaluated and that this is a refusal", msg)
@@ -804,7 +737,7 @@ func TestAppliesTo_AdmissionPhase_CannotProduceAMatchError(t *testing.T) {
 		{Paths: []string{"docs/["}},
 		{},
 	} {
-		sub, constrains := appliesToPhasePredicate(p, appliesToPhaseAdmission)
+		sub, constrains := appliesto.PhasePredicate(p, appliesto.PhaseAdmission)
 		if len(sub.Paths) > 0 {
 			t.Fatalf("the admission sub-predicate of %+v carries paths; Match can now error at admission and checkAppliesTo's matchErr branch needs a real test", p)
 		}
@@ -877,124 +810,6 @@ workflows:
 				t.Fatalf("status = %d, want 201 — overlap is benign because applies_to FILTERS an operator-named workflow:\n%s", w.Code, w.Body.String())
 			}
 		})
-	}
-}
-
-// --- satisfyingWorkflows: enumeration, ordering, and the error exclusion ---
-
-func TestSatisfyingWorkflows_EnumeratesAndExcludesUnevaluable(t *testing.T) {
-	parsed := &spec.Spec{Workflows: map[string]spec.Workflow{
-		"zeta":   {}, // no declaration — accepts anything
-		"alpha":  {AppliesTo: &spec.Predicate{Labels: []string{"chore"}}},
-		"beta":   {AppliesTo: &spec.Predicate{Labels: []string{"bug"}}},
-		"broken": {AppliesTo: &spec.Predicate{Paths: []string{"["}}},
-	}}
-
-	// At ADMISSION the paths-only `broken` declaration does not constrain, so
-	// it is a genuine alternative and its malformed glob is not yet evaluated
-	// — the same deferral M7 pins. `beta`'s labels criterion excludes it.
-	got := satisfyingWorkflows(parsed, spec.Change{Labels: []string{"chore"}}, appliesToPhaseAdmission)
-	if want := "alpha,broken,zeta"; strings.Join(got, ",") != want {
-		t.Errorf("admission satisfyingWorkflows = %v, want %s (name-ordered)", got, want)
-	}
-
-	// At the PLAN GATE the malformed glob DOES evaluate, and an unevaluable
-	// declaration must never be recommended as a place to take the change.
-	got = satisfyingWorkflows(parsed, spec.Change{Paths: []string{"docs/x.md"}}, appliesToPhasePlanGate)
-	for _, name := range got {
-		if name == "broken" {
-			t.Errorf("satisfyingWorkflows = %v, want `broken` EXCLUDED: a declaration that errors cannot be recommended", got)
-		}
-	}
-	if strings.Join(got, ",") != "alpha,beta,zeta" {
-		t.Errorf("plan-gate satisfyingWorkflows = %v, want the three workflows that do not constrain paths", got)
-	}
-
-	if satisfyingWorkflows(nil, spec.Change{}, appliesToPhaseAdmission) != nil {
-		t.Error("a nil spec must enumerate nothing rather than panic")
-	}
-}
-
-// --- the ONE renderer: shape parity across both rejection points ---
-
-func TestRenderAppliesToRejection_BothPhasesCarryTheSameShape(t *testing.T) {
-	base := appliesToRejection{
-		WorkflowID: "routine_change",
-		Criterion:  "paths",
-		Required:   []string{"docs/**"},
-		Observed:   []string{"backend/internal/server/runs.go"},
-		Satisfying: []string{"feature_change"},
-	}
-	base.Phase = appliesToPhaseAdmission
-	admission := renderAppliesToRejection(base)
-	base.ObservedLabel = "scope.files"
-	base.Phase = appliesToPhasePlanGate
-	planGate := renderAppliesToRejection(base)
-
-	for _, msg := range []string{admission, planGate} {
-		for _, want := range []string{"routine_change", "paths", "docs/**", "backend/internal/server/runs.go", "feature_change", "applies_to_override"} {
-			if !strings.Contains(msg, want) {
-				t.Errorf("message %q is missing %q — an operator refused at the plan gate is further into a run and needs the same help, not less", msg, want)
-			}
-		}
-	}
-	if !strings.Contains(planGate, "scope.files") {
-		t.Errorf("plan-gate message %q must describe the observed value as scope.files", planGate)
-	}
-	// A change no workflow accepts says so rather than trailing an empty list.
-	base.Satisfying = nil
-	if msg := renderAppliesToRejection(base); !strings.Contains(msg, "No workflow in this spec accepts this change") {
-		t.Errorf("message %q must state that nothing accepts the change", msg)
-	}
-}
-
-func TestFirstFailingCriterion_NamesTheCriterion(t *testing.T) {
-	c := spec.Change{Labels: []string{"bug"}, Paths: []string{"backend/x.go"}, Trigger: spec.TriggerDiff}
-	for _, tc := range []struct {
-		name string
-		sub  spec.Predicate
-		want string
-	}{
-		{"paths", spec.Predicate{Paths: []string{"docs/**"}}, "paths"},
-		{"labels", spec.Predicate{Labels: []string{"chore"}}, "labels"},
-		{"change_kind", spec.Predicate{ChangeKinds: []string{"docs"}}, "change_kind"},
-		{"trigger", spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerScheduled}}, "trigger"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, _, _, ok := firstFailingCriterion(tc.sub, c)
-			if !ok || got != tc.want {
-				t.Errorf("firstFailingCriterion = (%q, %v), want (%q, true)", got, ok, tc.want)
-			}
-		})
-	}
-	if _, _, _, ok := firstFailingCriterion(spec.Predicate{Labels: []string{"bug"}}, c); ok {
-		t.Error("firstFailingCriterion reported a failure for a satisfied predicate")
-	}
-}
-
-// TestTriggerFormForSource pins the documented trigger_source→TriggerForm
-// mapping the M5 cases exercise through the handler.
-func TestTriggerFormForSource(t *testing.T) {
-	for _, src := range []string{"github_issue", "cli", "ui", ""} {
-		if got := triggerFormForSource(src); got != spec.TriggerDiff {
-			t.Errorf("triggerFormForSource(%q) = %q, want diff — every v0 trigger source produces a code diff", src, got)
-		}
-	}
-}
-
-// TestAdmissionChange_EmptyLabelSetIsNotMatchAll pins the fail-closed reading
-// of an absent issue context at the Change-builder level.
-func TestAdmissionChange_EmptyLabelSetIsNotMatchAll(t *testing.T) {
-	c := admissionChange("cli", nil)
-	if len(c.Labels) != 0 {
-		t.Errorf("labels = %v, want empty for an issue-less run", c.Labels)
-	}
-	if len(c.Paths) != 0 {
-		t.Error("admissionChange supplied paths; paths must come only from the plan artifact, never a caller self-attestation")
-	}
-	ok, err := (spec.Predicate{Labels: []string{"chore"}}).Match(c)
-	if err != nil || ok {
-		t.Errorf("(%v, %v): an EMPTY label set must NOT satisfy a labels criterion", ok, err)
 	}
 }
 

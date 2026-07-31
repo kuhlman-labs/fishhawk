@@ -16,14 +16,15 @@ import (
 // caller-configured errors / posted bits, so the Router fan-out can be
 // asserted without any GitHub I/O.
 type recordingChannel struct {
-	statusUpdate int
-	pageClass    int
-	planReady    int
-	ciRetry      int
-	budgetAlert  int
-	slashReply   int
-	runRejected  int
-	artifactWire bool
+	statusUpdate     int
+	pageClass        int
+	planReady        int
+	ciRetry          int
+	budgetAlert      int
+	slashReply       int
+	runRejected      int
+	runNotApplicable int
+	artifactWire     bool
 
 	// Configurable returns.
 	err          error // returned from every error-returning method
@@ -65,6 +66,11 @@ func (c *recordingChannel) NotifyRunRejected(_ context.Context, _ string, _ forg
 	return c.err
 }
 
+func (c *recordingChannel) NotifyRunNotApplicable(_ context.Context, _ string, _ forge.CredentialScope, _ int, _, _ string) error {
+	c.runNotApplicable++
+	return c.err
+}
+
 func (c *recordingChannel) ArtifactListerWired() bool { return c.artifactWire }
 
 var _ Channel = (*recordingChannel)(nil)
@@ -97,10 +103,13 @@ func TestRouter_FansOutEverySurface(t *testing.T) {
 	if err := r.NotifyRunRejected(ctx, "x/y", forge.FromGitHubInstallationID(1), 2, "wf", "stage"); err != nil {
 		t.Fatalf("NotifyRunRejected: %v", err)
 	}
+	if err := r.NotifyRunNotApplicable(ctx, "x/y", forge.FromGitHubInstallationID(1), 2, "wf", "does not accept this change"); err != nil {
+		t.Fatalf("NotifyRunNotApplicable: %v", err)
+	}
 
 	for name, c := range map[string]*recordingChannel{"a": a, "b": b} {
 		if c.statusUpdate != 1 || c.pageClass != 1 || c.planReady != 1 || c.ciRetry != 1 ||
-			c.budgetAlert != 1 || c.slashReply != 1 || c.runRejected != 1 {
+			c.budgetAlert != 1 || c.slashReply != 1 || c.runRejected != 1 || c.runNotApplicable != 1 {
 			t.Errorf("channel %s did not receive every surface once: %+v", name, c)
 		}
 	}

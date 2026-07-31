@@ -2053,6 +2053,69 @@ func renderRunRejectedBody(workflowID, stageID string) string {
 	return b.String()
 }
 
+// NotifyRunNotApplicable posts a comment on the triggering issue when the
+// webhook dispatcher's applies_to admission gate refuses a GitHub-triggered run
+// because the workflow's routing declaration does not accept this change
+// (E53.10 / #2361). Without it the refusal is silent to the customer: the
+// webhook returns 202, no run appears, and the only trail is the operator-side
+// run_rejected_applies_to global-chain audit entry + a WARN log, neither of
+// which the customer can see.
+//
+// It follows NotifyRunRejected (#599) exactly: flat primitive params (repo,
+// scope, issueNumber, workflowID, message) because the gate fires before any
+// run row is minted — there is no run UUID to pass — and the signature matches
+// the webhook package's IssueNotifier interface so it can name the method
+// without importing this package's concrete types. The pre-rendered message
+// (the SHARED appliesto renderer's output) is embedded verbatim so a webhook
+// refusal reads identically to an API one.
+//
+// Skips silently when the receiver is nil, issueNumber <= 0, scope is zero, or
+// the repo is malformed (defense in depth; the dispatcher guard should only
+// call this with valid coordinates).
+//
+// Dedup posture (deliberately none at this layer, mirroring NotifyRunRejected):
+// the per-run audit-log dedup the other surfaces use requires a run row that
+// does not exist here, and the webhook receipt layer already dedups deliveries
+// before Dispatcher.Handle is invoked, so same-delivery redeliveries cannot
+// double-post. No notifier-level audit row is written — the canonical machine
+// record stays the dispatcher's run_rejected_applies_to global-chain entry.
+//
+// Best-effort: a post failure returns a wrapped error the dispatcher logs at
+// WARN; it does not change the refusal outcome.
+func (n *Notifier) NotifyRunNotApplicable(ctx context.Context, repo string, scope forge.CredentialScope, issueNumber int, workflowID, message string) error {
+	if n == nil {
+		return nil
+	}
+	if issueNumber <= 0 || scope.IsZero() {
+		return nil
+	}
+	repoRef, err := parseRepo(repo)
+	if err != nil {
+		return nil
+	}
+	body := renderRunNotApplicableBody(workflowID, message)
+	if _, err := n.github.CreateIssueComment(ctx, scope, repoRef, issueNumber, body); err != nil {
+		return fmt.Errorf("issuecomment: create run-not-applicable comment: %w", err)
+	}
+	return nil
+}
+
+// renderRunNotApplicableBody renders the explanatory comment posted when the
+// webhook applies_to admission gate refuses a run (#2361). It leads with
+// "Fishhawk did not start a run." and embeds the shared appliesto renderer's
+// message VERBATIM so a webhook refusal reads identically to an API one — the
+// message already names the failed criterion, the observed value, the workflows
+// that would accept the change, and the ways forward. Fixed short template —
+// far under GitHub's MaxIssueCommentBodyBytes cap, so no truncation needed.
+func renderRunNotApplicableBody(workflowID, message string) string {
+	var b strings.Builder
+	b.WriteString("**Fishhawk did not start a run.**\n\n")
+	fmt.Fprintf(&b, "Workflow `%s` declares an `applies_to` routing rule that this change does not "+
+		"satisfy, so the run was refused before it started:\n\n", workflowID)
+	fmt.Fprintf(&b, "> %s\n", message)
+	return b.String()
+}
+
 // commentContext bundles the per-run inputs the post-helpers need:
 // the run row (for installation_id), the parsed repo, the issue
 // number, and the pre-rendered run URL. Built once per call.

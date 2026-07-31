@@ -91,6 +91,71 @@ func TestMatchEvent_IssuesLabeled_FishhawkLabel(t *testing.T) {
 	}
 }
 
+// TestMatchIssue_CapturesIssueLabels pins the forge-authoritative label capture
+// (E53.10 / #2361): the applies_to admission gate evaluates against these, so
+// the union of issue.labels[] + the triggering label.name must be correct. The
+// fixture DELIBERATELY omits the triggering `fishhawk` label from issue.labels[]
+// to prove the union folds it in — the label-provenance assumption is a test,
+// not a claim.
+func TestMatchIssue_CapturesIssueLabels(t *testing.T) {
+	body := []byte(`{
+		"issue": {"number": 42, "labels": [{"name": "docs"}, {"name": "chore"}]},
+		"label": {"name": "fishhawk"}
+	}`)
+	ev := Event{Type: "issues", Action: "labeled", InstallationID: 7, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip || got.IssueRef == nil {
+		t.Fatalf("got = %+v, want a dispatch with an IssueRef", got)
+	}
+	labels := got.IssueRef.IssueLabels
+	want := map[string]bool{"docs": true, "chore": true, "fishhawk": true}
+	if len(labels) != len(want) {
+		t.Fatalf("IssueLabels = %v, want the union %v (issue.labels + the triggering label)", labels, want)
+	}
+	for _, l := range labels {
+		if !want[l] {
+			t.Errorf("IssueLabels carries unexpected %q; got %v", l, labels)
+		}
+		delete(want, l)
+	}
+	if len(want) != 0 {
+		t.Errorf("IssueLabels %v is missing %v — the triggering label must be unioned in even when issue.labels omits it", got.IssueRef.IssueLabels, want)
+	}
+}
+
+// TestMatchIssueComment_CapturesIssueLabels pins the same capture on the
+// /fishhawk run comment path. A comment carries no triggering label, so the
+// captured set is exactly the issue's own labels.
+func TestMatchIssueComment_CapturesIssueLabels(t *testing.T) {
+	body := []byte(`{
+		"comment": {"body": "/fishhawk run"},
+		"issue": {"number": 88, "labels": [{"name": "docs"}]}
+	}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 7, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip || got.IssueRef == nil {
+		t.Fatalf("got = %+v, want a dispatch with an IssueRef", got)
+	}
+	if len(got.IssueRef.IssueLabels) != 1 || got.IssueRef.IssueLabels[0] != "docs" {
+		t.Errorf("IssueLabels = %v, want [docs]", got.IssueRef.IssueLabels)
+	}
+}
+
+// TestMatchIssueComment_UnlabelledIssue_CapturesEmptySet proves an unlabelled
+// issue yields an EMPTY label set (not nil-as-match-all), which the admission
+// gate reads fail-closed against a labels criterion.
+func TestMatchIssueComment_UnlabelledIssue_CapturesEmptySet(t *testing.T) {
+	body := []byte(`{"comment": {"body": "/fishhawk run"}, "issue": {"number": 5}}`)
+	ev := Event{Type: "issue_comment", Action: "created", InstallationID: 7, RawBody: body}
+	got := MatchEvent(ev)
+	if got.Skip || got.IssueRef == nil {
+		t.Fatalf("got = %+v, want a dispatch", got)
+	}
+	if len(got.IssueRef.IssueLabels) != 0 {
+		t.Errorf("IssueLabels = %v, want empty for an unlabelled issue", got.IssueRef.IssueLabels)
+	}
+}
+
 func TestMatchEvent_IssuesLabeled_LabelMatchIsCaseInsensitive(t *testing.T) {
 	body := []byte(`{"issue":{"number":1},"label":{"name":"FishHawk"}}`)
 	ev := Event{Type: "issues", Action: "labeled", InstallationID: 1, RawBody: body}
@@ -2294,11 +2359,12 @@ workflows:
 // stubIssueNotifier captures dispatcher-side notifier invocations
 // without standing up the full issuecomment package wiring.
 type stubIssueNotifier struct {
-	mu          sync.Mutex
-	retryCalls  []stubCIRetryCall
-	statusCalls []uuid.UUID
-	rejectCalls []stubRunRejectedCall
-	err         error
+	mu                 sync.Mutex
+	retryCalls         []stubCIRetryCall
+	statusCalls        []uuid.UUID
+	rejectCalls        []stubRunRejectedCall
+	notApplicableCalls []stubRunNotApplicableCall
+	err                error
 }
 
 // stubRunRejectedCall records a NotifyRunRejected invocation for the
@@ -2311,6 +2377,16 @@ type stubRunRejectedCall struct {
 	stageID     string
 }
 
+// stubRunNotApplicableCall records a NotifyRunNotApplicable invocation for the
+// #2361 applies_to admission-gate tests.
+type stubRunNotApplicableCall struct {
+	repo        string
+	scope       forge.CredentialScope
+	issueNumber int
+	workflowID  string
+	message     string
+}
+
 func (s *stubIssueNotifier) NotifyRunRejected(_ context.Context, repo string,
 	scope forge.CredentialScope, issueNumber int, workflowID, stageID string) error {
 	s.mu.Lock()
@@ -2318,6 +2394,17 @@ func (s *stubIssueNotifier) NotifyRunRejected(_ context.Context, repo string,
 	s.rejectCalls = append(s.rejectCalls, stubRunRejectedCall{
 		repo: repo, scope: scope, issueNumber: issueNumber,
 		workflowID: workflowID, stageID: stageID,
+	})
+	return s.err
+}
+
+func (s *stubIssueNotifier) NotifyRunNotApplicable(_ context.Context, repo string,
+	scope forge.CredentialScope, issueNumber int, workflowID, message string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notApplicableCalls = append(s.notApplicableCalls, stubRunNotApplicableCall{
+		repo: repo, scope: scope, issueNumber: issueNumber,
+		workflowID: workflowID, message: message,
 	})
 	return s.err
 }
