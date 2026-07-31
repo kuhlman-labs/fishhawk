@@ -25,7 +25,7 @@ func TestResolvePredicates(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
 		s := New(Config{IdentityProvider: idp})
 		outcome, res, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
-			&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"})
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
 		if outcome != predicateSatisfied {
 			t.Fatalf("outcome = %v, want satisfied", outcome)
 		}
@@ -44,7 +44,7 @@ func TestResolvePredicates(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionWrite}
 		s := New(Config{IdentityProvider: idp})
 		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
-			&spec.Approvals{Count: one, MinPermission: "maintain"})
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "maintain"}, spec.ComposedRequirements{}))
 		if outcome != predicateRejected {
 			t.Fatalf("outcome = %v, want rejected", outcome)
 		}
@@ -60,7 +60,7 @@ func TestResolvePredicates(t *testing.T) {
 		idp := &fakeIdentityProvider{member: false}
 		s := New(Config{IdentityProvider: idp})
 		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
-			&spec.Approvals{Count: one, MemberOf: "acme/reviewers"})
+			effectiveApprovals(&spec.Approvals{Count: one, MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
 		if outcome != predicateRejected {
 			t.Fatalf("outcome = %v, want rejected", outcome)
 		}
@@ -76,7 +76,7 @@ func TestResolvePredicates(t *testing.T) {
 		idp := &fakeIdentityProvider{permErr: identity.ErrRateLimited}
 		s := New(Config{IdentityProvider: idp})
 		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
-			&spec.Approvals{Count: one, MinPermission: "write"})
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable", outcome)
 		}
@@ -86,7 +86,7 @@ func TestResolvePredicates(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, memberErr: errors.New("boom")}
 		s := New(Config{IdentityProvider: idp})
 		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
-			&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"})
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write", MemberOf: "acme/reviewers"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable", outcome)
 		}
@@ -96,7 +96,7 @@ func TestResolvePredicates(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin, member: true}
 		s := New(Config{IdentityProvider: idp})
 		outcome, _, _ := s.resolvePredicates(context.Background(), "", "github:op",
-			&spec.Approvals{Count: one, MinPermission: "write"})
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "write"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable (empty repo)", outcome)
 		}
@@ -109,7 +109,7 @@ func TestResolvePredicates(t *testing.T) {
 		idp := &fakeIdentityProvider{perm: identity.PermissionAdmin}
 		s := New(Config{IdentityProvider: idp})
 		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
-			&spec.Approvals{Count: one, MinPermission: "superuser"})
+			effectiveApprovals(&spec.Approvals{Count: one, MinPermission: "superuser"}, spec.ComposedRequirements{}))
 		if outcome != predicateUnavailable {
 			t.Fatalf("outcome = %v, want unavailable (unparseable tier)", outcome)
 		}
@@ -830,4 +830,88 @@ func TestApproveStageAs_Quorum_LateApproveOnSettledStage_NoDoubleAdvance(t *test
 	if len(rr.transitions) != 0 {
 		t.Errorf("transitions = %+v, want none (guard blocked the double-advance)", rr.transitions)
 	}
+}
+
+// TestResolvePredicates_EscalatedConjunction pins the membership CONJUNCTION
+// a fired escalation produces (E53.4 / #2227): EVERY composed group must
+// resolve true. Two escalations naming disjoint groups therefore produce a
+// gate no single approver can clear — the correct fail-closed reading for a
+// control that may only raise, surfacing as a gate that cannot clear rather
+// than one silently weakened.
+func TestResolvePredicates_EscalatedConjunction(t *testing.T) {
+	base := &spec.Approvals{Count: func(i int) *int { return &i }(1), MemberOf: "acme/leads"}
+	escalated := spec.ComposedRequirements{MemberOf: []string{"acme/security"}}
+
+	t.Run("every group resolved: satisfied, one forge call per group", func(t *testing.T) {
+		idp := &fakeIdentityProvider{member: true}
+		s := New(Config{IdentityProvider: idp})
+		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			effectiveApprovals(base, escalated))
+		if outcome != predicateSatisfied {
+			t.Fatalf("outcome = %v, want satisfied", outcome)
+		}
+		if idp.memberCalls != 2 {
+			t.Errorf("memberCalls = %d, want 2 (the conjunction resolves each group)", idp.memberCalls)
+		}
+	})
+
+	t.Run("a member of only ONE composed group is refused", func(t *testing.T) {
+		idp := &perGroupIdentityProvider{member: map[string]bool{"acme/leads": true, "acme/security": false}}
+		s := New(Config{IdentityProvider: idp})
+		outcome, res, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			effectiveApprovals(base, escalated))
+		if outcome != predicateRejected {
+			t.Fatalf("outcome = %v, want rejected — membership is a conjunction", outcome)
+		}
+		if predicate != "member_of" {
+			t.Errorf("predicate = %q, want member_of", predicate)
+		}
+		if res.MemberResolved == nil || *res.MemberResolved {
+			t.Errorf("member resolved = %v, want the failing group's false", res.MemberResolved)
+		}
+	})
+
+	t.Run("a membership error on an escalated group fails closed", func(t *testing.T) {
+		idp := &perGroupIdentityProvider{
+			member: map[string]bool{"acme/leads": true},
+			errs:   map[string]error{"acme/security": errors.New("forge down")},
+		}
+		s := New(Config{IdentityProvider: idp})
+		outcome, _, predicate := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			effectiveApprovals(base, escalated))
+		if outcome != predicateUnavailable {
+			t.Fatalf("outcome = %v, want unavailable", outcome)
+		}
+		if predicate != "member_of" {
+			t.Errorf("predicate = %q, want member_of", predicate)
+		}
+	})
+
+	t.Run("an escalation adds a predicate to a gate declaring none", func(t *testing.T) {
+		idp := &fakeIdentityProvider{member: false}
+		s := New(Config{IdentityProvider: idp})
+		countOnly := &spec.Approvals{Count: func(i int) *int { return &i }(1)}
+		outcome, _, _ := s.resolvePredicates(context.Background(), "acme/repo", "github:op",
+			effectiveApprovals(countOnly, escalated))
+		if outcome != predicateRejected {
+			t.Fatalf("outcome = %v, want rejected — the escalation added the group this gate never declared", outcome)
+		}
+	})
+}
+
+// perGroupIdentityProvider resolves membership PER GROUP, which the shared
+// fakeIdentityProvider (one bool for every ref) cannot express — and the
+// conjunction's whole point is that different groups resolve differently.
+type perGroupIdentityProvider struct {
+	fakeIdentityProvider
+	member map[string]bool
+	errs   map[string]error
+}
+
+func (f *perGroupIdentityProvider) ResolveMembership(_ context.Context, ref, _ string) (bool, error) {
+	f.memberCalls++
+	if err, ok := f.errs[ref]; ok {
+		return false, err
+	}
+	return f.member[ref], nil
 }

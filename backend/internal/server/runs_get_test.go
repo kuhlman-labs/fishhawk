@@ -2277,10 +2277,9 @@ func TestDelegationPayload_V0CampaignOverride_ByteIdentical(t *testing.T) {
 
 	runRow := &run.Run{ID: uuid.New(), State: run.StateRunning}
 	stages := []*run.Stage{{ID: uuid.New(), Sequence: 0, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}}
-	ev := &delegation.Evaluator{
-		Stages:   &staticStageLister{stages: stages},
-		Concerns: &staticConcernLister{},
-		Audit:    &staticAuditLister{},
+	ev, err := delegation.NewEvaluator(&staticStageLister{stages: stages}, &staticConcernLister{}, &staticAuditLister{}, staticEscalationResolver{})
+	if err != nil {
+		t.Fatalf("NewEvaluator: %v", err)
 	}
 	withOverride, err := ev.Evaluate(context.Background(), runRow, &wf, block)
 	if err != nil {
@@ -2343,4 +2342,161 @@ type staticAuditLister struct{}
 
 func (staticAuditLister) ListForRunByCategory(context.Context, uuid.UUID, string) ([]*audit.Entry, error) {
 	return nil, nil
+}
+
+// staticEscalationResolver fires nothing — the value a workflow declaring no
+// escalations resolves to (E53.4 / #2227), so this payload-projection test
+// asserts the unchanged serialization it always did.
+type staticEscalationResolver struct{}
+
+func (staticEscalationResolver) ResolveEscalations(context.Context, *run.Run, *spec.Workflow, uuid.UUID) (spec.ComposedRequirements, error) {
+	return spec.ComposedRequirements{}, nil
+}
+
+// --- escalations on the run read (E53.4 / #2227) -----------------------------
+
+// TestBuildEscalationsPayload is condition A's site 2: the run read surfaces
+// which escalations fired and what they raised, and the merge class the fired
+// ceiling clamped shows `gated` in the SAME response.
+//
+// It drives the two builders handleGetRun calls (buildEscalationsPayload and
+// buildDelegationPayload) and serializes a runResponse, so the assertion
+// covers the JSON field name and the omitempty posture as well as the values.
+func TestBuildEscalationsPayload(t *testing.T) {
+	const specYAML = `version: "2"
+workflows:
+  feature_change:
+    autonomy: high
+    actions:
+      merge:
+        mode: auto
+        when: gates_resolved_ci_green
+    escalations:
+      - match:
+          labels: ["security"]
+        require:
+          approvals:
+            count: 2
+            member_of: acme/security
+          max_autonomy: low
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	mkRun := func(labels []string) *run.Run {
+		r := &run.Run{
+			ID: uuid.New(), State: run.StateRunning,
+			WorkflowID: "feature_change", WorkflowSpec: []byte(specYAML),
+			TriggerSource: run.TriggerCLI,
+		}
+		if labels != nil {
+			r.IssueContext = &run.IssueContext{Labels: labels}
+		}
+		return r
+	}
+
+	t.Run("a fired escalation surfaces and clamps the merge class", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		runRow := mkRun([]string{"security"})
+		gated := &run.Stage{ID: uuid.New(), RunID: runRow.ID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+		rr.seed(runRow, gated)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: ar, ConcernRepo: newFakeConcernRepo()})
+
+		esc := s.buildEscalationsPayload(context.Background(), runRow)
+		if esc == nil {
+			t.Fatal("escalations block omitted for a run whose escalation fired")
+		}
+		if len(esc.Fired) != 1 || esc.Fired[0].Index != 0 {
+			t.Fatalf("fired = %+v, want escalation 0", esc.Fired)
+		}
+		if len(esc.Fired[0].Labels) != 1 || esc.Fired[0].Labels[0] != "security" {
+			t.Errorf("fired predicate = %+v, want labels [security]", esc.Fired[0])
+		}
+		if esc.Require.Count == nil || *esc.Require.Count != 2 {
+			t.Errorf("require.count = %v, want 2", esc.Require.Count)
+		}
+		if esc.Require.MaxAutonomy != string(spec.TierLow) {
+			t.Errorf("require.max_autonomy = %q, want low", esc.Require.MaxAutonomy)
+		}
+		if !strings.Contains(esc.Summary, "labels=security") {
+			t.Errorf("summary %q does not name the fired predicate", esc.Summary)
+		}
+
+		// The delegation block on the SAME read shows the clamped class.
+		del := s.buildDelegationPayload(context.Background(), runRow)
+		if del == nil {
+			t.Fatal("delegation block omitted")
+		}
+		var merge *runDelegationMatrixPayload
+		for i := range del.Matrix {
+			if del.Matrix[i].Action == spec.ActionMerge {
+				merge = &del.Matrix[i]
+			}
+		}
+		if merge == nil {
+			t.Fatalf("no merge entry in the matrix: %+v", del.Matrix)
+		}
+		if merge.Mode != string(spec.ModeGated) || merge.Source != string(spec.SourceEscalation) {
+			t.Errorf("merge entry = %+v, want gated/escalation", merge)
+		}
+
+		b, err := json.Marshal(runResponse{Escalations: esc})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if !strings.Contains(string(b), `"escalations"`) {
+			t.Errorf("serialized response carries no escalations field: %s", b)
+		}
+	})
+
+	t.Run("no escalation fires: the block is omitted and the response is byte-identical", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		runRow := mkRun([]string{"area:backend"})
+		rr.seed(runRow)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: ar, ConcernRepo: newFakeConcernRepo()})
+
+		if esc := s.buildEscalationsPayload(context.Background(), runRow); esc != nil {
+			t.Fatalf("escalations block = %+v, want omitted when nothing fired", esc)
+		}
+		b, err := json.Marshal(runResponse{})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if strings.Contains(string(b), "escalations") {
+			t.Errorf("an unfired run's response carries the field: %s", b)
+		}
+	})
+
+	t.Run("a workflow declaring no escalations omits the block with zero extra reads", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		runRow := escGateRun(t, "", nil)
+		rr.seed(runRow)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ArtifactRepo: ar, ConcernRepo: newFakeConcernRepo()})
+
+		if esc := s.buildEscalationsPayload(context.Background(), runRow); esc != nil {
+			t.Fatalf("escalations block = %+v, want omitted", esc)
+		}
+		if ar.calls != 0 || rr.calls != 0 {
+			t.Errorf("extra reads: artifact %d, run %d — want 0/0", ar.calls, rr.calls)
+		}
+	})
 }

@@ -386,7 +386,19 @@ func (s *Server) evaluateRunDelegation(ctx context.Context, runRow *run.Run, cam
 			slog.String("run_id", runRow.ID.String()))
 		return nil, wf, false
 	}
-	ev := &delegation.Evaluator{Stages: s.cfg.RunRepo, Concerns: s.cfg.ConcernRepo, Audit: s.cfg.AuditRepo}
+	// The escalation resolver is REQUIRED at construction (E53.4 / #2227).
+	// THIS is the site that would otherwise evaluate UNCLAMPED: the auto-drive
+	// gate acts without an operator in the loop, so an unclamped matrix here
+	// would auto-approve or auto-merge a change a fired `max_autonomy: low`
+	// escalation had restricted — the silent control failure the
+	// required-at-construction resolver exists to close. A constructor error
+	// reuses this function's existing observe-only degradation.
+	ev, err := delegation.NewEvaluator(s.cfg.RunRepo, s.cfg.ConcernRepo, s.cfg.AuditRepo, s.escalationResolver())
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: build delegation evaluator failed; observe-only",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", err.Error()))
+		return nil, wf, false
+	}
 	res, err := ev.Evaluate(ctx, runRow, &wf, override)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: delegation evaluate failed; observe-only",

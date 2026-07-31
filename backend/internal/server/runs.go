@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/escalation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -177,6 +178,46 @@ type runResponse struct {
 	// anywhere — so a run whose spec declares none keeps a byte-identical
 	// response.
 	ReviewAuthority []runReviewAuthorityPayload `json:"review_authority,omitempty"`
+	// Escalations is the run's fired per-path escalations (E53.4 / #2227):
+	// which declarations matched this change and the STRICTEST requirement
+	// they composed to, so an operator reads why a gate got stricter instead
+	// of diffing the workflow against the plan by hand. Populated by
+	// handleGetRun ONLY (same single-read posture as Concerns / Delegation).
+	// Omitted (nil) when the run's workflow declares no escalations, when none
+	// fired, or when the evaluation could not run — so a run on a workflow
+	// declaring none keeps a byte-identical response.
+	Escalations *runEscalationsPayload `json:"escalations,omitempty"`
+}
+
+// runEscalationsPayload is the fired-escalation surface on the wire (E53.4 /
+// #2227). Summary renders through escalation.RenderFired — the SAME helper the
+// escalation_fired audit payload renders through — so the run read and the
+// governance chain cannot describe one firing differently.
+type runEscalationsPayload struct {
+	Summary string                      `json:"summary"`
+	Fired   []runEscalationFiredPayload `json:"fired"`
+	Require runEscalationRequirePayload `json:"require"`
+}
+
+// runEscalationFiredPayload is one fired declaration: its index in the
+// workflow's escalations list (the coordinate validation errors report at) and
+// the criteria that matched.
+type runEscalationFiredPayload struct {
+	Index       int      `json:"index"`
+	Paths       []string `json:"paths,omitempty"`
+	Labels      []string `json:"labels,omitempty"`
+	ChangeKinds []string `json:"change_kind,omitempty"`
+	Triggers    []string `json:"trigger,omitempty"`
+}
+
+// runEscalationRequirePayload is the COMPOSED requirement — max count, the
+// de-duplicated membership CONJUNCTION, the strictest permission tier and the
+// lowest autonomy ceiling.
+type runEscalationRequirePayload struct {
+	Count         *int     `json:"count,omitempty"`
+	MemberOf      []string `json:"member_of,omitempty"`
+	MinPermission string   `json:"min_permission,omitempty"`
+	MaxAutonomy   string   `json:"max_autonomy,omitempty"`
 }
 
 // runReviewAuthorityPayload is one stage's resolved review authority on
@@ -1366,6 +1407,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// spec declares no operator_agent block, on terminal runs, and
 	// best-effort on any evaluation failure.
 	resp.Delegation = s.buildDelegationPayload(r.Context(), got)
+	// Escalations surface (E53.4 / #2227): single-run read ONLY, same posture
+	// as Delegation. Omitted (nil) when the workflow declares no escalations
+	// (ZERO extra reads on that path), when none fired, or when the evaluation
+	// could not run — the READ is best-effort even though the two GATES that
+	// consume the same resolver fail closed, because omitting a legibility
+	// surface withholds information while failing the read would withhold the
+	// whole run.
+	resp.Escalations = s.buildEscalationsPayload(r.Context(), got)
 	// Lineage-completion signal (E22.X / #1137): single-run read ONLY,
 	// same posture as Concerns. Omitted (nil) when no run repo is wired
 	// or the child-graph read fails (best-effort).
@@ -1564,10 +1613,16 @@ func (s *Server) buildDelegationPayload(ctx context.Context, runRow *run.Run) *r
 			"run_id", runRow.ID.String(), "workflow_id", runRow.WorkflowID)
 		return nil
 	}
-	ev := &delegation.Evaluator{
-		Stages:   s.cfg.RunRepo,
-		Concerns: s.cfg.ConcernRepo,
-		Audit:    s.cfg.AuditRepo,
+	// The escalation resolver is REQUIRED at construction (E53.4 / #2227): an
+	// evaluator that cannot clamp the `max_autonomy` ceiling would surface an
+	// unclamped matrix here, showing an operator `auto` on a class a fired
+	// escalation has restricted. A constructor error reuses this function's
+	// existing degradation — warn-log and omit the block.
+	ev, err := delegation.NewEvaluator(s.cfg.RunRepo, s.cfg.ConcernRepo, s.cfg.AuditRepo, s.escalationResolver())
+	if err != nil {
+		s.cfg.Logger.Warn("delegation: build evaluator failed; omitting delegation block",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		return nil
 	}
 	// No campaign context on the single-run read: pass a nil campaign
 	// override so resolution falls through to the workflow contract.
@@ -1639,6 +1694,68 @@ func specVersionMajor(version string) int {
 		return 0
 	}
 	return major
+}
+
+// buildEscalationsPayload evaluates the run's per-path escalations for the
+// single-run read (E53.4 / #2227) and projects what fired onto the wire.
+//
+// Returns nil — the field is omitted — when the workflow declares no
+// escalations (the short-circuit inside resolveEscalations, so ZERO extra
+// reads on that path), when nothing fired, or when the evaluation failed
+// (warn-logged, best-effort: this is the legibility surface, and the two GATES
+// consuming the same resolver are where the fail-closed refusal lives).
+//
+// stageID is deliberately the run's currently gated stage where one exists, so
+// the audit de-duplication this read shares with the gates keys on the same
+// slot rather than minting a second entry per page-refresh.
+func (s *Server) buildEscalationsPayload(ctx context.Context, runRow *run.Run) *runEscalationsPayload {
+	wf, err := s.escalationsForRun(runRow)
+	if err != nil || wf == nil {
+		return nil
+	}
+	var stageID uuid.UUID
+	if s.cfg.RunRepo != nil {
+		if stages, serr := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID); serr == nil {
+			for _, st := range stages {
+				if st.State == run.StageStateAwaitingApproval {
+					stageID = st.ID
+					break
+				}
+			}
+		}
+	}
+	res, err := s.resolveEscalations(ctx, runRow, wf, stageID)
+	if err != nil {
+		s.cfg.Logger.Warn("escalations: evaluate failed; omitting escalations block",
+			"run_id", runRow.ID.String(), "error", err.Error())
+		return nil
+	}
+	if !res.Any() {
+		return nil
+	}
+	out := &runEscalationsPayload{
+		Summary: escalation.RenderFired(res),
+		Fired:   make([]runEscalationFiredPayload, 0, len(res.Fired)),
+		Require: runEscalationRequirePayload{
+			Count:         res.Requirements.Count,
+			MemberOf:      res.Requirements.MemberOf,
+			MinPermission: res.Requirements.MinPermission,
+			MaxAutonomy:   string(res.Requirements.MaxAutonomy),
+		},
+	}
+	for _, f := range res.Fired {
+		e := runEscalationFiredPayload{
+			Index:       f.Index,
+			Paths:       f.Escalation.Match.Paths,
+			Labels:      f.Escalation.Match.Labels,
+			ChangeKinds: f.Escalation.Match.ChangeKinds,
+		}
+		for _, t := range f.Escalation.Match.Triggers {
+			e.Triggers = append(e.Triggers, string(t))
+		}
+		out.Fired = append(out.Fired, e)
+	}
+	return out
 }
 
 // delegationPayloadFrom projects an evaluated delegation.Result onto the

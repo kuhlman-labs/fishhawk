@@ -1692,3 +1692,157 @@ func TestReportMatrixProposals_NoAuditRepo(t *testing.T) {
 		t.Errorf("out = %+v reported = %v, want no report with no audit repository", out, reported)
 	}
 }
+
+// --- escalation autonomy ceiling at the AUTO-DRIVE gate (E53.4 / #2227) ------
+
+// autoDriveEscalationSpecYAML declares merge and approve as EXPLICIT
+// `mode: auto` overrides — the strongest form of delegation the grammar can
+// express — with the escalations block supplied by the caller. The predicate
+// matches on `trigger: [diff]`, which every v0 trigger source maps to, so the
+// escalation fires without needing a plan artifact or an issue-label snapshot.
+func autoDriveEscalationSpecYAML(escalations string) string {
+	return `version: "2"
+workflows:
+  feature_change:
+    autonomy: high
+    actions:
+      merge:
+        mode: auto
+        when: gates_resolved_ci_green
+      approve:
+        mode: auto
+        when: clean_dual_approval
+` + escalations + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+}
+
+const autoDriveLowCeilingEscalation = `    escalations:
+      - match:
+          trigger: [diff]
+        require:
+          max_autonomy: low
+`
+
+// TestAutoDriveRunGate_EscalationCeiling_NoAutoMerge is operator condition A's
+// site 4 — the construction site the earlier design left unwired, and the only
+// one that acts with NO operator in the loop. An explicitly-declared
+// `actions: {merge: {mode: auto}}` under a fired `max_autonomy: low` must
+// produce NO auto-merge.
+//
+// The PAIRED CONTROL (the same run WITHOUT the escalation auto-merges) is what
+// proves this test would have failed before the wiring, rather than passing
+// because the harness never reached the merge arm.
+func TestAutoDriveRunGate_EscalationCeiling_NoAutoMerge(t *testing.T) {
+	setup := func(t *testing.T, specYAML string) (*Server, *autoDriveRepo, *fakeMerger, uuid.UUID) {
+		t.Helper()
+		s, repo, au, _ := newAutoDriveServer(t)
+		runID, stages := startAutoDriveRunWithSpec(t, s, repo, specYAML)
+		stages[0].State = run.StageStateSucceeded
+		stages[1].State = run.StageStateSucceeded
+		if _, err := repo.TransitionRun(context.Background(), runID, run.StateRunning); err != nil {
+			t.Fatalf("TransitionRun -> running: %v", err)
+		}
+		if _, err := repo.SetRunPullRequestURL(context.Background(), runID, "https://github.com/x/y/pull/7"); err != nil {
+			t.Fatalf("SetRunPullRequestURL: %v", err)
+		}
+		seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
+		return s, repo, &fakeMerger{}, runID
+	}
+
+	t.Run("control: no escalation declared, the explicit auto merge acts", func(t *testing.T) {
+		s, repo, merger, runID := setup(t, autoDriveEscalationSpecYAML(""))
+		out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger, nil)
+		if err != nil {
+			t.Fatalf("AutoDriveRunGate: %v", err)
+		}
+		if !out.Acted || out.Action != delegation.ActionMerge {
+			t.Fatalf("outcome = %+v, want acted merge — without this control the ceiling assertion below proves nothing", out)
+		}
+		if merger.called != 1 {
+			t.Errorf("merger called %d times, want 1", merger.called)
+		}
+	})
+
+	t.Run("a fired low ceiling produces NO auto-merge", func(t *testing.T) {
+		s, repo, merger, runID := setup(t, autoDriveEscalationSpecYAML(autoDriveLowCeilingEscalation))
+		out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger, nil)
+		if err != nil {
+			t.Fatalf("AutoDriveRunGate: %v", err)
+		}
+		if out.Acted {
+			t.Fatalf("outcome = %+v, want NO action — the auto-drive gate acted through a fired max_autonomy: low ceiling", out)
+		}
+		if merger.called != 0 {
+			t.Errorf("merger called %d times, want 0", merger.called)
+		}
+	})
+}
+
+// TestAutoDriveRunGate_EscalationCeiling_NoAutoApprove is the same control at
+// the APPROVE arm: an explicitly-declared auto approve under a fired
+// `max_autonomy: low` never advances the plan gate.
+func TestAutoDriveRunGate_EscalationCeiling_NoAutoApprove(t *testing.T) {
+	setup := func(t *testing.T, specYAML string) (*Server, *autoDriveRepo, *auditFake, uuid.UUID) {
+		t.Helper()
+		s, repo, au, _ := newAutoDriveServer(t)
+		runID, _ := startAutoDriveRunWithSpec(t, s, repo, specYAML)
+		seedReviewEntry(t, au, runID, 1, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2})
+		seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+		seedReviewEntry(t, au, runID, 3, "plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+		return s, repo, au, runID
+	}
+
+	t.Run("control: no escalation declared, the explicit auto approve acts", func(t *testing.T) {
+		s, repo, au, runID := setup(t, autoDriveEscalationSpecYAML(""))
+		out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+		if err != nil {
+			t.Fatalf("AutoDriveRunGate: %v", err)
+		}
+		if !out.Acted || out.Action != delegation.ActionApprove {
+			t.Fatalf("outcome = %+v, want acted approve", out)
+		}
+		// The stage itself stays awaiting_approval: a delegated submission is
+		// recorded but never counts toward human quorum (#1709). What this
+		// control establishes is that the approve arm is REACHED and acts.
+		if countAudit(au, "approval_submitted") != 1 {
+			t.Errorf("approval_submitted entries = %d, want 1", countAudit(au, "approval_submitted"))
+		}
+	})
+
+	t.Run("a fired low ceiling produces NO auto-approve", func(t *testing.T) {
+		s, repo, au, runID := setup(t, autoDriveEscalationSpecYAML(autoDriveLowCeilingEscalation))
+		out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+		if err != nil {
+			t.Fatalf("AutoDriveRunGate: %v", err)
+		}
+		if out.Acted {
+			t.Fatalf("outcome = %+v, want NO action under a fired max_autonomy: low ceiling", out)
+		}
+		if n := countAudit(au, "approval_submitted"); n != 0 {
+			t.Errorf("approval_submitted entries = %d, want 0 — an approval was recorded through the ceiling", n)
+		}
+	})
+}
