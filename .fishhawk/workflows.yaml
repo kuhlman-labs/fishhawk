@@ -96,15 +96,14 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # `agent` only, deliberately NOT `author` (#2358). The ADR-055
-              # preset default is `not: [author, agent]`, restored here at the
-              # v1->v2 migration because the codemod reported these gates as
-              # WIDENED. But this repo is solo-developed: the sole gate member
-              # is also the operator who answers clarifications and attaches
-              # binding approval conditions, and doing either records them as a
-              # change actor — which made the gate unsatisfiable by anyone.
-              # `agent` is retained: no automated identity may satisfy a gate.
-              not: [agent]
+              # The ADR-055 preset default, restored now that #2358 landed.
+              # Operator gate participation — answering a clarification,
+              # attaching binding approval conditions, driving a stage — no
+              # longer counts as authorship, so `author` no longer makes this
+              # gate unsatisfiable by its sole member. It bites only where the
+              # run carries a real authorship signal (an operator-vouched
+              # commit). `agent` is an unconditional floor either way.
+              not: [author, agent]
       - id: implement
         type: implement
         executor:
@@ -185,15 +184,14 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # `agent` only, deliberately NOT `author` (#2358). The ADR-055
-              # preset default is `not: [author, agent]`, restored here at the
-              # v1->v2 migration because the codemod reported these gates as
-              # WIDENED. But this repo is solo-developed: the sole gate member
-              # is also the operator who answers clarifications and attaches
-              # binding approval conditions, and doing either records them as a
-              # change actor — which made the gate unsatisfiable by anyone.
-              # `agent` is retained: no automated identity may satisfy a gate.
-              not: [agent]
+              # The ADR-055 preset default, restored now that #2358 landed.
+              # Operator gate participation — answering a clarification,
+              # attaching binding approval conditions, driving a stage — no
+              # longer counts as authorship, so `author` no longer makes this
+              # gate unsatisfiable by its sole member. It bites only where the
+              # run carries a real authorship signal (an operator-vouched
+              # commit). `agent` is an unconditional floor either way.
+              not: [author, agent]
       # Runner-hosted advisory acceptance stage (ADR-049 / #1519, E31). It
       # rides the ordinary agent executor branch — never `delegate` (deploy-
       # only) — and carries no pre-flight deploy constraint or `deployment`
@@ -252,15 +250,14 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # `agent` only, deliberately NOT `author` (#2358). The ADR-055
-              # preset default is `not: [author, agent]`, restored here at the
-              # v1->v2 migration because the codemod reported these gates as
-              # WIDENED. But this repo is solo-developed: the sole gate member
-              # is also the operator who answers clarifications and attaches
-              # binding approval conditions, and doing either records them as a
-              # change actor — which made the gate unsatisfiable by anyone.
-              # `agent` is retained: no automated identity may satisfy a gate.
-              not: [agent]
+              # The ADR-055 preset default, restored now that #2358 landed.
+              # Operator gate participation — answering a clarification,
+              # attaching binding approval conditions, driving a stage — no
+              # longer counts as authorship, so `author` no longer makes this
+              # gate unsatisfiable by its sole member. It bites only where the
+              # run carries a real authorship signal (an operator-vouched
+              # commit). `agent` is an unconditional floor either way.
+              not: [author, agent]
   # High autonomy — agent implements and merges if gates pass.
   # Reserved for low-risk, high-volume work where the cost of a mistake
   # is contained and CI is a sufficient check.
@@ -351,12 +348,11 @@ workflows:
             approvals:
               count: 1
               members: [kuhlman-labs]
-              # `agent` only, deliberately NOT `author` (#2358). The ADR-055
-              # preset default is `not: [author, agent]`, restored here at the
-              # v1->v2 migration because the codemod reported these gates as
-              # WIDENED. But this repo is solo-developed: the sole gate member
-              # is also the operator who answers clarifications and attaches
-              # binding approval conditions, and doing either records them as a
-              # change actor — which made the gate unsatisfiable by anyone.
-              # `agent` is retained: no automated identity may satisfy a gate.
-              not: [agent]
+              # The ADR-055 preset default, restored now that #2358 landed.
+              # Operator gate participation — answering a clarification,
+              # attaching binding approval conditions, driving a stage — no
+              # longer counts as authorship, so `author` no longer makes this
+              # gate unsatisfiable by its sole member. It bites only where the
+              # run carries a real authorship signal (an operator-vouched
+              # commit). `agent` is an unconditional floor either way.
+              not: [author, agent]

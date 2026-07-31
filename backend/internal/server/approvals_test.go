@@ -5938,11 +5938,18 @@ func TestSubmitApproval_Quorum_AgentFloorIsUnconditional(t *testing.T) {
 	}
 }
 
-// TestSubmitApproval_LegacyGate_NoAuthorResolution pins that a gate carrying
-// NO approvals block keeps first-vote-advances byte-for-byte: neither the
-// authorship allow-list nor the `not:` reading engages, so even a subject the
-// run vouched as its change author advances the stage on the first vote.
-func TestSubmitApproval_LegacyGate_NoAuthorResolution(t *testing.T) {
+// TestSubmitApproval_LegacyGate_VouchedAuthorAdvancesFirstVote pins that a
+// gate carrying NO approvals block keeps first-vote-advances byte-for-byte:
+// the author-exclusion leg does not ENGAGE, so even a subject the run vouched
+// as its change author advances the stage on the first vote.
+//
+// Named for what it asserts. An earlier name claimed it pinned "no author
+// resolution", which it does not: the body observes behaviour, so it would
+// stay green if the legacy path resolved the author and then discarded the
+// result. That residue has no behavioural consequence — at worst one
+// redundant ListForRun on legacy gates — but a test must not promise an
+// internal-call property it never observes (#2358).
+func TestSubmitApproval_LegacyGate_VouchedAuthorAdvancesFirstVote(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	const author = "github:author"
 	legacySpec := []byte(`version: "1.0"
