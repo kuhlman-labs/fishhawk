@@ -52,27 +52,28 @@ sha256sum -c SHA256SUMS
 
 A passing verify means the file came from this repo's release workflow on this tag — no managed PGP key in the loop. See [ADR-009 / #75](https://github.com/kuhlman-labs/fishhawk/issues/75) for the broader supply-chain story.
 
-### 3. Export the environment
+### 3. Store a credential (secret-free registration)
+
+Mint a credential once with the CLI; it lands in the shared credential store (`credstore`, keyed by backend URL) that `fishhawk-mcp` reads at startup, so no bearer secret needs to live in your MCP client config:
 
 ```sh
-export FISHHAWK_API_TOKEN="<your token>"
-# Optional; defaults to http://localhost:8080.
+fishhawk token login --backend-url http://localhost:8080
+# Optional; only needed when the backend is not the localhost default.
 export FISHHAWK_BACKEND_URL="https://app.fishhawk.example.com"
 ```
 
-`FISHHAWK_API_TOKEN` is **required**. There is no "anonymous" mode — every tool round-trips the API and running unauthenticated would be a silent permission bug, not a developer convenience.
+The MCP server resolves its bearer through a three-rung ladder at startup: **`FISHHAWK_API_TOKEN` wins when set**; when empty, the credential stored for the resolved backend URL is used; when neither yields a usable token it **fails at startup** with a precise error naming `fishhawk token login` and the backend URL (not-found, empty-token, expired, and corrupt-store are four distinct messages). There is still no "anonymous" mode — every tool round-trips the API. If you would rather keep the token in the environment, `export FISHHAWK_API_TOKEN="<your token>"` before the next step and it takes precedence over the store.
 
 ### 4. Register with Claude Code
 
 ```sh
 claude mcp add fishhawk \
-  --env FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
   --env FISHHAWK_BACKEND_URL=$FISHHAWK_BACKEND_URL \
   --env FISHHAWK_RUNNER_BIN=/usr/local/bin/fishhawk-runner \
   -- /usr/local/bin/fishhawk-mcp
 ```
 
-`--` separates Claude Code's flags from the binary path. The exact flag shape varies by Claude Code version — `claude mcp add --help` is authoritative. Some clients prefer a config file path; some take env vars inline.
+`--` separates Claude Code's flags from the binary path. The exact flag shape varies by Claude Code version — `claude mcp add --help` is authoritative. Some clients prefer a config file path; some take env vars inline. With a stored credential there is **no `--env FISHHAWK_API_TOKEN`** to pass — add one only if you chose the environment-token path in step 3.
 
 `FISHHAWK_RUNNER_BIN` is required only when `fishhawk-runner` is not in system PATH and not co-located with `fishhawk-mcp`. When both binaries live in the same directory, the MCP server resolves `fishhawk-runner` automatically via its sibling-binary probe (`os.Executable` + `filepath.Dir`).
 
@@ -162,7 +163,10 @@ Cancellation: cancelling the `fishhawk_run_stage` tool call sends `SIGTERM` to t
 
 | Symptom | Likely cause |
 |---|---|
-| `FISHHAWK_API_TOKEN is required` on startup | The env var is unset or empty. Set it (see step 3). |
+| `no Fishhawk credential stored for <url>` on startup | Neither `FISHHAWK_API_TOKEN` nor a stored credential is present for the resolved backend URL. Run `fishhawk token login --backend-url <url>` (step 3), or set `FISHHAWK_API_TOKEN`. |
+| `the stored Fishhawk credential for <url> has an empty token` on startup | The credential store holds a truncated record. Re-run `fishhawk token login --backend-url <url>`. |
+| `the stored Fishhawk credential for <url> expired at …` on startup | The stored credential's `expires_at` is in the past. Re-run `fishhawk token login --backend-url <url>` (v0 tokens do not expire, so a nil expiry never triggers this). |
+| `cannot read the Fishhawk credential store for <url>` on startup | The store file is corrupt/unreadable. Fix or remove `~/.config/fishhawk/credentials` (path named in the error), then re-run `fishhawk token login`, or set `FISHHAWK_API_TOKEN`. |
 | Claude Code says the tool isn't available | The MCP add step didn't take. Re-run `claude mcp add fishhawk` and verify with `claude mcp list`. After rebuilding the binary, restart Claude Code so it re-spawns the MCP subprocess. |
 | `fishhawk: HTTP 401 (...)` from any tool | Token expired or invalid. Reissue via the backend's API-token surface. |
 | `fishhawk: HTTP 403 (insufficient_scope)` from a write tool | The token doesn't carry the required write scope (see the Write tools table). Reissue with `--scopes` including the right write scopes. |

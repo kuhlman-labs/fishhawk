@@ -146,6 +146,23 @@ updates:
       prefix: deps(redaction)
       include: scope
 
+  # Credstore Go module. No direct dependencies today — see /pricing.
+  - package-ecosystem: gomod
+    directory: /credstore
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    labels:
+      - type:chore
+      - area:backend
+      - autonomy:high
+    commit-message:
+      prefix: deps(credstore)
+      include: scope
+
   # Verifier Go module.
   - package-ecosystem: gomod
     directory: /verifier

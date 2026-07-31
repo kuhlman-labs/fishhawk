@@ -29,15 +29,14 @@ The child connection sits behind a small `childTransport` seam so a later phase 
 **One-time operator re-registration (required).** To move a live session off the manual-reconnect treadmill you must re-point the harness's `fishhawk` MCP server entry at the shim **instead of** `fishhawk-mcp` — a one-time step per host. If a plain `fishhawk-mcp` entry already exists, remove it and re-add pointed at the shim binary:
 
 ```sh
+fishhawk token login --backend-url http://localhost:8080   # mint a credential once
 claude mcp remove fishhawk    # drop the existing plain fishhawk-mcp entry, if any
-claude mcp add fishhawk \
-  -e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN \
-  -- /path/to/bin/fishhawk-mcp-shim
+claude mcp add fishhawk -- /path/to/bin/fishhawk-mcp-shim
 ```
 
-The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — the binary path given positionally after the `--` separator, with the token wired through `-e`/`--env` — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed. Run `/mcp` once after re-registering so the session picks up the shim; from then on child rebuilds hot-swap with no further `/mcp`.
+The registration mirrors the sibling [`fishhawk-mcp`](../fishhawk-mcp/README.md#install-operators) form — the binary path given positionally after the `--` separator — just pointed at the shim binary. With the standard `bin/` layout no `--child` flag is needed. Run `/mcp` once after re-registering so the session picks up the shim; from then on child rebuilds hot-swap with no further `/mcp`.
 
-The shim adds no auth of its own: it passes `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` straight through to the child, so the child needs them in its environment. Wire `FISHHAWK_API_TOKEN` via `--env` as above (and `FISHHAWK_BACKEND_URL` too when it is not the default `http://localhost:8080`).
+The shim passes env through unchanged: it adds no auth of its own and forwards `FISHHAWK_API_TOKEN` / `FISHHAWK_BACKEND_URL` straight to the child. With a **stored credential** (`fishhawk token login`) there is no `--env FISHHAWK_API_TOKEN` to pass — the child resolves the bearer from the shared [`credstore`](../../../credstore/README.md) at startup. If you would rather keep the token in the environment, wire it with `-e FISHHAWK_API_TOKEN=$FISHHAWK_API_TOKEN` on the `claude mcp add` line above (and `FISHHAWK_BACKEND_URL` too when it is not the default `http://localhost:8080`); an explicit env token wins over the store.
 
 ### `scripts/dev` integration
 

@@ -33,9 +33,11 @@ COPY verifier/go.mod verifier/go.sum ./verifier/
 # present here or the download fails with `cannot load module ../directory`
 # (AGENTS.md "Adding a Go module"; the #733/#672 red-main break).
 COPY directory/go.mod directory/go.sum ./directory/
-# pricing and redaction have no external imports, so no go.sum exists to copy.
+# pricing, redaction, and credstore have no external imports, so no go.sum
+# exists to copy.
 COPY pricing/go.mod ./pricing/
 COPY redaction/go.mod ./redaction/
+COPY credstore/go.mod ./credstore/
 
 # Pre-download deps. With a populated cache, source-only changes
 # avoid re-resolving the module graph.
@@ -52,6 +54,7 @@ COPY verifier ./verifier
 COPY directory ./directory
 COPY pricing ./pricing
 COPY redaction ./redaction
+COPY credstore ./credstore
 
 ARG VERSION=dev
 # GIT_SHA defaults to "unknown" so builds that don't pass it (today: the

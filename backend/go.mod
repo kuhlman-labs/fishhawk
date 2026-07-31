@@ -15,6 +15,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jackc/puddle/v2 v2.2.2
+	github.com/kuhlman-labs/fishhawk/credstore v0.0.0
 	github.com/kuhlman-labs/fishhawk/directory v0.0.0
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20260606222916-3bdc667bf430
 	github.com/kuhlman-labs/fishhawk/redaction v0.0.0-20260622095901-47e0c4255798
@@ -109,7 +110,10 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 )
 
-// The directory plane ships in this repo and has no upstream tag yet, so it
-// resolves from the filesystem rather than a pseudo-version. A
-// filesystem-replaced module records no go.sum entries by design.
+// The directory plane and credstore both ship in this repo and have no
+// upstream tag yet, so each resolves from the filesystem rather than a
+// pseudo-version. A filesystem-replaced module records no go.sum entries by
+// design.
 replace github.com/kuhlman-labs/fishhawk/directory => ../directory
+
+replace github.com/kuhlman-labs/fishhawk/credstore => ../credstore
