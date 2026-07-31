@@ -35,6 +35,39 @@ workflows:
     # the medium autonomy preset per METHODOLOGY.md — approve/fixup/retry
     # delegated under their named conditions; waive and merge stay human.
     autonomy: medium
+    # Per-path escalations (E53.4 / #2227), declared now that #2374 closed the
+    # fail-open window that made declaring them premature.
+    #
+    # This is docs/METHODOLOGY.md's low-autonomy surface list, converted from a
+    # commitment in Markdown into a control the product enforces: the workflow
+    # spec parser and validator, the audit-log integrity layer, the policy
+    # engine, and the auth / GitHub App surfaces. A change touching any of them
+    # clamps agent autonomy to `low`, so no action class resolves to `auto` for
+    # that change — the agent may not self-approve, self-fixup or self-retry
+    # its way through a gate on this repository's most load-bearing code.
+    #
+    # `max_autonomy` ONLY, deliberately no `approvals` raise. Raising the count
+    # to 2 would be honest about intent and dishonest about capability: this
+    # repository has ONE eligible approver, so a count of 2 is unsatisfiable
+    # and every escalated run would wedge at a gate no one can clear. A control
+    # that cannot be satisfied is not a stricter control, it is an outage. When
+    # a second approver exists, add `approvals: {count: 2}` here.
+    #
+    # `match.paths` is evaluated against the approved plan's scope.files at the
+    # approval gate, which works here because feature_change declares a plan
+    # stage. It would NOT work on this repo's other three workflows (#2382).
+    escalations:
+      - match:
+          paths:
+            - "backend/internal/spec/**"
+            - "cli/internal/spec/**"
+            - "backend/internal/audit/**"
+            - "backend/internal/policy/**"
+            - "backend/internal/auth/**"
+            - "backend/internal/githubapp/**"
+            - "verifier/**"
+        require:
+          max_autonomy: low
     policy:
       max_stage_runtime: "30m"
     # Periodic cost ceiling (ADR-030 / #688). Advisory — emits a
@@ -288,22 +321,16 @@ workflows:
     # control working, and the fix is amending this file, not reaching for
     # --applies-to-override (#2364) out of habit.
     #
-    # `paths` mirrors the implement stage's existing allowed_paths below, and
-    # is NOT enforced today: the `paths` criterion is deferred to the plan
-    # gate, routine_change has no plan stage, and nothing else evaluates it
-    # (#2377). It is declared as reviewable intent and becomes enforcement
-    # when #2377 closes. Until then the envelope is held post-hoc by
-    # allowed_paths, which catches a violation after the agent has run rather
-    # than refusing it at routing. Do not read this line as routing-time
-    # containment.
+    # NO `paths` here, deliberately. #2377 resolved the question the earlier
+    # declaration left open: a `paths` criterion is evaluated at the plan gate,
+    # routine_change declares no plan stage, so it could never be evaluated —
+    # and it is now REFUSED at spec validation rather than silently inert. The
+    # path envelope for this workflow is the implement stage's allowed_paths
+    # below, which is a post-hoc diff constraint: it catches a violation after
+    # the agent has run rather than refusing it at routing. That is a real
+    # control, and it is the accurate description of it.
     applies_to:
       labels: ["type:chore"]
-      paths:
-        - "docs/**"
-        - "**/*.md"
-        - "go.mod"
-        - "go.sum"
-        - "**/*_test.go"
     description: >-
       Workflow for documentation, dependency bumps, lint/format fixes, and tests for existing behavior. Agent may merge if all gates pass.
     # High-autonomy auto-retry (#276). Routine_change is the
