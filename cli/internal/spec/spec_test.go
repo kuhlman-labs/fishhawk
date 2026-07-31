@@ -2409,6 +2409,258 @@ func TestAppliesToChangeKindMessageParity(t *testing.T) {
 	}
 }
 
+// --- applies_to paths on a plan-less workflow (E53.15 / #2377) ---
+//
+// `fishhawk validate` and `fishhawk doctor` both route through ValidateBytes,
+// so the backend's plan-stage rule is mirrored here and each case below
+// crosses the schema layer, the v2 reuse resolver and the semantic sweep end
+// to end. The rule is UNCONDITIONAL: no other control admits a `paths`
+// declaration on a workflow that ships no plan.
+
+// planStageMsgFragment is the distinctive opening of the plan-stage rejection,
+// used by the two ORDER tests to assert the message is ABSENT. A pointer
+// substring will not do: the shared predicate's own malformed-glob message
+// carries `/applies_to/paths/0`, so matching on the pointer would report a
+// plan-stage error that was never raised.
+const planStageMsgFragment = "but no plan stage"
+
+// appliesToPlanlessCLIDoc renders a minimal v2 document whose single workflow
+// carries the given `applies_to` YAML block (already indented four spaces)
+// and declares implement + review stages but NO plan stage.
+func appliesToPlanlessCLIDoc(appliesTo string) []byte {
+	return []byte(`
+version: "2"
+workflows:
+  docs_change:
+` + appliesTo + `
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+      - id: review
+        type: review
+        executor:
+          human: true
+`)
+}
+
+// TestValidateBytes_AppliesTo_PathsNoPlanStage_Rejected is case (a): the
+// refusal at the exact pointer, asserted against the shipped constant.
+func TestValidateBytes_AppliesTo_PathsNoPlanStage_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(appliesToPlanlessCLIDoc(`    applies_to:
+      paths:
+        - "docs/**"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for applies_to.paths on a plan-less workflow", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/applies_to/paths") {
+		t.Errorf("error = %q, want it to name /workflows/docs_change/applies_to/paths", msg)
+	}
+	if want := fmt.Sprintf(spec.MsgFmtAppliesToPathsNoPlanStage, "docs_change"); !strings.Contains(msg, want) {
+		t.Errorf("error = %q, want it to carry the shipped rendering %q", msg, want)
+	}
+}
+
+// TestValidateBytes_AppliesTo_PathsNoPlanStage_MessageNamesFixes is case (b):
+// the message names the workflow, the reason and both real alternatives.
+func TestValidateBytes_AppliesTo_PathsNoPlanStage_MessageNamesFixes(t *testing.T) {
+	msg := fmt.Sprintf(spec.MsgFmtAppliesToPathsNoPlanStage, "routine_change")
+	for _, want := range []string{
+		"routine_change",
+		"plan stage",
+		"labels",
+		"trigger",
+		"constraints.allowed_paths",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, want it to name %q", msg, want)
+		}
+	}
+}
+
+// TestValidateBytes_AppliesTo_PathsWithPlanStage_Accepted is case (c), the
+// POSITIVE CONTROL: the identical declaration on a plan-BEARING workflow
+// validates clean.
+func TestValidateBytes_AppliesTo_PathsWithPlanStage_Accepted(t *testing.T) {
+	if err := spec.ValidateBytes(appliesToCLIDoc(`    applies_to:
+      paths:
+        - "docs/**"`)); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil for paths on a plan-bearing workflow", err)
+	}
+}
+
+// TestValidateBytes_AppliesTo_PlanlessPathIndependentCriteriaAccepted is
+// cases (d), (e) and (i): `labels` alone, `trigger` alone and no declaration
+// at all stay valid on a plan-less workflow — the routing controls this
+// repository's three plan-less workflows actually rely on.
+func TestValidateBytes_AppliesTo_PlanlessPathIndependentCriteriaAccepted(t *testing.T) {
+	cases := []struct {
+		name      string
+		appliesTo string
+	}{
+		{name: "labels only", appliesTo: `    applies_to:
+      labels:
+        - "type:chore"`},
+		{name: "trigger only", appliesTo: `    applies_to:
+      trigger:
+        - scheduled`},
+		{name: "no applies_to at all", appliesTo: `    description: "accepts any change"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := spec.ValidateBytes(appliesToPlanlessCLIDoc(tc.appliesTo)); err != nil {
+				t.Errorf("ValidateBytes = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_AppliesTo_PlanlessLabelsPlusPaths_Rejected is case (f):
+// the rule keys on the presence of `paths`, not on its exclusivity.
+func TestValidateBytes_AppliesTo_PlanlessLabelsPlusPaths_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(appliesToPlanlessCLIDoc(`    applies_to:
+      labels:
+        - "type:chore"
+      paths:
+        - "docs/**"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError; labels alongside paths must not admit the declaration", err)
+	}
+	if !strings.Contains(err.Error(), "/workflows/docs_change/applies_to/paths") {
+		t.Errorf("error = %q, want it to name /workflows/docs_change/applies_to/paths", err.Error())
+	}
+}
+
+// TestValidateBytes_AppliesTo_ChangeKindWinsOverNoPlanStage is case (g), the
+// rung-1 order contract mirrored: change_kind reports first.
+func TestValidateBytes_AppliesTo_ChangeKindWinsOverNoPlanStage(t *testing.T) {
+	err := spec.ValidateBytes(appliesToPlanlessCLIDoc(`    applies_to:
+      change_kind:
+        - refactor
+      paths:
+        - "docs/**"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, spec.MsgAppliesToChangeKindUnsupported) {
+		t.Errorf("error = %q, want the change_kind rejection to win over the plan-stage rule", msg)
+	}
+	if strings.Contains(msg, planStageMsgFragment) {
+		t.Errorf("error = %q, want no plan-stage error alongside it; rung 1 returns", msg)
+	}
+}
+
+// TestValidateBytes_AppliesTo_MalformedGlobWinsOverNoPlanStage is case (h),
+// the rung-2 order contract mirrored: the shared predicate grammar error wins,
+// proving rung 3 runs last.
+func TestValidateBytes_AppliesTo_MalformedGlobWinsOverNoPlanStage(t *testing.T) {
+	err := spec.ValidateBytes(appliesToPlanlessCLIDoc(`    applies_to:
+      paths:
+        - "docs/[unclosed"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "docs/[unclosed") {
+		t.Errorf("error = %q, want the malformed-glob diagnosis naming the offending glob", msg)
+	}
+	if strings.Contains(msg, planStageMsgFragment) {
+		t.Errorf("error = %q, want no plan-stage error alongside it; rung 2 returns", msg)
+	}
+}
+
+// TestValidateBytes_AppliesTo_PathsWithInheritedPlanStage_Accepted is case
+// (j), which doubles as the reuse-resolution seam test: the sweep runs AFTER
+// `extends` folds stages, so a workflow whose only plan stage is inherited
+// does produce a scope.files set and its `paths` declaration is evaluable.
+func TestValidateBytes_AppliesTo_PathsWithInheritedPlanStage_Accepted(t *testing.T) {
+	if err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+  derived:
+    extends: base
+    applies_to:
+      paths:
+        - "docs/**"
+`)); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil; the inherited plan stage makes paths evaluable", err)
+	}
+}
+
+// TestValidateBytes_AppliesTo_PlanlessBaseAttribution is case (k): a
+// plan-less BASE declaring `paths` is reported against the base and never
+// against the deriving workflow.
+func TestValidateBytes_AppliesTo_PlanlessBaseAttribution(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    applies_to:
+      paths:
+        - "docs/**"
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+  derived:
+    extends: base
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError naming the base's applies_to", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/base/applies_to/paths") {
+		t.Errorf("error = %q, want it reported against the declaring workflow (base)", msg)
+	}
+	if strings.Contains(msg, "/workflows/derived/applies_to") {
+		t.Errorf("error = %q, want no applies_to error against derived; extends folds stages only", msg)
+	}
+}
+
+// TestAppliesToPathsNoPlanStageMessageParity is the MECHANICAL drift guard for
+// the plan-stage message, modelled on TestAppliesToChangeKindMessageParity.
+// The two spec packages live in separate Go modules and the CLI cannot import
+// backend/internal/spec, so a source read over the repo root is the only
+// cross-module guard available.
+func TestAppliesToPathsNoPlanStageMessageParity(t *testing.T) {
+	want := `const MsgFmtAppliesToPathsNoPlanStage = ` + strconv.Quote(spec.MsgFmtAppliesToPathsNoPlanStage)
+	for _, path := range []string{
+		"../../../backend/internal/spec/validate.go",
+		"../../../cli/internal/spec/validate.go",
+	} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(src), want) {
+			t.Errorf("%s does not declare the applies_to plan-stage message verbatim;\nwant the line: %s\n"+
+				"The two modules cannot share a constant, so the backend and CLI copies must stay byte-identical or `fishhawk validate` and the backend will report different text for the same spec error.", path, want)
+		}
+	}
+}
+
 // --- escalations (E53.4 / #2227) ---
 //
 // `fishhawk validate` must not accept a spec the backend refuses at dispatch,

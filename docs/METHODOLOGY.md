@@ -215,9 +215,9 @@ The autonomy tiers are a mix of controls the product **enforces** and commitment
 - `permissions.write` and `permissions.shell` — **declared, audited and surfaced, NOT enforced anywhere, until E51 (#2133)** (tracked to removal by #2376).
 - `permissions.network` on **every stage other than an acceptance stage** — a declaration only, until E51 (#2133). The run-status per-entry `enforced` flag encodes exactly this split: true only for an acceptance stage's network declaration.
 
-**3. Enforced only where a plan stage exists.**
+**3. Declarable only where a plan stage exists.**
 
-- `applies_to`'s `paths` criterion is evaluated at the plan gate against the plan's `scope.files`, so it is **inert on a workflow that declares no plan stage** — no `scope.files` producer exists for it. Of this repository's four workflows only `feature_change` declares a plan stage, so `paths` is evaluable on one of the four; `labels` / `trigger` are what hold on the other three (#2377).
+- `applies_to`'s `paths` criterion is evaluated at the plan gate against the plan's `scope.files`, so on a workflow that declares no plan stage it could never be evaluated — no `scope.files` producer exists for it. Rather than admit a control that silently does nothing, both the backend and `fishhawk validate` **refuse the declaration at authoring time** (E53.15 / #2377). Of this repository's four workflows only `feature_change` declares a plan stage, so `paths` is declarable on one of the four; `labels` / `trigger` are what hold on the other three, and a stage's post-hoc `constraints.allowed_paths` is the path envelope available to them.
 
 **4. Still a commitment.**
 
