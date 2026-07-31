@@ -49,6 +49,33 @@ workflows:
     on_ci_failure:
       max_retries: 1
 
+    # --- Optional control-surface starters (commented; adapt then uncomment) ---
+    #
+    # applies_to declares which changes this workflow may be used for. A
+    # run whose change does not match is refused before any work begins.
+    # `labels` and `trigger` are checked at run admission; `paths` is
+    # checked later, at the plan gate, so a `paths` rule does nothing on a
+    # workflow that declares no plan stage. To confine by path, keep a plan
+    # stage. Uncomment and adapt:
+    # fishhawk:starter-begin applies_to
+    # applies_to:
+    #   labels: ["type:chore"]
+    #   paths: ["docs/**"]
+    # fishhawk:starter-end applies_to
+    #
+    # escalations raise the bar for a matching change — a higher approval
+    # count, an added membership group, a stricter permission, a lower
+    # autonomy ceiling. An escalation may only ever raise, never lower; one
+    # that would change nothing is refused. Uncomment and adapt:
+    # fishhawk:starter-begin escalations
+    # escalations:
+    #   - match:
+    #       paths: ["infra/**"]
+    #     require:
+    #       approvals:
+    #         count: 2
+    # fishhawk:starter-end escalations
+
     stages:
       - id: plan
         type: plan

@@ -130,6 +130,40 @@ explicitly instead. See [the migration doc](workflow-migration.md).
 The repo's own `.fishhawk/workflows.yaml` is intentionally NOT a preset
 mirror: it keeps `@kuhlman-labs` and `scripts/test verify`.
 
+### Commented control-surface starters
+
+Each preset ships two **commented** control-surface starters under the
+`feature_change` workflow key — an `applies_to` block and an `escalations`
+block — as adapt-then-uncomment shapes:
+
+- **`applies_to`** — the routing predicate declaring which changes a
+  workflow may be used for. The comment notes that `labels` / `trigger`
+  are refused at run admission while `paths` is checked at the plan gate,
+  so a `paths` rule does nothing on a workflow with no plan stage.
+- **`escalations`** — the per-path control that raises the bar for a
+  matching change. The comment notes that an escalation may only ever
+  raise, never lower.
+
+They ship **commented, not live**, for the reason a live one would fail
+the operator it was meant to help: a live `applies_to` would refuse a
+fresh repo's first run against the very workflow `fishhawk init` just
+wrote, and a live `escalations` block would assert a policy the adopting
+operator never chose. They are part of the **byte-identical shared base**
+(see the lockstep invariant above), so an operator editing one preset's
+starter must not expect the other two to diverge — the starter prose
+carries no tier-specific wording.
+
+Two invariants hold, both machine-enforced on both module sides by
+`TestShippedPresetsCarryControlSurfaceStarters`: the two starters must be
+**present and commented** (a live `applies_to:` / `escalations:` key
+fails), and each starter's shape must still **parse and validate when
+uncommented** — the test extracts the block between its
+`fishhawk:starter-begin` / `-end` sentinels, uncomments it
+programmatically, and runs it through the real validator, so a starter
+that drifted out of schema fails the build here rather than the first
+operator who uncomments it. A YAML comment is discarded at parse, so
+nothing else would catch it.
+
 ### Placeholder value every operator must replace
 
 One value is a generic placeholder a freshly-scaffolded repo must fill in

@@ -332,6 +332,92 @@ func TestPresetApprovalsGateHandleFree(t *testing.T) {
 	}
 }
 
+// --- control-surface starters (E53.6 capstone) -------------------------------
+
+// uncommentStarters returns the preset text with the two COMMENTED
+// control-surface starter blocks (the lines strictly between each
+// `fishhawk:starter-begin`/`-end` sentinel) uncommented in place, so the
+// shipped starter SHAPES can be run through the real validator. The
+// sentinel lines themselves stay comments. This is what proves a shipped
+// starter is not merely present but still parses and validates: comments
+// are discarded at parse, so nothing else would catch a starter that
+// drifted out of schema.
+func uncommentStarters(text string) string {
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+	in := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "# fishhawk:starter-begin"):
+			in = true
+			out = append(out, line)
+		case strings.HasPrefix(trimmed, "# fishhawk:starter-end"):
+			in = false
+			out = append(out, line)
+		case in:
+			out = append(out, strings.Replace(line, "# ", "", 1))
+		default:
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// TestShippedPresetsCarryControlSurfaceStarters is the done-means for the
+// E53.6 capstone's preset half, mirrored on the backend embed so BOTH
+// mirror sets are held to it. One assertion per named failure mode: every
+// shipped preset carries the two COMMENTED control-surface starter blocks
+// (applies_to and escalations); the starters stay INERT (never a live
+// key); and — per the operator's binding condition that a commented
+// starter nothing validates is unacceptable — the starter shapes still
+// parse and validate (ParseBytes: schema + semantic, incl. the escalation
+// only-raise check) when uncommented, so a starter drifted out of schema
+// fails the build here rather than the first operator who uncomments it.
+// A comment-only / no-op touch of a preset path fails (a) or (b).
+func TestShippedPresetsCarryControlSurfaceStarters(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			text := string(presetText(t, p))
+
+			// (a) the commented applies_to starter is present.
+			if !strings.Contains(text, "# fishhawk:starter-begin applies_to") {
+				t.Errorf("preset %q is missing the commented applies_to starter block:\n%s", p, text)
+			}
+			// (b) the commented escalations starter is present.
+			if !strings.Contains(text, "# fishhawk:starter-begin escalations") {
+				t.Errorf("preset %q is missing the commented escalations starter block:\n%s", p, text)
+			}
+			// (c) the starters stay INERT: no line, trimmed of leading
+			// whitespace, begins with a LIVE applies_to:/escalations: key.
+			// A future edit that uncomments one fails here rather than
+			// silently shipping a routing/escalation policy into every
+			// scaffolded repo.
+			for i, line := range strings.Split(text, "\n") {
+				tl := strings.TrimSpace(line)
+				if strings.HasPrefix(tl, "applies_to:") || strings.HasPrefix(tl, "escalations:") {
+					t.Errorf("preset %q line %d ships a LIVE control-surface key, want it commented: %s", p, i+1, line)
+				}
+			}
+			// (d) the shipped preset validates, AND the starter shapes
+			// validate once uncommented (CONDITION 2(a)): comments are
+			// discarded at parse, so this is the only machine check of the
+			// starter shape.
+			if _, err := ParseBytes([]byte(text)); err != nil {
+				t.Fatalf("shipped preset %q does not validate: %v", p, err)
+			}
+			uc := uncommentStarters(text)
+			if !strings.Contains(uc, "\n    applies_to:\n") || !strings.Contains(uc, "\n    escalations:\n") {
+				t.Fatalf("preset %q uncomment did not surface both starter keys — the sentinels did not match:\n%s", p, uc)
+			}
+			if _, err := ParseBytes([]byte(uc)); err != nil {
+				t.Fatalf("preset %q starter shapes do not validate once uncommented: %v\n%s", p, err, uc)
+			}
+		})
+	}
+}
+
 // TestPresetBytesUnknown covers the unknown-preset error branch.
 func TestPresetBytesUnknown(t *testing.T) {
 	if _, err := PresetBytes(Preset("bogus")); err == nil {

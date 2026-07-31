@@ -27,7 +27,9 @@ This is a methodology commitment, not a marketing line. The honest version of "b
 
 ## Autonomy tiers
 
-The tiers describe how Fishhawk's own changes are produced. They are not a feature of the product; they are a commitment about how this codebase is developed.
+The tiers describe how Fishhawk's own changes are produced. They are not a feature of the product; they are a commitment about how this codebase is developed — and each tier is **declared in the workflow spec** as `autonomy: low | medium | high` (ADR-066 / #2222).
+
+Read each tier as **two halves on different footing**. The *delegation* half — what an agent may do at that tier — is **enforced**: unified autonomy resolution expands the tier to an action matrix and re-evaluates each delegated action's condition against run state at action time (detailed under [Autonomy tiers in the workflow spec](#autonomy-tiers-in-the-workflow-spec)). The *surface* half — which **kinds of change** belong at which tier — is a commitment enforced only where a workflow **declares** the control that carries it: `applies_to` for routing a change to the right workflow, `escalations` for raising the bar on a sensitive path. Each list below is annotated with that control. The low-autonomy list is the case where the mechanism exists but this repository has **not** yet declared it — [the escalations section](#per-path-escalations-the-mechanism-and-why-this-repository-has-not-declared-it) states why, and [What is enforced, and what is still a commitment](#what-is-enforced-and-what-is-still-a-commitment) gives the per-control split in full.
 
 ### Low autonomy (human-led)
 
@@ -42,6 +44,8 @@ Applies to:
 - GitHub App authentication flow
 - Anything else where a subtle bug has catastrophic consequences
 
+**Carried by `escalations`** — the control that would raise the approval count, add a `member_of` group, tighten `min_permission` and clamp `max_autonomy` on these paths. The mechanism is shipped and tested (#2227), but **this repository declares no escalations today**, so this list is still a *commitment* rather than an enforced control (see [Per-path escalations](#per-path-escalations-the-mechanism-and-why-this-repository-has-not-declared-it) for why).
+
 ### Medium autonomy (agent-implements, human-approves)
 
 Agents implement the change end to end under a Fishhawk workflow run. A human approves the plan before implementation begins, and a human approves the resulting PR before merge. The agent does not merge.
@@ -54,6 +58,8 @@ Applies to:
 - The runner action (most of it; the cryptographic surface stays low-autonomy)
 - Most product feature work
 
+**Carried by** the workflow's declared `autonomy: medium` (enforced delegation — the agent implements, the human approves plan and PR) plus `applies_to` routing where a workflow declares it.
+
 ### High autonomy (agent-implements, agent-merges)
 
 Agents implement the change end to end under a Fishhawk workflow run, and the workflow permits the agent to merge if all gates pass. A human is still on the hook as the named approver of the workflow that allowed the merge — accountability does not disappear, it moves up a level.
@@ -65,6 +71,8 @@ Applies to:
 - Dependency bumps that pass CI
 - Internal tooling
 - Lint and format fixes
+
+**Carried by** `autonomy: high` (enforced delegation, including agent merge on the `gates_resolved_ci_green` condition) plus `applies_to` routing where declared — e.g. `applies_to: {paths: ["docs/**"]}` on a docs workflow, which a run touching the parser cannot satisfy.
 
 ---
 
@@ -171,11 +179,81 @@ governance file), or use the audited override for the single run.
 Downgrading enforcement to warn-only was considered and rejected in
 ADR-066 — a routing control nobody is refused by is a comment.
 
-The trust boundary is worth stating plainly, because a governance control
-that oversells itself is worse than one that doesn't exist: labels are
-fetched by the caller and shipped inline on the create request, so
-`applies_to` prevents **misrouting**, not a determined authorized caller.
-Server-side label fetching is the named hardening path.
+**The trust boundary differs by admission path**, and a governance control
+that oversells itself is worse than one that doesn't exist — so state it
+per path rather than as one caveat over both. On `POST /v0/runs` the issue
+labels are fetched by the caller and shipped inline on the create request,
+so *there* `applies_to` prevents **misrouting**, not a determined
+authorized caller; server-side label fetching is the named hardening path
+for the API. The **webhook** dispatch path (`issues.labeled`,
+`/fishhawk run`) is stronger: it evaluates the same `labels` / `trigger`
+predicate against the **forge-authoritative** `issue.labels[]` on the
+event payload — the forge's own view of the issue, not a caller
+attestation — and refuses fail-closed before creating any run row
+(#2361). A webhook trigger carries **no `applies_to_override`**: the event
+carries no operator request, so the audited override exists **only** on
+`POST /v0/runs`, and the webhook refusal instead names amending the
+declaration or re-starting the run through the API.
+
+---
+
+## What is enforced, and what is still a commitment
+
+The autonomy tiers are a mix of controls the product **enforces** and commitments this repository has **declared but not yet wired to a seam**. Stating that split per control — rather than as one "enforced" or "aspirational" verdict over the whole block — is the capstone's job. This is the same account, in the same words, as the [control-surface table](spec/workflow-v2.md#control-surface-what-is-enforced-and-where) in the workflow-v2 reference; the two are written to be read against each other. No sentence here claims a guarantee stronger than the seam behind it (`BRAND_FOUNDATIONS.md` §5 governs the wording).
+
+**1. Enforced.**
+
+- `reviewers.authority` — a declared authority (`advisory` / `gating`) wins over the ADR-027 count-derived reading at the review gate.
+- `applies_to` `labels` / `trigger` — admission-time routing, evaluated at **both** `POST /v0/runs` and the webhook dispatch path through one shared evaluation core, fail-closed.
+- Approval quorum, membership and permission predicates on the gate's `approvals` block.
+- Unified autonomy resolution — the tier expands to an action matrix and each delegated action's condition is re-evaluated against current run state at action time.
+- The escalation **mechanism**, **wherever a workflow declares it** — the approval gate raises the count, the membership conjunction and the minimum permission; delegation resolution applies the `max_autonomy` clamp.
+- `permissions.network` on an agent-executor **acceptance** stage, where it normalizes into `egress` and the runner's default-deny proxy applies it — the pre-existing ADR-050 control.
+
+**2. Declared but not enforced.**
+
+- `permissions.write` and `permissions.shell` — **declared, audited and surfaced, NOT enforced anywhere, until E51 (#2133)** (tracked to removal by #2376).
+- `permissions.network` on **every stage other than an acceptance stage** — a declaration only, until E51 (#2133). The run-status per-entry `enforced` flag encodes exactly this split: true only for an acceptance stage's network declaration.
+
+**3. Enforced only where a plan stage exists.**
+
+- `applies_to`'s `paths` criterion is evaluated at the plan gate against the plan's `scope.files`, so it is **inert on a workflow that declares no plan stage** — no `scope.files` producer exists for it. Of this repository's four workflows only `feature_change` declares a plan stage, so `paths` is evaluable on one of the four; `labels` / `trigger` are what hold on the other three (#2377).
+
+**4. Still a commitment.**
+
+- The low-autonomy surface list — the spec parser and validator, the audit-log integrity layer, the policy engine, anything cryptographic, the GitHub App auth flow — is a *commitment*, not an enforced control, until `escalations` are declared on those paths. The next section states why the declaration is not yet in place.
+
+---
+
+## Per-path escalations (the mechanism, and why this repository has not declared it)
+
+`escalations` is the control that would carry the low-autonomy surface list. Each entry pairs a `match` predicate with a `require` block that **raises** the bar for a matching change: a higher approval `count`, an added `member_of` group (a *conjunction* — an approver must belong to every composed group), a stricter `min_permission`, and a `max_autonomy` ceiling applied **last**, over the fully-resolved action matrix, after tier expansion and after every explicit `actions` override. Composition across several matching escalations is the strictest per dimension — max count, sorted union of groups, strictest permission, lowest tier — and therefore **order-independent**. An escalation may only ever **raise**; a declaration that would change nothing is refused at parse time.
+
+The mechanism is **shipped and tested** (E53.4 / #2227). What has **not** happened is a declaration on the real paths in this repository — its crypto, policy-engine and audit-integrity surfaces. This repository declares **no escalations today**, and the reason is specific: **#2374**, an open **fail-open window** on the `fetchApprovalsForStage` error path, where a firing count-only escalation is evaluated against a nil baseline and discards the baseline's `member_of` conjunction. That window is one I introduced in the enforcement seam, and the deliberate choice was **not to ship a declaration in front of it**: declaring an escalation on the crypto and audit-integrity paths while that path can silently drop a membership requirement would advertise a guarantee known to be conditional. Closing #2374 is the precondition; the declaration follows it, not the other way round.
+
+This is a gap in *declaration*, not in *mechanism*, and it is stated flatly rather than softened: no escalation has been declared on a sensitive path in this repository, and none should read as if one had.
+
+---
+
+## Dogfood record
+
+What has actually been demonstrated live against a running backend, with dates. This section is the honest treatment of the E53 capstone's two demonstration criteria: one was met, one was not, and both are recorded as such — neither faked, neither hedged.
+
+**2026-07-31 — `applies_to` routing refusal, demonstrated (criterion 6).** Starting `routine_change` on an issue labelled `type:feature`, against that workflow's `applies_to: {labels: ["type:chore"]}` declaration, was refused with HTTP 422 `workflow_not_applicable`. Transcribed from the run's authoritative record (PR #2378, delivering #2360), the refusal reads:
+
+```
+HTTP 422 (workflow_not_applicable): workflow "routine_change" does not accept
+this change: its applies_to labels criterion requires one of [type:chore], but
+the change's labels is [area:backend, area:workflow-spec, area:docs,
+autonomy:medium, type:feature, phase:alpha, milestone:alpha]. Workflows that
+would accept this change: feature_change, human_led_change, release. Amend the
+workflow's applies_to declaration, start the run under a workflow that accepts
+this change, or pass applies_to_override with a reason to force this run
+```
+
+The message names the requiring criterion, the change's own labels, the workflows that **would** accept the change, and the three remedies — amend the declaration, start under an accepting workflow, or pass `applies_to_override` with a reason. The admit direction was demonstrated in the same exercise: `routine_change` on a `type:chore` issue was admitted.
+
+**The firing escalation has NOT been demonstrated live (criterion 7).** No `escalations` declaration exists on a real path in this repository, so no escalation has fired in a live run, and this criterion is **not met** — not partially completed. The blocker is **#2374**, the fail-open window described in the previous section; the demonstration is deferred until that closes. What exists instead is unit and fixture coverage of the mechanism — the firing walk, the strictest-per-dimension composition, and the enforcement seam — under E53.4 / #2227. The mechanism is tested; the live declaration is not in place, and nothing here implies otherwise.
 
 ---
 
