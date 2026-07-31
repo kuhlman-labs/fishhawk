@@ -18,6 +18,7 @@ it.
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
 | Split parent acceptance-carrier (#2057) | _(none at the comment; the sibling `split_children_filed` completion marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` (plan-gate approve of a `split_proposal`-bearing plan) | on completion of split-child filing (all N children durably filed) | No (best-effort; the completion marker is persisted BEFORE this comment, so once it is durable a re-approval no-ops at the `priorCompletion` gate and never re-posts — the one residual is a re-post if the completion-marker append itself fails after the comment posts) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
+| Run not applicable (applies_to) | _(none at notifier; global-chain `run_rejected_applies_to` on the dispatcher)_ | _(none)_ | `Dispatcher.refusedByAppliesTo` applies_to admission gate (E53.10 / #2361) | dispatch refusal (workflow's `applies_to` labels/trigger not satisfied) | No (each refusal posts its own comment) |
 
 Notes:
 - **Run-link degradation when `FISHHAWKD_EXTERNAL_URL` is unset (#1787).** Every
@@ -364,6 +365,17 @@ Notes:
   the offending workflow_id / stage rather than a run UUID, and writes no
   notifier-level audit row — the canonical machine record is the dispatcher's
   `run_rejected_misconfigured` global-chain entry.
+- The run-not-applicable surface (`NotifyRunNotApplicable`, E53.10 / #2361) is
+  *runless* the same way: the dispatcher's `applies_to` admission gate refuses
+  before `CreateRun` when the workflow's routing declaration does not accept the
+  change, so there is no run row. It takes explicit issue coordinates + the
+  workflow_id + the pre-rendered rejection message (the shared `appliesto`
+  renderer's output, embedded verbatim so a webhook refusal reads identically to
+  an API one) rather than a run UUID, writes no notifier-level audit row — the
+  canonical machine record is the dispatcher's `run_rejected_applies_to`
+  global-chain entry, the SAME category the `POST /v0/runs` seam writes so one
+  audit query covers both — and the comment never advertises `applies_to_override`
+  (a webhook trigger carries no way to pass one).
 - The typed-reply approval path (`+1` / `lgtm` per E17.4) does NOT post its
   own slash reply (`silent=true`) — the user's typed reply *is* the
   acknowledgment. The plan-on-issue comment edit covers the broadcast.

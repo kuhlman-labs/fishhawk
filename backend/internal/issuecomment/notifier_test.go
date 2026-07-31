@@ -1455,6 +1455,101 @@ func TestNotifyRunRejected_SkipsBadParams(t *testing.T) {
 	}
 }
 
+// TestNotifyRunNotApplicable_PostsExplanation covers the #2361 surface: the
+// run-not-applicable comment leads with the fixed header, embeds the shared
+// appliesto renderer's message VERBATIM, posts no audit row (runless; canonical
+// record is the dispatcher's global-chain entry), and is not deduped.
+func TestNotifyRunNotApplicable_PostsExplanation(t *testing.T) {
+	gh := &fakeGitHub{}
+	au := &fakeAudit{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+
+	const message = `workflow "feature_change" does not accept this change: its applies_to labels criterion requires one of [docs], but the change's labels is [bug]. Workflows that would accept this change: routine_change`
+	if err := n.NotifyRunNotApplicable(context.Background(), "kuhlman-labs/fishhawk", forge.FromGitHubInstallationID(42), 1247,
+		"feature_change", message); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 comment; got %d", len(gh.calls))
+	}
+	call := gh.calls[0]
+	if call.scope != forge.FromGitHubInstallationID(42) {
+		t.Errorf("scope = %v, want scope for installation 42", call.scope)
+	}
+	if call.issueNumber != 1247 {
+		t.Errorf("issueNumber = %d, want 1247", call.issueNumber)
+	}
+	if !strings.Contains(call.body, "Fishhawk did not start a run.") {
+		t.Errorf("body missing the fixed header:\n%s", call.body)
+	}
+	// The shared renderer's message is embedded VERBATIM so a webhook refusal
+	// reads identically to an API one.
+	if !strings.Contains(call.body, message) {
+		t.Errorf("body must embed the shared renderer's message verbatim:\n%s", call.body)
+	}
+	if !strings.Contains(call.body, "feature_change") {
+		t.Errorf("body must name the workflow:\n%s", call.body)
+	}
+	// Runless surface: no notifier-level audit row.
+	if len(au.appended) != 0 {
+		t.Errorf("expected no audit rows; got %d", len(au.appended))
+	}
+
+	// Not deduped: a second refusal posts again.
+	if err := n.NotifyRunNotApplicable(context.Background(), "kuhlman-labs/fishhawk", forge.FromGitHubInstallationID(42), 1247,
+		"feature_change", message); err != nil {
+		t.Fatal(err)
+	}
+	if len(gh.calls) != 2 {
+		t.Errorf("run-not-applicable comments should not be deduped; got %d calls", len(gh.calls))
+	}
+}
+
+// TestNotifyRunNotApplicable_SkipsBadParams exercises the defensive skips:
+// nil receiver, zero issue, zero installation, malformed repo all no-op
+// without touching GitHub.
+func TestNotifyRunNotApplicable_SkipsBadParams(t *testing.T) {
+	// Nil receiver skips silently.
+	var nilNotifier *issuecomment.Notifier
+	if err := nilNotifier.NotifyRunNotApplicable(context.Background(), "x/y", forge.FromGitHubInstallationID(1), 1, "wf", "m"); err != nil {
+		t.Errorf("nil receiver must skip; got %v", err)
+	}
+
+	gh := &fakeGitHub{}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        &fakeRuns{},
+		Audit:       &fakeAudit{},
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	cases := []struct {
+		name        string
+		repo        string
+		scope       forge.CredentialScope
+		issueNumber int
+	}{
+		{"zero issue", "x/y", forge.FromGitHubInstallationID(99), 0},
+		{"zero installation", "x/y", forge.CredentialScope{}, 1},
+		{"malformed repo", "no-slash", forge.FromGitHubInstallationID(99), 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := n.NotifyRunNotApplicable(context.Background(), tc.repo, tc.scope,
+				tc.issueNumber, "feature_change", "m"); err != nil {
+				t.Errorf("expected nil; got %v", err)
+			}
+		})
+	}
+	if len(gh.calls) != 0 {
+		t.Errorf("expected 0 calls; got %d", len(gh.calls))
+	}
+}
+
 // TestPlanStatusFooter_MentionModePreserved is the behavior-preserving gate for
 // the renderApproverIdentity mention-mode split (#1788): the status-comment
 // surface (mention=true) still @-mentions a resolved GitHub login and still

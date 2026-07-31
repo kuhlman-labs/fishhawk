@@ -5,304 +5,37 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/appliesto"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
-// applies_to routing enforcement — the shared evaluation core (E53.3 / #2226,
+// applies_to routing enforcement — the server admission seam (E53.3 / #2226,
 // ADR-066 fork 4 as refined by the operator's 2026-07-30 ruling §1).
 //
-// A workflow's `applies_to` is a spec.Predicate (E53.1 / #2224) declaring
-// which changes may be routed through it. Enforcement is FAIL-CLOSED and runs
-// in TWO PHASES, because the predicate's criteria do not all have a producer
-// at the same moment:
-//
-//   - ADMISSION (this file, wired into POST /v0/runs): `labels` and `trigger`.
-//     Both are known before the run row exists — labels from the caller's
-//     issue-context snapshot, trigger from trigger_source.
-//   - PLAN GATE (applies_to_plan_gate.go, a sibling slice): `paths`. No path
-//     set exists at start_run; the first authoritative one is the approved
-//     plan's scope.files, which is BINDING rather than descriptive — the
-//     existing scope gate confines the implement stage to it — so a run
-//     admitted under a `paths: [docs/**]` declaration is CONFINED to docs-only,
-//     not merely claimed to be.
-//
-// Both points fire before any implement work, and both render through the ONE
-// message renderer below so an operator refused at either sees the same shape:
-// the workflow, the criterion that failed, the value observed, and which
-// workflows the change WOULD satisfy.
-//
-// FAIL-CLOSED IS UNIFORM AND DELIBERATELY ASYMMETRIC TO THIS PACKAGE'S
-// ADVISORY NEIGHBOURS. spec.Predicate.Match returns (false, error) for an
-// empty predicate or a malformed glob rather than silently not matching; both
-// call sites treat that error as a REJECTION. runScopePrecheck, runSurfaceSweep,
-// runTestSweep and overCapSplitRejection all correctly fail OPEN because they
-// are advisory sweeps — writing `if err != nil { admit }` here by analogy with
-// them is the tempting bug this comment exists to name.
-//
-// TRUST BOUNDARY: labels are fetched by the CALLER's `gh` and shipped inline on
-// the create request, so this control prevents MISROUTING, not a determined
-// authorized caller who attests whatever labels they like. That is an accepted
-// boundary for a routing control whose sanctioned exception is an audited
-// override; a server-side fetch is the named hardening follow-up.
+// The pure evaluation core (the two-phase split, the satisfying-workflow
+// enumeration, the ONE message renderer, and the trigger/label Change builders)
+// lives in backend/internal/appliesto and is shared verbatim with the plan gate
+// (applies_to_plan_gate.go) and the webhook dispatcher (E53.10 / #2361). This
+// file is the HTTP/audit-shaped ADAPTER for POST /v0/runs: it delegates every
+// evaluation to appliesto.* and owns only the create-request wiring, the 422
+// response, the run_rejected_applies_to audit append, and the audited override
+// grant + carry-forward.
 
-// appliesToPhase names which half of the two-phase split an evaluation is
-// running. The phase decides which criteria of the predicate are in play and
-// how the rejection message describes the observed value.
-type appliesToPhase int
-
-const (
-	// appliesToPhaseAdmission evaluates the criteria with a producer at
-	// start_run: labels and trigger.
-	appliesToPhaseAdmission appliesToPhase = iota
-	// appliesToPhasePlanGate evaluates the criterion whose producer is the
-	// approved plan: paths. Consumed by the sibling plan-gate slice.
-	appliesToPhasePlanGate
-)
-
-// appliesToPhasePredicate splits p into the sub-predicate belonging to phase.
-// The second return reports whether that phase has ANY criterion to evaluate;
-// false means the phase does not constrain and the caller must ADMIT without
-// calling Match (calling Match on an empty predicate would fail closed, which
-// is right for a caller that skipped Validate and wrong for a deliberately
-// deferred phase).
-//
-// The split is exhaustive over the predicate grammar: paths belong to the plan
-// gate, labels and trigger to admission. change_kind is rejected at spec-parse
-// time inside applies_to (no producer, no ratified token set), so it can never
-// reach here — but it is carried into the admission half rather than dropped
-// so a future producer landing the criterion cannot silently go unenforced.
-func appliesToPhasePredicate(p spec.Predicate, phase appliesToPhase) (spec.Predicate, bool) {
-	var sub spec.Predicate
-	switch phase {
-	case appliesToPhaseAdmission:
-		sub.Labels = p.Labels
-		sub.Triggers = p.Triggers
-		sub.ChangeKinds = p.ChangeKinds
-	case appliesToPhasePlanGate:
-		sub.Paths = p.Paths
-	}
-	constrains := len(sub.Paths) > 0 || len(sub.Labels) > 0 || len(sub.ChangeKinds) > 0 || len(sub.Triggers) > 0
-	return sub, constrains
-}
-
-// evaluateAppliesTo reports whether change c satisfies workflow wf's
-// applies_to declaration for the given phase.
-//
-// Returns (matched, evaluated, err):
-//   - a workflow declaring NO applies_to matches everything (true, false, nil)
-//     — the back-compat reading that keeps every existing workflow selectable;
-//   - a phase the predicate does not constrain matches (true, false, nil);
-//   - otherwise the phase sub-predicate's Match decides, and a Match ERROR is
-//     returned rather than swallowed so the caller can fail closed.
-func evaluateAppliesTo(wf spec.Workflow, c spec.Change, phase appliesToPhase) (bool, bool, error) {
-	if wf.AppliesTo == nil {
-		return true, false, nil
-	}
-	sub, constrains := appliesToPhasePredicate(*wf.AppliesTo, phase)
-	if !constrains {
-		return true, false, nil
-	}
-	ok, err := sub.Match(c)
-	if err != nil {
-		return false, true, err
-	}
-	return ok, true, nil
-}
-
-// satisfyingWorkflows enumerates, in name order, every workflow in parsed that
-// WOULD accept change c at this phase — the "where can I take this instead?"
-// half of the rejection message. A workflow declaring no applies_to accepts
-// any change and is included. A workflow whose predicate ERRORS is excluded:
-// a declaration we cannot evaluate must never be recommended.
-func satisfyingWorkflows(parsed *spec.Spec, c spec.Change, phase appliesToPhase) []string {
-	if parsed == nil {
+// issueContextLabels reads the label set off a create request's inline
+// issue-context snapshot, or nil when there is no snapshot. A nil snapshot is an
+// EMPTY label set — it fails closed against a labels criterion, never match-all.
+func issueContextLabels(ic *issueContextPayload) []string {
+	if ic == nil {
 		return nil
 	}
-	var out []string
-	for name, wf := range parsed.Workflows {
-		ok, _, err := evaluateAppliesTo(wf, c, phase)
-		if err != nil || !ok {
-			continue
-		}
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// appliesToRejection is everything the ONE renderer needs. Both rejection
-// points (admission here, the plan gate in the sibling slice) build this and
-// call renderAppliesToRejection, so the two messages cannot drift apart.
-type appliesToRejection struct {
-	// WorkflowID is the workflow the operator NAMED. applies_to filters an
-	// operator-named workflow; it never selects one, which is why two
-	// matching workflows is benign rather than a coin flip.
-	WorkflowID string
-	// Criterion is the predicate criterion that failed: labels, trigger or
-	// paths. Empty when MatchErr is set (the declaration could not be
-	// evaluated at all).
-	Criterion string
-	// Required is the criterion's declared values; Observed is what the
-	// change carried, described by ObservedLabel (e.g. "scope.files").
-	Required      []string
-	Observed      []string
-	ObservedLabel string
-	// AbsentIssueContext marks the EMPTY-label-set run: the change's label
-	// set is empty rather than merely non-matching. This gets its own
-	// sentence — "your labels don't match" is actively misleading when
-	// there are no labels to match with.
-	AbsentIssueContext bool
-	// IssueContextPresent discriminates the TWO ways a label set comes out
-	// empty, which have different fixes and must not be described with one
-	// sentence: an issue-LESS run (false — trigger_source=cli/ui, no issue
-	// context at all) versus an UNLABELLED issue (true — issue context is
-	// present and carries zero labels). Telling the operator of an
-	// issue-triggered run that it "carries NO issue context" sends them
-	// looking for a trigger problem they do not have.
-	IssueContextPresent bool
-	TriggerSource       string
-	// Satisfying is the workflows that WOULD accept this change.
-	Satisfying []string
-	// MatchErr is the fail-closed-on-error branch: the predicate could not be
-	// evaluated (empty predicate, malformed glob). Rendered as a rejection,
-	// never degraded into an admit.
-	MatchErr error
-	// Phase names where the refusal happened, so the two messages are
-	// distinguishable in a log without being differently shaped.
-	Phase appliesToPhase
-}
-
-// renderAppliesToRejection is THE message renderer both rejection points use.
-// Shape (binding, asserted by test): the workflow, the criterion that failed,
-// the value observed, and which workflows the change WOULD satisfy — plus the
-// three ways forward. An operator refused at the plan gate is further into a
-// run than one refused at admission and needs more help, not less, so the two
-// carry the same content.
-func renderAppliesToRejection(rj appliesToRejection) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "workflow %q does not accept this change", rj.WorkflowID)
-	label := rj.ObservedLabel
-	if label == "" {
-		label = rj.Criterion
-	}
-	observed := "[]"
-	if len(rj.Observed) > 0 {
-		observed = "[" + strings.Join(rj.Observed, ", ") + "]"
-	}
-	switch {
-	case rj.MatchErr != nil:
-		fmt.Fprintf(&b, ": its applies_to declaration could not be evaluated (%s), so the run is refused rather than admitted — a routing declaration that cannot be evaluated is never treated as match-all", rj.MatchErr.Error())
-	case rj.AbsentIssueContext && rj.IssueContextPresent:
-		// The issue exists and carries no labels. The observed value is
-		// still reported — the shape is binding on EVERY rejection path,
-		// and "[]" is the actionable fact here, not a detail to elide.
-		fmt.Fprintf(&b, ": its applies_to %s criterion requires one of [%s], but the change's %s is %s — the run's issue context carries no labels at all; an unlabelled issue cannot satisfy a labels criterion",
-			rj.Criterion, strings.Join(rj.Required, ", "), label, observed)
-	case rj.AbsentIssueContext:
-		fmt.Fprintf(&b, ": its applies_to %s criterion requires one of [%s], but the change's %s is %s because this run carries NO issue context (trigger_source=%s); an issue-less run cannot satisfy a labels criterion",
-			rj.Criterion, strings.Join(rj.Required, ", "), label, observed, rj.TriggerSource)
-	default:
-		fmt.Fprintf(&b, ": its applies_to %s criterion requires one of [%s], but the change's %s is %s",
-			rj.Criterion, strings.Join(rj.Required, ", "), label, observed)
-	}
-	if len(rj.Satisfying) > 0 {
-		fmt.Fprintf(&b, ". Workflows that would accept this change: %s", strings.Join(rj.Satisfying, ", "))
-	} else {
-		b.WriteString(". No workflow in this spec accepts this change")
-	}
-	if rj.Phase == appliesToPhasePlanGate {
-		b.WriteString(". Amend the workflow's applies_to declaration, narrow the plan's scope.files to satisfy it, or re-start the run with applies_to_override and a reason")
-	} else {
-		b.WriteString(". Amend the workflow's applies_to declaration, start the run under a workflow that accepts this change, or pass applies_to_override with a reason to force this run")
-	}
-	return b.String()
-}
-
-// firstFailingCriterion re-walks sub's DECLARED criteria in evaluation order
-// and reports the first one c does not satisfy, with its declared and observed
-// values, so the message names a specific criterion instead of "the
-// predicate". Returns ok=false only when every declared criterion is
-// satisfied, which a caller reaching here after a non-match will not see.
-func firstFailingCriterion(sub spec.Predicate, c spec.Change) (criterion string, required, observed []string, ok bool) {
-	if len(sub.Paths) > 0 {
-		if m, err := (spec.Predicate{Paths: sub.Paths}).Match(spec.Change{Paths: c.Paths}); err != nil || !m {
-			return "paths", sub.Paths, c.Paths, true
-		}
-	}
-	if len(sub.Labels) > 0 {
-		if m, err := (spec.Predicate{Labels: sub.Labels}).Match(spec.Change{Labels: c.Labels}); err != nil || !m {
-			return "labels", sub.Labels, c.Labels, true
-		}
-	}
-	if len(sub.ChangeKinds) > 0 {
-		if m, err := (spec.Predicate{ChangeKinds: sub.ChangeKinds}).Match(spec.Change{ChangeKind: c.ChangeKind}); err != nil || !m {
-			return "change_kind", sub.ChangeKinds, []string{c.ChangeKind}, true
-		}
-	}
-	if len(sub.Triggers) > 0 {
-		if m, err := (spec.Predicate{Triggers: sub.Triggers}).Match(spec.Change{Trigger: c.Trigger}); err != nil || !m {
-			return "trigger", triggerFormStrings(sub.Triggers), []string{string(normalizeTriggerForm(c.Trigger))}, true
-		}
-	}
-	return "", nil, nil, false
-}
-
-func triggerFormStrings(tf []spec.TriggerForm) []string {
-	out := make([]string, len(tf))
-	for i, t := range tf {
-		out[i] = string(t)
-	}
-	return out
-}
-
-// normalizeTriggerForm mirrors Predicate.Match's back-compat seam so the
-// rejection message reports the trigger form actually matched against rather
-// than an empty string.
-func normalizeTriggerForm(t spec.TriggerForm) spec.TriggerForm {
-	if t == "" {
-		return spec.TriggerDiff
-	}
-	return t
-}
-
-// triggerFormForSource maps a run's trigger_source onto the predicate's
-// TriggerForm vocabulary. Every trigger source v0 mints — github_issue, cli,
-// ui — produces a code diff, so all three map to TriggerDiff. The non-diff
-// forms (scheduled, on_demand) have NO producer today: ADR-065's groomer and
-// ADR-053's incident intake will emit them. A predicate declaring only a
-// non-diff form therefore matches nothing yet, which is documented rather than
-// rejected because — unlike change_kind — `trigger: [diff, scheduled]` is
-// partially usable against real runs today.
-func triggerFormForSource(triggerSource string) spec.TriggerForm {
-	switch triggerSource {
-	case string(run.TriggerGitHubIssue), string(run.TriggerCLI), string(run.TriggerUI):
-		return spec.TriggerDiff
-	default:
-		return spec.TriggerDiff
-	}
-}
-
-// admissionChange builds the spec.Change evaluated at start_run from the
-// create request's own inputs. Labels come from the issue-context snapshot the
-// caller shipped inline; a nil issue context yields a nil label set, which is
-// an EMPTY label set and fails closed against a labels criterion.
-//
-// Paths are deliberately absent: no authoritative path set exists at
-// admission, and the plan gate — not a caller self-attestation — supplies one.
-func admissionChange(triggerSource string, ic *issueContextPayload) spec.Change {
-	c := spec.Change{Trigger: triggerFormForSource(triggerSource)}
-	if ic != nil {
-		c.Labels = ic.Labels
-	}
-	return c
+	return ic.Labels
 }
 
 // appliesToOverrideRecord carries the audited-override decision from the
@@ -352,20 +85,21 @@ func (s *Server) checkAppliesTo(w http.ResponseWriter, r *http.Request, req *cre
 	// gate rather than silently evaluated against zero paths, which would
 	// reject every run).
 	var message string
-	var rj appliesToRejection
-	if sub, constrains := appliesToPhasePredicate(*workflowDef.AppliesTo, appliesToPhaseAdmission); constrains {
-		c := admissionChange(req.TriggerSource, req.IssueContext)
+	var rj appliesto.Rejection
+	if sub, constrains := appliesto.PhasePredicate(*workflowDef.AppliesTo, appliesto.PhaseAdmission); constrains {
+		c := appliesto.AdmissionChange(req.TriggerSource, issueContextLabels(req.IssueContext))
 		matched, matchErr := sub.Match(c)
 		if matchErr != nil || !matched {
-			rj = appliesToRejection{
+			rj = appliesto.Rejection{
 				WorkflowID:    req.WorkflowID,
 				TriggerSource: req.TriggerSource,
-				Satisfying:    satisfyingWorkflows(parsed, c, appliesToPhaseAdmission),
+				Satisfying:    appliesto.SatisfyingWorkflows(parsed, c, appliesto.PhaseAdmission),
 				MatchErr:      matchErr,
-				Phase:         appliesToPhaseAdmission,
+				Phase:         appliesto.PhaseAdmission,
+				Seam:          appliesto.SeamStartRun,
 			}
 			if matchErr == nil {
-				crit, required, observed, ok := firstFailingCriterion(sub, c)
+				crit, required, observed, ok := appliesto.FirstFailingCriterion(sub, c)
 				if ok {
 					rj.Criterion = crit
 					rj.Required = required
@@ -379,7 +113,7 @@ func (s *Server) checkAppliesTo(w http.ResponseWriter, r *http.Request, req *cre
 					rj.IssueContextPresent = req.IssueContext != nil
 				}
 			}
-			message = renderAppliesToRejection(rj)
+			message = appliesto.RenderRejection(rj)
 		}
 	}
 
@@ -430,11 +164,13 @@ func (s *Server) checkAppliesTo(w http.ResponseWriter, r *http.Request, req *cre
 // catch it: `paths` is re-evaluated at the plan gate, so a lost override there
 // merely costs the operator a re-run, but a `labels` or `trigger` violation has
 // no second evaluation point — the run would proceed to completion having
-// bypassed the declaration with nothing in the log saying so. This is the
-// asymmetry to the REFUSAL audit, whose append failure is correctly best-effort:
-// there the decision already went the safe way, so an audit problem must not
-// soften it. Here the decision goes the UNSAFE way, so the audit is a
-// precondition of it.
+// bypassed the declaration with nothing in the log saying so. THIS IS THE
+// DELIBERATE ASYMMETRY TO THE REFUSAL AUDIT (appendAppliesToRejectedAudit,
+// refusedByAppliesTo), whose append failure is correctly best-effort: a GRANT
+// records an EXCEPTION being made (503, no run row on failure), so an unrecorded
+// exception must not happen; a REFUSAL is the SAFE outcome, so its audit is
+// best-effort — admitting a run because we could not write a log line would
+// invert the control. Same control, opposite failure directions, both fail-safe.
 //
 // suppressed is the admission refusal the override forces past, or "" when
 // admission was satisfied and the override is being carried forward for the
@@ -477,8 +213,10 @@ func (s *Server) grantAppliesToOverride(w http.ResponseWriter, r *http.Request, 
 // appendAppliesToRejectedAudit records the refusal on the GLOBAL chain: the
 // run was refused pre-insert, so no run id exists to scope the entry to. A
 // nil AuditRepo or an append failure is warn-logged — the refusal itself has
-// already been decided and must not be softened by an audit problem.
-func (s *Server) appendAppliesToRejectedAudit(r *http.Request, req *createRunRequest, rj appliesToRejection, message string) {
+// already been decided and must not be softened by an audit problem. (See
+// grantAppliesToOverride for the asymmetry: a grant fails closed on the same
+// failure because it records an exception, not the safe outcome.)
+func (s *Server) appendAppliesToRejectedAudit(r *http.Request, req *createRunRequest, rj appliesto.Rejection, message string) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}

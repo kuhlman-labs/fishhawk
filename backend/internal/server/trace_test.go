@@ -5688,6 +5688,10 @@ func (r *pageClassRecorder) NotifyRunRejected(_ context.Context, _ string, _ for
 	return nil
 }
 
+func (r *pageClassRecorder) NotifyRunNotApplicable(_ context.Context, _ string, _ forge.CredentialScope, _ int, _, _ string) error {
+	return nil
+}
+
 func (r *pageClassRecorder) ArtifactListerWired() bool { return false }
 
 func (r *pageClassRecorder) pagedRun(runID uuid.UUID) bool {

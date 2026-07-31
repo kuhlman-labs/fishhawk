@@ -578,7 +578,7 @@ func TestRenderUnmatchedPaths_CapsAndReportsRemainder(t *testing.T) {
 
 // TestPlanGateSatisfyingWorkflows_QuantifiedLikeTheGate pins that the
 // "workflows that would accept this change" list is computed with the SAME
-// universal quantifier as the decision. satisfyingWorkflows (applies_to.go) is
+// universal quantifier as the decision. appliesto.SatisfyingWorkflows is
 // existential on paths, so reusing it here would let the message recommend a
 // workflow that then refuses the very same plan at the very same gate —
 // advice that costs the operator a second rejection.
