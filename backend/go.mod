@@ -19,7 +19,7 @@ require (
 	github.com/kuhlman-labs/fishhawk/directory v0.0.0
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20260606222916-3bdc667bf430
 	github.com/kuhlman-labs/fishhawk/redaction v0.0.0-20260622095901-47e0c4255798
-	github.com/modelcontextprotocol/go-sdk v1.6.1
+	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.43.0
@@ -108,6 +108,7 @@ require (
 	golang.org/x/oauth2 v0.35.0 // indirect
 	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 )
 
 // The directory plane and credstore both ship in this repo and have no
