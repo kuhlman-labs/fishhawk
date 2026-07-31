@@ -334,17 +334,23 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Author separation-of-duties (E39.4 / #1709): when the stage's gate
-	// carries a forge-neutral approvals block, the change author may not
-	// approve their own change. PRE-Submit like the sibling gates so a
+	// Author separation-of-duties (E39.4 / #1709, corrected by #2358): the
+	// change author may not approve their own change when the stage's gate
+	// declares `not:` INCLUDING "author" AND the run carries a human-
+	// authorship signal (an authorship-category audit row — today only
+	// operator_commit_vouched). Operator GATE PARTICIPATION —
+	// run_auto_driven, clarification_answered, approval_submitted,
+	// scope-amendment decisions, concern waivers — resolves no author, so
+	// none of them wedges the approver out of their own gate. A gate whose
+	// `not:` omits "author" skips author resolution entirely (one fewer
+	// ListForRun on this path). PRE-Submit like the sibling gates so a
 	// refused approval inserts no row and the quorum count is not
-	// incremented. Guarded strictly by "gate has an Approvals block AND
-	// decision == approve" — a legacy Approvers / no-approvals gate skips
-	// this entirely (byte-identical to today). Fail-open on an unresolved
-	// author (no user-kind actor yet) or an unreadable spec: author-SoD is
-	// skipped while agent-SoD and quorum still apply.
+	// incremented. A legacy Approvers / no-approvals gate skips this
+	// entirely (byte-identical to today). Fail-open on an unresolved author
+	// or an unreadable spec: author-SoD is skipped while agent-SoD and
+	// quorum still apply.
 	if decision == approval.DecisionApprove {
-		if approvals, aerr := s.fetchApprovalsForStage(r.Context(), stage); aerr == nil && approvals != nil {
+		if approvals, aerr := s.fetchApprovalsForStage(r.Context(), stage); aerr == nil && approvals != nil && approvalsExcludeAuthor(approvals) {
 			if author, ok := s.resolveChangeAuthor(r.Context(), stage.RunID); ok && author == subject {
 				s.writeError(w, r, http.StatusForbidden, "approver_is_change_author",
 					"the change author cannot approve their own change on a quorum gate",
@@ -753,10 +759,14 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
-	// Quorum path. Resolve the change author (fail-open: skipped when no
-	// user-kind actor exists yet), then classify this submitter. A delegated
-	// / agent-kind submission is recorded but never counts toward the human
-	// quorum, and its channel is forced to "delegated".
+	// Quorum path. Resolve the change author UNCONDITIONALLY (fail-open:
+	// unresolved when no authorship-category actor exists yet) — it feeds
+	// submitterClass, which is provenance for predicate_snapshot and must
+	// keep labeling a resolved author "author" even on a gate that permits
+	// them. Only the EXCLUSION is gated on the gate's `not:` (#2358). Then
+	// classify this submitter: a delegated / agent-kind submission is
+	// recorded but never counts toward the human quorum, and its channel is
+	// forced to "delegated".
 	changeAuthor, _ := s.resolveChangeAuthor(ctx, p.Stage.RunID)
 	submitterAgent := actorKindForSubject(res.Approval.ApproverSubject) == audit.ActorAgent
 	delegated := submitterAgent || p.DelegatedRule != ""
@@ -764,7 +774,16 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		channel = "delegated"
 	}
 
-	eligibleCount := s.countDistinctEligibleApprovers(ctx, p.Stage.RunID, p.Stage.ID, changeAuthor)
+	// Threading `not:` through the COUNT as well as the pre-Submit 403 is
+	// load-bearing, not belt-and-braces (#2358): gating only the 403 would
+	// RECORD a permitted author's approval and then decline to COUNT it,
+	// leaving quorum permanently one short — the same wedge presenting as a
+	// stuck gate rather than a clean 403, and strictly harder to diagnose
+	// than the bug being fixed. Both reads parse the same immutable cached
+	// spec bytes off the same run row within one request, so the 403 gate
+	// and the count can never disagree on `not:`.
+	excludeAuthor := approvalsExcludeAuthor(approvals)
+	eligibleCount := s.countDistinctEligibleApprovers(ctx, p.Stage.RunID, p.Stage.ID, changeAuthor, excludeAuthor)
 	required := 1
 	if approvals.Count != nil {
 		required = *approvals.Count

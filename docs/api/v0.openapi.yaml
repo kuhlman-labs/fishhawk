@@ -9029,14 +9029,28 @@ paths:
               and the subject is not in the gate's approvers list. For an
               `all_of` deploy gate this fires unless the subject belongs to
               EVERY named role.
-            - `approver_is_change_author` — E39.4 / #1709: the stage's
-              gate declares a forge-neutral `approvals` block and the
-              submitting subject is the change author (the run's earliest
-              user-kind actor). Author separation-of-duties is enforced
+            - `approver_is_change_author` — E39.4 / #1709, corrected by
+              #2358: fires only when the stage's gate declares a
+              forge-neutral `approvals` block whose `not` INCLUDES
+              `author`, AND the run carries a human-authorship audit
+              signal naming the submitting subject. Authorship is a closed
+              allow-list of audit categories — currently only
+              `operator_commit_vouched`, the operator's audited
+              declaration that a hand-pushed commit belongs to this run's
+              lineage. Operator GOVERNANCE acts are NOT authorship and
+              resolve no author: `run_auto_driven`,
+              `clarification_answered`, `approval_submitted`,
+              scope-amendment decisions and concern waivers/deferrals. On
+              a run that has reached only its plan gate no authorship
+              signal exists yet, so this leg does not fire there at all;
+              the plan-gate controls are the unconditional agent floor
+              (an agent-kind subject never satisfies a human quorum
+              whether or not `not` names `agent`) and the distinct-human
+              quorum count. Author separation-of-duties is enforced
               PRE-Submit, so no approval row is recorded and the quorum
-              count is not incremented. Runs with no recorded human actor
-              skip this check (author-SoD is unenforceable) while the
-              agent-SoD and distinct-count quorum still apply.
+              count is not incremented. Runs with no resolved author skip
+              this check while the agent floor and distinct-count quorum
+              still apply.
             - `insufficient_scope` — a **deploy-stage** `approve` from an
               operator bearer that holds `write:approvals` but is missing
               `write:deploy` (ADR-038 / #1390). `details.required_scope` is
