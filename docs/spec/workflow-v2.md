@@ -296,6 +296,8 @@ Three properties of the `paths` evaluation follow from that, and none of them is
 - **The set is the union, not the top level.** A decomposition fan-out child runs bounded to its *slice* scope and a `split_proposal` phase carries its own, so a top-level-only check would let a slice reach outside the declaration.
 - **A plan committing to no files at all is refused**, not admitted on a vacuous "every one of zero paths matched". Nothing in an empty scope demonstrates the plan falls inside the declaration.
 
+**A workflow that declares no plan stage never reaches the `paths` phase.** Because `paths` is evaluated at the plan gate, a workflow with no `plan` stage produces no `scope.files` set for it to check — so a `paths` criterion on such a workflow is accepted at parse time but **inert**: it constrains nothing at routing time. This follows from where the criterion has a producer, but it has a load-bearing reading for an author: a workflow that must be path-confined needs a plan stage, and `labels` / `trigger` are the criteria that hold on *every* workflow regardless of shape. In this repository only `feature_change` declares a plan stage, so `paths` is evaluable on exactly one of the four workflows; #2377 tracks surfacing a plan-less `paths` declaration rather than leaving it silently inert.
+
 **The trust boundary differs by admission path.** On `POST /v0/runs` issue labels are fetched by the caller and shipped inline on the create request, so a caller determined to route a change through the wrong workflow can attest whatever labels it likes — there, `applies_to` prevents **misrouting**, not a determined authorized caller, and server-side label fetching is the named hardening path. The **webhook** path is stronger: the labels are the forge's own `issue.labels[]`, not a caller attestation. The sanctioned exception is the audited override, and it exists **only on `POST /v0/runs`** (`applies_to_override` plus a required reason), which admits the run and records why — an escape hatch that leaves a trail. A **webhook trigger carries no `applies_to_override`**: the event carries no operator request, so there is nowhere to pass one, and the webhook refusal comment names amending the declaration or re-starting the run through `POST /v0/runs` / the CLI instead. An operator who needs the override re-starts the run through the API path where it is available.
 
 **An issue-less run resolves to an empty label set and is refused.** A `cli` or `ui` run carries no issue context, so a workflow declaring `labels` cannot be satisfied by it. This is fail-closed by design; the refusal names the absent issue context specifically, rather than reporting a generic predicate mismatch that would send the operator looking for a label that was never going to be there.
@@ -324,7 +326,7 @@ escalations: # optional; each entry RAISES the requirements for a matching chang
       max_autonomy: low # the workflow declares autonomy: high
 ```
 
-`escalations` declares **what gets stricter for a change matching a predicate**. Each entry pairs a `match` predicate with a `require` block, and a change satisfying the predicate has the block's requirements *raised* — a higher approval `count`, an additional `member_of` group, a stricter `min_permission`, a lower `max_autonomy` ceiling. A workflow declaring no `escalations` is on the unchanged path: nothing is raised, and the enforcement seams short-circuit before any extra read.
+`escalations` declares **what gets stricter for a change matching a predicate**. Each entry pairs a `match` [path predicate](#path-predicate) — the same shared matcher `applies_to` consumes, not a second one — with a `require` block, and a change satisfying the predicate has the block's requirements *raised* — a higher approval `count`, an additional `member_of` group, a stricter `min_permission`, a lower `max_autonomy` ceiling. A workflow declaring no `escalations` is on the unchanged path: nothing is raised, and the enforcement seams short-circuit before any extra read.
 
 **The `match:` wrapper is structurally forced, not stylistic.** `$defs/predicate` is `additionalProperties: false`, and JSON Schema Draft 2020-12 evaluates `additionalProperties` against the *whole instance object* rather than the referencing subschema's own scope. An escalation therefore **cannot** `$ref` the predicate and carry a sibling `require` key — the hoisted form
 
@@ -493,7 +495,7 @@ The optional per-stage `permissions` block (E53.5 / #2228) is a **declaration-on
 ```
 
 - **`permissions.network`** is a **spelling of `egress`**, not a parallel key: it carries the identical `target_hosts` grammar and is normalized into the stage's `egress` field at parse time, so an acceptance stage declaring `permissions.network` lands on the one enforced path exactly as `egress` does. Declaring **both** `egress` and `permissions.network` on one stage is a **validation error**, never a precedence rule — the quiet way to ship a silently-differing allow-list.
-- **`permissions.write`** is a list of doublestar globs (`**` crosses `/`) naming the paths the agent is expected to write. They are validated and matched through the **same shared predicate** as `applies_to` and `escalations`, so the write dialect cannot drift.
+- **`permissions.write`** is a list of doublestar globs (`**` crosses `/`) naming the paths the agent is expected to write. They are validated and matched through the **same shared [path predicate](#path-predicate)** as `applies_to` and `escalations`, so the write dialect cannot drift.
 - **`permissions.shell`** is a closed posture enum: `none`, `restricted`, or `unrestricted`.
 - An empty `permissions: {}` is an authoring error (the schema requires at least one of `network`, `write`, `shell`).
 
@@ -1166,6 +1168,22 @@ A predicate carries four optional criteria, each a non-empty list:
 
 **An empty predicate — no criterion at all — is a validation error, never match-all.** It is rejected both at the schema layer (`minProperties: 1`) and by the Go validator, so "match everything" can never be written by accident. Path handling is binary-safe and fail-closed: the matcher decodes git's C-quoted path form and reports an undecodable path by name rather than leaving it silently unmatched.
 
+## Control surface: what is enforced, and where
+
+The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, `permissions`) do **not** share one enforcement status, and reading them as if they did — "declared, therefore guaranteed", or the tidier and equally false "everything here is unenforced" — misstates what the product actually holds. This table is the consolidated per-control account. It states nothing the sections above do not; it keeps the honest split in one place so no reader has to reassemble it. A "declared" control is validated, audited and surfaced, but it is not a guarantee until a seam reads it. The same split, in the same words, governs this repository's own governance in [`docs/METHODOLOGY.md`](../METHODOLOGY.md); the two are written to be read against each other.
+
+| Control | What it constrains | Enforcement status |
+|---|---|---|
+| `reviewers.authority` | Whether a stage's agent reviewers gate advancement or merely advise (ADR-027). | **Enforced.** A declared `authority` wins over the count-derived reading at the review gate; the resolved mode and its provenance surface as `review_authority[]`. See [Authority](#authority). |
+| `applies_to.labels`, `applies_to.trigger` | Which changes a workflow may be used for, by issue label and run shape. | **Enforced at run admission** — `POST /v0/runs` **and** the webhook dispatch path — through one shared evaluation core, fail-closed. See [Workflow routing](#workflow-routing-applies_to). |
+| `applies_to.paths` | Confines a workflow's change set to declared globs. | **Enforced at the plan gate** against the `scope.files` union, universally quantified. **Inert on a workflow that declares no plan stage** — there is no `scope.files` producer for it to check (#2377). |
+| `escalations` | Raises the approval count, membership conjunction, minimum permission, or autonomy ceiling for a change matching a predicate. | **Enforced where declared**, at the approval gate and in delegation resolution; a workflow declaring none short-circuits before any extra read. The *mechanism* is shipped and tested; whether it holds on any given path depends on a declaration existing there. See [Escalations](#escalations). |
+| `permissions.network` | The egress host(s) a stage's agent may reach. | **Enforced on an agent-executor `acceptance` stage**, where it normalizes into `egress` and the runner's default-deny proxy applies it — the pre-existing ADR-050 control. On **every other stage** it is a declaration only, until E51 (#2133). The run-status per-entry `enforced` flag encodes exactly this split. |
+| `permissions.write` | The paths a stage's agent is expected to write. | Declared, audited (`stage_permissions_declared`) and surfaced (`permissions[]`), but **not enforced anywhere**, until E51 (#2133). |
+| `permissions.shell` | The stage's shell posture (`none` / `restricted` / `unrestricted`). | Declared, audited and surfaced, but **not enforced anywhere**, until E51 (#2133). |
+
+The `permissions.network` row is the one place the "everything under `permissions:` is unenforced" shorthand is false, and getting it wrong under-claims a real control as badly as the tidy version over-claims the others: on an acceptance stage the network declaration is enforced today, because `permissions.network` is a spelling of `egress` and lands on the one enforced path. `permissions.write` and `permissions.shell` have no reader yet, and `escalations` holds only where an author has declared it.
+
 ## Appendix: what changed from v0/v1
 
 Historical record. This appendix documents how v2 came to differ from v1 and what each E52 child licensed; it is **not** the reference — every member v2 declares is documented above.
@@ -1254,6 +1272,7 @@ Because minutes was a lossless integer, `15` becomes `15m`; unlike the integer f
 
 ## See also
 
+- [Control surface: what is enforced, and where](#control-surface-what-is-enforced-and-where) — the consolidated per-control enforcement account, read against `docs/METHODOLOGY.md`.
 - [`README.md`](README.md) — the versioning + coexistence policy across the three majors.
 - [`workflow-migration.md`](workflow-migration.md) — `fishhawk migrate-spec`, the v1 → v2 codemod and its approval-eligibility report.
 - [`workflow-preset.md`](workflow-preset.md) — the three shipped presets `fishhawk init` writes.
