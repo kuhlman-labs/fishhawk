@@ -39,12 +39,16 @@ import (
 //     constraint, or the deployment artifact on an acceptance stage each
 //     falls into the isDeploy==false else-branch below and is rejected
 //     exactly as on any other non-deploy stage.
-//   - workflow `applies_to` well-formedness (E53.3 / #2226): the routing
-//     predicate is checked at its declaration site — `change_kind` is
-//     rejected outright (no producer emits one), then the shared
-//     Predicate.Validate runs at /workflows/<name>/applies_to. Both rules
-//     are version-agnostic in code but unreachable below major 2, because
-//     no v0/v1 schema declares the property.
+//   - workflow `applies_to` well-formedness (E53.3 / #2226; E53.15 / #2377):
+//     the routing predicate is checked at its declaration site — `change_kind`
+//     is rejected outright (no producer emits one), then the shared
+//     Predicate.Validate runs at /workflows/<name>/applies_to, then a `paths`
+//     criterion is refused on a workflow declaring no plan stage (the plan
+//     gate is the only evaluator of `paths`, so such a declaration could never
+//     be evaluated — the control-that-silently-does-nothing failure E53 exists
+//     to prevent). All three rules are version-agnostic in code but
+//     unreachable below major 2, because no v0/v1 schema declares the
+//     property.
 //   - post-hoc-constraint<->produced-artifact binding at major >= 2 (E52.7 /
 //     #2219): a v2 stage carrying a post-hoc diff constraint must declare the
 //     pull_request artifact. The stage TYPES are general (plan / implement /
@@ -111,7 +115,7 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 		return fmt.Sprintf("/workflows/%s/stages/%d%s", name, i, suffix)
 	}
 
-	if err := validateAppliesTo(name, wf.AppliesTo); err != nil {
+	if err := validateAppliesTo(name, wf); err != nil {
 		return err
 	}
 
@@ -476,27 +480,86 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 // unusability into an authoring error naming the missing producer.
 const MsgAppliesToChangeKindUnsupported = "applies_to does not accept the change_kind criterion: nothing produces a change kind today, so the criterion can never be satisfied and this workflow would be selectable by no run; route on paths, labels or trigger instead (the shared predicate keeps change_kind for its other consumers)"
 
+// MsgFmtAppliesToPathsNoPlanStage is the rejection for a `paths` criterion
+// inside the `applies_to` of a workflow that declares no plan stage
+// (E53.15 / #2377). Argument: the workflow name.
+//
+// It is exported so a test can assert the shipped text rather than a
+// paraphrase, and it is duplicated BYTE-FOR-BYTE in
+// cli/internal/spec/validate.go — the two Go modules cannot share a package,
+// so parity is held by TestAppliesToPathsNoPlanStageMessageParity, which
+// reads both source files, exactly as MsgAppliesToChangeKindUnsupported's is.
+// It must therefore stay a single-line `const … = "…"` declaration.
+//
+// The rule is UNCONDITIONAL. `applies_to.paths` is evaluated at the plan
+// gate against the approved plan's `scope.files`; a workflow that ships no
+// plan stage never produces that set, so the criterion is never evaluated —
+// no rejection, no audit entry, no signal that the declaration did nothing.
+// A declaration admitted because some OTHER control holds a similar envelope
+// (a stage's post-hoc `constraints.allowed_paths`, say) is still never
+// evaluated at routing time, so there is no carve-out for one: the routing
+// criterion is refused at authoring time and the operator picks a control
+// that actually holds.
+const MsgFmtAppliesToPathsNoPlanStage = "workflow %q declares applies_to.paths but no plan stage: `paths` is evaluated at the plan gate against the approved plan's scope.files, so a workflow that produces no plan produces no path set to check it against and this criterion could never be evaluated — it is refused rather than silently accepted as a control that does something. Give this workflow a plan stage; or route on applies_to labels / trigger, which are evaluated at run admission on every workflow whatever its shape; or declare the stage's constraints.allowed_paths, a post-hoc envelope checked against the produced diff after the agent has run rather than at routing."
+
+// appliesToPathsNoPlanStageMessage renders MsgFmtAppliesToPathsNoPlanStage —
+// the shared shape helper (the escalationNoRaiseMessage precedent), so the
+// check and its tests assert ONE rendering rather than two hand-built strings.
+func appliesToPathsNoPlanStageMessage(workflow string) string {
+	return fmt.Sprintf(MsgFmtAppliesToPathsNoPlanStage, workflow)
+}
+
+// hasPlanStage reports whether the RESOLVED workflow declares a plan stage.
+// Resolved is the load-bearing word: parse.go folds workflow-v2 same-document
+// reuse before Validate runs, so a plan stage inherited through `extends`
+// counts — it is the resolved shape that decides whether a `scope.files`
+// producer exists.
+func hasPlanStage(wf *Workflow) bool {
+	for _, st := range wf.Stages {
+		if st.Type == StageTypePlan {
+			return true
+		}
+	}
+	return false
+}
+
 // validateAppliesTo checks a workflow's routing predicate at its own
-// declaration site (E53.3 / #2226). A nil predicate — the workflow declared
-// no `applies_to` — is valid and means "accepts any change", which is what
-// leaves every pre-#2226 document unaffected.
+// declaration site (E53.3 / #2226, extended E53.15 / #2377). A nil predicate
+// — the workflow declared no `applies_to` — is valid and means "accepts any
+// change", which is what leaves every pre-#2226 document unaffected. It takes
+// the whole *Workflow rather than the predicate alone because rung 3 is a
+// CROSS-MEMBER rule: a criterion's validity is conditioned on the workflow's
+// stage list, which is exactly what the JSON Schema cannot express.
 //
-// ORDER IS A CONTRACT (pinned by TestValidate_AppliesTo_ChangeKindWinsOverGlob):
-// the change_kind rejection runs FIRST, so a predicate declaring both an
-// unsupported change_kind and some other malformed criterion reports the
-// change_kind diagnosis — that criterion is wrong regardless of what else
-// the predicate says, and its message names a fix the generic predicate
-// error cannot.
+// ORDER IS A CONTRACT (pinned by TestValidate_AppliesTo_ChangeKindWinsOverGlob
+// and TestValidate_AppliesTo_MalformedGlobWinsOverNoPlanStage), three rungs:
 //
-// The second rung is the SHARED Predicate.Validate, called at this
-// workflow's pointer so the empty-predicate, malformed-glob, empty-label
-// and unknown-trigger-form rules are the predicate's own rather than a
-// re-implementation that could drift from #2227's and #2211's reading of
-// the same grammar.
-func validateAppliesTo(name string, p *Predicate) error {
-	if p == nil {
+//  1. the change_kind rejection runs FIRST, so a predicate declaring both an
+//     unsupported change_kind and some other malformed criterion reports the
+//     change_kind diagnosis — that criterion is wrong regardless of what else
+//     the predicate says, and its message names a fix the generic predicate
+//     error cannot;
+//  2. the SHARED Predicate.Validate, called at this workflow's pointer so the
+//     empty-predicate, malformed-glob, empty-label and unknown-trigger-form
+//     rules are the predicate's own rather than a re-implementation that could
+//     drift from #2227's and #2211's reading of the same grammar. A malformed
+//     glob is a grammar error the author must fix either way;
+//  3. the STRUCTURAL-IMPOSSIBILITY rung last: `paths` on a workflow declaring
+//     no plan stage. This is where validateEscalations puts its own structural
+//     rung (require.approvals on a workflow with no approval gate runs after
+//     Predicate.Validate), and the same reasoning applies — the diagnosis is
+//     about the workflow's shape, not the criterion's spelling, so it is only
+//     worth reporting once the criterion is well-formed.
+//
+// Rung 3 reads wf.Stages AFTER v2 reuse resolution (parse.go resolves reuse
+// before calling Validate), so a plan stage inherited via `extends` satisfies
+// it. Like its two siblings the rule is version-agnostic in code but
+// unreachable below major 2: no v0/v1 schema declares `applies_to`.
+func validateAppliesTo(name string, wf *Workflow) error {
+	if wf == nil || wf.AppliesTo == nil {
 		return nil
 	}
+	p := wf.AppliesTo
 	ptr := fmt.Sprintf("/workflows/%s/applies_to", name)
 	if len(p.ChangeKinds) > 0 {
 		return &ValidationError{
@@ -506,6 +569,12 @@ func validateAppliesTo(name string, p *Predicate) error {
 	}
 	if err := p.Validate(ptr); err != nil {
 		return &ValidationError{Path: ptr, Message: err.Error()}
+	}
+	if len(p.Paths) > 0 && !hasPlanStage(wf) {
+		return &ValidationError{
+			Path:    ptr + "/paths",
+			Message: appliesToPathsNoPlanStageMessage(name),
+		}
 	}
 	return nil
 }

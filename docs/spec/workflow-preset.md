@@ -139,7 +139,9 @@ block — as adapt-then-uncomment shapes:
 - **`applies_to`** — the routing predicate declaring which changes a
   workflow may be used for. The comment notes that `labels` / `trigger`
   are refused at run admission while `paths` is checked at the plan gate,
-  so a `paths` rule does nothing on a workflow with no plan stage.
+  so a `paths` rule is refused at validation on a workflow with no plan
+  stage (#2377) and the alternatives are `labels` / `trigger` or the
+  stage's post-hoc `constraints.allowed_paths`.
 - **`escalations`** — the per-path control that raises the bar for a
   matching change. The comment notes that an escalation may only ever
   raise, never lower.

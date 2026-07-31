@@ -53,9 +53,12 @@ workflows:
     # applies_to declares which changes this workflow may be used for. A
     # run whose change does not match is refused before any work begins.
     # `labels` and `trigger` are checked at run admission; `paths` is
-    # checked later, at the plan gate, so a `paths` rule does nothing on a
-    # workflow that declares no plan stage. To confine by path, keep a plan
-    # stage. Uncomment and adapt:
+    # checked at the plan gate, so a `paths` rule is REFUSED at validation on
+    # a workflow that declares no plan stage — it could never be evaluated. To
+    # confine by path, keep a plan stage; otherwise route on `labels` /
+    # `trigger` (checked on every workflow whatever its shape), or use the
+    # stage's `constraints.allowed_paths` (post-hoc, against the produced
+    # diff). Uncomment and adapt:
     # fishhawk:starter-begin applies_to
     # applies_to:
     #   labels: ["type:chore"]

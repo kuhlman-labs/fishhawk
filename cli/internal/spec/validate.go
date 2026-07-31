@@ -20,7 +20,8 @@ import (
 //     schema, so a malformed range like ">=abc" passes schema validation but
 //     is a spec authoring error;
 //   - reviewers.authority with no agent reviewers (E53.2 / #2225);
-//   - a workflow's applies_to routing predicate (E53.3 / #2226);
+//   - a workflow's applies_to routing predicate (E53.3 / #2226), including
+//     the plan-stage rule on its `paths` criterion (E53.15 / #2377);
 //   - a workflow's escalations block (E53.4 / #2227), minus the one check
 //     that needs the v2 autonomy resolver — see checkEscalations.
 //
@@ -192,10 +193,57 @@ func checkStagePermissions(stage map[string]any, base, wfName string, errs *[]Va
 // message (E53.2 / #2225) already use.
 const MsgAppliesToChangeKindUnsupported = "applies_to does not accept the change_kind criterion: nothing produces a change kind today, so the criterion can never be satisfied and this workflow would be selectable by no run; route on paths, labels or trigger instead (the shared predicate keeps change_kind for its other consumers)"
 
+// MsgFmtAppliesToPathsNoPlanStage is the rejection for a `paths` criterion
+// inside the `applies_to` of a workflow that declares no plan stage
+// (E53.15 / #2377). Argument: the workflow name. Byte-identical to
+// backend/internal/spec/validate.go's constant of the same name: the two Go
+// modules are deliberately separate (see this package's doc comment), so the
+// duplication is by design and TestAppliesToPathsNoPlanStageMessageParity —
+// which reads both source files over the repo root — is what keeps the
+// strings in lockstep, exactly as MsgAppliesToChangeKindUnsupported is. It
+// must therefore stay a single-line `const … = "…"` declaration.
+//
+// The rule is UNCONDITIONAL: there is no carve-out admitting the declaration
+// because some other control (a stage's post-hoc `constraints.allowed_paths`,
+// say) holds a similar envelope. Such a declaration is still never evaluated
+// at routing time, which is the failure the rule closes.
+const MsgFmtAppliesToPathsNoPlanStage = "workflow %q declares applies_to.paths but no plan stage: `paths` is evaluated at the plan gate against the approved plan's scope.files, so a workflow that produces no plan produces no path set to check it against and this criterion could never be evaluated — it is refused rather than silently accepted as a control that does something. Give this workflow a plan stage; or route on applies_to labels / trigger, which are evaluated at run admission on every workflow whatever its shape; or declare the stage's constraints.allowed_paths, a post-hoc envelope checked against the produced diff after the agent has run rather than at routing."
+
+// appliesToPathsNoPlanStageMessage renders MsgFmtAppliesToPathsNoPlanStage,
+// mirroring the backend's shared shape helper so the check and its tests
+// assert one rendering rather than two hand-built strings.
+func appliesToPathsNoPlanStageMessage(workflow string) string {
+	return fmt.Sprintf(MsgFmtAppliesToPathsNoPlanStage, workflow)
+}
+
+// hasPlanStageFromRaw reports whether the RESOLVED workflow declares a plan
+// stage, and whether its `stages` node was READABLE at all (the sweep runs
+// after reuse resolution, so a stage inherited through `extends` is present).
+// The two returns are separate because the caller must distinguish "no plan
+// stage" from "no stages node to look at" — see checkAppliesTo's rung 3.
+// Non-map entries are skipped, in the same shape-tolerant style as
+// approvalGatesFromRaw.
+func hasPlanStageFromRaw(wf map[string]any) (found, readable bool) {
+	stages, ok := wf["stages"].([]any)
+	if !ok {
+		return false, false
+	}
+	for _, stRaw := range stages {
+		st, ok := stRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if stType, _ := st["type"].(string); stType == "plan" {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 // checkAppliesTo mirrors the backend's semantic check on a workflow's
-// `applies_to` routing predicate (E53.3 / #2226,
+// `applies_to` routing predicate (E53.3 / #2226; E53.15 / #2377,
 // backend/internal/spec/validate.go), so `fishhawk validate` does not accept
-// a spec the backend refuses at dispatch. Two rungs, in a FIXED order that
+// a spec the backend refuses at dispatch. Three rungs, in a FIXED order that
 // matches the backend's:
 //
 //  1. a `change_kind` criterion is rejected outright, naming the missing
@@ -205,8 +253,20 @@ const MsgAppliesToChangeKindUnsupported = "applies_to does not accept the change
 //     the empty-predicate, malformed-glob, empty-label and unknown-trigger
 //     rules are the predicate's own rather than a re-implementation. This
 //     package carries a byte-identical copy of predicate.go, so rung 2's
-//     messages match the backend's by construction; only rung 1's constant
-//     is hand-duplicated.
+//     messages match the backend's by construction; only the two message
+//     constants are hand-duplicated;
+//  3. a `paths` criterion on a workflow declaring no plan stage is refused
+//     (the structural-impossibility rung, last for the reason the backend's
+//     doc comment gives). UNCONDITIONALLY: no other control admits it.
+//
+// ONE DELIBERATE DIVERGENCE from the typed backend, in rung 3: when `stages`
+// is not a list this sweep SKIPS the rung rather than reporting no-plan-stage.
+// This file's posture is that a node which is not the shape the schema
+// requires was already rejected upstream, and stacking a semantic
+// no-plan-stage error on a structural one would be a second, misleading
+// diagnosis. The backend has no equivalent leg: a typed *Spec with zero
+// stages genuinely HAS no plan stage, and the schema's minItems keeps that
+// unreachable from a parsed document.
 //
 // A workflow declaring no `applies_to` is untouched — that is the
 // accepts-any-change reading every pre-#2226 document gets. The projection
@@ -229,6 +289,16 @@ func checkAppliesTo(wf map[string]any, wfName string, errs *[]ValidationErrorEnt
 	}
 	if err := p.Validate(ptr); err != nil {
 		*errs = append(*errs, ValidationErrorEntry{Path: ptr, Message: err.Error()})
+		return
+	}
+	if len(p.Paths) == 0 {
+		return
+	}
+	if found, readable := hasPlanStageFromRaw(wf); readable && !found {
+		*errs = append(*errs, ValidationErrorEntry{
+			Path:    ptr + "/paths",
+			Message: appliesToPathsNoPlanStageMessage(wfName),
+		})
 	}
 }
 

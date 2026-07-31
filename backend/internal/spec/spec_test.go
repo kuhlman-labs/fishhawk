@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -5991,6 +5992,316 @@ func TestValidate_AppliesTo_Nil_Accepted(t *testing.T) {
 	}
 	if err := spec.Validate(s); err != nil {
 		t.Fatalf("Validate = %v, want nil for a workflow declaring no applies_to", err)
+	}
+}
+
+// --- applies_to paths on a plan-less workflow (E53.15 / #2377) ---
+//
+// `paths` is evaluated at the plan gate against the approved plan's
+// scope.files. A workflow declaring no plan stage never ships a plan, so the
+// criterion is never evaluated — no rejection, no audit entry, no signal that
+// the declaration did nothing. The rule below refuses that declaration at
+// authoring time, UNCONDITIONALLY: nothing admits it, and in particular a
+// stage's post-hoc `constraints.allowed_paths` does not, because the ROUTING
+// criterion is still never evaluated.
+
+// appliesToPlanlessWorkflowV2 renders a minimal v2 document whose single
+// workflow carries the given `applies_to` YAML block (already indented four
+// spaces) and declares implement + review stages but NO plan stage — the
+// shape three of this repository's four workflows actually have.
+func appliesToPlanlessWorkflowV2(appliesTo string) []byte {
+	return []byte(`
+version: "2"
+workflows:
+  trivial:
+` + appliesTo + `
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+      - id: review
+        type: review
+        executor:
+          human: true
+`)
+}
+
+// TestParse_AppliesTo_PathsNoPlanStage_Rejected is case (a): the refusal
+// itself, asserted at the exact pointer and against the SHIPPED constant
+// rather than a paraphrase.
+func TestParse_AppliesTo_PathsNoPlanStage_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes(appliesToPlanlessWorkflowV2(`    applies_to:
+      paths:
+        - "docs/**"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for applies_to.paths on a plan-less workflow", err)
+	}
+	if ve.Path != "/workflows/trivial/applies_to/paths" {
+		t.Errorf("Path = %q, want /workflows/trivial/applies_to/paths", ve.Path)
+	}
+	want := fmt.Sprintf(spec.MsgFmtAppliesToPathsNoPlanStage, "trivial")
+	if ve.Message != want {
+		t.Errorf("Message = %q, want the shipped rendering %q", ve.Message, want)
+	}
+}
+
+// TestParse_AppliesTo_PathsNoPlanStage_MessageNamesFixes is case (b), the
+// done-means assertion behind the operator's gate check: the message names
+// the WORKFLOW, the REASON (the missing plan stage) and BOTH real
+// alternatives. A no-op or vaguely-worded touch of validate.go leaves this
+// failing where a scope-presence gate would pass it (#1169).
+func TestParse_AppliesTo_PathsNoPlanStage_MessageNamesFixes(t *testing.T) {
+	msg := fmt.Sprintf(spec.MsgFmtAppliesToPathsNoPlanStage, "routine_change")
+	for _, want := range []string{
+		"routine_change",
+		"plan stage",
+		"labels",
+		"trigger",
+		"constraints.allowed_paths",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, want it to name %q", msg, want)
+		}
+	}
+}
+
+// TestParse_AppliesTo_PathsWithPlanStage_Accepted is case (c), the POSITIVE
+// CONTROL: the identical `paths` declaration on a plan-BEARING workflow
+// validates clean, so the rule is "rejects exactly this" rather than
+// "rejects something".
+func TestParse_AppliesTo_PathsWithPlanStage_Accepted(t *testing.T) {
+	if _, err := spec.ParseBytes(appliesToWorkflowV2(`    applies_to:
+      paths:
+        - "docs/**"`)); err != nil {
+		t.Fatalf("ParseBytes = %v, want nil for paths on a plan-bearing workflow", err)
+	}
+}
+
+// TestParse_AppliesTo_PlanlessPathIndependentCriteriaAccepted is cases (d),
+// (e) and (i): `labels` alone, `trigger` alone and no declaration at all all
+// stay valid on a plan-less workflow. (d) and (e) are the regression guard on
+// the only working path-independent routing control this repository's three
+// plan-less workflows have; (i) is the nil-predicate back-compat branch.
+func TestParse_AppliesTo_PlanlessPathIndependentCriteriaAccepted(t *testing.T) {
+	cases := []struct {
+		name      string
+		appliesTo string
+	}{
+		{name: "labels only", appliesTo: `    applies_to:
+      labels:
+        - "type:chore"`},
+		{name: "trigger only", appliesTo: `    applies_to:
+      trigger:
+        - scheduled`},
+		{name: "no applies_to at all", appliesTo: `    description: "accepts any change"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := spec.ParseBytes(appliesToPlanlessWorkflowV2(tc.appliesTo)); err != nil {
+				t.Errorf("ParseBytes = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestParse_AppliesTo_PlanlessLabelsPlusPaths_Rejected is case (f): the rule
+// keys on the PRESENCE of `paths`, not on its exclusivity. A workflow whose
+// declaration is otherwise satisfiable through `labels` is still refused,
+// because the `paths` half of it would never be evaluated.
+func TestParse_AppliesTo_PlanlessLabelsPlusPaths_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes(appliesToPlanlessWorkflowV2(`    applies_to:
+      labels:
+        - "type:chore"
+      paths:
+        - "docs/**"`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError; labels alongside paths must not admit the declaration", err)
+	}
+	if ve.Path != "/workflows/trivial/applies_to/paths" {
+		t.Errorf("Path = %q, want /workflows/trivial/applies_to/paths", ve.Path)
+	}
+}
+
+// TestValidate_AppliesTo_ChangeKindWinsOverNoPlanStage is case (g), the
+// rung-1 ORDER contract: a plan-less workflow declaring both an unsupported
+// change_kind and a `paths` criterion reports the change_kind diagnosis,
+// which names a fix the plan-stage message cannot.
+func TestValidate_AppliesTo_ChangeKindWinsOverNoPlanStage(t *testing.T) {
+	s := &spec.Spec{
+		Version: "2",
+		Workflows: map[string]spec.Workflow{"routed": {AppliesTo: &spec.Predicate{
+			ChangeKinds: []string{"refactor"},
+			Paths:       []string{"docs/**"},
+		}}},
+	}
+	err := spec.Validate(s)
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if ve.Message != spec.MsgAppliesToChangeKindUnsupported {
+		t.Errorf("Message = %q, want the change_kind rejection to win over the plan-stage rule", ve.Message)
+	}
+}
+
+// TestValidate_AppliesTo_MalformedGlobWinsOverNoPlanStage is case (h), the
+// rung-2 ORDER contract: a malformed glob on a plan-less workflow reports the
+// SHARED predicate grammar error, proving rung 3 runs last. A glob the author
+// must fix either way is not worth re-diagnosing as a workflow-shape problem.
+func TestValidate_AppliesTo_MalformedGlobWinsOverNoPlanStage(t *testing.T) {
+	s := &spec.Spec{
+		Version: "2",
+		Workflows: map[string]spec.Workflow{"routed": {AppliesTo: &spec.Predicate{
+			Paths: []string{"docs/[unclosed"},
+		}}},
+	}
+	err := spec.Validate(s)
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if ve.Path != "/workflows/routed/applies_to" {
+		t.Errorf("Path = %q, want the predicate's own pointer, not .../paths", ve.Path)
+	}
+	if !strings.Contains(ve.Message, "malformed path glob") {
+		t.Errorf("Message = %q, want the shared predicate grammar error to win over the plan-stage rule", ve.Message)
+	}
+}
+
+// TestParse_AppliesTo_PathsWithInheritedPlanStage_Accepted is case (j): the
+// rule reads the RESOLVED stage list. `extends` folds stages, so a workflow
+// whose only plan stage is inherited from a base DOES produce a scope.files
+// set and its `paths` declaration is evaluable.
+func TestParse_AppliesTo_PathsWithInheritedPlanStage_Accepted(t *testing.T) {
+	if _, err := spec.ParseBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+  derived:
+    extends: base
+    applies_to:
+      paths:
+        - "docs/**"
+`)); err != nil {
+		t.Fatalf("ParseBytes = %v, want nil; the inherited plan stage makes paths evaluable", err)
+	}
+}
+
+// TestParse_AppliesTo_PlanlessBaseAttribution is case (k): a plan-less BASE
+// declaring `paths` is reported against the BASE and never against the
+// deriving workflow — `extends` folds stages only, so each workflow's routing
+// declaration is validated in its own right (the same attribution
+// TestValidateBytes_AppliesTo_ExtendsDoesNotInherit pins for change_kind).
+func TestParse_AppliesTo_PlanlessBaseAttribution(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    applies_to:
+      paths:
+        - "docs/**"
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+  derived:
+    extends: base
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError naming the base's applies_to", err)
+	}
+	if ve.Path != "/workflows/base/applies_to/paths" {
+		t.Errorf("Path = %q, want it reported against the declaring workflow (base)", ve.Path)
+	}
+	if strings.Contains(ve.Message, "derived") {
+		t.Errorf("Message = %q, want no attribution to derived; extends folds stages only", ve.Message)
+	}
+}
+
+// TestParse_AppliesTo_PlanlessPathsNotAdmittedByPostHocEnvelope is the
+// LOAD-BEARING REGRESSION TEST for the rule's unconditionality, and the only
+// case in this block that a reintroduced carve-out would fail.
+//
+// The rejected exemption was: admit `applies_to.paths` on a plan-less
+// workflow when some stage already declares a post-hoc path envelope
+// (`constraints.allowed_paths` / `forbidden_paths`), on the reasoning that a
+// similar envelope is held elsewhere. It is wrong on the merits — the two
+// controls answer different questions at different times. `applies_to.paths`
+// decides WHICH WORKFLOW a change is routed to, at run admission, against the
+// approved plan's scope.files; a stage constraint checks the PRODUCED DIFF
+// after the agent has already run under a workflow that was selected some
+// other way. A plan-less workflow still never produces the set the routing
+// criterion is read against, so the declaration is still never evaluated —
+// which is the silently-inert control #2377 exists to close. Holding a
+// post-hoc envelope does not make it evaluated; it only makes the inertness
+// harder to notice.
+//
+// Every OTHER plan-less fixture in this block declares no constraints, so a
+// carve-out keyed on one would leave them all green. This test declares the
+// envelope explicitly and requires the refusal to stand.
+func TestParse_AppliesTo_PlanlessPathsNotAdmittedByPostHocEnvelope(t *testing.T) {
+	// The stage produces pull_request, so the E52.7 post-hoc-constraint
+	// binding rule is satisfied and the applies_to rule is the only
+	// candidate for the error these cases must still report.
+	planless := func(constraints string) []byte {
+		return []byte(`
+version: "2"
+workflows:
+  trivial:
+    applies_to:
+      paths:
+        - "docs/**"
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+` + constraints + `        produces:
+          - artifact: pull_request
+`)
+	}
+	// One case per envelope shape a carve-out could plausibly key on.
+	cases := []struct {
+		name        string
+		constraints string
+	}{
+		{name: "allowed_paths", constraints: "          allowed_paths: [\"docs/**\"]\n"},
+		{name: "forbidden_paths", constraints: "          forbidden_paths: [\"backend/**\"]\n"},
+		{name: "both", constraints: "          allowed_paths: [\"docs/**\"]\n          forbidden_paths: [\"backend/**\"]\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes(planless(tc.constraints))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want the applies_to.paths refusal to stand; a stage's post-hoc path envelope must NOT admit a routing criterion that is still never evaluated (#2377)", err)
+			}
+			if ve.Path != "/workflows/trivial/applies_to/paths" {
+				t.Fatalf("Path = %q, want /workflows/trivial/applies_to/paths", ve.Path)
+			}
+			want := fmt.Sprintf(spec.MsgFmtAppliesToPathsNoPlanStage, "trivial")
+			if ve.Message != want {
+				t.Errorf("Message = %q, want the unchanged shipped rendering %q", ve.Message, want)
+			}
+		})
 	}
 }
 
