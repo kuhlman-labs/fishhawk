@@ -664,6 +664,7 @@ The fix inverts the rule into a closed ALLOW-LIST, `authorshipCategories`, seede
 `backend/internal/server/runs.go`; wired in `backend/cmd/fishhawkd/serve.go` from `FISHHAWKD_DATABASE_URL`. POST/GET/list/cancel for runs.
 
 - **Idempotency (E8.2)**: POST accepts `Idempotency-Key` — same `(repo, key)` returns the existing run with 200 instead of creating a duplicate. Webhook-driven runs use the dedicated dedup path (E3.9) and don't carry a key.
+  The lookup sits between validation and admission (#2366): request/spec validation runs AHEAD of it (a replayed malformed body keeps its 400/422 — and a replayed create whose GitHub spec fetch now fails still gets that failure), while the three audit-emitting admission gates — plan-reviewer capability, blocking budget, `applies_to` — run BEHIND it, so a replay re-evaluates no governance or spend decision and appends no audit entry. Same seam as `handleRecoverRun` ("replay is not new spend") and `handleCreateCampaign`. This is governance-chain hygiene, not a control hole: the pre-#2366 ordering duplicated `run_admitted_applies_to_override` / `run_admitted_budget_override` grants on a retry rather than admitting anything it should have refused.
 - **Runner provenance (ADR-022 / #388 + E22.7 / #404)**: every run row carries `runner_kind` (`github_actions` | `local`), assigned by the backend at run-create time — the dispatcher stamps `github_actions`, the local-runner CLI (Phase C of E22 / #389) stamps `local`. The runner never self-declares (its claim would be unverifiable).
   The `trace_uploaded` audit payload echoes the field from the run row so compliance consumers can filter audit history by backend; `GET /v0/runs?runner_kind=` filters the list endpoint the same way.
   Migration 0024 added the column with `DEFAULT 'github_actions'` so legacy rows tag correctly.
@@ -683,7 +684,7 @@ The fix inverts the rule into a closed ALLOW-LIST, `authorshipCategories`, seede
   v0 scope is append-only — each transition gets a new comment rather than editing a sticky one (edit-in-place deferred).
   Comments are authored by the operator's GitHub identity, not the Fishhawk App — a deliberate split that mirrors who actually triggered the run.
   Failure handling is best-effort: missing `gh` or a failed post warns to stderr and the run continues normally. Full inventory: `docs/issue-comment-surfaces.md`.
-- **Blocking budget admission**: `handleCreateRun` calls `budget_admission.go::checkBlockingBudget` after the plan-reviewer guard and before `CreateRun` — documented with its shared decision core in `backend/internal/webhook/README.md`.
+- **Blocking budget admission**: `handleCreateRun` calls `budget_admission.go::checkBlockingBudget` after the `Idempotency-Key` replay lookup and before `CreateRun` (#2366) — documented with its shared decision core in `backend/internal/webhook/README.md`.
 
 ### Re-drive — run-level reopen (`redrive.go`, #698)
 

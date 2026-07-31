@@ -319,6 +319,110 @@ func TestCreateRun_IdempotencyKey_LookupErrorBubbles(t *testing.T) {
 	}
 }
 
+// TestCreateRun_InvalidBody_WithResolvingKey_StillValidationFailed pins the
+// OTHER side of the #2366 seam: validation stays AHEAD of the replay lookup.
+//
+// The key here ALREADY RESOLVES to a run created moments earlier, so the
+// lookup would answer 200-with-that-run if it had moved ahead of the
+// validator. The malformed body (no workflow_id) must still lose to the field
+// check with 400 validation_failed. A malformed-body test using an arbitrary
+// key could not fail for the reason it exists — the lookup would miss and fall
+// through to the same 400 either way.
+func TestCreateRun_InvalidBody_WithResolvingKey_StillValidationFailed(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	// Seed the key so it resolves.
+	req1 := httptest.NewRequest(http.MethodPost, "/v0/runs",
+		strings.NewReader(`{"repo":"x/y","workflow_id":"w","workflow_sha":"s","trigger_source":"cli"}`))
+	req1.Header.Set("Content-Type", "application/json")
+	req1.Header.Set("Idempotency-Key", "resolving")
+	w1 := httptest.NewRecorder()
+	s.handleCreateRun(w1, withAuth(req1))
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("seed status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+
+	// Same key, body missing workflow_id.
+	req2 := httptest.NewRequest(http.MethodPost, "/v0/runs",
+		strings.NewReader(`{"repo":"x/y","workflow_sha":"s","trigger_source":"cli"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Idempotency-Key", "resolving")
+	w2 := httptest.NewRecorder()
+	s.handleCreateRun(w2, withAuth(req2))
+
+	if w2.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 — validation must precede the replay lookup:\n%s", w2.Code, w2.Body.String())
+	}
+	if !strings.Contains(w2.Body.String(), `"validation_failed"`) {
+		t.Errorf("body missing validation_failed code: %s", w2.Body.String())
+	}
+	if len(repo.runs) != 1 {
+		t.Errorf("repo has %d runs, want 1 (the malformed request creates nothing)", len(repo.runs))
+	}
+}
+
+// TestCreateRun_Replay_SkipsPlanReviewerCapabilityGate covers the third
+// audit-emitting admission gate the lookup now precedes (#2366). The create
+// runs on a reviewer-capable deployment; the replay hits one whose reviewer
+// backend is unwired, which would otherwise 400 plan_reviewer_unconfigured and
+// append a SECOND run_rejected_misconfigured entry for a run that was already
+// admitted. Both servers share the run repository and the audit fake, so the
+// pair is one chain and the counts are comparable.
+func TestCreateRun_Replay_SkipsPlanReviewerCapabilityGate(t *testing.T) {
+	repo := newFakeRepo()
+	au := newAuditFake()
+	capable := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au,
+		PlanReviewer: &fakePlanReviewer{}})
+	unwired := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au})
+
+	raw, err := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  gatingReviewSpecYAML,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(s *Server) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(string(raw)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", "k-reviewer")
+		w := httptest.NewRecorder()
+		s.handleCreateRun(w, withAuth(req))
+		return w
+	}
+
+	w1 := post(capable)
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201 on a reviewer-capable deployment:\n%s", w1.Code, w1.Body.String())
+	}
+	var first runResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+
+	w2 := post(unwired)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 with the existing run, not the capability rejection:\n%s", w2.Code, w2.Body.String())
+	}
+	var second runResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("replay returned run %s, want the existing %s", second.ID, first.ID)
+	}
+	if n := countGlobalAudits(au, "run_rejected_misconfigured"); n != 0 {
+		t.Errorf("run_rejected_misconfigured audits = %d, want 0 — the capability gate ran on a replay", n)
+	}
+	if len(repo.runs) != 1 {
+		t.Errorf("repo has %d runs, want 1", len(repo.runs))
+	}
+}
+
 // errIdempotencyRepo wraps fakeRepo to inject a non-ErrNotFound
 // error from GetRunByIdempotencyKey while behaving normally for
 // every other method. Used to exercise the handler's "unexpected

@@ -82,6 +82,23 @@ func createRunViaHandler(t *testing.T, s *Server, body map[string]any) *httptest
 	return w
 }
 
+// createRunViaHandlerWithKey is createRunViaHandler carrying an
+// Idempotency-Key header, so a test can drive the create + replay pair the
+// admission-gate ordering (#2366) turns on.
+func createRunViaHandlerWithKey(t *testing.T, s *Server, body map[string]any, key string) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	s.handleCreateRun(w, withAuth(req))
+	return w
+}
+
 // guardedRunBody is the create-request skeleton every case below varies.
 func guardedRunBody(appliesToBlock string) map[string]any {
 	return map[string]any{
@@ -997,6 +1014,21 @@ func countGlobalAppends(au *auditFake, category string) int {
 	return n
 }
 
+// countRunScopedAppends counts the run-scoped appends of a category for one
+// run. The COUNT — not merely the presence findRunScopedAppend asserts — is
+// what a replay can inflate (#2366).
+func countRunScopedAppends(au *auditFake, runID uuid.UUID, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	n := 0
+	for i := range au.appended {
+		if au.appended[i].RunID == runID && au.appended[i].Category == category {
+			n++
+		}
+	}
+	return n
+}
+
 // findRunScopedAppend returns the first run-scoped append of a category.
 func findRunScopedAppend(au *auditFake, runID uuid.UUID, category string) *audit.ChainAppendParams {
 	au.mu.Lock()
@@ -1070,5 +1102,105 @@ func TestAppliesTo_AdmittedRun_RecordsNoOverrideEntry(t *testing.T) {
 	has, err := s.runHasAppliesToOverride(context.Background(), created.ID)
 	if err != nil || has {
 		t.Errorf("runHasAppliesToOverride = (%v, %v), want (false, nil) for a run admitted on its merits", has, err)
+	}
+}
+
+// --- #2366: the Idempotency-Key replay lookup precedes this gate ---
+//
+// The applies_to override grant is a governance record, not a log line: it is
+// a PRECONDITION of admission (M11c), and "how many times was this override
+// granted?" must have one answer per run. A replayed create that re-evaluates
+// the gate appends a second grant to the global chain for a run that was only
+// ever admitted once.
+
+// TestCreateRun_Replay_DoesNotReappendAppliesToOverrideGrant is the issue's
+// done-means: a create + replay pair leaves EXACTLY ONE grant entry on each
+// chain and one run row. It fails on the pre-#2366 ordering, which re-runs
+// checkAppliesTo on the replay and appends a duplicate grant.
+func TestCreateRun_Replay_DoesNotReappendAppliesToOverrideGrant(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	body := guardedRunBody(labelsGuard)
+	body["issue_context"] = issueCtx("bug")
+	body["applies_to_override"] = true
+	body["applies_to_override_reason"] = "one-off backport; declaration widening tracked separately"
+
+	w1 := createRunViaHandlerWithKey(t, s, body, "k-override")
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+	var first runResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+
+	w2 := createRunViaHandlerWithKey(t, s, body, "k-override")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200:\n%s", w2.Code, w2.Body.String())
+	}
+	var second runResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("replay returned run %s, want the existing %s", second.ID, first.ID)
+	}
+
+	if n := countGlobalAppends(au, "run_admitted_applies_to_override"); n != 1 {
+		t.Errorf("global run_admitted_applies_to_override entries = %d, want 1 across create+replay — the override was granted once", n)
+	}
+	if n := countRunScopedAppends(au, first.ID, "run_admitted_applies_to_override"); n != 1 {
+		t.Errorf("run-scoped run_admitted_applies_to_override entries = %d, want 1 across create+replay", n)
+	}
+	if n := len(repo.runs); n != 1 {
+		t.Errorf("run rows = %d, want 1 (the replay must not insert)", n)
+	}
+}
+
+// TestCreateRun_Replay_DoesNotReevaluateAppliesTo is the falsifiable form of
+// the ordering claim, stated as an observable outcome rather than a source
+// position: the replayed body is one the gate WOULD REFUSE (override omitted,
+// labels unsatisfied), yet it returns the existing run and appends ZERO
+// rejection entries. That can only hold if the gate does not run at all on the
+// replay path — deciding "the same way" is not available to it here.
+func TestCreateRun_Replay_DoesNotReevaluateAppliesTo(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	create := guardedRunBody(labelsGuard)
+	create["issue_context"] = issueCtx("bug")
+	create["applies_to_override"] = true
+	create["applies_to_override_reason"] = "one-off backport"
+
+	w1 := createRunViaHandlerWithKey(t, s, create, "k-refusable")
+	if w1.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201:\n%s", w1.Code, w1.Body.String())
+	}
+	var first runResponse
+	if err := json.Unmarshal(w1.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+
+	// The replay body drops the override and keeps the unsatisfied label, so
+	// evaluating it would produce 422 workflow_not_applicable.
+	replay := guardedRunBody(labelsGuard)
+	replay["issue_context"] = issueCtx("bug")
+
+	w2 := createRunViaHandlerWithKey(t, s, replay, "k-refusable")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 with the existing run — a replay must not be re-admitted:\n%s", w2.Code, w2.Body.String())
+	}
+	var second runResponse
+	if err := json.Unmarshal(w2.Body.Bytes(), &second); err != nil {
+		t.Fatal(err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("replay returned run %s, want the existing %s", second.ID, first.ID)
+	}
+	if n := countGlobalAppends(au, "run_rejected_applies_to"); n != 0 {
+		t.Errorf("run_rejected_applies_to entries = %d, want 0 — the gate ran on a replay", n)
+	}
+	if n := countGlobalAppends(au, "run_admitted_applies_to_override"); n != 1 {
+		t.Errorf("global run_admitted_applies_to_override entries = %d, want 1", n)
+	}
+	if n := len(repo.runs); n != 1 {
+		t.Errorf("run rows = %d, want 1", n)
 	}
 }

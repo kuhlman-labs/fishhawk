@@ -769,6 +769,57 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Idempotency-Key (E8.2 / #40). When set, a previously-created
+	// run with the same (repo, key) is returned 200 instead of
+	// fresh-creating + dispatching a duplicate. Empty header is
+	// equivalent to "not idempotent" — every call mints a new run.
+	//
+	// The lookup sits HERE, between validation and admission, and that
+	// seam is load-bearing (#2366). Everything ABOVE it is REQUEST AND
+	// SPEC VALIDATION: it emits no audit entry and makes no governance
+	// or spend decision, so re-running it on a replay costs nothing and
+	// keeps a replayed malformed body or unparseable spec on its
+	// existing 400/422. Everything BELOW it — the plan-reviewer
+	// capability gate, the blocking-budget gate, the applies_to gate —
+	// is ADMISSION: each decides governance or spend AND appends to the
+	// audit chain, so none may re-fire on a replay. Idempotency exists
+	// to make a retried request a no-op, and a retry that appends to
+	// the audit chain is not one: the applies_to override grant is a
+	// PRECONDITION of admission (503 with no run row when the append
+	// fails), so it is a load-bearing record rather than a log line,
+	// and "how many times was this override granted?" must have one
+	// answer per run, not one per delivery attempt. handleRecoverRun
+	// (recover.go, "replay is not new spend") and handleCreateCampaign
+	// (campaigns.go, replay resolved before the installation + epic
+	// children query) already place their lookups on this seam.
+	//
+	// The honest residual: the spec fetch above the lookup can be a
+	// GitHub round trip, which is external and mutable and may answer
+	// differently on the retry. So a replayed create whose spec fetch
+	// now fails gets that failure (422/500) rather than the run it
+	// already created. Validation is not "deterministic on request
+	// content"; it is merely free of audit and governance side effects,
+	// which is the property this ordering actually needs.
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempKey != "" {
+		existing, err := s.cfg.RunRepo.GetRunByIdempotencyKey(r.Context(), req.Repo, idempKey)
+		switch {
+		case err == nil:
+			// Replay: return the prior run with 200 (not 201).
+			// 200 is the idempotency convention — clients that
+			// react to "201 Created" by, e.g., posting a Slack
+			// notification get a chance to no-op on the replay.
+			s.writeJSON(w, r, http.StatusOK, toRunResponse(existing))
+			return
+		case errors.Is(err, run.ErrNotFound):
+			// First call with this key — fall through to create.
+		default:
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"idempotency lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
+	}
+
 	// Plan-review capability gate (#574 / ADR-027 / #955 / #1495). The spec is
 	// authoritative for WHICH reviewers a gating plan stage (effective agent
 	// count > 0, human == 0) runs; the FISHHAWKD_ENABLE_* / FISHHAWKD_ANTHROPIC_API_KEY
@@ -792,6 +843,10 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	//
 	// Advisory mode (human > 0) is allowed through entirely: the human gate
 	// remains authoritative and the runtime review loops record the degradation.
+	//
+	// Both branches append to the audit chain, so this gate sits BEHIND the
+	// Idempotency-Key lookup above (#2366): it decides once per NEW run, not
+	// once per delivery attempt of the same one.
 	if haveStageDefs {
 		for _, st := range workflowDef.Stages {
 			if st.Type != spec.StageTypePlan || st.Reviewers == nil {
@@ -839,6 +894,13 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// budget_override. No-stage / no-spec requests have empty Budgets
 	// and pass through. checkBlockingBudget writes the error response
 	// (and the audit) on refusal.
+	//
+	// It is also POST-REPLAY (#2366): the Idempotency-Key lookup above
+	// short-circuits a retry, so this gate decides once per NEW run
+	// rather than once per request. A replay of an already-created run
+	// is not new spend, so it is neither refused when the period has
+	// since been exhausted nor re-credited with a second
+	// run_admitted_budget_override grant.
 	if haveStageDefs && !s.checkBlockingBudget(w, r, req.Repo, req.WorkflowID, workflowDef.Budgets, req.BudgetOverride) {
 		return
 	}
@@ -850,35 +912,16 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// GitHub fetch) because both converge on workflowDef/parsed before
 	// reaching here. Fail-CLOSED, deliberately unlike the advisory
 	// sweeps elsewhere in this package — see applies_to.go's header.
+	//
+	// Like checkBlockingBudget it is POST-REPLAY (#2366): it decides
+	// once per NEW run, not once per request, so a replayed create
+	// re-evaluates no routing predicate and appends no second
+	// run_admitted_applies_to_override grant to the global chain.
 	var appliesToOverride *appliesToOverrideRecord
 	if haveStageDefs {
 		var admit bool
 		admit, appliesToOverride = s.checkAppliesTo(w, r, &req, parsed, workflowDef)
 		if !admit {
-			return
-		}
-	}
-
-	// Idempotency-Key (E8.2 / #40). When set, a previously-created
-	// run with the same (repo, key) is returned 200 instead of
-	// fresh-creating + dispatching a duplicate. Empty header is
-	// equivalent to "not idempotent" — every call mints a new run.
-	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	if idempKey != "" {
-		existing, err := s.cfg.RunRepo.GetRunByIdempotencyKey(r.Context(), req.Repo, idempKey)
-		switch {
-		case err == nil:
-			// Replay: return the prior run with 200 (not 201).
-			// 200 is the idempotency convention — clients that
-			// react to "201 Created" by, e.g., posting a Slack
-			// notification get a chance to no-op on the replay.
-			s.writeJSON(w, r, http.StatusOK, toRunResponse(existing))
-			return
-		case errors.Is(err, run.ErrNotFound):
-			// First call with this key — fall through to create.
-		default:
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"idempotency lookup failed", map[string]any{"error": err.Error()})
 			return
 		}
 	}
