@@ -286,11 +286,45 @@ const MsgFmtEscalationNoRaise = "workflow %q escalation %d: require.%s: %s does 
 // Byte-identical in cli/internal/spec/validate.go.
 const MsgFmtEscalationApprovalsNoApprovalGate = "workflow %q escalation %d: require.approvals raises the approval gate, but workflow %q declares no approval gate for it to raise; declare an approval gate on a stage of this workflow, or drop require.approvals (an escalation may still raise max_autonomy on a gate-less workflow)"
 
+// MsgFmtEscalationPathsNoPlanStage is the rejection for a `paths` criterion
+// inside an escalation's `match` on a workflow that declares no plan stage
+// (E53.16 / #2382). Arguments: workflow name, escalation index. It is the
+// escalation twin of MsgFmtAppliesToPathsNoPlanStage — the same structural
+// gap, arriving through the escalation door rather than the routing one.
+//
+// It is exported so a test can assert the shipped text rather than a
+// paraphrase, and it is duplicated BYTE-FOR-BYTE in
+// cli/internal/spec/validate.go — the two Go modules cannot share a package,
+// so parity is held by TestEscalationPathsNoPlanStageMessageParity, which
+// reads both source files (the backend copy lives HERE, in escalation.go,
+// beside the other escalation constants — not in validate.go). It must
+// therefore stay a single-line `const … = "…"` declaration.
+//
+// The rule is UNCONDITIONAL. An escalation's `match.paths` is evaluated at the
+// approval gate against the run's approved-plan scope.files
+// (planGateScopePaths via resolveStageEscalations); a workflow that ships no
+// plan stage never produces that set, so the escalation is never evaluated —
+// it never fires, with no rejection and no audit entry to signal it did
+// nothing, which is worse than the routing case because the control fails to
+// RAISE. A `paths` match admitted because some OTHER control holds a similar
+// envelope (a stage's post-hoc `constraints.allowed_paths`, say) is still
+// never evaluated at gate time, so there is no carve-out for one: the
+// escalation criterion is refused at authoring time and the operator picks a
+// match that actually fires.
+const MsgFmtEscalationPathsNoPlanStage = "workflow %q escalation %d declares match.paths but the workflow declares no plan stage: an escalation's paths are evaluated at the approval gate against the approved plan's scope.files, so a workflow that produces no plan produces no path set to match against and this escalation could never fire — it is refused rather than silently accepted as a control that does something. Give this workflow a plan stage; or match on labels / trigger, which are evaluated from the run's admission context on every workflow whatever its shape (the require dimensions that do not depend on paths — approvals, min_permission and max_autonomy under a non-paths match — still hold)."
+
 // escalationNoRaiseMessage renders MsgFmtEscalationNoRaise. It is the shared
 // shape helper the validation tests assert against, so "the same actionable
 // shape" is mechanically true rather than eyeballed.
 func escalationNoRaiseMessage(workflow string, idx int, dimension, escalated, baseline, fix string) string {
 	return fmt.Sprintf(MsgFmtEscalationNoRaise, workflow, idx, dimension, escalated, baseline, fix)
+}
+
+// escalationPathsNoPlanStageMessage renders MsgFmtEscalationPathsNoPlanStage —
+// the shared shape helper (the escalationNoRaiseMessage precedent), so the
+// check and its tests assert ONE rendering rather than two hand-built strings.
+func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
+	return fmt.Sprintf(MsgFmtEscalationPathsNoPlanStage, workflow, idx)
 }
 
 // validateEscalations checks a workflow's `escalations` block at its own
@@ -314,7 +348,10 @@ func escalationNoRaiseMessage(workflow string, idx int, dimension, escalated, ba
 //  4. approvals.count raise-check;
 //  5. approvals.min_permission raise-check;
 //  6. approvals.member_of no-op check;
-//  7. max_autonomy no-op check.
+//  7. max_autonomy no-op check;
+//  8. match.paths on a workflow declaring no plan stage (E53.16 / #2382) —
+//     the STRUCTURAL-IMPOSSIBILITY rung, the escalation twin of
+//     validateAppliesTo's rung 3.
 //
 // Steps 4-6's BASELINE is the workflow's LEAST-RESTRICTIVE declaration per
 // dimension — the max count and the strictest min_permission over EVERY
@@ -329,11 +366,29 @@ func escalationNoRaiseMessage(workflow string, idx int, dimension, escalated, ba
 // resolver there would be precisely the duplicate-implementation drift this
 // epic exists to prevent). Every other check is mirrored onto the CLI's
 // raw-tree validator with byte-identical messages.
+//
+// Step 8 is LAST for the reason validateAppliesTo's structural rung is last:
+// change_kind (rung 1) and the shared Predicate.Validate (rung 2) keep
+// reporting their sharper SPELLING diagnoses first, and the require-side rungs
+// (3-7) keep reporting first too, because a require diagnosis names a
+// dimension the author wrote wrong while this one names the workflow's SHAPE —
+// worth reporting only once the entry is otherwise well-formed. It reads
+// wf.Stages AFTER v2 reuse resolution (parse.go resolves reuse before Validate
+// runs), so a plan stage inherited through `extends` satisfies it; the reused
+// hasPlanStage (validate.go, same package) is the ONE plan-stage predicate. It
+// is UNCONDITIONAL — no post-hoc `constraints.allowed_paths` elsewhere in the
+// workflow admits it, because the escalation is still never evaluated. Like
+// its siblings the rule is version-agnostic in code but unreachable below
+// major 2 (no v0/v1 schema declares `escalations`), and it composes forward: a
+// future stage type producing an authoritative pre-implementation path set
+// relaxes the refusal by joining the producer set rather than repealing the
+// rule.
 func validateEscalations(name string, wf *Workflow) error {
 	if wf == nil || len(wf.Escalations) == 0 {
 		return nil
 	}
 	gates := approvalGatesOf(wf)
+	planless := !hasPlanStage(wf)
 	for i := range wf.Escalations {
 		e := wf.Escalations[i]
 		ptr := fmt.Sprintf("/workflows/%s/escalations/%d", name, i)
@@ -351,6 +406,12 @@ func validateEscalations(name string, wf *Workflow) error {
 		}
 		if err := validateEscalatedCeiling(name, i, ptr, e.Require.MaxAutonomy, wf); err != nil {
 			return err
+		}
+		if planless && len(e.Match.Paths) > 0 {
+			return &ValidationError{
+				Path:    ptr + "/match/paths",
+				Message: escalationPathsNoPlanStageMessage(name, i),
+			}
 		}
 	}
 	return nil

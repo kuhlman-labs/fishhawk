@@ -144,7 +144,10 @@ block — as adapt-then-uncomment shapes:
   stage's post-hoc `constraints.allowed_paths`.
 - **`escalations`** — the per-path control that raises the bar for a
   matching change. The comment notes that an escalation may only ever
-  raise, never lower.
+  raise, never lower, and — mirroring the `applies_to` note above — that a
+  `match.paths` rule is refused at validation on a workflow with no plan
+  stage (#2382), since it is checked against the approved plan's
+  `scope.files`; keep a plan stage or match on `labels` / `trigger`.
 
 They ship **commented, not live**, for the reason a live one would fail
 the operator it was meant to help: a live `applies_to` would refuse a

@@ -659,6 +659,415 @@ workflows:
 	}
 }
 
+// --- escalation match.paths on a plan-less workflow (E53.16 / #2382) ---
+//
+// An escalation's `match.paths` is evaluated at the approval gate against the
+// run's approved-plan scope.files (planGateScopePaths via
+// resolveStageEscalations). A workflow declaring no plan stage never ships a
+// plan, so the escalation is never evaluated — it never FIRES, with no
+// rejection and no audit entry to signal it did nothing. This is the
+// escalation twin of applies_to's plan-stage rule (#2377), and worse: the
+// control fails to RAISE rather than merely fails to route. The rule below
+// refuses that declaration at authoring time, UNCONDITIONALLY: nothing admits
+// it, and in particular a stage's post-hoc `constraints.allowed_paths` does
+// not, because the escalation is still never evaluated.
+
+// escalationPlanlessWorkflowV2 renders a minimal v2 document whose single
+// workflow declares implement + review stages and NO plan stage — the shape
+// three of this repository's four workflows actually have — plus a
+// workflow-level `autonomy: high` block so a `require: {max_autonomy: low}`
+// escalation genuinely RAISES (the only-ever-raise family then passes and the
+// paths rung is the candidate for the error). The caller supplies the
+// `escalations` block already indented four spaces (via escalationBlock).
+func escalationPlanlessWorkflowV2(escalations string) []byte {
+	return []byte(`
+version: "2"
+workflows:
+  trivial:
+    autonomy: high
+` + escalations + `
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+      - id: review
+        type: review
+        executor:
+          human: true
+`)
+}
+
+// planlessRaisingEscalation is the shared escalation body for the plan-less
+// fixture: one paths (or otherwise) match plus a genuinely-raising
+// `max_autonomy: low` require, so the only-ever-raise rungs pass and rung 8 is
+// the sole candidate for a rejection.
+func planlessRaisingEscalation(match string) string {
+	return escalationBlock(`      - match:
+` + match + `
+        require:
+          max_autonomy: low`)
+}
+
+// TestParse_Escalations_PathsNoPlanStage_Rejected is the refusal itself,
+// asserted at the exact pointer and against the SHIPPED constant rather than a
+// paraphrase (a comment-only or no-op touch of escalation.go fails here where a
+// scope-presence gate would pass, #1169).
+func TestParse_Escalations_PathsNoPlanStage_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes(escalationPlanlessWorkflowV2(planlessRaisingEscalation(`          paths: ["**/crypto/**"]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for match.paths on a plan-less workflow", err)
+	}
+	if ve.Path != "/workflows/trivial/escalations/0/match/paths" {
+		t.Errorf("Path = %q, want /workflows/trivial/escalations/0/match/paths", ve.Path)
+	}
+	want := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "trivial", 0)
+	if ve.Message != want {
+		t.Errorf("Message = %q, want the shipped rendering %q", ve.Message, want)
+	}
+}
+
+// TestParse_Escalations_PathsNoPlanStage_MessageNamesFixes is the done-means
+// assertion behind the operator's message-shape requirement: the rendered text
+// names the WORKFLOW, the missing plan stage as the REASON, both admission-time
+// alternatives (labels / trigger) and the non-paths require dimensions that
+// still hold. A vaguely-worded constant satisfies a substring gate structurally
+// while failing the reader.
+func TestParse_Escalations_PathsNoPlanStage_MessageNamesFixes(t *testing.T) {
+	msg := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "routine_change", 2)
+	for _, want := range []string{
+		"routine_change",
+		"plan stage",
+		"labels",
+		"trigger",
+		"approvals",
+		"min_permission",
+		"max_autonomy",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, want it to name %q", msg, want)
+		}
+	}
+}
+
+// TestParse_Escalations_PlanlessLabelsOnlyAccepted is a POSITIVE CONTROL the
+// issue names as mattering most: a `labels`-only escalation match still
+// validates on a plan-less workflow, so the fix removes no escalation form
+// this repository's three plan-less workflows can carry.
+func TestParse_Escalations_PlanlessLabelsOnlyAccepted(t *testing.T) {
+	if _, err := spec.ParseBytes(escalationPlanlessWorkflowV2(planlessRaisingEscalation(`          labels: ["area:auth"]`))); err != nil {
+		t.Fatalf("ParseBytes = %v, want nil for a labels-only escalation on a plan-less workflow", err)
+	}
+}
+
+// TestParse_Escalations_PlanlessTriggerOnlyAccepted is the second POSITIVE
+// CONTROL: a `trigger`-only escalation match validates on a plan-less workflow.
+func TestParse_Escalations_PlanlessTriggerOnlyAccepted(t *testing.T) {
+	if _, err := spec.ParseBytes(escalationPlanlessWorkflowV2(planlessRaisingEscalation(`          trigger: [diff]`))); err != nil {
+		t.Fatalf("ParseBytes = %v, want nil for a trigger-only escalation on a plan-less workflow", err)
+	}
+}
+
+// TestParse_Escalations_PathsWithPlanStage_Accepted is the positive control on
+// the plan-BEARING side: the identical paths match validates clean when the
+// workflow declares a plan stage, so the rule is "rejects exactly this" rather
+// than "rejects something".
+func TestParse_Escalations_PathsWithPlanStage_Accepted(t *testing.T) {
+	if _, err := spec.ParseBytes(escalationV2Doc(escalationBlock(`      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            count: 3`))); err != nil {
+		t.Fatalf("ParseBytes = %v, want nil for paths on a plan-bearing workflow", err)
+	}
+}
+
+// TestParse_Escalations_PlanlessLabelsPlusPaths_Rejected pins that the rule
+// keys on the PRESENCE of `paths`, not on exclusivity: an escalation otherwise
+// satisfiable through `labels` is still refused, at the paths pointer, because
+// the paths half of it would never be evaluated.
+func TestParse_Escalations_PlanlessLabelsPlusPaths_Rejected(t *testing.T) {
+	_, err := spec.ParseBytes(escalationPlanlessWorkflowV2(planlessRaisingEscalation(`          labels: ["area:auth"]
+          paths: ["**/crypto/**"]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError; labels alongside paths must not admit the escalation", err)
+	}
+	if ve.Path != "/workflows/trivial/escalations/0/match/paths" {
+		t.Errorf("Path = %q, want /workflows/trivial/escalations/0/match/paths", ve.Path)
+	}
+}
+
+// TestParse_Escalations_PathsWithInheritedPlanStage_Accepted proves the rung
+// reads the RESOLVED stage list: a deriving workflow inheriting its only plan
+// stage through `extends` DOES produce a scope.files set, so its paths
+// escalation is evaluable and accepted. It doubles as the reuse-resolution seam
+// test.
+func TestParse_Escalations_PathsWithInheritedPlanStage_Accepted(t *testing.T) {
+	if _, err := spec.ParseBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+  derived:
+    extends: base
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: low
+`)); err != nil {
+		t.Fatalf("ParseBytes = %v, want nil; the inherited plan stage makes the escalation evaluable", err)
+	}
+}
+
+// TestParse_Escalations_PlanlessBaseAttribution is the attribution pin: a
+// plan-less BASE's own bad escalation is reported against the BASE, never the
+// deriving workflow — `extends` folds stages only (the sibling of
+// TestParse_Escalations_ExtendsReportsAgainstTheDeclaringWorkflow already sited
+// in this file).
+func TestParse_Escalations_PlanlessBaseAttribution(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: low
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+  derived:
+    extends: base
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError naming the base's escalation", err)
+	}
+	if ve.Path != "/workflows/base/escalations/0/match/paths" {
+		t.Errorf("Path = %q, want it reported against the declaring workflow (base)", ve.Path)
+	}
+	if strings.Contains(ve.Message, "derived") {
+		t.Errorf("Message = %q, want no attribution to derived; extends folds stages only", ve.Message)
+	}
+}
+
+// TestParse_Escalations_PlanlessPathsNotAdmittedByPostHocEnvelope is the
+// LOAD-BEARING regression test for the rule's unconditionality, and the only
+// case in this block a reintroduced carve-out would fail.
+//
+// The rejected exemption was: admit a plan-less `match.paths` when some stage
+// already declares a post-hoc path envelope (`constraints.allowed_paths` /
+// `forbidden_paths`). It is wrong on the merits — the two controls answer
+// different questions at different times. The escalation's paths decide, at the
+// approval gate against the approved plan's scope.files, WHETHER THE ESCALATION
+// FIRES; a stage constraint checks the PRODUCED DIFF after the agent has run. A
+// plan-less workflow still never produces the set the escalation is read
+// against, so it still never fires — the silently-inert control #2382 closes.
+// Every OTHER plan-less fixture in this block declares no constraints, so a
+// carve-out keyed on one would leave them all green; this test declares the
+// envelope explicitly and requires the refusal to stand.
+func TestParse_Escalations_PlanlessPathsNotAdmittedByPostHocEnvelope(t *testing.T) {
+	// The stage produces pull_request, so the E52.7 post-hoc-constraint
+	// binding rule is satisfied and the escalation rule is the only candidate
+	// for the error these cases must still report.
+	planless := func(constraints string) []byte {
+		return []byte(`
+version: "2"
+workflows:
+  trivial:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: low
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+` + constraints + `        produces:
+          - artifact: pull_request
+`)
+	}
+	cases := []struct {
+		name        string
+		constraints string
+	}{
+		{name: "allowed_paths", constraints: "          allowed_paths: [\"infra/**\"]\n"},
+		{name: "forbidden_paths", constraints: "          forbidden_paths: [\"backend/**\"]\n"},
+		{name: "both", constraints: "          allowed_paths: [\"infra/**\"]\n          forbidden_paths: [\"backend/**\"]\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes(planless(tc.constraints))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want the match.paths refusal to stand; a stage's post-hoc path envelope must NOT admit an escalation that still never fires (#2382)", err)
+			}
+			if ve.Path != "/workflows/trivial/escalations/0/match/paths" {
+				t.Fatalf("Path = %q, want /workflows/trivial/escalations/0/match/paths", ve.Path)
+			}
+			want := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "trivial", 0)
+			if ve.Message != want {
+				t.Errorf("Message = %q, want the unchanged shipped rendering %q", ve.Message, want)
+			}
+		})
+	}
+}
+
+// TestValidate_Escalations_ChangeKindWinsOverNoPlanStage is the rung-1 ORDER
+// contract: a plan-less workflow whose escalation declares both an unsupported
+// change_kind and a paths criterion reports the change_kind diagnosis, which
+// names a fix the plan-stage message cannot.
+func TestValidate_Escalations_ChangeKindWinsOverNoPlanStage(t *testing.T) {
+	_, err := spec.ParseBytes(escalationPlanlessWorkflowV2(planlessRaisingEscalation(`          change_kind: [refactor]
+          paths: ["infra/**"]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if ve.Path != "/workflows/trivial/escalations/0/match/change_kind" {
+		t.Errorf("Path = %q, want the change_kind pointer", ve.Path)
+	}
+	if ve.Message != spec.MsgEscalationChangeKindUnsupported {
+		t.Errorf("Message = %q, want the change_kind rejection to win over the plan-stage rule", ve.Message)
+	}
+}
+
+// TestValidate_Escalations_MalformedGlobWinsOverNoPlanStage is the rung-2 ORDER
+// contract: a malformed glob on a plan-less workflow reports the SHARED
+// predicate grammar error at the match pointer, proving the paths rung runs
+// last.
+func TestValidate_Escalations_MalformedGlobWinsOverNoPlanStage(t *testing.T) {
+	_, err := spec.ParseBytes(escalationPlanlessWorkflowV2(planlessRaisingEscalation(`          paths: ["infra/["]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if ve.Path != "/workflows/trivial/escalations/0/match" {
+		t.Errorf("Path = %q, want the predicate's own pointer, not .../match/paths", ve.Path)
+	}
+	if !strings.Contains(ve.Message, "malformed path glob") {
+		t.Errorf("Message = %q, want the shared predicate grammar error to win over the plan-stage rule", ve.Message)
+	}
+}
+
+// TestValidate_Escalations_NoRaiseWinsOverNoPlanStage pins the LAST-rung
+// placement as a reviewable decision rather than an emergent property of
+// statement order: a no-raise `require.approvals.count` alongside an inert
+// paths match on a plan-less workflow reports the only-ever-raise diagnosis
+// (a require-side rung, 4), not the paths refusal. The plan-less fixture here
+// declares an approval gate on a NON-plan stage so a count baseline exists.
+func TestValidate_Escalations_NoRaiseWinsOverNoPlanStage(t *testing.T) {
+	_, err := spec.ParseBytes([]byte(`
+version: "2"
+workflows:
+  trivial:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            count: 1
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvals:
+              count: 2
+      - id: review
+        type: review
+        executor:
+          human: true
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	if ve.Path != "/workflows/trivial/escalations/0/require/approvals/count" {
+		t.Errorf("Path = %q, want the count raise-check to win over the plan-stage rule", ve.Path)
+	}
+	assertNoRaiseShape(t, ve.Message, "trivial", 0, "approvals.count")
+}
+
+// TestValidate_Escalations_PathsNoPlanStageGoLayerBranch drives the rung
+// through the exported Validate over a hand-built typed Spec whose workflow has
+// zero plan stages, so the fail-closed code is proved reachable rather than
+// assumed live behind a parse. An empty require passes the only-ever-raise
+// rungs, leaving the paths rung as the sole candidate.
+func TestValidate_Escalations_PathsNoPlanStageGoLayerBranch(t *testing.T) {
+	s := &spec.Spec{
+		Version: "2",
+		Workflows: map[string]spec.Workflow{"routed": {
+			Escalations: []spec.Escalation{{Match: spec.Predicate{Paths: []string{"crypto/**"}}}},
+		}},
+	}
+	err := spec.Validate(s)
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError from the Go layer", err)
+	}
+	if ve.Path != "/workflows/routed/escalations/0/match/paths" {
+		t.Errorf("Path = %q, want /workflows/routed/escalations/0/match/paths", ve.Path)
+	}
+	want := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "routed", 0)
+	if ve.Message != want {
+		t.Errorf("Message = %q, want %q", ve.Message, want)
+	}
+}
+
+// TestParse_Escalations_MultipleEntriesReportsOffendingIndex pins index
+// correctness through both the pointer and the rendered message: a clean entry
+// 0 (labels) followed by a paths-bearing entry 1 reports index 1 in BOTH.
+func TestParse_Escalations_MultipleEntriesReportsOffendingIndex(t *testing.T) {
+	_, err := spec.ParseBytes(escalationPlanlessWorkflowV2(escalationBlock(`      - match:
+          labels: ["area:auth"]
+        require:
+          max_autonomy: low
+      - match:
+          paths: ["**/crypto/**"]
+        require:
+          max_autonomy: low`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for the second entry", err)
+	}
+	if ve.Path != "/workflows/trivial/escalations/1/match/paths" {
+		t.Errorf("Path = %q, want it to name escalation index 1", ve.Path)
+	}
+	want := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "trivial", 1)
+	if ve.Message != want {
+		t.Errorf("Message = %q, want the rendering for index 1 %q", ve.Message, want)
+	}
+}
+
 // --- composition ---
 
 // intPtr is a local helper for the *int count dimension.
