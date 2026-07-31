@@ -9379,6 +9379,26 @@ paths:
               `member_of` group when set), and a human-readable
               `next_actions` array instructing the caller to retry once
               the forge is reachable.
+            - `escalation_unevaluable` — E53.4 / #2227, extended by
+              E53.14 / #2374: the workflow declares `escalations` whose
+              effect on this gate could not be evaluated, so the gate
+              **fails closed** rather than proceeding unescalated. No
+              approval row is inserted and the gate does not transition.
+              `details` carries `retryable: true`, `error` (the
+              underlying failure) and a `next_actions` array. Two causes,
+              distinguished by `details.reason`:
+              (a) the escalation RESOLVER failed — a `match` glob error,
+              or the run's approved plan is unreadable while a
+              `paths`-bearing escalation is declared (no `reason` field);
+              (b) `reason: baseline_unreadable` — the gate's own
+              `approvals` block could not be read (for example the run's
+              cached workflow spec does not declare this stage type)
+              while an escalation IS firing. An escalation raises
+              RELATIVE to the baseline, so the effective
+              baseline-plus-escalation requirement is then unknowable and
+              the gate refuses rather than enforcing a partially-known
+              requirement. A read failure with NOTHING escalated is
+              unaffected and still proceeds.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

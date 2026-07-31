@@ -6768,23 +6768,45 @@ func TestSubmitApproval_Escalation_PlanUnreadable_FailsClosed(t *testing.T) {
 	}
 }
 
-// TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced pins
-// the #2227 fixup (prior concern c7665be8): when fetchApprovalsForStage errors
-// but a paths/label/trigger escalation IS raised (escReq non-zero), the fetch
-// error must NOT short-circuit before resolveStageEscalations — the escalated
-// forge predicate is enforced against a nil baseline so a transient window
-// cannot let an out-of-group approval through. A regression restoring the
-// original early `if ferr != nil { return nil, true }` would wave the non-member
-// through and this 403 would vanish.
+// countOnlyEscalationSpecYAML is the #2374 bypass shape: the gate's BASELINE
+// carries the membership requirement (`member_of: acme/platform`) and the
+// escalation raises the COUNT ONLY. Composing that escalation against a nil
+// baseline yields "count 2, no membership at all" — the requirement the gate
+// must never enforce, and the one a count-only escalation gives
+// countEscalatedForgeApprovers no escalated forge predicate to re-resolve at
+// count time.
+func countOnlyEscalationSpecYAML(t *testing.T) string {
+	t.Helper()
+	s := strings.Replace(escalationApprovalSpecYAML,
+		"            count: 2\n            member_of: acme/security\n",
+		"            count: 2\n", 1)
+	s = strings.Replace(s,
+		"            approvals:\n              count: 1\n",
+		"            approvals:\n              count: 1\n              member_of: acme/platform\n", 1)
+	if strings.Contains(s, "acme/security") || !strings.Contains(s, "acme/platform") {
+		t.Fatalf("count-only fixture did not substitute; the test would assert the wrong shape:\n%s", s)
+	}
+	return s
+}
+
+// TestCheckApprovalPredicates_FetchError_CountOnlyEscalation_FailsClosed is the
+// #2374 defect pin. The gate's baseline declares `member_of: acme/platform`
+// and a COUNT-ONLY escalation fires. With the baseline unreadable, the
+// effective requirement is UNKNOWABLE — an escalation raises RELATIVE to the
+// baseline — so the gate must refuse with the retryable 503 rather than
+// enforce a baseline-less approximation.
 //
-// The fetch error is forced by a stage whose Type is absent from the workflow
-// (fetchApprovalsForStage returns "stage_type … not in workflow"), while
-// escalationsForRun still reads the workflow's firing escalation off the same
-// cached spec bytes — the exact ferr != nil ∧ escReq non-zero divergence.
-func TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced(t *testing.T) {
+// BEFORE this fix, effectiveApprovals(nil, escReq) composed to "count 2, no
+// membership", which took the not-predicate-guarded early return and returned
+// ok=true — admitting an out-of-group approver on the escalated count alone.
+// The load-bearing assertions are therefore ok=false and the 503 body: both
+// fail on the pre-fix code. The zero-forge-calls check is kept because it is
+// cheap, but it discriminates nothing on its own — the pre-fix code also made
+// zero forge calls, via that same early return (operator condition 2).
+func TestCheckApprovalPredicates_FetchError_CountOnlyEscalation_FailsClosed(t *testing.T) {
 	s, _, rr, _, idp := newApprovalServerWithIdentity(t,
 		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
-	stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+	stage := seedEscalationApprovalRun(t, rr, countOnlyEscalationSpecYAML(t))
 	// A stage type the workflow does not declare → fetchApprovalsForStage errors,
 	// but the workflow-level escalation still fires.
 	stage.Type = run.StageTypeAcceptance
@@ -6798,23 +6820,248 @@ func TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced(t *t
 	w := httptest.NewRecorder()
 	res, ok := s.checkApprovalPredicates(w, req, stage, "github:outsider", false)
 	if ok {
-		t.Fatalf("checkApprovalPredicates ok = true, want false — the escalated member_of must be enforced despite the fetch error")
+		t.Fatalf("checkApprovalPredicates ok = true, want false — an unreadable baseline under a count-only escalation drops the baseline's member_of and admits an out-of-group approver")
 	}
 	if res != nil {
-		t.Errorf("resolution = %v, want nil on a rejection", res)
+		t.Errorf("resolution = %v, want nil on a refusal", res)
 	}
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "acme/security") {
-		t.Errorf("403 body does not name the escalated group: %s", w.Body.String())
+	body := w.Body.String()
+	if !strings.Contains(body, "escalation_unevaluable") {
+		t.Errorf("503 body does not name the failure code: %s", body)
 	}
-	if !strings.Contains(w.Body.String(), `"escalated":true`) {
-		t.Errorf("403 body does not mark the predicate as escalated: %s", w.Body.String())
+	if !strings.Contains(body, `"retryable":true`) {
+		t.Errorf("503 body is not marked retryable: %s", body)
 	}
-	if idp.memberCalls != 1 {
-		t.Errorf("memberCalls = %d, want 1 (the escalated member_of was resolved)", idp.memberCalls)
+	if !strings.Contains(body, `"reason":"baseline_unreadable"`) {
+		t.Errorf("503 body does not distinguish the baseline-unreadable cause from the resolver-error one: %s", body)
 	}
+	if idp.permCalls != 0 || idp.memberCalls != 0 {
+		t.Errorf("forge calls perm %d / member %d, want 0/0 (the requirement was never composed)", idp.permCalls, idp.memberCalls)
+	}
+}
+
+// TestCheckApprovalPredicates_FetchError_PredicateEscalation_FailsClosed
+// supersedes TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced
+// (#2227 fixup) under #2374. That test asserted a 403 — the escalated
+// member_of ENFORCED against a nil baseline. That posture is the defect: an
+// escalation raises RELATIVE to the baseline, so enforcing a nil-baseline
+// composition silently drops whatever the baseline itself required. The gate
+// now REFUSES instead of enforcing a partially-known requirement, so the
+// vanished 403 assertion is intentional. A regression restoring nil-baseline
+// enforcement re-opens the membership-bypass window this file closes.
+//
+// The fixture is unchanged from the superseded test: a stage whose Type is
+// absent from the workflow (fetchApprovalsForStage returns "stage_type … not
+// in workflow"), while escalationsForRun still reads the workflow's firing
+// escalation off the same cached spec bytes — the exact ferr != nil ∧ escReq
+// non-zero divergence.
+func TestCheckApprovalPredicates_FetchError_PredicateEscalation_FailsClosed(t *testing.T) {
+	s, ar, rr, _, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+	stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+	stage.Type = run.StageTypeAcceptance
+
+	// Sanity: the fetch genuinely errors on this stage.
+	if _, ferr := s.fetchApprovalsForStage(context.Background(), stage); ferr == nil {
+		t.Fatal("fetchApprovalsForStage did not error; the test would not exercise the fetch-error branch")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+	w := httptest.NewRecorder()
+	res, ok := s.checkApprovalPredicates(w, req, stage, "github:outsider", false)
+	if ok {
+		t.Fatalf("checkApprovalPredicates ok = true, want false — an unreadable baseline under a firing escalation must refuse")
+	}
+	if res != nil {
+		t.Errorf("resolution = %v, want nil on a refusal", res)
+	}
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (was 403 before #2374):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "escalation_unevaluable") {
+		t.Errorf("503 body does not name the failure code: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"retryable":true`) {
+		t.Errorf("503 body is not marked retryable: %s", w.Body.String())
+	}
+	if idp.memberCalls != 0 {
+		t.Errorf("memberCalls = %d, want 0 — the gate must not resolve a requirement it cannot compute", idp.memberCalls)
+	}
+	if n := len(ar.all); n != 0 {
+		t.Errorf("approval rows inserted = %d, want 0 (the refusal is pre-Submit)", n)
+	}
+}
+
+// TestCheckApprovalPredicates_FetchError_NoEscalation_FailsOpen is the
+// fail-OPEN control proving the escReq.IsZero() branch is byte-identical to
+// today (#2374): the SAME forced fetch error on a run whose escalation does
+// NOT fire returns (nil, true) with NOTHING written to the recorder. Without
+// it, the new refusal could have swallowed the pre-existing baseline fail-open
+// posture — which the operator ratified as out of scope — and no test would
+// notice.
+func TestCheckApprovalPredicates_FetchError_NoEscalation_FailsOpen(t *testing.T) {
+	s, _, rr, _, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+	nonMatching := strings.Replace(escalationApprovalSpecYAML,
+		"          trigger: [diff]", "          labels: [security]", 1)
+	stage := seedEscalationApprovalRun(t, rr, nonMatching)
+	stage.Type = run.StageTypeAcceptance
+
+	if _, ferr := s.fetchApprovalsForStage(context.Background(), stage); ferr == nil {
+		t.Fatal("fetchApprovalsForStage did not error; the test would not exercise the fetch-error branch")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+	w := httptest.NewRecorder()
+	res, ok := s.checkApprovalPredicates(w, req, stage, "github:outsider", false)
+	if !ok {
+		t.Fatalf("checkApprovalPredicates ok = false, want true — a fetch error with NO escalation firing keeps the pre-existing fail-open read:\n%s", w.Body.String())
+	}
+	if res != nil {
+		t.Errorf("resolution = %v, want nil on the fail-open pass-through", res)
+	}
+	if w.Body.Len() != 0 {
+		t.Errorf("wrote a response body on the fail-open path: %s", w.Body.String())
+	}
+	if idp.permCalls != 0 || idp.memberCalls != 0 {
+		t.Errorf("forge calls perm %d / member %d, want 0/0", idp.permCalls, idp.memberCalls)
+	}
+}
+
+// TestSubmitApproval_FetchError_EscalationFiring_FailsClosed is the
+// CROSS-BOUNDARY assertion for #2374, spanning the HTTP handler → run-row /
+// cached-spec read → escalation resolver → approval repository. A unit test on
+// checkApprovalPredicates alone cannot prove the concern, which is precisely
+// that an approval is "inserted and counted" during the error window: only the
+// real POST path shows the row count and the stage state.
+func TestSubmitApproval_FetchError_EscalationFiring_FailsClosed(t *testing.T) {
+	s, ar, rr, _, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+	stage := seedEscalationApprovalRun(t, rr, countOnlyEscalationSpecYAML(t))
+	stage.Type = run.StageTypeAcceptance
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "escalation_unevaluable") {
+		t.Errorf("503 body does not name the failure code: %s", w.Body.String())
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage = %q, want still awaiting_approval", stage.State)
+	}
+	if n := len(ar.all); n != 0 {
+		t.Errorf("approval rows inserted = %d, want 0 — no approval may be inserted (and counted) during the error window", n)
+	}
+}
+
+// TestApproveStageAs_FetchError_EscalationFiring_DoesNotAdvance closes the
+// SIBLING gap the operator folded into #2374 (binding condition 1).
+// approveStageAs discarded the fetch error, so a nil approvals block
+// conflated "this gate declares no approvals" with "we could not read the
+// spec" and took the legacy first-vote-advances path — clearing an ESCALATED
+// gate on ONE vote, skipping both the escalated count and the baseline
+// predicates. It is reachable WITHOUT the pre-Submit gate the rest of this
+// change hardens: the campaign auto-driver (autodrive.go) calls approveStageAs
+// directly.
+func TestApproveStageAs_FetchError_EscalationFiring_DoesNotAdvance(t *testing.T) {
+	newSrv := func(t *testing.T) (*Server, *fakeApprovalRepo, *approvalRunRepo) {
+		t.Helper()
+		s, ar, rr, _, _ := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+		return s, ar, rr
+	}
+
+	t.Run("a firing escalation holds the gate on an unreadable baseline", func(t *testing.T) {
+		s, ar, rr := newSrv(t)
+		stage := seedEscalationApprovalRun(t, rr, countOnlyEscalationSpecYAML(t))
+		stage.Type = run.StageTypeAcceptance
+
+		res, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("approve returned error; the unreadable baseline must fail closed, not surface: %v", err)
+		}
+		if res.Stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("state = %q, want awaiting_approval — the legacy first-vote path must not clear an escalated gate on an unreadable baseline", res.Stage.State)
+		}
+		if len(rr.transitions) != 0 {
+			t.Errorf("recorded %d stage transitions, want 0 (the gate was held closed)", len(rr.transitions))
+		}
+		// The vote is RECORDED (a corrected retry is a duplicate, not a
+		// second vote) — the refusal is post-Submit on this path.
+		if n := len(ar.all); n != 1 {
+			t.Errorf("approval rows = %d, want 1 (recorded but not counted)", n)
+		}
+	})
+
+	t.Run("the campaign auto-drive call site does not clear an escalated gate", func(t *testing.T) {
+		// autodrive.go's exact shape: the campaign actor subject (agent kind)
+		// with a DelegatedRule, calling approveStageAs directly.
+		s, _, rr := newSrv(t)
+		stage := seedEscalationApprovalRun(t, rr, countOnlyEscalationSpecYAML(t))
+		stage.Type = run.StageTypeAcceptance
+
+		id := eligibleApproverIdentity(operatorrole.CampaignActorSubject)
+		res, err := s.approveStageAs(context.Background(), id, approveActionParams{
+			Stage:         stage,
+			Decision:      approval.DecisionApprove,
+			DelegatedRule: "clean_dual_approval",
+		})
+		if err != nil {
+			t.Fatalf("auto-drive approve: %v", err)
+		}
+		if res.Stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("state = %q, want awaiting_approval — the auto-driver reached the legacy path with an agent-kind vote and cleared an escalated gate", res.Stage.State)
+		}
+		if len(rr.transitions) != 0 {
+			t.Errorf("recorded %d stage transitions, want 0", len(rr.transitions))
+		}
+	})
+
+	t.Run("an unevaluable escalation resolver also holds the gate", func(t *testing.T) {
+		// Both inputs unreadable: the stage type is absent from the workflow
+		// (fetch error) AND a paths-bearing escalation cannot resolve its plan
+		// (resolver error). We cannot even tell whether an escalation fires, so
+		// the same not-advancing posture applies.
+		s, _, rr := newSrv(t)
+		pathsSpec := strings.Replace(escalationApprovalSpecYAML,
+			"          trigger: [diff]", `          paths: ["backend/**"]`, 1)
+		stage := seedEscalationApprovalRun(t, rr, pathsSpec)
+		stage.Type = run.StageTypeAcceptance
+
+		res, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("approve returned error; the resolver failure must fail closed, not surface: %v", err)
+		}
+		if res.Stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("state = %q, want awaiting_approval — an unevaluable escalation must not advance an unreadable-baseline gate", res.Stage.State)
+		}
+	})
+
+	t.Run("control: a fetch error with NO escalation firing still advances", func(t *testing.T) {
+		// The legacy first-vote path is untouched when nothing is escalated —
+		// the refusal is gated strictly on a firing (or unevaluable)
+		// escalation, not on the fetch error alone.
+		s, _, rr := newSrv(t)
+		nonMatching := strings.Replace(escalationApprovalSpecYAML,
+			"          trigger: [diff]", "          labels: [security]", 1)
+		stage := seedEscalationApprovalRun(t, rr, nonMatching)
+		stage.Type = run.StageTypeAcceptance
+
+		res, err := s.approveStageAs(context.Background(), eligibleApproverIdentity("github:r1"),
+			approveActionParams{Stage: stage, Decision: approval.DecisionApprove})
+		if err != nil {
+			t.Fatalf("approve: %v", err)
+		}
+		if res.Stage.State != run.StageStateSucceeded {
+			t.Fatalf("state = %q, want succeeded — without this control the fail-closed assertions prove nothing", res.Stage.State)
+		}
+	})
 }
 
 // withEscalationApprover injects a DISTINCT operator identity so the second
