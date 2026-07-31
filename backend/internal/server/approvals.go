@@ -956,10 +956,7 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 // falls through to today's path (matching checkApproverAuthorization's
 // best-effort posture), NOT on the forge RESOLUTION, which fails closed.
 func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request, stage *run.Stage, subject string, delegated bool) (*predicateResolution, bool) {
-	approvals, err := s.fetchApprovalsForStage(r.Context(), stage)
-	if err != nil {
-		return nil, true
-	}
+	approvals, ferr := s.fetchApprovalsForStage(r.Context(), stage)
 
 	// The escalation raise is resolved BEFORE the "is this gate predicate-
 	// guarded" test (E53.4 / #2227): an escalation can add a `member_of` or a
@@ -967,6 +964,16 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 	// block first would skip the forge gate on exactly the gate an escalation
 	// just tightened. It is also resolved on a gate with no approvals block at
 	// all — a `paths`-matched escalation raises membership there too.
+	//
+	// It is resolved BEFORE short-circuiting on a gate-fetch error too (#2227
+	// fixup): a TRANSIENT fetchApprovalsForStage failure must not skip an
+	// escalated member_of / min_permission predicate on a run whose spec
+	// declares one — otherwise an out-of-group approval recorded during the
+	// error window counts toward the escalated quorum at count time (the count
+	// path counts distinct approvers, not group membership, so membership is
+	// never re-checked there). resolveStageEscalations reads the run row
+	// itself and fails closed on a transient run-row error (degrading only on
+	// a missing/legacy row), so the two failure surfaces stay consistent.
 	//
 	// FAIL CLOSED on a resolver error: a Match error (a malformed glob reaching
 	// the gate) or an unreadable plan while a paths-bearing escalation is
@@ -984,6 +991,18 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 				},
 			})
 		return nil, false
+	}
+
+	// A gate-fetch error with NOTHING escalated keeps the pre-existing
+	// fail-open posture for the baseline predicates — they were always
+	// best-effort on this read, matching checkApproverAuthorization. But when
+	// an escalation IS raised (escReq non-zero), its predicate must still be
+	// enforced even though the baseline block is unreadable: an escalation
+	// only ever RAISES, so enforcing the escalated requirement against a nil
+	// baseline is safe and closes the window where a transient fetch error let
+	// an out-of-group approval through (#2227 fixup).
+	if ferr != nil && escReq.IsZero() {
+		return nil, true
 	}
 	effective := effectiveApprovals(approvals, escReq)
 

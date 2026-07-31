@@ -444,20 +444,33 @@ func (s *Server) resolveStageEscalations(ctx context.Context, stage *run.Stage) 
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
 	if err != nil {
-		// DEGRADES, and the reason is specific rather than a general
-		// tolerance: a workflow's `escalations` block is declared in the
-		// CACHED SPEC BYTES, which live ON this run row. An unreadable row
-		// means an unreadable spec, which escalationsForRun would answer with
-		// "declares none" anyway — so refusing here would not enforce an
-		// escalation we could otherwise have found; it would only convert
-		// every legacy / manual / spec-less run's approval into a 503, on a
-		// path where fetchApprovalsForStage already degrades to the legacy
-		// first-vote gate on the SAME read.
+		if errors.Is(err, run.ErrNotFound) {
+			// DEGRADES on a MISSING/legacy row only, and the reason is
+			// specific rather than a general tolerance: a workflow's
+			// `escalations` block is declared in the CACHED SPEC BYTES, which
+			// live ON this run row. A row that does not exist means a spec
+			// that does not exist, which escalationsForRun would answer with
+			// "declares none" anyway — so refusing here would not enforce an
+			// escalation we could otherwise have found; it would only convert
+			// every legacy / manual / spec-less run's approval into a 503, on
+			// a path where fetchApprovalsForStage already degrades to the
+			// legacy first-vote gate on the SAME read.
+			return spec.ComposedRequirements{}, nil //nolint:nilerr // see comment: a missing row's declaration is unrecoverable, so degrading is correct.
+		}
+		// A TRANSIENT repository error is NOT the legacy-row case (#2227
+		// fixup): the run row — and the escalation declaration on it — may
+		// well exist, so degrading to the baseline here would be exactly the
+		// "proceed unescalated" outcome the file header forbids, on a run
+		// whose spec can demonstrably declare an escalation. fetchApprovalsForStage
+		// can succeed off a cached read while this second GetRun fails
+		// transiently, so the two must not silently disagree. Fail closed,
+		// reusing the refusal posture the two named modes below take.
 		//
-		// The two fail-CLOSED modes this gate owns are the ones where a
-		// declaration IS visible and cannot be evaluated: a Match error, and
-		// an unreadable plan under a paths-bearing escalation. Both are below.
-		return spec.ComposedRequirements{}, nil //nolint:nilerr // see comment: the declaration lives on the unreadable row.
+		// The three fail-CLOSED modes this gate owns are the ones where a
+		// declaration IS (or may be) visible and cannot be evaluated: a
+		// transient run-row read error, a Match error, and an unreadable plan
+		// under a paths-bearing escalation. The last two are below.
+		return spec.ComposedRequirements{}, fmt.Errorf("resolve escalations: read run row: %w", err)
 	}
 	wf, err := s.escalationsForRun(runRow)
 	if err != nil || wf == nil {

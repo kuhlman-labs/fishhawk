@@ -476,13 +476,24 @@ func approvalGatesOf(wf *Workflow) []*Approvals {
 }
 
 // baselineApprovalCount is the LEAST-RESTRICTIVE approval count the workflow
-// declares — the MAX over its approval gates. An escalation must exceed it to
-// raise the requirement at every gate.
+// declares — the MAX of each approval gate's EFFECTIVE count. An escalation
+// must exceed it to raise the requirement at every gate.
+//
+// A gate that declares no explicit `count` still requires ONE approval — the
+// runtime default effectiveApprovals applies (out.count starts at 1) — so its
+// effective count is 1, not 0. Treating an omitted count as 0 would let an
+// escalation declaring `count: 1` pass this raise-check while raising nothing
+// at runtime (1 is already the effective baseline), the only-ever-raise
+// violation #2227's fixup closes.
 func baselineApprovalCount(gates []*Approvals) int {
 	baseline := 0
 	for _, a := range gates {
-		if a.Count != nil && *a.Count > baseline {
-			baseline = *a.Count
+		c := 1
+		if a.Count != nil {
+			c = *a.Count
+		}
+		if c > baseline {
+			baseline = c
 		}
 	}
 	return baseline

@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -96,6 +98,10 @@ type escGateRunRepo struct {
 	runs   map[uuid.UUID]*run.Run
 	stages map[uuid.UUID][]*run.Stage
 	calls  int
+	// getErr, when non-nil, is returned by GetRun instead of a seeded row —
+	// the transient (non-ErrNotFound) repository error the fail-closed branch
+	// must distinguish from a missing row.
+	getErr error
 }
 
 func newEscGateRunRepo() *escGateRunRepo {
@@ -113,6 +119,9 @@ func (r *escGateRunRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, erro
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
+	if r.getErr != nil {
+		return nil, r.getErr
+	}
 	got, ok := r.runs[id]
 	if !ok {
 		return nil, run.ErrNotFound
@@ -550,6 +559,12 @@ func TestEscalationFiredAudit_AppendFails_StillEnforced(t *testing.T) {
 	rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
 	au.appendErr = errors.New("audit store down")
 	s := escGateServer(rr, au, ar)
+	// Capture the warning so the required "logged, naming the escalation"
+	// half of the error path is ASSERTED, not merely present (operator
+	// condition 1): without this the test would pass even if the warn were
+	// dropped or stopped naming the raise.
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	runRow := escGateRun(t, escGatePathsBlock, nil)
 	planStage := &run.Stage{ID: uuid.New(), RunID: runRow.ID, Type: run.StageTypePlan}
 	rr.seed(runRow, planStage)
@@ -565,6 +580,21 @@ func TestEscalationFiredAudit_AppendFails_StillEnforced(t *testing.T) {
 	}
 	if res.Requirements.Count == nil || *res.Requirements.Count != 2 {
 		t.Errorf("Count = %v, want the escalated 2 — enforcement is independent of the audit write", res.Requirements.Count)
+	}
+
+	// A single WARN must be emitted, and it must NAME the escalation summary so
+	// the raise is recoverable from the application log even though the audit
+	// row was lost.
+	logged := logBuf.String()
+	if !strings.Contains(logged, "escalation_fired audit append failed") {
+		t.Errorf("no append-failure warning was logged: %q", logged)
+	}
+	summary := "backend/internal/server/**"
+	if !strings.Contains(logged, summary) {
+		t.Errorf("append-failure warning does not name the escalation (%q missing): %q", summary, logged)
+	}
+	if !strings.Contains(logged, au.appendErr.Error()) {
+		t.Errorf("append-failure warning does not carry the underlying error %q: %q", au.appendErr.Error(), logged)
 	}
 }
 
@@ -790,6 +820,87 @@ func TestResolveStageEscalations_UnreadableRunRow(t *testing.T) {
 	}
 	if !req.IsZero() {
 		t.Errorf("requirements = %+v, want zero", req)
+	}
+}
+
+// TestResolveStageEscalations_TransientRunRowError_FailsClosed pins the #2227
+// fixup: a TRANSIENT (non-ErrNotFound) GetRun error is NOT the legacy-row
+// degrade. The run row — and the escalation declaration on it — may exist, so
+// degrading to the baseline would be the "proceed unescalated" outcome the file
+// header forbids; the resolver must fail closed, which the approval seam turns
+// into a retryable 503 and the count seam into a not-advancing gate.
+func TestResolveStageEscalations_TransientRunRowError_FailsClosed(t *testing.T) {
+	rr := newEscGateRunRepo()
+	rr.getErr = errors.New("db connection reset") // NOT run.ErrNotFound
+	s := escGateServer(rr, &escGateAuditRepo{}, newEscGateArtifactRepo())
+	stage := &run.Stage{ID: uuid.New(), RunID: uuid.New(), Type: run.StageTypePlan}
+
+	req, err := s.resolveStageEscalations(context.Background(), stage)
+	if err == nil {
+		t.Fatal("resolveStageEscalations returned nil error on a transient GetRun failure; the gate would proceed unescalated")
+	}
+	if errors.Is(err, run.ErrNotFound) {
+		t.Errorf("error = %v, want the transient error surfaced, not the not-found degrade", err)
+	}
+	if !req.IsZero() {
+		t.Errorf("requirements = %+v, want zero alongside the error", req)
+	}
+}
+
+// TestResolveStageEscalations_ChangedPlanScope_DivergesBetweenResolutions is
+// the #2227 TOCTOU pin: the resolver reads MUTABLE plan scope, so two
+// resolutions of the SAME stage around a scope change return DIFFERENT fired
+// sets. This is the divergence the pre-Submit predicate check and the
+// post-Submit quorum count sit on — a change whose scope did not match when a
+// pre-Submit predicate check ran (no membership enforced, approval recorded)
+// can match by the time the quorum count reads the amended plan.
+//
+// Membership is enforced at INSERT time (checkApprovalPredicates), not
+// re-validated at count time (countDistinctEligibleApprovers counts distinct
+// approvers, not group membership), so an approval recorded during the
+// non-matching window is not retroactively re-checked. That residual cross-
+// request window is documented and accepted for this change (the design
+// explicitly supports a changed plan scope producing a changed fired set);
+// closing it fully would require re-resolving every counted approver's
+// membership at quorum time. This test exercises the divergence the concern
+// says the static-artifact tests did not.
+func TestResolveStageEscalations_ChangedPlanScope_DivergesBetweenResolutions(t *testing.T) {
+	rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+	s := escGateServer(rr, au, ar)
+	runRow := escGateRun(t, escGatePathsBlock, nil)
+	planStage := &run.Stage{ID: uuid.New(), RunID: runRow.ID, Type: run.StageTypePlan}
+	rr.seed(runRow, planStage)
+
+	// T1: the plan scope does NOT reach the escalated path — nothing fires, so
+	// a pre-Submit predicate check here would enforce no membership.
+	ar.seedPlan(t, planStage.ID, escGatePlan("docs/README.md"))
+	before, err := s.resolveStageEscalations(context.Background(), planStage)
+	if err != nil {
+		t.Fatalf("resolveStageEscalations (pre-change): %v", err)
+	}
+	if !before.IsZero() {
+		t.Fatalf("requirements = %+v, want zero — the plan scope does not match the escalation yet", before)
+	}
+
+	// A scope amendment moves the plan into the escalated path (the mutable read
+	// the two seams share).
+	ar.seedPlan(t, planStage.ID, escGatePlan("backend/internal/server/runs.go"))
+
+	// T2: the SAME stage now fires and raises the count + membership — the
+	// changed fired set the count seam would enforce against approvals some of
+	// which were recorded before the change.
+	after, err := s.resolveStageEscalations(context.Background(), planStage)
+	if err != nil {
+		t.Fatalf("resolveStageEscalations (post-change): %v", err)
+	}
+	if after.IsZero() {
+		t.Fatal("requirements are zero after the plan scope moved into the escalated path; the fired set did not track the mutable plan")
+	}
+	if after.Count == nil || *after.Count != 2 {
+		t.Errorf("Count = %v, want the escalated 2 after the scope change", after.Count)
+	}
+	if len(after.MemberOf) != 1 || after.MemberOf[0] != "acme/security" {
+		t.Errorf("MemberOf = %v, want [acme/security] after the scope change", after.MemberOf)
 	}
 }
 

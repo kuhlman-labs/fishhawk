@@ -355,11 +355,19 @@ func approvalGatesFromRaw(wf map[string]any) []map[string]any {
 }
 
 // baselineApprovalCountFromRaw is the workflow's LEAST-RESTRICTIVE approval
-// count — the MAX over its approval gates — mirroring the backend's baseline.
+// count — the MAX of each approval gate's EFFECTIVE count — mirroring the
+// backend's baseline. A gate that declares no explicit `count` still requires
+// ONE approval (the runtime default), so its effective count is 1, not 0:
+// treating an omitted count as 0 would let an escalation declaring `count: 1`
+// pass this raise-check while raising nothing at runtime (#2227 fixup).
 func baselineApprovalCountFromRaw(gates []map[string]any) int {
 	baseline := 0
 	for _, a := range gates {
-		if c, ok := rawInt(a["count"]); ok && c > baseline {
+		c := 1
+		if v, ok := rawInt(a["count"]); ok {
+			c = v
+		}
+		if c > baseline {
 			baseline = c
 		}
 	}

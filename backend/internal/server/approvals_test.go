@@ -6700,6 +6700,37 @@ func TestSubmitApproval_Escalation_RaisesCountAndMembership(t *testing.T) {
 	})
 }
 
+// TestSubmitApproval_Escalation_NonMatchingClearsAtBaseline is the missing
+// end-to-end control (#2227 fixup): a change the escalation predicate does NOT
+// match clears the gate at its BASELINE and resolves NO forge membership. The
+// escalation matches on `labels: [security]`, which the seeded run's (absent)
+// issue labels never satisfy, so nothing fires: the gate's baseline is count 1
+// with no forge predicate, the first vote advances, and the IdentityProvider is
+// never called. The submitter resolves member:false, so a spurious escalation
+// (or an unintended membership resolution) would 403 rather than pass — which
+// is what makes the "advances with zero forge calls" assertion meaningful.
+func TestSubmitApproval_Escalation_NonMatchingClearsAtBaseline(t *testing.T) {
+	s, ar, rr, _, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+	nonMatching := strings.Replace(escalationApprovalSpecYAML,
+		"          trigger: [diff]", "          labels: [security]", 1)
+	stage := seedEscalationApprovalRun(t, rr, nonMatching)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (non-matching change clears at baseline):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Fatalf("stage = %q, want succeeded — the escalation did not match, so the baseline count of 1 advances on the first vote", stage.State)
+	}
+	if idp.permCalls != 0 || idp.memberCalls != 0 {
+		t.Errorf("non-matching change resolved forge predicates: perm %d / member %d, want 0/0 (no membership resolution)", idp.permCalls, idp.memberCalls)
+	}
+	if n := len(ar.all); n != 1 {
+		t.Errorf("approval rows inserted = %d, want 1 (the baseline vote advanced)", n)
+	}
+}
+
 // TestSubmitApproval_Escalation_PlanUnreadable_FailsClosed drives the
 // reachable fail-closed mode through the real HTTP approve path: a
 // paths-bearing escalation is declared but the run's approved plan cannot be

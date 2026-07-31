@@ -250,6 +250,69 @@ func TestValidate_Escalations_MustRaise(t *testing.T) {
 	}
 }
 
+// noCountGateSpec builds a v2 *Spec whose ONE approval gate declares an
+// approvals block with NO explicit count, plus one paths-matched escalation
+// whose require.approvals.count is `escCount`. The gate is built directly
+// rather than parsed BECAUSE the v2 schema requires `count` on an approvals
+// block: a countless gate cannot survive ParseBytes, so this is the
+// defence-in-depth path for a spec that reached validation having bypassed the
+// schema (a hand-built struct, or an older binary's cached bytes) — the same
+// posture TestParse_Escalations_MalformedGlob uses at the resolver seam. The
+// effective count of a countless gate is the runtime default of 1
+// (effectiveApprovals starts out.count at 1), so an escalation count of 1
+// raises nothing and must still be refused.
+func noCountGateSpec(escCount int) *spec.Spec {
+	c := escCount
+	return &spec.Spec{
+		Version: "2",
+		Workflows: map[string]spec.Workflow{
+			"feature_change": {
+				Autonomy: spec.TierHigh,
+				Escalations: []spec.Escalation{{
+					Match:   spec.Predicate{Paths: []string{"infra/**"}},
+					Require: spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: &c}},
+				}},
+				Stages: []spec.Stage{{
+					ID:       "plan",
+					Type:     spec.StageTypePlan,
+					Executor: spec.Executor{Agent: "claude-code"},
+					Gates: []spec.Gate{{
+						Type:      spec.GateTypeApproval,
+						Approvals: &spec.Approvals{}, // no Count → effective count 1
+					}},
+				}},
+			},
+		},
+	}
+}
+
+// TestValidate_Escalations_OmittedCountBaseline is the #2227-fixup regression:
+// a gate declaring an approvals block but NO explicit count still requires ONE
+// approval, so an escalation declaring `count: 1` raises nothing at runtime and
+// must be refused — the only-ever-raise violation the earlier baseline-of-0
+// computation let through (it treated an omitted count as 0, so `1 > 0` passed).
+// The raising control (count 2) proves the check is "must raise above the
+// effective baseline of 1", not "reject every count".
+func TestValidate_Escalations_OmittedCountBaseline(t *testing.T) {
+	t.Run("count 1 against a no-explicit-count gate raises nothing", func(t *testing.T) {
+		err := spec.Validate(noCountGateSpec(1))
+		var ve *spec.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("err = %v, want *ValidationError — count 1 does not raise a gate whose effective count is already 1", err)
+		}
+		if ve.Path != "/workflows/feature_change/escalations/0/require/approvals/count" {
+			t.Errorf("path = %q, want the count pointer", ve.Path)
+		}
+		assertNoRaiseShape(t, ve.Message, "feature_change", 0, "approvals.count")
+	})
+
+	t.Run("count 2 against a no-explicit-count gate genuinely raises", func(t *testing.T) {
+		if err := spec.Validate(noCountGateSpec(2)); err != nil {
+			t.Fatalf("Validate: %v, want count 2 accepted — it raises the effective baseline of 1", err)
+		}
+	})
+}
+
 // TestValidate_Escalations_RaisingValuesAccepted is the POSITIVE control that
 // pins the rule as "must RAISE" rather than "must differ": a genuinely raising
 // value on every dimension parses clean.

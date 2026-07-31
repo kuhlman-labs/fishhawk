@@ -2569,6 +2569,17 @@ func TestValidateBytes_Escalations_MustRaise(t *testing.T) {
 	}
 }
 
+// NOTE (#2227 fixup): the omitted-count baseline regression is pinned on the
+// BACKEND (spec.TestValidate_Escalations_OmittedCountBaseline via the exported
+// spec.Validate) rather than here, because it is reachable only on a struct
+// that BYPASSED the schema — the v2 schema requires `count` on an approvals
+// block, and ValidateBytes runs schema.Validate BEFORE checkEscalations, so a
+// countless gate fails schema before the semantic baseline check ever sees it.
+// baselineApprovalCountFromRaw carries the same effective-count-of-1 default as
+// the backend for parity (a countless gate reaching checkEscalations off a
+// schema-bypassed path is defended identically), but that path is not
+// exercisable through ValidateBytes from this external test package.
+
 // TestValidateBytes_Escalations_ApprovalsWithNoApprovalGate mirrors the
 // workflow-wide inertness rejection.
 func TestValidateBytes_Escalations_ApprovalsWithNoApprovalGate(t *testing.T) {
