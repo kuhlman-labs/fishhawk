@@ -110,6 +110,49 @@ workflows:
 			wantMsg:  "valid only on a stage with an agent executor, not a human executor",
 		},
 		{
+			// The /egress pointer branch (validate.go: `ptr := "/egress"`,
+			// switched to "/permissions" only when a permissions block exists):
+			// a v2 stage declaring a BARE `egress` — no permissions block — on a
+			// non-agent executor. Distinct from the permissions_* cases, which
+			// all drive the /permissions branch, so the reported pointer field
+			// name cannot silently regress (fix-up medium+low/verification).
+			name: "egress_on_human_executor",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: gate
+        type: review
+        executor:
+          human: true
+        egress:
+          target_hosts: ["staging.example.com:8443"]
+`,
+			wantPath: "/workflows/wf/stages/0/egress",
+			wantMsg:  "valid only on a stage with an agent executor, not a human executor",
+		},
+		{
+			// The /egress branch on a DELEGATE executor — a bare `egress` on a
+			// deploy stage's delegating executor — pins the delegate arm of the
+			// same pointer branch (fix-up medium/verification).
+			name: "egress_on_delegate_executor",
+			doc: `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: release
+        type: deploy
+        executor:
+          delegate:
+            target: github_actions
+            workflow_ref: deploy.yml
+        egress:
+          target_hosts: ["staging.example.com:8443"]
+`,
+			wantPath: "/workflows/wf/stages/0/egress",
+			wantMsg:  "not a delegate executor",
+		},
+		{
 			name: "permissions_on_delegate_executor",
 			doc: `version: "2"
 workflows:

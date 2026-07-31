@@ -254,7 +254,7 @@ func TestCreateRun_NoPermissions_NoAuditEntry(t *testing.T) {
 // enforcement-honesty pin (fix-up high/security + operator condition 3): the
 // per-entry `enforced` flag is true ONLY for an acceptance stage whose executor
 // is the AGENT branch — the one declaration the runner's default-deny egress
-// proxy actually enforces by containing the agent. A non-agent (human/delegate)
+// proxy actually enforces by constraining that agent's egress. A non-agent (human/delegate)
 // acceptance stage runs no agent through the proxy, so enforced:true there would
 // falsely claim a network allow-list is enforced when no agent proxy is
 // involved. Implement (non-acceptance) egress is never enforced today either.
@@ -270,7 +270,7 @@ func TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance(t *testing
 		got[e.StageID] = e
 	}
 	if !got["accept-agent"].Enforced {
-		t.Error("agent-executor acceptance egress: enforced = false, want true (the proxy contains the agent)")
+		t.Error("agent-executor acceptance egress: enforced = false, want true (the proxy constrains the agent's egress)")
 	}
 	if !strings.Contains(got["accept-agent"].Note, "enforced today") {
 		t.Errorf("agent-executor acceptance note = %q, want the enforced-today note", got["accept-agent"].Note)
@@ -279,7 +279,7 @@ func TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance(t *testing
 		t.Error("human-executor acceptance egress: enforced = true, want false — no agent runs through the proxy")
 	}
 	if got["impl-agent"].Enforced {
-		t.Error("implement-stage egress: enforced = true, want false (only an acceptance agent is proxy-contained)")
+		t.Error("implement-stage egress: enforced = true, want false (only an acceptance agent's egress is proxy-constrained)")
 	}
 	// The non-enforced entries carry the declaration-only note either way.
 	for _, id := range []string{"accept-human", "impl-agent"} {
@@ -306,6 +306,38 @@ func TestEmitStagePermissionsDeclared_AppendFailsDoesNotFailRun(t *testing.T) {
 			t.Fatal("stage_permissions_declared entry recorded despite the injected append error")
 		}
 	}
+}
+
+// TestBuildStagePermissionsSurface_OmitsOnBadSpec pins the two run-status
+// omission branches buildStagePermissionsSurface adds (fix-up low/verification):
+// a run whose cached spec fails to parse, and a run whose WorkflowID is absent
+// from an otherwise-valid cached spec. Both are externally observable
+// run-status paths, and both must yield a nil (omitted) permissions surface
+// rather than a partial read or a panic.
+func TestBuildStagePermissionsSurface_OmitsOnBadSpec(t *testing.T) {
+	s, _, _, _ := newDelegationServer(t)
+
+	t.Run("malformed_cached_spec", func(t *testing.T) {
+		got := s.buildStagePermissionsSurface(&run.Run{
+			ID:           uuid.New(),
+			WorkflowID:   "feature_change",
+			WorkflowSpec: []byte("this is: not valid: workflow yaml: ["),
+		})
+		if got != nil {
+			t.Errorf("surface = %+v, want nil (unparseable cached spec → omitted)", got)
+		}
+	})
+
+	t.Run("workflow_not_in_spec", func(t *testing.T) {
+		got := s.buildStagePermissionsSurface(&run.Run{
+			ID:           uuid.New(),
+			WorkflowID:   "no_such_workflow",
+			WorkflowSpec: []byte(declaredPermissionsV2SpecYAML),
+		})
+		if got != nil {
+			t.Errorf("surface = %+v, want nil (workflow absent from cached spec → omitted)", got)
+		}
+	})
 }
 
 // reviewAuthorityFor returns the review_authority entry for the named stage.
