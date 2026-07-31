@@ -191,9 +191,10 @@ type runResponse struct {
 	// (E53.5 / #2228): one entry per stage of the run's workflow that declares a
 	// `permissions` or `egress` block. DECLARATION-ONLY — validated, audited and
 	// surfaced but NOT enforced until E51 #2133; each entry carries an honest
-	// per-entry `enforced` qualifier (true ONLY for an acceptance stage's
-	// network declaration, whose allow-list the runner's default-deny egress
-	// proxy enforces today; false everywhere else and for write/shell always).
+	// per-entry `enforced` qualifier (true ONLY for an AGENT-executor acceptance
+	// stage's network declaration, whose allow-list the runner's default-deny
+	// egress proxy enforces today by containing that agent; false everywhere
+	// else — including a non-agent acceptance stage — and for write/shell always).
 	// Populated by handleGetRun ONLY (same single-read posture as Concerns /
 	// Delegation — a pure projection of the run's cached workflow spec, not
 	// suppressed on a terminal run). Omitted (nil) when the run carries no
@@ -208,8 +209,10 @@ type runResponse struct {
 // per-entry qualifier (operator condition 3): a blanket enforced:false would LIE
 // for the acceptance stage, whose network allow-list IS enforced today by the
 // runner's default-deny egress proxy — so Enforced is true only for an
-// acceptance stage's network declaration and false everywhere else and for
-// write/shell always. Note names E51 #2133 either way.
+// AGENT-executor acceptance stage's network declaration (the proxy contains the
+// agent; a non-agent acceptance stage runs no agent through it, so claiming
+// enforced there would over-claim) and false everywhere else and for write/shell
+// always. Note names E51 #2133 either way.
 type runStagePermissionsPayload struct {
 	StageID   string   `json:"stage_id"`
 	StageType string   `json:"stage_type,omitempty"`
@@ -1742,9 +1745,11 @@ func (s *Server) buildReviewAuthorityPayload(runRow *run.Run) []runReviewAuthori
 // Egress at parse time, so a stage declaring the new spelling has a non-nil
 // Egress here). DECLARATION-ONLY — validated, audited and surfaced but not
 // enforced until E51 #2133. Each entry's Enforced flag is the HONEST per-entry
-// qualifier (operator condition 3): true only for an acceptance stage's network
-// declaration, whose allow-list the runner's default-deny egress proxy enforces
-// today; false everywhere else and for write/shell always. Returns nil when no
+// qualifier (operator condition 3): true only for an AGENT-executor acceptance
+// stage's network declaration, whose allow-list the runner's default-deny egress
+// proxy enforces today by containing that agent; false everywhere else — a
+// non-agent acceptance stage runs no agent through the proxy — and for
+// write/shell always. Returns nil when no
 // stage declares either block, so a workflow declaring none produces a
 // byte-identical (absent) surface. Shared by the run-status read and the
 // once-per-run audit emit so the two cannot describe one declaration
@@ -1766,7 +1771,18 @@ func buildStagePermissionsPayloads(wf spec.Workflow) []runStagePermissionsPayloa
 			entry.Write = st.Permissions.Write
 			entry.Shell = string(st.Permissions.Shell)
 		}
-		entry.Enforced = st.Type == spec.StageTypeAcceptance && st.Egress != nil
+		// Enforced is true ONLY when the runner's default-deny egress proxy
+		// actually contains an agent for this declaration: an acceptance stage,
+		// declaring egress, whose executor is the AGENT branch. The proxy
+		// contains the AGENT (acceptenv points HTTP(S)_PROXY at it before the
+		// agent spawn) — a human or delegate acceptance stage runs no agent
+		// through the proxy, so its network allow-list enforces nothing and
+		// claiming enforced:true would LIE on a security-sensitive declaration
+		// (fix-up: high/security). At major >= 2 the validator already rejects
+		// egress on a non-agent executor, but this projection runs on every
+		// major (a v0/v1 acceptance stage may pair a human executor with
+		// egress), so the guard makes the surface honest by construction here.
+		entry.Enforced = st.Type == spec.StageTypeAcceptance && st.Egress != nil && st.Executor.Agent != ""
 		if entry.Enforced {
 			entry.Note = "network allow-list enforced today by the runner's default-deny egress proxy; write/shell are declaration-only, not enforced until E51 (#2133)"
 		} else {

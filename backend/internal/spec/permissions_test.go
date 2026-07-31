@@ -241,6 +241,42 @@ func TestValidate_Permissions_UnknownShell(t *testing.T) {
 	}
 }
 
+// TestValidate_BothEgressAndPermissionsNetwork_ParseOnlyContract documents that
+// the `egress` + `permissions.network` both-declared CONFLICT is a ParseBytes-
+// seam guarantee (normalizeStagePermissions), deliberately NOT re-checked by the
+// exported Validate (fix-up low/untested-path). By the time Validate runs in the
+// normal flow, normalizeStagePermissions has already folded permissions.network
+// INTO Stage.Egress — a pointer COPY, not a move (TestNormalizeStagePermissions_
+// NetworkIntoEgress pins the two must then ALIAS) — so Validate structurally
+// cannot distinguish "author declared both" from "network was normalized into
+// egress" and must not re-check. A hand-constructed Spec passed DIRECTLY to
+// Validate with both fields set therefore validates clean. That is safe because
+// every real YAML document flows through ParseBytes (and the CLI mirrors the
+// check), where the conflict IS rejected — pinned in full by
+// TestParse_Permissions_Rejections' both_egress_and_permissions_network case —
+// so the conflict is unreachable via input. This test pins the parse-only
+// posture so it stays intentional rather than a silent gap.
+func TestValidate_BothEgressAndPermissionsNetwork_ParseOnlyContract(t *testing.T) {
+	s := &spec.Spec{
+		Version: "2",
+		Workflows: map[string]spec.Workflow{
+			"wf": {Stages: []spec.Stage{{
+				ID:       "apply",
+				Type:     spec.StageTypeImplement,
+				Executor: spec.Executor{Agent: "claude-code"},
+				Egress:   &spec.StageEgress{TargetHosts: []string{"a.example.com"}},
+				Permissions: &spec.StagePermissions{
+					Network: &spec.StageEgress{TargetHosts: []string{"b.example.com"}},
+				},
+			}}},
+		},
+	}
+	if err := spec.Validate(s); err != nil {
+		t.Fatalf("Validate on a both-set hand-constructed Spec = %v, want nil "+
+			"(the conflict is a ParseBytes-seam guarantee via normalizeStagePermissions, not re-checked in Validate)", err)
+	}
+}
+
 // TestParse_Permissions_SchemaRejections covers the rejections the JSON Schema
 // owns (verification 3): the empty block, an empty network host list, a URL-form
 // network entry (the ADR-050 hosts-not-URLs preservation), an unknown shell

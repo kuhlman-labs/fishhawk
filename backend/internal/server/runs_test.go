@@ -250,6 +250,64 @@ func TestCreateRun_NoPermissions_NoAuditEntry(t *testing.T) {
 	}
 }
 
+// TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance is the
+// enforcement-honesty pin (fix-up high/security + operator condition 3): the
+// per-entry `enforced` flag is true ONLY for an acceptance stage whose executor
+// is the AGENT branch — the one declaration the runner's default-deny egress
+// proxy actually enforces by containing the agent. A non-agent (human/delegate)
+// acceptance stage runs no agent through the proxy, so enforced:true there would
+// falsely claim a network allow-list is enforced when no agent proxy is
+// involved. Implement (non-acceptance) egress is never enforced today either.
+func TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance(t *testing.T) {
+	hosts := &spec.StageEgress{TargetHosts: []string{"staging.example.com:8443"}}
+	wf := spec.Workflow{Stages: []spec.Stage{
+		{ID: "accept-agent", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Agent: "claude-code"}, Egress: hosts},
+		{ID: "accept-human", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Human: true}, Egress: hosts},
+		{ID: "impl-agent", Type: spec.StageTypeImplement, Executor: spec.Executor{Agent: "claude-code"}, Egress: hosts},
+	}}
+	got := map[string]runStagePermissionsPayload{}
+	for _, e := range buildStagePermissionsPayloads(wf) {
+		got[e.StageID] = e
+	}
+	if !got["accept-agent"].Enforced {
+		t.Error("agent-executor acceptance egress: enforced = false, want true (the proxy contains the agent)")
+	}
+	if !strings.Contains(got["accept-agent"].Note, "enforced today") {
+		t.Errorf("agent-executor acceptance note = %q, want the enforced-today note", got["accept-agent"].Note)
+	}
+	if got["accept-human"].Enforced {
+		t.Error("human-executor acceptance egress: enforced = true, want false — no agent runs through the proxy")
+	}
+	if got["impl-agent"].Enforced {
+		t.Error("implement-stage egress: enforced = true, want false (only an acceptance agent is proxy-contained)")
+	}
+	// The non-enforced entries carry the declaration-only note either way.
+	for _, id := range []string{"accept-human", "impl-agent"} {
+		if !strings.Contains(got[id].Note, "#2133") {
+			t.Errorf("%s note = %q, want it to name the enforcement tracker #2133", id, got[id].Note)
+		}
+	}
+}
+
+// TestEmitStagePermissionsDeclared_AppendFailsDoesNotFailRun is the best-effort
+// degrade pin (fix-up low/untested-path): when the once-per-run audit append
+// fails, run creation still succeeds (the legibility surface must never fail run
+// creation) and no stage_permissions_declared entry is recorded.
+func TestEmitStagePermissionsDeclared_AppendFailsDoesNotFailRun(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	au.appendErrCategory = "stage_permissions_declared"
+	// Run creation must not fail on the injected audit-append error.
+	startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredPermissionsV2SpecYAML,
+	})
+	for _, e := range au.appended {
+		if e.Category == "stage_permissions_declared" {
+			t.Fatal("stage_permissions_declared entry recorded despite the injected append error")
+		}
+	}
+}
+
 // reviewAuthorityFor returns the review_authority entry for the named stage.
 func reviewAuthorityFor(t *testing.T, resp runResponse, stage string) runReviewAuthorityPayload {
 	t.Helper()

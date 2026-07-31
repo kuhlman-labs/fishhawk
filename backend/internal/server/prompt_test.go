@@ -377,24 +377,19 @@ func promptRenderRequest(t *testing.T, s *Server, stageID uuid.UUID) *httptest.R
 // prompt-seam half of the E53.5 / #2228 end-to-end egress proof (operator
 // condition 2a): the acceptance-stage prompt payload must literally carry the
 // resolved hosts in `egress_target_hosts` under BOTH the `egress` and
-// `permissions.network` spellings. It resolves the field the SAME way
-// handleGetStagePrompt does (resolveAcceptanceEgressTargetHosts, prompt.go),
-// then marshals the response to prove the wire tag carries the list rather than
-// asserting a function returned a slice — the module boundary is pinned on this
-// side of the seam; the runner's egressproxy allow-list is pinned on the other
-// (runner/internal/egressproxy/proxy_test.go).
+// `permissions.network` spellings. It DRIVES the real /prompt handler
+// (handleGetStagePrompt → resolveAcceptanceEgressTargetHosts → the wire) for
+// each spelling, so the proof is self-contained: a handler that stopped
+// populating EgressTargetHosts would fail this, not just the resolver — the
+// module boundary is pinned on this side of the seam; the runner's egressproxy
+// allow-list is pinned on the other (runner/internal/egressproxy/proxy_test.go).
 func TestAcceptancePromptPayload_CarriesEgressHosts_BothSpellings(t *testing.T) {
-	ctx := context.Background()
-	s := New(Config{Addr: "127.0.0.1:0"})
-	mk := func(specYAML string) *run.Run {
-		return &run.Run{ID: uuid.New(), WorkflowID: "wf", WorkflowSpec: []byte(specYAML)}
-	}
 	specs := map[string]string{
 		"egress": `version: "2"
 workflows:
-  wf:
+  feature_change:
     stages:
-      - id: accept
+      - id: acceptance
         type: acceptance
         executor: {agent: claude-code}
         egress:
@@ -402,9 +397,9 @@ workflows:
 `,
 		"permissions_network": `version: "2"
 workflows:
-  wf:
+  feature_change:
     stages:
-      - id: accept
+      - id: acceptance
         type: acceptance
         executor: {agent: claude-code}
         permissions:
@@ -414,14 +409,25 @@ workflows:
 	}
 	for name, specYAML := range specs {
 		t.Run(name, func(t *testing.T) {
-			// Populate the field exactly as handleGetStagePrompt does.
-			resp := promptResponse{EgressTargetHosts: s.resolveAcceptanceEgressTargetHosts(ctx, mk(specYAML))}
-			raw, err := json.Marshal(resp)
+			s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+			runRow, err := s.cfg.RunRepo.GetRun(context.Background(), runID)
 			if err != nil {
-				t.Fatalf("marshal promptResponse: %v", err)
+				t.Fatalf("GetRun: %v", err)
 			}
-			if !strings.Contains(string(raw), `"egress_target_hosts":["staging.example.com:8443"]`) {
-				t.Errorf("prompt payload does not carry the resolved hosts on the wire under the %s spelling:\n%s", name, raw)
+			runRow.WorkflowSpec = []byte(specYAML)
+			w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if want := []string{"staging.example.com:8443"}; !reflect.DeepEqual(resp.EgressTargetHosts, want) {
+				t.Errorf("EgressTargetHosts = %v, want %v under the %s spelling", resp.EgressTargetHosts, want, name)
+			}
+			if !strings.Contains(w.Body.String(), `"egress_target_hosts":["staging.example.com:8443"]`) {
+				t.Errorf("prompt payload does not carry the resolved hosts on the wire under the %s spelling:\n%s", name, w.Body.String())
 			}
 		})
 	}
