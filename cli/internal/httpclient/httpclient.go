@@ -159,16 +159,14 @@ type CreateRunInput struct {
 	// an empty or whitespace-only reason, so the bypass is never
 	// unexplained in the audit trail.
 	//
-	// NO `fishhawk run start` FLAG SETS THIS YET. The wire field and
-	// its marshalling are here so a caller of this package can set
-	// it, but `run start` exposes no `--applies-to-override` pair, so
-	// a CLI operator refused by the routing declaration has no
-	// sanctioned way past it and must use the MCP `fishhawk_start_run`
-	// tool or POST /v0/runs directly. Wiring the flags is the tracked
-	// follow-up; do not describe the flags as shipped until they are.
+	// Set by `run start --applies-to-override` /
+	// `--applies-to-override-reason` (E53.11 / #2364). The CLI
+	// enforces the required-reason rule locally, before the
+	// round-trip, so a reasonless override never reaches the backend.
 	AppliesToOverride bool `json:"applies_to_override,omitempty"`
 	// AppliesToOverrideReason is the operator's justification for
-	// AppliesToOverride, recorded verbatim on the
+	// AppliesToOverride. Sent as typed; the backend records it with
+	// surrounding whitespace trimmed on the
 	// `run_admitted_applies_to_override` audit entry that is the
 	// override's source of truth.
 	AppliesToOverrideReason string `json:"applies_to_override_reason,omitempty"`

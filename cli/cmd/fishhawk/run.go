@@ -132,6 +132,10 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		"force the run past a blocking periodic cost budget that is over its limit for the current period (#688)")
 	upstreamRunID := fs.String("upstream-run-id", "",
 		"UUID of the upstream feature_change run whose ci_green/review_merged a deploy-only release run's required_upstream pre-flight gate evaluates (E23.11/#1417); distinct from parent_run_id")
+	appliesToOverride := fs.Bool("applies-to-override", false,
+		"force the run past the workflow's applies_to routing declaration when the change does not satisfy it; requires --applies-to-override-reason. Prefer amending the declaration or starting under a workflow that accepts the change — this bypass is audited (E53.3/#2226)")
+	appliesToOverrideReason := fs.String("applies-to-override-reason", "",
+		"REQUIRED with --applies-to-override: why this change may be routed through a workflow whose applies_to declaration refuses it. Recorded on the run_admitted_applies_to_override audit entry with surrounding whitespace trimmed")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -145,6 +149,28 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "fishhawk run start: --upstream-run-id %q is not a valid UUID\n", *upstreamRunID)
 			return exitUsage
 		}
+	}
+
+	// Validate the applies_to override pair BEFORE discoverSpec runs.
+	// Placement is load-bearing: a reasonless override is then a
+	// deterministic usage error from ANY directory, not one that
+	// depends on a discoverable `.fishhawk/workflows.yaml`.
+	switch {
+	case *appliesToOverride && strings.TrimSpace(*appliesToOverrideReason) == "":
+		// Mirrors the backend's own rule (400 validation_failed,
+		// field applies_to_override_reason): a bypass of a
+		// governance control is never unexplained.
+		_, _ = fmt.Fprintln(stderr,
+			"fishhawk run start: --applies-to-override-reason is required when --applies-to-override is set; the reason is recorded on the run_admitted_applies_to_override audit entry")
+		return exitUsage
+	case !*appliesToOverride && strings.TrimSpace(*appliesToOverrideReason) != "":
+		// Deliberate LOCAL strictness, not a wire-contract
+		// divergence: the API silently ignores a lone reason, so
+		// the run would be refused by applies_to while the
+		// operator believed the override was passed.
+		_, _ = fmt.Fprintln(stderr,
+			"fishhawk run start: --applies-to-override-reason has no effect without --applies-to-override; pass both or neither")
+		return exitUsage
 	}
 
 	// Parse the explicit --issue argument up front so a typo
@@ -220,6 +246,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		RunnerKind:     *runnerKind,
 		WorkflowSpec:   string(specBytes),
 		BudgetOverride: *overrideBudget,
+		// Sent UNTRIMMED on purpose: the backend trims for its own
+		// emptiness check and records strings.TrimSpace(...) on the
+		// audit entry, so normalizing here would add a second
+		// normalization point that can silently diverge from the
+		// recorded value.
+		AppliesToOverride:       *appliesToOverride,
+		AppliesToOverrideReason: *appliesToOverrideReason,
 	}
 	if *triggerRef != "" {
 		in.TriggerRef = triggerRef
