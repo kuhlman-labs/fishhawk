@@ -1170,3 +1170,27 @@ Read-only; cascades gracefully (not-installed → spec-unavailable → empty rev
   Bearer-token clients (CLI, server-to-server) and GET-style methods bypass; safe-listed paths (`/v0/auth/github/*`, `/webhooks/github`) bypass too.
 - Mismatch returns `403 csrf_required`.
 - Frontend's `frontend/src/api/client.ts` reads the cookie via `getCookie()` (`frontend/src/lib/cookie.ts`) and auto-attaches the header on every state-changing call. Vitest runs jsdom under `https://localhost/` so `__Host-` cookies are accepted (jsdom rejects them under HTTP).
+
+### Per-path escalation enforcement (`escalation_gate.go`, E53.4 / #2227)
+
+A workflow-v2 `escalations:` block declares `{match: <predicate>, require: {...}}` rules that RAISE requirements for a change the predicate matches. The declaration side (grammar, strictest composition, only-ever-raise validation, the pure clamp) lives in `backend/internal/spec`; the pure firing walk in `backend/internal/escalation`. This file is where the run's `spec.Change` is BUILT and the firing decision becomes enforcement.
+
+**One resolver, two seams, one audit emit point.** `resolveEscalations` is reached by both consumers — `approveStageAs` / `checkApprovalPredicates` on the approval gate, and `delegation.Evaluate` through the `escalationResolver()` adapter — and the `escalation_fired` audit entry is written inside it. That is what makes "audited at every firing seam" structural: a `max_autonomy`-only escalation on a workflow with NO approval gate, which changes behaviour purely through the delegation clamp, is audited exactly as an approvals escalation is, and a future third consumer inherits the audit rather than having to remember it.
+
+**The change.** Paths are the UNION of the approved plan's top-level `scope.files`, every decomposition `sub_plan` scope and every `split_proposal` phase scope — the same union `planGateScopePaths` computes for `applies_to` (#2226). A decomposed run's fan-out child runs bounded to its SLICE scope, so checking only the top level would let a slice touch an escalated path without escalating. Labels come from the run row's IMMUTABLE `IssueContext.Labels` snapshot; trigger from `trigger_source` through the shared `appliesto` mapping.
+
+Unlike `applies_to` there is **no two-phase split**: escalations are evaluated only at gate time, when all three producers exist, so the full predicate is evaluated in one pass. The plan is loaded ONLY when some declaration carries a `paths` criterion, so a label-only declaration is not refused because the run has no plan yet.
+
+**Fail-closed modes**, each returning a refusal rather than proceeding unescalated:
+
+| Mode | Approval seam | Delegation seam |
+|---|---|---|
+| `Match` error (a malformed glob that bypassed validation) | retryable 503 `escalation_unevaluable` | `Evaluate` errors → the caller's existing degradation |
+| Plan unreadable/absent while a `paths`-bearing escalation is declared | same 503 | same |
+| Membership resolution error on an escalated group | `predicateUnavailable` → 503 `forge_unavailable` | n/a |
+
+**Enforcement at BOTH approval points.** The raise is applied at the pre-Submit 403 (`checkApprovalPredicates`) *and* at the quorum count (`approveStageAs`), for the #2358 reason `not:` had to be: raising only the 403 would record an approval the gate then declines to count, wedging it one short. Both read the same immutable cached spec bytes on the same run row within one request. `effectiveApprovals` takes max / strictest / union per dimension, so **runtime lowering is structurally impossible** even for a spec that bypassed declaration-time validation.
+
+**Audit posture (operator-ratified, #2361 asymmetry).** The `escalation_fired` append is **best-effort, not a precondition of enforcement**: an escalation firing moves in the SAFE direction (the gate gets stricter), so failing the gate because a log line could not be written would convert an audit-store outage into a total governance outage. The rule: *a REFUSAL or a RAISE is best-effort — the safe outcome already happened; a GRANT (the `applies_to` override) is a precondition — it records an exception being MADE.* De-duplication is read-then-append on `(run, stage, fingerprint)`, which handles the common SEQUENTIAL case; it is **not** atomic, so two concurrent evaluations can both append. A duplicate governance-chain entry is hygiene, not a control gap (the #2366 class) — there is no per-`(run, stage)` uniqueness guarantee. A de-duplication READ failure emits anyway (fail toward visibility).
+
+Surfaced on `GET /v0/runs/{run_id}` as the `escalations` block (single-run read only, omitted when the workflow declares none or nothing fired), rendered through the same `escalation.RenderFired` helper as the audit payload so the two cannot drift.

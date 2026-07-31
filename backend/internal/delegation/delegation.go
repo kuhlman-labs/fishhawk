@@ -57,6 +57,26 @@ type AuditLister interface {
 	ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error)
 }
 
+// EscalationResolver answers "what did the run's `escalations` declaration
+// raise for this change" (E53.4 / #2227). The delegation seam consumes ONE
+// dimension of the answer — the `max_autonomy` CEILING — and applies it LAST,
+// over the fully resolved matrix.
+//
+// stageID is the stage the seam is evaluating, threaded through so the
+// resolver's audit de-duplication can key on (run, stage); uuid.Nil is
+// legitimate (no stage is currently gated) and keys the run-level slot.
+//
+// The implementation lives server-side (backend/internal/server's
+// escalation_gate.go) because answering needs the run's approved plan, its
+// issue-label snapshot and the audit repository — none of which this package
+// knows about. It is REQUIRED at construction (see NewEvaluator): the
+// no-escalations case is answered INSIDE the resolver, which returns the zero
+// ComposedRequirements when the workflow declares none, so "inert" is reached
+// by a code path that exists rather than by a nil field nobody set.
+type EscalationResolver interface {
+	ResolveEscalations(ctx context.Context, runRow *run.Run, wf *spec.Workflow, stageID uuid.UUID) (spec.ComposedRequirements, error)
+}
+
 // actionClasses maps each delegable action verb to the workflow-v2 action
 // CLASS that governs it (ADR-066 / #2222). The two vocabularies differ in
 // exactly one place — the verb is route_fixup, the class is fixup — so the
@@ -175,13 +195,48 @@ type Result struct {
 }
 
 // Evaluator answers delegation conditions over the server's existing
-// repository surfaces. All three dependencies are required; the caller
-// (handleGetRun, the delegated-action handlers) guards nil wiring and
-// degrades by omitting the surface.
+// repository surfaces. All FOUR dependencies are required; the caller
+// (handleGetRun, the delegated-action handlers, the auto-drive gate) guards
+// nil wiring and degrades by omitting the surface / refusing the action.
+//
+// THE FIELDS ARE UNEXPORTED ON PURPOSE (E53.4 / #2227). Go forbids a composite
+// literal from setting a non-exported field of a struct in another package
+// (https://go.dev/ref/spec#Composite_literals), so `&delegation.Evaluator{…}`
+// is a COMPILE ERROR everywhere outside this package and NewEvaluator is the
+// only way in. That is what makes an Evaluator which cannot clamp
+// UNCONSTRUCTIBLE rather than merely discouraged: the enforcement site someone
+// adds six months from now cannot compile without supplying an escalation
+// resolver, so the "we forgot to wire the ceiling at this seam" bug class — the
+// one that left the auto-drive gate evaluating unclamped — is closed by the
+// type system instead of by review.
+//
+// Honestly stated: the compile-time guarantee binds every OTHER package. A
+// same-package literal is still possible, which is why this package's own
+// tests construct through NewEvaluator too. The three enforcement sites all
+// live in backend/internal/server, so the guarantee covers all of them.
 type Evaluator struct {
-	Stages   StageLister
-	Concerns ConcernLister
-	Audit    AuditLister
+	stages      StageLister
+	concerns    ConcernLister
+	audit       AuditLister
+	escalations EscalationResolver
+}
+
+// NewEvaluator is the ONLY constructor. It returns an error naming any nil
+// dependency, INCLUDING the escalation resolver — there is deliberately no
+// optional/nil-means-inert resolver and no exported no-op resolver to reach
+// for, because both re-open the bug class the unexported fields close.
+func NewEvaluator(stages StageLister, concerns ConcernLister, audit AuditLister, escalations EscalationResolver) (*Evaluator, error) {
+	switch {
+	case stages == nil:
+		return nil, fmt.Errorf("delegation: new evaluator: stages lister is required")
+	case concerns == nil:
+		return nil, fmt.Errorf("delegation: new evaluator: concerns lister is required")
+	case audit == nil:
+		return nil, fmt.Errorf("delegation: new evaluator: audit lister is required")
+	case escalations == nil:
+		return nil, fmt.Errorf("delegation: new evaluator: escalation resolver is required (an evaluator that cannot clamp the autonomy ceiling would silently under-enforce a fired escalation)")
+	}
+	return &Evaluator{stages: stages, concerns: concerns, audit: audit, escalations: escalations}, nil
 }
 
 // Decision returns the already-computed Decision for the named action
@@ -290,7 +345,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return nil, nil
 	}
 
-	stages, err := e.Stages.ListStagesForRun(ctx, runRow.ID)
+	stages, err := e.stages.ListStagesForRun(ctx, runRow.ID)
 	if err != nil {
 		return nil, fmt.Errorf("list stages: %w", err)
 	}
@@ -301,6 +356,44 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return nil, nil
 	}
 	matrix := resolveMatrix(campaignOverride, wf, gate)
+
+	// THE ESCALATION CEILING IS APPLIED LAST (E53.4 / #2227), and "last" is
+	// load-bearing rather than incidental. By this point the workflow tier has
+	// resolved AND every explicit `actions` override has already won AND a
+	// campaign override — the outermost rung — has been projected into the
+	// matrix. Clamping here means the ceiling wins over all three; clamping the
+	// tier or the declared entries instead would let an explicit
+	// `actions: {merge: {mode: auto}}` re-widen the class afterwards, which is
+	// the exact failure the acceptance criteria name.
+	//
+	// The DERIVED knob block is re-derived from the clamped matrix, not merely
+	// the surfaced one: every enforcement site downstream (this function's five
+	// knob evaluators, the four checkDelegation handlers, AutoDriveRunGate, the
+	// campaign driver) reads the derived *OperatorAgent, so clamping only the
+	// matrix would show `gated` on the run read while the agent stayed
+	// authorized to act.
+	//
+	// A resolver ERROR is returned, never swallowed: each caller's existing
+	// degradation (omit the delegation block / 500 / observe-only) delegates
+	// nothing, so that mode is already fail-closed.
+	//
+	// A nil matrix means no matrix governs the run (a v0/v1 knob block with no
+	// campaign override). `escalations` is a workflow-v2-only property, so such
+	// a run can carry no declaration and there is nothing to clamp.
+	var gatedStageID uuid.UUID
+	if gated != nil {
+		gatedStageID = gated.ID
+	}
+	req, err := e.escalations.ResolveEscalations(ctx, runRow, wf, gatedStageID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve escalations: %w", err)
+	}
+	if req.MaxAutonomy != "" && matrix != nil {
+		matrix = spec.ClampResolvedMatrix(matrix, req.MaxAutonomy)
+		if derived := spec.DerivedOperatorAgent(matrix); derived != nil {
+			effective = derived
+		}
+	}
 
 	// A stage parked at awaiting_input (#1057) is waiting on a human to
 	// answer the planner's clarification_request — a parked D-category
@@ -322,7 +415,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		return &Result{MustPageHuman: effective.MustPageHuman, ReviewerRejectClass: rejectClass, ModelPolicy: effective.ModelPolicy}, nil
 	}
 
-	open, err := e.Concerns.ListOpenByRun(ctx, runRow.ID)
+	open, err := e.concerns.ListOpenByRun(ctx, runRow.ID)
 	if err != nil {
 		return nil, fmt.Errorf("list open concerns: %w", err)
 	}
@@ -541,7 +634,7 @@ func (e *Evaluator) reviewRound(ctx context.Context, runRow *run.Run, wf *spec.W
 	if !ok {
 		return 0, nil, false, fmt.Errorf("stage type %q has no reviewer surface", stageType)
 	}
-	startedEntries, err := e.Audit.ListForRunByCategory(ctx, runRow.ID, startedCat)
+	startedEntries, err := e.audit.ListForRunByCategory(ctx, runRow.ID, startedCat)
 	if err != nil {
 		return 0, nil, false, fmt.Errorf("list %s: %w", startedCat, err)
 	}
@@ -568,7 +661,7 @@ func (e *Evaluator) reviewRound(ctx context.Context, runRow *run.Run, wf *spec.W
 		configured = specConfigured
 	}
 
-	reviewedEntries, err := e.Audit.ListForRunByCategory(ctx, runRow.ID, reviewedCat)
+	reviewedEntries, err := e.audit.ListForRunByCategory(ctx, runRow.ID, reviewedCat)
 	if err != nil {
 		return 0, nil, false, fmt.Errorf("list %s: %w", reviewedCat, err)
 	}
@@ -870,7 +963,7 @@ func evalInfraFlake(stages []*run.Stage) (bool, string) {
 // action surface exists.
 func (e *Evaluator) evalGatesResolvedCIGreen(ctx context.Context, runRow *run.Run, stages []*run.Stage, open []*concern.Concern) (bool, string, error) {
 	const cond = string(spec.ConditionGatesResolvedCIGreen)
-	entries, err := e.Audit.ListForRunByCategory(ctx, runRow.ID, drive.Category)
+	entries, err := e.audit.ListForRunByCategory(ctx, runRow.ID, drive.Category)
 	if err != nil {
 		return false, "", fmt.Errorf("list %s: %w", drive.Category, err)
 	}

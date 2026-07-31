@@ -29,7 +29,9 @@ import "sort"
 // events, the deployment-dispatch failure, and the campaign-lifecycle
 // markers (advanced / gate-acted / issue-started / issue-settled /
 // issue-restarted / paused) written via audit.AppendGlobalChained. #1941
-// added the failed-run revive audit kind (run_revived, #1915). When a
+// added the failed-run revive audit kind (run_revived, #1915). E53.4 / #2227
+// added escalation_fired, written at the ONE server-side escalation resolver
+// both enforcement seams reach. When a
 // new canonical category is introduced, add it here so operators can await
 // it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -85,6 +87,7 @@ var KnownCategories = map[string]struct{}{
 	"deployment_rollback_initiated":           {},
 	"dispatch_reaper_failed":                  {},
 	"dispatch_watchdog_elapsed":               {},
+	"escalation_fired":                        {},
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
 	"implement_review_backstop_elapsed":       {},

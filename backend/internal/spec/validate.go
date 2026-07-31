@@ -107,6 +107,17 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 		return err
 	}
 
+	// workflow `escalations` well-formedness (E53.4 / #2227): the
+	// only-ever-raise family, checked at the declaration site. Runs beside
+	// applies_to and AFTER it, so a workflow wrong in both places reports
+	// its routing declaration first (routing decides whether the workflow
+	// is usable at all; an escalation only decides how strict it gets).
+	// Version-agnostic in code but unreachable below major 2 — no v0/v1
+	// schema declares the property.
+	if err := validateEscalations(name, wf); err != nil {
+		return err
+	}
+
 	seen := make(map[string]int, len(wf.Stages))
 	for i, stage := range wf.Stages {
 		if prev, ok := seen[stage.ID]; ok {

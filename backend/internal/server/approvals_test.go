@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -29,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
@@ -6545,4 +6547,363 @@ func (*orchestratorRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string
 // tenant account, matching its pre-promotion effective behavior.
 func (*approvalRunRepo) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
+}
+
+// --- escalation enforcement at the approval gate (E53.4 / #2227) ------------
+
+// escalationApprovalSpecYAML declares a plan approval gate at a BASELINE of
+// count 1 with no forge predicate, plus one escalation raising the count to 2
+// and adding a `member_of` group. The predicate matches on `trigger: [diff]`,
+// which every v0 trigger source maps to, so the escalation fires without a
+// plan artifact — the approval harness wires no artifact repository, and the
+// paths half of the predicate is covered end to end in escalation_gate_test.go.
+const escalationApprovalSpecYAML = `version: "2"
+workflows:
+  feature_change:
+    escalations:
+      - match:
+          trigger: [diff]
+        require:
+          approvals:
+            count: 2
+            member_of: acme/security
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// seedEscalationApprovalRun wires a gated plan stage whose run row carries the
+// given cached spec, so fetchApprovalsForStage and the escalation resolver both
+// read the same immutable bytes.
+func seedEscalationApprovalRun(t *testing.T, rr *approvalRunRepo, specYAML string) *run.Stage {
+	t.Helper()
+	if _, err := spec.ParseBytes([]byte(specYAML)); err != nil {
+		t.Fatalf("fixture spec does not parse: %v", err)
+	}
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+	rr.seedRun(&run.Run{
+		ID: stage.RunID, State: run.StateRunning, Repo: "acme/repo",
+		WorkflowID: "feature_change", WorkflowSpec: []byte(specYAML),
+		TriggerSource: run.TriggerCLI,
+	})
+	return stage
+}
+
+// TestSubmitApproval_Escalation_RaisesCountAndMembership is the CROSS-BOUNDARY
+// test the plan calls for: a real approval driven through the HTTP approve
+// path on a run whose cached spec declares a firing escalation, asserting end
+// to end that (a) the first approval does NOT advance the stage because the
+// escalated count is 2 where the gate baseline is 1, (b) a submitter outside
+// the escalated group is refused at the pre-Submit 403, and (c) the second
+// eligible in-group approval advances it.
+func TestSubmitApproval_Escalation_RaisesCountAndMembership(t *testing.T) {
+	t.Run("escalated count: the first approval does not advance", func(t *testing.T) {
+		s, _, rr, _, _ := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+		stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("stage = %q, want still awaiting_approval — the escalated count of 2 was not enforced", stage.State)
+		}
+	})
+
+	t.Run("control: the SAME gate without the escalation advances on the first approval", func(t *testing.T) {
+		s, _, rr, _, _ := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+		unescalated := strings.Replace(escalationApprovalSpecYAML, `    escalations:
+      - match:
+          trigger: [diff]
+        require:
+          approvals:
+            count: 2
+            member_of: acme/security
+`, "", 1)
+		stage := seedEscalationApprovalRun(t, rr, unescalated)
+
+		if w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if stage.State != run.StageStateSucceeded {
+			t.Fatalf("stage = %q, want succeeded — without this control the escalated-count assertion proves nothing", stage.State)
+		}
+	})
+
+	t.Run("escalated member_of: a non-member is refused at the pre-Submit 403", func(t *testing.T) {
+		// The gate itself declares NO member_of; the escalation added one, so
+		// this refusal exists only because the raise is applied BEFORE the
+		// "is this gate predicate-guarded" test.
+		s, ar, rr, _, idp := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+		stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "acme/security") {
+			t.Errorf("403 body does not name the escalated group: %s", w.Body.String())
+		}
+		if idp.memberCalls != 1 {
+			t.Errorf("memberCalls = %d, want 1", idp.memberCalls)
+		}
+		if n := len(ar.all); n != 0 {
+			t.Errorf("approval rows inserted = %d, want 0 (the refusal is pre-Submit)", n)
+		}
+	})
+
+	t.Run("two eligible in-group approvals advance the gate", func(t *testing.T) {
+		s, _, rr, _, _ := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+		stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+
+		if w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`); w.Code != http.StatusOK {
+			t.Fatalf("first approval status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if stage.State != run.StageStateAwaitingApproval {
+			t.Fatalf("stage advanced on the first approval")
+		}
+		req := httptest.NewRequest(http.MethodPost,
+			fmt.Sprintf("/v0/stages/%s/approvals", stage.ID), strings.NewReader(`{"decision":"approve"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.SetPathValue("stage_id", stage.ID.String())
+		w := httptest.NewRecorder()
+		s.handleSubmitApproval(w, withEscalationApprover(req, "github:second-approver"))
+		if w.Code != http.StatusOK {
+			t.Fatalf("second approval status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if stage.State != run.StageStateSucceeded {
+			t.Errorf("stage = %q, want succeeded once the escalated quorum of 2 is reached", stage.State)
+		}
+	})
+}
+
+// TestSubmitApproval_Escalation_NonMatchingClearsAtBaseline is the missing
+// end-to-end control (#2227 fixup): a change the escalation predicate does NOT
+// match clears the gate at its BASELINE and resolves NO forge membership. The
+// escalation matches on `labels: [security]`, which the seeded run's (absent)
+// issue labels never satisfy, so nothing fires: the gate's baseline is count 1
+// with no forge predicate, the first vote advances, and the IdentityProvider is
+// never called. The submitter resolves member:false, so a spurious escalation
+// (or an unintended membership resolution) would 403 rather than pass — which
+// is what makes the "advances with zero forge calls" assertion meaningful.
+func TestSubmitApproval_Escalation_NonMatchingClearsAtBaseline(t *testing.T) {
+	s, ar, rr, _, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+	nonMatching := strings.Replace(escalationApprovalSpecYAML,
+		"          trigger: [diff]", "          labels: [security]", 1)
+	stage := seedEscalationApprovalRun(t, rr, nonMatching)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (non-matching change clears at baseline):\n%s", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateSucceeded {
+		t.Fatalf("stage = %q, want succeeded — the escalation did not match, so the baseline count of 1 advances on the first vote", stage.State)
+	}
+	if idp.permCalls != 0 || idp.memberCalls != 0 {
+		t.Errorf("non-matching change resolved forge predicates: perm %d / member %d, want 0/0 (no membership resolution)", idp.permCalls, idp.memberCalls)
+	}
+	if n := len(ar.all); n != 1 {
+		t.Errorf("approval rows inserted = %d, want 1 (the baseline vote advanced)", n)
+	}
+}
+
+// TestSubmitApproval_Escalation_PlanUnreadable_FailsClosed drives the
+// reachable fail-closed mode through the real HTTP approve path: a
+// paths-bearing escalation is declared but the run's approved plan cannot be
+// read (this harness wires no artifact repository), so the gate returns a
+// retryable 503 rather than advancing UNESCALATED.
+//
+// The sibling Match-error mode is asserted at resolveEscalations
+// (TestResolveEscalations_MatchError_FailsClosed) rather than here on purpose:
+// spec validation rejects a malformed glob at ParseBytes, so a malformed
+// declaration cannot survive a cached-spec parse to reach this handler. That
+// branch is defence-in-depth for a spec that bypassed validation, and the unit
+// test is where it is reachable.
+func TestSubmitApproval_Escalation_PlanUnreadable_FailsClosed(t *testing.T) {
+	s, ar, rr, _, _ := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+	pathsSpec := strings.Replace(escalationApprovalSpecYAML,
+		"          trigger: [diff]", `          paths: ["backend/**"]`, 1)
+	stage := seedEscalationApprovalRun(t, rr, pathsSpec)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "escalation_unevaluable") {
+		t.Errorf("503 body does not name the escalation failure: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"retryable":true`) {
+		t.Errorf("503 body is not marked retryable: %s", w.Body.String())
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage = %q, want still awaiting_approval", stage.State)
+	}
+	if n := len(ar.all); n != 0 {
+		t.Errorf("approval rows inserted = %d, want 0", n)
+	}
+}
+
+// TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced pins
+// the #2227 fixup (prior concern c7665be8): when fetchApprovalsForStage errors
+// but a paths/label/trigger escalation IS raised (escReq non-zero), the fetch
+// error must NOT short-circuit before resolveStageEscalations — the escalated
+// forge predicate is enforced against a nil baseline so a transient window
+// cannot let an out-of-group approval through. A regression restoring the
+// original early `if ferr != nil { return nil, true }` would wave the non-member
+// through and this 403 would vanish.
+//
+// The fetch error is forced by a stage whose Type is absent from the workflow
+// (fetchApprovalsForStage returns "stage_type … not in workflow"), while
+// escalationsForRun still reads the workflow's firing escalation off the same
+// cached spec bytes — the exact ferr != nil ∧ escReq non-zero divergence.
+func TestCheckApprovalPredicates_FetchError_EscalatedPredicateStillEnforced(t *testing.T) {
+	s, _, rr, _, idp := newApprovalServerWithIdentity(t,
+		&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+	stage := seedEscalationApprovalRun(t, rr, escalationApprovalSpecYAML)
+	// A stage type the workflow does not declare → fetchApprovalsForStage errors,
+	// but the workflow-level escalation still fires.
+	stage.Type = run.StageTypeAcceptance
+
+	// Sanity: the fetch genuinely errors on this stage.
+	if _, ferr := s.fetchApprovalsForStage(context.Background(), stage); ferr == nil {
+		t.Fatal("fetchApprovalsForStage did not error; the test would not exercise the fetch-error branch")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+	w := httptest.NewRecorder()
+	res, ok := s.checkApprovalPredicates(w, req, stage, "github:outsider", false)
+	if ok {
+		t.Fatalf("checkApprovalPredicates ok = true, want false — the escalated member_of must be enforced despite the fetch error")
+	}
+	if res != nil {
+		t.Errorf("resolution = %v, want nil on a rejection", res)
+	}
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "acme/security") {
+		t.Errorf("403 body does not name the escalated group: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"escalated":true`) {
+		t.Errorf("403 body does not mark the predicate as escalated: %s", w.Body.String())
+	}
+	if idp.memberCalls != 1 {
+		t.Errorf("memberCalls = %d, want 1 (the escalated member_of was resolved)", idp.memberCalls)
+	}
+}
+
+// withEscalationApprover injects a DISTINCT operator identity so the second
+// approval counts as a second distinct eligible approver toward the escalated
+// quorum. (withAuth's identity is fixed, and runs_fake_test.go is another
+// slice's file.)
+func withEscalationApprover(req *http.Request, subject string) *http.Request {
+	id := testOperatorIdentity()
+	id.Subject = subject
+	return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+}
+
+// TestCheckDelegation_EscalationCeiling_Refuses is condition A's site 3: a
+// delegated approve on a run whose fired ceiling clamps the `approve` class is
+// REFUSED with the fail-closed delegation error rather than acted on.
+func TestCheckDelegation_EscalationCeiling_Refuses(t *testing.T) {
+	delegationSpec := func(escalations string) string {
+		return `version: "2"
+workflows:
+  feature_change:
+    autonomy: high
+    actions:
+      approve:
+        mode: auto
+        when: clean_dual_approval
+` + escalations + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	}
+	const lowCeiling = `    escalations:
+      - match:
+          trigger: [diff]
+        require:
+          max_autonomy: low
+`
+	call := func(t *testing.T, specYAML string) *httptest.ResponseRecorder {
+		t.Helper()
+		s, _, rr, _, _ := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+		s.cfg.ConcernRepo = newFakeConcernRepo()
+		stage := seedEscalationApprovalRun(t, rr, specYAML)
+		req := httptest.NewRequest(http.MethodPost, "/x", nil)
+		w := httptest.NewRecorder()
+		_, ok := s.checkDelegation(w, withAuth(req), stage.RunID, delegation.ActionApprove)
+		if ok && w.Code == 0 {
+			w.WriteHeader(http.StatusOK)
+		}
+		return w
+	}
+
+	t.Run("control: no escalation, the approve class IS delegated and its condition is evaluated", func(t *testing.T) {
+		w := call(t, delegationSpec(""))
+		// The refusal names clean_dual_approval, which can only happen if the
+		// approve class reached the decision set and its condition was
+		// evaluated. Without this control the ceiling assertion below would
+		// pass even if the class had never been delegated at all.
+		if !strings.Contains(w.Body.String(), "clean_dual_approval") {
+			t.Fatalf("body = %s, want a refusal naming the evaluated approve condition", w.Body.String())
+		}
+	})
+
+	t.Run("a fired low ceiling removes the class from the decision set entirely", func(t *testing.T) {
+		w := call(t, delegationSpec(lowCeiling))
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "delegation_not_configured") {
+			t.Errorf("body = %s, want delegation_not_configured — the clamped class must not be delegated at all", w.Body.String())
+		}
+	})
 }

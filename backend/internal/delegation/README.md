@@ -30,3 +30,27 @@ Resolution runs on the same ladder as the effective block. A campaign-level over
 - Surfaced as the `delegation` block on `GET /v0/runs/{run_id}` (`runs.go::buildDelegationPayload` — single-run read ONLY, omitted on terminal runs / legacy spec-less rows / evaluation failure, the Concerns degradation posture).
 - Every unmet decision names the exact failed predicate.
 - Action-time enforcement (`delegated: true` on approve/fixup/retry/waive) is the #1026 enforcement slice; audit-payload rule attribution rides it.
+
+## Escalation autonomy ceiling (E53.4 / #2227)
+
+A workflow's `escalations` block may declare a `max_autonomy` CEILING for a change matching its predicate. This package applies it **LAST** — after `spec.ResolveOperatorAgent` and `resolveMatrix` have produced the fully resolved block, i.e. after the workflow tier AND after every explicit `actions` override AND after a campaign override has been projected into the matrix. Clamping the tier or the declared entries instead would let an explicit `actions: {merge: {mode: auto}}` re-widen the class afterwards.
+
+Final resolution order: **workflow tier → explicit `actions` overrides → campaign override → escalation ceiling.**
+
+`Evaluate` then RE-DERIVES the knob block (`spec.DerivedOperatorAgent`) from the clamped matrix. Every enforcement site reads the derived `*OperatorAgent`, not the surfaced `ResolvedMatrix`, so clamping only the matrix would show `gated` on the run read while leaving the agent authorized to act.
+
+### The resolver is REQUIRED at construction
+
+`Evaluator`'s four dependencies are **unexported** and `NewEvaluator(stages, concerns, audit, escalations)` is the only constructor. Go forbids a composite literal from setting a non-exported field of a struct in another package, so `&delegation.Evaluator{…}` is a **compile error** everywhere outside this package. An Evaluator that cannot clamp is therefore *unconstructible* rather than merely discouraged — the enforcement site someone adds later cannot compile without supplying a resolver.
+
+There is deliberately **no** optional / nil-means-inert resolver and **no** exported no-op resolver: the no-escalations case is answered INSIDE the server resolver, which returns the zero `spec.ComposedRequirements` when the workflow declares none, so "inert" is reached by a code path that exists. Honestly stated: same-package construction is still possible, which is why this package's own tests go through `NewEvaluator` too; the guarantee binds every OTHER package, and all three enforcement sites live in `backend/internal/server`.
+
+Production construction sites, all converted:
+
+| Site | Fail-closed degradation on a constructor / resolver error |
+|---|---|
+| `server/runs.go::buildDelegationPayload` | warn-log, omit the delegation block |
+| `server/approvals.go::checkDelegation` | 500, the delegated action is refused |
+| `server/autodrive.go::evaluateRunDelegation` | observe-only — the auto-drive gate acts with no operator in the loop, so this is the site an unclamped evaluator would have hurt most |
+
+A resolver ERROR returns an error from `Evaluate`; each caller's existing degradation delegates nothing, so that mode is already fail-closed.

@@ -2,6 +2,7 @@ package spec_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -2404,6 +2405,387 @@ func TestAppliesToChangeKindMessageParity(t *testing.T) {
 		if !strings.Contains(string(src), want) {
 			t.Errorf("%s does not declare the applies_to change_kind message verbatim;\nwant the line: %s\n"+
 				"The two modules cannot share a constant, so the backend and CLI copies must stay byte-identical or `fishhawk validate` and the backend will report different text for the same spec error.", path, want)
+		}
+	}
+}
+
+// --- escalations (E53.4 / #2227) ---
+//
+// `fishhawk validate` must not accept a spec the backend refuses at dispatch,
+// so the backend's only-ever-raise family is mirrored here over the raw yaml
+// tree. The implementations are independent (the two Go modules share no
+// package); the tests below assert the SHIPPED message text on both sides, and
+// TestEscalationMessageParity reads both source files and fails on any drift in
+// the three hand-duplicated strings.
+//
+// ONE check is deliberately backend-only: the `max_autonomy` no-op check needs
+// the v2 autonomy resolver this package does not carry. Its absence here is the
+// documented boundary, asserted by TestValidateBytes_Escalations_MaxAutonomy_
+// NotCheckedByTheCLI so the gap is a pinned decision rather than an oversight.
+
+// escalationCLIDoc renders a v2 workflow with one approval gate declaring
+// count 2 / min_permission write plus the caller's `escalations` block
+// (already indented four spaces).
+func escalationCLIDoc(escalations string) []byte {
+	return []byte(`
+version: "2"
+workflows:
+  feature_change:
+    autonomy: high
+` + escalations + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 2
+              min_permission: write
+`)
+}
+
+// escalationCLIBlock wraps one escalation's `require` body in the list syntax.
+func escalationCLIBlock(require string) string {
+	return "    escalations:\n      - match:\n          paths: [\"infra/**\"]\n        require:\n" + require
+}
+
+// TestValidateBytes_Escalations_Valid is the positive control: a genuinely
+// raising escalation on every dimension — and a workflow declaring none —
+// validate clean, so the mirrored check cannot pass by rejecting everything.
+func TestValidateBytes_Escalations_Valid(t *testing.T) {
+	cases := []struct {
+		name    string
+		require string
+	}{
+		{name: "count above the baseline", require: "          approvals:\n            count: 3"},
+		{name: "min_permission above the baseline", require: "          approvals:\n            min_permission: admin"},
+		{name: "member_of no gate declares", require: "          approvals:\n            member_of: platform/security"},
+		{name: "max_autonomy ceiling", require: "          max_autonomy: low"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := spec.ValidateBytes(escalationCLIDoc(escalationCLIBlock(tc.require))); err != nil {
+				t.Fatalf("ValidateBytes: %v, want a raising escalation accepted", err)
+			}
+		})
+	}
+	t.Run("no escalations at all", func(t *testing.T) {
+		if err := spec.ValidateBytes(escalationCLIDoc("")); err != nil {
+			t.Fatalf("ValidateBytes: %v, want a workflow declaring no escalations accepted", err)
+		}
+	})
+}
+
+// TestValidateBytes_Escalations_ChangeKind_Rejected is the CLI parity check
+// for the no-producer refusal.
+func TestValidateBytes_Escalations_ChangeKind_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(escalationCLIDoc(`    escalations:
+      - match:
+          change_kind: [refactor]
+        require:
+          max_autonomy: low`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for change_kind in an escalation match", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/feature_change/escalations/0/match/change_kind") {
+		t.Errorf("error = %q, want it to name the escalation's match/change_kind pointer", msg)
+	}
+	if !strings.Contains(msg, spec.MsgEscalationChangeKindUnsupported) {
+		t.Errorf("error = %q, want it to carry MsgEscalationChangeKindUnsupported", msg)
+	}
+}
+
+// TestValidateBytes_Escalations_MalformedGlob_Rejected covers the shared
+// Predicate.Validate rung at the escalation's own pointer. (The empty
+// predicate and unknown trigger forms are schema-caught — see
+// TestValidateBytes_Escalations_SchemaCaughtForms.)
+func TestValidateBytes_Escalations_MalformedGlob_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(escalationCLIDoc(`    escalations:
+      - match:
+          paths: ["infra/["]
+        require:
+          max_autonomy: low`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for a malformed escalation glob", err)
+	}
+	if !strings.Contains(err.Error(), "/workflows/feature_change/escalations/0/match") {
+		t.Errorf("error = %q, want it reported at the escalation's match pointer", err.Error())
+	}
+}
+
+// TestValidateBytes_Escalations_MustRaise mirrors the backend's per-dimension
+// table: each weakened-or-no-op value is refused, naming the dimension's
+// pointer and carrying the shared no-raise shape.
+func TestValidateBytes_Escalations_MustRaise(t *testing.T) {
+	cases := []struct {
+		name     string
+		require  string
+		wantPath string
+	}{
+		{
+			name:     "count equal to the baseline",
+			require:  "          approvals:\n            count: 2",
+			wantPath: "/workflows/feature_change/escalations/0/require/approvals/count",
+		},
+		{
+			name:     "count below the baseline",
+			require:  "          approvals:\n            count: 1",
+			wantPath: "/workflows/feature_change/escalations/0/require/approvals/count",
+		},
+		{
+			name:     "min_permission equal to the baseline",
+			require:  "          approvals:\n            min_permission: write",
+			wantPath: "/workflows/feature_change/escalations/0/require/approvals/min_permission",
+		},
+		{
+			name:     "min_permission below the baseline",
+			require:  "          approvals:\n            min_permission: read",
+			wantPath: "/workflows/feature_change/escalations/0/require/approvals/min_permission",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := spec.ValidateBytes(escalationCLIDoc(escalationCLIBlock(tc.require)))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError for a non-raising escalation", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tc.wantPath) {
+				t.Errorf("error = %q, want it to name %q", msg, tc.wantPath)
+			}
+			if !strings.Contains(msg, "does not raise") || !strings.Contains(msg, "may only ever RAISE") {
+				t.Errorf("error = %q, want the shared no-raise shape", msg)
+			}
+		})
+	}
+}
+
+// NOTE (#2227 fixup): the omitted-count baseline regression is pinned on the
+// BACKEND (spec.TestValidate_Escalations_OmittedCountBaseline via the exported
+// spec.Validate) rather than here, because it is reachable only on a struct
+// that BYPASSED the schema — the v2 schema requires `count` on an approvals
+// block, and ValidateBytes runs schema.Validate BEFORE checkEscalations, so a
+// countless gate fails schema before the semantic baseline check ever sees it.
+// baselineApprovalCountFromRaw carries the same effective-count-of-1 default as
+// the backend for parity (a countless gate reaching checkEscalations off a
+// schema-bypassed path is defended identically), but that path is not
+// exercisable through ValidateBytes from this external test package.
+
+// TestValidateBytes_Escalations_ApprovalsWithNoApprovalGate mirrors the
+// workflow-wide inertness rejection.
+func TestValidateBytes_Escalations_ApprovalsWithNoApprovalGate(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  gateless:
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            count: 5
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for require.approvals with no approval gate", err)
+	}
+	want := fmt.Sprintf(spec.MsgFmtEscalationApprovalsNoApprovalGate, "gateless", 0, "gateless")
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to carry %q", err.Error(), want)
+	}
+}
+
+// escalationCLIMemberOfDoc renders two approval gates whose member_of
+// declarations the caller chooses, plus one member_of escalation.
+func escalationCLIMemberOfDoc(gateOne, gateTwo, escalated string) []byte {
+	memberLine := func(group string) string {
+		if group == "" {
+			return ""
+		}
+		return "\n              member_of: " + group
+	}
+	return []byte(`
+version: "2"
+workflows:
+  feature_change:
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            member_of: ` + escalated + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1` + memberLine(gateOne) + `
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvals:
+              count: 1` + memberLine(gateTwo) + `
+`)
+}
+
+// TestValidateBytes_Escalations_MemberOfBoundaryPair is the CLI half of the
+// no-op check and its boundary — the same three cases the backend pins.
+func TestValidateBytes_Escalations_MemberOfBoundaryPair(t *testing.T) {
+	t.Run("every approval gate already requires the group", func(t *testing.T) {
+		err := spec.ValidateBytes(escalationCLIMemberOfDoc("platform/security", "platform/security", "platform/security"))
+		var ve *spec.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("err = %v, want *ValidationError for a member_of every gate already requires", err)
+		}
+		if !strings.Contains(err.Error(), "/workflows/feature_change/escalations/0/require/approvals/member_of") {
+			t.Errorf("error = %q, want it to name the member_of pointer", err.Error())
+		}
+	})
+	t.Run("only one of two gates requires the group", func(t *testing.T) {
+		if err := spec.ValidateBytes(escalationCLIMemberOfDoc("platform/security", "", "platform/security")); err != nil {
+			t.Fatalf("ValidateBytes: %v, want acceptance — the escalation raises the gate that omits the group", err)
+		}
+	})
+	t.Run("no gate requires the group", func(t *testing.T) {
+		if err := spec.ValidateBytes(escalationCLIMemberOfDoc("", "", "platform/security")); err != nil {
+			t.Fatalf("ValidateBytes: %v, want acceptance for the ordinary raising case", err)
+		}
+	})
+}
+
+// TestValidateBytes_Escalations_SchemaCaughtForms pins the structural rules
+// the mirrored SCHEMA gives the CLI for free — including the two minProperties
+// rules that make a no-op `require` unwritable.
+func TestValidateBytes_Escalations_SchemaCaughtForms(t *testing.T) {
+	cases := []struct {
+		name        string
+		escalations string
+	}{
+		{name: "empty list", escalations: "    escalations: []"},
+		{name: "entry missing match", escalations: "    escalations:\n      - require:\n          max_autonomy: low"},
+		{name: "entry missing require", escalations: "    escalations:\n      - match:\n          paths: [\"infra/**\"]"},
+		{name: "hoisted paths", escalations: "    escalations:\n      - paths: [\"infra/**\"]\n        require:\n          max_autonomy: low"},
+		{name: "empty require", escalations: "    escalations:\n      - match:\n          paths: [\"infra/**\"]\n        require: {}"},
+		{name: "empty nested approvals", escalations: escalationCLIBlock("          approvals: {}")},
+		{name: "empty match predicate", escalations: "    escalations:\n      - match: {}\n        require:\n          max_autonomy: low"},
+		{name: "unknown trigger form", escalations: "    escalations:\n      - match:\n          trigger: [rebase]\n        require:\n          max_autonomy: low"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := spec.ValidateBytes(escalationCLIDoc(tc.escalations))
+			if err == nil {
+				t.Fatal("err = nil, want a rejection from the mirrored schema")
+			}
+			if !strings.Contains(err.Error(), "escalations") {
+				t.Errorf("error = %q, want it to name escalations", err.Error())
+			}
+		})
+	}
+}
+
+// TestValidateBytes_Escalations_MaxAutonomy_NotCheckedByTheCLI pins the ONE
+// documented gap: the ceiling's no-op check needs the v2 autonomy resolver,
+// which this package deliberately does not carry, so the CLI accepts a
+// no-op ceiling the backend refuses. Pinned so the boundary is a decision
+// rather than an oversight — if the CLI ever grows the resolver, this test
+// fails and the gap is closed deliberately.
+func TestValidateBytes_Escalations_MaxAutonomy_NotCheckedByTheCLI(t *testing.T) {
+	// `autonomy: high` with a `high` ceiling clamps nothing; the backend
+	// refuses it as a no-op.
+	if err := spec.ValidateBytes(escalationCLIDoc(escalationCLIBlock("          max_autonomy: high"))); err != nil {
+		t.Fatalf("ValidateBytes: %v, want the CLI to accept it — the max_autonomy no-op check is backend-only", err)
+	}
+}
+
+// TestValidateBytes_Escalations_ExtendsDoesNotInherit pins the resolution
+// interaction: `extends` folds only STAGES, so a base's invalid escalation is
+// reported against the BASE and never attributed to the deriving workflow.
+func TestValidateBytes_Escalations_ExtendsDoesNotInherit(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    escalations:
+      - match:
+          change_kind: [refactor]
+        require:
+          max_autonomy: low
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+  derived:
+    extends: base
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError naming the base's escalation", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/base/escalations/0/match/change_kind") {
+		t.Errorf("error = %q, want it reported against the declaring workflow (base)", msg)
+	}
+	if strings.Contains(msg, "/workflows/derived/escalations") {
+		t.Errorf("error = %q, want no escalation error against derived; extends folds stages only", msg)
+	}
+}
+
+// TestEscalationMessageParity is the MECHANICAL drift guard for the three
+// hand-duplicated escalation strings, the same posture
+// TestAppliesToChangeKindMessageParity takes for its single constant: the two
+// modules cannot share a constant, so parity is asserted by reading both
+// source files and requiring the identical declaration line in each.
+func TestEscalationMessageParity(t *testing.T) {
+	wants := []string{
+		`const MsgEscalationChangeKindUnsupported = ` + strconv.Quote(spec.MsgEscalationChangeKindUnsupported),
+		`const MsgFmtEscalationNoRaise = ` + strconv.Quote(spec.MsgFmtEscalationNoRaise),
+		`const MsgFmtEscalationApprovalsNoApprovalGate = ` + strconv.Quote(spec.MsgFmtEscalationApprovalsNoApprovalGate),
+	}
+	for _, path := range []string{
+		"../../../backend/internal/spec/escalation.go",
+		"../../../cli/internal/spec/validate.go",
+	} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		for _, want := range wants {
+			if !strings.Contains(string(src), want) {
+				t.Errorf("%s does not declare an escalation message verbatim;\nwant the line: %s\n"+
+					"The two modules cannot share a constant, so the backend and CLI copies must stay byte-identical or `fishhawk validate` and the backend will report different text for the same spec error.", path, want)
+			}
 		}
 	}
 }

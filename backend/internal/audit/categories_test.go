@@ -148,3 +148,14 @@ func TestKnownCategoryList_NonEmptyAndSorted(t *testing.T) {
 		t.Error("KnownCategoryList returned a shared backing array; callers can corrupt it")
 	}
 }
+
+// TestKnownCategories_EscalationFired registers the E53.4 / #2227 category so
+// an operator can await it. An unregistered category is an un-awaitable audit
+// stream, which would leave "the operator sees why a gate got stricter" only
+// half true — and categories_completeness_test.go's AST sweep fails the build
+// on a category backend code emits but the registry omits.
+func TestKnownCategories_EscalationFired(t *testing.T) {
+	if !IsKnownCategory("escalation_fired") {
+		t.Fatal("escalation_fired is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

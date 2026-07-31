@@ -21,6 +21,38 @@ import (
 
 // --- fakes ------------------------------------------------------------------
 
+// fakeEscalations is the test EscalationResolver. The zero value answers "no
+// escalation fired" — the value a workflow declaring none resolves to, which
+// is why there is no nil-resolver path to test around.
+type fakeEscalations struct {
+	req   spec.ComposedRequirements
+	err   error
+	calls int
+}
+
+func (f *fakeEscalations) ResolveEscalations(context.Context, *run.Run, *spec.Workflow, uuid.UUID) (spec.ComposedRequirements, error) {
+	f.calls++
+	return f.req, f.err
+}
+
+// newTestEvaluator constructs through the REQUIRED-resolver constructor, with
+// a resolver that fires nothing — so every pre-#2227 test asserts the
+// unchanged behaviour it always did. Same-package construction of the
+// unexported-field struct is still possible here; going through NewEvaluator
+// anyway is what keeps these tests honest about the contract every OTHER
+// package is bound to.
+func newTestEvaluator(stages StageLister, concerns ConcernLister, au AuditLister) *Evaluator {
+	return newTestEvaluatorWith(stages, concerns, au, &fakeEscalations{})
+}
+
+func newTestEvaluatorWith(stages StageLister, concerns ConcernLister, au AuditLister, r EscalationResolver) *Evaluator {
+	ev, err := NewEvaluator(stages, concerns, au, r)
+	if err != nil {
+		panic(err)
+	}
+	return ev
+}
+
 type fakeStages struct {
 	stages []*run.Stage
 	err    error
@@ -161,11 +193,7 @@ func TestConfigured(t *testing.T) {
 // TestEvaluate_NoBlock_FailClosed: a spec without an operator_agent
 // block evaluates to nil — nothing delegated, no repository reads.
 func TestEvaluate_NoBlock_FailClosed(t *testing.T) {
-	ev := &Evaluator{
-		Stages:   &fakeStages{err: errors.New("must not be called")},
-		Concerns: &fakeConcerns{err: errors.New("must not be called")},
-		Audit:    &fakeAudit{err: errors.New("must not be called")},
-	}
+	ev := newTestEvaluator(&fakeStages{err: errors.New("must not be called")}, &fakeConcerns{err: errors.New("must not be called")}, &fakeAudit{err: errors.New("must not be called")})
 	res, err := ev.Evaluate(context.Background(), newRun(), testWorkflow(nil, nil), nil)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
@@ -183,11 +211,7 @@ func TestEvaluate_GateOverrideWinsWholesale(t *testing.T) {
 		MustPageHuman: []string{spec.PageEventPlanRejection},
 	}
 	wf := testWorkflow(allKnobs(), gateBlock)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 	if len(res.Actions) != 1 || res.Actions[0].Action != ActionWaive {
 		t.Fatalf("Actions = %+v, want only the gate block's waive knob (wholesale override)", res.Actions)
@@ -205,11 +229,7 @@ func TestEvaluate_GateOverrideWinsWholesale(t *testing.T) {
 // only applies while its gate is the pending one).
 func TestEvaluate_WorkflowBlockWhenNoGatePending(t *testing.T) {
 	wf := testWorkflow(allKnobs(), &spec.OperatorAgent{MayWaive: spec.ConditionSoloLow})
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}},
-		Concerns: &fakeConcerns{},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}}, &fakeConcerns{}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 	if len(res.Actions) != 5 {
 		t.Fatalf("Actions = %+v, want all five workflow-level knobs", res.Actions)
@@ -223,11 +243,7 @@ func TestEvaluate_WorkflowBlockWhenNoGatePending(t *testing.T) {
 // otherwise satisfy solo_low/waive) must NOT yield a met action.
 func TestEvaluate_AwaitingInputParksHuman(t *testing.T) {
 	wf := testWorkflow(allKnobs(), nil)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 	if res == nil {
 		t.Fatal("Result is nil; want the must_page_human envelope while parked at awaiting_input")
@@ -245,11 +261,7 @@ func TestEvaluate_AwaitingInputParksHuman(t *testing.T) {
 // pending — fail-closed, nil result.
 func TestEvaluate_GateOnlyBlock_NotPending_FailClosed(t *testing.T) {
 	wf := testWorkflow(nil, allKnobs()) // block only on the plan gate
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded), mkStage(1, run.StageTypeImplement, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded), mkStage(1, run.StageTypeImplement, run.StageStateAwaitingApproval)}}, &fakeConcerns{}, &fakeAudit{})
 	res, err := ev.Evaluate(context.Background(), newRun(), wf, nil)
 	if err != nil {
 		t.Fatalf("Evaluate: %v", err)
@@ -297,11 +309,7 @@ func TestEvaluate_CampaignOverridePrecedence(t *testing.T) {
 	// gate and gateBlock is the workflow's EffectiveOperatorAgent absent a
 	// campaign override.
 	newEvaluator := func() *Evaluator {
-		return &Evaluator{
-			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-			Concerns: &fakeConcerns{},
-			Audit:    &fakeAudit{},
-		}
+		return newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{}, &fakeAudit{})
 	}
 
 	t.Run("campaign override wins over gate and workflow wholesale", func(t *testing.T) {
@@ -400,11 +408,7 @@ func TestEvaluate_ModelPolicy_Passthrough(t *testing.T) {
 		block := allKnobs()
 		block.ModelPolicy = samplePolicy()
 		wf := testWorkflow(block, nil)
-		ev := &Evaluator{
-			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}},
-			Concerns: &fakeConcerns{},
-			Audit:    &fakeAudit{},
-		}
+		ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}}, &fakeConcerns{}, &fakeAudit{})
 		res := evaluate(t, ev, wf, newRun())
 		if res.ModelPolicy != block.ModelPolicy {
 			t.Fatalf("ModelPolicy = %+v, want the workflow block's policy passed through by pointer", res.ModelPolicy)
@@ -415,11 +419,7 @@ func TestEvaluate_ModelPolicy_Passthrough(t *testing.T) {
 		block := allKnobs()
 		block.ModelPolicy = samplePolicy()
 		wf := testWorkflow(block, nil)
-		ev := &Evaluator{
-			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
-			Concerns: &fakeConcerns{},
-			Audit:    &fakeAudit{},
-		}
+		ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}}, &fakeConcerns{}, &fakeAudit{})
 		res := evaluate(t, ev, wf, newRun())
 		if res.ModelPolicy != block.ModelPolicy {
 			t.Fatalf("ModelPolicy = %+v, want the policy surfaced on the parked path", res.ModelPolicy)
@@ -434,11 +434,7 @@ func TestEvaluate_ModelPolicy_Passthrough(t *testing.T) {
 			ModelPolicy: &spec.ModelPolicy{Strategy: spec.ModelPolicyFollowPlanRecommendation},
 		}
 		wf := testWorkflow(wfBlock, gateBlock)
-		ev := &Evaluator{
-			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-			Concerns: &fakeConcerns{},
-			Audit:    &fakeAudit{},
-		}
+		ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{}, &fakeAudit{})
 		res := evaluate(t, ev, wf, newRun())
 		if res.ModelPolicy != gateBlock.ModelPolicy {
 			t.Fatalf("ModelPolicy = %+v, want the gate block's policy (wholesale override, not the workflow's)", res.ModelPolicy)
@@ -447,11 +443,7 @@ func TestEvaluate_ModelPolicy_Passthrough(t *testing.T) {
 
 	t.Run("nil when the effective block declares none", func(t *testing.T) {
 		wf := testWorkflow(allKnobs(), nil) // allKnobs sets no ModelPolicy
-		ev := &Evaluator{
-			Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}},
-			Concerns: &fakeConcerns{},
-			Audit:    &fakeAudit{},
-		}
+		ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateSucceeded)}}, &fakeConcerns{}, &fakeAudit{})
 		res := evaluate(t, ev, wf, newRun())
 		if res.ModelPolicy != nil {
 			t.Fatalf("ModelPolicy = %+v, want nil for an absent model_policy", res.ModelPolicy)
@@ -462,7 +454,7 @@ func TestEvaluate_ModelPolicy_Passthrough(t *testing.T) {
 // --- clean_dual_approval ------------------------------------------------------
 
 func cleanDualEvaluator(stages []*run.Stage, open []*concern.Concern, au *fakeAudit) *Evaluator {
-	return &Evaluator{Stages: &fakeStages{stages: stages}, Concerns: &fakeConcerns{open: open}, Audit: au}
+	return newTestEvaluator(&fakeStages{stages: stages}, &fakeConcerns{open: open}, au)
 }
 
 func TestCleanDualApproval(t *testing.T) {
@@ -815,11 +807,7 @@ func TestReviewerRejectClass_PerAuthority(t *testing.T) {
 func TestReviewerRejectClass_ParkedAwaitingInput(t *testing.T) {
 	wf := testWorkflow(allKnobs(), nil)
 	implementStage(wf).Reviewers = &spec.ReviewersConfig{Agent: 1, Human: 0} // gating
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
-		Concerns: &fakeConcerns{},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}}, &fakeConcerns{}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 	if res == nil {
 		t.Fatal("Result is nil; want the must_page_human envelope while parked")
@@ -1333,9 +1321,9 @@ func TestEvaluate_RepoFailuresPropagate(t *testing.T) {
 		name string
 		ev   *Evaluator
 	}{
-		{"stage list failure", &Evaluator{Stages: &fakeStages{err: boom}, Concerns: &fakeConcerns{}, Audit: &fakeAudit{}}},
-		{"concern list failure", &Evaluator{Stages: &fakeStages{}, Concerns: &fakeConcerns{err: boom}, Audit: &fakeAudit{}}},
-		{"audit list failure", &Evaluator{Stages: &fakeStages{}, Concerns: &fakeConcerns{}, Audit: &fakeAudit{err: boom}}},
+		{"stage list failure", newTestEvaluator(&fakeStages{err: boom}, &fakeConcerns{}, &fakeAudit{})},
+		{"concern list failure", newTestEvaluator(&fakeStages{}, &fakeConcerns{err: boom}, &fakeAudit{})},
+		{"audit list failure", newTestEvaluator(&fakeStages{}, &fakeConcerns{}, &fakeAudit{err: boom})},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1352,11 +1340,7 @@ func TestEvaluate_RepoFailuresPropagate(t *testing.T) {
 // knob in allKnobs() produces a Decision the lookup helper can resolve.
 func allKnobsEvaluator() (*Evaluator, *spec.Workflow, *run.Run) {
 	wf := testWorkflow(allKnobs(), nil)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	return ev, wf, newRun()
 }
 
@@ -1517,11 +1501,7 @@ func TestEvaluate_V2Matrix_TierAndProvenance(t *testing.T) {
     actions:
       approve:
         mode: gated`)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 
 	if res.Tier != spec.TierMedium {
@@ -1564,11 +1544,7 @@ func TestEvaluate_V2Matrix_TierAndProvenance(t *testing.T) {
 // class Source=explicit — the campaign named the whole block itself.
 func TestEvaluate_CampaignOverride_MatrixProjection(t *testing.T) {
 	wf := testWorkflow(nil, nil)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	override := &spec.OperatorAgent{MayWaive: spec.ConditionSoloLow, MustPageHuman: []string{spec.PageEventPlanRejection}}
 	res, err := ev.Evaluate(context.Background(), newRun(), wf, override)
 	if err != nil {
@@ -1600,11 +1576,7 @@ func TestEvaluate_ReportMode_Evaluated(t *testing.T) {
       waive:
         mode: report
         when: solo_low`)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 
 	d, ok := res.Report(ActionWaive)
@@ -1639,11 +1611,7 @@ func TestEvaluate_ReportMode_ForeignConditionRefused(t *testing.T) {
 	// A non-nil derived block makes the workflow delegation-configured so the
 	// evaluator resolves the matrix rather than short-circuiting.
 	wf.OperatorAgent = spec.DerivedOperatorAgent(spec.ResolveAutonomy(wf, nil))
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 
 	if d, ok := res.Report(ActionWaive); ok {
@@ -1662,11 +1630,7 @@ func TestEvaluate_ReportMode_BareEntryHasNoReportDecision(t *testing.T) {
 	wf := parseV2Workflow(t, `    actions:
       approve:
         mode: report`)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
-		Concerns: &fakeConcerns{},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}}, &fakeConcerns{}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 
 	if len(res.Reports) != 0 {
@@ -1683,11 +1647,7 @@ func TestEvaluate_ReportMode_BareEntryHasNoReportDecision(t *testing.T) {
 // proposal to a human the run is already blocked on.
 func TestEvaluate_ParkedAwaitingInput_NoMatrix(t *testing.T) {
 	wf := parseV2Workflow(t, `    autonomy: high`)
-	ev := &Evaluator{
-		Stages:   &fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
-		Concerns: &fakeConcerns{open: []*concern.Concern{openConcern("low")}},
-		Audit:    &fakeAudit{},
-	}
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}}, &fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
 	res := evaluate(t, ev, wf, newRun())
 
 	if res.Matrix != nil || res.Reports != nil || res.Actions != nil {
@@ -1718,4 +1678,175 @@ func TestActionForClass(t *testing.T) {
 	if got, ok := ActionForClass("promote"); ok {
 		t.Errorf("ActionForClass(\"promote\") = %q, true; want false (extension class)", got)
 	}
+}
+
+// --- escalation ceiling (E53.4 / #2227) --------------------------------------
+
+// TestNewEvaluator_RequiresEveryDependency pins the required-at-construction
+// contract. The RESOLVER case is the one this change adds: an Evaluator that
+// cannot clamp would silently under-enforce a fired escalation, so it must be
+// unconstructible rather than merely discouraged.
+func TestNewEvaluator_RequiresEveryDependency(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+		call func() (*Evaluator, error)
+	}{
+		{"nil stages", "stages", func() (*Evaluator, error) {
+			return NewEvaluator(nil, &fakeConcerns{}, &fakeAudit{}, &fakeEscalations{})
+		}},
+		{"nil concerns", "concerns", func() (*Evaluator, error) {
+			return NewEvaluator(&fakeStages{}, nil, &fakeAudit{}, &fakeEscalations{})
+		}},
+		{"nil audit", "audit", func() (*Evaluator, error) {
+			return NewEvaluator(&fakeStages{}, &fakeConcerns{}, nil, &fakeEscalations{})
+		}},
+		{"nil escalation resolver", "escalation resolver", func() (*Evaluator, error) {
+			return NewEvaluator(&fakeStages{}, &fakeConcerns{}, &fakeAudit{}, nil)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ev, err := tc.call()
+			if err == nil {
+				t.Fatalf("NewEvaluator returned no error for %s", tc.name)
+			}
+			if ev != nil {
+				t.Errorf("NewEvaluator returned a non-nil evaluator alongside the error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not name the missing dependency %q", err, tc.want)
+			}
+		})
+	}
+	if _, err := NewEvaluator(&fakeStages{}, &fakeConcerns{}, &fakeAudit{}, &fakeEscalations{}); err != nil {
+		t.Fatalf("NewEvaluator with every dependency: %v", err)
+	}
+}
+
+// TestEvaluate_EscalationCeiling_ClampsExplicitAuto is criterion 4's core
+// case: an EXPLICITLY declared `actions: {merge: {mode: auto, when: ...}}`
+// under a fired `max_autonomy: low` resolves to GATED with
+// Source=escalation, AND the DERIVED OperatorAgent.MayMerge knob — the one
+// every enforcement site actually reads — is EMPTY.
+//
+// Asserting the derived knob rather than only the surfaced matrix is the
+// point: clamping the matrix alone would show `gated` on the run read while
+// leaving the agent authorized to act.
+func TestEvaluate_EscalationCeiling_ClampsExplicitAuto(t *testing.T) {
+	wf := parseV2Workflow(t, `    autonomy: low
+    actions:
+      merge:
+        mode: auto
+        when: gates_resolved_ci_green`)
+
+	stages := []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+
+	t.Run("control: no escalation fires, the explicit override stands", func(t *testing.T) {
+		ev := newTestEvaluator(&fakeStages{stages: stages}, &fakeConcerns{}, &fakeAudit{})
+		res, err := ev.Evaluate(context.Background(), newRun(), wf, nil)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if e := matrixEntry(t, res, spec.ActionMerge); e.Mode != spec.ModeAuto {
+			t.Fatalf("merge mode = %q, want auto (the control would be vacuous otherwise)", e.Mode)
+		}
+		if _, ok := res.Decision(ActionMerge); !ok {
+			t.Error("merge is not in the decision set; the derived MayMerge knob was empty before the clamp, so the clamp assertion below proves nothing")
+		}
+	})
+
+	t.Run("fired low ceiling clamps the explicit auto and empties the derived knob", func(t *testing.T) {
+		esc := &fakeEscalations{req: spec.ComposedRequirements{MaxAutonomy: spec.TierLow}}
+		ev := newTestEvaluatorWith(&fakeStages{stages: stages}, &fakeConcerns{}, &fakeAudit{}, esc)
+		res, err := ev.Evaluate(context.Background(), newRun(), wf, nil)
+		if err != nil {
+			t.Fatalf("Evaluate: %v", err)
+		}
+		if esc.calls != 1 {
+			t.Errorf("resolver calls = %d, want 1", esc.calls)
+		}
+		e := matrixEntry(t, res, spec.ActionMerge)
+		if e.Mode != spec.ModeGated {
+			t.Errorf("merge mode = %q, want gated under a low ceiling", e.Mode)
+		}
+		if e.Source != spec.SourceEscalation {
+			t.Errorf("merge source = %q, want %q", e.Source, spec.SourceEscalation)
+		}
+		if e.Condition != "" {
+			t.Errorf("merge condition = %q, want dropped by the clamp", e.Condition)
+		}
+		// THE derived-knob assertion: no merge DECISION means
+		// DerivedOperatorAgent produced an empty MayMerge from the clamped
+		// matrix, so every enforcement site reading the derived block sees no
+		// merge authority.
+		if d, ok := res.Decision(ActionMerge); ok {
+			t.Errorf("merge is still in the decision set (%+v); the derived MayMerge knob was not re-derived from the clamped matrix", d)
+		}
+	})
+}
+
+// TestEvaluate_EscalationCeiling_CampaignOverrideClamped: a campaign override
+// is projected into a matrix at the OUTERMOST rung, and the ceiling is applied
+// after that projection — so the clamp holds against that rung too.
+func TestEvaluate_EscalationCeiling_CampaignOverrideClamped(t *testing.T) {
+	wf := testWorkflow(allKnobs(), nil)
+	stages := []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+	esc := &fakeEscalations{req: spec.ComposedRequirements{MaxAutonomy: spec.TierLow}}
+	ev := newTestEvaluatorWith(&fakeStages{stages: stages}, &fakeConcerns{}, &fakeAudit{}, esc)
+
+	res, err := ev.Evaluate(context.Background(), newRun(), wf, allKnobs())
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if e := matrixEntry(t, res, spec.ActionMerge); e.Mode != spec.ModeGated || e.Source != spec.SourceEscalation {
+		t.Errorf("merge entry = %+v, want gated/escalation — the ceiling must clamp the campaign rung too", e)
+	}
+	if d, ok := res.Decision(ActionMerge); ok {
+		t.Errorf("merge still delegated under a campaign override + low ceiling: %+v", d)
+	}
+}
+
+// TestEvaluate_EscalationResolverError_FailsClosed: a resolver error is
+// RETURNED from Evaluate, so each call site takes its existing fail-closed
+// branch and delegates nothing. Swallowing it would delegate at the UNCLAMPED
+// matrix, which is the failure this whole seam exists to prevent.
+func TestEvaluate_EscalationResolverError_FailsClosed(t *testing.T) {
+	wf := parseV2Workflow(t, `    autonomy: high`)
+	boom := errors.New("plan unreadable")
+	ev := newTestEvaluatorWith(
+		&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		&fakeConcerns{}, &fakeAudit{}, &fakeEscalations{err: boom})
+
+	res, err := ev.Evaluate(context.Background(), newRun(), wf, nil)
+	if !errors.Is(err, boom) {
+		t.Fatalf("Evaluate error = %v, want the resolver failure", err)
+	}
+	if res != nil {
+		t.Errorf("Result = %+v, want nil alongside the error", res)
+	}
+}
+
+// TestEvaluate_EscalationCeiling_StageIDThreaded: the resolver receives the
+// currently gated stage, which is what lets the ONE server-side emit point
+// de-duplicate its audit entry per (run, stage).
+func TestEvaluate_EscalationCeiling_StageIDThreaded(t *testing.T) {
+	wf := parseV2Workflow(t, `    autonomy: high`)
+	gated := mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)
+	seen := make(chan uuid.UUID, 1)
+	ev := newTestEvaluatorWith(&fakeStages{stages: []*run.Stage{gated}}, &fakeConcerns{}, &fakeAudit{},
+		stageCapturingResolver{seen: seen})
+	if _, err := ev.Evaluate(context.Background(), newRun(), wf, nil); err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if got := <-seen; got != gated.ID {
+		t.Errorf("resolver stage id = %s, want the gated stage %s", got, gated.ID)
+	}
+}
+
+type stageCapturingResolver struct{ seen chan uuid.UUID }
+
+func (r stageCapturingResolver) ResolveEscalations(_ context.Context, _ *run.Run, _ *spec.Workflow, stageID uuid.UUID) (spec.ComposedRequirements, error) {
+	r.seen <- stageID
+	return spec.ComposedRequirements{}, nil
 }

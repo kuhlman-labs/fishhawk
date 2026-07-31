@@ -47,6 +47,7 @@ const (
 var v2DocCitedHeadings = []string{
 	"Reuse: defaults and extends",
 	"Autonomy: tier shorthand and action matrix",
+	"Escalations",
 	v2DocAppendixHeading,
 }
 

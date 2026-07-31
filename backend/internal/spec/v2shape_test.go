@@ -907,3 +907,158 @@ func TestConstraintKindNames(t *testing.T) {
 		t.Errorf("postHocKindName = %q, want forbidden_paths", got)
 	}
 }
+
+// --- escalations: the SCHEMA-level rejections (E53.4 / #2227) --------------
+//
+// These are the structural rules the JSON Schema owns, asserted through
+// ParseBytes so the shipped canonical schema (and therefore both mirrors) is
+// what answers. They are the load-bearing half of the claim that a no-op
+// escalation is refused STRUCTURALLY rather than only by the Go validator: the
+// two minProperties rules below are what make `require: {}` and
+// `require: {approvals: {}}` unwritable in the first place.
+func TestSchema_Escalations_StructuralRejections(t *testing.T) {
+	doc := func(escalations string) []byte {
+		return []byte(`
+version: "2"
+workflows:
+  feature_change:
+    autonomy: high
+` + escalations + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+	}
+
+	cases := []struct {
+		name        string
+		escalations string
+		why         string
+	}{
+		{
+			name:        "an empty escalations list",
+			escalations: "    escalations: []",
+			why:         "minItems 1 — a declared-but-empty block is an authoring slip, not a control",
+		},
+		{
+			name: "an entry missing match",
+			escalations: `    escalations:
+      - require:
+          max_autonomy: low`,
+			why: "`match` is in the entry's required set",
+		},
+		{
+			name: "an entry missing require",
+			escalations: `    escalations:
+      - match:
+          paths: ["infra/**"]`,
+			why: "`require` is in the entry's required set",
+		},
+		{
+			name: "the hoisted-paths form from the issue's original example",
+			escalations: `    escalations:
+      - paths: ["infra/**"]
+        require:
+          max_autonomy: low`,
+			why: "the predicate is a CLOSED object, which is what structurally forces the `match:` wrapper",
+		},
+		{
+			name: "an empty require block",
+			escalations: `    escalations:
+      - match:
+          paths: ["infra/**"]
+        require: {}`,
+			why: "the OUTER minProperties 1 — an escalation must require something",
+		},
+		{
+			name: "an empty nested approvals block",
+			escalations: `    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals: {}`,
+			why: "the NESTED minProperties 1 — without it this would satisfy the outer one while requiring nothing",
+		},
+		{
+			name: "an empty match predicate",
+			escalations: `    escalations:
+      - match: {}
+        require:
+          max_autonomy: low`,
+			why: "the shared predicate's own minProperties 1 — an empty predicate is never match-all",
+		},
+		{
+			name: "an unknown require dimension",
+			escalations: `    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_budget: 5`,
+			why: "require is additionalProperties:false — a dimension the enforcement seams do not read must not parse",
+		},
+		{
+			name: "a min_permission outside the closed enum",
+			escalations: `    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            min_permission: owner`,
+			why: "the enum mirrors identity.Permission sans none",
+		},
+		{
+			name: "a max_autonomy outside the tier enum",
+			escalations: `    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: none`,
+			why: "max_autonomy is $defs/autonomy_tier",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseBytes(doc(tc.escalations))
+			var se *SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SchemaError (%s)", err, tc.why)
+			}
+		})
+	}
+}
+
+// TestSchema_Escalations_MatchWrapperAccepted is the positive control for the
+// table above: the wrapper form the doc's worked example uses parses.
+func TestSchema_Escalations_MatchWrapperAccepted(t *testing.T) {
+	s, err := ParseBytes([]byte(`
+version: "2"
+workflows:
+  feature_change:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: low
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	if got := len(s.Workflows["feature_change"].Escalations); got != 1 {
+		t.Errorf("Escalations = %d entries, want 1", got)
+	}
+}
