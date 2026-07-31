@@ -264,6 +264,12 @@ func TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance(t *testing
 		{ID: "accept-agent", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Agent: "claude-code"}, Egress: hosts},
 		{ID: "accept-human", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Human: true}, Egress: hosts},
 		{ID: "impl-agent", Type: spec.StageTypeImplement, Executor: spec.Executor{Agent: "claude-code"}, Egress: hosts},
+		// An AGENT-executor acceptance stage declaring ONLY write/shell and NO
+		// network/egress: enforced must stay false. This pins the `st.Egress != nil`
+		// clause of the Enforced predicate — without it, acceptance+agent alone would
+		// flip write/shell-only permissions to enforced:true, over-claiming that a
+		// non-existent network allow-list is enforced (fix-up: untested-path).
+		{ID: "accept-write-only", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Agent: "claude-code"}, Permissions: &spec.StagePermissions{Write: []string{"artifacts/**"}, Shell: spec.ShellPostureRestricted}},
 	}}
 	got := map[string]runStagePermissionsPayload{}
 	for _, e := range buildStagePermissionsPayloads(wf) {
@@ -281,8 +287,11 @@ func TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance(t *testing
 	if got["impl-agent"].Enforced {
 		t.Error("implement-stage egress: enforced = true, want false (only an acceptance agent's egress is proxy-constrained)")
 	}
+	if got["accept-write-only"].Enforced {
+		t.Error("agent-executor acceptance with only write/shell (no network): enforced = true, want false — there is no network allow-list to enforce")
+	}
 	// The non-enforced entries carry the declaration-only note either way.
-	for _, id := range []string{"accept-human", "impl-agent"} {
+	for _, id := range []string{"accept-human", "impl-agent", "accept-write-only"} {
 		if !strings.Contains(got[id].Note, "#2133") {
 			t.Errorf("%s note = %q, want it to name the enforcement tracker #2133", id, got[id].Note)
 		}
