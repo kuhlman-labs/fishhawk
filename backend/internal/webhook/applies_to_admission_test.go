@@ -248,6 +248,50 @@ func TestAppliesToWebhook_UnevaluablePredicate_FailsClosed(t *testing.T) {
 	}
 }
 
+// --- Fail-closed: the MatchErr branch's OBSERVABLE effects, driven behaviorally ---
+//
+// refusedByAppliesTo's matchErr branch cannot be exercised end to end: the
+// admission sub-predicate never carries an error-capable criterion (paths is
+// deferred to the plan gate; the empty predicate is filtered by `constrains`
+// before Match is called), which is exactly what the structural tripwire above
+// proves. So a Match error cannot reach the gate through a real spec, and no
+// call to refusedByAppliesTo can produce one. But the branch has two OBSERVABLE
+// effects that must not be left to the tripwire's promise — the "could not be
+// evaluated" fail-closed refusal MESSAGE and the evaluation_error AUDIT payload
+// field — and both are behavioral. This drives a Match error through the webhook
+// seam's renderer and its audit builder and asserts each, mirroring the accepted
+// server precedent (server.TestAppliesTo_M13_MatchError_FailsClosed).
+func TestAppliesToWebhook_MatchError_RendersEvaluationErrorAndRefusesShape(t *testing.T) {
+	d, _, _, au := newDispatcherWithStubs(t)
+	matchErr := errors.New(`path predicate: malformed glob "docs/["`)
+
+	// (1) The webhook seam renders a Match error as a REFUSAL, never an admit —
+	// a declaration that cannot be evaluated is never treated as match-all.
+	rj := appliesto.Rejection{
+		WorkflowID: DefaultWorkflowID,
+		MatchErr:   matchErr,
+		Phase:      appliesto.PhaseAdmission,
+		Seam:       appliesto.SeamWebhook,
+	}
+	msg := appliesto.RenderRejection(rj)
+	if !strings.Contains(msg, "could not be evaluated") || !strings.Contains(msg, "never treated as match-all") {
+		t.Errorf("a MatchErr must render as a fail-closed refusal; got %q", msg)
+	}
+	// The webhook tail still must not advertise an override on this path either.
+	if strings.Contains(msg, "applies_to_override") {
+		t.Errorf("webhook MatchErr message must not mention applies_to_override:\n%s", msg)
+	}
+
+	// (2) The refusal audit carries the evaluation_error payload field naming the
+	// cause — the observable a downstream operator uses to distinguish an
+	// unevaluable declaration from an ordinary unsatisfied criterion.
+	d.appendAppliesToRejectedAudit(context.Background(), appliesToEvent(), labeledRunMatch(1, "bug"), rj, msg, "sha", d.now())
+	payload := firstGlobalPayload(t, au, "run_rejected_applies_to")
+	if payload["evaluation_error"] != matchErr.Error() {
+		t.Errorf("payload.evaluation_error = %v, want %q", payload["evaluation_error"], matchErr.Error())
+	}
+}
+
 // --- Admit: no applies_to declaration (back-compat) ---
 
 func TestAppliesToWebhook_NoDeclaration_Admits(t *testing.T) {
@@ -327,6 +371,7 @@ func TestAppliesToWebhook_AuditUnavailable_StillRefuses(t *testing.T) {
 
 func TestAppliesToWebhook_AuditAppendFailure_StillRefuses(t *testing.T) {
 	d, _, _, au := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
 	au.appendErr = errAuditDown
 	notifier := &stubIssueNotifier{}
 	d.IssueNotifier = notifier
@@ -338,6 +383,12 @@ func TestAppliesToWebhook_AuditAppendFailure_StillRefuses(t *testing.T) {
 	}
 	if len(notifier.notApplicableCalls) != 1 {
 		t.Errorf("NotifyRunNotApplicable calls = %d, want 1 — the comment still fires despite the audit failure", len(notifier.notApplicableCalls))
+	}
+	// The approval condition's other observable for a degraded path: the failure
+	// is LOGGED. A regression deleting this warning would otherwise pass the
+	// refusal-survives assertion above.
+	if got := logs.String(); !strings.Contains(got, "append run_rejected_applies_to audit entry failed") || !strings.Contains(got, errAuditDown.Error()) {
+		t.Errorf("audit append failure must be warn-logged (message + cause); logs:\n%s", got)
 	}
 }
 
@@ -358,10 +409,44 @@ func TestAppliesToWebhook_NotifierNil_StillRefuses(t *testing.T) {
 	}
 }
 
+// --- Degrade: a nil IssueRef refuses (fail-closed) and skips the comment ---
+//
+// Both real entry points (matchIssue, matchIssueComment) always populate
+// IssueRef on a MatchActionRun, so this is defense in depth. A nil ref yields an
+// empty label set — a fail-closed refusal against a labels criterion — and the
+// comment gate is skipped because there is no issue to comment on. The
+// empty-set-refuses AND comment-skips combination is asserted nowhere else.
+func TestAppliesToWebhook_NilIssueRef_RefusesAndSkipsComment(t *testing.T) {
+	d, _, _, au := newDispatcherWithStubs(t)
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	parsed, wf := parseFeatureChange(t, appliesToSpecYAML("    applies_to:\n      labels:\n        - docs\n"))
+	m := Match{
+		Action:        MatchActionRun,
+		WorkflowID:    DefaultWorkflowID,
+		TriggerSource: run.TriggerGitHubIssue,
+		TriggerRef:    "issue:1",
+		IssueRef:      nil, // no issue reference at all
+	}
+
+	if !d.refusedByAppliesTo(context.Background(), appliesToEvent(), m, wf, parsed, forge.FromGitHubInstallationID(42), "sha", d.now()) {
+		t.Fatal("a nil IssueRef must fail closed: an empty label set cannot satisfy a labels criterion")
+	}
+	// The refusal is still audited...
+	if n := countGlobalCategory(au, "run_rejected_applies_to"); n != 1 {
+		t.Errorf("run_rejected_applies_to entries = %d, want 1", n)
+	}
+	// ...but no comment is posted: there is no issue to comment on.
+	if len(notifier.notApplicableCalls) != 0 {
+		t.Errorf("NotifyRunNotApplicable calls = %d, want 0 (no IssueRef to comment on)", len(notifier.notApplicableCalls))
+	}
+}
+
 // --- Degrade: a notifier post error leaves the refusal intact ---
 
 func TestAppliesToWebhook_NotifierError_StillRefuses(t *testing.T) {
 	d, _, _, au := newDispatcherWithStubs(t)
+	logs := captureDispatcherLogs(d)
 	notifier := &stubIssueNotifier{err: errAuditDown}
 	d.IssueNotifier = notifier
 	parsed, wf := parseFeatureChange(t, appliesToSpecYAML("    applies_to:\n      labels:\n        - docs\n"))
@@ -375,6 +460,12 @@ func TestAppliesToWebhook_NotifierError_StillRefuses(t *testing.T) {
 	}
 	if n := countGlobalCategory(au, "run_rejected_applies_to"); n != 1 {
 		t.Errorf("run_rejected_applies_to entries = %d, want 1", n)
+	}
+	// The approval condition's other observable for a degraded path: the comment
+	// failure is LOGGED. A regression deleting this warning would otherwise pass
+	// the refusal-survives assertion above.
+	if got := logs.String(); !strings.Contains(got, "run-not-applicable comment failed") || !strings.Contains(got, errAuditDown.Error()) {
+		t.Errorf("notifier post failure must be warn-logged (message + cause); logs:\n%s", got)
 	}
 }
 

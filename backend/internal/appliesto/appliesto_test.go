@@ -125,12 +125,19 @@ func TestSatisfyingWorkflows_EnumeratesAndExcludesUnevaluable(t *testing.T) {
 // applies_to_override (an override that does not exist on a path carrying no
 // operator request must not be advertised), while the other two do.
 func TestRenderRejection_AllThreeSeamsCarryTheSameShape(t *testing.T) {
+	// Every field EXCEPT Seam is held identical across the three renders, so the
+	// ONLY thing that can make the three messages differ is the Seam-selected
+	// tail. An earlier version perturbed ObservedLabel to "scope.files" for the
+	// plan-gate render, which guaranteed inequality regardless of the tail and
+	// made the "three tails differ" assertion below vacuous — it could no longer
+	// catch a plan-gate tail that silently collapsed to the start_run tail.
 	base := Rejection{
-		WorkflowID: "routine_change",
-		Criterion:  "paths",
-		Required:   []string{"docs/**"},
-		Observed:   []string{"backend/internal/server/runs.go"},
-		Satisfying: []string{"feature_change"},
+		WorkflowID:    "routine_change",
+		Criterion:     "paths",
+		Required:      []string{"docs/**"},
+		Observed:      []string{"backend/internal/server/runs.go"},
+		ObservedLabel: "scope.files",
+		Satisfying:    []string{"feature_change"},
 	}
 	base.Seam = SeamStartRun
 	base.Phase = PhaseAdmission
@@ -139,20 +146,16 @@ func TestRenderRejection_AllThreeSeamsCarryTheSameShape(t *testing.T) {
 	webhook := RenderRejection(base)
 	base.Seam = SeamPlanGate
 	base.Phase = PhasePlanGate
-	base.ObservedLabel = "scope.files"
 	planGate := RenderRejection(base)
 
-	// The binding shape — workflow, criterion, required, observed, satisfying —
-	// is identical on every seam.
+	// The binding shape — workflow, criterion, required, observed, satisfying,
+	// and the observed-value label — is identical on every seam.
 	for _, msg := range []string{startRun, webhook, planGate} {
-		for _, want := range []string{"routine_change", "paths", "docs/**", "backend/internal/server/runs.go", "feature_change"} {
+		for _, want := range []string{"routine_change", "paths", "docs/**", "backend/internal/server/runs.go", "feature_change", "scope.files"} {
 			if !strings.Contains(msg, want) {
 				t.Errorf("message %q is missing %q — the binding shape must not vary by seam", msg, want)
 			}
 		}
-	}
-	if !strings.Contains(planGate, "scope.files") {
-		t.Errorf("plan-gate message %q must describe the observed value as scope.files", planGate)
 	}
 
 	// The tails: start_run and plan gate name applies_to_override; the webhook
