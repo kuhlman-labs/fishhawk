@@ -737,10 +737,18 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	// quorum. Every other path — a reject, or a legacy Approvers /
 	// no-approvals gate — keeps today's first-vote-advances semantics. The
 	// fetch fails open to the legacy path on any spec-read error, matching
-	// checkApproverAuthorization's best-effort posture.
+	// checkApproverAuthorization's best-effort posture — EXCEPT when an
+	// escalation is firing, which the nil branch below refuses (#2374). The
+	// error is CAPTURED rather than discarded because a nil block alone
+	// conflates two different situations, and only one of them is safe to
+	// advance on.
 	var approvals *spec.Approvals
+	var fetchErr error
 	if p.Decision == approval.DecisionApprove {
-		if a, ferr := s.fetchApprovalsForStage(ctx, p.Stage); ferr == nil {
+		a, ferr := s.fetchApprovalsForStage(ctx, p.Stage)
+		if ferr != nil {
+			fetchErr = ferr
+		} else {
 			approvals = a
 		}
 	}
@@ -750,6 +758,44 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	channel := approvalChannel(id, p.DelegatedRule != "")
 
 	if approvals == nil {
+		// The two situations a nil block conflates (#2374): "this gate
+		// declares no approvals block" (nil, no error) and "we could not read
+		// the spec" (nil after a fetch ERROR). Only the first is a gate whose
+		// requirement is KNOWN to be the legacy first-vote one. On the second
+		// the baseline is unknown, and falling through to first-vote-advances
+		// would clear an ESCALATED gate on a single vote — skipping both the
+		// escalated count and the baseline predicates. That path is reachable
+		// WITHOUT the pre-Submit gate checkApprovalPredicates hardens: the
+		// campaign auto-driver calls this method directly (autodrive.go), and
+		// the legacy path advances on a first vote regardless of the agent
+		// floor that would otherwise keep it uncounted.
+		//
+		// So on a fetch error, resolve the escalations and fail toward NOT
+		// ADVANCING when one is firing — or when the resolver itself errored,
+		// which leaves us unable to tell whether one is. Same rule and same
+		// words as the post-Submit escErr branch below: the escalated
+		// requirement is unknown, so an advance could clear a gate an
+		// escalation had raised. A true no-approvals gate (nil block, NO fetch
+		// error) keeps first-vote-advances byte for byte.
+		if fetchErr != nil {
+			escReq, escErr := s.resolveStageEscalations(ctx, p.Stage)
+			if escErr != nil || !escReq.IsZero() {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"approval: gate approvals block unreadable while an escalation is firing; not advancing the gate",
+					slog.String("stage_id", p.Stage.ID.String()),
+					slog.String("error", fetchErr.Error()),
+					slog.Bool("escalation_unevaluable", escErr != nil),
+				)
+				// Recorded but not counted toward an unknown requirement: the
+				// row stands (a corrected retry is a duplicate, not a second
+				// vote), and the stage stays awaiting_approval until the
+				// baseline is readable again. No predicate_snapshot — nothing
+				// about the effective requirement is known to snapshot.
+				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, nil)
+				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
+				return &approveActionResult{Stage: p.Stage}, nil
+			}
+		}
 		// Legacy / no-approvals path: first vote advances, unchanged from
 		// today except the additive identity{provider,subject}/channel
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
@@ -990,7 +1036,10 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 //
 // Fail-open on the gate READ: a nil approvals block or a spec-read error
 // falls through to today's path (matching checkApproverAuthorization's
-// best-effort posture), NOT on the forge RESOLUTION, which fails closed.
+// best-effort posture), NOT on the forge RESOLUTION, which fails closed. The
+// one exception is a spec-read error while an escalation IS firing (#2374):
+// the effective requirement is then unknowable, so the gate returns the
+// retryable 503 rather than enforcing a baseline-less approximation of it.
 func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request, stage *run.Stage, subject string, delegated bool) (*predicateResolution, bool) {
 	approvals, ferr := s.fetchApprovalsForStage(r.Context(), stage)
 
@@ -1031,14 +1080,40 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 
 	// A gate-fetch error with NOTHING escalated keeps the pre-existing
 	// fail-open posture for the baseline predicates — they were always
-	// best-effort on this read, matching checkApproverAuthorization. But when
-	// an escalation IS raised (escReq non-zero), its predicate must still be
-	// enforced even though the baseline block is unreadable: an escalation
-	// only ever RAISES, so enforcing the escalated requirement against a nil
-	// baseline is safe and closes the window where a transient fetch error let
-	// an out-of-group approval through (#2227 fixup).
-	if ferr != nil && escReq.IsZero() {
-		return nil, true
+	// best-effort on this read, matching checkApproverAuthorization.
+	//
+	// But when an escalation IS firing (escReq non-zero), the effective
+	// requirement is UNKNOWABLE, not merely partially known (#2374). The
+	// earlier posture here — enforce the escalated requirement against a nil
+	// baseline, on the reasoning that an escalation only ever RAISES — is the
+	// defect: an escalation raises RELATIVE to the baseline, so composing it
+	// against a nil baseline DISCARDS the baseline's own member_of /
+	// min_permission. The concrete bypass is a gate whose baseline declares
+	// `member_of` with a firing COUNT-ONLY escalation: effectiveApprovals(nil,
+	// escReq) is then "the raised count, no membership at all", which falls
+	// straight through the not-predicate-guarded early return below and admits
+	// an out-of-group approver on the escalated count alone. The count-time
+	// forge re-validation does not cover that shape either — a count-only
+	// escalation carries no escalated forge predicate for
+	// countEscalatedForgeApprovers to re-resolve. So refuse with the same
+	// retryable 503 every other unreadable-input branch in this file uses: a
+	// control must not enforce a requirement it cannot compute.
+	if ferr != nil {
+		if escReq.IsZero() {
+			return nil, true
+		}
+		s.writeError(w, r, http.StatusServiceUnavailable, "escalation_unevaluable",
+			"the gate's baseline approvals block could not be read while an escalation is firing, so the effective (baseline plus escalation) requirement is unknowable; the approval gate failed closed rather than enforcing a partially-known requirement",
+			map[string]any{
+				"stage_id":  stage.ID.String(),
+				"retryable": true,
+				"reason":    "baseline_unreadable",
+				"error":     ferr.Error(),
+				"next_actions": []string{
+					"Retry the approval; if it persists, check that the run's cached workflow spec declares this stage type",
+				},
+			})
+		return nil, false
 	}
 	effective := effectiveApprovals(approvals, escReq)
 
