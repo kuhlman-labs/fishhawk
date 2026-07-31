@@ -217,7 +217,7 @@ The autonomy tiers are a mix of controls the product **enforces** and commitment
 
 **3. Declarable only where a plan stage exists.**
 
-- `applies_to`'s `paths` criterion is evaluated at the plan gate against the plan's `scope.files`, so on a workflow that declares no plan stage it could never be evaluated — no `scope.files` producer exists for it. Rather than admit a control that silently does nothing, both the backend and `fishhawk validate` **refuse the declaration at authoring time** (E53.15 / #2377). Of this repository's four workflows only `feature_change` declares a plan stage, so `paths` is declarable on one of the four; `labels` / `trigger` are what hold on the other three, and a stage's post-hoc `constraints.allowed_paths` is the path envelope available to them.
+- `applies_to`'s `paths` criterion is evaluated at the plan gate against the plan's `scope.files`, so on a workflow that declares no plan stage it could never be evaluated — no `scope.files` producer exists for it. Rather than admit a control that silently does nothing, both the backend and `fishhawk validate` **refuse the declaration at authoring time** (E53.15 / #2377). The same rule holds for an `escalations[].match.paths` criterion, refused on a plan-less workflow for the same reason (E53.16 / #2382) — there the control fails to *raise* rather than to route. Of this repository's four workflows only `feature_change` declares a plan stage, so both `paths` criteria are declarable on one of the four (and this repository's one escalation declaration sits there, so it is unaffected); `labels` / `trigger` are what hold on the other three, and a stage's post-hoc `constraints.allowed_paths` is the path envelope available to them.
 
 **4. Still a commitment.**
 

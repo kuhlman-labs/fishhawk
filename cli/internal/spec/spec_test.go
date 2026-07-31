@@ -3074,6 +3074,407 @@ workflows:
 	}
 }
 
+// --- escalation match.paths on a plan-less workflow (E53.16 / #2382) ---
+//
+// The CLI twin of backend/internal/spec/escalation_test.go's block, driving the
+// real spec.ValidateBytes end to end through the schema layer, the v2 reuse
+// resolver and the semantic sweep, so `fishhawk validate` and `fishhawk doctor`
+// cannot accept an escalation the backend refuses at dispatch.
+
+// escalationPlanlessCLIDoc renders a v2 document whose single workflow declares
+// implement + review stages and NO plan stage, with a workflow-level
+// `autonomy: high` block so a `require: {max_autonomy: low}` escalation
+// genuinely raises. The caller supplies the `escalations` block (four-space
+// indented).
+func escalationPlanlessCLIDoc(escalations string) []byte {
+	return []byte(`
+version: "2"
+workflows:
+  docs_change:
+    autonomy: high
+` + escalations + `
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+      - id: review
+        type: review
+        executor:
+          human: true
+`)
+}
+
+// planlessRaisingEscalationCLI wraps one match body (six-space indented) in a
+// paths-or-otherwise escalation with a genuinely-raising max_autonomy require.
+func planlessRaisingEscalationCLI(match string) string {
+	return "    escalations:\n      - match:\n" + match + "\n        require:\n          max_autonomy: low"
+}
+
+// TestValidateBytes_Escalations_PathsNoPlanStage_Rejected is the CLI twin of
+// the refusal: same pointer, same shipped rendering.
+func TestValidateBytes_Escalations_PathsNoPlanStage_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(escalationPlanlessCLIDoc(planlessRaisingEscalationCLI(`          paths: ["**/crypto/**"]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for match.paths on a plan-less workflow", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/escalations/0/match/paths") {
+		t.Errorf("error = %q, want it to name /workflows/docs_change/escalations/0/match/paths", msg)
+	}
+	if want := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "docs_change", 0); !strings.Contains(msg, want) {
+		t.Errorf("error = %q, want it to carry the shipped rendering %q", msg, want)
+	}
+}
+
+// TestValidateBytes_Escalations_PathsNoPlanStage_MessageNamesFixes is the CLI
+// twin of the message-shape assertion.
+func TestValidateBytes_Escalations_PathsNoPlanStage_MessageNamesFixes(t *testing.T) {
+	msg := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "routine_change", 2)
+	for _, want := range []string{
+		"routine_change",
+		"plan stage",
+		"labels",
+		"trigger",
+		"approvals",
+		"min_permission",
+		"max_autonomy",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message = %q, want it to name %q", msg, want)
+		}
+	}
+}
+
+// TestValidateBytes_Escalations_PlanlessLabelsOnlyAccepted is the CLI POSITIVE
+// CONTROL: a labels-only escalation match validates on a plan-less workflow.
+func TestValidateBytes_Escalations_PlanlessLabelsOnlyAccepted(t *testing.T) {
+	if err := spec.ValidateBytes(escalationPlanlessCLIDoc(planlessRaisingEscalationCLI(`          labels: ["area:auth"]`))); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil for a labels-only escalation on a plan-less workflow", err)
+	}
+}
+
+// TestValidateBytes_Escalations_PlanlessTriggerOnlyAccepted is the second CLI
+// POSITIVE CONTROL: a trigger-only escalation match validates on a plan-less
+// workflow.
+func TestValidateBytes_Escalations_PlanlessTriggerOnlyAccepted(t *testing.T) {
+	if err := spec.ValidateBytes(escalationPlanlessCLIDoc(planlessRaisingEscalationCLI(`          trigger: [diff]`))); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil for a trigger-only escalation on a plan-less workflow", err)
+	}
+}
+
+// TestValidateBytes_Escalations_PathsWithPlanStage_Accepted is the positive
+// control on the plan-BEARING side.
+func TestValidateBytes_Escalations_PathsWithPlanStage_Accepted(t *testing.T) {
+	if err := spec.ValidateBytes(escalationCLIDoc(escalationCLIBlock("          approvals:\n            count: 3"))); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil for paths on a plan-bearing workflow", err)
+	}
+}
+
+// TestValidateBytes_Escalations_PlanlessLabelsPlusPaths_Rejected pins that the
+// rule keys on the presence of `paths`, not on exclusivity.
+func TestValidateBytes_Escalations_PlanlessLabelsPlusPaths_Rejected(t *testing.T) {
+	err := spec.ValidateBytes(escalationPlanlessCLIDoc(planlessRaisingEscalationCLI(`          labels: ["area:auth"]
+          paths: ["**/crypto/**"]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError; labels alongside paths must not admit the escalation", err)
+	}
+	if !strings.Contains(err.Error(), "/workflows/docs_change/escalations/0/match/paths") {
+		t.Errorf("error = %q, want it to name /workflows/docs_change/escalations/0/match/paths", err.Error())
+	}
+}
+
+// TestValidateBytes_Escalations_PathsWithInheritedPlanStage_Accepted doubles as
+// the reuse-resolution seam test: a deriving workflow inheriting its only plan
+// stage through `extends` has an evaluable paths escalation.
+func TestValidateBytes_Escalations_PathsWithInheritedPlanStage_Accepted(t *testing.T) {
+	if err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+  derived:
+    extends: base
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: low
+`)); err != nil {
+		t.Fatalf("ValidateBytes = %v, want nil; the inherited plan stage makes the escalation evaluable", err)
+	}
+}
+
+// TestValidateBytes_Escalations_PlanlessBaseAttribution is the CLI attribution
+// pin: a plan-less base's bad escalation is reported against the base.
+func TestValidateBytes_Escalations_PlanlessBaseAttribution(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  base:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: low
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+  derived:
+    extends: base
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError naming the base's escalation", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/base/escalations/0/match/paths") {
+		t.Errorf("error = %q, want it reported against the declaring workflow (base)", msg)
+	}
+	if strings.Contains(msg, "/workflows/derived/escalations") {
+		t.Errorf("error = %q, want no escalation error against derived; extends folds stages only", msg)
+	}
+}
+
+// TestValidateBytes_Escalations_PlanlessPathsNotAdmittedByPostHocEnvelope is
+// the CLI twin of the unconditionality regression: a stage's post-hoc path
+// envelope does NOT admit a plan-less paths escalation.
+func TestValidateBytes_Escalations_PlanlessPathsNotAdmittedByPostHocEnvelope(t *testing.T) {
+	planless := func(constraints string) []byte {
+		return []byte(`
+version: "2"
+workflows:
+  docs_change:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: low
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+` + constraints + `        produces:
+          - artifact: pull_request
+`)
+	}
+	cases := []struct {
+		name        string
+		constraints string
+	}{
+		{name: "allowed_paths", constraints: "          allowed_paths: [\"infra/**\"]\n"},
+		{name: "forbidden_paths", constraints: "          forbidden_paths: [\"backend/**\"]\n"},
+		{name: "both", constraints: "          allowed_paths: [\"infra/**\"]\n          forbidden_paths: [\"backend/**\"]\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := spec.ValidateBytes(planless(tc.constraints))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want the match.paths refusal to stand; a post-hoc path envelope must NOT admit an escalation that still never fires (#2382)", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "/workflows/docs_change/escalations/0/match/paths") {
+				t.Fatalf("error = %q, want /workflows/docs_change/escalations/0/match/paths", msg)
+			}
+			if want := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "docs_change", 0); !strings.Contains(msg, want) {
+				t.Errorf("error = %q, want the unchanged shipped rendering %q", msg, want)
+			}
+		})
+	}
+}
+
+// TestValidateBytes_Escalations_ChangeKindWinsOverNoPlanStage is the CLI rung-1
+// order contract mirrored: change_kind reports first.
+func TestValidateBytes_Escalations_ChangeKindWinsOverNoPlanStage(t *testing.T) {
+	err := spec.ValidateBytes(escalationPlanlessCLIDoc(planlessRaisingEscalationCLI(`          change_kind: [refactor]
+          paths: ["infra/**"]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/escalations/0/match/change_kind") {
+		t.Errorf("error = %q, want the change_kind pointer", msg)
+	}
+	if !strings.Contains(msg, spec.MsgEscalationChangeKindUnsupported) {
+		t.Errorf("error = %q, want the change_kind rejection to win over the plan-stage rule", msg)
+	}
+}
+
+// TestValidateBytes_Escalations_MalformedGlobWinsOverNoPlanStage is the CLI
+// rung-2 order contract mirrored: the shared predicate grammar error reports at
+// the match pointer, proving the paths rung runs last.
+func TestValidateBytes_Escalations_MalformedGlobWinsOverNoPlanStage(t *testing.T) {
+	err := spec.ValidateBytes(escalationPlanlessCLIDoc(planlessRaisingEscalationCLI(`          paths: ["infra/["]`)))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/escalations/0/match:") {
+		t.Errorf("error = %q, want the entry reported at the predicate's own match pointer", msg)
+	}
+	if !strings.Contains(msg, "malformed path glob") {
+		t.Errorf("error = %q, want the shared predicate grammar error to win over the plan-stage rule", msg)
+	}
+	// Slice PAST the `%q`/`%d` format verbs (index 26 onward): the first 40
+	// bytes still carry the verbs, which rendering substitutes, so
+	// Contains(rendered, [:40]) is vacuously false and could never fire.
+	if strings.Contains(msg, spec.MsgFmtEscalationPathsNoPlanStage[26:]) {
+		t.Errorf("error = %q, want no plan-stage refusal; the grammar error runs before the paths rung", msg)
+	}
+}
+
+// TestValidateBytes_Escalations_NoRaiseWinsOverNoPlanStage is the CLI LAST-rung
+// pin: a no-raise count alongside an inert paths match reports the
+// only-ever-raise diagnosis (a require-side rung), not the paths refusal.
+func TestValidateBytes_Escalations_NoRaiseWinsOverNoPlanStage(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  docs_change:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            count: 1
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvals:
+              count: 2
+      - id: review
+        type: review
+        executor:
+          human: true
+`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/escalations/0/require/approvals/count") {
+		t.Errorf("error = %q, want the count raise-check to win over the plan-stage rule", msg)
+	}
+	if strings.Contains(msg, "/match/paths") {
+		t.Errorf("error = %q, want no paths refusal; the require-side rung reports first", msg)
+	}
+}
+
+// TestValidateBytes_Escalations_MultipleEntriesReportsOffendingIndex pins index
+// correctness in both pointer and rendered message: a clean entry 0 followed by
+// a paths-bearing entry 1 reports index 1.
+func TestValidateBytes_Escalations_MultipleEntriesReportsOffendingIndex(t *testing.T) {
+	err := spec.ValidateBytes(escalationPlanlessCLIDoc(`    escalations:
+      - match:
+          labels: ["area:auth"]
+        require:
+          max_autonomy: low
+      - match:
+          paths: ["**/crypto/**"]
+        require:
+          max_autonomy: low`))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError for the second entry", err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "/workflows/docs_change/escalations/1/match/paths") {
+		t.Errorf("error = %q, want it to name escalation index 1", msg)
+	}
+	if want := fmt.Sprintf(spec.MsgFmtEscalationPathsNoPlanStage, "docs_change", 1); !strings.Contains(msg, want) {
+		t.Errorf("error = %q, want the rendering for index 1 %q", msg, want)
+	}
+}
+
+// TestValidateBytes_Escalations_StagesNotAList_NoStackedDiagnosis is the
+// CLI-only case for the documented divergence. The internal branch it guards —
+// hasPlanStageFromRaw returning readable=false, so the paths rung SKIPS rather
+// than stacking a semantic no-plan-stage error on a structural one — is not
+// reachable through ValidateBytes: the v2 schema requires a list-typed `stages`
+// and rejects a non-list node before the semantic sweep runs. This test asserts
+// the resulting USER-VISIBLE contract: a malformed `stages` node reports the
+// structural error, and the CLI never emits the plan-stage semantic diagnosis
+// on top of it. (The sibling `readable` guard in checkAppliesTo, #2377, is
+// unreachable for the same reason and untested for it.)
+func TestValidateBytes_Escalations_StagesNotAList_NoStackedDiagnosis(t *testing.T) {
+	err := spec.ValidateBytes([]byte(`
+version: "2"
+workflows:
+  docs_change:
+    autonomy: high
+    escalations:
+      - match:
+          paths: ["**/crypto/**"]
+        require:
+          max_autonomy: low
+    stages: "not a list"
+`))
+	if err == nil {
+		t.Fatal("want a structural error for a non-list stages node, got nil")
+	}
+	// Slice PAST the `%q`/`%d` format verbs (index 26 onward): the first 40
+	// bytes still carry the verbs, so Contains([:40]) is vacuously false — and
+	// this is this test's ONLY discriminating assertion, so the vacuity would
+	// leave it proving nothing about the absence of a stacked diagnosis.
+	if strings.Contains(err.Error(), spec.MsgFmtEscalationPathsNoPlanStage[26:]) {
+		t.Errorf("error = %q, want the structural stages error, not a stacked no-plan-stage diagnosis", err.Error())
+	}
+}
+
+// TestEscalationPathsNoPlanStageMessageParity is the MECHANICAL drift guard for
+// the plan-stage escalation message, modelled on
+// TestAppliesToPathsNoPlanStageMessageParity. NOTE the backend copy lives in
+// escalation.go (beside the other escalation constants), NOT validate.go, so
+// the read paths differ from #2377's. The two spec packages are separate Go
+// modules and the CLI cannot import backend/internal/spec, so a source read
+// over the repo root is the only cross-module guard available.
+func TestEscalationPathsNoPlanStageMessageParity(t *testing.T) {
+	want := `const MsgFmtEscalationPathsNoPlanStage = ` + strconv.Quote(spec.MsgFmtEscalationPathsNoPlanStage)
+	for _, path := range []string{
+		"../../../backend/internal/spec/escalation.go",
+		"../../../cli/internal/spec/validate.go",
+	} {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(src), want) {
+			t.Errorf("%s does not declare the escalation plan-stage message verbatim;\nwant the line: %s\n"+
+				"The two modules cannot share a constant, so the backend and CLI copies must stay byte-identical or `fishhawk validate` and the backend will report different text for the same spec error.", path, want)
+		}
+	}
+}
+
 // --- permissions (E53.5 / #2228) ---
 
 // permissionsCLIDoc wraps a stage body (8-space indented) in a minimal v2

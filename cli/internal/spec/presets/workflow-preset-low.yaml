@@ -68,7 +68,12 @@ workflows:
     # escalations raise the bar for a matching change — a higher approval
     # count, an added membership group, a stricter permission, a lower
     # autonomy ceiling. An escalation may only ever raise, never lower; one
-    # that would change nothing is refused. Uncomment and adapt:
+    # that would change nothing is refused. A `match.paths` rule is likewise
+    # REFUSED at validation on a workflow that declares no plan stage — it is
+    # checked against the approved plan's scope.files, so it could never fire;
+    # keep a plan stage to escalate by path, or match on `labels` / `trigger`,
+    # checked at run admission on every workflow whatever its shape. Uncomment
+    # and adapt:
     # fishhawk:starter-begin escalations
     # escalations:
     #   - match:

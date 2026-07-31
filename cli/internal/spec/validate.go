@@ -323,6 +323,23 @@ const MsgFmtEscalationNoRaise = "workflow %q escalation %d: require.%s: %s does 
 // Arguments: workflow name, escalation index.
 const MsgFmtEscalationApprovalsNoApprovalGate = "workflow %q escalation %d: require.approvals raises the approval gate, but workflow %q declares no approval gate for it to raise; declare an approval gate on a stage of this workflow, or drop require.approvals (an escalation may still raise max_autonomy on a gate-less workflow)"
 
+// MsgFmtEscalationPathsNoPlanStage is the rejection for a `paths` criterion
+// inside an escalation's `match` on a workflow declaring no plan stage
+// (E53.16 / #2382). Arguments: workflow name, escalation index. Byte-identical
+// to backend/internal/spec/escalation.go's constant of the same name (the
+// escalation constants live in escalation.go there, not validate.go): the two
+// Go modules are deliberately separate (see this package's doc comment), so
+// the duplication is by design and TestEscalationPathsNoPlanStageMessageParity
+// — which reads both source files over the repo root — is what keeps the
+// strings in lockstep. It must therefore stay a single-line `const … = "…"`
+// declaration.
+//
+// The rule is UNCONDITIONAL: there is no carve-out admitting the declaration
+// because some other control (a stage's post-hoc `constraints.allowed_paths`,
+// say) holds a similar envelope. Such an escalation is still never evaluated
+// at gate time, which is the failure the rule closes.
+const MsgFmtEscalationPathsNoPlanStage = "workflow %q escalation %d declares match.paths but the workflow declares no plan stage: an escalation's paths are evaluated at the approval gate against the approved plan's scope.files, so a workflow that produces no plan produces no path set to match against and this escalation could never fire — it is refused rather than silently accepted as a control that does something. Give this workflow a plan stage; or match on labels / trigger, which are evaluated from the run's admission context on every workflow whatever its shape (the require dimensions that do not depend on paths — approvals, min_permission and max_autonomy under a non-paths match — still hold)."
+
 // escalationNoRaiseMessage renders MsgFmtEscalationNoRaise — the shared shape
 // helper, mirroring the backend's, so the four dimensions cannot drift into
 // four differently actionable messages on either side.
@@ -330,14 +347,24 @@ func escalationNoRaiseMessage(workflow string, idx int, dimension, escalated, ba
 	return fmt.Sprintf(MsgFmtEscalationNoRaise, workflow, idx, dimension, escalated, baseline, fix)
 }
 
+// escalationPathsNoPlanStageMessage renders MsgFmtEscalationPathsNoPlanStage,
+// mirroring the backend's shared shape helper so the check and its tests
+// assert one rendering rather than two hand-built strings.
+func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
+	return fmt.Sprintf(MsgFmtEscalationPathsNoPlanStage, workflow, idx)
+}
+
 // checkEscalations mirrors the backend's only-ever-raise family on a
-// workflow's `escalations` block (E53.4 / #2227,
+// workflow's `escalations` block (E53.4 / #2227; E53.16 / #2382,
 // backend/internal/spec/escalation.go), so `fishhawk validate` and `fishhawk
-// doctor` reject a no-op or lowering escalation locally instead of deferring
-// it to the backend at dispatch. The rungs and their ORDER match the backend's
-// exactly: the `change_kind` refusal, the shared Predicate.Validate, the
-// approvals-with-no-approval-gate rejection, then the count, min_permission
-// and member_of checks.
+// doctor` reject a no-op or lowering escalation — or a `match.paths` that a
+// plan-less workflow can never fire — locally instead of deferring it to the
+// backend at dispatch. The rungs and their ORDER match the backend's exactly:
+// the `change_kind` refusal, the shared Predicate.Validate, the
+// approvals-with-no-approval-gate rejection, the count, min_permission and
+// member_of checks, then LAST the `match.paths`-on-a-plan-less-workflow refusal
+// (the structural-impossibility rung, last for the reason the backend's doc
+// comment gives). The plan-stage predicate is the reused hasPlanStageFromRaw.
 //
 // THE ONE CHECK THAT STAYS BACKEND-ONLY is `max_autonomy`'s no-op check: it
 // needs the v2 tier expansion and a resolved-matrix comparison, and this
@@ -350,14 +377,29 @@ func escalationNoRaiseMessage(workflow string, idx int, dimension, escalated, ba
 //
 // Unlike the backend this sweep COLLECTS every entry's first error rather than
 // returning on the first, matching the file's existing accumulate-then-report
-// posture. It runs AFTER schema validation, so a node that is not the shape
-// the schema requires was already rejected upstream and is skipped here.
+// posture. To keep the backend's ONE-ENTRY-PER-ESCALATION contract, the paths
+// rung captures the error count before the require-side rungs and reports only
+// when no earlier rung reported for THIS escalation. It also runs regardless
+// of whether the `require` node was a readable map — `require` is
+// schema-required, so an unreadable one means a document already rejected
+// structurally, but the rung must not be silently dead on that leg.
+//
+// ONE DELIBERATE DIVERGENCE from the typed backend, in the paths rung: when
+// `stages` is not a list (hasPlanStageFromRaw's second return is false) this
+// sweep SKIPS the rung rather than stacking a semantic no-plan-stage diagnosis
+// on the structural one already reported upstream. The typed backend has no
+// equivalent leg — a typed *Spec with zero stages genuinely HAS no plan stage,
+// and the schema's minItems keeps that unreachable from a parsed document.
+//
+// It runs AFTER schema validation, so a node that is not the shape the schema
+// requires was already rejected upstream and is skipped here.
 func checkEscalations(wf map[string]any, wfName string, errs *[]ValidationErrorEntry) {
 	list, ok := wf["escalations"].([]any)
 	if !ok {
 		return
 	}
 	gates := approvalGatesFromRaw(wf)
+	planStageFound, stagesReadable := hasPlanStageFromRaw(wf)
 	for i, raw := range list {
 		esc, ok := raw.(map[string]any)
 		if !ok {
@@ -380,11 +422,19 @@ func checkEscalations(wf map[string]any, wfName string, errs *[]ValidationErrorE
 			*errs = append(*errs, ValidationErrorEntry{Path: ptr + "/match", Message: err.Error()})
 			continue
 		}
-		require, ok := esc["require"].(map[string]any)
-		if !ok {
-			continue
+		// Capture the count before the require-side rungs so the paths rung
+		// can preserve one-entry-per-escalation: it reports only when no
+		// earlier rung reported for THIS escalation.
+		before := len(*errs)
+		if require, ok := esc["require"].(map[string]any); ok {
+			checkEscalatedApprovals(require, wfName, i, ptr, gates, errs)
 		}
-		checkEscalatedApprovals(require, wfName, i, ptr, gates, errs)
+		if len(*errs) == before && stagesReadable && !planStageFound && len(p.Paths) > 0 {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    ptr + "/match/paths",
+				Message: escalationPathsNoPlanStageMessage(wfName, i),
+			})
+		}
 	}
 }
 
