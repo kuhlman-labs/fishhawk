@@ -19,7 +19,9 @@ import (
 //     schema, so a malformed range like ">=abc" passes schema validation but
 //     is a spec authoring error;
 //   - reviewers.authority with no agent reviewers (E53.2 / #2225);
-//   - a workflow's applies_to routing predicate (E53.3 / #2226).
+//   - a workflow's applies_to routing predicate (E53.3 / #2226);
+//   - a workflow's escalations block (E53.4 / #2227), minus the one check
+//     that needs the v2 autonomy resolver — see checkEscalations.
 //
 // It operates on the yaml.v3-decoded map[string]any / []any tree (never
 // structs — this package is schema-only), tolerating any shape mismatch by
@@ -45,6 +47,9 @@ func validateAgentVersions(raw any) error {
 		// the stage loop — a stages-less workflow must still have its
 		// routing predicate reported.
 		checkAppliesTo(wf, wfName, &errs)
+		// escalations is likewise a WORKFLOW member and must be reported for
+		// a stages-less workflow too.
+		checkEscalations(wf, wfName, &errs)
 		stages, ok := wf["stages"].([]any)
 		if !ok {
 			continue
@@ -174,6 +179,247 @@ func checkAppliesTo(wf map[string]any, wfName string, errs *[]ValidationErrorEnt
 	if err := p.Validate(ptr); err != nil {
 		*errs = append(*errs, ValidationErrorEntry{Path: ptr, Message: err.Error()})
 	}
+}
+
+// MsgEscalationChangeKindUnsupported is the rejection for a `change_kind`
+// criterion inside an escalation's `match` (E53.4 / #2227). Byte-identical to
+// backend/internal/spec/escalation.go's constant of the same name, as are the
+// two format constants below: the two Go modules are deliberately separate
+// (see this package's doc comment), so the duplication is by design and the
+// paired message assertions in both spec_test.go files — plus
+// TestEscalationMessageParity, which reads both source files — are what keep
+// the strings in lockstep, exactly as MsgAppliesToChangeKindUnsupported is.
+const MsgEscalationChangeKindUnsupported = "escalations does not accept the change_kind criterion in `match`: nothing produces a change kind today, so the criterion can never be satisfied and this escalation could never fire; match on paths, labels or trigger instead (the shared predicate keeps change_kind for its other consumers)"
+
+// MsgFmtEscalationNoRaise is the ONE message shape every only-ever-raise
+// rejection uses. Arguments, in order: workflow name, escalation index,
+// dimension, the escalated value as written, the baseline it fails to raise,
+// and the fix.
+const MsgFmtEscalationNoRaise = "workflow %q escalation %d: require.%s: %s does not raise %s; an escalation may only ever RAISE a requirement, so one that changes nothing is refused rather than silently accepted as a control that does something. %s"
+
+// MsgFmtEscalationApprovalsNoApprovalGate is the rejection for a
+// `require.approvals` block on a workflow declaring no approval gate at all.
+// Arguments: workflow name, escalation index.
+const MsgFmtEscalationApprovalsNoApprovalGate = "workflow %q escalation %d: require.approvals raises the approval gate, but workflow %q declares no approval gate for it to raise; declare an approval gate on a stage of this workflow, or drop require.approvals (an escalation may still raise max_autonomy on a gate-less workflow)"
+
+// escalationNoRaiseMessage renders MsgFmtEscalationNoRaise — the shared shape
+// helper, mirroring the backend's, so the four dimensions cannot drift into
+// four differently actionable messages on either side.
+func escalationNoRaiseMessage(workflow string, idx int, dimension, escalated, baseline, fix string) string {
+	return fmt.Sprintf(MsgFmtEscalationNoRaise, workflow, idx, dimension, escalated, baseline, fix)
+}
+
+// checkEscalations mirrors the backend's only-ever-raise family on a
+// workflow's `escalations` block (E53.4 / #2227,
+// backend/internal/spec/escalation.go), so `fishhawk validate` and `fishhawk
+// doctor` reject a no-op or lowering escalation locally instead of deferring
+// it to the backend at dispatch. The rungs and their ORDER match the backend's
+// exactly: the `change_kind` refusal, the shared Predicate.Validate, the
+// approvals-with-no-approval-gate rejection, then the count, min_permission
+// and member_of checks.
+//
+// THE ONE CHECK THAT STAYS BACKEND-ONLY is `max_autonomy`'s no-op check: it
+// needs the v2 tier expansion and a resolved-matrix comparison, and this
+// package deliberately carries no v2autonomy.go — mirroring the resolver here
+// would be precisely the duplicate-implementation drift E53 exists to prevent.
+// The schema mirror still gives the CLI every STRUCTURAL rule for free
+// (including `require: {}` and `require: {approvals: {}}`), so what the CLI
+// misses is exactly one semantic no-op refusal, which the backend raises at
+// dispatch.
+//
+// Unlike the backend this sweep COLLECTS every entry's first error rather than
+// returning on the first, matching the file's existing accumulate-then-report
+// posture. It runs AFTER schema validation, so a node that is not the shape
+// the schema requires was already rejected upstream and is skipped here.
+func checkEscalations(wf map[string]any, wfName string, errs *[]ValidationErrorEntry) {
+	list, ok := wf["escalations"].([]any)
+	if !ok {
+		return
+	}
+	gates := approvalGatesFromRaw(wf)
+	for i, raw := range list {
+		esc, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		ptr := fmt.Sprintf("/workflows/%s/escalations/%d", wfName, i)
+		matchRaw, ok := esc["match"].(map[string]any)
+		if !ok {
+			continue
+		}
+		p := predicateFromRaw(matchRaw)
+		if len(p.ChangeKinds) > 0 {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    ptr + "/match/change_kind",
+				Message: MsgEscalationChangeKindUnsupported,
+			})
+			continue
+		}
+		if err := p.Validate(ptr + "/match"); err != nil {
+			*errs = append(*errs, ValidationErrorEntry{Path: ptr + "/match", Message: err.Error()})
+			continue
+		}
+		require, ok := esc["require"].(map[string]any)
+		if !ok {
+			continue
+		}
+		checkEscalatedApprovals(require, wfName, i, ptr, gates, errs)
+	}
+}
+
+// checkEscalatedApprovals mirrors the backend's approvals rungs for one
+// escalation, appending the FIRST rejection it finds so the reported
+// dimension order matches the backend's.
+func checkEscalatedApprovals(require map[string]any, wfName string, idx int, ptr string, gates []map[string]any, errs *[]ValidationErrorEntry) {
+	approvals, ok := require["approvals"].(map[string]any)
+	if !ok {
+		return
+	}
+	if len(gates) == 0 {
+		*errs = append(*errs, ValidationErrorEntry{
+			Path:    ptr + "/require/approvals",
+			Message: fmt.Sprintf(MsgFmtEscalationApprovalsNoApprovalGate, wfName, idx, wfName),
+		})
+		return
+	}
+	if count, ok := rawInt(approvals["count"]); ok {
+		baseline := baselineApprovalCountFromRaw(gates)
+		if count <= baseline {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path: ptr + "/require/approvals/count",
+				Message: escalationNoRaiseMessage(wfName, idx, "approvals.count",
+					fmt.Sprintf("count %d", count),
+					fmt.Sprintf("the workflow's baseline of %d (the highest count any approval gate declares)", baseline),
+					fmt.Sprintf("Declare a count above %d, or drop require.approvals.count.", baseline)),
+			})
+			return
+		}
+	}
+	if perm, _ := approvals["min_permission"].(string); perm != "" {
+		baseline := baselineMinPermissionFromRaw(gates)
+		if permissionRank(perm) <= permissionRank(baseline) {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path: ptr + "/require/approvals/min_permission",
+				Message: escalationNoRaiseMessage(wfName, idx, "approvals.min_permission",
+					fmt.Sprintf("min_permission %q", perm),
+					fmt.Sprintf("the workflow's baseline of %q (the strictest tier any approval gate declares)", baseline),
+					fmt.Sprintf("Declare a tier stricter than %q, or drop require.approvals.min_permission.", baseline)),
+			})
+			return
+		}
+	}
+	if group, _ := approvals["member_of"].(string); group != "" && everyGateRequiresGroupRaw(gates, group) {
+		*errs = append(*errs, ValidationErrorEntry{
+			Path: ptr + "/require/approvals/member_of",
+			Message: escalationNoRaiseMessage(wfName, idx, "approvals.member_of",
+				fmt.Sprintf("member_of %q", group),
+				fmt.Sprintf("the workflow's baseline: every approval gate already requires %q, and membership composes as a de-duplicated conjunction, so the composed set is identical to the baseline", group),
+				"Name a group some approval gate does NOT already require, or drop require.approvals.member_of."),
+		})
+	}
+}
+
+// approvalGatesFromRaw collects every approval gate's `approvals` node in the
+// RESOLVED workflow (the sweep runs after reuse resolution, so a gate
+// inherited through `extends` is present). Shape mismatches are skipped, as
+// everywhere in this file.
+func approvalGatesFromRaw(wf map[string]any) []map[string]any {
+	var out []map[string]any
+	stages, ok := wf["stages"].([]any)
+	if !ok {
+		return nil
+	}
+	for _, stRaw := range stages {
+		st, ok := stRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		gates, ok := st["gates"].([]any)
+		if !ok {
+			continue
+		}
+		for _, gRaw := range gates {
+			g, ok := gRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if gType, _ := g["type"].(string); gType != "approval" {
+				continue
+			}
+			if approvals, ok := g["approvals"].(map[string]any); ok {
+				out = append(out, approvals)
+			}
+		}
+	}
+	return out
+}
+
+// baselineApprovalCountFromRaw is the workflow's LEAST-RESTRICTIVE approval
+// count — the MAX over its approval gates — mirroring the backend's baseline.
+func baselineApprovalCountFromRaw(gates []map[string]any) int {
+	baseline := 0
+	for _, a := range gates {
+		if c, ok := rawInt(a["count"]); ok && c > baseline {
+			baseline = c
+		}
+	}
+	return baseline
+}
+
+// baselineMinPermissionFromRaw is the STRICTEST min_permission declared over
+// the workflow's approval gates, or "" when none declares one.
+func baselineMinPermissionFromRaw(gates []map[string]any) string {
+	baseline := ""
+	for _, a := range gates {
+		if p, _ := a["min_permission"].(string); permissionRank(p) > permissionRank(baseline) {
+			baseline = p
+		}
+	}
+	return baseline
+}
+
+// everyGateRequiresGroupRaw reports whether EVERY approval gate already names
+// group — the condition under which an escalated member_of de-duplicates away
+// and raises nothing.
+func everyGateRequiresGroupRaw(gates []map[string]any, group string) bool {
+	for _, a := range gates {
+		if g, _ := a["member_of"].(string); g != group {
+			return false
+		}
+	}
+	return len(gates) > 0
+}
+
+// permissionOrder is the forge-neutral permission ladder, weakest first,
+// mirroring the backend's. Index = strictness ordinal.
+var permissionOrder = []string{"read", "triage", "write", "maintain", "admin"}
+
+// permissionRank returns the strictness ordinal of a permission tier, or -1
+// for an unrecognized / absent one (so any declared tier raises an absent
+// baseline).
+func permissionRank(p string) int {
+	for i, name := range permissionOrder {
+		if name == p {
+			return i
+		}
+	}
+	return -1
+}
+
+// rawInt projects a yaml.v3-decoded numeric node onto int. yaml.v3 decodes a
+// plain integer as `int`, but a document round-tripped through JSON (as the
+// backend's parse path does) carries float64, so both are accepted; anything
+// else is not a count and reports absent rather than being coerced.
+func rawInt(node any) (int, bool) {
+	switch v := node.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	}
+	return 0, false
 }
 
 // predicateFromRaw projects a yaml.v3-decoded predicate node onto the typed
