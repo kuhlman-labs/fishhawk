@@ -6235,6 +6235,76 @@ workflows:
 	}
 }
 
+// TestParse_AppliesTo_PlanlessPathsNotAdmittedByPostHocEnvelope is the
+// LOAD-BEARING REGRESSION TEST for the rule's unconditionality, and the only
+// case in this block that a reintroduced carve-out would fail.
+//
+// The rejected exemption was: admit `applies_to.paths` on a plan-less
+// workflow when some stage already declares a post-hoc path envelope
+// (`constraints.allowed_paths` / `forbidden_paths`), on the reasoning that a
+// similar envelope is held elsewhere. It is wrong on the merits — the two
+// controls answer different questions at different times. `applies_to.paths`
+// decides WHICH WORKFLOW a change is routed to, at run admission, against the
+// approved plan's scope.files; a stage constraint checks the PRODUCED DIFF
+// after the agent has already run under a workflow that was selected some
+// other way. A plan-less workflow still never produces the set the routing
+// criterion is read against, so the declaration is still never evaluated —
+// which is the silently-inert control #2377 exists to close. Holding a
+// post-hoc envelope does not make it evaluated; it only makes the inertness
+// harder to notice.
+//
+// Every OTHER plan-less fixture in this block declares no constraints, so a
+// carve-out keyed on one would leave them all green. This test declares the
+// envelope explicitly and requires the refusal to stand.
+func TestParse_AppliesTo_PlanlessPathsNotAdmittedByPostHocEnvelope(t *testing.T) {
+	// The stage produces pull_request, so the E52.7 post-hoc-constraint
+	// binding rule is satisfied and the applies_to rule is the only
+	// candidate for the error these cases must still report.
+	planless := func(constraints string) []byte {
+		return []byte(`
+version: "2"
+workflows:
+  trivial:
+    applies_to:
+      paths:
+        - "docs/**"
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+` + constraints + `        produces:
+          - artifact: pull_request
+`)
+	}
+	// One case per envelope shape a carve-out could plausibly key on.
+	cases := []struct {
+		name        string
+		constraints string
+	}{
+		{name: "allowed_paths", constraints: "          allowed_paths: [\"docs/**\"]\n"},
+		{name: "forbidden_paths", constraints: "          forbidden_paths: [\"backend/**\"]\n"},
+		{name: "both", constraints: "          allowed_paths: [\"docs/**\"]\n          forbidden_paths: [\"backend/**\"]\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes(planless(tc.constraints))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want the applies_to.paths refusal to stand; a stage's post-hoc path envelope must NOT admit a routing criterion that is still never evaluated (#2377)", err)
+			}
+			if ve.Path != "/workflows/trivial/applies_to/paths" {
+				t.Fatalf("Path = %q, want /workflows/trivial/applies_to/paths", ve.Path)
+			}
+			want := fmt.Sprintf(spec.MsgFmtAppliesToPathsNoPlanStage, "trivial")
+			if ve.Message != want {
+				t.Errorf("Message = %q, want the unchanged shipped rendering %q", ve.Message, want)
+			}
+		})
+	}
+}
+
 // TestParse_AppliesTo_V0AndV1Rejected pins that `applies_to` is v2-only by
 // construction: neither the v0 nor the v1 workflow definition declares the
 // property and both are additionalProperties:false, so a v0/v1 document

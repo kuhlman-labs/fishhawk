@@ -2639,6 +2639,66 @@ workflows:
 	}
 }
 
+// TestValidateBytes_AppliesTo_PlanlessPathsNotAdmittedByPostHocEnvelope
+// mirrors the backend's LOAD-BEARING REGRESSION TEST for the rule's
+// unconditionality (see that test's comment for why the rejected carve-out is
+// wrong on the merits). Mirrored deliberately: `fishhawk validate` must not
+// accept a spec the backend refuses, so a carve-out reintroduced in EITHER
+// sweep has to fail a test — this package's rung 3 is hand-written against
+// the raw document rather than shared with the backend's typed check, so the
+// backend's test cannot cover it.
+//
+// Every other plan-less fixture in this block declares no constraints, so a
+// carve-out keyed on a stage's post-hoc path envelope would leave them all
+// green. This one declares the envelope and requires the refusal to stand.
+func TestValidateBytes_AppliesTo_PlanlessPathsNotAdmittedByPostHocEnvelope(t *testing.T) {
+	// The stage produces pull_request, so the post-hoc-constraint binding
+	// rule is satisfied and the applies_to rule is the only candidate for
+	// the error these cases must still report.
+	planless := func(constraints string) []byte {
+		return []byte(`
+version: "2"
+workflows:
+  docs_change:
+    applies_to:
+      paths:
+        - "docs/**"
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+` + constraints + `        produces:
+          - artifact: pull_request
+`)
+	}
+	cases := []struct {
+		name        string
+		constraints string
+	}{
+		{name: "allowed_paths", constraints: "          allowed_paths: [\"docs/**\"]\n"},
+		{name: "forbidden_paths", constraints: "          forbidden_paths: [\"backend/**\"]\n"},
+		{name: "both", constraints: "          allowed_paths: [\"docs/**\"]\n          forbidden_paths: [\"backend/**\"]\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := spec.ValidateBytes(planless(tc.constraints))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want the applies_to.paths refusal to stand; a stage's post-hoc path envelope must NOT admit a routing criterion that is still never evaluated (#2377)", err)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "/workflows/docs_change/applies_to/paths") {
+				t.Fatalf("error = %q, want it to name /workflows/docs_change/applies_to/paths", msg)
+			}
+			if want := fmt.Sprintf(spec.MsgFmtAppliesToPathsNoPlanStage, "docs_change"); !strings.Contains(msg, want) {
+				t.Errorf("error = %q, want it to carry the unchanged shipped rendering %q", msg, want)
+			}
+		})
+	}
+}
+
 // TestAppliesToPathsNoPlanStageMessageParity is the MECHANICAL drift guard for
 // the plan-stage message, modelled on TestAppliesToChangeKindMessageParity.
 // The two spec packages live in separate Go modules and the CLI cannot import
