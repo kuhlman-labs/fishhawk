@@ -309,6 +309,17 @@ func ParseBytes(data []byte) (*Spec, error) {
 		}
 	}
 
+	// Fold a v2 `permissions.network` declaration into the existing
+	// Stage.Egress field (E53.5 / #2228) — the acceptance-criterion-2 seam, so
+	// every egress consumer keeps reading one field. Runs AFTER the typed
+	// decode and BEFORE Validate, so validation and every downstream reader
+	// observe the resolved Stage.Egress; it returns the both-declared conflict
+	// error rather than choosing a precedence. Version-agnostic in code — the
+	// schema gates `permissions` to v2, since no v0/v1 schema accepts the key.
+	if err := normalizeStagePermissions(&spec); err != nil {
+		return nil, err
+	}
+
 	if err := Validate(&spec); err != nil {
 		return nil, err
 	}

@@ -654,18 +654,73 @@ type Stage struct {
 	Budget      *Budget          `json:"budget,omitempty" yaml:"budget,omitempty"`
 	Gates       []Gate           `json:"gates,omitempty" yaml:"gates,omitempty"`
 	Reviewers   *ReviewersConfig `json:"reviewers,omitempty" yaml:"reviewers,omitempty"`
-	// Egress is the acceptance-stage egress allowance (v1.3, ADR-050 /
-	// #1532): the declared target-instance host(s) the acceptance agent may
-	// reach through the runner's default-deny egress proxy. Valid only on an
-	// acceptance stage — Validate rejects it on any other type.
+	// Egress is the egress allowance (ADR-050 / #1532; generalized E53.5 /
+	// #2228): the declared target-instance host(s) a stage's agent may reach.
+	// On an acceptance stage the allow-list IS enforced today by the runner's
+	// default-deny egress proxy; on any other stage type at major >= 2 it is a
+	// declaration only, not enforced until E51 #2133. Below major 2 it stays
+	// acceptance-stage-only (Validate rejects it on any other type). At major
+	// >= 2 the acceptance/non-acceptance split is version-gated in Validate and
+	// the binding is keyed on the executor branch (agent) rather than the type.
+	//
+	// A v2 `permissions.network` declaration is normalized INTO this field
+	// after the typed decode (see permissions.go), so every enforcement
+	// consumer keeps reading this ONE field whichever spelling the author used.
 	Egress *StageEgress `json:"egress,omitempty" yaml:"egress,omitempty"`
+	// Permissions is the workflow-v2 declaration-only per-stage permissions
+	// block (E53.5 / #2228): network / write / shell. It is DECLARATION-ONLY —
+	// validated, audited and surfaced but NOT enforced until E51 #2133; do not
+	// rely on it as containment. REQUIRED for the schema-permitted key to
+	// survive ParseBytes' DisallowUnknownFields decode. `permissions.network`
+	// is a SPELLING of Egress and is normalized into it after decode; declaring
+	// both on one stage is a validation error, never a precedence rule.
+	Permissions *StagePermissions `json:"permissions,omitempty" yaml:"permissions,omitempty"`
 }
 
-// StageEgress declares the customer-controlled slot of the acceptance
-// agent's egress allow-list (ADR-050 decision #1). Entries are host or
-// host:port — never URLs — because scheme and path are not egress-relevant.
-// The runner adds the model API endpoint and the Fishhawk backend itself;
-// they are not declarable here.
+// StagePermissions is the declaration-only per-stage permissions block (E53.5 /
+// #2228). Every field is optional individually; the schema's minProperties 1
+// forbids the empty block. DECLARATION-ONLY: validated, audited and surfaced
+// but NOT enforced until E51 #2133 — do not rely on it as containment.
+type StagePermissions struct {
+	// Network is a SPELLING of the stage Egress allowance, the same
+	// host/host:port grammar. normalizeStagePermissions copies it into
+	// Stage.Egress after decode, so every egress consumer reads one field;
+	// declaring both Network and Egress on one stage is a validation error.
+	Network *StageEgress `json:"network,omitempty" yaml:"network,omitempty"`
+	// Write is a list of doublestar globs naming the paths the stage's agent
+	// is expected to write, validated and matched THROUGH the shared Predicate
+	// (WritePredicate) so the dialect cannot drift from applies_to/escalations.
+	Write []string `json:"write,omitempty" yaml:"write,omitempty"`
+	// Shell is the declared shell posture, a closed enum (ShellPosture).
+	Shell ShellPosture `json:"shell,omitempty" yaml:"shell,omitempty"`
+}
+
+// ShellPosture is the closed set of declarable shell postures (E53.5 / #2228).
+// DECLARATION-ONLY — nothing enforces the value until E51 #2133.
+type ShellPosture string
+
+// Shell postures per the schema enum.
+const (
+	ShellPostureNone         ShellPosture = "none"
+	ShellPostureRestricted   ShellPosture = "restricted"
+	ShellPostureUnrestricted ShellPosture = "unrestricted"
+)
+
+// ValidShellPostures returns the closed set of shell postures, in declaration
+// order. It is the accessor a doc or consumer reads rather than re-listing the
+// constants, mirroring ValidTriggerForms in predicate.go.
+func ValidShellPostures() []ShellPosture {
+	return []ShellPosture{ShellPostureNone, ShellPostureRestricted, ShellPostureUnrestricted}
+}
+
+// StageEgress declares the customer-controlled slot of a stage's egress
+// allow-list (ADR-050 decision #1; generalized E53.5 / #2228). Entries are host
+// or host:port — never URLs — because scheme and path are not egress-relevant.
+// The runner adds the model API endpoint and the Fishhawk backend itself; they
+// are not declarable here. ENFORCEMENT is not uniform: on an ACCEPTANCE stage
+// the allow-list is enforced today by the runner's default-deny proxy; on any
+// other stage type (reachable at major >= 2, and via the permissions.network
+// spelling) it is a declaration only, not enforced until E51 #2133.
 type StageEgress struct {
 	TargetHosts []string `json:"target_hosts" yaml:"target_hosts"`
 }

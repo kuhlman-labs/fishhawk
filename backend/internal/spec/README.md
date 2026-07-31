@@ -185,6 +185,18 @@ v2 deletes the legacy GitHub-handle gate `approvers` role allow-list and the top
 
 - **`extends` does not inherit it.** Reuse resolution folds `stages` only, so a deriving workflow does not pick up its base's `escalations` — consistent with `applies_to`, `budgets`, `policy`, `decomposition` and `autonomy`. Pinned in `escalation_test.go` (deliberately sited there rather than in `v2reuse_test.go`) by both halves: the deriving workflow's field is nil, and a base's invalid escalation is reported against the BASE.
 
+## Declared per-stage permissions — `permissions` (E53.5 / #2228)
+
+`$defs/stage` gains an optional `permissions` object (`network` / `write` / `shell`), decoding onto `Stage.Permissions *StagePermissions`, and the acceptance-stage-only `egress` binding is GENERALIZED at major `>= 2` off its type keying. The block is **DECLARATION-ONLY**: validated, audited and surfaced but **NOT enforced until E51 (#2133)** — no surface calls it containment, sandboxing, isolation, or a security control; it is a legibility/quality aid, not an adversary-proof control. Enforcement is a sibling epic. Reference prose: `docs/spec/workflow-v2.md` § 'Permissions (network / write / shell)'; the honesty wording is machine-checked by `TestPermissionsSchemaHonesty` against the SHIPPED canonical schema (`permissions.go` / `permissions_test.go`).
+
+- **`permissions.network` is a SPELLING of `egress`, not a parallel key.** `normalizeStagePermissions` (run in `parse.go` after the typed decode, before `Validate`) copies `Permissions.Network` into the existing `Stage.Egress`, so every enforcement consumer (`resolveAcceptanceStageSpec` → `resolveAcceptanceEgressTargetHosts` → the acceptance prompt's `egress_target_hosts` → `egressproxy.BuildAllowlist`) keeps reading ONE field and an acceptance stage can never be routed onto an unenforced path by choosing the new spelling. Declaring BOTH `egress` and `permissions.network` on one stage is a validation error (`MsgFmtPermissionsEgressConflict`), never a precedence rule.
+
+- **The egress binding is version-gated.** Below major 2 an `egress` block stays acceptance-stage-only (frozen; `TestParse_V13Egress_On{Implement,Deploy}Stage_Rejected` pin it). At major `>= 2` an `egress` block or a `permissions` block is valid on any AGENT-executor stage and rejected on a `human` or `delegate` executor (`MsgFmtPermissionsExecutorBinding`); the v2 `egress_off_acceptance` case moved out of `TestValidate_V2ExistingBindingMessagesUnchanged` into the positive `TestValidate_V2Egress_OnImplementStage_Accepted`.
+
+- **`permissions.write` runs through the shared `Predicate`.** `StagePermissions.WritePredicate()` returns `Predicate{Paths: write}`, so the write glob dialect and match semantics cannot drift from `applies_to`/`escalations`; a malformed glob is caught by `doublestar.ValidatePattern` at declaration time. The executor-binding and conflict messages carry the non-enforcement disclaimer (operator condition 4); a pure syntax error (malformed glob, unknown `shell` posture) does NOT.
+
+- **CLI parity** mirrors the two schema-inexpressible checks — the `egress`+`permissions.network` conflict (`MsgFmtPermissionsEgressConflict`, byte-parity via `TestPermissionsMessageParity`) and `write` glob validity through the byte-identical `predicate.go`. The executor binding is left to the backend (as the deploy binding is) and the `shell` enum to the schema.
+
 ## Agent-version compatibility ranges (v1.4, E32.13 / #1743)
 
 `executor.agent_version` + `reviewers.agents[i].agent_version` declare the semver comparator RANGE (e.g. `">=2.1 <2.2"`) of agent CLI versions a workflow was validated against, failing dispatch loudly when the resolved CLI version falls outside it (the #1741 opaque-CLI-drift diagnosis).

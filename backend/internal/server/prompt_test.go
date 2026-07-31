@@ -373,6 +373,66 @@ func promptRenderRequest(t *testing.T, s *Server, stageID uuid.UUID) *httptest.R
 	return w
 }
 
+// TestAcceptancePromptPayload_CarriesEgressHosts_BothSpellings is the
+// prompt-seam half of the E53.5 / #2228 end-to-end egress proof (operator
+// condition 2a): the acceptance-stage prompt payload must literally carry the
+// resolved hosts in `egress_target_hosts` under BOTH the `egress` and
+// `permissions.network` spellings. It DRIVES the real /prompt handler
+// (handleGetStagePrompt → resolveAcceptanceEgressTargetHosts → the wire) for
+// each spelling, so the proof is self-contained: a handler that stopped
+// populating EgressTargetHosts would fail this, not just the resolver — the
+// module boundary is pinned on this side of the seam; the runner's egressproxy
+// allow-list is pinned on the other (runner/internal/egressproxy/proxy_test.go).
+func TestAcceptancePromptPayload_CarriesEgressHosts_BothSpellings(t *testing.T) {
+	specs := map[string]string{
+		"egress": `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor: {agent: claude-code}
+        egress:
+          target_hosts: ["staging.example.com:8443"]
+`,
+		"permissions_network": `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: acceptance
+        type: acceptance
+        executor: {agent: claude-code}
+        permissions:
+          network:
+            target_hosts: ["staging.example.com:8443"]
+`,
+	}
+	for name, specYAML := range specs {
+		t.Run(name, func(t *testing.T) {
+			s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+			runRow, err := s.cfg.RunRepo.GetRun(context.Background(), runID)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			runRow.WorkflowSpec = []byte(specYAML)
+			w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if want := []string{"staging.example.com:8443"}; !reflect.DeepEqual(resp.EgressTargetHosts, want) {
+				t.Errorf("EgressTargetHosts = %v, want %v under the %s spelling", resp.EgressTargetHosts, want, name)
+			}
+			if !strings.Contains(w.Body.String(), `"egress_target_hosts":["staging.example.com:8443"]`) {
+				t.Errorf("prompt payload does not carry the resolved hosts on the wire under the %s spelling:\n%s", name, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestGetStagePrompt_HappyPath_ImplementWithIssue(t *testing.T) {
 	s, rr, sf, gh := newPromptServer(t)
 	runID := uuid.New()

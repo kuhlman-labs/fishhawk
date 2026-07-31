@@ -31,7 +31,9 @@ import "sort"
 // issue-restarted / paused) written via audit.AppendGlobalChained. #1941
 // added the failed-run revive audit kind (run_revived, #1915). E53.4 / #2227
 // added escalation_fired, written at the ONE server-side escalation resolver
-// both enforcement seams reach. When a
+// both enforcement seams reach. E53.5 / #2228 added stage_permissions_declared,
+// written ONCE per run at run creation when the workflow declares any stage
+// `permissions` or `egress` block (declaration-only, enforced: false). When a
 // new canonical category is introduced, add it here so operators can await
 // it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -180,6 +182,7 @@ var KnownCategories = map[string]struct{}{
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_triggered":                   {},
 	"stage_override_retried":                  {},
+	"stage_permissions_declared":              {},
 	"stage_retried":                           {},
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},

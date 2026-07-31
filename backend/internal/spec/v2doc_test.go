@@ -48,6 +48,7 @@ var v2DocCitedHeadings = []string{
 	"Reuse: defaults and extends",
 	"Autonomy: tier shorthand and action matrix",
 	"Escalations",
+	"Permissions (network / write / shell)",
 	v2DocAppendixHeading,
 }
 

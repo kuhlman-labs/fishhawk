@@ -171,6 +171,184 @@ workflows:
           - artifact: pull_request
 `
 
+// declaredPermissionsV2SpecYAML is a plan+implement v2 workflow whose implement
+// stage declares a full permissions block (E53.5 / #2228): network (normalized
+// into Egress), write globs, and a shell posture.
+const declaredPermissionsV2SpecYAML = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        permissions:
+          network:
+            target_hosts: ["api.internal.example.com:8443"]
+          write: ["src/**/*.go"]
+          shell: restricted
+        produces:
+          - artifact: pull_request
+`
+
+// TestCreateRun_EmitsStagePermissionsDeclared is the audit half of E53.5 /
+// #2228's done-means (verification 6): run creation appends EXACTLY ONE
+// stage_permissions_declared entry whose payload carries the feature-level
+// enforced:false and enforcement_tracked_by:"#2133". A comment-only or partial
+// edit fails this where a touched-the-file presence gate would pass (#1169).
+func TestCreateRun_EmitsStagePermissionsDeclared(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredPermissionsV2SpecYAML,
+	})
+
+	var found []audit.ChainAppendParams
+	for _, e := range au.appended {
+		if e.Category == "stage_permissions_declared" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("stage_permissions_declared entries = %d, want exactly 1", len(found))
+	}
+	var payload stagePermissionsAuditPayload
+	if err := json.Unmarshal(found[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.Enforced {
+		t.Error("feature-level enforced = true, want false (the permissions block is declaration-only)")
+	}
+	if payload.EnforcementTrackedBy != "#2133" {
+		t.Errorf("enforcement_tracked_by = %q, want #2133", payload.EnforcementTrackedBy)
+	}
+	if len(payload.Stages) != 1 || payload.Stages[0].StageID != "implement" {
+		t.Errorf("payload stages = %+v, want one implement entry", payload.Stages)
+	}
+}
+
+// TestCreateRun_NoPermissions_NoAuditEntry is the control (verification 6 / 10):
+// a workflow declaring no permissions/egress appends NO stage_permissions_declared
+// entry, keeping its audit stream byte-identical.
+func TestCreateRun_NoPermissions_NoAuditEntry(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredAdvisoryV2SpecYAML,
+	})
+	for _, e := range au.appended {
+		if e.Category == "stage_permissions_declared" {
+			t.Fatal("unexpected stage_permissions_declared entry for a spec declaring no permissions/egress")
+		}
+	}
+}
+
+// TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance is the
+// enforcement-honesty pin (fix-up high/security + operator condition 3): the
+// per-entry `enforced` flag is true ONLY for an acceptance stage whose executor
+// is the AGENT branch — the one declaration the runner's default-deny egress
+// proxy actually enforces by constraining that agent's egress. A non-agent (human/delegate)
+// acceptance stage runs no agent through the proxy, so enforced:true there would
+// falsely claim a network allow-list is enforced when no agent proxy is
+// involved. Implement (non-acceptance) egress is never enforced today either.
+func TestBuildStagePermissionsPayloads_EnforcedOnlyForAgentAcceptance(t *testing.T) {
+	hosts := &spec.StageEgress{TargetHosts: []string{"staging.example.com:8443"}}
+	wf := spec.Workflow{Stages: []spec.Stage{
+		{ID: "accept-agent", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Agent: "claude-code"}, Egress: hosts},
+		{ID: "accept-human", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Human: true}, Egress: hosts},
+		{ID: "impl-agent", Type: spec.StageTypeImplement, Executor: spec.Executor{Agent: "claude-code"}, Egress: hosts},
+		// An AGENT-executor acceptance stage declaring ONLY write/shell and NO
+		// network/egress: enforced must stay false. This pins the `st.Egress != nil`
+		// clause of the Enforced predicate — without it, acceptance+agent alone would
+		// flip write/shell-only permissions to enforced:true, over-claiming that a
+		// non-existent network allow-list is enforced (fix-up: untested-path).
+		{ID: "accept-write-only", Type: spec.StageTypeAcceptance, Executor: spec.Executor{Agent: "claude-code"}, Permissions: &spec.StagePermissions{Write: []string{"artifacts/**"}, Shell: spec.ShellPostureRestricted}},
+	}}
+	got := map[string]runStagePermissionsPayload{}
+	for _, e := range buildStagePermissionsPayloads(wf) {
+		got[e.StageID] = e
+	}
+	if !got["accept-agent"].Enforced {
+		t.Error("agent-executor acceptance egress: enforced = false, want true (the proxy constrains the agent's egress)")
+	}
+	if !strings.Contains(got["accept-agent"].Note, "enforced today") {
+		t.Errorf("agent-executor acceptance note = %q, want the enforced-today note", got["accept-agent"].Note)
+	}
+	if got["accept-human"].Enforced {
+		t.Error("human-executor acceptance egress: enforced = true, want false — no agent runs through the proxy")
+	}
+	if got["impl-agent"].Enforced {
+		t.Error("implement-stage egress: enforced = true, want false (only an acceptance agent's egress is proxy-constrained)")
+	}
+	if got["accept-write-only"].Enforced {
+		t.Error("agent-executor acceptance with only write/shell (no network): enforced = true, want false — there is no network allow-list to enforce")
+	}
+	// The non-enforced entries carry the declaration-only note either way.
+	for _, id := range []string{"accept-human", "impl-agent", "accept-write-only"} {
+		if !strings.Contains(got[id].Note, "#2133") {
+			t.Errorf("%s note = %q, want it to name the enforcement tracker #2133", id, got[id].Note)
+		}
+	}
+}
+
+// TestEmitStagePermissionsDeclared_AppendFailsDoesNotFailRun is the best-effort
+// degrade pin (fix-up low/untested-path): when the once-per-run audit append
+// fails, run creation still succeeds (the legibility surface must never fail run
+// creation) and no stage_permissions_declared entry is recorded.
+func TestEmitStagePermissionsDeclared_AppendFailsDoesNotFailRun(t *testing.T) {
+	s, repo, au, _ := newDelegationServer(t)
+	au.appendErrCategory = "stage_permissions_declared"
+	// Run creation must not fail on the injected audit-append error.
+	startDriveE2ERun(t, s, repo, map[string]any{
+		"repo": "x/y", "workflow_id": "feature_change", "workflow_sha": "abc",
+		"trigger_source": "cli", "workflow_spec": declaredPermissionsV2SpecYAML,
+	})
+	for _, e := range au.appended {
+		if e.Category == "stage_permissions_declared" {
+			t.Fatal("stage_permissions_declared entry recorded despite the injected append error")
+		}
+	}
+}
+
+// TestBuildStagePermissionsSurface_OmitsOnBadSpec pins the two run-status
+// omission branches buildStagePermissionsSurface adds (fix-up low/verification):
+// a run whose cached spec fails to parse, and a run whose WorkflowID is absent
+// from an otherwise-valid cached spec. Both are externally observable
+// run-status paths, and both must yield a nil (omitted) permissions surface
+// rather than a partial read or a panic.
+func TestBuildStagePermissionsSurface_OmitsOnBadSpec(t *testing.T) {
+	s, _, _, _ := newDelegationServer(t)
+
+	t.Run("malformed_cached_spec", func(t *testing.T) {
+		got := s.buildStagePermissionsSurface(&run.Run{
+			ID:           uuid.New(),
+			WorkflowID:   "feature_change",
+			WorkflowSpec: []byte("this is: not valid: workflow yaml: ["),
+		})
+		if got != nil {
+			t.Errorf("surface = %+v, want nil (unparseable cached spec → omitted)", got)
+		}
+	})
+
+	t.Run("workflow_not_in_spec", func(t *testing.T) {
+		got := s.buildStagePermissionsSurface(&run.Run{
+			ID:           uuid.New(),
+			WorkflowID:   "no_such_workflow",
+			WorkflowSpec: []byte(declaredPermissionsV2SpecYAML),
+		})
+		if got != nil {
+			t.Errorf("surface = %+v, want nil (workflow absent from cached spec → omitted)", got)
+		}
+	})
+}
+
 // reviewAuthorityFor returns the review_authority entry for the named stage.
 func reviewAuthorityFor(t *testing.T, resp runResponse, stage string) runReviewAuthorityPayload {
 	t.Helper()

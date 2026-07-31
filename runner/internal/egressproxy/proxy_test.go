@@ -267,6 +267,44 @@ func TestBuildAllowlist(t *testing.T) {
 	}
 }
 
+// TestAllowlist_AdmitsResolvedHostsDeniesUndeclared is the runner half of the
+// E53.5 / #2228 end-to-end egress proof (operator condition 2b): the allow-list
+// the runner BUILDS from the resolved acceptance target hosts admits exactly
+// those hosts through the default-deny proxy and denies an undeclared one. The
+// backend half — that the acceptance prompt payload carries those hosts in
+// egress_target_hosts under both the `egress` and `permissions.network`
+// spellings — is pinned on the other side of the module boundary
+// (backend/internal/server/prompt_test.go), because no single test can span both
+// modules.
+func TestAllowlist_AdmitsResolvedHostsDeniesUndeclared(t *testing.T) {
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "reached the declared target")
+	}))
+	defer backend.Close()
+	targetHost := strings.TrimPrefix(backend.URL, "https://")
+
+	// The resolved hosts the backend served on egress_target_hosts (under either
+	// the egress or the permissions.network spelling) compose the allow-list.
+	allow := egressproxy.BuildAllowlist([]string{targetHost}, "https://fishhawk.example.test:8080")
+	p := startProxy(t, egressproxy.Config{AllowHosts: allow})
+
+	resp, err := proxiedClient(t, p).Get(backend.URL)
+	if err != nil {
+		t.Fatalf("GET to the declared target host failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "reached the declared target" {
+		t.Errorf("body = %q, want the declared target's response", body)
+	}
+
+	if _, err := proxiedClient(t, p).Get("https://undeclared.example.test/"); err == nil {
+		t.Fatal("GET to an undeclared host succeeded, want a default-deny refusal")
+	} else if !strings.Contains(err.Error(), "403") && !strings.Contains(err.Error(), "Forbidden") {
+		t.Errorf("error = %v, want a 403/Forbidden refusal for the undeclared host", err)
+	}
+}
+
 // TestClose_Idempotent proves double-Close is safe (the invocation teardown
 // path may race the deferred cleanup).
 func TestClose_Idempotent(t *testing.T) {

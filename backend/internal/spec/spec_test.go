@@ -4924,22 +4924,6 @@ workflows:
 			wantPath: "/workflows/wf/stages/0/produces/0/artifact",
 			wantMsg:  `acceptance artifact is valid only on an acceptance stage, not a "implement" stage (ADR-049)`,
 		},
-		{
-			name: "egress_off_acceptance",
-			doc: `version: "2"
-workflows:
-  wf:
-    stages:
-      - id: apply
-        type: implement
-        executor:
-          agent: claude-code
-        egress:
-          target_hosts: ["staging.example.com"]
-`,
-			wantPath: "/workflows/wf/stages/0/egress",
-			wantMsg:  `egress allowance is valid only on an acceptance stage, not a "implement" stage (ADR-050)`,
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -4955,6 +4939,28 @@ workflows:
 				t.Errorf("ValidationError.Message = %q, want the UNCHANGED %q", ve.Message, tc.wantMsg)
 			}
 		})
+	}
+}
+
+// TestValidate_V2Egress_OnImplementStage_Accepted pins the deliberate v2
+// loosening (E53.5 / #2228): the acceptance-only egress binding no longer fires
+// at major >= 2, so a v2 implement stage (an agent executor) declaring `egress`
+// now parses and validates. Its v1.3 counterparts
+// (TestParse_V13Egress_On{Implement,Deploy}Stage_Rejected) stay unchanged as the
+// frozen-major pins, so the gate is version-scoped rather than removed.
+func TestValidate_V2Egress_OnImplementStage_Accepted(t *testing.T) {
+	if _, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        egress:
+          target_hosts: ["staging.example.com"]
+`)); err != nil {
+		t.Fatalf("v2 implement stage declaring egress should validate, got %v", err)
 	}
 }
 

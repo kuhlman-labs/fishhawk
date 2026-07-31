@@ -265,6 +265,39 @@
         },
         "egress": {
           "$ref": "#/$defs/stage_egress"
+        },
+        "permissions": {
+          "$ref": "#/$defs/stage_permissions"
+        }
+      }
+    },
+    "stage_permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "Declared per-stage permissions (E53.5 / #2228): a DECLARATION-ONLY record of the network destinations, write paths and shell posture a stage's agent is expected to use. This declaration is validated, audited and surfaced but is NOT enforced until E51 (#2133); do not rely on it as containment. `permissions.network` is a SPELLING of the stage `egress` allowance — it is normalized into the same field after decode, so an acceptance stage declaring it lands on the one enforced path exactly as `egress` does; declaring BOTH `egress` and `permissions.network` on one stage is a validation error, never a precedence rule. minProperties 1: an empty `permissions: {}` is an authoring error, not a default.",
+      "properties": {
+        "network": {
+          "$ref": "#/$defs/stage_egress",
+          "description": "The network destinations the stage's agent is expected to reach, as the SAME host / host:port grammar as `egress` — this is a SPELLING of `egress`, normalized into it after decode (declaring both on one stage is a validation error). This declaration is validated, audited and surfaced but is NOT enforced until E51 (#2133); do not rely on it as containment. On an ACCEPTANCE stage the resolved allowance IS enforced today by the runner's default-deny egress proxy, because it normalizes into `egress`; on any other stage type it is a declaration only."
+        },
+        "write": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Doublestar globs (bmatcuk/doublestar/v4 semantics; `**` crosses `/`) naming the paths the stage's agent is expected to write, validated and matched through the SAME shared predicate as `applies_to` and `escalations` so the write dialect cannot drift. This declaration is validated, audited and surfaced but is NOT enforced until E51 (#2133); do not rely on it as containment.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "shell": {
+          "type": "string",
+          "enum": [
+            "none",
+            "restricted",
+            "unrestricted"
+          ],
+          "description": "The stage's declared shell posture: `none`, `restricted` or `unrestricted`. This declaration is validated, audited and surfaced but is NOT enforced until E51 (#2133); do not rely on it as containment."
         }
       }
     },
@@ -274,7 +307,7 @@
       "required": [
         "target_hosts"
       ],
-      "description": "Egress allowance for an acceptance stage (ADR-050 / #1532): the declared target-instance host(s) the acceptance agent may reach. Valid ONLY on an acceptance stage — the validator rejects it on any other type. These entries are the single customer-controlled slot in the runner's default-deny egress allow-list; the model API endpoint and the Fishhawk backend are added by the runner and are not declarable here. Keep the grammar minimal: hosts, not URLs — scheme and path are not egress-relevant.",
+      "description": "Egress allowance (ADR-050 / #1532; generalized E53.5 / #2228): the declared target-instance host(s) a stage's agent is expected to reach. On an ACCEPTANCE stage the allow-list IS enforced today by the runner's default-deny egress proxy — these entries are the single customer-controlled slot, with the model API endpoint and the Fishhawk backend added by the runner and not declarable here. On any OTHER stage type the declaration is surfaced and audited but NOT enforced until E51 (#2133). At workflow-v2 an `egress` block (equivalently the `permissions.network` spelling) is valid on any agent-executor stage and rejected on a human or delegate executor; below major 2 it stays acceptance-stage-only. Keep the grammar minimal: hosts, not URLs — scheme and path are not egress-relevant.",
       "properties": {
         "target_hosts": {
           "type": "array",
