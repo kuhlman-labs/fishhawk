@@ -31,6 +31,10 @@ Resolution runs on the same ladder as the effective block. A campaign-level over
 - Every unmet decision names the exact failed predicate.
 - Action-time enforcement (`delegated: true` on approve/fixup/retry/waive) is the #1026 enforcement slice; audit-payload rule attribution rides it.
 
+### `may_approve` decline on a human-quorum gate (#2381)
+
+A met `may_approve` (`clean_dual_approval`) is necessary but NOT sufficient for the auto-driver to submit an approve: the gate's real quorum state independently decides whether a delegated vote could ever advance it. `server/autodrive.go`'s `may_approve` arm calls `delegatedApproveWouldAdvance` (`server/quorum.go`) FIRST and DECLINES — `decision_required` / `decision_state: human_quorum_required`, no approval submitted — on a gate declaring an `approvals` block (a delegated submission is unconditionally uncounted, so it can never reach the human count), on an unreadable block, and on a firing or unevaluable escalation over a block-less gate (fail-closed, the #2374 posture). A delegated approve returning a DUPLICATE reports `decision_state: delegated_approval_no_progress`. Only a genuine legacy no-approvals, no-escalation gate still auto-approves. This keeps a delegated vote — which #1709 records but never counts — from wedging a human-quorum gate the auto-driver can never clear on its own.
+
 ## Escalation autonomy ceiling (E53.4 / #2227)
 
 A workflow's `escalations` block may declare a `max_autonomy` CEILING for a change matching its predicate. This package applies it **LAST** — after `spec.ResolveOperatorAgent` and `resolveMatrix` have produced the fully resolved block, i.e. after the workflow tier AND after every explicit `actions` override AND after a campaign override has been projected into the matrix. Clamping the tier or the declared entries instead would let an explicit `actions: {merge: {mode: auto}}` re-widen the class afterwards.

@@ -390,6 +390,41 @@ func TestAutoDrive_RouteFixupBudgetExhausted_ParksDecision(t *testing.T) {
 	}
 }
 
+// TestAutoDriveHTTP_HumanQuorumGate_DecisionRequired is the #2381 endpoint-half
+// pin AND the server-emit half of the constant round trip (binding condition 1):
+// the REAL POST /v0/runs/{id}/auto-drive handler, driving a delegated approve on
+// a human-quorum gate, serializes decision_required=true and
+// decision_state=human_quorum_required on the wire (the exact
+// operatorrole.DecisionStateHumanQuorumRequired value the driver decodes and
+// compares), and appends ZERO run_auto_driven attribution rows for the declined
+// pass (the 160-row surface this issue closes).
+func TestAutoDriveHTTP_HumanQuorumGate_DecisionRequired(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRunWithSpec(t, s, repo, autoDriveEscalationSpecYAML(""))
+	seedCleanPlanApproval(t, au, runID)
+
+	w := autoDrivePost(t, s, s.handleAutoDrive, runID, "", "{}", autoDriveOperatorIdentity())
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var out autoDriveResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Acted || out.Paged {
+		t.Fatalf("outcome = %+v, want decision_required (not acted/paged)", out)
+	}
+	if !out.DecisionRequired || out.DecisionState != operatorrole.DecisionStateHumanQuorumRequired {
+		t.Fatalf("outcome = %+v, want decision_required=true decision_state=%q", out, operatorrole.DecisionStateHumanQuorumRequired)
+	}
+	if countAudit(au, CategoryRunAutoDriven) != 0 {
+		t.Error("run_auto_driven row appended on a decision_required (non-acted) human-quorum decline")
+	}
+	if countAudit(au, "approval_submitted") != 0 {
+		t.Error("approval_submitted row recorded on a human-quorum decline; the arm must not submit")
+	}
+}
+
 // TestAutoDrive_RouteFixupGenuineError_Surfaces500 is the sibling to the
 // decision-required park: a GENUINE (non-sentinel) route_fixup dispatch failure
 // — here a repo transition error — still surfaces as 500 auto_drive_dispatch_failed,

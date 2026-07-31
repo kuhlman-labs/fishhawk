@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -72,11 +73,16 @@ type AutoDriveOutcome struct {
 	// well-defined, EXPECTED gate state and must hand the gate to the
 	// operator — distinct from observe-only (which means keep polling): the
 	// driver must STOP, not spin. DecisionState names the state (e.g.
-	// fixup_budget_exhausted / fixup_ceiling_reached) and Action names the
+	// fixup_budget_exhausted / fixup_ceiling_reached; the #2381 delegated-approval
+	// states operatorrole.DecisionStateHumanQuorumRequired and
+	// DecisionStateDelegatedApprovalNoProgress) and Action names the
 	// delegated verb whose arm surfaced it. Set with Acted=false and
 	// Paged=false. Introduced by the E48.41 / #2091 fix so an exhausted
 	// fix-up budget on the delegated route_fixup arm parks the operator with
-	// real next moves instead of bubbling to an HTTP 500.
+	// real next moves instead of bubbling to an HTTP 500; extended by #2381 so the
+	// may_approve arm parks the operator when a delegated approve could never
+	// advance a human-quorum gate (human_quorum_required) or made no progress as a
+	// duplicate (delegated_approval_no_progress) instead of wedging the run.
 	DecisionRequired bool
 	DecisionState    string
 	// Reported is true when a workflow-v2 `mode: report` class surfaced a
@@ -175,12 +181,43 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 	// may_approve(clean_dual_approval) -> approve the gated review stage.
 	if d, found := res.Decision(delegation.ActionApprove); found && d.Met {
 		if gated := gatedReviewStage(stages); gated != nil {
-			if _, aerr := s.approveStageAs(ctx, id, approveActionParams{
+			// FIX 1 (#2381): pre-check whether a delegated approve could EVER
+			// advance THIS gate before submitting one. A human-quorum gate never
+			// counts a delegated vote (#1709), and a firing / unevaluable escalation
+			// or an unreadable approvals block all fail closed — decline and hand the
+			// gate to the operator rather than recording a delegated vote that can
+			// only wedge it (occupying the sole eligible approver's slot so the
+			// operator's later real approve collides as a #986 duplicate). No approval
+			// is submitted, so no approval row, no approval_submitted audit, and no
+			// run_auto_driven row for the declined pass.
+			if advance, reason := s.delegatedApproveWouldAdvance(ctx, gated); !advance {
+				return AutoDriveOutcome{
+					DecisionRequired: true,
+					DecisionState:    operatorrole.DecisionStateHumanQuorumRequired,
+					Action:           delegation.ActionApprove,
+					Note:             reason,
+				}, nil
+			}
+			result, aerr := s.approveStageAs(ctx, id, approveActionParams{
 				Stage:         gated,
 				Decision:      approval.DecisionApprove,
 				DelegatedRule: string(d.Condition),
-			}); aerr != nil {
+			})
+			if aerr != nil {
 				return AutoDriveOutcome{Action: delegation.ActionApprove, Note: "approve dispatch failed"}, aerr
+			}
+			// FIX 2 server leg (#2381): a delegated approve that came back a
+			// DUPLICATE (Submit did not insert) made no progress — report
+			// decision_required rather than a no-op acted:true, so handleAutoDrive
+			// appends no attribution row for the no-op and the driver parks the
+			// operator instead of looping the gate.
+			if result.Duplicate != nil {
+				return AutoDriveOutcome{
+					DecisionRequired: true,
+					DecisionState:    operatorrole.DecisionStateDelegatedApprovalNoProgress,
+					Action:           delegation.ActionApprove,
+					Note:             "a delegated approval was already recorded for this gate; no progress",
+				}, nil
 			}
 			return AutoDriveOutcome{Acted: true, Action: delegation.ActionApprove, Note: "auto-approved " + string(gated.Type) + " gate"}, nil
 		}

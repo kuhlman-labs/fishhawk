@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/latency"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -123,6 +124,20 @@ func TestPlanStatusFooterForAuditPayload_IdentityForms(t *testing.T) {
 				"approver": "operator-agent/operator-role-v0",
 			},
 			wantActor: "the operator agent (`operator-agent/operator-role-v0`)",
+		},
+		{
+			// #2381: the DISTINCT operator-agent delegated identity a delegated
+			// approval is now recorded under renders through the SAME
+			// operator-agent form (IsTokenSubject matches the operator-agent/
+			// prefix), names the rule, and carries NO @-mention — an approver
+			// identity that could inject a mention into an issue comment is the
+			// failure this render path exists to prevent.
+			name: "operator-agent delegated identity (#2381)",
+			payload: map[string]any{
+				"approver":  operatorrole.DelegatedApprovalActorSubject,
+				"delegated": "clean_dual_approval",
+			},
+			wantActor: "the operator agent (`operator-agent/delegated`, delegated: `clean_dual_approval`)",
 		},
 		{
 			// The delegated rule comes from the audit payload; even

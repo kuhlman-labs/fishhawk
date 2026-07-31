@@ -11,6 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 )
 
 // driveSpawnFunc is the injectable spawn seam for fishhawk_drive_run. It
@@ -118,6 +120,15 @@ const (
 	// no-state-change, no-parked-gate iterations after which the verb returns
 	// stalled rather than spinning.
 	driveStallThreshold = 3
+	// driveNoProgressThreshold bounds a repeated DELEGATED gate act that leaves
+	// the run/stage signature unchanged (#2381): after this many consecutive
+	// identical acts the driver STOPS decision_required:delegated_act_no_progress
+	// rather than re-acting to max_minutes (a no-op act bounded at 2 rows, not
+	// ~160). The FIRST act is always allowed, so a legitimate route_fixup/retry
+	// that re-shapes the stage topology — and thus the signature — resets the
+	// counter and keeps driving; the queued-merge path never reaches a second
+	// identical act (mergeQueued short-circuits the gate call).
+	driveNoProgressThreshold = 2
 	// defaultDriveDispatchedStaleAfter is the runner-liveness threshold: a stage
 	// this invocation did not spawn that has sat in 'dispatched' longer than this
 	// (with no runner observed) is treated as genuinely runner-less rather than
@@ -177,6 +188,11 @@ const (
 	// (distinct from the run-state-derived 'cancelled', which reports a run the
 	// backend moved to the cancelled terminal state).
 	stoppedContextCancelled = "context_cancelled"
+	// driveDelegatedActNoProgress is the decision_required state the no-progress
+	// guard stops on (#2381): a repeated delegated gate act left the run/stage
+	// signature unchanged. It has its own driveDecisionActions arm, so the drive
+	// verb's "every decision_required:* names an operator judgment" contract holds.
+	driveDelegatedActNoProgress = "delegated_act_no_progress"
 	// stoppedAcceptanceNeedsTarget is the resumable stop when the acceptance
 	// target-identity gate (#1953) refuses to spawn: the admission endpoint
 	// reported the plan needs live validation against a declared target and the
@@ -408,6 +424,12 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 	stall := 0
 	var lastSig string
 	mergeQueued := false // a delegated merge was queued; poll for the webhook-settle, don't re-act
+	// No-progress guard state (#2381): the most recent delegated gate act's run/
+	// stage signature + action, so a second consecutive identical act with an
+	// unchanged signature can be bounded rather than looped to max_minutes.
+	noProgressActs := 0
+	haveActed := false
+	var lastActedSig, lastActedAction string
 
 	// QUEUED-MERGE MEMORY across invocations: a prior run_auto_driven act:gate
 	// merge row means a merge was already queued on an earlier invocation, so a
@@ -863,6 +885,23 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			return nil, out, nil
 		case gate.Acted:
 			stall = 0
+			// No-progress guard (#2381): a second consecutive delegated gate act
+			// with the SAME action AND an unchanged run/stage signature made no
+			// progress (a repeated no-op act, the ~160-row livelock). The FIRST act
+			// is always allowed; a legitimate route_fixup/retry re-shapes the stage
+			// topology — changing the signature — so it resets the counter and keeps
+			// driving. The signature is read from THIS iteration's stages (pre-act),
+			// so comparing consecutive acted-gate signatures detects whether the
+			// PREVIOUS act changed anything.
+			actedSig := driveSignature(runRow, stages)
+			if haveActed && actedSig == lastActedSig && gate.Action == lastActedAction {
+				noProgressActs++
+			} else {
+				noProgressActs = 1
+			}
+			haveActed = true
+			lastActedSig = actedSig
+			lastActedAction = gate.Action
 			// A gate action re-shapes the stage topology (a re-opened stage on
 			// retry/route_fixup); clear the per-invocation spawn guard so a
 			// re-opened stage is re-dispatched rather than treated as in-flight.
@@ -876,6 +915,13 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			// auto-merge every interval).
 			if gate.Action == driveActionMerge {
 				mergeQueued = true
+			}
+			// At the threshold, STOP rather than re-act to max_minutes — bounding a
+			// repeated no-op delegated act at driveNoProgressThreshold rows.
+			if noProgressActs >= driveNoProgressThreshold {
+				out.StoppedReason = "decision_required:" + driveDelegatedActNoProgress
+				out.NextActions = driveDecisionActions(driveDelegatedActNoProgress, runUUID, in.WorkingDir)
+				return nil, out, nil
 			}
 			driveSleep(ctx, pollInterval)
 			continue
@@ -1388,6 +1434,61 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 		// fixup_stage action is dropped. Only the out-of-band concern
 		// dispositions (waive / defer) and cancel remain.
 		return &NextActions{State: state, Actions: driveFixupConcernActions(params)}
+	case state == operatorrole.DecisionStateHumanQuorumRequired:
+		// A delegated approve could never advance THIS gate (a human-quorum
+		// approvals block, or a firing/unevaluable escalation, or an unreadable
+		// block) — #2381. The operator must cast a real, COUNTING approval. Point
+		// them first at the gate view, then at the approve verb (which consumes
+		// their own approval slot — now free, because the delegated vote was
+		// recorded under a distinct operator-agent identity, not the operator's).
+		return &NextActions{State: state, Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_get_gate_view",
+				Params:       params,
+				Precondition: "the gate declares an approvals block requiring distinct human approvers, which a delegated approval is recorded but never counted against",
+				Consumes:     consumesNone,
+				Reason:       "read the parked gate and its reviews to see what a human approval must satisfy",
+			},
+			{
+				Action:       "fishhawk_approve_plan",
+				Params:       params,
+				Precondition: "a human-quorum gate needs a real (non-delegated) operator approval; the delegated vote did not consume your approval slot",
+				Consumes:     consumesApprovalSlot,
+				Reason:       "cast your own counting approval to reach quorum, then re-invoke fishhawk_drive_run",
+			},
+		}}
+	case state == operatorrole.DecisionStateDelegatedApprovalNoProgress:
+		// A delegated approve came back a duplicate — the delegated vote already
+		// stands but never counts toward a human quorum (#2381). The operator's own
+		// real approve is the move; their approval slot is free.
+		return &NextActions{State: state, Actions: []SuggestedAction{{
+			Action:       "fishhawk_approve_plan",
+			Params:       params,
+			Precondition: "a delegated approval was already recorded for this gate but is never counted toward a human quorum; your own approval slot is free",
+			Consumes:     consumesApprovalSlot,
+			Reason:       "cast your own counting approval to reach quorum, then re-invoke fishhawk_drive_run",
+		}}}
+	case state == driveDelegatedActNoProgress:
+		// A repeated delegated act left the run/stage signature unchanged (#2381):
+		// the driver bounded it rather than looping to max_minutes. Inspect the
+		// run, then decide — most often a real operator approval a delegated act
+		// cannot supply.
+		return &NextActions{State: state, Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_get_run_status",
+				Params:       params,
+				Precondition: "a repeated delegated gate act made no progress; the driver stopped rather than looping",
+				Consumes:     consumesNone,
+				Reason:       "inspect the run's full next_actions block to see why the act is not advancing",
+			},
+			{
+				Action:       "fishhawk_approve_plan",
+				Params:       params,
+				Precondition: "the parked gate most likely needs a real operator approval a delegated act cannot supply",
+				Consumes:     consumesApprovalSlot,
+				Reason:       "if the gate is a human-quorum approval gate, cast your own approval, then re-invoke fishhawk_drive_run",
+			},
+		}}
 	case strings.HasPrefix(state, "plan_"):
 		return &NextActions{State: state, Actions: []SuggestedAction{{
 			Action:       "fishhawk_approve_plan",

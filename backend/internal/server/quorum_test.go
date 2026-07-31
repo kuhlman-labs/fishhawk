@@ -475,6 +475,172 @@ func approvalSubmittedEntry(subject, payload string) *audit.Entry {
 	}
 }
 
+// TestEffectiveApprovalSubject pins the #2381 remap: a delegated approval by a
+// human-kind subject is recorded under the distinct operator-agent delegated
+// identity, while an already-agent subject (the campaign driver) and every
+// non-delegated approval are returned UNCHANGED.
+func TestEffectiveApprovalSubject(t *testing.T) {
+	cases := []struct {
+		name      string
+		subject   string
+		delegated bool
+		want      string
+	}{
+		{"delegated human -> synthetic", "brett@local-mcp", true, operatorrole.DelegatedApprovalActorSubject},
+		{"non-delegated human -> unchanged", "brett@local-mcp", false, "brett@local-mcp"},
+		{"delegated campaign agent -> unchanged", operatorrole.CampaignActorSubject, true, operatorrole.CampaignActorSubject},
+		{"delegated synthetic agent -> unchanged", operatorrole.DelegatedApprovalActorSubject, true, operatorrole.DelegatedApprovalActorSubject},
+		{"non-delegated agent -> unchanged", operatorrole.CampaignActorSubject, false, operatorrole.CampaignActorSubject},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := effectiveApprovalSubject(tc.subject, tc.delegated); got != tc.want {
+				t.Errorf("effectiveApprovalSubject(%q, %v) = %q, want %q", tc.subject, tc.delegated, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDelegatedApproverSubjects_SyntheticSubjectExcludedOnce pins that recording
+// a delegated approval under the distinct operator-agent delegated subject
+// (#2381) keeps the operator's own subject out of the delegated set — so the
+// human's real approve counts exactly once — while the synthetic row is excluded
+// twice over (the agent floor AND the delegated set).
+func TestDelegatedApproverSubjects_SyntheticSubjectExcludedOnce(t *testing.T) {
+	const operator = "brett@local-mcp"
+	runID := uuid.New()
+	stageID := uuid.New()
+	repo := newFakeApprovalRepo()
+	repo.all = append(repo.all,
+		&approval.Approval{StageID: stageID, ApproverSubject: operatorrole.DelegatedApprovalActorSubject, Decision: approval.DecisionApprove},
+		&approval.Approval{StageID: stageID, ApproverSubject: operator, Decision: approval.DecisionApprove},
+	)
+	au := &resolveChangeAuthorFake{entries: []*audit.Entry{
+		approvalSubmittedEntry(operatorrole.DelegatedApprovalActorSubject, `{"delegated":"clean_dual_approval"}`),
+		approvalSubmittedEntry(operator, `{}`),
+	}}
+	s := New(Config{ApprovalRepo: repo, AuditRepo: au})
+
+	del := s.delegatedApproverSubjects(context.Background(), runID)
+	if _, ok := del[operatorrole.DelegatedApprovalActorSubject]; !ok {
+		t.Errorf("delegated set missing the synthetic subject: %v", del)
+	}
+	if _, ok := del[operator]; ok {
+		t.Errorf("delegated set contains the human subject %q; the human's real approve must be countable: %v", operator, del)
+	}
+	subjects := s.distinctEligibleApproverSubjects(context.Background(), runID, stageID, "", false)
+	if len(subjects) != 1 || subjects[0] != operator {
+		t.Errorf("distinctEligibleApproverSubjects = %v, want exactly [%q] (human once, synthetic excluded)", subjects, operator)
+	}
+}
+
+// gatedLegacySpecYAML is a v0 workflow whose plan gate uses the LEGACY
+// `approvers` role allow-list (no forge-neutral approvals block) and declares no
+// escalations — the one gate a delegated approve still advances byte-for-byte.
+const gatedLegacySpecYAML = `version: "0.7"
+roles:
+  tech_lead:
+    members: ["@org/tech-leads"]
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvers:
+              any_of: [tech_lead]
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestDelegatedApproveWouldAdvance walks the four DECLINE modes plus the single
+// ADVANCE case of the #2381 may_approve pre-check. Modes (c)/(d) are defensive
+// fail-closed branches: escalations exist only in workflow-v2, where an approval
+// gate ALWAYS carries an approvals block, so a block-less gate with a firing (or
+// unevaluable) escalation cannot arise on a real APPROVAL gate — they are
+// exercised here on a stage that carries no approval gate while a workflow-level
+// escalation is declared, mirroring approveStageAs's own nil-block escalation
+// posture (#2374).
+func TestDelegatedApproveWouldAdvance(t *testing.T) {
+	newStage := func(runRow *run.Run, typ run.StageType) *run.Stage {
+		return &run.Stage{ID: uuid.New(), RunID: runRow.ID, Type: typ}
+	}
+
+	t.Run("(a) approvals block present -> decline", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		s := escGateServer(rr, au, ar)
+		runRow := escGateRun(t, "", nil) // no escalations; the plan gate carries approvals count:1
+		plan := newStage(runRow, run.StageTypePlan)
+		rr.seed(runRow, plan)
+		advance, reason := s.delegatedApproveWouldAdvance(context.Background(), plan)
+		if advance {
+			t.Fatalf("advance = true on an approvals-block gate; want a decline")
+		}
+		if !strings.Contains(reason, "counted") {
+			t.Errorf("reason = %q, want a recorded-but-never-counted explanation", reason)
+		}
+	})
+
+	t.Run("(b) approvals requirement unreadable -> fail-closed decline", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		s := escGateServer(rr, au, ar)
+		runRow := &run.Run{ID: uuid.New(), WorkflowID: "feature_change"} // no cached spec -> fetch error
+		plan := newStage(runRow, run.StageTypePlan)
+		rr.seed(runRow, plan)
+		if advance, _ := s.delegatedApproveWouldAdvance(context.Background(), plan); advance {
+			t.Fatal("advance = true when the approvals requirement is unreadable; want a fail-closed decline")
+		}
+	})
+
+	t.Run("(c) block-less gate + firing escalation -> decline", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		s := escGateServer(rr, au, ar)
+		runRow := escGateRun(t, escGatePathsBlock, nil)
+		plan := newStage(runRow, run.StageTypePlan)
+		impl := newStage(runRow, run.StageTypeImplement) // implement stage declares NO approval gate
+		rr.seed(runRow, plan, impl)
+		ar.seedPlan(t, plan.ID, escGatePlan("backend/internal/server/runs.go")) // matches -> escalation fires
+		if advance, _ := s.delegatedApproveWouldAdvance(context.Background(), impl); advance {
+			t.Fatal("advance = true on a block-less gate with a firing escalation; want a decline")
+		}
+	})
+
+	t.Run("(d) escalation unevaluable -> fail-closed decline", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		s := escGateServer(rr, au, ar)
+		runRow := escGateRun(t, escGatePathsBlock, nil)
+		plan := newStage(runRow, run.StageTypePlan)
+		impl := newStage(runRow, run.StageTypeImplement)
+		rr.seed(runRow, plan, impl)
+		// No plan artifact seeded: a paths-bearing escalation cannot be evaluated,
+		// so resolveStageEscalations errors -> fail-closed decline.
+		if advance, _ := s.delegatedApproveWouldAdvance(context.Background(), impl); advance {
+			t.Fatal("advance = true when the escalation is unevaluable; want a fail-closed decline")
+		}
+	})
+
+	t.Run("genuine legacy no-approvals, no-escalation gate -> advance", func(t *testing.T) {
+		rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+		s := escGateServer(rr, au, ar)
+		runRow := &run.Run{ID: uuid.New(), WorkflowID: "feature_change", WorkflowSpec: []byte(gatedLegacySpecYAML), TriggerSource: run.TriggerCLI}
+		plan := newStage(runRow, run.StageTypePlan)
+		rr.seed(runRow, plan)
+		if advance, reason := s.delegatedApproveWouldAdvance(context.Background(), plan); !advance {
+			t.Fatalf("advance = false on a genuine legacy gate; want advance (reason %q)", reason)
+		}
+	})
+}
+
 func TestPredicateSnapshotMarshaling(t *testing.T) {
 	reached := &predicateSnapshot{
 		CountRequired:  2,

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 )
 
 // drive_run_test.go pins the fishhawk_drive_run loop (#1700) per-stop-mode
@@ -929,6 +932,208 @@ func TestDriveRun_DecisionRequired_FixupBudgetExhausted(t *testing.T) {
 	}
 	if len(rec.list()) != 0 {
 		t.Errorf("a spawn happened on a decision_required stop: %v", rec.list())
+	}
+}
+
+// TestDriveRun_HumanQuorumRequired_StopsWithApproveAction is the #2381 driver
+// pin AND the client-decode + driver-stop half of the constant round trip: the
+// gate returns decision_required/human_quorum_required, and the loop STOPS with
+// that reason, carries a next_actions roster naming fishhawk_approve_plan
+// (consuming the operator's now-free approval slot), and spawns nothing.
+func TestDriveRun_HumanQuorumRequired_StopsWithApproveAction(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{
+			DecisionRequired: true,
+			DecisionState:    operatorrole.DecisionStateHumanQuorumRequired,
+			Action:           "approve",
+			Note:             "human quorum required",
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+operatorrole.DecisionStateHumanQuorumRequired {
+		t.Fatalf("stopped_reason = %q, want decision_required:human_quorum_required", out.StoppedReason)
+	}
+	if out.StoppedReason == stoppedGateError {
+		t.Fatal("human_quorum_required must not collapse into gate_error")
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("human_quorum_required stop carried no next_actions")
+	}
+	// fishhawk_approve_plan must be present and consume the (now-free) approval slot.
+	var approve *SuggestedAction
+	for i := range out.NextActions.Actions {
+		if out.NextActions.Actions[i].Action == "fishhawk_approve_plan" {
+			approve = &out.NextActions.Actions[i]
+		}
+	}
+	if approve == nil {
+		t.Fatalf("next_actions did not name fishhawk_approve_plan: %v", actionNameList(out.NextActions.Actions))
+	}
+	if approve.Consumes != consumesApprovalSlot {
+		t.Errorf("fishhawk_approve_plan consumes = %q, want %q", approve.Consumes, consumesApprovalSlot)
+	}
+	if len(rec.list()) != 0 {
+		t.Errorf("a spawn happened on a human_quorum_required stop: %v", rec.list())
+	}
+}
+
+// TestAutoDriveOutcome_WireTagParity is the #2381 single test that spans the
+// server-emit → client-decode seam binding condition 1 asked for. A runtime
+// handler→client-model round trip in ONE process is architecturally
+// impossible here: the server's autoDriveResponse lives in package
+// internal/server, the client's AutoDriveOutcome lives in package main
+// (cmd/fishhawk-mcp) and so cannot be imported by a server test, and the
+// server's auto-drive harness is unexported test-only code over the large
+// run.Repository, so a mcp-side test cannot drive the real handler to a
+// human-quorum decline without reproducing it wholesale. The load-bearing
+// handoff is a json struct TAG, which Go cannot express as a shared const
+// symbol at all. So the two sides share the VALUE via the operatorrole
+// constants (referenced by the server emitter AND the driver's compare) and
+// share the FIELD NAME via this source-read parity test — condition 1's
+// stated fallback when the two sides genuinely cannot share a symbol.
+//
+// It reads both struct definitions from source and asserts the decision_state
+// and decision_required json field names are byte-identical across the two
+// structs AND equal the wire literals the constant round trip rides on. This
+// is the one failure the composition otherwise misses: population is already
+// pinned server-side (TestAutoDriveHTTP_HumanQuorumGate_DecisionRequired
+// decodes the REAL handler's body and asserts DecisionState ==
+// operatorrole.DecisionStateHumanQuorumRequired — the handler leaving it empty
+// fails there) and read is pinned client-side
+// (TestDriveRun_HumanQuorumRequired_StopsWithApproveAction), but each side
+// decodes through its OWN struct, so a tag rename on either side would ship
+// green. It fails HERE.
+func TestAutoDriveOutcome_WireTagParity(t *testing.T) {
+	const (
+		serverSrc = "../../internal/server/autodrive_http.go" // autoDriveResponse
+		clientSrc = "client.go"                               // AutoDriveOutcome
+	)
+	for _, tc := range []struct {
+		field     string
+		wireField string
+	}{
+		{"DecisionRequired", "decision_required"},
+		{"DecisionState", "decision_state"},
+	} {
+		serverTag := jsonFieldName(t, serverSrc, tc.field)
+		clientTag := jsonFieldName(t, clientSrc, tc.field)
+		if serverTag != clientTag {
+			t.Errorf("%s json field name diverged across the emit/decode seam: server=%q client=%q — a wire-tag split silently drops the outcome to the decoder's zero value and the driver never stops", tc.field, serverTag, clientTag)
+		}
+		if serverTag != tc.wireField {
+			t.Errorf("%s server json field name = %q, want wire literal %q", tc.field, serverTag, tc.wireField)
+		}
+		if clientTag != tc.wireField {
+			t.Errorf("%s client json field name = %q, want wire literal %q", tc.field, clientTag, tc.wireField)
+		}
+	}
+}
+
+// jsonFieldName reads goSrc and returns the json field NAME (the part before
+// any comma-separated option) declared on the struct field named field. It
+// fails the test if the field or its json tag is absent, so a field renamed or
+// stripped of its json tag surfaces here rather than as a silent empty string.
+func jsonFieldName(t *testing.T, goSrc, field string) string {
+	t.Helper()
+	src, err := os.ReadFile(goSrc)
+	if err != nil {
+		t.Fatalf("read %s: %v", goSrc, err)
+	}
+	re := regexp.MustCompile("(?m)^\\s*" + regexp.QuoteMeta(field) + "\\s+\\S+\\s+`json:\"([^\",]+)")
+	m := re.FindSubmatch(src)
+	if m == nil {
+		t.Fatalf("no json-tagged field %q found in %s", field, goSrc)
+	}
+	return string(m[1])
+}
+
+// TestDriveRun_RepeatedActedGate_BoundedByNoProgress pins FIX 2's driver leg: a
+// gate that keeps returning acted:true on an UNCHANGING run/stage fixture (a
+// repeated no-op act) is bounded — the loop stops at
+// decision_required:delegated_act_no_progress after EXACTLY
+// driveNoProgressThreshold gate calls, the direct pin on the ~160-act regression,
+// instead of running to max_minutes.
+func TestDriveRun_RepeatedActedGate_BoundedByNoProgress(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	// acted:true for the SAME action while the fixture never changes -> identical
+	// signature across gate calls -> no progress.
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Acted: true, Action: "route_fixup", Note: "no-op act"}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != "decision_required:"+driveDelegatedActNoProgress {
+		t.Fatalf("stopped_reason = %q, want decision_required:delegated_act_no_progress", out.StoppedReason)
+	}
+	if f.gateCalls != driveNoProgressThreshold {
+		t.Errorf("gate calls = %d, want exactly %d (the ~160-act regression pin)", f.gateCalls, driveNoProgressThreshold)
+	}
+	if out.NextActions == nil || len(out.NextActions.Actions) == 0 {
+		t.Fatal("no-progress stop carried no next_actions")
+	}
+}
+
+// TestDriveRun_ActedGateThatChangesState_KeepsDriving is the non-firing control:
+// an acted gate that genuinely CHANGES the run/stage signature (a legitimate
+// route_fixup/retry) resets the no-progress counter and keeps driving past the
+// threshold — it is NOT mistaken for a no-op act.
+func TestDriveRun_ActedGateThatChangesState_KeepsDriving(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_approval", 1),
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome {
+		return AutoDriveOutcome{Acted: true, Action: "route_fixup", Note: "real progress"}
+	}
+	// Each poll flips the plan stage's recorded state (implement stays
+	// awaiting_approval so the gate is still reached), so consecutive acted-gate
+	// signatures DIFFER; after several acts the run settles terminal.
+	f.onStages = func(f *driveFakeBackend) {
+		// ALWAYS flip the plan stage's state by parity so consecutive acted-gate
+		// signatures differ (the no-progress guard must reset each time); settle
+		// the run terminal after several acts (seen at the next iteration's top).
+		if f.gateCalls >= 4 {
+			f.runState = "succeeded"
+		}
+		if f.gateCalls%2 == 1 {
+			f.stages[0].State = "blocked"
+		} else {
+			f.stages[0].State = "succeeded"
+		}
+	}
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason == "decision_required:"+driveDelegatedActNoProgress {
+		t.Fatalf("a state-changing acted gate was mislabeled no-progress after %d gate calls", f.gateCalls)
+	}
+	if f.gateCalls <= driveNoProgressThreshold {
+		t.Errorf("gate calls = %d, want > %d (the loop kept driving past the threshold on changing signatures)", f.gateCalls, driveNoProgressThreshold)
 	}
 }
 
