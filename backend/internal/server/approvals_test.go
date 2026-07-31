@@ -7064,6 +7064,131 @@ func TestApproveStageAs_FetchError_EscalationFiring_DoesNotAdvance(t *testing.T)
 	})
 }
 
+// autoDriveEscalatedSpecYAML renders the workflow-v2 document the campaign
+// cross-boundary test drives: `approve: {mode: auto}` so the auto-driver
+// reaches its may_approve arm, plus the #2374 bypass shape — a baseline
+// carrying `member_of` under a firing COUNT-ONLY escalation.
+//
+// withPlanStage is the whole trick. The document WITH the plan stage seeds the
+// run's two stage rows at create time; swapping the run's cached spec to the
+// document WITHOUT it leaves the plan stage ROW in place (so gatedReviewStage
+// still finds it awaiting approval) while fetchApprovalsForStage now errors
+// with "stage_type \"plan\" not in workflow" — the unreadable baseline. The
+// workflow-level escalation is declared in both, so it still fires off the
+// swapped bytes.
+func autoDriveEscalatedSpecYAML(withPlanStage bool) string {
+	planStage := `      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+            - provider: codex
+          human: 1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              member_of: acme/platform
+`
+	if !withPlanStage {
+		planStage = ""
+	}
+	return `version: "2"
+workflows:
+  feature_change:
+    actions:
+      approve:
+        mode: auto
+        when: clean_dual_approval
+    escalations:
+      - match:
+          trigger: [diff]
+        require:
+          approvals:
+            count: 2
+    stages:
+` + planStage + `      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+        produces:
+          - artifact: pull_request
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              member_of: acme/platform
+`
+}
+
+// TestAutoDriveRunGate_Approve_FetchError_EscalationFiring_HoldsGate is the
+// CROSS-BOUNDARY assertion for binding condition 1 (#2374). The sibling
+// subtest above calls approveStageAs directly with campaign-shaped parameters,
+// which proves the control but not the ROUTE: it would still pass if
+// AutoDriveRunGate stopped dispatching through that arm, or performed a
+// further transition after the call returned. This drives the real
+// campaign auto-driver — delegation evaluation -> gate derivation ->
+// may_approve dispatch -> approveStageAs -> state transition — over a run
+// whose baseline approvals block is unreadable while an escalation fires, and
+// asserts BOTH halves: the driver DID reach its approve arm (out.Acted /
+// ActionApprove), and the gate is nonetheless still closed afterwards with no
+// stage or run state moved.
+func TestAutoDriveRunGate_Approve_FetchError_EscalationFiring_HoldsGate(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRunWithSpec(t, s, repo, autoDriveEscalatedSpecYAML(true))
+	plan, impl := stages[0], stages[1]
+	seedCleanPlanApproval(t, au, runID)
+
+	// Swap the cached spec for the plan-stage-less document: the stage ROW
+	// stays, its declaration does not.
+	runRow := getRun(t, repo, runID)
+	runRow.WorkflowSpec = []byte(autoDriveEscalatedSpecYAML(false))
+	runStateBefore, implStateBefore := runRow.State, impl.State
+
+	// Sanity: this fixture really is the ferr != nil ∧ escReq non-zero
+	// divergence, not an accidentally-readable gate that would make the
+	// assertions below vacuous.
+	if _, ferr := s.fetchApprovalsForStage(context.Background(), plan); ferr == nil {
+		t.Fatal("fetchApprovalsForStage did not error; the fixture does not exercise the unreadable-baseline branch")
+	}
+	escReq, escErr := s.resolveStageEscalations(context.Background(), plan)
+	if escErr != nil || escReq.IsZero() {
+		t.Fatalf("escalation did not fire (err %v, req %+v); the fixture would prove the wrong branch", escErr, escReq)
+	}
+
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	// Half one: the driver genuinely routed through the may_approve arm. A
+	// regression that stopped dispatching approve here would leave the gate
+	// closed too, and every assertion below would pass for the wrong reason.
+	if !out.Acted || out.Action != delegation.ActionApprove {
+		t.Fatalf("outcome = %+v, want acted approve — the test must reach the approve arm to prove anything about it", out)
+	}
+	// Half two: the gate is still closed, and nothing else moved either.
+	if plan.State != run.StageStateAwaitingApproval {
+		t.Fatalf("plan stage = %q, want still awaiting_approval — the campaign auto-driver cleared an escalated gate on an unreadable baseline", plan.State)
+	}
+	if impl.State != implStateBefore {
+		t.Errorf("implement stage = %q, want unchanged %q (no transition beyond the held gate)", impl.State, implStateBefore)
+	}
+	if got := getRun(t, repo, runID); got.State != runStateBefore {
+		t.Errorf("run state = %q, want unchanged %q", got.State, runStateBefore)
+	}
+	// The vote is recorded and attributed to the campaign actor, so the
+	// held gate is auditable rather than silent.
+	assertOperatorActor(t, auditEntry(t, au, "approval_submitted"))
+}
+
 // withEscalationApprover injects a DISTINCT operator identity so the second
 // approval counts as a second distinct eligible approver toward the escalated
 // quorum. (withAuth's identity is fixed, and runs_fake_test.go is another
