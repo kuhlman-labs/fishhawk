@@ -3,7 +3,14 @@
 The Fishhawk MCP tool library — the `fishhawk_*` tool registry, its onboarding
 resources, and the API client they call. Extracted verbatim from the
 `fishhawk-mcp` command (E66.7 / [#2408](https://github.com/kuhlman-labs/fishhawk/issues/2408), [ADR-076](https://github.com/kuhlman-labs/fishhawk/issues/2388)) so `fishhawkd` can serve the identical
-registry over its own `/mcp` route ([#2390](https://github.com/kuhlman-labs/fishhawk/issues/2390)) without re-implementing every tool. The
+registry over its own `/mcp` route ([#2390](https://github.com/kuhlman-labs/fishhawk/issues/2390)) without re-implementing every tool. That route has
+since LANDED: `backend/cmd/fishhawkd` wires `NewServer` into the route's
+`server.MCPServerFactory` seam, which calls it once per `/mcp` request bound to
+that request's bearer — making fishhawkd the SECOND live consumer of this
+package alongside the stdio binary. The seam exists because
+`backend/internal/server` must NOT import this package: these in-package tests
+drive a real `server.New` (`campaign_test.go`), so that edge would close an
+import cycle in THIS package's test binary. The
 [`fishhawk-mcp` binary](../../cmd/fishhawk-mcp/README.md) keeps its import path and build target; it now imports this
 package and calls `NewServer` to construct the same fully-registered server it
 built inline before. This is a behaviour-preserving relocation: no route, no
@@ -12,8 +19,8 @@ instructions, and embedded runbook resource are byte-identical before and after.
 
 ## Entry points
 
-Three exported identifiers are the intended surface (`#2390` consumes only the
-first two):
+Three exported identifiers are the intended surface (fishhawkd's `/mcp` route
+consumes only the first two):
 
 - **`Config{BackendURL, APIToken}`** — the construction input: the backend base
   URL every tool calls and the bearer token the API client authenticates with.
@@ -24,8 +31,9 @@ first two):
 - **`NewServer(Config) *mcp.Server`** — builds a fully-registered server: the
   empty shell (`buildServer`), every `fishhawk_*` tool (`registerTools`), and
   the onboarding runbook resource (`registerOnboardingResources`). The single
-  cross-package construction path the binary and, in #2390, fishhawkd's `/mcp`
-  route both use.
+  cross-package construction path both live consumers use: the stdio binary
+  (once at startup) and fishhawkd's `/mcp` route (once per request, via the
+  injected `server.MCPServerFactory`, #2390).
 - **`Instructions`** — the server `instructions` string advertised on the MCP
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.

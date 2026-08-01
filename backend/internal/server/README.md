@@ -1212,3 +1212,193 @@ A workflow-v2 stage may declare a `permissions` block (`network` / `write` / `sh
 
 - **Run-status read.** `GET /v0/runs/{run_id}` carries a `permissions` array (`runStagePermissionsPayload`), one entry per stage declaring a `permissions`/`egress` block, populated by `handleGetRun` ONLY via `buildStagePermissionsSurface` (same single-read spec-projection posture as `review_authority`; NOT suppressed on a terminal run). Omitted (nil, `omitempty`) when the run has no cached spec, the spec fails to parse, or no stage declares either block — so a run declaring none stays byte-identical. Each entry's `enforced` flag is the HONEST per-entry qualifier: **true only for an acceptance stage's network declaration** (whose allow-list the runner's default-deny egress proxy enforces today), false everywhere else and for write/shell always — a blanket `enforced:false` would lie for the one place the control is real.
 - **Once-per-run audit.** `CreateRunForTrigger` emits ONE `stage_permissions_declared` entry at creation (best-effort, warn-logged — a legibility surface never fails run creation) when any stage declares a block; the payload carries a feature-level `enforced:false` + `enforcement_tracked_by:"#2133"` plus the same per-stage entries. `buildStagePermissionsPayloads` is shared by both surfaces so the read and the audit cannot describe one declaration differently.
+
+## MCP surface on fishhawkd (`mcproute.go`, ADR-076 slice 2 / E66.2 #2390)
+
+`POST/GET/DELETE /mcp` serves the Fishhawk MCP tool registry over the
+streamable-HTTP transport, on fishhawkd's own listener, inside the ordinary
+middleware chain. The registry comes from `mcpserver.NewServer` — the same call
+`backend/cmd/fishhawk-mcp` makes — so there is ONE tool-registration path and no
+second registry to drift. The stdio binary is untouched by this route and
+remains the headless/CI path.
+
+### Why the registry is INJECTED, not imported
+
+This package does NOT import `backend/internal/mcpserver`. It declares a
+`MCPServerFactory func(backendURL, apiToken string) *mcp.Server` seam on
+`Config`, and `backend/cmd/fishhawkd` — which already imports both — wires
+`mcpserver.NewServer` into it.
+
+The reason is a hard constraint, not a style preference: `mcpserver`'s
+IN-PACKAGE tests drive a real `server.New` (see
+`backend/internal/mcpserver/campaign_test.go`), so an import edge from here to
+`mcpserver` closes an import cycle in `mcpserver`'s TEST binary. `go build`
+stays green and `go test ./internal/mcpserver/...` fails with `import cycle not
+allowed in test` — a failure mode a plain build check does not surface. Only the
+direction of the reference changed; there is still exactly one registration path.
+
+A nil factory is a named failure, not a nil dereference: the route answers `503
+mcp_route_misconfigured` naming the unwired seam, diagnosed BEFORE any address
+work because an unwired deployment cannot serve the route at any address.
+
+### Refusal ladder (`resolveMCPRouteState` → `handleMCP`)
+
+Evaluated in this order. The ordering is load-bearing, not cosmetic: the
+malformed-address diagnosis PRECEDES the loopback predicate, because a loopback
+check that ran first would swallow every unparseable address into a 403 and
+leave the 503 branch unreachable.
+
+| # | Condition | Response |
+|---|---|---|
+| 1 | `MCPRoute` normalizes to `off` | `404 route_not_found` |
+| 2 | no `MCPServerFactory` wired | `503 mcp_route_misconfigured` (names the unwired seam) |
+| 3 | `net.SplitHostPort(Addr)` fails | `503 mcp_route_misconfigured` (names the unparseable address) |
+| 4 | listener host cannot be classified (DNS failure / no addresses) | `503 mcp_route_misconfigured` |
+| 5 | listener host is not loopback | `403 mcp_route_loopback_only` (ADR-033) |
+| 6 | `MCPSelfURL` is set but is not a loopback base URL | `503 mcp_route_misconfigured` (names the bearer-forwarding risk) |
+| 7 | no bearer identity on the request | `401 authentication_required` |
+| — | otherwise | delegate to the streamable handler |
+
+The verdict is computed ONCE at `New()` from the immutable `Config` and stored
+on the `Server`. It is a pure function of that config, and resolving it per
+request would put a blocking DNS lookup on every `/mcp` call with a resolver
+outage intermittently flipping a serving route to 403.
+
+### Why stateless (and what it costs)
+
+`newMCPHandler` passes `StreamableHTTPOptions{Stateless: true}`. In go-sdk
+v1.6.1 (`mcp/streamable.go`) the handler's `sessions` map is written only on the
+non-stateless branch — the `if stateless { defer session.Close() } else { …save
+the transport… }` split after `server.Connect` — so the `h.sessions[sessionID]`
+lookup is always nil and `h.getServer(req)` runs on EVERY request. Per-request
+bearer binding therefore becomes literally true: the token authorizing a tool
+call is provably the token on the request that triggered it, and there is no
+session registry to leak, GC, or hijack.
+
+The alternative — a stateful handler plus a hand-rolled session registry — was
+rejected on evidence rather than taste. The SDK's own session-hijacking guard
+keys on `auth.TokenInfoFromContext`, and `tokenInfoKey` is UNEXPORTED with no
+exported setter (`auth/auth.go`), so only the SDK's own
+`auth.RequireBearerToken` middleware can populate it — and that middleware emits
+its own plain-text 401, conflicting with this route's standard-envelope,
+no-new-auth-code requirement. Doing it ourselves would mean response-header
+capture plus expiry GC: strictly more code and more failure modes.
+
+The honest cost, since #2390 originally required all three transport legs and
+was AMENDED to withdraw that requirement: a stateless server holds no session to
+stream from or tear down, so `GET` answers the spec-prescribed `405` with
+`Allow: POST` and `DELETE` is a `204` no-op. All three method patterns are still
+registered so no leg falls through to a 404 that would misreport a disabled
+route. In-request notifications — the progress heartbeats the long-running tools
+emit — are NOT lost: they ride the POST response's own stream, which stateless
+preserves, and `TestMCPRoute_InRequestProgressNotification` drives a real tool
+call with a `progressToken` over `POST /mcp` and asserts one arrives. Slice 3
+(#2391) revisits the mode if a tool ever needs sampling, elicitation, or
+subscriptions.
+
+### Derived, IP-pinned self URL
+
+The tools reach data by dialling fishhawkd's own REST API, so the route needs a
+base URL to hand them. There is deliberately NO `--mcp-self-url` flag: the value
+is DERIVED from the already-loopback-validated listener, so no operator-settable
+knob can aim the round-trip — and every caller's raw bearer — off-host.
+`Config.MCPSelfURL` survives as an embedder/test seam only (an httptest server
+picks its own port) and goes through the same loopback predicate.
+
+The derived URL is always built from a RESOLVED loopback IP literal, never a
+hostname. Validating a hostname at construction while STORING the hostname would
+leave the HTTP client to re-resolve it at call time, so a DNS record changed
+after startup would send every caller's bearer off-host — defeating the refusal
+this design claims. `net.JoinHostPort` does the assembly so an IPv6 literal
+comes out bracketed (`[::1]:8080` → `http://[::1]:8080`, not the unparseable
+`http://::1:8080`).
+
+An `MCPSelfURL` whose scheme is `https` and whose host is a HOSTNAME is REFUSED
+(`503`), because pinning and TLS cannot both hold: the rewrite hands the client
+an IP literal, so the handshake verifies against a certificate issued for a name
+the dialled host no longer carries. That shape would validate at construction
+and then fail EVERY tool call in the handshake, so it is diagnosed once at
+`New()` instead of continuously at call time. `https` with an IP LITERAL is
+still accepted — nothing is rewritten, so a certificate carrying that IP SAN
+verifies normally.
+
+### The listener binds the pinned IP too (`listenAddr`, `verifyMCPListenerLoopback`)
+
+Pinning only the self URL leaves the same resolution-to-use gap on the side that
+protects the ENTIRE surface. `resolveMCPRouteState` classifies `Config.Addr` at
+`New()`, but the bind happens later in `Start`; handing `net.Listen` the
+original hostname lets it re-resolve, so a DNS record changed in between binds
+the bare-bearer tool surface to an off-host interface while the route still
+reports itself loopback-only.
+
+So an enabled route also pins the BIND address: `mcpRouteState.listenAddr` is
+`Config.Addr` with the host replaced by the resolved loopback literal, and
+`Start` binds that. The classified address and the bound address are then the
+same address by construction. Every other verdict leaves `listenAddr` empty and
+`Start` binds `Config.Addr` verbatim, so a deployment that does not serve the
+route binds exactly what it always did.
+
+`Start` creates the listener explicitly (rather than via `ListenAndServe`) so
+`verifyMCPListenerLoopback` can compare the address actually bound against the
+verdict before a single request is served. Pinning should make that check
+unreachable; it is enforced anyway because the failure it guards is serving the
+whole bare-bearer tool surface off-host, so a contradiction fails closed on the
+ENTIRE listener — `Start` returns an error naming
+`FISHHAWKD_ADDR=127.0.0.1:8080` / `--mcp-route=off` rather than serving REST
+with an exposed `/mcp`. `net.Listener.Addr` is always a resolved literal, so no
+DNS runs on that path either.
+
+An EMPTY listener host is reported NON-loopback and is deliberately not clamped
+to `127.0.0.1`. `net.Listen` documents that an empty or unspecified host listens
+on every available unicast address, so by the time the route resolves, fishhawkd
+has already bound all interfaces — the opposite of
+`backend/cmd/fishhawk-mcp/http_transport.go`'s `validateLoopbackAddr`, which may
+clamp because it controls its own bind. The operator-visible consequence is that
+the shipped `FISHHAWKD_ADDR` default `:8080` draws the 403 until it is set to
+`127.0.0.1:8080`; that is named in the flag help, the 403 message, and the
+`fishhawkd` README.
+
+### Auth, CSRF, and privilege parity
+
+The route requires a BEARER identity — non-anonymous AND carrying a `TokenID`.
+Both `fhk_` and `fhm_` are accepted with no special-casing. A cookie session is
+refused `401`, and that refusal is what makes the `csrfExemptPath` entry for
+`/mcp` safe: a browser cookie session can never reach the tool surface, so
+exempting the path cannot open a browser-driven CSRF path onto it.
+
+`bearerAuth` resolves an absent OR invalid bearer to the anonymous Identity and
+falls through rather than rejecting, so the 401 is emitted by `handleMCP` itself
+through the shared `writeError` envelope — no new auth code. It also means a
+MISSING header and an UNKNOWN token are indistinguishable to the handler and
+deliberately share one message; discriminating them would leak token validity.
+
+Because each tool authenticates by calling this same REST API with the caller's
+token, a tool call is exactly as privileged as the equivalent REST call,
+including its denials.
+
+### Streaming seam
+
+`statusRecorder` (in `middleware.go`) declares `Unwrap() http.ResponseWriter`.
+`http.ResponseController` reaches a wrapped writer only through that convention,
+and the go-sdk flushes SSE through it; without `Unwrap`, every `/mcp` response
+would buffer until the handler returned. The SDK ignores the `Flush` error, so
+this is a streaming-latency fix rather than a correctness one — the response is
+identical either way, it just arrives all at once.
+
+### Known cost, accepted
+
+Constructing a full `mcpserver.NewServer` per request pays every tool's
+registration (including jsonschema reflection) on each call, and each tool call
+additionally costs one loopback HTTP round-trip. Both are accepted for a
+loopback single-operator endpoint. A token-keyed server cache is deliberately
+NOT added: it would reintroduce exactly the shared-server confusion the
+per-request binding exists to prevent. If it proves material under slice 3's
+remote posture, a cache with an explicit eviction contract is the follow-up, not
+a silent one.
+
+Host-side tools reached through the route (`fishhawk_run_stage`,
+`fishhawk_dispatch_stage`, `fishhawk_run_children`, `fishhawk_drive_run`) spawn
+the runner on the fishhawkd host and forward the CALLER's token in the child
+environment. Under the loopback-only default that host is the operator's own
+machine, so dogfood behaviour is unchanged — but both facts become live
+questions the moment slice 3 admits a remote client.

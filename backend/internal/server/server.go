@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -557,6 +558,43 @@ type Config struct {
 	// behaves identically before and after.
 	HandoffSecret string
 
+	// MCPRoute controls the bearer-authenticated MCP surface mounted at
+	// POST/GET/DELETE /mcp (ADR-076 slice 2, #2390). "on" (the zero value
+	// normalizes to on) serves it; "off" makes all three methods answer 404
+	// and is the operator's explicit opt-out for a deployment that binds a
+	// non-loopback address on purpose. Wired from --mcp-route /
+	// FISHHAWKD_MCP_ROUTE in serve.go, which rejects any other value at
+	// startup rather than degrading silently.
+	MCPRoute string
+
+	// MCPSelfURL is the base URL the per-request MCP tool client calls back
+	// on. It is an EMBEDDER/TEST SEAM WITH NO CLI FLAG: production always
+	// leaves it empty and takes the value derived from the already-loopback-
+	// validated listener, so no operator-settable knob can aim the loopback
+	// round-trip — and every caller's raw bearer — off-host. An httptest
+	// server picks its own port, which is the case this exists for. When it
+	// IS set it goes through the same loopback predicate as the listener and
+	// is rewritten to the resolved loopback IP; a non-loopback value refuses
+	// the route with 503 rather than forwarding the bearer. An https URL
+	// naming a HOSTNAME is refused for the same reason at the same moment:
+	// the rewrite would leave TLS negotiating against a certificate issued
+	// for a name the dialled IP literal does not carry, so it would validate
+	// at construction and fail every tool call in the handshake.
+	MCPSelfURL string
+
+	// MCPServerFactory builds the per-request MCP tool server the /mcp route
+	// serves (ADR-076 / #2390). REQUIRED to enable the route: nil leaves it
+	// answering 503 mcp_route_misconfigured, because there is no tool registry
+	// to serve. serve.go wires mcpserver.NewServer; the indirection exists
+	// because a direct import would close an import cycle in mcpserver's own
+	// test binary — see the MCPServerFactory doc comment in mcproute.go.
+	MCPServerFactory MCPServerFactory
+
+	// mcpLookupIP is the DNS seam resolveMCPRouteState uses to classify a
+	// hostname listen address / self URL. Unexported so only this package's
+	// tests can inject it; nil means net.LookupIP.
+	mcpLookupIP func(string) ([]net.IP, error)
+
 	// RegionPinner stamps accounts.home_region from a verified handoff. Nil,
 	// or a pinner whose cell region is unset, disables the pin surface on the
 	// same fail-closed terms as an empty HandoffSecret. Constructed by
@@ -676,6 +714,19 @@ type Server struct {
 	// prior process. Stamped once at New from Config.ProcessStart (default
 	// time.Now()); never mutated after construction.
 	processStart time.Time
+
+	// mcpRoute is the /mcp route verdict, resolved ONCE at New() from the
+	// immutable Config (ADR-076 / #2390). handleMCP reads it per request;
+	// it is never recomputed, so no request pays a DNS lookup and a
+	// resolver outage cannot intermittently flip the route to 403.
+	mcpRoute mcpRouteState
+
+	// mcpHandler is the streamable-HTTP handler backing /mcp, built once
+	// at New() when mcpRoute.mode is mcpRouteEnabled and nil otherwise —
+	// handleMCP's ladder returns before dereferencing it in every other
+	// mode. The per-request tool registry (and its bearer binding) is
+	// constructed inside the handler's getServer factory, not here.
+	mcpHandler http.Handler
 
 	// reconcileRecomputeAuditComplete lets a test observe the
 	// audit-complete republish ReconcileOrphanedReviews fires after healing an
@@ -798,6 +849,13 @@ func New(cfg Config) *Server {
 			s.issueNotifier = issuecomment.NewRouter(ghChannel)
 		}
 	}
+	// Resolve the /mcp route verdict before the mux is built (ADR-076 /
+	// #2390). Doing it here rather than per request keeps the DNS lookup a
+	// hostname listen address needs off the request path entirely.
+	s.mcpRoute = resolveMCPRouteState(cfg, cfg.mcpLookupIP)
+	if s.mcpRoute.mode == mcpRouteEnabled {
+		s.mcpHandler = newMCPHandler(s.mcpRoute, cfg.MCPServerFactory, cfg.Logger)
+	}
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildHandler(),
@@ -812,12 +870,42 @@ func (s *Server) Handler() http.Handler {
 	return s.http.Handler
 }
 
+// listenAddr is the address Start binds. It is Config.Addr verbatim in
+// every posture EXCEPT an enabled /mcp route, where it is that address with
+// the host replaced by the loopback IP resolveMCPRouteState resolved at
+// New(). Handing net.Listen the original HOSTNAME there would let the bind
+// re-resolve it, so a DNS record changed between New() and Start could put
+// the bare-bearer tool surface on an off-host interface the route still
+// believes is loopback (ADR-033).
+func (s *Server) listenAddr() string {
+	if s.mcpRoute.mode == mcpRouteEnabled && s.mcpRoute.listenAddr != "" {
+		return s.mcpRoute.listenAddr
+	}
+	return s.cfg.Addr
+}
+
 // Start begins serving on the configured address. It blocks until
 // Shutdown is called or the listener errors. http.ErrServerClosed
 // is reported as a clean shutdown, not an error.
+//
+// The listener is created explicitly rather than by ListenAndServe so the
+// address actually BOUND can be checked against the /mcp route verdict
+// before a request is served. Binding the pinned literal above should make
+// that check unreachable; it is enforced anyway because the alternative
+// failure is serving the whole bare-bearer tool surface off-host, so a
+// contradiction fails closed on the entire listener rather than being served.
 func (s *Server) Start() error {
-	s.cfg.Logger.Info("fishhawkd listening", slog.String("addr", s.cfg.Addr))
-	if err := s.http.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	addr := s.listenAddr()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	if err := verifyMCPListenerLoopback(s.mcpRoute, ln.Addr()); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	s.cfg.Logger.Info("fishhawkd listening", slog.String("addr", ln.Addr().String()))
+	if err := s.http.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("listen: %w", err)
 	}
 	return nil
@@ -901,6 +989,11 @@ func (s *Server) resolveRepoScope(ctx context.Context, owner, name string) (forg
 // state-changing methods on session-cookie-authed requests. It
 // runs after bearerAuth so it can branch on the resolved Identity:
 // bearer tokens and anonymous requests bypass the check.
+//
+// The /mcp route (ADR-076 / #2390) sits INSIDE this same chain — it is
+// authenticated by the same bearerAuth pass as every REST route and is
+// csrf-exempt because it is a non-cookie, non-browser JSON-RPC transport
+// whose handler independently refuses any cookie-session identity.
 func (s *Server) buildHandler() http.Handler {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)

@@ -3555,6 +3555,38 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    MCPLoopbackOnly:
+      description: |
+        The MCP route is loopback-only per ADR-033 and this daemon listens
+        on an address reachable off-host (`error: mcp_route_loopback_only`,
+        `details.listen_host` naming the rejected host). Set
+        `FISHHAWKD_ADDR=127.0.0.1:8080` to enable the route, or
+        `--mcp-route=off` to disable it explicitly.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    MCPRouteDisabled:
+      description: |
+        The MCP route is disabled on this deployment
+        (`error: route_not_found`, from `--mcp-route=off` /
+        `FISHHAWKD_MCP_ROUTE=off`). Distinct from an unrouted path: the
+        code is explicit so a client can tell "turned off" from "not built".
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    MCPRouteMisconfigured:
+      description: |
+        The MCP route cannot be served safely
+        (`error: mcp_route_misconfigured`): no tool-server factory is wired,
+        the listen address is not a valid `host:port`, a hostname could not
+        be classified, or an embedder-supplied self URL is not a loopback
+        base URL — serving would forward every caller's bearer off-host — or
+        is `https://` with a hostname, which cannot survive being pinned to
+        its resolved IP and would fail TLS on every tool call. The message
+        carries the specific diagnosis.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
     RepoForbidden:
       description: |
         `error: repo_forbidden` — the caller is a workspace member in good
@@ -3603,6 +3635,133 @@ security:
   - bearerToken: []
 
 paths:
+  # ---------------------------------------------------------------------
+  # MCP tool surface — bearer-authenticated, loopback-only (ADR-076)
+  # ---------------------------------------------------------------------
+  /mcp:
+    post:
+      operationId: postMCP
+      summary: MCP streamable-HTTP endpoint (client-to-server messages)
+      description: |
+        Serves the Fishhawk MCP tool registry over the streamable-HTTP
+        transport, mounted on fishhawkd's own listener (ADR-076 slice 2,
+        #2390). The request body is a JSON-RPC message per the MCP
+        specification, not a Fishhawk-defined schema; the response is
+        `text/event-stream` (or `application/json`), so the body is
+        deliberately unmodelled here. Clients must send
+        `Content-Type: application/json` and an `Accept` header containing
+        BOTH `application/json` and `text/event-stream`.
+
+        Three legs are registered — POST (client-to-server messages), GET
+        (the server-to-client stream) and DELETE (session termination) — so
+        every leg reaches this handler's refusal ladder rather than a bare
+        404. The handler runs the SDK in STATELESS mode, which binds each
+        tool call to the bearer on the request that triggered it; the cost
+        is that GET answers 405 and DELETE is a 204 no-op (see those
+        operations).
+
+        Refusal ladder, in order: route disabled (`--mcp-route=off`) →
+        `404 route_not_found`; no tool-server factory wired, the listen
+        address is unparseable, or an embedder-supplied self URL is not
+        loopback → `503 mcp_route_misconfigured`; the daemon listens on a
+        non-loopback address → `403 mcp_route_loopback_only` (ADR-033); no
+        bearer identity → `401 authentication_required`. A cookie session is
+        NOT accepted — the route is bearer-only, which is what makes its CSRF
+        exemption safe.
+
+        Tool calls carry exactly the privilege of the equivalent REST call:
+        each tool reaches data by calling this same API with the caller's
+        token, so a denial there is the denial here. Clients present a
+        Fishhawk bearer token; spec-compliant OAuth is slice 3 (#2391).
+      security:
+        - bearerToken: []
+      tags: [mcp]
+      requestBody:
+        required: true
+        description: A JSON-RPC request, notification, or batch per the MCP specification.
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: |
+            The JSON-RPC response, streamed as server-sent events (or
+            returned as JSON). No `Mcp-Session-Id` response header is
+            emitted: stateless mode establishes no reusable session.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          description: |
+            Malformed JSON-RPC body, an unsupported `MCP-Protocol-Version`
+            header, or — unreachable through the ladder above — a request
+            the tool-server factory declined to build.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/MCPLoopbackOnly' }
+        '404': { $ref: '#/components/responses/MCPRouteDisabled' }
+        '415':
+          description: '`Content-Type` was not `application/json`.'
+        '503': { $ref: '#/components/responses/MCPRouteMisconfigured' }
+    get:
+      operationId: getMCP
+      summary: MCP standalone event stream (not offered)
+      description: |
+        Registered so the leg reaches the refusal ladder, but a stateless
+        server holds no session to stream from. When the route is enabled
+        and the caller is authenticated, this answers `405 Method Not
+        Allowed` with `Allow: POST` — the streamable-HTTP specification's
+        prescribed response for a server that does not offer the standalone
+        stream. In-request notifications (progress heartbeats from
+        long-running tools) still reach the client on the POST response's
+        own stream. Slice 3 (#2391) revisits the transport mode if a tool
+        ever needs sampling, elicitation, or subscriptions.
+      security:
+        - bearerToken: []
+      tags: [mcp]
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/MCPLoopbackOnly' }
+        '404': { $ref: '#/components/responses/MCPRouteDisabled' }
+        '405':
+          description: |
+            No standalone event stream is offered. Carries `Allow: POST`
+            per RFC 9110 section 15.5.6.
+          headers:
+            Allow:
+              schema:
+                type: string
+                example: POST
+        '503': { $ref: '#/components/responses/MCPRouteMisconfigured' }
+    delete:
+      operationId: deleteMCP
+      summary: MCP session termination (no-op)
+      description: |
+        Registered so the leg reaches the refusal ladder. A stateless
+        server holds no session to tear down, so an authenticated request
+        carrying an `Mcp-Session-Id` header succeeds as a no-op.
+      security:
+        - bearerToken: []
+      tags: [mcp]
+      responses:
+        '204':
+          description: Accepted; nothing was torn down because no session was held.
+        '400':
+          description: The `Mcp-Session-Id` header was absent.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/MCPLoopbackOnly' }
+        '404': { $ref: '#/components/responses/MCPRouteDisabled' }
+        '503': { $ref: '#/components/responses/MCPRouteMisconfigured' }
+
   # ---------------------------------------------------------------------
   # Liveness — public, unversioned
   # ---------------------------------------------------------------------
@@ -11919,3 +12078,5 @@ tags:
     description: Endpoints called by the fishhawk/runner GitHub Action.
   - name: webhooks
     description: Inbound from GitHub App installations.
+  - name: mcp
+    description: MCP tool surface served over streamable HTTP (ADR-076).

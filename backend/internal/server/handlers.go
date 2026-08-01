@@ -25,6 +25,24 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// below are left as-is. The tier of each write route encodes the
 	// operator's admin-vs-member founder decision, visible here for review.
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	// The MCP surface (ADR-076 slice 2, #2390). All three streamable-HTTP
+	// legs are registered — POST (client->server messages), GET (the
+	// server->client stream) and DELETE (session termination) — so every
+	// leg lands on handleMCP and its refusal ladder rather than falling
+	// through to a bare 404 that would misreport a disabled route.
+	//
+	// The route is bearer-authenticated and loopback-only per ADR-033
+	// until slice 3 (#2391) adds spec-OAuth. Honest consequence of the
+	// stateless transport mode this handler uses (see newMCPHandler): GET
+	// answers the SDK's spec-legal 405 with `Allow: POST` and DELETE is a
+	// 204 no-op, because a stateless server holds no session to stream
+	// from or tear down. #2390 was amended to withdraw the standalone-SSE
+	// and session-teardown requirement — the per-request bearer binding
+	// stateless makes literal is the more important property, and no
+	// registered fishhawk_* tool issues a server->client request today.
+	mux.HandleFunc("POST /mcp", s.handleMCP)
+	mux.HandleFunc("GET /mcp", s.handleMCP)
+	mux.HandleFunc("DELETE /mcp", s.handleMCP)
 	mux.HandleFunc("GET /v0/runs", s.handleListRuns)
 	mux.HandleFunc("POST /v0/runs", s.handleCreateRun)
 	mux.HandleFunc("GET /v0/runs/{run_id}", s.requireRunAccount(readAccess, s.handleGetRun))

@@ -699,3 +699,57 @@ func TestEnforceAccount_NoMirror_Unchanged(t *testing.T) {
 		t.Fatalf("status = %d reached = %v, want 200 / true", rec.Code, reached)
 	}
 }
+
+// TestStatusRecorder_UnwrapEnablesFlush pins the streaming seam (#2390).
+//
+// http.ResponseController reaches a wrapped ResponseWriter ONLY through the
+// `Unwrap() http.ResponseWriter` convention. Without statusRecorder.Unwrap,
+// Flush returns http.ErrNotSupported for every response that passes through
+// the logging middleware — including the SSE stream the /mcp streamable-HTTP
+// transport writes, whose bytes would then buffer until the handler returned.
+//
+// The test drives a REAL listener rather than httptest.NewRecorder: the
+// recorder does not implement Flush at all, so it could not distinguish a
+// working Unwrap from a missing one.
+func TestStatusRecorder_UnwrapEnablesFlush(t *testing.T) {
+	if got := (&statusRecorder{ResponseWriter: httptest.NewRecorder()}).Unwrap(); got == nil {
+		t.Fatal("Unwrap returned nil")
+	}
+
+	var flushErr error
+	var flushed bool
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "event: ping\ndata: 1\n\n")
+		flushErr = http.NewResponseController(w).Flush()
+		flushed = true
+	})
+
+	// The full production chain, in buildHandler's order.
+	s := New(Config{Addr: "127.0.0.1:0"})
+	var h http.Handler = inner
+	h = s.csrf(h)
+	h = s.bearerAuth(nil, nil, nil)(h)
+	h = logging(slog.New(slog.NewTextHandler(io.Discard, nil)))(h)
+	h = requestID(h)
+	h = recovery(slog.Default())(h)
+
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/stream")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !flushed {
+		t.Fatal("handler did not run")
+	}
+	if flushErr != nil {
+		t.Fatalf("Flush through the full middleware chain failed: %v — statusRecorder is not unwrappable, "+
+			"so every /mcp SSE response would buffer until the handler returned", flushErr)
+	}
+}

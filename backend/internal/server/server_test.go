@@ -886,3 +886,28 @@ func TestWebhookGitLab_FullStack_CSRFExempt(t *testing.T) {
 		t.Fatalf("status = %d, want 202 (routed + CSRF-exempt); body=%s", resp.StatusCode, b)
 	}
 }
+
+// TestNewServer_MCPRouteStateFromZeroConfig pins the zero-value default:
+// New() applies the ":8080" Addr default, which is NOT loopback, so a
+// literally-zero Config must yield the 403 posture rather than an enabled
+// route. An explicit loopback Addr yields the derived, enabled state.
+func TestNewServer_MCPRouteStateFromZeroConfig(t *testing.T) {
+	zero := New(Config{MCPServerFactory: testMCPServerFactory})
+	if zero.mcpRoute.mode != mcpRouteNotLoopback {
+		t.Errorf("zero Config mode = %v, want mcpRouteNotLoopback (the :8080 default binds all interfaces)", zero.mcpRoute.mode)
+	}
+	if zero.mcpHandler != nil {
+		t.Error("zero Config built an MCP handler for a route that refuses every request")
+	}
+
+	loopback := New(Config{Addr: "127.0.0.1:8080", MCPServerFactory: testMCPServerFactory})
+	if loopback.mcpRoute.mode != mcpRouteEnabled {
+		t.Fatalf("loopback mode = %v, want mcpRouteEnabled", loopback.mcpRoute.mode)
+	}
+	if loopback.mcpRoute.selfURL != "http://127.0.0.1:8080" {
+		t.Errorf("selfURL = %q, want the derived http://127.0.0.1:8080", loopback.mcpRoute.selfURL)
+	}
+	if loopback.mcpHandler == nil {
+		t.Error("an enabled route has no handler")
+	}
+}

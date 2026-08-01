@@ -6,6 +6,23 @@ Stdio **session-survival supervisor** for the [`fishhawk-mcp`](../fishhawk-mcp/)
 
 Claude Code owns the MCP server subprocess and does **not** reconnect a restarted stdio server. A `scripts/dev reload` that rebuilds `fishhawk-mcp` leaves the live session pointed at the old binary until the operator runs `/mcp` by hand (see [ADR-021 gotcha](../fishhawk-mcp/README.md) and the dev-loop reconnect banner). The shim closes that gap: it sits between the client and `fishhawk-mcp`, watches the child binary for a rebuild, and hot-swaps it under the live session so the tool set refreshes with no manual reconnect.
 
+## Scope: the STDIO path only (ADR-076 slice 2 / #2390)
+
+The shim supervises the **stdio** `fishhawk-mcp` child. It has nothing to do
+with fishhawkd's `/mcp` route, which serves the same tool registry over
+streamable HTTP on fishhawkd's own listener.
+
+A client connected to `/mcp` needs no reconnect-after-rebuild dance: a
+`scripts/dev reload` restarts `fishhawkd` itself, and the client reconnects to
+the same URL, so there is no long-lived subprocess holding stale code the way
+the harness-owned stdio child does. (Claude Code will not re-establish a dropped
+HTTP MCP connection on its own either — that is a client-side gap, not a stale
+binary, and is E66's concern rather than the shim's.)
+
+The `childTransport` seam mentioned below is what would let a future phase point
+the shim at that HTTP upstream instead of a stdio child; nothing in #2390
+changes the shim.
+
 ## How it works
 
 The shim spawns `fishhawk-mcp` as a child over pipes and passes newline-delimited JSON-RPC frames **byte-verbatim** in both directions. It parses only (a) the client's `initialize` request (recorded with the child's response) and (b) message ids, for in-flight request tracking.

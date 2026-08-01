@@ -176,6 +176,21 @@ func (s *statusRecorder) WriteHeader(code int) {
 	s.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap exposes the wrapped ResponseWriter to http.ResponseController,
+// which reaches a wrapped writer ONLY through this convention. Without
+// it, Flush/SetWriteDeadline/etc. return http.ErrNotSupported for every
+// response that passes through the logging middleware — including the
+// SSE stream the /mcp streamable-HTTP transport writes (#2390), whose
+// bytes would then buffer until the handler returned.
+//
+// The go-sdk ignores the Flush error, so this is a streaming-LATENCY
+// fix, not a correctness one: the response is identical either way, it
+// just arrives all at once. Strictly additive, and it unblocks any
+// future streaming endpoint on the same terms.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 // logging emits one structured log line per request after the handler
 // returns. Fields: method, path, status, duration_ms, request_id.
 func logging(logger *slog.Logger) func(http.Handler) http.Handler {

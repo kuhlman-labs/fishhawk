@@ -53,6 +53,13 @@ func TestCSRFExemptPath(t *testing.T) {
 		"/v0/auth/gitlab/callback",
 		"/webhooks/github",
 		"/webhooks/gitlab",
+		// The MCP surface (ADR-076 / #2390): a bearer-authenticated,
+		// non-cookie JSON-RPC transport. handleMCP independently refuses
+		// any cookie-session identity with 401, so the exemption cannot
+		// become a browser-driven CSRF path onto the tool surface —
+		// asserted end-to-end by
+		// TestMCPRoute_CookieSessionReachesHandlerNotCSRF.
+		"/mcp",
 	}
 	for _, p := range exempt {
 		if !csrfExemptPath(p) {
@@ -64,6 +71,10 @@ func TestCSRFExemptPath(t *testing.T) {
 		"/v0/auth/logout",
 		"/v0/runs",
 		"/v0/stages/abc/approvals",
+		// Exact match only: a sibling path must not inherit the /mcp
+		// exemption.
+		"/mcp/tools",
+		"/v0/mcp",
 	}
 	for _, p := range notExempt {
 		if csrfExemptPath(p) {
