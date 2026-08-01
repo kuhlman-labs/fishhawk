@@ -144,18 +144,19 @@ var surfacePatterns = []surfacePattern{
 		// #873/#867: registering or removing a fishhawk_* MCP tool in
 		// tools.go must move in lockstep with tools_test.go — whose
 		// TestToolDescriptions_ConformToHouseStyle hardcodes
-		// wantToolCount = 16 (plus the when/eligibility-leading house-style
+		// wantToolCount = 45 (plus the when/eligibility-leading house-style
 		// assertion) and red-lines verify if the count drifts — and with
-		// README.md, the human-facing MCP tool listing. tools.go is the
+		// README.md, the tool library's tool listing. tools.go is the
 		// trigger only (not a sibling): the pattern fires when the
 		// registration file is in scope but a coupled file is missing.
+		// Retargeted to backend/internal/mcpserver by E66.7 / #2408.
 		Name: "mcp tool registration requires count test + readme",
 		Triggers: []string{
-			"backend/cmd/fishhawk-mcp/tools.go",
+			"backend/internal/mcpserver/tools.go",
 		},
 		Siblings: []string{
-			"backend/cmd/fishhawk-mcp/tools_test.go",
-			"backend/cmd/fishhawk-mcp/README.md",
+			"backend/internal/mcpserver/tools_test.go",
+			"backend/internal/mcpserver/README.md",
 		},
 	},
 	// #1077: a canonical docs/spec/*.schema.json edited without its

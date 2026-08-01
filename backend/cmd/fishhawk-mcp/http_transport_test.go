@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 )
 
 func TestValidateLoopbackAddr(t *testing.T) {
@@ -164,15 +166,12 @@ func (b bearerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 // asserts a bearer-less client is rejected.
 func TestServeHTTP_RoundTrip(t *testing.T) {
 	const token = "tok_roundtrip"
-	cfg := config{backendURL: "http://localhost:8080", apiToken: token}
+	// Build through the extracted cross-package entry point mcpserver.NewServer
+	// (E66.7 / #2408) — the same construction path main.go's newServer now uses
+	// — so this seam test exercises the binary->package boundary and the
+	// onboarding resource still crosses the registration->transport seam.
 	newServer := func() *mcp.Server {
-		srv := buildServer(cfg)
-		registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFunc(nil)})
-		// Mirror production's construction path (main.go newServer) so this
-		// test does not diverge from it — the onboarding resource must cross
-		// the registration->transport seam on the HTTP transport too.
-		registerOnboardingResources(srv)
-		return srv
+		return mcpserver.NewServer(mcpserver.Config{BackendURL: "http://localhost:8080", APIToken: token})
 	}
 
 	// Bind a loopback listener up front so we know the port and can run
@@ -251,15 +250,15 @@ func TestServeHTTP_RoundTrip(t *testing.T) {
 		}
 		found := false
 		for _, r := range list.Resources {
-			if r.URI == runbookURI {
+			if r.URI == "fishhawk://runbook" {
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("HTTP ListResources did not include %s (resource did not cross the transport seam)", runbookURI)
+			t.Fatalf("HTTP ListResources did not include %s (resource did not cross the transport seam)", "fishhawk://runbook")
 		}
 
-		res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: runbookURI})
+		res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "fishhawk://runbook"})
 		if err != nil {
 			t.Fatalf("ReadResource over HTTP: %v", err)
 		}

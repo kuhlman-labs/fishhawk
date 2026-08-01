@@ -385,6 +385,17 @@ _detect_rebuild_set() {
         if [[ -z "${rebuild_set[fishhawk-runner]:-}" ]]; then rebuild_set[fishhawk-runner]="$f"; fi
         if [[ -z "${rebuild_set[fishhawk]:-}" ]];        then rebuild_set[fishhawk]="$f"; fi
         ;;
+      # The extracted MCP tool library (E66.7 / #2408) feeds BOTH fishhawkd
+      # (which will serve it over /mcp, #2390) and fishhawk-mcp (which imports
+      # it). This arm MUST precede the `backend/internal/*` arm below —
+      # first-match-wins, and that broader arm marks only fishhawkd, so an arm
+      # after it would never fire and an mcpserver edit would silently skip the
+      # fishhawk-mcp rebuild. Do NOT `return`, so a later shim path in the same
+      # diff still marks the shim.
+      backend/internal/mcpserver/*)
+        if [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]]; then rebuild_set[fishhawkd]="$f"; fi
+        if [[ -z "${rebuild_set[fishhawk-mcp]:-}" ]];    then rebuild_set[fishhawk-mcp]="$f"; fi
+        ;;
       backend/cmd/fishhawkd/*|backend/internal/*)
         if [[ "${rebuild_set[fishhawkd]}" == "__baseline__" ]]; then rebuild_set[fishhawkd]="$f"; fi
         ;;
@@ -502,7 +513,7 @@ _diff_touches_mcp() {
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     case "$f" in
-      backend/cmd/fishhawk-mcp/*|backend/internal/plan/*|backend/internal/spec/*)
+      backend/cmd/fishhawk-mcp/*|backend/internal/mcpserver/*|backend/internal/plan/*|backend/internal/spec/*)
         return 0
         ;;
     esac
