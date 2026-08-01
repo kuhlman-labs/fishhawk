@@ -239,6 +239,175 @@ func TestResolveMCPRouteState_PinsResolvedLoopbackIP(t *testing.T) {
 	}
 }
 
+// TestResolveMCPRouteState_PinsListenAddr is the listener half of the same
+// resolution-to-use gap: pinning only the self URL leaves net.Listen to
+// re-resolve the HOSTNAME in Config.Addr at Start, so a DNS record changed
+// between New() and Start would bind the bare-bearer tool surface to an
+// off-host interface the route still classifies as loopback.
+//
+// The end-to-end companion — Start actually binding the pinned literal — is
+// TestMCPRoute_StartBindsPinnedLoopbackIP below.
+func TestResolveMCPRouteState_PinsListenAddr(t *testing.T) {
+	st := resolveMCPRouteState(
+		Config{Addr: "flipflop.test:8080", MCPServerFactory: testMCPServerFactory},
+		loopbackLookup)
+	if st.mode != mcpRouteEnabled {
+		t.Fatalf("mode = %v, want mcpRouteEnabled", st.mode)
+	}
+	if st.listenAddr != "127.0.0.1:8080" {
+		t.Fatalf("listenAddr = %q, want the pinned 127.0.0.1:8080", st.listenAddr)
+	}
+	if strings.Contains(st.listenAddr, "flipflop.test") {
+		t.Errorf("listenAddr retained the hostname %q — net.Listen would re-resolve it at bind time", st.listenAddr)
+	}
+
+	// An IPv6 loopback literal must stay bracketed, or the bind address is
+	// unparseable.
+	v6 := resolveMCPRouteState(
+		Config{Addr: "[::1]:8080", MCPServerFactory: testMCPServerFactory}, nil)
+	if v6.listenAddr != "[::1]:8080" {
+		t.Errorf("ipv6 listenAddr = %q, want [::1]:8080", v6.listenAddr)
+	}
+}
+
+// TestMCPRoute_ListenAddrUntouchedWhenRouteNotServed asserts the pinning is
+// confined to a served route: a deployment the route refuses (or has
+// switched off) must bind EXACTLY the address it configured, so this change
+// cannot move a non-MCP deployment's listener.
+func TestMCPRoute_ListenAddrUntouchedWhenRouteNotServed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"non-loopback listener (403)", Config{Addr: "0.0.0.0:8080"}},
+		{"route off", Config{Addr: "127.0.0.1:8080", MCPRoute: "off"}},
+		{"default empty host", Config{Addr: ":8080"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := mcpTestServer(t, tc.cfg)
+			if s.mcpRoute.mode == mcpRouteEnabled {
+				t.Fatalf("mode = %v; this case is supposed to NOT serve the route", s.mcpRoute.mode)
+			}
+			if got := s.listenAddr(); got != tc.cfg.Addr {
+				t.Errorf("listenAddr() = %q, want the configured %q untouched", got, tc.cfg.Addr)
+			}
+		})
+	}
+}
+
+// TestMCPRoute_StartBindsPinnedLoopbackIP drives the REAL bind: Config.Addr
+// names a hostname whose injected resolver answers loopback at construction
+// and TEST-NET-3 (203.0.113.9, assignable on no interface) afterwards.
+//
+// If Start handed net.Listen the hostname, the bind would re-resolve and
+// fail with "cannot assign requested address" — and in production it would
+// instead bind whatever the new record named, exposing the bare-bearer tool
+// surface off-host behind a route that still reported itself loopback-only.
+// A clean bind on the pinned literal is the proof.
+func TestMCPRoute_StartBindsPinnedLoopbackIP(t *testing.T) {
+	var mu sync.Mutex
+	construction := true
+	lookup := func(string) ([]net.IP, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if construction {
+			construction = false
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		}
+		return []net.IP{net.ParseIP("203.0.113.9")}, nil
+	}
+
+	s, _ := mcpTestServer(t, Config{Addr: "flipflop.test:0", mcpLookupIP: lookup})
+	if s.mcpRoute.mode != mcpRouteEnabled {
+		t.Fatalf("mode = %v (reason %q), want mcpRouteEnabled", s.mcpRoute.mode, s.mcpRoute.reason)
+	}
+	if got := s.listenAddr(); got != "127.0.0.1:0" {
+		t.Fatalf("listenAddr() = %q, want the pinned 127.0.0.1:0", got)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+
+	// Shutdown is safe whether or not Serve has begun — a server already
+	// shutting down makes Serve return ErrServerClosed, which Start reports
+	// as a clean stop. What it cannot mask is the BIND: Start calls
+	// net.Listen before Serve either way, so a re-resolving bind surfaces as
+	// a non-nil Start error here.
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start = %v; the bind re-resolved the hostname instead of using the pinned loopback literal", err)
+	}
+
+	// Prove the record really did flip, so the assertion above is about
+	// pinning rather than a resolver that never changed.
+	after, _ := lookup("flipflop.test")
+	if len(after) != 1 || after[0].IsLoopback() {
+		t.Fatalf("post-construction lookup = %v, want a single non-loopback address", after)
+	}
+}
+
+// stringAddr is a net.Addr whose String() is whatever the test needs —
+// including a value net.SplitHostPort cannot parse, which no real
+// net.TCPAddr produces.
+type stringAddr string
+
+func (stringAddr) Network() string  { return "tcp" }
+func (a stringAddr) String() string { return string(a) }
+
+// TestVerifyMCPListenerLoopback pins the bind-time assertion. It is the last
+// line of the loopback-only enforcement: if the address actually bound ever
+// disagrees with the verdict resolved at New(), the whole listener fails
+// closed rather than serving a bare-bearer tool surface off-host.
+func TestVerifyMCPListenerLoopback(t *testing.T) {
+	enabled := mcpRouteState{mode: mcpRouteEnabled, listenAddr: "127.0.0.1:8080"}
+	tests := []struct {
+		name    string
+		state   mcpRouteState
+		bound   net.Addr
+		wantErr string // empty => want nil
+	}{
+		{name: "ipv4 loopback", state: enabled, bound: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}},
+		{name: "ipv6 loopback", state: enabled, bound: &net.TCPAddr{IP: net.ParseIP("::1"), Port: 8080}},
+		{
+			name: "public bind refuses", state: enabled,
+			bound:   &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 8080},
+			wantErr: "reachable off-host",
+		},
+		{
+			name: "unspecified bind refuses", state: enabled,
+			bound:   &net.TCPAddr{IP: net.IPv4zero, Port: 8080},
+			wantErr: "reachable off-host",
+		},
+		{name: "unparseable bind refuses", state: enabled, bound: stringAddr("nonsense"), wantErr: "not a valid host:port"},
+		{name: "nil addr refuses", state: enabled, wantErr: "no address"},
+		// Every non-enabled verdict already refuses at the handler, so the
+		// listener carries no MCP surface to protect and must not be gated.
+		{name: "route off ignores the bind", state: mcpRouteState{mode: mcpRouteOff},
+			bound: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 8080}},
+		{name: "non-loopback verdict ignores the bind", state: mcpRouteState{mode: mcpRouteNotLoopback},
+			bound: &net.TCPAddr{IP: net.ParseIP("203.0.113.9"), Port: 8080}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyMCPListenerLoopback(tc.state, tc.bound)
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("err = nil, want a refusal mentioning %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("err = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestResolveMCPRouteState_SelfURLValidation tables pinLoopbackSelfURL through
 // resolveMCPRouteState: every rejected shape is a 503 diagnosis, and an
 // accepted one is rewritten to its resolved loopback IP.
@@ -251,7 +420,23 @@ func TestResolveMCPRouteState_SelfURLValidation(t *testing.T) {
 		wantMsg string // non-empty => expect mcpRouteMisconfigured mentioning this
 	}{
 		{name: "explicit loopback literal", selfURL: "http://127.0.0.1:7777", wantURL: "http://127.0.0.1:7777"},
-		{name: "https loopback", selfURL: "https://127.0.0.1:7777", wantURL: "https://127.0.0.1:7777"},
+		// https with an IP LITERAL rewrites nothing, so a certificate
+		// carrying that IP SAN still verifies — accepted.
+		{name: "https loopback literal", selfURL: "https://127.0.0.1:7777", wantURL: "https://127.0.0.1:7777"},
+		// https with a HOSTNAME is the construction-passes/every-call-fails
+		// shape: pinning replaces the name with an IP literal, so TLS would
+		// be negotiated against a certificate issued for a name the dialled
+		// host no longer carries. Refused at New(), not at handshake time.
+		{
+			name:    "https hostname is refused",
+			selfURL: "https://localhost:7777", lookup: loopbackLookup,
+			wantMsg: "would fail in the handshake",
+		},
+		{
+			name:    "https hostname without a port is refused",
+			selfURL: "https://mcp.internal", lookup: loopbackLookup,
+			wantMsg: "pinned to its resolved loopback address",
+		},
 		{name: "ipv6 loopback keeps its brackets", selfURL: "http://[::1]:7777", wantURL: "http://[::1]:7777"},
 		{name: "no port", selfURL: "http://127.0.0.1", wantURL: "http://127.0.0.1"},
 		{

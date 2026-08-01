@@ -3580,8 +3580,10 @@ components:
         (`error: mcp_route_misconfigured`): no tool-server factory is wired,
         the listen address is not a valid `host:port`, a hostname could not
         be classified, or an embedder-supplied self URL is not a loopback
-        base URL — serving would forward every caller's bearer off-host. The
-        message carries the specific diagnosis.
+        base URL — serving would forward every caller's bearer off-host — or
+        is `https://` with a hostname, which cannot survive being pinned to
+        its resolved IP and would fail TLS on every tool call. The message
+        carries the specific diagnosis.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }

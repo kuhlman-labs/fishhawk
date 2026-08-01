@@ -575,7 +575,11 @@ type Config struct {
 	// server picks its own port, which is the case this exists for. When it
 	// IS set it goes through the same loopback predicate as the listener and
 	// is rewritten to the resolved loopback IP; a non-loopback value refuses
-	// the route with 503 rather than forwarding the bearer.
+	// the route with 503 rather than forwarding the bearer. An https URL
+	// naming a HOSTNAME is refused for the same reason at the same moment:
+	// the rewrite would leave TLS negotiating against a certificate issued
+	// for a name the dialled IP literal does not carry, so it would validate
+	// at construction and fail every tool call in the handshake.
 	MCPSelfURL string
 
 	// MCPServerFactory builds the per-request MCP tool server the /mcp route
@@ -866,12 +870,42 @@ func (s *Server) Handler() http.Handler {
 	return s.http.Handler
 }
 
+// listenAddr is the address Start binds. It is Config.Addr verbatim in
+// every posture EXCEPT an enabled /mcp route, where it is that address with
+// the host replaced by the loopback IP resolveMCPRouteState resolved at
+// New(). Handing net.Listen the original HOSTNAME there would let the bind
+// re-resolve it, so a DNS record changed between New() and Start could put
+// the bare-bearer tool surface on an off-host interface the route still
+// believes is loopback (ADR-033).
+func (s *Server) listenAddr() string {
+	if s.mcpRoute.mode == mcpRouteEnabled && s.mcpRoute.listenAddr != "" {
+		return s.mcpRoute.listenAddr
+	}
+	return s.cfg.Addr
+}
+
 // Start begins serving on the configured address. It blocks until
 // Shutdown is called or the listener errors. http.ErrServerClosed
 // is reported as a clean shutdown, not an error.
+//
+// The listener is created explicitly rather than by ListenAndServe so the
+// address actually BOUND can be checked against the /mcp route verdict
+// before a request is served. Binding the pinned literal above should make
+// that check unreachable; it is enforced anyway because the alternative
+// failure is serving the whole bare-bearer tool surface off-host, so a
+// contradiction fails closed on the entire listener rather than being served.
 func (s *Server) Start() error {
-	s.cfg.Logger.Info("fishhawkd listening", slog.String("addr", s.cfg.Addr))
-	if err := s.http.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	addr := s.listenAddr()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	if err := verifyMCPListenerLoopback(s.mcpRoute, ln.Addr()); err != nil {
+		_ = ln.Close()
+		return err
+	}
+	s.cfg.Logger.Info("fishhawkd listening", slog.String("addr", ln.Addr().String()))
+	if err := s.http.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("listen: %w", err)
 	}
 	return nil

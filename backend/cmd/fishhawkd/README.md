@@ -40,6 +40,17 @@ Use `--mcp-route=off` as the explicit opt-out for a deployment that binds a
 non-loopback address on purpose — all three methods then answer
 `404 route_not_found`, which is distinguishable from an unrouted path.
 
+**A HOSTNAME `--addr` binds its resolved loopback IP, not the name.** When the
+route is served and `--addr` names a host (e.g. `localhost:8080`), the daemon
+binds the loopback IP that host resolved to at startup. Handing the name to
+`net.Listen` would re-resolve it at bind time, so a DNS record changed between
+startup and the bind could put the bare-bearer tool surface on an off-host
+interface the route still classified as loopback. If the bound address is
+somehow not loopback while the route is enabled, **fishhawkd refuses to serve at
+all** (naming `FISHHAWKD_ADDR=127.0.0.1:8080` / `--mcp-route=off`) rather than
+serving REST with an exposed `/mcp`. Every other verdict — route off, a
+non-loopback or unparseable address — binds `--addr` exactly as configured.
+
 `serve.go` wires `mcpserver.NewServer` into `server.Config.MCPServerFactory`;
 the route reaches the tool registry through that seam rather than importing the
 package (a direct import would close an import cycle in `mcpserver`'s own test

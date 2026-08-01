@@ -1313,6 +1313,41 @@ this design claims. `net.JoinHostPort` does the assembly so an IPv6 literal
 comes out bracketed (`[::1]:8080` → `http://[::1]:8080`, not the unparseable
 `http://::1:8080`).
 
+An `MCPSelfURL` whose scheme is `https` and whose host is a HOSTNAME is REFUSED
+(`503`), because pinning and TLS cannot both hold: the rewrite hands the client
+an IP literal, so the handshake verifies against a certificate issued for a name
+the dialled host no longer carries. That shape would validate at construction
+and then fail EVERY tool call in the handshake, so it is diagnosed once at
+`New()` instead of continuously at call time. `https` with an IP LITERAL is
+still accepted — nothing is rewritten, so a certificate carrying that IP SAN
+verifies normally.
+
+### The listener binds the pinned IP too (`listenAddr`, `verifyMCPListenerLoopback`)
+
+Pinning only the self URL leaves the same resolution-to-use gap on the side that
+protects the ENTIRE surface. `resolveMCPRouteState` classifies `Config.Addr` at
+`New()`, but the bind happens later in `Start`; handing `net.Listen` the
+original hostname lets it re-resolve, so a DNS record changed in between binds
+the bare-bearer tool surface to an off-host interface while the route still
+reports itself loopback-only.
+
+So an enabled route also pins the BIND address: `mcpRouteState.listenAddr` is
+`Config.Addr` with the host replaced by the resolved loopback literal, and
+`Start` binds that. The classified address and the bound address are then the
+same address by construction. Every other verdict leaves `listenAddr` empty and
+`Start` binds `Config.Addr` verbatim, so a deployment that does not serve the
+route binds exactly what it always did.
+
+`Start` creates the listener explicitly (rather than via `ListenAndServe`) so
+`verifyMCPListenerLoopback` can compare the address actually bound against the
+verdict before a single request is served. Pinning should make that check
+unreachable; it is enforced anyway because the failure it guards is serving the
+whole bare-bearer tool surface off-host, so a contradiction fails closed on the
+ENTIRE listener — `Start` returns an error naming
+`FISHHAWKD_ADDR=127.0.0.1:8080` / `--mcp-route=off` rather than serving REST
+with an exposed `/mcp`. `net.Listener.Addr` is always a resolved literal, so no
+DNS runs on that path either.
+
 An EMPTY listener host is reported NON-loopback and is deliberately not clamped
 to `127.0.0.1`. `net.Listen` documents that an empty or unspecified host listens
 on every available unicast address, so by the time the route resolves, fishhawkd

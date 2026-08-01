@@ -69,6 +69,19 @@ type mcpRouteState struct {
 	// loopback refusal so an operator can see what was rejected.
 	listenHost string
 
+	// listenAddr is the host:port Start BINDS when the route is enabled,
+	// with the host rewritten to the RESOLVED loopback IP for exactly the
+	// reason selfURL is: classifying a hostname at New() while handing the
+	// HOSTNAME to net.Listen leaves the bind to re-resolve it, so a DNS
+	// record changed between construction and Start would put the whole
+	// bare-bearer tool surface on an off-host interface that the route
+	// still believes is loopback. Binding the pinned literal makes the
+	// classified address and the bound address the same address by
+	// construction. Empty unless mode is mcpRouteEnabled — every other
+	// verdict leaves Config.Addr untouched, so a deployment that does not
+	// serve the route binds exactly what it always did.
+	listenAddr string
+
 	// reason is the human-readable diagnosis carried by the 503.
 	reason string
 }
@@ -188,10 +201,12 @@ func resolveMCPRouteState(cfg Config, lookupIP func(string) ([]net.IP, error)) m
 		return mcpRouteState{mode: mcpRouteNotLoopback, listenHost: host}
 	}
 
-	// Derive the self URL from the RESOLVED loopback IP. net.JoinHostPort
-	// brackets an IPv6 literal, which naive concatenation does not:
-	// "::1" + ":8080" would yield the unparseable "http://::1:8080".
-	selfURL := "http://" + net.JoinHostPort(resolved, port)
+	// Derive BOTH the bind address and the self URL from the RESOLVED
+	// loopback IP. net.JoinHostPort brackets an IPv6 literal, which naive
+	// concatenation does not: "::1" + ":8080" would yield the unparseable
+	// "http://::1:8080".
+	listenAddr := net.JoinHostPort(resolved, port)
+	selfURL := "http://" + listenAddr
 
 	if raw := strings.TrimSpace(cfg.MCPSelfURL); raw != "" {
 		pinned, perr := pinLoopbackSelfURL(raw, lookupIP)
@@ -206,7 +221,38 @@ func resolveMCPRouteState(cfg Config, lookupIP func(string) ([]net.IP, error)) m
 		selfURL = pinned
 	}
 
-	return mcpRouteState{mode: mcpRouteEnabled, selfURL: selfURL, listenHost: host}
+	return mcpRouteState{mode: mcpRouteEnabled, selfURL: selfURL, listenHost: host, listenAddr: listenAddr}
+}
+
+// verifyMCPListenerLoopback is the bind-time half of the loopback refusal:
+// resolveMCPRouteState classifies an address, Start binds one, and this
+// asserts they are the same kind of address before a single request is
+// served.
+//
+// state.listenAddr already pins the resolved IP literal, so this should be
+// unreachable — which is exactly why it is here. A gap between the
+// classified address and the bound one would expose the entire bare-bearer
+// tool surface off-host while the route reported itself healthy, so the
+// posture is fail-closed: Start refuses to serve at all rather than serving
+// REST with an off-host /mcp. bound comes from net.Listener.Addr, which is
+// always a resolved literal, so no DNS runs here.
+func verifyMCPListenerLoopback(state mcpRouteState, bound net.Addr) error {
+	if state.mode != mcpRouteEnabled {
+		return nil
+	}
+	if bound == nil {
+		return fmt.Errorf("the MCP route is enabled but the listener reported no address; refusing to serve a loopback-only tool surface (ADR-033) on an unverifiable listener")
+	}
+	host, _, err := net.SplitHostPort(bound.String())
+	if err != nil {
+		return fmt.Errorf("the MCP route is enabled but the bound listener address %q is not a valid host:port (%v); refusing to serve a loopback-only tool surface (ADR-033) on an unverifiable listener", bound.String(), err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return fmt.Errorf("the MCP route was classified loopback at startup but the listener bound %q, which is reachable off-host; "+
+			"refusing to serve the bare-bearer MCP tool surface beyond loopback (ADR-033) — set FISHHAWKD_ADDR=127.0.0.1:8080, or --mcp-route=off to disable the route explicitly", bound.String())
+	}
+	return nil
 }
 
 // pinLoopbackSelfURL validates an embedder-supplied self URL and rewrites
@@ -231,6 +277,22 @@ func pinLoopbackSelfURL(raw string, lookupIP func(string) ([]net.IP, error)) (st
 	}
 	if !ok {
 		return "", fmt.Errorf("host %q is not a loopback address", u.Hostname())
+	}
+	// An https URL naming a HOSTNAME cannot survive the pinning below, and
+	// the failure would land at the worst possible moment: construction
+	// reports the route healthy, then EVERY tool call dies in the TLS
+	// handshake, because the dialled host is now an IP literal while the
+	// certificate was issued for the hostname. Refuse it at New(), where
+	// the operator sees one diagnosis, instead of at call time where they
+	// see a stream of handshake errors. The refusal is narrow on purpose:
+	// https with an IP LITERAL rewrites nothing, so a certificate carrying
+	// that IP SAN still verifies and is left alone. It is checked AFTER the
+	// loopback verdict so a public https host keeps the sharper
+	// not-a-loopback-address diagnosis.
+	if u.Scheme == "https" && net.ParseIP(u.Hostname()) == nil {
+		return "", fmt.Errorf("scheme https with hostname %q cannot be served: the host is pinned to its resolved loopback address %s, "+
+			"so TLS would be negotiated against a certificate issued for %q and every tool call would fail in the handshake; "+
+			"use http://, or name the loopback IP literal the certificate covers", u.Hostname(), resolved, u.Hostname())
 	}
 	if p := u.Port(); p != "" {
 		u.Host = net.JoinHostPort(resolved, p)
