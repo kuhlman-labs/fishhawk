@@ -199,7 +199,32 @@ workflows:
           # category-B at 32 files on a plan the gate had approved with a
           # 32-file scope — the cap lagged real feature sizes. Plan-gate
           # coherence pre-check (scope.files vs this cap) tracked separately.
-          max_files_changed: 45
+          #
+          # TEMPORARY GOVERNED EXCEPTION, 45 -> 95 (2026-08-01, E66.7 / #2408).
+          # THE RESTORE TO 45 IS TRACKED BY #2416 — this raise is not permanent.
+          #
+          # E66.7 extracts the MCP tool library out of `package main` into
+          # backend/internal/mcpserver so fishhawkd can serve the same tool
+          # registry (ADR-076 / #2387). The change is COMPILE-ATOMIC and cannot
+          # be reduced: Go requires a method's receiver base type to be declared
+          # in the method's own package, and 43 files reference `runResolver`
+          # from tools.go, so every method-bearing file must move in ONE commit.
+          # A decomposition child inherits the same per-run cap, so splitting
+          # does not help either — proven, not assumed: the auto-filed split's
+          # lead phase was itself over cap (#2410/#2411, both closed; #2412).
+          #
+          # Why the spec had to change rather than a per-run override: an
+          # approval-time --override-scope-cap clears the PLAN gate's declared-
+          # scope pre-check but does NOT reach this implement-stage constraint,
+          # which re-evaluates the real diff after implement. Runs 1d94db6f and
+          # 7625f9e7 each produced a correct 86-file diff (77 renames + 6 edits
+          # + 3 adds) and were failed category-B here regardless. Defect: #2415.
+          #
+          # 95 leaves headroom over the measured 86. NOTE: while raised, the
+          # looser cap applies to EVERY feature_change run, not only #2408 —
+          # keep the window short and restore via #2416 as soon as the
+          # extraction merges.
+          max_files_changed: 95
           forbidden_paths:
             - ".github/workflows/**"
             - ".fishhawk/**"
