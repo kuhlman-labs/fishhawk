@@ -88,6 +88,31 @@ func TestHandleHealth_StartNonce(t *testing.T) {
 	}
 }
 
+// TestMCPRouteRegistered guards the route table: all three method-scoped
+// /mcp patterns must reach handleMCP. Driven with a NON-loopback listener so
+// the answer is the ladder's 403 — an UNREGISTERED method would instead 404
+// with the mux's default not-found body, which is distinguishable from both
+// the 403 and the route-off 404 (that one carries route_not_found).
+func TestMCPRouteRegistered(t *testing.T) {
+	s := New(Config{Addr: "0.0.0.0:8080", MCPServerFactory: testMCPServerFactory})
+	for _, m := range []string{http.MethodPost, http.MethodGet, http.MethodDelete} {
+		t.Run(m, func(t *testing.T) {
+			req := httptest.NewRequest(m, "/mcp", strings.NewReader("{}"))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Accept", "application/json, text/event-stream")
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (route reaches handleMCP's ladder):\n%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "mcp_route_loopback_only") {
+				t.Errorf("body = %s, want mcp_route_loopback_only (handleMCP reached)", rec.Body.String())
+			}
+		})
+	}
+}
+
 // TestReleaseNotesPreviewRouteRegistered guards the route table: GET
 // /v0/releases/notes/preview (#1587) must reach handleReleaseNotesPreview. The
 // anonymous request reaches the handler's auth ladder and returns 401 — an

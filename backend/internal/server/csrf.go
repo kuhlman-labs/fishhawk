@@ -98,6 +98,16 @@ func csrfExemptPath(p string) bool {
 	switch p {
 	case "/webhooks/github", "/webhooks/gitlab":
 		return true
+	// /mcp (ADR-076 / #2390) is a bearer-authenticated, non-cookie,
+	// non-browser JSON-RPC transport: the streamable-HTTP body carries no
+	// form encoding a browser could forge, and handleMCP independently
+	// REFUSES any cookie-session identity with 401 before the transport
+	// runs. So the exemption cannot become a browser-driven CSRF path onto
+	// the tool surface. Like the two webhook entries above it, this is
+	// belt-and-braces: the middleware's `id.SessionID == ""` bypass
+	// already lets bearer requests through.
+	case "/mcp":
+		return true
 	}
 	return false
 }

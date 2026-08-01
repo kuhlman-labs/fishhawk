@@ -2828,3 +2828,58 @@ func TestServeRegistersRepoACLTTLFlag(t *testing.T) {
 		t.Errorf("--repo-acl-ttl usage text lost its operator-facing documentation; got %q", entry)
 	}
 }
+
+// TestResolveMCPRouteMode tables the --mcp-route / FISHHAWKD_MCP_ROUTE
+// normalizer (ADR-076 / #2390). The unrecognized-value row is the
+// load-bearing one: an operator who typed --mcp-route=disabled intending to
+// close the tool surface must have the process REFUSE to start, not be served
+// the route because the string wasn't exactly "off".
+func TestResolveMCPRouteMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty defaults to on", in: "", want: "on"},
+		{name: "on", in: "on", want: "on"},
+		{name: "off", in: "off", want: "off"},
+		{name: "case insensitive", in: "OFF", want: "off"},
+		{name: "surrounding whitespace", in: "  on  ", want: "on"},
+		{name: "unrecognized fails closed", in: "disabled", wantErr: true},
+		{name: "true is not on", in: "true", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveMCPRouteMode(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveMCPRouteMode(%q) = %q, nil; want an error", tc.in, got)
+				}
+				if !strings.Contains(err.Error(), "must be on or off") {
+					t.Errorf("err = %v, want it to name the accepted values", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveMCPRouteMode(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("resolveMCPRouteMode(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServeRejectsInvalidMCPRoute pins the same fail-closed decision THROUGH
+// runServe, so a refactor that drops the call site (leaving the pure helper
+// green) still fails.
+func TestServeRejectsInvalidMCPRoute(t *testing.T) {
+	var log bytes.Buffer
+	if code := runServe([]string{"--mcp-route=disabled"}, &log); code != exitFailure {
+		t.Fatalf("exit code = %d, want exitFailure for an unrecognized --mcp-route", code)
+	}
+	if !strings.Contains(log.String(), "invalid --mcp-route") {
+		t.Errorf("log = %s, want the invalid --mcp-route diagnosis", log.String())
+	}
+}

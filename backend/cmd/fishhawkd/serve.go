@@ -22,6 +22,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
@@ -50,6 +52,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
@@ -86,6 +89,26 @@ import (
 // FISHHAWKD_PLAN_REVIEW_TIMEOUT flag fallback and the startup warn threshold
 // so the two can never drift (#664).
 const defaultPlanReviewTimeout = 300 * time.Second
+
+// resolveMCPRouteMode normalizes the --mcp-route / FISHHAWKD_MCP_ROUTE
+// value onto the server.Config.MCPRoute contract (ADR-076 / #2390).
+//
+// Exactly "on" and "off" are accepted (case-insensitive, surrounding
+// whitespace trimmed); empty means "on" so an unset env var keeps the
+// route served. Anything else is an ERROR, not a silent fallback: an
+// operator who wrote --mcp-route=disabled intending to close the surface
+// must have the process refuse to start rather than discover later that
+// the route was served all along.
+func resolveMCPRouteMode(raw string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(raw)); v {
+	case "", "on":
+		return "on", nil
+	case "off":
+		return "off", nil
+	default:
+		return "", fmt.Errorf("--mcp-route must be on or off; got %q", raw)
+	}
+}
 
 // planReviewTimeoutBelowDefault reports whether the effective plan-review
 // timeout is below the #606 floor (defaultPlanReviewTimeout). Extracted as a
@@ -953,6 +976,11 @@ func runServe(args []string, logSink io.Writer) int {
 	startNonce := fs.String("start-nonce", envOr("FISHHAWKD_START_NONCE", ""),
 		"per-start opaque identity token echoed by GET /healthz as start_nonce; empty omits the field. "+
 			"scripts/dev sets one per spawn to prove listener identity across pid reuse (#1018)")
+	mcpRoute := fs.String("mcp-route", envOr("FISHHAWKD_MCP_ROUTE", "on"),
+		"whether to serve the bearer-authenticated MCP surface at /mcp (ADR-076 / #2390): on|off. "+
+			"The route is LOOPBACK-ONLY per ADR-033 — with the default --addr=:8080 the daemon binds every "+
+			"interface, so /mcp answers 403 until --addr is set to 127.0.0.1:8080. Use off as the explicit "+
+			"opt-out for a deployment that binds a non-loopback address on purpose")
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
 		"postgres URL; when empty, /v0/runs endpoints respond 503")
 	webhookSecret := fs.String("github-webhook-secret",
@@ -1332,6 +1360,16 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// MCP route mode (ADR-076 / #2390). Fail closed on an unrecognized
+	// value rather than silently degrading: an operator who typed
+	// --mcp-route=disabled expecting the route gone must be told, not
+	// served the route because the string wasn't exactly "off".
+	mcpRouteMode, err := resolveMCPRouteMode(*mcpRoute)
+	if err != nil {
+		logger.Error("invalid --mcp-route", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -1370,7 +1408,18 @@ func runServe(args []string, logSink io.Writer) int {
 	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
 	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
 
-	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle}
+	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode}
+
+	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
+	// route takes a FACTORY rather than importing mcpserver itself: an import
+	// edge from internal/server to internal/mcpserver would close a cycle in
+	// mcpserver's own test binary, whose in-package tests drive a real
+	// server.New. This command already imports both, so it is the natural
+	// place to join them — and mcpserver.NewServer stays the single
+	// tool-registration path for both the stdio binary and the route.
+	cfg.MCPServerFactory = func(backendURL, apiToken string) *mcp.Server {
+		return mcpserver.NewServer(mcpserver.Config{BackendURL: backendURL, APIToken: apiToken})
+	}
 
 	// OAuth token-login wiring (E39.3 / #1708). The client_id the discovery
 	// endpoint advertises is the SAME --oauth-client-id the browser sign-in

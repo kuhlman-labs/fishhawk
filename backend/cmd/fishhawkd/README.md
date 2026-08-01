@@ -14,6 +14,44 @@ Deliberately asymmetric with GitHub: an absent GitLab secret logs nothing (GitLa
 would nag every GitHub-only deployment). The shared webhook delivery store (`webhook_deliveries` on Postgres,
 else in-memory) is created when EITHER secret is set, so a GitLab-only deployment gets the store too.
 
+## MCP route (`--mcp-route`, ADR-076 slice 2 / E66.2 #2390)
+
+`FISHHAWKD_MCP_ROUTE` (`--mcp-route`) controls whether fishhawkd serves the
+Fishhawk MCP tool surface at `POST/GET/DELETE /mcp`.
+
+| Env var | Flag | Values | Default |
+|---|---|---|---|
+| `FISHHAWKD_MCP_ROUTE` | `--mcp-route` | `on` \| `off` (empty means `on`) | `on` |
+
+Any other value FAILS STARTUP with `invalid --mcp-route` rather than degrading
+silently: an operator who wrote `--mcp-route=disabled` intending to close the
+surface must be told, not discover later that the route was served all along.
+
+**LOUD NOTE — the shipped `--addr` default blocks the route.** The route is
+loopback-only per ADR-033, and the default `FISHHAWKD_ADDR` / `--addr` value
+`:8080` binds EVERY interface (`net.Listen` treats an empty host as "all
+available unicast addresses"). So on a stock configuration `/mcp` answers
+`403 mcp_route_loopback_only` until the listen address is set to
+`127.0.0.1:8080`. The unspecified host is deliberately not clamped to loopback:
+fishhawkd has already bound every interface by then, so treating `:8080` as
+loopback would serve the tool surface off-host behind a bare bearer.
+
+Use `--mcp-route=off` as the explicit opt-out for a deployment that binds a
+non-loopback address on purpose — all three methods then answer
+`404 route_not_found`, which is distinguishable from an unrouted path.
+
+`serve.go` wires `mcpserver.NewServer` into `server.Config.MCPServerFactory`;
+the route reaches the tool registry through that seam rather than importing the
+package (a direct import would close an import cycle in `mcpserver`'s own test
+binary). A deployment that somehow left it unwired gets `503
+mcp_route_misconfigured` naming the gap.
+
+There is deliberately **no `--mcp-self-url` flag.** The base URL the tools dial
+back on is derived from the validated loopback listener (and pinned to its
+resolved IP), so no operator-settable knob can aim the loopback round-trip — and
+every caller's raw bearer — off-host. Long-form contract:
+`backend/internal/server/README.md`.
+
 ## Configurable GitHub / OAuth endpoints (E44.2 / #1826)
 
 For GitHub Enterprise Server (Mode 1, self-hosted) and data-resident GitHub

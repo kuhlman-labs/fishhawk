@@ -1,0 +1,329 @@
+package server
+
+import (
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+// MCPServerFactory builds a fully-registered MCP tool server for ONE request,
+// bound to backendURL and apiToken.
+//
+// It is an INJECTED seam rather than a direct backend/internal/mcpserver
+// import, and the reason is a hard constraint, not a style preference:
+// mcpserver's in-package tests drive a real server.New (see
+// backend/internal/mcpserver/campaign_test.go), so an import edge from this
+// package to mcpserver would close an import cycle in mcpserver's TEST binary
+// — `go build` stays green and `go test ./internal/mcpserver/...` fails. The
+// arrow is therefore inverted: backend/cmd/fishhawkd, which already imports
+// both, wires mcpserver.NewServer in. There is still exactly ONE tool-
+// registration path; only the direction of the reference changed.
+type MCPServerFactory func(backendURL, apiToken string) *mcp.Server
+
+// mcpRouteMode is the verdict resolveMCPRouteState reaches for the /mcp
+// route. It is computed ONCE at New() from the immutable Config and read
+// by handleMCP on every request — see resolveMCPRouteState for why the
+// verdict is not recomputed per request.
+type mcpRouteMode int
+
+const (
+	// mcpRouteEnabled serves the MCP surface. The state's selfURL is the
+	// loopback base URL the per-request tool client dials back on.
+	mcpRouteEnabled mcpRouteMode = iota
+
+	// mcpRouteOff is the operator's explicit opt-out (--mcp-route=off).
+	// All three methods answer 404.
+	mcpRouteOff
+
+	// mcpRouteMisconfigured means the route CANNOT be served safely: the
+	// listen address is unparseable, a hostname would not resolve, or an
+	// embedder-supplied MCPSelfURL points off-loopback. 503 with the
+	// diagnosis in reason.
+	mcpRouteMisconfigured
+
+	// mcpRouteNotLoopback means the listener is reachable off-host, so
+	// serving the tool surface behind a bare bearer would expose it
+	// beyond the operator's machine (ADR-033). 403.
+	mcpRouteNotLoopback
+)
+
+// mcpRouteState is the resolved, immutable route verdict.
+type mcpRouteState struct {
+	mode mcpRouteMode
+
+	// selfURL is the base URL the per-request mcpserver tool client
+	// dials. Always built from a RESOLVED loopback IP literal, never a
+	// hostname: a hostname stored here would be re-resolved by the HTTP
+	// client at call time, so a DNS change after construction would send
+	// every caller's raw bearer off-host — defeating the refusal this
+	// route enforces. Empty unless mode is mcpRouteEnabled.
+	selfURL string
+
+	// listenHost is the host portion of Config.Addr, echoed in the
+	// loopback refusal so an operator can see what was rejected.
+	listenHost string
+
+	// reason is the human-readable diagnosis carried by the 503.
+	reason string
+}
+
+// normalizeMCPRoute maps Config.MCPRoute onto the on/off decision. The
+// zero value normalizes to ON so a Config that never mentions the route
+// still serves it; only an explicit "off" disables. Strict validation of
+// the operator-supplied string lives in fishhawkd's resolveMCPRouteMode,
+// which refuses to start on an unrecognized value — this function is the
+// permissive last mile for an embedder-constructed Config.
+func normalizeMCPRoute(raw string) string {
+	if strings.EqualFold(strings.TrimSpace(raw), "off") {
+		return "off"
+	}
+	return "on"
+}
+
+// mcpLoopbackHost decides whether host is a loopback address and, when it
+// is, returns the resolved loopback IP to PIN into the self URL.
+//
+// An EMPTY host is deliberately NOT clamped to 127.0.0.1 and is reported
+// non-loopback: net.Listen documents that an empty or unspecified host
+// listens on every available unicast address, so fishhawkd has already
+// bound all interfaces by the time this runs. That is the opposite of
+// backend/cmd/fishhawk-mcp/http_transport.go's validateLoopbackAddr,
+// which MAY clamp because it controls its own bind — fishhawkd cannot
+// unbind, so treating ":8080" as loopback would serve the tool surface
+// off-host behind a bare bearer.
+//
+// A literal IP is decided by net.IP.IsLoopback and pins itself. A
+// hostname is resolved via lookupIP and must be loopback on EVERY
+// resolved address; the first address is pinned. A resolution failure is
+// reported as an error (503), never silently accepted.
+func mcpLoopbackHost(host string, lookupIP func(string) ([]net.IP, error)) (string, bool, error) {
+	if host == "" {
+		return "", false, nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if !ip.IsLoopback() {
+			return "", false, nil
+		}
+		return ip.String(), true, nil
+	}
+	if lookupIP == nil {
+		lookupIP = net.LookupIP
+	}
+	addrs, err := lookupIP(host)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return "", false, fmt.Errorf("resolve %q: no addresses", host)
+	}
+	for _, a := range addrs {
+		if !a.IsLoopback() {
+			return "", false, nil
+		}
+	}
+	return addrs[0].String(), true, nil
+}
+
+// resolveMCPRouteState computes the /mcp route verdict from cfg.
+//
+// The ladder is ordered so every branch has a reaching input and the
+// cheapest, most specific diagnosis wins:
+//
+//  1. explicit off                      -> mcpRouteOff (404)
+//  2. no MCPServerFactory wired         -> mcpRouteMisconfigured (503)
+//  3. unparseable Config.Addr           -> mcpRouteMisconfigured (503)
+//  4. listener host not loopback        -> mcpRouteNotLoopback (403)
+//     (or unresolvable                  -> mcpRouteMisconfigured)
+//  5. MCPSelfURL set but not loopback   -> mcpRouteMisconfigured (503)
+//  6. otherwise                         -> mcpRouteEnabled
+//
+// Step 3 deliberately precedes step 4: net.SplitHostPort's failure is a
+// distinct, actionable diagnosis, and putting the loopback predicate
+// first would leave the malformed-Addr branch unreachable.
+//
+// This runs ONCE, at New(). The verdict is a pure function of the
+// immutable Config, and resolving per request would put a blocking DNS
+// lookup on every /mcp call with a resolver outage intermittently
+// flipping the route to 403.
+func resolveMCPRouteState(cfg Config, lookupIP func(string) ([]net.IP, error)) mcpRouteState {
+	if normalizeMCPRoute(cfg.MCPRoute) == "off" {
+		return mcpRouteState{mode: mcpRouteOff}
+	}
+
+	// No tool registry, nothing to serve — and this is checked before the
+	// address work because an unwired deployment cannot serve the route at
+	// any address. Production wires it in serve.go; an embedder that mounts
+	// this package without it gets a named diagnosis rather than a nil-
+	// dereference or an empty tool list.
+	if cfg.MCPServerFactory == nil {
+		return mcpRouteState{
+			mode:   mcpRouteMisconfigured,
+			reason: "the MCP route has no tool-server factory wired (Config.MCPServerFactory is nil), so there is no tool registry to serve",
+		}
+	}
+
+	host, port, err := net.SplitHostPort(cfg.Addr)
+	if err != nil {
+		return mcpRouteState{
+			mode:   mcpRouteMisconfigured,
+			reason: fmt.Sprintf("the MCP route cannot resolve its own base URL: listen address %q is not a valid host:port (%v)", cfg.Addr, err),
+		}
+	}
+
+	resolved, ok, err := mcpLoopbackHost(host, lookupIP)
+	switch {
+	case err != nil:
+		return mcpRouteState{
+			mode:       mcpRouteMisconfigured,
+			listenHost: host,
+			reason:     fmt.Sprintf("the MCP route cannot classify its listen address: %v", err),
+		}
+	case !ok:
+		return mcpRouteState{mode: mcpRouteNotLoopback, listenHost: host}
+	}
+
+	// Derive the self URL from the RESOLVED loopback IP. net.JoinHostPort
+	// brackets an IPv6 literal, which naive concatenation does not:
+	// "::1" + ":8080" would yield the unparseable "http://::1:8080".
+	selfURL := "http://" + net.JoinHostPort(resolved, port)
+
+	if raw := strings.TrimSpace(cfg.MCPSelfURL); raw != "" {
+		pinned, perr := pinLoopbackSelfURL(raw, lookupIP)
+		if perr != nil {
+			return mcpRouteState{
+				mode:       mcpRouteMisconfigured,
+				listenHost: host,
+				reason: fmt.Sprintf("MCPSelfURL %q is not a usable loopback base URL (%v); serving the MCP route would forward every caller's bearer token off-host, "+
+					"so the route refuses rather than proxying credentials to a non-loopback destination", raw, perr),
+			}
+		}
+		selfURL = pinned
+	}
+
+	return mcpRouteState{mode: mcpRouteEnabled, selfURL: selfURL, listenHost: host}
+}
+
+// pinLoopbackSelfURL validates an embedder-supplied self URL and rewrites
+// its host to the RESOLVED loopback IP. Rewriting — rather than merely
+// validating — closes the resolution-to-use gap: a hostname left in place
+// is re-resolved by the HTTP client on every tool call, so a DNS record
+// flipped after construction would carry the caller's bearer off-host.
+func pinLoopbackSelfURL(raw string, lookupIP func(string) ([]net.IP, error)) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("scheme %q is not http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("no host")
+	}
+	resolved, ok, err := mcpLoopbackHost(u.Hostname(), lookupIP)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("host %q is not a loopback address", u.Hostname())
+	}
+	if p := u.Port(); p != "" {
+		u.Host = net.JoinHostPort(resolved, p)
+	} else {
+		u.Host = resolved
+	}
+	return u.String(), nil
+}
+
+// newMCPHandler builds the streamable-HTTP handler that serves the MCP
+// surface, with the tool registry constructed PER REQUEST and bound to
+// that request's bearer token.
+//
+// Stateless is the load-bearing option. In go-sdk v1.6.1
+// (mcp/streamable.go) the handler's sessions map is written only on the
+// non-stateless branch — the `if stateless { defer session.Close() }
+// else { ...save the transport... }` split after server.Connect — so the
+// `h.sessions[sessionID]` lookup is always nil and `h.getServer(req)`
+// runs on EVERY request. The token authorizing a tool call is therefore
+// provably the token on the request that triggered it, and there is no
+// session registry to leak, GC, or hijack.
+//
+// The honest cost, spelled out because it is a real narrowing: a
+// stateless server holds no session to stream from or tear down, so GET
+// answers the spec-prescribed 405 with `Allow: POST` and DELETE is a 204
+// no-op. In-request notifications (the progress heartbeats Fishhawk's
+// long-running tools emit) still reach the client — they ride the POST
+// response's own stream, which stateless mode preserves.
+func newMCPHandler(state mcpRouteState, newServer MCPServerFactory, logger *slog.Logger) http.Handler {
+	factory := func(r *http.Request) *mcp.Server {
+		tok, ok := tokenFromHeader(r)
+		if !ok {
+			// DO NOT "simplify" this into a direct
+			// mcpserver.NewServer(...) call. Returning nil makes the
+			// SDK answer 400 rather than constructing a tool registry
+			// with an empty token. It is unreachable in production
+			// because handleMCP's ladder already refuses a request
+			// without a bearer identity with 401 — removing the guard
+			// would silently make the bearer optional here.
+			return nil
+		}
+		return newServer(state.selfURL, tok)
+	}
+	return mcp.NewStreamableHTTPHandler(factory, &mcp.StreamableHTTPOptions{
+		Stateless: true,
+		Logger:    logger,
+	})
+}
+
+// handleMCP serves POST/GET/DELETE /mcp. It runs the refusal ladder, then
+// the bearer-identity gate, then delegates to the streamable handler.
+//
+// The auth gate requires a BEARER identity (a non-anonymous Identity
+// carrying a TokenID), not merely an authenticated one. That is what
+// makes the csrfExemptPath entry for /mcp safe: a browser cookie session
+// can never reach the tool surface, so exempting the path from the
+// double-submit check cannot open a browser-driven CSRF path onto it.
+//
+// Both fhk_ and fhm_ identities are accepted with no special-casing — an
+// MCP tool call is exactly as privileged as the equivalent REST call,
+// including its denials, because the tools reach data by dialling
+// fishhawkd's own REST API with the caller's token.
+func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	switch s.mcpRoute.mode {
+	case mcpRouteOff:
+		s.writeError(w, r, http.StatusNotFound, "route_not_found",
+			"the MCP route is disabled on this deployment (--mcp-route=off)", nil)
+		return
+	case mcpRouteMisconfigured:
+		s.writeError(w, r, http.StatusServiceUnavailable, "mcp_route_misconfigured",
+			s.mcpRoute.reason, nil)
+		return
+	case mcpRouteNotLoopback:
+		s.writeError(w, r, http.StatusForbidden, "mcp_route_loopback_only",
+			"the MCP route is loopback-only (ADR-033) and this daemon listens on "+
+				strconv.Quote(s.mcpRoute.listenHost)+", which is reachable off-host; "+
+				"set FISHHAWKD_ADDR=127.0.0.1:8080 to enable it, or --mcp-route=off to disable it explicitly",
+			map[string]any{"listen_host": s.mcpRoute.listenHost})
+		return
+	}
+
+	// A missing bearer and an unknown bearer are INDISTINGUISHABLE here:
+	// bearerAuth resolves both to the anonymous Identity and falls
+	// through, and discriminating them would leak token validity. A
+	// cookie-session identity (non-anonymous, but no TokenID) lands on
+	// the same envelope.
+	id := IdentityFrom(r.Context())
+	if id.IsAnonymous() || id.TokenID == "" {
+		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
+			"the MCP route requires a Fishhawk bearer token (Authorization: Bearer fhk_… or fhm_…); "+
+				"a browser cookie session is not accepted", nil)
+		return
+	}
+
+	s.mcpHandler.ServeHTTP(w, r)
+}
