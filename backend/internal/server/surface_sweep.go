@@ -151,11 +151,11 @@ var surfacePatterns = []surfacePattern{
 		// registration file is in scope but a coupled file is missing.
 		Name: "mcp tool registration requires count test + readme",
 		Triggers: []string{
-			"backend/cmd/fishhawk-mcp/tools.go",
+			"backend/internal/mcpserver/tools.go",
 		},
 		Siblings: []string{
-			"backend/cmd/fishhawk-mcp/tools_test.go",
-			"backend/cmd/fishhawk-mcp/README.md",
+			"backend/internal/mcpserver/tools_test.go",
+			"backend/internal/mcpserver/README.md",
 		},
 	},
 	// #1077: a canonical docs/spec/*.schema.json edited without its

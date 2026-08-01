@@ -86,7 +86,7 @@ var sanctioned = map[string]string{
 	// three payload shapes must stay byte-identical across server, MCP,
 	// and CLI, so they mirror the API's int64 verbatim.
 	"backend/internal/server/onboarding.go": "onboarding payload mirror of the GitHub installations API",
-	"backend/cmd/fishhawk-mcp/client.go":    "onboarding payload mirror of the GitHub installations API",
+	"backend/internal/mcpserver/client.go":  "onboarding payload mirror of the GitHub installations API",
 	"cli/cmd/fishhawk/doctor_onboarding.go": "onboarding payload mirror of the GitHub installations API",
 
 	// (The #1861 runnerbackend.TriggerParams.InstallationID entry was removed

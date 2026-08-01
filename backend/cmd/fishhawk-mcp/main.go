@@ -46,7 +46,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
@@ -67,27 +67,6 @@ const (
 	// non-loopback value is rejected before binding (validateLoopbackAddr).
 	defaultHTTPAddr = "127.0.0.1:8765"
 )
-
-// serverName and serverVersion identify this binary on the MCP
-// handshake. Bumped manually as the tool surface evolves; tied to
-// the Fishhawk release line rather than the protocol spec version.
-const (
-	serverName    = "fishhawk-mcp"
-	serverVersion = "v0.1.0"
-)
-
-// handshakeVersion returns the version string advertised on the MCP
-// handshake: the manually-bumped serverVersion base, suffixed with the
-// build's git SHA when one was stamped (e.g. "v0.1.0+abc1234-dirty") so
-// an operator can tell which commit the connected server was built from.
-// serverInfo.version is informational in the MCP handshake — clients do
-// not parse or gate on it.
-func handshakeVersion(sha string) string {
-	if sha == "unknown" || sha == "" {
-		return serverVersion
-	}
-	return serverVersion + "+" + sha
-}
 
 func main() {
 	os.Exit(run(context.Background(), os.Args, os.Stderr))
@@ -140,20 +119,15 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 
 	// newServer builds a fully-registered server; the stdio path uses one
 	// instance, the http path calls it per session. Tool registration is
-	// identical across both transports.
+	// identical across both transports and lives in the mcpserver package
+	// (E66.7 / #2408) so fishhawkd's /mcp route (#2390) can share it.
 	newServer := func() *mcp.Server {
-		srv := buildServer(cfg)
-		registerTools(srv, &runResolver{
-			api:    newAPIClient(cfg),
-			getenv: os.Getenv,
-		})
-		registerOnboardingResources(srv)
-		return srv
+		return mcpserver.NewServer(cfg)
 	}
 
 	switch tf.transport {
 	case transportHTTP:
-		if err := serveHTTP(ctx, tf.addr, cfg.apiToken, newServer); err != nil {
+		if err := serveHTTP(ctx, tf.addr, cfg.APIToken, newServer); err != nil {
 			_, _ = fmt.Fprintf(stderr, "fishhawk-mcp: transport error: %v\n", err)
 			return exitFailure
 		}
@@ -164,14 +138,6 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		}
 	}
 	return exitOK
-}
-
-// config captures the validated startup environment. Kept tiny on
-// purpose — tools that need additional state read from the same env
-// at registration time rather than threading a giant struct.
-type config struct {
-	backendURL string
-	apiToken   string
 }
 
 // loadConfig validates the env and resolves the bearer token through
@@ -206,17 +172,17 @@ type config struct {
 //     storm. A NIL ExpiresAt means non-expiring and IS accepted —
 //     v0 tokens do not expire (cli/README.md, E39.3 / #1708), so
 //     reading nil as expired would refuse every field credential.
-func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Credential, error)) (config, error) {
-	c := config{
-		backendURL: strings.TrimRight(getenv("FISHHAWK_BACKEND_URL"), "/"),
-		apiToken:   getenv("FISHHAWK_API_TOKEN"),
+func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Credential, error)) (mcpserver.Config, error) {
+	c := mcpserver.Config{
+		BackendURL: strings.TrimRight(getenv("FISHHAWK_BACKEND_URL"), "/"),
+		APIToken:   getenv("FISHHAWK_API_TOKEN"),
 	}
-	if c.backendURL == "" {
-		c.backendURL = "http://localhost:8080"
+	if c.BackendURL == "" {
+		c.BackendURL = "http://localhost:8080"
 	}
 	// Rung 1: an explicit env token wins outright; the store is never
 	// consulted.
-	if c.apiToken != "" {
+	if c.APIToken != "" {
 		return c, nil
 	}
 
@@ -224,39 +190,27 @@ func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Cre
 	// The URL default + trailing-slash trim above are applied BEFORE
 	// the lookup so the key matches what `fishhawk token login
 	// --backend-url <url>` stored.
-	cred, err := loadCred(c.backendURL)
+	cred, err := loadCred(c.BackendURL)
 	if err != nil {
 		if errors.Is(err, credstore.ErrNotFound) {
-			return config{}, fmt.Errorf("no Fishhawk credential stored for %s: run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, c.backendURL)
+			return mcpserver.Config{}, fmt.Errorf("no Fishhawk credential stored for %s: run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.BackendURL, c.BackendURL)
 		}
 		// Rung 3d: a corrupt or unreadable store (credstore.List wraps
 		// the read/parse error with the file path). Surface it wrapped,
 		// worded distinctly from not-found, so a corrupt store is loud
 		// rather than silently re-read as "no credential".
-		return config{}, fmt.Errorf("cannot read the Fishhawk credential store for %s: %w; fix or remove the store, then run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, err, c.backendURL)
+		return mcpserver.Config{}, fmt.Errorf("cannot read the Fishhawk credential store for %s: %w; fix or remove the store, then run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.BackendURL, err, c.BackendURL)
 	}
 	// Rung 3b: a credential exists but carries no token (a truncated
 	// store) — never let that become a silent empty bearer.
 	if cred.Token == "" {
-		return config{}, fmt.Errorf("the stored Fishhawk credential for %s has an empty token: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, c.backendURL)
+		return mcpserver.Config{}, fmt.Errorf("the stored Fishhawk credential for %s has an empty token: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.BackendURL, c.BackendURL)
 	}
 	// Rung 3c: an expired credential. A nil ExpiresAt means non-
 	// expiring (v0 tokens do not expire) and is accepted.
 	if cred.ExpiresAt != nil && cred.ExpiresAt.Before(time.Now()) {
-		return config{}, fmt.Errorf("the stored Fishhawk credential for %s expired at %s: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.backendURL, cred.ExpiresAt.Format(time.RFC3339), c.backendURL)
+		return mcpserver.Config{}, fmt.Errorf("the stored Fishhawk credential for %s expired at %s: re-run `fishhawk token login --backend-url %s`, or set FISHHAWK_API_TOKEN", c.BackendURL, cred.ExpiresAt.Format(time.RFC3339), c.BackendURL)
 	}
-	c.apiToken = cred.Token
+	c.APIToken = cred.Token
 	return c, nil
-}
-
-// buildServer constructs the MCP server shell without any tools.
-// Splitting the constructor out of run + registerTools keeps the
-// test surface small — buildServer is the empty server every test
-// can start from, registerTools is the part each tool's test
-// exercises.
-func buildServer(_ config) *mcp.Server {
-	return mcp.NewServer(&mcp.Implementation{
-		Name:    serverName,
-		Version: handshakeVersion(version.GitSHA),
-	}, &mcp.ServerOptions{Instructions: onboardingInstructions})
 }

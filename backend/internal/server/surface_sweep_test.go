@@ -149,9 +149,9 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 		notifier       = "backend/internal/issuecomment/notifier.go"
 		pullrequest    = "backend/internal/server/pullrequest.go"
 		surfacesDoc    = "docs/issue-comment-surfaces.md"
-		mcpTools       = "backend/cmd/fishhawk-mcp/tools.go"
-		mcpToolsTest   = "backend/cmd/fishhawk-mcp/tools_test.go"
-		mcpReadme      = "backend/cmd/fishhawk-mcp/README.md"
+		mcpTools       = "backend/internal/mcpserver/tools.go"
+		mcpToolsTest   = "backend/internal/mcpserver/tools_test.go"
+		mcpReadme      = "backend/internal/mcpserver/README.md"
 	)
 	tests := []struct {
 		name        string

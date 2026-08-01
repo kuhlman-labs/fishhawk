@@ -75,11 +75,11 @@ func TestLoadConfig_HappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.backendURL != "https://app.fishhawk.example.com" {
-		t.Errorf("backendURL = %q", cfg.backendURL)
+	if cfg.BackendURL != "https://app.fishhawk.example.com" {
+		t.Errorf("backendURL = %q", cfg.BackendURL)
 	}
-	if cfg.apiToken != "tok_abc123" {
-		t.Errorf("apiToken = %q", cfg.apiToken)
+	if cfg.APIToken != "tok_abc123" {
+		t.Errorf("apiToken = %q", cfg.APIToken)
 	}
 }
 
@@ -93,8 +93,8 @@ func TestLoadConfig_BackendURLDefaultsToLocalhost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.backendURL != "http://localhost:8080" {
-		t.Errorf("backendURL = %q, want http://localhost:8080", cfg.backendURL)
+	if cfg.BackendURL != "http://localhost:8080" {
+		t.Errorf("backendURL = %q, want http://localhost:8080", cfg.BackendURL)
 	}
 }
 
@@ -111,8 +111,8 @@ func TestLoadConfig_BackendURLTrailingSlashStripped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.backendURL != "https://app.fishhawk.example.com" {
-		t.Errorf("backendURL = %q (trailing slash not stripped)", cfg.backendURL)
+	if cfg.BackendURL != "https://app.fishhawk.example.com" {
+		t.Errorf("backendURL = %q (trailing slash not stripped)", cfg.BackendURL)
 	}
 }
 
@@ -129,8 +129,8 @@ func TestLoadConfig_EnvTokenWins_StoreUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.apiToken != "tok_env" {
-		t.Errorf("apiToken = %q, want tok_env", cfg.apiToken)
+	if cfg.APIToken != "tok_env" {
+		t.Errorf("apiToken = %q, want tok_env", cfg.APIToken)
 	}
 }
 
@@ -141,8 +141,8 @@ func TestLoadConfig_StoreHitResolvesToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.apiToken != "fhk_stored" {
-		t.Errorf("apiToken = %q, want fhk_stored", cfg.apiToken)
+	if cfg.APIToken != "fhk_stored" {
+		t.Errorf("apiToken = %q, want fhk_stored", cfg.APIToken)
 	}
 }
 
@@ -164,8 +164,8 @@ func TestLoadConfig_StoreLookupUsesNormalizedURL(t *testing.T) {
 	if gotURL != "http://localhost:8080" {
 		t.Errorf("loadCred called with %q, want the unslashed key http://localhost:8080", gotURL)
 	}
-	if cfg.apiToken != "fhk_norm" {
-		t.Errorf("apiToken = %q, want fhk_norm", cfg.apiToken)
+	if cfg.APIToken != "fhk_norm" {
+		t.Errorf("apiToken = %q, want fhk_norm", cfg.APIToken)
 	}
 }
 
@@ -210,8 +210,8 @@ func TestLoadConfig_EmptyStoredToken(t *testing.T) {
 	if !strings.Contains(err.Error(), "empty token") {
 		t.Errorf("empty-token error missing its unique substring; got %q", err.Error())
 	}
-	if cfg.apiToken != "" {
-		t.Errorf("empty-token branch must not resolve a token; got %q", cfg.apiToken)
+	if cfg.APIToken != "" {
+		t.Errorf("empty-token branch must not resolve a token; got %q", cfg.APIToken)
 	}
 }
 
@@ -248,8 +248,8 @@ func TestLoadConfig_NilExpiryAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("nil expiry must be accepted as non-expiring, got %v", err)
 	}
-	if cfg.apiToken != "fhk_live" {
-		t.Errorf("apiToken = %q, want fhk_live", cfg.apiToken)
+	if cfg.APIToken != "fhk_live" {
+		t.Errorf("apiToken = %q, want fhk_live", cfg.APIToken)
 	}
 }
 
@@ -260,8 +260,8 @@ func TestLoadConfig_FutureExpiryAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("future expiry must be accepted, got %v", err)
 	}
-	if cfg.apiToken != "fhk_future" {
-		t.Errorf("apiToken = %q, want fhk_future", cfg.apiToken)
+	if cfg.APIToken != "fhk_future" {
+		t.Errorf("apiToken = %q, want fhk_future", cfg.APIToken)
 	}
 }
 
@@ -289,10 +289,12 @@ func TestLoadConfig_CorruptStore(t *testing.T) {
 // TestLoadConfig_StoredCredentialReachesAPIClient crosses the module
 // seam with the REAL credstore package (not a stub): it writes a
 // credential with credstore.Store, drives loadConfig(getenv,
-// credstore.Load) → newAPIClient, and asserts the constructed client
-// carries the stored token as its bearer — proving credstore module →
-// mcp config → apiClient holds across the module boundary that
-// per-layer units would each pass while leaving the seam untested.
+// credstore.Load), and asserts the resolved mcpserver.Config carries the
+// stored token as its APIToken — proving credstore module → mcp config
+// holds across the module boundary that per-layer units would each pass
+// while leaving the seam untested. The apiClient that Config feeds now
+// lives (and is tested) inside the mcpserver package via NewServer, so
+// this binary-side test asserts the seam up to the exported Config.
 func TestLoadConfig_StoredCredentialReachesAPIClient(t *testing.T) {
 	// Point the store at a throwaway dir; credstore honors
 	// XDG_CONFIG_HOME. t.Setenv restores the prior value after the test.
@@ -314,47 +316,8 @@ func TestLoadConfig_StoredCredentialReachesAPIClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.apiToken != "fhk_e2e" {
-		t.Fatalf("cfg.apiToken = %q, want fhk_e2e", cfg.apiToken)
-	}
-
-	client := newAPIClient(cfg)
-	if client.token != "fhk_e2e" {
-		t.Errorf("apiClient bearer = %q, want the stored token fhk_e2e", client.token)
-	}
-}
-
-func TestBuildServer_HandshakeReady(t *testing.T) {
-	// E19.2 ships handshake-only: the server should construct
-	// cleanly with an empty tool registry. The protocol-level
-	// handshake itself is tested by the SDK; this test just locks
-	// in that buildServer doesn't panic and returns a non-nil
-	// server we can hand to mcp.StdioTransport later.
-	srv := buildServer(config{
-		backendURL: "http://localhost:8080",
-		apiToken:   "tok",
-	})
-	if srv == nil {
-		t.Fatal("buildServer returned nil")
-	}
-}
-
-func TestHandshakeVersion(t *testing.T) {
-	// Unstamped builds (GitSHA "unknown") advertise the bare base so the
-	// handshake string is unchanged from pre-stamping behavior; stamped
-	// builds append "+<sha>" including any -dirty suffix.
-	for _, tc := range []struct {
-		sha  string
-		want string
-	}{
-		{"unknown", serverVersion},
-		{"", serverVersion},
-		{"abc1234", serverVersion + "+abc1234"},
-		{"abc1234-dirty", serverVersion + "+abc1234-dirty"},
-	} {
-		if got := handshakeVersion(tc.sha); got != tc.want {
-			t.Errorf("handshakeVersion(%q) = %q, want %q", tc.sha, got, tc.want)
-		}
+	if cfg.APIToken != "fhk_e2e" {
+		t.Fatalf("cfg.APIToken = %q, want fhk_e2e", cfg.APIToken)
 	}
 }
 

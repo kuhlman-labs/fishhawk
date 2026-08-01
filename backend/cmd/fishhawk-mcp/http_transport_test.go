@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 )
 
 func TestValidateLoopbackAddr(t *testing.T) {
@@ -164,15 +166,18 @@ func (b bearerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 // asserts a bearer-less client is rejected.
 func TestServeHTTP_RoundTrip(t *testing.T) {
 	const token = "tok_roundtrip"
-	cfg := config{backendURL: "http://localhost:8080", apiToken: token}
+	// Build the server through the exported mcpserver.NewServer seam —
+	// the same construction path production's newServer uses (main.go),
+	// so this test crosses binary -> package -> transport and fails if
+	// the constructor seam, the Config field rename, or the tool-
+	// registration path regressed. The onboarding resource must cross the
+	// registration->transport seam on the HTTP transport too, which
+	// NewServer registers.
 	newServer := func() *mcp.Server {
-		srv := buildServer(cfg)
-		registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFunc(nil)})
-		// Mirror production's construction path (main.go newServer) so this
-		// test does not diverge from it — the onboarding resource must cross
-		// the registration->transport seam on the HTTP transport too.
-		registerOnboardingResources(srv)
-		return srv
+		return mcpserver.NewServer(mcpserver.Config{
+			BackendURL: "http://localhost:8080",
+			APIToken:   token,
+		})
 	}
 
 	// Bind a loopback listener up front so we know the port and can run
@@ -251,15 +256,15 @@ func TestServeHTTP_RoundTrip(t *testing.T) {
 		}
 		found := false
 		for _, r := range list.Resources {
-			if r.URI == runbookURI {
+			if r.URI == "fishhawk://runbook" {
 				found = true
 			}
 		}
 		if !found {
-			t.Fatalf("HTTP ListResources did not include %s (resource did not cross the transport seam)", runbookURI)
+			t.Fatalf("HTTP ListResources did not include %s (resource did not cross the transport seam)", "fishhawk://runbook")
 		}
 
-		res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: runbookURI})
+		res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "fishhawk://runbook"})
 		if err != nil {
 			t.Fatalf("ReadResource over HTTP: %v", err)
 		}
