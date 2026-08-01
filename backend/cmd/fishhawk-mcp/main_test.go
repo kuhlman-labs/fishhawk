@@ -288,11 +288,12 @@ func TestLoadConfig_CorruptStore(t *testing.T) {
 
 // TestLoadConfig_StoredCredentialReachesAPIClient crosses the module
 // seam with the REAL credstore package (not a stub): it writes a
-// credential with credstore.Store, drives loadConfig(getenv,
-// credstore.Load) → newAPIClient, and asserts the constructed client
-// carries the stored token as its bearer — proving credstore module →
-// mcp config → apiClient holds across the module boundary that
-// per-layer units would each pass while leaving the seam untested.
+// credential with credstore.Store and drives loadConfig(getenv,
+// credstore.Load), asserting the resolved config carries the stored
+// token — proving credstore module → mcp config holds across the module
+// boundary. The onward config → apiClient bearer half moved to
+// mcpserver (server_test.go's NewServer/Config.internal() assertion)
+// with newAPIClient; loadConfig itself stays a CLI concern here.
 func TestLoadConfig_StoredCredentialReachesAPIClient(t *testing.T) {
 	// Point the store at a throwaway dir; credstore honors
 	// XDG_CONFIG_HOME. t.Setenv restores the prior value after the test.
@@ -316,45 +317,6 @@ func TestLoadConfig_StoredCredentialReachesAPIClient(t *testing.T) {
 	}
 	if cfg.apiToken != "fhk_e2e" {
 		t.Fatalf("cfg.apiToken = %q, want fhk_e2e", cfg.apiToken)
-	}
-
-	client := newAPIClient(cfg)
-	if client.token != "fhk_e2e" {
-		t.Errorf("apiClient bearer = %q, want the stored token fhk_e2e", client.token)
-	}
-}
-
-func TestBuildServer_HandshakeReady(t *testing.T) {
-	// E19.2 ships handshake-only: the server should construct
-	// cleanly with an empty tool registry. The protocol-level
-	// handshake itself is tested by the SDK; this test just locks
-	// in that buildServer doesn't panic and returns a non-nil
-	// server we can hand to mcp.StdioTransport later.
-	srv := buildServer(config{
-		backendURL: "http://localhost:8080",
-		apiToken:   "tok",
-	})
-	if srv == nil {
-		t.Fatal("buildServer returned nil")
-	}
-}
-
-func TestHandshakeVersion(t *testing.T) {
-	// Unstamped builds (GitSHA "unknown") advertise the bare base so the
-	// handshake string is unchanged from pre-stamping behavior; stamped
-	// builds append "+<sha>" including any -dirty suffix.
-	for _, tc := range []struct {
-		sha  string
-		want string
-	}{
-		{"unknown", serverVersion},
-		{"", serverVersion},
-		{"abc1234", serverVersion + "+abc1234"},
-		{"abc1234-dirty", serverVersion + "+abc1234-dirty"},
-	} {
-		if got := handshakeVersion(tc.sha); got != tc.want {
-			t.Errorf("handshakeVersion(%q) = %q, want %q", tc.sha, got, tc.want)
-		}
 	}
 }
 

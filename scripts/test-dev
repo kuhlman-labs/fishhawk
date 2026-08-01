@@ -179,6 +179,19 @@ else
   pass "_diff_touches_shim stays quiet for a shared-lib path (shim not in the shared-lib case)"
 fi
 
+# 4c. The extracted MCP tool library (E66.7 / #2408): an mcpserver-only change
+# must fire the fishhawk-mcp banner (it feeds fishhawk-mcp) but NOT the shim.
+if _diff_touches_mcp "backend/internal/mcpserver/tools.go"; then
+  pass "_diff_touches_mcp matches backend/internal/mcpserver/ (E66.7 / #2408)"
+else
+  fail "_diff_touches_mcp should match backend/internal/mcpserver/"
+fi
+if _diff_touches_shim "backend/internal/mcpserver/tools.go"; then
+  fail "_diff_touches_shim should NOT match a backend/internal/mcpserver path"
+else
+  pass "_diff_touches_shim stays quiet for a backend/internal/mcpserver path (cross-glob non-collision)"
+fi
+
 # 4b. _sha_with_dirty: pure dirty-suffix helper (#1007). Empty porcelain text
 # means a clean tree -> bare sha; any output means dirty -> '-dirty' suffix.
 out="$(_sha_with_dirty abc1234 "")"
@@ -447,6 +460,29 @@ if print -r -- "$drs_body" | grep -q 'backend/cmd/fishhawk-mcp-shim/\*'; then
   pass "_detect_rebuild_set carries the fishhawk-mcp-shim trigger glob"
 else
   fail "_detect_rebuild_set should carry backend/cmd/fishhawk-mcp-shim/* glob"
+fi
+
+# 5h-bis. The extracted MCP tool library glob (E66.7 / #2408): _detect_rebuild_set
+# must carry backend/internal/mcpserver/*, and — load-bearing — that arm must
+# appear BEFORE the broad `backend/cmd/fishhawkd/*|backend/internal/*` arm. zsh
+# `case` is first-match-wins: the broad arm marks only fishhawkd, so an mcpserver
+# arm placed after it would never fire and an mcpserver edit would silently skip
+# the fishhawk-mcp rebuild. No runtime test would notice; the ordering grep does.
+if print -r -- "$drs_body" | grep -q 'backend/internal/mcpserver/\*'; then
+  pass "_detect_rebuild_set carries the backend/internal/mcpserver/* glob"
+else
+  fail "_detect_rebuild_set should carry backend/internal/mcpserver/* glob"
+fi
+# NOTE: zsh `typeset -f` reprints a case pattern with spaces around `|`
+# (`(backend/cmd/fishhawkd/* | backend/internal/*)`), so match each arm by a
+# unique substring rather than the source-literal `a|b` form. `backend/cmd/fishhawkd/`
+# appears only in the broad arm; `backend/internal/mcpserver/` only in the new one.
+mcpserver_ln="$(print -r -- "$drs_body" | grep -n 'backend/internal/mcpserver/' | head -1 | cut -d: -f1)"
+fishhawkd_ln="$(print -r -- "$drs_body" | grep -n 'backend/cmd/fishhawkd/' | head -1 | cut -d: -f1)"
+if [[ -n "$mcpserver_ln" && -n "$fishhawkd_ln" && "$mcpserver_ln" -lt "$fishhawkd_ln" ]]; then
+  pass "_detect_rebuild_set: mcpserver arm precedes the broad backend/internal/* arm (first-match-wins)"
+else
+  fail "_detect_rebuild_set: mcpserver arm (line ${mcpserver_ln:-none}) must precede the backend/internal/* arm (line ${fishhawkd_ln:-none})"
 fi
 # The shared-lib case must fall through (no early `return`) so a diff touching
 # both a shared lib AND the shim still marks the shim. Behavioral proof: drive

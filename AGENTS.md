@@ -112,6 +112,7 @@ Cross-reference: this checklist codifies the rollout discipline introduced by #5
 |---|---|
 | `backend/cmd/fishhawkd/` or `backend/internal/{server,prompt,plan,spec,runner,webhook,notifier,github,storage,db,...}` | `fishhawkd` |
 | `backend/cmd/fishhawk-mcp/` | `fishhawk-mcp` |
+| `backend/internal/mcpserver/` (extracted MCP tool library, E66.7 / #2408) | `fishhawk-mcp`, `fishhawkd` |
 | `backend/cmd/fishhawk-mcp-shim/` | `fishhawk-mcp-shim` |
 | `runner/cmd/fishhawk-runner/` or `runner/internal/...` | `fishhawk-runner` |
 | `cli/cmd/fishhawk/` or `cli/internal/...` | `fishhawk` CLI |

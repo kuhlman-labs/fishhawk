@@ -46,7 +46,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/version"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
@@ -67,27 +67,6 @@ const (
 	// non-loopback value is rejected before binding (validateLoopbackAddr).
 	defaultHTTPAddr = "127.0.0.1:8765"
 )
-
-// serverName and serverVersion identify this binary on the MCP
-// handshake. Bumped manually as the tool surface evolves; tied to
-// the Fishhawk release line rather than the protocol spec version.
-const (
-	serverName    = "fishhawk-mcp"
-	serverVersion = "v0.1.0"
-)
-
-// handshakeVersion returns the version string advertised on the MCP
-// handshake: the manually-bumped serverVersion base, suffixed with the
-// build's git SHA when one was stamped (e.g. "v0.1.0+abc1234-dirty") so
-// an operator can tell which commit the connected server was built from.
-// serverInfo.version is informational in the MCP handshake — clients do
-// not parse or gate on it.
-func handshakeVersion(sha string) string {
-	if sha == "unknown" || sha == "" {
-		return serverVersion
-	}
-	return serverVersion + "+" + sha
-}
 
 func main() {
 	os.Exit(run(context.Background(), os.Args, os.Stderr))
@@ -138,17 +117,16 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		return exitFailure
 	}
 
-	// newServer builds a fully-registered server; the stdio path uses one
-	// instance, the http path calls it per session. Tool registration is
-	// identical across both transports.
+	// newServer builds a fully-registered server through the extracted
+	// mcpserver package (E66.7 / #2408); the stdio path uses one instance,
+	// the http path calls it per session. Tool registration is identical
+	// across both transports and identical to fishhawkd's future /mcp route
+	// (#2390), which constructs the same server from the same entry point.
 	newServer := func() *mcp.Server {
-		srv := buildServer(cfg)
-		registerTools(srv, &runResolver{
-			api:    newAPIClient(cfg),
-			getenv: os.Getenv,
+		return mcpserver.NewServer(mcpserver.Config{
+			BackendURL: cfg.backendURL,
+			APIToken:   cfg.apiToken,
 		})
-		registerOnboardingResources(srv)
-		return srv
 	}
 
 	switch tf.transport {
@@ -247,16 +225,4 @@ func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Cre
 	}
 	c.apiToken = cred.Token
 	return c, nil
-}
-
-// buildServer constructs the MCP server shell without any tools.
-// Splitting the constructor out of run + registerTools keeps the
-// test surface small — buildServer is the empty server every test
-// can start from, registerTools is the part each tool's test
-// exercises.
-func buildServer(_ config) *mcp.Server {
-	return mcp.NewServer(&mcp.Implementation{
-		Name:    serverName,
-		Version: handshakeVersion(version.GitSHA),
-	}, &mcp.ServerOptions{Instructions: onboardingInstructions})
 }
