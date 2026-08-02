@@ -3,12 +3,14 @@ package oauthas
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -501,6 +503,299 @@ func TestFetch_DoesNotCacheFailures(t *testing.T) {
 	}
 	if doc.ClientID != clientID {
 		t.Fatalf("second Fetch ClientID = %q", doc.ClientID)
+	}
+}
+
+// --- cache bounds (#2429) -------------------------------------------------
+//
+// newKeyedDocServer starts ONE TLS server that serves a self-referential CIMD
+// document for every distinct "?v=<key>" client_id and counts requests per key.
+// That is exactly the attack shape #2429 describes: a single host minting
+// unlimited distinct VALID client_ids (ValidateClientIDURL permits a query and the
+// self-referential check binds it), each one a permanent cache allocation before
+// the cap. The per-key hit counter is how these tests observe cache residency
+// behaviourally — a served request means the entry was gone.
+func newKeyedDocServer(t *testing.T) (clientID func(string) string, hits func(string) int, client *http.Client) {
+	t.Helper()
+	var mu sync.Mutex
+	counts := map[string]int{}
+	var base string
+	srv := newDocServer(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		counts[r.URL.Query().Get("v")]++
+		mu.Unlock()
+		writeJSON(w, http.StatusOK, validDocJSON(base+"?"+r.URL.RawQuery))
+	})
+	base = srv.URL
+	return func(k string) string { return base + "?v=" + k },
+		func(k string) int {
+			mu.Lock()
+			defer mu.Unlock()
+			return counts[k]
+		},
+		srv.Client()
+}
+
+// fetchKey fetches one keyed client_id, failing the test on error.
+func fetchKey(t *testing.T, f *Fetcher, clientID func(string) string, key string) {
+	t.Helper()
+	if _, err := f.Fetch(context.Background(), clientID(key)); err != nil {
+		t.Fatalf("Fetch(%s): %v", key, err)
+	}
+}
+
+// TestFetch_CacheIsBounded is the core #2429 pin: a flood of distinct one-shot
+// client_ids cannot grow the cache past MaxCacheEntries. Deleting the eviction
+// loop in cacheStore turns this red.
+func TestFetch_CacheIsBounded(t *testing.T) {
+	t.Parallel()
+	const capEntries = 8
+	id, _, client := newKeyedDocServer(t)
+	f := &Fetcher{HTTPClient: client, MaxCacheEntries: capEntries}
+	for i := 0; i < capEntries+50; i++ {
+		fetchKey(t, f, id, fmt.Sprintf("k%d", i))
+	}
+	if got := f.cacheLen(); got > capEntries {
+		t.Fatalf("cacheLen = %d after %d distinct client_ids, want <= %d (the cache is unbounded)", got, capEntries+50, capEntries)
+	}
+	if l, o := f.cacheLen(), f.cacheOrderLen(); l != o {
+		t.Fatalf("cacheLen = %d, cacheOrderLen = %d (map/list drift)", l, o)
+	}
+}
+
+// TestFetch_CacheEvictsLeastRecentlyUsedNotOldest pins LRU over FIFO. A FIFO cap
+// would let the same flood evict a legitimate client that is still in active use,
+// converting a memory-exhaustion vector into an eviction denial of service.
+func TestFetch_CacheEvictsLeastRecentlyUsedNotOldest(t *testing.T) {
+	t.Parallel()
+	const capEntries = 8
+	id, hits, client := newKeyedDocServer(t)
+	f := &Fetcher{HTTPClient: client, MaxCacheEntries: capEntries}
+
+	fetchKey(t, f, id, "hot") // the OLDEST entry by insertion order
+	for i := 0; i < capEntries-1; i++ {
+		fetchKey(t, f, id, fmt.Sprintf("cold%d", i)) // fill to capacity
+	}
+	fetchKey(t, f, id, "hot") // a cache HIT: still the oldest insertion, now the most recently USED
+	if got := hits("hot"); got != 1 {
+		t.Fatalf("hot key server hits = %d, want 1 (the second fetch must be a cache hit)", got)
+	}
+	// Exactly capEntries-1 further cold keys: enough to evict every cold key
+	// inserted before the hot hit, and not one more (an additional insertion would
+	// evict `hot` on legitimate LRU grounds and make this test vacuous).
+	for i := capEntries - 1; i < 2*(capEntries-1); i++ {
+		fetchKey(t, f, id, fmt.Sprintf("cold%d", i))
+	}
+
+	fetchKey(t, f, id, "hot")
+	if got := hits("hot"); got != 1 {
+		t.Fatalf("hot key server hits = %d, want 1: the in-use entry was evicted, so eviction is FIFO (oldest insertion) not LRU", got)
+	}
+}
+
+// TestFetch_ActiveExpirySweepReclaimsOneShotKeys pins the amortized store-triggered
+// sweep. No key is ever looked up twice here, so the pre-#2429 lazy
+// reclaim-on-same-key-lookup would return nothing at all. Deleting the amortized
+// sweep call in cacheStore turns this red. It also pins the `next := el.Next()`
+// capture: several consecutively-expiring entries mean a walk that ends at its
+// first removal leaves the rest behind.
+func TestFetch_ActiveExpirySweepReclaimsOneShotKeys(t *testing.T) {
+	t.Parallel()
+	id, _, client := newKeyedDocServer(t)
+	now := time.Unix(1_000_000, 0)
+	f := &Fetcher{
+		HTTPClient:      client,
+		MaxCacheEntries: 8, // well above the entry count: capacity never triggers the sweep
+		CacheTTL:        time.Minute,
+		Now:             func() time.Time { return now },
+	}
+	for i := 0; i < 4; i++ {
+		fetchKey(t, f, id, fmt.Sprintf("shot%d", i))
+	}
+	if got := f.cacheLen(); got != 4 {
+		t.Fatalf("cacheLen = %d before expiry, want 4", got)
+	}
+
+	now = now.Add(time.Minute) // every entry above is now expired
+	fetchKey(t, f, id, "other")
+
+	if got := f.cacheLen(); got != 1 {
+		t.Fatalf("cacheLen = %d after a store on a DIFFERENT key, want 1 (expired one-shot entries were not reclaimed)", got)
+	}
+	if got := f.cacheOrderLen(); got != 1 {
+		t.Fatalf("cacheOrderLen = %d, want 1 (recency list retained swept entries)", got)
+	}
+}
+
+// TestFetch_ExpiredEntriesEvictedBeforeLiveOnes pins that the sweep is a FULL walk
+// of the recency list, not a scan of the least-recently-used tail.
+//
+// The load-bearing arrangement is a cache HIT on `early` while it is still live:
+// cacheGet moves it to the FRONT without re-stamping expiresAt, so once the clock
+// passes its TTL an EXPIRED entry sits AHEAD of three live ones. A full walk
+// reclaims it and the newcomer lands below capacity, so every live entry survives.
+// A tail-only sweep finds a LIVE entry at the tail, stops, and then evicts that
+// live entry to make room — while the expired entry stays cached.
+func TestFetch_ExpiredEntriesEvictedBeforeLiveOnes(t *testing.T) {
+	t.Parallel()
+	const capEntries = 4
+	id, hits, client := newKeyedDocServer(t)
+	now := time.Unix(1_000_000, 0)
+	f := &Fetcher{
+		HTTPClient:      client,
+		MaxCacheEntries: capEntries,
+		CacheTTL:        time.Minute,
+		Now:             func() time.Time { return now },
+	}
+
+	fetchKey(t, f, id, "early") // expires at t0+60s
+	now = now.Add(30 * time.Second)
+	for i := 0; i < capEntries-1; i++ {
+		fetchKey(t, f, id, fmt.Sprintf("live%d", i)) // expire at t0+90s
+	}
+	fetchKey(t, f, id, "early") // cache HIT → front of the recency list, expiry NOT re-stamped
+	if got := hits("early"); got != 1 {
+		t.Fatalf("early key server hits = %d, want 1: the setup fetch must be a CACHE hit, or the expired-ahead-of-live ordering was never constructed", got)
+	}
+	if got := f.cacheLen(); got != capEntries {
+		t.Fatalf("cacheLen = %d before the sweep, want %d (the cache must be exactly at capacity)", got, capEntries)
+	}
+
+	now = now.Add(30 * time.Second) // t0+60s: `early` is expired, the live entries are not
+	fetchKey(t, f, id, "newcomer")  // the store that triggers both the sweep and any eviction
+
+	for i := 0; i < capEntries-1; i++ {
+		k := fmt.Sprintf("live%d", i)
+		fetchKey(t, f, id, k)
+		if got := hits(k); got != 1 {
+			t.Fatalf("%s server hits = %d, want 1: a LIVE entry was evicted while an EXPIRED entry sat ahead of it in the recency list (tail-only sweep)", k, got)
+		}
+	}
+}
+
+// TestFetcher_DefaultMaxCacheEntries asserts the SHIPPED default literally, so a
+// test-only small cap elsewhere cannot mask a wrong default.
+func TestFetcher_DefaultMaxCacheEntries(t *testing.T) {
+	t.Parallel()
+	f := &Fetcher{}
+	if got := f.maxCacheEntries(); got != 256 {
+		t.Fatalf("zero-value Fetcher maxCacheEntries = %d, want 256", got)
+	}
+}
+
+func TestFetcher_NonPositiveMaxCacheEntriesFallsBackToDefault(t *testing.T) {
+	t.Parallel()
+	for _, n := range []int{0, -1} {
+		f := &Fetcher{MaxCacheEntries: n}
+		if got := f.maxCacheEntries(); got != defaultMaxCacheEntries {
+			t.Fatalf("MaxCacheEntries=%d → maxCacheEntries = %d, want the default %d (a misconfigured cap must never read as unbounded or as cache-nothing)", n, got, defaultMaxCacheEntries)
+		}
+	}
+}
+
+// TestFetch_CacheMapAndListStayConsistent walks every mutation class — store, hit,
+// capacity eviction, expiry sweep, and the expired-on-lookup removal in cacheGet —
+// asserting after each that the key map and the recency list agree. A removal that
+// touches only one side leaks the other and silently defeats the bound.
+func TestFetch_CacheMapAndListStayConsistent(t *testing.T) {
+	t.Parallel()
+	const capEntries = 4
+	id, _, client := newKeyedDocServer(t)
+	now := time.Unix(1_000_000, 0)
+	f := &Fetcher{
+		HTTPClient:      client,
+		MaxCacheEntries: capEntries,
+		CacheTTL:        time.Minute,
+		Now:             func() time.Time { return now },
+	}
+	check := func(phase string) {
+		t.Helper()
+		if l, o := f.cacheLen(), f.cacheOrderLen(); l != o {
+			t.Fatalf("%s: cacheLen = %d, cacheOrderLen = %d (map/list drift)", phase, l, o)
+		}
+	}
+
+	check("zero value") // also pins cacheOrderLen's nil-list branch
+	fetchKey(t, f, id, "a")
+	fetchKey(t, f, id, "b")
+	check("stores")
+	fetchKey(t, f, id, "a") // cache hit → MoveToFront
+	check("hit")
+	for _, k := range []string{"c", "d", "e"} {
+		fetchKey(t, f, id, k)
+	}
+	check("capacity eviction")
+	now = now.Add(time.Minute) // everything above expires
+	fetchKey(t, f, id, "f")
+	check("expiry sweep")
+	now = now.Add(time.Minute) // `f` expires too
+	fetchKey(t, f, id, "f")    // same-key lookup on an EXPIRED entry → cacheGet removal
+	check("expired-on-get removal")
+
+	// cacheStore's existing-key branch is unreachable through Fetch on a single
+	// goroutine — cacheGet either hits (no store follows) or removes the expired
+	// entry before the store — so it is exercised directly rather than left to a
+	// nondeterministic race in the concurrency test. A re-store must overwrite in
+	// place (no duplicate entry, no list growth) and re-stamp the expiry.
+	key := id("restamped")
+	f.cacheStore(key, &ClientMetadata{ClientID: key})
+	before := f.cacheLen()
+	now = now.Add(59 * time.Second) // still inside the first store's 1-minute TTL
+	f.cacheStore(key, &ClientMetadata{ClientID: key, ClientName: "restored"})
+	if got := f.cacheLen(); got != before {
+		t.Fatalf("re-storing an existing key changed cacheLen %d → %d (the overwrite must replace in place)", before, got)
+	}
+	check("existing-key overwrite")
+
+	now = now.Add(2 * time.Second) // past the FIRST store's expiry, inside the re-stamped one
+	doc, ok := f.cacheGet(key)
+	if !ok {
+		t.Fatalf("cacheGet after overwrite = miss, want hit (the re-store did not re-stamp expiresAt)")
+	}
+	if doc.ClientName != "restored" {
+		t.Fatalf("cacheGet after overwrite ClientName = %q, want %q (the re-store did not replace the document)", doc.ClientName, "restored")
+	}
+}
+
+// TestFetch_CacheConcurrentAccess drives hits, stores, sweeps and evictions
+// interleaved over one overlapping key set. Under -race it pins that the LRU's two
+// halves are mutated only under the Fetcher mutex.
+func TestFetch_CacheConcurrentAccess(t *testing.T) {
+	t.Parallel()
+	const (
+		capEntries   = 8
+		goroutines   = 8
+		perGoroutine = 20
+		keySpace     = capEntries * 2 // wider than the cap, so evictions really happen
+	)
+	id, _, client := newKeyedDocServer(t)
+	f := &Fetcher{HTTPClient: client, MaxCacheEntries: capEntries}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				if _, err := f.Fetch(context.Background(), id(fmt.Sprintf("k%d", (g+i)%keySpace))); err != nil {
+					errs <- err
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent Fetch: %v", err)
+	}
+
+	if got := f.cacheLen(); got > capEntries {
+		t.Fatalf("cacheLen = %d after concurrent access, want <= %d", got, capEntries)
+	}
+	if l, o := f.cacheLen(), f.cacheOrderLen(); l != o {
+		t.Fatalf("cacheLen = %d, cacheOrderLen = %d (map/list drift under concurrency)", l, o)
 	}
 }
 

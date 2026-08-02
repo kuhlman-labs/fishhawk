@@ -1,6 +1,7 @@
 package oauthas
 
 import (
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,15 +71,28 @@ func ValidateClientIDURL(raw string) (*url.URL, error) {
 }
 
 const (
-	defaultFetchTimeout = 5 * time.Second
-	defaultMaxBytes     = 64 * 1024
-	defaultMaxRedirects = 3
-	defaultCacheTTL     = 15 * time.Minute
+	defaultFetchTimeout    = 5 * time.Second
+	defaultMaxBytes        = 64 * 1024
+	defaultMaxRedirects    = 3
+	defaultCacheTTL        = 15 * time.Minute
+	defaultMaxCacheEntries = 256
 )
 
+// cacheEntry carries its own key so an eviction that starts from the recency list
+// can delete the matching map entry. Mutating one side without the other leaks the
+// other and silently defeats the bound.
 type cacheEntry struct {
+	key       string
 	doc       *ClientMetadata
 	expiresAt time.Time
+}
+
+// entryOf reads the *cacheEntry a recency-list element carries. The list is
+// private to this file and only ever holds *cacheEntry, so the assertion cannot
+// fail; the two-value form is used because errcheck requires checked assertions.
+func entryOf(el *list.Element) *cacheEntry {
+	e, _ := el.Value.(*cacheEntry)
+	return e
 }
 
 // Fetcher fetches and validates a CIMD document behind injected HTTP-client,
@@ -104,11 +118,24 @@ type Fetcher struct {
 	MaxRedirects int
 	// CacheTTL bounds a validated cache entry's lifetime (default 15m).
 	CacheTTL time.Duration
+	// MaxCacheEntries caps how many validated documents are held (default 256);
+	// eviction is least-recently-USED. The cap exists because the cache key is the
+	// client_id, an attacker-influenced string: one host can mint unlimited
+	// distinct valid client_ids (a query is permitted and the self-referential
+	// check binds it), so without a cap every successful fetch is a permanent
+	// allocation (#2429). A zero or negative value means the default — never
+	// "unbounded" and never "cache nothing".
+	MaxCacheEntries int
 	// Now is the clock used for cache expiry (default time.Now).
 	Now func() time.Time
 
-	mu    sync.Mutex
-	cache map[string]cacheEntry
+	// entries and order are the two halves of one capped LRU cache and are always
+	// mutated together under mu: entries maps client_id → its recency-list element,
+	// order holds *cacheEntry front (most recent) to back (least recent).
+	mu          sync.Mutex
+	entries     map[string]*list.Element
+	order       *list.List
+	nextSweepAt time.Time
 }
 
 func (f *Fetcher) guard() addrGuard {
@@ -151,6 +178,13 @@ func (f *Fetcher) cacheTTL() time.Duration {
 		return f.CacheTTL
 	}
 	return defaultCacheTTL
+}
+
+func (f *Fetcher) maxCacheEntries() int {
+	if f.MaxCacheEntries > 0 {
+		return f.MaxCacheEntries
+	}
+	return defaultMaxCacheEntries
 }
 
 // effectiveClient returns a client that reuses any injected Transport but always
@@ -201,7 +235,8 @@ func (f *Fetcher) checkRedirect(req *http.Request, via []*http.Request) error {
 }
 
 // Fetch retrieves and validates the CIMD document for clientID. A validated
-// document is cached (deep-copied); failures are never cached. Every returned
+// document is cached (deep-copied) in a size-capped LRU bounded by
+// MaxCacheEntries; failures are never cached. Every returned
 // document is a deep copy, so a caller mutating it cannot poison the cache.
 func (f *Fetcher) Fetch(ctx context.Context, clientID string) (*ClientMetadata, error) {
 	if doc, ok := f.cacheGet(clientID); ok {
@@ -285,24 +320,103 @@ func validateClientMetadata(requestedClientID string, doc *ClientMetadata) error
 func (f *Fetcher) cacheGet(clientID string) (*ClientMetadata, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	e, ok := f.cache[clientID]
+	el, ok := f.entries[clientID]
 	if !ok {
 		return nil, false
 	}
+	e := entryOf(el)
 	if !f.now().Before(e.expiresAt) {
-		delete(f.cache, clientID)
+		f.removeLocked(el)
 		return nil, false
 	}
+	// A hit records recency but deliberately does NOT re-stamp expiresAt, so a
+	// cached document is still re-fetched every TTL. That is why recency order is
+	// not expiry order — see sweepExpiredLocked.
+	f.order.MoveToFront(el)
 	return e.doc.clone(), true
 }
 
 func (f *Fetcher) cacheStore(clientID string, doc *ClientMetadata) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.cache == nil {
-		f.cache = make(map[string]cacheEntry)
+	if f.entries == nil {
+		f.entries = make(map[string]*list.Element)
+		f.order = list.New()
 	}
-	f.cache[clientID] = cacheEntry{doc: doc.clone(), expiresAt: f.now().Add(f.cacheTTL())}
+	now := f.now()
+
+	// Trigger (a): amortized active expiry, at most once per TTL window. Without
+	// it a below-capacity cache holding one-shot keys — the attacker's shape, where
+	// no later lookup of the same key ever arrives — would never return that
+	// memory.
+	if !now.Before(f.nextSweepAt) {
+		f.sweepExpiredLocked(now)
+		f.nextSweepAt = now.Add(f.cacheTTL())
+	}
+
+	expiresAt := now.Add(f.cacheTTL())
+	if el, ok := f.entries[clientID]; ok {
+		e := entryOf(el)
+		e.doc = doc.clone()
+		e.expiresAt = expiresAt
+		f.order.MoveToFront(el)
+		return
+	}
+
+	// Trigger (b): at or over capacity, sweep unconditionally so an expired entry
+	// is always reclaimed in preference to evicting a live one.
+	maxEntries := f.maxCacheEntries()
+	if len(f.entries) >= maxEntries {
+		f.sweepExpiredLocked(now)
+	}
+
+	f.entries[clientID] = f.order.PushFront(&cacheEntry{key: clientID, doc: doc.clone(), expiresAt: expiresAt})
+	for len(f.entries) > maxEntries {
+		f.removeLocked(f.order.Back())
+	}
+}
+
+// sweepExpiredLocked removes every expired entry. It is a FULL walk, not a scan of
+// the least-recently-used tail: cacheGet moves an entry to the front without
+// re-stamping expiresAt, so an expired entry can sit ahead of live ones and a
+// tail-only scan would stop at the first live entry and leave it behind. At a cap
+// of a few hundred the full walk is trivially cheap.
+//
+// next is captured BEFORE Remove because container/list zeroes a removed element's
+// next/prev links (see https://pkg.go.dev/container/list#List.Remove), so reading
+// el.Next() afterwards would end the walk at the first removal.
+func (f *Fetcher) sweepExpiredLocked(now time.Time) {
+	for el := f.order.Front(); el != nil; {
+		next := el.Next()
+		if !now.Before(entryOf(el).expiresAt) {
+			f.removeLocked(el)
+		}
+		el = next
+	}
+}
+
+// removeLocked drops el from BOTH the recency list and the key map.
+func (f *Fetcher) removeLocked(el *list.Element) {
+	delete(f.entries, entryOf(el).key)
+	f.order.Remove(el)
+}
+
+// cacheLen and cacheOrderLen expose the two halves of the cache separately so a
+// same-package test can prove they never drift — a delete that touches only one
+// side leaks the other and silently defeats the bound.
+func (f *Fetcher) cacheLen() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.entries)
+}
+
+func (f *Fetcher) cacheOrderLen() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.order == nil {
+		return 0
+	}
+	return f.order.Len()
 }
 
 // wrapFetchErr surfaces a typed *Error carried in the transport error chain (e.g.
