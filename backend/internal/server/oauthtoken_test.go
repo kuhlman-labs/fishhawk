@@ -464,12 +464,21 @@ func TestToken_RefreshReuseIsInvalidGrantAndLineageIsRevokedAfterReturn(t *testi
 func TestToken_RefreshRevokedAndReusedCollapseToOneOpaqueError(t *testing.T) {
 	srv, store := newOAuthTokenServer(t)
 	first := exchangeForRefresh(t, srv, store)
-	// Rotate once (consumes first), then reuse: reuse -> invalid_grant.
-	_ = decodeToken(t, postToken(srv, refreshForm(first.RefreshToken), nil))
+	// Rotate once (consumes first, mints a successor), then reuse the consumed
+	// token: the reuse -> invalid_grant AND its lineage sweep revokes the
+	// successor. The successor is now GENUINELY REVOKED — it was never itself
+	// presented, so it exercises the store's ErrRevoked branch, not
+	// ErrRefreshReused.
+	rotated := decodeToken(t, postToken(srv, refreshForm(first.RefreshToken), nil))
 	reuse := oauthErrCode(t, postToken(srv, refreshForm(first.RefreshToken), nil))
+	// Presenting the REVOKED successor must collapse to the SAME opaque
+	// invalid_grant (the branch the test name promises but the prior form never
+	// reached). A regression mapping ErrRevoked to a distinguishable response
+	// fails here.
+	revoked := oauthErrCode(t, postToken(srv, refreshForm(rotated.RefreshToken), nil))
 	// A brand-new, never-issued token -> also invalid_grant (indistinguishable).
 	notfound := oauthErrCode(t, postToken(srv, refreshForm("fhr_"+strings.Repeat("z", 40)), nil))
-	if reuse != "invalid_grant" || notfound != "invalid_grant" {
-		t.Fatalf("reuse=%s notfound=%s, both want invalid_grant", reuse, notfound)
+	if reuse != "invalid_grant" || revoked != "invalid_grant" || notfound != "invalid_grant" {
+		t.Fatalf("reuse=%s revoked=%s notfound=%s, all want invalid_grant", reuse, revoked, notfound)
 	}
 }

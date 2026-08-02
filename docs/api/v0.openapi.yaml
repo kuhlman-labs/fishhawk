@@ -3992,13 +3992,13 @@ paths:
             `state` and `iss` (RFC 9207 §2) for a redirectable invalid request.
         '400':
           description: |
-            An in-place HTML error for an UNREDIRECTABLE invalid request — an
-            unresolvable `client_id` or a `redirect_uri` that does not match the
-            registered client — where redirecting the error would hand it to an
-            unverified destination.
+            An in-place RFC 6749 §5.2 JSON error for an UNREDIRECTABLE invalid
+            request — an unresolvable `client_id` or a `redirect_uri` that does
+            not match the registered client — where redirecting the error would
+            hand it to an unverified destination.
           content:
-            text/html:
-              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
         '503': { $ref: '#/components/responses/OAuthASUnavailable' }
     post:
       operationId: postOAuthAuthorize
@@ -4043,15 +4043,33 @@ paths:
             On deny, redirect with `error=access_denied`, `state`, `iss`
             (RFC 9207 §2).
         '400':
-          description: The consent request was malformed or referenced no pending authorization.
+          description: |
+            The consent request was malformed or referenced no pending
+            authorization. Unredirectable authorization errors (an unresolvable
+            `client_id` or a mismatched `redirect_uri`) return the RFC 6749 §5.2
+            JSON `OAuthError`; an unparseable form body returns the standard
+            Fishhawk `Error` envelope.
           content:
-            text/html:
-              schema: { type: string }
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/OAuthError'
+                  - $ref: '#/components/schemas/Error'
+        '401':
+          description: |
+            `auth_required` — the decision was submitted without an authenticated
+            session (a `SameSite=Lax` session cookie is required to reach this
+            endpoint). Standard Fishhawk `Error` envelope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: The CSRF cookie / `csrf_token` form field did not validate.
+          description: |
+            The CSRF cookie / `csrf_token` form field did not validate. Standard
+            Fishhawk `Error` envelope.
           content:
-            text/html:
-              schema: { type: string }
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503': { $ref: '#/components/responses/OAuthASUnavailable' }
 
   /v0/oauth/token:

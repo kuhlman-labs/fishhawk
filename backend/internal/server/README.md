@@ -1442,7 +1442,8 @@ half-configured server.
 
 The authorization endpoint must decide WHERE an invalid-request error goes
 before it can decide the error itself. Two failures are answered IN-PLACE (an
-HTML error to the browser), never redirected:
+RFC 6749 §5.2 JSON error via `writeOAuthError`, not an HTML page), never
+redirected:
 
 1. an **unresolvable `client_id`** (no CIMD, no registered client), and
 2. a **`redirect_uri` that does not match** the resolved client's registered set.

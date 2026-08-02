@@ -136,8 +136,16 @@ func (s *Server) tokenAuthorizationCode(w http.ResponseWriter, r *http.Request, 
 		// store surfaces this as ErrCodeConsumed; the handler drives the
 		// lineage sweep (RedeemAuthorizationCode does not, by contract).
 		if errors.Is(err, oauthstore.ErrCodeConsumed) {
-			if c, lerr := s.cfg.OAuthStore.LookupAuthorizationCode(r.Context(), code); lerr == nil {
-				_, _ = s.cfg.OAuthStore.RevokeGrantsForCode(r.Context(), c.ID)
+			// Log rather than discard the lookup/revoke errors: a real-store no-op
+			// (the sweep silently failing while the response still says
+			// invalid_grant, leaving the replayed code's tokens live) is otherwise
+			// invisible — no log, and per-layer unit fakes cannot see the seam.
+			if c, lerr := s.cfg.OAuthStore.LookupAuthorizationCode(r.Context(), code); lerr != nil {
+				s.cfg.Logger.Error("replay lineage sweep: look up consumed authorization code",
+					"error", lerr.Error())
+			} else if _, rerr := s.cfg.OAuthStore.RevokeGrantsForCode(r.Context(), c.ID); rerr != nil {
+				s.cfg.Logger.Error("replay lineage sweep: revoke grants for replayed code",
+					"error", rerr.Error(), "code_id", c.ID.String())
 			}
 		}
 		// Every classification (consumed, expired, not found, revoked,

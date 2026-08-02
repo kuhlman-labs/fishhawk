@@ -113,9 +113,19 @@ func TestOAuthFlow_CodeIsSingleUse(t *testing.T) {
 	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
 
 	code := redirectQuery(t, postConsent(srv, consentForm(nil), &id)).Get("code")
-	_ = decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
+	first := decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
 	replay := postToken(srv, codeExchangeForm(code), nil)
 	if oauthErrCode(t, replay) != "invalid_grant" {
 		t.Fatalf("replay err = %s, want invalid_grant", oauthErrCode(t, replay))
+	}
+	// The invalid_grant response is not enough: RFC 6749 §4.1.2 requires the
+	// replay to REVOKE the lineage. Assert it against the REAL Postgres
+	// repository — the first exchange's access token must stop authenticating.
+	// This is the cross-boundary seam the plan's integration-test rationale
+	// names: the handler-driven sweep passes against the in-memory fake while a
+	// real-store no-op (discarded lookup/revoke error) would leave this token
+	// live with no unit test to catch it.
+	if _, err := store.AuthenticateAccessToken(ctx, first.AccessToken); err == nil {
+		t.Fatal("first-issued access token still authenticates after the replay swept the lineage")
 	}
 }
