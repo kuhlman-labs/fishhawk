@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -582,8 +584,10 @@ func TestOAuthASState_MisconfiguredBeatsLoopbackGate(t *testing.T) {
 
 // TestOAuthASState_LoopbackGateDefaultsOff (#17, DONE-MEANS): a Config that never
 // mentions OAuthASRequireLoopback, on a 0.0.0.0 bind, resolves ENABLED and
-// serves. A comment-only touch or a default flipped to true fails HERE where a
-// scope-presence check would pass.
+// serves. This pins the SERVER-side (Config zero-value) default: a resolver that
+// treated an unset gate as on would 403 here. The CLI flag default (serve.go's
+// --oauth-require-loopback registration) is pinned separately by
+// TestResolveOAuthCIMDLimiterFlags in the fishhawkd package.
 func TestOAuthASState_LoopbackGateDefaultsOff(t *testing.T) {
 	srv := New(Config{
 		Addr:          "0.0.0.0:8080", // public bind, gate UNSET
@@ -596,6 +600,59 @@ func TestOAuthASState_LoopbackGateDefaultsOff(t *testing.T) {
 	if rr.Code != http.StatusOK || !doc.ClientIDMetadataDocumentSupported {
 		t.Fatalf("default-off AS must serve metadata on a public bind; status=%d", rr.Code)
 	}
+}
+
+// TestOAuthASState_LoopbackGateFailsClosedOnUnclassifiableHost pins the two
+// fail-closed branches of the loopback gate (#2441): under the gate, a listen
+// address that cannot be PARSED (net.SplitHostPort fails) and one whose host
+// cannot be CLASSIFIED (the DNS seam errors) both resolve MISCONFIGURED, never
+// silently ENABLED. Without the gate on, the same defective Addr must NOT reach
+// the classifier — the gate is what makes the listen host load-bearing — so the
+// disabled-gate control still resolves enabled. Calls resolveOAuthASState
+// directly to inject the DNS seam.
+func TestOAuthASState_LoopbackGateFailsClosedOnUnclassifiableHost(t *testing.T) {
+	base := func() Config {
+		return Config{
+			OAuthASIssuer:    testIssuer,
+			OAuthStore:       newFakeOAuthStore(),
+			OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+		}
+	}
+	// A DNS seam that always fails, standing in for a resolver outage while
+	// classifying a non-IP listen host.
+	failingLookup := func(string) ([]net.IP, error) {
+		return nil, errors.New("resolver unreachable")
+	}
+
+	t.Run("unparseable listen address under the gate is misconfigured", func(t *testing.T) {
+		cfg := base()
+		cfg.Addr = "garbage-no-port" // net.SplitHostPort fails: missing port
+		cfg.OAuthASRequireLoopback = true
+		st := resolveOAuthASState(cfg, net.LookupIP)
+		if st.mode != oauthASMisconfigured {
+			t.Fatalf("mode = %d, want oauthASMisconfigured (%d) for an unparseable Addr under the gate", st.mode, oauthASMisconfigured)
+		}
+	})
+
+	t.Run("unresolvable listen host under the gate is misconfigured", func(t *testing.T) {
+		cfg := base()
+		cfg.Addr = "as.internal.example:8080" // non-IP host → hits the DNS seam
+		cfg.OAuthASRequireLoopback = true
+		st := resolveOAuthASState(cfg, failingLookup)
+		if st.mode != oauthASMisconfigured {
+			t.Fatalf("mode = %d, want oauthASMisconfigured (%d) when the DNS seam errors under the gate", st.mode, oauthASMisconfigured)
+		}
+	})
+
+	t.Run("without the gate a defective Addr never reaches the classifier", func(t *testing.T) {
+		cfg := base()
+		cfg.Addr = "garbage-no-port" // would fail SplitHostPort IF the gate ran
+		// gate OFF, failing lookup that must never be called
+		st := resolveOAuthASState(cfg, failingLookup)
+		if st.mode != oauthASEnabled {
+			t.Fatalf("mode = %d, want oauthASEnabled (%d) — a defective Addr must not matter when the gate is off", st.mode, oauthASEnabled)
+		}
+	})
 }
 
 // TestOAuthASRoutes_LoopbackGateRefusesAllFour (#15): with the gate on and a

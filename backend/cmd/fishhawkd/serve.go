@@ -165,6 +165,44 @@ func newOAuthCIMDFetcher(issuerResolved string) *oauthas.Fetcher {
 	return &oauthas.Fetcher{}
 }
 
+// oauthCIMDLimiterFlags carries the five #2441 knobs — the CIMD outbound-fetch
+// limiter's per-source and global burst/interval, plus the loopback gate — as
+// live *flag pointers.
+type oauthCIMDLimiterFlags struct {
+	rateBurst          *int
+	rateInterval       *time.Duration
+	globalRateBurst    *int
+	globalRateInterval *time.Duration
+	requireLoopback    *bool
+}
+
+// registerOAuthCIMDLimiterFlags registers the five #2441 knobs on fs with their
+// production names, env fallbacks, and defaults, and returns the resolved
+// pointers. runServe AND serve_test.go both drive THIS function, so the
+// registered defaults are pinned by the same code the daemon runs: a misspelled/
+// deleted flag, a broken flag-over-env precedence, or a flipped default (e.g.
+// the loopback gate to true, or the source burst to 50) fails the test here —
+// which a test duplicating the default literals could not catch (#2441 fix-up).
+func registerOAuthCIMDLimiterFlags(fs *flag.FlagSet) *oauthCIMDLimiterFlags {
+	f := &oauthCIMDLimiterFlags{}
+	f.rateBurst = fs.Int("oauth-cimd-rate-burst", envOrInt("FISHHAWKD_OAUTH_CIMD_RATE_BURST", 5),
+		"per-source burst for the OAuth CIMD outbound-fetch limiter (#2441); a source may burst this many store-miss client resolutions. Zero/negative resolves to the default")
+	f.rateInterval = fs.Duration("oauth-cimd-rate-interval", envOrDuration("FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL", 10*time.Second),
+		"per-source refill interval for the OAuth CIMD limiter: one token is regained per interval")
+	f.globalRateBurst = fs.Int("oauth-cimd-global-rate-burst", envOrInt("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", 30),
+		"GLOBAL burst for the OAuth CIMD limiter — the ceiling that bounds total outbound fetch rate when an attacker rotates across a /64. Zero/negative resolves to the default")
+	f.globalRateInterval = fs.Duration("oauth-cimd-global-rate-interval", envOrDuration("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL", time.Second),
+		"GLOBAL refill interval for the OAuth CIMD limiter: one global token is regained per interval")
+	// DEFAULT FALSE is the scope decision, so it gets its own note: an
+	// on-by-default gate would 403 the #2439 / #1642 / #2032 live walks the
+	// moment it shipped. The limiter above protects the operator who has NOT
+	// thrown this switch.
+	f.requireLoopback = fs.Bool("oauth-require-loopback",
+		envOr("FISHHAWKD_OAUTH_REQUIRE_LOOPBACK", "false") == "true",
+		"code-enforced loopback gate for the OAuth AS (#2441): when set, all four OAuth routes answer 403 oauth_as_loopback_only unless the listener is loopback. OFF by default so it does not silently 403 the live-walk deployments that need a public bind")
+	return f
+}
+
 // planReviewTimeoutBelowDefault reports whether the effective plan-review
 // timeout is below the #606 floor (defaultPlanReviewTimeout). Extracted as a
 // pure predicate so the below/equal/above boundary is unit-testable without
@@ -1047,21 +1085,7 @@ func runServe(args []string, logSink io.Writer) int {
 		"access-token lifetime for the OAuth AS")
 	oauthRefreshTokenTTL := fs.Duration("oauth-refresh-token-ttl", envOrDuration("FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL", 336*time.Hour),
 		"refresh-token lifetime for the OAuth AS")
-	oauthCIMDRateBurst := fs.Int("oauth-cimd-rate-burst", envOrInt("FISHHAWKD_OAUTH_CIMD_RATE_BURST", 5),
-		"per-source burst for the OAuth CIMD outbound-fetch limiter (#2441); a source may burst this many store-miss client resolutions. Zero/negative resolves to the default")
-	oauthCIMDRateInterval := fs.Duration("oauth-cimd-rate-interval", envOrDuration("FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL", 10*time.Second),
-		"per-source refill interval for the OAuth CIMD limiter: one token is regained per interval")
-	oauthCIMDGlobalRateBurst := fs.Int("oauth-cimd-global-rate-burst", envOrInt("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", 30),
-		"GLOBAL burst for the OAuth CIMD limiter — the ceiling that bounds total outbound fetch rate when an attacker rotates across a /64. Zero/negative resolves to the default")
-	oauthCIMDGlobalRateInterval := fs.Duration("oauth-cimd-global-rate-interval", envOrDuration("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL", time.Second),
-		"GLOBAL refill interval for the OAuth CIMD limiter: one global token is regained per interval")
-	// DEFAULT FALSE is the scope decision, so it gets its own note: an
-	// on-by-default gate would 403 the #2439 / #1642 / #2032 live walks the
-	// moment it shipped. The limiter above protects the operator who has NOT
-	// thrown this switch.
-	oauthRequireLoopback := fs.Bool("oauth-require-loopback",
-		envOr("FISHHAWKD_OAUTH_REQUIRE_LOOPBACK", "false") == "true",
-		"code-enforced loopback gate for the OAuth AS (#2441): when set, all four OAuth routes answer 403 oauth_as_loopback_only unless the listener is loopback. OFF by default so it does not silently 403 the live-walk deployments that need a public bind")
+	oauthLimiterFlags := registerOAuthCIMDLimiterFlags(fs)
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
 		"postgres URL; when empty, /v0/runs endpoints respond 503")
 	webhookSecret := fs.String("github-webhook-secret",
@@ -1539,11 +1563,11 @@ func runServe(args []string, logSink io.Writer) int {
 	cfg.OAuthAccessTokenTTL = *oauthAccessTokenTTL
 	cfg.OAuthRefreshTokenTTL = *oauthRefreshTokenTTL
 	cfg.OAuthCIMDFetcher = newOAuthCIMDFetcher(oauthIssuerResolved)
-	cfg.OAuthCIMDRateBurst = *oauthCIMDRateBurst
-	cfg.OAuthCIMDRateInterval = *oauthCIMDRateInterval
-	cfg.OAuthCIMDGlobalRateBurst = *oauthCIMDGlobalRateBurst
-	cfg.OAuthCIMDGlobalRateInterval = *oauthCIMDGlobalRateInterval
-	cfg.OAuthASRequireLoopback = *oauthRequireLoopback
+	cfg.OAuthCIMDRateBurst = *oauthLimiterFlags.rateBurst
+	cfg.OAuthCIMDRateInterval = *oauthLimiterFlags.rateInterval
+	cfg.OAuthCIMDGlobalRateBurst = *oauthLimiterFlags.globalRateBurst
+	cfg.OAuthCIMDGlobalRateInterval = *oauthLimiterFlags.globalRateInterval
+	cfg.OAuthASRequireLoopback = *oauthLimiterFlags.requireLoopback
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a
