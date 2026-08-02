@@ -145,6 +145,47 @@ func TestOAuthCIMDLimiter_CombinedSourceEmptyRefusesGlobalUnchanged(t *testing.T
 	}
 }
 
+// TestOAuthCIMDLimiter_CombinedBothEmptyReturnsMaxWait pins CONDITION 1(b)'s
+// load-bearing rule directly: when BOTH buckets are empty the returned wait is
+// the MAXIMUM of the two, never the per-source one. The independent-exhaustion
+// cases above each leave ONE bucket with tokens, so an implementation that
+// returned the source wait whenever it was positive (and only otherwise the
+// global wait) would pass all of them yet understate Retry-After here whenever
+// the global wait is the longer. Both sub-cases drain BOTH buckets from one
+// source (equal bursts, so N admits empty both) at a frozen clock, then assert
+// the refusal wait equals the LONGER refill regardless of which bucket it is.
+func TestOAuthCIMDLimiter_CombinedBothEmptyReturnsMaxWait(t *testing.T) {
+	drainBothThenRefuse := func(t *testing.T, sourceRefill, globalRefill time.Duration) time.Duration {
+		t.Helper()
+		clk := newFrozen()
+		// Equal bursts (3) so 3 admits from ONE source empty BOTH buckets.
+		lim := newOAuthCIMDLimiter(clk.now, 3, sourceRefill, 3, globalRefill, 100)
+		for i := 0; i < 3; i++ {
+			if ok, _ := lim.Allow("1.2.3.4"); !ok {
+				t.Fatalf("admit %d within both bursts must pass", i)
+			}
+		}
+		ok, wait := lim.Allow("1.2.3.4")
+		if ok {
+			t.Fatal("must refuse with both buckets empty")
+		}
+		return wait
+	}
+
+	t.Run("global wait longer", func(t *testing.T) {
+		// source 1s, global 10s → both empty → max is the global wait (10s).
+		if wait := drainBothThenRefuse(t, time.Second, 10*time.Second); wait != 10*time.Second {
+			t.Fatalf("returned wait = %v, want the LONGER (global) wait 10s — the MAX of the two", wait)
+		}
+	})
+	t.Run("source wait longer", func(t *testing.T) {
+		// Reverse: source 10s, global 1s → both empty → max is the source wait (10s).
+		if wait := drainBothThenRefuse(t, 10*time.Second, time.Second); wait != 10*time.Second {
+			t.Fatalf("returned wait = %v, want the LONGER (source) wait 10s — the MAX of the two", wait)
+		}
+	})
+}
+
 // TestOAuthCIMDLimiter_TrackedSourcesBounded: maxSources+50 distinct keys leave
 // the tracked count at exactly maxSources. Delete the LRU eviction and the count
 // climbs past maxSources → RED.

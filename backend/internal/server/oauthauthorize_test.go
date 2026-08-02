@@ -166,6 +166,39 @@ func TestOAuthRoutes_DistinctSourcesGetIndependentBuckets(t *testing.T) {
 	}
 }
 
+// TestOAuthAuthorize_StoreOutageRenders503 pins the shared renderer's
+// store-outage arm END TO END on the authorize route (concern: the 503 branch of
+// writeOAuthClientError was covered only at the resolver's error-CODE level, not
+// through a rendered HTTP status). A non-ErrNotFound store error must render 503
+// temporarily_unavailable IN PLACE — NOT fall through to the default 400, and NOT
+// be mistaken for the limiter's 429 (both carry ErrCodeTemporarilyUnavailable; the
+// renderer discriminates on the typed cause). Deleting the
+// ErrCodeTemporarilyUnavailable case (letting a store outage keep defaultStatus
+// 400) turns this RED.
+func TestOAuthAuthorize_StoreOutageRenders503(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.getErr = context.DeadlineExceeded
+	rt := newCIMD()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+
+	rr := getAuthorize(srv, authorizeQuery(map[string]string{"client_id": "client-x"}), nil)
+	if rr.Code == http.StatusTooManyRequests {
+		t.Fatalf("a store outage must not render as the limiter's 429; body=%s", rr.Body.String())
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("store-outage status = %d, want 503 (not the default 400); body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "temporarily_unavailable") {
+		t.Fatalf("body = %q, want the flat §5.2 temporarily_unavailable envelope", rr.Body.String())
+	}
+	if rt.fetches() != 0 {
+		t.Fatalf("a store outage must abort before any CIMD fetch: fetches = %d", rt.fetches())
+	}
+	if loc := rr.Header().Get("Location"); loc != "" {
+		t.Fatalf("the in-place store-outage error must not redirect (Location=%q)", loc)
+	}
+}
+
 // assertRetryAfterAtLeastOne parses Retry-After as an integer of at least 1.
 func assertRetryAfterAtLeastOne(t *testing.T, rr *httptest.ResponseRecorder) {
 	t.Helper()
