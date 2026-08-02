@@ -31,9 +31,6 @@ func NewPostgresRepository(pool *pgxpool.Pool) Repository {
 }
 
 func (r *postgresRepo) UpsertClient(ctx context.Context, in NewClient) (*Client, error) {
-	if in.Provider == "" {
-		return nil, errors.New("oauthstore: provider required")
-	}
 	if in.Metadata.ClientID == "" {
 		return nil, errors.New("oauthstore: client_id required")
 	}
@@ -44,7 +41,6 @@ func (r *postgresRepo) UpsertClient(ctx context.Context, in NewClient) (*Client,
 	q := oauthstoredb.New(r.pool)
 	row, err := q.UpsertClient(ctx, oauthstoredb.UpsertClientParams{
 		ID:                      uuid.New(),
-		Provider:                in.Provider,
 		ClientID:                in.Metadata.ClientID,
 		RedirectUris:            emptyIfNil(in.Metadata.RedirectURIs),
 		GrantTypes:              emptyIfNil(in.Metadata.GrantTypes),
@@ -62,12 +58,9 @@ func (r *postgresRepo) UpsertClient(ctx context.Context, in NewClient) (*Client,
 	return rowToClient(row), nil
 }
 
-func (r *postgresRepo) GetClient(ctx context.Context, provider, clientID string) (*Client, error) {
+func (r *postgresRepo) GetClientByID(ctx context.Context, clientID string) (*Client, error) {
 	q := oauthstoredb.New(r.pool)
-	row, err := q.GetClientByClientID(ctx, oauthstoredb.GetClientByClientIDParams{
-		Provider: provider,
-		ClientID: clientID,
-	})
+	row, err := q.GetClientByClientID(ctx, clientID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -619,7 +612,6 @@ func (r *postgresRepo) RevokeRefreshToken(ctx context.Context, id uuid.UUID) (*R
 func rowToClient(r oauthstoredb.OauthClient) *Client {
 	return &Client{
 		ID:                      r.ID,
-		Provider:                r.Provider,
 		ClientID:                r.ClientID,
 		RedirectURIs:            r.RedirectUris,
 		GrantTypes:              r.GrantTypes,

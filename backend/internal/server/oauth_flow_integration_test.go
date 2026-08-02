@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -15,19 +16,30 @@ import (
 )
 
 // TestOAuthFlow_EndToEnd_AuthorizeConsentTokenRefresh drives the whole chain —
-// consent POST -> token -> refresh — against the REAL oauthstore Postgres
-// repository, asserting the DERIVED-authority contract observable only across
-// the whole chain: the minted access token's persisted audience equals the
-// requested RFC 8707 resource, its subject/provider/scopes equal the consenting
-// session's, and the rotated successor inherits all of them verbatim.
+// GET /v0/oauth/authorize -> consent POST -> token -> refresh — against the REAL
+// oauthstore Postgres repository, asserting the DERIVED-authority contract
+// observable only across the whole chain: the minted access token's persisted
+// audience equals the requested RFC 8707 resource, its subject/provider/scopes
+// equal the consenting session's, and the rotated successor inherits all of them
+// verbatim.
+//
+// It is also the CROSS-BOUNDARY test for #2437, which is why the authorize GET
+// is driven here rather than only in the handler unit tests: migration 0064, the
+// hand-edited sqlc layer, repository.GetClientByID, resolveOAuthClient's single
+// store read and the HTTP handlers are all exercised on ONE path, with NO
+// provider present in the request at any point. The load-bearing half is the
+// ANONYMOUS authorize below — the redirect_uri is validated against the persisted
+// row PRE-IDENTITY, which is exactly the position from which a forge
+// discriminator could never have been supplied. Per-layer units would each pass
+// while this seam broke.
 func TestOAuthFlow_EndToEnd_AuthorizeConsentTokenRefresh(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
 	store := oauthstore.NewPostgresRepository(pool)
 
-	// Pre-register a public client (store-first resolution).
+	// Pre-register a public client (store-first resolution). NO provider: a
+	// registration names which SOFTWARE is asking, not who authenticated.
 	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
-		Provider: "github",
 		Metadata: oauthas.ClientMetadata{
 			ClientID:                "client-x",
 			RedirectURIs:            []string{"https://app.example/cb"},
@@ -47,7 +59,39 @@ func TestOAuthFlow_EndToEnd_AuthorizeConsentTokenRefresh(t *testing.T) {
 	// Untenanted identity (empty AccountID -> NULL account_id, no accounts FK).
 	id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
 
-	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+	_, gh := stubGitHubOAuthServer(t)
+	srv := New(Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       store,
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+		AuthRepo:         repo,
+		GitHubOAuth:      gh,
+	})
+
+	// PRE-IDENTITY authorize. Anonymous, so no provider exists anywhere in the
+	// request — yet the registered redirect_uri must still resolve off the
+	// persisted row, which is what sends this to sign-in rather than to an
+	// invalid_client / redirect-mismatch refusal.
+	anon := getAuthorize(srv, authorizeQuery(nil), nil)
+	if anon.Code != http.StatusFound {
+		t.Fatalf("anonymous authorize status = %d, want 302 to sign-in; body=%s", anon.Code, anon.Body.String())
+	}
+	if loc := anon.Header().Get("Location"); !strings.HasPrefix(loc, "/v0/auth/github/login?next=") {
+		t.Fatalf("anonymous authorize Location = %q, want the forge sign-in redirect (the store row resolved)", loc)
+	}
+	// The counterpart that makes the above non-vacuous: an UNREGISTERED
+	// redirect_uri is refused in place, so the sign-in redirect really did
+	// depend on the persisted redirect_uris rather than on skipping the check.
+	mismatch := getAuthorize(srv, authorizeQuery(map[string]string{"redirect_uri": "https://evil.example/cb"}), nil)
+	if mismatch.Code == http.StatusFound && strings.HasPrefix(mismatch.Header().Get("Location"), "/v0/auth/github/login") {
+		t.Fatal("an unregistered redirect_uri reached sign-in; the store row's redirect_uris were not enforced pre-identity")
+	}
+
+	// Signed in, the same store-resolved client renders the consent page.
+	consentPage := getAuthorize(srv, authorizeQuery(nil), &id)
+	if consentPage.Code != http.StatusOK {
+		t.Fatalf("authorize consent page status = %d, want 200; body=%s", consentPage.Code, consentPage.Body.String())
+	}
 
 	// Consent POST -> 302 with a code.
 	consentRR := postConsent(srv, consentForm(nil), &id)
@@ -95,7 +139,6 @@ func TestOAuthFlow_CodeIsSingleUse(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	store := oauthstore.NewPostgresRepository(pool)
 	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
-		Provider: "github",
 		Metadata: oauthas.ClientMetadata{
 			ClientID:                "client-x",
 			RedirectURIs:            []string{"https://app.example/cb"},
@@ -144,7 +187,6 @@ func TestOAuthFlow_LimiterLivePreservesHappyPathThenThrottlesCIMD(t *testing.T) 
 	pool := pgtest.NewPool(t)
 	store := oauthstore.NewPostgresRepository(pool)
 	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
-		Provider: "github",
 		Metadata: oauthas.ClientMetadata{
 			ClientID:                "client-x",
 			RedirectURIs:            []string{"https://app.example/cb"},

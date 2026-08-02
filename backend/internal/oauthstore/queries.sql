@@ -1,6 +1,8 @@
 -- OAuth 2.1 authorization-server storage queries (E66.18 / #2433, ADR-076).
 -- sqlc generates typed Go into ./db per backend/sqlc.yaml. Schema:
--- internal/postgres/migrations/0063_oauth_as_storage.up.sql.
+-- internal/postgres/migrations/0063_oauth_as_storage.up.sql, amended by 0064
+-- (#2437), which dropped oauth_clients.provider and keyed that table on
+-- client_id alone. The three credential tables keep their provider column.
 --
 -- Every query below is keyed either on a 256-bit credential hash or on a row
 -- id. NONE filters on account_id — see 0063's header part (c): ID-based
@@ -28,11 +30,11 @@
 -- pinned by TestUpsertClient_AccountIDIsStickyAcrossRefreshes rather than
 -- silently becoming a cross-tenant move.
 INSERT INTO oauth_clients (
-    id, provider, client_id, redirect_uris, grant_types, response_types,
+    id, client_id, redirect_uris, grant_types, response_types,
     token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-ON CONFLICT (provider, client_id) DO UPDATE
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (client_id) DO UPDATE
    SET redirect_uris              = EXCLUDED.redirect_uris,
        grant_types                = EXCLUDED.grant_types,
        response_types             = EXCLUDED.response_types,
@@ -46,11 +48,12 @@ ON CONFLICT (provider, client_id) DO UPDATE
 RETURNING *;
 
 -- name: GetClientByClientID :one
--- Keyed on the forge-scoped composite, so the same CIMD URL under two
--- providers is two distinct registrations.
+-- Keyed on client_id ALONE, which is globally unique (0064): a client
+-- registration names which SOFTWARE is asking — its client_id is a CIMD
+-- document URL — and has no identity provider to be scoped by. So one CIMD URL
+-- is one registration, and this read can never return an ambiguous pair.
 SELECT * FROM oauth_clients
- WHERE provider = $1
-   AND client_id = $2;
+ WHERE client_id = $1;
 
 -- name: CreateAuthorizationCode :one
 -- code_hash is the hex sha256 of the plaintext; the plaintext itself is never

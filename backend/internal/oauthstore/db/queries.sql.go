@@ -350,24 +350,19 @@ func (q *Queries) GetAuthorizationCodeByHash(ctx context.Context, codeHash strin
 }
 
 const getClientByClientID = `-- name: GetClientByClientID :one
-SELECT id, provider, client_id, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id, first_seen_at, updated_at FROM oauth_clients
- WHERE provider = $1
-   AND client_id = $2
+SELECT id, client_id, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id, first_seen_at, updated_at FROM oauth_clients
+ WHERE client_id = $1
 `
 
-type GetClientByClientIDParams struct {
-	Provider string `json:"provider"`
-	ClientID string `json:"client_id"`
-}
-
-// Keyed on the forge-scoped composite, so the same CIMD URL under two
-// providers is two distinct registrations.
-func (q *Queries) GetClientByClientID(ctx context.Context, arg GetClientByClientIDParams) (OauthClient, error) {
-	row := q.db.QueryRow(ctx, getClientByClientID, arg.Provider, arg.ClientID)
+// Keyed on client_id ALONE, which is globally unique (0064): a client
+// registration names which SOFTWARE is asking — its client_id is a CIMD
+// document URL — and has no identity provider to be scoped by. So one CIMD URL
+// is one registration, and this read can never return an ambiguous pair.
+func (q *Queries) GetClientByClientID(ctx context.Context, clientID string) (OauthClient, error) {
+	row := q.db.QueryRow(ctx, getClientByClientID, clientID)
 	var i OauthClient
 	err := row.Scan(
 		&i.ID,
-		&i.Provider,
 		&i.ClientID,
 		&i.RedirectUris,
 		&i.GrantTypes,
@@ -649,11 +644,11 @@ func (q *Queries) TouchAccessTokenLastUsed(ctx context.Context, arg TouchAccessT
 const upsertClient = `-- name: UpsertClient :one
 
 INSERT INTO oauth_clients (
-    id, provider, client_id, redirect_uris, grant_types, response_types,
+    id, client_id, redirect_uris, grant_types, response_types,
     token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-ON CONFLICT (provider, client_id) DO UPDATE
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+ON CONFLICT (client_id) DO UPDATE
    SET redirect_uris              = EXCLUDED.redirect_uris,
        grant_types                = EXCLUDED.grant_types,
        response_types             = EXCLUDED.response_types,
@@ -664,12 +659,11 @@ ON CONFLICT (provider, client_id) DO UPDATE
        scope                      = EXCLUDED.scope,
        account_id                 = COALESCE(oauth_clients.account_id, EXCLUDED.account_id),
        updated_at                 = now()
-RETURNING id, provider, client_id, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id, first_seen_at, updated_at
+RETURNING id, client_id, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id, first_seen_at, updated_at
 `
 
 type UpsertClientParams struct {
 	ID                      uuid.UUID  `json:"id"`
-	Provider                string     `json:"provider"`
 	ClientID                string     `json:"client_id"`
 	RedirectUris            []string   `json:"redirect_uris"`
 	GrantTypes              []string   `json:"grant_types"`
@@ -684,7 +678,9 @@ type UpsertClientParams struct {
 
 // OAuth 2.1 authorization-server storage queries (E66.18 / #2433, ADR-076).
 // sqlc generates typed Go into ./db per backend/sqlc.yaml. Schema:
-// internal/postgres/migrations/0063_oauth_as_storage.up.sql.
+// internal/postgres/migrations/0063_oauth_as_storage.up.sql, amended by 0064
+// (#2437), which dropped oauth_clients.provider and keyed that table on
+// client_id alone. The three credential tables keep their provider column.
 //
 // Every query below is keyed either on a 256-bit credential hash or on a row
 // id. NONE filters on account_id — see 0063's header part (c): ID-based
@@ -712,7 +708,6 @@ type UpsertClientParams struct {
 func (q *Queries) UpsertClient(ctx context.Context, arg UpsertClientParams) (OauthClient, error) {
 	row := q.db.QueryRow(ctx, upsertClient,
 		arg.ID,
-		arg.Provider,
 		arg.ClientID,
 		arg.RedirectUris,
 		arg.GrantTypes,
@@ -727,7 +722,6 @@ func (q *Queries) UpsertClient(ctx context.Context, arg UpsertClientParams) (Oau
 	var i OauthClient
 	err := row.Scan(
 		&i.ID,
-		&i.Provider,
 		&i.ClientID,
 		&i.RedirectUris,
 		&i.GrantTypes,

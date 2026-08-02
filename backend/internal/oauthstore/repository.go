@@ -120,13 +120,17 @@ func HashPlaintext(prefix, plaintext string) (string, error) {
 
 // Client is a persisted CIMD-derived client registration.
 //
+// NOT FORGE-SCOPED, and deliberately so (0064 / #2437): a registration names
+// WHICH SOFTWARE is asking — ClientID is a CIMD document URL — not who
+// authenticated, so it carries no identity provider and one URL is one
+// registration globally. The three credential types below (AuthorizationCode,
+// AccessToken, RefreshToken) DO record a subject and keep their Provider field.
+//
 // REFRESH-ON-FETCH: UpsertClient overwrites the metadata columns when the same
-// (Provider, ClientID) is seen again, because the CIMD document is
-// authoritative and client-controlled. FirstSeenAt is preserved across
-// refreshes; UpdatedAt moves.
+// ClientID is seen again, because the CIMD document is authoritative and
+// client-controlled. FirstSeenAt is preserved across refreshes; UpdatedAt moves.
 type Client struct {
 	ID                      uuid.UUID
-	Provider                string
 	ClientID                string
 	RedirectURIs            []string
 	GrantTypes              []string
@@ -231,9 +235,9 @@ func (t RefreshToken) IsRevoked() bool { return t.RevokedAt != nil }
 func (t RefreshToken) IsExpired(now time.Time) bool { return !now.Before(t.ExpiresAt) }
 
 // NewClient is the input to UpsertClient. It is the persisted projection of an
-// oauthas.ClientMetadata plus the forge/tenant discriminators.
+// oauthas.ClientMetadata plus the tenant discriminator — and NO forge one: see
+// Client for why a registration has no identity provider.
 type NewClient struct {
-	Provider  string
 	Metadata  oauthas.ClientMetadata
 	AccountID string
 }
@@ -329,14 +333,17 @@ type IssuedGrant struct {
 // a failed check) is explicitly foreclosed.
 type Repository interface {
 	// UpsertClient records a CIMD-derived registration, OVERWRITING the
-	// metadata of an existing (provider, client_id) row. See Client: the
-	// document is authoritative, so a client that rotates its redirect URIs is
-	// reflected on the next fetch rather than pinned to its first snapshot.
+	// metadata of the existing row for that client_id (the conflict target is
+	// client_id ALONE — 0064). See Client: the document is authoritative, so a
+	// client that rotates its redirect URIs is reflected on the next fetch
+	// rather than pinned to its first snapshot.
 	UpsertClient(ctx context.Context, in NewClient) (*Client, error)
 
-	// GetClient returns the registration for (provider, clientID), or
-	// ErrNotFound.
-	GetClient(ctx context.Context, provider, clientID string) (*Client, error)
+	// GetClientByID returns the registration for clientID, or ErrNotFound.
+	// client_id is globally unique, so this resolves to AT MOST ONE row —
+	// there is no forge scope to disambiguate and no ambiguous pair a caller
+	// could have to arbitrate.
+	GetClientByID(ctx context.Context, clientID string) (*Client, error)
 
 	// CreateAuthorizationCode mints a code and returns the row with PlainText
 	// set — the only time that value exists outside the client.
