@@ -73,13 +73,15 @@ func toOAuthError(err error) *oauthas.Error {
 // the matched registered redirect URI, and the parsed PKCE method + scopes.
 func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req authorizeRequest) (authorizeResolved, bool) {
 	// ---- IN-PLACE PHASE: no redirect is permitted yet. ----
-	client, cerr := s.resolveOAuthClient(r.Context(), req.clientID)
+	// The CIMD limiter fires INSIDE resolveOAuthClient, before
+	// MatchRedirectURIAny has validated any redirect_uri, so a rate-limit 429 is
+	// rendered in place and NEVER redirected — required by RFC 6749 §4.1.2.1,
+	// which forbids delivering an error to an unverified redirect target. The
+	// shared renderer maps the limiter refusal to 429 + Retry-After and a store
+	// outage to 503; a plain invalid_client stays 400 here.
+	client, cerr := s.resolveOAuthClient(r, req.clientID)
 	if cerr != nil {
-		status := http.StatusBadRequest
-		if cerr.Code == oauthas.ErrCodeTemporarilyUnavailable {
-			status = http.StatusServiceUnavailable
-		}
-		s.writeOAuthError(w, r, status, cerr.Code, cerr.Description)
+		s.writeOAuthClientError(w, r, http.StatusBadRequest, cerr)
 		return authorizeResolved{}, false
 	}
 	matched, merr := oauthas.MatchRedirectURIAny(client.RedirectURIs, req.redirectURI)

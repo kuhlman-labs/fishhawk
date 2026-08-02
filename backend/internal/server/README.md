@@ -1585,27 +1585,82 @@ This is a workaround, and the operator follow-up is named: **drop `provider`
 from the `oauth_clients` uniqueness key** (an OAuth client is provider-agnostic),
 filed at the #2436 plan gate.
 
-### Recorded, not acted on
+### CIMD amplification limiter + loopback gate (#2441)
 
-Two known gaps are documented here without a change in this slice:
+The outbound CIMD amplification primitive on the two unauthenticated OAuth AS
+routes is now bounded. A `GET /v0/oauth/authorize` (before its identity check) or
+a `POST /v0/oauth/token` (unauthenticated by nature — public client) with an
+unseen `client_id` URL still induces one outbound CIMD fetch, but the RATE and
+VOLUME of those fetches are now capped, and a code-enforced (default-off) loopback
+gate is available. Shipped contract:
+
+- **Two-bucket token limiter (`oauthcimdlimit.go`).** `oauthCIMDLimiter` holds a
+  PER-SOURCE bucket keyed by the canonicalised source address AND one GLOBAL
+  bucket; a request passes only when BOTH admit. The global bucket is not
+  redundant: a per-source limiter alone is defeated by an attacker rotating across
+  an IPv6 /64, whose fresh keys each get a full-burst bucket and simply evict the
+  old ones out of the LRU — the global bucket is what bounds total outbound rate
+  under that rotation. Admission is ATOMIC (both consulted under one mutex, a token
+  consumed from NEITHER unless BOTH admit — a refusal never drains the admitting
+  bucket, which would silently self-tighten the effective rate under load), and the
+  returned wait is the MAXIMUM of the two buckets' waits. The limiter's OWN source
+  map is a capped LRU (the key is attacker-influenced, so an unbounded map is the
+  same memory-exhaustion bug #2434 closed for the CIMD document cache). The source
+  key uses `netip.Addr.Unmap()` so `1.2.3.4` and `::ffff:1.2.3.4` share ONE bucket;
+  any unparseable `RemoteAddr` shares a single `unknown` bucket (degrading toward
+  MORE limiting). There is DELIBERATELY no `X-Forwarded-For` read (no trusted-proxy
+  config exists) and no off switch (an operator-disable knob would reintroduce the
+  unbounded case a config typo could reach); raise `--oauth-cimd-rate-burst` /
+  `--oauth-cimd-global-rate-burst` to loosen it. Defaults: 5 burst + 1/10s per
+  source; 30 burst + 1/1s global.
+- **CIMD-branch-only placement.** The limiter is consulted INSIDE
+  `resolveOAuthClient`, only on the zero-store-hits branch — a `client_id` that
+  resolves from the store dials nothing outbound and is never throttled. Honest
+  narrowing: the guard sits on the CIMD RESOLUTION branch, a superset of real
+  outbound fetches, so a `client_id` already warm in the fetcher's 15-minute LRU
+  costs a token though it dials nothing; erring toward throttling is the safe
+  direction for a volume-bounding control.
+- **In-place 429.** The refusal renders as HTTP 429 with a `Retry-After`
+  (RFC 9110 §10.2.3 delta-seconds, ceil, floor 1) and the flat RFC 6749 §5.2 body
+  with code `temporarily_unavailable`. On authorize it fires before
+  `MatchRedirectURIAny` validates any `redirect_uri`, so it is rendered IN PLACE and
+  NEVER redirected (RFC 6749 §4.1.2.1). The wait is carried as a typed
+  `cimdRateLimitedError` in the `*oauthas.Error` Cause, so the renderer reads it
+  structurally rather than re-consulting the limiter (which would burn a second
+  token). NOTE: `temporarily_unavailable` is not in the RFC 6749 §5.2
+  token-endpoint code set — see "Deliberate §5.2 departure" below.
+- **Four-verdict loopback gate.** `resolveOAuthASState` gained an
+  `oauthASNotLoopback` verdict: when `--oauth-require-loopback` is set and the
+  listener is not loopback, all four OAuth routes answer `403 oauth_as_loopback_only`
+  (reusing the `mcpLoopbackHost` predicate and DNS seam). The ladder order is
+  disabled → misconfigured → not-loopback → enabled, so a deployment with both a
+  defective issuer and a public bind reports the CONFIG defect (the actionable
+  diagnosis). The gate DEFAULTS OFF: an on-by-default gate would silently 403 the
+  #2439 / #1642 / #2032 live walks that need a public bind. The honest cost is that
+  the gate protects nobody who has not opted in — the LIMITER is what protects an
+  unaware operator, and the interim obligation below remains until the operator
+  throws the switch.
+
+Interim operational control: with the gate off (the default), an operator binding
+this AS to a public address relies on the limiter to bound abuse rate — it does not
+make the routes unreachable. Keep the daemon bound to loopback
+(`FISHHAWKD_ADDR=127.0.0.1`) unless you have deliberately enabled a public bind.
+
+**Deliberate §5.2 departure.** RFC 6749 §4.1.2.1's authorization-endpoint error
+list includes `temporarily_unavailable`, so the authorize side is conformant.
+§5.2's token-endpoint list is CLOSED and does NOT include it. We KEEP
+`temporarily_unavailable` at the token endpoint anyway: HTTP 429 is the normative
+signal and the body is advisory. Substituting a §5.2-conformant code would be worse
+— `invalid_client` would tell the client its credentials are wrong (they are not),
+inviting it to discard a valid registration rather than retry after the interval.
+
+Still recorded, not acted on:
 
 - **No operator write path for pre-registration.** `oauth_clients` rows are
   hand-written SQL today — `oauthstore.UpsertClient` exists but has NO caller.
   Registration-free CIMD clients are the supported path; a pre-registration
   admin surface is future work.
-- **CIMD-triggering requests are unrate-limited — and NOT per-route loopback
-  gated.** A `GET /v0/oauth/authorize` (before its identity check) or a `POST
-  /v0/oauth/token` (unauthenticated by nature — public client) with an unseen
-  `client_id` URL triggers an outbound CIMD fetch, and nothing bounds the RATE of
-  those fetches. Unlike `/mcp` (which self-gates to a loopback listener via
-  `mcpRouteState`), these OAuth AS routes carry NO per-route loopback check: the
-  only thing keeping the fetch non-remotely-reachable in the current alpha is the
-  operator binding fishhawkd to a loopback address (`FISHHAWKD_ADDR=127.0.0.1`).
-  So an earlier claim that this "is only externally reachable once #2391" was
-  inaccurate — it is reachable by anyone who can reach the daemon's listener
-  today. The SSRF connect-time guard in `oauthas` bounds WHERE a fetch can go and
-  the fetcher's LRU bounds cache memory, but neither bounds HOW OFTEN or HOW MANY
-  CONCURRENT fetches an attacker can force. Rate limiting (and a per-route
-  loopback/auth gate before a public bind) is therefore a HARD prerequisite for
-  binding this AS to a public address, tracked with #2391 — until it lands the
-  operator MUST keep the daemon bound to loopback.
+- **No negative cache for failed `client_id` validations.** Caching a TRANSIENT
+  failure would pin a briefly-unreachable legitimate CIMD host as invalid for the
+  whole TTL; the limiter already bounds repeated bad ids. Filed as its own design
+  question rather than folded in here.

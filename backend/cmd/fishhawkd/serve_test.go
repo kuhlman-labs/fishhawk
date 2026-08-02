@@ -2948,6 +2948,60 @@ func TestResolveOAuthTTLs_DefaultsApplied(t *testing.T) {
 	}
 }
 
+// TestResolveOAuthCIMDLimiterFlags pins the five #2441 knobs' flag/env
+// resolution (the same envOr* seam serve.go wires; runServe's cfg.X assignment
+// is the systemic gap tracked at #2443, deliberately not claimed here). It
+// includes the DEFAULT-OFF pin for the loopback gate: a flipped default fails
+// here where a scope-presence check would pass.
+func TestResolveOAuthCIMDLimiterFlags(t *testing.T) {
+	// Defaults with the env unset.
+	for _, k := range []string{
+		"FISHHAWKD_OAUTH_CIMD_RATE_BURST", "FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL",
+		"FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", "FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL",
+		"FISHHAWKD_OAUTH_REQUIRE_LOOPBACK",
+	} {
+		t.Setenv(k, "")
+	}
+	if got := envOrInt("FISHHAWKD_OAUTH_CIMD_RATE_BURST", 5); got != 5 {
+		t.Errorf("source burst default = %d, want 5", got)
+	}
+	if got := envOrDuration("FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL", 10*time.Second); got != 10*time.Second {
+		t.Errorf("source interval default = %v, want 10s", got)
+	}
+	if got := envOrInt("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", 30); got != 30 {
+		t.Errorf("global burst default = %d, want 30", got)
+	}
+	if got := envOrDuration("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL", time.Second); got != time.Second {
+		t.Errorf("global interval default = %v, want 1s", got)
+	}
+	// DEFAULT-OFF pin: the gate resolves to false with the env unset.
+	if got := envOr("FISHHAWKD_OAUTH_REQUIRE_LOOPBACK", "false") == "true"; got {
+		t.Error("loopback gate must default OFF (false) with the env unset")
+	}
+
+	// Env override wins for each.
+	t.Setenv("FISHHAWKD_OAUTH_CIMD_RATE_BURST", "9")
+	t.Setenv("FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL", "3s")
+	t.Setenv("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", "77")
+	t.Setenv("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL", "2s")
+	t.Setenv("FISHHAWKD_OAUTH_REQUIRE_LOOPBACK", "true")
+	if got := envOrInt("FISHHAWKD_OAUTH_CIMD_RATE_BURST", 5); got != 9 {
+		t.Errorf("source burst override = %d, want 9", got)
+	}
+	if got := envOrDuration("FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL", 10*time.Second); got != 3*time.Second {
+		t.Errorf("source interval override = %v, want 3s", got)
+	}
+	if got := envOrInt("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", 30); got != 77 {
+		t.Errorf("global burst override = %d, want 77", got)
+	}
+	if got := envOrDuration("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL", time.Second); got != 2*time.Second {
+		t.Errorf("global interval override = %v, want 2s", got)
+	}
+	if got := envOr("FISHHAWKD_OAUTH_REQUIRE_LOOPBACK", "false") == "true"; !got {
+		t.Error("loopback gate env override to true must win")
+	}
+}
+
 // TestServe_ConstructsDefaultCIMDFetcherWhenIssuerConfigured is the production
 // half of FIX 2: an issuer makes the fetcher non-nil (so the misconfigured
 // verdict is unreachable in production); no issuer leaves it nil.

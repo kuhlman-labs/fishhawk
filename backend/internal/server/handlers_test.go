@@ -113,6 +113,37 @@ func TestMCPRouteRegistered(t *testing.T) {
 	}
 }
 
+// TestOAuthASLoopbackGateRouteRegistered guards the route table: with the
+// loopback gate on and a public bind, ALL FOUR OAuth patterns must reach
+// oauthASEnabled and answer 403 oauth_as_loopback_only. An UNregistered pattern
+// would 404 with the mux's default not-found body instead, distinguishable from
+// the gate's 403 (#2441).
+func TestOAuthASLoopbackGateRouteRegistered(t *testing.T) {
+	s := New(Config{
+		Addr: "0.0.0.0:8080", OAuthASRequireLoopback: true,
+		OAuthASIssuer: testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	patterns := []struct{ method, path string }{
+		{http.MethodGet, "/.well-known/oauth-authorization-server"},
+		{http.MethodGet, "/v0/oauth/authorize"},
+		{http.MethodPost, "/v0/oauth/authorize"},
+		{http.MethodPost, "/v0/oauth/token"},
+	}
+	for _, p := range patterns {
+		t.Run(p.method+" "+p.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(p.method, p.path, nil)
+			s.Handler().ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403 (route reaches oauthASEnabled):\n%s", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "oauth_as_loopback_only") {
+				t.Errorf("body = %s, want oauth_as_loopback_only", rec.Body.String())
+			}
+		})
+	}
+}
+
 // TestReleaseNotesPreviewRouteRegistered guards the route table: GET
 // /v0/releases/notes/preview (#1587) must reach handleReleaseNotesPreview. The
 // anonymous request reaches the handler's auth ladder and returns 401 — an

@@ -3749,6 +3749,43 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
 
+    OAuthASLoopbackOnly:
+      description: |
+        The OAuth 2.1 authorization server is loopback-only on this deployment
+        (`error: oauth_as_loopback_only`, #2441). Returned by every one of the
+        four AS routes when `--oauth-require-loopback` is set AND the daemon
+        listens on a non-loopback address. The gate DEFAULTS OFF — with it off
+        (the default) the routes serve on a public bind and the CIMD limiter
+        bounds abuse rate instead. Uses the standard Fishhawk error envelope, not
+        the RFC 6749 flat error shape; `details.listen_host` names the rejected
+        listen host.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    OAuthCIMDRateLimited:
+      description: |
+        The outbound Client ID Metadata Document (CIMD) fetch this request would
+        trigger is rate limited (#2441). Returned ONLY on a store-miss `client_id`
+        (a pre-registered client is never throttled) when the per-source or global
+        token-bucket limiter refuses. The `Retry-After` header carries RFC 9110
+        §10.2.3 delta-seconds (a non-negative integer, floored at 1). The body is
+        the RFC 6749 §5.2 flat `{error, error_description}` shape with
+        `error: temporarily_unavailable` — a DELIBERATE departure at the token
+        endpoint, whose §5.2 code list does not include `temporarily_unavailable`:
+        HTTP 429 is the normative signal and the body is advisory, and a
+        §5.2-conformant `invalid_client` would wrongly tell the client its
+        credentials are bad.
+      headers:
+        Retry-After:
+          description: RFC 9110 §10.2.3 delta-seconds until a token is available (integer, ≥ 1).
+          schema: { type: integer, minimum: 1, example: 10 }
+        Cache-Control:
+          schema: { type: string, example: no-store }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/OAuthError' }
+
 # ---------------------------------------------------------------------------
 # Default security: cookie OR bearer for all UI/CLI endpoints. Runner-
 # facing and webhook endpoints override this individually.
@@ -3919,6 +3956,7 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OAuthServerMetadata' }
+        '403': { $ref: '#/components/responses/OAuthASLoopbackOnly' }
         '503': { $ref: '#/components/responses/OAuthASUnavailable' }
 
   /v0/oauth/authorize:
@@ -3999,6 +4037,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OAuthError' }
+        '403': { $ref: '#/components/responses/OAuthASLoopbackOnly' }
+        '429': { $ref: '#/components/responses/OAuthCIMDRateLimited' }
         '503': { $ref: '#/components/responses/OAuthASUnavailable' }
     post:
       operationId: postOAuthAuthorize
@@ -4065,11 +4105,14 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
           description: |
-            The CSRF cookie / `csrf_token` form field did not validate. Standard
-            Fishhawk `Error` envelope.
+            Either the CSRF cookie / `csrf_token` form field did not validate, or
+            the loopback gate refused the route (`error: oauth_as_loopback_only`,
+            #2441 — `--oauth-require-loopback` set on a non-loopback bind). Both
+            use the standard Fishhawk `Error` envelope.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/OAuthCIMDRateLimited' }
         '503': { $ref: '#/components/responses/OAuthASUnavailable' }
 
   /v0/oauth/token:
@@ -4158,6 +4201,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OAuthError' }
+        '403': { $ref: '#/components/responses/OAuthASLoopbackOnly' }
+        '429': { $ref: '#/components/responses/OAuthCIMDRateLimited' }
         '503': { $ref: '#/components/responses/OAuthASUnavailable' }
 
   # ---------------------------------------------------------------------

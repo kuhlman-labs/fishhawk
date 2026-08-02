@@ -70,13 +70,11 @@ func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	clientID := r.PostForm.Get("client_id")
-	client, cerr := s.resolveOAuthClient(r.Context(), clientID)
+	// The shared renderer maps a CIMD limiter refusal to 429 + Retry-After and a
+	// store outage to 503; a plain invalid_client stays 401 on this endpoint.
+	client, cerr := s.resolveOAuthClient(r, clientID)
 	if cerr != nil {
-		status := http.StatusUnauthorized
-		if cerr.Code == oauthas.ErrCodeTemporarilyUnavailable {
-			status = http.StatusServiceUnavailable
-		}
-		s.writeOAuthError(w, r, status, cerr.Code, cerr.Description)
+		s.writeOAuthClientError(w, r, http.StatusUnauthorized, cerr)
 		return
 	}
 	// Public client only.

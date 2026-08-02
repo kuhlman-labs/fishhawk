@@ -1,10 +1,11 @@
 package server
 
 import (
-	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +50,13 @@ const (
 	// All four routes answer 503 with the specific reason; NO partial
 	// metadata document is ever rendered.
 	oauthASMisconfigured
+
+	// oauthASNotLoopback means every prerequisite is present AND the operator
+	// set --oauth-require-loopback, but the listener is reachable off-host. All
+	// four routes answer 403 oauth_as_loopback_only naming the listen host and
+	// the flag (ADR-076 / #2441). This verdict is UNREACHABLE unless the gate is
+	// switched on, which defaults off.
+	oauthASNotLoopback
 )
 
 // oauthASState is the resolved, immutable AS verdict.
@@ -72,12 +80,25 @@ type oauthASState struct {
 	// reason is the human-readable diagnosis carried by the 503 in the
 	// misconfigured verdict.
 	reason string
+
+	// listenHost is the host portion of Config.Addr, echoed in the 403
+	// oauth_as_loopback_only body so an operator can see what was rejected.
+	// Populated only in the not-loopback verdict.
+	listenHost string
 }
 
 // resolveOAuthASState computes the AS verdict from cfg. It NEVER panics on a
 // bad value — a defective issuer/resource is carried as the misconfigured
 // verdict and rendered per request, so New() cannot crash on operator config.
-func resolveOAuthASState(cfg Config) oauthASState {
+//
+// The ladder is ORDERED disabled -> misconfigured -> not-loopback -> enabled,
+// and the loopback check runs LAST on purpose: a deployment with BOTH a
+// defective issuer and a public bind reports the CONFIG defect, which is the
+// actionable diagnosis (the same "cheapest, most specific diagnosis wins"
+// ordering resolveMCPRouteState documents). lookupIP is the DNS seam shared with
+// the /mcp route (cfg.mcpLookupIP; nil means net.LookupIP), reusing the ONE
+// mcpLoopbackHost classifier rather than a second copy.
+func resolveOAuthASState(cfg Config, lookupIP func(string) ([]net.IP, error)) oauthASState {
 	codeTTL := cfg.OAuthCodeTTL
 	if codeTTL <= 0 {
 		codeTTL = defaultOAuthCodeTTL
@@ -125,6 +146,22 @@ func resolveOAuthASState(cfg Config) oauthASState {
 	// CIMD can never advertise client_id_metadata_document_supported.
 	if cfg.OAuthCIMDFetcher == nil {
 		return misconfigured("the OAuth AS has an issuer configured but no OAuthCIMDFetcher wired")
+	}
+
+	// LOOPBACK GATE (last, default-off, #2441). It fires only when the operator
+	// set --oauth-require-loopback; an unresolvable listen host UNDER the gate is
+	// misconfigured (fail closed), never silently enabled. Reuses the SAME
+	// mcpLoopbackHost predicate and DNS seam as the /mcp route.
+	if cfg.OAuthASRequireLoopback {
+		host, _, err := net.SplitHostPort(cfg.Addr)
+		if err != nil {
+			return misconfigured("the OAuth AS loopback gate cannot parse the listen address " + strconv.Quote(cfg.Addr) + ": " + err.Error())
+		}
+		if _, ok, err := mcpLoopbackHost(host, lookupIP); err != nil {
+			return misconfigured("the OAuth AS loopback gate cannot classify the listen address: " + err.Error())
+		} else if !ok {
+			return oauthASState{mode: oauthASNotLoopback, listenHost: host}
+		}
 	}
 
 	return oauthASState{
@@ -189,6 +226,12 @@ func (s *Server) oauthASEnabled(w http.ResponseWriter, r *http.Request) bool {
 	switch s.oauthAS.mode {
 	case oauthASEnabled:
 		return true
+	case oauthASNotLoopback:
+		s.writeError(w, r, http.StatusForbidden, "oauth_as_loopback_only",
+			"the OAuth 2.1 authorization server is loopback-only on this deployment (--oauth-require-loopback) and this daemon listens on "+
+				strconv.Quote(s.oauthAS.listenHost)+", which is reachable off-host; set FISHHAWKD_ADDR=127.0.0.1:8080, or clear --oauth-require-loopback to serve it on a public bind",
+			map[string]any{"listen_host": s.oauthAS.listenHost})
+		return false
 	case oauthASMisconfigured:
 		s.writeError(w, r, http.StatusServiceUnavailable, "oauth_as_unconfigured",
 			"the OAuth 2.1 authorization server is misconfigured on this deployment: "+s.oauthAS.reason, nil)
@@ -302,7 +345,13 @@ func oauthStringsEqual(a, b []string) bool {
 // Deliberately NO UpsertClient on this hot path: persisting a CIMD-derived row
 // would make the store branch shadow every later refresh, converting the
 // fetcher's bounded TTL into a permanent pin.
-func (s *Server) resolveOAuthClient(ctx context.Context, clientID string) (*resolvedOAuthClient, *oauthas.Error) {
+//
+// It takes the whole *http.Request (not just its context) so the source key for
+// the CIMD limiter is derived by the ONE oauthCIMDSourceKey helper inside the
+// resolver, rather than by each route — the seam that lets both routes share the
+// guard through a single call site.
+func (s *Server) resolveOAuthClient(r *http.Request, clientID string) (*resolvedOAuthClient, *oauthas.Error) {
+	ctx := r.Context()
 	var hits []resolvedOAuthClient
 	for _, p := range oauthASProviders {
 		c, err := s.cfg.OAuthStore.GetClient(ctx, p, clientID)
@@ -339,8 +388,29 @@ func (s *Server) resolveOAuthClient(ctx context.Context, clientID string) (*reso
 		return &c, nil
 	}
 
-	// Zero store hits: validate as a CIMD client_id URL and fetch. Every
-	// failure renders in place as invalid_client.
+	// Zero store hits: this is the ONLY branch that can induce an outbound CIMD
+	// fetch, so the rate limiter is consulted HERE and only here (#2441). A
+	// store-resolved client_id short-circuited above and was never throttled —
+	// throttling the pre-registered flow would degrade it for no benefit, since
+	// it dials nothing. HONEST NARROWING: the guard sits on the CIMD RESOLUTION
+	// branch, a superset of real outbound fetches — a client_id already warm in
+	// the fetcher's LRU costs a token though it dials nothing. Peeking the cache
+	// first would need a new exported oauthas seam and open a check-then-fetch
+	// window; erring toward throttling is the safe direction for a control whose
+	// purpose is bounding outbound VOLUME, and the burst default is sized so a
+	// legitimate re-authorising client never notices. The wait is carried as a
+	// TYPED cimdRateLimitedError in Cause (binding CONDITION 2), so the renderer
+	// reads Retry-After structurally instead of re-consulting the limiter.
+	if ok, wait := s.oauthCIMDLimiter.Allow(oauthCIMDSourceKey(r)); !ok {
+		return nil, &oauthas.Error{
+			Code:        oauthas.ErrCodeTemporarilyUnavailable,
+			Description: "client resolution is temporarily rate limited; retry after the interval in Retry-After",
+			Cause:       &cimdRateLimitedError{retryAfter: wait},
+		}
+	}
+
+	// Validate as a CIMD client_id URL and fetch. Every failure renders in place
+	// as invalid_client.
 	if _, err := oauthas.ValidateClientIDURL(clientID); err != nil {
 		return nil, asInvalidClient(err)
 	}

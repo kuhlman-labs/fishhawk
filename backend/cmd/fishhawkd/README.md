@@ -82,6 +82,19 @@ issuer or resource **refuses to start**. Full state machine and handler contract
 | `FISHHAWKD_OAUTH_CODE_TTL` | `--oauth-code-ttl` | authorization-code lifetime | `60s` |
 | `FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL` | `--oauth-access-token-ttl` | issued access-token lifetime (`expires_in`) | `1h` |
 | `FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL` | `--oauth-refresh-token-ttl` | issued refresh-token lifetime | `336h` |
+| `FISHHAWKD_OAUTH_CIMD_RATE_BURST` | `--oauth-cimd-rate-burst` | per-source burst for the CIMD outbound-fetch limiter (#2441); zero/negative → default. There is no off switch — raise the burst to loosen it | `5` |
+| `FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL` | `--oauth-cimd-rate-interval` | per-source refill interval (one token per interval) | `10s` |
+| `FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST` | `--oauth-cimd-global-rate-burst` | GLOBAL burst — bounds total outbound fetch rate under /64 source rotation | `30` |
+| `FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL` | `--oauth-cimd-global-rate-interval` | GLOBAL refill interval (one token per interval) | `1s` |
+| `FISHHAWKD_OAUTH_REQUIRE_LOOPBACK` | `--oauth-require-loopback` | code-enforced loopback gate: when `true`, all four OAuth routes answer `403 oauth_as_loopback_only` unless the listener is loopback. OFF by default so it does not silently 403 the live-walk deployments that need a public bind — the limiter above is what protects an operator who leaves it off | `false` |
+
+The CIMD limiter (#2441) bounds the outbound amplification the two unauthenticated
+OAuth AS routes (`GET /v0/oauth/authorize`, `POST /v0/oauth/token`) expose: an
+unseen `client_id` URL triggers one outbound CIMD fetch, and these knobs cap the
+rate/volume. A refused request answers `429 temporarily_unavailable` with a
+`Retry-After` header. The limiter is consulted ONLY on the store-miss branch, so a
+pre-registered `client_id` is never throttled. See
+`backend/internal/server/README.md` for the two-bucket contract.
 
 These are the AS ISSUER-side knobs and are unrelated to the GitHub sign-in
 OAuth-CLIENT endpoints below (`FISHHAWKD_OAUTH_AUTHORIZE_URL` et al.), which

@@ -644,6 +644,32 @@ type Config struct {
 	OAuthCodeTTL         time.Duration
 	OAuthAccessTokenTTL  time.Duration
 	OAuthRefreshTokenTTL time.Duration
+
+	// OAuthCIMDRateBurst / OAuthCIMDRateInterval bound the PER-SOURCE CIMD
+	// outbound-fetch limiter (ADR-076 / #2441): a source address may burst
+	// OAuthCIMDRateBurst store-miss client resolutions and then regains one
+	// token per OAuthCIMDRateInterval. OAuthCIMDGlobalRateBurst /
+	// OAuthCIMDGlobalRateInterval are the GLOBAL twin — the ceiling that bounds
+	// total outbound fetch rate when an attacker rotates across a /64, defeating
+	// the per-source bucket alone. Zero/negative resolves to the documented
+	// defaults (5 / 10s per source; 30 / 1s global) — NEVER unbounded. There is
+	// deliberately NO off switch: like the CIMD cache bound, an operator-disable
+	// knob would reintroduce the unbounded case a config typo could reach. Wired
+	// from the --oauth-cimd-rate-* flags in serve.go.
+	OAuthCIMDRateBurst          int
+	OAuthCIMDRateInterval       time.Duration
+	OAuthCIMDGlobalRateBurst    int
+	OAuthCIMDGlobalRateInterval time.Duration
+
+	// OAuthASRequireLoopback is the code-enforced (default-off) loopback gate
+	// for the OAuth AS (ADR-076 / #2441): when true, all four OAuth routes answer
+	// 403 oauth_as_loopback_only if the listener is not loopback. DEFAULT OFF is
+	// a scope decision, not an oversight — an on-by-default gate would silently
+	// 403 the #2439 / #1642 / #2032 live walks that need a public bind. The
+	// limiter above is what protects an operator who has NOT thrown this switch;
+	// the README's interim loopback obligation is the operational control. Wired
+	// from --oauth-require-loopback / FISHHAWKD_OAUTH_REQUIRE_LOOPBACK in serve.go.
+	OAuthASRequireLoopback bool
 }
 
 // Server wraps an http.Server with the routes and middleware stack
@@ -771,6 +797,12 @@ type Server struct {
 	// than an intermittent one.
 	oauthAS oauthASState
 
+	// oauthCIMDLimiter bounds the outbound CIMD amplification the two
+	// unauthenticated OAuth AS routes expose (ADR-076 / #2441). Consulted ONLY
+	// on the store-miss CIMD resolution branch, so a store-resolved client_id
+	// costs nothing outbound and is never throttled. Always non-nil after New().
+	oauthCIMDLimiter *oauthCIMDLimiter
+
 	// mcpHandler is the streamable-HTTP handler backing /mcp, built once
 	// at New() when mcpRoute.mode is mcpRouteEnabled and nil otherwise —
 	// handleMCP's ladder returns before dereferencing it in every other
@@ -838,6 +870,16 @@ func New(cfg Config) *Server {
 	if s.nowFunc == nil {
 		s.nowFunc = time.Now
 	}
+	// Build the CIMD limiter AFTER the nowFunc default is installed, handing it
+	// a CLOSURE over s.nowFunc rather than the resolved value — a captured value
+	// would ignore a test that reassigns s.nowFunc after New, which is exactly
+	// how the frozen clock is injected (#2441 / binding constraint 3).
+	s.oauthCIMDLimiter = newOAuthCIMDLimiter(
+		func() time.Time { return s.nowFunc() },
+		cfg.OAuthCIMDRateBurst, cfg.OAuthCIMDRateInterval,
+		cfg.OAuthCIMDGlobalRateBurst, cfg.OAuthCIMDGlobalRateInterval,
+		defaultOAuthCIMDMaxSources,
+	)
 	// Stamp the boot marker the startup orphaned-review reconcile compares
 	// audit timestamps against (#1781). Default to now; a test-injected
 	// Config.ProcessStart lets the boot-marker gate be exercised deterministically.
@@ -909,7 +951,7 @@ func New(cfg Config) *Server {
 	// Resolve the OAuth AS verdict once (ADR-076 slice 3, #2436). A defective
 	// issuer/resource/store/fetcher is carried as the misconfigured verdict and
 	// rendered per request; New() never panics on operator config.
-	s.oauthAS = resolveOAuthASState(cfg)
+	s.oauthAS = resolveOAuthASState(cfg, cfg.mcpLookupIP)
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildHandler(),
