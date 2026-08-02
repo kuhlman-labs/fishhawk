@@ -47,14 +47,21 @@ Only its **hex sha256** is persisted — the api_tokens pattern.
 **exactly once**, by the mint path that generated the value, and is never
 re-derivable. Every row mapper leaves it empty by construction, so this is
 structural rather than conventional.
-`TestCredentials_PlaintextReturnedOnlyAtMint` asserts it across every read path
-the `Repository` exposes — `LookupAuthorizationCode`, the code carried on
-`RedeemAuthorizationCode`'s grant, `AuthenticateAccessToken`, and the
-post-rotation grant. It deliberately does **not** claim a refresh-token-by-
-plaintext read: the interface exposes none (`GetRefreshTokenByHash` lives only
-in the generated layer, as an implementation detail of `RotateRefreshToken`), and
-an acceptance claim the store API cannot express would be worse than a narrower
-one that is true.
+`TestCredentials_PlaintextReturnedOnlyAtMint` asserts it **exhaustively over the
+interface**, not illustratively: every exported method that can return a
+credential struct appears. The three mint paths return a non-empty `PlainText`;
+the five non-mint paths that return one — `LookupAuthorizationCode`, the code
+carried on `RedeemAuthorizationCode`'s grant, `AuthenticateAccessToken`,
+`RevokeAccessToken` and `RevokeRefreshToken` — return it empty.
+
+`RevokeRefreshToken` is the load-bearing addition: it is the **only** public path
+that hands back a *persisted* refresh-token row, so without it the refresh class
+would be asserted on mint output alone — a row that never made the round trip
+through the database. The assertions are paired with an identity/`revoked_at`
+check so an empty struct could not satisfy them vacuously. (`GetClient` /
+`UpsertClient` return a `*Client`, which carries no `PlainText` field at all;
+`GetRefreshTokenByHash` lives only in the generated layer, as an implementation
+detail of `RotateRefreshToken`.)
 
 Distinct prefixes per class are load-bearing: presenting an access token where a
 refresh token is expected fails at `HashPlaintext` with `ErrMalformedCredential`
@@ -72,8 +79,12 @@ client's document already controls the client.
 `first_seen_at` is preserved across refreshes (it is not in the `DO UPDATE` SET
 list); `updated_at` moves.
 `TestUpsertClient_RefreshesOnConflictAndIsProviderScoped` asserts that a changed
-document updates the persisted row, that `first_seen_at` does not move, and that
-the same `client_id` under `gitlab` is a distinct registration.
+document updates the persisted row, that `first_seen_at` does not move, that
+`updated_at` is **strictly** later, and that the same `client_id` under `gitlab`
+is a distinct registration. The strictness matters: an `after || equal` form
+would permit an unchanged `updated_at`, so dropping `updated_at = now()` from the
+`DO UPDATE` would pass it — the assertion would no longer be load-bearing for the
+"`updated_at` moves" half of the claim.
 
 ## Row-level security: these four tables sit OUTSIDE it, deliberately
 
@@ -196,8 +207,61 @@ rollback-on-error implementation cannot satisfy. Counterfactual (c) reintroduces
 that shape and the test goes red on those assertions while the returned error is
 unchanged.
 
-Revoked is classified **before** consumed, so a third presentation of a
-swept token reports `ErrRevoked` rather than replaying the sweep.
+### The lineage lock — why the guarantee also holds under CONCURRENCY
+
+Committing the sweep is necessary but **not sufficient**. Per-token row locks do
+not serialize a rotation against a sweep of the same lineage: the sweep's
+`UPDATE … WHERE authorization_code_id = $1` fixes its statement snapshot when the
+statement starts, so a rotation that INSERTs a successor pair and commits after
+that instant produces rows the sweep can never see. The reuse verdict would
+return with a **live descendant credential still usable** — the exact failure the
+guarantee forbids.
+
+So the **authorization-code row is the mutex for its whole lineage**.
+`RotateRefreshToken` and `RevokeGrantsForCode` both take it `FOR UPDATE`
+(`LockAuthorizationCodeByID`) *before* reading or mutating any descendant;
+`RedeemAuthorizationCode` already held the same lock via
+`LockAuthorizationCodeByHash`, so the ordering is uniform across the package and
+deadlock-free. Rotation therefore runs in three steps: (1) an unlocked read that
+resolves **only** the immutable `authorization_code_id` and decides nothing, (2)
+the lineage lock, (3) the authoritative re-read under it. Step 3 is what lets a
+rotation queued behind a sweep observe `revoked_at` and mint nothing.
+
+Only two interleavings remain, both safe: the rotation commits first and the
+sweep's later snapshot includes its successor, or the sweep commits first and the
+rotation returns `ErrRevoked`.
+
+| Test | Role |
+|---|---|
+| `TestRotateRefreshToken_ReuseSweepSerializesOnLineage` | **counterfactual vehicle.** An outside transaction holds the code row's `FOR UPDATE` lock and the reuse call must BLOCK. Delete `lockLineage` and it sails through (the sweep's UPDATEs never touch the code row) → RED, deterministically |
+| `TestRotateRefreshToken_ReuseLeavesNoLiveDescendantUnderConcurrency` | the end-to-end **invariant** under a real race: after a concurrent rotate + replay, zero live rows remain in the lineage and a winning rotation's access token does not authenticate. Deliberately *not* the counterfactual vehicle — the losing interleaving is timing dependent, so removing the lock would make it flaky rather than reliably red |
+
+### Classification order: revoked → REUSED → expired
+
+`revoked` first, so a third presentation of an already-swept token reports
+`ErrRevoked` rather than replaying the sweep.
+
+`reused` **before** `expired` is a deliberate decision, not an accident of
+ordering. A replayed rotated token is precisely the compromise signal the sweep
+exists for, and the *presented* token's expiry says nothing about its
+**successors** — they carry later expiries and are the credentials actually at
+risk. Classifying expiry first would silently drop the signal exactly when a
+stolen token is replayed late, leaving the live successors unrevoked. So
+`ErrExpired` on this path means "lapsed and **never rotated**";
+`TestRotateRefreshToken_ExpiredReuseStillSweepsLineage` pins the combination
+(counterfactual: hoist the `IsExpired` check above `IsConsumed` → red on both the
+returned error and the unswept successor), and
+`TestRotateRefreshToken_ExpiredUnknownAreDistinct` keeps the never-rotated case.
+
+### The unreachable consume branch is not the reuse sentinel
+
+`ConsumeRefreshToken`'s conditional UPDATE cannot match zero rows on this path:
+step 3 read `consumed_at` as NULL while holding both the lineage lock and the
+row's own `FOR UPDATE`. If it ever did, returning `ErrRefreshReused` there would
+break the commit-then-signal guarantee above — that return **rolls the
+transaction back**, so the caller would receive the reuse sentinel with no
+committed revocation. It returns a wrapped internal error instead: an invariant
+violation is not a reuse verdict.
 
 ## Revoked is an observable state, not an absence
 

@@ -333,7 +333,10 @@ type Repository interface {
 	// RevokeGrantsForCode revokes every still-active access and refresh token
 	// descended from codeID and returns the total number of rows revoked. This
 	// is the RFC 6749 §4.1.2 replay response, implementable because the lineage
-	// columns are real and NOT NULL.
+	// columns are real and NOT NULL. It takes the same authorization-code row
+	// lock RotateRefreshToken takes, so a concurrent rotation cannot slip a
+	// successor past the sweep. An unknown codeID revokes zero rows without
+	// erroring.
 	RevokeGrantsForCode(ctx context.Context, codeID uuid.UUID) (int64, error)
 
 	// AuthenticateAccessToken resolves a bearer plaintext to its token row.
@@ -359,8 +362,22 @@ type Repository interface {
 	// this method returns — a caller that reads the store afterwards observes a
 	// revoked lineage, never a rolled-back one.
 	//
-	// A revoked token yields ErrRevoked and a lapsed one ErrExpired; a token
-	// with no matching row yields ErrNotFound.
+	// The guarantee holds UNDER CONCURRENCY, not merely in isolation: this
+	// method and RevokeGrantsForCode both serialize on the authorization-code
+	// row (FOR UPDATE) before touching any descendant, so a rotation racing a
+	// sweep of the same lineage cannot leave a live successor behind the reuse
+	// verdict. Either the rotation commits first and the sweep sees its
+	// successor, or the sweep commits first and the rotation observes ErrRevoked
+	// and mints nothing.
+	//
+	// CLASSIFICATION ORDER is part of the contract: revoked → REUSED → expired.
+	// Reuse is classified BEFORE expiry deliberately — a replayed rotated token
+	// is the compromise signal the sweep exists for, and the presented token's
+	// own expiry says nothing about its successors, which carry later expiries.
+	// So an already-rotated token that has ALSO lapsed still sweeps the lineage
+	// and returns ErrRefreshReused, never ErrExpired. ErrExpired is reserved for
+	// a token that lapsed WITHOUT having been rotated; a token with no matching
+	// row yields ErrNotFound.
 	RotateRefreshToken(ctx context.Context, plaintext string, mint MintRequest) (*IssuedGrant, error)
 
 	// RevokeAccessToken marks an access token revoked. Idempotent: a second

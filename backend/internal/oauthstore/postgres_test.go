@@ -20,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 	oauthstoredb "github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 const (
@@ -155,13 +156,17 @@ func TestCredentials_HashedAtRest(t *testing.T) {
 // PlainText, and EVERY read path this Repository exposes returns it EMPTY. An
 // implementation that memoised a plaintext or re-emitted it on a read fails.
 //
-// Scope note (#2433 approval condition 4): Repository exposes no
-// refresh-token-by-plaintext read, so this test asserts what the API can
-// actually observe — LookupAuthorizationCode, the code carried on
-// RedeemAuthorizationCode's grant, AuthenticateAccessToken, and the
-// post-rotation IssuedGrant — rather than claiming a read path that does not
-// exist. GetRefreshTokenByHash lives only in the generated layer and is an
-// implementation detail of RotateRefreshToken.
+// Coverage is EXHAUSTIVE over the interface, not illustrative: every exported
+// method that can return a credential struct is asserted here. The mint paths
+// (CreateAuthorizationCode, RedeemAuthorizationCode, RotateRefreshToken) return
+// a non-empty PlainText; the five non-mint paths that return one —
+// LookupAuthorizationCode, the code carried on RedeemAuthorizationCode's grant,
+// AuthenticateAccessToken, RevokeAccessToken and RevokeRefreshToken — return it
+// EMPTY. RevokeRefreshToken is the only public path that hands back a PERSISTED
+// refresh-token row, so omitting it would leave the refresh class asserted on
+// mint output alone. (GetClient/UpsertClient return a *Client, which carries no
+// PlainText field at all; GetRefreshTokenByHash lives only in the generated
+// layer, as an implementation detail of RotateRefreshToken.)
 func TestCredentials_PlaintextReturnedOnlyAtMint(t *testing.T) {
 	ctx := context.Background()
 	repo, _ := newRepo(t)
@@ -225,6 +230,36 @@ func TestCredentials_PlaintextReturnedOnlyAtMint(t *testing.T) {
 	}
 	if authed2.PlainText != "" {
 		t.Errorf("successor AuthenticateAccessToken PlainText = %q, want empty", authed2.PlainText)
+	}
+
+	// Read path 4: RevokeRefreshToken — the ONLY public path that returns a
+	// PERSISTED refresh-token row. Without this the refresh class would be
+	// asserted on mint output alone, which is exactly what the invariant is
+	// about: the row that came BACK OUT of the database must not carry a
+	// plaintext.
+	revokedRefresh, err := repo.RevokeRefreshToken(ctx, rotated.Refresh.ID)
+	if err != nil {
+		t.Fatalf("RevokeRefreshToken: %v", err)
+	}
+	if revokedRefresh.PlainText != "" {
+		t.Errorf("RevokeRefreshToken PlainText = %q, want empty", revokedRefresh.PlainText)
+	}
+	// And it really is the row we minted, not some empty struct that would make
+	// the assertion above pass vacuously.
+	if revokedRefresh.ID != rotated.Refresh.ID || revokedRefresh.RevokedAt == nil {
+		t.Errorf("RevokeRefreshToken returned %+v, want the persisted successor row with revoked_at set", revokedRefresh)
+	}
+
+	// Read path 5: RevokeAccessToken, the same for the access class.
+	revokedAccess, err := repo.RevokeAccessToken(ctx, rotated.Access.ID)
+	if err != nil {
+		t.Fatalf("RevokeAccessToken: %v", err)
+	}
+	if revokedAccess.PlainText != "" {
+		t.Errorf("RevokeAccessToken PlainText = %q, want empty", revokedAccess.PlainText)
+	}
+	if revokedAccess.ID != rotated.Access.ID || revokedAccess.RevokedAt == nil {
+		t.Errorf("RevokeAccessToken returned %+v, want the persisted successor row with revoked_at set", revokedAccess)
 	}
 }
 
@@ -802,10 +837,222 @@ func TestRotateRefreshToken_ReuseRevokesLineageAfterReturn(t *testing.T) {
 	}
 }
 
+// TestRotateRefreshToken_ReuseSweepSerializesOnLineage is the COUNTERFACTUAL
+// VEHICLE for the lineage lock, and therefore for the whole-lineage revocation
+// guarantee holding under CONCURRENCY rather than only in isolation.
+//
+// The hole it closes: per-token row locks do not serialize a rotation against a
+// sweep of the same lineage. The sweep's `UPDATE … WHERE authorization_code_id
+// = $1` takes its statement snapshot when the statement starts, so a rotation
+// that INSERTs a successor pair and commits after that instant produces rows the
+// sweep can never see — a usable descendant credential surviving reuse
+// detection, which is exactly what the API's guarantee forbids.
+//
+// A racing test cannot pin that reliably (the losing interleaving is timing
+// dependent), so this asserts the MECHANISM directly and deterministically: an
+// outside transaction holds the authorization-code row's FOR UPDATE lock, and
+// the reuse call must BLOCK on it. Delete lockLineage from RotateRefreshToken
+// and the call sails straight through — the sweep's UPDATEs never touch the code
+// row — so the first assertion goes red.
+func TestRotateRefreshToken_ReuseSweepSerializesOnLineage(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode: %v", err)
+	}
+	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	if err != nil {
+		t.Fatalf("RotateRefreshToken: %v", err)
+	}
+
+	// Hold the lineage row lock from OUTSIDE the repository — this stands in for
+	// a concurrent rotation that is mid-flight and has not yet committed.
+	blocker, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin blocking transaction: %v", err)
+	}
+	defer func() { _ = blocker.Rollback(ctx) }()
+	if _, err := blocker.Exec(ctx,
+		`SELECT id FROM oauth_authorization_codes WHERE id = $1 FOR UPDATE`, code.ID); err != nil {
+		t.Fatalf("lock the lineage row: %v", err)
+	}
+
+	// Replay the already-rotated token. It must queue behind the lineage lock.
+	done := make(chan error, 1)
+	go func() {
+		_, e := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+		done <- e
+	}()
+
+	select {
+	case e := <-done:
+		t.Fatalf("the reuse sweep completed (err = %v) while an outside transaction held the lineage row lock — "+
+			"RotateRefreshToken does not serialize on the lineage, so a concurrent rotation can commit a successor "+
+			"pair the sweep's snapshot never sees", e)
+	case <-time.After(timescale.D(500 * time.Millisecond)):
+		// Still blocked: the lineage lock is real.
+	}
+
+	// Release it; the sweep now proceeds and commits.
+	if err := blocker.Rollback(ctx); err != nil {
+		t.Fatalf("release the lineage lock: %v", err)
+	}
+	select {
+	case e := <-done:
+		if !errors.Is(e, oauthstore.ErrRefreshReused) {
+			t.Fatalf("reuse after the lineage lock was released = %v, want ErrRefreshReused", e)
+		}
+	case <-time.After(timescale.D(15 * time.Second)):
+		t.Fatal("the reuse sweep never completed after the lineage lock was released — it is deadlocked, not serialized")
+	}
+
+	if n := scanInt(t, pool,
+		`SELECT count(*) FROM oauth_access_tokens WHERE authorization_code_id = $1 AND revoked_at IS NULL`,
+		code.ID); n != 0 {
+		t.Errorf("%d access tokens still live after the sweep, want 0", n)
+	}
+	if _, err := repo.AuthenticateAccessToken(ctx, successor.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Errorf("successor access token after the serialized sweep = %v, want ErrRevoked", err)
+	}
+}
+
+// TestRotateRefreshToken_ReuseLeavesNoLiveDescendantUnderConcurrency asserts the
+// END-TO-END invariant the lineage lock exists to deliver, under a real race: a
+// legitimate rotation of the LIVE successor runs concurrently with a replay of
+// the CONSUMED predecessor, and once the reuse verdict is returned NO credential
+// in that lineage may still be usable.
+//
+// Both admissible interleavings are safe and both are accepted here: either the
+// rotation commits first (and the sweep, queued behind the lineage lock, sees its
+// successor), or the sweep commits first (and the rotation's post-lock re-read
+// observes revoked_at and returns ErrRevoked, minting nothing). What is NOT
+// admissible — a successful rotation whose tokens survive the sweep — is what the
+// live-row count and the AuthenticateAccessToken assertion below reject.
+//
+// This is the invariant, NOT the counterfactual vehicle: the losing interleaving
+// is timing dependent, so removing the lock would make this test FLAKY rather
+// than reliably red. TestRotateRefreshToken_ReuseSweepSerializesOnLineage is
+// where the mechanism is pinned deterministically.
+func TestRotateRefreshToken_ReuseLeavesNoLiveDescendantUnderConcurrency(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+
+	const rounds = 8
+	for round := range rounds {
+		code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
+		grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+		if err != nil {
+			t.Fatalf("round %d redeem: %v", round, err)
+		}
+		// One clean rotation, so the predecessor is consumed (the reuse trigger)
+		// and the successor is live (the credential that must not survive).
+		successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+		if err != nil {
+			t.Fatalf("round %d first rotation: %v", round, err)
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		var rotateGrant *oauthstore.IssuedGrant
+		var rotateErr, reuseErr error
+
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			rotateGrant, rotateErr = repo.RotateRefreshToken(ctx, successor.Refresh.PlainText, mintReq())
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, reuseErr = repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+		}()
+		close(start)
+		wg.Wait()
+
+		if !errors.Is(reuseErr, oauthstore.ErrRefreshReused) {
+			t.Fatalf("round %d replay of the consumed predecessor = %v, want ErrRefreshReused", round, reuseErr)
+		}
+		if rotateErr != nil && !errors.Is(rotateErr, oauthstore.ErrRevoked) {
+			t.Fatalf("round %d concurrent rotation = %v, want nil or ErrRevoked (no other class)", round, rotateErr)
+		}
+
+		if n := scanInt(t, pool,
+			`SELECT count(*) FROM oauth_access_tokens WHERE authorization_code_id = $1 AND revoked_at IS NULL`,
+			code.ID); n != 0 {
+			t.Errorf("round %d: %d access tokens in the lineage are still live after reuse detection, want 0", round, n)
+		}
+		if n := scanInt(t, pool,
+			`SELECT count(*) FROM oauth_refresh_tokens WHERE authorization_code_id = $1 AND revoked_at IS NULL`,
+			code.ID); n != 0 {
+			t.Errorf("round %d: %d refresh tokens in the lineage are still live after reuse detection, want 0", round, n)
+		}
+		// The concrete harm, through the public API: if the racing rotation won,
+		// its access token must NOT authenticate.
+		if rotateErr == nil {
+			if _, err := repo.AuthenticateAccessToken(ctx, rotateGrant.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+				t.Errorf("round %d: the successor minted by the racing rotation = %v, want ErrRevoked — it escaped the reuse sweep",
+					round, err)
+			}
+		}
+	}
+}
+
+// TestRotateRefreshToken_ExpiredReuseStillSweepsLineage pins the reused-BEFORE-
+// expired classification order. An already-rotated token that has ALSO lapsed is
+// still a replay, and a replay is the compromise signal the sweep exists for —
+// the presented token's expiry says nothing about its SUCCESSORS, which carry
+// later expiries and are the credentials actually at risk.
+//
+// COUNTERFACTUAL: move the IsExpired check ahead of IsConsumed in
+// RotateRefreshToken and this test goes red twice over — the returned error
+// becomes ErrExpired and the live successor is never swept.
+func TestRotateRefreshToken_ExpiredReuseStillSweepsLineage(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode: %v", err)
+	}
+	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	if err != nil {
+		t.Fatalf("RotateRefreshToken: %v", err)
+	}
+
+	// The stolen predecessor lapses before it is replayed. Only its OWN
+	// expires_at moves; the successor pair keeps the live expiries it was minted
+	// with, which is the whole point.
+	if _, err := pool.Exec(ctx,
+		`UPDATE oauth_refresh_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1`,
+		grant.Refresh.ID); err != nil {
+		t.Fatalf("lapse the presented token: %v", err)
+	}
+
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq()); !errors.Is(err, oauthstore.ErrRefreshReused) {
+		t.Fatalf("replay of an expired-AND-consumed token = %v, want ErrRefreshReused (a late replay is still a replay)", err)
+	}
+
+	// The signal was acted on, not merely reported: the successor pair — whose
+	// expiries have NOT lapsed — is revoked.
+	if _, err := repo.AuthenticateAccessToken(ctx, successor.Access.PlainText); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Errorf("successor access token after an expired replay = %v, want ErrRevoked — the sweep was skipped", err)
+	}
+	if n := scanInt(t, pool,
+		`SELECT count(*) FROM oauth_refresh_tokens WHERE authorization_code_id = $1 AND revoked_at IS NULL`,
+		code.ID); n != 0 {
+		t.Errorf("%d refresh tokens still live after an expired replay, want 0", n)
+	}
+}
+
 // TestRotateRefreshToken_ExpiredUnknownAreDistinct covers the remaining
-// rotation failure branches: a lapsed token yields ErrExpired and a
-// never-issued one ErrNotFound. (Revoked is covered by the third presentation
-// in the reuse test above.)
+// rotation failure branches: a lapsed token that was NEVER rotated yields
+// ErrExpired (the expired-AND-consumed combination is a reuse signal instead —
+// see TestRotateRefreshToken_ExpiredReuseStillSweepsLineage) and a never-issued
+// one ErrNotFound. (Revoked is covered by the third presentation in the reuse
+// test above.)
 func TestRotateRefreshToken_ExpiredUnknownAreDistinct(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
@@ -985,8 +1232,14 @@ func TestUpsertClient_RefreshesOnConflictAndIsProviderScoped(t *testing.T) {
 	if !second.FirstSeenAt.Equal(first.FirstSeenAt) {
 		t.Errorf("first_seen_at moved on refresh: %v → %v", first.FirstSeenAt, second.FirstSeenAt)
 	}
-	if !second.UpdatedAt.After(first.UpdatedAt) && !second.UpdatedAt.Equal(first.UpdatedAt) {
-		t.Errorf("updated_at went backwards: %v → %v", first.UpdatedAt, second.UpdatedAt)
+	// STRICTLY after. The previous `after || equal` form was not load-bearing:
+	// it permitted an unchanged updated_at, so a DO UPDATE that dropped
+	// `updated_at = now()` would have passed it — the very half of "first_seen_at
+	// is preserved, updated_at MOVES" it was there to assert. The two upserts run
+	// in separate transactions, so their now() values are distinct by
+	// construction.
+	if !second.UpdatedAt.After(first.UpdatedAt) {
+		t.Errorf("updated_at = %v, want strictly after the first insert's %v — refresh-on-fetch must move it", second.UpdatedAt, first.UpdatedAt)
 	}
 
 	// A read returns the refreshed document, not the pinned original.

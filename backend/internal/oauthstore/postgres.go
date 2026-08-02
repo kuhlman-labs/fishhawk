@@ -202,13 +202,47 @@ func (r *postgresRepo) RedeemAuthorizationCode(ctx context.Context, plaintext st
 }
 
 func (r *postgresRepo) RevokeGrantsForCode(ctx context.Context, codeID uuid.UUID) (int64, error) {
-	q := oauthstoredb.New(r.pool)
-	return r.revokeLineage(ctx, q, codeID)
+	var n int64
+	// Runs under the SAME lineage lock RotateRefreshToken takes, acquired in the
+	// same order (code row, then descendants), so a rotation concurrent with
+	// this sweep is serialized rather than able to commit a successor pair the
+	// sweep's statement snapshot cannot see. See lockLineage.
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := oauthstoredb.New(tx)
+		if err := lockLineage(ctx, q, codeID); err != nil {
+			return err
+		}
+		var err error
+		n, err = r.revokeLineage(ctx, q, codeID)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// lockLineage takes the authorization-code row's FOR UPDATE lock, which is the
+// mutex for that code's WHOLE lineage. Every path that mints into a lineage or
+// sweeps one takes it FIRST, so the ordering is uniform and deadlock-free
+// (RedeemAuthorizationCode's LockAuthorizationCodeByHash is the same lock, taken
+// at the same point).
+//
+// This is what makes the whole-lineage revocation guarantee hold under
+// CONCURRENCY rather than only in isolation — see the query's own comment in
+// queries.sql for why per-token row locks are not sufficient. A missing code row
+// locks nothing and is not an error.
+func lockLineage(ctx context.Context, q *oauthstoredb.Queries, codeID uuid.UUID) error {
+	if err := q.LockAuthorizationCodeByID(ctx, codeID); err != nil {
+		return fmt.Errorf("oauthstore: lock authorization code lineage: %w", err)
+	}
+	return nil
 }
 
 // revokeLineage revokes every still-active access and refresh token descended
 // from codeID and returns the total row count. Shared by RevokeGrantsForCode
-// and RotateRefreshToken's reuse path so the two can never drift.
+// and RotateRefreshToken's reuse path so the two can never drift. Callers MUST
+// hold the lineage lock (lockLineage) first.
 func (r *postgresRepo) revokeLineage(ctx context.Context, q *oauthstoredb.Queries, codeID uuid.UUID) (int64, error) {
 	at := tstz(r.now())
 	access, err := q.RevokeAccessTokensForCode(ctx, oauthstoredb.RevokeAccessTokensForCodeParams{
@@ -284,6 +318,33 @@ func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string,
 
 	txErr := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
 		q := oauthstoredb.New(tx)
+
+		// STEP 1 — resolve the LINEAGE, and nothing else. This read is
+		// deliberately unlocked and no decision is taken from it: its only
+		// output is authorization_code_id, an immutable column. Classifying off
+		// this snapshot would be reading state we do not yet hold the lock for.
+		lineageRow, err := q.GetRefreshTokenByHash(ctx, hash)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("oauthstore: resolve refresh token lineage: %w", err)
+		}
+
+		// STEP 2 — take the LINEAGE LOCK before any decision-bearing read. This
+		// is what makes the whole-lineage revocation guarantee hold under
+		// concurrency: a rotation and a reuse sweep of the same lineage can no
+		// longer interleave such that the sweep commits while a successor pair
+		// it never saw is still being minted. Pinned by
+		// TestRotateRefreshToken_ReuseSweepSerializesOnLineage.
+		if err := lockLineage(ctx, q, lineageRow.AuthorizationCodeID); err != nil {
+			return err
+		}
+
+		// STEP 3 — the AUTHORITATIVE read, taken under the lineage lock. Under
+		// READ COMMITTED this statement's snapshot postdates the commit of any
+		// rotation or sweep we queued behind, so it observes their consumed_at /
+		// revoked_at rather than the stale values step 1 may have held.
 		row, err := q.LockRefreshTokenByHash(ctx, hash)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return ErrNotFound
@@ -293,25 +354,36 @@ func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string,
 		}
 		presented := rowToRefreshToken(row)
 
-		// Revoked and expired are returned as errors: there is nothing to
-		// commit on those paths. Revoked is classified FIRST so a token swept
-		// by a prior reuse detection reports ErrRevoked rather than replaying
-		// the sweep.
+		// CLASSIFICATION ORDER IS A STATED DESIGN DECISION: revoked → reused →
+		// expired (see Repository.RotateRefreshToken and the README).
+		//
+		// Revoked is first so a token already swept by a prior reuse detection
+		// reports ErrRevoked rather than replaying the sweep.
 		if presented.IsRevoked() {
 			return ErrRevoked
-		}
-		if presented.IsExpired(r.now()) {
-			return ErrExpired
 		}
 
 		if presented.IsConsumed() {
 			// RFC 6749 §4.1.2 reuse: revoke the WHOLE lineage, keyed on the
 			// PRESENTED token's authorization_code_id (NOT NULL by schema).
+			//
+			// Classified BEFORE expiry ON PURPOSE. A replayed rotated token is
+			// precisely the compromise signal the sweep exists for, and the
+			// PRESENTED token's own expiry says nothing about its SUCCESSORS —
+			// they carry later expiries and would stay live. Ordering expiry
+			// first would drop the signal exactly when a stolen token is
+			// replayed late. Pinned by
+			// TestRotateRefreshToken_ExpiredReuseStillSweepsLineage.
 			if _, err := r.revokeLineage(ctx, q, presented.AuthorizationCodeID); err != nil {
 				return err
 			}
 			reused = true
 			return nil // COMMIT the revocation; signal outside.
+		}
+
+		// Expired is returned as an error: there is nothing to commit.
+		if presented.IsExpired(r.now()) {
+			return ErrExpired
 		}
 
 		// Lineage is DERIVED, never caller-supplied (#2433 approval condition
@@ -327,9 +399,18 @@ func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string,
 			ReplacedByID: &issued.Refresh.ID,
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				// The conditional predicate rejected the row: a concurrent
-				// rotation consumed it first. Roll back this mint.
-				return ErrRefreshReused
+				// UNREACHABLE by construction: the lineage lock plus this row's
+				// own FOR UPDATE serialize every rotation of this lineage, and
+				// step 3 read consumed_at as NULL under both, so no other
+				// transaction can have consumed the row in between.
+				//
+				// It is deliberately NOT ErrRefreshReused. This return rolls the
+				// transaction back, so the sentinel would reach the caller with
+				// NO committed lineage revocation — contradicting the
+				// commit-then-signal guarantee documented on
+				// Repository.RotateRefreshToken. An invariant violation is an
+				// internal error, not a reuse verdict.
+				return fmt.Errorf("oauthstore: consume refresh token: conditional update matched no row while holding the lineage lock: %w", err)
 			}
 			return fmt.Errorf("oauthstore: consume refresh token: %w", err)
 		}

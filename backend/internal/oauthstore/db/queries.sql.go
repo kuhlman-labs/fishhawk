@@ -446,6 +446,35 @@ func (q *Queries) LockAuthorizationCodeByHash(ctx context.Context, codeHash stri
 	return i, err
 }
 
+const lockAuthorizationCodeByID = `-- name: LockAuthorizationCodeByID :exec
+SELECT id FROM oauth_authorization_codes
+ WHERE id = $1
+   FOR UPDATE
+`
+
+// THE LINEAGE LOCK. The authorization-code row is the mutex for its WHOLE
+// lineage: RotateRefreshToken and RevokeGrantsForCode both take it FOR UPDATE
+// before reading or mutating any descendant, so every rotation and every sweep
+// of one lineage is serialized.
+//
+// Without it the whole-lineage revocation guarantee does NOT hold under
+// concurrency. Row locks on the individual token rows are not enough: the sweep
+// UPDATEs (`WHERE authorization_code_id = $1`) take their statement snapshot
+// when the statement starts, so a rotation that INSERTs a successor pair and
+// commits after that instant produces rows the sweep can never see — a usable
+// descendant credential surviving reuse detection. Serializing on the code row
+// forces one of two safe orders instead: the rotation commits first and the
+// sweep's later snapshot includes its successor, or the sweep commits first and
+// the rotation's post-lock re-read observes revoked_at set and mints nothing.
+//
+// Selecting only `id` keeps this a pure lock acquisition. A missing row locks
+// nothing and is NOT an error (RevokeGrantsForCode on an unknown code id must
+// still revoke zero rows rather than fail), which is why this is :exec.
+func (q *Queries) LockAuthorizationCodeByID(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, lockAuthorizationCodeByID, id)
+	return err
+}
+
 const lockRefreshTokenByHash = `-- name: LockRefreshTokenByHash :one
 SELECT id, token_hash, subject, client_id, audience, scopes, provider, account_id, authorization_code_id, access_token_id, replaced_by_id, issued_at, expires_at, last_used_at, consumed_at, revoked_at FROM oauth_refresh_tokens
  WHERE token_hash = $1

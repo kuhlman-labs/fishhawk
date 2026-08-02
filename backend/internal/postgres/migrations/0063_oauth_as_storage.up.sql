@@ -44,7 +44,8 @@
 --         already holding that tenant's plaintext credential.
 --       * Every ID-BASED operation (RevokeAccessToken / RevokeRefreshToken by
 --         id, RevokeAccessTokensForCode / RevokeRefreshTokensForCode by code
---         id) carries NO database-level tenant check whatsoever. Those
+--         id, LockAuthorizationCodeByID — the lineage lock — by code id)
+--         carries NO database-level tenant check whatsoever. Those
 --         operations are reachable only from an already-authenticated caller in
 --         #2391, which is where the authorization decision belongs. That is an
 --         APPLICATION-layer control, not a database one, and this header does
