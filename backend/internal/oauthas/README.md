@@ -130,6 +130,61 @@ the injected client's `Transport` is nil, so a caller passing
 falls through to `http.DefaultTransport`). A caller who injects a client with a
 non-nil `Transport` owns that transport's egress policy — it is used as-is.
 
+## Cache bounds (#2429)
+
+The `Fetcher` caches validated CIMD documents keyed by `client_id` — an
+**attacker-influenced string**. `ValidateClientIDURL` permits a query and the
+self-referential check binds it, so one host can serve unlimited distinct valid
+client_ids (`https://evil.example/id?v=1..N`). Before #2429 every successful
+fetch was therefore a permanent allocation in an unbounded map, and TTL expiry
+reclaimed nothing at all for those one-shot keys because reclamation only fired
+on a later lookup of the SAME key, which never arrives.
+
+The cache is now a **size-capped LRU** over stdlib `container/list` (a recency
+list plus a key map, both under one mutex — no new dependency):
+
+- **`MaxCacheEntries` caps residency, default 256.** A zero or negative value
+  means the default, never "unbounded" and never "cache nothing". 256 is a
+  judgment call, not a derived number: well above any plausible legitimate
+  concurrent-client count, and trivially small in memory (a validated document
+  with a few redirect URIs is well under 1 KiB). #2391 can raise it without
+  touching this package.
+- **Eviction is least-recently-USED, not FIFO.** Under exactly the flood this
+  issue describes, a FIFO cap would evict a hot legitimate client after `cap`
+  attacker insertions — converting a memory-exhaustion vector into an
+  eviction-based denial of service. LRU keeps a client that is still in use.
+- **Reclamation is STORE-TRIGGERED, not timer-driven.** The expiry sweep runs
+  only inside `cacheStore`, so a below-capacity cache receiving no further stores
+  holds its expired entries until the next store arrives. That is a deliberate
+  property, not an oversight: this package has no lifecycle hooks and starting a
+  background goroutine from a zero-value struct would be worse. The residual is
+  bounded by the cap at a few hundred sub-KiB entries, so it is a liveness
+  characteristic, not a memory-exhaustion vector — #2391 must not read a stronger
+  liveness guarantee into it than exists.
+- **Two sweep triggers.** (a) Amortized: at most once per TTL window, so a
+  below-capacity cache still returns memory for one-shot keys. (b) Unconditional
+  when the cache is at or over capacity, so an expired entry is always reclaimed
+  in preference to evicting a live one.
+- **The sweep is a FULL walk of the recency list, not a scan of the
+  least-recently-used tail.** A cache hit moves an entry to the front WITHOUT
+  re-stamping its expiry, so recency order is not expiry order: an expired entry
+  can sit ahead of live ones. A tail-only scan would stop at the first live entry
+  and then evict it, leaving the expired entry cached.
+  `TestFetch_ExpiredEntriesEvictedBeforeLiveOnes` constructs that exact ordering
+  and fails against a tail-only sweep.
+- **The cache is per-`Fetcher` and in-memory**, so the cap bounds ONE instance.
+  The intended use is one long-lived `Fetcher`, where the cap applies as designed.
+  A `Fetcher` constructed per request is merely useless as a cache, not dangerous
+  — there is no shared state to exhaust.
+
+**What a size cap does NOT close.** An unauthenticated request that triggers an
+outbound HTTPS CIMD fetch is an amplification vector regardless of cache size: a
+capped cache bounds memory, not fetch rate, and a flood of distinct client_ids
+still produces one outbound fetch each. Rate-limiting CIMD-triggering requests
+belongs to **#2391's handler layer**, not to this pure domain core, which holds no
+config and no HTTP. #2429 is a hard prerequisite for #2391 — no handler may reach
+the `Fetcher` uncapped — but it is not the whole of the defence.
+
 ## The "validate one thing, then let something else become the real thing" bug class
 
 This area has a recurring, named defect class worth hunting for in every review
