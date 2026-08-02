@@ -56,6 +56,8 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/onboarding"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -108,6 +110,59 @@ func resolveMCPRouteMode(raw string) (string, error) {
 	default:
 		return "", fmt.Errorf("--mcp-route must be on or off; got %q", raw)
 	}
+}
+
+// resolveOAuthIssuer validates the --oauth-issuer / FISHHAWKD_OAUTH_ISSUER value
+// (ADR-076 slice 3, #2436). An EMPTY value leaves the AS off (returns ""). A
+// non-empty value must parse as an oauthas.ParseIssuer https issuer AND be
+// ORIGIN-ONLY (no path): the metadata route is registered at the fixed
+// well-known path GET /.well-known/oauth-authorization-server, and RFC 8414 §3.1
+// forms the well-known URI for a PATH-BEARING issuer by inserting the well-known
+// segment between host and path — so an issuer with a path advertises a
+// discovery location the registered route does not serve (CONDITION 4). Like
+// resolveMCPRouteMode, this fails LOUD: an operator who configured an issuer
+// expecting the AS to serve must be told, not silently disabled.
+func resolveOAuthIssuer(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	issuer, err := oauthas.ParseIssuer(raw)
+	if err != nil {
+		return "", fmt.Errorf("--oauth-issuer is not a valid RFC 8414 https issuer: %w", err)
+	}
+	u, err := url.Parse(issuer.String())
+	if err != nil {
+		return "", fmt.Errorf("--oauth-issuer could not be parsed: %w", err)
+	}
+	if u.Path != "" {
+		return "", fmt.Errorf("--oauth-issuer must be origin-only (no path); got %q — a path-bearing issuer's RFC 8414 discovery URL is not served by the fixed /.well-known/oauth-authorization-server route", raw)
+	}
+	return issuer.String(), nil
+}
+
+// resolveOAuthResource validates the --oauth-resource value. Empty is allowed
+// (the AS defaults it to <issuer>/mcp); a non-empty but unparseable value fails
+// loud, the same posture resolveOAuthIssuer takes for a bad issuer.
+func resolveOAuthResource(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	if _, err := oauthas.ParseResourceIdentifier(raw); err != nil {
+		return "", fmt.Errorf("--oauth-resource is not a valid RFC 8707 resource identifier: %w", err)
+	}
+	return raw, nil
+}
+
+// newOAuthCIMDFetcher constructs the ONE long-lived CIMD fetcher the AS uses
+// (so #2429's per-Fetcher cache cap applies as designed) WHENEVER an issuer is
+// configured, and nil otherwise. This is the production half of FIX 2 (#2436):
+// it makes the nil-fetcher misconfigured verdict unreachable in production, so
+// the server-side nil-fetcher guard exists purely as an embedder check.
+func newOAuthCIMDFetcher(issuerResolved string) *oauthas.Fetcher {
+	if issuerResolved == "" {
+		return nil
+	}
+	return &oauthas.Fetcher{}
 }
 
 // planReviewTimeoutBelowDefault reports whether the effective plan-review
@@ -981,6 +1036,17 @@ func runServe(args []string, logSink io.Writer) int {
 			"The route is LOOPBACK-ONLY per ADR-033 — with the default --addr=:8080 the daemon binds every "+
 			"interface, so /mcp answers 403 until --addr is set to 127.0.0.1:8080. Use off as the explicit "+
 			"opt-out for a deployment that binds a non-loopback address on purpose")
+	oauthIssuer := fs.String("oauth-issuer", envOr("FISHHAWKD_OAUTH_ISSUER", ""),
+		"RFC 8414 issuer (https, origin-only, no path) for the OAuth 2.1 authorization server (ADR-076 / #2436); "+
+			"empty leaves the AS off. A non-empty but invalid value refuses to start rather than degrading silently")
+	oauthResource := fs.String("oauth-resource", envOr("FISHHAWKD_OAUTH_RESOURCE", ""),
+		"RFC 8707 resource identifier the AS mints token audiences for; empty defaults to <issuer>/mcp")
+	oauthCodeTTL := fs.Duration("oauth-code-ttl", envOrDuration("FISHHAWKD_OAUTH_CODE_TTL", 60*time.Second),
+		"authorization-code lifetime for the OAuth AS")
+	oauthAccessTokenTTL := fs.Duration("oauth-access-token-ttl", envOrDuration("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", time.Hour),
+		"access-token lifetime for the OAuth AS")
+	oauthRefreshTokenTTL := fs.Duration("oauth-refresh-token-ttl", envOrDuration("FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL", 336*time.Hour),
+		"refresh-token lifetime for the OAuth AS")
 	dbURL := fs.String("db", envOr("FISHHAWKD_DATABASE_URL", ""),
 		"postgres URL; when empty, /v0/runs endpoints respond 503")
 	webhookSecret := fs.String("github-webhook-secret",
@@ -1370,6 +1436,21 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// OAuth AS issuer + resource (ADR-076 slice 3, #2436). Both fail LOUD on a
+	// non-empty invalid value rather than silently disabling: an operator who
+	// configured an issuer expecting the AS to serve must be told. Empty issuer
+	// leaves the AS off.
+	oauthIssuerResolved, err := resolveOAuthIssuer(*oauthIssuer)
+	if err != nil {
+		logger.Error("invalid --oauth-issuer", slog.String("error", err.Error()))
+		return exitFailure
+	}
+	oauthResourceResolved, err := resolveOAuthResource(*oauthResource)
+	if err != nil {
+		logger.Error("invalid --oauth-resource", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -1431,6 +1512,18 @@ func runServe(args []string, logSink io.Writer) int {
 	cfg.OperatorRepo = *operatorRepo
 	cfg.OperatorMinPermission = operatorMinPerm
 	cfg.OperatorDefaultScopes = operatorDefaultScopes
+
+	// OAuth 2.1 authorization server (ADR-076 slice 3, #2436). Issuer/resource
+	// are validated above; the store + a single long-lived CIMD Fetcher are
+	// constructed WHENEVER an issuer is configured (see the pool block below),
+	// so the nil-Fetcher misconfigured verdict is unreachable in production —
+	// the server-side nil-Fetcher guard exists purely as an embedder check.
+	cfg.OAuthASIssuer = oauthIssuerResolved
+	cfg.OAuthASResource = oauthResourceResolved
+	cfg.OAuthCodeTTL = *oauthCodeTTL
+	cfg.OAuthAccessTokenTTL = *oauthAccessTokenTTL
+	cfg.OAuthRefreshTokenTTL = *oauthRefreshTokenTTL
+	cfg.OAuthCIMDFetcher = newOAuthCIMDFetcher(oauthIssuerResolved)
 
 	// Plan-review agent wiring. Resolved by a pure helper so the selection seam
 	// (which adapters the flags configure) is unit-testable without booting a
@@ -1513,6 +1606,10 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.ConcernRepo = concern.NewPostgresRepository(pool)
 		cfg.RefinementRepo = resolveRefinementRepo(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
+		// OAuth AS credential store (ADR-076 slice 3, #2436). Wired whenever a
+		// pool exists; the AS is enabled only when an issuer is ALSO configured
+		// (resolveOAuthASState folds store + fetcher into the enabled predicate).
+		cfg.OAuthStore = oauthstore.NewPostgresRepository(pool)
 		// Account-role reader for the handler-authz write tiers (ADR-057 /
 		// E44.5, #1829). Nil pool leaves cfg.AccountRoles nil (untenanted-allow
 		// — role-bounding skipped), mirroring AuthMembership's nil-pool posture.

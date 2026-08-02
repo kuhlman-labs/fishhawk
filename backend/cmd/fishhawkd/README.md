@@ -63,6 +63,30 @@ resolved IP), so no operator-settable knob can aim the loopback round-trip — a
 every caller's raw bearer — off-host. Long-form contract:
 `backend/internal/server/README.md`.
 
+## OAuth 2.1 authorization server (ADR-076 slice 3 / E66.19 #2436)
+
+Five flags/env vars configure the embedded OAuth 2.1 authorization server that
+mints Fishhawk access tokens to MCP clients (the four
+`/.well-known/oauth-authorization-server` + `/v0/oauth/{authorize,token}`
+routes). **`--oauth-issuer` alone enables the AS** — empty means off, and every
+one of the four routes then answers `503 oauth_as_unconfigured`. When the issuer
+is set but any input is defective the server resolves MISCONFIGURED and the four
+routes answer the same `503` (never a partial metadata document); an INVALID
+issuer or resource **refuses to start**. Full state machine and handler contract:
+`backend/internal/server/README.md`.
+
+| Env var | Flag | Meaning | Default |
+|---|---|---|---|
+| `FISHHAWKD_OAUTH_ISSUER` | `--oauth-issuer` | RFC 8414 issuer — an **https origin-only** URL (no path); the sole AS enablement signal. An invalid value refuses startup | empty (AS off) |
+| `FISHHAWKD_OAUTH_RESOURCE` | `--oauth-resource` | RFC 8707 resource indicator the AS binds tokens to | empty → `<issuer>/mcp` |
+| `FISHHAWKD_OAUTH_CODE_TTL` | `--oauth-code-ttl` | authorization-code lifetime | `60s` |
+| `FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL` | `--oauth-access-token-ttl` | issued access-token lifetime (`expires_in`) | `1h` |
+| `FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL` | `--oauth-refresh-token-ttl` | issued refresh-token lifetime | `336h` |
+
+These are the AS ISSUER-side knobs and are unrelated to the GitHub sign-in
+OAuth-CLIENT endpoints below (`FISHHAWKD_OAUTH_AUTHORIZE_URL` et al.), which
+point fishhawkd AT a forge's OAuth endpoints for user sign-in.
+
 ## Configurable GitHub / OAuth endpoints (E44.2 / #1826)
 
 For GitHub Enterprise Server (Mode 1, self-hosted) and data-resident GitHub

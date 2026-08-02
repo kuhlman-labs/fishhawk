@@ -1,0 +1,121 @@
+package server
+
+import (
+	"context"
+	"testing"
+
+	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+)
+
+// TestOAuthFlow_EndToEnd_AuthorizeConsentTokenRefresh drives the whole chain —
+// consent POST -> token -> refresh — against the REAL oauthstore Postgres
+// repository, asserting the DERIVED-authority contract observable only across
+// the whole chain: the minted access token's persisted audience equals the
+// requested RFC 8707 resource, its subject/provider/scopes equal the consenting
+// session's, and the rotated successor inherits all of them verbatim.
+func TestOAuthFlow_EndToEnd_AuthorizeConsentTokenRefresh(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	store := oauthstore.NewPostgresRepository(pool)
+
+	// Pre-register a public client (store-first resolution).
+	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
+		Provider: "github",
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                "client-x",
+			RedirectURIs:            []string{"https://app.example/cb"},
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			ResponseTypes:           []string{"code"},
+			TokenEndpointAuthMethod: "none",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertClient: %v", err)
+	}
+
+	repo := newFakeAuthRepo()
+	uid := uuid.New()
+	repo.mu.Lock()
+	repo.users[uid.String()] = &auth.User{ID: uid.String(), Provider: "github", GitHubLogin: "octocat"}
+	repo.mu.Unlock()
+	// Untenanted identity (empty AccountID -> NULL account_id, no accounts FK).
+	id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
+
+	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+
+	// Consent POST -> 302 with a code.
+	consentRR := postConsent(srv, consentForm(nil), &id)
+	code := redirectQuery(t, consentRR).Get("code")
+	if code == "" {
+		t.Fatal("consent did not mint a code")
+	}
+
+	// Token exchange.
+	resp := decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
+	if resp.AccessToken == "" || resp.RefreshToken == "" {
+		t.Fatal("token response missing access/refresh token")
+	}
+
+	at, err := store.AuthenticateAccessToken(ctx, resp.AccessToken)
+	if err != nil {
+		t.Fatalf("authenticate minted access token: %v", err)
+	}
+	if at.Audience != testResource {
+		t.Errorf("access token audience = %q, want %q (RFC 8707 resource)", at.Audience, testResource)
+	}
+	if at.Subject != "github:octocat" || at.Provider != "github" {
+		t.Errorf("access token subject/provider = %q/%q", at.Subject, at.Provider)
+	}
+	if !equalStrings(at.Scopes, []string{"read:runs"}) {
+		t.Errorf("access token scopes = %v", at.Scopes)
+	}
+
+	// Refresh rotation: the successor inherits every authority field.
+	rotated := decodeToken(t, postToken(srv, refreshForm(resp.RefreshToken), nil))
+	at2, err := store.AuthenticateAccessToken(ctx, rotated.AccessToken)
+	if err != nil {
+		t.Fatalf("authenticate rotated access token: %v", err)
+	}
+	if at2.Audience != testResource || at2.Subject != "github:octocat" || at2.Provider != "github" || !equalStrings(at2.Scopes, []string{"read:runs"}) {
+		t.Errorf("rotated token did not inherit authority: aud=%q sub=%q prov=%q scopes=%v",
+			at2.Audience, at2.Subject, at2.Provider, at2.Scopes)
+	}
+}
+
+// TestOAuthFlow_CodeIsSingleUse re-presents a redeemed code against the real
+// repository and asserts invalid_grant.
+func TestOAuthFlow_CodeIsSingleUse(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	store := oauthstore.NewPostgresRepository(pool)
+	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
+		Provider: "github",
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                "client-x",
+			RedirectURIs:            []string{"https://app.example/cb"},
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			ResponseTypes:           []string{"code"},
+			TokenEndpointAuthMethod: "none",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertClient: %v", err)
+	}
+	repo := newFakeAuthRepo()
+	uid := uuid.New()
+	repo.mu.Lock()
+	repo.users[uid.String()] = &auth.User{ID: uid.String(), Provider: "github", GitHubLogin: "octocat"}
+	repo.mu.Unlock()
+	id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
+	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+
+	code := redirectQuery(t, postConsent(srv, consentForm(nil), &id)).Get("code")
+	_ = decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
+	replay := postToken(srv, codeExchangeForm(code), nil)
+	if oauthErrCode(t, replay) != "invalid_grant" {
+		t.Fatalf("replay err = %s, want invalid_grant", oauthErrCode(t, replay))
+	}
+}

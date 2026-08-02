@@ -911,3 +911,38 @@ func TestNewServer_MCPRouteStateFromZeroConfig(t *testing.T) {
 		t.Error("an enabled route has no handler")
 	}
 }
+
+// TestServer_OAuthASServesMetadataWhenConfigured is the full-stack case: an
+// AS-configured Config serves the RFC 8414 document through the whole
+// middleware stack, and an unconfigured one leaves all four patterns on the
+// 503 oauth_as_unconfigured path (ADR-076 slice 3, #2436).
+func TestServer_OAuthASServesMetadataWhenConfigured(t *testing.T) {
+	srv := newEnabledOAuthServer(newFakeOAuthStore(), newCIMDFetcher(newCIMD()))
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server", nil)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("metadata: status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"client_id_metadata_document_supported":true`) {
+		t.Fatalf("metadata body missing CIMD gate: %s", rr.Body.String())
+	}
+
+	off := New(Config{})
+	for _, p := range []struct{ method, path string }{
+		{http.MethodGet, "/.well-known/oauth-authorization-server"},
+		{http.MethodGet, "/v0/oauth/authorize"},
+		{http.MethodPost, "/v0/oauth/authorize"},
+		{http.MethodPost, "/v0/oauth/token"},
+	} {
+		req := httptest.NewRequest(p.method, p.path, nil)
+		if p.method == http.MethodPost {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+		rr := httptest.NewRecorder()
+		off.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s %s: status = %d, want 503", p.method, p.path, rr.Code)
+		}
+	}
+}

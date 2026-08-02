@@ -2883,3 +2883,79 @@ func TestServeRejectsInvalidMCPRoute(t *testing.T) {
 		t.Errorf("log = %s, want the invalid --mcp-route diagnosis", log.String())
 	}
 }
+
+// TestResolveOAuthIssuer covers the AS issuer validation (ADR-076 slice 3,
+// #2436), including CONDITION 4: a path-bearing issuer is refused at startup
+// because the fixed /.well-known route does not serve its RFC 8414 discovery
+// URL.
+func TestResolveOAuthIssuer(t *testing.T) {
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty leaves AS off", in: "", want: ""},
+		{name: "valid https origin", in: "https://as.example", want: "https://as.example"},
+		{name: "trailing slash normalized", in: "https://as.example/", want: "https://as.example"},
+		{name: "non-https refused", in: "http://as.example", wantErr: true},
+		{name: "path-bearing refused (CONDITION 4)", in: "https://as.example/sub", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveOAuthIssuer(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("resolveOAuthIssuer(%q) = %q, nil; want an error", tc.in, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveOAuthIssuer(%q): %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("resolveOAuthIssuer(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveOAuthResource(t *testing.T) {
+	if got, err := resolveOAuthResource(""); err != nil || got != "" {
+		t.Fatalf("empty resource: got %q, %v; want \"\", nil", got, err)
+	}
+	if got, err := resolveOAuthResource("https://as.example/mcp"); err != nil || got != "https://as.example/mcp" {
+		t.Fatalf("valid resource: got %q, %v", got, err)
+	}
+	if _, err := resolveOAuthResource("not a uri"); err == nil {
+		t.Fatal("unparseable resource must be refused")
+	}
+}
+
+// TestResolveOAuthTTLs_DefaultsApplied pins the flag defaults (60s / 1h / 336h).
+func TestResolveOAuthTTLs_DefaultsApplied(t *testing.T) {
+	t.Setenv("FISHHAWKD_OAUTH_CODE_TTL", "")
+	t.Setenv("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", "")
+	t.Setenv("FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL", "")
+	if got := envOrDuration("FISHHAWKD_OAUTH_CODE_TTL", 60*time.Second); got != 60*time.Second {
+		t.Errorf("code ttl default = %v", got)
+	}
+	if got := envOrDuration("FISHHAWKD_OAUTH_ACCESS_TOKEN_TTL", time.Hour); got != time.Hour {
+		t.Errorf("access ttl default = %v", got)
+	}
+	if got := envOrDuration("FISHHAWKD_OAUTH_REFRESH_TOKEN_TTL", 336*time.Hour); got != 336*time.Hour {
+		t.Errorf("refresh ttl default = %v", got)
+	}
+}
+
+// TestServe_ConstructsDefaultCIMDFetcherWhenIssuerConfigured is the production
+// half of FIX 2: an issuer makes the fetcher non-nil (so the misconfigured
+// verdict is unreachable in production); no issuer leaves it nil.
+func TestServe_ConstructsDefaultCIMDFetcherWhenIssuerConfigured(t *testing.T) {
+	if f := newOAuthCIMDFetcher(""); f != nil {
+		t.Fatal("no issuer must leave the fetcher nil")
+	}
+	if f := newOAuthCIMDFetcher("https://as.example"); f == nil {
+		t.Fatal("an issuer must construct a non-nil CIMD fetcher")
+	}
+}
