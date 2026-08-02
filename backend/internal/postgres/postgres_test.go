@@ -1132,13 +1132,18 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0062 (#1983, E48.23) is now the latest migration (the
-	// audit_entries_merge_verdict_recorded_once_idx partial unique index). Roll
-	// it back FIRST — it is index-only, so its rollback drops just that index —
-	// then 0061 (users.provider), so this test's historical assertions, which
-	// pin 0060 as the one-step-rollback target, stay valid. 0062's own up/down
-	// reversal is pinned by TestMigrateDown_MergeVerdictUniqueReversal, and
-	// 0061's by TestMigrateDown_UsersProviderReversal below.
+	// 0063 (#2433, E66.18) is now the latest migration (the four OAuth AS
+	// storage tables). Roll it back FIRST — it drops only its own four tables —
+	// then 0062 (the audit_entries_merge_verdict_recorded_once_idx partial
+	// unique index, index-only), then 0061 (users.provider), so this test's
+	// historical assertions, which pin 0060 as the one-step-rollback target,
+	// stay valid. 0063's own up/down reversal is pinned by
+	// TestMigrateDown_OAuthASStorageReversal, 0062's by
+	// TestMigrateDown_MergeVerdictUniqueReversal, and 0061's by
+	// TestMigrateDown_UsersProviderReversal below.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062): %v", err)
 	}
@@ -1979,8 +1984,12 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 		t.Fatalf("seed gitlab user: %v", err)
 	}
 
-	// Roll back 0062 (the index-only merge-verdict uniqueness) first so the next
-	// one-step down targets 0061 — the reversal under test.
+	// Roll back 0063 (the OAuth AS storage tables) and 0062 (the index-only
+	// merge-verdict uniqueness) first so the next one-step down targets 0061 —
+	// the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063 to reach 0062): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062 to reach 0061): %v", err)
 	}
@@ -2057,6 +2066,11 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 		t.Errorf("index def = %q, want a UNIQUE index (0062)", idxDef)
 	}
 
+	// Roll back 0063 (the OAuth AS storage tables) first so the next one-step
+	// down targets 0062 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063 to reach 0062): %v", err)
+	}
 	// One MigrateDown drops exactly that index (index-only rollback).
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062): %v", err)
@@ -2080,6 +2094,122 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 	}
 	if auditTable != 1 {
 		t.Errorf("'audit_entries' table count after MigrateDown = %d, want 1 (0062 is index-only)", auditTable)
+	}
+}
+
+// TestMigrateDown_OAuthASStorageReversal pins 0063 (#2433, E66.18) on three
+// axes:
+//
+//  1. REVERSAL — all four oauth_* tables exist after MigrateUp and are ABSENT
+//     after exactly one MigrateDown.
+//  2. TOUCHES NOTHING PRE-EXISTING — a representative earlier surface survives
+//     that rollback: api_tokens AND its 0057 api_tokens_tenant_isolation policy.
+//     That pairing is the binding proof, because a down migration that
+//     over-reached into the RLS-policied tables would drop the policy while
+//     leaving the table.
+//  3. THE RLS DECISION ITSELF — while the tables exist, pg_policies must carry
+//     ZERO policies for them and pg_class.relrowsecurity must be false for all
+//     four. 0063's header explains WHY these tables sit outside row-level
+//     security (the token endpoint's code lookup is pre-identity by
+//     construction); this makes that decision machine-enforced rather than only
+//     commented, so a later accidental policy addition is caught here.
+func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	oauthTables := []string{
+		"oauth_clients",
+		"oauth_authorization_codes",
+		"oauth_access_tokens",
+		"oauth_refresh_tokens",
+	}
+
+	// (1) Present after MigrateUp.
+	for _, tbl := range oauthTables {
+		var count int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM information_schema.tables WHERE table_name = $1`, tbl,
+		).Scan(&count); err != nil {
+			t.Fatalf("query %s table after MigrateUp: %v", tbl, err)
+		}
+		if count != 1 {
+			t.Errorf("'%s' table count after MigrateUp = %d, want 1 (0063 applied)", tbl, count)
+		}
+	}
+
+	// (3) The RLS decision, asserted while the tables exist.
+	for _, tbl := range oauthTables {
+		var polCount int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM pg_policies WHERE tablename = $1`, tbl,
+		).Scan(&polCount); err != nil {
+			t.Fatalf("query %s policies: %v", tbl, err)
+		}
+		if polCount != 0 {
+			t.Errorf("%s carries %d row-level-security policies, want 0 — 0063 places these tables OUTSIDE RLS deliberately (see its header); adding a policy needs that decision revisited", tbl, polCount)
+		}
+		var rowSec, forceSec bool
+		if err := pool.QueryRow(context.Background(),
+			`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = $1`, tbl,
+		).Scan(&rowSec, &forceSec); err != nil {
+			t.Fatalf("query %s pg_class RLS flags: %v", tbl, err)
+		}
+		if rowSec || forceSec {
+			t.Errorf("%s relrowsecurity=%v relforcerowsecurity=%v, want false/false (0063 leaves these outside RLS)", tbl, rowSec, forceSec)
+		}
+	}
+
+	// (1) One MigrateDown drops exactly the four.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063): %v", err)
+	}
+	for _, tbl := range oauthTables {
+		var count int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM information_schema.tables WHERE table_name = $1`, tbl,
+		).Scan(&count); err != nil {
+			t.Fatalf("query %s table after MigrateDown: %v", tbl, err)
+		}
+		if count != 0 {
+			t.Errorf("'%s' table count after MigrateDown = %d, want 0 (0063 reverted)", tbl, count)
+		}
+	}
+
+	// (2) Nothing pre-existing was touched: api_tokens AND its 0057 policy.
+	var apiTokens int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'api_tokens'`,
+	).Scan(&apiTokens); err != nil {
+		t.Fatalf("query api_tokens after MigrateDown: %v", err)
+	}
+	if apiTokens != 1 {
+		t.Errorf("'api_tokens' table count after MigrateDown = %d, want 1 (0063's down touches nothing pre-existing)", apiTokens)
+	}
+	var apiTokenPolicy int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_policies
+		 WHERE tablename = 'api_tokens' AND policyname = 'api_tokens_tenant_isolation'`,
+	).Scan(&apiTokenPolicy); err != nil {
+		t.Fatalf("query api_tokens_tenant_isolation after MigrateDown: %v", err)
+	}
+	if apiTokenPolicy != 1 {
+		t.Errorf("api_tokens_tenant_isolation policy count after MigrateDown = %d, want 1 (0057 survives 0063's rollback)", apiTokenPolicy)
+	}
+	var apiTokensRowSec bool
+	if err := pool.QueryRow(context.Background(),
+		`SELECT relrowsecurity FROM pg_class WHERE relname = 'api_tokens'`,
+	).Scan(&apiTokensRowSec); err != nil {
+		t.Fatalf("query api_tokens pg_class RLS flag after MigrateDown: %v", err)
+	}
+	if !apiTokensRowSec {
+		t.Error("api_tokens relrowsecurity = false after MigrateDown, want true (0057 survives 0063's rollback)")
 	}
 }
 
@@ -2148,6 +2278,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063 (drop OAuth AS storage tables) failed): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062 (drop merge-verdict unique index) failed): %v", err)
 	}
@@ -2262,6 +2395,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062 to reach 0053): %v", err)
@@ -2389,6 +2525,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// stages) then 0056 (sessions.account_id + origin + auto_join_role, inert
 	// re: stages) then 0055 (account_members + account_id + endpoint
 	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063 to reach 0053): %v", err)
+	}
 	// inert re: stages) then 0053, and the flipped row returns to dispatched.
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062 to reach 0053): %v", err)
@@ -2453,6 +2592,9 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062 to reach 0054): %v", err)
