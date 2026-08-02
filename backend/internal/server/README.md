@@ -1542,18 +1542,26 @@ actually took.
 
 ### Registered-metadata enforcement, RFC 7591 defaults (CONDITION-2)
 
-A client's registered `response_types` and `grant_types` are ENFORCED, not
-advisory:
+A client's registered `response_types`, `grant_types` and `scope` are ENFORCED,
+not advisory:
 
 - authorize rejects a `response_type` the client did not register with
   `unauthorized_client`;
 - token rejects a `grant_type` the client did not register with
-  `unauthorized_client`.
+  `unauthorized_client`;
+- authorize rejects a requested `scope` outside the client's registered `scope`
+  set with `invalid_scope` (`runAuthorizeLadder` step 7, via
+  `registeredScopeSet`). The token endpoint needs no scope check — it derives
+  scope from the persisted code row (the derived-authority invariant), so a
+  narrow registration bounds every code and every token descended from it.
 
 Absent registration fields take the RFC 7591 defaults: `response_types` →
 `["code"]`, `grant_types` → `["authorization_code"]`. An **absent `scope`** on
 the registration means NO scope restriction (the client may request any operator
-scope), distinct from an empty list.
+scope), distinct from an empty list — `registeredScopeSet` returns nil for an
+absent scope and the ladder enforces only when the set is non-empty, so a
+scope-omitting CIMD client (e.g. Claude Code) stays unrestricted while a client
+that DID pin a narrow scope is bounded to it.
 
 ### THE PROVIDER WART — `oauth_clients` is keyed `UNIQUE (provider, client_id)`
 
@@ -1582,9 +1590,19 @@ Two known gaps are documented here without a change in this slice:
   hand-written SQL today — `oauthstore.UpsertClient` exists but has NO caller.
   Registration-free CIMD clients are the supported path; a pre-registration
   admin surface is future work.
-- **CIMD-triggering authorize requests are unrate-limited.** A `GET
-  /v0/oauth/authorize` with an unseen `client_id` triggers an outbound CIMD
-  fetch, and nothing bounds the rate of those fetches. This is only externally
-  reachable once #2391 lifts the loopback-only posture; the SSRF connect-time
-  guard in `oauthas` bounds WHERE a fetch can go, not HOW OFTEN, so rate limiting
-  is a prerequisite for the remote posture, tracked with #2391.
+- **CIMD-triggering requests are unrate-limited — and NOT per-route loopback
+  gated.** A `GET /v0/oauth/authorize` (before its identity check) or a `POST
+  /v0/oauth/token` (unauthenticated by nature — public client) with an unseen
+  `client_id` URL triggers an outbound CIMD fetch, and nothing bounds the RATE of
+  those fetches. Unlike `/mcp` (which self-gates to a loopback listener via
+  `mcpRouteState`), these OAuth AS routes carry NO per-route loopback check: the
+  only thing keeping the fetch non-remotely-reachable in the current alpha is the
+  operator binding fishhawkd to a loopback address (`FISHHAWKD_ADDR=127.0.0.1`).
+  So an earlier claim that this "is only externally reachable once #2391" was
+  inaccurate — it is reachable by anyone who can reach the daemon's listener
+  today. The SSRF connect-time guard in `oauthas` bounds WHERE a fetch can go and
+  the fetcher's LRU bounds cache memory, but neither bounds HOW OFTEN or HOW MANY
+  CONCURRENT fetches an attacker can force. Rate limiting (and a per-route
+  loopback/auth gate before a public bind) is therefore a HARD prerequisite for
+  binding this AS to a public address, tracked with #2391 — until it lands the
+  operator MUST keep the daemon bound to loopback.

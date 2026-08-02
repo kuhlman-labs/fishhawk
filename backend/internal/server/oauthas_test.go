@@ -615,22 +615,40 @@ func TestResolveOAuthClient_CIMDFetchOnStoreMiss(t *testing.T) {
 func TestResolveOAuthClient_PreRegistrationBeatsCIMDCache(t *testing.T) {
 	store := newFakeOAuthStore()
 	clientID := "https://client.example/cimd"
-	// Store registers redirect A.
-	store.seedClient(storeClient("github", clientID, []string{"https://client.example/A"}))
 	rt := newCIMD()
-	// The document would register ONLY redirect B — but the store hit must win
-	// and the fetcher must never be consulted.
+	// The CIMD document registers ONLY redirect B.
 	rt.docs[clientID] = cimdDoc(clientID, []string{"https://client.example/B"}, nil, nil, "")
 	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+
+	// WARM THE CIMD CACHE FIRST. With no store row, the id resolves via CIMD (B)
+	// and the fetcher now holds a cached document for clientID. This is the cache
+	// hit the test's name claims: a cache-first resolver that consulted a
+	// POPULATED cache before the store would serve B on the next call. (The prior
+	// version started with an empty cache, so a cache-first resolver would miss
+	// the cache, fall through to the store, and pass — the test was vacuous.)
+	if c, err := srv.resolveOAuthClient(context.Background(), clientID); err != nil {
+		t.Fatalf("warm: %v", err)
+	} else if !equalStrings(c.RedirectURIs, []string{"https://client.example/B"}) {
+		t.Fatalf("warm redirect uris = %v, want B", c.RedirectURIs)
+	}
+	if rt.fetches() != 1 {
+		t.Fatalf("warm expected exactly one fetch, got %d", rt.fetches())
+	}
+
+	// Now pre-register the SAME client_id in the store with redirect A.
+	store.seedClient(storeClient("github", clientID, []string{"https://client.example/A"}))
+
+	// The store hit must beat the WARM CIMD cache entry (B), and must not trigger
+	// a second fetch — store-first short-circuits before the fetcher is touched.
 	c, err := srv.resolveOAuthClient(context.Background(), clientID)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 	if !equalStrings(c.RedirectURIs, []string{"https://client.example/A"}) {
-		t.Fatalf("pre-registration must win: redirect uris = %v", c.RedirectURIs)
+		t.Fatalf("pre-registration must beat the warm cache: redirect uris = %v", c.RedirectURIs)
 	}
-	if rt.fetches() != 0 {
-		t.Fatalf("store hit consulted CIMD (%d fetches)", rt.fetches())
+	if rt.fetches() != 1 {
+		t.Fatalf("store hit consulted CIMD again (%d fetches, want 1)", rt.fetches())
 	}
 }
 

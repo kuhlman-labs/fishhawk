@@ -128,11 +128,29 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 		})
 		return authorizeResolved{}, false
 	}
-	// (6) scopes.
+	// (6) scopes: valid against the server-wide vocabulary first.
 	scopes, err := oauthas.ParseScope(req.scope)
 	if err != nil {
 		s.redirectOAuthError(w, r, matched, req.state, toOAuthError(err))
 		return authorizeResolved{}, false
+	}
+	// (7) registered scope restriction (CONDITION 2's registration-driven
+	// boundary, sibling to response_types/grant_types). When the client PINNED
+	// a scope set, the request must stay within it — else a client the operator
+	// deliberately registered narrow could obtain any operator scope, widening
+	// the authority baked into the code and every derived token. An ABSENT
+	// registered scope is NO restriction (the documented distinction), so the
+	// check runs only when the set is non-empty.
+	if registered := registeredScopeSet(client); len(registered) > 0 {
+		for _, want := range scopes {
+			if !containsOAuth(registered, want) {
+				s.redirectOAuthError(w, r, matched, req.state, &oauthas.Error{
+					Code:        oauthas.ErrCodeInvalidScope,
+					Description: "the requested scope exceeds the client's registered scope",
+				})
+				return authorizeResolved{}, false
+			}
+		}
 	}
 
 	return authorizeResolved{client: client, matchedRedirect: matched, method: method, scopes: scopes}, true

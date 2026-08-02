@@ -432,3 +432,61 @@ func TestAuthorize_ClaudeCodeShapedDocumentAuthorizes(t *testing.T) {
 		t.Fatalf("Claude Code-shaped document must authorize; status=%d body=%s", rr.Code, rr.Body.String())
 	}
 }
+
+// TestAuthorize_EnforcesRegisteredScope is the registration-driven scope
+// boundary (the sibling of the response_types/grant_types checks): a client the
+// operator registered narrow cannot request a scope outside its set, while an
+// ABSENT registered scope imposes no restriction — the documented
+// absent-vs-empty distinction. Without enforcement a narrow-registered client
+// could obtain any operator scope the user consents to, widening the authority
+// baked into the code and every derived token.
+func TestAuthorize_EnforcesRegisteredScope(t *testing.T) {
+	// Exceeds the registered set -> invalid_scope. This runs in the redirect
+	// phase (client + redirect URI already matched), so no identity is needed to
+	// observe the refusal. Deleting the enforcement makes this authorize instead.
+	t.Run("exceeds registered scope", func(t *testing.T) {
+		store := newFakeOAuthStore()
+		c := storeClient("github", "client-x", []string{"https://app.example/cb"})
+		c.Scope = "read:runs" // registered narrow; write:runs is outside it
+		store.seedClient(c)
+		srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "write:runs"}), nil)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope", q.Get("error"))
+		}
+	})
+
+	// Within the registered set -> authorizes (consent renders).
+	t.Run("within registered scope authorizes", func(t *testing.T) {
+		store := newFakeOAuthStore()
+		c := storeClient("github", "client-x", []string{"https://app.example/cb"})
+		c.Scope = "read:runs write:runs" // registered
+		store.seedClient(c)
+		repo := newFakeAuthRepo()
+		srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+		id := signedInIdentity(repo, "github")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "write:runs"}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("within-registration scope must authorize; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	// ABSENT registered scope -> NO restriction: the SAME request the narrow
+	// client above was refused for now succeeds. This is the counterfactual for
+	// the absent-vs-empty distinction — treating an absent scope as an empty set
+	// (dropping the len>0 guard) would refuse this and redden the test.
+	t.Run("absent registered scope is unrestricted", func(t *testing.T) {
+		store := newFakeOAuthStore()
+		c := storeClient("github", "client-x", []string{"https://app.example/cb"})
+		c.Scope = "" // ABSENT
+		store.seedClient(c)
+		repo := newFakeAuthRepo()
+		srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+		id := signedInIdentity(repo, "github")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "write:runs"}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("absent registered scope must impose no restriction; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+	})
+}

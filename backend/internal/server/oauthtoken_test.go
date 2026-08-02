@@ -127,24 +127,60 @@ func TestToken_AnyAuthorizationSchemeRefusedAsInvalidClient(t *testing.T) {
 
 func TestToken_ClientIDReadFromPostFormOnly(t *testing.T) {
 	srv, store := newOAuthTokenServer(t)
-	form := codeExchangeForm(mintCode(t, store)) // body client_id=client-x
-	// A DIFFERENT client_id in the query string must NOT influence the outcome.
+	// The DISCRIMINATING case for FIX 3's single-source property. A both-present
+	// request (body client-x, query wrong-client) is UNATTAINABLE as a
+	// counterfactual: Go's ParseForm builds r.Form by copying PostForm first and
+	// appending the query after, so r.Form.Get("client_id") returns the BODY
+	// value whenever both are present — a handler rewritten to read r.Form would
+	// pass identically. So instead the BODY omits client_id while the query
+	// supplies a VALID one: r.PostForm-only reading yields an empty client_id ->
+	// invalid_client, while r.Form would resolve client-x from the query and
+	// SUCCEED. This refusal is the property; a 200 here means r.Form leaked in.
+	form := codeExchangeForm(mintCode(t, store))
+	form.Del("client_id") // body carries NO client_id
 	rr := postToken(srv, form, func(r *http.Request) {
-		r.URL.RawQuery = "client_id=wrong-client"
+		r.URL.RawQuery = "client_id=client-x" // a valid client, ONLY in the query
 	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("query-string client_id changed the outcome; status=%d body=%s", rr.Code, rr.Body.String())
+	if rr.Code != http.StatusUnauthorized || oauthErrCode(t, rr) != "invalid_client" {
+		t.Fatalf("query-string client_id was honored (r.Form leak); status=%d err=%s, want 401 invalid_client",
+			rr.Code, oauthErrCode(t, rr))
 	}
 }
 
 func TestToken_SessionCookieIdentityIsInert(t *testing.T) {
 	srv, store := newOAuthTokenServer(t)
-	id := Identity{Subject: "github:octocat", UserID: uuid.NewString(), SessionID: uuid.NewString()}
-	rr := postToken(srv, codeExchangeForm(mintCode(t, store)), func(r *http.Request) {
+
+	// Baseline: a fully anonymous exchange.
+	anon := decodeToken(t, postToken(srv, codeExchangeForm(mintCode(t, store)), nil))
+
+	// A session cookie for a DIFFERENT user must produce an outcome IDENTICAL to
+	// the anonymous baseline and must not leak its subject into the token's
+	// authority. A bare "still 200" assertion (the prior form) passes even if the
+	// handler reads session identity, so this compares the full observable
+	// outcome against the baseline AND checks the minted token's derived subject.
+	sessionSubject := "github:eve" // NOT the code's subject (github:octocat)
+	id := Identity{Subject: sessionSubject, UserID: uuid.NewString(), SessionID: uuid.NewString()}
+	code := mintCode(t, store)
+	withCookie := decodeToken(t, postToken(srv, codeExchangeForm(code), func(r *http.Request) {
 		*r = *r.WithContext(context.WithValue(r.Context(), ctxKeyIdentity, id))
-	})
-	if rr.Code != http.StatusOK {
-		t.Fatalf("a session cookie must be inert on /token; status=%d body=%s", rr.Code, rr.Body.String())
+	}))
+
+	if withCookie.Scope != anon.Scope || withCookie.TokenType != anon.TokenType {
+		t.Fatalf("cookie-carrying outcome diverged from anonymous: %+v vs %+v", withCookie, anon)
+	}
+	if (withCookie.RefreshToken == "") != (anon.RefreshToken == "") {
+		t.Fatal("refresh-token presence diverged between the cookie and anonymous requests")
+	}
+
+	// The authority boundary: no minted access token may carry the SESSION
+	// subject — every token's subject is derived from the code row. A handler
+	// that read session identity into issuance would mint a github:eve token.
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	for _, at := range store.access {
+		if at.Subject == sessionSubject {
+			t.Fatalf("the session subject %q leaked into a minted access token; issuance read session identity", sessionSubject)
+		}
 	}
 }
 

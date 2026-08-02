@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
@@ -380,6 +381,17 @@ func registeredGrantTypes(c *resolvedOAuthClient) []string {
 		return []string{"authorization_code"}
 	}
 	return c.GrantTypes
+}
+
+// registeredScopeSet splits the client's registered scope string on ASCII
+// spaces (RFC 6749 §3.3 / RFC 7591). An ABSENT (empty) registered scope returns
+// nil — meaning NO restriction, distinct from an empty set — so the caller
+// enforces a restriction only when len(set) > 0. The docs promise this exact
+// distinction (backend/internal/server/README.md); it is what keeps a
+// scope-omitting client (e.g. the Claude Code CIMD document) unrestricted while
+// a client that DID pin a narrow scope is bounded to it.
+func registeredScopeSet(c *resolvedOAuthClient) []string {
+	return strings.Fields(c.Scope)
 }
 
 func containsOAuth(ss []string, want string) bool {
