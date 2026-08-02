@@ -422,3 +422,39 @@ func TestOnboardingStartRouteRefusesSignedHandoffWhenDisabled(t *testing.T) {
 		t.Errorf("body = %s, want region_pin_disabled", rec.Body.String())
 	}
 }
+
+// OAuth AS route registration (ADR-076 slice 3, #2436). An UNCONFIGURED server
+// answers the handler's own 503 oauth_as_unconfigured body — distinguishable
+// from the mux's default 404 — so a 503 here proves the route is wired.
+func TestOAuthASMetadataRouteRegistered(t *testing.T) {
+	assertOAuthRouteRegistered(t, http.MethodGet, "/.well-known/oauth-authorization-server")
+}
+
+func TestOAuthAuthorizeRouteRegistered(t *testing.T) {
+	assertOAuthRouteRegistered(t, http.MethodGet, "/v0/oauth/authorize")
+}
+
+func TestOAuthConsentRouteRegistered(t *testing.T) {
+	assertOAuthRouteRegistered(t, http.MethodPost, "/v0/oauth/authorize")
+}
+
+func TestOAuthTokenRouteRegistered(t *testing.T) {
+	assertOAuthRouteRegistered(t, http.MethodPost, "/v0/oauth/token")
+}
+
+func assertOAuthRouteRegistered(t *testing.T, method, path string) {
+	t.Helper()
+	s := New(Config{}) // AS disabled
+	req := httptest.NewRequest(method, path, nil)
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("%s %s: status = %d, want 503 (route reaches handler); body=%s", method, path, rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "oauth_as_unconfigured") {
+		t.Fatalf("%s %s: body = %s, want oauth_as_unconfigured", method, path, rec.Body.String())
+	}
+}

@@ -38,6 +38,8 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
@@ -601,6 +603,47 @@ type Config struct {
 	// serve.go only when BOTH FISHHAWKD_HOME_REGION and FISHHAWKD_HANDOFF_
 	// SECRET are set.
 	RegionPinner *account.RegionPinner
+
+	// OAuthASIssuer is the RFC 8414 issuer this deployment's OAuth 2.1
+	// authorization server (ADR-076 slice 3, #2436) advertises, e.g.
+	// https://as.example. EMPTY leaves the AS DISABLED — all four OAuth routes
+	// answer 503 oauth_as_unconfigured and no metadata document is served. A
+	// non-empty value that oauthas.ParseIssuer rejects (non-https, empty host,
+	// query, fragment, userinfo) resolves the AS to MISCONFIGURED at New().
+	// ParseIssuer does NOT reject a path (it trims only a trailing slash); the
+	// origin-only guard lives in serve.go's resolveOAuthIssuer, so an embedder
+	// wiring Config directly is responsible for passing an origin-only issuer.
+	// Wired from FISHHAWKD_OAUTH_ISSUER in serve.go, which refuses to start on
+	// a bad value rather than degrading silently.
+	OAuthASIssuer string
+
+	// OAuthASResource is the RFC 8707 resource identifier this AS mints token
+	// audiences for. Empty defaults to <issuer>/mcp. A non-empty but
+	// unparseable value resolves the AS to MISCONFIGURED. Wired from
+	// FISHHAWKD_OAUTH_RESOURCE in serve.go.
+	OAuthASResource string
+
+	// OAuthStore persists the AS credentials (client registrations,
+	// authorization codes, access + refresh tokens). REQUIRED to enable the
+	// AS: nil with an issuer configured resolves to MISCONFIGURED. Wired from
+	// oauthstore.NewPostgresRepository in serve.go.
+	OAuthStore oauthstore.Repository
+
+	// OAuthCIMDFetcher fetches and validates client-id metadata documents on a
+	// store miss. REQUIRED to enable the AS (FIX 2, #2436): nil with an issuer
+	// configured resolves to MISCONFIGURED, so a server that cannot fetch CIMD
+	// can never advertise client_id_metadata_document_supported. serve.go
+	// always constructs one long-lived *oauthas.Fetcher when an issuer is set,
+	// making the nil-fetcher state unreachable in production.
+	OAuthCIMDFetcher *oauthas.Fetcher
+
+	// OAuthCodeTTL / OAuthAccessTokenTTL / OAuthRefreshTokenTTL bound the
+	// lifetimes of minted authorization codes, access tokens and refresh
+	// tokens. Zero applies the defaults (60s / 1h / 336h). Wired from the
+	// --oauth-*-ttl flags in serve.go.
+	OAuthCodeTTL         time.Duration
+	OAuthAccessTokenTTL  time.Duration
+	OAuthRefreshTokenTTL time.Duration
 }
 
 // Server wraps an http.Server with the routes and middleware stack
@@ -720,6 +763,13 @@ type Server struct {
 	// it is never recomputed, so no request pays a DNS lookup and a
 	// resolver outage cannot intermittently flip the route to 403.
 	mcpRoute mcpRouteState
+
+	// oauthAS is the OAuth 2.1 authorization-server route verdict, resolved
+	// ONCE at New() from the immutable Config (ADR-076 slice 3, #2436),
+	// mirroring mcpRoute. The four OAuth handlers read it per request; it is
+	// never recomputed, so a defective issuer/resource is a stable 503 rather
+	// than an intermittent one.
+	oauthAS oauthASState
 
 	// mcpHandler is the streamable-HTTP handler backing /mcp, built once
 	// at New() when mcpRoute.mode is mcpRouteEnabled and nil otherwise —
@@ -856,6 +906,10 @@ func New(cfg Config) *Server {
 	if s.mcpRoute.mode == mcpRouteEnabled {
 		s.mcpHandler = newMCPHandler(s.mcpRoute, cfg.MCPServerFactory, cfg.Logger)
 	}
+	// Resolve the OAuth AS verdict once (ADR-076 slice 3, #2436). A defective
+	// issuer/resource/store/fetcher is carried as the misconfigured verdict and
+	// rendered per request; New() never panics on operator config.
+	s.oauthAS = resolveOAuthASState(cfg)
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildHandler(),

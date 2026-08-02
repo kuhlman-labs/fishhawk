@@ -43,6 +43,18 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /mcp", s.handleMCP)
 	mux.HandleFunc("GET /mcp", s.handleMCP)
 	mux.HandleFunc("DELETE /mcp", s.handleMCP)
+	// OAuth 2.1 authorization server (ADR-076 slice 3, #2436). An
+	// unconfigured/misconfigured deployment answers all four with the
+	// handler's own 503 oauth_as_unconfigured body.
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleOAuthASMetadata)
+	mux.HandleFunc("GET /v0/oauth/authorize", s.handleOAuthAuthorize)
+	mux.HandleFunc("POST /v0/oauth/authorize", s.handleOAuthConsent)
+	// The token route is CSRF-EXEMPT (csrf.go) while the authorize POST above
+	// is NOT: the token endpoint is non-cookie, form-encoded, public-client and
+	// refuses any Authorization header, so exempting it cannot open a
+	// browser-driven path; the consent POST is cookie-authenticated and stays
+	// enforced via the form-field fallback.
+	mux.HandleFunc("POST /v0/oauth/token", s.handleOAuthToken)
 	mux.HandleFunc("GET /v0/runs", s.handleListRuns)
 	mux.HandleFunc("POST /v0/runs", s.handleCreateRun)
 	mux.HandleFunc("GET /v0/runs/{run_id}", s.requireRunAccount(readAccess, s.handleGetRun))

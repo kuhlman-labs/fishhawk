@@ -1,10 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -108,8 +112,48 @@ func csrfExemptPath(p string) bool {
 	// already lets bearer requests through.
 	case "/mcp":
 		return true
+	// POST /v0/oauth/token (ADR-076 slice 3, #2436) is non-cookie,
+	// form-encoded and public-client: handleOAuthToken ignores session
+	// identity entirely and refuses ANY Authorization header, so the
+	// exemption cannot become a browser-driven path onto anything the forger
+	// does not already have to supply. NOTE: /v0/oauth/authorize is
+	// deliberately NOT exempt — the consent POST is cookie-authenticated and
+	// is exactly the request an attacker would forge, so it stays CSRF-
+	// enforced through the form-field fallback below.
+	case "/v0/oauth/token":
+		return true
 	}
 	return false
+}
+
+// csrfFormFallbackMaxBytes bounds the consent-POST body the form-field fallback
+// buffers before ParseForm runs (CONDITION 3, #2436). Reading the raw body
+// bypasses the size protection ParseForm would otherwise apply, so the read is
+// explicitly capped; a hidden-field OAuth form is a few hundred bytes, so 1 MiB
+// is generous while foreclosing an unbounded allocation from an unauthenticated
+// request.
+const csrfFormFallbackMaxBytes = 1 << 20
+
+// csrfFormFallbackPath reports whether p is the ONE path on which the CSRF
+// middleware accepts a form-field token in lieu of the X-CSRF-Token header. It
+// is a narrow exact-match list mirroring csrfExemptPath's reviewable-here
+// convention: a plain HTML consent form cannot set a request header, so
+// enforcement on /v0/oauth/authorize needs a form-field path. Every other route
+// stays header-only.
+func csrfFormFallbackPath(p string) bool {
+	return p == "/v0/oauth/authorize"
+}
+
+// isFormURLEncoded reports whether ct is application/x-www-form-urlencoded.
+func isFormURLEncoded(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return false
+	}
+	return mt == "application/x-www-form-urlencoded"
 }
 
 // csrf enforces the double-submit pattern. On any state-changing
@@ -142,6 +186,30 @@ func (s *Server) csrf(next http.Handler) http.Handler {
 		var cookieValue string
 		if c, err := r.Cookie(CSRFCookieName); err == nil {
 			cookieValue = c.Value
+		}
+
+		// Form-field fallback (CONDITION 3, #2436): on the ONE fallback path,
+		// with a form-encoded body and no header, read the csrf_token form
+		// value and compare it exactly as the header would be. The body MUST be
+		// buffered and RESTORED — ParseForm consumes it, so without the restore
+		// the handler's own ParseForm sees an empty form. The read is bounded to
+		// foreclose an unbounded allocation from an unauthenticated request.
+		if header == "" && csrfFormFallbackPath(r.URL.Path) && isFormURLEncoded(r.Header.Get("Content-Type")) {
+			buf, err := io.ReadAll(io.LimitReader(r.Body, csrfFormFallbackMaxBytes+1))
+			if err != nil {
+				s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+					"could not read the request body", nil)
+				return
+			}
+			if int64(len(buf)) > csrfFormFallbackMaxBytes {
+				s.writeError(w, r, http.StatusRequestEntityTooLarge, "request_too_large",
+					"the request body exceeds the maximum size", nil)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(buf))
+			if vals, perr := url.ParseQuery(string(buf)); perr == nil {
+				header = vals.Get("csrf_token")
+			}
 		}
 
 		if header == "" || cookieValue == "" ||

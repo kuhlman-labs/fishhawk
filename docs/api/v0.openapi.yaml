@@ -113,6 +113,118 @@ components:
             code: run_not_found
             message: No run with id 11111111-2222-3333-4444-555555555555
 
+    OAuthServerMetadata:
+      type: object
+      description: |
+        RFC 8414 authorization-server metadata (ADR-076 slice 3, #2436). Every
+        field is an unconditional literal when the AS is enabled.
+      required:
+        - issuer
+        - authorization_endpoint
+        - token_endpoint
+        - response_types_supported
+        - grant_types_supported
+        - scopes_supported
+        - code_challenge_methods_supported
+        - authorization_response_iss_parameter_supported
+        - client_id_metadata_document_supported
+        - token_endpoint_auth_methods_supported
+      properties:
+        issuer:
+          type: string
+          format: uri
+          description: The AS issuer — an https origin with no path (`--oauth-issuer`).
+          example: https://fishhawk.example.com
+        authorization_endpoint:
+          type: string
+          format: uri
+          example: https://fishhawk.example.com/v0/oauth/authorize
+        token_endpoint:
+          type: string
+          format: uri
+          example: https://fishhawk.example.com/v0/oauth/token
+        response_types_supported:
+          type: array
+          items: { type: string }
+          example: [code]
+        grant_types_supported:
+          type: array
+          items: { type: string }
+          example: [authorization_code, refresh_token]
+        scopes_supported:
+          type: array
+          items: { type: string }
+          description: The operator scope vocabulary.
+          example:
+            - read:runs
+            - read:audit
+            - write:runs
+            - write:approvals
+            - write:stages
+            - write:deploy
+            - write:campaigns
+            - read:audit-export
+        code_challenge_methods_supported:
+          type: array
+          items: { type: string }
+          example: [S256]
+        authorization_response_iss_parameter_supported:
+          type: boolean
+          description: RFC 9207 — the authorize response carries `iss`.
+          example: true
+        client_id_metadata_document_supported:
+          type: boolean
+          description: |
+            RFC 8414 CIMD support. Always `true` when this document is served: a
+            nil CIMD fetcher resolves the AS to MISCONFIGURED (503 everywhere),
+            so support is never conditionally advertised.
+          example: true
+        token_endpoint_auth_methods_supported:
+          type: array
+          items: { type: string }
+          description: Public client only.
+          example: [none]
+
+    OAuthTokenResponse:
+      type: object
+      description: |
+        RFC 6749 §5.1 successful token response for the public-client
+        authorization-code and refresh-token grants (#2436).
+      required: [access_token, token_type, expires_in, scope]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          example: Bearer
+        expires_in:
+          type: integer
+          description: Access-token lifetime in seconds (`--oauth-access-token-ttl`).
+          example: 3600
+        refresh_token:
+          type: string
+          description: Present when a refresh token was issued or rotated.
+        scope:
+          type: string
+          description: Space-delimited granted scopes.
+          example: read:runs write:runs
+
+    OAuthError:
+      type: object
+      description: |
+        RFC 6749 §5.2 flat error body (`{error, error_description}`) returned by
+        the token endpoint — distinct from the standard Fishhawk error envelope
+        (#2436).
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: RFC 6749 error code (e.g. `invalid_request`, `invalid_grant`, `invalid_client`, `unauthorized_client`, `unsupported_grant_type`).
+          example: invalid_grant
+        error_description:
+          type: string
+          example: authorization code is expired
+
     WorkItemRequest:
       type: object
       required: [repo, type, summary]
@@ -3625,6 +3737,17 @@ components:
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
+    OAuthASUnavailable:
+      description: |
+        The OAuth 2.1 authorization server is not enabled or is misconfigured on
+        this deployment (`error: oauth_as_unconfigured`). Returned by every one
+        of the four AS routes when the server construction resolved DISABLED (no
+        `--oauth-issuer`) or MISCONFIGURED (issuer supplied but a defect — bad
+        issuer, bad RFC 8707 resource, nil store, or nil CIMD fetcher). Uses the
+        standard Fishhawk error envelope, not the RFC 6749 flat error shape.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
 
 # ---------------------------------------------------------------------------
 # Default security: cookie OR bearer for all UI/CLI endpoints. Runner-
@@ -3761,6 +3884,281 @@ paths:
         '403': { $ref: '#/components/responses/MCPLoopbackOnly' }
         '404': { $ref: '#/components/responses/MCPRouteDisabled' }
         '503': { $ref: '#/components/responses/MCPRouteMisconfigured' }
+
+  # ---------------------------------------------------------------------
+  # OAuth 2.1 authorization server — ADR-076 slice 3 (#2436)
+  # Served only when the AS is ENABLED (a valid https issuer + valid RFC 8707
+  # resource + a non-nil store + a non-nil CIMD fetcher). A DISABLED (no issuer)
+  # or MISCONFIGURED (issuer supplied but a defect) deployment answers every one
+  # of the four routes 503 `oauth_as_unconfigured` — never a partial document.
+  # ---------------------------------------------------------------------
+  /.well-known/oauth-authorization-server:
+    get:
+      operationId: getOAuthServerMetadata
+      summary: OAuth 2.1 authorization-server metadata (RFC 8414)
+      description: |
+        RFC 8414 authorization-server metadata for the Fishhawk OAuth 2.1 AS
+        (ADR-076 slice 3, #2436). Unauthenticated; served with
+        `Cache-Control: no-store`. Every advertised value is an unconditional
+        literal when the AS is enabled — there is no conditional advertisement.
+        In particular `client_id_metadata_document_supported` is always `true`
+        when this document is served at all: a deployment whose CIMD fetcher is
+        nil resolves to MISCONFIGURED and answers 503 here, so a server that
+        cannot fetch a Client ID Metadata Document can never advertise support
+        for one.
+      security: []
+      tags: [oauth]
+      responses:
+        '200':
+          description: Authorization-server metadata.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthServerMetadata' }
+        '503': { $ref: '#/components/responses/OAuthASUnavailable' }
+
+  /v0/oauth/authorize:
+    get:
+      operationId: getOAuthAuthorize
+      summary: OAuth 2.1 authorization endpoint (consent)
+      description: |
+        Renders an HTML consent page for a public-client authorization-code +
+        PKCE request (RFC 6749 §4.1.1, RFC 7636). When the browser is signed
+        out, responds `302` to the forge sign-in flow. On an invalid request
+        (RFC 6749 §4.1.2.1) it responds either in-place (an HTML error, for the
+        two UNREDIRECTABLE cases — an unresolvable `client_id` and a
+        `redirect_uri` that does not match the registered client) or as a `302`
+        redirect back to the client carrying `error`, `state`, and `iss`
+        (RFC 9207). The consent GET MINTS a `__Host-csrf` cookie when the
+        request carries none, because that cookie is `SameSite=Strict` and is
+        not sent on the cross-site top-level authorize navigation.
+      security: []
+      tags: [oauth]
+      parameters:
+        - name: client_id
+          in: query
+          required: true
+          description: The client identifier — a Client ID Metadata Document URL (CIMD, RFC 8414 registration-free) or a pre-registered id.
+          schema: { type: string }
+        - name: redirect_uri
+          in: query
+          required: true
+          description: Redirect URI; must match one registered for the client (RFC 8252 §7.3 matching).
+          schema: { type: string, format: uri }
+        - name: response_type
+          in: query
+          required: true
+          description: Must be `code`. A value the client did not register is refused `unauthorized_client`.
+          schema: { type: string, enum: [code] }
+        - name: code_challenge
+          in: query
+          required: true
+          description: PKCE code challenge (RFC 7636).
+          schema: { type: string }
+        - name: code_challenge_method
+          in: query
+          required: true
+          description: Must be `S256`.
+          schema: { type: string, enum: [S256] }
+        - name: resource
+          in: query
+          required: false
+          description: RFC 8707 resource indicator; must match the deployment's configured resource.
+          schema: { type: string, format: uri }
+        - name: scope
+          in: query
+          required: false
+          description: Space-delimited requested scopes from the operator vocabulary; absent means no restriction beyond the client's registration.
+          schema: { type: string }
+        - name: state
+          in: query
+          required: false
+          description: Opaque client value echoed back on the redirect.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The HTML consent page.
+          content:
+            text/html:
+              schema: { type: string }
+        '302':
+          description: |
+            Redirect to forge sign-in (signed-out), or a redirect back to the
+            client's `redirect_uri` carrying an RFC 6749 §4.1.2.1 `error` with
+            `state` and `iss` (RFC 9207 §2) for a redirectable invalid request.
+        '400':
+          description: |
+            An in-place RFC 6749 §5.2 JSON error for an UNREDIRECTABLE invalid
+            request — an unresolvable `client_id` or a `redirect_uri` that does
+            not match the registered client — where redirecting the error would
+            hand it to an unverified destination.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
+        '503': { $ref: '#/components/responses/OAuthASUnavailable' }
+    post:
+      operationId: postOAuthAuthorize
+      summary: OAuth 2.1 authorization endpoint (consent decision)
+      description: |
+        Records the operator's consent decision for a pending authorization
+        request. Form-encoded (`approve` or `deny`). CSRF is enforced via the
+        `__Host-csrf` cookie with a narrow path-scoped `csrf_token` form-field
+        fallback (the `SameSite=Strict` cookie is not sent on the cross-site
+        top-level navigation). On approve, responds `302` to the `redirect_uri`
+        carrying `code`, `state`, and `iss` (RFC 9207). On deny, responds `302`
+        carrying `error=access_denied`, `state`, and `iss`.
+      security: []
+      tags: [oauth]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [approve, deny]
+                  description: The consent decision; any value other than `approve` is treated as a denial.
+                csrf_token:
+                  type: string
+                  description: Path-scoped CSRF fallback, matched against the `__Host-csrf` cookie.
+                client_id: { type: string }
+                redirect_uri: { type: string, format: uri }
+                response_type: { type: string, enum: [code] }
+                code_challenge: { type: string }
+                code_challenge_method: { type: string, enum: [S256] }
+                resource: { type: string, format: uri }
+                scope: { type: string }
+                state: { type: string }
+      responses:
+        '302':
+          description: |
+            On approve, redirect to `redirect_uri` with `code`, `state`, `iss`.
+            On deny, redirect with `error=access_denied`, `state`, `iss`
+            (RFC 9207 §2).
+        '400':
+          description: |
+            The consent request was malformed or referenced no pending
+            authorization. Unredirectable authorization errors (an unresolvable
+            `client_id` or a mismatched `redirect_uri`) return the RFC 6749 §5.2
+            JSON `OAuthError`; an unparseable form body returns the standard
+            Fishhawk `Error` envelope.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/OAuthError'
+                  - $ref: '#/components/schemas/Error'
+        '401':
+          description: |
+            `auth_required` — the decision was submitted without an authenticated
+            session (a `SameSite=Lax` session cookie is required to reach this
+            endpoint). Standard Fishhawk `Error` envelope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            The CSRF cookie / `csrf_token` form field did not validate. Standard
+            Fishhawk `Error` envelope.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/OAuthASUnavailable' }
+
+  /v0/oauth/token:
+    post:
+      operationId: postOAuthToken
+      summary: OAuth 2.1 token endpoint
+      description: |
+        Exchanges an authorization code (`grant_type=authorization_code`) or
+        rotates a refresh token (`grant_type=refresh_token`) for an access
+        token. PUBLIC client only (`token_endpoint_auth_method=none`):
+        `client_id` is read from the form body, and ANY `Authorization` header
+        is refused `401 invalid_client` with a `WWW-Authenticate` header, since
+        a public client presents no client credential. Form-encoded request;
+        the success body and every error carry `Cache-Control: no-store`.
+        Errors are the RFC 6749 §5.2 flat JSON `{error, error_description}`
+        shape, NOT the standard Fishhawk error envelope.
+      security: []
+      tags: [oauth]
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              required: [grant_type, client_id]
+              properties:
+                grant_type:
+                  type: string
+                  enum: [authorization_code, refresh_token]
+                client_id:
+                  type: string
+                  description: Read from the form body only; the endpoint is public-client (`none`).
+                code:
+                  type: string
+                  description: Required for `grant_type=authorization_code`.
+                redirect_uri:
+                  type: string
+                  format: uri
+                  description: Required for `grant_type=authorization_code`; must match the authorize request.
+                code_verifier:
+                  type: string
+                  description: PKCE verifier (RFC 7636); required for `grant_type=authorization_code`.
+                refresh_token:
+                  type: string
+                  description: Required for `grant_type=refresh_token`.
+                resource:
+                  type: string
+                  format: uri
+                  description: RFC 8707 resource indicator.
+      responses:
+        '200':
+          description: Access token issued.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthTokenResponse' }
+        '400':
+          description: |
+            RFC 6749 §5.2 error (e.g. `invalid_request`, `invalid_grant`,
+            `unauthorized_client`, `unsupported_grant_type`), flat JSON.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
+        '401':
+          description: |
+            `invalid_client` — the request carried an `Authorization` header,
+            which a public client must not. Carries `WWW-Authenticate`.
+          headers:
+            WWW-Authenticate:
+              schema:
+                type: string
+                example: Bearer
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthError' }
+        '503': { $ref: '#/components/responses/OAuthASUnavailable' }
 
   # ---------------------------------------------------------------------
   # Liveness — public, unversioned
@@ -12080,3 +12478,5 @@ tags:
     description: Inbound from GitHub App installations.
   - name: mcp
     description: MCP tool surface served over streamable HTTP (ADR-076).
+  - name: oauth
+    description: OAuth 2.1 authorization server for MCP clients (ADR-076 slice 3, #2436).

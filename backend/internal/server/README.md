@@ -1402,3 +1402,210 @@ the runner on the fishhawkd host and forward the CALLER's token in the child
 environment. Under the loopback-only default that host is the operator's own
 machine, so dogfood behaviour is unchanged — but both facts become live
 questions the moment slice 3 admits a remote client.
+
+## OAuth 2.1 authorization server (`oauthas.go` / `oauthauthorize.go` / `oauthtoken.go`, ADR-076 slice 3 / E66.19 #2436)
+
+The four endpoints — `GET /.well-known/oauth-authorization-server`,
+`GET`/`POST /v0/oauth/authorize`, `POST /v0/oauth/token` — mint a Fishhawk
+access token to a spec-compliant MCP client via authorization-code + PKCE. The
+handlers are the HTTP shell over the pure `backend/internal/oauthas` domain
+(PKCE, redirect matching, CIMD fetch, typed RFC 6749 errors) and the
+`backend/internal/oauthstore` persistence; this package adds no crypto or
+storage logic of its own.
+
+### Three-verdict enablement, resolved ONCE at construction
+
+`New()` resolves the AS to exactly one of three verdicts and stores it; every
+route reads that one value:
+
+- **DISABLED** — no issuer configured. All four routes answer
+  `503 oauth_as_unconfigured`.
+- **ENABLED** — a valid https issuer AND a valid RFC 8707 resource AND a
+  non-nil store AND a non-nil CIMD fetcher. Routes served.
+- **MISCONFIGURED** — an issuer was supplied but a required input is defective:
+  a bad issuer, a bad resource, a nil store, or a nil CIMD fetcher. All four
+  routes answer `503 oauth_as_unconfigured`, and the metadata route emits NO
+  partial document.
+
+**A nil CIMD Fetcher is MISCONFIGURED, not a conditional advertisement.** The
+tempting alternative — serve metadata with `client_id_metadata_document_supported:
+false` when no fetcher is wired — was rejected: it would let a deployment that
+cannot fetch a Client ID Metadata Document still stand up an AS, advertising a
+narrowed capability that silently diverges from what the four
+otherwise-unconditional-literal metadata fields promise. Folding the nil fetcher
+into MISCONFIGURED keeps the enabled metadata document a set of unconditional
+literals — `client_id_metadata_document_supported` is `true` whenever the
+document is served at all — so a client never has to branch on a
+half-configured server.
+
+### Authorize error ordering: two errors are UNREDIRECTABLE (RFC 6749 §4.1.2.1)
+
+The authorization endpoint must decide WHERE an invalid-request error goes
+before it can decide the error itself. Two failures are answered IN-PLACE (an
+RFC 6749 §5.2 JSON error via `writeOAuthError`, not an HTML page), never
+redirected:
+
+1. an **unresolvable `client_id`** (no CIMD, no registered client), and
+2. a **`redirect_uri` that does not match** the resolved client's registered set.
+
+RFC 6749 §4.1.2.1 is explicit: redirecting an error to an unverified or
+unregistered `redirect_uri` would make the AS an open redirector and could hand
+an attacker-chosen destination the `state`/`iss`. So these two are resolved
+FIRST, and only once the client and redirect URI are both validated does any
+OTHER invalid-request error (bad `response_type`, missing/short PKCE challenge,
+unregistered scope, resource mismatch) redirect back to the now-trusted
+`redirect_uri`. **Every redirected error carries `state` and `iss`** (RFC 9207
+§2) — the same authorization-response `iss` the metadata advertises via
+`authorization_response_iss_parameter_supported: true`, so a client can bind the
+error to the issuer it dialed.
+
+### CSRF on `/v0/oauth/authorize`: the SameSite trap (CONDITION-1)
+
+The `POST` consent decision is CSRF-protected by the standard `__Host-csrf`
+cookie, but with a NARROW, path-scoped `csrf_token` form-field fallback that
+exists nowhere else in the surface. The reason is a cookie-attribute
+interaction, not laxness: the `__Host-csrf` cookie is `SameSite=Strict`, so it
+is **NOT sent on the cross-site top-level navigation** that lands the browser on
+`GET /v0/oauth/authorize` from the MCP client's site — while the
+`SameSite=Lax` session cookie IS. A double-submit that read only the Strict
+cookie would therefore see no token on the very first consent render and wedge
+the flow.
+
+So the consent **GET mints a `__Host-csrf` cookie when the request carries
+none**, and the POST accepts the token from the `csrf_token` form field matched
+against that cookie. The fallback is scoped to this one path.
+
+**General lesson, recorded because it defeated handler-level testing:** a test
+suite that constructs cookies programmatically cannot observe `SameSite` at
+all — `net/http` does not replay the browser's cross-site send/suppress rule —
+so a handler test that hand-attaches the `__Host-csrf` cookie will pass while a
+real browser sends no such cookie on the cross-site navigation. Handler-level
+testing cannot catch this class; the mint-on-GET behavior is the structural fix,
+not a test assertion.
+
+**Bounded form read (CONDITION-3).** The `csrf_token` fallback parses the POST
+body under a 1 MiB cap — implemented with `io.LimitReader` (reading one byte past
+the cap) plus a manual length check that returns `413` on overflow, not
+`http.MaxBytesReader` — so an unbounded form body cannot be read into memory on
+this unauthenticated, pre-consent path.
+
+### Token endpoint: public-client only
+
+`POST /v0/oauth/token` serves `grant_type=authorization_code` and
+`grant_type=refresh_token` for a PUBLIC client
+(`token_endpoint_auth_method=none`) exclusively:
+
+- **`client_id` is read from `r.PostForm` ONLY.** There is no client
+  authentication to parse.
+- **ANY `Authorization` header is refused `401 invalid_client`** with a
+  `WWW-Authenticate` response header. A public client presents no client
+  credential, so a request that carries one is malformed by definition — failing
+  it closed (rather than ignoring the header) keeps a confused-deputy credential
+  from being silently accepted as if the endpoint were confidential.
+
+Success bodies and every error carry `Cache-Control: no-store`; errors are the
+RFC 6749 §5.2 flat JSON `{error, error_description}` — deliberately NOT the
+standard Fishhawk error envelope — while the whole-AS `503
+oauth_as_unconfigured` refusal DOES use the standard envelope.
+
+### Verify-before-consume, and the derived-authority invariant
+
+Code redemption and refresh rotation go through `oauthstore`'s transactional
+**verify-before-consume** seam: the handler hands the store the presented code
+(or refresh token) and the PKCE verifier, and the store verifies the hashed
+credential and marks it consumed inside ONE transaction, so a replayed code
+cannot race a second redemption.
+
+The handler passes the store only what it must: a `RedemptionRequest` /
+`RotationRequest` carries **only the expiries** (`--oauth-access-token-ttl`,
+`--oauth-refresh-token-ttl`). The token's SUBJECT, CLIENT, SCOPE, and RESOURCE
+are **derived by the store from the persisted code/refresh row**, never taken
+from the request — the derived-authority invariant. The handler cannot widen a
+token's authority by what it passes; the authority is whatever the original
+authorization persisted.
+
+### Client resolution: store-first, no `UpsertClient` on the hot path
+
+`client_id` resolves store-first: a pre-registered `oauth_clients` row is used if
+present, else the id is fetched and validated as a CIMD (RFC 8414
+registration-free). **A resolved CIMD is deliberately NOT persisted.** Writing an
+`oauth_clients` row for a CIMD-resolved client would SHADOW later CIMD
+refreshes — the store lookup would win on every subsequent request and pin the
+first-seen document, converting the CIMD fetcher's bounded TTL into a permanent
+pin. So there is no `UpsertClient` call on the authorize/token path; the fetcher
+stays authoritative for CIMD clients.
+
+Two CIMD gate fields (advertised in metadata,
+`client_id_metadata_document_supported: true`) are what let a modern client
+register-free. **If either the metadata advertisement or the CIMD fetch path is
+missed, a client silently DOWNGRADES** — Claude Code, for one, falls back to
+deprecated Dynamic Client Registration (DCR) rather than erroring, so a broken
+CIMD path is invisible unless you check which registration route the client
+actually took.
+
+### Registered-metadata enforcement, RFC 7591 defaults (CONDITION-2)
+
+A client's registered `response_types`, `grant_types` and `scope` are ENFORCED,
+not advisory:
+
+- authorize rejects a `response_type` the client did not register with
+  `unauthorized_client`;
+- token rejects a `grant_type` the client did not register with
+  `unauthorized_client`;
+- authorize rejects a requested `scope` outside the client's registered `scope`
+  set with `invalid_scope` (`runAuthorizeLadder` step 7, via
+  `registeredScopeSet`). The token endpoint needs no scope check — it derives
+  scope from the persisted code row (the derived-authority invariant), so a
+  narrow registration bounds every code and every token descended from it.
+
+Absent registration fields take the RFC 7591 defaults: `response_types` →
+`["code"]`, `grant_types` → `["authorization_code"]`. An **absent `scope`** on
+the registration means NO scope restriction (the client may request any operator
+scope), distinct from an empty list — `registeredScopeSet` returns nil for an
+absent scope and the ladder enforces only when the set is non-empty, so a
+scope-omitting CIMD client (e.g. Claude Code) stays unrestricted while a client
+that DID pin a narrow scope is bounded to it.
+
+### THE PROVIDER WART — `oauth_clients` is keyed `UNIQUE (provider, client_id)`
+
+`oauth_clients` inherits the tenancy convention of a `UNIQUE (provider,
+client_id)` key. But an OAuth client registration describes the **MCP client** —
+it is not an identity provider and carries no forge, so there is no natural
+`provider` value to key on. This slice works around it by **iterating the
+supported provider set `{github, gitlab}` in a fixed order** when resolving a
+`client_id`:
+
+- **identical duplicates resolve** — the same registration under both providers
+  is treated as one client;
+- **divergent duplicates FAIL CLOSED** — if the two provider rows disagree, the
+  resolution refuses rather than silently picking the first-iterated provider's
+  row.
+
+This is a workaround, and the operator follow-up is named: **drop `provider`
+from the `oauth_clients` uniqueness key** (an OAuth client is provider-agnostic),
+filed at the #2436 plan gate.
+
+### Recorded, not acted on
+
+Two known gaps are documented here without a change in this slice:
+
+- **No operator write path for pre-registration.** `oauth_clients` rows are
+  hand-written SQL today — `oauthstore.UpsertClient` exists but has NO caller.
+  Registration-free CIMD clients are the supported path; a pre-registration
+  admin surface is future work.
+- **CIMD-triggering requests are unrate-limited — and NOT per-route loopback
+  gated.** A `GET /v0/oauth/authorize` (before its identity check) or a `POST
+  /v0/oauth/token` (unauthenticated by nature — public client) with an unseen
+  `client_id` URL triggers an outbound CIMD fetch, and nothing bounds the RATE of
+  those fetches. Unlike `/mcp` (which self-gates to a loopback listener via
+  `mcpRouteState`), these OAuth AS routes carry NO per-route loopback check: the
+  only thing keeping the fetch non-remotely-reachable in the current alpha is the
+  operator binding fishhawkd to a loopback address (`FISHHAWKD_ADDR=127.0.0.1`).
+  So an earlier claim that this "is only externally reachable once #2391" was
+  inaccurate — it is reachable by anyone who can reach the daemon's listener
+  today. The SSRF connect-time guard in `oauthas` bounds WHERE a fetch can go and
+  the fetcher's LRU bounds cache memory, but neither bounds HOW OFTEN or HOW MANY
+  CONCURRENT fetches an attacker can force. Rate limiting (and a per-route
+  loopback/auth gate before a public bind) is therefore a HARD prerequisite for
+  binding this AS to a public address, tracked with #2391 — until it lands the
+  operator MUST keep the daemon bound to loopback.
