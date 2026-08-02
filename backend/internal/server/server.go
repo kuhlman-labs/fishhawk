@@ -608,8 +608,11 @@ type Config struct {
 	// authorization server (ADR-076 slice 3, #2436) advertises, e.g.
 	// https://as.example. EMPTY leaves the AS DISABLED — all four OAuth routes
 	// answer 503 oauth_as_unconfigured and no metadata document is served. A
-	// non-empty value that oauthas.ParseIssuer rejects (non-https, path,
+	// non-empty value that oauthas.ParseIssuer rejects (non-https, empty host,
 	// query, fragment, userinfo) resolves the AS to MISCONFIGURED at New().
+	// ParseIssuer does NOT reject a path (it trims only a trailing slash); the
+	// origin-only guard lives in serve.go's resolveOAuthIssuer, so an embedder
+	// wiring Config directly is responsible for passing an origin-only issuer.
 	// Wired from FISHHAWKD_OAUTH_ISSUER in serve.go, which refuses to start on
 	// a bad value rather than degrading silently.
 	OAuthASIssuer string

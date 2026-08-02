@@ -194,6 +194,41 @@ func TestToken_ClientSecretRefusedAsInvalidClient(t *testing.T) {
 	}
 }
 
+// TestToken_EmptyFirstAuthorizationValueDoesNotMaskCredential pins the
+// duplicate-value bypass: an empty first Authorization value followed by a real
+// credential makes Header.Get return "" and would slip the credential past a
+// Get-only refusal. Counterfactual: against a handler that read Header.Get, this
+// exact request is a VALID code exchange and returns 200 — the 401 assertion is
+// the whole test.
+func TestToken_EmptyFirstAuthorizationValueDoesNotMaskCredential(t *testing.T) {
+	srv, store := newOAuthTokenServer(t)
+	rr := postToken(srv, codeExchangeForm(mintCode(t, store)), func(r *http.Request) {
+		r.Header["Authorization"] = []string{"", "Basic Zm9vOmJhcg=="}
+	})
+	if rr.Code != http.StatusUnauthorized || oauthErrCode(t, rr) != "invalid_client" {
+		t.Fatalf("empty-first Authorization value masked the credential; status=%d err=%s, want 401 invalid_client",
+			rr.Code, oauthErrCode(t, rr))
+	}
+	if got := rr.Header().Get("WWW-Authenticate"); !strings.HasPrefix(got, "Basic") {
+		t.Fatalf("WWW-Authenticate = %q, want Basic ... (scheme from the non-empty value)", got)
+	}
+}
+
+// TestToken_EmptyFirstClientSecretValueDoesNotMaskCredential pins the same
+// bypass for the body field: client_secret=&client_secret=secret makes
+// PostForm.Get return "". Counterfactual: a Get-only refusal proceeds to a valid
+// 200 exchange.
+func TestToken_EmptyFirstClientSecretValueDoesNotMaskCredential(t *testing.T) {
+	srv, store := newOAuthTokenServer(t)
+	form := codeExchangeForm(mintCode(t, store))
+	form["client_secret"] = []string{"", "s3cr3t"} // empty first value, then a real secret
+	rr := postToken(srv, form, nil)
+	if rr.Code != http.StatusUnauthorized || oauthErrCode(t, rr) != "invalid_client" {
+		t.Fatalf("empty-first client_secret value masked the credential; status=%d err=%s, want 401 invalid_client",
+			rr.Code, oauthErrCode(t, rr))
+	}
+}
+
 // ---- Verify-before-consume: state read AFTER the call ----
 
 func assertCodeStillRedeemable(t *testing.T, store *fakeOAuthStore, code string) {

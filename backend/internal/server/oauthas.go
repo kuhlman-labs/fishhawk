@@ -403,6 +403,25 @@ func containsOAuth(ss []string, want string) bool {
 	return false
 }
 
+// firstNonEmptyOAuth returns the first non-empty entry in ss, or "". Used to
+// inspect ALL values of a possibly-duplicated request header/field rather than
+// only the first (which http.Header.Get / url.Values.Get would return) — a
+// duplicate whose first value is empty must not mask a later credential.
+func firstNonEmptyOAuth(ss []string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// anyNonEmptyOAuth reports whether ss holds any non-empty entry. Same
+// duplicate-value defense as firstNonEmptyOAuth, for a presence-only check.
+func anyNonEmptyOAuth(ss []string) bool {
+	return firstNonEmptyOAuth(ss) != ""
+}
+
 // oauthErrorBody is the RFC 6749 §5.2 error envelope — a FLAT object, distinct
 // from the server's fishhawk errorEnvelope, because OAuth clients parse this
 // exact shape.

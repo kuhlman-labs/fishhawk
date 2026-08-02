@@ -1483,8 +1483,10 @@ testing cannot catch this class; the mint-on-GET behavior is the structural fix,
 not a test assertion.
 
 **Bounded form read (CONDITION-3).** The `csrf_token` fallback parses the POST
-body under a 1 MiB cap (`http.MaxBytesReader`) so an unbounded form body cannot
-be read into memory on this unauthenticated, pre-consent path.
+body under a 1 MiB cap — implemented with `io.LimitReader` (reading one byte past
+the cap) plus a manual length check that returns `413` on overflow, not
+`http.MaxBytesReader` — so an unbounded form body cannot be read into memory on
+this unauthenticated, pre-consent path.
 
 ### Token endpoint: public-client only
 

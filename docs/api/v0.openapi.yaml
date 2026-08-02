@@ -4019,11 +4019,12 @@ paths:
           application/x-www-form-urlencoded:
             schema:
               type: object
-              required: [decision]
+              required: [action]
               properties:
-                decision:
+                action:
                   type: string
                   enum: [approve, deny]
+                  description: The consent decision; any value other than `approve` is treated as a denial.
                 csrf_token:
                   type: string
                   description: Path-scoped CSRF fallback, matched against the `__Host-csrf` cookie.
@@ -4100,9 +4101,6 @@ paths:
                   type: string
                   format: uri
                   description: RFC 8707 resource indicator.
-                scope:
-                  type: string
-                  description: Optional narrowed scope on a refresh.
       responses:
         '200':
           description: Access token issued.

@@ -29,7 +29,10 @@ func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 	// kind belongs on a `none`-auth endpoint, so refuse the WHOLE Authorization
 	// header (not just Basic) — RFC 6749 §2.3.1 puts client credentials there.
 	// §5.2 requires a 401 with a WWW-Authenticate matching the attempted scheme.
-	if authz := r.Header.Get("Authorization"); authz != "" {
+	// Inspect EVERY value, not just Header.Get's first: a duplicated header whose
+	// first value is empty ("" then "Basic …") would otherwise slip a later
+	// credential past Get and defeat this public-client-only refusal.
+	if authz := firstNonEmptyOAuth(r.Header.Values("Authorization")); authz != "" {
 		scheme := "Bearer"
 		if fields := strings.Fields(authz); len(fields) > 0 {
 			scheme = fields[0]
@@ -47,8 +50,10 @@ func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// client_secret on a public-client endpoint is refused outright — there is
-	// no secret to present.
-	if r.PostForm.Get("client_secret") != "" {
+	// no secret to present. Check EVERY value, not just PostForm.Get's first:
+	// client_secret=&client_secret=secret presents an empty first value that Get
+	// would return, slipping a real secret past this refusal.
+	if anyNonEmptyOAuth(r.PostForm["client_secret"]) {
 		s.writeOAuthError(w, r, http.StatusUnauthorized, oauthas.ErrCodeInvalidClient,
 			"this endpoint authenticates public clients only; a client_secret is not accepted")
 		return
