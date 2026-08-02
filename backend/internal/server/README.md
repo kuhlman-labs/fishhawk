@@ -1526,9 +1526,22 @@ authorization persisted.
 
 ### Client resolution: store-first, no `UpsertClient` on the hot path
 
-`client_id` resolves store-first: a pre-registered `oauth_clients` row is used if
-present, else the id is fetched and validated as a CIMD (RFC 8414
-registration-free). **A resolved CIMD is deliberately NOT persisted.** Writing an
+`client_id` resolves store-first, in **one** store read: **a `client_id`
+resolves to at most one registration.** `oauth_clients` is keyed `UNIQUE
+(client_id)` (migration 0064 / #2437) because a client registration names which
+*software* is asking — `client_id` **is** a CIMD document URL — not who
+authenticated, so it carries no forge discriminator to be scoped by. A
+pre-registered row is used if present, else the id is fetched and validated as a
+CIMD (RFC 8414 registration-free).
+
+That single read replaces the #2436 interim workaround, which looped the fixed
+provider set `{github, gitlab}` and failed closed on divergent duplicates. The
+fail-closed branch is not relaxed, it is **unreachable**: the database no longer
+permits two rows to share a `client_id`. What holds that claim up is a schema
+assertion, not resolver code — `oauthstore`'s
+`TestSchema_OAuthClientsKeyedOnClientIDAlone` reads the live catalog for exactly
+one unique-or-PK constraint over `{client_id}` and no constraint whose column set
+includes `provider`. **A resolved CIMD is deliberately NOT persisted.** Writing an
 `oauth_clients` row for a CIMD-resolved client would SHADOW later CIMD
 refreshes — the store lookup would win on every subsequent request and pin the
 first-seen document, converting the CIMD fetcher's bounded TTL into a permanent
@@ -1566,25 +1579,6 @@ absent scope and the ladder enforces only when the set is non-empty, so a
 scope-omitting CIMD client (e.g. Claude Code) stays unrestricted while a client
 that DID pin a narrow scope is bounded to it.
 
-### THE PROVIDER WART — `oauth_clients` is keyed `UNIQUE (provider, client_id)`
-
-`oauth_clients` inherits the tenancy convention of a `UNIQUE (provider,
-client_id)` key. But an OAuth client registration describes the **MCP client** —
-it is not an identity provider and carries no forge, so there is no natural
-`provider` value to key on. This slice works around it by **iterating the
-supported provider set `{github, gitlab}` in a fixed order** when resolving a
-`client_id`:
-
-- **identical duplicates resolve** — the same registration under both providers
-  is treated as one client;
-- **divergent duplicates FAIL CLOSED** — if the two provider rows disagree, the
-  resolution refuses rather than silently picking the first-iterated provider's
-  row.
-
-This is a workaround, and the operator follow-up is named: **drop `provider`
-from the `oauth_clients` uniqueness key** (an OAuth client is provider-agnostic),
-filed at the #2436 plan gate.
-
 ### CIMD amplification limiter + loopback gate (#2441)
 
 The outbound CIMD amplification primitive on the two unauthenticated OAuth AS
@@ -1614,7 +1608,7 @@ gate is available. Shipped contract:
   `--oauth-cimd-global-rate-burst` to loosen it. Defaults: 5 burst + 1/10s per
   source; 30 burst + 1/1s global.
 - **CIMD-branch-only placement.** The limiter is consulted INSIDE
-  `resolveOAuthClient`, only on the zero-store-hits branch — a `client_id` that
+  `resolveOAuthClient`, only on the store-miss branch — a `client_id` that
   resolves from the store dials nothing outbound and is never throttled. Honest
   narrowing: the guard sits on the CIMD RESOLUTION branch, a superset of real
   outbound fetches, so a `client_id` already warm in the fetcher's 15-minute LRU

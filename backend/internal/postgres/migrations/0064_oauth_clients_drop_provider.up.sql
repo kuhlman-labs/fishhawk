@@ -1,0 +1,57 @@
+-- 0064: oauth_clients is NOT forge-scoped (E66.20 / #2437, ADR-076) — drop the
+-- `provider` column and key the table on client_id ALONE.
+--
+-- (a) WHY. An OAuth client registration names WHICH SOFTWARE is asking: its
+--     client_id IS a CIMD document URL (RFC 7591 metadata fetched over https),
+--     and that document says nothing about who authenticated. 0063 applied its
+--     uniform forge-discriminator rule one table too far. The THREE SIBLING
+--     TABLES — oauth_authorization_codes, oauth_access_tokens,
+--     oauth_refresh_tokens — record a SUBJECT and therefore genuinely are
+--     forge-scoped; they keep their `provider` column untouched by this
+--     migration. Only oauth_clients loses it.
+--
+--     The column is DROPPED rather than retained as informational metadata,
+--     because it cannot be populated with a true value. The natural writer is a
+--     CIMD fetch on the PRE-IDENTITY /authorize path, which by construction has
+--     no provider — so the column could only ever record a hardcoded 'github'
+--     or its own DEFAULT, and a reader would believe it. A retained column with
+--     a CHECK and a DEFAULT is also visually indistinguishable from the sibling
+--     tables' genuine discriminator, so absence is the only enforcement that
+--     survives the same reflex that produced the defect.
+--
+--     DROP COLUMN is sufficient on its own: PostgreSQL automatically drops
+--     every index and table constraint involving the column, so this one
+--     statement removes oauth_clients_provider_check AND the
+--     oauth_clients_provider_client_id_key composite unique. An explicit DROP
+--     CONSTRAINT for either would be redundant, and its absence is asserted by
+--     TestMigrateDown_OAuthClientsProviderReversal (no pg_constraint row for the
+--     CHECK after MigrateUp).
+--
+-- (b) MIGRATION HONESTY — why there is NO data-migration dedup step, stated
+--     rather than left for a reader to reconstruct. ADD CONSTRAINT UNIQUE
+--     (client_id) could in principle fail on pre-existing rows holding the same
+--     client_id under two providers. That state CANNOT exist in any deployment
+--     today: oauth_clients has no production writer (UpsertClient's only call
+--     sites in the tree are tests — #2438 tracks the missing operator write
+--     path) and resolveOAuthClient deliberately does not persist CIMD-derived
+--     rows, so the table is empty everywhere. A dedup step would therefore be
+--     dead code guarding an unreachable state. If #2438 lands a writer BEFORE
+--     this migration ships, that reasoning expires and a dedup step is required.
+--
+-- (c) The single-column UNIQUE is LOAD-BEARING, not cosmetic: UpsertClient's
+--     `ON CONFLICT (client_id)` infers its arbiter index from the conflict
+--     target, and the dropped composite (provider, client_id) index does not
+--     satisfy that inference. Without this constraint every upsert fails with
+--     SQLSTATE 42P10.
+--
+-- This retires the #2436 interim workaround in backend/internal/server/oauthas.go
+-- (the fixed provider loop, the divergent-duplicate fail-closed branch, and the
+-- projection comparison that served it): the database no longer permits the
+-- ambiguous state that guard existed for, so the guard is not relaxed — it is
+-- made unreachable.
+--
+-- Touches oauth_clients and nothing else.
+
+ALTER TABLE oauth_clients DROP COLUMN provider;
+
+ALTER TABLE oauth_clients ADD CONSTRAINT oauth_clients_client_id_key UNIQUE (client_id);

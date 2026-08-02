@@ -1,8 +1,10 @@
 # `backend/internal/oauthstore` — OAuth 2.1 authorization-server storage
 
-Anchor: #2433 (E66.18), ADR-076. Migration
+Anchor: #2433 (E66.18), ADR-076. Migrations
 `0063_oauth_as_storage` (four tables: `oauth_clients`,
-`oauth_authorization_codes`, `oauth_access_tokens`, `oauth_refresh_tokens`).
+`oauth_authorization_codes`, `oauth_access_tokens`, `oauth_refresh_tokens`) and
+`0064_oauth_clients_drop_provider` (#2437, E66.20 — `oauth_clients` is not
+forge-scoped; see Schema below).
 First consumer: #2391 (the HTTP endpoints), which has not landed.
 
 ## Why persistence lives here and not in `internal/oauthas`
@@ -28,14 +30,36 @@ CIMD fetching. #2391 owns the endpoints and composes this store with `oauthas`.
 
 | Table | Holds | Notes |
 |---|---|---|
-| `oauth_clients` | CIMD-derived registrations | `UNIQUE (provider, client_id)`; `client_id` is the CIMD document URL |
+| `oauth_clients` | CIMD-derived registrations | `UNIQUE (client_id)` — **no `provider` column**; `client_id` is the CIMD document URL |
 | `oauth_authorization_codes` | issued codes | `code_hash` UNIQUE; **both** `expires_at` and `consumed_at`, with distinct predicates |
 | `oauth_access_tokens` | bearer tokens | `authorization_code_id` **NOT NULL** — the lineage edge |
 | `oauth_refresh_tokens` | rotating refresh chain | `authorization_code_id` **NOT NULL** too; plus `access_token_id` and the nullable self-referential `replaced_by_id` |
 
-All four carry the forge-neutral `provider` discriminator (`github`/`gitlab`,
-CHECK-constrained) and a nullable `account_id` from day one, so Mode 2 workspace
+All four carry a nullable `account_id` from day one, so Mode 2 workspace
 issuance (ADR-057 / E44) needs no token-schema migration later.
+
+**Only the THREE credential tables carry the forge `provider` discriminator**
+(`github`/`gitlab`, CHECK-constrained): `oauth_authorization_codes`,
+`oauth_access_tokens`, `oauth_refresh_tokens`. Each records a **subject** — who
+authenticated — which genuinely is forge-scoped.
+
+`oauth_clients` does **not**, and its column was dropped by 0064 (#2437). A
+client registration names *which software is asking* — its `client_id` **is** a
+CIMD document URL — not who authenticated, so it has no identity provider. 0063
+applied the uniform discriminator rule one table too far. The column was dropped
+rather than retained as informational metadata because it could not be populated
+with a true value: the natural writer is a CIMD fetch on the **pre-identity**
+`/authorize` path, which by construction has no provider, so the column could
+only ever record a hardcoded `'github'` or its own DEFAULT — and a reader would
+believe it. A retained column with a CHECK and a DEFAULT is also visually
+indistinguishable from the three siblings' genuine discriminator, so absence is
+the only enforcement that survives the reflex that produced the defect.
+`TestSchema_OAuthClientsKeyedOnClientIDAlone` asserts against the live catalog
+that the column is gone, the CHECK is gone, exactly one unique-or-PK constraint
+has the column set `{client_id}`, and no constraint's column set includes
+`provider`; `TestMigrateDown_OAuthClientsProviderReversal` (in
+`internal/postgres`) pins 0064 in both directions and pins the blast radius —
+the three siblings keep their column either way.
 
 ## Credentials are hashed at rest; plaintext exists only at mint
 
@@ -58,7 +82,7 @@ carried on `RedeemAuthorizationCode`'s grant, `AuthenticateAccessToken`,
 that hands back a *persisted* refresh-token row, so without it the refresh class
 would be asserted on mint output alone — a row that never made the round trip
 through the database. The assertions are paired with an identity/`revoked_at`
-check so an empty struct could not satisfy them vacuously. (`GetClient` /
+check so an empty struct could not satisfy them vacuously. (`GetClientByID` /
 `UpsertClient` return a `*Client`, which carries no `PlainText` field at all;
 `GetRefreshTokenByHash` lives only in the generated layer, as an implementation
 detail of `RotateRefreshToken`.)
@@ -69,8 +93,10 @@ and **no database round-trip**.
 
 ## Client registrations REFRESH on fetch — they are not pinned
 
-`UpsertClient` **overwrites** the metadata columns on `(provider, client_id)`
-conflict. A CIMD document is authoritative and client-controlled by design, so a
+`UpsertClient` **overwrites** the metadata columns on a `client_id` conflict —
+the conflict target is `client_id` **alone** (0064), so one CIMD document URL is
+one registration globally and `GetClientByID` can never resolve to an ambiguous
+pair. A CIMD document is authoritative and client-controlled by design, so a
 legitimate client that rotates its redirect URIs must not be permanently broken
 by a first-use snapshot; the `oauthas` fetcher's TTL bounds staleness. Pinning
 would also give only illusory protection — an attacker who can rewrite the
@@ -93,10 +119,12 @@ regression there is a cross-tenant move rather than a cosmetic change.
 
 `first_seen_at` is preserved across refreshes (it is not in the `DO UPDATE` SET
 list); `updated_at` moves.
-`TestUpsertClient_RefreshesOnConflictAndIsProviderScoped` asserts that a changed
+`TestUpsertClient_RefreshesOnClientIDConflict` asserts that a changed
 document updates the persisted row, that `first_seen_at` does not move, that
-`updated_at` is **strictly** later, and that the same `client_id` under `gitlab`
-is a distinct registration. The strictness matters: an `after || equal` form
+`updated_at` is **strictly** later, and — the #2437 inversion — that a second
+registration of the same `client_id` returns the **same** row id with exactly
+one row persisted for that `client_id`, where under 0063 it produced a distinct
+forge-scoped registration. The strictness matters: an `after || equal` form
 would permit an unchanged `updated_at`, so dropping `updated_at = now()` from the
 `DO UPDATE` would pass it — the assertion would no longer be load-bearing for the
 "`updated_at` moves" half of the claim.

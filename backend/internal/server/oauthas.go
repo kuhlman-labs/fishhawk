@@ -243,29 +243,10 @@ func (s *Server) oauthASEnabled(w http.ResponseWriter, r *http.Request) bool {
 	}
 }
 
-// oauthASProviders is the fixed-order supported-provider set the store-first
-// client resolver iterates. It is tied to migration 0063's
-// oauth_clients_provider_check CHECK constraint (provider IN ('github',
-// 'gitlab')); a future provider lands here and in that constraint together.
-//
-// THE PROVIDER WART: oauth_clients is keyed UNIQUE (provider, client_id), but an
-// OAuth client registration describes the MCP client, which is not an identity
-// provider and has no forge — so the discriminator is meaningless here. This
-// helper iterates the set and fails closed on divergent duplicates until the
-// operator follow-up (drop `provider` from the uniqueness key, filed at the
-// #2436 plan gate) lands. See backend/internal/server/README.md.
-var oauthASProviders = []string{"github", "gitlab"}
-
-// errAmbiguousClientRegistration marks a client_id registered under more than
-// one provider with DIVERGENT metadata — an operator misconfiguration that
-// fails closed (rendered invalid_client in place) rather than silently
-// picking one row or falling through to CIMD.
-var errAmbiguousClientRegistration = errors.New("oauth client_id registered under multiple providers with divergent metadata")
-
-// resolvedOAuthClient is the provider-neutral projection of a client
-// registration, resolved from the store or a CIMD document. It carries only the
-// authority-bearing capability fields; per-row bookkeeping (id, provider,
-// account_id, timestamps) is deliberately dropped.
+// resolvedOAuthClient is the projection of a client registration, resolved from
+// the store or a CIMD document. It carries only the authority-bearing
+// capability fields; per-row bookkeeping (id, account_id, timestamps) is
+// deliberately dropped.
 type resolvedOAuthClient struct {
 	RedirectURIs            []string
 	GrantTypes              []string
@@ -303,44 +284,21 @@ func resolvedFromCIMD(m *oauthas.ClientMetadata) resolvedOAuthClient {
 	}
 }
 
-// sameProjection reports whether two resolved registrations project identically
-// across every authority-bearing field. Two identical rows are one client
-// registered twice; any divergence is the ambiguity that fails closed.
-func sameProjection(a, b resolvedOAuthClient) bool {
-	return oauthStringsEqual(a.RedirectURIs, b.RedirectURIs) &&
-		oauthStringsEqual(a.GrantTypes, b.GrantTypes) &&
-		oauthStringsEqual(a.ResponseTypes, b.ResponseTypes) &&
-		a.TokenEndpointAuthMethod == b.TokenEndpointAuthMethod &&
-		a.ClientName == b.ClientName &&
-		a.ClientURI == b.ClientURI &&
-		a.LogoURI == b.LogoURI &&
-		a.Scope == b.Scope
-}
-
-func oauthStringsEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// resolveOAuthClient resolves a client_id STORE-FIRST across the fixed provider
-// set, then falls through to CIMD only on zero store hits (FIX 1). It returns an
-// *oauthas.Error the caller renders directly:
+// resolveOAuthClient resolves a client_id STORE-FIRST, then falls through to
+// CIMD only on a store miss (FIX 1). It returns an *oauthas.Error the caller
+// renders directly:
 //
-//   - a non-ErrNotFound store error from ANY provider aborts with
-//     temporarily_unavailable ("we could not look" is never "no such client");
-//   - exactly one store hit is used as-is, and the CIMD fetcher is NEVER
-//     consulted;
-//   - two or more identical hits resolve to the first; any divergence returns
-//     invalid_client wrapping errAmbiguousClientRegistration and does NOT fall
-//     through to CIMD;
-//   - zero store hits validate the client_id as a CIMD URL and fetch it.
+//   - a store hit is used as-is, and the CIMD fetcher is NEVER consulted;
+//   - a non-ErrNotFound store error aborts with temporarily_unavailable ("we
+//     could not look" is never "no such client");
+//   - ErrNotFound validates the client_id as a CIMD URL and fetches it.
+//
+// ONE store read, because oauth_clients is keyed on client_id ALONE (migration
+// 0064 / #2437). The #2436 interim workaround this replaces looped over a fixed
+// provider set and failed closed on divergent duplicates; that guard is not
+// relaxed, it is UNREACHABLE — the database no longer permits two rows to share
+// a client_id, and TestSchema_OAuthClientsKeyedOnClientIDAlone is what holds
+// that claim up.
 //
 // Deliberately NO UpsertClient on this hot path: persisting a CIMD-derived row
 // would make the store branch shadow every later refresh, converting the
@@ -352,43 +310,22 @@ func oauthStringsEqual(a, b []string) bool {
 // guard through a single call site.
 func (s *Server) resolveOAuthClient(r *http.Request, clientID string) (*resolvedOAuthClient, *oauthas.Error) {
 	ctx := r.Context()
-	var hits []resolvedOAuthClient
-	for _, p := range oauthASProviders {
-		c, err := s.cfg.OAuthStore.GetClient(ctx, p, clientID)
-		if err != nil {
-			if errors.Is(err, oauthstore.ErrNotFound) {
-				continue
-			}
-			return nil, &oauthas.Error{
-				Code:        oauthas.ErrCodeTemporarilyUnavailable,
-				Description: "the client registration store is temporarily unavailable",
-				Cause:       err,
-			}
-		}
-		hits = append(hits, resolvedFromStore(c))
-	}
-
-	switch len(hits) {
-	case 1:
-		c := hits[0]
-		return &c, nil
-	case 0:
-		// fall through to CIMD.
+	c, err := s.cfg.OAuthStore.GetClientByID(ctx, clientID)
+	switch {
+	case err == nil:
+		resolved := resolvedFromStore(c)
+		return &resolved, nil
+	case errors.Is(err, oauthstore.ErrNotFound):
+		// Fall through to CIMD.
 	default:
-		for i := 1; i < len(hits); i++ {
-			if !sameProjection(hits[0], hits[i]) {
-				return nil, &oauthas.Error{
-					Code:        oauthas.ErrCodeInvalidClient,
-					Description: "client_id is registered under multiple providers (github, gitlab) with divergent metadata; refusing to guess",
-					Cause:       errAmbiguousClientRegistration,
-				}
-			}
+		return nil, &oauthas.Error{
+			Code:        oauthas.ErrCodeTemporarilyUnavailable,
+			Description: "the client registration store is temporarily unavailable",
+			Cause:       err,
 		}
-		c := hits[0]
-		return &c, nil
 	}
 
-	// Zero store hits: this is the ONLY branch that can induce an outbound CIMD
+	// Store miss: this is the ONLY branch that can induce an outbound CIMD
 	// fetch, so the rate limiter is consulted HERE and only here (#2441). A
 	// store-resolved client_id short-circuited above and was never throttled —
 	// throttling the pre-registered flow would degrade it for no benefit, since
@@ -414,12 +351,12 @@ func (s *Server) resolveOAuthClient(r *http.Request, clientID string) (*resolved
 	if _, err := oauthas.ValidateClientIDURL(clientID); err != nil {
 		return nil, asInvalidClient(err)
 	}
-	doc, err := s.cfg.OAuthCIMDFetcher.Fetch(ctx, clientID)
-	if err != nil {
-		return nil, asInvalidClient(err)
+	doc, fetchErr := s.cfg.OAuthCIMDFetcher.Fetch(ctx, clientID)
+	if fetchErr != nil {
+		return nil, asInvalidClient(fetchErr)
 	}
-	c := resolvedFromCIMD(doc)
-	return &c, nil
+	resolved := resolvedFromCIMD(doc)
+	return &resolved, nil
 }
 
 // asInvalidClient coerces a CIMD fetch/validation failure into an

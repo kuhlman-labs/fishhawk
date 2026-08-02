@@ -1590,17 +1590,28 @@ func TestRevokeToken_IdempotentAndNotFound(t *testing.T) {
 // Clients
 // ---------------------------------------------------------------------------
 
-// TestUpsertClient_RefreshesOnConflictAndIsProviderScoped is the acceptance
-// criterion for #2433 approval condition 3: a CHANGED CIMD document UPDATES the
-// persisted row (refresh-on-fetch), rather than being pinned to its first-use
-// snapshot. first_seen_at is preserved across the refresh; updated_at moves.
-// The same client_id under a different provider is a DISTINCT row.
-func TestUpsertClient_RefreshesOnConflictAndIsProviderScoped(t *testing.T) {
+// TestUpsertClient_RefreshesOnClientIDConflict is the acceptance criterion for
+// #2433 approval condition 3: a CHANGED CIMD document UPDATES the persisted row
+// (refresh-on-fetch), rather than being pinned to its first-use snapshot.
+// first_seen_at is preserved across the refresh; updated_at moves.
+//
+// It also carries the DONE-MEANS assertion for #2437: the conflict target is
+// client_id ALONE, so the tail of this test is the INVERSE of what it asserted
+// under 0063. Where a second registration of the same CIMD URL "under a
+// different provider" used to produce a DISTINCT row, it must now return the
+// SAME registration id — one CIMD document URL is one registration globally.
+//
+// This test is also the first half of the mandated counterfactual: deleting the
+// migration's `ADD CONSTRAINT oauth_clients_client_id_key UNIQUE (client_id)`
+// makes the very first UpsertClient fail with SQLSTATE 42P10 ("there is no
+// unique or exclusion constraint matching the ON CONFLICT specification"),
+// because `ON CONFLICT (client_id)` infers its arbiter index from that
+// constraint. TestSchema_OAuthClientsKeyedOnClientIDAlone is the other half.
+func TestUpsertClient_RefreshesOnClientIDConflict(t *testing.T) {
 	ctx := context.Background()
-	repo, _ := newRepo(t)
+	repo, pool := newRepo(t)
 
 	first, err := repo.UpsertClient(ctx, oauthstore.NewClient{
-		Provider: "github",
 		Metadata: oauthas.ClientMetadata{
 			ClientID:                testClientID,
 			RedirectURIs:            []string{"http://127.0.0.1:8765/callback"},
@@ -1617,7 +1628,6 @@ func TestUpsertClient_RefreshesOnConflictAndIsProviderScoped(t *testing.T) {
 	// The client rotates its redirect URIs and renames itself. Refresh-on-fetch
 	// means the persisted row FOLLOWS the document.
 	second, err := repo.UpsertClient(ctx, oauthstore.NewClient{
-		Provider: "github",
 		Metadata: oauthas.ClientMetadata{
 			ClientID:                testClientID,
 			RedirectURIs:            []string{"http://127.0.0.1:9999/cb", "http://[::1]:9999/cb"},
@@ -1655,20 +1665,22 @@ func TestUpsertClient_RefreshesOnConflictAndIsProviderScoped(t *testing.T) {
 	}
 
 	// A read returns the refreshed document, not the pinned original.
-	got, err := repo.GetClient(ctx, "github", testClientID)
+	got, err := repo.GetClientByID(ctx, testClientID)
 	if err != nil {
-		t.Fatalf("GetClient: %v", err)
+		t.Fatalf("GetClientByID: %v", err)
 	}
 	if len(got.RedirectURIs) != 2 {
-		t.Errorf("GetClient redirect_uris = %v, want the refreshed pair", got.RedirectURIs)
+		t.Errorf("GetClientByID redirect_uris = %v, want the refreshed pair", got.RedirectURIs)
 	}
 	if got.ClientURI != "https://client.example.com" {
-		t.Errorf("GetClient client_uri = %q, want the refreshed value", got.ClientURI)
+		t.Errorf("GetClientByID client_uri = %q, want the refreshed value", got.ClientURI)
 	}
 
-	// Provider scoping: the same CIMD URL under gitlab is a DISTINCT row.
-	gitlab, err := repo.UpsertClient(ctx, oauthstore.NewClient{
-		Provider: "gitlab",
+	// THE #2437 INVERSION. This upsert is byte-for-byte the one that used to be
+	// seeded "under gitlab" and produced a SECOND row. With provider gone from
+	// the key it must collapse onto the SAME registration — and, being a
+	// refresh, overwrite the metadata with this document's.
+	third, err := repo.UpsertClient(ctx, oauthstore.NewClient{
 		Metadata: oauthas.ClientMetadata{
 			ClientID:                testClientID,
 			RedirectURIs:            []string{"http://127.0.0.1:1234/cb"},
@@ -1676,13 +1688,19 @@ func TestUpsertClient_RefreshesOnConflictAndIsProviderScoped(t *testing.T) {
 		},
 	})
 	if err != nil {
-		t.Fatalf("UpsertClient (gitlab): %v", err)
+		t.Fatalf("UpsertClient (second registration of the same client_id): %v", err)
 	}
-	if gitlab.ID == first.ID {
-		t.Error("the same client_id under a different provider reused the github row, want a distinct registration")
+	if third.ID != first.ID {
+		t.Errorf("a second registration of the same client_id created a NEW row (%s → %s); one CIMD document URL "+
+			"must be ONE registration globally now that oauth_clients is keyed on client_id alone", first.ID, third.ID)
 	}
-	if _, err := repo.GetClient(ctx, "gitlab", testAltClientID); !errors.Is(err, oauthstore.ErrNotFound) {
-		t.Errorf("GetClient(unknown) = %v, want ErrNotFound", err)
+	// And exactly one row exists for that client_id — the id equality above
+	// would also hold if a stray duplicate sat beside it unread.
+	if n := scanInt(t, pool, `SELECT count(*) FROM oauth_clients WHERE client_id = $1`, testClientID); n != 1 {
+		t.Errorf("oauth_clients rows for client_id = %d, want exactly 1", n)
+	}
+	if _, err := repo.GetClientByID(ctx, testAltClientID); !errors.Is(err, oauthstore.ErrNotFound) {
+		t.Errorf("GetClientByID(unknown) = %v, want ErrNotFound", err)
 	}
 }
 
@@ -1720,7 +1738,6 @@ func TestUpsertClient_AccountIDIsStickyAcrossRefreshes(t *testing.T) {
 	upsert := func(accountID string) *oauthstore.Client {
 		t.Helper()
 		got, err := repo.UpsertClient(ctx, oauthstore.NewClient{
-			Provider: "github",
 			Metadata: oauthas.ClientMetadata{
 				ClientID:                testClientID,
 				RedirectURIs:            []string{"http://127.0.0.1:8765/callback"},
@@ -1756,32 +1773,30 @@ func TestUpsertClient_AccountIDIsStickyAcrossRefreshes(t *testing.T) {
 
 	// Read back over raw SQL: the claim is about the persisted column.
 	if got := scanString(t, pool,
-		`SELECT account_id::text FROM oauth_clients WHERE provider = 'github' AND client_id = $1`,
+		`SELECT account_id::text FROM oauth_clients WHERE client_id = $1`,
 		testClientID); got != tenantA.String() {
 		t.Errorf("persisted account_id = %q, want tenant A %s", got, tenantA)
 	}
 	// The metadata columns still follow the document — stickiness is scoped to the
 	// tenant column, it did not turn the whole row into a pin-at-first-use
 	// snapshot.
-	if got, err := repo.GetClient(ctx, "github", testClientID); err != nil {
-		t.Fatalf("GetClient: %v", err)
+	if got, err := repo.GetClientByID(ctx, testClientID); err != nil {
+		t.Fatalf("GetClientByID: %v", err)
 	} else if got.TokenEndpointAuthMethod != "none" || len(got.RedirectURIs) != 1 {
-		t.Errorf("GetClient = %+v, want the refreshed document's metadata", got)
+		t.Errorf("GetClientByID = %+v, want the refreshed document's metadata", got)
 	}
 }
 
-// TestUpsertClient_RejectsMissingIdentifiers covers the two required-field
-// guards, which refuse before any database round-trip.
+// TestUpsertClient_RejectsMissingIdentifiers covers the ONE remaining
+// required-field guard, which refuses before any database round-trip. The
+// provider-required case is gone with the column (0064 / #2437): a client
+// registration has no identity provider, so there is nothing left to require.
 func TestUpsertClient_RejectsMissingIdentifiers(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
 	pool.Close()
 
-	if _, err := repo.UpsertClient(ctx, oauthstore.NewClient{Metadata: oauthas.ClientMetadata{ClientID: testClientID}}); err == nil ||
-		!strings.Contains(err.Error(), "provider required") {
-		t.Errorf("UpsertClient with no provider = %v, want a provider-required error", err)
-	}
-	if _, err := repo.UpsertClient(ctx, oauthstore.NewClient{Provider: "github"}); err == nil ||
+	if _, err := repo.UpsertClient(ctx, oauthstore.NewClient{}); err == nil ||
 		!strings.Contains(err.Error(), "client_id required") {
 		t.Errorf("UpsertClient with no client_id = %v, want a client_id-required error", err)
 	}
@@ -1873,7 +1888,6 @@ func TestAccountID_RoundTripsAndRejectsMalformed(t *testing.T) {
 		t.Errorf("CreateAuthorizationCode with a malformed account_id = %v, want an invalid-account_id error", err)
 	}
 	if _, err := repo.UpsertClient(ctx, oauthstore.NewClient{
-		Provider:  "github",
 		Metadata:  oauthas.ClientMetadata{ClientID: testClientID},
 		AccountID: "not-a-uuid",
 	}); err == nil || !strings.Contains(err.Error(), "invalid account_id") {
@@ -1923,12 +1937,11 @@ func TestRepository_DatabaseErrorsAreNotMisclassified(t *testing.T) {
 	}
 
 	_, err = repo.UpsertClient(ctx, oauthstore.NewClient{
-		Provider: "github",
 		Metadata: oauthas.ClientMetadata{ClientID: testClientID},
 	})
 	check("UpsertClient", err)
-	_, err = repo.GetClient(ctx, "github", testClientID)
-	check("GetClient", err)
+	_, err = repo.GetClientByID(ctx, testClientID)
+	check("GetClientByID", err)
 	_, err = repo.CreateAuthorizationCode(ctx, oauthstore.NewAuthorizationCode{
 		ClientID: testClientID, Subject: testSubject, ExpiresAt: time.Now().UTC().Add(time.Minute),
 	})
@@ -1993,5 +2006,102 @@ func TestSchema_RejectsUnsupportedEnumValues(t *testing.T) {
 	if grant.Access.Provider != "gitlab" || grant.Refresh.Provider != "gitlab" {
 		t.Errorf("token provider = %q/%q, want the code's \"gitlab\" (never the column default)",
 			grant.Access.Provider, grant.Refresh.Provider)
+	}
+}
+
+// TestSchema_OAuthClientsKeyedOnClientIDAlone is the SCHEMA-level proof for
+// #2437, and it carries the whole argument for deleting a security control: the
+// resolver's divergent-duplicate fail-closed branch (#2436) was removed on the
+// claim that the database can no longer represent the state it guarded against.
+// Nothing in the resolver can hold that claim up — only this can. If it stays
+// green while the constraint is missing, the resolver is silently first-matching
+// again.
+//
+// So it asserts against the LIVE catalog, not against the migration text:
+//
+//   - oauth_clients has NO provider column, and no oauth_clients_provider_check;
+//   - EXACTLY ONE unique-or-primary-key constraint has the column set
+//     {client_id};
+//   - NO constraint has a column set that includes provider.
+//
+// The column-set framing is deliberate and is the operator's binding
+// CONDITION 1. oauth_clients has a PRIMARY KEY on id, and a PK *is* a unique
+// constraint — so a naive "exactly one unique constraint" assertion would
+// either fail confusingly or get written to pass by filtering contype down to
+// 'u' and thereby stop seeing a PK that drifted onto the wrong columns. Both
+// contypes are enumerated and the discrimination is done on COLUMNS.
+//
+// MANDATED COUNTERFACTUAL (a): delete `ADD CONSTRAINT oauth_clients_client_id_key
+// UNIQUE (client_id)` from 0064's up-migration and this test goes RED on the
+// {client_id} count (0, want 1), alongside
+// TestUpsertClient_RefreshesOnClientIDConflict failing with SQLSTATE 42P10.
+func TestSchema_OAuthClientsKeyedOnClientIDAlone(t *testing.T) {
+	ctx := context.Background()
+	_, pool := newRepo(t)
+
+	if n := scanInt(t, pool,
+		`SELECT count(*) FROM information_schema.columns
+          WHERE table_name = 'oauth_clients' AND column_name = 'provider'`); n != 0 {
+		t.Errorf("oauth_clients.provider column count = %d, want 0 — a client registration names which SOFTWARE "+
+			"is asking (a CIMD document URL), not who authenticated, so it has no identity provider", n)
+	}
+	if n := scanInt(t, pool,
+		`SELECT count(*) FROM pg_constraint con
+            JOIN pg_class rel ON rel.oid = con.conrelid
+           WHERE rel.relname = 'oauth_clients' AND con.conname = 'oauth_clients_provider_check'`); n != 0 {
+		t.Errorf("oauth_clients_provider_check count = %d, want 0 — DROP COLUMN must have taken the CHECK with it", n)
+	}
+
+	// Every unique-or-PK constraint on the table with its column set, ordered by
+	// name so a failure prints a stable, readable inventory.
+	rows, err := pool.Query(ctx,
+		`SELECT con.conname, con.contype::text,
+                (SELECT array_agg(att.attname ORDER BY att.attname)
+                   FROM unnest(con.conkey) AS k(attnum)
+                   JOIN pg_attribute att
+                     ON att.attrelid = rel.oid AND att.attnum = k.attnum) AS cols
+           FROM pg_constraint con
+           JOIN pg_class rel ON rel.oid = con.conrelid
+          WHERE rel.relname = 'oauth_clients' AND con.contype IN ('u', 'p')
+          ORDER BY con.conname`)
+	if err != nil {
+		t.Fatalf("query oauth_clients unique/pk constraints: %v", err)
+	}
+	defer rows.Close()
+
+	type constraintShape struct {
+		name    string
+		contype string
+		cols    []string
+	}
+	var shapes []constraintShape
+	for rows.Next() {
+		var s constraintShape
+		if err := rows.Scan(&s.name, &s.contype, &s.cols); err != nil {
+			t.Fatalf("scan constraint row: %v", err)
+		}
+		shapes = append(shapes, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate constraint rows: %v", err)
+	}
+
+	clientIDOnly := 0
+	for _, s := range shapes {
+		if len(s.cols) == 1 && s.cols[0] == "client_id" {
+			clientIDOnly++
+		}
+		for _, c := range s.cols {
+			if c == "provider" {
+				t.Errorf("constraint %s (contype %s) has column set %v, which includes provider — oauth_clients "+
+					"must carry NO forge discriminator in any key", s.name, s.contype, s.cols)
+			}
+		}
+	}
+	if clientIDOnly != 1 {
+		t.Errorf("unique/PK constraints on oauth_clients with column set {client_id} = %d, want exactly 1; "+
+			"full inventory = %+v. Without it `ON CONFLICT (client_id)` has no arbiter index (SQLSTATE 42P10) "+
+			"AND one CIMD document URL could be registered twice, which is the state the resolver's deleted "+
+			"ambiguity guard existed for", clientIDOnly, shapes)
 	}
 }

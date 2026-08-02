@@ -31,11 +31,11 @@ import (
 type fakeOAuthStore struct {
 	mu      sync.Mutex
 	now     func() time.Time
-	clients map[string]*oauthstore.Client            // provider|client_id
+	clients map[string]*oauthstore.Client            // client_id (globally unique, 0064)
 	codes   map[string]*oauthstore.AuthorizationCode // plaintext
 	access  map[string]*oauthstore.AccessToken       // plaintext
 	refresh map[string]*oauthstore.RefreshToken      // plaintext
-	getErr  error                                    // when set, GetClient returns it
+	getErr  error                                    // when set, GetClientByID returns it
 }
 
 func newFakeOAuthStore() *fakeOAuthStore {
@@ -54,7 +54,7 @@ func (f *fakeOAuthStore) seedClient(c *oauthstore.Client) {
 	if c.ID == uuid.Nil {
 		c.ID = uuid.New()
 	}
-	f.clients[c.Provider+"|"+c.ClientID] = c
+	f.clients[c.ClientID] = c
 }
 
 func (f *fakeOAuthStore) UpsertClient(_ context.Context, in oauthstore.NewClient) (*oauthstore.Client, error) {
@@ -62,7 +62,6 @@ func (f *fakeOAuthStore) UpsertClient(_ context.Context, in oauthstore.NewClient
 	defer f.mu.Unlock()
 	c := &oauthstore.Client{
 		ID:                      uuid.New(),
-		Provider:                in.Provider,
 		ClientID:                in.Metadata.ClientID,
 		RedirectURIs:            in.Metadata.RedirectURIs,
 		GrantTypes:              in.Metadata.GrantTypes,
@@ -74,17 +73,17 @@ func (f *fakeOAuthStore) UpsertClient(_ context.Context, in oauthstore.NewClient
 		Scope:                   in.Metadata.Scope,
 		AccountID:               in.AccountID,
 	}
-	f.clients[c.Provider+"|"+c.ClientID] = c
+	f.clients[c.ClientID] = c
 	return c, nil
 }
 
-func (f *fakeOAuthStore) GetClient(_ context.Context, provider, clientID string) (*oauthstore.Client, error) {
+func (f *fakeOAuthStore) GetClientByID(_ context.Context, clientID string) (*oauthstore.Client, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.getErr != nil {
 		return nil, f.getErr
 	}
-	if c, ok := f.clients[provider+"|"+clientID]; ok {
+	if c, ok := f.clients[clientID]; ok {
 		cp := *c
 		return &cp, nil
 	}
@@ -728,9 +727,20 @@ func assertUnconfigured(t *testing.T, rr *httptest.ResponseRecorder) {
 // Client resolution (FIX 1).
 // ---------------------------------------------------------------------------
 
-func storeClient(provider, clientID string, redirects []string) *oauthstore.Client {
+// storeClient builds a pre-registered client row.
+//
+// It sets NO provider — a registration names which SOFTWARE is asking
+// (client_id is a CIMD document URL), not who authenticated, so oauth_clients
+// carries no forge discriminator (0064 / #2437) and oauthstore.Client has no
+// such field to set.
+//
+// The leading `_ string` is the VESTIGIAL provider argument, kept ONLY so the
+// 16 call sites in oauthauthorize_test.go / oauthtoken_test.go / csrf_test.go —
+// outside this change's declared scope — still compile. It is deliberately
+// unnamed so it cannot be read, and deleting it (a one-argument sweep across
+// those three files) is pure cleanup with no behavioural component.
+func storeClient(_ string, clientID string, redirects []string) *oauthstore.Client {
 	return &oauthstore.Client{
-		Provider:                provider,
 		ClientID:                clientID,
 		RedirectURIs:            redirects,
 		GrantTypes:              []string{"authorization_code", "refresh_token"},
@@ -739,7 +749,20 @@ func storeClient(provider, clientID string, redirects []string) *oauthstore.Clie
 	}
 }
 
-func TestResolveOAuthClient_SingleProviderHit(t *testing.T) {
+// TestResolveOAuthClient_StoreHitResolvesWithoutCIMD is the store-first
+// short-circuit: ONE store read resolves the client and the fetcher is never
+// dialled.
+//
+// The two ambiguity tests that used to sit here — identical-across-providers
+// resolves, divergent-across-providers fails closed — are DELETED, not
+// weakened. They exercised the #2436 interim workaround, whose whole reason for
+// existing was that oauth_clients was keyed UNIQUE (provider, client_id) and so
+// could hold two rows for one client_id. Migration 0064 removes that
+// possibility from the database, so the state they seeded is unrepresentable
+// and their survival would mean the fix did not land. What holds the claim up
+// is the schema assertion — oauthstore's
+// TestSchema_OAuthClientsKeyedOnClientIDAlone — not a resolver unit test.
+func TestResolveOAuthClient_StoreHitResolvesWithoutCIMD(t *testing.T) {
 	store := newFakeOAuthStore()
 	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
 	rt := newCIMD()
@@ -753,38 +776,6 @@ func TestResolveOAuthClient_SingleProviderHit(t *testing.T) {
 	}
 	if rt.fetches() != 0 {
 		t.Fatalf("CIMD fetched %d times on a store hit", rt.fetches())
-	}
-}
-
-func TestResolveOAuthClient_IdenticalRegistrationsAcrossProvidersResolve(t *testing.T) {
-	store := newFakeOAuthStore()
-	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
-	store.seedClient(storeClient("gitlab", "client-x", []string{"https://app.example/cb"}))
-	srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
-	c, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "client-x")
-	if err != nil {
-		t.Fatalf("identical duplicates should resolve, got %v", err)
-	}
-	if !equalStrings(c.RedirectURIs, []string{"https://app.example/cb"}) {
-		t.Fatalf("redirect uris = %v", c.RedirectURIs)
-	}
-}
-
-func TestResolveOAuthClient_DivergentRegistrationsAcrossProvidersFailClosed(t *testing.T) {
-	store := newFakeOAuthStore()
-	store.seedClient(storeClient("github", "client-x", []string{"https://a.example/cb"}))
-	store.seedClient(storeClient("gitlab", "client-x", []string{"https://b.example/cb"}))
-	rt := newCIMD()
-	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
-	_, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "client-x")
-	if err == nil {
-		t.Fatal("divergent duplicates must fail closed")
-	}
-	if err.Code != oauthas.ErrCodeInvalidClient {
-		t.Fatalf("code = %q, want invalid_client", err.Code)
-	}
-	if rt.fetches() != 0 {
-		t.Fatalf("ambiguity fell through to CIMD (%d fetches)", rt.fetches())
 	}
 }
 
@@ -854,13 +845,31 @@ func TestResolveOAuthClient_UnknownClientIsInvalidClient(t *testing.T) {
 	}
 }
 
+// TestResolveOAuthClient_StoreErrorIsNotInvalidClient is the fail-closed branch
+// of the (now single) store read: a non-ErrNotFound error means "we could not
+// look", which is never "no such client". It must ABORT with
+// temporarily_unavailable and must NOT fall through to CIMD — a fallthrough
+// would silently downgrade an outage to an unregistered-client resolution.
+//
+// The client_id here is a well-formed CIMD URL with a document waiting for it,
+// which is what makes the CIMD assertion non-vacuous: on a fallthrough the
+// fetch would SUCCEED and the resolver would return a client rather than an
+// error. (A non-URL client_id would fail ValidateClientIDURL and mask the
+// difference behind an invalid_client.) MANDATED COUNTERFACTUAL (c): change the
+// default branch to fall through and this goes red on both assertions.
 func TestResolveOAuthClient_StoreErrorIsNotInvalidClient(t *testing.T) {
 	store := newFakeOAuthStore()
 	store.getErr = context.DeadlineExceeded
-	srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
-	_, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "client-x")
+	clientID := "https://client.example/cimd"
+	rt := newCIMD()
+	rt.docs[clientID] = cimdDoc(clientID, []string{"https://client.example/cb"}, nil, nil, "")
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+	_, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), clientID)
 	if err == nil || err.Code != oauthas.ErrCodeTemporarilyUnavailable {
 		t.Fatalf("err = %v, want temporarily_unavailable", err)
+	}
+	if rt.fetches() != 0 {
+		t.Fatalf("a store outage fell through to CIMD (%d fetches); 'we could not look' must never resolve a client", rt.fetches())
 	}
 }
 

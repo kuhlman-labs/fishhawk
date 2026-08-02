@@ -44,7 +44,6 @@ type OauthAuthorizationCode struct {
 
 type OauthClient struct {
 	ID                      uuid.UUID          `json:"id"`
-	Provider                string             `json:"provider"`
 	ClientID                string             `json:"client_id"`
 	RedirectUris            []string           `json:"redirect_uris"`
 	GrantTypes              []string           `json:"grant_types"`

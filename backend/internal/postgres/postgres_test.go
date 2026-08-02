@@ -1132,15 +1132,21 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0063 (#2433, E66.18) is now the latest migration (the four OAuth AS
-	// storage tables). Roll it back FIRST — it drops only its own four tables —
-	// then 0062 (the audit_entries_merge_verdict_recorded_once_idx partial
-	// unique index, index-only), then 0061 (users.provider), so this test's
-	// historical assertions, which pin 0060 as the one-step-rollback target,
-	// stay valid. 0063's own up/down reversal is pinned by
+	// 0064 (#2437, E66.20) is now the latest migration (it drops
+	// oauth_clients.provider and keys that table on client_id alone). Roll it
+	// back FIRST — it touches only oauth_clients — then 0063 (#2433, E66.18; the
+	// four OAuth AS storage tables), then 0062 (the
+	// audit_entries_merge_verdict_recorded_once_idx partial unique index,
+	// index-only), then 0061 (users.provider), so this test's historical
+	// assertions, which pin 0060 as the one-step-rollback target, stay valid.
+	// 0064's own up/down reversal is pinned by
+	// TestMigrateDown_OAuthClientsProviderReversal, 0063's by
 	// TestMigrateDown_OAuthASStorageReversal, 0062's by
 	// TestMigrateDown_MergeVerdictUniqueReversal, and 0061's by
 	// TestMigrateDown_UsersProviderReversal below.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063): %v", err)
 	}
@@ -1984,9 +1990,12 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 		t.Fatalf("seed gitlab user: %v", err)
 	}
 
-	// Roll back 0063 (the OAuth AS storage tables) and 0062 (the index-only
-	// merge-verdict uniqueness) first so the next one-step down targets 0061 —
-	// the reversal under test.
+	// Roll back 0064 (oauth_clients.provider drop), 0063 (the OAuth AS storage
+	// tables) and 0062 (the index-only merge-verdict uniqueness) first so the
+	// next one-step down targets 0061 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064 to reach 0062): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063 to reach 0062): %v", err)
 	}
@@ -2066,8 +2075,12 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 		t.Errorf("index def = %q, want a UNIQUE index (0062)", idxDef)
 	}
 
-	// Roll back 0063 (the OAuth AS storage tables) first so the next one-step
-	// down targets 0062 — the reversal under test.
+	// Roll back 0064 (oauth_clients.provider drop) and 0063 (the OAuth AS
+	// storage tables) first so the next one-step down targets 0062 — the
+	// reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064 to reach 0062): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063 to reach 0062): %v", err)
 	}
@@ -2101,7 +2114,9 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 // axes:
 //
 //  1. REVERSAL — all four oauth_* tables exist after MigrateUp and are ABSENT
-//     after exactly one MigrateDown.
+//     after exactly one MigrateDown, taken once 0064 (#2437, E66.20 — the
+//     oauth_clients.provider drop, which sits above 0063 and touches only
+//     oauth_clients) has been rolled back to reach 0063.
 //  2. TOUCHES NOTHING PRE-EXISTING — a representative earlier surface survives
 //     that rollback: api_tokens AND its 0057 api_tokens_tenant_isolation policy.
 //     That pairing is the binding proof, because a down migration that
@@ -2166,6 +2181,11 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 		}
 	}
 
+	// Roll back 0064 (oauth_clients.provider drop) first so the next one-step
+	// down targets 0063 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064 to reach 0063): %v", err)
+	}
 	// (1) One MigrateDown drops exactly the four.
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063): %v", err)
@@ -2213,6 +2233,114 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_OAuthClientsProviderReversal pins 0064 (#2437, E66.20) in
+// BOTH directions, and pins the blast radius:
+//
+//  1. AFTER MigrateUp — oauth_clients has NO provider column, NO
+//     oauth_clients_provider_check and NO composite
+//     oauth_clients_provider_client_id_key, while client_id ALONE is unique.
+//     The absent CHECK and composite are the assertion that DROP COLUMN really
+//     does take dependent constraints with it (PostgreSQL ALTER TABLE, DROP
+//     COLUMN: "Indexes and table constraints involving the column will be
+//     automatically dropped as well"), which is why the migration adds no
+//     explicit DROP CONSTRAINT.
+//  2. AFTER exactly one MigrateDown — the column, its CHECK and the composite
+//     unique are all BACK, and the single-column unique is gone: the 0063 shape
+//     restored exactly.
+//  3. BLAST RADIUS — the three SIBLING oauth_* tables keep their provider
+//     column across BOTH directions. They record WHO authenticated, which
+//     genuinely is forge-scoped; only oauth_clients (which records which
+//     SOFTWARE is asking) loses the discriminator. A sweep that over-reached
+//     into the credential tables fails here.
+func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	count := func(what, sql string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(context.Background(), sql, args...).Scan(&n); err != nil {
+			t.Fatalf("query %s: %v", what, err)
+		}
+		return n
+	}
+	providerColumn := func(table string) int {
+		return count(table+".provider",
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = $1 AND column_name = 'provider'`, table)
+	}
+	constraintCount := func(name string) int {
+		return count(name,
+			`SELECT count(*) FROM pg_constraint con
+			   JOIN pg_class rel ON rel.oid = con.conrelid
+			  WHERE rel.relname = 'oauth_clients' AND con.conname = $1`, name)
+	}
+
+	siblings := []string{"oauth_authorization_codes", "oauth_access_tokens", "oauth_refresh_tokens"}
+
+	// (1) After MigrateUp: no provider column, no CHECK, no composite unique,
+	// and client_id alone IS unique.
+	if n := providerColumn("oauth_clients"); n != 0 {
+		t.Errorf("oauth_clients.provider count after MigrateUp = %d, want 0 (0064 dropped it)", n)
+	}
+	if n := constraintCount("oauth_clients_provider_check"); n != 0 {
+		t.Errorf("oauth_clients_provider_check count after MigrateUp = %d, want 0 — DROP COLUMN must take the "+
+			"dependent CHECK with it, which is why 0064 adds no explicit DROP CONSTRAINT", n)
+	}
+	if n := constraintCount("oauth_clients_provider_client_id_key"); n != 0 {
+		t.Errorf("oauth_clients_provider_client_id_key count after MigrateUp = %d, want 0 — DROP COLUMN must take "+
+			"the dependent composite unique with it", n)
+	}
+	if n := constraintCount("oauth_clients_client_id_key"); n != 1 {
+		t.Errorf("oauth_clients_client_id_key count after MigrateUp = %d, want 1 — without it "+
+			"`ON CONFLICT (client_id)` has no arbiter index and one CIMD URL could be registered twice", n)
+	}
+
+	// (3) The three identity-bearing siblings keep their discriminator.
+	for _, tbl := range siblings {
+		if n := providerColumn(tbl); n != 1 {
+			t.Errorf("%s.provider count after MigrateUp = %d, want 1 — 0064 touches ONLY oauth_clients; the "+
+				"credential tables record WHO authenticated and stay forge-scoped", tbl, n)
+		}
+	}
+
+	// (2) Exactly one MigrateDown restores the 0063 shape.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064): %v", err)
+	}
+	if n := providerColumn("oauth_clients"); n != 1 {
+		t.Errorf("oauth_clients.provider count after MigrateDown = %d, want 1 (0064 reverted)", n)
+	}
+	if n := constraintCount("oauth_clients_provider_check"); n != 1 {
+		t.Errorf("oauth_clients_provider_check count after MigrateDown = %d, want 1 (0063's CHECK restored)", n)
+	}
+	if n := constraintCount("oauth_clients_provider_client_id_key"); n != 1 {
+		t.Errorf("oauth_clients_provider_client_id_key count after MigrateDown = %d, want 1 (0063's composite restored)", n)
+	}
+	if n := constraintCount("oauth_clients_client_id_key"); n != 0 {
+		t.Errorf("oauth_clients_client_id_key count after MigrateDown = %d, want 0 — the reversal must not leave "+
+			"BOTH keys in place", n)
+	}
+	// The rollback also leaves the four tables themselves — it is an ALTER, not a
+	// drop — so 0063's tables survive it.
+	if n := count("oauth_clients table",
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'oauth_clients'`); n != 1 {
+		t.Errorf("'oauth_clients' table count after MigrateDown = %d, want 1 (0064 is an ALTER; 0063's table survives)", n)
+	}
+	for _, tbl := range siblings {
+		if n := providerColumn(tbl); n != 1 {
+			t.Errorf("%s.provider count after MigrateDown = %d, want 1 (0064's down touches only oauth_clients)", tbl, n)
+		}
+	}
+}
+
 // TestMigrateDown_NormalizesPausedRows is the binding-condition-#1
 // rollback-realism guard: 0040's down migration must NOT fail when live
 // 'paused' rows exist. Before re-adding the narrower state CHECK constraints
@@ -2255,7 +2383,11 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Step down past 0060 (drop repo_acl_purge_watermarks — a per-identity purge
+	// Step down past 0064 (drop oauth_clients.provider + its client_id-only
+	// unique — inert re: campaigns) then 0063 (drop the four OAuth AS storage
+	// tables — inert re: campaigns) then 0062 (drop the merge-verdict partial
+	// unique index — inert re: campaigns) then 0061 (drop users.provider — inert
+	// re: campaigns) then 0060 (drop repo_acl_purge_watermarks — a per-identity purge
 	// generation counter, inert re: campaigns) then 0059 (drop repo_acl_entries — a per-identity forge
 	// permission cache, inert re: campaigns) then 0058 (drop the audit_entries_global_account_seq_idx
 	// partial index — inert re: campaigns) then 0057 (drop the RLS policies + disable RLS — purely
@@ -2278,6 +2410,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064 (drop oauth_clients.provider) failed): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063 (drop OAuth AS storage tables) failed): %v", err)
 	}
@@ -2383,7 +2518,10 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0060 (repo_acl_purge_watermarks, inert re:
+	// Apply everything, then roll 0064 (oauth_clients.provider drop, inert re:
+	// stages), 0063 (the four OAuth AS storage tables, inert re: stages), 0062
+	// (the merge-verdict partial unique index, inert re: stages), 0061
+	// (users.provider, inert re: stages), 0060 (repo_acl_purge_watermarks, inert re:
 	// stages), 0059 (repo_acl_entries, inert re: stages),
 	// 0058 (the run-less-chain partial index,
 	// inert re: stages), 0057 (the RLS policies, inert re: stages —
@@ -2395,6 +2533,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063 to reach 0053): %v", err)
@@ -2518,13 +2659,20 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 		t.Errorf("re-opened local stage (started_at set) state after backfill = %q, want dispatched (conservatively skipped)", got)
 	}
 
-	// Down reverses the backfill: roll back 0060 (repo_acl_purge_watermarks,
+	// Down reverses the backfill: roll back 0064 (oauth_clients.provider drop,
+	// inert re: stages) then 0063 (the four OAuth AS storage tables, inert re:
+	// stages) then 0062 (the merge-verdict partial unique index, inert re:
+	// stages) then 0061 (users.provider, inert re: stages) then 0060
+	// (repo_acl_purge_watermarks,
 	// inert re: stages) then 0059 (repo_acl_entries, inert re:
 	// stages) then 0058 (the run-less-chain partial
 	// index, inert re: stages) then 0057 (the RLS policies, inert re:
 	// stages) then 0056 (sessions.account_id + origin + auto_join_role, inert
 	// re: stages) then 0055 (account_members + account_id + endpoint
 	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064 to reach 0053): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063 to reach 0053): %v", err)
 	}
@@ -2586,12 +2734,16 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0060, 0059, 0058, 0057, 0056 and 0055 back so we can seed a
+	// Apply everything, then roll 0064, 0063, 0062, 0061, 0060, 0059, 0058, 0057, 0056 and 0055
+	// back so we can seed a
 	// run+installation pair under the pre-0055 schema (accounts + installations
 	// exist at 0052; runs.installation_id exists at 0005; runs.account_id does
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0064 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0063 to reach 0054): %v", err)
