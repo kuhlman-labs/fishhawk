@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/google/uuid"
@@ -127,5 +129,74 @@ func TestOAuthFlow_CodeIsSingleUse(t *testing.T) {
 	// live with no unit test to catch it.
 	if _, err := store.AuthenticateAccessToken(ctx, first.AccessToken); err == nil {
 		t.Fatal("first-issued access token still authenticates after the replay swept the lineage")
+	}
+}
+
+// TestOAuthFlow_LimiterLivePreservesHappyPathThenThrottlesCIMD is the
+// cross-layer end-to-end for #2441: it drives a COMPLETE consent -> token flow
+// through the real mux with the CIMD limiter LIVE at its default (proving the
+// control does not break the store-resolved happy path), then drives the SAME
+// stack's CIMD store-miss branch past the burst and asserts the outbound-fetch
+// count FROZE at the burst. One test crossing flag-less Config -> New -> handler
+// -> outbound fetch.
+func TestOAuthFlow_LimiterLivePreservesHappyPathThenThrottlesCIMD(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	store := oauthstore.NewPostgresRepository(pool)
+	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
+		Provider: "github",
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                "client-x",
+			RedirectURIs:            []string{"https://app.example/cb"},
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			ResponseTypes:           []string{"code"},
+			TokenEndpointAuthMethod: "none",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertClient: %v", err)
+	}
+	repo := newFakeAuthRepo()
+	uid := uuid.New()
+	repo.mu.Lock()
+	repo.users[uid.String()] = &auth.User{ID: uid.String(), Provider: "github", GitHubLogin: "octocat"}
+	repo.mu.Unlock()
+	id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
+
+	rt := newCIMD()
+	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(rt), AuthRepo: repo})
+
+	// Happy path (store-resolved client, never throttled): consent -> token.
+	code := redirectQuery(t, postConsent(srv, consentForm(nil), &id)).Get("code")
+	if code == "" {
+		t.Fatal("limiter-live consent did not mint a code (happy path broken)")
+	}
+	resp := decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
+	if resp.AccessToken == "" {
+		t.Fatal("limiter-live token exchange returned no access token")
+	}
+	if rt.fetches() != 0 {
+		t.Fatalf("store-resolved happy path dialled CIMD %d times", rt.fetches())
+	}
+
+	// Same stack's CIMD branch: distinct store-miss client_ids past the burst.
+	burst := defaultOAuthCIMDSourceBurst
+	tokenForm := func(clientID string) url.Values {
+		v := url.Values{}
+		v.Set("grant_type", "authorization_code")
+		v.Set("code", "irrelevant")
+		v.Set("client_id", clientID)
+		return v
+	}
+	for i := 0; i < burst; i++ {
+		if rr := postToken(srv, tokenForm("https://ci"+itoa16(i)+".example/cimd"), nil); rr.Code == http.StatusTooManyRequests {
+			t.Fatalf("within-burst CIMD request %d was rate limited", i)
+		}
+	}
+	froze := rt.fetches()
+	if rr := postToken(srv, tokenForm("https://ci-over.example/cimd"), nil); rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-burst CIMD status = %d, want 429", rr.Code)
+	}
+	if rt.fetches() != froze {
+		t.Fatalf("the rate-limited CIMD request still dialled: fetches %d -> %d", froze, rt.fetches())
 	}
 }

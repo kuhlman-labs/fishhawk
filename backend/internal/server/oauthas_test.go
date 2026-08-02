@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -357,6 +359,16 @@ func newEnabledOAuthServer(store oauthstore.Repository, fetcher *oauthas.Fetcher
 const testIssuer = "https://as.example"
 const testResource = "https://as.example/mcp"
 
+// resolveReq builds a request whose RemoteAddr keys the CIMD limiter. Since
+// resolveOAuthClient now derives the limiter source key from the request, the
+// resolver tests hand it a request with an explicit RemoteAddr rather than a
+// bare context.
+func resolveReq(remoteAddr string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/v0/oauth/authorize", nil)
+	req.RemoteAddr = remoteAddr
+	return req
+}
+
 // ---------------------------------------------------------------------------
 // Metadata + AS-state tests.
 // ---------------------------------------------------------------------------
@@ -517,6 +529,188 @@ func TestNew_OAuthASStateVerdicts(t *testing.T) {
 	}
 }
 
+// TestOAuthASState_NotLoopbackWhenRequiredAndPublicBind (#2441 gate #14): the
+// gate on + a public bind resolves to the not-loopback verdict.
+func TestOAuthASState_NotLoopbackWhenRequiredAndPublicBind(t *testing.T) {
+	srv := New(Config{
+		Addr: "0.0.0.0:8080", OAuthASRequireLoopback: true,
+		OAuthASIssuer: testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if srv.oauthAS.mode != oauthASNotLoopback {
+		t.Fatalf("mode = %d, want oauthASNotLoopback (%d)", srv.oauthAS.mode, oauthASNotLoopback)
+	}
+	if srv.oauthAS.listenHost != "0.0.0.0" {
+		t.Fatalf("listenHost = %q, want 0.0.0.0", srv.oauthAS.listenHost)
+	}
+}
+
+// TestOAuthASState_LoopbackBindPassesGate: the gate on + a loopback bind still
+// resolves ENABLED.
+func TestOAuthASState_LoopbackBindPassesGate(t *testing.T) {
+	srv := New(Config{
+		Addr: "127.0.0.1:8080", OAuthASRequireLoopback: true,
+		OAuthASIssuer: testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if srv.oauthAS.mode != oauthASEnabled {
+		t.Fatalf("mode = %d, want oauthASEnabled on a loopback bind under the gate", srv.oauthAS.mode)
+	}
+}
+
+// TestOAuthASState_DisabledBeatsLoopbackGate (#16): no issuer + gate on + public
+// bind yields the DISABLED 503 verdict, pinning the ladder order (disabled is
+// decided before the loopback check). Deleting the disabled-first ordering would
+// surface not-loopback here instead.
+func TestOAuthASState_DisabledBeatsLoopbackGate(t *testing.T) {
+	srv := New(Config{Addr: "0.0.0.0:8080", OAuthASRequireLoopback: true}) // no issuer
+	if srv.oauthAS.mode != oauthASDisabled {
+		t.Fatalf("mode = %d, want oauthASDisabled (disabled must beat the loopback gate)", srv.oauthAS.mode)
+	}
+	rr, _ := getMetadata(t, srv)
+	assertUnconfigured(t, rr)
+}
+
+// TestOAuthASState_MisconfiguredBeatsLoopbackGate: a defective issuer + gate on +
+// public bind reports the CONFIG defect (503), not the 403 — the loopback check
+// runs last on purpose.
+func TestOAuthASState_MisconfiguredBeatsLoopbackGate(t *testing.T) {
+	srv := New(Config{
+		Addr: "0.0.0.0:8080", OAuthASRequireLoopback: true,
+		OAuthASIssuer: "http://as.example", OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if srv.oauthAS.mode != oauthASMisconfigured {
+		t.Fatalf("mode = %d, want oauthASMisconfigured (config defect beats the loopback gate)", srv.oauthAS.mode)
+	}
+}
+
+// TestOAuthASState_LoopbackGateDefaultsOff (#17, DONE-MEANS): a Config that never
+// mentions OAuthASRequireLoopback, on a 0.0.0.0 bind, resolves ENABLED and
+// serves. This pins the SERVER-side (Config zero-value) default: a resolver that
+// treated an unset gate as on would 403 here. The CLI flag default (serve.go's
+// --oauth-require-loopback registration) is pinned separately by
+// TestResolveOAuthCIMDLimiterFlags in the fishhawkd package.
+func TestOAuthASState_LoopbackGateDefaultsOff(t *testing.T) {
+	srv := New(Config{
+		Addr:          "0.0.0.0:8080", // public bind, gate UNSET
+		OAuthASIssuer: testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if srv.oauthAS.mode != oauthASEnabled {
+		t.Fatalf("mode = %d, want oauthASEnabled — the loopback gate must default OFF", srv.oauthAS.mode)
+	}
+	rr, doc := getMetadata(t, srv)
+	if rr.Code != http.StatusOK || !doc.ClientIDMetadataDocumentSupported {
+		t.Fatalf("default-off AS must serve metadata on a public bind; status=%d", rr.Code)
+	}
+}
+
+// TestOAuthASState_LoopbackGateFailsClosedOnUnclassifiableHost pins the two
+// fail-closed branches of the loopback gate (#2441): under the gate, a listen
+// address that cannot be PARSED (net.SplitHostPort fails) and one whose host
+// cannot be CLASSIFIED (the DNS seam errors) both resolve MISCONFIGURED, never
+// silently ENABLED. Without the gate on, the same defective Addr must NOT reach
+// the classifier — the gate is what makes the listen host load-bearing — so the
+// disabled-gate control still resolves enabled. Calls resolveOAuthASState
+// directly to inject the DNS seam.
+func TestOAuthASState_LoopbackGateFailsClosedOnUnclassifiableHost(t *testing.T) {
+	base := func() Config {
+		return Config{
+			OAuthASIssuer:    testIssuer,
+			OAuthStore:       newFakeOAuthStore(),
+			OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+		}
+	}
+	// A DNS seam that always fails, standing in for a resolver outage while
+	// classifying a non-IP listen host.
+	failingLookup := func(string) ([]net.IP, error) {
+		return nil, errors.New("resolver unreachable")
+	}
+
+	t.Run("unparseable listen address under the gate is misconfigured", func(t *testing.T) {
+		cfg := base()
+		cfg.Addr = "garbage-no-port" // net.SplitHostPort fails: missing port
+		cfg.OAuthASRequireLoopback = true
+		st := resolveOAuthASState(cfg, net.LookupIP)
+		if st.mode != oauthASMisconfigured {
+			t.Fatalf("mode = %d, want oauthASMisconfigured (%d) for an unparseable Addr under the gate", st.mode, oauthASMisconfigured)
+		}
+	})
+
+	t.Run("unresolvable listen host under the gate is misconfigured", func(t *testing.T) {
+		cfg := base()
+		cfg.Addr = "as.internal.example:8080" // non-IP host → hits the DNS seam
+		cfg.OAuthASRequireLoopback = true
+		st := resolveOAuthASState(cfg, failingLookup)
+		if st.mode != oauthASMisconfigured {
+			t.Fatalf("mode = %d, want oauthASMisconfigured (%d) when the DNS seam errors under the gate", st.mode, oauthASMisconfigured)
+		}
+	})
+
+	t.Run("without the gate a defective Addr never reaches the classifier", func(t *testing.T) {
+		cfg := base()
+		cfg.Addr = "garbage-no-port" // would fail SplitHostPort IF the gate ran
+		// gate OFF, failing lookup that must never be called
+		st := resolveOAuthASState(cfg, failingLookup)
+		if st.mode != oauthASEnabled {
+			t.Fatalf("mode = %d, want oauthASEnabled (%d) — a defective Addr must not matter when the gate is off", st.mode, oauthASEnabled)
+		}
+	})
+}
+
+// TestOAuthASRoutes_LoopbackGateRefusesAllFour (#15): with the gate on and a
+// public bind, ALL FOUR OAuth route patterns answer 403 oauth_as_loopback_only
+// and none renders a metadata document.
+func TestOAuthASRoutes_LoopbackGateRefusesAllFour(t *testing.T) {
+	srv := New(Config{
+		Addr: "0.0.0.0:8080", OAuthASRequireLoopback: true,
+		OAuthASIssuer: testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	paths := []struct{ method, path string }{
+		{http.MethodGet, "/.well-known/oauth-authorization-server"},
+		{http.MethodGet, "/v0/oauth/authorize"},
+		{http.MethodPost, "/v0/oauth/authorize"},
+		{http.MethodPost, "/v0/oauth/token"},
+	}
+	for _, p := range paths {
+		req := httptest.NewRequest(p.method, p.path, nil)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		if rr.Code != http.StatusForbidden {
+			t.Fatalf("%s %s: status = %d, want 403", p.method, p.path, rr.Code)
+		}
+		if !strings.Contains(rr.Body.String(), "oauth_as_loopback_only") {
+			t.Fatalf("%s %s: body = %q, want oauth_as_loopback_only", p.method, p.path, rr.Body.String())
+		}
+		if strings.Contains(rr.Body.String(), "client_id_metadata_document_supported") {
+			t.Fatalf("%s %s: gated route rendered a metadata document", p.method, p.path)
+		}
+	}
+}
+
+// TestResolveOAuthClient_StoreHitIsNeverRateLimited (#9, the PLACEMENT
+// counterfactual): burst+10 store-resolved resolutions from ONE source all
+// succeed, the counting round-tripper reports ZERO fetches, and the source's
+// limiter token count is UNCHANGED (a state read). Moving the Allow call to the
+// top of resolveOAuthClient turns this RED.
+func TestResolveOAuthClient_StoreHitIsNeverRateLimited(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
+	rt := newCIMD()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+	const remote = "203.0.113.7:5555"
+	key := oauthCIMDSourceKey(resolveReq(remote))
+	n := defaultOAuthCIMDSourceBurst + 10
+	for i := 0; i < n; i++ {
+		if _, err := srv.resolveOAuthClient(resolveReq(remote), "client-x"); err != nil {
+			t.Fatalf("store resolution %d must never be rate limited, got %v", i, err)
+		}
+	}
+	if rt.fetches() != 0 {
+		t.Fatalf("store hits dialled CIMD %d times", rt.fetches())
+	}
+	if got := srv.oauthCIMDLimiter.sourceTokens(key); got != float64(defaultOAuthCIMDSourceBurst) {
+		t.Fatalf("store-hit path drained the source bucket: tokens = %v, want %d (untouched)", got, defaultOAuthCIMDSourceBurst)
+	}
+}
+
 func assertUnconfigured(t *testing.T, rr *httptest.ResponseRecorder) {
 	t.Helper()
 	if rr.Code != http.StatusServiceUnavailable {
@@ -550,7 +744,7 @@ func TestResolveOAuthClient_SingleProviderHit(t *testing.T) {
 	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
 	rt := newCIMD()
 	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
-	c, err := srv.resolveOAuthClient(context.Background(), "client-x")
+	c, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "client-x")
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -567,7 +761,7 @@ func TestResolveOAuthClient_IdenticalRegistrationsAcrossProvidersResolve(t *test
 	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
 	store.seedClient(storeClient("gitlab", "client-x", []string{"https://app.example/cb"}))
 	srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
-	c, err := srv.resolveOAuthClient(context.Background(), "client-x")
+	c, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "client-x")
 	if err != nil {
 		t.Fatalf("identical duplicates should resolve, got %v", err)
 	}
@@ -582,7 +776,7 @@ func TestResolveOAuthClient_DivergentRegistrationsAcrossProvidersFailClosed(t *t
 	store.seedClient(storeClient("gitlab", "client-x", []string{"https://b.example/cb"}))
 	rt := newCIMD()
 	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
-	_, err := srv.resolveOAuthClient(context.Background(), "client-x")
+	_, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "client-x")
 	if err == nil {
 		t.Fatal("divergent duplicates must fail closed")
 	}
@@ -600,7 +794,7 @@ func TestResolveOAuthClient_CIMDFetchOnStoreMiss(t *testing.T) {
 	clientID := "https://client.example/cimd"
 	rt.docs[clientID] = cimdDoc(clientID, []string{"https://client.example/cb"}, nil, nil, "")
 	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
-	c, err := srv.resolveOAuthClient(context.Background(), clientID)
+	c, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), clientID)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -626,7 +820,7 @@ func TestResolveOAuthClient_PreRegistrationBeatsCIMDCache(t *testing.T) {
 	// POPULATED cache before the store would serve B on the next call. (The prior
 	// version started with an empty cache, so a cache-first resolver would miss
 	// the cache, fall through to the store, and pass — the test was vacuous.)
-	if c, err := srv.resolveOAuthClient(context.Background(), clientID); err != nil {
+	if c, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), clientID); err != nil {
 		t.Fatalf("warm: %v", err)
 	} else if !equalStrings(c.RedirectURIs, []string{"https://client.example/B"}) {
 		t.Fatalf("warm redirect uris = %v, want B", c.RedirectURIs)
@@ -640,7 +834,7 @@ func TestResolveOAuthClient_PreRegistrationBeatsCIMDCache(t *testing.T) {
 
 	// The store hit must beat the WARM CIMD cache entry (B), and must not trigger
 	// a second fetch — store-first short-circuits before the fetcher is touched.
-	c, err := srv.resolveOAuthClient(context.Background(), clientID)
+	c, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), clientID)
 	if err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
@@ -654,7 +848,7 @@ func TestResolveOAuthClient_PreRegistrationBeatsCIMDCache(t *testing.T) {
 
 func TestResolveOAuthClient_UnknownClientIsInvalidClient(t *testing.T) {
 	srv := newEnabledOAuthServer(newFakeOAuthStore(), newCIMDFetcher(newCIMD()))
-	_, err := srv.resolveOAuthClient(context.Background(), "not-a-url")
+	_, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "not-a-url")
 	if err == nil || err.Code != oauthas.ErrCodeInvalidClient {
 		t.Fatalf("err = %v, want invalid_client", err)
 	}
@@ -664,7 +858,7 @@ func TestResolveOAuthClient_StoreErrorIsNotInvalidClient(t *testing.T) {
 	store := newFakeOAuthStore()
 	store.getErr = context.DeadlineExceeded
 	srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
-	_, err := srv.resolveOAuthClient(context.Background(), "client-x")
+	_, err := srv.resolveOAuthClient(resolveReq("192.0.2.1:1234"), "client-x")
 	if err == nil || err.Code != oauthas.ErrCodeTemporarilyUnavailable {
 		t.Fatalf("err = %v, want temporarily_unavailable", err)
 	}

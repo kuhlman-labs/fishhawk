@@ -2948,6 +2948,114 @@ func TestResolveOAuthTTLs_DefaultsApplied(t *testing.T) {
 	}
 }
 
+// resolveOAuthCIMDLimiterFlags drives serve.go's OWN registerOAuthCIMDLimiterFlags
+// on a fresh flag set and parses args, so the test asserts the production flag
+// declarations — names, env fallbacks, and defaults — rather than re-deriving
+// them from literals it supplies itself. A misspelled/deleted flag, a broken
+// flag-over-env precedence, or a flipped default in serve.go fails here.
+func resolveOAuthCIMDLimiterFlags(t *testing.T, args []string) *oauthCIMDLimiterFlags {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	f := registerOAuthCIMDLimiterFlags(fs)
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return f
+}
+
+// TestResolveOAuthCIMDLimiterFlags pins the five #2441 knobs by driving
+// serve.go's registerOAuthCIMDLimiterFlags directly (runServe's cfg.X assignment
+// is the systemic gap tracked at #2443, deliberately not claimed here). It
+// covers the registered defaults (env unset), the env fallback, and the
+// explicit-flag-over-env precedence — including the DEFAULT-OFF pin for the
+// loopback gate: flipping any production default fails here where a duplicated
+// literal or a scope-presence check would pass.
+func TestResolveOAuthCIMDLimiterFlags(t *testing.T) {
+	for _, k := range []string{
+		"FISHHAWKD_OAUTH_CIMD_RATE_BURST", "FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL",
+		"FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", "FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL",
+		"FISHHAWKD_OAUTH_REQUIRE_LOOPBACK",
+	} {
+		t.Setenv(k, "")
+	}
+
+	t.Run("registered defaults with the env unset", func(t *testing.T) {
+		f := resolveOAuthCIMDLimiterFlags(t, nil)
+		if *f.rateBurst != 5 {
+			t.Errorf("source burst default = %d, want 5", *f.rateBurst)
+		}
+		if *f.rateInterval != 10*time.Second {
+			t.Errorf("source interval default = %v, want 10s", *f.rateInterval)
+		}
+		if *f.globalRateBurst != 30 {
+			t.Errorf("global burst default = %d, want 30", *f.globalRateBurst)
+		}
+		if *f.globalRateInterval != time.Second {
+			t.Errorf("global interval default = %v, want 1s", *f.globalRateInterval)
+		}
+		// DEFAULT-OFF pin: the production flag default is false with the env
+		// unset. A serve.go default flipped to true fails HERE.
+		if *f.requireLoopback {
+			t.Error("loopback gate must default OFF (false) with the env unset")
+		}
+	})
+
+	t.Run("env override wins over the registered default", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_OAUTH_CIMD_RATE_BURST", "9")
+		t.Setenv("FISHHAWKD_OAUTH_CIMD_RATE_INTERVAL", "3s")
+		t.Setenv("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", "77")
+		t.Setenv("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_INTERVAL", "2s")
+		t.Setenv("FISHHAWKD_OAUTH_REQUIRE_LOOPBACK", "true")
+		f := resolveOAuthCIMDLimiterFlags(t, nil)
+		if *f.rateBurst != 9 {
+			t.Errorf("source burst override = %d, want 9", *f.rateBurst)
+		}
+		if *f.rateInterval != 3*time.Second {
+			t.Errorf("source interval override = %v, want 3s", *f.rateInterval)
+		}
+		if *f.globalRateBurst != 77 {
+			t.Errorf("global burst override = %d, want 77", *f.globalRateBurst)
+		}
+		if *f.globalRateInterval != 2*time.Second {
+			t.Errorf("global interval override = %v, want 2s", *f.globalRateInterval)
+		}
+		if !*f.requireLoopback {
+			t.Error("loopback gate env override to true must win")
+		}
+	})
+
+	t.Run("explicit flag arg wins over the env", func(t *testing.T) {
+		// Env says one thing; the explicit flag must override each knob,
+		// including flipping the loopback gate back OFF.
+		t.Setenv("FISHHAWKD_OAUTH_CIMD_RATE_BURST", "9")
+		t.Setenv("FISHHAWKD_OAUTH_CIMD_GLOBAL_RATE_BURST", "77")
+		t.Setenv("FISHHAWKD_OAUTH_REQUIRE_LOOPBACK", "true")
+		f := resolveOAuthCIMDLimiterFlags(t, []string{
+			"--oauth-cimd-rate-burst", "11",
+			"--oauth-cimd-rate-interval", "7s",
+			"--oauth-cimd-global-rate-burst", "88",
+			"--oauth-cimd-global-rate-interval", "4s",
+			"--oauth-require-loopback=false",
+		})
+		if *f.rateBurst != 11 {
+			t.Errorf("source burst = %d, want 11 (flag over env)", *f.rateBurst)
+		}
+		if *f.rateInterval != 7*time.Second {
+			t.Errorf("source interval = %v, want 7s (flag over env)", *f.rateInterval)
+		}
+		if *f.globalRateBurst != 88 {
+			t.Errorf("global burst = %d, want 88 (flag over env)", *f.globalRateBurst)
+		}
+		if *f.globalRateInterval != 4*time.Second {
+			t.Errorf("global interval = %v, want 4s (flag over env)", *f.globalRateInterval)
+		}
+		if *f.requireLoopback {
+			t.Error("explicit --oauth-require-loopback=false must win over the env true")
+		}
+	})
+}
+
 // TestServe_ConstructsDefaultCIMDFetcherWhenIssuerConfigured is the production
 // half of FIX 2: an issuer makes the fetcher non-nil (so the misconfigured
 // verdict is unreachable in production); no issuer leaves it nil.

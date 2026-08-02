@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -62,6 +63,156 @@ func getAuthorize(srv *Server, query string, id *Identity) *httptest.ResponseRec
 	rr := httptest.NewRecorder()
 	srv.handleOAuthAuthorize(rr, req)
 	return rr
+}
+
+// getAuthorizeFrom drives GET /v0/oauth/authorize from an EXPLICIT source
+// address so the distinct-source and per-source-burst tests can key the limiter.
+func getAuthorizeFrom(srv *Server, query, remoteAddr string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/v0/oauth/authorize?"+query, nil)
+	req.RemoteAddr = remoteAddr
+	rr := httptest.NewRecorder()
+	srv.handleOAuthAuthorize(rr, req)
+	return rr
+}
+
+// TestOAuthAuthorize_CIMDFetchesStopAtBurst (#10) drives the REAL authorize
+// route with a DISTINCT client_id per request (so the fetcher's LRU cannot mask
+// the difference — the #2436 cache-vacuity shape) and asserts the load-bearing
+// property: outbound fetches STOP at the burst. A limiter that returned 429
+// while still dialling would fail here where an error-identity-only assertion
+// would pass.
+func TestOAuthAuthorize_CIMDFetchesStopAtBurst(t *testing.T) {
+	store := newFakeOAuthStore()
+	rt := newCIMD()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+	burst := defaultOAuthCIMDSourceBurst
+
+	for i := 0; i < burst; i++ {
+		clientID := "https://client" + itoa16(i) + ".example/cimd"
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"client_id": clientID}), nil)
+		if rr.Code == http.StatusTooManyRequests {
+			t.Fatalf("request %d within burst was rate limited (body=%s)", i, rr.Body.String())
+		}
+	}
+	if rt.fetches() != burst {
+		t.Fatalf("within-burst fetches = %d, want %d (one outbound per store miss)", rt.fetches(), burst)
+	}
+	before := rt.fetches()
+
+	rr := getAuthorize(srv, authorizeQuery(map[string]string{"client_id": "https://over.example/cimd"}), nil)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-burst status = %d, want 429; body=%s", rr.Code, rr.Body.String())
+	}
+	assertRetryAfterAtLeastOne(t, rr)
+	if rr.Header().Get("Location") != "" {
+		t.Fatalf("rate-limit refusal must render IN PLACE, not redirect (Location=%q)", rr.Header().Get("Location"))
+	}
+	if rt.fetches() != before {
+		t.Fatalf("a rate-limited authorize still dialled CIMD: fetches %d -> %d", before, rt.fetches())
+	}
+}
+
+// TestOAuthAuthorize_RateLimitRefusalIsNotRedirected (#12) pins RFC 6749
+// §4.1.2.1: the 429 renders in place with a flat §5.2 body and NO Location,
+// EVEN with a valid registered redirect_uri present. Deleting the in-place
+// property (redirecting the limiter refusal) turns this RED.
+func TestOAuthAuthorize_RateLimitRefusalIsNotRedirected(t *testing.T) {
+	store := newFakeOAuthStore()
+	rt := newCIMD()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+	// A CIMD document whose registered redirect_uri IS the one the request
+	// supplies — so a (wrong) redirected refusal would have a valid target.
+	clientID := "https://valid.example/cimd"
+	rt.docs[clientID] = cimdDoc(clientID, []string{"https://valid.example/cb"}, nil, nil, "")
+
+	// Warm the source bucket to empty from a DIFFERENT set of client_ids.
+	for i := 0; i < defaultOAuthCIMDSourceBurst; i++ {
+		getAuthorize(srv, authorizeQuery(map[string]string{"client_id": "https://warm" + itoa16(i) + ".example/cimd"}), nil)
+	}
+	q := authorizeQuery(map[string]string{"client_id": clientID, "redirect_uri": "https://valid.example/cb"})
+	rr := getAuthorize(srv, q, nil)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429; body=%s", rr.Code, rr.Body.String())
+	}
+	if rr.Header().Get("Location") != "" {
+		t.Fatalf("§4.1.2.1: the refusal must not redirect even with a valid redirect_uri (Location=%q)", rr.Header().Get("Location"))
+	}
+	if !strings.Contains(rr.Body.String(), "temporarily_unavailable") {
+		t.Fatalf("body = %q, want the flat §5.2 temporarily_unavailable envelope", rr.Body.String())
+	}
+}
+
+// TestOAuthRoutes_DistinctSourcesGetIndependentBuckets (#13) proves the handler
+// passes the REAL source rather than a constant: source A exhausts its burst,
+// but source B's first request is still admitted. A shared-bucket (constant-key)
+// implementation refuses B.
+func TestOAuthRoutes_DistinctSourcesGetIndependentBuckets(t *testing.T) {
+	store := newFakeOAuthStore()
+	rt := newCIMD()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+	burst := defaultOAuthCIMDSourceBurst
+
+	// Exhaust source A's per-source bucket.
+	for i := 0; i < burst; i++ {
+		getAuthorizeFrom(srv, authorizeQuery(map[string]string{"client_id": "https://a" + itoa16(i) + ".example/cimd"}), "198.51.100.1:1111")
+	}
+	if rr := getAuthorizeFrom(srv, authorizeQuery(map[string]string{"client_id": "https://a-over.example/cimd"}), "198.51.100.1:1111"); rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("source A over-burst status = %d, want 429", rr.Code)
+	}
+	// Source B, first request: independent bucket, must NOT be rate limited.
+	rr := getAuthorizeFrom(srv, authorizeQuery(map[string]string{"client_id": "https://b.example/cimd"}), "198.51.100.2:2222")
+	if rr.Code == http.StatusTooManyRequests {
+		t.Fatalf("source B was refused — the route is keying a constant, not the real source (body=%s)", rr.Body.String())
+	}
+}
+
+// TestOAuthAuthorize_StoreOutageRenders503 pins the shared renderer's
+// store-outage arm END TO END on the authorize route (concern: the 503 branch of
+// writeOAuthClientError was covered only at the resolver's error-CODE level, not
+// through a rendered HTTP status). A non-ErrNotFound store error must render 503
+// temporarily_unavailable IN PLACE — NOT fall through to the default 400, and NOT
+// be mistaken for the limiter's 429 (both carry ErrCodeTemporarilyUnavailable; the
+// renderer discriminates on the typed cause). Deleting the
+// ErrCodeTemporarilyUnavailable case (letting a store outage keep defaultStatus
+// 400) turns this RED.
+func TestOAuthAuthorize_StoreOutageRenders503(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.getErr = context.DeadlineExceeded
+	rt := newCIMD()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+
+	rr := getAuthorize(srv, authorizeQuery(map[string]string{"client_id": "client-x"}), nil)
+	if rr.Code == http.StatusTooManyRequests {
+		t.Fatalf("a store outage must not render as the limiter's 429; body=%s", rr.Body.String())
+	}
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("store-outage status = %d, want 503 (not the default 400); body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "temporarily_unavailable") {
+		t.Fatalf("body = %q, want the flat §5.2 temporarily_unavailable envelope", rr.Body.String())
+	}
+	if rt.fetches() != 0 {
+		t.Fatalf("a store outage must abort before any CIMD fetch: fetches = %d", rt.fetches())
+	}
+	if loc := rr.Header().Get("Location"); loc != "" {
+		t.Fatalf("the in-place store-outage error must not redirect (Location=%q)", loc)
+	}
+}
+
+// assertRetryAfterAtLeastOne parses Retry-After as an integer of at least 1.
+func assertRetryAfterAtLeastOne(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	ra := rr.Header().Get("Retry-After")
+	if ra == "" {
+		t.Fatal("missing Retry-After on a 429")
+	}
+	n, err := strconv.Atoi(ra)
+	if err != nil {
+		t.Fatalf("Retry-After = %q, want an integer delta-seconds: %v", ra, err)
+	}
+	if n < 1 {
+		t.Fatalf("Retry-After = %d, want >= 1", n)
+	}
 }
 
 func redirectQuery(t *testing.T, rr *httptest.ResponseRecorder) url.Values {

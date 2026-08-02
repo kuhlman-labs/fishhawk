@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -57,6 +58,48 @@ func postToken(srv *Server, form url.Values, mut func(*http.Request)) *httptest.
 	rr := httptest.NewRecorder()
 	srv.handleOAuthToken(rr, req)
 	return rr
+}
+
+// TestOAuthToken_CIMDFetchesStopAtBurst (#11) is the token-endpoint twin of the
+// authorize burst test: the REAL token route driven with a DISTINCT client_id
+// per request, asserting outbound fetches STOP at the burst and the over-burst
+// request is a 429 with Retry-After.
+func TestOAuthToken_CIMDFetchesStopAtBurst(t *testing.T) {
+	store := newFakeOAuthStore()
+	rt := newCIMD()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(rt))
+	burst := defaultOAuthCIMDSourceBurst
+
+	form := func(clientID string) url.Values {
+		v := url.Values{}
+		v.Set("grant_type", "authorization_code")
+		v.Set("code", "irrelevant")
+		v.Set("client_id", clientID)
+		return v
+	}
+	for i := 0; i < burst; i++ {
+		rr := postToken(srv, form("https://tc"+itoa16(i)+".example/cimd"), nil)
+		if rr.Code == http.StatusTooManyRequests {
+			t.Fatalf("token request %d within burst was rate limited (body=%s)", i, rr.Body.String())
+		}
+	}
+	if rt.fetches() != burst {
+		t.Fatalf("within-burst fetches = %d, want %d", rt.fetches(), burst)
+	}
+	before := rt.fetches()
+
+	rr := postToken(srv, form("https://tc-over.example/cimd"), nil)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("over-burst token status = %d, want 429; body=%s", rr.Code, rr.Body.String())
+	}
+	if ra := rr.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("missing Retry-After on the token 429")
+	} else if n, err := strconv.Atoi(ra); err != nil || n < 1 {
+		t.Fatalf("Retry-After = %q, want an integer >= 1", ra)
+	}
+	if rt.fetches() != before {
+		t.Fatalf("a rate-limited token request still dialled CIMD: fetches %d -> %d", before, rt.fetches())
+	}
 }
 
 func codeExchangeForm(code string) url.Values {

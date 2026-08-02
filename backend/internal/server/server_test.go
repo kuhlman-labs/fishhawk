@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -944,5 +946,37 @@ func TestServer_OAuthASServesMetadataWhenConfigured(t *testing.T) {
 		if rr.Code != http.StatusServiceUnavailable {
 			t.Fatalf("%s %s: status = %d, want 503", p.method, p.path, rr.Code)
 		}
+	}
+}
+
+// TestNew_WiresCIMDLimiterOnBuiltHandler is the full-stack wiring assertion
+// (Config -> New -> a limiter live on the BUILT handler, #2441): the limiter is
+// non-nil after New, and driving the real authorize route through Handler() past
+// the source burst yields a 429 — proving the seam is reached through the whole
+// middleware chain, not just a direct handler call.
+func TestNew_WiresCIMDLimiterOnBuiltHandler(t *testing.T) {
+	store := newFakeOAuthStore()
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
+	if srv.oauthCIMDLimiter == nil {
+		t.Fatal("New must construct a non-nil oauthCIMDLimiter")
+	}
+	drive := func(clientID string) int {
+		q := url.Values{}
+		q.Set("client_id", clientID)
+		q.Set("redirect_uri", "https://app.example/cb")
+		q.Set("response_type", "code")
+		q.Set("resource", testResource)
+		req := httptest.NewRequest(http.MethodGet, "/v0/oauth/authorize?"+q.Encode(), nil)
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, req)
+		return rr.Code
+	}
+	for i := 0; i < defaultOAuthCIMDSourceBurst; i++ {
+		if code := drive("https://wired" + strconv.Itoa(i) + ".example/cimd"); code == http.StatusTooManyRequests {
+			t.Fatalf("request %d within burst was rate limited on the built handler", i)
+		}
+	}
+	if code := drive("https://wired-over.example/cimd"); code != http.StatusTooManyRequests {
+		t.Fatalf("over-burst status through Handler() = %d, want 429 (limiter not live on the built handler)", code)
 	}
 }
