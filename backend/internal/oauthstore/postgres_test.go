@@ -46,7 +46,15 @@ func newCode(t *testing.T, repo oauthstore.Repository, expiresAt time.Time) *oau
 
 func newCodeFor(t *testing.T, repo oauthstore.Repository, clientID string, expiresAt time.Time) *oauthstore.AuthorizationCode {
 	t.Helper()
-	code, err := repo.CreateAuthorizationCode(context.Background(), oauthstore.NewAuthorizationCode{
+	return newCodeSpec(t, repo, codeSpec(clientID, expiresAt))
+}
+
+// codeSpec is the default authorization-code input. A test that needs a grant
+// with DISTINCTIVE authority mutates this and creates the code from it: since
+// redemption derives every authority field from the code row, the code is now
+// the only place that authority can be set.
+func codeSpec(clientID string, expiresAt time.Time) oauthstore.NewAuthorizationCode {
+	return oauthstore.NewAuthorizationCode{
 		ClientID:            clientID,
 		RedirectURI:         "http://127.0.0.1:8765/callback",
 		CodeChallenge:       oauthas.DeriveS256Challenge("verifier-verifier-verifier-verifier"),
@@ -56,21 +64,24 @@ func newCodeFor(t *testing.T, repo oauthstore.Repository, clientID string, expir
 		Subject:             testSubject,
 		Provider:            "github",
 		ExpiresAt:           expiresAt,
-	})
+	}
+}
+
+func newCodeSpec(t *testing.T, repo oauthstore.Repository, in oauthstore.NewAuthorizationCode) *oauthstore.AuthorizationCode {
+	t.Helper()
+	code, err := repo.CreateAuthorizationCode(context.Background(), in)
 	if err != nil {
 		t.Fatalf("CreateAuthorizationCode: %v", err)
 	}
 	return code
 }
 
-func mintReq() oauthstore.MintRequest {
+// redeemReq is the WHOLE of a redemption caller's input. Like rotateReq it
+// carries no authority field, because RedemptionRequest cannot express one —
+// see TestRedeemAuthorizationCode_AuthorityIsDerivedNotCallerSupplied.
+func redeemReq() oauthstore.RedemptionRequest {
 	now := time.Now().UTC()
-	return oauthstore.MintRequest{
-		Subject:            testSubject,
-		ClientID:           testClientID,
-		Audience:           testAudience,
-		Scopes:             []string{"runs:read"},
-		Provider:           "github",
+	return oauthstore.RedemptionRequest{
 		AccessTokenExpiry:  now.Add(time.Hour),
 		RefreshTokenExpiry: now.Add(24 * time.Hour),
 	}
@@ -119,6 +130,72 @@ func scanInt(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
 	return out
 }
 
+// authority is the six columns a minted pair must inherit from the row the store
+// derived it from — the consumed authorization code at redemption, the presented
+// refresh token at rotation.
+type authority struct {
+	Subject   string
+	ClientID  string
+	Audience  string
+	Scopes    []string
+	Provider  string
+	AccountID string
+}
+
+// assertGrantAuthority reads all six authority columns of BOTH rows of a grant
+// back over RAW SQL and compares them to want. source names the row the values
+// were supposed to be derived FROM, so a failure says which derivation broke.
+//
+// Reading the database rather than the returned structs is load-bearing: the
+// returned structs are the repository's own mappers, and the claim is about what
+// was PERSISTED.
+func assertGrantAuthority(t *testing.T, pool *pgxpool.Pool, grant *oauthstore.IssuedGrant, source string, want authority) {
+	t.Helper()
+	for _, tc := range []struct {
+		name  string
+		table string
+		id    uuid.UUID
+	}{
+		{"access", "oauth_access_tokens", grant.Access.ID},
+		{"refresh", "oauth_refresh_tokens", grant.Refresh.ID},
+	} {
+		var subject, clientID, audience, provider string
+		var scopes []string
+		// account_id is nullable, and a NULL is exactly what dropping the
+		// derivation would write — so it is scanned as a pointer and reported as a
+		// failed assertion rather than a scan error.
+		var acctPtr *string
+		if err := pool.QueryRow(context.Background(),
+			`SELECT subject, client_id, audience, scopes, provider, account_id::text FROM `+tc.table+` WHERE id = $1`,
+			tc.id).Scan(&subject, &clientID, &audience, &scopes, &provider, &acctPtr); err != nil {
+			t.Fatalf("read %s row: %v", tc.name, err)
+		}
+		acct := "NULL"
+		if acctPtr != nil {
+			acct = *acctPtr
+		}
+		if subject != want.Subject {
+			t.Errorf("%s subject = %q, want %s's %q", tc.name, subject, source, want.Subject)
+		}
+		if clientID != want.ClientID {
+			t.Errorf("%s client_id = %q, want %s's %q", tc.name, clientID, source, want.ClientID)
+		}
+		if audience != want.Audience {
+			t.Errorf("%s audience = %q, want %s's %q", tc.name, audience, source, want.Audience)
+		}
+		if !reflect.DeepEqual(scopes, want.Scopes) {
+			t.Errorf("%s scopes = %v, want %s's %v — a mint must never widen or replace the granted scope set",
+				tc.name, scopes, source, want.Scopes)
+		}
+		if provider != want.Provider {
+			t.Errorf("%s provider = %q, want %s's %q (never the column default)", tc.name, provider, source, want.Provider)
+		}
+		if acct != want.AccountID {
+			t.Errorf("%s account_id = %q, want %s's tenant %q", tc.name, acct, source, want.AccountID)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Done-means: credentials hashed at rest, plaintext only at mint
 // ---------------------------------------------------------------------------
@@ -140,7 +217,7 @@ func TestCredentials_HashedAtRest(t *testing.T) {
 		t.Errorf("code_hash = %q, want %q", storedCode, want)
 	}
 
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -198,7 +275,7 @@ func TestCredentials_PlaintextReturnedOnlyAtMint(t *testing.T) {
 	}
 
 	// Mint path 2: RedeemAuthorizationCode mints the pair...
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -292,7 +369,7 @@ func TestRedeemAuthorizationCode_VerifyRejectionRollsBack(t *testing.T) {
 	sentinel := errors.New("pkce mismatch")
 	_, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, func(*oauthstore.AuthorizationCode) error {
 		return sentinel
-	}, mintReq())
+	}, redeemReq())
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("RedeemAuthorizationCode error = %v, want the verify error unchanged", err)
 	}
@@ -309,7 +386,7 @@ func TestRedeemAuthorizationCode_VerifyRejectionRollsBack(t *testing.T) {
 	// burn the legitimate client's code.
 	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, func(*oauthstore.AuthorizationCode) error {
 		return nil
-	}, mintReq())
+	}, redeemReq())
 	if err != nil {
 		t.Fatalf("second RedeemAuthorizationCode after a rejected verify: %v", err)
 	}
@@ -345,7 +422,7 @@ func TestRedeemAuthorizationCode_VerifySeesTheLoadedRow(t *testing.T) {
 
 	// A code issued to testClientID, presented under a DIFFERENT client, is
 	// refused — by the caller's verifier.
-	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, bindTo(testAltClientID), mintReq()); !errors.Is(err, &oauthas.Error{Code: oauthas.ErrCodeInvalidGrant}) {
+	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, bindTo(testAltClientID), redeemReq()); !errors.Is(err, &oauthas.Error{Code: oauthas.ErrCodeInvalidGrant}) {
 		t.Fatalf("redemption under a mismatched client_id = %v, want an invalid_grant *oauthas.Error", err)
 	}
 	if seen == nil {
@@ -365,7 +442,7 @@ func TestRedeemAuthorizationCode_VerifySeesTheLoadedRow(t *testing.T) {
 	}
 
 	// The matching client still redeems.
-	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, bindTo(testClientID), mintReq()); err != nil {
+	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, bindTo(testClientID), redeemReq()); err != nil {
 		t.Fatalf("redemption under the matching client_id: %v", err)
 	}
 }
@@ -383,7 +460,7 @@ func TestRedeemAuthorizationCode_ExpiredSkipsVerify(t *testing.T) {
 	_, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, func(*oauthstore.AuthorizationCode) error {
 		calls++
 		return nil
-	}, mintReq())
+	}, redeemReq())
 	if !errors.Is(err, oauthstore.ErrExpired) {
 		t.Fatalf("RedeemAuthorizationCode on an expired code = %v, want ErrExpired", err)
 	}
@@ -408,7 +485,7 @@ func TestRedeemAuthorizationCode_ConsumedCodeSkipsVerify(t *testing.T) {
 	repo, _ := newRepo(t)
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
 
-	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq()); err != nil {
+	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq()); err != nil {
 		t.Fatalf("first RedeemAuthorizationCode: %v", err)
 	}
 
@@ -416,7 +493,7 @@ func TestRedeemAuthorizationCode_ConsumedCodeSkipsVerify(t *testing.T) {
 	_, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, func(*oauthstore.AuthorizationCode) error {
 		calls++
 		return nil
-	}, mintReq())
+	}, redeemReq())
 	if !errors.Is(err, oauthstore.ErrCodeConsumed) {
 		t.Fatalf("replayed RedeemAuthorizationCode = %v, want ErrCodeConsumed", err)
 	}
@@ -495,7 +572,7 @@ func TestRedeemAuthorizationCode_ConcurrentSingleUse(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			grants[i], errs[i] = repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+			grants[i], errs[i] = repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 		}()
 	}
 	close(start)
@@ -545,7 +622,7 @@ func TestAuthenticateAccessToken_RevokedExpiredUnknownAreDistinct(t *testing.T) 
 
 	// Revoked.
 	revokedCode := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	revokedGrant, err := repo.RedeemAuthorizationCode(ctx, revokedCode.PlainText, nil, mintReq())
+	revokedGrant, err := repo.RedeemAuthorizationCode(ctx, revokedCode.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("redeem (revoked case): %v", err)
 	}
@@ -558,7 +635,7 @@ func TestAuthenticateAccessToken_RevokedExpiredUnknownAreDistinct(t *testing.T) 
 
 	// Expired.
 	expiredCode := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	expiredMint := mintReq()
+	expiredMint := redeemReq()
 	expiredMint.AccessTokenExpiry = time.Now().UTC().Add(-time.Minute)
 	expiredGrant, err := repo.RedeemAuthorizationCode(ctx, expiredCode.PlainText, nil, expiredMint)
 	if err != nil {
@@ -601,7 +678,7 @@ func TestAuthenticateAccessToken_MalformedNoRoundTrip(t *testing.T) {
 	if _, err := repo.LookupAuthorizationCode(ctx, "nope"); !errors.Is(err, oauthstore.ErrMalformedCredential) {
 		t.Errorf("LookupAuthorizationCode = %v, want ErrMalformedCredential", err)
 	}
-	if _, err := repo.RedeemAuthorizationCode(ctx, "nope", nil, mintReq()); !errors.Is(err, oauthstore.ErrMalformedCredential) {
+	if _, err := repo.RedeemAuthorizationCode(ctx, "nope", nil, redeemReq()); !errors.Is(err, oauthstore.ErrMalformedCredential) {
 		t.Errorf("RedeemAuthorizationCode = %v, want ErrMalformedCredential", err)
 	}
 	if _, err := repo.RotateRefreshToken(ctx, "nope", nil, rotateReq()); !errors.Is(err, oauthstore.ErrMalformedCredential) {
@@ -631,7 +708,7 @@ func TestLookupAuthorizationCode_UnknownIsNotFound(t *testing.T) {
 	if consumed := scanTimestamp(t, pool, `SELECT consumed_at FROM oauth_authorization_codes WHERE id = $1`, code.ID); consumed.Valid {
 		t.Error("LookupAuthorizationCode stamped consumed_at, want a read-only load")
 	}
-	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq()); err != nil {
+	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq()); err != nil {
 		t.Fatalf("redemption after a lookup: %v", err)
 	}
 }
@@ -646,7 +723,7 @@ func TestRedeemAuthorizationCode_UnknownIsNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeneratePlaintext: %v", err)
 	}
-	if _, err := repo.RedeemAuthorizationCode(ctx, never, nil, mintReq()); !errors.Is(err, oauthstore.ErrNotFound) {
+	if _, err := repo.RedeemAuthorizationCode(ctx, never, nil, redeemReq()); !errors.Is(err, oauthstore.ErrNotFound) {
 		t.Errorf("RedeemAuthorizationCode(unknown) = %v, want ErrNotFound", err)
 	}
 }
@@ -665,7 +742,7 @@ func TestRotateRefreshToken_RotatesAndChains(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -711,10 +788,10 @@ func TestRotateRefreshToken_RotatesAndChains(t *testing.T) {
 //
 // The condition's stated remedy was "derive it and ignore any caller-supplied
 // value"; this implementation goes one step further and makes the wrong value
-// INEXPRESSIBLE — MintRequest carries no authorization-code id at all, so there
-// is nothing for a caller to get wrong and no mismatch error to define. The
-// reflection guard below is what keeps that structural: a future refactor that
-// re-adds the field (the exact hole the condition names) reddens this test.
+// INEXPRESSIBLE — neither request type carries an authorization-code id at all,
+// so there is nothing for a caller to get wrong and no mismatch error to define.
+// The reflection guard below is what keeps that structural: a future refactor
+// that re-adds the field (the exact hole the condition names) reddens this test.
 //
 // The behavioural half then proves derivation end to end: rotate a token
 // belonging to code A while an UNRELATED grant B (different client_id, audience
@@ -727,22 +804,28 @@ func TestRotateRefreshToken_LineageIsDerivedNotCallerSupplied(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
 
-	if f, ok := reflect.TypeOf(oauthstore.MintRequest{}).FieldByName("AuthorizationCodeID"); ok {
-		t.Fatalf("MintRequest carries a caller-supplied lineage field %s — condition 1 forbids it; "+
-			"RotateRefreshToken must DERIVE authorization_code_id from the presented token's row", f.Name)
+	for _, reqType := range []reflect.Type{
+		reflect.TypeOf(oauthstore.RedemptionRequest{}),
+		reflect.TypeOf(oauthstore.RotationRequest{}),
+	} {
+		if f, ok := reqType.FieldByName("AuthorizationCodeID"); ok {
+			t.Fatalf("%s carries a caller-supplied lineage field %s — condition 1 forbids it; both mint paths "+
+				"must DERIVE authorization_code_id from a row the store owns", reqType.Name(), f.Name)
+		}
 	}
 
 	codeA := newCodeFor(t, repo, testClientID, time.Now().UTC().Add(time.Minute))
-	grantA, err := repo.RedeemAuthorizationCode(ctx, codeA.PlainText, nil, mintReq())
+	grantA, err := repo.RedeemAuthorizationCode(ctx, codeA.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("redeem A: %v", err)
 	}
-	codeB := newCodeFor(t, repo, testAltClientID, time.Now().UTC().Add(time.Minute))
-	mintB := mintReq()
-	mintB.ClientID = testAltClientID
-	mintB.Audience = "https://elsewhere.example.com"
-	mintB.Scopes = []string{"runs:write"}
-	grantB, err := repo.RedeemAuthorizationCode(ctx, codeB.PlainText, nil, mintB)
+	// B's authority is distinctive, which it can now only be by being distinctive
+	// on the CODE — a redemption caller cannot express it.
+	specB := codeSpec(testAltClientID, time.Now().UTC().Add(time.Minute))
+	specB.Resource = "https://elsewhere.example.com"
+	specB.Scopes = []string{"runs:write"}
+	codeB := newCodeSpec(t, repo, specB)
+	grantB, err := repo.RedeemAuthorizationCode(ctx, codeB.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("redeem B: %v", err)
 	}
@@ -810,6 +893,9 @@ func TestRotateRefreshToken_LineageIsDerivedNotCallerSupplied(t *testing.T) {
 // caller's request would write the request's zero values — and 'provider' in
 // particular would come back as the defaulted 'github' rather than the presented
 // 'gitlab', so the assertion cannot be satisfied vacuously.
+//
+// The distinctive authority is now set on the CODE, because redemption derives
+// it too — see TestRedeemAuthorizationCode_AuthorityIsDerivedNotCallerSupplied.
 func TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
@@ -831,15 +917,14 @@ func TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied(t *testing.T) {
 		t.Fatalf("seed account: %v", err)
 	}
 
-	code := newCodeFor(t, repo, testAltClientID, time.Now().UTC().Add(time.Minute))
-	mint := mintReq()
-	mint.Subject = "gitlab:victim"
-	mint.ClientID = testAltClientID
-	mint.Audience = "https://tenant.example.com/mcp"
-	mint.Scopes = []string{"runs:read", "runs:write"}
-	mint.Provider = "gitlab"
-	mint.AccountID = accountID.String()
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mint)
+	spec := codeSpec(testAltClientID, time.Now().UTC().Add(time.Minute))
+	spec.Subject = "gitlab:victim"
+	spec.Resource = "https://tenant.example.com/mcp"
+	spec.Scopes = []string{"runs:read", "runs:write"}
+	spec.Provider = "gitlab"
+	spec.AccountID = accountID.String()
+	code := newCodeSpec(t, repo, spec)
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -849,57 +934,102 @@ func TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied(t *testing.T) {
 		t.Fatalf("RotateRefreshToken: %v", err)
 	}
 
-	cases := []struct {
-		name  string
-		query string
-		id    uuid.UUID
-	}{
-		{
-			"access",
-			`SELECT subject, client_id, audience, scopes, provider, account_id::text FROM oauth_access_tokens WHERE id = $1`,
-			rotated.Access.ID,
-		},
-		{
-			"refresh",
-			`SELECT subject, client_id, audience, scopes, provider, account_id::text FROM oauth_refresh_tokens WHERE id = $1`,
-			rotated.Refresh.ID,
-		},
+	assertGrantAuthority(t, pool, rotated, "the presented token", authority{
+		Subject:   spec.Subject,
+		ClientID:  spec.ClientID,
+		Audience:  spec.Resource,
+		Scopes:    spec.Scopes,
+		Provider:  spec.Provider,
+		AccountID: accountID.String(),
+	})
+}
+
+// TestRedeemAuthorizationCode_AuthorityIsDerivedNotCallerSupplied closes the
+// REDEMPTION half of the same principle, and is the falsifying test for the
+// implement-review finding that rotation's fix left it open.
+//
+// The hole, stated concretely as the review did: RedeemAuthorizationCode derived
+// only authorization_code_id from the locked code, while subject, client_id,
+// audience, scopes, provider and account_id came from a caller-supplied request
+// and were never checked against the code's OWN row — even though that row
+// carries all six, a prior authority record exactly analogous to a presented
+// refresh token's. So a github, untenanted code issued for github:octocat with
+// runs:read could be redeemed into gitlab:victim tokens for a newly supplied
+// tenant, a different audience and a WIDENED runs:read+runs:write scope set.
+// Possession of one authorization code minted credentials carrying authority the
+// code never granted, and #2391 was left having to reconstruct every field
+// perfectly for the boundary to hold.
+//
+// Structural half: RedemptionRequest cannot express any of the six. That is the
+// counterfactual vehicle — re-adding a field to make the escalation expressible
+// again reddens this test immediately, before any behaviour is written. It is
+// also the only vehicle that CAN pin it: once the field is gone there is no
+// divergent value to pass, so no behavioural test can distinguish "derived" from
+// "the caller happened to pass the right thing" (the blindness the README names).
+//
+// Behavioural half: a code distinctive on every axis — tenanted, gitlab, two
+// scopes, the alternate client, its own resource indicator — redeems into a pair
+// whose six persisted columns are exactly the code's, read back over raw SQL.
+// 'provider' again cannot pass vacuously: dropping the derivation writes the
+// column-defaulted 'github', not the code's 'gitlab'.
+func TestRedeemAuthorizationCode_AuthorityIsDerivedNotCallerSupplied(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+
+	for _, forbidden := range []string{
+		"Subject", "ClientID", "Audience", "Scopes", "Provider", "AccountID", "AuthorizationCodeID",
+	} {
+		if f, ok := reflect.TypeOf(oauthstore.RedemptionRequest{}).FieldByName(forbidden); ok {
+			t.Fatalf("RedemptionRequest carries the caller-supplied authority field %s — redemption must DERIVE "+
+				"every authority field from the consumed code's row, so minting a pair with authority the code "+
+				"never granted (a different subject or tenant, a widened scope set, another forge) stays "+
+				"inexpressible rather than merely validated", f.Name)
+		}
 	}
-	for _, tc := range cases {
-		var subject, clientID, audience, provider string
-		var scopes []string
-		// account_id is nullable, and a NULL is exactly what dropping the
-		// derivation would write — so it is scanned as a pointer and reported as
-		// a failed assertion rather than a scan error.
-		var acctPtr *string
-		if err := pool.QueryRow(ctx, tc.query, tc.id).Scan(
-			&subject, &clientID, &audience, &scopes, &provider, &acctPtr); err != nil {
-			t.Fatalf("read %s successor: %v", tc.name, err)
-		}
-		acct := "NULL"
-		if acctPtr != nil {
-			acct = *acctPtr
-		}
-		if subject != mint.Subject {
-			t.Errorf("%s successor subject = %q, want the presented token's %q", tc.name, subject, mint.Subject)
-		}
-		if clientID != mint.ClientID {
-			t.Errorf("%s successor client_id = %q, want the presented token's %q", tc.name, clientID, mint.ClientID)
-		}
-		if audience != mint.Audience {
-			t.Errorf("%s successor audience = %q, want the presented token's %q", tc.name, audience, mint.Audience)
-		}
-		if !reflect.DeepEqual(scopes, mint.Scopes) {
-			t.Errorf("%s successor scopes = %v, want the presented token's %v — a rotation must never widen or "+
-				"replace the granted scope set", tc.name, scopes, mint.Scopes)
-		}
-		if provider != mint.Provider {
-			t.Errorf("%s successor provider = %q, want the presented token's %q (never the column default)",
-				tc.name, provider, mint.Provider)
-		}
-		if acct != accountID.String() {
-			t.Errorf("%s successor account_id = %q, want the presented token's tenant %s", tc.name, acct, accountID)
-		}
+
+	accountID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO accounts (id, provider, account_key, granularity) VALUES ($1, 'github', $2, 'enterprise')`,
+		accountID, "acct-"+accountID.String()); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	spec := codeSpec(testAltClientID, time.Now().UTC().Add(time.Minute))
+	spec.Subject = "gitlab:octocat"
+	spec.Resource = "https://tenant.example.com/mcp"
+	spec.Scopes = []string{"runs:read", "runs:write"}
+	spec.Provider = "gitlab"
+	spec.AccountID = accountID.String()
+	code := newCodeSpec(t, repo, spec)
+
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode: %v", err)
+	}
+	assertGrantAuthority(t, pool, grant, "the consumed code", authority{
+		Subject:   spec.Subject,
+		ClientID:  spec.ClientID,
+		Audience:  spec.Resource,
+		Scopes:    spec.Scopes,
+		Provider:  spec.Provider,
+		AccountID: accountID.String(),
+	})
+
+	// The audience mapping is the one non-identity projection, so it is pinned
+	// separately at its other boundary: a code with NO resource indicator mints an
+	// empty audience rather than one the token caller chose. An implementation
+	// that fell back to a default or to caller input would write something else.
+	noResource := codeSpec(testClientID, time.Now().UTC().Add(time.Minute))
+	noResource.Resource = ""
+	plain := newCodeSpec(t, repo, noResource)
+	plainGrant, err := repo.RedeemAuthorizationCode(ctx, plain.PlainText, nil, redeemReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode (no resource): %v", err)
+	}
+	if aud := scanString(t, pool,
+		`SELECT audience FROM oauth_access_tokens WHERE id = $1`, plainGrant.Access.ID); aud != "" {
+		t.Errorf("audience for a code with no resource indicator = %q, want empty — the store must not invent "+
+			"an audience the authorization request never named", aud)
 	}
 }
 
@@ -933,7 +1063,7 @@ func TestRotateRefreshToken_VerifyRejectionRollsBack(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1012,7 +1142,7 @@ func TestRotateRefreshToken_ClassificationSkipsVerify(t *testing.T) {
 
 	// Reused: rotate once, then replay the consumed token.
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1040,7 +1170,7 @@ func TestRotateRefreshToken_ClassificationSkipsVerify(t *testing.T) {
 
 	// Expired but never rotated.
 	expiredCode := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	expiredMint := mintReq()
+	expiredMint := redeemReq()
 	expiredMint.RefreshTokenExpiry = time.Now().UTC().Add(-time.Minute)
 	expiredGrant, err := repo.RedeemAuthorizationCode(ctx, expiredCode.PlainText, nil, expiredMint)
 	if err != nil {
@@ -1072,7 +1202,7 @@ func TestRotateRefreshToken_ReuseRevokesLineageAfterReturn(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1140,7 +1270,7 @@ func TestRotateRefreshToken_ReuseSweepSerializesOnLineage(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1224,7 +1354,7 @@ func TestRotateRefreshToken_ReuseLeavesNoLiveDescendantUnderConcurrency(t *testi
 	const rounds = 8
 	for round := range rounds {
 		code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-		grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+		grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 		if err != nil {
 			t.Fatalf("round %d redeem: %v", round, err)
 		}
@@ -1295,7 +1425,7 @@ func TestRotateRefreshToken_ExpiredReuseStillSweepsLineage(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1340,7 +1470,7 @@ func TestRotateRefreshToken_ExpiredUnknownAreDistinct(t *testing.T) {
 	repo, pool := newRepo(t)
 
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	expiredMint := mintReq()
+	expiredMint := redeemReq()
 	expiredMint.RefreshTokenExpiry = time.Now().UTC().Add(-time.Minute)
 	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, expiredMint)
 	if err != nil {
@@ -1374,12 +1504,12 @@ func TestRevokeGrantsForCode_ScopedToLineage(t *testing.T) {
 	repo, _ := newRepo(t)
 
 	codeA := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grantA, err := repo.RedeemAuthorizationCode(ctx, codeA.PlainText, nil, mintReq())
+	grantA, err := repo.RedeemAuthorizationCode(ctx, codeA.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("redeem A: %v", err)
 	}
 	codeB := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grantB, err := repo.RedeemAuthorizationCode(ctx, codeB.PlainText, nil, mintReq())
+	grantB, err := repo.RedeemAuthorizationCode(ctx, codeB.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("redeem B: %v", err)
 	}
@@ -1419,7 +1549,7 @@ func TestRevokeToken_IdempotentAndNotFound(t *testing.T) {
 	repo, _ := newRepo(t)
 
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1556,6 +1686,90 @@ func TestUpsertClient_RefreshesOnConflictAndIsProviderScoped(t *testing.T) {
 	}
 }
 
+// TestUpsertClient_AccountIDIsStickyAcrossRefreshes pins the ONE column the
+// refresh-on-fetch rationale does not cover.
+//
+// account_id is a tenant discriminator, not CIMD document metadata: nothing in
+// the client-controlled document determines it, so "the document is
+// authoritative" — which justifies overwriting redirect_uris, grant_types and
+// the rest — says nothing about it. Overwriting it would make a later fetch made
+// in a DIFFERENT account context silently re-assign the registration's tenant.
+// That is inert today (no shipped query filters on oauth_clients.account_id) and
+// this test is why it stays that way: when a later child adds the RLS policy
+// 0063's header anticipates, a regression here is a cross-tenant move.
+//
+// The decision is COALESCE — sticky first assignment, never a move. The four
+// upserts below walk each transition, and the case that carries the security
+// claim is the third: a refresh under tenant B leaves the row on tenant A.
+func TestUpsertClient_AccountIDIsStickyAcrossRefreshes(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+
+	seed := func(name string) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO accounts (id, provider, account_key, granularity) VALUES ($1, 'github', $2, 'enterprise')`,
+			id, name+"-"+id.String()); err != nil {
+			t.Fatalf("seed account %s: %v", name, err)
+		}
+		return id
+	}
+	tenantA, tenantB := seed("a"), seed("b")
+
+	upsert := func(accountID string) *oauthstore.Client {
+		t.Helper()
+		got, err := repo.UpsertClient(ctx, oauthstore.NewClient{
+			Provider: "github",
+			Metadata: oauthas.ClientMetadata{
+				ClientID:                testClientID,
+				RedirectURIs:            []string{"http://127.0.0.1:8765/callback"},
+				TokenEndpointAuthMethod: "none",
+			},
+			AccountID: accountID,
+		})
+		if err != nil {
+			t.Fatalf("UpsertClient(account=%q): %v", accountID, err)
+		}
+		return got
+	}
+
+	// 1. First seen untenanted — the alpha window.
+	if got := upsert(""); got.AccountID != "" {
+		t.Errorf("first upsert AccountID = %q, want empty", got.AccountID)
+	}
+	// 2. Adopted once: a NULL tenant is still assignable, so a backfilling fetch
+	//    does not need a migration to claim an existing registration.
+	if got := upsert(tenantA.String()); got.AccountID != tenantA.String() {
+		t.Errorf("adoption upsert AccountID = %q, want tenant A %s", got.AccountID, tenantA)
+	}
+	// 3. THE LOAD-BEARING CASE: a refresh in tenant B's context does NOT move the
+	//    registration. EXCLUDED.account_id here would return tenant B.
+	if got := upsert(tenantB.String()); got.AccountID != tenantA.String() {
+		t.Errorf("refresh under tenant B moved the registration to %q, want it pinned to tenant A %s — a CIMD "+
+			"refresh must not re-assign a registration's tenant", got.AccountID, tenantA)
+	}
+	// 4. And an untenanted refresh does not orphan it either.
+	if got := upsert(""); got.AccountID != tenantA.String() {
+		t.Errorf("untenanted refresh AccountID = %q, want tenant A %s", got.AccountID, tenantA)
+	}
+
+	// Read back over raw SQL: the claim is about the persisted column.
+	if got := scanString(t, pool,
+		`SELECT account_id::text FROM oauth_clients WHERE provider = 'github' AND client_id = $1`,
+		testClientID); got != tenantA.String() {
+		t.Errorf("persisted account_id = %q, want tenant A %s", got, tenantA)
+	}
+	// The metadata columns still follow the document — stickiness is scoped to the
+	// tenant column, it did not turn the whole row into a pin-at-first-use
+	// snapshot.
+	if got, err := repo.GetClient(ctx, "github", testClientID); err != nil {
+		t.Fatalf("GetClient: %v", err)
+	} else if got.TokenEndpointAuthMethod != "none" || len(got.RedirectURIs) != 1 {
+		t.Errorf("GetClient = %+v, want the refreshed document's metadata", got)
+	}
+}
+
 // TestUpsertClient_RejectsMissingIdentifiers covers the two required-field
 // guards, which refuse before any database round-trip.
 func TestUpsertClient_RejectsMissingIdentifiers(t *testing.T) {
@@ -1626,10 +1840,9 @@ func TestAccountID_RoundTripsAndRejectsMalformed(t *testing.T) {
 		t.Errorf("code Provider = %q, want the defaulted \"github\"", code.Provider)
 	}
 
-	mint := mintReq()
-	mint.AccountID = accountID.String()
-	mint.Provider = ""
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mint)
+	// The grant's tenant comes from the CODE, not from the redemption caller —
+	// which is why no AccountID is passed here and none can be.
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1666,12 +1879,12 @@ func TestAccountID_RoundTripsAndRejectsMalformed(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "invalid account_id") {
 		t.Errorf("UpsertClient with a malformed account_id = %v, want an invalid-account_id error", err)
 	}
-	if _, err := repo.RedeemAuthorizationCode(ctx, untenanted.PlainText, nil, oauthstore.MintRequest{
-		Subject:   testSubject,
-		AccountID: "not-a-uuid",
-	}); err == nil || !strings.Contains(err.Error(), "invalid account_id") {
-		t.Errorf("RedeemAuthorizationCode with a malformed mint account_id = %v, want an invalid-account_id error", err)
-	}
+	// There is deliberately NO redemption case here. RedemptionRequest cannot
+	// carry an account_id at all (see
+	// TestRedeemAuthorizationCode_AuthorityIsDerivedNotCallerSupplied), and the
+	// value the mint path now uses comes off the code row — always a valid uuid or
+	// NULL. The malformed input is refused at the two entry points that still
+	// accept one, which is where it can actually arrive.
 }
 
 // TestRepository_DatabaseErrorsAreNotMisclassified is the store-unavailable
@@ -1685,7 +1898,7 @@ func TestRepository_DatabaseErrorsAreNotMisclassified(t *testing.T) {
 
 	// Mint real credentials, THEN take the database away.
 	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, redeemReq())
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
@@ -1722,7 +1935,7 @@ func TestRepository_DatabaseErrorsAreNotMisclassified(t *testing.T) {
 	check("CreateAuthorizationCode", err)
 	_, err = repo.LookupAuthorizationCode(ctx, live.PlainText)
 	check("LookupAuthorizationCode", err)
-	_, err = repo.RedeemAuthorizationCode(ctx, live.PlainText, nil, mintReq())
+	_, err = repo.RedeemAuthorizationCode(ctx, live.PlainText, nil, redeemReq())
 	check("RedeemAuthorizationCode", err)
 	_, err = repo.AuthenticateAccessToken(ctx, grant.Access.PlainText)
 	check("AuthenticateAccessToken", err)
@@ -1763,16 +1976,22 @@ func TestSchema_RejectsUnsupportedEnumValues(t *testing.T) {
 		t.Errorf("CreateAuthorizationCode with provider=bitbucket = %v, want the provider CHECK violation", err)
 	}
 
-	// The mint path propagates the same refusal rather than silently minting.
-	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
-	mint := mintReq()
-	mint.Provider = "bitbucket"
-	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mint); err == nil ||
-		!strings.Contains(err.Error(), "provider_check") {
-		t.Errorf("RedeemAuthorizationCode with an invalid mint provider = %v, want the provider CHECK violation", err)
+	// The mint path can no longer REACH the token tables' provider CHECK from the
+	// public API, and that is a strictly stronger property than the refusal this
+	// block used to assert: a redemption's provider is derived from the code row,
+	// which the CHECK above already constrained, so an unsupported forge is
+	// refused one step earlier — at code creation — and never gets as far as a
+	// half-built grant. What remains observable is that the derived value is the
+	// code's own, including the non-default one.
+	gitlabSpec := codeSpec(testClientID, time.Now().UTC().Add(time.Minute))
+	gitlabSpec.Provider = "gitlab"
+	gitlabCode := newCodeSpec(t, repo, gitlabSpec)
+	grant, err := repo.RedeemAuthorizationCode(ctx, gitlabCode.PlainText, nil, redeemReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode (gitlab code): %v", err)
 	}
-	// ...and the rollback left the code redeemable.
-	if _, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq()); err != nil {
-		t.Errorf("redemption after a failed mint: %v — the failed mint burned the code", err)
+	if grant.Access.Provider != "gitlab" || grant.Refresh.Provider != "gitlab" {
+		t.Errorf("token provider = %q/%q, want the code's \"gitlab\" (never the column default)",
+			grant.Access.Provider, grant.Refresh.Provider)
 	}
 }

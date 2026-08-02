@@ -76,6 +76,21 @@ by a first-use snapshot; the `oauthas` fetcher's TTL bounds staleness. Pinning
 would also give only illusory protection — an attacker who can rewrite the
 client's document already controls the client.
 
+**`account_id` is the one exception, and it is sticky.** It is a *tenant
+discriminator*, not CIMD document metadata: nothing in the client-controlled
+document determines it, so "the document is authoritative" — the argument that
+justifies overwriting `redirect_uris`, `grant_types` and the rest — does not
+reach it. Overwriting it would let a later fetch made in a **different account
+context** silently re-assign the registration's tenant. So the `DO UPDATE`
+`COALESCE`s it: an established tenant survives every refresh, a row first seen
+untenanted can still be adopted once, and a registration can never be **moved**
+between tenants. That is inert today (no shipped query filters on
+`oauth_clients.account_id`), which is exactly why it is pinned now —
+`TestUpsertClient_AccountIDIsStickyAcrossRefreshes` walks all four transitions,
+and the load-bearing one is the refresh under tenant B that leaves the row on
+tenant A. When a later child adds the RLS policy 0063's header anticipates, a
+regression there is a cross-tenant move rather than a cosmetic change.
+
 `first_seen_at` is preserved across refreshes (it is not in the `DO UPDATE` SET
 list); `updated_at` moves.
 `TestUpsertClient_RefreshesOnConflictAndIsProviderScoped` asserts that a changed
@@ -130,7 +145,7 @@ failed check, so it is explicitly foreclosed by the interface shape:
 - `LookupAuthorizationCode` is a **read-only** load. It never touches
   `consumed_at`, so #2391 can validate `client_id`, `redirect_uri`, PKCE and
   resource and render a typed `oauthas` error **without burning the grant**.
-- `RedeemAuthorizationCode(ctx, plaintext, verify, mint)` is the transactional
+- `RedeemAuthorizationCode(ctx, plaintext, verify, redeem)` is the transactional
   seam, with an ordering **contract**: one transaction → `SELECT … FOR UPDATE` →
   refuse consumed (`ErrCodeConsumed`) → refuse expired (`ErrExpired`) → call
   `verify` → conditional consume + mint **only** when `verify` returns nil. A
@@ -194,36 +209,65 @@ test stays green. This was verified empirically, not just argued — see the PR'
 Test plan. Mandating a red there would mandate an unattainable result, which is
 why each control is pinned where it is *individually* observable.
 
-## Rotation derives EVERY authority field, not just the lineage
+## BOTH mint paths derive EVERY authority field, not just the lineage
 
-`RotationRequest` is the whole of what a rotation caller supplies: the successor
-pair's two expiries. Subject, `client_id`, audience, scopes, provider,
-`account_id` **and** `authorization_code_id` are all read off the presented
-refresh token's own row.
+`RedemptionRequest` and `RotationRequest` are the whole of what a caller
+supplies: the pair's two expiries. Subject, `client_id`, audience, scopes,
+provider, `account_id` **and** `authorization_code_id` are read off a row the
+store already owns — the authorization code this transaction consumed, or the
+presented refresh token.
+
+| Mint path | Input | Authority derived from | Audience |
+|---|---|---|---|
+| `RedeemAuthorizationCode` | `RedemptionRequest` (2 expiries) | the code row consumed under the lock | the code's RFC 8707 `resource` |
+| `RotateRefreshToken` | `RotationRequest` (2 expiries) | the presented refresh token's row | inherited verbatim |
 
 The reason is the one below generalised. Making only the lineage store-owned
 closes the *escaping-the-sweep* hole and leaves a wider one: a caller that still
-supplied the authority fields could present one refresh token and mint a
-successor under a **different client, subject, audience, scope set, forge
-provider or tenant** — authorization escalation that no chaining test can see,
-because chaining tests pass the expected values. So the same remedy applies at
-the same strength: the wrong value is **inexpressible**, not validated.
-`MintRequest` keeps those fields because it is now redemption-only, where the
-caller has separately proved it holds the code and there is no prior token row
-to inherit from.
+supplied the authority fields could present one credential and mint a pair under
+a **different client, subject, audience, scope set, forge provider or tenant** —
+authorization escalation that no chaining test can see, because chaining tests
+pass the expected values. So the same remedy applies at the same strength: the
+wrong value is **inexpressible**, not validated.
 
-RFC 6749 §6 scope **narrowing** is deliberately not expressible today — the
-successor inherits the scope set verbatim. A narrowing field is additive later
-and must be validated as a strict subset; **widening must stay inexpressible.**
+**Redemption was the unclosed half** and is the more consequential one. The code
+row carries `subject`, `scopes`, `client_id`, `resource`, `provider` and
+`account_id` — a prior authority record *exactly* analogous to a presented
+refresh token's, loaded under lock at the moment of mint. While those six came
+from the caller instead, a github, untenanted code issued for `github:octocat`
+with `runs:read` could be redeemed into `gitlab:victim` tokens for a newly
+supplied tenant, a different audience and a **widened** `runs:read runs:write`
+scope set. That made #2391 responsible for perfectly reconstructing and
+validating every field, rather than the store enforcing the boundary. The
+earlier "there is no prior token row to inherit from" justification was
+factually weak, and is retracted.
 
-`TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied` keeps both halves: a
-reflection guard over `RotationRequest`'s fields (re-adding any authority field
-reddens it) plus a behavioural half that mints a grant distinctive on every axis
-— tenanted account, non-default `gitlab` provider, two scopes, the alternate
-client, a distinct audience — rotates it and reads all six columns of **both**
-successor rows back over raw SQL. An implementation taking authority from the
-request would write its zero values, and `provider` in particular would come
-back as the column-defaulted `github`, so the assertions cannot pass vacuously.
+The audience mapping is the one non-identity projection, so it is stated
+plainly: a redeemed pair's `audience` is the code's RFC 8707 `resource`
+indicator, recorded at `/authorize`. A code with no resource mints an **empty**
+audience — the store will not invent one the authorization request never named.
+
+Scope **narrowing** (RFC 6749 §3.3 at redemption, §6 at rotation) is deliberately
+not expressible today — the pair inherits the scope set verbatim. A narrowing
+field is additive later and must be validated as a strict subset; **widening must
+stay inexpressible.**
+
+`TestRedeemAuthorizationCode_AuthorityIsDerivedNotCallerSupplied` and
+`TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied` each keep both
+halves: a reflection guard over the request type's fields plus a behavioural half
+that mints a grant distinctive on every axis — tenanted account, non-default
+`gitlab` provider, two scopes, the alternate client, its own resource indicator
+— and reads all six columns of **both** persisted rows back over raw SQL. An
+implementation taking authority from the request would write its zero values, and
+`provider` in particular would come back as the column-defaulted `github`, so the
+assertions cannot pass vacuously.
+
+**Which half is the counterfactual vehicle: the reflection guard.** Once the
+field is gone there is no divergent value left to pass, so no behavioural test
+can distinguish "derived" from "the caller happened to pass the right thing" —
+the same blindness that let the redemption hole survive the first review. The
+guard reddens the instant a refactor makes the escalation expressible again,
+which is before any wrong behaviour can be written.
 
 ## Lineage is store-owned; reuse revocation is COMMITTED before the error returns
 
@@ -232,8 +276,8 @@ makes `RevokeGrantsForCode` — the RFC 6749 §4.1.2 replay response — reachab
 all. The trade is named: a future grant type with no originating code
 (`client_credentials`) needs a follow-up migration relaxing the column.
 
-`MintRequest` deliberately carries **no** authorization-code id.
-`RedeemAuthorizationCode` stamps the code it just consumed, and
+Neither `RedemptionRequest` nor `RotationRequest` carries an authorization-code
+id. `RedeemAuthorizationCode` stamps the code it just consumed, and
 `RotateRefreshToken` **derives** the id from the presented refresh token's own
 row. A caller cannot supply a wrong value because neither input type can express
 one — so a successor can never be minted outside the sweep's reach.

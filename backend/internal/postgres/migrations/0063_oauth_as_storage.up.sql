@@ -81,6 +81,14 @@
 -- staleness. Pinning would give only illusory protection: an attacker who can
 -- rewrite the client's document already controls the client. first_seen_at
 -- records when we first saw the client; updated_at moves on every refresh.
+--
+-- account_id is the exception, and deliberately so: it is a TENANT
+-- DISCRIMINATOR, not document metadata, so nothing in the client-controlled
+-- document determines it and the "the document is authoritative" argument does
+-- not reach it. UpsertClient's DO UPDATE COALESCEs it — an established tenant
+-- survives every later refresh whatever account context that fetch runs in, and
+-- a row first seen untenanted can still be adopted once — so a refresh can never
+-- MOVE a registration between tenants once the policy in part (d) below exists.
 CREATE TABLE oauth_clients (
     id                         UUID         PRIMARY KEY,
     provider                   TEXT         NOT NULL DEFAULT 'github',

@@ -252,28 +252,38 @@ type NewAuthorizationCode struct {
 	ExpiresAt           time.Time
 }
 
-// MintRequest describes the token pair a REDEMPTION produces. It is the input
-// to RedeemAuthorizationCode ONLY — rotation takes RotationRequest.
+// RedemptionRequest is the WHOLE of what a redemption caller supplies: the
+// minted pair's expiries.
 //
-// It deliberately carries NO authorization-code id. Lineage is an invariant the
-// STORE owns, not a value a caller can get wrong (#2433 approval condition 1):
-// RedeemAuthorizationCode stamps the code it just consumed, and
-// RotateRefreshToken DERIVES the id from the presented refresh token's own row.
-// A caller cannot mint a successor that escapes RevokeGrantsForCode's sweep.
+// Every AUTHORITY-bearing field — subject, client_id, audience, scopes,
+// provider, account_id — and the authorization_code_id lineage are DERIVED by
+// RedeemAuthorizationCode from the authorization-code row it consumed under the
+// lock. This type cannot express any of them, so holding an authorization code
+// buys exactly one thing: a token pair carrying the authority that code was
+// ISSUED with.
 //
-// The authority fields below are caller-supplied HERE because at redemption the
-// caller has separately proved it holds the code, there is no prior token row to
-// inherit from, and #2391 must project the code's own subject/scopes onto the
-// grant. At ROTATION the same fields are already fixed by the presented token's
-// row, so re-accepting them would be a token-issuance surface rather than an
-// input — see RotationRequest.
-type MintRequest struct {
-	Subject            string
-	ClientID           string
-	Audience           string
-	Scopes             []string
-	Provider           string
-	AccountID          string
+// This is the redemption half of the same principle RotationRequest carries. A
+// caller-supplied authority here was the wider hole: the code row already
+// records subject, scopes, client_id, resource, provider and account_id — a
+// prior authority record exactly analogous to a presented refresh token's — and
+// accepting those values from the caller instead meant possession of ONE
+// authorization code could mint credentials carrying authority the code never
+// granted (a different subject or tenant, a widened scope set, another forge).
+// No chaining test can see that, because chaining tests pass the expected
+// values; so the wrong value is made INEXPRESSIBLE rather than validated, and
+// #2391 does not have to perfectly reconstruct every field for the boundary to
+// hold.
+//
+// The audience mapping is stated because it is the one non-identity projection:
+// the pair's `audience` is the code's RFC 8707 `resource` indicator, recorded at
+// /authorize. A code carrying no resource mints an empty audience rather than
+// one the token caller chose.
+//
+// RFC 6749 §3.3 scope NARROWING at the token endpoint is deliberately not
+// expressible today: the pair inherits the code's scope set verbatim. Adding a
+// narrowing field later is additive and MUST be validated as a strict subset of
+// the code's scopes — widening must stay inexpressible.
+type RedemptionRequest struct {
 	AccessTokenExpiry  time.Time
 	RefreshTokenExpiry time.Time
 }
@@ -356,9 +366,14 @@ type Repository interface {
 	// legitimate client's code — a later redemption with a passing verify still
 	// succeeds. verify may be nil, meaning "no additional checks".
 	//
-	// The minted pair carries the consumed code's id as its lineage, making
-	// RevokeGrantsForCode reachable.
-	RedeemAuthorizationCode(ctx context.Context, plaintext string, verify func(*AuthorizationCode) error, mint MintRequest) (*IssuedGrant, error)
+	// AUTHORITY AND LINEAGE ARE BOTH DERIVED, never supplied. The minted pair
+	// inherits subject, client_id, scopes, provider and account_id from the code
+	// row consumed in step 6, its audience from that row's RFC 8707 resource
+	// indicator, and the code's own id as its lineage — so the pair carries the
+	// authority the code was ISSUED with and RevokeGrantsForCode stays reachable.
+	// RedemptionRequest carries only the pair's expiries; see its doc for why the
+	// wrong value is made inexpressible rather than validated.
+	RedeemAuthorizationCode(ctx context.Context, plaintext string, verify func(*AuthorizationCode) error, redeem RedemptionRequest) (*IssuedGrant, error)
 
 	// RevokeGrantsForCode revokes every still-active access and refresh token
 	// descended from codeID and returns the total number of rows revoked. This

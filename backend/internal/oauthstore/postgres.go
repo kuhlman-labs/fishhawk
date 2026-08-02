@@ -135,7 +135,7 @@ func (r *postgresRepo) LookupAuthorizationCode(ctx context.Context, plaintext st
 	return rowToCode(row), nil
 }
 
-func (r *postgresRepo) RedeemAuthorizationCode(ctx context.Context, plaintext string, verify func(*AuthorizationCode) error, mint MintRequest) (*IssuedGrant, error) {
+func (r *postgresRepo) RedeemAuthorizationCode(ctx context.Context, plaintext string, verify func(*AuthorizationCode) error, redeem RedemptionRequest) (*IssuedGrant, error) {
 	hash, err := HashPlaintext(CodePrefix, plaintext)
 	if err != nil {
 		return nil, err
@@ -187,11 +187,19 @@ func (r *postgresRepo) RedeemAuthorizationCode(ctx context.Context, plaintext st
 			return fmt.Errorf("oauthstore: consume authorization code: %w", err)
 		}
 
-		issued, err := mintPair(ctx, q, consumed.ID, mint)
+		// Authority AND lineage are both DERIVED from the row this transaction
+		// just consumed (#2433 implement-review follow-up): the pair inherits the
+		// code's own subject/client/scopes/provider/account and its resource
+		// indicator as the audience, and is stamped with the code's id. Taking
+		// those from the caller instead would let possession of ONE code mint
+		// credentials carrying authority the code never granted — the same
+		// escalation the rotation path closed, on the other mint path.
+		consumedCode := rowToCode(consumed)
+		issued, err := mintPair(ctx, q, consumedCode.ID, codeAuthority(consumedCode, redeem))
 		if err != nil {
 			return err
 		}
-		issued.Code = rowToCode(consumed)
+		issued.Code = consumedCode
 		grant = issued
 		return nil
 	})
@@ -405,7 +413,7 @@ func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string,
 		// can never escape RevokeGrantsForCode, and its subject/client/audience/
 		// scopes/provider/account, so it can never carry authority the presented
 		// token did not already hold.
-		issued, err := mintPair(ctx, q, presented.AuthorizationCodeID, successorMint(presented, rotate))
+		issued, err := mintPair(ctx, q, presented.AuthorizationCodeID, tokenAuthority(presented, rotate))
 		if err != nil {
 			return err
 		}
@@ -443,14 +451,55 @@ func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string,
 	return grant, nil
 }
 
-// successorMint builds a rotation's MintRequest ENTIRELY from the presented
+// grantAuthority is the six authority columns a minted pair carries, plus its
+// expiries. It is UNEXPORTED on purpose: it is the store's INTERNAL carrier
+// between a derivation helper and mintPair, never a caller input. Both public
+// mint paths build it from a row this store already owns — the consumed
+// authorization code (codeAuthority) or the presented refresh token
+// (tokenAuthority) — so neither RedemptionRequest nor RotationRequest can
+// express an authority field, and there is no wrong value to validate.
+type grantAuthority struct {
+	Subject            string
+	ClientID           string
+	Audience           string
+	Scopes             []string
+	Provider           string
+	AccountID          string
+	AccessTokenExpiry  time.Time
+	RefreshTokenExpiry time.Time
+}
+
+// codeAuthority builds a redemption's authority ENTIRELY from the
+// authorization-code row just consumed under the lock, taking only the expiries
+// from the caller.
+//
+// Audience comes from the code's RFC 8707 `resource` indicator — the audience
+// the code was issued FOR, recorded at /authorize. That is the one non-identity
+// projection; every other field is copied straight across. A code with no
+// resource yields an empty audience (the column is NOT NULL but unconstrained on
+// emptiness), which is the honest answer: the store will not invent an audience
+// the authorization request never named.
+func codeAuthority(code *AuthorizationCode, redeem RedemptionRequest) grantAuthority {
+	return grantAuthority{
+		Subject:            code.Subject,
+		ClientID:           code.ClientID,
+		Audience:           code.Resource,
+		Scopes:             code.Scopes,
+		Provider:           code.Provider,
+		AccountID:          code.AccountID,
+		AccessTokenExpiry:  redeem.AccessTokenExpiry,
+		RefreshTokenExpiry: redeem.RefreshTokenExpiry,
+	}
+}
+
+// tokenAuthority builds a rotation's authority ENTIRELY from the presented
 // refresh token's own row, taking only the expiries from the caller. Every
 // authority field is therefore inherited rather than asserted, which is what
 // makes cross-client / cross-scope / cross-tenant issuance inexpressible at the
 // rotation API. The empty AccountID of an untenanted token round-trips back to a
 // NULL account_id through parseAccountID.
-func successorMint(presented *RefreshToken, rotate RotationRequest) MintRequest {
-	return MintRequest{
+func tokenAuthority(presented *RefreshToken, rotate RotationRequest) grantAuthority {
+	return grantAuthority{
 		Subject:            presented.Subject,
 		ClientID:           presented.ClientID,
 		Audience:           presented.Audience,
@@ -463,9 +512,13 @@ func successorMint(presented *RefreshToken, rotate RotationRequest) MintRequest 
 }
 
 // mintPair inserts the access/refresh token pair for one grant, stamping
-// codeID as the lineage on BOTH rows. codeID is always derived by the caller
-// from a row this store owns — never from a MintRequest.
-func mintPair(ctx context.Context, q *oauthstoredb.Queries, codeID uuid.UUID, mint MintRequest) (*IssuedGrant, error) {
+// codeID as the lineage on BOTH rows. Both codeID and mint are always derived
+// by the caller from a row this store owns — never from a caller's request.
+func mintPair(ctx context.Context, q *oauthstoredb.Queries, codeID uuid.UUID, mint grantAuthority) (*IssuedGrant, error) {
+	// Unreachable in practice now that both authority sources are database rows
+	// (a valid uuid or NULL round-tripping through accountIDString), but kept
+	// rather than dropped: a future mint path must fail loud here rather than
+	// silently drop a tenant.
 	accountID, err := parseAccountID(mint.AccountID)
 	if err != nil {
 		return nil, err

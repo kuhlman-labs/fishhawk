@@ -126,8 +126,10 @@ type CreateAccessTokenParams struct {
 
 // authorization_code_id is NOT NULL at the schema: every v0 token descends from
 // an authorization code, which is what makes the whole-lineage revocation sweep
-// reachable. On the rotation path the repository DERIVES this value from the
-// presented refresh token's row rather than accepting it from the caller.
+// reachable. The repository DERIVES it — and every authority column below it —
+// from a row it already owns on BOTH mint paths: the consumed authorization code
+// at redemption, the presented refresh token at rotation. None of these values
+// is ever taken from a caller's request.
 func (q *Queries) CreateAccessToken(ctx context.Context, arg CreateAccessTokenParams) (OauthAccessToken, error) {
 	row := q.db.QueryRow(ctx, createAccessToken,
 		arg.ID,
@@ -245,7 +247,8 @@ type CreateRefreshTokenParams struct {
 }
 
 // access_token_id pins the sibling access token minted in the same grant;
-// authorization_code_id carries the lineage (NOT NULL, derived by the store).
+// authorization_code_id carries the lineage (NOT NULL, derived by the store —
+// as are subject, client_id, audience, scopes, provider and account_id).
 func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) (OauthRefreshToken, error) {
 	row := q.db.QueryRow(ctx, createRefreshToken,
 		arg.ID,
@@ -659,7 +662,7 @@ ON CONFLICT (provider, client_id) DO UPDATE
        client_uri                 = EXCLUDED.client_uri,
        logo_uri                   = EXCLUDED.logo_uri,
        scope                      = EXCLUDED.scope,
-       account_id                 = EXCLUDED.account_id,
+       account_id                 = COALESCE(oauth_clients.account_id, EXCLUDED.account_id),
        updated_at                 = now()
 RETURNING id, provider, client_id, redirect_uris, grant_types, response_types, token_endpoint_auth_method, client_name, client_uri, logo_uri, scope, account_id, first_seen_at, updated_at
 `
@@ -693,6 +696,19 @@ type UpsertClientParams struct {
 // not be permanently broken by a first-use snapshot; the fetcher's TTL bounds
 // staleness. first_seen_at is preserved by the DO UPDATE (it is not in the SET
 // list); updated_at moves on every refresh.
+//
+// account_id is the ONE column the refresh-on-fetch rationale does NOT cover,
+// so it is treated differently and the decision is written down. It is a tenant
+// discriminator, not CIMD document metadata: nothing in the client-controlled
+// document determines it, so "the document is authoritative" says nothing about
+// it. COALESCE makes the assignment STICKY — an established tenant survives
+// every later refresh, whatever account context that fetch runs in, while a row
+// first seen untenanted can still be adopted once. A registration can therefore
+// never be MOVED between tenants by a refresh. That is inert today (no shipped
+// query filters on oauth_clients.account_id) and is the point: when a later
+// child adds the RLS policy 0063's header anticipates, the behaviour is already
+// pinned by TestUpsertClient_AccountIDIsStickyAcrossRefreshes rather than
+// silently becoming a cross-tenant move.
 func (q *Queries) UpsertClient(ctx context.Context, arg UpsertClientParams) (OauthClient, error) {
 	row := q.db.QueryRow(ctx, upsertClient,
 		arg.ID,
