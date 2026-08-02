@@ -141,10 +141,38 @@ failed check, so it is explicitly foreclosed by the interface shape:
 intercepted code plus a wrong verifier leaves `consumed_at` NULL and mints zero
 tokens, and the legitimate client's later redemption still succeeds.
 
-**The client binding is the caller's, not the database's.** `RedeemAuthorizationCode`
-takes no `client_id` and enforces no binding itself;
+- `RotateRefreshToken(ctx, plaintext, verify, rotate)` carries the **same** seam,
+  for the same reason. Deriving authority (below) stops a token holder minting
+  under *someone else's* authority; it does not stop a **thief** presenting a
+  stolen token and receiving a valid successor under the *victim's* authority.
+  Only RFC 6749 §6's "was this refresh token issued to the authenticated
+  client?" check does that, and an opaque plaintext API with no read seam gives
+  #2391 nowhere to make it. `verify` receives the presented row (`PlainText`
+  empty) after classification and before anything is minted or consumed; its
+  error is returned **unchanged** and rolls back.
+  `TestRotateRefreshToken_VerifyRejectionRollsBack` asserts the rejected rotation
+  leaves `consumed_at`/`replaced_by_id` NULL, mints zero rows, and does not
+  prevent the legitimate rotation that follows.
+  `TestRotateRefreshToken_ClassificationSkipsVerify` is the ordering half: a
+  revoked, reused or expired token never reaches `verify`, and the reuse sweep
+  fires regardless, because a security response must not be gated on the caller's
+  callback.
+
+  **Which of those two is a counterfactual vehicle, stated precisely.** Only the
+  second. Dropping the `verify` call or ignoring its error reddens the first, but
+  its rollback assertions are **not** independently observable: `pgx.BeginFunc`
+  rolls back on any non-nil callback return, so moving `verify` *below* the mint
+  leaves that test green — checked empirically, not argued. So it is an
+  **invariant** check that the seam sits inside the one transaction. The ordering
+  claim is individually observable in the call counter next door: hoist `verify`
+  above the classification block and `ClassificationSkipsVerify` goes red on all
+  three of the revoked, reused and expired paths.
+
+**The client binding is the caller's, not the database's.** Neither
+`RedeemAuthorizationCode` nor `RotateRefreshToken` takes a `client_id` or
+enforces a binding itself;
 `TestRedeemAuthorizationCode_VerifySeesTheLoadedRow` exercises the caller-supplied
-verify seam standing in for #2391's token endpoint. Do not read it as a
+verify seam standing in for #2391's token endpoint. Do not read either as a
 database-enforced binding.
 
 ## The single-use controls, and which one is load-bearing
@@ -166,6 +194,37 @@ test stays green. This was verified empirically, not just argued — see the PR'
 Test plan. Mandating a red there would mandate an unattainable result, which is
 why each control is pinned where it is *individually* observable.
 
+## Rotation derives EVERY authority field, not just the lineage
+
+`RotationRequest` is the whole of what a rotation caller supplies: the successor
+pair's two expiries. Subject, `client_id`, audience, scopes, provider,
+`account_id` **and** `authorization_code_id` are all read off the presented
+refresh token's own row.
+
+The reason is the one below generalised. Making only the lineage store-owned
+closes the *escaping-the-sweep* hole and leaves a wider one: a caller that still
+supplied the authority fields could present one refresh token and mint a
+successor under a **different client, subject, audience, scope set, forge
+provider or tenant** — authorization escalation that no chaining test can see,
+because chaining tests pass the expected values. So the same remedy applies at
+the same strength: the wrong value is **inexpressible**, not validated.
+`MintRequest` keeps those fields because it is now redemption-only, where the
+caller has separately proved it holds the code and there is no prior token row
+to inherit from.
+
+RFC 6749 §6 scope **narrowing** is deliberately not expressible today — the
+successor inherits the scope set verbatim. A narrowing field is additive later
+and must be validated as a strict subset; **widening must stay inexpressible.**
+
+`TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied` keeps both halves: a
+reflection guard over `RotationRequest`'s fields (re-adding any authority field
+reddens it) plus a behavioural half that mints a grant distinctive on every axis
+— tenanted account, non-default `gitlab` provider, two scopes, the alternate
+client, a distinct audience — rotates it and reads all six columns of **both**
+successor rows back over raw SQL. An implementation taking authority from the
+request would write its zero values, and `provider` in particular would come
+back as the column-defaulted `github`, so the assertions cannot pass vacuously.
+
 ## Lineage is store-owned; reuse revocation is COMMITTED before the error returns
 
 `authorization_code_id` is `NOT NULL` on **both** token tables. That is what
@@ -176,13 +235,13 @@ all. The trade is named: a future grant type with no originating code
 `MintRequest` deliberately carries **no** authorization-code id.
 `RedeemAuthorizationCode` stamps the code it just consumed, and
 `RotateRefreshToken` **derives** the id from the presented refresh token's own
-row. A caller cannot supply a wrong value because the type cannot express one —
-so a successor can never be minted outside the sweep's reach.
+row. A caller cannot supply a wrong value because neither input type can express
+one — so a successor can never be minted outside the sweep's reach.
 `TestRotateRefreshToken_LineageIsDerivedNotCallerSupplied` keeps that structural
 with a reflection guard (a future refactor re-adding the field reddens it) plus
-the behavioural half: rotating code A's token while the `MintRequest` describes
-an unrelated grant B still produces a successor swept by
-`RevokeGrantsForCode(A)` and untouched by `RevokeGrantsForCode(B)`.
+the behavioural half: rotating code A's token while an unrelated grant B is live
+alongside it still produces a successor swept by `RevokeGrantsForCode(A)` and
+untouched by `RevokeGrantsForCode(B)`.
 
 ### Why the reuse verdict cannot be returned from inside the transaction
 

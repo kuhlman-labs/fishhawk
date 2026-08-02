@@ -252,13 +252,21 @@ type NewAuthorizationCode struct {
 	ExpiresAt           time.Time
 }
 
-// MintRequest describes the token pair a redemption or rotation produces.
+// MintRequest describes the token pair a REDEMPTION produces. It is the input
+// to RedeemAuthorizationCode ONLY — rotation takes RotationRequest.
 //
 // It deliberately carries NO authorization-code id. Lineage is an invariant the
 // STORE owns, not a value a caller can get wrong (#2433 approval condition 1):
 // RedeemAuthorizationCode stamps the code it just consumed, and
 // RotateRefreshToken DERIVES the id from the presented refresh token's own row.
 // A caller cannot mint a successor that escapes RevokeGrantsForCode's sweep.
+//
+// The authority fields below are caller-supplied HERE because at redemption the
+// caller has separately proved it holds the code, there is no prior token row to
+// inherit from, and #2391 must project the code's own subject/scopes onto the
+// grant. At ROTATION the same fields are already fixed by the presented token's
+// row, so re-accepting them would be a token-issuance surface rather than an
+// input — see RotationRequest.
 type MintRequest struct {
 	Subject            string
 	ClientID           string
@@ -266,6 +274,28 @@ type MintRequest struct {
 	Scopes             []string
 	Provider           string
 	AccountID          string
+	AccessTokenExpiry  time.Time
+	RefreshTokenExpiry time.Time
+}
+
+// RotationRequest is the WHOLE of what a rotation caller supplies: the successor
+// pair's expiries.
+//
+// Every AUTHORITY-bearing field — subject, client_id, audience, scopes,
+// provider, account_id — and the authorization_code_id lineage are DERIVED by
+// RotateRefreshToken from the presented refresh token's own row. This type
+// cannot express any of them, so holding a refresh token buys exactly one thing:
+// a successor carrying the SAME authority. Cross-client, cross-subject,
+// cross-audience, cross-scope, cross-provider and cross-tenant issuance are
+// inexpressible rather than merely discouraged (#2433 implement-review
+// follow-up to approval condition 1, which closed the lineage half of the same
+// hole).
+//
+// RFC 6749 §6 scope NARROWING is deliberately not expressible today: the
+// successor inherits the presented token's scope set verbatim. Adding a
+// narrowing field later is additive and MUST be validated as a strict subset of
+// the presented token's scopes — widening must stay inexpressible.
+type RotationRequest struct {
 	AccessTokenExpiry  time.Time
 	RefreshTokenExpiry time.Time
 }
@@ -351,10 +381,30 @@ type Repository interface {
 	// RotateRefreshToken performs the OAuth 2.1 rotation: consume the presented
 	// token, mint a successor pair, and chain them via replaced_by_id.
 	//
-	// The successor's authorization_code_id is DERIVED from the presented
-	// token's row. MintRequest cannot express it, so a caller cannot mint a
-	// successor outside RevokeGrantsForCode's reach (#2433 approval condition
-	// 1).
+	// AUTHORITY AND LINEAGE ARE BOTH DERIVED, never supplied. The successor
+	// inherits subject, client_id, audience, scopes, provider, account_id AND
+	// authorization_code_id from the presented token's row; RotationRequest
+	// carries only the successor expiries. So a caller can neither mint a
+	// successor outside RevokeGrantsForCode's reach (#2433 approval condition 1)
+	// nor mint one under a different client, subject, audience, scope set,
+	// provider or tenant (its implement-review follow-up).
+	//
+	// verify is the READ/VERIFY SEAM this otherwise-opaque plaintext API would
+	// lack. It receives the presented token row — PlainText empty, like every
+	// other read — AFTER classification and BEFORE anything is minted or
+	// consumed, so #2391 can enforce RFC 6749 §6's "was this refresh token
+	// issued to the authenticated client?" binding. Derivation alone does not
+	// cover that: it stops a thief minting under someone else's authority, but a
+	// thief presenting a stolen token would still receive a valid successor
+	// under the VICTIM's authority. That binding is the caller's to enforce, as
+	// with RedeemAuthorizationCode's verify. A verify error is returned
+	// UNCHANGED and rolls the transaction back, so a rejected rotation does not
+	// consume the legitimate client's token — its later, passing rotation still
+	// succeeds. verify may be nil, meaning "no additional checks".
+	//
+	// verify is NOT called for a revoked, reused or expired token: those are
+	// classified first, and the reuse sweep in particular is a security response
+	// that must not be gated on the caller's callback.
 	//
 	// REUSE: presenting an already-consumed token revokes the WHOLE lineage
 	// (every access and refresh token sharing its authorization_code_id) and
@@ -378,7 +428,7 @@ type Repository interface {
 	// and returns ErrRefreshReused, never ErrExpired. ErrExpired is reserved for
 	// a token that lapsed WITHOUT having been rotated; a token with no matching
 	// row yields ErrNotFound.
-	RotateRefreshToken(ctx context.Context, plaintext string, mint MintRequest) (*IssuedGrant, error)
+	RotateRefreshToken(ctx context.Context, plaintext string, verify func(*RefreshToken) error, rotate RotationRequest) (*IssuedGrant, error)
 
 	// RevokeAccessToken marks an access token revoked. Idempotent: a second
 	// call returns the existing row with its original revoked_at. Carries NO

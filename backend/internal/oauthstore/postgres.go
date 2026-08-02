@@ -294,7 +294,7 @@ func (r *postgresRepo) AuthenticateAccessToken(ctx context.Context, plaintext st
 	return tok, nil
 }
 
-func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string, mint MintRequest) (*IssuedGrant, error) {
+func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string, verify func(*RefreshToken) error, rotate RotationRequest) (*IssuedGrant, error) {
 	hash, err := HashPlaintext(RefreshTokenPrefix, plaintext)
 	if err != nil {
 		return nil, err
@@ -386,10 +386,26 @@ func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string,
 			return ErrExpired
 		}
 
-		// Lineage is DERIVED, never caller-supplied (#2433 approval condition
-		// 1): the successor inherits the presented token's
-		// authorization_code_id, so it can never escape RevokeGrantsForCode.
-		issued, err := mintPair(ctx, q, presented.AuthorizationCodeID, mint)
+		// The verify seam runs ONLY on a live token, and only after every
+		// classification above — the reuse sweep is a security response and
+		// must not be gated on the caller's callback. It is the seam #2391 needs
+		// to enforce the RFC 6749 §6 client binding, which derivation cannot
+		// give it (see Repository.RotateRefreshToken).
+		if verify != nil {
+			if err := verify(presented); err != nil {
+				// Returned UNCHANGED so BeginFunc rolls back: a rejected
+				// rotation must not consume the legitimate client's token.
+				return err
+			}
+		}
+
+		// Lineage AND authority are both DERIVED, never caller-supplied (#2433
+		// approval condition 1 and its implement-review follow-up): the
+		// successor inherits the presented token's authorization_code_id, so it
+		// can never escape RevokeGrantsForCode, and its subject/client/audience/
+		// scopes/provider/account, so it can never carry authority the presented
+		// token did not already hold.
+		issued, err := mintPair(ctx, q, presented.AuthorizationCodeID, successorMint(presented, rotate))
 		if err != nil {
 			return err
 		}
@@ -425,6 +441,25 @@ func (r *postgresRepo) RotateRefreshToken(ctx context.Context, plaintext string,
 		return nil, ErrRefreshReused
 	}
 	return grant, nil
+}
+
+// successorMint builds a rotation's MintRequest ENTIRELY from the presented
+// refresh token's own row, taking only the expiries from the caller. Every
+// authority field is therefore inherited rather than asserted, which is what
+// makes cross-client / cross-scope / cross-tenant issuance inexpressible at the
+// rotation API. The empty AccountID of an untenanted token round-trips back to a
+// NULL account_id through parseAccountID.
+func successorMint(presented *RefreshToken, rotate RotationRequest) MintRequest {
+	return MintRequest{
+		Subject:            presented.Subject,
+		ClientID:           presented.ClientID,
+		Audience:           presented.Audience,
+		Scopes:             presented.Scopes,
+		Provider:           presented.Provider,
+		AccountID:          presented.AccountID,
+		AccessTokenExpiry:  rotate.AccessTokenExpiry,
+		RefreshTokenExpiry: rotate.RefreshTokenExpiry,
+	}
 }
 
 // mintPair inserts the access/refresh token pair for one grant, stamping

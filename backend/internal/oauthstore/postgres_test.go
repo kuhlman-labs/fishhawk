@@ -76,6 +76,17 @@ func mintReq() oauthstore.MintRequest {
 	}
 }
 
+// rotateReq is the WHOLE of a rotation caller's input. It carries no authority
+// field because RotationRequest cannot express one — see
+// TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied.
+func rotateReq() oauthstore.RotationRequest {
+	now := time.Now().UTC()
+	return oauthstore.RotationRequest{
+		AccessTokenExpiry:  now.Add(time.Hour),
+		RefreshTokenExpiry: now.Add(24 * time.Hour),
+	}
+}
+
 func hexSHA256(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
@@ -209,7 +220,7 @@ func TestCredentials_PlaintextReturnedOnlyAtMint(t *testing.T) {
 	}
 
 	// Mint path 3: rotation mints a fresh pair and carries no code plaintext.
-	rotated, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	rotated, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 	if err != nil {
 		t.Fatalf("RotateRefreshToken: %v", err)
 	}
@@ -593,7 +604,7 @@ func TestAuthenticateAccessToken_MalformedNoRoundTrip(t *testing.T) {
 	if _, err := repo.RedeemAuthorizationCode(ctx, "nope", nil, mintReq()); !errors.Is(err, oauthstore.ErrMalformedCredential) {
 		t.Errorf("RedeemAuthorizationCode = %v, want ErrMalformedCredential", err)
 	}
-	if _, err := repo.RotateRefreshToken(ctx, "nope", mintReq()); !errors.Is(err, oauthstore.ErrMalformedCredential) {
+	if _, err := repo.RotateRefreshToken(ctx, "nope", nil, rotateReq()); !errors.Is(err, oauthstore.ErrMalformedCredential) {
 		t.Errorf("RotateRefreshToken = %v, want ErrMalformedCredential", err)
 	}
 }
@@ -659,7 +670,7 @@ func TestRotateRefreshToken_RotatesAndChains(t *testing.T) {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
 
-	rotated, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	rotated, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 	if err != nil {
 		t.Fatalf("RotateRefreshToken: %v", err)
 	}
@@ -706,10 +717,12 @@ func TestRotateRefreshToken_RotatesAndChains(t *testing.T) {
 // re-adds the field (the exact hole the condition names) reddens this test.
 //
 // The behavioural half then proves derivation end to end: rotate a token
-// belonging to code A while the MintRequest describes an UNRELATED grant
-// (different client_id, audience and scopes, matching a second code B), and
-// assert the successor is swept by RevokeGrantsForCode(A) and untouched by
-// RevokeGrantsForCode(B).
+// belonging to code A while an UNRELATED grant B (different client_id, audience
+// and scopes) exists alongside it, and assert the successor is swept by
+// RevokeGrantsForCode(A) and untouched by RevokeGrantsForCode(B).
+//
+// The AUTHORITY fields the successor inherits are the sibling guarantee, pinned
+// separately by TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied.
 func TestRotateRefreshToken_LineageIsDerivedNotCallerSupplied(t *testing.T) {
 	ctx := context.Background()
 	repo, pool := newRepo(t)
@@ -734,19 +747,17 @@ func TestRotateRefreshToken_LineageIsDerivedNotCallerSupplied(t *testing.T) {
 		t.Fatalf("redeem B: %v", err)
 	}
 
-	// Rotate A's refresh token while the MintRequest describes B's grant.
-	rotated, err := repo.RotateRefreshToken(ctx, grantA.Refresh.PlainText, mintB)
+	// Rotate A's refresh token. B's grant is live alongside it, so a successor
+	// stamped with anything other than A's code would be a real escape rather
+	// than an unobservable one.
+	rotated, err := repo.RotateRefreshToken(ctx, grantA.Refresh.PlainText, nil, rotateReq())
 	if err != nil {
 		t.Fatalf("RotateRefreshToken: %v", err)
 	}
 	lineage := scanString(t, pool, `SELECT authorization_code_id::text FROM oauth_access_tokens WHERE id = $1`, rotated.Access.ID)
 	if lineage != codeA.ID.String() {
-		t.Fatalf("successor lineage = %s, want the PRESENTED token's code %s (never the MintRequest's context %s)",
+		t.Fatalf("successor lineage = %s, want the PRESENTED token's code %s (never the unrelated grant B's %s)",
 			lineage, codeA.ID, codeB.ID)
-	}
-	// The mint request's own fields still apply — only lineage is store-owned.
-	if rotated.Access.ClientID != testAltClientID {
-		t.Errorf("successor client_id = %q, want the MintRequest's %q", rotated.Access.ClientID, testAltClientID)
 	}
 
 	// Sweeping B must NOT reach the successor...
@@ -773,6 +784,277 @@ func TestRotateRefreshToken_LineageIsDerivedNotCallerSupplied(t *testing.T) {
 	}
 }
 
+// TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied is the falsifying
+// test for the implement-review follow-up to #2433 approval condition 1.
+//
+// Condition 1 made the LINEAGE store-owned, which stops a successor escaping the
+// revocation sweep. It does not close the other half: while a rotation caller
+// could still supply subject / client_id / audience / scopes / provider /
+// account_id, anyone holding ONE refresh token could mint a successor under a
+// DIFFERENT client, subject, audience, scope set, forge or tenant — an
+// authorization-escalation surface no chaining test can see, because those tests
+// pass the expected values.
+//
+// The remedy is the same shape as condition 1's: make the wrong value
+// INEXPRESSIBLE rather than validated. RotationRequest carries the successor
+// expiries and nothing else.
+//
+// Structural half: a reflection guard over RotationRequest's fields, so a future
+// refactor re-adding an authority field reddens this test rather than silently
+// reopening the hole.
+//
+// Behavioural half: mint a grant whose authority is distinctive on EVERY axis
+// (tenanted account, non-default provider, two scopes, the alternate client and
+// a distinct audience), rotate it, and read all six columns of BOTH successor
+// rows back over RAW SQL. An implementation that took authority from the
+// caller's request would write the request's zero values — and 'provider' in
+// particular would come back as the defaulted 'github' rather than the presented
+// 'gitlab', so the assertion cannot be satisfied vacuously.
+func TestRotateRefreshToken_AuthorityIsDerivedNotCallerSupplied(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+
+	for _, forbidden := range []string{
+		"Subject", "ClientID", "Audience", "Scopes", "Provider", "AccountID", "AuthorizationCodeID",
+	} {
+		if f, ok := reflect.TypeOf(oauthstore.RotationRequest{}).FieldByName(forbidden); ok {
+			t.Fatalf("RotationRequest carries the caller-supplied authority field %s — rotation must DERIVE "+
+				"every authority field from the presented token's row so cross-client, cross-scope and "+
+				"cross-tenant issuance stay inexpressible", f.Name)
+		}
+	}
+
+	accountID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO accounts (id, provider, account_key, granularity) VALUES ($1, 'github', $2, 'enterprise')`,
+		accountID, "acct-"+accountID.String()); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+
+	code := newCodeFor(t, repo, testAltClientID, time.Now().UTC().Add(time.Minute))
+	mint := mintReq()
+	mint.Subject = "gitlab:victim"
+	mint.ClientID = testAltClientID
+	mint.Audience = "https://tenant.example.com/mcp"
+	mint.Scopes = []string{"runs:read", "runs:write"}
+	mint.Provider = "gitlab"
+	mint.AccountID = accountID.String()
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mint)
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode: %v", err)
+	}
+
+	rotated, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
+	if err != nil {
+		t.Fatalf("RotateRefreshToken: %v", err)
+	}
+
+	cases := []struct {
+		name  string
+		query string
+		id    uuid.UUID
+	}{
+		{
+			"access",
+			`SELECT subject, client_id, audience, scopes, provider, account_id::text FROM oauth_access_tokens WHERE id = $1`,
+			rotated.Access.ID,
+		},
+		{
+			"refresh",
+			`SELECT subject, client_id, audience, scopes, provider, account_id::text FROM oauth_refresh_tokens WHERE id = $1`,
+			rotated.Refresh.ID,
+		},
+	}
+	for _, tc := range cases {
+		var subject, clientID, audience, provider string
+		var scopes []string
+		// account_id is nullable, and a NULL is exactly what dropping the
+		// derivation would write — so it is scanned as a pointer and reported as
+		// a failed assertion rather than a scan error.
+		var acctPtr *string
+		if err := pool.QueryRow(ctx, tc.query, tc.id).Scan(
+			&subject, &clientID, &audience, &scopes, &provider, &acctPtr); err != nil {
+			t.Fatalf("read %s successor: %v", tc.name, err)
+		}
+		acct := "NULL"
+		if acctPtr != nil {
+			acct = *acctPtr
+		}
+		if subject != mint.Subject {
+			t.Errorf("%s successor subject = %q, want the presented token's %q", tc.name, subject, mint.Subject)
+		}
+		if clientID != mint.ClientID {
+			t.Errorf("%s successor client_id = %q, want the presented token's %q", tc.name, clientID, mint.ClientID)
+		}
+		if audience != mint.Audience {
+			t.Errorf("%s successor audience = %q, want the presented token's %q", tc.name, audience, mint.Audience)
+		}
+		if !reflect.DeepEqual(scopes, mint.Scopes) {
+			t.Errorf("%s successor scopes = %v, want the presented token's %v — a rotation must never widen or "+
+				"replace the granted scope set", tc.name, scopes, mint.Scopes)
+		}
+		if provider != mint.Provider {
+			t.Errorf("%s successor provider = %q, want the presented token's %q (never the column default)",
+				tc.name, provider, mint.Provider)
+		}
+		if acct != accountID.String() {
+			t.Errorf("%s successor account_id = %q, want the presented token's tenant %s", tc.name, acct, accountID)
+		}
+	}
+}
+
+// TestRotateRefreshToken_VerifyRejectionRollsBack pins the read/verify seam the
+// same implement-review concern named. Deriving authority stops a token holder
+// minting under SOMEONE ELSE's authority; it does not stop a THIEF presenting a
+// stolen token and receiving a valid successor under the victim's authority.
+// Only an RFC 6749 §6 "was this token issued to the authenticated client?" check
+// does that, and the opaque plaintext API exposed no seam through which #2391
+// could make it. Rotation now takes one, mirroring RedeemAuthorizationCode's.
+//
+// Three claims, each load-bearing:
+//   - verify SEES the presented row (client_id, subject, lineage) and sees it
+//     with an EMPTY PlainText, so the seam cannot become a plaintext leak;
+//   - a verify error is returned UNCHANGED and rolls the transaction back —
+//     consumed_at and replaced_by_id stay NULL and NO successor rows are minted,
+//     so a wrong presenter cannot burn the legitimate client's refresh token;
+//   - the legitimate rotation afterwards still succeeds.
+//
+// Counterfactual, stated at the strength it actually holds: dropping the verify
+// call — or ignoring its error — reddens this test. The ROLLBACK half is NOT
+// independently observable, and is deliberately not claimed to be: pgx.BeginFunc
+// rolls back on ANY non-nil callback return, so moving the verify call BELOW
+// mintPair/ConsumeRefreshToken leaves this test green. That was checked
+// empirically rather than argued. The state assertions are therefore an
+// INVARIANT check that the seam sits inside that single transaction, not a
+// control with a counterfactual of its own; the ordering claim that IS
+// individually observable is pinned next door by
+// TestRotateRefreshToken_ClassificationSkipsVerify's call counter.
+func TestRotateRefreshToken_VerifyRejectionRollsBack(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode: %v", err)
+	}
+
+	countTokens := func() int {
+		t.Helper()
+		return scanInt(t, pool,
+			`SELECT count(*) FROM oauth_access_tokens WHERE authorization_code_id = $1`, code.ID)
+	}
+	before := countTokens()
+
+	wrongClient := errors.New("presenting client is not the token's client")
+	var seen *oauthstore.RefreshToken
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, func(rt *oauthstore.RefreshToken) error {
+		seen = rt
+		return wrongClient
+	}, rotateReq()); !errors.Is(err, wrongClient) {
+		t.Fatalf("RotateRefreshToken with a rejecting verify = %v, want the caller's error unchanged", err)
+	}
+
+	if seen == nil {
+		t.Fatal("verify was never called on a live refresh token")
+	}
+	if seen.ID != grant.Refresh.ID || seen.ClientID != testClientID || seen.Subject != testSubject {
+		t.Errorf("verify saw %+v, want the PRESENTED row (id %s, client %q, subject %q)",
+			seen, grant.Refresh.ID, testClientID, testSubject)
+	}
+	if seen.AuthorizationCodeID != code.ID {
+		t.Errorf("verify saw authorization_code_id %s, want the originating code %s — #2391 needs the lineage "+
+			"to make its binding decision", seen.AuthorizationCodeID, code.ID)
+	}
+	if seen.PlainText != "" {
+		t.Errorf("verify saw PlainText %q, want empty — the seam must not re-emit a credential", seen.PlainText)
+	}
+
+	// Rolled back: nothing consumed, nothing minted.
+	if consumed := scanTimestamp(t, pool,
+		`SELECT consumed_at FROM oauth_refresh_tokens WHERE id = $1`, grant.Refresh.ID); consumed.Valid {
+		t.Error("a rejected rotation stamped consumed_at, burning the legitimate client's refresh token")
+	}
+	if replaced := scanInt(t, pool,
+		`SELECT count(*) FROM oauth_refresh_tokens WHERE id = $1 AND replaced_by_id IS NULL`,
+		grant.Refresh.ID); replaced != 1 {
+		t.Error("a rejected rotation stamped replaced_by_id")
+	}
+	if after := countTokens(); after != before {
+		t.Errorf("a rejected rotation minted %d access token(s), want 0", after-before)
+	}
+
+	// The legitimate rotation still succeeds.
+	rotated, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, func(*oauthstore.RefreshToken) error {
+		return nil
+	}, rotateReq())
+	if err != nil {
+		t.Fatalf("rotation after a rejected one: %v", err)
+	}
+	if rotated.Refresh.ID == grant.Refresh.ID {
+		t.Fatal("rotation returned the presented token, want a fresh successor")
+	}
+}
+
+// TestRotateRefreshToken_ClassificationSkipsVerify pins the ordering half of the
+// seam's contract: verify runs ONLY on a live token. A revoked, reused or expired
+// token is refused without paying for the caller's callback, and the reuse sweep
+// in particular — a security response — must not be gated on it. The counter is
+// the vehicle: a verify call moved above the classification block reddens it.
+func TestRotateRefreshToken_ClassificationSkipsVerify(t *testing.T) {
+	ctx := context.Background()
+	repo, pool := newRepo(t)
+
+	calls := 0
+	counting := func(*oauthstore.RefreshToken) error {
+		calls++
+		return nil
+	}
+
+	// Reused: rotate once, then replay the consumed token.
+	code := newCode(t, repo, time.Now().UTC().Add(time.Minute))
+	grant, err := repo.RedeemAuthorizationCode(ctx, code.PlainText, nil, mintReq())
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode: %v", err)
+	}
+	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
+	if err != nil {
+		t.Fatalf("RotateRefreshToken: %v", err)
+	}
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, counting, rotateReq()); !errors.Is(err, oauthstore.ErrRefreshReused) {
+		t.Fatalf("replay = %v, want ErrRefreshReused", err)
+	}
+	if calls != 0 {
+		t.Errorf("verify was called %d time(s) on a REUSED token, want 0 — the sweep must not be gated on the "+
+			"caller's callback", calls)
+	}
+	// And the sweep still happened, callback or not.
+	if revoked := scanTimestamp(t, pool,
+		`SELECT revoked_at FROM oauth_refresh_tokens WHERE id = $1`, successor.Refresh.ID); !revoked.Valid {
+		t.Error("the reuse sweep did not revoke the successor when a verify callback was supplied")
+	}
+
+	// Revoked: the successor was just swept.
+	if _, err := repo.RotateRefreshToken(ctx, successor.Refresh.PlainText, counting, rotateReq()); !errors.Is(err, oauthstore.ErrRevoked) {
+		t.Fatalf("rotating a revoked token = %v, want ErrRevoked", err)
+	}
+
+	// Expired but never rotated.
+	expiredCode := newCode(t, repo, time.Now().UTC().Add(time.Minute))
+	expiredMint := mintReq()
+	expiredMint.RefreshTokenExpiry = time.Now().UTC().Add(-time.Minute)
+	expiredGrant, err := repo.RedeemAuthorizationCode(ctx, expiredCode.PlainText, nil, expiredMint)
+	if err != nil {
+		t.Fatalf("RedeemAuthorizationCode (expired): %v", err)
+	}
+	if _, err := repo.RotateRefreshToken(ctx, expiredGrant.Refresh.PlainText, counting, rotateReq()); !errors.Is(err, oauthstore.ErrExpired) {
+		t.Fatalf("rotating an expired token = %v, want ErrExpired", err)
+	}
+
+	if calls != 0 {
+		t.Errorf("verify was called %d time(s) across the revoked/reused/expired paths, want 0", calls)
+	}
+}
+
 // TestRotateRefreshToken_ReuseRevokesLineageAfterReturn is where rejection
 // defect 1 is pinned. Presenting an already-rotated refresh token must return
 // ErrRefreshReused AND leave the whole lineage revoked in COMMITTED state.
@@ -794,13 +1076,13 @@ func TestRotateRefreshToken_ReuseRevokesLineageAfterReturn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
-	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 	if err != nil {
 		t.Fatalf("RotateRefreshToken: %v", err)
 	}
 
 	// Present the ALREADY-ROTATED token a second time.
-	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq()); !errors.Is(err, oauthstore.ErrRefreshReused) {
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq()); !errors.Is(err, oauthstore.ErrRefreshReused) {
 		t.Fatalf("reused refresh token = %v, want ErrRefreshReused", err)
 	}
 
@@ -832,7 +1114,7 @@ func TestRotateRefreshToken_ReuseRevokesLineageAfterReturn(t *testing.T) {
 
 	// A THIRD presentation pins the post-sweep classification ORDER: the token
 	// is now revoked, so ErrRevoked wins over the reuse verdict.
-	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq()); !errors.Is(err, oauthstore.ErrRevoked) {
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq()); !errors.Is(err, oauthstore.ErrRevoked) {
 		t.Errorf("third presentation = %v, want ErrRevoked (revoked is classified before consumed)", err)
 	}
 }
@@ -862,7 +1144,7 @@ func TestRotateRefreshToken_ReuseSweepSerializesOnLineage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
-	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 	if err != nil {
 		t.Fatalf("RotateRefreshToken: %v", err)
 	}
@@ -882,7 +1164,7 @@ func TestRotateRefreshToken_ReuseSweepSerializesOnLineage(t *testing.T) {
 	// Replay the already-rotated token. It must queue behind the lineage lock.
 	done := make(chan error, 1)
 	go func() {
-		_, e := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+		_, e := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 		done <- e
 	}()
 
@@ -948,7 +1230,7 @@ func TestRotateRefreshToken_ReuseLeavesNoLiveDescendantUnderConcurrency(t *testi
 		}
 		// One clean rotation, so the predecessor is consumed (the reuse trigger)
 		// and the successor is live (the credential that must not survive).
-		successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+		successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 		if err != nil {
 			t.Fatalf("round %d first rotation: %v", round, err)
 		}
@@ -962,12 +1244,12 @@ func TestRotateRefreshToken_ReuseLeavesNoLiveDescendantUnderConcurrency(t *testi
 		go func() {
 			defer wg.Done()
 			<-start
-			rotateGrant, rotateErr = repo.RotateRefreshToken(ctx, successor.Refresh.PlainText, mintReq())
+			rotateGrant, rotateErr = repo.RotateRefreshToken(ctx, successor.Refresh.PlainText, nil, rotateReq())
 		}()
 		go func() {
 			defer wg.Done()
 			<-start
-			_, reuseErr = repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+			_, reuseErr = repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 		}()
 		close(start)
 		wg.Wait()
@@ -1017,7 +1299,7 @@ func TestRotateRefreshToken_ExpiredReuseStillSweepsLineage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
-	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	successor, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 	if err != nil {
 		t.Fatalf("RotateRefreshToken: %v", err)
 	}
@@ -1031,7 +1313,7 @@ func TestRotateRefreshToken_ExpiredReuseStillSweepsLineage(t *testing.T) {
 		t.Fatalf("lapse the presented token: %v", err)
 	}
 
-	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq()); !errors.Is(err, oauthstore.ErrRefreshReused) {
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq()); !errors.Is(err, oauthstore.ErrRefreshReused) {
 		t.Fatalf("replay of an expired-AND-consumed token = %v, want ErrRefreshReused (a late replay is still a replay)", err)
 	}
 
@@ -1064,7 +1346,7 @@ func TestRotateRefreshToken_ExpiredUnknownAreDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RedeemAuthorizationCode: %v", err)
 	}
-	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq()); !errors.Is(err, oauthstore.ErrExpired) {
+	if _, err := repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq()); !errors.Is(err, oauthstore.ErrExpired) {
 		t.Errorf("expired refresh token = %v, want ErrExpired", err)
 	}
 	// An expired rotation must not consume or mint.
@@ -1079,7 +1361,7 @@ func TestRotateRefreshToken_ExpiredUnknownAreDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GeneratePlaintext: %v", err)
 	}
-	if _, err := repo.RotateRefreshToken(ctx, never, mintReq()); !errors.Is(err, oauthstore.ErrNotFound) {
+	if _, err := repo.RotateRefreshToken(ctx, never, nil, rotateReq()); !errors.Is(err, oauthstore.ErrNotFound) {
 		t.Errorf("never-issued refresh token = %v, want ErrNotFound", err)
 	}
 }
@@ -1115,7 +1397,7 @@ func TestRevokeGrantsForCode_ScopedToLineage(t *testing.T) {
 	if _, err := repo.AuthenticateAccessToken(ctx, grantB.Access.PlainText); err != nil {
 		t.Errorf("B's access token was caught by A's sweep: %v", err)
 	}
-	if _, err := repo.RotateRefreshToken(ctx, grantA.Refresh.PlainText, mintReq()); !errors.Is(err, oauthstore.ErrRevoked) {
+	if _, err := repo.RotateRefreshToken(ctx, grantA.Refresh.PlainText, nil, rotateReq()); !errors.Is(err, oauthstore.ErrRevoked) {
 		t.Errorf("A's refresh token = %v, want ErrRevoked", err)
 	}
 
@@ -1444,7 +1726,7 @@ func TestRepository_DatabaseErrorsAreNotMisclassified(t *testing.T) {
 	check("RedeemAuthorizationCode", err)
 	_, err = repo.AuthenticateAccessToken(ctx, grant.Access.PlainText)
 	check("AuthenticateAccessToken", err)
-	_, err = repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, mintReq())
+	_, err = repo.RotateRefreshToken(ctx, grant.Refresh.PlainText, nil, rotateReq())
 	check("RotateRefreshToken", err)
 	_, err = repo.RevokeGrantsForCode(ctx, code.ID)
 	check("RevokeGrantsForCode", err)
