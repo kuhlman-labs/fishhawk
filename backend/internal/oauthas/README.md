@@ -144,7 +144,14 @@ become the value actually used:
    re-resolve (DNS rebinding). Closed by pinning the dialed literal.
 4. **connect-only redirect revalidation** — guard the connect address of the
    initial request but not each redirect hop. Closed by revalidating every hop
-   against the full predicate and sharing the guarded dialer across hops.
+   against the predicate and sharing the guarded dialer across hops. One honest
+   caveat: the hop is revalidated via `req.URL.String()`, and `url.URL.String()`
+   cannot re-serialize a bare trailing `#` (net/url records no empty-fragment
+   flag — the same limitation the redirect-URI matcher handles lexically), so the
+   LEXICAL empty-fragment rule does not extend to hops; the hop check enforces the
+   PARSED predicate (scheme, host, userinfo, non-empty fragment), not the
+   raw-string one. Practical impact is negligible — fragments are never
+   transmitted in requests.
 
 Each is closed by design here and pinned by a named falsifying test.
 

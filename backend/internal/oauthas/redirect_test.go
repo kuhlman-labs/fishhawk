@@ -95,22 +95,33 @@ func TestMatchRedirectURI_ComponentRejectionMatrix(t *testing.T) {
 		registered string
 		requested  string
 	}
+	_ = nonGood
 	variants := []variant{
+		// Loopback branch: the malformed URI is paired with a CLEAN URI whose
+		// scheme/host/path already match (only the port differs, which the
+		// loopback branch ignores). So byte-exact equality does NOT save the
+		// case — deleting the component guard would let the pair MATCH. These
+		// falsify the guards on the registered and the requested side.
 		// userinfo
 		{"userinfo registered loopback", "http://u@127.0.0.1/callback", loopGoodReq},
 		{"userinfo requested loopback", loopGoodReg, "http://u@127.0.0.1:5000/callback"},
-		{"userinfo registered nonloopback", "https://u@app.example/callback", nonGood},
-		{"userinfo requested nonloopback", nonGood, "https://u@app.example/callback"},
 		// query
 		{"query registered loopback", "http://127.0.0.1/callback?a=1", loopGoodReq},
 		{"query requested loopback", loopGoodReg, "http://127.0.0.1:5000/callback?a=1"},
-		{"query registered nonloopback", "https://app.example/callback?a=1", nonGood},
-		{"query requested nonloopback", nonGood, "https://app.example/callback?a=1"},
 		// fragment (non-empty)
 		{"fragment registered loopback", "http://127.0.0.1/callback#f", loopGoodReq},
 		{"fragment requested loopback", loopGoodReg, "http://127.0.0.1:5000/callback#f"},
-		{"fragment registered nonloopback", "https://app.example/callback#f", nonGood},
-		{"fragment requested nonloopback", nonGood, "https://app.example/callback#f"},
+
+		// Non-loopback branch: this branch is a byte-exact string comparison, so
+		// pairing a malformed URI with a DIFFERENT clean one would be refused by
+		// the byte comparison alone even with the component guards deleted — a
+		// vacuous test. To actually falsify component validation the SAME
+		// malformed URI is supplied on BOTH sides: byte-exact equality WOULD
+		// accept it, so a refusal proves the guard fired at validation rather
+		// than the pair being caught as unequal (#2427 fix-up).
+		{"userinfo identical nonloopback", "https://u@app.example/callback", "https://u@app.example/callback"},
+		{"query identical nonloopback", "https://app.example/callback?a=1", "https://app.example/callback?a=1"},
+		{"fragment identical nonloopback", "https://app.example/callback#f", "https://app.example/callback#f"},
 	}
 	for _, v := range variants {
 		t.Run(v.name, func(t *testing.T) {
@@ -128,8 +139,11 @@ func TestMatchRedirectURI_EmptyFragmentRefused(t *testing.T) {
 	assertRedirectRefused(t, MatchRedirectURI("http://127.0.0.1/callback", "http://127.0.0.1:5000/callback#"))
 	// registered side too.
 	assertRedirectRefused(t, MatchRedirectURI("http://127.0.0.1/callback#", "http://127.0.0.1:5000/callback"))
-	// non-loopback both sides.
-	assertRedirectRefused(t, MatchRedirectURI("https://app.example/callback", "https://app.example/callback#"))
+	// non-loopback: supply the identical bare-'#' URI on BOTH sides so the
+	// byte-exact non-loopback comparison WOULD accept it — only the lexical
+	// empty-fragment guard can refuse, which is what this pins (a
+	// clean-vs-'#' pair would be caught as unequal regardless of the guard).
+	assertRedirectRefused(t, MatchRedirectURI("https://app.example/callback#", "https://app.example/callback#"))
 	// Confirm the parsed guard alone would MISS this (documents why lexical).
 	u, err := parseNoLexical("http://127.0.0.1/callback#")
 	if err != nil {

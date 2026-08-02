@@ -137,6 +137,14 @@ func canonicalHost(u *url.URL) string {
 			return host
 		}
 	}
+	// u.Hostname() strips the brackets from an IPv6 literal, so re-bracket
+	// before appending the port; otherwise "[2001:db8::1]:8443" (host
+	// "2001:db8::1", port "8443") and "[2001:db8::1:8443]" (host
+	// "2001:db8::1:8443", no port) both canonicalize to "2001:db8::1:8443",
+	// conflating two distinct IPv6 authorities and widening audience binding.
+	if strings.Contains(host, ":") {
+		return "[" + host + "]:" + port
+	}
 	return host + ":" + port
 }
 

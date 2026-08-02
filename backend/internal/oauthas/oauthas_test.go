@@ -110,6 +110,14 @@ func TestResourceMatches(t *testing.T) {
 		{name: "differing query", audience: "https://mcp.example/v0?a=b", requested: "https://mcp.example/v0?a=c", wantMatch: false},
 		{name: "non-default port significant", audience: "https://mcp.example/v0", requested: "https://mcp.example:8443/v0", wantMatch: false},
 		{name: "differing host", audience: "https://mcp.example/v0", requested: "https://evil.example/v0", wantMatch: false},
+		// An IPv6 literal with a non-default port must not collide with a
+		// different IPv6 literal whose address happens to embed those port
+		// digits. Without re-bracketing in canonicalHost both would flatten to
+		// the host string "2001:db8::1:8443", silently matching two distinct
+		// authorities.
+		{name: "ipv6 port not conflated with embedded address", audience: "https://[2001:db8::1]:8443/v0", requested: "https://[2001:db8::1:8443]/v0", wantMatch: false},
+		{name: "ipv6 exact match", audience: "https://[2001:db8::1]:8443/v0", requested: "https://[2001:db8::1]:8443/v0", wantMatch: true},
+		{name: "ipv6 default port elided", audience: "https://[2001:db8::1]/v0", requested: "https://[2001:db8::1]:443/v0", wantMatch: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

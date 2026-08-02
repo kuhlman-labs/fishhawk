@@ -178,9 +178,18 @@ func (f *Fetcher) effectiveClient() *http.Client {
 }
 
 // checkRedirect caps hops at MaxRedirects and revalidates each hop against the
-// FULL client_id predicate, so an https client_id cannot downgrade the fetch to
-// http and a hop cannot introduce userinfo or a fragment. The connect-address
-// guard applies to every hop automatically via the shared dialer.
+// PARSED client_id predicate, so an https client_id cannot downgrade the fetch to
+// http and a hop cannot introduce userinfo or a non-empty fragment. The
+// connect-address guard applies to every hop automatically via the shared dialer.
+//
+// One lexical corner is structurally unavailable at the hop boundary: the hop URL
+// is revalidated via req.URL.String(), and url.URL.String() cannot re-serialize a
+// bare trailing '#' (net/url records no empty-fragment flag — the same limitation
+// documented for redirect-URI matching), so a Location header ending in a bare '#'
+// is NOT caught by the lexical empty-fragment rule; only non-empty hop fragments
+// are. This is negligible in practice — fragments are never transmitted in
+// requests — but it means the hop check enforces the PARSED predicate, not the
+// lexical raw-string one applied to the initial client_id.
 func (f *Fetcher) checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) > f.maxRedirects() {
 		return newError(ErrCodeInvalidClient, "client_id document exceeded the redirect limit").withCause(ErrNotSelfReferential)
