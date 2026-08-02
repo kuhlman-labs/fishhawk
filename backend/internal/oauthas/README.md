@@ -85,6 +85,18 @@ current consumer. Such URIs are refused by the empty-host check. If a
 private-scheme client ever appears, that is an additive change with its own
 review — it is not left ambiguous now.
 
+## Audience matching (RFC 8707)
+
+`ResourceMatches` compares a requested resource against a token audience: scheme
+and host case-insensitively with the scheme's default port elided, an empty path
+treated as `/`, and **path plus query compared byte-exactly on their ESCAPED
+(percent-encoded) form**. The path is compared via `EscapedPath`, not the decoded
+`Path`: `url.Parse` decodes percent-escapes into `Path`, so comparing `Path` would
+conflate distinct resource identifiers differing only in encoding (`"/a%2Fb"` and
+`"/a/b"` both decode to `"/a/b"`), silently widening token audience binding. Query
+comparison uses the raw `RawQuery`, which is already unescaped-preserving. Nothing
+else is normalized.
+
 ## What the connect guard does and does not guarantee
 
 `PublicOnlyAddrGuard` + `guardedDialer` enforce a **point-in-time enumeration of
@@ -111,6 +123,12 @@ It does **NOT**:
 `http.Transport` still derives TLS SNI and certificate verification from the URL
 host even though `DialContext` connects to a pinned literal, so certificate
 validation is unaffected.
+
+The `Fetcher` wires the guarded transport whenever its `HTTPClient` is nil **or**
+the injected client's `Transport` is nil, so a caller passing
+`&http.Client{Timeout: …}` is not silently unguarded (a nil `Transport` otherwise
+falls through to `http.DefaultTransport`). A caller who injects a client with a
+non-nil `Transport` owns that transport's egress policy — it is used as-is.
 
 ## The "validate one thing, then let something else become the real thing" bug class
 

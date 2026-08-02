@@ -91,8 +91,14 @@ func ParseResourceIdentifier(raw string) (ResourceIdentifier, error) {
 
 // ResourceMatches reports whether a requested resource matches a token audience
 // per RFC 8707: scheme and host are compared case-insensitively with the scheme's
-// default port elided; path and query are compared byte-exactly; an empty path is
-// treated as equal to "/" and nothing else is normalized.
+// default port elided; path and query are compared byte-exactly on their ESCAPED
+// (percent-encoded) form; an empty path is treated as equal to "/" and nothing
+// else is normalized.
+//
+// The path is compared via EscapedPath, NOT the decoded Path: url.Parse decodes
+// percent-escapes into Path, so comparing Path would conflate distinct resource
+// identifiers whose only difference is encoding (e.g. "/a%2Fb" and "/a/b" both
+// decode to "/a/b"), silently widening token audience binding.
 func ResourceMatches(tokenAudience, requested string) bool {
 	a, err := url.Parse(tokenAudience)
 	if err != nil {
@@ -108,7 +114,7 @@ func ResourceMatches(tokenAudience, requested string) bool {
 	if canonicalHost(a) != canonicalHost(b) {
 		return false
 	}
-	if normalizeEmptyPath(a.Path) != normalizeEmptyPath(b.Path) {
+	if normalizeEmptyPath(a.EscapedPath()) != normalizeEmptyPath(b.EscapedPath()) {
 		return false
 	}
 	return a.RawQuery == b.RawQuery

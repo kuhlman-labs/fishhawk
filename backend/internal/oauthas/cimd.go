@@ -83,10 +83,14 @@ type cacheEntry struct {
 
 // Fetcher fetches and validates a CIMD document behind injected HTTP-client,
 // address-guard and DNS-lookup seams, with a connect-time SSRF guard. The zero
-// value is usable: an unset HTTPClient builds one whose Transport uses the
-// PublicOnlyAddrGuard-backed guarded dialer, and every bound has a default.
+// value is usable: an unset HTTPClient (or one with a nil Transport) is given a
+// Transport backed by the PublicOnlyAddrGuard guarded dialer, and every bound has
+// a default.
 type Fetcher struct {
 	// HTTPClient, when nil, is built with a guarded dialer using Guard and Lookup.
+	// A non-nil client with a nil Transport ALSO gets the guarded dialer, so a
+	// caller passing &http.Client{Timeout: …} is not silently unguarded; a non-nil
+	// Transport is used as-is and the caller owns its egress policy.
 	HTTPClient *http.Client
 	// Guard defaults to PublicOnlyAddrGuard.
 	Guard addrGuard
@@ -150,16 +154,24 @@ func (f *Fetcher) cacheTTL() time.Duration {
 }
 
 // effectiveClient returns a client that reuses any injected Transport but always
-// applies this Fetcher's redirect-revalidating CheckRedirect. It never mutates an
-// injected *http.Client.
+// applies this Fetcher's redirect-revalidating CheckRedirect. When neither an
+// injected client nor its Transport is set, it installs the guarded transport, so
+// a caller passing &http.Client{Timeout: …} (a nil Transport) still gets the
+// connect-time SSRF guard rather than silently inheriting http.DefaultTransport. A
+// non-nil injected Transport is used as-is (the caller owns its egress policy). It
+// never mutates an injected *http.Client.
 func (f *Fetcher) effectiveClient() *http.Client {
 	base := f.HTTPClient
 	if base == nil {
+		base = &http.Client{}
+	}
+	transport := base.Transport
+	if transport == nil {
 		gd := newGuardedDialer(f.guard(), f.Lookup)
-		base = &http.Client{Transport: &http.Transport{DialContext: gd.DialContext}}
+		transport = &http.Transport{DialContext: gd.DialContext}
 	}
 	return &http.Client{
-		Transport:     base.Transport,
+		Transport:     transport,
 		Jar:           base.Jar,
 		CheckRedirect: f.checkRedirect,
 	}

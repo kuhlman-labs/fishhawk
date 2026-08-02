@@ -102,6 +102,11 @@ func TestResourceMatches(t *testing.T) {
 		{name: "query preserved match", audience: "https://mcp.example/v0?a=b", requested: "https://mcp.example/v0?a=b", wantMatch: true},
 		{name: "differing path", audience: "https://mcp.example/v0", requested: "https://mcp.example/v1", wantMatch: false},
 		{name: "path case-sensitive", audience: "https://mcp.example/V0", requested: "https://mcp.example/v0", wantMatch: false},
+		// Percent-encoding must not be conflated: "/a%2Fb" (an encoded slash) is a
+		// distinct resource identifier from "/a/b" even though url.Parse decodes both
+		// Paths to "/a/b". Comparing the escaped form keeps them apart.
+		{name: "encoded slash not conflated with literal slash", audience: "https://mcp.example/a%2Fb", requested: "https://mcp.example/a/b", wantMatch: false},
+		{name: "encoded path exact match", audience: "https://mcp.example/a%2Fb", requested: "https://mcp.example/a%2Fb", wantMatch: true},
 		{name: "differing query", audience: "https://mcp.example/v0?a=b", requested: "https://mcp.example/v0?a=c", wantMatch: false},
 		{name: "non-default port significant", audience: "https://mcp.example/v0", requested: "https://mcp.example:8443/v0", wantMatch: false},
 		{name: "differing host", audience: "https://mcp.example/v0", requested: "https://evil.example/v0", wantMatch: false},
@@ -151,5 +156,21 @@ func assertCode(t *testing.T, err error, code ErrorCode) {
 	}
 	if oe.Code != code {
 		t.Fatalf("error code = %q, want %q (err=%v)", oe.Code, code, err)
+	}
+}
+
+// assertErrorDescriptionContains asserts err is (or wraps) an *Error whose
+// client-facing Description contains sub. It pins a refusal's IDENTITY (not merely
+// its code), so a test cannot pass on a look-alike error — e.g. a transport error
+// from following a rejected redirect hop, which maps to the same code but a
+// different description.
+func assertErrorDescriptionContains(t *testing.T, err error, sub string) {
+	t.Helper()
+	var oe *Error
+	if !errors.As(err, &oe) {
+		t.Fatalf("error %v is not an *Error", err)
+	}
+	if !strings.Contains(oe.Description, sub) {
+		t.Fatalf("error description = %q, want it to contain %q", oe.Description, sub)
 	}
 }

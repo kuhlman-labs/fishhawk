@@ -129,8 +129,16 @@ func TestFetch_RefusesOnTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Fetch = nil, want timeout error")
 	}
-	if elapsed >= timescale.D(2*time.Second) {
-		t.Fatalf("Fetch took %v, expected it to return near the timeout", elapsed)
+	// Pin the timeout behavior, not merely "some error": the failure must be a
+	// context deadline, and it must return well before the handler would have
+	// completed. Without the Fetcher applying its own Timeout the handler responds
+	// after handlerWedge with a valid document and Fetch succeeds; a non-deadline
+	// error would also slip past a bare err != nil check.
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if elapsed >= handlerWedge {
+		t.Fatalf("Fetch took %v, want it to return before the handler wedge %v (its Timeout must fire first)", elapsed, handlerWedge)
 	}
 }
 
@@ -177,6 +185,43 @@ func TestFetch_RefusesAbsentTokenEndpointAuthMethod(t *testing.T) {
 		t.Fatalf("Fetch = nil, want refusal for absent token_endpoint_auth_method (defaults to client_secret_basic)")
 	}
 	assertCode(t, err, ErrCodeInvalidClient)
+}
+
+func TestFetch_RefusesInvalidRedirectURIInDocument(t *testing.T) {
+	t.Parallel()
+	// A document whose redirect_uris carries a fragment must be refused at
+	// admission (validateClientMetadata → validateRedirectURIComponents), not
+	// admitted. This pins the per-URI component check on the document path.
+	var clientID string
+	srv := newDocServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, `{"client_id":"`+clientID+`","redirect_uris":["http://127.0.0.1/cb#frag"],"token_endpoint_auth_method":"none"}`)
+	})
+	clientID = srv.URL
+	f := &Fetcher{HTTPClient: srv.Client()}
+	_, err := f.Fetch(context.Background(), clientID)
+	if err == nil {
+		t.Fatalf("Fetch = nil, want refusal for a document redirect_uri with a fragment")
+	}
+	assertCode(t, err, ErrCodeInvalidClient)
+	assertErrorDescriptionContains(t, err, "invalid redirect_uri")
+}
+
+func TestFetch_RefusesGrantTypesWithoutAuthorizationCode(t *testing.T) {
+	t.Parallel()
+	// grant_types present but omitting authorization_code must be refused; a present
+	// list that includes it is admitted (covered by TestFetch_Succeeds).
+	var clientID string
+	srv := newDocServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, `{"client_id":"`+clientID+`","redirect_uris":["http://127.0.0.1/cb"],"grant_types":["refresh_token"],"token_endpoint_auth_method":"none"}`)
+	})
+	clientID = srv.URL
+	f := &Fetcher{HTTPClient: srv.Client()}
+	_, err := f.Fetch(context.Background(), clientID)
+	if err == nil {
+		t.Fatalf("Fetch = nil, want refusal for grant_types missing authorization_code")
+	}
+	assertCode(t, err, ErrCodeInvalidClient)
+	assertErrorDescriptionContains(t, err, "grant_types must include authorization_code")
 }
 
 func TestFetch_RefusesPrivateConnectAddress(t *testing.T) {
@@ -245,19 +290,42 @@ func TestFetch_RefusesRedirectSchemeDowngrade(t *testing.T) {
 		t.Fatalf("Fetch = nil, want refusal for https->http redirect")
 	}
 	assertCode(t, err, ErrCodeInvalidClient)
+	// Pin the refusal's IDENTITY. Without checkRedirect's ValidateClientIDURL call
+	// the client would follow the hop, get ECONNREFUSED on port 1, and wrapFetchErr
+	// would map that transport error to the SAME ErrCodeInvalidClient — so a bare
+	// code check is vacuous. The scheme-rejection description only appears when the
+	// hop-revalidation predicate actually runs.
+	assertErrorDescriptionContains(t, err, "scheme must be https")
 }
 
 func TestFetch_RefusesRedirectToUserinfoOrFragment(t *testing.T) {
 	t.Parallel()
-	for _, loc := range []string{"https://user@ok.example/cb", "https://ok.example/cb#frag"} {
-		location := loc
-		srv := newDocServer(t, func(w http.ResponseWriter, r *http.Request) {
-			http.Redirect(w, r, location, http.StatusFound)
+	// Loopback hop targets (port 1) so the counterfactual — checkRedirect deleted —
+	// dials a dead loopback port rather than egressing to real DNS; the assertion on
+	// the rejection description is what makes each case non-vacuous.
+	cases := []struct {
+		name        string
+		location    string
+		wantDescSub string
+	}{
+		{"userinfo", "https://user@127.0.0.1:1/cb", "must not contain userinfo"},
+		{"fragment", "https://127.0.0.1:1/cb#frag", "must not contain a fragment"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			srv := newDocServer(t, func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, tc.location, http.StatusFound)
+			})
+			f := &Fetcher{HTTPClient: srv.Client()}
+			_, err := f.Fetch(context.Background(), srv.URL)
+			if err == nil {
+				t.Fatalf("Fetch redirect to %q = nil, want refusal", tc.location)
+			}
+			assertCode(t, err, ErrCodeInvalidClient)
+			assertErrorDescriptionContains(t, err, tc.wantDescSub)
 		})
-		f := &Fetcher{HTTPClient: srv.Client()}
-		if _, err := f.Fetch(context.Background(), srv.URL); err == nil {
-			t.Fatalf("Fetch redirect to %q = nil, want refusal", location)
-		}
 	}
 }
 
@@ -268,11 +336,18 @@ func TestFetch_RefusesTooManyRedirects(t *testing.T) {
 		// and keeps redirecting); the hop cap must trip before the loop runs away.
 		http.Redirect(w, r, "/loop", http.StatusFound)
 	})
-	f := &Fetcher{HTTPClient: srv.Client(), MaxRedirects: 1}
+	// Bound the counterfactual: with the hop cap removed the relative-redirect loop
+	// would otherwise spin until the default 5s timeout. The real path trips the cap
+	// on the second hop and returns immediately.
+	f := &Fetcher{HTTPClient: srv.Client(), MaxRedirects: 1, Timeout: timescale.D(2 * time.Second)}
 	_, err := f.Fetch(context.Background(), srv.URL)
 	if err == nil {
 		t.Fatalf("Fetch = nil, want redirect-limit refusal")
 	}
+	assertCode(t, err, ErrCodeInvalidClient)
+	// Pin identity: the hop-cap rejection, not a deadline from an unbounded loop
+	// (which would map to the same code and make the test vacuous).
+	assertErrorDescriptionContains(t, err, "exceeded the redirect limit")
 }
 
 func TestFetch_RefusesNon200(t *testing.T) {
@@ -312,6 +387,20 @@ func TestFetcher_DefaultGuardIsPublicOnly(t *testing.T) {
 	want := reflect.ValueOf(PublicOnlyAddrGuard).Pointer()
 	if got != want {
 		t.Fatalf("zero-value Fetcher's default guard is not PublicOnlyAddrGuard")
+	}
+}
+
+// TestFetch_InjectedClientNilTransportStillGuarded pins the low/security fix: a
+// non-nil *http.Client with a nil Transport must still inherit the connect-time
+// guard, not silently fall through to http.DefaultTransport. The Lookup seam
+// resolves to a private address the default guard refuses; without the guarded
+// transport this path would instead attempt real egress to client.example.
+func TestFetch_InjectedClientNilTransportStillGuarded(t *testing.T) {
+	t.Parallel()
+	f := &Fetcher{HTTPClient: &http.Client{}, Lookup: staticLookup(netip.MustParseAddr("10.0.0.5"))}
+	_, err := f.Fetch(context.Background(), "https://client.example/id")
+	if err == nil || !errors.Is(err, ErrBlockedAddress) {
+		t.Fatalf("Fetch = %v, want ErrBlockedAddress (nil-transport injected client must be guarded)", err)
 	}
 }
 
