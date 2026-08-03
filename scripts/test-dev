@@ -2163,6 +2163,469 @@ else
   print "skip: git not found — skipping confirmed-sweep fixture"
 fi
 
+# ===========================================================================
+# 16. Opt-in local TLS front end (E66.28 / #2453). Hermetic: no real caddy and
+# no real TLS handshake in the purity/failure-mode blocks (stubs only), so the
+# suite still runs where caddy is absent. The cert path is proven separately
+# with REAL openssl (16h) — gated on openssl / s_server availability.
+# ===========================================================================
+
+# 16a. _tls_enabled: 0 ONLY when FISHHAWK_DEV_TLS is exactly "1".
+if FISHHAWK_DEV_TLS=1 _tls_enabled; then
+  pass "_tls_enabled returns 0 when FISHHAWK_DEV_TLS=1"
+else
+  fail "_tls_enabled should return 0 when FISHHAWK_DEV_TLS=1"
+fi
+if FISHHAWK_DEV_TLS=0 _tls_enabled; then
+  fail "_tls_enabled should return non-zero when FISHHAWK_DEV_TLS=0"
+else
+  pass "_tls_enabled returns non-zero for FISHHAWK_DEV_TLS=0"
+fi
+if _tls_enabled; then
+  fail "_tls_enabled should return non-zero when FISHHAWK_DEV_TLS is unset"
+else
+  pass "_tls_enabled returns non-zero when FISHHAWK_DEV_TLS is unset (default off)"
+fi
+if FISHHAWK_DEV_TLS=true _tls_enabled; then
+  fail "_tls_enabled should return non-zero for FISHHAWK_DEV_TLS=true (only literal 1 enables)"
+else
+  pass "_tls_enabled treats FISHHAWK_DEV_TLS=true as disabled (only literal 1 enables)"
+fi
+
+# 16b. _tls_port / _tls_healthz_url: default 8443 + override.
+if [[ "$(_tls_port)" == "8443" ]]; then
+  pass "_tls_port defaults to 8443"
+else
+  fail "_tls_port should default to 8443 (got: $(_tls_port))"
+fi
+if [[ "$(FISHHAWK_DEV_TLS_PORT=9443 _tls_port)" == "9443" ]]; then
+  pass "_tls_port honors FISHHAWK_DEV_TLS_PORT"
+else
+  fail "_tls_port should honor FISHHAWK_DEV_TLS_PORT (got: $(FISHHAWK_DEV_TLS_PORT=9443 _tls_port))"
+fi
+if [[ "$(_tls_healthz_url)" == "https://localhost:8443/healthz" ]]; then
+  pass "_tls_healthz_url is the https localhost URL on the TLS port"
+else
+  fail "_tls_healthz_url should be https://localhost:8443/healthz (got: $(_tls_healthz_url))"
+fi
+
+# 16c. DONE-MEANS rendered-config assertion. Not mere helper presence: the
+# shipped config text must terminate TLS, bind loopback-only, and forward to the
+# unchanged fishhawkd. A comment-only touch fails these.
+caddy_text="$(_tls_render_caddyfile 8443 /c/server.pem /c/server.key 127.0.0.1:8080)"
+if print -r -- "$caddy_text" | grep -qE '^:8443 \{'; then
+  pass "rendered Caddyfile uses the bare :8443 site address (host-agnostic)"
+else
+  fail "rendered Caddyfile should carry a bare ':8443 {' site address (got: $caddy_text)"
+fi
+# CONDITION 1 (binding assertion): the listener is pinned loopback-only.
+if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*bind 127\.0\.0\.1 ::1$'; then
+  pass "rendered Caddyfile binds loopback-only (bind 127.0.0.1 ::1) — condition 1"
+else
+  fail "rendered Caddyfile MUST contain 'bind 127.0.0.1 ::1' (condition 1 — got: $caddy_text)"
+fi
+if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*tls /c/server\.pem /c/server\.key$'; then
+  pass "rendered Caddyfile terminates TLS with the cert/key pair"
+else
+  fail "rendered Caddyfile should carry 'tls <cert> <key>' (got: $caddy_text)"
+fi
+if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*reverse_proxy 127\.0\.0\.1:8080$'; then
+  pass "rendered Caddyfile reverse-proxies to the plain-http fishhawkd (127.0.0.1:8080)"
+else
+  fail "rendered Caddyfile should reverse_proxy to 127.0.0.1:8080 (got: $caddy_text)"
+fi
+if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*auto_https off$'; then
+  pass "rendered Caddyfile disables auto_https (no ACME)"
+else
+  fail "rendered Caddyfile should carry 'auto_https off' (got: $caddy_text)"
+fi
+if print -r -- "$caddy_text" | grep -qE '^[[:space:]]*admin off$'; then
+  pass "rendered Caddyfile disables the admin endpoint (no :2019 listener)"
+else
+  fail "rendered Caddyfile should carry 'admin off' (got: $caddy_text)"
+fi
+
+# 16d. NON-VACUITY of the scope-item-2 control: the readiness gate goes THROUGH
+# the proxy. Drive _tls_up with a stub proxy bin (sleeps → a live pid), a stub
+# curl FIRST on PATH that captures its full argv and exits 0, and a stubbed cert
+# step. Assert the captured argv points at the https gate URL with --cacert, and
+# NOT at the plain-http upstream — so repointing the gate at fishhawkd goes red.
+# (During implementation the gate was repointed at http://127.0.0.1:8080 and
+# this case went RED as required; restored — see PR notes.)
+if [[ -n "$(_port_listeners 8443)" ]]; then
+  print "skip: port 8443 already has a listener — skipping the through-the-proxy non-vacuity case"
+else
+  nv_wd="$(mktemp -d -t test-dev-tlsnv.XXXXXX)"
+  print '#!/bin/sh\nsleep 30\n' > "$nv_wd/proxy"; chmod +x "$nv_wd/proxy"
+  mkdir -p "$nv_wd/bin"
+  print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$nv_wd/curl.argv\"\nexit 0\n" > "$nv_wd/bin/curl"; chmod +x "$nv_wd/bin/curl"
+  (
+    TLS_DIR="$nv_wd/tls"; TLS_PID_FILE="$nv_wd/tls.pid"; TLS_LOG_FILE="$nv_wd/tls.log"; LOG_DIR="$nv_wd"
+    export FISHHAWK_DEV_TLS_PROXY_BIN="$nv_wd/proxy"
+    _tls_ensure_certs() { mkdir -p "$1"; : > "$1/ca.pem"; : > "$1/server.pem"; : > "$1/server.key"; return 0 }
+    PATH="$nv_wd/bin:$PATH" _tls_up >/dev/null 2>&1
+    [[ -f "$TLS_PID_FILE" ]] && kill "$(cat "$TLS_PID_FILE")" 2>/dev/null
+  )
+  nv_cap="$(cat "$nv_wd/curl.argv" 2>/dev/null)"
+  if [[ "$nv_cap" == *"https://localhost:8443/healthz"* ]]; then
+    pass "_tls_up gates on the https proxy URL (through-the-proxy readiness)"
+  else
+    fail "_tls_up gate should curl https://localhost:8443/healthz (got: $nv_cap)"
+  fi
+  if [[ "$nv_cap" == *"--cacert $nv_wd/tls/ca.pem"* ]]; then
+    pass "_tls_up gate passes --cacert with the derived ca.pem path"
+  else
+    fail "_tls_up gate should pass --cacert <ca.pem> (got: $nv_cap)"
+  fi
+  if [[ "$nv_cap" != *"http://127.0.0.1:8080"* ]]; then
+    pass "_tls_up gate does NOT probe the plain-http upstream directly (non-vacuity)"
+  else
+    fail "_tls_up gate must not curl the plain-http upstream http://127.0.0.1:8080 (got: $nv_cap)"
+  fi
+  rm -rf "$nv_wd"
+fi
+
+# 16e. Failure mode: proxy binary absent. FISHHAWK_DEV_TLS_PROXY_BIN unset and a
+# PATH with no caddy → non-zero, stderr names 'brew install caddy', NO pid file
+# written (the never-silently-skip proof). _tls_resolve_proxy_bin uses only
+# builtins, so scoping PATH to the _tls_up call is safe.
+fm_wd="$(mktemp -d -t test-dev-tlsfm.XXXXXX)"
+mkdir -p "$fm_wd/empty"
+(
+  TLS_PID_FILE="$fm_wd/tls.pid"; TLS_DIR="$fm_wd/tls"; TLS_LOG_FILE="$fm_wd/tls.log"
+  unset FISHHAWK_DEV_TLS_PROXY_BIN
+  out="$(PATH="$fm_wd/empty" _tls_up 2>&1)"; rc=$?
+  if (( rc != 0 )); then pass "_tls_up fails (non-zero) when no proxy binary resolves"; else fail "_tls_up should fail when no proxy binary resolves"; fi
+  if [[ "$out" == *"brew install caddy"* ]]; then pass "_tls_up names 'brew install caddy' when the proxy binary is absent"; else fail "_tls_up should name 'brew install caddy' (got: $out)"; fi
+  if [[ ! -f "$TLS_PID_FILE" ]]; then pass "_tls_up writes NO pid file when the proxy binary is absent (never silently skips)"; else fail "_tls_up must not write a pid file on proxy-binary-absent"; fi
+)
+rm -rf "$fm_wd"
+
+# 16f. Failure mode: openssl absent. A resolvable proxy bin but no openssl on
+# PATH → non-zero + actionable message, before any cert/pid work.
+fm_wd="$(mktemp -d -t test-dev-tlsfm.XXXXXX)"
+mkdir -p "$fm_wd/empty"
+print '#!/bin/sh\nsleep 5\n' > "$fm_wd/proxy"; chmod +x "$fm_wd/proxy"
+(
+  TLS_PID_FILE="$fm_wd/tls.pid"; TLS_DIR="$fm_wd/tls"; TLS_LOG_FILE="$fm_wd/tls.log"
+  export FISHHAWK_DEV_TLS_PROXY_BIN="$fm_wd/proxy"
+  out="$(PATH="$fm_wd/empty" _tls_up 2>&1)"; rc=$?
+  if (( rc != 0 )); then pass "_tls_up fails (non-zero) when openssl is absent"; else fail "_tls_up should fail when openssl is absent"; fi
+  if [[ "$out" == *"openssl not found"* ]]; then pass "_tls_up names openssl as the missing prerequisite"; else fail "_tls_up should name the missing openssl (got: $out)"; fi
+  if [[ ! -f "$TLS_PID_FILE" ]]; then pass "_tls_up writes NO pid file when openssl is absent"; else fail "_tls_up must not write a pid file on openssl-absent"; fi
+)
+rm -rf "$fm_wd"
+
+# 16g. Failure mode: TLS port already occupied. Bind the TLS port with an nc
+# one-shot listener (the section-13 fixture family) → non-zero and the message
+# names the squatting pid. Requires lsof + nc (skip cleanly otherwise).
+if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null; then
+  print "skip: nc or lsof not found — skipping the TLS port-occupied failure-mode case"
+else
+  occ_port=""
+  for _try in 1 2 3 4 5; do
+    cand=$(( 20000 + (RANDOM % 20000) ))
+    if [[ -z "$(_port_listeners "$cand")" ]]; then occ_port="$cand"; break; fi
+  done
+  if [[ -z "$occ_port" ]]; then
+    fail "could not find a free high port for the TLS port-occupied fixture"
+  else
+    nc -l 127.0.0.1 "$occ_port" >/dev/null 2>&1 &
+    occ_nc_pid=$!
+    i=0
+    while (( i < 20 )); do
+      if [[ -n "$(_port_listeners "$occ_port")" ]]; then break; fi
+      sleep 0.1
+      (( ++i ))
+    done
+    fm_wd="$(mktemp -d -t test-dev-tlsfm.XXXXXX)"
+    print '#!/bin/sh\nsleep 5\n' > "$fm_wd/proxy"; chmod +x "$fm_wd/proxy"
+    (
+      TLS_PID_FILE="$fm_wd/tls.pid"; TLS_DIR="$fm_wd/tls"; TLS_LOG_FILE="$fm_wd/tls.log"
+      export FISHHAWK_DEV_TLS_PROXY_BIN="$fm_wd/proxy"
+      export FISHHAWK_DEV_TLS_PORT="$occ_port"
+      out="$(_tls_up 2>&1)"; rc=$?
+      if (( rc != 0 )); then pass "_tls_up fails (non-zero) when the TLS port is occupied"; else fail "_tls_up should fail when the TLS port is occupied"; fi
+      if [[ "$out" == *"$occ_nc_pid"* ]]; then pass "_tls_up port-preflight names the squatting pid"; else fail "_tls_up should name squatter pid ${occ_nc_pid} (got: $out)"; fi
+      if [[ ! -f "$TLS_PID_FILE" ]]; then pass "_tls_up writes NO pid file when the port is occupied"; else fail "_tls_up must not write a pid file on port-occupied"; fi
+    )
+    rm -rf "$fm_wd"
+    kill "$occ_nc_pid" 2>/dev/null
+    wait "$occ_nc_pid" 2>/dev/null
+  fi
+fi
+
+# 16h. Failure mode: proxy spawn-then-die. A stub bin that exits immediately →
+# the gate's kill -0 fails → _tls_up returns non-zero, tails the log, and
+# removes the pid file. A stub curl that fails keeps the loop bounded.
+if [[ -n "$(_port_listeners 8443)" ]]; then
+  print "skip: port 8443 busy — skipping the spawn-then-die failure-mode case"
+else
+  fm_wd="$(mktemp -d -t test-dev-tlsfm.XXXXXX)"
+  print '#!/bin/sh\nexit 0\n' > "$fm_wd/proxy"; chmod +x "$fm_wd/proxy"
+  mkdir -p "$fm_wd/bin"
+  print '#!/bin/sh\nexit 1\n' > "$fm_wd/bin/curl"; chmod +x "$fm_wd/bin/curl"
+  (
+    TLS_DIR="$fm_wd/tls"; TLS_PID_FILE="$fm_wd/tls.pid"; TLS_LOG_FILE="$fm_wd/tls.log"; LOG_DIR="$fm_wd"
+    export FISHHAWK_DEV_TLS_PROXY_BIN="$fm_wd/proxy"
+    _tls_ensure_certs() { mkdir -p "$1"; : > "$1/ca.pem"; : > "$1/server.pem"; : > "$1/server.key"; return 0 }
+    print "proxy exited (fixture marker)" > "$fm_wd/tls.log"
+    out="$(PATH="$fm_wd/bin:$PATH" _tls_up 2>&1)"; rc=$?
+    if (( rc != 0 )); then pass "_tls_up fails (non-zero) on proxy spawn-then-die"; else fail "_tls_up should fail when the proxy dies immediately"; fi
+    if [[ "$out" == *"fixture marker"* ]]; then pass "_tls_up tails the proxy log on spawn-then-die"; else fail "_tls_up should tail the log on spawn-then-die (got: $out)"; fi
+    if [[ ! -f "$TLS_PID_FILE" ]]; then pass "_tls_up removes the pid file on spawn-then-die"; else fail "_tls_up should remove the pid file on spawn-then-die"; fi
+  )
+  rm -rf "$fm_wd"
+fi
+
+# 16i. Failure mode: readiness-gate timeout with a LIVE proxy. Redefine the gate
+# to always time out (return 1) so the test is fast and deterministic; the point
+# is _tls_up's failure HANDLING — kill the live proxy AND remove the pid file.
+if [[ -n "$(_port_listeners 8443)" ]]; then
+  print "skip: port 8443 busy — skipping the readiness-timeout failure-mode case"
+else
+  fm_wd="$(mktemp -d -t test-dev-tlsfm.XXXXXX)"
+  print '#!/bin/sh\nsleep 30\n' > "$fm_wd/proxy"; chmod +x "$fm_wd/proxy"
+  captured_pid=""
+  (
+    TLS_DIR="$fm_wd/tls"; TLS_PID_FILE="$fm_wd/tls.pid"; TLS_LOG_FILE="$fm_wd/tls.log"; LOG_DIR="$fm_wd"
+    export FISHHAWK_DEV_TLS_PROXY_BIN="$fm_wd/proxy"
+    _tls_ensure_certs() { mkdir -p "$1"; : > "$1/ca.pem"; : > "$1/server.pem"; : > "$1/server.key"; return 0 }
+    _await_tls_healthz() { return 1 }
+    out="$(_tls_up 2>&1)"; rc=$?
+    print -r -- "$rc" > "$fm_wd/rc"
+    if [[ -f "$fm_wd/lastpid" ]]; then :; fi
+  )
+  # Reconstruct: after _tls_up returns, the pid file must be gone and the proxy
+  # process killed. The pid file was removed by _tls_up, so read it from the log
+  # is not possible; instead assert the pid file is gone and no stub proxy of
+  # this fixture survives.
+  fm_rc="$(cat "$fm_wd/rc" 2>/dev/null)"
+  if [[ "$fm_rc" != "0" && -n "$fm_rc" ]]; then pass "_tls_up fails (non-zero) on readiness-gate timeout"; else fail "_tls_up should fail on readiness-gate timeout (rc=$fm_rc)"; fi
+  if [[ ! -f "$fm_wd/tls.pid" ]]; then pass "_tls_up removes the pid file on readiness-gate timeout"; else fail "_tls_up should remove the pid file on readiness-gate timeout"; fi
+  # The stub proxy must have been killed; if any 'sleep 30' from our stub path
+  # survives, this leaks. Best-effort: pgrep by the fixture proxy path.
+  if command -v pgrep &>/dev/null; then
+    if [[ -z "$(pgrep -f "$fm_wd/proxy" 2>/dev/null)" ]]; then
+      pass "_tls_up killed the live proxy on readiness-gate timeout"
+    else
+      fail "_tls_up should kill the live proxy on readiness-gate timeout"
+      pkill -f "$fm_wd/proxy" 2>/dev/null
+    fi
+  else
+    print "skip: pgrep not found — skipping the proxy-killed assertion (pid file removal already asserted)"
+  fi
+  rm -rf "$fm_wd"
+fi
+
+# 16j. _tls_down behavioral contract (mirrors _preview_kill_tracked).
+# Absent pid file → silent no-op returning 0 (the disabled-default regression
+# control from step 12 case 6).
+tls_dn_wd="$(mktemp -d -t test-dev-tlsdn.XXXXXX)"
+if _tls_down "$tls_dn_wd/absent.pid" >/dev/null 2>&1; then
+  pass "_tls_down returns 0 on an absent pid file (idempotent no-op)"
+else
+  fail "_tls_down should return 0 when the pid file is absent"
+fi
+# Live stub pid → process killed AND pid file removed (step 12 case 7, and the
+# condition-2 teardown-after-flag-cleared behavior: _tls_down never consults
+# FISHHAWK_DEV_TLS, so a cleared flag does not orphan the proxy).
+print '#!/bin/sh\nsleep 30\n' > "$tls_dn_wd/proc"; chmod +x "$tls_dn_wd/proc"
+"$tls_dn_wd/proc" &
+tls_dn_pid=$!
+print "$tls_dn_pid" > "$tls_dn_wd/live.pid"
+FISHHAWK_DEV_TLS='' _tls_down "$tls_dn_wd/live.pid" >/dev/null 2>&1
+if ! kill -0 "$tls_dn_pid" 2>/dev/null; then
+  pass "_tls_down kills a live proxy even with FISHHAWK_DEV_TLS cleared (condition 2 — no orphan)"
+else
+  fail "_tls_down should kill the live proxy pid ${tls_dn_pid}"
+  kill "$tls_dn_pid" 2>/dev/null
+fi
+if [[ ! -f "$tls_dn_wd/live.pid" ]]; then
+  pass "_tls_down removes the pid file after killing the proxy"
+else
+  fail "_tls_down should remove the pid file after killing the proxy"
+fi
+wait "$tls_dn_pid" 2>/dev/null
+rm -rf "$tls_dn_wd"
+
+# 16k. Call-site wiring (body-grep, section-13b style). cmd_up runs the TLS leg
+# under an _tls_enabled guard, AFTER the #1018 nonce verification (so the nonce
+# identity proof stays on plain-http fishhawkd), and BEFORE _signal_mcp_activation.
+tls_up_body="$(typeset -f cmd_up)"
+tls_down_body="$(typeset -f cmd_down)"
+if print -r -- "$tls_up_body" | grep -q '_tls_up'; then
+  pass "cmd_up invokes _tls_up"
+else
+  fail "cmd_up should invoke _tls_up"
+fi
+if print -r -- "$tls_up_body" | grep -q '_tls_enabled'; then
+  pass "cmd_up guards the TLS leg with _tls_enabled (default off)"
+else
+  fail "cmd_up should guard the TLS leg with _tls_enabled"
+fi
+tls_nonce_line="$(print -r -- "$tls_up_body" | grep -n '_verify_healthz_nonce' | head -n 1 | cut -d: -f1)"
+tls_up_line="$(print -r -- "$tls_up_body" | grep -n '_tls_up' | head -n 1 | cut -d: -f1)"
+tls_mcp_line="$(print -r -- "$tls_up_body" | grep -n '_signal_mcp_activation' | head -n 1 | cut -d: -f1)"
+if [[ -n "$tls_nonce_line" && -n "$tls_up_line" ]] && (( tls_nonce_line < tls_up_line )); then
+  pass "cmd_up runs _tls_up AFTER the #1018 nonce verification (nonce proof stays on plain http)"
+else
+  fail "cmd_up should order _verify_healthz_nonce before _tls_up (nonce=$tls_nonce_line tls=$tls_up_line)"
+fi
+if [[ -n "$tls_up_line" && -n "$tls_mcp_line" ]] && (( tls_up_line < tls_mcp_line )); then
+  pass "cmd_up runs _tls_up BEFORE _signal_mcp_activation (MCP banner stays last)"
+else
+  fail "cmd_up should order _tls_up before _signal_mcp_activation (tls=$tls_up_line mcp=$tls_mcp_line)"
+fi
+# cmd_down calls _tls_down UNCONDITIONALLY (condition 2): no _tls_enabled guard.
+if print -r -- "$tls_down_body" | grep -q '_tls_down'; then
+  pass "cmd_down invokes _tls_down"
+else
+  fail "cmd_down should invoke _tls_down"
+fi
+if print -r -- "$tls_down_body" | grep -q '_tls_enabled'; then
+  fail "cmd_down must NOT guard _tls_down on _tls_enabled (condition 2 — teardown is unconditional)"
+else
+  pass "cmd_down tears down the TLS front end unconditionally (no _tls_enabled guard — condition 2)"
+fi
+
+# 16l. REAL-openssl cert-path proofs (conditions 3/4/5 + idempotency). Skipped
+# cleanly where openssl is unavailable so the suite stays portable.
+if ! command -v openssl &>/dev/null; then
+  print "skip: openssl not found — skipping the real cert-path proofs (conditions 3/4/5)"
+else
+  # Idempotency: two runs leave the CA byte-identical (the NODE_EXTRA_CA_CERTS
+  # stability the docs depend on).
+  cert_wd="$(mktemp -d -t test-dev-tlscert.XXXXXX)"
+  (
+    TLS_DIR="$cert_wd/tls"
+    _tls_ensure_certs "$cert_wd/tls" >/dev/null 2>&1
+  )
+  if [[ -f "$cert_wd/tls/ca.pem" && -f "$cert_wd/tls/server.pem" && -f "$cert_wd/tls/server.key" ]]; then
+    ca_sha1="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+    (
+      TLS_DIR="$cert_wd/tls"
+      _tls_ensure_certs "$cert_wd/tls" >/dev/null 2>&1
+    )
+    ca_sha2="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+    if [[ "$ca_sha1" == "$ca_sha2" ]]; then
+      pass "_tls_ensure_certs is idempotent — CA byte-identical across two runs"
+    else
+      fail "_tls_ensure_certs should leave the CA byte-identical on the second run"
+    fi
+    # Leftover temp dir check (workspace hygiene).
+    if [[ -z "$(print -rl -- "$cert_wd"/tls/.gen.*(N) 2>/dev/null)" ]]; then
+      pass "_tls_ensure_certs leaves no .gen temp dir behind"
+    else
+      fail "_tls_ensure_certs should clean up its temp dir"
+    fi
+  else
+    fail "_tls_ensure_certs did not produce ca.pem/server.pem/server.key"
+  fi
+
+  # CONDITION 4: mismatched CA/leaf pair triggers regeneration (self-repair),
+  # not a skip. Seed a valid leaf next to a DIFFERENT (valid) CA.
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$cert_wd/tls/ca.key" \
+    -out "$cert_wd/tls/ca.pem" -days 825 -subj "/CN=Different CA" >/dev/null 2>&1
+  if ! openssl verify -CAfile "$cert_wd/tls/ca.pem" "$cert_wd/tls/server.pem" >/dev/null 2>&1; then
+    srv_before="$(shasum "$cert_wd/tls/server.pem" | cut -d' ' -f1)"
+    (
+      TLS_DIR="$cert_wd/tls"
+      _tls_ensure_certs "$cert_wd/tls" >/dev/null 2>&1
+    )
+    srv_after="$(shasum "$cert_wd/tls/server.pem" | cut -d' ' -f1)"
+    if [[ "$srv_before" != "$srv_after" ]] && openssl verify -CAfile "$cert_wd/tls/ca.pem" "$cert_wd/tls/server.pem" >/dev/null 2>&1; then
+      pass "_tls_ensure_certs regenerates a MISMATCHED leaf and re-verifies the chain (condition 4)"
+    else
+      fail "_tls_ensure_certs should regenerate a leaf that no longer verifies against the CA (condition 4)"
+    fi
+  else
+    fail "condition-4 fixture setup failed (seeded CA unexpectedly still verifies the leaf)"
+  fi
+
+  # CONDITION 5: a leaf within its renewal window renews WITHOUT rotating the
+  # still-valid CA. Sign a 1-day leaf with the existing CA, then regenerate.
+  ca_keep="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+  openssl req -newkey rsa:2048 -nodes -keyout "$cert_wd/tls/server.key" \
+    -out "$cert_wd/short.csr" -subj "/CN=localhost" >/dev/null 2>&1
+  printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$cert_wd/short.ext"
+  openssl x509 -req -in "$cert_wd/short.csr" -CA "$cert_wd/tls/ca.pem" \
+    -CAkey "$cert_wd/tls/ca.key" -CAcreateserial -out "$cert_wd/tls/server.pem" \
+    -days 1 -extfile "$cert_wd/short.ext" >/dev/null 2>&1
+  if ! openssl x509 -in "$cert_wd/tls/server.pem" -checkend 604800 >/dev/null 2>&1; then
+    srv_short="$(shasum "$cert_wd/tls/server.pem" | cut -d' ' -f1)"
+    (
+      TLS_DIR="$cert_wd/tls"
+      _tls_ensure_certs "$cert_wd/tls" >/dev/null 2>&1
+    )
+    ca_after="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+    srv_renewed="$(shasum "$cert_wd/tls/server.pem" | cut -d' ' -f1)"
+    if [[ "$ca_keep" == "$ca_after" ]]; then
+      pass "_tls_ensure_certs preserves the CA when only the leaf renews (condition 5 — no NODE_EXTRA_CA_CERTS churn)"
+    else
+      fail "_tls_ensure_certs must NOT rotate the CA on a leaf-only renewal (condition 5)"
+    fi
+    if [[ "$srv_short" != "$srv_renewed" ]] && openssl x509 -in "$cert_wd/tls/server.pem" -checkend 604800 >/dev/null 2>&1; then
+      pass "_tls_ensure_certs renews the near-expiry leaf to a fresh long-lived one (condition 5)"
+    else
+      fail "_tls_ensure_certs should renew a near-expiry leaf (condition 5)"
+    fi
+  else
+    fail "condition-5 fixture setup failed (short leaf unexpectedly not near expiry)"
+  fi
+
+  # CONDITION 3: serve the REAL generated pair with `openssl s_server` on an
+  # ephemeral port and verify BOTH URL shapes with curl --cacert. Pins the
+  # dual-SAN shape + full chain end to end. Skipped if s_server is unavailable.
+  s_server_ok=0
+  if echo | openssl s_server -help >/dev/null 2>&1 || openssl s_server -help 2>&1 | grep -qi 'accept'; then
+    s_server_ok=1
+  fi
+  if (( ! s_server_ok )); then
+    print "skip: openssl s_server unavailable — skipping the dual-SAN handshake proof (condition 3)"
+  elif ! command -v lsof &>/dev/null || ! command -v curl &>/dev/null; then
+    print "skip: lsof/curl unavailable — skipping the dual-SAN handshake proof (condition 3)"
+  else
+    # Regenerate a clean pair (the condition-4/5 fixtures left a mixed state).
+    rm -rf "$cert_wd/tls"
+    (
+      TLS_DIR="$cert_wd/tls"
+      _tls_ensure_certs "$cert_wd/tls" >/dev/null 2>&1
+    )
+    ss_port=""
+    for _try in 1 2 3 4 5; do
+      cand=$(( 20000 + (RANDOM % 20000) ))
+      if [[ -z "$(_port_listeners "$cand")" ]]; then ss_port="$cand"; break; fi
+    done
+    if [[ -z "$ss_port" ]]; then
+      fail "could not find a free port for the s_server dual-SAN proof"
+    else
+      openssl s_server -accept "$ss_port" -cert "$cert_wd/tls/server.pem" \
+        -key "$cert_wd/tls/server.key" -www -quiet >/dev/null 2>&1 &
+      ss_pid=$!
+      i=0
+      while (( i < 30 )); do
+        if [[ -n "$(_port_listeners "$ss_port")" ]]; then break; fi
+        sleep 0.1
+        (( ++i ))
+      done
+      if curl --silent --fail --max-time 3 --cacert "$cert_wd/tls/ca.pem" "https://localhost:${ss_port}/" >/dev/null 2>&1; then
+        pass "generated cert verifies via curl --cacert for the localhost URL (condition 3)"
+      else
+        fail "generated cert should verify for https://localhost (condition 3 — dual-SAN)"
+      fi
+      if curl --silent --fail --max-time 3 --cacert "$cert_wd/tls/ca.pem" "https://127.0.0.1:${ss_port}/" >/dev/null 2>&1; then
+        pass "generated cert verifies via curl --cacert for the 127.0.0.1 URL (condition 3 — dual SAN)"
+      else
+        fail "generated cert should verify for https://127.0.0.1 (condition 3 — dual-SAN)"
+      fi
+      kill "$ss_pid" 2>/dev/null
+      wait "$ss_pid" 2>/dev/null
+    fi
+  fi
+  rm -rf "$cert_wd"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"
