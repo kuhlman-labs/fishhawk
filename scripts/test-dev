@@ -2612,6 +2612,44 @@ else
     fail "condition-5 fixture setup failed (short leaf unexpectedly not near expiry)"
   fi
 
+  # CERT/KEY MISMATCH (the FALSE branch of _tls_cert_key_match): a half-published
+  # pair from a SIGKILL between the checked mvs — a valid CA-signed server.pem
+  # next to a NON-matching server.key — must REGENERATE, not be reused. This is
+  # the ONLY exercise of that helper's false path: replace _tls_cert_key_match
+  # with `return 0` and the stale leaf is reused here (server.pem unchanged) and
+  # this case goes red, pinning the silent-reuse wedge (5b797641) the control
+  # exists to prevent. server.pem still VERIFIES against the CA, so `openssl
+  # verify` alone would skip over it — only the cert/key correspondence check
+  # catches the mismatch. Reuses condition-5's leftover state (valid CA + fresh
+  # matched leaf); overwrite only server.key with a freshly generated non-match.
+  openssl req -newkey rsa:2048 -nodes -keyout "$cert_wd/tls/server.key" \
+    -out "$cert_wd/mismatch.csr" -subj "/CN=localhost" >/dev/null 2>&1
+  if openssl verify -CAfile "$cert_wd/tls/ca.pem" "$cert_wd/tls/server.pem" >/dev/null 2>&1 \
+    && ! _tls_cert_key_match "$cert_wd/tls/server.pem" "$cert_wd/tls/server.key"; then
+    srv_mm_before="$(shasum "$cert_wd/tls/server.pem" | cut -d' ' -f1)"
+    ca_mm_before="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+    (
+      TLS_DIR="$cert_wd/tls"
+      _tls_ensure_certs "$cert_wd/tls" >/dev/null 2>&1
+    )
+    srv_mm_after="$(shasum "$cert_wd/tls/server.pem" | cut -d' ' -f1)"
+    ca_mm_after="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+    if [[ "$srv_mm_before" != "$srv_mm_after" ]] \
+      && _tls_cert_key_match "$cert_wd/tls/server.pem" "$cert_wd/tls/server.key" \
+      && openssl verify -CAfile "$cert_wd/tls/ca.pem" "$cert_wd/tls/server.pem" >/dev/null 2>&1; then
+      pass "_tls_ensure_certs regenerates a leaf whose KEY no longer matches its cert (cert/key self-repair — false branch of _tls_cert_key_match)"
+    else
+      fail "_tls_ensure_certs should regenerate a leaf whose key does not match its cert (silent-reuse self-repair)"
+    fi
+    if [[ "$ca_mm_before" == "$ca_mm_after" ]]; then
+      pass "_tls_ensure_certs preserves the CA while self-repairing a cert/key mismatch (condition 5 — leaf-only regen)"
+    else
+      fail "_tls_ensure_certs must NOT rotate the CA when self-repairing a cert/key mismatch (condition 5)"
+    fi
+  else
+    fail "cert/key-mismatch fixture setup failed (server.pem should still verify against the CA but not match the new key)"
+  fi
+
   # CA-near-expiry branch (ca_ok=0 via -checkend on the CA itself → FULL
   # regeneration including CA rotation). Condition-5's fixtures only ever expire
   # the leaf; this expires the CA. Seed a 1-day CA + a leaf it signed, then
