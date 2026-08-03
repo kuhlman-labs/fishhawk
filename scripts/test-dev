@@ -2449,6 +2449,44 @@ fi
 wait "$tls_dn_pid" 2>/dev/null
 rm -rf "$tls_dn_wd"
 
+# 16j-2. _tls_down SIGKILL-after-5s escalation branch: a proxy that IGNORES
+# SIGTERM must be waited on and escalated to SIGKILL, not left orphaned. This is
+# the branch _tls_up's readiness-failure cleanup now relies on (it tears down
+# through _tls_down rather than a bare single TERM). ~5s cost, deterministic.
+tls_kill_wd="$(mktemp -d -t test-dev-tlskill.XXXXXX)"
+# The stub installs its TERM-ignore trap, THEN touches the ready marker ($1), so
+# the test can wait for the trap to be armed before _tls_down sends TERM —
+# otherwise TERM can land in the startup window (default disposition) and kill
+# the stub, never exercising the SIGKILL escalation branch.
+print '#!/bin/sh\ntrap "" TERM\n: > "$1"\nsleep 30\n' > "$tls_kill_wd/ignterm"; chmod +x "$tls_kill_wd/ignterm"
+"$tls_kill_wd/ignterm" "$tls_kill_wd/ready" &
+tls_kill_pid=$!
+print "$tls_kill_pid" > "$tls_kill_wd/ignterm.pid"
+tls_kill_i=0
+while [[ ! -f "$tls_kill_wd/ready" ]] && (( tls_kill_i < 50 )); do
+  sleep 0.1
+  (( ++tls_kill_i ))
+done
+tls_kill_out="$(_tls_down "$tls_kill_wd/ignterm.pid" 2>&1)"
+if ! kill -0 "$tls_kill_pid" 2>/dev/null; then
+  pass "_tls_down escalates to SIGKILL a proxy that ignores SIGTERM (no orphan)"
+else
+  fail "_tls_down should SIGKILL a TERM-ignoring proxy pid ${tls_kill_pid}"
+  kill -KILL "$tls_kill_pid" 2>/dev/null
+fi
+if [[ "$tls_kill_out" == *"SIGKILL after 5s"* ]]; then
+  pass "_tls_down reports the SIGKILL-after-5s escalation"
+else
+  fail "_tls_down should report the SIGKILL escalation (got: $tls_kill_out)"
+fi
+if [[ ! -f "$tls_kill_wd/ignterm.pid" ]]; then
+  pass "_tls_down removes the pid file after a SIGKILL escalation"
+else
+  fail "_tls_down should remove the pid file after a SIGKILL escalation"
+fi
+wait "$tls_kill_pid" 2>/dev/null
+rm -rf "$tls_kill_wd"
+
 # 16k. Call-site wiring (body-grep, section-13b style). cmd_up runs the TLS leg
 # under an _tls_enabled guard, AFTER the #1018 nonce verification (so the nonce
 # identity proof stays on plain-http fishhawkd), and BEFORE _signal_mcp_activation.
@@ -2574,6 +2612,37 @@ else
     fail "condition-5 fixture setup failed (short leaf unexpectedly not near expiry)"
   fi
 
+  # CA-near-expiry branch (ca_ok=0 via -checkend on the CA itself → FULL
+  # regeneration including CA rotation). Condition-5's fixtures only ever expire
+  # the leaf; this expires the CA. Seed a 1-day CA + a leaf it signed, then
+  # regenerate and assert the CA rotated to a fresh, still-verifiable chain.
+  rm -rf "$cert_wd/tls"; mkdir -p "$cert_wd/tls"
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$cert_wd/tls/ca.key" \
+    -out "$cert_wd/tls/ca.pem" -days 1 -subj "/CN=Expiring CA" >/dev/null 2>&1
+  openssl req -newkey rsa:2048 -nodes -keyout "$cert_wd/tls/server.key" \
+    -out "$cert_wd/caexp.csr" -subj "/CN=localhost" >/dev/null 2>&1
+  printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\n' > "$cert_wd/caexp.ext"
+  openssl x509 -req -in "$cert_wd/caexp.csr" -CA "$cert_wd/tls/ca.pem" \
+    -CAkey "$cert_wd/tls/ca.key" -CAcreateserial -out "$cert_wd/tls/server.pem" \
+    -days 90 -extfile "$cert_wd/caexp.ext" >/dev/null 2>&1
+  ca_exp_before="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+  if ! openssl x509 -in "$cert_wd/tls/ca.pem" -checkend 604800 >/dev/null 2>&1; then
+    (
+      TLS_DIR="$cert_wd/tls"
+      _tls_ensure_certs "$cert_wd/tls" >/dev/null 2>&1
+    )
+    ca_exp_after="$(shasum "$cert_wd/tls/ca.pem" | cut -d' ' -f1)"
+    if [[ "$ca_exp_before" != "$ca_exp_after" ]] \
+      && openssl x509 -in "$cert_wd/tls/ca.pem" -checkend 604800 >/dev/null 2>&1 \
+      && openssl verify -CAfile "$cert_wd/tls/ca.pem" "$cert_wd/tls/server.pem" >/dev/null 2>&1; then
+      pass "_tls_ensure_certs rotates the CA when the CA itself is near expiry (full regen)"
+    else
+      fail "_tls_ensure_certs should rotate an expiring CA and re-issue a verifiable leaf"
+    fi
+  else
+    fail "CA-near-expiry fixture setup failed (1-day CA unexpectedly not near expiry)"
+  fi
+
   # CONDITION 3: serve the REAL generated pair with `openssl s_server` on an
   # ephemeral port and verify BOTH URL shapes with curl --cacert. Pins the
   # dual-SAN shape + full chain end to end. Skipped if s_server is unavailable.
@@ -2625,6 +2694,66 @@ else
   fi
   rm -rf "$cert_wd"
 fi
+
+# 16m. Hermetic error-branch proofs for _tls_ensure_certs (no real openssl
+# needed — the failure paths are what's under test). Each is a defensive branch
+# whose contract is: fail loud (non-zero), leave the real dir untouched, and
+# clean up any temp dir.
+# (a) openssl-generation failure: reuse checks fail (empty dir), the generation
+# subshell fails → tmp dir removed, real dir has no ca.pem, non-zero return.
+gen_wd="$(mktemp -d -t test-dev-tlsgen.XXXXXX)"
+(
+  TLS_DIR="$gen_wd/tls"
+  openssl() { return 1 }
+  _tls_ensure_certs "$gen_wd/tls" >/dev/null 2>&1
+  print -r -- "$?" > "$gen_wd/rc"
+)
+gen_rc="$(cat "$gen_wd/rc" 2>/dev/null)"
+if [[ -n "$gen_rc" && "$gen_rc" != "0" ]]; then
+  pass "_tls_ensure_certs fails (non-zero) when openssl generation fails"
+else
+  fail "_tls_ensure_certs should fail when openssl generation fails (rc=$gen_rc)"
+fi
+if [[ ! -f "$gen_wd/tls/ca.pem" ]]; then
+  pass "_tls_ensure_certs leaves the real dir untouched on generation failure"
+else
+  fail "_tls_ensure_certs must not publish artifacts on generation failure"
+fi
+if [[ -z "$(print -rl -- "$gen_wd"/tls/.gen.*(N) 2>/dev/null)" ]]; then
+  pass "_tls_ensure_certs removes its temp dir on generation failure"
+else
+  fail "_tls_ensure_certs should remove its temp dir on generation failure"
+fi
+rm -rf "$gen_wd"
+# (b) mktemp failure: no temp dir can be created → named error, non-zero return,
+# real dir has no artifacts.
+mkt_wd="$(mktemp -d -t test-dev-tlsmkt.XXXXXX)"
+(
+  TLS_DIR="$mkt_wd/tls"
+  openssl() { return 1 }   # force reuse checks to fail so generation is attempted
+  mktemp() { return 1 }
+  out="$(_tls_ensure_certs "$mkt_wd/tls" 2>&1)"; rc=$?
+  print -r -- "$rc" > "$mkt_wd/rc"
+  print -r -- "$out" > "$mkt_wd/out"
+)
+mkt_rc="$(cat "$mkt_wd/rc" 2>/dev/null)"
+mkt_out="$(cat "$mkt_wd/out" 2>/dev/null)"
+if [[ -n "$mkt_rc" && "$mkt_rc" != "0" ]]; then
+  pass "_tls_ensure_certs fails (non-zero) when mktemp cannot create a temp dir"
+else
+  fail "_tls_ensure_certs should fail when mktemp fails (rc=$mkt_rc)"
+fi
+if [[ "$mkt_out" == *"temp dir"* ]]; then
+  pass "_tls_ensure_certs names the temp-dir failure"
+else
+  fail "_tls_ensure_certs should name the temp-dir failure (got: $mkt_out)"
+fi
+if [[ ! -f "$mkt_wd/tls/ca.pem" ]]; then
+  pass "_tls_ensure_certs leaves the real dir untouched on mktemp failure"
+else
+  fail "_tls_ensure_certs must not publish artifacts on mktemp failure"
+fi
+rm -rf "$mkt_wd"
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then

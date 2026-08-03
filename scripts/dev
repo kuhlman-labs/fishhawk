@@ -1132,6 +1132,20 @@ _tls_require_openssl() {
   return 1
 }
 
+# Does <cert>'s public key correspond to <key>'s private key? The reuse checks
+# below validate expiry and leaf→CA verification, but neither proves the cert
+# actually matches its OWN private key. An interrupted publish (cert moved, key
+# not, or vice versa) leaves a mismatched cert/key pair that Caddy rejects at
+# load with no obvious cause — and a bare -checkend/-verify would reuse it
+# forever. Compare the SPKI DER of both sides so the mismatch is caught and the
+# pair regenerated. Any-key-type safe (uses `openssl pkey`, not RSA modulus).
+_tls_cert_key_match() {
+  local cert="$1" key="$2" cpub kpub
+  cpub="$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null)" || return 1
+  kpub="$(openssl pkey -in "$key" -pubout 2>/dev/null)" || return 1
+  [[ -n "$cpub" && "$cpub" == "$kpub" ]]
+}
+
 # Idempotent cert generation into <dir> (created mode 0700). Regenerates only
 # what is stale, so the CA path stays STABLE across up/down/reload cycles and an
 # operator's exported NODE_EXTRA_CA_CERTS is not invalidated by a routine reload.
@@ -1164,19 +1178,25 @@ _tls_ensure_certs() {
   mkdir -p "$dir"
   chmod 700 "$dir" 2>/dev/null || true
 
-  # Is the existing CA reusable? Present (cert+key) and not within its own
-  # renewal window. (Condition 5: keep it whenever still valid.)
+  # Is the existing CA reusable? Present (cert+key), the cert matches its key,
+  # and not within its own renewal window. (Condition 5: keep it whenever still
+  # valid.) A CA cert/key mismatch would silently block every future renewal, so
+  # it forces a rotation here rather than being reused.
   local ca_ok=0
   if [[ -f "$ca_cert" && -f "$ca_key" ]] \
-    && openssl x509 -in "$ca_cert" -checkend "$ca_renew" >/dev/null 2>&1; then
+    && openssl x509 -in "$ca_cert" -checkend "$ca_renew" >/dev/null 2>&1 \
+    && _tls_cert_key_match "$ca_cert" "$ca_key"; then
     ca_ok=1
   fi
 
   # Is the existing leaf reusable? Only when the CA is reusable, the leaf is
-  # present, unexpired, AND verifies against the CURRENT CA (condition 4).
+  # present, unexpired, matches its OWN key, AND verifies against the CURRENT CA
+  # (condition 4). The cert/key check catches a mismatched leaf/key pair that
+  # -verify alone would reuse and Caddy would reject at load indefinitely.
   local leaf_ok=0
   if (( ca_ok )) && [[ -f "$leaf_cert" && -f "$leaf_key" ]] \
     && openssl x509 -in "$leaf_cert" -checkend "$leaf_renew" >/dev/null 2>&1 \
+    && _tls_cert_key_match "$leaf_cert" "$leaf_key" \
     && openssl verify -CAfile "$ca_cert" "$leaf_cert" >/dev/null 2>&1; then
     leaf_ok=1
   fi
@@ -1226,13 +1246,23 @@ extendedKeyUsage=serverAuth" > "${tmp}/leaf.ext"
   fi
 
   # Publish. Reused CA bytes are left in place untouched (condition 5); only a
-  # regenerated CA is moved. The verified leaf is always moved.
+  # regenerated CA is moved. The verified leaf is always moved. Each mv is
+  # CHECKED: an unchecked publish that fails partway (e.g. cert moved, key not)
+  # leaves a mismatched pair on disk. A failure fails loud here; the cert/key
+  # correspondence checks above then self-repair any half-published pair a hard
+  # interruption (SIGKILL between moves) still manages to leave behind.
   if (( regen_ca )); then
-    mv -f "${tmp}/ca.pem" "$ca_cert"
-    mv -f "${tmp}/ca.key" "$ca_key"
+    if ! mv -f "${tmp}/ca.pem" "$ca_cert" || ! mv -f "${tmp}/ca.key" "$ca_key"; then
+      rm -rf "$tmp"
+      print -u2 "error: failed to publish the regenerated CA into ${dir}"
+      return 1
+    fi
   fi
-  mv -f "${tmp}/server.pem" "$leaf_cert"
-  mv -f "${tmp}/server.key" "$leaf_key"
+  if ! mv -f "${tmp}/server.pem" "$leaf_cert" || ! mv -f "${tmp}/server.key" "$leaf_key"; then
+    rm -rf "$tmp"
+    print -u2 "error: failed to publish the TLS leaf into ${dir}"
+    return 1
+  fi
   rm -rf "$tmp"
   return 0
 }
@@ -1308,14 +1338,15 @@ _tls_up() {
   print "$proxy_pid" > "$TLS_PID_FILE"
 
   # Readiness gate THROUGH the proxy — a proxy that never came up cannot read as
-  # green. On failure follow the #628 contract: diagnostic + log tail, kill the
-  # proxy, remove the pid file, non-zero.
+  # green. On failure follow the #628 contract: diagnostic + log tail, then tear
+  # the proxy down through _tls_down (NOT a bare single TERM): a proxy that
+  # delays or ignores TERM must be waited on and escalated to SIGKILL, or it
+  # survives as an untracked OAuth/MCP front end after the pid file is gone.
   if ! _await_tls_healthz "$proxy_pid" "$(_tls_healthz_url)" "$(_tls_ca_file)" 15; then
     print -u2 "error: TLS proxy did not answer $(_tls_healthz_url) within 15s"
     print -u2 "last ${TLS_LOG_FILE} lines:"
     tail -n 15 "$TLS_LOG_FILE" >&2
-    kill "$proxy_pid" 2>/dev/null || true
-    rm -f "$TLS_PID_FILE"
+    _tls_down "$TLS_PID_FILE" >&2
     return 1
   fi
 
