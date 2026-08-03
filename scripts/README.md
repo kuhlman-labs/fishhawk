@@ -431,3 +431,76 @@ by `scripts/test-dev`. Operator quickstart + the values-local-vs-prod
 split: `docs/deploy/kubernetes.md`. The true end-to-end path (image
 build → chart install → `/healthz` green) is an operator smoke test
 against a Docker-Desktop cluster, not run in CI.
+
+## Opt-in local TLS front end (E66.28 / [#2453](https://github.com/kuhlman-labs/fishhawk/issues/2453))
+
+An **opt-in, default-off** loopback-only reverse proxy (caddy) that
+terminates TLS on `:8443` and forwards to the **unmodified** plain-http
+`fishhawkd` on `127.0.0.1:8080`, so the OAuth 2.1 AS can be exercised
+over `https` on a workstation with no Go code changes. Enabled by
+`FISHHAWK_DEV_TLS=1` in `.env`. Operator quickstart, the client-trust
+(`NODE_EXTRA_CA_CERTS`) step, the AS config recipe and the
+audience-port foot-gun: `docs/local-tls.md`.
+
+### Helper inventory
+
+All under `scripts/dev`, pure or single-purpose so `scripts/test-dev`
+drives them with stubs (no real caddy, no real handshake):
+
+- `_tls_enabled` — 0 only when `FISHHAWK_DEV_TLS` is exactly `1`.
+- `_tls_port` / `_tls_healthz_url` — TLS port (default 8443,
+  `FISHHAWK_DEV_TLS_PORT`) and the through-the-proxy `https` health URL.
+- `_tls_ca_file` / `_tls_cert_file` / `_tls_key_file` / `_tls_caddyfile`
+  — artifact paths under `.fishhawk/cache/tls/`.
+- `_tls_render_caddyfile <port> <cert> <key> <upstream>` — the config
+  text: a global block (`auto_https off`, `admin off`) and a bare
+  `:<port>` site carrying `bind 127.0.0.1 ::1` (loopback-only listener),
+  `tls <cert> <key>` and `reverse_proxy <upstream>`.
+- `_tls_resolve_proxy_bin` — fail-loud detection
+  (`FISHHAWK_DEV_TLS_PROXY_BIN` > `command -v caddy`); NEVER returns 0
+  having found nothing.
+- `_tls_require_openssl` — the cert-generation prerequisite.
+- `_tls_ensure_certs <dir>` — idempotent openssl generation of a
+  self-signed CA + a dual-SAN (`DNS:localhost` + `IP:127.0.0.1`) leaf.
+  Regenerates only when missing, near expiry, or when the chain fails
+  `openssl verify -CAfile`; generates into a temp dir moved into place
+  only after the chain verifies; never rotates a still-valid CA on a
+  leaf-only renewal (so an exported `NODE_EXTRA_CA_CERTS` stays valid).
+- `_await_tls_healthz <pid> <url> <cafile> <deadline>` — a **sibling**
+  of `_await_healthz` (so the `#628`/`#965` gate contract is untouched):
+  polls `curl --cacert` through the proxy, fails fast on spawn-then-die.
+- `_tls_up` / `_tls_down` — orchestration and teardown.
+
+### Fail-loud detection and the through-the-proxy gate
+
+`_tls_up` checks the proxy binary and openssl **first** (before any
+artifact is created), preflights the TLS port (`#965` posture, naming a
+squatter), generates certs, renders the Caddyfile, spawns the proxy
+(pid → `.fishhawk/tls-proxy.pid`, log → `logs/tls-proxy.log`), then
+gates readiness **through the proxy** — `curl --cacert` against
+`https://localhost:8443/healthz`. A proxy that never came up cannot read
+as green; on gate failure it tails the log, kills the proxy, removes the
+pid file and returns non-zero. It runs in `cmd_up` **after** the `#1018`
+nonce round-trip (which stays on plain-http `fishhawkd`) and **before**
+the MCP banner.
+
+### Teardown
+
+`cmd_down` calls `_tls_down` **unconditionally** (guarded on the pid
+file's existence, never on `FISHHAWK_DEV_TLS`), so disabling the flag
+between `up` and `down`/`reload` never orphans the proxy. Certs are
+deliberately not removed (CA stability).
+
+### Testing
+
+`scripts/test-dev` pins the helpers against stubs: the rendered-config
+done-means assertion (bare `:8443` site, `bind 127.0.0.1 ::1`,
+`tls`/`reverse_proxy`, `auto_https off`, `admin off`), the non-vacuity
+through-the-proxy gate, one case per `_tls_up` failure branch
+(proxy-binary-absent, openssl-absent, port-occupied, spawn-then-die,
+readiness-timeout), `_tls_down` idempotency + live-kill, the call-site
+wiring, and — gated on real `openssl`/`s_server` — the cert path end to
+end (idempotency, chain-mismatch self-repair, leaf-only renewal, and a
+dual-SAN handshake served by `openssl s_server` verified with
+`curl --cacert` on both URL shapes). The Caddyfile itself is unproven
+until caddy is installed; the live operator walk covers it.

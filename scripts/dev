@@ -22,6 +22,18 @@ PREVIEW_PID_FILE="${REPO_ROOT}/.fishhawk/preview.pid"
 PREVIEW_WORKTREE="${REPO_ROOT}/.fishhawk/cache/preview-worktree"
 PREVIEW_LOG_FILE="${LOG_DIR}/fishhawkd-preview.log"
 
+# Opt-in local TLS front end (E66.28 / #2453): a loopback-only reverse proxy
+# (caddy) that terminates TLS on :8443 and forwards to the UNMODIFIED plain-http
+# fishhawkd on 127.0.0.1:8080, so the OAuth 2.1 AS can be exercised over https
+# on a workstation without touching Go code. Off by default; enabled by
+# FISHHAWK_DEV_TLS=1 in .env. The pid file is covered by the .gitignore
+# `.fishhawk/*.pid` glob (and is NOT space-prefixed, so _clean_stray_pid_files
+# leaves it alone); the cert cache sits under the already-gitignored
+# .fishhawk/cache/. See docs/local-tls.md.
+TLS_PID_FILE="${REPO_ROOT}/.fishhawk/tls-proxy.pid"
+TLS_DIR="${REPO_ROOT}/.fishhawk/cache/tls"
+TLS_LOG_FILE="${LOG_DIR}/tls-proxy.log"
+
 cmd="${1:-}"
 
 _die() { print -u2 "error: $*"; exit 1 }
@@ -1035,6 +1047,351 @@ _prune_aged_artifacts() {
   return 0
 }
 
+# --- Opt-in local TLS front end (E66.28 / #2453) ---------------------------
+# Every helper below is pure or single-purpose so scripts/test-dev can drive it
+# with stubs (no real caddy, no real handshake). The orchestration (_tls_up)
+# and teardown (_tls_down) are the only impure legs.
+
+# Enabled ONLY when FISHHAWK_DEV_TLS is exactly "1" (default off, so the stack's
+# behavior is byte-for-byte unchanged for anyone who does not opt in).
+_tls_enabled() {
+  [[ "${FISHHAWK_DEV_TLS:-}" == "1" ]]
+}
+
+# Listen port for the TLS front end (default 8443). Derived defensively like
+# _healthz_port: take the port after the last colon so FISHHAWK_DEV_TLS_PORT may
+# be given as '8443' or ':8443'.
+_tls_port() {
+  local port="${FISHHAWK_DEV_TLS_PORT:-8443}"
+  port="${port##*:}"
+  if [[ -z "$port" ]]; then port=8443; fi
+  print "$port"
+}
+
+# Health endpoint reached THROUGH the proxy (https). The readiness gate curls
+# this, so a proxy that never came up can never read as green.
+_tls_healthz_url() {
+  print "https://localhost:$(_tls_port)/healthz"
+}
+
+# Artifact paths under TLS_DIR. Kept as helpers (not globals) so a test can
+# repoint TLS_DIR and the derivations follow.
+_tls_ca_file()    { print "${TLS_DIR}/ca.pem" }
+_tls_cert_file()  { print "${TLS_DIR}/server.pem" }
+_tls_key_file()   { print "${TLS_DIR}/server.key" }
+_tls_caddyfile()  { print "${TLS_DIR}/Caddyfile" }
+
+# Render the Caddyfile text to stdout. <port> <cert> <key> <upstream>.
+# CONDITION 1 (non-negotiable): the site address is the BARE :<port> for
+# host-agnostic matching (a host-qualified `https://localhost:<port>` would 404
+# a client connecting to the IP-literal https://127.0.0.1:<port>, defeating the
+# dual-SAN leaf), but the listener itself is pinned loopback-only with
+# `bind 127.0.0.1 ::1` — a bare :<port> would otherwise bind 0.0.0.0 and publish
+# the loopback-only fishhawkd (bare-bearer MCP surface + the whole OAuth AS) to
+# every host on the network. `auto_https off` stops caddy attempting ACME;
+# `admin off` stops it binding its default admin endpoint on localhost:2019.
+_tls_render_caddyfile() {
+  local port="$1" cert="$2" key="$3" upstream="$4"
+  print -r -- "{
+	auto_https off
+	admin off
+}
+
+:${port} {
+	bind 127.0.0.1 ::1
+	tls ${cert} ${key}
+	reverse_proxy ${upstream}
+}"
+}
+
+# Fail-loud proxy-binary detection. FISHHAWK_DEV_TLS_PROXY_BIN (an explicit path,
+# also the seam the tests inject a stub through) wins over `command -v caddy`.
+# NEVER returns 0 having found nothing — a silent skip would hand the operator a
+# green `up` with no TLS listener, the exact failure this control prevents.
+_tls_resolve_proxy_bin() {
+  if [[ -n "${FISHHAWK_DEV_TLS_PROXY_BIN:-}" ]]; then
+    print -r -- "$FISHHAWK_DEV_TLS_PROXY_BIN"
+    return 0
+  fi
+  local found
+  if found="$(command -v caddy 2>/dev/null)"; then
+    print -r -- "$found"
+    return 0
+  fi
+  print -u2 "error: no TLS proxy binary found — install caddy ('brew install caddy'), or set FISHHAWK_DEV_TLS_PROXY_BIN to its path"
+  return 1
+}
+
+# openssl is the cert-generation prerequisite. Its absence must be an actionable
+# error, not a confusing openssl usage dump from a later invocation.
+_tls_require_openssl() {
+  if command -v openssl &>/dev/null; then
+    return 0
+  fi
+  print -u2 "error: openssl not found on PATH — required to generate the local dev TLS certificates; install it, then retry"
+  return 1
+}
+
+# Does <cert>'s public key correspond to <key>'s private key? The reuse checks
+# below validate expiry and leaf→CA verification, but neither proves the cert
+# actually matches its OWN private key. An interrupted publish (cert moved, key
+# not, or vice versa) leaves a mismatched cert/key pair that Caddy rejects at
+# load with no obvious cause — and a bare -checkend/-verify would reuse it
+# forever. Compare the SPKI DER of both sides so the mismatch is caught and the
+# pair regenerated. Any-key-type safe (uses `openssl pkey`, not RSA modulus).
+_tls_cert_key_match() {
+  local cert="$1" key="$2" cpub kpub
+  cpub="$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null)" || return 1
+  kpub="$(openssl pkey -in "$key" -pubout 2>/dev/null)" || return 1
+  [[ -n "$cpub" && "$cpub" == "$kpub" ]]
+}
+
+# Idempotent cert generation into <dir> (created mode 0700). Regenerates only
+# what is stale, so the CA path stays STABLE across up/down/reload cycles and an
+# operator's exported NODE_EXTRA_CA_CERTS is not invalidated by a routine reload.
+#
+# CONDITION 4: the reuse decision validates the CHAIN, not just expiry — an
+# interrupted generation (new CA written, leaf signing failed) leaves a
+# mismatched CA/leaf pair that a bare `-checkend` would skip over forever. The
+# leaf is reused ONLY when it is unexpired AND `openssl verify -CAfile <ca>
+# <leaf>` succeeds. Generation happens in a temp dir moved into place only after
+# every artifact is written and the chain verifies.
+#
+# CONDITION 5: when only the LEAF is renewing (leaf near expiry / mismatched but
+# the CA is still valid) the CA is REUSED, never rotated — rotating it would
+# invalidate the operator's exported CA. The CA is regenerated only when it is
+# itself missing or near its own expiry.
+_tls_ensure_certs() {
+  local dir="$1"
+  local ca_cert="${dir}/ca.pem"
+  local ca_key="${dir}/ca.key"
+  local leaf_cert="${dir}/server.pem"
+  local leaf_key="${dir}/server.key"
+
+  # Renewal windows / validity (seconds and days). Modest CA life; the leaf is
+  # short-lived and renewed 7 days before expiry.
+  local leaf_renew=604800   # 7 days
+  local ca_renew=604800     # 7 days
+  local ca_days=825
+  local leaf_days=90
+
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+
+  # Is the existing CA reusable? Present (cert+key), the cert matches its key,
+  # and not within its own renewal window. (Condition 5: keep it whenever still
+  # valid.) A CA cert/key mismatch would silently block every future renewal, so
+  # it forces a rotation here rather than being reused.
+  local ca_ok=0
+  if [[ -f "$ca_cert" && -f "$ca_key" ]] \
+    && openssl x509 -in "$ca_cert" -checkend "$ca_renew" >/dev/null 2>&1 \
+    && _tls_cert_key_match "$ca_cert" "$ca_key"; then
+    ca_ok=1
+  fi
+
+  # Is the existing leaf reusable? Only when the CA is reusable, the leaf is
+  # present, unexpired, matches its OWN key, AND verifies against the CURRENT CA
+  # (condition 4). The cert/key check catches a mismatched leaf/key pair that
+  # -verify alone would reuse and Caddy would reject at load indefinitely.
+  local leaf_ok=0
+  if (( ca_ok )) && [[ -f "$leaf_cert" && -f "$leaf_key" ]] \
+    && openssl x509 -in "$leaf_cert" -checkend "$leaf_renew" >/dev/null 2>&1 \
+    && _tls_cert_key_match "$leaf_cert" "$leaf_key" \
+    && openssl verify -CAfile "$ca_cert" "$leaf_cert" >/dev/null 2>&1; then
+    leaf_ok=1
+  fi
+
+  if (( ca_ok && leaf_ok )); then
+    return 0   # stable path preserved — nothing to regenerate
+  fi
+
+  local regen_ca=1
+  if (( ca_ok )); then regen_ca=0; fi
+
+  local tmp
+  if ! tmp="$(mktemp -d "${dir}/.gen.XXXXXX" 2>/dev/null)"; then
+    print -u2 "error: could not create a temp dir for TLS certificate generation under ${dir}"
+    return 1
+  fi
+  chmod 700 "$tmp" 2>/dev/null || true
+
+  # Generate into tmp. On ANY step failing, the real dir is left untouched.
+  if ! (
+      umask 077
+      set -e
+      if (( regen_ca )); then
+        openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout "${tmp}/ca.key" -out "${tmp}/ca.pem" \
+          -days "$ca_days" -subj "/CN=Fishhawk local dev CA" 2>/dev/null
+      else
+        # Reuse the operator's existing CA to sign the new leaf (condition 5).
+        cp "$ca_cert" "${tmp}/ca.pem"
+        cp "$ca_key" "${tmp}/ca.key"
+      fi
+      openssl req -newkey rsa:2048 -nodes \
+        -keyout "${tmp}/server.key" -out "${tmp}/server.csr" \
+        -subj "/CN=localhost" 2>/dev/null
+      print -r -- "subjectAltName=DNS:localhost,IP:127.0.0.1
+extendedKeyUsage=serverAuth" > "${tmp}/leaf.ext"
+      openssl x509 -req -in "${tmp}/server.csr" \
+        -CA "${tmp}/ca.pem" -CAkey "${tmp}/ca.key" -CAcreateserial \
+        -out "${tmp}/server.pem" -days "$leaf_days" \
+        -extfile "${tmp}/leaf.ext" 2>/dev/null
+      # Prove the pair verifies before publishing it (condition 4).
+      openssl verify -CAfile "${tmp}/ca.pem" "${tmp}/server.pem" >/dev/null 2>&1
+    ); then
+    rm -rf "$tmp"
+    print -u2 "error: TLS certificate generation failed (openssl) — is openssl healthy?"
+    return 1
+  fi
+
+  # Publish. Reused CA bytes are left in place untouched (condition 5); only a
+  # regenerated CA is moved. The verified leaf is always moved. Each mv is
+  # CHECKED: an unchecked publish that fails partway (e.g. cert moved, key not)
+  # leaves a mismatched pair on disk. A failure fails loud here; the cert/key
+  # correspondence checks above then self-repair any half-published pair a hard
+  # interruption (SIGKILL between moves) still manages to leave behind.
+  if (( regen_ca )); then
+    if ! mv -f "${tmp}/ca.pem" "$ca_cert" || ! mv -f "${tmp}/ca.key" "$ca_key"; then
+      rm -rf "$tmp"
+      print -u2 "error: failed to publish the regenerated CA into ${dir}"
+      return 1
+    fi
+  fi
+  if ! mv -f "${tmp}/server.pem" "$leaf_cert" || ! mv -f "${tmp}/server.key" "$leaf_key"; then
+    rm -rf "$tmp"
+    print -u2 "error: failed to publish the TLS leaf into ${dir}"
+    return 1
+  fi
+  rm -rf "$tmp"
+  return 0
+}
+
+# Sibling of _await_healthz (NOT a change to it, so the #628/#965 gate contract
+# and its tests stay untouched). Poll <url> through the proxy with curl --cacert
+# until <pid> answers, for up to <deadline> seconds. Returns 1 early if the
+# proxy has already exited (spawn-then-die fails fast) or the deadline elapses.
+_await_tls_healthz() {
+  local pid="$1"
+  local url="$2"
+  local cafile="$3"
+  local deadline="${4:-15}"
+  local i=0
+  while (( i < deadline )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 1
+    fi
+    if curl --silent --fail --max-time 2 --cacert "$cafile" "$url" &>/dev/null; then
+      return 0
+    fi
+    sleep 1
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
+  done
+  return 1
+}
+
+# Orchestrate the TLS front end. Returns non-zero on every failure so cmd_up can
+# fail loud. Order matters: the two requirement checks run FIRST (before any
+# artifact is created), so a bin/openssl-absent failure never writes a pid file.
+_tls_up() {
+  local bin
+  if ! bin="$(_tls_resolve_proxy_bin)"; then
+    return 1
+  fi
+  if ! _tls_require_openssl; then
+    return 1
+  fi
+
+  # Port preflight (#965 posture): a listener already on the TLS port would let
+  # the squatter answer the gate while our proxy dies on bind. Fail loud naming
+  # each squatting pid. lsof-missing degrades (no preflight), matching cmd_up.
+  local tport
+  tport="$(_tls_port)"
+  if command -v lsof &>/dev/null; then
+    local squatters=""
+    if ! squatters="$(_port_listeners "$tport")"; then squatters=""; fi
+    if [[ -n "$squatters" ]]; then
+      local spid scomm sdesc=""
+      while IFS= read -r spid; do
+        if [[ -z "$spid" ]]; then continue; fi
+        scomm="?"
+        if ! scomm="$(ps -p "$spid" -o comm= 2>/dev/null)"; then scomm="?"; fi
+        sdesc+="pid ${spid} (${scomm:t}) "
+      done <<< "$squatters"
+      print -u2 "error: TLS port ${tport} already has a listener: ${sdesc}— run 'scripts/dev down', or kill the pid, then retry"
+      return 1
+    fi
+  else
+    print "warning: lsof not found — skipping TLS port preflight (degraded)"
+  fi
+
+  if ! _tls_ensure_certs "$TLS_DIR"; then
+    return 1
+  fi
+
+  _tls_render_caddyfile "$tport" "$(_tls_cert_file)" "$(_tls_key_file)" "127.0.0.1:$(_healthz_port)" > "$(_tls_caddyfile)"
+
+  mkdir -p "$LOG_DIR"
+  "$bin" run --config "$(_tls_caddyfile)" --adapter caddyfile >> "$TLS_LOG_FILE" 2>&1 &
+  local proxy_pid=$!
+  disown
+  print "$proxy_pid" > "$TLS_PID_FILE"
+
+  # Readiness gate THROUGH the proxy — a proxy that never came up cannot read as
+  # green. On failure follow the #628 contract: diagnostic + log tail, then tear
+  # the proxy down through _tls_down (NOT a bare single TERM): a proxy that
+  # delays or ignores TERM must be waited on and escalated to SIGKILL, or it
+  # survives as an untracked OAuth/MCP front end after the pid file is gone.
+  if ! _await_tls_healthz "$proxy_pid" "$(_tls_healthz_url)" "$(_tls_ca_file)" 15; then
+    print -u2 "error: TLS proxy did not answer $(_tls_healthz_url) within 15s"
+    print -u2 "last ${TLS_LOG_FILE} lines:"
+    tail -n 15 "$TLS_LOG_FILE" >&2
+    _tls_down "$TLS_PID_FILE" >&2
+    return 1
+  fi
+
+  print "TLS front end up (pid ${proxy_pid}) — $(_tls_healthz_url)"
+  print "  export NODE_EXTRA_CA_CERTS=$(_tls_ca_file)"
+  print "  see docs/local-tls.md for the AS config recipe and the audience-port foot-gun"
+  return 0
+}
+
+# Tear down the TLS front end. Modelled on _preview_kill_tracked: idempotent on
+# an absent pid file (a double teardown and a never-started teardown are both
+# harmless no-ops returning 0). CONDITION 2: cmd_down calls this UNCONDITIONALLY
+# (guarded on the pid file, never on FISHHAWK_DEV_TLS), so an operator who
+# disables the flag between `up` and `down`/`reload` does not orphan the proxy.
+# Certs are deliberately NOT removed (the CA-stability rationale in
+# _tls_ensure_certs).
+_tls_down() {
+  local pid_file="$1"
+  if [[ ! -f "$pid_file" ]]; then
+    print "TLS front end is not running (no pid file)"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$pid_file")"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    print "TLS front end already stopped"
+    rm -f "$pid_file"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  local i=0
+  while kill -0 "$pid" 2>/dev/null && (( i < 5 )); do
+    sleep 1
+    (( ++i ))   # pre-increment; post-increment returns 1 at i==0 → set -e abort (#631)
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    print "TLS front end killed (SIGKILL after 5s)"
+  else
+    print "TLS front end stopped"
+  fi
+  rm -f "$pid_file"
+  return 0
+}
+
 cmd_up() {
   print "up: starting"
   _warn_stale_worktrees || true
@@ -1296,6 +1653,19 @@ cmd_up() {
 
   print "fishhawkd started (pid ${pid}) — logs: ${LOG_FILE}"
 
+  # Opt-in TLS front end (E66.28 / #2453). Runs AFTER the plain-http /healthz
+  # gate and the #1018 nonce round-trip succeed — the nonce identity proof stays
+  # on plain-http fishhawkd exactly as #1018 requires (a proxy in the path would
+  # defeat its listener-identity semantics). The through-the-proxy readiness
+  # gate is an ADDITIONAL requirement for `up` to report success; a non-zero
+  # _tls_up fails loud (fishhawkd keeps running — retry after the named fix).
+  # Placed before _signal_mcp_activation so the MCP banner stays the last line.
+  if _tls_enabled; then
+    if ! _tls_up; then
+      exit 1
+    fi
+  fi
+
   # Last line(s): tell the operator what MCP-activation step (if any) this run
   # requires. The kind selects among the schema-major banner (#1422), the
   # distinct shim-rebuilt banner, the plain mcp reconnect banner, the one-line
@@ -1312,6 +1682,12 @@ cmd_down() {
     source "${REPO_ROOT}/.env"
     set +a
   fi
+
+  # Tear down the TLS front end FIRST, so the proxy stops before its upstream.
+  # CONDITION 2: unconditional (guarded on the pid file inside _tls_down, NEVER
+  # on FISHHAWK_DEV_TLS) — an operator who disabled the flag between `up` and
+  # `down`/`reload` must not orphan the proxy. Idempotent on an absent pid file.
+  _tls_down "$TLS_PID_FILE"
 
   # The missing-pid-file and already-stopped paths no longer return success
   # immediately — every path falls through to the port fallback below, so
@@ -2142,6 +2518,10 @@ _usage() {
   print -u2 "  k8s builds the fishhawkd image, helm-installs the chart with values-local"
   print -u2 "  against the Docker-Desktop cluster, and gates on /healthz; k8s-down kills"
   print -u2 "  the port-forward and helm-uninstalls. See docs/deploy/kubernetes.md."
+  print -u2 ""
+  print -u2 "  Set FISHHAWK_DEV_TLS=1 in .env to add an opt-in loopback-only TLS front end"
+  print -u2 "  (caddy) on :8443 forwarding to the plain-http fishhawkd, so the OAuth 2.1 AS"
+  print -u2 "  can be exercised over https on a workstation. See docs/local-tls.md."
   print -u2 ""
   print -u2 "binary activation after a rebuild:"
   print -u2 "  fishhawkd         rebuilt + restarted by up/reload"
