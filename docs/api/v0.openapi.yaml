@@ -3817,8 +3817,8 @@ paths:
         every leg reaches this handler's refusal ladder rather than a bare
         404. The handler runs the SDK in STATELESS mode, which binds each
         tool call to the bearer on the request that triggered it; the cost
-        is that GET answers 405 and DELETE is a 204 no-op (see those
-        operations).
+        is that POST is the only method served — GET and DELETE both answer
+        405 with `Allow: POST` (see those operations).
 
         Refusal ladder, in order: route disabled (`--mcp-route=off`) →
         `404 route_not_found`; no tool-server factory wired, the listen
@@ -3904,19 +3904,30 @@ paths:
         '503': { $ref: '#/components/responses/MCPRouteMisconfigured' }
     delete:
       operationId: deleteMCP
-      summary: MCP session termination (no-op)
+      summary: MCP session termination (not offered)
       description: |
-        Registered so the leg reaches the refusal ladder. A stateless
-        server holds no session to tear down, so an authenticated request
-        carrying an `Mcp-Session-Id` header succeeds as a no-op.
+        Registered so the leg reaches the refusal ladder, but no session
+        termination is offered: a stateless server holds no session to tear
+        down, and as of go-sdk v1.7.0 it does not read `Mcp-Session-Id` at
+        all. An authenticated request therefore answers `405 Method Not
+        Allowed` with `Allow: POST`, whatever session id it presents.
+
+        Through go-sdk v1.6.1 this leg answered `204` as a no-op. The change
+        is a tightening, not a regression: refusing outright is what proves
+        a fabricated `Mcp-Session-Id` buys the caller nothing.
       security:
         - bearerToken: []
       tags: [mcp]
       responses:
-        '204':
-          description: Accepted; nothing was torn down because no session was held.
-        '400':
-          description: The `Mcp-Session-Id` header was absent.
+        '405':
+          description: |
+            No session termination is offered. Carries `Allow: POST`
+            per RFC 9110 section 15.5.6.
+          headers:
+            Allow:
+              schema:
+                type: string
+                example: POST
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/MCPLoopbackOnly' }
         '404': { $ref: '#/components/responses/MCPRouteDisabled' }
