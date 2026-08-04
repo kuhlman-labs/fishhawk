@@ -1266,14 +1266,26 @@ outage intermittently flipping a serving route to 403.
 
 ### Why stateless (and what it costs)
 
-`newMCPHandler` passes `StreamableHTTPOptions{Stateless: true}`. In go-sdk
-v1.6.1 (`mcp/streamable.go`) the handler's `sessions` map is written only on the
-non-stateless branch — the `if stateless { defer session.Close() } else { …save
-the transport… }` split after `server.Connect` — so the `h.sessions[sessionID]`
-lookup is always nil and `h.getServer(req)` runs on EVERY request. Per-request
-bearer binding therefore becomes literally true: the token authorizing a tool
-call is provably the token on the request that triggered it, and there is no
-session registry to leak, GC, or hijack.
+`newMCPHandler` passes `StreamableHTTPOptions{Stateless: true}`. As of go-sdk
+v1.7.0 a stateless server neither reads nor sets `Mcp-Session-Id` and serves
+every request from a temporary session (`ServerOptions.GetSessionID` is not
+consulted), so there is no `sessions` map to look up and the request factory
+runs on EVERY request. Per-request bearer binding is therefore literally true:
+the token authorizing a tool call is provably the token on the request that
+triggered it, and there is no session registry to leak, GC, or hijack.
+
+Through v1.6.1 the same guarantee held for a weaker reason — the `sessions` map
+was simply never WRITTEN on the stateless branch (the `if stateless { defer
+session.Close() } else { …save the transport… }` split after `server.Connect`),
+so the lookup was always nil. v1.7.0 removed session handling from stateless
+mode outright, per the sessionless direction of SEP-2567. The old behavior is
+restorable via the `MCPGODEBUG` parameter `allowsessionsinstateless=1` — **do
+not set it**: it would reintroduce the very session lookup this route's security
+argument depends on being absent.
+
+Stateless is also what makes the route eligible for protocol `2026-07-28`: the
+streamable transport accepts that version only when `Stateless` is true, so this
+route negotiates up while a stateful one would negotiate down to `2025-11-25`.
 
 The alternative — a stateful handler plus a hand-rolled session registry — was
 rejected on evidence rather than taste. The SDK's own session-hijacking guard
@@ -1286,10 +1298,14 @@ capture plus expiry GC: strictly more code and more failure modes.
 
 The honest cost, since #2390 originally required all three transport legs and
 was AMENDED to withdraw that requirement: a stateless server holds no session to
-stream from or tear down, so `GET` answers the spec-prescribed `405` with
-`Allow: POST` and `DELETE` is a `204` no-op. All three method patterns are still
-registered so no leg falls through to a 404 that would misreport a disabled
-route. In-request notifications — the progress heartbeats the long-running tools
+stream from or tear down, so POST is the only method served — `GET` and `DELETE`
+both answer the spec-prescribed `405` with `Allow: POST`. (`DELETE` was a `204`
+no-op through v1.6.1; with session handling gone there is no session id left to
+no-op ON. `TestMCPRoute_DELETE_405WithAllow` presents a fabricated
+`Mcp-Session-Id` precisely so the `405` proves the header bought the caller
+nothing — a regression to `204` there would mean session handling had returned.)
+All three method patterns are still registered so no leg falls through to a 404
+that would misreport a disabled route. In-request notifications — the progress heartbeats the long-running tools
 emit — are NOT lost: they ride the POST response's own stream, which stateless
 preserves, and `TestMCPRoute_InRequestProgressNotification` drives a real tool
 call with a `progressToken` over `POST /mcp` and asserts one arrives. Slice 3

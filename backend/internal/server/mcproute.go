@@ -306,21 +306,34 @@ func pinLoopbackSelfURL(raw string, lookupIP func(string) ([]net.IP, error)) (st
 // surface, with the tool registry constructed PER REQUEST and bound to
 // that request's bearer token.
 //
-// Stateless is the load-bearing option. In go-sdk v1.6.1
-// (mcp/streamable.go) the handler's sessions map is written only on the
-// non-stateless branch — the `if stateless { defer session.Close() }
-// else { ...save the transport... }` split after server.Connect — so the
-// `h.sessions[sessionID]` lookup is always nil and `h.getServer(req)`
-// runs on EVERY request. The token authorizing a tool call is therefore
-// provably the token on the request that triggered it, and there is no
-// session registry to leak, GC, or hijack.
+// Stateless is the load-bearing option, and as of go-sdk v1.7.0 it is
+// load-bearing by CONSTRUCTION rather than by consequence. A stateless
+// server neither reads nor sets Mcp-Session-Id and serves every request
+// from a temporary session; there is no sessions map to consult, so the
+// factory above runs on EVERY request. The token authorizing a tool call
+// is therefore provably the token on the request that triggered it, and
+// there is no session registry to leak, GC, or hijack.
+//
+// (Through v1.6.1 the same guarantee held for a weaker reason — the
+// handler's sessions map was simply never WRITTEN on the stateless
+// branch, so the lookup was always nil. v1.7.0 removed session handling
+// from stateless mode outright, per the sessionless direction of SEP-2567.
+// The pre-v1.7.0 behavior is restorable via the MCPGODEBUG parameter
+// `allowsessionsinstateless=1`; do NOT set it — it would reintroduce the
+// session lookup this route's security argument depends on being absent.)
+//
+// Stateless is also what makes the route eligible for protocol
+// 2026-07-28: the streamable transport accepts that version only when
+// Stateless is true, so this route negotiates up while a stateful one
+// would negotiate down to 2025-11-25.
 //
 // The honest cost, spelled out because it is a real narrowing: a
-// stateless server holds no session to stream from or tear down, so GET
-// answers the spec-prescribed 405 with `Allow: POST` and DELETE is a 204
-// no-op. In-request notifications (the progress heartbeats Fishhawk's
-// long-running tools emit) still reach the client — they ride the POST
-// response's own stream, which stateless mode preserves.
+// stateless server holds no session to stream from or tear down, so
+// every non-POST method answers the spec-prescribed 405 with
+// `Allow: POST` — GET, and since v1.7.0 DELETE too (it was a 204 no-op
+// through v1.6.1). In-request notifications (the progress heartbeats
+// Fishhawk's long-running tools emit) still reach the client — they ride
+// the POST response's own stream, which stateless mode preserves.
 func newMCPHandler(state mcpRouteState, newServer MCPServerFactory, logger *slog.Logger) http.Handler {
 	factory := func(r *http.Request) *mcp.Server {
 		tok, ok := tokenFromHeader(r)

@@ -809,9 +809,19 @@ func TestMCPRoute_GET_405WithAllow(t *testing.T) {
 	}
 }
 
-// TestMCPRoute_DELETE_204 pins the other consequence: a stateless server
-// holds no session to tear down, so DELETE is a no-op success.
-func TestMCPRoute_DELETE_204(t *testing.T) {
+// TestMCPRoute_DELETE_405WithAllow pins the other consequence, and the
+// stronger form it took in go-sdk v1.7.0: a stateless server holds no
+// session to tear down, and since v1.7.0 it does not read Mcp-Session-Id
+// at all, so DELETE is refused outright rather than accepted as the 204
+// no-op it answered through v1.6.1.
+//
+// The fabricated Mcp-Session-Id is the point of the test, not incidental
+// setup: a 405 here proves the header bought the caller nothing. If this
+// ever regresses to 204, session handling has been reintroduced into
+// stateless mode (see the MCPGODEBUG note on newMCPHandler) and the
+// per-request token binding this route's security argument rests on no
+// longer holds.
+func TestMCPRoute_DELETE_405WithAllow(t *testing.T) {
 	s, token := mcpTestServer(t, Config{Addr: "127.0.0.1:8080"})
 	req := httptest.NewRequest(http.MethodDelete, "/mcp", nil)
 	req.Header.Set("Mcp-Session-Id", "fabricated-session")
@@ -819,8 +829,11 @@ func TestMCPRoute_DELETE_204(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204:\n%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405:\n%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Allow"); got != "POST" {
+		t.Errorf("Allow = %q, want POST", got)
 	}
 }
 
