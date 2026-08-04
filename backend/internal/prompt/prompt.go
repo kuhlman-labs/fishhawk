@@ -1325,6 +1325,11 @@ func buildImplement(t Trigger) string {
 	// via FixupConcerns) and does not call this helper, so a fix-up pass is never
 	// re-demanded a full fresh-branch defensive-branch enumeration.
 	writeFailureModeTestChecklist(&b)
+
+	// Counterfactual attainability (#2444): execute-and-record complement of the
+	// plan-prompt rule. Rendered on the full implement path here and — unlike
+	// writeFailureModeTestChecklist — ALSO on the fix-up path (see buildImplementFixup).
+	writeCounterfactualDiscipline(&b)
 	return b.String()
 }
 
@@ -1385,6 +1390,34 @@ func writeApprovalConditionsReinforcement(b *strings.Builder, t Trigger) {
 func writeFailureModeTestChecklist(b *strings.Builder) {
 	b.WriteString("\n### Per-failure-mode test checklist — confirm in your PR Notes\n\n")
 	b.WriteString("Before you finish: enumerate the fail-closed / defensive / error branches you added or changed (each guard that returns early, rejects, degrades, or falls back), and confirm EACH one has a test asserting its observable behavior — not just the happy path plus a subset. If the plan's verification or an approval condition names multiple failure modes, every named mode needs its own assertion (#1199, sibling of the plan-stage Per-failure-mode test rule). In your PR `## Notes` section, add a short checklist mapping each defensive branch to the test that asserts it (or state explicitly why a branch is genuinely untestable). This is the recurring reviewer concern (#1193, #1197): branches enumerated in prose but only partly tested.\n")
+}
+
+// writeCounterfactualDiscipline renders the tail "### Counterfactual
+// attainability" block (#2444): the execute-and-record complement of the
+// plan-prompt Counterfactual attainability rule. Where that rule makes the
+// planner NAME a counterfactual test per control, this makes the implementer
+// DELETE each control, RUN the guarding test, observe RED, restore
+// byte-identically, and record the observed RED output in PR `## Notes`.
+//
+// UNLIKE writeFailureModeTestChecklist — which is deliberately fix-up-exempt —
+// this renders on BOTH the full implement path AND the fix-up path: a fix-up
+// reason is itself a place where a control gets designed, and it sits
+// downstream of every plan-gate condition, so a control introduced by a fix-up
+// (e.g. #2453's certificate/key correspondence check, which landed correct and
+// completely unpinned) would otherwise escape the plan-stage rule entirely
+// (#2453/#2444). It is not nil-gated on anything.
+func writeCounterfactualDiscipline(b *strings.Builder) {
+	b.WriteString("\n### Counterfactual attainability — confirm in your PR Notes\n\n")
+	b.WriteString("For every control you add or change in this pass — any guard, validation, check, or refusal, in ANY language and whether or not it looks " +
+		"security-relevant: DELETE the control, RUN the test that guards it, observe it go RED, then restore the file byte-identically. Do not reason that it " +
+		"would fail — run it. Record the observed RED output for each cycle in your PR `## Notes`. Three traps that leave a test green with the control deleted: " +
+		"(a) asserting error IDENTITY when the control's effect is COMMITTED STATE — a control that fires and is then rolled back returns a byte-identical error, " +
+		"so read the state after the call returns instead; (b) pairing a malformed input with a DIFFERENT clean value, where a byte-exact comparison refuses it " +
+		"whether or not the guard exists — pair the malformed input with ITSELF; (c) pointing a hop/target URL at an unreachable address, where the connection " +
+		"error maps to the same code the control returns — point it at a reachable in-test server. Seed bad state BY CONSTRUCTION rather than by calling the " +
+		"control inside the test's own setup guard, so the RED lands on the behavioral assertion and not on a fixture-setup failure. If a test genuinely cannot " +
+		"serve as a counterfactual vehicle, prove that by running it under the deletion and say so — do not assert it. A control you invent in THIS pass gets the " +
+		"same treatment as one the plan named (#2444).\n")
 }
 
 // maxFixupConcernBytes bounds the rendered size of each fix-up concern block
@@ -1837,6 +1870,13 @@ func buildImplementFixup(t Trigger) string {
 	if t.ImplementRunID != "" && t.ImplementStageID != "" {
 		writeFixupCommitMessage(&b, t)
 	}
+
+	// Counterfactual attainability (#2444/#2453): DELIBERATELY rendered on the
+	// fix-up path — unlike writeFailureModeTestChecklist, which is fix-up-exempt.
+	// A fix-up reason designs controls too, downstream of every plan-gate
+	// condition, so a control a fix-up introduces (e.g. #2453's cert/key
+	// correspondence check) needs the same execute-and-record discipline.
+	writeCounterfactualDiscipline(&b)
 
 	writeGitOpsProhibition(&b)
 	return b.String()
@@ -2348,6 +2388,18 @@ func buildPlan(t Trigger) string {
 		"not just the happy path plus a subset of the modes. Enumerating the modes in prose while testing only some of them is exactly the gap reviewers keep catching " +
 		"post-hoc and deferring to a per-issue follow-up (#1182/PR#1192, #1191/PR#1196, #1184/PR#1198). Sibling rules: the Done-means test rule above (#1169) and the " +
 		"binding_assertions discipline (#1185) — this rule extends them from 'the change has a behavioral test' to 'EACH enumerated failure mode has one'.\n")
+	b.WriteString("\n")
+	b.WriteString("Counterfactual attainability rule: for EVERY control this change adds or tightens — any guard, validation, check, or refusal, in ANY language and " +
+		"whether or not the change looks security-relevant — verification.test_strategy MUST name a test that goes RED when the control is deleted. " +
+		"Four rules for the tests you name: (1) name the test whose failure the control's deletion causes, and require implement to DELETE the control, " +
+		"RUN that test, observe RED, and restore — never to reason that it would fail; seed any bad state the test needs BY CONSTRUCTION (a freshly generated " +
+		"unrelated key is definitionally non-matching) rather than by calling the control inside the test's own setup guard, so the RED lands on the behavioral " +
+		"assertion instead of 'fixture setup failed'. (2) If a named test cannot serve as a counterfactual vehicle, that must be proven EMPIRICALLY by running it " +
+		"under the deletion, not asserted (#2433 did this correctly, re-running a concurrency test under two separate deletions and reporting GREEN both times). " +
+		"(3) Error IDENTITY is insufficient when the control's effect is COMMITTED STATE — a control that fires and is then rolled back returns a byte-identical " +
+		"error, so for any such control name a test that READS that state after the call returns. (4) Pair a malformed input with ITSELF where a byte-exact " +
+		"comparison would otherwise reject it for an unrelated reason, and point hop/target URLs at reachable in-test servers — an unreachable address makes the " +
+		"deletion fail for the same reason the control would, so the test passes either way.\n")
 	b.WriteString("\n")
 	b.WriteString("Counter-examples from production bugs:\n")
 	b.WriteString("- SIGKILL and orphan file descriptors: SIGKILL kills only the direct child process; grandchildren that inherited stdout " +

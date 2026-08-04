@@ -2316,6 +2316,112 @@ func TestBuild_Implement_FailureModeTestChecklist_Absent_OnFixup(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_CounterfactualAttainabilityRule pins the #2444 plan-prompt
+// rule: verification.test_strategy must name, per control, a test that goes RED
+// when the control is deleted. Asserts phrases unique to the rule text (not a
+// vacuous presence check), itself honoring the counterfactual discipline it
+// codifies — deleting the WriteString reddens this test with a missing
+// substring. The bare issue numbers (#2436/#2453) were struck from the rule per
+// approval condition 1(b), so they are deliberately NOT asserted here (condition
+// 3); the phrase-level wants below carry the test.
+func TestBuild_Plan_CounterfactualAttainabilityRule(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a refactor",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Counterfactual attainability rule",
+		"goes RED when the control is deleted",
+		"proven EMPIRICALLY by running it under the deletion",
+		"Pair a malformed input with ITSELF",
+		"reachable in-test servers",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing counterfactual attainability rule string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Implement_CounterfactualDiscipline_Rendered pins the #2444
+// execute-and-record block on the FULL implement path. Deleting the
+// writeCounterfactualDiscipline call in buildImplement (or its WriteString)
+// reddens this with a missing substring.
+func TestBuild_Implement_CounterfactualDiscipline_Rendered(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:         "o/r",
+		IssueNumber:  42,
+		ApprovedPlan: fixturePlan(),
+		// ApprovalConditions deliberately nil: the block is unconditional.
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"### Counterfactual attainability — confirm in your PR Notes",
+		"Record the observed RED output",
+		"restore the file byte-identically",
+		"pair the malformed input with ITSELF",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("implement prompt missing counterfactual discipline string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Implement_CounterfactualDiscipline_RenderedOnFixup is the #2453 pin:
+// the block renders on the FIX-UP path too, deliberately unlike the fix-up-exempt
+// #1199 checklist. Reuses the fix-up trigger construction of
+// TestBuild_Implement_FailureModeTestChecklist_Absent_OnFixup so the two exercise
+// the same buildImplementFixup fixture. Because this test and _Rendered drive two
+// DIFFERENT builders through two DIFFERENT call sites, deleting either single call
+// site reddens exactly one of them.
+func TestBuild_Implement_CounterfactualDiscipline_RenderedOnFixup(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   42,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	const heading = "### Counterfactual attainability — confirm in your PR Notes"
+	if !strings.Contains(got, heading) {
+		t.Errorf("fix-up prompt missing counterfactual discipline heading %q\n---\n%s", heading, got)
+	}
+	if !strings.Contains(got, "A control you invent in THIS pass") {
+		t.Errorf("fix-up prompt must extend the discipline to controls invented in the fix-up pass\n---\n%s", got)
+	}
+}
+
+// TestBuild_Implement_CounterfactualDiscipline_DistinctFromFailureModeHeading is
+// the self-paired case: a PRESENCE and an ABSENCE over the SAME fix-up prompt
+// string. It pins that the new fix-up block did not smuggle the deliberately
+// fix-up-exempt #1199 "### Per-failure-mode test checklist" onto that path.
+func TestBuild_Implement_CounterfactualDiscipline_DistinctFromFailureModeHeading(t *testing.T) {
+	got, err := Build("implement", Trigger{
+		Repo:          "o/r",
+		IssueNumber:   42,
+		ApprovedPlan:  fixturePlan(),
+		FixupConcerns: []FixupConcern{{Text: "[medium/coverage] no test for the bound-exhausted path"}},
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "### Counterfactual attainability — confirm in your PR Notes") {
+		t.Errorf("fix-up prompt must carry the counterfactual heading\n---\n%s", got)
+	}
+	if strings.Contains(got, "### Per-failure-mode test checklist") {
+		t.Errorf("fix-up prompt must NOT carry the fix-up-exempt per-failure-mode checklist heading\n---\n%s", got)
+	}
+}
+
 func TestBuild_Implement_FixupConcerns_Rendered(t *testing.T) {
 	concerns := []FixupConcern{
 		{Text: "[high/security] missing authz check on the fixup endpoint"},
