@@ -941,17 +941,19 @@ func New(cfg Config) *Server {
 			s.issueNotifier = issuecomment.NewRouter(ghChannel)
 		}
 	}
+	// Resolve the OAuth AS verdict FIRST (ADR-076 slice 3, #2436): the /mcp
+	// route's conditional loopback lift (#2391) reads it, so it must be resolved
+	// before the route. A defective issuer/resource/store/fetcher is carried as
+	// the misconfigured verdict and rendered per request; New() never panics on
+	// operator config.
+	s.oauthAS = resolveOAuthASState(cfg, cfg.mcpLookupIP)
 	// Resolve the /mcp route verdict before the mux is built (ADR-076 /
 	// #2390). Doing it here rather than per request keeps the DNS lookup a
 	// hostname listen address needs off the request path entirely.
-	s.mcpRoute = resolveMCPRouteState(cfg, cfg.mcpLookupIP)
+	s.mcpRoute = resolveMCPRouteState(cfg, s.oauthAS, cfg.mcpLookupIP)
 	if s.mcpRoute.mode == mcpRouteEnabled {
 		s.mcpHandler = newMCPHandler(s.mcpRoute, cfg.MCPServerFactory, cfg.Logger)
 	}
-	// Resolve the OAuth AS verdict once (ADR-076 slice 3, #2436). A defective
-	// issuer/resource/store/fetcher is carried as the misconfigured verdict and
-	// rendered per request; New() never panics on operator config.
-	s.oauthAS = resolveOAuthASState(cfg, cfg.mcpLookupIP)
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           s.buildHandler(),

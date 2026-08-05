@@ -125,6 +125,11 @@ func TestOAuthASLoopbackGateRouteRegistered(t *testing.T) {
 	})
 	patterns := []struct{ method, path string }{
 		{http.MethodGet, "/.well-known/oauth-authorization-server"},
+		// The RFC 9728 PRM routes (#2391) inherit the same loopback-gate 403 arm:
+		// leaving one branch of an existing convention unpinned on brand-new
+		// routes is how conventions rot (CONDITION 4).
+		{http.MethodGet, "/.well-known/oauth-protected-resource"},
+		{http.MethodGet, "/.well-known/oauth-protected-resource/mcp"},
 		{http.MethodGet, "/v0/oauth/authorize"},
 		{http.MethodPost, "/v0/oauth/authorize"},
 		{http.MethodPost, "/v0/oauth/token"},
@@ -471,6 +476,19 @@ func TestOAuthConsentRouteRegistered(t *testing.T) {
 
 func TestOAuthTokenRouteRegistered(t *testing.T) {
 	assertOAuthRouteRegistered(t, http.MethodPost, "/v0/oauth/token")
+}
+
+// RFC 9728 Protected Resource Metadata route registration (#2391, CONDITION 3).
+// An UNCONFIGURED server answers the handler's own 503 oauth_as_unconfigured
+// body — distinguishable from the mux's default 404 — so a 503 proves the route
+// is wired. The suffixed route gates on oauthASEnabled BEFORE the suffix check,
+// so it too answers 503 when the AS is disabled.
+func TestOAuthPRMRouteRegistered(t *testing.T) {
+	assertOAuthRouteRegistered(t, http.MethodGet, "/.well-known/oauth-protected-resource")
+}
+
+func TestOAuthPRMSuffixedRouteRegistered(t *testing.T) {
+	assertOAuthRouteRegistered(t, http.MethodGet, "/.well-known/oauth-protected-resource/mcp")
 }
 
 func assertOAuthRouteRegistered(t *testing.T, method, path string) {

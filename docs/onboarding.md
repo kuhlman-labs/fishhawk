@@ -154,3 +154,44 @@ mint a token, or push the execution-path workflow — those cross an external
 boundary and are the operator's to complete. The closing `doctor` run and the
 printed checklist name each one. A `doctor` failure does not fail `init`: the
 scaffold succeeded, so `init` reports the doctor issues and still exits 0.
+
+## OAuth-based MCP onboarding (ADR-076 slice 3, #2391)
+
+Connecting a spec-compliant MCP client to fishhawkd's `/mcp` surface is the
+PRIMARY onboarding path (#2262): the client discovers where to authenticate
+rather than being hand-fed a token. It walks RFC 9728 / RFC 8414 discovery:
+
+1. **Unauthenticated `POST /mcp`** → `401` with a `WWW-Authenticate: Bearer`
+   challenge carrying `resource_metadata="<PRM URL>"` (RFC 6750 §3 / RFC 9728
+   §5.1).
+2. **`GET` the PRM URL** (`/.well-known/oauth-protected-resource/<resource
+   path>`) → the protected-resource metadata, whose `authorization_servers[0]`
+   names the authorization server.
+3. **`GET /.well-known/oauth-authorization-server`** → the RFC 8414 AS metadata
+   (`authorization_endpoint`, `token_endpoint`, `code_challenge_methods_
+   supported: ["S256"]`, …).
+4. **Authorize** (`GET /v0/oauth/authorize`, authorization-code + PKCE) →
+   consent → an authorization code.
+5. **Token** (`POST /v0/oauth/token`) → an audience-bound `fho_` access token.
+6. **Authenticated `POST /mcp`** with `Authorization: Bearer fho_…` → the tool
+   surface.
+
+This loop is served only when the OAuth AS is ENABLED (`--oauth-issuer` set,
+plus a wired store and CIMD fetcher). A DISABLED or MISCONFIGURED AS answers the
+discovery routes `503 oauth_as_unconfigured`, and the `/mcp` `401` degrades to
+the realm-only challenge — the client then falls back to an operator-issued
+`fhk_` bearer.
+
+### Bind address vs. the loopback lift
+
+`FISHHAWKD_ADDR` MUST be a loopback address (e.g. `127.0.0.1:8080`) while the
+lift condition is unmet — i.e. whenever no `--oauth-issuer` is configured. With
+no OAuth AS, `/mcp` is bearer-only and loopback-only per ADR-033, so a
+non-loopback bind answers `403 mcp_route_loopback_only`.
+
+The bind MAY be non-loopback ONLY when the OAuth AS is enabled: enabling it lifts
+the loopback refusal into authenticated-only mode, where `/mcp` accepts ONLY an
+audience-validated `fho_` identity and a bare `fhk_`/`fhm_` token is refused
+off-host. Network exposure and auth tightening land together — you do not get one
+without the other. `--oauth-require-loopback` (default off) forces BOTH the AS and
+`/mcp` back to loopback-only even with an issuer configured.

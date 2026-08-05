@@ -980,3 +980,49 @@ func TestNew_WiresCIMDLimiterOnBuiltHandler(t *testing.T) {
 		t.Fatalf("over-burst status through Handler() = %d, want 429 (limiter not live on the built handler)", code)
 	}
 }
+
+// TestServer_LiftedListenAddrBindsConfigAddr pins the lifted-posture bind
+// contract (#2391) by driving the REAL bind + verify sequence: a non-loopback
+// UNSPECIFIED bind with the OAuth AS enabled LIFTS the /mcp loopback refusal and
+// binds cfg.Addr VERBATIM (listenAddr() returns it unchanged, unlike the unlifted
+// route which pins the resolved loopback literal), and Start SUCCEEDS because the
+// real net.Listen binds and verifyMCPListenerLoopback passes on a lift carrying a
+// resource. An earlier form asserted only listenAddr()/verifyMCPListenerLoopback
+// directly and so passed regardless of whether Start's real bind/verify sequence
+// worked — the vacuity this now closes. TestMCPRoute_StartBindsPinnedLoopbackIP
+// covers the unlifted pinned-literal direction; the specific-host pin (where the
+// lifted bind IS pinned) is TestResolveMCPRouteState_LiftedBindPinnedToSelfURLHost.
+func TestServer_LiftedListenAddrBindsConfigAddr(t *testing.T) {
+	// An unspecified non-loopback bind with the OAuth AS enabled is the lifted
+	// posture; :0 takes an ephemeral port so the real bind is deterministic.
+	s := New(Config{
+		Addr:             "0.0.0.0:0",
+		MCPServerFactory: testMCPServerFactory,
+		OAuthASIssuer:    testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if s.mcpRoute.mode != mcpRouteEnabled || !s.mcpRoute.authenticatedOnly {
+		t.Fatalf("route not lifted: mode=%v authOnly=%v (reason %q)", s.mcpRoute.mode, s.mcpRoute.authenticatedOnly, s.mcpRoute.reason)
+	}
+	// An unspecified bind pins nothing (net.Listen binds every interface, which
+	// includes the loopback the selfURL dials), so listenAddr() is cfg.Addr
+	// verbatim.
+	if s.mcpRoute.listenAddr != "" {
+		t.Errorf("lifted unspecified listenAddr = %q, want empty so listenAddr() returns cfg.Addr verbatim", s.mcpRoute.listenAddr)
+	}
+	if got := s.listenAddr(); got != "0.0.0.0:0" {
+		t.Errorf("listenAddr() = %q, want the configured 0.0.0.0:0 verbatim in the lifted posture", got)
+	}
+
+	// Drive the REAL bind + verify: Start calls net.Listen then
+	// verifyMCPListenerLoopback before Serve, so a bind failure or a verify
+	// refusal surfaces here as a non-nil Start error. A resourced lift must bind
+	// off-host cleanly.
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Start = %v; the lifted off-host bind failed its real bind/verify sequence", err)
+	}
+}

@@ -753,3 +753,162 @@ func TestStatusRecorder_UnwrapEnablesFlush(t *testing.T) {
 			"so every /mcp SSE response would buffer until the handler returned", flushErr)
 	}
 }
+
+// --- AS-issued (fho_) access-token bearer branch (ADR-076 slice 3, #2391) ---
+
+// newOAuthEnabledServerForBearer builds an AS-enabled server (issuer
+// https://as.example, resource https://as.example/mcp) over store, so the fho_
+// branch in bearerAuth is live.
+func newOAuthEnabledServerForBearer(store *fakeOAuthStore) *Server {
+	return New(Config{
+		Addr:             "127.0.0.1:0",
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       store,
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+}
+
+// driveBearerToken runs one request bearing tok through bearerAuth and returns
+// the resolved Identity, the response status and body.
+func driveBearerToken(s *Server, tokens apitokenAuthenticator, mcpTokens mcptokenAuthenticator, tok string) (Identity, int, string) {
+	var captured Identity
+	h := s.bearerAuth(tokens, mcpTokens, nil)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		captured = IdentityFrom(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	if tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return captured, rec.Code, rec.Body.String()
+}
+
+const testFhoToken = "fho_bearertokenbearertokenbearertoken01"
+
+// TestBearerAuth_OAuthTokenMatchingAudienceAccepted is the fho_ happy path: a
+// token whose audience matches THIS deployment's resource resolves to a bearer
+// identity carrying the OAuthAudience marker.
+func TestBearerAuth_OAuthTokenMatchingAudienceAccepted(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedAccessToken(testFhoToken, "github:octocat", testResource, "", []string{"read:runs"})
+	s := newOAuthEnabledServerForBearer(store)
+
+	id, status, body := driveBearerToken(s, nil, nil, testFhoToken)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fall-through handler):\n%s", status, body)
+	}
+	if id.IsAnonymous() {
+		t.Fatalf("identity = %+v, want a resolved fho_ identity", id)
+	}
+	if id.Subject != "github:octocat" || id.OAuthAudience != testResource {
+		t.Errorf("identity = %+v, want subject github:octocat + OAuthAudience %q", id, testResource)
+	}
+	if id.TokenID == "" {
+		t.Error("TokenID is empty; a resolved bearer identity must carry one")
+	}
+}
+
+// TestBearerAuth_OAuthTokenForeignAudienceIsAnonymous is the CONDITION /
+// counterfactual pin for the audience guard. The token is minted BY
+// CONSTRUCTION with audience https://other.example/mcp while the server's
+// resource is https://as.example/mcp — two real, same-shaped, same-scheme
+// resource identifiers that are definitionally non-matching without the control
+// being consulted in setup. Deleting the ResourceMatches guard reddens this.
+func TestBearerAuth_OAuthTokenForeignAudienceIsAnonymous(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedAccessToken(testFhoToken, "github:octocat", "https://other.example/mcp", "", []string{"read:runs"})
+	s := newOAuthEnabledServerForBearer(store)
+
+	id, status, body := driveBearerToken(s, nil, nil, testFhoToken)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", status, body)
+	}
+	if !id.IsAnonymous() {
+		t.Errorf("identity = %+v, want anonymous (foreign audience must not authenticate)", id)
+	}
+}
+
+// TestBearerAuth_OAuthTokenRefusedWhenASDisabled pins the AS-enabled
+// precondition with a NEVER-DIALED seam: with the AS disabled the fho_ branch
+// must not even be entered, so the store's AuthenticateAccessToken is never
+// called. Deleting the precondition makes the branch dial the store (calls > 0),
+// which is what this asserts against — a plain anonymous assertion would stay
+// green because the empty resource is a redundant backstop.
+func TestBearerAuth_OAuthTokenRefusedWhenASDisabled(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedAccessToken(testFhoToken, "github:octocat", testResource, "", []string{"read:runs"})
+	s := New(Config{Addr: "127.0.0.1:0", OAuthStore: store}) // store wired, but NO issuer → AS disabled
+
+	id, status, _ := driveBearerToken(s, nil, nil, testFhoToken)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if !id.IsAnonymous() {
+		t.Errorf("identity = %+v, want anonymous (fho_ never accepted without an AS)", id)
+	}
+	if store.authAccessCalls != 0 {
+		t.Errorf("AuthenticateAccessToken called %d times, want 0 — the fho_ branch dialled the store with the AS disabled", store.authAccessCalls)
+	}
+}
+
+// TestBearerAuth_UnknownOAuthTokenIsAnonymous: an unseeded fho_ token
+// (ErrNotFound) falls through to anonymous.
+func TestBearerAuth_UnknownOAuthTokenIsAnonymous(t *testing.T) {
+	s := newOAuthEnabledServerForBearer(newFakeOAuthStore())
+	id, status, _ := driveBearerToken(s, nil, nil, testFhoToken)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if !id.IsAnonymous() {
+		t.Errorf("identity = %+v, want anonymous for an unknown fho_ token", id)
+	}
+}
+
+// TestBearerAuth_OAuthTokenDBUnavailableIs503 mirrors the #764 posture of the
+// sibling branches: a DB-unavailable classified error is a 503, never a
+// fall-through to anonymous.
+func TestBearerAuth_OAuthTokenDBUnavailableIs503(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.authAccessErr = fmt.Errorf("oauthstore: lookup access token: %w", &pgconn.ConnectError{})
+	s := newOAuthEnabledServerForBearer(store)
+
+	id, status, body := driveBearerToken(s, nil, nil, testFhoToken)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", status, body)
+	}
+	if !strings.Contains(body, "service_unavailable") {
+		t.Errorf("body = %s, want service_unavailable", body)
+	}
+	if !id.IsAnonymous() {
+		t.Errorf("identity = %+v, want the handler not to have run (503 short-circuit)", id)
+	}
+}
+
+// TestBearerAuth_PrefixRoutingPreservedWithOAuthEnabled proves the fho_ case
+// does not cannibalize the apitoken default: with the AS enabled, an fhk_ token
+// still resolves through the apitoken authenticator (OAuthAudience empty), and
+// the OAuth store is never dialed for it.
+func TestBearerAuth_PrefixRoutingPreservedWithOAuthEnabled(t *testing.T) {
+	store := newFakeOAuthStore()
+	s := newOAuthEnabledServerForBearer(store)
+	apiRepo := newFakeTokenRepo()
+	tok, err := apiRepo.Issue(context.Background(), "svc:api", []string{"read:runs"})
+	if err != nil {
+		t.Fatalf("issue apitoken: %v", err)
+	}
+
+	id, status, body := driveBearerToken(s, apiRepo, nil, tok.PlainText)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", status, body)
+	}
+	if id.Subject != "svc:api" {
+		t.Errorf("subject = %q, want svc:api (fhk_ still routed to apitoken)", id.Subject)
+	}
+	if id.OAuthAudience != "" {
+		t.Errorf("OAuthAudience = %q, want empty for an fhk_ identity", id.OAuthAudience)
+	}
+	if store.authAccessCalls != 0 {
+		t.Errorf("OAuth store dialled %d times for an fhk_ token, want 0", store.authAccessCalls)
+	}
+}

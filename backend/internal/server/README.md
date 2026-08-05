@@ -1264,6 +1264,104 @@ on the `Server`. It is a pure function of that config, and resolving it per
 request would put a blocking DNS lookup on every `/mcp` call with a resolver
 outage intermittently flipping a serving route to 403.
 
+### Protected-resource half: PRM, audience validation, discovery challenge, conditional lift (`oauthprm.go`, ADR-076 slice 3 / E66.3 #2391)
+
+This half makes the MCP resource discoverable and OAuth-authenticatable, and it
+depends on the OAuth AS verdict (`oauthas.go`), so `server.New` resolves
+`s.oauthAS` BEFORE `s.mcpRoute`.
+
+**PRM document + two URLs (RFC 9728).** `GET /.well-known/oauth-protected-resource`
+(bare) and `GET /.well-known/oauth-protected-resource/{resource_path...}`
+(RFC 9728 §3.1 path-suffixed) both serve an `oauthPRMetadata` document —
+`resource`, `authorization_servers` (this AS's own issuer), `scopes_supported`
+(identical to the AS metadata's), `bearer_methods_supported: ["header"]`,
+`resource_name` — but ONLY when the AS is ENABLED (else `503
+oauth_as_unconfigured`, via the same `oauthASEnabled` gate the AS metadata route
+uses; never a partial document). `protectedResourceMetadataURL` derives the URL
+by INSERTING the well-known path between the resource's origin and its own path.
+The two derived values are encoded DIFFERENTLY on purpose: `prmURL` (advertised)
+uses `EscapedPath` so a segment needing encoding stays valid, while `prmSuffix`
+(compared against `r.PathValue("resource_path")`) uses the DECODED `url.URL.Path`
+because Go's `ServeMux` returns `PathValue` percent-decoded — comparing a decoded
+value against an escaped suffix could never match for a path needing encoding, so
+the handler would 404 the exact URL its own document advertises. The suffixed
+handler answers `404 route_not_found` on a mismatch, so the document is never
+served under a URL claiming a different resource. A resource whose scheme cannot
+host an http(s) PRM document makes derivation fail, which `resolveOAuthASState`
+carries as MISCONFIGURED — an AS that cannot name its own PRM document does not
+advertise itself.
+
+**Audience validation lives in `bearerAuth`, not `handleMCP`.** A third bearer
+prefix branch resolves `fho_` AS-issued access tokens (`oauthstore.
+AccessTokenPrefix`), entered ONLY when the AS is enabled (with no AS there is no
+resource to validate against, so `fho_` is never accepted and the store is never
+even dialed — fail closed). On success it validates the token's audience against
+this deployment's resource with `oauthas.ResourceMatches`; a foreign audience
+leaves the ANONYMOUS identity. This is deliberately in the middleware and not in
+`handleMCP`: the `/mcp` tool client dials fishhawkd's OWN REST API back with the
+caller's raw token (`newMCPHandler`'s factory), so validating only in the handler
+would leave every REST route accepting a token minted for a foreign resource. A
+matching audience stamps `Identity.OAuthAudience` — the marker the lifted-mode
+gate reads. A DB-unavailable classified error is a `503`, matching the #764
+posture of the sibling branches; `AuthMethod` is deliberately NOT set (its
+OpenAPI enum is `[static, oauth]` and widening it is out of scope).
+
+**Byte-identical discovery challenge.** `writeMCPAuthChallenge` is the ONE
+builder for the `/mcp` `401`: it sets `WWW-Authenticate` from
+`oauthChallengeHeader(s.oauthAS.prmURL)` — the RFC 9728 §5.1 `resource_metadata`
+form when the AS is enabled, the realm-only form otherwise — then writes ONE
+fixed envelope. All three refusal paths (no Authorization header, unknown bearer,
+off-loopback bare token) produce a BYTE-IDENTICAL status, header and body; giving
+the bare-token case a distinct message would make a valid bare token
+distinguishable from an invalid one, the token-validity leak `handleMCP`'s
+indistinguishability property forbids. `oauthChallengeHeader` FAILS CLOSED on an
+unescapable `prmURL` (a `"`, `\`, or control byte) by omitting the parameter and
+returning the realm-only form, so an unsafe value is never spliced into the
+quoted-string header.
+
+**Conditional loopback lift (exact condition, both directions).** In
+`resolveMCPRouteState` the non-loopback arm refuses (`403
+mcp_route_loopback_only`) UNLESS the AS verdict is `oauthASEnabled` — then the
+refusal LIFTS: the route serves with `authenticatedOnly = true` and
+`challengeResource = <resource>`, and `handleMCP` accepts ONLY an
+audience-validated OAuth identity (`Identity.OAuthAudience != ""`). A bare
+`fhk_`/`fhm_` token carries a `TokenID` but no `OAuthAudience` and is refused
+off-host with the same `401`. So network exposure and auth tightening land
+together: ADR-033's no-bare-bearer-off-host invariant is kept, not traded away.
+`--oauth-require-loopback` drives the AS verdict to `oauthASNotLoopback` (not
+enabled) on a public bind, so setting it keeps the `/mcp` refusal too. In the
+lifted posture a bind naming a SPECIFIC host pins `listenAddr` to the SAME
+resolved literal the selfURL is built from (see the selfURL-asymmetry paragraph),
+so the address the tool client dials the caller's bearer to is provably the
+address `net.Listen` bound; an empty/unspecified bind leaves `listenAddr` empty so
+`Server.listenAddr()` binds `cfg.Addr` verbatim (every interface, which includes
+the loopback the selfURL dials). `verifyMCPListenerLoopback` skips the loopback
+assertion off-host but STILL fails closed if the lift carries an empty
+`challengeResource` — a lift with no audience to enforce would serve the
+bare-bearer surface off-host, so `Start` refuses the whole listener.
+
+**selfURL asymmetry in the lifted posture (CONDITION 5).** Unlike the unlifted
+route — whose self URL is ALWAYS a resolved loopback IP literal — a bind-derived
+lifted selfURL may resolve to a SPECIFIC non-loopback LOCAL address. For an empty
+or unspecified bind (`:8080`, `0.0.0.0`, `[::]`) the dial-back stays on
+`127.0.0.1`, because `net.Listen` on such a host binds every local unicast
+address including loopback, so ADR-033's forwarding invariant is fully preserved.
+For a SPECIFIC non-loopback local bind, the tool client's dial-back addresses
+that same locally-assigned address; packets to a locally-assigned unicast address
+are delivered by the host's own stack and never traverse a physical link, so the
+bearer is not put on the wire — but this is a documented NARROWING of ADR-033's
+stricter always-`127.0.0.1` posture, not an equivalence. **The selfURL and the
+bind derive from ONE resolution.** `liftedSelfURL` returns both the dial-back URL
+AND the `listenAddr` the specific-host bind is pinned to, built from the same
+`net.ParseIP`/`lookupIP` result, so `net.Listen` cannot re-resolve a hostname at
+`Start` and land the listener on a different host than the selfURL dials — the
+divergence that would carry the caller's raw bearer toward uncontrolled egress
+(#2391). An embedder-supplied `MCPSelfURL` keeps the existing loopback-pinning
+treatment unchanged and leaves the bind at `cfg.Addr` verbatim (the self URL is
+an independent loopback dial-back target); a hostname bind is resolved and its
+first address pinned into BOTH selfURL and `listenAddr`, a resolution failure
+being `503 mcp_route_misconfigured` (never a silent accept).
+
 ### Why stateless (and what it costs)
 
 `newMCPHandler` passes `StreamableHTTPOptions{Stateless: true}`. As of go-sdk

@@ -181,7 +181,7 @@ func TestMCPSelfURLDerivation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			st := resolveMCPRouteState(Config{Addr: tc.addr, MCPServerFactory: testMCPServerFactory}, tc.lookup)
+			st := resolveMCPRouteState(Config{Addr: tc.addr, MCPServerFactory: testMCPServerFactory}, oauthASState{}, tc.lookup)
 			if st.mode != mcpRouteEnabled {
 				t.Fatalf("mode = %v, want mcpRouteEnabled", st.mode)
 			}
@@ -221,7 +221,7 @@ func TestResolveMCPRouteState_PinsResolvedLoopbackIP(t *testing.T) {
 		return []net.IP{net.ParseIP("127.0.0.1")}, nil
 	}
 
-	st := resolveMCPRouteState(Config{Addr: "flipflop.test:8080", MCPServerFactory: testMCPServerFactory}, lookup)
+	st := resolveMCPRouteState(Config{Addr: "flipflop.test:8080", MCPServerFactory: testMCPServerFactory}, oauthASState{}, lookup)
 	if st.mode != mcpRouteEnabled {
 		t.Fatalf("mode = %v, want mcpRouteEnabled at construction", st.mode)
 	}
@@ -250,7 +250,7 @@ func TestResolveMCPRouteState_PinsResolvedLoopbackIP(t *testing.T) {
 func TestResolveMCPRouteState_PinsListenAddr(t *testing.T) {
 	st := resolveMCPRouteState(
 		Config{Addr: "flipflop.test:8080", MCPServerFactory: testMCPServerFactory},
-		loopbackLookup)
+		oauthASState{}, loopbackLookup)
 	if st.mode != mcpRouteEnabled {
 		t.Fatalf("mode = %v, want mcpRouteEnabled", st.mode)
 	}
@@ -264,7 +264,7 @@ func TestResolveMCPRouteState_PinsListenAddr(t *testing.T) {
 	// An IPv6 loopback literal must stay bracketed, or the bind address is
 	// unparseable.
 	v6 := resolveMCPRouteState(
-		Config{Addr: "[::1]:8080", MCPServerFactory: testMCPServerFactory}, nil)
+		Config{Addr: "[::1]:8080", MCPServerFactory: testMCPServerFactory}, oauthASState{}, nil)
 	if v6.listenAddr != "[::1]:8080" {
 		t.Errorf("ipv6 listenAddr = %q, want [::1]:8080", v6.listenAddr)
 	}
@@ -456,7 +456,7 @@ func TestResolveMCPRouteState_SelfURLValidation(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			st := resolveMCPRouteState(Config{Addr: "127.0.0.1:8080", MCPSelfURL: tc.selfURL, MCPServerFactory: testMCPServerFactory}, tc.lookup)
+			st := resolveMCPRouteState(Config{Addr: "127.0.0.1:8080", MCPSelfURL: tc.selfURL, MCPServerFactory: testMCPServerFactory}, oauthASState{}, tc.lookup)
 			if tc.wantURL != "" {
 				if st.mode != mcpRouteEnabled {
 					t.Fatalf("mode = %v (reason %q), want mcpRouteEnabled", st.mode, st.reason)
@@ -1012,4 +1012,363 @@ func mcpToolNamesOverRoute(t *testing.T, ctx context.Context, baseURL, token str
 		names[tool.Name] = true
 	}
 	return names
+}
+
+// ---------------------------------------------------------------------------
+// Conditional loopback lift + discovery challenge (ADR-076 slice 3, #2391)
+// ---------------------------------------------------------------------------
+
+// enabledOAuthState resolves an AS-enabled verdict at issuer https://as.example
+// (resource https://as.example/mcp) for the lift tests.
+func enabledOAuthState(t *testing.T) oauthASState {
+	t.Helper()
+	as := resolveOAuthASState(Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       newFakeOAuthStore(),
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	}, nil)
+	if as.mode != oauthASEnabled {
+		t.Fatalf("AS mode = %v (reason %q), want enabled", as.mode, as.reason)
+	}
+	return as
+}
+
+// TestResolveMCPRouteState_LiftedWhenASEnabled: a non-loopback bind with the AS
+// enabled LIFTS the loopback refusal into authenticated-only mode.
+func TestResolveMCPRouteState_LiftedWhenASEnabled(t *testing.T) {
+	st := resolveMCPRouteState(
+		Config{Addr: "0.0.0.0:8080", MCPServerFactory: testMCPServerFactory},
+		enabledOAuthState(t), nil)
+	if st.mode != mcpRouteEnabled {
+		t.Fatalf("mode = %v (reason %q), want mcpRouteEnabled (lifted)", st.mode, st.reason)
+	}
+	if !st.authenticatedOnly {
+		t.Error("authenticatedOnly = false, want true in the lifted posture")
+	}
+	if st.challengeResource != testResource {
+		t.Errorf("challengeResource = %q, want %q", st.challengeResource, testResource)
+	}
+	if st.listenAddr != "" {
+		t.Errorf("listenAddr = %q, want empty so listenAddr() binds cfg.Addr verbatim", st.listenAddr)
+	}
+	if st.selfURL != "http://127.0.0.1:8080" {
+		t.Errorf("selfURL = %q, want the loopback dial-back http://127.0.0.1:8080", st.selfURL)
+	}
+}
+
+// TestResolveMCPRouteState_StillRefusedWithoutAS is the counterfactual vehicle
+// for the lift's AS-enabled condition: with NO AS, a non-loopback bind stays
+// refused (403). Deleting the as.mode != oauthASEnabled condition (so a
+// non-loopback bind always lifts) reddens this.
+func TestResolveMCPRouteState_StillRefusedWithoutAS(t *testing.T) {
+	st := resolveMCPRouteState(
+		Config{Addr: "0.0.0.0:8080", MCPServerFactory: testMCPServerFactory},
+		oauthASState{}, nil)
+	if st.mode != mcpRouteNotLoopback {
+		t.Fatalf("mode = %v, want mcpRouteNotLoopback (no AS, no lift)", st.mode)
+	}
+	if st.authenticatedOnly {
+		t.Error("authenticatedOnly = true without an AS; the refusal must not lift")
+	}
+}
+
+// TestResolveMCPRouteState_RequireLoopbackKeepsMCPRefused: --oauth-require-loopback
+// on a public bind drives the AS verdict to oauthASNotLoopback (not enabled), so
+// the /mcp refusal survives too — the flag keeps BOTH surfaces loopback-only.
+func TestResolveMCPRouteState_RequireLoopbackKeepsMCPRefused(t *testing.T) {
+	as := resolveOAuthASState(Config{
+		Addr:                   "0.0.0.0:8080",
+		OAuthASRequireLoopback: true,
+		OAuthASIssuer:          testIssuer,
+		OAuthStore:             newFakeOAuthStore(),
+		OAuthCIMDFetcher:       newCIMDFetcher(newCIMD()),
+	}, nil)
+	if as.mode != oauthASNotLoopback {
+		t.Fatalf("AS mode = %v, want oauthASNotLoopback under --oauth-require-loopback on a public bind", as.mode)
+	}
+	st := resolveMCPRouteState(
+		Config{Addr: "0.0.0.0:8080", MCPServerFactory: testMCPServerFactory}, as, nil)
+	if st.mode != mcpRouteNotLoopback {
+		t.Fatalf("mode = %v, want mcpRouteNotLoopback (require-loopback keeps /mcp refused)", st.mode)
+	}
+}
+
+// TestResolveMCPRouteState_LiftedSelfURLForUnspecifiedHost: an empty or
+// unspecified listen host yields the loopback dial-back, because net.Listen on
+// such a host binds every local address INCLUDING loopback.
+func TestResolveMCPRouteState_LiftedSelfURLForUnspecifiedHost(t *testing.T) {
+	for _, addr := range []string{":8080", "0.0.0.0:8080", "[::]:8080"} {
+		t.Run(addr, func(t *testing.T) {
+			st := resolveMCPRouteState(
+				Config{Addr: addr, MCPServerFactory: testMCPServerFactory},
+				enabledOAuthState(t), nil)
+			if st.mode != mcpRouteEnabled || !st.authenticatedOnly {
+				t.Fatalf("mode = %v authOnly = %v, want lifted", st.mode, st.authenticatedOnly)
+			}
+			if st.selfURL != "http://127.0.0.1:8080" {
+				t.Errorf("selfURL = %q, want http://127.0.0.1:8080", st.selfURL)
+			}
+		})
+	}
+}
+
+// TestResolveMCPRouteState_LiftedSelfURLForSpecificHost: a specific non-loopback
+// local literal pins itself in the dial-back (a documented NARROWING of
+// ADR-033's always-127.0.0.1 posture).
+func TestResolveMCPRouteState_LiftedSelfURLForSpecificHost(t *testing.T) {
+	st := resolveMCPRouteState(
+		Config{Addr: "192.0.2.10:8080", MCPServerFactory: testMCPServerFactory},
+		enabledOAuthState(t), nil)
+	if st.mode != mcpRouteEnabled || !st.authenticatedOnly {
+		t.Fatalf("mode = %v authOnly = %v, want lifted", st.mode, st.authenticatedOnly)
+	}
+	if st.selfURL != "http://192.0.2.10:8080" {
+		t.Errorf("selfURL = %q, want http://192.0.2.10:8080", st.selfURL)
+	}
+}
+
+// TestResolveMCPRouteState_LiftedSelfURLForHostname: a hostname is resolved and
+// its first address pinned.
+func TestResolveMCPRouteState_LiftedSelfURLForHostname(t *testing.T) {
+	lookup := func(string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.5")}, nil }
+	st := resolveMCPRouteState(
+		Config{Addr: "public.example:8080", MCPServerFactory: testMCPServerFactory},
+		enabledOAuthState(t), lookup)
+	if st.mode != mcpRouteEnabled || !st.authenticatedOnly {
+		t.Fatalf("mode = %v authOnly = %v (reason %q), want lifted", st.mode, st.authenticatedOnly, st.reason)
+	}
+	if st.selfURL != "http://203.0.113.5:8080" {
+		t.Errorf("selfURL = %q, want the resolved http://203.0.113.5:8080", st.selfURL)
+	}
+}
+
+// TestResolveMCPRouteState_LiftedSelfURLResolutionFailureIsMisconfigured: a
+// hostname bind whose resolution FAILS is 503 misconfigured, never a silent
+// accept.
+func TestResolveMCPRouteState_LiftedSelfURLResolutionFailureIsMisconfigured(t *testing.T) {
+	lookup := func(string) ([]net.IP, error) { return nil, errors.New("nxdomain") }
+	st := resolveMCPRouteState(
+		Config{Addr: "broken.example:8080", MCPServerFactory: testMCPServerFactory},
+		enabledOAuthState(t), lookup)
+	if st.mode != mcpRouteMisconfigured {
+		t.Fatalf("mode = %v, want mcpRouteMisconfigured on a lifted-bind resolution failure", st.mode)
+	}
+	if !strings.Contains(st.reason, "nxdomain") {
+		t.Errorf("reason = %q, want the resolver diagnosis", st.reason)
+	}
+}
+
+// TestResolveMCPRouteState_LiftedBindPinnedToSelfURLHost is the security pin for
+// #2391's lifted-bind divergence: when the lifted bind names a SPECIFIC host the
+// listener is pinned to the SAME resolved literal the selfURL is derived from, so
+// the address the tool client forwards the caller's raw bearer to is provably the
+// address net.Listen binds. The pre-fix behavior left listenAddr empty, so
+// net.Listen re-resolved the hostname in cfg.Addr at Start and a DNS answer that
+// changed since New() would put the listener on a different host than the selfURL
+// dials — carrying the bearer off toward uncontrolled egress. Deleting the
+// bindAddr pin (listenAddr left "") reddens the listenAddr / equality assertions
+// below. A stable resolver is enough: the property is that ONE resolution feeds
+// BOTH selfURL and the bind, which the selfURL-host == bind equality proves
+// regardless of whether a second lookup would agree.
+func TestResolveMCPRouteState_LiftedBindPinnedToSelfURLHost(t *testing.T) {
+	lookup := func(string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.5")}, nil }
+	s := New(Config{
+		Addr:             "public.example:8080",
+		MCPServerFactory: testMCPServerFactory,
+		mcpLookupIP:      lookup,
+		OAuthASIssuer:    testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	st := s.mcpRoute
+	if st.mode != mcpRouteEnabled || !st.authenticatedOnly {
+		t.Fatalf("mode = %v authOnly = %v (reason %q), want lifted", st.mode, st.authenticatedOnly, st.reason)
+	}
+	if st.selfURL != "http://203.0.113.5:8080" {
+		t.Errorf("selfURL = %q, want the resolved http://203.0.113.5:8080", st.selfURL)
+	}
+	if st.listenAddr != "203.0.113.5:8080" {
+		t.Fatalf("listenAddr = %q, want the pinned resolved literal 203.0.113.5:8080 (not the hostname)", st.listenAddr)
+	}
+	// The invariant the pin exists to hold: the bind address IS the selfURL's
+	// host:port, so no second DNS resolution can aim them at different hosts.
+	u, err := url.Parse(st.selfURL)
+	if err != nil {
+		t.Fatalf("selfURL does not parse: %v", err)
+	}
+	if u.Host != st.listenAddr {
+		t.Errorf("selfURL host %q != bind address %q — the two derive from different resolutions and can diverge", u.Host, st.listenAddr)
+	}
+	// listenAddr() must hand net.Listen the pinned literal, never the hostname it
+	// would re-resolve at Start.
+	if got := s.listenAddr(); got != "203.0.113.5:8080" {
+		t.Errorf("listenAddr() = %q, want the pinned literal (not the hostname)", got)
+	}
+	if strings.Contains(s.listenAddr(), "public.example") {
+		t.Errorf("listenAddr() = %q retained the hostname — net.Listen would re-resolve it at Start", s.listenAddr())
+	}
+}
+
+// TestVerifyMCPListenerLoopback_LiftWithoutResourceFailsClosed pins the
+// bind-time fail-closed guard: a lift constructed with no audience to enforce
+// refuses the whole listener; with a resource it passes even off-host.
+func TestVerifyMCPListenerLoopback_LiftWithoutResourceFailsClosed(t *testing.T) {
+	if err := verifyMCPListenerLoopback(
+		mcpRouteState{mode: mcpRouteEnabled, authenticatedOnly: true, challengeResource: ""},
+		&net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 8080}); err == nil {
+		t.Fatal("verifyMCPListenerLoopback = nil for a lift with no resource, want a fail-closed error")
+	}
+	if err := verifyMCPListenerLoopback(
+		mcpRouteState{mode: mcpRouteEnabled, authenticatedOnly: true, challengeResource: testResource},
+		&net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 8080}); err != nil {
+		t.Errorf("verifyMCPListenerLoopback = %v for a lift WITH a resource off-host, want nil", err)
+	}
+}
+
+// TestHandleMCP_ChallengeIdenticalForMissingAndUnknownBearer is the CONDITION-2
+// pin: the three refusal paths return a BYTE-IDENTICAL 401 (status, header,
+// body), AND on an AS-enabled deployment the WWW-Authenticate header names the
+// derived PRM URL as resource_metadata. The content assertion is the one the
+// challenge-emission counterfactual must break — byte-equality alone stays green
+// when both paths lose the header together.
+func TestHandleMCP_ChallengeIdenticalForMissingAndUnknownBearer(t *testing.T) {
+	sessions, cookie := mcpTestSession(t)
+	tokenRepo, _ := mcpTestTokens(t)
+	store := newFakeOAuthStore()
+	s := New(Config{
+		Addr: "127.0.0.1:8080", APITokenRepo: tokenRepo, AuthRepo: sessions,
+		MCPServerFactory: testMCPServerFactory,
+		OAuthASIssuer:    testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if s.oauthAS.mode != oauthASEnabled {
+		t.Fatalf("AS mode = %v, want enabled so the challenge carries a PRM URL", s.oauthAS.mode)
+	}
+
+	challenge := func(decorate func(*http.Request)) (int, string, string) {
+		req := newMCPPost(mcpInitializeBody)
+		if decorate != nil {
+			decorate(req)
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String()
+	}
+
+	missStatus, missHdr, missBody := challenge(nil)
+	unkStatus, unkHdr, unkBody := challenge(func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer fhk_not_a_real_token")
+	})
+	ckStatus, ckHdr, ckBody := challenge(func(r *http.Request) {
+		r.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: cookie})
+	})
+
+	for _, tc := range []struct {
+		name      string
+		status    int
+		hdr, body string
+	}{
+		{"missing", missStatus, missHdr, missBody},
+		{"unknown", unkStatus, unkHdr, unkBody},
+		{"cookie", ckStatus, ckHdr, ckBody},
+	} {
+		if tc.status != http.StatusUnauthorized {
+			t.Errorf("%s: status = %d, want 401", tc.name, tc.status)
+		}
+	}
+	if missBody != unkBody || missHdr != unkHdr {
+		t.Errorf("missing and unknown envelopes differ (leaks token validity):\nhdr %q vs %q\nbody %q vs %q",
+			missHdr, unkHdr, missBody, unkBody)
+	}
+	if ckHdr != missHdr {
+		t.Errorf("cookie challenge header %q differs from the bearer paths %q", ckHdr, missHdr)
+	}
+	// CONTENT: the header must name the derived PRM URL (not merely be equal).
+	wantParam := `resource_metadata="` + s.oauthAS.prmURL + `"`
+	if !strings.Contains(missHdr, wantParam) {
+		t.Errorf("WWW-Authenticate = %q, want it to contain %q", missHdr, wantParam)
+	}
+}
+
+// TestHandleMCP_ChallengeRealmOnlyWhenASDisabled: with no AS configured the
+// challenge is the realm-only form (no resource_metadata).
+func TestHandleMCP_ChallengeRealmOnlyWhenASDisabled(t *testing.T) {
+	s, _ := mcpTestServer(t, Config{Addr: "127.0.0.1:8080"})
+	req := newMCPPost(mcpInitializeBody)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); got != `Bearer realm="fishhawk"` {
+		t.Errorf("WWW-Authenticate = %q, want realm-only", got)
+	}
+}
+
+// TestHandleMCP_LiftedRefusesBareBearerToken is the counterfactual vehicle for
+// the lifted-mode audience gate: in the lifted posture a bare fhk_ token (valid,
+// TokenID set, but no OAuthAudience) is refused with the same 401, while an
+// audience-bound fho_ identity is admitted. Deleting the
+// `authenticatedOnly && OAuthAudience == ""` gate lets the bare token reach the
+// streamable handler (status no longer 401), reddening this.
+func TestHandleMCP_LiftedRefusesBareBearerToken(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedAccessToken(testFhoToken, "github:octocat", testResource, "", []string{"read:runs"})
+	tokenRepo, bareToken := mcpTestTokens(t)
+	s := New(Config{
+		Addr:             "0.0.0.0:8080", // non-loopback → lifted because the AS is enabled
+		APITokenRepo:     tokenRepo,
+		MCPServerFactory: testMCPServerFactory,
+		OAuthASIssuer:    testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if s.mcpRoute.mode != mcpRouteEnabled || !s.mcpRoute.authenticatedOnly {
+		t.Fatalf("route mode = %v authOnly = %v (reason %q), want lifted", s.mcpRoute.mode, s.mcpRoute.authenticatedOnly, s.mcpRoute.reason)
+	}
+
+	envelope := func(decorate func(*http.Request)) (int, string, string) {
+		req := newMCPPost(mcpInitializeBody)
+		if decorate != nil {
+			decorate(req)
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String()
+	}
+
+	// A bare fhk_ token is refused off-host with the 401 challenge.
+	bareStatus, bareHdr, bareBody := envelope(func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+bareToken)
+	})
+	if bareStatus != http.StatusUnauthorized {
+		t.Fatalf("bare fhk_ status = %d, want 401 (refused off-host in lifted mode):\n%s", bareStatus, bareBody)
+	}
+	if !strings.Contains(bareBody, "authentication_required") {
+		t.Errorf("bare fhk_ body = %s, want authentication_required", bareBody)
+	}
+
+	// INDISTINGUISHABILITY on the off-loopback bare-token branch (concern
+	// medium/verification): a VALID bare token refused in lifted mode must produce
+	// a status/header/body BYTE-IDENTICAL to a MISSING bearer, or the difference
+	// would let a caller tell a valid-but-unaudienced token from no token at all —
+	// the token-validity leak the shared writeMCPAuthChallenge builder prevents.
+	// This exercises handleMCP's `authenticatedOnly && OAuthAudience == ""` arm,
+	// which the loopback-deployment identical-challenge test never reaches.
+	missStatus, missHdr, missBody := envelope(nil)
+	if bareStatus != missStatus || bareHdr != missHdr || bareBody != missBody {
+		t.Errorf("off-loopback bare-token envelope differs from the missing-bearer envelope (leaks token validity):\n"+
+			"status %d vs %d\nhdr %q vs %q\nbody %q vs %q",
+			bareStatus, missStatus, bareHdr, missHdr, bareBody, missBody)
+	}
+	// And it is the real AS discovery challenge (names the derived PRM URL), not a
+	// realm-only fallback that would satisfy byte-equality while breaking discovery.
+	wantParam := `resource_metadata="` + s.oauthAS.prmURL + `"`
+	if !strings.Contains(bareHdr, wantParam) {
+		t.Errorf("bare-token WWW-Authenticate = %q, want it to name %q", bareHdr, wantParam)
+	}
+
+	// An audience-bound fho_ identity is admitted (reaches the streamable
+	// handler; NOT a 401).
+	okStatus, _, okBody := envelope(func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+testFhoToken)
+	})
+	if okStatus == http.StatusUnauthorized {
+		t.Fatalf("fho_ status = 401, want admitted to the tool surface:\n%s", okBody)
+	}
 }

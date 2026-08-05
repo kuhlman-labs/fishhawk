@@ -569,3 +569,87 @@ func TestMCPRoute_SelfURLPinnedToResolvedIP(t *testing.T) {
 		t.Fatalf("post-construction lookup = %v (err %v), want a single non-loopback address", after, err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// (e) OAuth AS-issued (fho_) access tokens across all four layers (#2391)
+// ---------------------------------------------------------------------------
+
+// newOAuthMCPFixture stands up the cross-layer harness with the OAuth AS enabled
+// over store (issuer https://as.example, resource https://as.example/mcp).
+func newOAuthMCPFixture(t *testing.T, store *fakeOAuthStore) *mcpFixture {
+	t.Helper()
+	return newMCPFixture(t, func(cfg *Config) {
+		cfg.OAuthASIssuer = testIssuer
+		cfg.OAuthStore = store
+		cfg.OAuthCIMDFetcher = newCIMDFetcher(newCIMD())
+	})
+}
+
+// TestMCPRoute_OAuthTokenEndToEnd is the cross-layer proof (HTTP handler +
+// middleware + oauthas domain + oauthstore persistence): a matching-audience
+// fho_ access token presented at POST /mcp is accepted, drives a real tool call,
+// and the tool's dial-back to fishhawkd's own REST API carries that same fho_
+// token — which fails on a 401 unless the fho_ token authenticates on ordinary
+// REST routes too (the assumption that drove audience validation into
+// bearerAuth).
+//
+// The bearer is minted by driving the REAL token endpoint — an
+// authorization-code redemption at POST /v0/oauth/token via handleOAuthToken,
+// which persists the access token through the store's RedeemAuthorizationCode
+// and hands back exactly the plaintext /mcp then validates. That closes the
+// test_vacuity a hand-seeded record left open: a directly-fabricated
+// AccessToken row would keep every assertion below green even if the token
+// endpoint emitted an incompatible token or persistence could not authenticate
+// one, because the endpoint and persistence would never be on the path. The
+// code is seeded BY CONSTRUCTION (mintCode), never the access token; the token
+// under assertion is the endpoint's own emission.
+func TestMCPRoute_OAuthTokenEndToEnd(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedClient(storeClient("github", "client-x", []string{"https://app.example/cb"}))
+	f := newOAuthMCPFixture(t, store)
+
+	code := mintCode(t, store)
+	fho := decodeToken(t, postToken(f.server, codeExchangeForm(code), nil)).AccessToken
+	if !strings.HasPrefix(fho, "fho_") {
+		t.Fatalf("token endpoint emitted %q, want an fho_ access token", fho)
+	}
+	seeded := f.seedRun(t)
+
+	status, resp := f.postMCP(t, fho, "", callToolBody(1, "fishhawk_list_runs", map[string]any{}))
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", status, resp)
+	}
+	if !strings.Contains(resp, seeded.ID.String()) {
+		t.Fatalf("tool result does not mention the seeded run %s:\n%s", seeded.ID, resp)
+	}
+	inbound := lastInboundFor(t, f.recorder.snapshot(), "/v0/runs")
+	if inbound.auth != "Bearer "+fho {
+		t.Errorf("dial-back carried %q, want the fho_ token %q", inbound.auth, "Bearer "+fho)
+	}
+}
+
+// TestMCPRoute_ForeignAudienceTokenRejectedEndToEnd seeds a token whose audience
+// is a DIFFERENT resource — bad state BY CONSTRUCTION, never by calling the
+// control — and asserts /mcp answers the 401 discovery challenge, never admitting
+// it to the tool surface.
+func TestMCPRoute_ForeignAudienceTokenRejectedEndToEnd(t *testing.T) {
+	store := newFakeOAuthStore()
+	f := newOAuthMCPFixture(t, store)
+	const fho = "fho_foreignforeignforeignforeignforeign01"
+	store.seedAccessToken(fho, "github:mallory", "https://other.example/mcp", "", []string{"read:runs"})
+	f.seedRun(t)
+
+	status, resp := f.postMCP(t, fho, "", callToolBody(1, "fishhawk_list_runs", map[string]any{}))
+	if status != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (foreign audience rejected):\n%s", status, resp)
+	}
+	if !strings.Contains(resp, "authentication_required") {
+		t.Errorf("body = %s, want authentication_required", resp)
+	}
+	// The foreign-audience token must never have reached the tool dial-back.
+	for _, c := range f.recorder.snapshot() {
+		if c.path == "/v0/runs" {
+			t.Errorf("foreign-audience token reached the REST dial-back at %s; it must be refused at /mcp", c.path)
+		}
+	}
+}
