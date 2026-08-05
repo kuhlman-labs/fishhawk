@@ -4169,7 +4169,13 @@ paths:
         - name: scope
           in: query
           required: false
-          description: Space-delimited requested scopes from the operator vocabulary; absent means no restriction beyond the client's registration.
+          description: >-
+            Space-delimited requested scopes from the operator vocabulary. A request carrying NO scope token — the key
+            absent, or a present-but-empty `scope=`, which are treated identically — is DEFAULTED per RFC 6749 §3.3
+            rather than refused: to the client's registered `scope` intersected with the server vocabulary when the
+            registration pins one, otherwise to the whole advertised `scopes_supported` set. A registration naming no
+            supported scope is refused `invalid_scope`. Every present value still validates: an unknown scope, a
+            whitespace-only value, and a scope exceeding the client's registration all fail `invalid_scope`.
           schema: { type: string }
         - name: state
           in: query

@@ -44,6 +44,45 @@ the parsed literal against `SupportedScopes` by value and order (#2427 condition
 5, option **a** — real detection, not a restated constant). Real drift fails the
 in-loop verify gate. Publishing `scopes_supported` makes later narrowing additive.
 
+### Defaulting a request that carries no scope token (#2466)
+
+RFC 6749 §3.3 permits exactly two behaviours when an authorization request omits
+`scope`: process it with a **pre-defined default**, or fail `invalid_scope`. This
+server takes the FIRST branch, via `ResolveRequestedScope(requested, registered)`
+— a scope-omitting client (the shape of Claude Code's CIMD document) previously
+could not get past the first authorize.
+
+The contract is keyed on whether the request **carries a scope token**, not on
+whether the parameter is present: `url.Values.Get` returns `""` for both an
+absent `scope` key and a present-but-empty `scope=`, and the two are
+DELIBERATELY equivalent — an empty value carries zero scope tokens, so making a
+client that serializes an empty list fail where one that omits the key succeeds
+would be exactly the onboarding trap this removes.
+
+- **A non-empty `requested`** is delegated to `ParseScope` UNCHANGED, so every
+  present-value branch keeps its behaviour and error identity. A whitespace-only
+  `scope=%20%20` is PRESENT and still fails `invalid_scope`; so does an unknown
+  scope; so does a scope exceeding the client's registered set (enforced one step
+  later, in the server's authorize ladder).
+- **An empty `requested`** defaults to the client's REGISTERED scope when the
+  registration pins one, otherwise to the whole `SupportedScopes` vocabulary
+  (what the PRM and AS metadata advertise as `scopes_supported`).
+
+The registered default is **intersected** with `SupportedScopes` (registration
+order preserved, de-duplicated) rather than taken verbatim. A registration may
+pin scopes outside this server's vocabulary — the server splits the raw
+registration string without validating its members — and such a scope is already
+UNREQUESTABLE through the explicit path, because `ParseScope` rejects it before
+the registered-scope restriction is ever reached. Defaulting to it verbatim would
+grant through the default what the explicit path refuses.
+
+A registration whose intersection is **EMPTY** fails CLOSED with `invalid_scope`
+rather than minting a code carrying an empty grant.
+
+The returned default is a defensive COPY: the caller persists it on the
+authorization-code row, so handing out `SupportedScopes`' backing array would let
+one request corrupt the vocabulary for every later one.
+
 ## PKCE contract
 
 S256 **only**. `plain` is refused and never advertised. An **absent**
