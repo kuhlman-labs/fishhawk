@@ -50,10 +50,18 @@ func authorizeRequestFromValues(v url.Values) authorizeRequest {
 // authorizeResolved is the validated output of the ladder: everything a consent
 // render or a code mint needs, all derived from the request under validation.
 type authorizeResolved struct {
-	client          *resolvedOAuthClient
-	matchedRedirect string
-	method          oauthas.CodeChallengeMethod
-	scopes          []string
+	client *resolvedOAuthClient
+	// responseRedirect is the DELIVERY URI (#2470), not the registered one: the
+	// matched registration with the requested port substituted on the loopback
+	// branch. The name is load-bearing — it was called matchedRedirect, and that
+	// name made "deliver the response to the registered URI" look correct at
+	// every call site while a loopback client on an ephemeral port never received
+	// its code. ONE value feeds the success 302, every error/deny 302, and the
+	// code row's redirect_uri, so the token endpoint's byte-exact comparison sees
+	// the URI the client actually used.
+	responseRedirect string
+	method           oauthas.CodeChallengeMethod
+	scopes           []string
 }
 
 // toOAuthError extracts the concrete *oauthas.Error a domain helper returned, or
@@ -70,11 +78,11 @@ func toOAuthError(err error) *oauthas.Error {
 // runAuthorizeLadder validates req through the in-place then redirect phases. On
 // ANY failure it writes the response (an in-place RFC 6749 §5.2 error or a
 // redirect) and returns ok=false; on success it returns the resolved client,
-// the matched registered redirect URI, and the parsed PKCE method + scopes.
+// the response (delivery) redirect URI, and the parsed PKCE method + scopes.
 func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req authorizeRequest) (authorizeResolved, bool) {
 	// ---- IN-PLACE PHASE: no redirect is permitted yet. ----
 	// The CIMD limiter fires INSIDE resolveOAuthClient, before
-	// MatchRedirectURIAny has validated any redirect_uri, so a rate-limit 429 is
+	// ResolveRedirectURI has validated any redirect_uri, so a rate-limit 429 is
 	// rendered in place and NEVER redirected — required by RFC 6749 §4.1.2.1,
 	// which forbids delivering an error to an unverified redirect target. The
 	// shared renderer maps the limiter refusal to 429 + Retry-After and a store
@@ -84,25 +92,25 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 		s.writeOAuthClientError(w, r, http.StatusBadRequest, cerr)
 		return authorizeResolved{}, false
 	}
-	matched, merr := oauthas.MatchRedirectURIAny(client.RedirectURIs, req.redirectURI)
+	responseRedirect, merr := oauthas.ResolveRedirectURI(client.RedirectURIs, req.redirectURI)
 	if merr != nil {
 		oe := toOAuthError(merr)
 		s.writeOAuthError(w, r, http.StatusBadRequest, oe.Code, oe.Description)
 		return authorizeResolved{}, false
 	}
 
-	// ---- REDIRECT PHASE: every error delivered to the matched redirect URI. ----
+	// ---- REDIRECT PHASE: every error delivered to the response redirect URI. ----
 	// (3) response_type: server-wide "code" first, then the client's registered
 	// capability (CONDITION 2).
 	if req.responseType != "code" {
-		s.redirectOAuthError(w, r, matched, req.state, &oauthas.Error{
+		s.redirectOAuthError(w, r, responseRedirect, req.state, &oauthas.Error{
 			Code:        oauthas.ErrCodeUnsupportedResponseType,
 			Description: "only response_type=code is supported",
 		})
 		return authorizeResolved{}, false
 	}
 	if !containsOAuth(registeredResponseTypes(client), "code") {
-		s.redirectOAuthError(w, r, matched, req.state, &oauthas.Error{
+		s.redirectOAuthError(w, r, responseRedirect, req.state, &oauthas.Error{
 			Code:        oauthas.ErrCodeUnauthorizedClient,
 			Description: "the client is not registered for response_type=code",
 		})
@@ -111,20 +119,20 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 	// (4) PKCE method + challenge (S256 only; absent method refused, never defaulted).
 	method, err := oauthas.ParseCodeChallengeMethod(req.codeChallengeMethod)
 	if err != nil {
-		s.redirectOAuthError(w, r, matched, req.state, toOAuthError(err))
+		s.redirectOAuthError(w, r, responseRedirect, req.state, toOAuthError(err))
 		return authorizeResolved{}, false
 	}
 	if err := oauthas.ValidateCodeChallenge(req.codeChallenge); err != nil {
-		s.redirectOAuthError(w, r, matched, req.state, toOAuthError(err))
+		s.redirectOAuthError(w, r, responseRedirect, req.state, toOAuthError(err))
 		return authorizeResolved{}, false
 	}
 	// (5) RFC 8707 resource: required and must match the configured resource.
 	if _, err := oauthas.ParseResourceIdentifier(req.resource); err != nil {
-		s.redirectOAuthError(w, r, matched, req.state, toOAuthError(err))
+		s.redirectOAuthError(w, r, responseRedirect, req.state, toOAuthError(err))
 		return authorizeResolved{}, false
 	}
 	if !oauthas.ResourceMatches(s.oauthAS.resource.String(), req.resource) {
-		s.redirectOAuthError(w, r, matched, req.state, &oauthas.Error{
+		s.redirectOAuthError(w, r, responseRedirect, req.state, &oauthas.Error{
 			Code:        oauthas.ErrCodeInvalidTarget,
 			Description: "the requested resource does not match this authorization server's resource identifier",
 		})
@@ -133,7 +141,7 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 	// (6) scopes: valid against the server-wide vocabulary first.
 	scopes, err := oauthas.ParseScope(req.scope)
 	if err != nil {
-		s.redirectOAuthError(w, r, matched, req.state, toOAuthError(err))
+		s.redirectOAuthError(w, r, responseRedirect, req.state, toOAuthError(err))
 		return authorizeResolved{}, false
 	}
 	// (7) registered scope restriction (CONDITION 2's registration-driven
@@ -146,7 +154,7 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 	if registered := registeredScopeSet(client); len(registered) > 0 {
 		for _, want := range scopes {
 			if !containsOAuth(registered, want) {
-				s.redirectOAuthError(w, r, matched, req.state, &oauthas.Error{
+				s.redirectOAuthError(w, r, responseRedirect, req.state, &oauthas.Error{
 					Code:        oauthas.ErrCodeInvalidScope,
 					Description: "the requested scope exceeds the client's registered scope",
 				})
@@ -155,7 +163,7 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 		}
 	}
 
-	return authorizeResolved{client: client, matchedRedirect: matched, method: method, scopes: scopes}, true
+	return authorizeResolved{client: client, responseRedirect: responseRedirect, method: method, scopes: scopes}, true
 }
 
 // handleOAuthAuthorize serves GET /v0/oauth/authorize: validate, then (identity
@@ -215,7 +223,7 @@ func (s *Server) handleOAuthConsent(w http.ResponseWriter, r *http.Request) {
 
 	// DENY is a redirect (client + redirect URI have validated by here).
 	if r.PostForm.Get("action") != "approve" {
-		s.redirectOAuthError(w, r, resolved.matchedRedirect, req.state, &oauthas.Error{
+		s.redirectOAuthError(w, r, resolved.responseRedirect, req.state, &oauthas.Error{
 			Code:        oauthas.ErrCodeAccessDenied,
 			Description: "the user denied the authorization request",
 		})
@@ -238,8 +246,11 @@ func (s *Server) handleOAuthConsent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	code, err := s.cfg.OAuthStore.CreateAuthorizationCode(r.Context(), oauthstore.NewAuthorizationCode{
-		ClientID:            req.clientID,
-		RedirectURI:         resolved.matchedRedirect,
+		ClientID: req.clientID,
+		// The DELIVERY URI, not the registration: the token endpoint compares this
+		// byte-exactly against the redirect_uri the client presents, and the client
+		// presents the one it requested (#2470).
+		RedirectURI:         resolved.responseRedirect,
 		CodeChallenge:       req.codeChallenge,
 		CodeChallengeMethod: resolved.method,
 		Scopes:              resolved.scopes,
@@ -255,9 +266,11 @@ func (s *Server) handleOAuthConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 302 to the MATCHED registered redirect URI with the code, echoed state
-	// and iss. The code plaintext exists only in this redirect.
-	u, err := url.Parse(resolved.matchedRedirect)
+	// 302 to the RESPONSE redirect URI with the code, echoed state and iss — the
+	// registered URI carrying the requested loopback port, so a native client
+	// listening on an ephemeral port actually receives the code (RFC 8252 §7.3).
+	// The code plaintext exists only in this redirect.
+	u, err := url.Parse(resolved.responseRedirect)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not build the authorization response redirect", nil)

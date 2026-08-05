@@ -4125,6 +4125,14 @@ paths:
         (RFC 9207). The consent GET MINTS a `__Host-csrf` cookie when the
         request carries none, because that cookie is `SameSite=Strict` and is
         not sent on the cross-site top-level authorize navigation.
+
+        For a LOOPBACK `redirect_uri` the authorization response — the success
+        redirect AND every error/deny redirect — is delivered to the PORT the
+        client requested, not to the registered one (RFC 8252 §7.3). A native
+        client registers portless because it listens on an ephemeral port. Only
+        the port carries over: scheme, host and path come from the registered
+        URI. The authorization code is bound to that same port-bearing URI, which
+        is what `POST /v0/oauth/token` must be presented.
       security: []
       tags: [oauth]
       parameters:
@@ -4202,6 +4210,11 @@ paths:
         top-level navigation). On approve, responds `302` to the `redirect_uri`
         carrying `code`, `state`, and `iss` (RFC 9207). On deny, responds `302`
         carrying `error=access_denied`, `state`, and `iss`.
+
+        For a LOOPBACK `redirect_uri`, both the approve and the deny redirect go
+        to the PORT the client requested rather than to the registered portless
+        URI (RFC 8252 §7.3); only the port carries over from the request. The
+        minted code is bound to that port-bearing URI.
       security: []
       tags: [oauth]
       requestBody:
@@ -4302,7 +4315,13 @@ paths:
                 redirect_uri:
                   type: string
                   format: uri
-                  description: Required for `grant_type=authorization_code`; must match the authorize request.
+                  description: >-
+                    Required for `grant_type=authorization_code`; compared
+                    BYTE-EXACTLY against the authorization request's (RFC 6749
+                    §4.1.3). For a loopback client this is the PORT-BEARING URI
+                    the authorize request carried and the response was delivered
+                    to — presenting the registered portless URI instead is
+                    refused `invalid_grant`.
                 code_verifier:
                   type: string
                   description: PKCE verifier (RFC 7636); required for `grant_type=authorization_code`.

@@ -169,21 +169,171 @@ func TestMatchRedirectURI_RelativeAndUnparseableRefused(t *testing.T) {
 	assertRedirectRefused(t, MatchRedirectURI("https://app.example/callback", "://bad"))
 }
 
-func TestMatchRedirectURIAny(t *testing.T) {
+// TestResolveRedirectURI_DeliversToRequestedLoopbackPort is the #2470 primary
+// regression pin (M1/M2/M3/M7/M9): the DELIVERY URI carries the port the client
+// requested, while everything else comes from the registration.
+//
+// COUNTERFACTUAL: with the port substitution deleted (ResolveRedirectURI
+// returning the matched registration verbatim) M1, M7 and M9 go RED — each
+// registered fixture is PORTLESS by construction, so the delivery and the
+// registration are definitionally different strings and no setup call consults
+// the control.
+func TestResolveRedirectURI_DeliversToRequestedLoopbackPort(t *testing.T) {
 	t.Parallel()
-	registered := []string{"https://a.example/cb", "http://127.0.0.1/cb"}
-	got, err := MatchRedirectURIAny(registered, "http://127.0.0.1:9000/cb")
+	cases := []struct {
+		name       string
+		registered []string
+		requested  string
+		want       string
+	}{
+		{
+			// M1: the Claude Code case. Portless loopback registration (RFC 8252
+			// §7.3), ephemeral listening port on the request.
+			name:       "M1 portless registration delivers to the requested ephemeral port",
+			registered: []string{"http://127.0.0.1/callback"},
+			requested:  "http://127.0.0.1:57121/callback",
+			want:       "http://127.0.0.1:57121/callback",
+		},
+		{
+			// M2: the inverse. A portless REQUEST against a port-bearing
+			// registration delivers portless — the response mirrors the request,
+			// it does not impose the registration's port.
+			name:       "M2 portless request delivers portless",
+			registered: []string{"http://127.0.0.1:3000/callback"},
+			requested:  "http://127.0.0.1/callback",
+			want:       "http://127.0.0.1/callback",
+		},
+		{
+			// M3: non-loopback. That branch of the matcher required byte equality,
+			// so the delivery is the registration verbatim and nothing changes.
+			name:       "M3 non-loopback delivery is the registration verbatim",
+			registered: []string{"https://app.example/cb"},
+			requested:  "https://app.example/cb",
+			want:       "https://app.example/cb",
+		},
+		{
+			// M7: IPv6 bracketing round-trips. Hostname() strips the brackets, so
+			// a naive hostname+":"+port join would produce http://::1:5000/cb.
+			name:       "M7 IPv6 literal re-brackets around the requested port",
+			registered: []string{"http://[::1]/cb"},
+			requested:  "http://[::1]:5000/cb",
+			want:       "http://[::1]:5000/cb",
+		},
+		{
+			// M9: the multi-URI registration Claude Code actually publishes — both
+			// members portless. Resolution picks the matching member and echoes
+			// the port onto THAT member's host.
+			name:       "M9 real multi-URI CIMD registration resolves against the matching member",
+			registered: []string{"http://localhost/callback", "http://127.0.0.1/callback"},
+			requested:  "http://127.0.0.1:57121/callback",
+			want:       "http://127.0.0.1:57121/callback",
+		},
+		{
+			// M9': the same registration, the OTHER member requested.
+			name:       "M9 multi-URI registration resolves the localhost member",
+			registered: []string{"http://localhost/callback", "http://127.0.0.1/callback"},
+			requested:  "http://localhost:51000/callback",
+			want:       "http://localhost:51000/callback",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ResolveRedirectURI(tc.registered, tc.requested)
+			if err != nil {
+				t.Fatalf("ResolveRedirectURI(%v, %q) = %v, want a delivery URI", tc.registered, tc.requested, err)
+			}
+			if got != tc.want {
+				t.Fatalf("delivery = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveRedirectURI_ProvenanceOnlyThePortCrossesOver is M8, the load-bearing
+// counterfactual: the registration's host differs from the request's ONLY in
+// CASE, so an implementation that echoed the REQUESTED string would return
+// http://localhost:5000/cb while substituting only the port returns
+// http://LOCALHOST:5000/cb. The case difference is invisible to the matcher
+// (which compares hosts case-insensitively) but visible in the delivery, which
+// is exactly what proves scheme/host/path come from the registered side.
+//
+// It is simultaneously the port counterfactual: with the substitution deleted
+// the delivery is the portless http://LOCALHOST/cb.
+func TestResolveRedirectURI_ProvenanceOnlyThePortCrossesOver(t *testing.T) {
+	t.Parallel()
+	got, err := ResolveRedirectURI([]string{"http://LOCALHOST/cb"}, "http://localhost:5000/cb")
 	if err != nil {
-		t.Fatalf("MatchRedirectURIAny = %v, want match", err)
+		t.Fatalf("ResolveRedirectURI = %v, want a delivery URI", err)
 	}
-	if got != "http://127.0.0.1/cb" {
-		t.Fatalf("matched %q, want the loopback registration", got)
+	const want = "http://LOCALHOST:5000/cb"
+	if got != want {
+		t.Fatalf("delivery = %q, want %q — scheme/host/path must come from the REGISTERED URI and only the port from the request", got, want)
 	}
-	if _, err := MatchRedirectURIAny(registered, "https://evil.example/cb"); err == nil {
-		t.Fatalf("MatchRedirectURIAny matched an unregistered URI")
+}
+
+// TestResolveRedirectURI_Refusals covers every refusal branch, each returning an
+// EMPTY delivery so a caller can never redirect on error.
+//
+// COUNTERFACTUAL for the open-redirect refusal: deleting the MatchRedirectURI
+// acceptance guard inside ResolveRedirectURI's loop turns the M4 subtests RED —
+// the evil inputs are well-formed absolute URIs with no userinfo/query/fragment,
+// so the deletion cannot be absorbed by a component rejection, and the loop
+// would return the first registration with no error.
+func TestResolveRedirectURI_Refusals(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		registered []string
+		requested  string
+	}{
+		// M4: host, scheme and path mismatch against a loopback registration.
+		{"M4 differing host", []string{"http://127.0.0.1/cb"}, "https://evil.example/cb"},
+		{"M4 differing scheme", []string{"http://127.0.0.1/cb"}, "https://127.0.0.1:5000/cb"},
+		{"M4 differing path", []string{"http://127.0.0.1/cb"}, "http://127.0.0.1:5000/other"},
+		// M5: no registrations at all.
+		{"M5 empty registration list", nil, "https://a.example/cb"},
+		// M6: a non-numeric port — net/url refuses it at parse time, so it can
+		// never reach the delivery builder as anything but a digit string.
+		{"M6 non-numeric port", []string{"http://127.0.0.1/callback"}, "http://127.0.0.1:notaport/callback"},
 	}
-	if _, err := MatchRedirectURIAny(nil, "https://a.example/cb"); err == nil {
-		t.Fatalf("MatchRedirectURIAny with no registrations should error")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ResolveRedirectURI(tc.registered, tc.requested)
+			assertRedirectRefused(t, err)
+			if got != "" {
+				t.Fatalf("a refused resolution returned delivery %q, want empty", got)
+			}
+		})
+	}
+}
+
+// TestDeliveryRedirectURI_FailsClosedOnAnInvalidComponent pins the delivery
+// builder's own fail-closed branch. Through ResolveRedirectURI it is unreachable
+// (MatchRedirectURI validated both sides first), so it is exercised directly:
+// a component failure must be an ERROR with an empty delivery, never a silent
+// fallback to the requested string.
+func TestDeliveryRedirectURI_FailsClosedOnAnInvalidComponent(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		registered string
+		requested  string
+	}{
+		{"invalid registered", "http://127.0.0.1/cb?a=1", "http://127.0.0.1:5000/cb"},
+		{"invalid requested", "http://127.0.0.1/cb", "http://u@127.0.0.1:5000/cb"},
+		{"unparseable requested", "http://127.0.0.1/cb", "http://127.0.0.1:notaport/cb"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := deliveryRedirectURI(tc.registered, tc.requested)
+			assertRedirectRefused(t, err)
+			if got != "" {
+				t.Fatalf("delivery = %q, want empty on a component failure", got)
+			}
+		})
 	}
 }
 
