@@ -2659,8 +2659,10 @@ func TestRunStage_AcceptanceShortCircuit_PostFetchFailure(t *testing.T) {
 // error naming working_dir, no runner spawned, and NO committed state (the
 // fakeBackend recorded no host-dispatch marker). The no-state assertion lands on
 // state, not error identity, per the counterfactual rule's committed-state
-// clause — run_stage's earliest state-committing side effect is the
-// host-dispatch marker (#2479).
+// clause — for a NON-acceptance (implement) stage run_stage's earliest
+// state-committing side effect is the host-dispatch marker (#2479). The
+// acceptance verb has an even earlier one (the admission POST); it is pinned
+// separately by TestRunStage_HTTPTransportRefusesOmittedWorkingDir_NoAdmission.
 func TestRunStage_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
@@ -2686,6 +2688,64 @@ func TestRunStage_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
 		t.Errorf("runner spawned despite the refusal: %v", *calls)
 	}
 	if n := fb.hostDispatchCalledByID[stageID]; n != 0 {
+		t.Errorf("host-dispatch marker called %d times, want 0 (refusal must commit no state)", n)
+	}
+}
+
+// TestRunStage_HTTPTransportRefusesOmittedWorkingDir_NoAdmission extends the
+// no-state ordering control to the ACCEPTANCE verb's EARLIEST state-committing
+// side effect: the acceptance-dispatch admission POST (#1928). For an acceptance
+// run_stage the admission call precedes the host-dispatch marker AND can settle
+// the stage server-side (short-circuit to a passed verdict), so it — not the
+// marker — is the earliest observable side effect. working_dir is resolved at
+// step (1z), ahead of the admission call, so an omitted working_dir over HTTP
+// must refuse BEFORE any admission POST fires.
+//
+// The assertion lands on state (admissionCalledByID == 0), not error identity:
+// a regression that moved working_dir resolution after the admission call would
+// fire it once (admissionShortCircuit is set, so it would also settle the stage)
+// and turn this red — which asserting the error string alone could never catch
+// (#2479, fix-up per approval condition 3 / test-vacuity concern).
+func TestRunStage_HTTPTransportRefusesOmittedWorkingDir_NoAdmission(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	// If admission were ever reached it would short-circuit the stage to a
+	// settled verdict — a committed state change the refusal must prevent.
+	fb.admissionShortCircuit = true
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	acceptanceID := uuid.New()
+	seedStages(fb, runID,
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+		Stage{ID: uuid.NewString(), RunID: runID.String(), Type: "implement", State: "succeeded"},
+		Stage{ID: acceptanceID.String(), RunID: runID.String(), Type: "acceptance", State: "pending"},
+	)
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y",
+		// working_dir intentionally omitted.
+	})
+	// Non-fatal on the error precheck so the state assertions below ALWAYS run:
+	// under the deleted-control counterfactual the refusal error disappears AND
+	// the admission POST fires, and the load-bearing RED must land on the latter.
+	if err == nil {
+		t.Error("expected a refusal error when working_dir is omitted over HTTP")
+	} else if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("error should name working_dir; got %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("runner spawned despite the refusal: %v", *calls)
+	}
+	// The earliest state-committing side effect of an acceptance run_stage — the
+	// admission POST — must NOT have fired. This is the load-bearing ordering
+	// assertion the marker-only check could not make.
+	if n := fb.admissionCalledByID[acceptanceID]; n != 0 {
+		t.Errorf("acceptance-admission POST called %d times, want 0 (refusal must precede the earliest admission side effect)", n)
+	}
+	if n := fb.hostDispatchCalledByID[acceptanceID]; n != 0 {
 		t.Errorf("host-dispatch marker called %d times, want 0 (refusal must commit no state)", n)
 	}
 }
