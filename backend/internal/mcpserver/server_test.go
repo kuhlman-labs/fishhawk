@@ -1,6 +1,15 @@
 package mcpserver
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
 
 // envFunc returns a func(string) string backed by a literal map. Relocated
 // into the package with the moved tests (E66.7 / #2408): it previously lived
@@ -75,5 +84,151 @@ func TestConfigInternal_PlumbsTokenToAPIClient(t *testing.T) {
 	}
 	if client.baseURL != "http://localhost:8080" {
 		t.Errorf("apiClient baseURL = %q, want http://localhost:8080", client.baseURL)
+	}
+}
+
+// callDispatchViaNewServer builds a REAL server via NewServer(cfg), connects an
+// in-memory MCP client session, and calls fishhawk_dispatch_stage with the given
+// arguments. It crosses Config -> config -> runResolver -> handler -> tool result
+// — the seam a per-layer unit test on resolveWorkingDir cannot cover, because a
+// unit test stays green even if NewServer forgets to thread HTTPTransport onto
+// the resolver (#2479).
+func callDispatchViaNewServer(t *testing.T, cfg Config, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	ctx := context.Background()
+	server := NewServer(cfg)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { clientSession.Close() })
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_dispatch_stage",
+		Arguments: args,
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	return res
+}
+
+// TestNewServer_HTTPTransportRefusesOmittedWorkingDir is the cross-boundary
+// proof: a REAL NewServer(Config{HTTPTransport:true}) refuses an omitted
+// working_dir at the tool-result layer, and the fake backend saw NO dispatch
+// (no host-dispatch marker). A unit test on resolveWorkingDir alone would pass
+// even if NewServer failed to thread the flag; this one would not (#2479).
+func TestNewServer_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "awaiting_host_dispatch")
+
+	res := callDispatchViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: true},
+		map[string]any{
+			"run_id":           runID.String(),
+			"workflow":         "feature_change",
+			"stage":            "implement",
+			"github_repo":      "x/y",
+			"push_and_open_pr": false,
+			// working_dir intentionally omitted.
+		})
+	if !res.IsError {
+		t.Fatalf("expected the tool call to error over HTTP with working_dir omitted; content: %+v", res.Content)
+	}
+	blob, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(blob), "working_dir") {
+		t.Errorf("error content should name working_dir; got %s", blob)
+	}
+	// The fake backend saw no dispatch (refusal committed no state).
+	if n := fb.hostDispatchCalledByID[stageID]; n != 0 {
+		t.Errorf("host-dispatch marker called %d times, want 0 (refused before any state)", n)
+	}
+}
+
+// TestNewServer_HTTPTransportEchoesResolvedWorkingDir satisfies binding
+// condition 2: an actual MCP tool-call result over the HTTP-transport server
+// carries resolved_working_dir, PRESENT and correct, for an explicit absolute
+// working_dir. Handler-level echo assertions alone don't prove the field
+// survives serialization into a real tool result — a reflection/tag typo could
+// silently drop it (#2479).
+func TestNewServer_HTTPTransportEchoesResolvedWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withFakeRunner(t, "exit 0")
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	dir := t.TempDir() // absolute
+	res := callDispatchViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: true},
+		map[string]any{
+			"run_id":           runID.String(),
+			"workflow":         "feature_change",
+			"stage":            "implement",
+			"working_dir":      dir,
+			"github_repo":      "x/y",
+			"push_and_open_pr": false,
+			"runner_binary":    "/fake/fishhawk-runner",
+		})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	if res.StructuredContent == nil {
+		t.Fatal("StructuredContent is nil; the typed output did not serialize")
+	}
+	raw, _ := json.Marshal(res.StructuredContent)
+	if !strings.Contains(string(raw), "resolved_working_dir") {
+		t.Fatalf("tool result missing the resolved_working_dir field on the wire: %s", raw)
+	}
+	var out DispatchStageOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode DispatchStageOutput: %v", err)
+	}
+	if out.ResolvedWorkingDir != dir {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, dir)
+	}
+}
+
+// TestNewServer_StdioTransportResolvesOmittedWorkingDir is the mirror: a REAL
+// NewServer(Config{HTTPTransport:false}) does NOT refuse an omitted working_dir
+// — it resolves it to the absolute process cwd and dispatches — proving the
+// divergence is keyed on the threaded transport flag (#2479).
+func TestNewServer_StdioTransportResolvesOmittedWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	withFakeRunner(t, "exit 0")
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	res := callDispatchViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: false},
+		map[string]any{
+			"run_id":           runID.String(),
+			"workflow":         "feature_change",
+			"stage":            "implement",
+			"github_repo":      "x/y",
+			"push_and_open_pr": false,
+			"runner_binary":    "/fake/fishhawk-runner",
+			// working_dir intentionally omitted.
+		})
+	if res.IsError {
+		t.Fatalf("stdio transport must NOT refuse an omitted working_dir; content: %+v", res.Content)
+	}
+	raw, _ := json.Marshal(res.StructuredContent)
+	var out DispatchStageOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode DispatchStageOutput: %v", err)
+	}
+	if out.ResolvedWorkingDir != cwd {
+		t.Errorf("resolved_working_dir = %q, want the absolute cwd %q", out.ResolvedWorkingDir, cwd)
 	}
 }

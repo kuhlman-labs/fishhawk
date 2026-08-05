@@ -2548,3 +2548,142 @@ func TestScanPendingScopeAmendments_MalformedEventsNotSwallowed(t *testing.T) {
 		t.Errorf("non-map path entries must be skipped with the event kept; got %+v", got[3])
 	}
 }
+
+// --- #2479: transport-conditional working_dir resolution ---
+
+// TestRunChildren_HTTPTransportRefusesOmittedWorkingDir drives the real handler
+// on an httpTransport resolver with working_dir OMITTED and asserts the OUTCOME:
+// an error naming working_dir, and NO committed side effect. run_children's
+// earliest observable side effect is provisioning a per-child worktree — done by
+// the spawned runner via --parallel-isolate — so zero spawns proves zero
+// worktrees. The no-state assertion lands on state (spawn count + host-dispatch
+// markers), not error identity, per the counterfactual rule's committed-state
+// clause (#2479).
+func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedPlanDecomposed(fb, parent, []string{child0.String()}, 0)
+
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, _, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		// working_dir intentionally omitted.
+	})
+	if err == nil {
+		t.Fatal("expected a refusal error when working_dir is omitted over HTTP")
+	}
+	if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("error should name working_dir; got %v", err)
+	}
+	// No per-child worktree provisioned: no runner spawned (the runner is what
+	// provisions the worktree via --parallel-isolate).
+	if got := atomic.LoadInt32(&spawns); got != 0 {
+		t.Errorf("spawned %d runners (and provisioned worktrees) despite the refusal; want 0", got)
+	}
+	// No host-dispatch marker CAS-flipped either.
+	fb.mu.Lock()
+	markers := 0
+	for _, n := range fb.hostDispatchCalledByID {
+		markers += n
+	}
+	fb.mu.Unlock()
+	if markers != 0 {
+		t.Errorf("host-dispatch markers called %d times, want 0 (refusal must commit no state)", markers)
+	}
+}
+
+// TestRunChildren_StdioTransportOmittedResolvesToAbsoluteCwd asserts the stdio
+// default: an omitted working_dir resolves to the absolute process cwd and each
+// child's argv carries `--working-dir <cwd>`, never "." (#2479).
+func TestRunChildren_StdioTransportOmittedResolvesToAbsoluteCwd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil) // stdio
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedPlanDecomposed(fb, parent, []string{child0.String()}, 0)
+
+	var mu sync.Mutex
+	var gotArgv []string
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+cwd) {
+		t.Errorf("child argv missing --working-dir %q: %v", cwd, joined)
+	}
+	if strings.Contains(joined, "--working-dir .") {
+		t.Errorf("child argv carries the literal \".\": %v", joined)
+	}
+	if out.ResolvedWorkingDir != cwd {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, cwd)
+	}
+}
+
+// TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged passes an explicit
+// absolute working_dir and asserts resolved_working_dir echoes it and the child
+// argv still carries `--working-dir <that path>` (#2479).
+func TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+
+	dir := t.TempDir()
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedPlanDecomposed(fb, parent, []string{child0.String()}, 0)
+
+	var mu sync.Mutex
+	var gotArgv []string
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.ResolvedWorkingDir != dir {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, dir)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+dir) {
+		t.Errorf("child argv missing --working-dir %q: %v", dir, joined)
+	}
+}

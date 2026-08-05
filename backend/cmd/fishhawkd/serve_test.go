@@ -3067,3 +3067,22 @@ func TestServe_ConstructsDefaultCIMDFetcherWhenIssuerConfigured(t *testing.T) {
 		t.Fatal("an issuer must construct a non-nil CIMD fetcher")
 	}
 }
+
+// TestMcpRouteServerConfig pins the /mcp route's production wiring (#2479): the
+// factory must build its mcpserver.Config with HTTPTransport:true (fishhawkd is
+// a long-lived daemon, so the runner-spawning verbs must refuse an omitted or
+// relative working_dir), plus the URL/token passthrough. Without this the
+// mcpserver-level behaviour could be perfect while the route shipped the
+// permissive zero value.
+func TestMcpRouteServerConfig(t *testing.T) {
+	cfg := mcpRouteServerConfig("http://127.0.0.1:8080", "fhk_x")
+	if !cfg.HTTPTransport {
+		t.Error("HTTPTransport = false, want true (the /mcp route serves over HTTP on the daemon)")
+	}
+	if cfg.BackendURL != "http://127.0.0.1:8080" {
+		t.Errorf("BackendURL = %q, want http://127.0.0.1:8080", cfg.BackendURL)
+	}
+	if cfg.APIToken != "fhk_x" {
+		t.Errorf("APIToken = %q, want fhk_x", cfg.APIToken)
+	}
+}

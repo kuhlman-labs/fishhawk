@@ -349,10 +349,14 @@ func TestExportedSurfaceMatchesBaseline(t *testing.T) {
 }
 
 // TestEntryPointsExist asserts the three intended entry points are present
-// and Config carries exactly the two documented exported fields — a third
-// exported field on Config fails it. Config/NewServer/Instructions are the
-// only surface #2390 consumes; this guards their shape independently of the
-// bulk baseline.
+// and Config carries exactly the three documented exported fields — a fourth
+// exported field on Config, or a dropped one, fails it. Config/NewServer/
+// Instructions are the only surface #2390 consumes; this guards their shape
+// independently of the bulk baseline. HTTPTransport joined {APIToken,
+// BackendURL} with #2479 (the transport-conditional working_dir refusal), so
+// the baseline is updated to the new EXACT three-field set — NOT loosened to a
+// subset/contains check: a new exported field on Config must stay a conscious
+// act.
 func TestEntryPointsExist(t *testing.T) {
 	surface := map[string]struct{}{}
 	for _, n := range collectExportedIdents(t) {
@@ -364,7 +368,9 @@ func TestEntryPointsExist(t *testing.T) {
 		}
 	}
 
-	// Config's exported fields must be exactly {BackendURL, APIToken}.
+	// Config's exported fields must be exactly {APIToken, BackendURL,
+	// HTTPTransport} — an EXACT-SET check (not subset/contains), so both a new
+	// leaked field and a dropped one fail.
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "server.go", nil, 0)
 	if err != nil {
@@ -395,8 +401,15 @@ func TestEntryPointsExist(t *testing.T) {
 		}
 	}
 	sort.Strings(fields)
-	want := []string{"APIToken", "BackendURL"}
-	if len(fields) != len(want) || fields[0] != want[0] || fields[1] != want[1] {
-		t.Errorf("Config exported fields = %v, want %v", fields, want)
+	want := []string{"APIToken", "BackendURL", "HTTPTransport"}
+	mismatch := len(fields) != len(want)
+	for i := range want {
+		if i >= len(fields) || fields[i] != want[i] {
+			mismatch = true
+			break
+		}
+	}
+	if mismatch {
+		t.Errorf("Config exported fields = %v, want exactly %v", fields, want)
 	}
 }

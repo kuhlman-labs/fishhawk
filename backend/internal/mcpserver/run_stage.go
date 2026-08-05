@@ -83,7 +83,7 @@ type RunStageInput struct {
 	StageID       string `json:"stage_id,omitempty" jsonschema:"stage UUID inside the run; optional — when omitted it is auto-resolved from (run_id, stage type). Pass explicitly only to disambiguate, or for back-compat; when supplied it must match the resolved stage of the requested type"`
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. The acceptance stage (E31.9) validates the merged change against a running preview/target instance; prefer fishhawk_dispatch_stage for it (it runs long, non-blocking) and it takes neither --plan-out nor --check-base-ref"`
-	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in; defaults to the MCP server's cwd"`
+	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) this is REQUIRED and must be an absolute path — the server's cwd is the daemon's own checkout, so an omitted or relative value is refused. On the stdio transport it defaults to the client-spawned process's own directory (resolved to an absolute path)"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1) so every run carries a pull_request_url for the review gate + merge reconciler. Pass false explicitly to keep the commit-yourself flow (the operator commits + pushes). A bare omitted value resolves to true."`
@@ -124,6 +124,13 @@ type RunStageOutput struct {
 	DiffSummary  *DiffSummary  `json:"diff_summary,omitempty" jsonschema:"present when the runner emitted a git_diff event and git show --numstat HEAD succeeded; nil for plan stages"`
 	AuditPointer *AuditPointer `json:"audit_pointer,omitempty" jsonschema:"most-recent audit entry for this run with its entry hash; nil on any fetch failure"`
 	RunURL       string        `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
+
+	// ResolvedWorkingDir echoes the absolute checkout the runner was spawned
+	// against, after transport-conditional working_dir resolution (#2479), so a
+	// wrong checkout is visible in the tool result rather than discovered from a
+	// contaminated diff. Omitted on the pre-spawn acceptance short-circuit /
+	// needs-target returns (no runner was spawned).
+	ResolvedWorkingDir string `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the runner was spawned against, after transport-conditional working_dir resolution (#2479)"`
 
 	// StageWaitStatus records the stage-execution wait contract on the durable
 	// (run_id, stage_id) handle (#879/#880, ADR-037), derived from the same
@@ -401,16 +408,21 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 	guardWarnings = append(guardWarnings, siblingWarnings...)
 
+	// (1z) Resolve working_dir transport-conditionally BEFORE the runner-binary
+	// resolution, the acceptance short-circuit admission call, the host-dispatch
+	// marker and the spawn (#2479). An omitted/relative working_dir over HTTP
+	// fails here with a clean error and commits no state.
+	workingDir, err := r.resolveWorkingDir(in.WorkingDir)
+	if err != nil {
+		return nil, RunStageOutput{}, err
+	}
+	in.WorkingDir = workingDir
+
 	// (2) Resolve the runner binary.
 	// Resolution order: input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > error.
 	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
 	if err != nil {
 		return nil, RunStageOutput{}, err
-	}
-
-	workingDir := in.WorkingDir
-	if workingDir == "" {
-		workingDir = "."
 	}
 
 	// (3) Resolve the GitHub repo. push_and_open_pr=false means the
@@ -730,23 +742,24 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 
 	out := RunStageOutput{
-		ExitCode:         exitCode,
-		StageState:       stageState,
-		Events:           resultEvents,
-		Warnings:         warnings,
-		DiffSummary:      diffSummary,
-		AuditPointer:     auditPointer,
-		RunURL:           runURL,
-		StageWaitStatus:  stageWaitStatus,
-		Outcome:          summary.Outcome,
-		Turns:            summary.Turns,
-		TokensUsed:       summary.TokensUsed,
-		ElapsedSeconds:   summary.ElapsedSeconds,
-		LastEventKind:    summary.LastEventKind,
-		FixupNoChanges:   summary.FixupNoChanges,
-		Budget:           budgetStatus,
-		ReviewActionHint: reviewActionHint,
-		NextActions:      nextActions,
+		ExitCode:           exitCode,
+		StageState:         stageState,
+		Events:             resultEvents,
+		Warnings:           warnings,
+		DiffSummary:        diffSummary,
+		AuditPointer:       auditPointer,
+		RunURL:             runURL,
+		ResolvedWorkingDir: workingDir,
+		StageWaitStatus:    stageWaitStatus,
+		Outcome:            summary.Outcome,
+		Turns:              summary.Turns,
+		TokensUsed:         summary.TokensUsed,
+		ElapsedSeconds:     summary.ElapsedSeconds,
+		LastEventKind:      summary.LastEventKind,
+		FixupNoChanges:     summary.FixupNoChanges,
+		Budget:             budgetStatus,
+		ReviewActionHint:   reviewActionHint,
+		NextActions:        nextActions,
 	}
 
 	// Return-cancellation signal: if the parent ctx was the reason
@@ -941,20 +954,18 @@ func resolveRunnerBinary(input string, getenv func(string) string) (string, erro
 //
 // baseBranch and repo are passed already-resolved (the caller defaults
 // baseBranch to "main" and resolves repo from input/origin); pushAndOpenPR is
-// the caller's resolved *bool default. workingDir is defaulted here from
-// in.WorkingDir so both callers share the same "." fallback.
+// the caller's resolved *bool default. workingDir is NOT defaulted here: both
+// callers resolve it transport-conditionally via resolveWorkingDir (#2479) and
+// set in.WorkingDir to the resulting ABSOLUTE path before calling this, so the
+// composer uses in.WorkingDir verbatim and never falls back to ".".
 func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo, baseBranch string, pushAndOpenPR bool) []string {
-	workingDir := in.WorkingDir
-	if workingDir == "" {
-		workingDir = "."
-	}
 	argv := []string{
 		"--run-id", in.RunID,
 		"--backend-url", r.api.baseURL,
 		"--workflow", in.Workflow,
 		"--stage", in.Stage,
 		stageIDArgFlag, resolvedStageID,
-		"--working-dir", workingDir,
+		"--working-dir", in.WorkingDir,
 		"--fetch-prompt",
 		"--upload-trace",
 	}

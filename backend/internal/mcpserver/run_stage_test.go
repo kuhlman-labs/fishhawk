@@ -2651,3 +2651,111 @@ func TestRunStage_AcceptanceShortCircuit_PostFetchFailure(t *testing.T) {
 		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
 	}
 }
+
+// --- #2479: transport-conditional working_dir resolution ---
+
+// TestRunStage_HTTPTransportRefusesOmittedWorkingDir drives the real handler on
+// an httpTransport resolver with working_dir OMITTED and asserts the OUTCOME: an
+// error naming working_dir, no runner spawned, and NO committed state (the
+// fakeBackend recorded no host-dispatch marker). The no-state assertion lands on
+// state, not error identity, per the counterfactual rule's committed-state
+// clause — run_stage's earliest state-committing side effect is the
+// host-dispatch marker (#2479).
+func TestRunStage_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+		// working_dir intentionally omitted.
+	})
+	if err == nil {
+		t.Fatal("expected a refusal error when working_dir is omitted over HTTP")
+	}
+	if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("error should name working_dir; got %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("runner spawned despite the refusal: %v", *calls)
+	}
+	if n := fb.hostDispatchCalledByID[stageID]; n != 0 {
+		t.Errorf("host-dispatch marker called %d times, want 0 (refusal must commit no state)", n)
+	}
+}
+
+// TestRunStage_StdioTransportOmittedResolvesToAbsoluteCwd asserts the stdio
+// default: an omitted working_dir resolves to the absolute process cwd and the
+// argv carries `--working-dir <cwd>`, never "." (#2479).
+func TestRunStage_StdioTransportOmittedResolvesToAbsoluteCwd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil) // stdio
+	calls := captureAllArgv(t)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(*calls))
+	}
+	joined := strings.Join((*calls)[0], " ")
+	if !strings.Contains(joined, "--working-dir "+cwd) {
+		t.Errorf("argv missing --working-dir %q: %v", cwd, (*calls)[0])
+	}
+	if strings.Contains(joined, "--working-dir .") {
+		t.Errorf("argv carries the literal \".\": %v", (*calls)[0])
+	}
+	if out.ResolvedWorkingDir != cwd {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, cwd)
+	}
+}
+
+// TestRunStage_ExplicitWorkingDirEchoedAndUnchanged passes an explicit absolute
+// working_dir and asserts resolved_working_dir echoes it and the argv still
+// carries `--working-dir <that path>` (#2479).
+func TestRunStage_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	calls := captureAllArgv(t)
+
+	dir := t.TempDir()
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		WorkingDir: dir, GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.ResolvedWorkingDir != dir {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, dir)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(*calls))
+	}
+	if !strings.Contains(strings.Join((*calls)[0], " "), "--working-dir "+dir) {
+		t.Errorf("argv missing --working-dir %q: %v", dir, (*calls)[0])
+	}
+}

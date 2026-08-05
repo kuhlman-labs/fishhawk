@@ -329,3 +329,29 @@ func envFunc(env map[string]string) func(string) string {
 		return env[k]
 	}
 }
+
+// TestMcpServerConfig pins the fishhawk-mcp production wiring (#2479): the Config
+// is TRANSPORT-aware, HTTPTransport:true for the `--transport http` branch (this
+// binary's process cwd is then a long-lived daemon's, as wrong as fishhawkd's)
+// and false for the stdio default (the client-spawned process, whose cwd IS the
+// caller's project). Without this both production callers could ship the
+// permissive zero value while every mcpserver test passes.
+func TestMcpServerConfig(t *testing.T) {
+	cfg := config{backendURL: "http://127.0.0.1:9090", apiToken: "fhk_y"}
+
+	httpCfg := mcpServerConfig(cfg, true)
+	if !httpCfg.HTTPTransport {
+		t.Error("http branch: HTTPTransport = false, want true")
+	}
+	if httpCfg.BackendURL != "http://127.0.0.1:9090" || httpCfg.APIToken != "fhk_y" {
+		t.Errorf("http branch: passthrough wrong: %+v", httpCfg)
+	}
+
+	stdioCfg := mcpServerConfig(cfg, false)
+	if stdioCfg.HTTPTransport {
+		t.Error("stdio branch: HTTPTransport = true, want false")
+	}
+	if stdioCfg.BackendURL != "http://127.0.0.1:9090" || stdioCfg.APIToken != "fhk_y" {
+		t.Errorf("stdio branch: passthrough wrong: %+v", stdioCfg)
+	}
+}
