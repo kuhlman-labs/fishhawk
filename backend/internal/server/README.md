@@ -1330,11 +1330,15 @@ off-host with the same `401`. So network exposure and auth tightening land
 together: ADR-033's no-bare-bearer-off-host invariant is kept, not traded away.
 `--oauth-require-loopback` drives the AS verdict to `oauthASNotLoopback` (not
 enabled) on a public bind, so setting it keeps the `/mcp` refusal too. In the
-lifted posture `listenAddr` is left empty so `Server.listenAddr()` binds
-`cfg.Addr` verbatim, and `verifyMCPListenerLoopback` skips the loopback
-assertion but STILL fails closed if the lift carries an empty `challengeResource`
-— a lift with no audience to enforce would serve the bare-bearer surface
-off-host, so `Start` refuses the whole listener.
+lifted posture a bind naming a SPECIFIC host pins `listenAddr` to the SAME
+resolved literal the selfURL is built from (see the selfURL-asymmetry paragraph),
+so the address the tool client dials the caller's bearer to is provably the
+address `net.Listen` bound; an empty/unspecified bind leaves `listenAddr` empty so
+`Server.listenAddr()` binds `cfg.Addr` verbatim (every interface, which includes
+the loopback the selfURL dials). `verifyMCPListenerLoopback` skips the loopback
+assertion off-host but STILL fails closed if the lift carries an empty
+`challengeResource` — a lift with no audience to enforce would serve the
+bare-bearer surface off-host, so `Start` refuses the whole listener.
 
 **selfURL asymmetry in the lifted posture (CONDITION 5).** Unlike the unlifted
 route — whose self URL is ALWAYS a resolved loopback IP literal — a bind-derived
@@ -1346,10 +1350,17 @@ For a SPECIFIC non-loopback local bind, the tool client's dial-back addresses
 that same locally-assigned address; packets to a locally-assigned unicast address
 are delivered by the host's own stack and never traverse a physical link, so the
 bearer is not put on the wire — but this is a documented NARROWING of ADR-033's
-stricter always-`127.0.0.1` posture, not an equivalence. An embedder-supplied
-`MCPSelfURL` keeps the existing loopback-pinning treatment unchanged; a hostname
-bind is resolved and its first address pinned, a resolution failure being
-`503 mcp_route_misconfigured` (never a silent accept).
+stricter always-`127.0.0.1` posture, not an equivalence. **The selfURL and the
+bind derive from ONE resolution.** `liftedSelfURL` returns both the dial-back URL
+AND the `listenAddr` the specific-host bind is pinned to, built from the same
+`net.ParseIP`/`lookupIP` result, so `net.Listen` cannot re-resolve a hostname at
+`Start` and land the listener on a different host than the selfURL dials — the
+divergence that would carry the caller's raw bearer toward uncontrolled egress
+(#2391). An embedder-supplied `MCPSelfURL` keeps the existing loopback-pinning
+treatment unchanged and leaves the bind at `cfg.Addr` verbatim (the self URL is
+an independent loopback dial-back target); a hostname bind is resolved and its
+first address pinned into BOTH selfURL and `listenAddr`, a resolution failure
+being `503 mcp_route_misconfigured` (never a silent accept).
 
 ### Why stateless (and what it costs)
 

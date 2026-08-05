@@ -227,7 +227,7 @@ func resolveMCPRouteState(cfg Config, as oauthASState, lookupIP func(string) ([]
 		if as.mode != oauthASEnabled {
 			return mcpRouteState{mode: mcpRouteNotLoopback, listenHost: host}
 		}
-		selfURL, serr := liftedSelfURL(cfg, host, port, lookupIP)
+		selfURL, bindAddr, serr := liftedSelfURL(cfg, host, port, lookupIP)
 		if serr != nil {
 			return mcpRouteState{
 				mode:       mcpRouteMisconfigured,
@@ -236,12 +236,21 @@ func resolveMCPRouteState(cfg Config, as oauthASState, lookupIP func(string) ([]
 					"serving would forward every caller's bearer off-host, so the route refuses", serr),
 			}
 		}
-		// listenAddr is left EMPTY so Server.listenAddr() falls back to
-		// cfg.Addr verbatim — the lifted deployment binds the address the
-		// operator asked for.
+		// bindAddr PINS the listener to the SAME resolved literal the selfURL was
+		// derived from whenever the bind names a specific host: net.Listen would
+		// otherwise re-resolve a hostname in cfg.Addr at Start, and a DNS answer
+		// that changed since New() would put the listener on a different address
+		// than the tool client dials — forwarding every caller's raw bearer to a
+		// host that is not the local listener (the token-exfiltration divergence
+		// #2391 closes). For an empty/unspecified bind bindAddr is empty so
+		// listenAddr() falls back to cfg.Addr verbatim: net.Listen binds every
+		// interface (the operator's deliberate public bind) and the loopback
+		// selfURL is reached over the loopback that all-interfaces bind includes,
+		// so there is no divergence to pin shut.
 		return mcpRouteState{
 			mode:              mcpRouteEnabled,
 			selfURL:           selfURL,
+			listenAddr:        bindAddr,
 			listenHost:        host,
 			authenticatedOnly: true,
 			challengeResource: as.resource.String(),
@@ -271,47 +280,59 @@ func resolveMCPRouteState(cfg Config, as oauthASState, lookupIP func(string) ([]
 	return mcpRouteState{mode: mcpRouteEnabled, selfURL: selfURL, listenHost: host, listenAddr: listenAddr}
 }
 
-// liftedSelfURL derives the loopback dial-back base URL for a route lifted off
-// loopback because an OAuth AS is enabled (ADR-076 slice 3, #2391). The bearer
-// the tool client forwards must stay on loopback even though the LISTENER is
-// off-host, so:
+// liftedSelfURL derives BOTH the loopback dial-back base URL AND the address
+// Start must BIND for a route lifted off loopback because an OAuth AS is enabled
+// (ADR-076 slice 3, #2391). The bearer the tool client forwards must reach the
+// SAME listener fishhawkd bound even though the LISTENER is off-host, so the
+// returned bindAddr pins the listener to the resolved literal the selfURL was
+// derived from whenever the bind names a specific host — closing the gap where
+// two independent DNS resolutions (selfURL at New, net.Listen at Start) diverge
+// and carry the caller's bearer somewhere the listener is not:
 //
 //   - an embedder-supplied MCPSelfURL keeps the existing pinLoopbackSelfURL
-//     treatment unchanged (it must still resolve to a loopback address);
-//   - an empty or unspecified listen host yields http://127.0.0.1:<port>,
-//     because net.Listen on an empty/unspecified host binds every local unicast
-//     address INCLUDING loopback, so the dial-back stays on loopback and
-//     ADR-033's forwarding invariant is fully preserved;
+//     treatment unchanged (it must still resolve to a loopback address). bindAddr
+//     is EMPTY: the self URL is an independent loopback dial-back target, so the
+//     listener binds the operator's chosen cfg.Addr verbatim;
+//   - an empty or unspecified listen host yields http://127.0.0.1:<port> with an
+//     EMPTY bindAddr, because net.Listen on an empty/unspecified host binds every
+//     local unicast address INCLUDING loopback, so the loopback dial-back is
+//     reached without a physical hop and ADR-033's forwarding invariant holds
+//     with no address to pin;
 //   - a specific host resolves to a literal (a literal pins itself; a hostname
 //     goes through lookupIP and pins the first address, a resolution failure
-//     being an error the caller renders as mcpRouteMisconfigured). This is a
-//     NARROWING of ADR-033's stricter always-127.0.0.1 posture — the dial-back
-//     addresses that same locally-assigned address, delivered by the host's own
-//     stack without a physical hop — and is documented as such in README.md.
-func liftedSelfURL(cfg Config, host, port string, lookupIP func(string) ([]net.IP, error)) (string, error) {
+//     being an error the caller renders as mcpRouteMisconfigured). Here selfURL
+//     AND bindAddr are BOTH built from that ONE resolution, so the address the
+//     tool client dials is provably the address the listener bound — a NARROWING
+//     of ADR-033's stricter always-127.0.0.1 posture (the dial-back addresses
+//     that same locally-assigned address, delivered by the host's own stack
+//     without a physical hop), documented as such in README.md.
+func liftedSelfURL(cfg Config, host, port string, lookupIP func(string) ([]net.IP, error)) (selfURL, bindAddr string, err error) {
 	if raw := strings.TrimSpace(cfg.MCPSelfURL); raw != "" {
-		return pinLoopbackSelfURL(raw, lookupIP)
+		pinned, perr := pinLoopbackSelfURL(raw, lookupIP)
+		return pinned, "", perr
 	}
 	if host == "" {
-		return "http://127.0.0.1:" + port, nil
+		return "http://127.0.0.1:" + port, "", nil
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		if ip.IsUnspecified() {
-			return "http://127.0.0.1:" + port, nil
+			return "http://127.0.0.1:" + port, "", nil
 		}
-		return "http://" + net.JoinHostPort(ip.String(), port), nil
+		lit := net.JoinHostPort(ip.String(), port)
+		return "http://" + lit, lit, nil
 	}
 	if lookupIP == nil {
 		lookupIP = net.LookupIP
 	}
 	addrs, err := lookupIP(host)
 	if err != nil {
-		return "", fmt.Errorf("resolve %q: %w", host, err)
+		return "", "", fmt.Errorf("resolve %q: %w", host, err)
 	}
 	if len(addrs) == 0 {
-		return "", fmt.Errorf("resolve %q: no addresses", host)
+		return "", "", fmt.Errorf("resolve %q: no addresses", host)
 	}
-	return "http://" + net.JoinHostPort(addrs[0].String(), port), nil
+	lit := net.JoinHostPort(addrs[0].String(), port)
+	return "http://" + lit, lit, nil
 }
 
 // verifyMCPListenerLoopback is the bind-time half of the loopback refusal:

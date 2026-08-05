@@ -1158,6 +1158,55 @@ func TestResolveMCPRouteState_LiftedSelfURLResolutionFailureIsMisconfigured(t *t
 	}
 }
 
+// TestResolveMCPRouteState_LiftedBindPinnedToSelfURLHost is the security pin for
+// #2391's lifted-bind divergence: when the lifted bind names a SPECIFIC host the
+// listener is pinned to the SAME resolved literal the selfURL is derived from, so
+// the address the tool client forwards the caller's raw bearer to is provably the
+// address net.Listen binds. The pre-fix behavior left listenAddr empty, so
+// net.Listen re-resolved the hostname in cfg.Addr at Start and a DNS answer that
+// changed since New() would put the listener on a different host than the selfURL
+// dials — carrying the bearer off toward uncontrolled egress. Deleting the
+// bindAddr pin (listenAddr left "") reddens the listenAddr / equality assertions
+// below. A stable resolver is enough: the property is that ONE resolution feeds
+// BOTH selfURL and the bind, which the selfURL-host == bind equality proves
+// regardless of whether a second lookup would agree.
+func TestResolveMCPRouteState_LiftedBindPinnedToSelfURLHost(t *testing.T) {
+	lookup := func(string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.5")}, nil }
+	s := New(Config{
+		Addr:             "public.example:8080",
+		MCPServerFactory: testMCPServerFactory,
+		mcpLookupIP:      lookup,
+		OAuthASIssuer:    testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	st := s.mcpRoute
+	if st.mode != mcpRouteEnabled || !st.authenticatedOnly {
+		t.Fatalf("mode = %v authOnly = %v (reason %q), want lifted", st.mode, st.authenticatedOnly, st.reason)
+	}
+	if st.selfURL != "http://203.0.113.5:8080" {
+		t.Errorf("selfURL = %q, want the resolved http://203.0.113.5:8080", st.selfURL)
+	}
+	if st.listenAddr != "203.0.113.5:8080" {
+		t.Fatalf("listenAddr = %q, want the pinned resolved literal 203.0.113.5:8080 (not the hostname)", st.listenAddr)
+	}
+	// The invariant the pin exists to hold: the bind address IS the selfURL's
+	// host:port, so no second DNS resolution can aim them at different hosts.
+	u, err := url.Parse(st.selfURL)
+	if err != nil {
+		t.Fatalf("selfURL does not parse: %v", err)
+	}
+	if u.Host != st.listenAddr {
+		t.Errorf("selfURL host %q != bind address %q — the two derive from different resolutions and can diverge", u.Host, st.listenAddr)
+	}
+	// listenAddr() must hand net.Listen the pinned literal, never the hostname it
+	// would re-resolve at Start.
+	if got := s.listenAddr(); got != "203.0.113.5:8080" {
+		t.Errorf("listenAddr() = %q, want the pinned literal (not the hostname)", got)
+	}
+	if strings.Contains(s.listenAddr(), "public.example") {
+		t.Errorf("listenAddr() = %q retained the hostname — net.Listen would re-resolve it at Start", s.listenAddr())
+	}
+}
+
 // TestVerifyMCPListenerLoopback_LiftWithoutResourceFailsClosed pins the
 // bind-time fail-closed guard: a lift constructed with no audience to enforce
 // refuses the whole listener; with a resource it passes even off-host.
@@ -1273,25 +1322,53 @@ func TestHandleMCP_LiftedRefusesBareBearerToken(t *testing.T) {
 		t.Fatalf("route mode = %v authOnly = %v (reason %q), want lifted", s.mcpRoute.mode, s.mcpRoute.authenticatedOnly, s.mcpRoute.reason)
 	}
 
-	// A bare fhk_ token is refused off-host with the 401 challenge.
-	bareReq := newMCPPost(mcpInitializeBody)
-	bareReq.Header.Set("Authorization", "Bearer "+bareToken)
-	bareRec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(bareRec, bareReq)
-	if bareRec.Code != http.StatusUnauthorized {
-		t.Fatalf("bare fhk_ status = %d, want 401 (refused off-host in lifted mode):\n%s", bareRec.Code, bareRec.Body.String())
+	envelope := func(decorate func(*http.Request)) (int, string, string) {
+		req := newMCPPost(mcpInitializeBody)
+		if decorate != nil {
+			decorate(req)
+		}
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Code, rec.Header().Get("WWW-Authenticate"), rec.Body.String()
 	}
-	if !strings.Contains(bareRec.Body.String(), "authentication_required") {
-		t.Errorf("bare fhk_ body = %s, want authentication_required", bareRec.Body.String())
+
+	// A bare fhk_ token is refused off-host with the 401 challenge.
+	bareStatus, bareHdr, bareBody := envelope(func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+bareToken)
+	})
+	if bareStatus != http.StatusUnauthorized {
+		t.Fatalf("bare fhk_ status = %d, want 401 (refused off-host in lifted mode):\n%s", bareStatus, bareBody)
+	}
+	if !strings.Contains(bareBody, "authentication_required") {
+		t.Errorf("bare fhk_ body = %s, want authentication_required", bareBody)
+	}
+
+	// INDISTINGUISHABILITY on the off-loopback bare-token branch (concern
+	// medium/verification): a VALID bare token refused in lifted mode must produce
+	// a status/header/body BYTE-IDENTICAL to a MISSING bearer, or the difference
+	// would let a caller tell a valid-but-unaudienced token from no token at all —
+	// the token-validity leak the shared writeMCPAuthChallenge builder prevents.
+	// This exercises handleMCP's `authenticatedOnly && OAuthAudience == ""` arm,
+	// which the loopback-deployment identical-challenge test never reaches.
+	missStatus, missHdr, missBody := envelope(nil)
+	if bareStatus != missStatus || bareHdr != missHdr || bareBody != missBody {
+		t.Errorf("off-loopback bare-token envelope differs from the missing-bearer envelope (leaks token validity):\n"+
+			"status %d vs %d\nhdr %q vs %q\nbody %q vs %q",
+			bareStatus, missStatus, bareHdr, missHdr, bareBody, missBody)
+	}
+	// And it is the real AS discovery challenge (names the derived PRM URL), not a
+	// realm-only fallback that would satisfy byte-equality while breaking discovery.
+	wantParam := `resource_metadata="` + s.oauthAS.prmURL + `"`
+	if !strings.Contains(bareHdr, wantParam) {
+		t.Errorf("bare-token WWW-Authenticate = %q, want it to name %q", bareHdr, wantParam)
 	}
 
 	// An audience-bound fho_ identity is admitted (reaches the streamable
 	// handler; NOT a 401).
-	okReq := newMCPPost(mcpInitializeBody)
-	okReq.Header.Set("Authorization", "Bearer "+testFhoToken)
-	okRec := httptest.NewRecorder()
-	s.Handler().ServeHTTP(okRec, okReq)
-	if okRec.Code == http.StatusUnauthorized {
-		t.Fatalf("fho_ status = 401, want admitted to the tool surface:\n%s", okRec.Body.String())
+	okStatus, _, okBody := envelope(func(r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+testFhoToken)
+	})
+	if okStatus == http.StatusUnauthorized {
+		t.Fatalf("fho_ status = 401, want admitted to the tool surface:\n%s", okBody)
 	}
 }
