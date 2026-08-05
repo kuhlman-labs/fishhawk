@@ -138,8 +138,17 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 		})
 		return authorizeResolved{}, false
 	}
-	// (6) scopes: valid against the server-wide vocabulary first.
-	scopes, err := oauthas.ParseScope(req.scope)
+	// (6) scopes: valid against the server-wide vocabulary first. A request that
+	// CARRIES NO SCOPE TOKEN (the key absent, or a present-but-empty `scope=` —
+	// url.Values.Get cannot tell them apart and they are deliberately equivalent)
+	// is DEFAULTED per RFC 6749 §3.3 rather than refused (#2466): to the client's
+	// registered scope intersected with this server's vocabulary when the
+	// registration pins one, else to the whole vocabulary. Every PRESENT value
+	// still validates exactly as before — an unknown scope, a whitespace-only
+	// `scope=%20%20`, and a scope exceeding the registration all still fail
+	// invalid_scope.
+	registered := registeredScopeSet(client)
+	scopes, err := oauthas.ResolveRequestedScope(req.scope, registered)
 	if err != nil {
 		s.redirectOAuthError(w, r, responseRedirect, req.state, toOAuthError(err))
 		return authorizeResolved{}, false
@@ -150,8 +159,12 @@ func (s *Server) runAuthorizeLadder(w http.ResponseWriter, r *http.Request, req 
 	// deliberately registered narrow could obtain any operator scope, widening
 	// the authority baked into the code and every derived token. An ABSENT
 	// registered scope is NO restriction (the documented distinction), so the
-	// check runs only when the set is non-empty.
-	if registered := registeredScopeSet(client); len(registered) > 0 {
+	// check runs only when the set is non-empty. It is deliberately NOT skipped
+	// for a DEFAULTED set: that set passes by construction (every member came
+	// from the registration, or the registration was absent and imposes no
+	// restriction), so one unconditional restriction ladder beats a conditional
+	// one a later edit could get wrong.
+	if len(registered) > 0 {
 		for _, want := range scopes {
 			if !containsOAuth(registered, want) {
 				s.redirectOAuthError(w, r, responseRedirect, req.state, &oauthas.Error{
@@ -329,8 +342,21 @@ func (s *Server) renderConsent(w http.ResponseWriter, r *http.Request, req autho
 		CodeChallenge:       req.codeChallenge,
 		CodeChallengeMethod: req.codeChallengeMethod,
 		ResourceParam:       req.resource,
-		Scope:               req.scope,
-		State:               req.state,
+		// The RESOLVED scope set, NOT the raw request value (#2466 CONDITION B):
+		// what the page DISPLAYS is what the POST submits, so what the user saw
+		// is what gets granted. Echoing the raw value would make a scope-less GET
+		// produce a scope-less POST that re-derives the default against whatever
+		// the registration says at POST time — a consent/grant divergence. With
+		// the resolved value the POST validates through the ordinary PRESENT-scope
+		// path: if the registration NARROWED in between, the POST carries scopes
+		// it no longer permits and is refused invalid_scope at step 7 (a refusal,
+		// not a silent grant); if it BROADENED, the narrower displayed set is
+		// granted. Both match what was displayed. This adds no tampering surface —
+		// a user editing their own hidden field could equally have crafted that
+		// authorize request directly, and step 7 still bounds it whenever a
+		// registration pins a scope.
+		Scope: oauthas.ScopeString(resolved.scopes),
+		State: req.state,
 	}); err != nil {
 		s.cfg.Logger.Error("render oauth consent page", "error", err.Error())
 	}

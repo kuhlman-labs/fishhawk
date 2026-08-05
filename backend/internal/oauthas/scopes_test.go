@@ -122,6 +122,85 @@ func TestParseScope(t *testing.T) {
 	}
 }
 
+// TestResolveRequestedScope covers one case per branch of the #2466 defaulting
+// helper. The PRESENT cases are the unchanged-behaviour controls (they delegate
+// to ParseScope verbatim); the NO-SCOPE-TOKEN cases are the new behaviour.
+func TestResolveRequestedScope(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		requested  string
+		registered []string
+		want       []string
+		wantErr    bool
+	}{
+		// PRESENT path — delegated to ParseScope, unchanged.
+		{name: "present valid passes through", requested: "read:runs write:runs", want: []string{"read:runs", "write:runs"}},
+		{name: "present unknown refused", requested: "bogus:scope", wantErr: true},
+		// CONDITION A boundary: whitespace-only is PRESENT, so it stays refused —
+		// this is what proves the change did not swallow the present-but-invalid
+		// path along with the genuinely-tokenless one.
+		{name: "present whitespace-only refused not defaulted", requested: "   ", wantErr: true},
+		{name: "present whitespace-only refused even with a registration", requested: "   ", registered: []string{"read:runs"}, wantErr: true},
+
+		// NO SCOPE TOKEN — defaults. An absent key and a present-but-empty
+		// `scope=` both arrive here as "" and are deliberately equivalent
+		// (CONDITION A); the handler-level pin for the `scope=` wire form is
+		// TestAuthorize_AbsentScopeDefaults/present_but_empty_scope_takes_default.
+		{name: "no token and no registration defaults to the whole vocabulary", requested: "", registered: nil, want: SupportedScopes},
+		{name: "no token defaults to a fully supported registration", requested: "", registered: []string{"read:runs", "write:runs"}, want: []string{"read:runs", "write:runs"}},
+		{name: "no token drops registered scopes outside the vocabulary", requested: "", registered: []string{"openid", "read:runs"}, want: []string{"read:runs"}},
+		{name: "no token and a wholly unsupported registration fails closed", requested: "", registered: []string{"openid", "profile"}, wantErr: true},
+		{name: "no token dedups a duplicate-bearing registration", requested: "", registered: []string{"write:runs", "read:runs", "write:runs"}, want: []string{"write:runs", "read:runs"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ResolveRequestedScope(tc.requested, tc.registered)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveRequestedScope(%q, %v) = %v, want error", tc.requested, tc.registered, got)
+				}
+				assertCode(t, err, ErrCodeInvalidScope)
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveRequestedScope(%q, %v) unexpected error: %v", tc.requested, tc.registered, err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("ResolveRequestedScope(%q, %v) = %v, want %v", tc.requested, tc.registered, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveRequestedScope_DefaultDoesNotAliasSupportedScopes pins the
+// defensive copy: the caller stores the returned slice on the authorization-code
+// row, so handing out SupportedScopes' backing array would let one request
+// corrupt the package vocabulary for every later one.
+func TestResolveRequestedScope_DefaultDoesNotAliasSupportedScopes(t *testing.T) {
+	// NOT parallel: it mutates its own copy and then re-reads the package var.
+	got, err := ResolveRequestedScope("", nil)
+	if err != nil {
+		t.Fatalf("ResolveRequestedScope: %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("default scope set is empty")
+	}
+	first := SupportedScopes[0]
+	got[0] = "corrupted:scope"
+	if SupportedScopes[0] != first {
+		t.Fatalf("mutating the returned default corrupted SupportedScopes[0] = %q, want %q", SupportedScopes[0], first)
+	}
+	again, err := ResolveRequestedScope("", nil)
+	if err != nil {
+		t.Fatalf("second ResolveRequestedScope: %v", err)
+	}
+	if !reflect.DeepEqual(again, SupportedScopes) {
+		t.Fatalf("second default = %v, want %v", again, SupportedScopes)
+	}
+}
+
 func TestScopeString(t *testing.T) {
 	t.Parallel()
 	in := []string{"read:runs", "write:runs"}

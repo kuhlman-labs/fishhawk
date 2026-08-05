@@ -1721,6 +1721,36 @@ absent scope and the ladder enforces only when the set is non-empty, so a
 scope-omitting CIMD client (e.g. Claude Code) stays unrestricted while a client
 that DID pin a narrow scope is bounded to it.
 
+An **absent REQUEST `scope`** now defaults too (#2466), which makes the two sides
+consistent — an absent registration already meant "no restriction", so failing
+closed on an absent request parameter was the odd one out. The ladder's step 6
+calls `oauthas.ResolveRequestedScope(req.scope, registeredScopeSet(client))`: a
+request that CARRIES NO SCOPE TOKEN (the key absent, or a present-but-empty
+`scope=` — `url.Values.Get` cannot tell them apart and they are deliberately
+equivalent) is granted the client's registered scope INTERSECTED with the server
+vocabulary, or the whole vocabulary when the registration pins nothing; a
+registration naming no supported scope fails CLOSED with `invalid_scope`. Every
+PRESENT value still validates exactly as before — an unknown scope, a
+whitespace-only `scope=%20%20`, and a scope exceeding the registration all still
+fail `invalid_scope`. Step 7 is NOT skipped for a defaulted set: it passes by
+construction, so one unconditional restriction ladder beats a conditional one a
+later edit could get wrong. Contract detail: `backend/internal/oauthas/README.md`.
+
+**The consent form's hidden `scope` field carries the RESOLVED set, not the raw
+request value.** The page DISPLAYS the resolved scopes, so submitting the raw
+value would make a scope-less GET produce a scope-less POST that re-derives
+against whatever the registration says at POST time — a consent/grant divergence
+in which the user approves one set and another is granted. Carrying the resolved
+value makes the POST validate through the ordinary PRESENT-scope path: if the
+registration NARROWED in between, the POST carries scopes it no longer permits
+and is refused `invalid_scope` at step 7 (a refusal, not a silent grant); if it
+BROADENED, the narrower displayed set is granted. Both outcomes match what the
+user saw. This adds no tampering surface — a user editing their own hidden field
+could equally have crafted that authorize request directly, and step 7 still
+bounds it whenever a registration pins a scope. Pinned by
+`TestAuthorizeConsent_GrantMatchesDisplayedScopeWhenRegistrationChanges`, which
+MUTATES the registration between the consent GET and POST in both directions.
+
 ### CIMD amplification limiter + loopback gate (#2441)
 
 The outbound CIMD amplification primitive on the two unauthenticated OAuth AS

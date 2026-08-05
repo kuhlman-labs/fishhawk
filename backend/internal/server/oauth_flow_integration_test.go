@@ -327,3 +327,102 @@ func TestOAuthFlow_LimiterLivePreservesHappyPathThenThrottlesCIMD(t *testing.T) 
 		t.Fatalf("the rate-limited CIMD request still dialled: fetches %d -> %d", froze, rt.fetches())
 	}
 }
+
+// TestOAuthFlow_ScopeOmittedClientOnboardsEndToEnd is the #2466 cross-boundary
+// test: a client that never sends a `scope` parameter — the shape of Claude
+// Code's CIMD document, and the onboarding block the issue reports — completes
+// the whole chain and receives a usable token carrying the DEFAULTED scope set.
+//
+// It runs over the REAL oauthstore Postgres repository because the defaulted
+// value crosses five layers: derived in oauthas, applied in the authorize
+// ladder, rendered into the consent form's hidden field, persisted on the code
+// row, inherited by the access token, and echoed in the RFC 6749 §5.1 response.
+// Every per-layer unit passes while any one of those seams drops it.
+//
+// The consent POST submits the value the rendered page actually carried (what a
+// browser would send), so the CONDITION-B hidden-field wiring is exercised on the
+// live path rather than assumed.
+func TestOAuthFlow_ScopeOmittedClientOnboardsEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	store := oauthstore.NewPostgresRepository(pool)
+
+	// A public client with NO registered scope and no response_types — the
+	// Claude-Code-shaped registration, which pins nothing.
+	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                "client-x",
+			ClientName:              "Claude Code",
+			RedirectURIs:            []string{"https://app.example/cb"},
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			TokenEndpointAuthMethod: "none",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertClient: %v", err)
+	}
+
+	repo := newFakeAuthRepo()
+	uid := uuid.New()
+	repo.mu.Lock()
+	repo.users[uid.String()] = &auth.User{ID: uid.String(), Provider: "github", GitHubLogin: "octocat"}
+	repo.mu.Unlock()
+	id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
+
+	_, gh := stubGitHubOAuthServer(t)
+	srv := New(Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthStore:       store,
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+		AuthRepo:         repo,
+		GitHubOAuth:      gh,
+	})
+
+	noScope := map[string]string{"scope": "\x00"}
+
+	// Anonymous, scope-less: the request is VALID, so it reaches sign-in rather
+	// than being refused invalid_scope at the client. Before #2466 this 302'd
+	// back to the client with error=invalid_scope and onboarding stopped here.
+	anon := getAuthorize(srv, authorizeQuery(noScope), nil)
+	if anon.Code != http.StatusFound {
+		t.Fatalf("anonymous scope-less authorize status = %d, want 302; body=%s", anon.Code, anon.Body.String())
+	}
+	if loc := anon.Header().Get("Location"); !strings.HasPrefix(loc, "/v0/auth/github/login?next=") {
+		t.Fatalf("anonymous scope-less authorize Location = %q, want the forge sign-in redirect (not an invalid_scope bounce)", loc)
+	}
+
+	// Signed in: the consent page renders and offers the defaulted vocabulary.
+	page := getAuthorize(srv, authorizeQuery(noScope), &id)
+	if page.Code != http.StatusOK {
+		t.Fatalf("scope-less consent page status = %d, want 200; body=%s", page.Code, page.Body.String())
+	}
+	shown := consentScopeListItems(t, page.Body.String())
+	if !equalStrings(shown, oauthas.SupportedScopes) {
+		t.Fatalf("consent displayed %v, want the advertised vocabulary %v", shown, oauthas.SupportedScopes)
+	}
+	hidden := consentHiddenScope(t, page.Body.String())
+
+	// Consent POST exactly as the browser would submit the rendered form.
+	code := redirectQuery(t, postConsent(srv, consentForm(map[string]string{"scope": hidden}), &id)).Get("code")
+	if code == "" {
+		t.Fatal("scope-less consent did not mint a code")
+	}
+
+	// Token exchange: the §5.1 response echoes the defaulted scope string.
+	resp := decodeToken(t, postToken(srv, codeExchangeForm(code), nil))
+	if want := oauthas.ScopeString(oauthas.SupportedScopes); resp.Scope != want {
+		t.Errorf("token response scope = %q, want %q", resp.Scope, want)
+	}
+
+	// COMMITTED STATE at the far end of the chain: the persisted access token
+	// carries the defaulted set, read back out of the real repository.
+	at, err := store.AuthenticateAccessToken(ctx, resp.AccessToken)
+	if err != nil {
+		t.Fatalf("authenticate the minted access token: %v", err)
+	}
+	if !equalStrings(at.Scopes, oauthas.SupportedScopes) {
+		t.Fatalf("access token scopes = %v, want the defaulted vocabulary %v", at.Scopes, oauthas.SupportedScopes)
+	}
+	if at.Audience != testResource {
+		t.Errorf("access token audience = %q, want %q", at.Audience, testResource)
+	}
+}

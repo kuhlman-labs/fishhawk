@@ -781,3 +781,275 @@ func TestAuthorize_EnforcesRegisteredScope(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// Scope defaulting for a request carrying no scope token (#2466).
+// ---------------------------------------------------------------------------
+
+// consentScopeListItems returns the scopes the consent page DISPLAYED (its
+// <li> entries), in render order.
+func consentScopeListItems(t *testing.T, body string) []string {
+	t.Helper()
+	start := strings.Index(body, "<ul>")
+	end := strings.Index(body, "</ul>")
+	if start < 0 || end < start {
+		t.Fatalf("consent page has no scope list; body=%s", body)
+	}
+	var out []string
+	for _, chunk := range strings.Split(body[start:end], "<li>")[1:] {
+		item, _, ok := strings.Cut(chunk, "</li>")
+		if !ok {
+			t.Fatalf("malformed scope list item %q", chunk)
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// consentHiddenScope returns the value of the consent form's hidden scope field
+// — i.e. exactly what a browser submitting that form would POST.
+func consentHiddenScope(t *testing.T, body string) string {
+	t.Helper()
+	const marker = `<input type="hidden" name="scope" value="`
+	i := strings.Index(body, marker)
+	if i < 0 {
+		t.Fatalf("consent page has no hidden scope field; body=%s", body)
+	}
+	rest := body[i+len(marker):]
+	v, _, ok := strings.Cut(rest, `"`)
+	if !ok {
+		t.Fatalf("unterminated hidden scope field: %q", rest)
+	}
+	return v
+}
+
+// mintedCodeScopes returns the scopes on the single code the fake store minted.
+func mintedCodeScopes(t *testing.T, store *fakeOAuthStore) []string {
+	t.Helper()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.codes) != 1 {
+		t.Fatalf("expected exactly 1 minted code, got %d", len(store.codes))
+	}
+	for _, c := range store.codes {
+		return c.Scopes
+	}
+	return nil
+}
+
+// scopeDefaultServer seeds client-x with the given registered scope string and
+// returns a signed-in, consent-capable server.
+func scopeDefaultServer(t *testing.T, registeredScope string) (*Server, *fakeOAuthStore, Identity) {
+	t.Helper()
+	store := newFakeOAuthStore()
+	c := storeClient("github", "client-x", []string{"https://app.example/cb"})
+	c.Scope = registeredScope
+	store.seedClient(c)
+	repo := newFakeAuthRepo()
+	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+	return srv, store, signedInIdentity(repo, "github")
+}
+
+// TestAuthorize_AbsentScopeDefaults is the #2466 behaviour: an authorization
+// request carrying NO SCOPE TOKEN is defaulted per RFC 6749 §3.3 instead of
+// refused invalid_scope, while every PRESENT value keeps failing exactly as it
+// did. Driven through the REAL authorize/consent routes.
+func TestAuthorize_AbsentScopeDefaults(t *testing.T) {
+	// (a) No registered scope -> the whole advertised vocabulary. The consent
+	// page lists what will be granted, so the assertion is on the rendered list.
+	//
+	// COUNTERFACTUAL: with the defaulting deleted (ResolveRequestedScope calling
+	// ParseScope unconditionally) this 302s error=invalid_scope where it wants a
+	// 200 consent page.
+	t.Run("registered_scope_absent", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "\x00"}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("a scope-less request must authorize; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		if got := consentScopeListItems(t, rr.Body.String()); !equalStrings(got, oauthas.SupportedScopes) {
+			t.Fatalf("consent listed %v, want the full vocabulary %v", got, oauthas.SupportedScopes)
+		}
+	})
+
+	// (b) A pinned registration BOUNDS the default exactly as it bounds an
+	// explicit request.
+	t.Run("registered_scope_pinned", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "read:runs write:runs")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "\x00"}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		got := consentScopeListItems(t, rr.Body.String())
+		if !equalStrings(got, []string{"read:runs", "write:runs"}) {
+			t.Fatalf("consent listed %v, want exactly the pinned pair", got)
+		}
+		if strings.Contains(rr.Body.String(), "write:deploy") {
+			t.Fatal("the default escaped the registration: write:deploy was offered")
+		}
+	})
+
+	// (c) FAIL CLOSED: a registration naming only scopes outside this server's
+	// vocabulary cannot be defaulted to — an empty grant is refused, never minted.
+	//
+	// COUNTERFACTUAL: deleting the empty-intersection guard (returning the empty
+	// filtered set) renders a consent page instead of redirecting invalid_scope.
+	t.Run("registration_with_no_supported_scope_refused", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "openid profile")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "\x00"}), &id)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope", q.Get("error"))
+		}
+		if q.Get("state") != "st-123" {
+			t.Errorf("state = %q, want st-123", q.Get("state"))
+		}
+		if q.Get("iss") != testIssuer {
+			t.Errorf("iss = %q, want %q", q.Get("iss"), testIssuer)
+		}
+	})
+
+	// (d) The intersection, asserted on COMMITTED STATE: a registration mixing a
+	// supported and an unsupported scope grants ONLY the supported member. An
+	// error-identity assertion could not see this — a filtered and an unfiltered
+	// default both return a byte-identical 302.
+	//
+	// COUNTERFACTUAL: deleting the IsSupportedScope filter persists `openid` on
+	// the code row. `openid` is definitionally not in SupportedScopes, so the bad
+	// state is seeded by construction and no fixture step calls the control.
+	t.Run("mixed_registration_grants_only_supported", func(t *testing.T) {
+		srv, store, id := scopeDefaultServer(t, "openid read:runs")
+		rr := postConsent(srv, consentForm(map[string]string{"scope": "\x00"}), &id)
+		_ = redirectQuery(t, rr)
+		if got := mintedCodeScopes(t, store); !equalStrings(got, []string{"read:runs"}) {
+			t.Fatalf("minted code scopes = %v, want exactly [read:runs] — the unsupported registered scope must be dropped, not granted", got)
+		}
+	})
+
+	// (e) UNCHANGED-BEHAVIOUR control: a PRESENT unknown scope is still refused.
+	t.Run("present_unknown_scope_still_refused", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "bogus:scope"}), &id)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope", q.Get("error"))
+		}
+	})
+
+	// (f) CONDITION A, ratified: a present-but-EMPTY `scope=` carries zero scope
+	// tokens, so it is semantically identical to omission and takes the SAME
+	// default. A client that serializes an empty list must not fail where one
+	// that omits the key succeeds.
+	t.Run("present_but_empty_scope_takes_default", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "")
+		query := authorizeQuery(map[string]string{"scope": ""})
+		// Non-vacuity: the key really is on the wire, as `scope=`.
+		if !strings.Contains(query, "scope=&") && !strings.HasSuffix(query, "scope=") {
+			t.Fatalf("query %q does not carry a present-but-empty scope key", query)
+		}
+		rr := getAuthorize(srv, query, &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("`scope=` must take the default like an absent key; status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		if got := consentScopeListItems(t, rr.Body.String()); !equalStrings(got, oauthas.SupportedScopes) {
+			t.Fatalf("consent listed %v, want the full vocabulary %v", got, oauthas.SupportedScopes)
+		}
+	})
+
+	// (g) CONDITION A's boundary, sitting beside (f): a present WHITESPACE-ONLY
+	// value IS distinguishable from omission and MUST keep failing invalid_scope.
+	// This is what proves the defaulting did not swallow the present-but-invalid
+	// path.
+	t.Run("present_whitespace_only_scope_still_refused", func(t *testing.T) {
+		srv, _, id := scopeDefaultServer(t, "")
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "  "}), &id)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope — a whitespace-only scope is PRESENT and must not be defaulted", q.Get("error"))
+		}
+	})
+}
+
+// TestAuthorizeConsent_GrantMatchesDisplayedScopeWhenRegistrationChanges is the
+// #2466 CONDITION B pin: the consent form's hidden scope field carries the
+// RESOLVED scope set (the same values rendered to the user), not the raw request
+// value, so what the page displayed is what the POST grants — even when the
+// client registration MUTATES between the consent GET and the consent POST.
+//
+// COUNTERFACTUAL: restore `Scope: req.scope` in renderConsent and both
+// directions redden. A scope-less GET then produces a scope-less POST that
+// re-derives against the registration as it stands at POST time: the BROADENED
+// case grants write:runs the user never saw, and the NARROWED case silently
+// mints a code instead of refusing.
+func TestAuthorizeConsent_GrantMatchesDisplayedScopeWhenRegistrationChanges(t *testing.T) {
+	// mutate re-seeds client-x with a new registered scope, standing in for an
+	// operator (or a CIMD document) changing the registration mid-flow.
+	mutate := func(store *fakeOAuthStore, scope string) {
+		c := storeClient("github", "client-x", []string{"https://app.example/cb"})
+		c.Scope = scope
+		store.seedClient(c)
+	}
+
+	// display drives the consent GET with NO scope token and returns what the
+	// page showed alongside what the form would submit.
+	display := func(t *testing.T, srv *Server, id Identity) (shown []string, hidden string) {
+		t.Helper()
+		rr := getAuthorize(srv, authorizeQuery(map[string]string{"scope": "\x00"}), &id)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("consent GET status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		}
+		body := rr.Body.String()
+		shown = consentScopeListItems(t, body)
+		hidden = consentHiddenScope(t, body)
+		// The form must submit precisely what it displayed.
+		if !equalStrings(shown, strings.Fields(hidden)) {
+			t.Fatalf("hidden scope field %q does not match the displayed scopes %v — the form submits something other than what the user saw", hidden, shown)
+		}
+		return shown, hidden
+	}
+
+	// NARROWING: the POST carries scopes the narrowed registration no longer
+	// permits, so step 7 refuses invalid_scope — a refusal, not a silent grant.
+	t.Run("registration_narrows_between_get_and_post", func(t *testing.T) {
+		srv, store, id := scopeDefaultServer(t, "read:runs write:runs")
+		shown, hidden := display(t, srv, id)
+		if !equalStrings(shown, []string{"read:runs", "write:runs"}) {
+			t.Fatalf("consent displayed %v, want the registered pair", shown)
+		}
+
+		mutate(store, "read:runs") // NARROWED after the user saw the page
+
+		rr := postConsent(srv, consentForm(map[string]string{"scope": hidden}), &id)
+		q := redirectQuery(t, rr)
+		if q.Get("error") != "invalid_scope" {
+			t.Fatalf("error = %q, want invalid_scope — a POST carrying the displayed scopes must be refused by the narrowed registration, never silently downgraded", q.Get("error"))
+		}
+		store.mu.Lock()
+		n := len(store.codes)
+		store.mu.Unlock()
+		if n != 0 {
+			t.Fatalf("a code was minted despite the refusal: %d codes", n)
+		}
+	})
+
+	// BROADENING: the POST carries the NARROWER displayed set, and that is what
+	// is granted — the user is never given authority they did not see.
+	t.Run("registration_broadens_between_get_and_post", func(t *testing.T) {
+		srv, store, id := scopeDefaultServer(t, "read:runs")
+		shown, hidden := display(t, srv, id)
+		if !equalStrings(shown, []string{"read:runs"}) {
+			t.Fatalf("consent displayed %v, want [read:runs]", shown)
+		}
+
+		mutate(store, "read:runs write:runs") // BROADENED after the user saw the page
+
+		rr := postConsent(srv, consentForm(map[string]string{"scope": hidden}), &id)
+		if q := redirectQuery(t, rr); q.Get("code") == "" {
+			t.Fatalf("approval minted no code (error=%q)", q.Get("error"))
+		}
+		got := mintedCodeScopes(t, store)
+		if !equalStrings(got, shown) {
+			t.Fatalf("granted scopes = %v, want the DISPLAYED set %v — the broadened registration must not widen a grant the user already saw", got, shown)
+		}
+	})
+}
