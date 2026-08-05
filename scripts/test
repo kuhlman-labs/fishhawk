@@ -770,18 +770,34 @@ _verify_patch_coverage() {
 }
 
 # _verify_gate_harnesses: run the standalone harnesses that pin the gate scripts
-# themselves (~3s total). They are the only machine check that scripts/test's
-# patch-coverage wiring and scripts/check-coverage.py still behave as documented,
+# themselves. They are the only machine check that scripts/test's patch-coverage
+# wiring, scripts/check-coverage.py, and scripts/dev still behave as documented,
 # and "must be green" is worth nothing if nothing ever runs them — `scripts/test
 # verify` on a Python/shell-only diff otherwise takes the no-changed-Go-packages
-# SKIP path and exercises neither the gate nor its harnesses. A missing or
-# non-executable harness prints a reason and is skipped; a FAILING one fails
-# verify (set -e), which is the point.
+# SKIP path and exercises neither the gate nor its harnesses. test-check-coverage
+# and test-patch-coverage together run in ~11s; test-dev — which pins scripts/dev
+# (the readiness gate + #1018 nonce round-trip, the container lease, the
+# stale-worktree sweep, MCP banner selection, the #2453 TLS helpers) — takes the
+# loop to ~26s, still small next to a verify gate that already runs lint plus a
+# full -race module loop for minutes. All three run UNCONDITIONALLY rather than
+# diff-scoped: a `scripts/`-touched guard would itself be a branch needing a pin
+# and could mis-classify, and the two coverage harnesses already run every time.
+# A missing or non-executable harness prints a reason and is skipped; test-dev is
+# ADDITIONALLY skipped when zsh is absent from PATH — it is `#!/usr/bin/env zsh`,
+# so the exec would otherwise fail 127 and red-line verify instead of skipping.
+# A FAILING harness fails verify (set -e), which is the point (#2455).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage; do
+  for h in test-check-coverage test-patch-coverage test-dev; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
+      continue
+    fi
+    # test-dev is `#!/usr/bin/env zsh`; on a host without zsh the exec fails 127
+    # and would red-line verify rather than take the documented skip. The two
+    # coverage harnesses are POSIX-portable and need no such guard (#2455).
+    if [ "$h" = "test-dev" ] && ! command -v zsh >/dev/null 2>&1; then
+      echo "scripts/test: scripts/test-dev needs zsh, absent from PATH — skipping that harness" >&2
       continue
     fi
     printf '>>> scripts/%s\n' "$h"

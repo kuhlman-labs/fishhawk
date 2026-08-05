@@ -58,16 +58,162 @@ else
   fail "(a) cmd_verify ordering (lint=$lint_line doc=$doc_line sync=$sync_line harness=$harness_line cov=$cov_line)"
 fi
 
-# (a2) verify actually EXECUTES both standalone harnesses, so "must be green" is
-# machine-checked rather than asserted in prose.
+# (a2) STATIC wiring assertion: verify names all three standalone harnesses and
+# each is executable on disk. This is explicitly NOT the propagation control — it
+# would still pass if a red harness failed to turn verify red — which is why the
+# behavioral cases (a3)-(a6) below drive the REAL function. (#2455 added test-dev.)
 harness_body="$(declare -f _verify_gate_harnesses)"
 if printf '%s' "$harness_body" | grep -q 'test-check-coverage' \
    && printf '%s' "$harness_body" | grep -q 'test-patch-coverage' \
+   && printf '%s' "$harness_body" | grep -q 'test-dev' \
    && [ -x "$REPO_ROOT/scripts/test-check-coverage" ] \
-   && [ -x "$REPO_ROOT/scripts/test-patch-coverage" ]; then
-  pass "(a2) cmd_verify runs both gate harnesses, and both are executable"
+   && [ -x "$REPO_ROOT/scripts/test-patch-coverage" ] \
+   && [ -x "$REPO_ROOT/scripts/test-dev" ]; then
+  pass "(a2) cmd_verify runs all three gate harnesses, and all are executable"
 else
   fail "(a2) gate-harness wiring ('$harness_body')"
+fi
+
+# ---------------------------------------------------------------------------
+# (a3)-(a6) BEHAVIORAL cases for _verify_gate_harnesses. Drive the REAL function
+# against a fake ROOT of stub harnesses so we pin PROPAGATION (a red harness
+# turns verify red), the zsh interpreter guard, and the non-executable skip —
+# not merely that a harness is named (that is (a2), which survives broken
+# propagation). Failure propagates out of the function via `set -e` in the parent
+# shell; this file runs `set +e` after sourcing, so we re-enable errexit inside a
+# subshell and invoke it in the BARE form `( set -e; ... ); rc=$?` — NOT
+# `( ... ) || rc=$?`, whose `||` suppresses the subshell's own errexit.
+#
+# Stub construction (approval condition 3): #!/bin/sh absolute-path shebangs
+# (kernel execs without consulting PATH) and `: > marker` redirection (no
+# PATH-resolved external), so an (a5)-style empty-PATH run cannot make a case go
+# red for an unrelated reason. Loop order is check -> patch -> dev.
+mk_stub() {  # <path> <marker> <rc>
+  {
+    printf '#!/bin/sh\n'
+    printf ': > "%s"\n' "$2"
+    printf 'exit %s\n' "$3"
+  } > "$1"
+  chmod +x "$1"
+}
+make_harnesses() {  # <root> <check-rc> <patch-rc> <dev-rc>
+  local root="$1" crc="$2" prc="$3" drc="$4"
+  rm -rf "$root"
+  mkdir -p "$root/scripts" "$root/markers"
+  mk_stub "$root/scripts/test-check-coverage" "$root/markers/test-check-coverage" "$crc"
+  mk_stub "$root/scripts/test-patch-coverage" "$root/markers/test-patch-coverage" "$prc"
+  mk_stub "$root/scripts/test-dev"            "$root/markers/test-dev"            "$drc"
+}
+
+# (a3) PROPAGATION control + counterfactual vehicle for the loop-list entry. The
+# FIRST harness (test-check-coverage) exits 1 while a LATER one (test-dev) would
+# succeed; the loop must ABORT on the failure. Assert BOTH rc!=0 AND that the
+# later harness's marker does NOT exist — the second half distinguishes "loop
+# aborted" from "loop ran to completion and returned the last status" (approval
+# condition 1). Counterfactual: delete `test-dev` from the loop list -> the loop
+# never reaches a case that fails here for that entry; delete `set -e` from the
+# subshell -> the loop runs to the end, test-dev's marker appears and rc becomes
+# 0 -> RED (both proven by hand and recorded in the PR Notes).
+fake="$tmproot/harn_a3"
+make_harnesses "$fake" 1 0 0
+( set -e; ROOT="$fake"; _verify_gate_harnesses ) >/dev/null 2>&1; rc=$?
+if [ "$rc" -ne 0 ] && [ ! -e "$fake/markers/test-dev" ]; then
+  pass "(a3) a failing harness aborts the loop: rc!=0 AND a later harness never ran (PROPAGATION control)"
+else
+  dev_marker=no; [ -e "$fake/markers/test-dev" ] && dev_marker=yes
+  fail "(a3) propagation (rc=$rc later-harness-ran=$dev_marker)"
+fi
+
+# (a3b) TEST-DEV WIRING counterfactual — a failing test-dev turns verify red.
+# This is the behavioral proof for the actual #2455 change (adding test-dev to
+# the loop), and is deliberately DISTINCT from (a3): (a3) proves PROPAGATION
+# (abort-before-later-harnesses) using test-check-coverage as the failer, and
+# NOTHING there depends on test-dev being in the loop — remove test-dev and (a3)
+# still passes. This case closes that gap. It is NOT and cannot be a propagation
+# control: test-dev is structurally LAST, so a no-errexit for-loop returns its
+# status whether or not the loop aborts, and abort-vs-complete is moot for the
+# last harness. What it proves NON-VACUOUSLY is wiring: with test-dev exiting 1
+# and both coverage stubs passing, the loop runs all three (both coverage markers
+# present, test-dev's own marker present) and test-dev's failure is the SOLE
+# cause of rc!=0. Counterfactual (approval condition 1(d)): delete `test-dev`
+# from the loop list in scripts/test -> the loop runs only the two passing
+# coverage stubs, rc becomes 0 and the dev marker is absent -> RED (run by hand,
+# output recorded in the PR Notes). (a2)'s static grep does NOT catch that same
+# deletion — it matches `test-dev` in the loop's zsh guard/comment even when the
+# name is gone from the loop LIST — which is exactly why a behavioral case is
+# needed. test-dev only executes when zsh resolves (the loop guards on it), so
+# skip cleanly on a zsh-less host rather than fail for the wrong reason.
+if command -v zsh >/dev/null 2>&1; then
+  fake="$tmproot/harn_a3b"
+  make_harnesses "$fake" 0 0 1
+  ( set -e; ROOT="$fake"; _verify_gate_harnesses ) >/dev/null 2>&1; rc=$?
+  if [ "$rc" -ne 0 ] && [ -e "$fake/markers/test-check-coverage" ] \
+     && [ -e "$fake/markers/test-patch-coverage" ] && [ -e "$fake/markers/test-dev" ]; then
+    pass "(a3b) a failing test-dev fails verify: loop ran all three, test-dev's exit is the sole cause of rc!=0 (WIRING counterfactual, NOT the propagation control)"
+  else
+    dev_marker=no; [ -e "$fake/markers/test-dev" ] && dev_marker=yes
+    fail "(a3b) test-dev wiring (rc=$rc dev-marker=$dev_marker)"
+  fi
+else
+  echo "SKIP: (a3b) zsh absent — cannot assert a failing test-dev executes"
+fi
+
+# (a4) NON-VACUITY control: all three exit 0 -> rc 0 and all three ran. Ensures
+# (a3)'s red cannot be an unrelated setup failure. test-dev only executes when
+# zsh resolves (the loop guards on it), so skip cleanly on a zsh-less host.
+if command -v zsh >/dev/null 2>&1; then
+  fake="$tmproot/harn_a4"
+  make_harnesses "$fake" 0 0 0
+  ( set -e; ROOT="$fake"; _verify_gate_harnesses ) >/dev/null 2>&1; rc=$?
+  if [ "$rc" -eq 0 ] && [ -e "$fake/markers/test-check-coverage" ] \
+     && [ -e "$fake/markers/test-patch-coverage" ] && [ -e "$fake/markers/test-dev" ]; then
+    pass "(a4) all three harnesses pass: rc=0 and all three ran (non-vacuity control)"
+  else
+    fail "(a4) non-vacuity (rc=$rc)"
+  fi
+else
+  echo "SKIP: (a4) zsh absent — cannot assert test-dev executes"
+fi
+
+# (a5) COUNTERFACTUAL vehicle for the zsh guard. test-dev carries a REAL
+# `#!/usr/bin/env zsh` shebang; PATH points at an empty dir so `env zsh` is
+# genuinely unresolvable. With the guard present the harness is SKIPPED: rc 0, a
+# printed reason naming zsh, and NO test-dev marker. The two coverage stubs run
+# first and must still succeed (their #!/bin/sh + builtins are PATH-independent),
+# so a red here can only be the guard. Counterfactual: delete the zsh guard ->
+# the zsh-shebang stub is exec'd under empty PATH -> exit 127 -> RED.
+fake="$tmproot/harn_a5"
+make_harnesses "$fake" 0 0 0
+{
+  printf '#!/usr/bin/env zsh\n'
+  printf ': > "%s"\n' "$fake/markers/test-dev"
+} > "$fake/scripts/test-dev"
+chmod +x "$fake/scripts/test-dev"
+mkdir -p "$tmproot/emptypath"
+( set -e; PATH="$tmproot/emptypath"; ROOT="$fake"; _verify_gate_harnesses ) >"$tmproot/a5.out" 2>&1; rc=$?
+a5_out="$(cat "$tmproot/a5.out")"
+if [ "$rc" -eq 0 ] && printf '%s' "$a5_out" | grep -q 'zsh' \
+   && [ ! -e "$fake/markers/test-dev" ]; then
+  pass "(a5) test-dev is skipped (not failed) when zsh is unresolvable: rc=0, reason names zsh, stub never ran"
+else
+  dev_marker=no; [ -e "$fake/markers/test-dev" ] && dev_marker=yes
+  fail "(a5) zsh guard (rc=$rc dev-marker=$dev_marker out='$a5_out')"
+fi
+
+# (a6) the pre-existing missing/non-executable skip branch, for test-dev. A
+# present-but-chmod-x test-dev -> rc 0, the documented reason, and the other two
+# harnesses still ran.
+fake="$tmproot/harn_a6"
+make_harnesses "$fake" 0 0 0
+chmod -x "$fake/scripts/test-dev"
+( set -e; ROOT="$fake"; _verify_gate_harnesses ) >"$tmproot/a6.out" 2>&1; rc=$?
+a6_out="$(cat "$tmproot/a6.out")"
+if [ "$rc" -eq 0 ] && printf '%s' "$a6_out" | grep -q 'missing or not executable' \
+   && [ -e "$fake/markers/test-check-coverage" ] && [ -e "$fake/markers/test-patch-coverage" ] \
+   && [ ! -e "$fake/markers/test-dev" ]; then
+  pass "(a6) a non-executable test-dev takes the documented skip; the other two still ran"
+else
+  fail "(a6) non-executable skip (rc=$rc out='$a6_out')"
 fi
 
 # ---------------------------------------------------------------------------

@@ -304,12 +304,16 @@ gate off.
 hand-written profiles) and `scripts/test-patch-coverage` (shell wiring,
 sourcing `scripts/test` lib-only with an overridden `ROOT`). They are
 standalone in the `scripts/test-*` style AND `scripts/test verify` runs
-both (`_verify_gate_harnesses`, ~3s, right after the schema-sync check):
-"must be green" is machine-enforced rather than asserted in prose,
-because a Python/shell-only diff otherwise takes the
-no-changed-Go-packages SKIP path and exercises neither the gate nor its
-harnesses. A missing/non-executable harness prints a reason and is
-skipped; a failing one fails verify. `test-patch-coverage` must stub
+them via `_verify_gate_harnesses` (right after the schema-sync check),
+alongside `scripts/test-dev` since #2455 — the three together take the
+loop to ~26s, from ~11s for the two coverage harnesses. "Must be green"
+is machine-enforced rather than asserted in prose, because a
+Python/shell-only diff otherwise takes the no-changed-Go-packages SKIP
+path and exercises neither the gate nor its harnesses. A
+missing/non-executable harness prints a reason and is skipped;
+`test-dev` is ALSO skipped when zsh is absent from PATH (it is
+`#!/usr/bin/env zsh`, so the exec would otherwise fail 127); a failing
+harness fails verify. `test-patch-coverage` must stub
 `_verify_gate_harnesses` wherever it calls the real `cmd_verify`, or it
 re-executes itself without bound.
 
@@ -504,3 +508,8 @@ end (idempotency, chain-mismatch self-repair, leaf-only renewal, and a
 dual-SAN handshake served by `openssl s_server` verified with
 `curl --cacert` on both URL shapes). The Caddyfile itself is unproven
 until caddy is installed; the live operator walk covers it.
+
+Since #2455 `scripts/test verify` runs `scripts/test-dev` in its
+`_verify_gate_harnesses` loop, so a `scripts/dev` regression fails
+in-loop rather than only when a human remembers to run the harness (it
+is still runnable standalone; skipped in-loop when zsh is absent).
