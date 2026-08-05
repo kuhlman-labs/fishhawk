@@ -185,6 +185,52 @@ components:
           description: Public client only.
           example: [none]
 
+    ProtectedResourceMetadata:
+      type: object
+      description: |
+        RFC 9728 Protected Resource Metadata (ADR-076 slice 3, #2391). Describes
+        the Fishhawk MCP resource and points a discovering client at the
+        authorization server that mints tokens for it. Served only when the AS is
+        enabled; `Cache-Control: no-store`.
+      required:
+        - resource
+        - authorization_servers
+        - scopes_supported
+        - bearer_methods_supported
+        - resource_name
+      properties:
+        resource:
+          type: string
+          format: uri
+          description: The RFC 8707 resource identifier this document describes (`--oauth-resource`, default `<issuer>/mcp`).
+          example: https://fishhawk.example.com/mcp
+        authorization_servers:
+          type: array
+          items: { type: string, format: uri }
+          description: The issuer(s) that mint tokens for this resource — here, fishhawkd's own AS.
+          example: [https://fishhawk.example.com]
+        scopes_supported:
+          type: array
+          items: { type: string }
+          description: The operator scope vocabulary (identical to the AS metadata's `scopes_supported`).
+          example:
+            - read:runs
+            - read:audit
+            - write:runs
+            - write:approvals
+            - write:stages
+            - write:deploy
+            - write:campaigns
+            - read:audit-export
+        bearer_methods_supported:
+          type: array
+          items: { type: string }
+          description: How a bearer token is presented — the Authorization header only.
+          example: [header]
+        resource_name:
+          type: string
+          example: Fishhawk
+
     OAuthTokenResponse:
       type: object
       description: |
@@ -3832,7 +3878,18 @@ paths:
         Tool calls carry exactly the privilege of the equivalent REST call:
         each tool reaches data by calling this same API with the caller's
         token, so a denial there is the denial here. Clients present a
-        Fishhawk bearer token; spec-compliant OAuth is slice 3 (#2391).
+        Fishhawk bearer token (`fhk_`/`fhm_`) or, when the OAuth AS is enabled,
+        an AS-issued audience-validated `fho_` access token (RFC 8707).
+
+        The `401` carries an RFC 6750 §3 `WWW-Authenticate: Bearer` challenge
+        with the RFC 9728 §5.1 `resource_metadata` discovery pointer when the AS
+        is enabled (the realm-only form otherwise). A missing credential and an
+        unknown credential are INDISTINGUISHABLE — byte-identical status, header
+        and body — so the response never leaks token validity (#2391). When the
+        daemon binds a non-loopback address AND the OAuth AS is enabled, the
+        ADR-033 loopback refusal is LIFTED and the route accepts ONLY an
+        audience-validated `fho_` identity — a bare `fhk_`/`fhm_` token is
+        refused off-host with the same `401` challenge.
       security:
         - bearerToken: []
       tags: [mcp]
@@ -3866,7 +3923,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+        '401':
+          description: |
+            No bearer identity (missing, unknown, or — in the lifted
+            off-loopback posture — a bare non-OAuth token). Carries the
+            `WWW-Authenticate: Bearer` challenge with `resource_metadata` when
+            the AS is enabled. Missing and unknown credentials are
+            indistinguishable (#2391).
+          headers:
+            WWW-Authenticate:
+              schema:
+                type: string
+                example: Bearer realm="fishhawk", resource_metadata="https://fishhawk.example.com/.well-known/oauth-protected-resource/mcp"
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '403': { $ref: '#/components/responses/MCPLoopbackOnly' }
         '404': { $ref: '#/components/responses/MCPRouteDisabled' }
         '415':
@@ -3968,6 +4039,75 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/OAuthServerMetadata' }
         '403': { $ref: '#/components/responses/OAuthASLoopbackOnly' }
+        '503': { $ref: '#/components/responses/OAuthASUnavailable' }
+
+  /.well-known/oauth-protected-resource:
+    get:
+      operationId: getProtectedResourceMetadata
+      summary: RFC 9728 protected-resource metadata (bare well-known path)
+      description: |
+        RFC 9728 Protected Resource Metadata for the Fishhawk MCP resource
+        (ADR-076 slice 3, #2391). Unauthenticated; `Cache-Control: no-store`.
+        `authorization_servers[0]` is fishhawkd's own issuer, so a client that
+        hits the `401` discovery challenge on `POST /mcp` walks
+        challenge → this document → the AS metadata → authorize → token.
+
+        This bare path is an interoperability convenience: it serves the
+        identical document whenever the AS is enabled. The RFC-correct URL a
+        client discovers via the `resource_metadata` challenge parameter is the
+        path-suffixed form below, whose `resource` matches the request URL.
+      security: []
+      tags: [oauth]
+      responses:
+        '200':
+          description: Protected-resource metadata.
+          headers:
+            Cache-Control:
+              schema: { type: string, example: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProtectedResourceMetadata' }
+        '403': { $ref: '#/components/responses/OAuthASLoopbackOnly' }
+        '503': { $ref: '#/components/responses/OAuthASUnavailable' }
+
+  /.well-known/oauth-protected-resource/{resource_path}:
+    get:
+      operationId: getProtectedResourceMetadataSuffixed
+      summary: RFC 9728 protected-resource metadata (RFC 9728 §3.1 path-suffixed)
+      description: |
+        The RFC 9728 §3.1 path-suffixed protected-resource metadata URL, derived
+        by INSERTING `/.well-known/oauth-protected-resource` between the resource
+        identifier's origin and its own path — so the resource
+        `https://host/mcp` is described at
+        `https://host/.well-known/oauth-protected-resource/mcp`. This is the URL
+        the `POST /mcp` `401` challenge advertises as `resource_metadata`.
+
+        Answers `404 route_not_found` when the suffix does not match this
+        deployment's resource path, so the document is never served under a URL
+        claiming a different resource. Unauthenticated; `Cache-Control: no-store`.
+      security: []
+      tags: [oauth]
+      parameters:
+        - name: resource_path
+          in: path
+          required: true
+          description: The resource identifier's path, matched against this deployment's resource.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Protected-resource metadata.
+          headers:
+            Cache-Control:
+              schema: { type: string, example: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProtectedResourceMetadata' }
+        '403': { $ref: '#/components/responses/OAuthASLoopbackOnly' }
+        '404':
+          description: "The path suffix does not match this deployment's resource (`error: route_not_found`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503': { $ref: '#/components/responses/OAuthASUnavailable' }
 
   /v0/oauth/authorize:

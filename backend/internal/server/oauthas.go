@@ -67,6 +67,15 @@ type oauthASState struct {
 	issuer   oauthas.Issuer
 	resource oauthas.ResourceIdentifier
 
+	// prmURL is the RFC 9728 §3.1 protected-resource-metadata URL derived from
+	// resource, and prmSuffix is the decoded route suffix the path-suffixed PRM
+	// handler matches against. Both are populated only in the enabled verdict
+	// (oauthprm.go). prmURL is what the /mcp 401 challenge advertises as
+	// resource_metadata; a derivation failure is carried as the misconfigured
+	// verdict, never silently dropped.
+	prmURL    string
+	prmSuffix string
+
 	// authorizationEndpoint and tokenEndpoint are the issuer-rooted URLs the
 	// metadata document advertises and the consent form posts back to.
 	authorizationEndpoint string
@@ -164,10 +173,20 @@ func resolveOAuthASState(cfg Config, lookupIP func(string) ([]net.IP, error)) oa
 		}
 	}
 
+	// Derive the PRM URL + route suffix (RFC 9728 §3.1). A derivation error is
+	// carried as MISCONFIGURED, never silently dropped: an AS that cannot name
+	// its own protected-resource metadata document must not advertise itself.
+	prmURL, prmSuffix, err := protectedResourceMetadataURL(resource)
+	if err != nil {
+		return misconfigured("the OAuth AS cannot derive its RFC 9728 protected-resource metadata URL: " + err.Error())
+	}
+
 	return oauthASState{
 		mode:                  oauthASEnabled,
 		issuer:                issuer,
 		resource:              resource,
+		prmURL:                prmURL,
+		prmSuffix:             prmSuffix,
 		authorizationEndpoint: issuer.String() + "/v0/oauth/authorize",
 		tokenEndpoint:         issuer.String() + "/v0/oauth/token",
 		codeTTL:               codeTTL,

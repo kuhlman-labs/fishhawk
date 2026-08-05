@@ -16,6 +16,8 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -85,6 +87,16 @@ type Identity struct {
 	// approval audit records it (approvals.go) so a decision's provenance
 	// includes which credential kind acted.
 	AuthMethod string
+
+	// OAuthAudience is the RFC 8707 resource identifier an AS-issued (`fho_`)
+	// access token was minted for. Set ONLY on the AS-issued bearer path in
+	// bearerAuth, and ONLY after the token's audience validated against THIS
+	// deployment's resource — so a non-empty value is proof the caller holds an
+	// audience-validated OAuth identity. handleMCP's lifted (off-loopback)
+	// authenticated-mode gate reads it: a bare fhk_/fhm_ token leaves it empty
+	// and is refused off-host, keeping ADR-033's no-bare-bearer-off-host
+	// invariant intact while the loopback refusal is lifted for OAuth.
+	OAuthAudience string
 }
 
 // IsAnonymous reports whether i represents an unauthenticated
@@ -350,6 +362,41 @@ func (s *Server) bearerAuth(tokens apitokenAuthenticator, mcpTokens mcptokenAuth
 							}
 							id.AccountID = acct
 						}
+					case s.cfg.OAuthStore != nil && s.oauthAS.mode == oauthASEnabled && strings.HasPrefix(tok, oauthstore.AccessTokenPrefix):
+						// AS-issued (`fho_`) access token. Entered ONLY when an
+						// OAuth AS is actually enabled — with no AS there is no
+						// resource to validate an audience against, so an fho_
+						// token is never accepted (fail closed) and never even
+						// dials the store.
+						rec, err := s.cfg.OAuthStore.AuthenticateAccessToken(r.Context(), tok)
+						if dberr.IsUnavailable(err) {
+							// Mirror the #764 posture of the two sibling
+							// branches: an outage is a 503, never a masked
+							// per-handler 401.
+							s.writeDBUnavailable(w, r)
+							return
+						}
+						if err == nil && oauthas.ResourceMatches(rec.Audience, s.oauthAS.resource.String()) {
+							// RFC 8707 audience validation. A foreign-audience
+							// token leaves the ANONYMOUS identity on EVERY route
+							// — validation lives HERE rather than only in
+							// handleMCP because the /mcp tool client dials this
+							// same REST API back with the caller's raw token
+							// (mcproute.go newMCPHandler), so a handler-only
+							// check would let every REST route accept a token
+							// minted for another resource. AuthMethod is
+							// deliberately left unset (its OpenAPI enum is
+							// [static, oauth] and widening it is out of scope).
+							id = Identity{
+								Subject:       rec.Subject,
+								TokenID:       rec.ID.String(),
+								Scopes:        append([]string(nil), rec.Scopes...),
+								AccountID:     rec.AccountID,
+								OAuthAudience: rec.Audience,
+							}
+						}
+						// Any other error (unknown/revoked/expired/malformed) or
+						// a non-matching audience falls through to anonymous.
 					case tokens != nil:
 						rec, err := tokens.Authenticate(r.Context(), tok)
 						if dberr.IsUnavailable(err) {

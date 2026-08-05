@@ -36,6 +36,31 @@ type fakeOAuthStore struct {
 	access  map[string]*oauthstore.AccessToken       // plaintext
 	refresh map[string]*oauthstore.RefreshToken      // plaintext
 	getErr  error                                    // when set, GetClientByID returns it
+
+	// authAccessErr, when set, is returned by AuthenticateAccessToken instead
+	// of a lookup — used to drive the DB-unavailable seam. authAccessCalls
+	// counts entries into AuthenticateAccessToken, so a "never dialed" assertion
+	// (the AS-disabled fho_ counterfactual) is real rather than inferred.
+	authAccessErr   error
+	authAccessCalls int
+}
+
+// seedAccessToken registers a live access token under plaintext with the given
+// audience/subject/scopes, so a test can present an AS-issued bearer built BY
+// CONSTRUCTION — never by driving the control under test.
+func (f *fakeOAuthStore) seedAccessToken(plaintext, subject, audience, accountID string, scopes []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.access[plaintext] = &oauthstore.AccessToken{
+		ID:        uuid.New(),
+		Subject:   subject,
+		Audience:  audience,
+		AccountID: accountID,
+		Scopes:    scopes,
+		IssuedAt:  f.now(),
+		ExpiresAt: f.now().Add(time.Hour),
+		PlainText: plaintext,
+	}
 }
 
 func newFakeOAuthStore() *fakeOAuthStore {
@@ -161,6 +186,10 @@ func (f *fakeOAuthStore) RevokeGrantsForCode(_ context.Context, codeID uuid.UUID
 func (f *fakeOAuthStore) AuthenticateAccessToken(_ context.Context, plaintext string) (*oauthstore.AccessToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.authAccessCalls++
+	if f.authAccessErr != nil {
+		return nil, f.authAccessErr
+	}
 	t, ok := f.access[plaintext]
 	if !ok {
 		return nil, oauthstore.ErrNotFound
@@ -892,4 +921,24 @@ func cimdDoc(clientID string, redirects, grantTypes, responseTypes []string, sco
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
+}
+
+// TestResolveOAuthASState_MisconfiguredWhenPRMURLUnderivable pins the
+// fail-closed derivation fallback (#2391): an issuer that is valid but a
+// resource whose scheme cannot host an RFC 9728 PRM document must resolve to
+// MISCONFIGURED, never enabled. Deleting the derivation-error fallback in
+// resolveOAuthASState (so the error is swallowed) reddens this.
+func TestResolveOAuthASState_MisconfiguredWhenPRMURLUnderivable(t *testing.T) {
+	st := resolveOAuthASState(Config{
+		OAuthASIssuer:    testIssuer,
+		OAuthASResource:  "ftp://as.example/mcp", // absolute + host, so ParseResourceIdentifier accepts it; not http(s), so PRM derivation refuses it
+		OAuthStore:       newFakeOAuthStore(),
+		OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	}, nil)
+	if st.mode != oauthASMisconfigured {
+		t.Fatalf("mode = %v, want oauthASMisconfigured (PRM URL underivable)", st.mode)
+	}
+	if !strings.Contains(st.reason, "protected-resource metadata URL") {
+		t.Errorf("reason = %q, want it to name the PRM derivation failure", st.reason)
+	}
 }

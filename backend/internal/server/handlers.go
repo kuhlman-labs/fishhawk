@@ -47,6 +47,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// unconfigured/misconfigured deployment answers all four with the
 	// handler's own 503 oauth_as_unconfigured body.
 	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.handleOAuthASMetadata)
+	// RFC 9728 Protected Resource Metadata (ADR-076 slice 3, #2391): the bare
+	// well-known path plus its RFC 9728 §3.1 path-suffixed sibling (the
+	// {resource_path...} multi-segment wildcard is Go 1.22+ ServeMux syntax).
+	// Both GET, so csrfSafeMethod already skips CSRF. A disabled/misconfigured
+	// AS answers the handler's own 503 oauth_as_unconfigured body.
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.handleOAuthPRM)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/{resource_path...}", s.handleOAuthPRMSuffixed)
 	mux.HandleFunc("GET /v0/oauth/authorize", s.handleOAuthAuthorize)
 	mux.HandleFunc("POST /v0/oauth/authorize", s.handleOAuthConsent)
 	// The token route is CSRF-EXEMPT (csrf.go) while the authorize POST above

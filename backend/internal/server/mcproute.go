@@ -84,6 +84,21 @@ type mcpRouteState struct {
 
 	// reason is the human-readable diagnosis carried by the 503.
 	reason string
+
+	// authenticatedOnly is true when the loopback refusal has been LIFTED
+	// because an OAuth AS is enabled (ADR-076 slice 3, #2391). In this posture
+	// the listener is intentionally reachable off-host, so handleMCP accepts
+	// ONLY an audience-validated OAuth identity (Identity.OAuthAudience != "")
+	// — a bare fhk_/fhm_ token is refused, keeping ADR-033's
+	// no-bare-bearer-off-host invariant intact. False in every other posture,
+	// including a normal loopback-served route.
+	authenticatedOnly bool
+
+	// challengeResource is the resource identifier the lift enforces, echoed so
+	// verifyMCPListenerLoopback can fail closed if the lift was somehow
+	// constructed with no audience to enforce. Populated only when
+	// authenticatedOnly is true.
+	challengeResource string
 }
 
 // normalizeMCPRoute maps Config.MCPRoute onto the on/off decision. The
@@ -164,7 +179,12 @@ func mcpLoopbackHost(host string, lookupIP func(string) ([]net.IP, error)) (stri
 // immutable Config, and resolving per request would put a blocking DNS
 // lookup on every /mcp call with a resolver outage intermittently
 // flipping the route to 403.
-func resolveMCPRouteState(cfg Config, lookupIP func(string) ([]net.IP, error)) mcpRouteState {
+//
+// as is the ALREADY-RESOLVED OAuth AS verdict (server.go resolves it BEFORE
+// the /mcp route). It drives the conditional loopback lift: a non-loopback
+// listener is refused UNLESS the AS is enabled, in which case the route serves
+// in authenticated-only mode (ADR-076 slice 3, #2391).
+func resolveMCPRouteState(cfg Config, as oauthASState, lookupIP func(string) ([]net.IP, error)) mcpRouteState {
 	if normalizeMCPRoute(cfg.MCPRoute) == "off" {
 		return mcpRouteState{mode: mcpRouteOff}
 	}
@@ -198,7 +218,34 @@ func resolveMCPRouteState(cfg Config, lookupIP func(string) ([]net.IP, error)) m
 			reason:     fmt.Sprintf("the MCP route cannot classify its listen address: %v", err),
 		}
 	case !ok:
-		return mcpRouteState{mode: mcpRouteNotLoopback, listenHost: host}
+		// The listener is reachable off-host. Refuse UNLESS an OAuth AS is
+		// enabled — then LIFT the refusal and serve in authenticated-only mode,
+		// so network exposure and auth tightening land together (ADR-076 slice
+		// 3, #2391). Note --oauth-require-loopback drives as.mode to
+		// oauthASNotLoopback on a public bind, so setting that flag keeps the
+		// /mcp refusal too.
+		if as.mode != oauthASEnabled {
+			return mcpRouteState{mode: mcpRouteNotLoopback, listenHost: host}
+		}
+		selfURL, serr := liftedSelfURL(cfg, host, port, lookupIP)
+		if serr != nil {
+			return mcpRouteState{
+				mode:       mcpRouteMisconfigured,
+				listenHost: host,
+				reason: fmt.Sprintf("the MCP route was lifted off loopback for OAuth but cannot resolve its own loopback dial-back base URL: %v; "+
+					"serving would forward every caller's bearer off-host, so the route refuses", serr),
+			}
+		}
+		// listenAddr is left EMPTY so Server.listenAddr() falls back to
+		// cfg.Addr verbatim — the lifted deployment binds the address the
+		// operator asked for.
+		return mcpRouteState{
+			mode:              mcpRouteEnabled,
+			selfURL:           selfURL,
+			listenHost:        host,
+			authenticatedOnly: true,
+			challengeResource: as.resource.String(),
+		}
 	}
 
 	// Derive BOTH the bind address and the self URL from the RESOLVED
@@ -224,6 +271,49 @@ func resolveMCPRouteState(cfg Config, lookupIP func(string) ([]net.IP, error)) m
 	return mcpRouteState{mode: mcpRouteEnabled, selfURL: selfURL, listenHost: host, listenAddr: listenAddr}
 }
 
+// liftedSelfURL derives the loopback dial-back base URL for a route lifted off
+// loopback because an OAuth AS is enabled (ADR-076 slice 3, #2391). The bearer
+// the tool client forwards must stay on loopback even though the LISTENER is
+// off-host, so:
+//
+//   - an embedder-supplied MCPSelfURL keeps the existing pinLoopbackSelfURL
+//     treatment unchanged (it must still resolve to a loopback address);
+//   - an empty or unspecified listen host yields http://127.0.0.1:<port>,
+//     because net.Listen on an empty/unspecified host binds every local unicast
+//     address INCLUDING loopback, so the dial-back stays on loopback and
+//     ADR-033's forwarding invariant is fully preserved;
+//   - a specific host resolves to a literal (a literal pins itself; a hostname
+//     goes through lookupIP and pins the first address, a resolution failure
+//     being an error the caller renders as mcpRouteMisconfigured). This is a
+//     NARROWING of ADR-033's stricter always-127.0.0.1 posture — the dial-back
+//     addresses that same locally-assigned address, delivered by the host's own
+//     stack without a physical hop — and is documented as such in README.md.
+func liftedSelfURL(cfg Config, host, port string, lookupIP func(string) ([]net.IP, error)) (string, error) {
+	if raw := strings.TrimSpace(cfg.MCPSelfURL); raw != "" {
+		return pinLoopbackSelfURL(raw, lookupIP)
+	}
+	if host == "" {
+		return "http://127.0.0.1:" + port, nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsUnspecified() {
+			return "http://127.0.0.1:" + port, nil
+		}
+		return "http://" + net.JoinHostPort(ip.String(), port), nil
+	}
+	if lookupIP == nil {
+		lookupIP = net.LookupIP
+	}
+	addrs, err := lookupIP(host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q: %w", host, err)
+	}
+	if len(addrs) == 0 {
+		return "", fmt.Errorf("resolve %q: no addresses", host)
+	}
+	return "http://" + net.JoinHostPort(addrs[0].String(), port), nil
+}
+
 // verifyMCPListenerLoopback is the bind-time half of the loopback refusal:
 // resolveMCPRouteState classifies an address, Start binds one, and this
 // asserts they are the same kind of address before a single request is
@@ -238,6 +328,17 @@ func resolveMCPRouteState(cfg Config, lookupIP func(string) ([]net.IP, error)) m
 // always a resolved literal, so no DNS runs here.
 func verifyMCPListenerLoopback(state mcpRouteState, bound net.Addr) error {
 	if state.mode != mcpRouteEnabled {
+		return nil
+	}
+	if state.authenticatedOnly {
+		// The route was LIFTED off loopback for OAuth, so the listener is
+		// intentionally off-host and the loopback assertion does not apply.
+		// But a lift with NO audience to enforce would serve the bare-bearer
+		// tool surface off-host, so fail closed rather than serving it.
+		if state.challengeResource == "" {
+			return fmt.Errorf("the MCP route was lifted off loopback for OAuth but carries no resource identifier to enforce; " +
+				"refusing to serve the tool surface off-host with no audience to validate (ADR-076)")
+		}
 		return nil
 	}
 	if bound == nil {
@@ -394,11 +495,35 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	// the same envelope.
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() || id.TokenID == "" {
-		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
-			"the MCP route requires a Fishhawk bearer token (Authorization: Bearer fhk_… or fhm_…); "+
-				"a browser cookie session is not accepted", nil)
+		s.writeMCPAuthChallenge(w, r)
+		return
+	}
+
+	// Lifted (off-loopback) authenticated-only mode: accept ONLY an
+	// audience-validated OAuth identity. A bare fhk_/fhm_ token carries a
+	// TokenID (so it passed the gate above) but no OAuthAudience, and must be
+	// refused off-host with the SAME 401 challenge — giving it a distinct
+	// message would make a VALID bare token distinguishable from an invalid
+	// one, the exact token-validity leak the byte-identical challenge above
+	// prevents.
+	if s.mcpRoute.authenticatedOnly && id.OAuthAudience == "" {
+		s.writeMCPAuthChallenge(w, r)
 		return
 	}
 
 	s.mcpHandler.ServeHTTP(w, r)
+}
+
+// writeMCPAuthChallenge emits the /mcp 401 authentication_required envelope with
+// the RFC 6750 §3 / RFC 9728 §5.1 Bearer discovery challenge. It is the ONE
+// builder for all three refusal paths — the no-Authorization-header request, the
+// unknown-bearer request and the off-loopback bare-token request — so all three
+// produce a BYTE-IDENTICAL status, header and body. The challenge names the
+// derived PRM URL when an AS is enabled and is the realm-only form otherwise
+// (oauthChallengeHeader), and prmURL is empty on a disabled AS.
+func (s *Server) writeMCPAuthChallenge(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("WWW-Authenticate", oauthChallengeHeader(s.oauthAS.prmURL))
+	s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
+		"the MCP route requires a Fishhawk bearer token (Authorization: Bearer fhk_… or fhm_…); "+
+			"a browser cookie session is not accepted", nil)
 }

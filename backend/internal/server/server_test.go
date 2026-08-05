@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -978,5 +979,35 @@ func TestNew_WiresCIMDLimiterOnBuiltHandler(t *testing.T) {
 	}
 	if code := drive("https://wired-over.example/cimd"); code != http.StatusTooManyRequests {
 		t.Fatalf("over-burst status through Handler() = %d, want 429 (limiter not live on the built handler)", code)
+	}
+}
+
+// TestServer_LiftedListenAddrBindsConfigAddr pins the lifted-posture bind
+// contract (#2391): a non-loopback bind with the OAuth AS enabled LIFTS the
+// /mcp loopback refusal and binds cfg.Addr VERBATIM (listenAddr() returns it
+// unchanged, unlike the unlifted route which pins the resolved loopback
+// literal), and Start succeeds because verifyMCPListenerLoopback passes on a
+// lift carrying a resource. TestMCPRoute_StartBindsPinnedLoopbackIP covers the
+// unlifted pinned-literal direction.
+func TestServer_LiftedListenAddrBindsConfigAddr(t *testing.T) {
+	// A non-loopback bind with the OAuth AS enabled is the lifted posture.
+	s := New(Config{
+		Addr:             "0.0.0.0:8080",
+		MCPServerFactory: testMCPServerFactory,
+		OAuthASIssuer:    testIssuer, OAuthStore: newFakeOAuthStore(), OAuthCIMDFetcher: newCIMDFetcher(newCIMD()),
+	})
+	if s.mcpRoute.mode != mcpRouteEnabled || !s.mcpRoute.authenticatedOnly {
+		t.Fatalf("route not lifted: mode=%v authOnly=%v (reason %q)", s.mcpRoute.mode, s.mcpRoute.authenticatedOnly, s.mcpRoute.reason)
+	}
+	if s.mcpRoute.listenAddr != "" {
+		t.Errorf("lifted listenAddr = %q, want empty so listenAddr() returns cfg.Addr verbatim", s.mcpRoute.listenAddr)
+	}
+	if got := s.listenAddr(); got != "0.0.0.0:8080" {
+		t.Errorf("listenAddr() = %q, want the configured 0.0.0.0:8080 verbatim in the lifted posture", got)
+	}
+	// verifyMCPListenerLoopback must PASS for the lift (it carries a resource),
+	// even on an off-host bound address — otherwise Start would refuse it.
+	if err := verifyMCPListenerLoopback(s.mcpRoute, &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 8080}); err != nil {
+		t.Errorf("verifyMCPListenerLoopback rejected a resourced lift off-host: %v", err)
 	}
 }
