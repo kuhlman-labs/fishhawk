@@ -4143,3 +4143,154 @@ func assertProbeMatchesArgv(t *testing.T, site string, argv []string, stageID st
 		t.Errorf("%s: expected %q to be immediately followed by the stage id %q (two-token shape); argv: %v", site, stageIDArgFlag, stageID, argv)
 	}
 }
+
+// --- #2479: transport-conditional working_dir resolution -------------------
+
+// TestDriveRun_HTTPTransportRefusesOmittedWorkingDir drives the real handler on
+// an httpTransport resolver with working_dir OMITTED and asserts the OUTCOME: an
+// error naming working_dir, no runner spawned, and NO committed state — the
+// fakeBackend recorded ZERO auto-drive acts (drive_run's earliest state-
+// committing side effect is the record-act) and ZERO host-dispatch markers. The
+// no-state assertion lands on state, not error identity, per the counterfactual
+// rule's committed-state clause: a fired-then-rolled-back refusal returns a
+// byte-identical error (#2479).
+func TestDriveRun_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "awaiting_host_dispatch", 1),
+	})
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.httpTransport = true
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, _, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err == nil {
+		t.Fatal("expected a refusal error when working_dir is omitted over HTTP")
+	}
+	if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("error should name working_dir; got %v", err)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Errorf("driver spawned despite the refusal: %v", got)
+	}
+	f.mu.Lock()
+	nActs := len(f.recordedActs)
+	markers := f.hostDispatchCalledN
+	f.mu.Unlock()
+	if nActs != 0 {
+		t.Errorf("driver recorded %d auto-drive acts despite the refusal; want 0 (must commit no state)", nActs)
+	}
+	if markers != 0 {
+		t.Errorf("host-dispatch markers called %d times, want 0 (refusal must commit no state)", markers)
+	}
+}
+
+// TestDriveRun_StdioTransportOmittedResolvesToAbsoluteCwd asserts the stdio
+// default: an omitted working_dir resolves to the absolute process cwd and the
+// spawned argv carries `--working-dir <cwd>`, never "." (#2479).
+func TestDriveRun_StdioTransportOmittedResolvesToAbsoluteCwd(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "pending", 1),
+	})
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	var mu sync.Mutex
+	var gotArgv []string
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		typ := f.typeForStageID(stageID)
+		rec.add(typ)
+		f.mu.Lock()
+		if f.onSpawn != nil {
+			f.onSpawn(f, typ)
+		}
+		f.mu.Unlock()
+		return "/tmp/log", nil
+	}
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+cwd) {
+		t.Errorf("argv missing --working-dir %q: %v", cwd, joined)
+	}
+	if strings.Contains(joined, "--working-dir .") {
+		t.Errorf("argv carries the literal \".\": %v", joined)
+	}
+	if out.ResolvedWorkingDir != cwd {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, cwd)
+	}
+}
+
+// TestDriveRun_ExplicitWorkingDirEchoedAndUnchanged passes an explicit absolute
+// working_dir and asserts resolved_working_dir echoes it and the spawned argv
+// still carries `--working-dir <that path>` (#2479).
+func TestDriveRun_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "pending", 1),
+	})
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.httpTransport = true
+	var mu sync.Mutex
+	var gotArgv []string
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		typ := f.typeForStageID(stageID)
+		rec.add(typ)
+		f.mu.Lock()
+		if f.onSpawn != nil {
+			f.onSpawn(f, typ)
+		}
+		f.mu.Unlock()
+		return "/tmp/log", nil
+	}
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", WorkingDir: dir})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.ResolvedWorkingDir != dir {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, dir)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+dir) {
+		t.Errorf("argv missing --working-dir %q: %v", dir, joined)
+	}
+}

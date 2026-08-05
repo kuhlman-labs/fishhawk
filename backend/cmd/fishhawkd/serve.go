@@ -1060,6 +1060,17 @@ func resolveBudgetLocation(name string, logger *slog.Logger) *time.Location {
 	return loc
 }
 
+// mcpRouteServerConfig builds the mcpserver.Config the /mcp route's factory
+// hands to mcpserver.NewServer (ADR-076 / #2390). HTTPTransport is TRUE because
+// the route serves the tool registry over an HTTP transport on a long-lived
+// daemon: the process cwd is fishhawkd's own checkout, never a caller's, so the
+// runner-spawning verbs must refuse an omitted or relative working_dir and
+// require an absolute path (#2479). Extracted from the inline factory closure so
+// this posture is directly assertable — NewServer returns an opaque *mcp.Server.
+func mcpRouteServerConfig(backendURL, apiToken string) mcpserver.Config {
+	return mcpserver.Config{BackendURL: backendURL, APIToken: apiToken, HTTPTransport: true}
+}
+
 // runServe boots the HTTP server with graceful SIGINT/SIGTERM
 // handling. Returns the intended process exit code.
 func runServe(args []string, logSink io.Writer) int {
@@ -1537,8 +1548,16 @@ func runServe(args []string, logSink io.Writer) int {
 	// server.New. This command already imports both, so it is the natural
 	// place to join them — and mcpserver.NewServer stays the single
 	// tool-registration path for both the stdio binary and the route.
+	// HTTPTransport:true is set on the route's Config because /mcp serves the
+	// tool registry over an HTTP transport: fishhawkd is a long-lived daemon, so
+	// its process cwd can never be a caller's intended checkout. The flag makes
+	// the runner-spawning verbs refuse an omitted or relative working_dir and
+	// require an absolute path instead (#2479). The Config build is extracted so
+	// the wiring is directly assertable — mcpserver.NewServer returns an opaque
+	// *mcp.Server, so pinning the route is built in HTTP posture requires
+	// asserting on the Config the factory constructs.
 	cfg.MCPServerFactory = func(backendURL, apiToken string) *mcp.Server {
-		return mcpserver.NewServer(mcpserver.Config{BackendURL: backendURL, APIToken: apiToken})
+		return mcpserver.NewServer(mcpRouteServerConfig(backendURL, apiToken))
 	}
 
 	// OAuth token-login wiring (E39.3 / #1708). The client_id the discovery

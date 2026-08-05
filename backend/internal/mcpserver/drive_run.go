@@ -241,7 +241,7 @@ const driveRunnerKindLocal = "local"
 // DriveRunInput is the fishhawk_drive_run tool's input (#1700).
 type DriveRunInput struct {
 	RunID        string `json:"run_id" jsonschema:"Fishhawk run UUID; the local runner_kind:local run to drive between human gates"`
-	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in; defaults to the MCP server's cwd"`
+	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) this is REQUIRED and must be an absolute path — the server's cwd is the daemon's own checkout, so an omitted or relative value is refused. On the stdio transport it defaults to the client-spawned process's own directory (resolved to an absolute path)"`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR; defaults to main"`
 	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, sibling to this binary, then PATH"`
@@ -261,13 +261,14 @@ type DriveStep struct {
 // DriveRunOutput is the drive verb's terminal report. Every outcome is
 // resumable by re-invoking with the same run_id.
 type DriveRunOutput struct {
-	RunID         string       `json:"run_id"`
-	StoppedReason string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | context_cancelled"`
-	RunState      string       `json:"run_state"`
-	StepsTaken    []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
-	PageEvent     string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
-	NextActions   *NextActions `json:"next_actions,omitempty" jsonschema:"the legal next operator moves, set on a decision_required / paged / stalled stop. fishhawk_get_run_status carries the full lifecycle block"`
-	Warnings      []string     `json:"warnings,omitempty"`
+	RunID              string       `json:"run_id"`
+	ResolvedWorkingDir string       `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the driver spawned runners against, after transport-conditional working_dir resolution (#2479)"`
+	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | context_cancelled"`
+	RunState           string       `json:"run_state"`
+	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
+	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
+	NextActions        *NextActions `json:"next_actions,omitempty" jsonschema:"the legal next operator moves, set on a decision_required / paged / stalled stop. fishhawk_get_run_status carries the full lifecycle block"`
+	Warnings           []string     `json:"warnings,omitempty"`
 }
 
 // registerDriveRun wires the fishhawk_drive_run tool (#1700).
@@ -354,10 +355,19 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 	if baseBranch == "" {
 		baseBranch = "main"
 	}
-	workingDir := in.WorkingDir
-	if workingDir == "" {
-		workingDir = "."
+
+	// Resolve working_dir transport-conditionally BEFORE the spawn-seam/binary
+	// resolution and before the drive loop takes its first act (#2479). An
+	// omitted/relative working_dir over HTTP fails here with a clean error, so no
+	// act is recorded and no runner is spawned on a refused call. Fold the
+	// resolved ABSOLUTE dir back onto `in` so every downstream consumer — the
+	// composeRunnerArgv dispatch literal, the best-effort repo detection, and the
+	// driveDecisionActions next_actions params — carries it.
+	workingDir, err := r.resolveWorkingDir(in.WorkingDir)
+	if err != nil {
+		return nil, DriveRunOutput{}, err
 	}
+	in.WorkingDir = workingDir
 
 	// Resolve the spawn seam + binary once. When a spawn seam is injected
 	// (tests) the real binary resolution is skipped so the loop runs without a
@@ -417,7 +427,7 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 	var progress float64
 
-	out := DriveRunOutput{RunID: runUUID.String(), Warnings: warnings}
+	out := DriveRunOutput{RunID: runUUID.String(), ResolvedWorkingDir: workingDir, Warnings: warnings}
 
 	spawned := map[string]bool{}        // stage IDs spawned this invocation (idempotency guard)
 	dispatchedCount := map[string]int{} // stage ID -> dispatch count (fixup_redispatch discriminator)

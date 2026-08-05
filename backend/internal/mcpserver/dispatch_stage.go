@@ -26,7 +26,7 @@ type DispatchStageInput struct {
 	StageID       string `json:"stage_id,omitempty" jsonschema:"stage UUID inside the run; optional — when omitted it is auto-resolved from (run_id, stage type), same as fishhawk_run_stage"`
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. dispatch is the DEFAULT verb for a local acceptance stage (E31.9) — it validates against a running preview/target instance and runs long, so non-blocking dispatch keeps the session free; no new argv (composeRunnerArgv passes --stage through, and acceptance takes neither --plan-out nor --check-base-ref)"`
-	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in; defaults to the MCP server's cwd"`
+	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) this is REQUIRED and must be an absolute path — the server's cwd is the daemon's own checkout, so an omitted or relative value is refused. On the stdio transport it defaults to the client-spawned process's own directory (resolved to an absolute path)"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true"`
@@ -41,12 +41,13 @@ type DispatchStageInput struct {
 // LogPath points at the detached runner's redirected stdout/stderr (a local
 // diagnostic only — the durable record is the backend + signed trace).
 type DispatchStageOutput struct {
-	RunID           string           `json:"run_id" jsonschema:"the run UUID the stage was dispatched on (the durable ADR-037 handle, with stage_id)"`
-	StageID         string           `json:"stage_id" jsonschema:"the resolved stage UUID the runner was spawned against (the durable ADR-037 handle, with run_id)"`
-	StageWaitStatus *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the freshly-dispatched stage's execution wait status (normally pending/running with poll_interval_seconds=30); poll fishhawk_get_run_status on that cadence to terminal. Omitted (with a warning) when the post-dispatch stage fetch failed"`
-	RunURL          string           `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
-	LogPath         string           `json:"log_path,omitempty" jsonschema:"path to the detached runner's redirected stdout/stderr log on the MCP host (a diagnostic only; the durable record is the backend state + the signed trace bundle)"`
-	Warnings        []string         `json:"warnings,omitempty"`
+	RunID              string           `json:"run_id" jsonschema:"the run UUID the stage was dispatched on (the durable ADR-037 handle, with stage_id)"`
+	StageID            string           `json:"stage_id" jsonschema:"the resolved stage UUID the runner was spawned against (the durable ADR-037 handle, with run_id)"`
+	ResolvedWorkingDir string           `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the runner was spawned against, after transport-conditional working_dir resolution (#2479). Echoed so a wrong checkout is visible in the tool result rather than discovered from a contaminated diff"`
+	StageWaitStatus    *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the freshly-dispatched stage's execution wait status (normally pending/running with poll_interval_seconds=30); poll fishhawk_get_run_status on that cadence to terminal. Omitted (with a warning) when the post-dispatch stage fetch failed"`
+	RunURL             string           `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
+	LogPath            string           `json:"log_path,omitempty" jsonschema:"path to the detached runner's redirected stdout/stderr log on the MCP host (a diagnostic only; the durable record is the backend state + the signed trace bundle)"`
+	Warnings           []string         `json:"warnings,omitempty"`
 
 	// NeedsTarget is the pre-spawn acceptance refusal (E48.6 / #1953): set only
 	// when the acceptance-admission endpoint reported the plan needs live
@@ -140,6 +141,16 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 	}
 
+	// (1z) Resolve working_dir transport-conditionally BEFORE any guard, record,
+	// marker write or spawn (#2479). Ordering is load-bearing: the refusal must
+	// commit no state, so an omitted/relative working_dir over HTTP fails with a
+	// clean error and the stage stays parked, never a marker flipped forward with
+	// no runner behind it.
+	workingDir, err := r.resolveWorkingDir(in.WorkingDir)
+	if err != nil {
+		return nil, DispatchStageOutput{}, err
+	}
+
 	// (1a) Pre-dispatch runner_kind mismatch guardrail (#1355). A host
 	// dispatch always spawns a LOCAL runner, so reject one against a run
 	// already LOCKED to runner_kind=github_actions BEFORE the runner spawns.
@@ -174,11 +185,6 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		return nil, DispatchStageOutput{}, err
 	}
 
-	workingDir := in.WorkingDir
-	if workingDir == "" {
-		workingDir = "."
-	}
-
 	// (4) Resolve the GitHub repo with the same soft-fail rule run_stage uses:
 	// push_and_open_pr=false makes a missing repo a warning, not an error.
 	// Seeded with any guard fail-open warning from step (1a) and (2a).
@@ -209,7 +215,7 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		StageID:       in.StageID,
 		Workflow:      in.Workflow,
 		Stage:         in.Stage,
-		WorkingDir:    in.WorkingDir,
+		WorkingDir:    workingDir,
 		GitHubRepo:    in.GitHubRepo,
 		BaseBranch:    in.BaseBranch,
 		PushAndOpenPR: in.PushAndOpenPR,
@@ -389,11 +395,12 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	}
 
 	return nil, DispatchStageOutput{
-		RunID:           runUUID.String(),
-		StageID:         resolvedStageID,
-		StageWaitStatus: stageWaitStatus,
-		RunURL:          r.api.baseURL + "/runs/" + runUUID.String(),
-		LogPath:         logPath,
-		Warnings:        warnings,
+		RunID:              runUUID.String(),
+		StageID:            resolvedStageID,
+		ResolvedWorkingDir: workingDir,
+		StageWaitStatus:    stageWaitStatus,
+		RunURL:             r.api.baseURL + "/runs/" + runUUID.String(),
+		LogPath:            logPath,
+		Warnings:           warnings,
 	}, nil
 }

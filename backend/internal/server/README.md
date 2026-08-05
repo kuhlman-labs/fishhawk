@@ -1241,6 +1241,22 @@ A nil factory is a named failure, not a nil dereference: the route answers `503
 mcp_route_misconfigured` naming the unwired seam, diagnosed BEFORE any address
 work because an unwired deployment cannot serve the route at any address.
 
+### Clients must pass an absolute `working_dir` ([#2479](https://github.com/kuhlman-labs/fishhawk/issues/2479))
+
+fishhawkd wires the factory with `mcpserver.Config{HTTPTransport: true}` (see
+`mcpRouteServerConfig` in `backend/cmd/fishhawkd/serve.go`), because `/mcp`
+serves the registry over an HTTP transport on a long-lived daemon: the serving
+process's cwd is fishhawkd's OWN checkout, never a caller's. So the four
+runner-spawning verbs (`fishhawk_dispatch_stage`, `fishhawk_run_stage`,
+`fishhawk_run_children`, `fishhawk_drive_run`) **require an absolute
+`working_dir`** over this surface. An omitted or relative `working_dir` is
+refused at the tool layer with an actionable error naming the field — the tool
+call returns an error result and the run is NOT dispatched against fishhawkd's
+tree. Clients pass `working_dir` as an absolute path to the checkout the run
+should execute in; the resolved directory is echoed back as
+`resolved_working_dir`. The long-form contract lives in the
+[mcpserver README](../mcpserver/README.md).
+
 ### Refusal ladder (`resolveMCPRouteState` → `handleMCP`)
 
 Evaluated in this order. The ordering is load-bearing, not cosmetic: the

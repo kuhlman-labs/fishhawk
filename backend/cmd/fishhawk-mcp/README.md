@@ -107,6 +107,8 @@ The HTTP transport is a **single-operator local shared endpoint, NOT multi-tenan
 
 The go-sdk's own DNS-rebinding protection (rejecting a non-loopback `Host` header) stays enabled; the loopback bind + bearer gate are independent of it. Tool registration is identical across both transports.
 
+**`--transport http` also puts this binary in the refusing `working_dir` posture ([#2479](https://github.com/kuhlman-labs/fishhawk/issues/2479)).** The `Config` this binary builds is transport-aware, not binary-aware: `mcpServerConfig` sets `HTTPTransport: true` on the `http` branch and `false` on the stdio default. In HTTP mode this process's cwd is a long-lived daemon's directory, exactly as wrong for a caller as fishhawkd's `/mcp` route, so the four runner-spawning verbs (`fishhawk_dispatch_stage`, `fishhawk_run_stage`, `fishhawk_run_children`, `fishhawk_drive_run`) **require an absolute `working_dir`** and refuse an omitted or relative one with an error naming the field. On stdio (the client-spawned subprocess, whose cwd is the caller's project) an omitted `working_dir` still defaults to that directory, resolved to an absolute path. See [mcpserver README — `working_dir` resolution](../../internal/mcpserver/README.md).
+
 ## Install (operators)
 
 Pre-built binaries ship with every `mcp/vX.Y.Z` GitHub Release: darwin-arm64, darwin-amd64, linux-amd64, linux-arm64. Full install path including cosign verification and `claude mcp add` registration lives at [`docs/mcp/install.md`](../../../docs/mcp/install.md).

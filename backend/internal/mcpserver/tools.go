@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -23,6 +25,20 @@ import (
 type runResolver struct {
 	api    *apiClient
 	getenv func(string) string
+
+	// httpTransport marks the registry as served over an HTTP transport
+	// (fishhawkd's /mcp route, or `fishhawk-mcp --transport http`). When
+	// true, resolveWorkingDir refuses an omitted or relative working_dir on
+	// the runner-spawning verbs, because the serving process's cwd is a
+	// long-lived daemon's checkout, not the caller's (#2479). Threaded from
+	// config.httpTransport in NewServer; false for the stdio transport.
+	httpTransport bool
+
+	// getwd is the injectable cwd seam resolveWorkingDir uses on the stdio
+	// transport to resolve an omitted working_dir to an absolute path. Nil
+	// falls back to os.Getwd; tests inject a failing stub to exercise the
+	// cwd-failure branch (#2479).
+	getwd func() (string, error)
 
 	// reviewPollInterval is the poll cadence fishhawk_await_review uses
 	// while a review is pending. Zero falls back to
@@ -57,6 +73,59 @@ type runResolver struct {
 	// probeRunnerLiveness (which execs pgrep); tests inject a canned verdict so
 	// the loop runs the dead/live/unknown branches without a real process table.
 	driveProbeRunnerLiveness func(ctx context.Context, stageID string) runnerLivenessVerdict
+}
+
+// resolveWorkingDir is the single shared working_dir resolver every
+// runner-spawning verb (dispatch_stage, run_stage, run_children, drive_run)
+// calls BEFORE it commits any state. It makes the resolution
+// transport-conditional (#2479):
+//
+//   - HTTP transport + empty input: REFUSE. The serving process's cwd is the
+//     fishhawkd host's long-lived checkout, not the caller's — silently
+//     defaulting to it would drive the run against the wrong tree. The error
+//     names the field and tells the caller to pass an absolute path.
+//   - HTTP transport + non-absolute input: REFUSE, same class of error. A
+//     relative path resolves against the identical daemon cwd, so accepting it
+//     would leave the hole half-open.
+//   - stdio transport: resolve to an ABSOLUTE path — getwd() for an empty
+//     input (the client-spawned process's own directory), filepath.Abs
+//     otherwise — so the runner receives a concrete directory instead of the
+//     literal ".". A getwd/Abs failure propagates as an error rather than
+//     degrading back to a relative path.
+func (r *runResolver) resolveWorkingDir(in string) (string, error) {
+	if r.httpTransport {
+		if in == "" {
+			return "", errors.New(
+				"working_dir is required over the HTTP MCP transport: the server's cwd is the fishhawkd host's checkout, not your project; pass working_dir as an absolute path to the checkout this run should execute in")
+		}
+		// The `in != ""` guard is redundant with the empty-refusal above under
+		// normal control flow — but it keeps the two refusals INDEPENDENT for the
+		// counterfactual pass (#2479): deleting the empty-refusal above must let an
+		// empty input fall THROUGH to the stdio cwd-resolution below (turning the
+		// http+empty test red), not get re-caught here by `!filepath.IsAbs("")`.
+		if in != "" && !filepath.IsAbs(in) {
+			return "", fmt.Errorf(
+				"working_dir %q must be an absolute path over the HTTP MCP transport: a relative path resolves against the fishhawkd host's cwd, not your project; pass working_dir as an absolute path to the checkout this run should execute in", in)
+		}
+		// An accepted absolute path falls through to filepath.Abs below (idempotent
+		// on an already-absolute path), so HTTP and stdio share one exit.
+	}
+	if in == "" {
+		getwd := r.getwd
+		if getwd == nil {
+			getwd = os.Getwd
+		}
+		cwd, err := getwd()
+		if err != nil {
+			return "", fmt.Errorf("resolve working_dir from process cwd: %w", err)
+		}
+		return cwd, nil
+	}
+	abs, err := filepath.Abs(in)
+	if err != nil {
+		return "", fmt.Errorf("resolve working_dir %q to an absolute path: %w", in, err)
+	}
+	return abs, nil
 }
 
 // registerTools wires every MCP tool onto srv. Called once at

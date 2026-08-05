@@ -2548,3 +2548,314 @@ func TestScanPendingScopeAmendments_MalformedEventsNotSwallowed(t *testing.T) {
 		t.Errorf("non-map path entries must be skipped with the event kept; got %+v", got[3])
 	}
 }
+
+// --- #2479: transport-conditional working_dir resolution ---
+
+// TestRunChildren_HTTPTransportRefusesOmittedWorkingDir drives the real handler
+// on an httpTransport resolver with working_dir OMITTED and asserts the OUTCOME:
+// an error naming working_dir, and NO committed side effect. This fast variant
+// pins the cheap proxies (zero spawns via the fake seam, zero host-dispatch
+// markers). Because the spawn seam is FAKE here, it cannot observe a real
+// worktree — the fired-then-refused counterfactual approval condition 3 targets
+// (a worktree provisioned BEFORE the refusal) is caught instead by
+// TestRunChildren_HTTPTransportRefusesOmittedWorkingDir_NoWorktree, which drives
+// the REAL runner and asserts directly on the worktrees root (#2479).
+func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedPlanDecomposed(fb, parent, []string{child0.String()}, 0)
+
+	var spawns int32
+	withFakeSpawn(t, func(_ context.Context, _ string, _, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		atomic.AddInt32(&spawns, 1)
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, _, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		// working_dir intentionally omitted.
+	})
+	if err == nil {
+		t.Fatal("expected a refusal error when working_dir is omitted over HTTP")
+	}
+	if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("error should name working_dir; got %v", err)
+	}
+	// No per-child worktree provisioned: no runner spawned (the runner is what
+	// provisions the worktree via --parallel-isolate).
+	if got := atomic.LoadInt32(&spawns); got != 0 {
+		t.Errorf("spawned %d runners (and provisioned worktrees) despite the refusal; want 0", got)
+	}
+	// No host-dispatch marker CAS-flipped either.
+	fb.mu.Lock()
+	markers := 0
+	for _, n := range fb.hostDispatchCalledByID {
+		markers += n
+	}
+	fb.mu.Unlock()
+	if markers != 0 {
+		t.Errorf("host-dispatch markers called %d times, want 0 (refusal must commit no state)", markers)
+	}
+}
+
+// TestRunChildren_HTTPTransportRefusesOmittedWorkingDir_NoWorktree is approval
+// condition 3's load-bearing counterfactual for run_children: it drives the REAL
+// spawnRunnerStage seam (a real fishhawk-runner provisions a per-child worktree
+// via --parallel-isolate) and asserts, ON THE FILESYSTEM, that the
+// omitted-working_dir HTTP refusal provisions NONE. The state assertion lands on
+// the worktrees root directly, not on a spawn-count proxy — so a regression that
+// provisioned a worktree BEFORE refusing working_dir (the fired-then-refused
+// case the fast variant's spawn-count check cannot catch) leaves a run-<child>
+// dir here and turns this red.
+//
+// getwd is injected to the real repo so the counterfactual is attainable:
+// DELETING the http+empty refusal in resolveWorkingDir makes an omitted
+// working_dir fall THROUGH to getwd (the repo), the real runner spawns, and a
+// real worktree appears under repo/.git/fishhawk-worktrees — the observed RED.
+// With the control present, resolveWorkingDir refuses before getwd is consulted,
+// so no runner spawns and the root stays empty/absent (#2479, fix-up).
+func TestRunChildren_HTTPTransportRefusesOmittedWorkingDir_NoWorktree(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the fishhawk-runner binary and spawns real subprocesses")
+	}
+	for _, tool := range []string{"go", "git"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("%s not available", tool)
+		}
+	}
+
+	// (1) Build the real fishhawk-runner from the runner module.
+	_, thisFile, _, _ := runtime.Caller(0)
+	runnerDir := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "runner", "cmd", "fishhawk-runner")
+	runnerBin := filepath.Join(t.TempDir(), "fishhawk-runner")
+	build := exec.Command("go", "build", "-o", runnerBin, ".")
+	build.Dir = runnerDir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build fishhawk-runner: %v\n%s", err, out)
+	}
+
+	// (2) A fake `claude` that exits non-zero — a spawned runner would fail fast
+	// but only AFTER it provisions its worktree, so a worktree would persist.
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// (3) Real operator git repo with a seed commit (worktree add needs one).
+	repo := t.TempDir()
+	gitRunT(t, repo, "init", "-q")
+	if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRunT(t, repo, "add", "-A")
+	gitRunT(t, repo, "commit", "-q", "-m", "seed")
+
+	// (4) Backend serving BOTH the MCP-side discovery calls (reached before the
+	// refusal) and the runner-subprocess calls (only reached in the deleted-control
+	// counterfactual, when the real runner actually spawns).
+	parent := uuid.New()
+	child := uuid.New()
+	stage := uuid.New()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeJSON := func(w http.ResponseWriter, status int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"run_id":      r.PathValue("run_id"),
+			"public_key":  base64.StdEncoding.EncodeToString(pub),
+			"private_key": base64.StdEncoding.EncodeToString(priv),
+			"issued_at":   time.Now().UTC(),
+			"expires_at":  time.Now().Add(time.Hour).UTC(),
+		})
+	})
+	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"stage_type":             "implement",
+			"prompt":                 "do the slice work",
+			"prompt_hash":            "sha256:test",
+			"decomposed_from_run_id": parent.String(),
+		})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/trace", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusAccepted, map[string]any{
+			"run_id": r.PathValue("run_id"), "stage_id": "", "variant": "redacted", "content_hash": "x",
+		})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, Run{ID: r.PathValue("run_id"), State: "pending", Repo: "x/y"})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("run_id") != child.String() {
+			writeJSON(w, http.StatusOK, listStagesResult{})
+			return
+		}
+		writeJSON(w, http.StatusOK, listStagesResult{Items: []Stage{
+			{ID: stage.String(), RunID: child.String(), Type: "implement", State: "pending"},
+		}})
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("category") != "plan_decomposed" {
+			writeJSON(w, http.StatusOK, listAuditResult{})
+			return
+		}
+		writeJSON(w, http.StatusOK, listAuditResult{Items: []AuditEntry{{
+			ID: uuid.NewString(), Sequence: 1, RunID: r.PathValue("run_id"), Category: "plan_decomposed",
+			Payload: map[string]any{
+				"child_run_ids":          []string{child.String()},
+				"effective_max_parallel": 1,
+			},
+		}}})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, HostDispatchResult{Transitioned: true, StageState: "dispatched"})
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// (5) HTTP transport; the spawn seam is left at its default (real
+	// spawnRunnerStage). getwd is injected to the real repo so a DELETED
+	// http+empty refusal would fall through to it and spawn a real runner — the
+	// counterfactual RED. With the control present getwd is never consulted.
+	r := &runResolver{
+		api:           newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv:        func(string) string { return "" },
+		httpTransport: true,
+		getwd:         func() (string, error) { return repo, nil },
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, _, err = r.runChildren(ctx, nil, RunChildrenInput{
+		RunID:        parent.String(),
+		Workflow:     "wf",
+		GitHubRepo:   "x/y",
+		RunnerBinary: runnerBin,
+		// working_dir intentionally omitted → refused over HTTP before any spawn.
+	})
+	// Non-fatal on the error precheck so the worktree-state assertion below ALWAYS
+	// runs: under the deleted-control counterfactual the refusal error disappears
+	// AND a real per-child worktree is provisioned, and the load-bearing RED must
+	// land on that filesystem state, not on the error precheck.
+	if err == nil {
+		t.Error("expected a refusal error when working_dir is omitted over HTTP")
+	} else if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("error should name working_dir; got %v", err)
+	}
+
+	// (6) The load-bearing state assertion (condition 3): NO per-child worktree
+	// was provisioned. Assert directly on the worktrees root rather than inferring
+	// it from a spawn count — an absent root means zero worktrees; a present root
+	// must hold no run-<child> dir.
+	wtRoot := filepath.Join(repo, ".git", "fishhawk-worktrees")
+	entries, rderr := os.ReadDir(wtRoot)
+	if rderr == nil {
+		for _, e := range entries {
+			if e.IsDir() && strings.HasPrefix(e.Name(), "run-") {
+				t.Errorf("per-child worktree %q provisioned despite the refusal; want none", e.Name())
+			}
+		}
+	} else if !os.IsNotExist(rderr) {
+		t.Fatalf("read worktrees root %s: %v", wtRoot, rderr)
+	}
+}
+
+// TestRunChildren_StdioTransportOmittedResolvesToAbsoluteCwd asserts the stdio
+// default: an omitted working_dir resolves to the absolute process cwd and each
+// child's argv carries `--working-dir <cwd>`, never "." (#2479).
+func TestRunChildren_StdioTransportOmittedResolvesToAbsoluteCwd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil) // stdio
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedPlanDecomposed(fb, parent, []string{child0.String()}, 0)
+
+	var mu sync.Mutex
+	var gotArgv []string
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+cwd) {
+		t.Errorf("child argv missing --working-dir %q: %v", cwd, joined)
+	}
+	if strings.Contains(joined, "--working-dir .") {
+		t.Errorf("child argv carries the literal \".\": %v", joined)
+	}
+	if out.ResolvedWorkingDir != cwd {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, cwd)
+	}
+}
+
+// TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged passes an explicit
+// absolute working_dir and asserts resolved_working_dir echoes it and the child
+// argv still carries `--working-dir <that path>` (#2479).
+func TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+
+	dir := t.TempDir()
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedChildRun(fb, child0, "pending")
+	seedPlanDecomposed(fb, parent, []string{child0.String()}, 0)
+
+	var mu sync.Mutex
+	var gotArgv []string
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		WorkingDir: dir,
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.ResolvedWorkingDir != dir {
+		t.Errorf("resolved_working_dir = %q, want %q", out.ResolvedWorkingDir, dir)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+dir) {
+		t.Errorf("child argv missing --working-dir %q: %v", dir, joined)
+	}
+}

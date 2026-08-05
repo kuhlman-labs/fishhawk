@@ -49,7 +49,7 @@ func clampMaxParallel(effective, override int) int {
 type RunChildrenInput struct {
 	RunID        string `json:"run_id" jsonschema:"the DECOMPOSED PARENT run UUID; the tool discovers its children from the parent's plan_decomposed audit entry"`
 	Workflow     string `json:"workflow" jsonschema:"workflow ID matching the run's workflow (passed through to each child's runner)"`
-	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in; defaults to the MCP server's cwd. Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched"`
+	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) this is REQUIRED and must be an absolute path — the server's cwd is the daemon's own checkout, so an omitted or relative value is refused. On the stdio transport it defaults to the client-spawned process's own directory (resolved to an absolute path). Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched"`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for each child's implement stage; defaults to main"`
 	MaxParallel  int    `json:"max_parallel,omitempty" jsonschema:"optional operator concurrency override; clamp-DOWN-only against the orchestrator-resolved effective cap (it can lower an unlimited/looser cap, never raise it). Omit (0) to use the effective cap as-is"`
@@ -97,6 +97,10 @@ type RunChildrenOutput struct {
 	Children        []ChildResult `json:"children" jsonschema:"one entry per discovered child, in plan_decomposed order"`
 	DispatchedCount int           `json:"dispatched_count" jsonschema:"how many children this call spawned (pending at discovery)"`
 	EffectiveCap    int           `json:"effective_cap" jsonschema:"the resolved concurrency cap the dispatch ran under (0 == unlimited)"`
+	// ResolvedWorkingDir echoes the absolute checkout each child's per-child
+	// worktree was provisioned under, after transport-conditional working_dir
+	// resolution (#2479).
+	ResolvedWorkingDir string `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the children were spawned against, after transport-conditional working_dir resolution (#2479)"`
 	// PendingAmendmentChildren lists, in plan_decomposed order, the run ids of
 	// children that filed a mid-stage scope amendment which timed out UNDECIDED
 	// during the blocking fan-out (#2095 gap #1). Non-empty here means a matching
@@ -294,16 +298,22 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 			"run %s plan_decomposed entry names no child_run_ids", in.RunID)
 	}
 
+	// Resolve working_dir transport-conditionally BEFORE the runner-binary
+	// resolution, the origin auto-detect, and — crucially — before any per-child
+	// worktree is provisioned under the checkout's shared gitdir (#2479). An
+	// omitted/relative working_dir over HTTP fails here with a clean error and
+	// provisions no worktree.
+	workingDir, err := r.resolveWorkingDir(in.WorkingDir)
+	if err != nil {
+		return nil, RunChildrenOutput{}, err
+	}
+
 	// Resolve the runner binary once (shared by every child spawn).
 	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
 	if err != nil {
 		return nil, RunChildrenOutput{}, err
 	}
 
-	workingDir := in.WorkingDir
-	if workingDir == "" {
-		workingDir = "."
-	}
 	baseBranch := in.BaseBranch
 	if baseBranch == "" {
 		baseBranch = "main"
@@ -654,8 +664,9 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 	// concurrent-invocation no-op recorded Dispatched:false and so does not
 	// inflate the count.
 	out := RunChildrenOutput{
-		EffectiveCap: concurrencyCap,
-		Warnings:     warnings,
+		EffectiveCap:       concurrencyCap,
+		ResolvedWorkingDir: workingDir,
+		Warnings:           warnings,
 	}
 	for _, d := range dispatches {
 		if res, ok := dispatched[d.runID]; ok {

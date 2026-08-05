@@ -120,13 +120,19 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 	// newServer builds a fully-registered server through the extracted
 	// mcpserver package (E66.7 / #2408); the stdio path uses one instance,
 	// the http path calls it per session. Tool registration is identical
-	// across both transports and identical to fishhawkd's future /mcp route
-	// (#2390), which constructs the same server from the same entry point.
+	// across both transports and identical to fishhawkd's /mcp route (#2390),
+	// which constructs the same server from the same entry point.
+	//
+	// The Config is TRANSPORT-aware, not binary-aware (#2479): the `--transport
+	// http` branch puts THIS binary in the same refusing posture as fishhawkd's
+	// route — its process cwd is a long-lived daemon's directory, as wrong for a
+	// caller as fishhawkd's — so mcpServerConfig sets HTTPTransport:true there and
+	// false on the stdio default. Keying the divergence on the transport (not the
+	// binary) is what makes `fishhawk-mcp --transport http` refuse an omitted
+	// working_dir too.
+	httpTransport := tf.transport == transportHTTP
 	newServer := func() *mcp.Server {
-		return mcpserver.NewServer(mcpserver.Config{
-			BackendURL: cfg.backendURL,
-			APIToken:   cfg.apiToken,
-		})
+		return mcpserver.NewServer(mcpServerConfig(cfg, httpTransport))
 	}
 
 	switch tf.transport {
@@ -142,6 +148,22 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		}
 	}
 	return exitOK
+}
+
+// mcpServerConfig builds the mcpserver.Config for this binary's transport
+// (#2479). HTTPTransport is keyed on the TRANSPORT, not the binary: true for
+// `--transport http` (where this process's cwd is a long-lived daemon's
+// directory, as wrong for a caller as fishhawkd's /mcp route), false for the
+// stdio default (the client-spawned process, whose cwd IS the caller's project).
+// Keying on transport is what makes `fishhawk-mcp --transport http` refuse an
+// omitted or relative working_dir on the runner-spawning verbs, matching the
+// route, while stdio keeps the resolve-to-cwd default.
+func mcpServerConfig(cfg config, httpTransport bool) mcpserver.Config {
+	return mcpserver.Config{
+		BackendURL:    cfg.backendURL,
+		APIToken:      cfg.apiToken,
+		HTTPTransport: httpTransport,
+	}
 }
 
 // config captures the validated startup environment. Kept tiny on

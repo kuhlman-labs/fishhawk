@@ -53,6 +53,13 @@ const Instructions = onboardingInstructions
 type config struct {
 	backendURL string
 	apiToken   string
+
+	// httpTransport marks the tool registry as served over an HTTP
+	// transport (fishhawkd's /mcp route, or `fishhawk-mcp --transport
+	// http`). Package-private mirror of Config.HTTPTransport; threaded onto
+	// the runResolver so the runner-spawning verbs refuse an omitted or
+	// relative working_dir in that posture (#2479).
+	httpTransport bool
 }
 
 // Config is the exported construction input for NewServer. Its two fields
@@ -65,12 +72,24 @@ type config struct {
 type Config struct {
 	BackendURL string
 	APIToken   string
+
+	// HTTPTransport is the TRANSPORT signal (not a binary signal): true
+	// whenever this tool registry is served over an HTTP transport —
+	// fishhawkd's /mcp route (ADR-076 / #2390) or `fishhawk-mcp --transport
+	// http`. In that posture the serving process's cwd is a long-lived
+	// daemon's checkout that can NEVER be a caller's intent, so the
+	// runner-spawning verbs (dispatch_stage, run_stage, run_children,
+	// drive_run) refuse an omitted or relative working_dir and require an
+	// absolute path instead (#2479). On the stdio transport (the client-
+	// spawned process) it stays false: the process cwd is the caller's own
+	// project directory, so an omitted working_dir resolves to it.
+	HTTPTransport bool
 }
 
 // internal bridges the exported Config into the package-private config the
 // tool constructors consume, without touching newAPIClient's signature.
 func (c Config) internal() config {
-	return config{backendURL: c.BackendURL, apiToken: c.APIToken}
+	return config{backendURL: c.BackendURL, apiToken: c.APIToken, httpTransport: c.HTTPTransport}
 }
 
 // handshakeVersion returns the version string advertised on the MCP
@@ -107,8 +126,9 @@ func NewServer(cfg Config) *mcp.Server {
 	c := cfg.internal()
 	srv := buildServer(c)
 	registerTools(srv, &runResolver{
-		api:    newAPIClient(c),
-		getenv: os.Getenv,
+		api:           newAPIClient(c),
+		getenv:        os.Getenv,
+		httpTransport: c.httpTransport,
 	})
 	registerOnboardingResources(srv)
 	return srv

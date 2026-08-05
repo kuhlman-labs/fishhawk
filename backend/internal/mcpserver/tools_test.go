@@ -1382,6 +1382,120 @@ func envFuncFromMap(env map[string]string) func(string) string {
 	return func(k string) string { return env[k] }
 }
 
+// TestResolveWorkingDir pins the transport-conditional working_dir resolver
+// (#2479), one case per named branch of resolveWorkingDir. The two HTTP refusal
+// branches (i) and (ii) are the controls the counterfactual pass deletes; cases
+// (iv) and (vii) pin the stdio absolute-cwd resolution and its getwd-failure
+// propagation.
+func TestResolveWorkingDir(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	absDir := t.TempDir() // t.TempDir() is always absolute
+
+	// (i) http + empty -> error naming working_dir.
+	t.Run("http_empty_refused", func(t *testing.T) {
+		r := &runResolver{httpTransport: true}
+		got, err := r.resolveWorkingDir("")
+		if err == nil {
+			t.Fatalf("expected an error, got %q", got)
+		}
+		if !strings.Contains(err.Error(), "working_dir") {
+			t.Errorf("error should name working_dir; got %v", err)
+		}
+	})
+
+	// (ii) http + relative -> error (a relative path resolves against the daemon
+	// cwd, so it is refused too).
+	t.Run("http_relative_refused", func(t *testing.T) {
+		r := &runResolver{httpTransport: true}
+		got, err := r.resolveWorkingDir("sub/dir")
+		if err == nil {
+			t.Fatalf("expected an error for a relative path, got %q", got)
+		}
+		if !strings.Contains(err.Error(), "working_dir") {
+			t.Errorf("error should name working_dir; got %v", err)
+		}
+	})
+
+	// (iii) http + absolute -> passed through unchanged.
+	t.Run("http_absolute_passthrough", func(t *testing.T) {
+		r := &runResolver{httpTransport: true}
+		got, err := r.resolveWorkingDir(absDir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != absDir {
+			t.Errorf("http+absolute = %q, want %q (unchanged)", got, absDir)
+		}
+	})
+
+	// (iv) stdio + empty -> the process cwd as an ABSOLUTE path, never ".".
+	t.Run("stdio_empty_resolves_to_absolute_cwd", func(t *testing.T) {
+		r := &runResolver{httpTransport: false}
+		got, err := r.resolveWorkingDir("")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got == "." {
+			t.Fatal("stdio+empty resolved to the literal \".\"; want the absolute cwd")
+		}
+		if !filepath.IsAbs(got) {
+			t.Errorf("stdio+empty = %q, want an absolute path", got)
+		}
+		if got != cwd {
+			t.Errorf("stdio+empty = %q, want os.Getwd() %q", got, cwd)
+		}
+	})
+
+	// (v) stdio + relative -> filepath.Abs of it.
+	t.Run("stdio_relative_resolves_to_abs", func(t *testing.T) {
+		r := &runResolver{httpTransport: false}
+		want, err := filepath.Abs("sub/dir")
+		if err != nil {
+			t.Fatalf("filepath.Abs: %v", err)
+		}
+		got, err := r.resolveWorkingDir("sub/dir")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != want {
+			t.Errorf("stdio+relative = %q, want %q", got, want)
+		}
+	})
+
+	// (vi) stdio + absolute -> unchanged.
+	t.Run("stdio_absolute_unchanged", func(t *testing.T) {
+		r := &runResolver{httpTransport: false}
+		got, err := r.resolveWorkingDir(absDir)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != absDir {
+			t.Errorf("stdio+absolute = %q, want %q (unchanged)", got, absDir)
+		}
+	})
+
+	// (vii) stdio + a failing getwd seam -> error propagated, no "." fallback.
+	t.Run("stdio_getwd_failure_propagated", func(t *testing.T) {
+		r := &runResolver{
+			httpTransport: false,
+			getwd:         func() (string, error) { return "", fmt.Errorf("boom") },
+		}
+		got, err := r.resolveWorkingDir("")
+		if err == nil {
+			t.Fatalf("expected the getwd error to propagate, got %q", got)
+		}
+		if got == "." {
+			t.Error("getwd failure degraded to the literal \".\"; want the error propagated")
+		}
+		if !strings.Contains(err.Error(), "boom") {
+			t.Errorf("error should wrap the getwd failure; got %v", err)
+		}
+	})
+}
+
 func sampleRun(id uuid.UUID, repo string, age time.Duration) Run {
 	pr := "https://github.com/" + repo + "/pull/42"
 	tr := "issue:42"
