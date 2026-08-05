@@ -335,6 +335,63 @@ func TestToken_RedirectURIMismatchLeavesCodeRedeemable(t *testing.T) {
 	}
 }
 
+// TestToken_LoopbackPortBearingCodeExchangesWithTheURIItWasBoundTo is the #2470
+// token-layer pin, and the record of a DELIBERATE no-change: the byte-exact
+// `c.RedirectURI != redirectURI` comparison in oauthtoken.go is retained. The
+// fix lives entirely in what the authorize handler BINDS to the code row.
+//
+// Relaxing the port here would create a SECOND port-relaxation surface, on the
+// endpoint that mints tokens, for no client benefit — RFC 6749 §4.1.3 requires
+// the presented redirect_uri to be identical to the authorization request's,
+// which is now what the row holds. The consequence, asserted below: a client that
+// authorized on a port-bearing URI and then exchanges with the PORTLESS one is
+// correctly refused invalid_grant.
+func TestToken_LoopbackPortBearingCodeExchangesWithTheURIItWasBoundTo(t *testing.T) {
+	store := newFakeOAuthStore()
+	store.seedClient(storeClient("github", "client-loop", loopbackRedirectURIs))
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
+
+	mint := func(t *testing.T) string {
+		t.Helper()
+		_, challenge := testPKCE()
+		code, err := store.CreateAuthorizationCode(context.Background(), oauthstore.NewAuthorizationCode{
+			ClientID:            "client-loop",
+			RedirectURI:         loopbackRequestedRedirect, // the DELIVERY URI the authorize handler binds
+			CodeChallenge:       challenge,
+			CodeChallengeMethod: oauthas.CodeChallengeMethodS256,
+			Scopes:              []string{"read:runs"},
+			Resource:            testResource,
+			Subject:             "github:octocat",
+			Provider:            "github",
+			ExpiresAt:           time.Now().Add(time.Minute),
+		})
+		if err != nil {
+			t.Fatalf("mint code: %v", err)
+		}
+		return code.PlainText
+	}
+	exchange := func(code, redirectURI string) url.Values {
+		verifier, _ := testPKCE()
+		v := url.Values{}
+		v.Set("grant_type", "authorization_code")
+		v.Set("code", code)
+		v.Set("redirect_uri", redirectURI)
+		v.Set("code_verifier", verifier)
+		v.Set("client_id", "client-loop")
+		return v
+	}
+
+	// The URI the client actually used exchanges successfully.
+	_ = decodeToken(t, postToken(srv, exchange(mint(t), loopbackRequestedRedirect), nil))
+
+	// The REGISTERED portless URI does not — it is not what the authorization
+	// request carried.
+	rr := postToken(srv, exchange(mint(t), "http://127.0.0.1/callback"), nil)
+	if oauthErrCode(t, rr) != "invalid_grant" {
+		t.Fatalf("portless exchange err = %q, want invalid_grant (§4.1.3 identity is enforced byte-exactly)", oauthErrCode(t, rr))
+	}
+}
+
 func TestToken_ResourceMismatchLeavesCodeRedeemable(t *testing.T) {
 	srv, store := newOAuthTokenServer(t)
 	code := mintCode(t, store)

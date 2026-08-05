@@ -1573,6 +1573,34 @@ unregistered scope, resource mismatch) redirect back to the now-trusted
 `authorization_response_iss_parameter_supported: true`, so a client can bind the
 error to the issuer it dialed.
 
+### One `responseRedirect` value: the delivery URI, not the registration (#2470)
+
+`runAuthorizeLadder` resolves ONE value — `authorizeResolved.responseRedirect`,
+from `oauthas.ResolveRedirectURI` — and every outbound use of a redirect URI in
+the authorize flow reads it: the success `302`, all eight in-ladder
+`redirectOAuthError` calls, the consent deny branch, AND
+`CreateAuthorizationCode(RedirectURI:)`.
+
+It is the **delivery** URI, not the matched registration. RFC 8252 §7.3 has a
+loopback native client register PORTLESS because it listens on an ephemeral port,
+so `ResolveRedirectURI` substitutes the requested port onto the registered URI
+(see `backend/internal/oauthas/README.md` for the construction and its
+registered-side-authoritative guarantees). Delivering to the registration instead
+meant a loopback client never received its code, and the code row was bound to a
+URI the client could not present — the #2470 defect. The field was called
+`matchedRedirect`, and that name is what made the wrong value look right at every
+call site; the rename is part of the fix.
+
+**`oauthtoken.go`'s `c.RedirectURI != redirectURI` comparison is deliberately
+UNCHANGED and stays byte-exact.** RFC 6749 §4.1.3 requires the presented
+`redirect_uri` to be identical to the authorization request's, which is now what
+the row holds, so the client presenting the URI it actually used compares equal.
+Relaxing the port there would add a SECOND port-relaxation surface on the
+endpoint that mints tokens, for no client benefit. Consequence, asserted in
+`oauthtoken_test.go` and end to end in `oauth_flow_integration_test.go`: a client
+that authorized on a port-bearing URI and exchanges with the portless one is
+correctly refused `invalid_grant`.
+
 ### CSRF on `/v0/oauth/authorize`: the SameSite trap (CONDITION-1)
 
 The `POST` consent decision is CSRF-protected by the standard `__Host-csrf`
@@ -1731,7 +1759,7 @@ gate is available. Shipped contract:
 - **In-place 429.** The refusal renders as HTTP 429 with a `Retry-After`
   (RFC 9110 §10.2.3 delta-seconds, ceil, floor 1) and the flat RFC 6749 §5.2 body
   with code `temporarily_unavailable`. On authorize it fires before
-  `MatchRedirectURIAny` validates any `redirect_uri`, so it is rendered IN PLACE and
+  `ResolveRedirectURI` validates any `redirect_uri`, so it is rendered IN PLACE and
   NEVER redirected (RFC 6749 §4.1.2.1). The wait is carried as a typed
   `cimdRateLimitedError` in the `*oauthas.Error` Cause, so the renderer reads it
   structurally rather than re-consulting the limiter (which would burn a second

@@ -69,6 +69,41 @@ If exactly one side is loopback the match is refused (no cross-branch match).
 requested URI on BOTH branches.** The port relaxation is the ONLY thing loopback
 relaxes.
 
+### MATCH is not DELIVER (#2470)
+
+Ignoring the port at match time is only half of RFC 8252 §7.3. A native client
+registers PORTLESS precisely because it listens on an ephemeral port, so the
+authorization RESPONSE must go to the port it asked for — delivering to the
+registered portless URI means the client never receives its code, and binds the
+code row to a URI the client cannot present at the token endpoint.
+
+`MatchRedirectURI` is therefore a pure PREDICATE. **`ResolveRedirectURI`** is the
+function callers want: it returns the DELIVERY URI — the first registration the
+matcher accepts, with the requested URI's port substituted on the loopback
+branch.
+
+| | matcher | delivery URI |
+|---|---|---|
+| loopback port | ignored | **preserved** — the requested port is what the response is sent to |
+| scheme, host, path | compared | taken from the REGISTERED URI |
+| userinfo, query, fragment | refused on both sides | absent by construction (inherited from the validated registered URI) |
+| non-loopback | byte-exact equality required | the registration verbatim (identical to the request by definition) |
+
+**ONLY the port ever crosses from the request into the delivery URI.** The
+delivery URI is built by copying the PARSED registered `*url.URL` — preserving
+`Scheme`, `Path` and `RawPath` exactly — and replacing only `Host` with the
+registered hostname (re-bracketed for an IPv6 literal, since `Hostname()` strips
+the brackets) joined to the requested port. `net/url` rejects a non-numeric port
+at parse time, so the only value taken from the request is a digit string; it
+cannot carry a path, query or authority component. The construction runs only
+AFTER `MatchRedirectURI` has accepted, so no unvalidated request component can
+reach a `Location` header, and a component failure inside the builder is a
+fail-closed error, never a fallback to the requested string.
+
+`MatchRedirectURIAny` (which returned the REGISTERED URI) was replaced rather
+than kept alongside: two functions differing only in which URI they return are
+indistinguishable at a call site, which is how #2470 shipped.
+
 **The fragment check is LEXICAL** (it rejects any raw redirect URI containing
 `#`, before parsing). This is deliberate and load-bearing: `net/url` records no
 "fragment was present but empty" flag (unlike `ForceQuery` for `?`), so a bare

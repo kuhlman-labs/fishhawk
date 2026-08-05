@@ -175,6 +175,91 @@ func TestOAuthFlow_CodeIsSingleUse(t *testing.T) {
 	}
 }
 
+// TestOAuthFlow_LoopbackEphemeralPortEndToEnd is the #2470 cross-boundary test:
+// handler -> real oauthstore Postgres -> token endpoint, on ONE path. It is
+// required because the defect lives in the SEAM — every per-layer unit passed
+// while a loopback client never received its code — and because the load-bearing
+// half is COMMITTED STATE (the redirect_uri actually persisted on the code row),
+// which no status-code or Location assertion can see.
+//
+// A PORTLESS loopback client (RFC 8252 §7.3, the registration Claude Code
+// publishes) authorizes from an ephemeral port; the assertions are that the 302
+// reaches that port, the persisted code row is bound to the port-bearing URI, an
+// exchange presenting that URI mints a usable access token, and a second code
+// exchanged with the REGISTERED portless URI is refused invalid_grant.
+func TestOAuthFlow_LoopbackEphemeralPortEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	store := oauthstore.NewPostgresRepository(pool)
+
+	if _, err := store.UpsertClient(ctx, oauthstore.NewClient{
+		Metadata: oauthas.ClientMetadata{
+			ClientID:                "client-loop",
+			RedirectURIs:            loopbackRedirectURIs, // both PORTLESS
+			GrantTypes:              []string{"authorization_code", "refresh_token"},
+			ResponseTypes:           []string{"code"},
+			TokenEndpointAuthMethod: "none",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertClient: %v", err)
+	}
+
+	repo := newFakeAuthRepo()
+	uid := uuid.New()
+	repo.mu.Lock()
+	repo.users[uid.String()] = &auth.User{ID: uid.String(), Provider: "github", GitHubLogin: "octocat"}
+	repo.mu.Unlock()
+	id := Identity{Subject: "github:octocat", UserID: uid.String(), SessionID: uuid.NewString()}
+	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+
+	// Consent approve from the ephemeral port -> 302 to THAT port.
+	consentRR := postConsent(srv, consentForm(loopbackOverrides(nil)), &id)
+	q := assertRedirectHostPort(t, consentRR, "127.0.0.1:57121")
+	code := q.Get("code")
+	if code == "" {
+		t.Fatal("consent did not mint a code")
+	}
+
+	// COMMITTED STATE: the persisted row must carry the port-bearing URI. Read it
+	// back out of the REAL repository rather than inferring it from the redirect.
+	row, err := store.LookupAuthorizationCode(ctx, code)
+	if err != nil {
+		t.Fatalf("look up the persisted code: %v", err)
+	}
+	if row.RedirectURI != loopbackRequestedRedirect {
+		t.Fatalf("persisted code redirect_uri = %q, want %q — the row must be bound to the delivery URI, not the portless registration",
+			row.RedirectURI, loopbackRequestedRedirect)
+	}
+
+	// Exchange with the URI the client used: succeeds and mints a usable token.
+	verifier, _ := testPKCE()
+	exchange := func(code, redirectURI string) url.Values {
+		v := url.Values{}
+		v.Set("grant_type", "authorization_code")
+		v.Set("code", code)
+		v.Set("redirect_uri", redirectURI)
+		v.Set("code_verifier", verifier)
+		v.Set("client_id", "client-loop")
+		return v
+	}
+	resp := decodeToken(t, postToken(srv, exchange(code, loopbackRequestedRedirect), nil))
+	if _, err := store.AuthenticateAccessToken(ctx, resp.AccessToken); err != nil {
+		t.Fatalf("the minted access token does not authenticate: %v", err)
+	}
+
+	// A FRESH code exchanged with the registered PORTLESS URI is refused: RFC
+	// 6749 §4.1.3 identity is enforced byte-exactly at the token endpoint, which
+	// this change deliberately left unchanged.
+	second := redirectQuery(t, postConsent(srv, consentForm(loopbackOverrides(nil)), &id)).Get("code")
+	if second == "" {
+		t.Fatal("second consent did not mint a code")
+	}
+	rr := postToken(srv, exchange(second, "http://127.0.0.1/callback"), nil)
+	if oauthErrCode(t, rr) != "invalid_grant" {
+		t.Fatalf("portless exchange err = %q, want invalid_grant", oauthErrCode(t, rr))
+	}
+}
+
 // TestOAuthFlow_LimiterLivePreservesHappyPathThenThrottlesCIMD is the
 // cross-layer end-to-end for #2441: it drives a COMPLETE consent -> token flow
 // through the real mux with the CIMD limiter LIVE at its default (proving the

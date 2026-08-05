@@ -584,6 +584,146 @@ func TestAuthorize_ClaudeCodeShapedDocumentAuthorizes(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Loopback ephemeral-port delivery (#2470).
+// ---------------------------------------------------------------------------
+
+// loopbackRedirectURIs is the registration Claude Code publishes: both members
+// PORTLESS, per RFC 8252 §7.3 (a native client cannot know its ephemeral port at
+// registration time).
+var loopbackRedirectURIs = []string{"http://localhost/callback", "http://127.0.0.1/callback"}
+
+// The ephemeral port such a client is actually listening on.
+const loopbackRequestedRedirect = "http://127.0.0.1:57121/callback"
+
+// newLoopbackConsentServer seeds client-loop with the portless loopback pair and
+// returns a signed-in consent-capable server.
+func newLoopbackConsentServer(t *testing.T) (*Server, *fakeOAuthStore, Identity) {
+	t.Helper()
+	store := newFakeOAuthStore()
+	store.seedClient(storeClient("github", "client-loop", loopbackRedirectURIs))
+	repo := newFakeAuthRepo()
+	srv := New(Config{OAuthASIssuer: testIssuer, OAuthStore: store, OAuthCIMDFetcher: newCIMDFetcher(newCIMD()), AuthRepo: repo})
+	return srv, store, signedInIdentity(repo, "github")
+}
+
+// loopbackOverrides is the base override set pointing a request at client-loop's
+// ephemeral loopback port.
+func loopbackOverrides(extra map[string]string) map[string]string {
+	o := map[string]string{"client_id": "client-loop", "redirect_uri": loopbackRequestedRedirect}
+	for k, v := range extra {
+		o[k] = v
+	}
+	return o
+}
+
+// assertRedirectHostPort parses the Location and asserts its authority.
+func assertRedirectHostPort(t *testing.T, rr *httptest.ResponseRecorder, want string) url.Values {
+	t.Helper()
+	if rr.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302; body=%s", rr.Code, rr.Body.String())
+	}
+	u, err := url.Parse(rr.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse Location: %v", err)
+	}
+	if u.Host != want {
+		t.Fatalf("Location host:port = %q, want %q — the response must reach the port the client is listening on (Location=%s)",
+			u.Host, want, rr.Header().Get("Location"))
+	}
+	return u.Query()
+}
+
+// TestAuthorizeConsent_LoopbackApprovalDeliversToRequestedPort is the #2470
+// handler-level regression pin: the approval 302 goes to the REQUESTED ephemeral
+// port, not the registered portless URI, and still carries code, state and iss.
+//
+// COUNTERFACTUAL: with ResolveRedirectURI's port substitution deleted the
+// Location host is 127.0.0.1 with no port — the registration is PORTLESS by
+// construction, so no setup step consults the control.
+func TestAuthorizeConsent_LoopbackApprovalDeliversToRequestedPort(t *testing.T) {
+	srv, store, id := newLoopbackConsentServer(t)
+	rr := postConsent(srv, consentForm(loopbackOverrides(nil)), &id)
+	q := assertRedirectHostPort(t, rr, "127.0.0.1:57121")
+	if q.Get("code") == "" {
+		t.Fatal("approval redirect carried no code")
+	}
+	if q.Get("state") != "st-123" {
+		t.Errorf("state = %q, want st-123", q.Get("state"))
+	}
+	if q.Get("iss") != testIssuer {
+		t.Errorf("iss = %q, want %q", q.Get("iss"), testIssuer)
+	}
+	// The code row must be BOUND to the delivery URI, so the token endpoint's
+	// byte-exact comparison sees the URI the client actually used. This is
+	// COMMITTED STATE — a status/Location assertion cannot see it.
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.codes) != 1 {
+		t.Fatalf("expected 1 minted code, got %d", len(store.codes))
+	}
+	for _, c := range store.codes {
+		if c.RedirectURI != loopbackRequestedRedirect {
+			t.Fatalf("code row redirect_uri = %q, want %q (the delivery URI)", c.RedirectURI, loopbackRequestedRedirect)
+		}
+	}
+}
+
+// TestAuthorize_LoopbackErrorRedirectPreservesRequestedPort covers the ERROR
+// branch — the #2466 shape (a scope exceeding the client's registered scope) —
+// which is delivered through the SAME responseRedirect value. An error that went
+// to the portless registration would be just as undeliverable as the code.
+func TestAuthorize_LoopbackErrorRedirectPreservesRequestedPort(t *testing.T) {
+	store := newFakeOAuthStore()
+	c := storeClient("github", "client-loop", loopbackRedirectURIs)
+	c.Scope = "read:runs" // registered narrow; write:runs is outside it
+	store.seedClient(c)
+	srv := newEnabledOAuthServer(store, newCIMDFetcher(newCIMD()))
+	rr := getAuthorize(srv, authorizeQuery(loopbackOverrides(map[string]string{"scope": "write:runs"})), nil)
+	q := assertRedirectHostPort(t, rr, "127.0.0.1:57121")
+	if q.Get("error") != "invalid_scope" {
+		t.Fatalf("error = %q, want invalid_scope", q.Get("error"))
+	}
+	if q.Get("state") != "st-123" || q.Get("iss") != testIssuer {
+		t.Errorf("state/iss = %q/%q", q.Get("state"), q.Get("iss"))
+	}
+}
+
+// TestAuthorizeConsent_LoopbackDenialPreservesRequestedPort covers the DENY
+// branch, the third consumer of responseRedirect.
+func TestAuthorizeConsent_LoopbackDenialPreservesRequestedPort(t *testing.T) {
+	srv, _, id := newLoopbackConsentServer(t)
+	form := consentForm(loopbackOverrides(nil))
+	form.Set("action", "deny")
+	rr := postConsent(srv, form, &id)
+	q := assertRedirectHostPort(t, rr, "127.0.0.1:57121")
+	if q.Get("error") != "access_denied" {
+		t.Fatalf("error = %q, want access_denied", q.Get("error"))
+	}
+}
+
+// TestAuthorize_LoopbackUnregisteredRedirectRefusedInPlace is the open-redirect
+// pin: port relaxation must not have widened the matcher. An unregistered host
+// against the loopback client is refused 400 IN PLACE with NO Location.
+//
+// COUNTERFACTUAL: deleting the MatchRedirectURI acceptance guard inside
+// ResolveRedirectURI's loop makes this resolve to the first registration and
+// proceed past the in-place phase — the request is driven SIGNED IN so that
+// "proceeded" is observable as a rendered 200 consent page rather than as an
+// unrelated sign-in-unconfigured refusal. The evil URI is a well-formed absolute
+// URI with no userinfo/query/fragment, so the deletion cannot be absorbed by a
+// component rejection.
+func TestAuthorize_LoopbackUnregisteredRedirectRefusedInPlace(t *testing.T) {
+	srv, _, id := newLoopbackConsentServer(t)
+	rr := getAuthorize(srv, authorizeQuery(loopbackOverrides(map[string]string{"redirect_uri": "https://evil.example/cb"})), &id)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 in place; body=%s Location=%q", rr.Code, rr.Body.String(), rr.Header().Get("Location"))
+	}
+	if loc := rr.Header().Get("Location"); loc != "" {
+		t.Fatalf("an unregistered redirect_uri produced a Location (%q); §4.1.2.1 forbids it", loc)
+	}
+}
+
 // TestAuthorize_EnforcesRegisteredScope is the registration-driven scope
 // boundary (the sibling of the response_types/grant_types checks): a client the
 // operator registered narrow cannot request a scope outside its set, while an

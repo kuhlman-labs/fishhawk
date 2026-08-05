@@ -24,6 +24,16 @@ import (
 // normalization. If exactly one is loopback the match is refused. Every refusal
 // returns ErrRedirectMismatch wrapped in an invalid_request *Error whose
 // Description names the offending component and never echoes the requested URI.
+//
+// MATCH is not DELIVER (#2470). Ignoring the port at MATCH time is only half of
+// RFC 8252 §7.3: a native client registers portless precisely because it listens
+// on an ephemeral port, so the authorization RESPONSE must go to the port it
+// asked for — delivering to the registered portless URI means the client never
+// receives its code. ResolveRedirectURI is the function that produces the
+// DELIVERY URI; MatchRedirectURI stays purely a predicate. ONLY the port ever
+// crosses from the requested URI into the delivery URI: scheme, host and path,
+// and the guarantee that there is no userinfo, query or fragment, all come from
+// the validated REGISTERED side.
 func MatchRedirectURI(registered, requested string) error {
 	regU, err := validateRedirectURIComponents(registered)
 	if err != nil {
@@ -53,18 +63,78 @@ func MatchRedirectURI(registered, requested string) error {
 	}
 }
 
-// MatchRedirectURIAny returns the first registered URI that MatchRedirectURI
-// accepts for requested, for the multi-URI registration case.
-func MatchRedirectURIAny(registered []string, requested string) (string, error) {
+// ResolveRedirectURI returns the DELIVERY redirect URI for requested against a
+// client's registered set, for the multi-URI registration case: the first
+// registration MatchRedirectURI accepts, with the requested URI's PORT
+// substituted on the loopback branch (see deliveryRedirectURI).
+//
+// It deliberately REPLACES the older MatchRedirectURIAny, which returned the
+// registered URI. Keeping both would leave a function that returns the
+// registered URI beside one that returns the delivery URI, re-arming the #2470
+// footgun: every caller wants the delivery URI, and the two are
+// indistinguishable at a call site.
+//
+// Every refusal (an empty registration list; no registration accepting
+// requested) is the same ErrRedirectMismatch-wrapped invalid_request as before,
+// and returns an EMPTY delivery URI — a caller must never redirect on error.
+func ResolveRedirectURI(registered []string, requested string) (string, error) {
 	if len(registered) == 0 {
 		return "", newError(ErrCodeInvalidRequest, "no registered redirect URIs").withCause(ErrRedirectMismatch)
 	}
 	for _, reg := range registered {
 		if err := MatchRedirectURI(reg, requested); err == nil {
-			return reg, nil
+			return deliveryRedirectURI(reg, requested)
 		}
 	}
 	return "", newError(ErrCodeInvalidRequest, "redirect URI does not match any registered URI").withCause(ErrRedirectMismatch)
+}
+
+// deliveryRedirectURI builds the URI the authorization response is delivered to,
+// from an ALREADY-MATCHED (registered, requested) pair.
+//
+// The construction is registered-side-authoritative: it copies the PARSED
+// registered *url.URL — keeping Scheme, Path and RawPath exactly as registered,
+// and inheriting validateRedirectURIComponents' guarantee of no userinfo, query
+// or fragment — and replaces ONLY the Host, with the registered hostname joined
+// to the REQUESTED port. Nothing else is ever read from the requested URI, so no
+// requested scheme, host or path can reach a Location header.
+//
+// Non-loopback is a no-op by construction: that branch of MatchRedirectURI
+// required byte equality, so registered and requested are the same string and the
+// registration is returned verbatim. Only the loopback branch, which ignores the
+// port, has a port to carry over (RFC 8252 §7.3).
+//
+// Both raw strings are re-parsed through the SAME validator MatchRedirectURI
+// used, so a parse or component failure here is a fail-closed error — never a
+// silent fallback to the requested string. Through ResolveRedirectURI that
+// branch is unreachable (the matcher validated both sides first); it is the
+// contract for any future direct caller, and is pinned by a direct unit test.
+func deliveryRedirectURI(registered, requested string) (string, error) {
+	regU, err := validateRedirectURIComponents(registered)
+	if err != nil {
+		return "", err
+	}
+	reqU, err := validateRedirectURIComponents(requested)
+	if err != nil {
+		return "", err
+	}
+	if !isLoopbackHost(regU) || !isLoopbackHost(reqU) {
+		return registered, nil
+	}
+	delivery := *regU
+	host := regU.Hostname()
+	if strings.Contains(host, ":") {
+		// Hostname() strips an IPv6 literal's brackets, and re-joining
+		// hostname+":"+port unbracketed yields the unparseable http://::1:5000/cb.
+		host = "[" + host + "]"
+	}
+	// net/url rejects a non-numeric port at parse time, so Port() is a digit
+	// string: it cannot inject a path, query or authority component.
+	if port := reqU.Port(); port != "" {
+		host += ":" + port
+	}
+	delivery.Host = host
+	return delivery.String(), nil
 }
 
 // validateRedirectURIComponents applies the shared component rules to a single
