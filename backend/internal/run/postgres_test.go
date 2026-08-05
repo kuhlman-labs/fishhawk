@@ -44,6 +44,81 @@ func makeStage(t *testing.T, repo run.Repository, runID uuid.UUID, seq int) *run
 	return s
 }
 
+// TestCreateRun_PersistsWorkingDir pins the working_dir binding (E66.42 /
+// #2482) across all THREE Run read paths — CreateRun's own return, GetRun, and
+// ListRuns — against a real Postgres. The three reads hit three different sqlc
+// expansion sites, so a column-list/scan positional mismatch in the hand-edited
+// db/queries.sql.go (which would silently mis-bind two adjacent TEXT columns)
+// surfaces here as a wrong string, not a compile error.
+func TestCreateRun_PersistsWorkingDir(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	const wd = "/Users/dev/src/fishhawk"
+	created, err := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+		RunnerKind:    run.RunnerKindLocal,
+		WorkingDir:    wd,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if created.WorkingDir != wd {
+		t.Errorf("CreateRun returned WorkingDir = %q, want %q", created.WorkingDir, wd)
+	}
+
+	got, err := repo.GetRun(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.WorkingDir != wd {
+		t.Errorf("GetRun returned WorkingDir = %q, want %q", got.WorkingDir, wd)
+	}
+
+	list, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: "kuhlman-labs/fishhawk", Limit: 100})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	var found bool
+	for _, r := range list {
+		if r.ID == created.ID {
+			found = true
+			if r.WorkingDir != wd {
+				t.Errorf("ListRuns returned WorkingDir = %q, want %q", r.WorkingDir, wd)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("ListRuns did not return the created run %s", created.ID)
+	}
+
+	// An unbound run reads back "" through the same three paths (the migration
+	// 0065 '' default), not a spurious value from a shifted column.
+	unbound, err := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create unbound run: %v", err)
+	}
+	if unbound.WorkingDir != "" {
+		t.Errorf("unbound CreateRun WorkingDir = %q, want \"\"", unbound.WorkingDir)
+	}
+	gotUnbound, err := repo.GetRun(ctx, unbound.ID)
+	if err != nil {
+		t.Fatalf("get unbound run: %v", err)
+	}
+	if gotUnbound.WorkingDir != "" {
+		t.Errorf("unbound GetRun WorkingDir = %q, want \"\"", gotUnbound.WorkingDir)
+	}
+}
+
 // TestPostgres_AccountID_RoundTrip exercises migration 0055's nullable
 // runs.account_id (ADR-057 / E44.5): a run bound to a tenant account reads its
 // account back through GetRun AND the GetRunAccountID capability, while an

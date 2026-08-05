@@ -146,8 +146,17 @@ type Run struct {
 	// MUST byte-match the backend's runReviewAuthorityPayload or the field
 	// silently decodes to nil.
 	ReviewAuthority []RunReviewAuthority `json:"review_authority,omitempty" jsonschema:"per-stage resolved review authority: each entry carries the stage id, its type, the resolved mode (advisory | gating | gateless) and its provenance (declared | derived). Omitted when the run's spec declares no reviewers block"`
-	CreatedAt       time.Time            `json:"created_at"`
-	UpdatedAt       time.Time            `json:"updated_at"`
+	// WorkingDir mirrors the backend runResponse.working_dir (E66.42 /
+	// #2482): the run's bound local checkout, recorded once at start_run and
+	// inherited by every later runner-spawning verb. The
+	// resolveWorkingDirForRun ladder reads it on an omitted-parameter call to
+	// inherit the binding, and to refuse a conflicting explicit override. The
+	// json tag MUST byte-match the backend's runResponse field or this mirror
+	// silently decodes to empty and every inheriting verb reverts to demanding
+	// the parameter — the #371-class hand-maintained-wire-mirror trap.
+	WorkingDir string    `json:"working_dir,omitempty" jsonschema:"the run's bound local checkout (bound once at start_run; the later runner-spawning verbs inherit it). Omitted when the run carries no binding"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // RunReviewAuthority mirrors the backend's run-status review_authority entry
@@ -649,6 +658,7 @@ type createRunRequest struct {
 	TriggerSource  string        `json:"trigger_source"`
 	TriggerRef     *string       `json:"trigger_ref,omitempty"`
 	RunnerKind     string        `json:"runner_kind,omitempty"`
+	WorkingDir     string        `json:"working_dir,omitempty"`
 	WorkflowSpec   string        `json:"workflow_spec,omitempty"`
 	IssueContext   *IssueContext `json:"issue_context,omitempty"`
 	BudgetOverride bool          `json:"budget_override,omitempty"`
@@ -673,13 +683,17 @@ type createRunRequest struct {
 // fishhawk_start_run via MCP has the same composition reach the
 // CLI's `fishhawk run start` does.
 type StartRunParams struct {
-	Repo                    string
-	WorkflowID              string
-	WorkflowSHA             string
-	TriggerSource           string
-	TriggerRef              string
-	IdempotencyKey          string
-	RunnerKind              string
+	Repo           string
+	WorkflowID     string
+	WorkflowSHA    string
+	TriggerSource  string
+	TriggerRef     string
+	IdempotencyKey string
+	RunnerKind     string
+	// WorkingDir binds the run's local checkout (E66.42 / #2482); persisted
+	// on the run row so every later runner-spawning verb inherits it. Empty
+	// leaves the run unbound.
+	WorkingDir              string
 	WorkflowSpec            string
 	IssueContext            *IssueContext
 	BudgetOverride          bool
@@ -1787,6 +1801,7 @@ func (c *apiClient) StartRun(ctx context.Context, p StartRunParams) (*Run, bool,
 		WorkflowSHA:             p.WorkflowSHA,
 		TriggerSource:           p.TriggerSource,
 		RunnerKind:              p.RunnerKind,
+		WorkingDir:              p.WorkingDir,
 		WorkflowSpec:            p.WorkflowSpec,
 		IssueContext:            p.IssueContext,
 		BudgetOverride:          p.BudgetOverride,

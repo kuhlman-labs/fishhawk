@@ -2461,3 +2461,66 @@ func TestNextActions_LiveValidationGuidance(t *testing.T) {
 		foldLiveValidationAdvisory(baseRun(&RunLiveValidation{PendingCriteriaCount: 1, WalkRef: "#1"}), nil)
 	})
 }
+
+// TestNextActions_CarryBoundWorkingDir pins the foldWorkingDirParams fold
+// (E66.42 / #2482): every emitted action whose verb is one of the four
+// runner-spawning verbs carries params["working_dir"] equal to the run's
+// binding, across the plan-approved dispatch arm and the run_children arm; a
+// paired unbound-run case asserts the key is ABSENT (not empty), so the fold
+// cannot pass by unconditionally writing a key. It also asserts the fold is
+// SELECTIVE — a non-four-verb action (the poll) is not stamped.
+func TestNextActions_CarryBoundWorkingDir(t *testing.T) {
+	const bound = "/Users/dev/src/fishhawk"
+
+	// Plan-approved dispatch arm: local run, plan succeeded + implement pending
+	// → fishhawk_dispatch_stage + fishhawk_run_stage, both four-verb.
+	t.Run("dispatch_arm_stamped", func(t *testing.T) {
+		run := naRun("running")
+		run.RunnerKind = "local"
+		run.WorkingDir = bound
+		na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"), naStage("implement", "pending")},
+			nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+
+		for _, verb := range []string{"fishhawk_dispatch_stage", "fishhawk_run_stage"} {
+			a := findAction(t, na, verb)
+			if a.Params["working_dir"] != bound {
+				t.Errorf("%s params[working_dir] = %q, want %q", verb, a.Params["working_dir"], bound)
+			}
+		}
+		// Selective: the poll action (not a runner-spawning verb) is NOT stamped.
+		for _, a := range na.Actions {
+			if _, isFourVerb := workingDirInheritingActions[a.Action]; !isFourVerb {
+				if _, has := a.Params["working_dir"]; has {
+					t.Errorf("non-runner-spawning action %q should NOT carry working_dir; got %v", a.Action, a.Params)
+				}
+			}
+		}
+	})
+
+	// run_children arm: awaiting_children → fishhawk_run_children.
+	t.Run("run_children_arm_stamped", func(t *testing.T) {
+		run := naRun("running")
+		run.RunnerKind = "local"
+		run.WorkingDir = bound
+		na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_children")},
+			nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+		a := findAction(t, na, "fishhawk_run_children")
+		if a.Params["working_dir"] != bound {
+			t.Errorf("fishhawk_run_children params[working_dir] = %q, want %q", a.Params["working_dir"], bound)
+		}
+	})
+
+	// Unbound-run pairing: the key must be ABSENT (not an empty-string path the
+	// agent would pass verbatim and get refused over HTTP).
+	t.Run("unbound_run_key_absent", func(t *testing.T) {
+		run := naRun("running")
+		run.RunnerKind = "local"
+		// WorkingDir intentionally empty (unbound).
+		na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"), naStage("implement", "pending")},
+			nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+		a := findAction(t, na, "fishhawk_dispatch_stage")
+		if _, has := a.Params["working_dir"]; has {
+			t.Errorf("unbound run must NOT carry working_dir; got %v", a.Params)
+		}
+	})
+}

@@ -49,7 +49,7 @@ func clampMaxParallel(effective, override int) int {
 type RunChildrenInput struct {
 	RunID        string `json:"run_id" jsonschema:"the DECOMPOSED PARENT run UUID; the tool discovers its children from the parent's plan_decomposed audit entry"`
 	Workflow     string `json:"workflow" jsonschema:"workflow ID matching the run's workflow (passed through to each child's runner)"`
-	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) this is REQUIRED and must be an absolute path — the server's cwd is the daemon's own checkout, so an omitted or relative value is refused. On the stdio transport it defaults to the client-spawned process's own directory (resolved to an absolute path). Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched"`
+	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in. OPTIONAL when the parent run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path). Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched"`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for each child's implement stage; defaults to main"`
 	MaxParallel  int    `json:"max_parallel,omitempty" jsonschema:"optional operator concurrency override; clamp-DOWN-only against the orchestrator-resolved effective cap (it can lower an unlimited/looser cap, never raise it). Omit (0) to use the effective cap as-is"`
@@ -302,8 +302,11 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 	// resolution, the origin auto-detect, and — crucially — before any per-child
 	// worktree is provisioned under the checkout's shared gitdir (#2479). An
 	// omitted/relative working_dir over HTTP fails here with a clean error and
-	// provisions no worktree.
-	workingDir, err := r.resolveWorkingDir(in.WorkingDir)
+	// provisions no worktree. Run-aware against the PARENT run (E66.42 / #2482):
+	// an omitted parameter inherits the parent's start_run binding (children
+	// provision their per-child worktrees under that checkout); a conflicting
+	// explicit value is refused; a run-read failure fails closed over HTTP.
+	workingDir, err := r.resolveWorkingDirForRun(ctx, parentUUID, in.WorkingDir)
 	if err != nil {
 		return nil, RunChildrenOutput{}, err
 	}

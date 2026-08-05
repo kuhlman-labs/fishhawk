@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,9 +88,16 @@ type runResponse struct {
 	CostUSDTotal float64 `json:"cost_usd_total"`
 	// ResolvedModel pins the agent model id the run executed under
 	// (#649). Always emitted (empty string for legacy/unstamped runs).
-	ResolvedModel string    `json:"resolved_model"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ResolvedModel string `json:"resolved_model"`
+	// WorkingDir echoes the run's bound local checkout (E66.42 / #2482):
+	// the directory the run's local stages execute in, bound once at
+	// start_run and inherited by every later runner-spawning verb. Omitted
+	// (omitempty) for a run with no binding — a github_actions run, or a
+	// legacy row that predates the column. The MCP client mirror decodes
+	// this field; the json tag MUST byte-match its counterpart.
+	WorkingDir string    `json:"working_dir,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 	// Concerns is the run's OPEN review-concern summary (#964): count,
 	// per-state breakdown, and the stable IDs fishhawk_fixup_stage's
 	// concern_ids addressing needs. Populated by handleGetRun ONLY —
@@ -496,6 +504,7 @@ func toRunResponse(r *run.Run) runResponse {
 		Drive:              r.Drive,
 		CostUSDTotal:       r.CostUSDTotal,
 		ResolvedModel:      r.ResolvedModel,
+		WorkingDir:         r.WorkingDir,
 		CreatedAt:          r.CreatedAt,
 		UpdatedAt:          r.UpdatedAt,
 	}
@@ -537,6 +546,16 @@ type createRunRequest struct {
 	// passes `local`. Validated against `run.ValidRunnerKinds` at
 	// the handler.
 	RunnerKind string `json:"runner_kind,omitempty"`
+	// WorkingDir binds the local checkout the run's local stages execute
+	// in (E66.42 / #2482), recorded on the run row so every later
+	// runner-spawning MCP verb inherits it instead of re-typing the path.
+	// Optional; omitted leaves the run unbound (a github_actions run has no
+	// local checkout to bind). Server-side validation is minimal and
+	// transport-agnostic — the daemon cannot know a plain REST caller's
+	// transport — so it rejects only a value that is non-empty and not
+	// absolute (a relative binding would poison every inheriting verb). The
+	// MCP layer owns the transport-conditional required/absolute admission.
+	WorkingDir string `json:"working_dir,omitempty"`
 	// WorkflowSpec is the YAML bytes of the workflow spec at the
 	// requested workflow_sha, transported as a string. When
 	// supplied (#411), the handler parses it, validates that
@@ -660,6 +679,18 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"field": "runner_kind", "got": req.RunnerKind})
 			return
 		}
+	}
+
+	// working_dir, when supplied, must be absolute (E66.42 / #2482).
+	// Persisting a relative binding would poison every later inheriting
+	// verb, so reject it here — the one working_dir failure this
+	// transport-agnostic layer can prevent on its own. The MCP layer adds
+	// the transport-conditional required/absolute admission on top.
+	if req.WorkingDir != "" && !filepath.IsAbs(req.WorkingDir) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"working_dir must be an absolute path",
+			map[string]any{"field": "working_dir", "got": req.WorkingDir})
+		return
 	}
 
 	// IssueContext is only meaningful for issue-triggered runs
@@ -1052,6 +1083,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		TriggerSource:      run.TriggerSource(req.TriggerSource),
 		TriggerRef:         req.TriggerRef,
 		RunnerKind:         req.RunnerKind,
+		WorkingDir:         req.WorkingDir,
 		InstallationID:     installationID,
 		IssueContext:       issueCtx,
 		Drive:              req.Drive,
@@ -1233,6 +1265,12 @@ type CreateRunForTriggerParams struct {
 	// explicitly (the API handler validates; the campaign adapter passes
 	// the operator-selected kind).
 	RunnerKind string
+	// WorkingDir binds the run's local checkout (E66.42 / #2482), recorded
+	// on the run row so every later runner-spawning MCP verb inherits it.
+	// Empty for an unbound run (a github_actions run, or the campaign
+	// adapter, which spawns no local runner). The API handler validates it
+	// is absolute when non-empty before passing it here.
+	WorkingDir string
 	// InstallationID is the best-effort resolved GitHub App installation
 	// (#713); nil when no App is attributable.
 	InstallationID *int64
@@ -1284,6 +1322,9 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 		// Empty RunnerKind → repo layer applies the default
 		// (RunnerKindGitHubActions).
 		RunnerKind: p.RunnerKind,
+		// WorkingDir binds the run's local checkout (E66.42 / #2482); empty
+		// for an unbound run. Persisted verbatim onto the run row.
+		WorkingDir: p.WorkingDir,
 		// Best-effort App installation (#713). Nil when no App is
 		// installed; the runner then falls back to the operator's `gh` token.
 		InstallationID: p.InstallationID,

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -79,6 +80,60 @@ func TestOnboarding_InstructionsDeliveredOnInitialize(t *testing.T) {
 		if !strings.Contains(got, anchor) {
 			t.Errorf("instructions missing happy-path anchor %q", anchor)
 		}
+	}
+}
+
+// TestOnboardingInstructions_DirectTheAgentToResolveItsOwnCheckout is the
+// Half-2 DONE-MEANS for the onboarding surface (E66.42 / #2482): the
+// onboardingInstructions string must carry THREE separate claims about
+// working_dir — the requirement on start_run, the instruction that the CALLING
+// AGENT resolves its OWN checkout, and that the later verbs INHERIT it — as
+// three independent assertions so a half-edit fails where a presence gate would
+// pass.
+func TestOnboardingInstructions_DirectTheAgentToResolveItsOwnCheckout(t *testing.T) {
+	got := onboardingInstructions
+	lower := strings.ToLower(got)
+
+	// (1) The working_dir requirement on start_run.
+	if !strings.Contains(lower, "working_dir") {
+		t.Errorf("onboardingInstructions must name working_dir on start_run; got:\n%s", got)
+	}
+	// (2) The calling agent resolves its OWN checkout.
+	if !strings.Contains(lower, "resolve your own checkout") {
+		t.Errorf("onboardingInstructions must instruct the calling agent to resolve its OWN checkout; got:\n%s", got)
+	}
+	// (3) The later verbs INHERIT it.
+	if !strings.Contains(lower, "inherit") {
+		t.Errorf("onboardingInstructions must state the later verbs inherit the binding; got:\n%s", got)
+	}
+}
+
+// TestStartRunSchema_WorkingDirInstructsTheCaller walks the REGISTERED
+// start_run tool's input schema (the same jsonschema.For inference AddTool uses,
+// not the Go struct-tag literal) and asserts the working_dir description carries
+// the same three claims, so the requirement is proven present on the surface an
+// agent actually reads (E66.42 / #2482).
+func TestStartRunSchema_WorkingDirInstructsTheCaller(t *testing.T) {
+	schema, err := jsonschema.For[StartRunInput](nil)
+	if err != nil {
+		t.Fatalf("infer StartRunInput schema: %v", err)
+	}
+	wd, ok := schema.Properties["working_dir"]
+	if !ok || wd == nil {
+		t.Fatalf("working_dir property missing from the advertised start_run schema")
+	}
+	desc := strings.ToLower(wd.Description)
+	// (1) REQUIRED over HTTP for a local run.
+	if !strings.Contains(desc, "required") {
+		t.Errorf("working_dir description must state it is REQUIRED (over HTTP for a local run); got %q", wd.Description)
+	}
+	// (2) The calling agent resolves its OWN checkout.
+	if !strings.Contains(desc, "resolve your own checkout") {
+		t.Errorf("working_dir description must instruct the calling agent to resolve its OWN checkout; got %q", wd.Description)
+	}
+	// (3) The later verbs INHERIT it.
+	if !strings.Contains(desc, "inherit") {
+		t.Errorf("working_dir description must state the later verbs inherit it; got %q", wd.Description)
 	}
 }
 

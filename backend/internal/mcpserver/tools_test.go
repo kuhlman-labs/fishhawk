@@ -953,6 +953,12 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		if resp.State == "" {
 			resp.State = "pending"
 		}
+		// Echo the bound working_dir back like the real handler's
+		// persist-then-read (E66.42 / #2482), so the full tool → client request
+		// JSON → handler → response mirror chain is exercised.
+		if resp.WorkingDir == "" {
+			resp.WorkingDir = body.WorkingDir
+		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 	mux.HandleFunc("POST /v0/runs/{run_id}/recover", func(w http.ResponseWriter, r *http.Request) {
@@ -1494,6 +1500,261 @@ func TestResolveWorkingDir(t *testing.T) {
 			t.Errorf("error should wrap the getwd failure; got %v", err)
 		}
 	})
+}
+
+// --- E66.42 / #2482: run-aware working_dir resolution + inheritance ---
+
+// minimalWorkflowSpecYAML is a schema-valid inline workflow spec (empty
+// workflows map) that lets start_run's local specValidate pass without a disk
+// walk — the tool's admission control and wire mapping are what these tests
+// exercise, not spec content.
+func minimalWorkflowSpecYAML(_ *testing.T) string {
+	return "version: \"0.3\"\n" +
+		"workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: implement\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		"        produces:\n" +
+		"          - artifact: pull_request\n"
+}
+
+// seedRunWorkingDir seeds a run served by GET /v0/runs/{id} carrying a bound
+// working_dir, so resolveWorkingDirForRun and the inheriting verbs read it.
+func seedRunWorkingDir(fb *fakeBackend, runID uuid.UUID, wd string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y", WorkingDir: wd}
+}
+
+// TestResolveWorkingDirForRun_RelativeBindingRefused (C2): a run bound to the
+// literal relative path "./sub" is refused on an omitted-parameter call over
+// HTTP with the same must-be-absolute error an explicit "./sub" produces —
+// inheritance is validated identically to an explicit value. Deleting the
+// feed-the-binding-through-resolveWorkingDir step (returning the binding
+// verbatim) turns it red.
+func TestResolveWorkingDirForRun_RelativeBindingRefused(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+
+	runID := uuid.New()
+	seedRunWorkingDir(fb, runID, "./sub") // a relative binding, seeded by construction
+
+	got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+	if err == nil {
+		t.Fatalf("expected a refusal for a relative binding, got %q", got)
+	}
+	if !strings.Contains(err.Error(), "working_dir") || !strings.Contains(err.Error(), "absolute") {
+		t.Errorf("error should be the must-be-absolute error naming working_dir; got %v", err)
+	}
+}
+
+// TestResolveWorkingDirForRun_ConflictingOverrideRefused (C3): a run bound to
+// absolute dir A refuses an explicit absolute dir B (a SECOND, independently
+// created temp dir — definitionally different, not derived from A) naming both
+// paths; sibling cases pair the binding WITH ITSELF and with its own un-cleaned
+// `A/./` binding form and assert ACCEPT, so the test cannot pass by refusing
+// everything and the filepath.Clean normalization is proven real. Deleting the
+// conflict check turns the refuse case red; deleting the Clean turns the
+// un-cleaned-binding accept case red.
+func TestResolveWorkingDirForRun_ConflictingOverrideRefused(t *testing.T) {
+	a := t.TempDir()
+	b := t.TempDir() // independently created — definitionally != a
+
+	cases := []struct {
+		name        string
+		binding     string
+		input       string
+		wantRefused bool
+	}{
+		{"conflict_B_vs_A", a, b, true},
+		{"self_paired_accept", a, a, false},
+		{"uncleaned_binding_accept", a + "/./", a, false},
+		{"trailing_slash_input_accept", a, a + "/", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			r.httpTransport = true
+			runID := uuid.New()
+			seedRunWorkingDir(fb, runID, tc.binding)
+
+			got, err := r.resolveWorkingDirForRun(context.Background(), runID, tc.input)
+			if tc.wantRefused {
+				if err == nil {
+					t.Fatalf("expected a conflict refusal, got %q", got)
+				}
+				// Names BOTH paths.
+				if !strings.Contains(err.Error(), a) || !strings.Contains(err.Error(), b) {
+					t.Errorf("conflict error should name both paths (%q and %q); got %v", a, b, err)
+				}
+				// Names the symlink caveat (Condition 3b).
+				if !strings.Contains(err.Error(), "symlink") {
+					t.Errorf("conflict error should state paths are compared without resolving symlinks; got %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("expected accept, got error %v", err)
+				}
+				if filepath.Clean(got) != filepath.Clean(a) {
+					t.Errorf("accepted path = %q, want (cleaned) %q", got, a)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveWorkingDirForRun_RunReadFailureFailsClosed (C4, strengthened by
+// Condition 1 / #2482): the client points at a REACHABLE in-test server
+// returning 500 for GET /v0/runs/{id} (so the deletion cannot fail for the same
+// reason the control would), over HTTP, and asserts a refusal REGARDLESS of
+// whether an explicit value was supplied. The EXPLICIT-input case is the
+// non-vacuous counterfactual vehicle: an omitted value would be refused anyway
+// by the downstream #2479 rule, but an explicit absolute path is self-validating
+// and — WITHOUT the fail-closed branch — would be accepted despite an unknown
+// (possibly conflicting) binding. Deleting the fail-closed branch turns the
+// explicit case red.
+func TestResolveWorkingDirForRun_RunReadFailureFailsClosed(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	runID := uuid.New()
+	fb.mu.Lock()
+	fb.getStatusByID[runID] = http.StatusInternalServerError // reachable server, 500
+	fb.mu.Unlock()
+
+	cwd, _ := os.Getwd()
+
+	// Explicit absolute input — the Condition-1 case. Self-validating, so only
+	// the fail-closed branch refuses it under an unreadable run.
+	explicit := t.TempDir()
+	if got, err := r.resolveWorkingDirForRun(context.Background(), runID, explicit); err == nil {
+		t.Errorf("explicit input over HTTP with an unreadable run must fail closed, got %q", got)
+	}
+
+	// Omitted input also fails closed (and is NOT the process cwd).
+	got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+	if err == nil {
+		t.Fatalf("omitted input over HTTP with an unreadable run must fail closed, got %q", got)
+	}
+	if got == cwd {
+		t.Errorf("returned the process cwd %q on a read failure over HTTP; must fail closed", cwd)
+	}
+}
+
+// TestResolveWorkingDirForRun_RunReadFailureStdioDegradesToCwd is C4's stdio
+// sibling: the SAME 500 on stdio degrades to the documented process-cwd
+// carve-out, so the two branches are pinned independently.
+func TestResolveWorkingDirForRun_RunReadFailureStdioDegradesToCwd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil) // stdio (httpTransport:false)
+	runID := uuid.New()
+	fb.mu.Lock()
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+	fb.mu.Unlock()
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd: %v", err)
+	}
+	got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("stdio should degrade to cwd on a read failure, got error %v", err)
+	}
+	if got != cwd {
+		t.Errorf("stdio degrade = %q, want the process cwd %q", got, cwd)
+	}
+}
+
+// TestStartRun_HTTPLocalRunnerRequiresWorkingDir (C5): an HTTP-transport
+// start_run with runner_kind=local and no working_dir is refused AND NO POST
+// /v0/runs reached the backend (a never-dialed seam — error identity alone
+// would not distinguish a refusal from a backend rejection). A paired
+// runner_kind=github_actions case asserts it still SUCCEEDS so the control
+// cannot pass by refusing everything. Deleting the admission check turns the
+// local case red.
+func TestStartRun_HTTPLocalRunnerRequiresWorkingDir(t *testing.T) {
+	inlineSpec := minimalWorkflowSpecYAML(t)
+
+	t.Run("local_no_working_dir_refused_never_dialed", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = true
+
+		_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+			RunnerKind: "local", WorkflowSpec: inlineSpec, WorkflowSHA: "deadbeef",
+			// working_dir omitted.
+		})
+		if err == nil {
+			t.Fatal("expected a refusal for a local HTTP start_run with no working_dir")
+		}
+		if !strings.Contains(err.Error(), "working_dir") {
+			t.Errorf("error should name working_dir; got %v", err)
+		}
+		// Never-dialed seam: no POST /v0/runs reached the backend.
+		fb.mu.Lock()
+		body := fb.createRunBody
+		fb.mu.Unlock()
+		if body.Repo != "" {
+			t.Errorf("POST /v0/runs was dialed despite the refusal (createRunBody=%+v)", body)
+		}
+	})
+
+	t.Run("github_actions_no_working_dir_succeeds", func(t *testing.T) {
+		_, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = true
+
+		_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+			RunnerKind: "github_actions", WorkflowSpec: inlineSpec, WorkflowSHA: "deadbeef",
+			// working_dir omitted — legitimate for a github_actions run.
+		})
+		if err != nil {
+			t.Fatalf("a github_actions HTTP start_run with no working_dir must succeed, got %v", err)
+		}
+		if out.Run.ID == "" {
+			t.Error("expected a created run id")
+		}
+	})
+}
+
+// TestStartRun_WorkingDirRoundTripsThroughToolSurface (Condition 2 / #2482) is
+// the missing end-to-end SUCCESS test: it drives start_run over the tool surface
+// with a bound absolute path and asserts the value is readable back through the
+// full chain — the tool → the client's JSON request → the HTTP handler → the
+// response mirror. A broken tools.go-to-client mapping or a client serialization
+// slip (the #371-class hand-maintained wire mirror) fails here.
+func TestStartRun_WorkingDirRoundTripsThroughToolSurface(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	inlineSpec := minimalWorkflowSpecYAML(t)
+
+	wd := t.TempDir() // absolute
+	_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+		RunnerKind: "local", WorkingDir: wd, WorkflowSpec: inlineSpec, WorkflowSHA: "deadbeef",
+	})
+	if err != nil {
+		t.Fatalf("startRun: %v", err)
+	}
+	// The client's JSON request carried working_dir to the backend.
+	fb.mu.Lock()
+	sent := fb.createRunBody.WorkingDir
+	fb.mu.Unlock()
+	if sent != wd {
+		t.Errorf("POST /v0/runs body working_dir = %q, want %q (tool→client mapping)", sent, wd)
+	}
+	// The response mirror decoded the persisted value back.
+	if out.Run.WorkingDir != wd {
+		t.Errorf("StartRunOutput.Run.WorkingDir = %q, want %q (client mirror decode)", out.Run.WorkingDir, wd)
+	}
 }
 
 func sampleRun(id uuid.UUID, repo string, age time.Duration) Run {

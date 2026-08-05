@@ -26,7 +26,7 @@ type DispatchStageInput struct {
 	StageID       string `json:"stage_id,omitempty" jsonschema:"stage UUID inside the run; optional — when omitted it is auto-resolved from (run_id, stage type), same as fishhawk_run_stage"`
 	Workflow      string `json:"workflow" jsonschema:"workflow ID matching the run's workflow"`
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. dispatch is the DEFAULT verb for a local acceptance stage (E31.9) — it validates against a running preview/target instance and runs long, so non-blocking dispatch keeps the session free; no new argv (composeRunnerArgv passes --stage through, and acceptance takes neither --plan-out nor --check-base-ref)"`
-	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) this is REQUIRED and must be an absolute path — the server's cwd is the daemon's own checkout, so an omitted or relative value is refused. On the stdio transport it defaults to the client-spawned process's own directory (resolved to an absolute path)"`
+	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR (no effect when push_and_open_pr is false); defaults to main"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1), same as fishhawk_run_stage. A bare omitted value resolves to true"`
@@ -145,8 +145,10 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// marker write or spawn (#2479). Ordering is load-bearing: the refusal must
 	// commit no state, so an omitted/relative working_dir over HTTP fails with a
 	// clean error and the stage stays parked, never a marker flipped forward with
-	// no runner behind it.
-	workingDir, err := r.resolveWorkingDir(in.WorkingDir)
+	// no runner behind it. Run-aware (E66.42 / #2482): an omitted parameter
+	// inherits the run's start_run binding; a conflicting explicit value is
+	// refused; a run-read failure fails closed over HTTP.
+	workingDir, err := r.resolveWorkingDirForRun(ctx, runUUID, in.WorkingDir)
 	if err != nil {
 		return nil, DispatchStageOutput{}, err
 	}

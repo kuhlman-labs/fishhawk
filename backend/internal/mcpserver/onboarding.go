@@ -19,7 +19,7 @@ import (
 const onboardingInstructions = `Fishhawk drives a software change through gated stages. You are the operator: the agent proposes, you decide at each gate.
 
 Happy-path loop (one issue, one run):
-1. fishhawk_start_run — open a run for the issue. Pass runner_kind:local for the local dogfood loop (it defaults to github_actions).
+1. fishhawk_start_run — open a run for the issue. Pass runner_kind:local for the local dogfood loop (it defaults to github_actions). Pass working_dir as the ABSOLUTE path to the checkout this run executes in: YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path — and the later runner-spawning verbs INHERIT it, so you pass it once.
 2. fishhawk_run_stage (plan) — the agent writes a plan. Blocks until the plan stage settles.
 3. fishhawk_approve_plan — read the plan AND its advisory reviews first; approve, or fishhawk_reject_plan with a reason to replan.
 4. fishhawk_dispatch_stage (implement) — execute the approved plan. On the local runner this is what spawns the runner; it does not auto-start.

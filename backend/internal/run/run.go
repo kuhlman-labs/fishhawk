@@ -456,9 +456,19 @@ type Run struct {
 	// the caller's account; an untenanted run is allowed through (#1830 will
 	// close the NULL-allow window once every row is populated).
 	AccountID string
-	State     State
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	// WorkingDir is the local checkout the run's local (host-spawned)
+	// stages execute in, bound ONCE at start_run and inherited by every
+	// later runner-spawning verb (E66.42 / #2482). Empty means 'no binding'
+	// — a legacy row (migration 0065's '' default), or a run created without
+	// one (a github_actions run has no local checkout to bind). The MCP
+	// resolveWorkingDirForRun ladder reads it: an omitted parameter inherits
+	// this value, and an explicit value conflicting with a non-empty binding
+	// is refused (the #1866 contamination shape). The empty state is what the
+	// #2479 HTTP refusal still catches.
+	WorkingDir string
+	State      State
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

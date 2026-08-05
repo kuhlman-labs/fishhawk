@@ -94,9 +94,13 @@ func (f *fakeRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		MaxRetriesSnapshot: p.MaxRetriesSnapshot,
 		IssueContext:       p.IssueContext,
 		UpstreamRunID:      p.UpstreamRunID,
-		State:              run.StatePending,
-		CreatedAt:          now,
-		UpdatedAt:          now,
+		// Mirror the postgres adapter's field-by-field copy so the run's
+		// bound checkout (E66.42 / #2482) survives the HTTP round-trip tests
+		// that drive this fake instead of Postgres.
+		WorkingDir: p.WorkingDir,
+		State:      run.StatePending,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	f.runs[r.ID] = r
 	return r, nil

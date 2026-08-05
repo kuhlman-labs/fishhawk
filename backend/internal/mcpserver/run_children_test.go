@@ -2859,3 +2859,46 @@ func TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 		t.Errorf("child argv missing --working-dir %q: %v", dir, joined)
 	}
 }
+
+// TestRunChildren_InheritsBoundWorkingDir (E66.42 / #2482): run_children called
+// over HTTP with working_dir OMITTED inherits the PARENT run's start_run binding
+// (children provision their per-child worktrees under that checkout) — the child
+// argv carries --working-dir <bound> and resolved_working_dir echoes it.
+func TestRunChildren_InheritsBoundWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+
+	bound := t.TempDir()
+	parent := uuid.New()
+	child0 := uuid.New()
+	seedRunWorkingDir(fb, parent, bound)
+	seedChildRun(fb, child0, "pending")
+	seedPlanDecomposed(fb, parent, []string{child0.String()}, 0)
+
+	var mu sync.Mutex
+	var gotArgv []string
+	withFakeSpawn(t, func(_ context.Context, _ string, argv, _ []string, _ *mcp.CallToolRequest, _ any) ([]RunnerEvent, []string, int, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		return completedEvents("ok"), nil, 0, nil
+	})
+
+	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
+		RunID: parent.String(), Workflow: "wf", GitHubRepo: "x/y", RunnerBinary: "/fake/fishhawk-runner",
+		// working_dir OMITTED — inherits the parent's binding.
+	})
+	if err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	if out.ResolvedWorkingDir != bound {
+		t.Errorf("resolved_working_dir = %q, want inherited %q", out.ResolvedWorkingDir, bound)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+bound) {
+		t.Errorf("child argv missing inherited --working-dir %q: %v", bound, joined)
+	}
+}

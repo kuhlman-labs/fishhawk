@@ -99,6 +99,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		Drive:                  p.Drive,
 		SliceIndex:             intPtrToInt32Ptr(p.SliceIndex),
 		UpstreamRunID:          p.UpstreamRunID,
+		WorkingDir:             p.WorkingDir,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -893,6 +894,17 @@ func rowToRun(r rundb.Run) *Run {
 	out.ResolvedModel = r.ResolvedModel
 	out.Drive = r.Drive
 	out.SliceIndex = int32PtrToIntPtr(r.SliceIndex)
+	// WorkingDir round-trips through the single shared row mapper (E66.42 /
+	// #2482), so GetRun / ListRuns / GetRunByIdempotencyKey all pick up the
+	// binding from one edit. The frozen sqlc queries that never SELECT the
+	// column (AddRunCost, the Update* set) leave rundb.Run.WorkingDir "" —
+	// safe, exactly as they leave AccountID: those paths don't consume it.
+	// WorkingDir round-trips through the single shared row mapper (E66.42 /
+	// #2482), so GetRun / ListRuns / GetRunByIdempotencyKey all pick up the
+	// binding from one edit. The frozen sqlc queries that never SELECT the
+	// column (AddRunCost, the Update* set) leave rundb.Run.WorkingDir "" —
+	// safe, exactly as they leave AccountID: those paths don't consume it.
+	out.WorkingDir = r.WorkingDir
 	return out
 }
 

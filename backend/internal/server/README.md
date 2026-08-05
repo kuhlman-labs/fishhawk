@@ -1257,6 +1257,17 @@ should execute in; the resolved directory is echoed back as
 `resolved_working_dir`. The long-form contract lives in the
 [mcpserver README](../mcpserver/README.md).
 
+As of [E66.42 / #2482](https://github.com/kuhlman-labs/fishhawk/issues/2482)
+the path is **bound once at `fishhawk_start_run`** (persisted as
+`runs.working_dir`, migration 0065, echoed as `working_dir` on the Run) and the
+four verbs **inherit** it, so a driving loop passes it once. Over HTTP a
+`runner_kind: local` `start_run` requires an absolute `working_dir`; the
+inheriting verbs still refuse an omitted-**and-unbound** or relative value, and
+refuse an explicit value that conflicts with the run's binding. `POST /v0/runs`
+itself validates only that a supplied `working_dir` is absolute (a 400 naming
+the field) — it is transport-agnostic and cannot know a plain REST caller's
+transport, so the required/absolute admission stays in the MCP layer.
+
 ### Refusal ladder (`resolveMCPRouteState` → `handleMCP`)
 
 Evaluated in this order. The ordering is load-bearing, not cosmetic: the

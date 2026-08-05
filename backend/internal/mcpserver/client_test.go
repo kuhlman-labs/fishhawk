@@ -127,6 +127,25 @@ func TestFiledWorkItem_DecodesLabelCompleteness(t *testing.T) {
 	}
 }
 
+// TestRunMirror_DecodesWorkingDir pins the client Run mirror's working_dir json
+// tag against the backend's runResponse tag (E66.42 / #2482): the tags must be
+// byte-identical or the mirror silently decodes to empty and every inheriting
+// verb reverts to demanding the parameter (the #371-class trap). The literal
+// key here is the backend's wire tag; a rename on either side breaks this.
+func TestRunMirror_DecodesWorkingDir(t *testing.T) {
+	const body = `{"id":"11111111-1111-1111-1111-111111111111","repo":"x/y",` +
+		`"workflow_id":"feature_change","workflow_sha":"deadbeef","trigger_source":"cli",` +
+		`"state":"running","working_dir":"/Users/dev/src/fishhawk",` +
+		`"created_at":"2026-08-05T00:00:00Z","updated_at":"2026-08-05T00:00:00Z"}`
+	var got Run
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode Run: %v", err)
+	}
+	if got.WorkingDir != "/Users/dev/src/fishhawk" {
+		t.Errorf("Run.WorkingDir = %q, want the decoded binding (json tag mismatch?)", got.WorkingDir)
+	}
+}
+
 // TestDeferFiledIssue_DecodesLabelCompleteness pins the same wire contract on
 // the defer path's filed-issue block (#1616).
 func TestDeferFiledIssue_DecodesLabelCompleteness(t *testing.T) {

@@ -93,6 +93,45 @@ func TestGetRun_EchoesDrive(t *testing.T) {
 	}
 }
 
+// TestGetRun_EchoesWorkingDir asserts GET /v0/runs/{id} projects the run's
+// bound working_dir (E66.42 / #2482) onto the read surface — the other half of
+// the create/read round-trip — and omits it (omitempty) for an unbound run.
+func TestGetRun_EchoesWorkingDir(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	const wd = "/Users/dev/src/fishhawk"
+	seeded, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI, RunnerKind: run.RunnerKindLocal,
+		WorkingDir: wd,
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", seeded.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.WorkingDir != wd {
+		t.Errorf("WorkingDir = %q, want %q", resp.WorkingDir, wd)
+	}
+
+	// An unbound run omits the field (omitempty).
+	plain, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", plain.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), "working_dir") {
+		t.Errorf("unbound run body should omit working_dir: %s", w.Body.String())
+	}
+}
+
 // TestGetRun_EchoesRunnerKindResolved asserts GET /v0/runs/{id} projects the
 // run's runner_kind_resolved lock flag (#1346/#1348/#1355) onto the read
 // surface, always present (false for legacy/un-resolved rows) so the

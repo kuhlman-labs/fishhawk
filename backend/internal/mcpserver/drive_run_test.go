@@ -46,6 +46,7 @@ type driveFakeBackend struct {
 	runID      uuid.UUID
 	runState   string
 	runnerKind string // GET run response runner_kind; defaults to "local"
+	workingDir string // GET run response working_dir binding (E66.42 / #2482); empty = unbound
 	// derivedStatus, when non-empty, is encoded as the run's derived_status on
 	// the GET /v0/runs/{id} response so the drive loop's fetchRunDriveView decodes
 	// the backend's authoritative acceptance_pending signal (#1961). Empty (the
@@ -342,7 +343,7 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 				Run
 				DerivedStatus string `json:"derived_status,omitempty"`
 			}{
-				Run:           Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, RunnerKind: f.runnerKind, PullRequestURL: &pr},
+				Run:           Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, RunnerKind: f.runnerKind, WorkingDir: f.workingDir, PullRequestURL: &pr},
 				DerivedStatus: f.derivedStatus,
 			})
 		}
@@ -4292,5 +4293,58 @@ func TestDriveRun_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 	mu.Unlock()
 	if !strings.Contains(joined, "--working-dir "+dir) {
 		t.Errorf("argv missing --working-dir %q: %v", dir, joined)
+	}
+}
+
+// TestDriveRun_InheritsBoundWorkingDir (E66.42 / #2482): drive_run called over
+// HTTP with working_dir OMITTED inherits the run's start_run binding — the
+// spawned argv carries --working-dir <bound> (the INHERITED value folded onto
+// `in` and reaching the spawn) and resolved_working_dir echoes it.
+func TestDriveRun_InheritsBoundWorkingDir(t *testing.T) {
+	bound := t.TempDir()
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "pending", 1),
+	})
+	f.workingDir = bound // the run's start_run binding
+	f.onSpawn = func(f *driveFakeBackend, typ string) {
+		if typ == "implement" {
+			f.setState("implement", "succeeded")
+			f.runState = "succeeded"
+		}
+	}
+	f.onGate = func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} }
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.httpTransport = true
+	var mu sync.Mutex
+	var gotArgv []string
+	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter) (string, error) {
+		mu.Lock()
+		gotArgv = append([]string(nil), argv...)
+		mu.Unlock()
+		typ := f.typeForStageID(stageID)
+		rec.add(typ)
+		f.mu.Lock()
+		if f.onSpawn != nil {
+			f.onSpawn(f, typ)
+		}
+		f.mu.Unlock()
+		return "/tmp/log", nil
+	}
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.ResolvedWorkingDir != bound {
+		t.Errorf("resolved_working_dir = %q, want inherited %q", out.ResolvedWorkingDir, bound)
+	}
+	mu.Lock()
+	joined := strings.Join(gotArgv, " ")
+	mu.Unlock()
+	if !strings.Contains(joined, "--working-dir "+bound) {
+		t.Errorf("argv missing inherited --working-dir %q: %v", bound, joined)
 	}
 }
