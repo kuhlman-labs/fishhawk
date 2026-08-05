@@ -3,7 +3,9 @@
 # Sources scripts/dev with DEV_LIB_ONLY=1 (dispatch suppressed) and asserts the
 # MCP-activation signalling and cmd_reload wiring without starting the stack.
 # Must be zsh: scripts/dev uses zsh-only features (typeset -A, subscript flags).
-# Standalone like scripts/test-cleanup-merged — not wired into scripts/test or CI.
+# Run by `scripts/test verify` (via _verify_gate_harnesses, #2455) and still
+# runnable standalone. Not in CI: CI is ubuntu-latest and wiring it there means
+# editing .github/workflows/**, which is human-authored by convention.
 set -uo pipefail
 
 REPO_ROOT="${0:A:h:h}"
