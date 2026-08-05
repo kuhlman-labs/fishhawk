@@ -124,17 +124,38 @@ else
   fail "(a3) propagation (rc=$rc later-harness-ran=$dev_marker)"
 fi
 
-# (a3b) SUPPLEMENTARY regression pin — failing harness LAST. NOT the propagation
-# control: a no-errexit for-loop returns the LAST command's status, so a last
-# stub exiting 1 yields rc!=0 whether or not the loop aborts. Kept only to catch
-# a future edit that silences the last harness's status entirely.
-fake="$tmproot/harn_a3b"
-make_harnesses "$fake" 0 0 1
-( set -e; ROOT="$fake"; _verify_gate_harnesses ) >/dev/null 2>&1; rc=$?
-if [ "$rc" -ne 0 ]; then
-  pass "(a3b) a failing LAST harness yields rc!=0 (regression pin, NOT the propagation control)"
+# (a3b) TEST-DEV WIRING counterfactual — a failing test-dev turns verify red.
+# This is the behavioral proof for the actual #2455 change (adding test-dev to
+# the loop), and is deliberately DISTINCT from (a3): (a3) proves PROPAGATION
+# (abort-before-later-harnesses) using test-check-coverage as the failer, and
+# NOTHING there depends on test-dev being in the loop — remove test-dev and (a3)
+# still passes. This case closes that gap. It is NOT and cannot be a propagation
+# control: test-dev is structurally LAST, so a no-errexit for-loop returns its
+# status whether or not the loop aborts, and abort-vs-complete is moot for the
+# last harness. What it proves NON-VACUOUSLY is wiring: with test-dev exiting 1
+# and both coverage stubs passing, the loop runs all three (both coverage markers
+# present, test-dev's own marker present) and test-dev's failure is the SOLE
+# cause of rc!=0. Counterfactual (approval condition 1(d)): delete `test-dev`
+# from the loop list in scripts/test -> the loop runs only the two passing
+# coverage stubs, rc becomes 0 and the dev marker is absent -> RED (run by hand,
+# output recorded in the PR Notes). (a2)'s static grep does NOT catch that same
+# deletion — it matches `test-dev` in the loop's zsh guard/comment even when the
+# name is gone from the loop LIST — which is exactly why a behavioral case is
+# needed. test-dev only executes when zsh resolves (the loop guards on it), so
+# skip cleanly on a zsh-less host rather than fail for the wrong reason.
+if command -v zsh >/dev/null 2>&1; then
+  fake="$tmproot/harn_a3b"
+  make_harnesses "$fake" 0 0 1
+  ( set -e; ROOT="$fake"; _verify_gate_harnesses ) >/dev/null 2>&1; rc=$?
+  if [ "$rc" -ne 0 ] && [ -e "$fake/markers/test-check-coverage" ] \
+     && [ -e "$fake/markers/test-patch-coverage" ] && [ -e "$fake/markers/test-dev" ]; then
+    pass "(a3b) a failing test-dev fails verify: loop ran all three, test-dev's exit is the sole cause of rc!=0 (WIRING counterfactual, NOT the propagation control)"
+  else
+    dev_marker=no; [ -e "$fake/markers/test-dev" ] && dev_marker=yes
+    fail "(a3b) test-dev wiring (rc=$rc dev-marker=$dev_marker)"
+  fi
 else
-  fail "(a3b) last-harness status (rc=$rc)"
+  echo "SKIP: (a3b) zsh absent — cannot assert a failing test-dev executes"
 fi
 
 # (a4) NON-VACUITY control: all three exit 0 -> rc 0 and all three ran. Ensures
