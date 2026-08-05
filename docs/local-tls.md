@@ -64,16 +64,71 @@ Certificates land in the already-gitignored `.fishhawk/cache/tls/`:
   `https://127.0.0.1:8443`.
 
 No system trust store install is required — **no `sudo`, no TouchID prompt, no
-keychain mutation**. Point each client at the CA:
+keychain mutation**. Installing the CA into the macOS system trust store would
+**not** fix first-time MCP OAuth either (see below) — BoringSSL inside the Bun
+runtime is the blocker, not the OS trust store, so a system install buys
+nothing there. Point each client at the CA:
 
 - **Node / Claude Code runtime:**
   `export NODE_EXTRA_CA_CERTS=<repo>/.fishhawk/cache/tls/ca.pem`
   (`scripts/dev up` prints this line). Without it, the client fails with
-  `UNABLE_TO_VERIFY_LEAF_SIGNATURE`.
+  `UNABLE_TO_VERIFY_LEAF_SIGNATURE`. This is the documented baseline and it IS
+  what makes `claude mcp list` and token refresh work — but it is **not**
+  sufficient for first-time MCP OAuth; see the subsection immediately below.
 - **curl:** `curl --cacert <repo>/.fishhawk/cache/tls/ca.pem https://localhost:8443/…`
 
 `fishhawkd`'s own internal self-dial stays on plain `http`, so no Go client needs
 the CA.
+
+### `NODE_EXTRA_CA_CERTS` is NOT sufficient for first-time MCP OAuth
+
+Since Claude Code v2.1.113, the client ships as a Bun-compiled binary whose
+global `fetch` uses BoringSSL, which does not honor `NODE_EXTRA_CA_CERTS`
+(extra CAs must be supplied per-call via `init.tls.ca`); Claude Code threads
+the CA through most HTTPS calls but not the OAuth initiation path, which calls
+the MCP SDK's `auth()` with no CA-aware `fetchFn` — this is an **upstream**
+defect, tracked at
+[anthropics/claude-code#55760](https://github.com/anthropics/claude-code/issues/55760)
+(open), not a Fishhawk one.
+
+The local CA and TLS front end are **not** at fault: system Node v26 accepts
+the CA over both `https` and undici `fetch`, and
+`curl --cacert .fishhawk/cache/tls/ca.pem https://localhost:8443/healthz`
+returns `200`. The failure is confined to the Bun runtime inside the `claude`
+binary.
+
+Per-path behavior (observed on Claude Code 2.1.222 — check whether
+`anthropics/claude-code#55760` has since landed before relying on this):
+
+- `claude mcp list` — **works**; `StreamableHTTPClientTransport` threads the CA
+  into `init.tls.ca`.
+- Token refresh for an already-authenticated server — **works**; passes a
+  CA-aware `fetchFn`.
+- First-time OAuth initiation — **fails** with
+  `SDK auth failed: unable to verify the first certificate`; falls back to the
+  global `Bun.fetch` with no CA override.
+
+**One-time bootstrap** for first-time OAuth against the local dev CA:
+
+```sh
+NODE_TLS_REJECT_UNAUTHORIZED=0 claude
+```
+
+Then inside the session: `/mcp` → `<server>` → `Authenticate`. Quit and
+relaunch normally, **without** the variable.
+
+- This bypass is needed **exactly once** — once a refresh token exists, the
+  token-refresh path is CA-aware and honors `NODE_EXTRA_CA_CERTS` on every
+  later launch.
+- It disables TLS verification process-wide for **that one session only**.
+  **Do not** persist it into a shell profile, `.env`, or any other standing
+  setting.
+
+**Forward path:** the OAuth issuer is only an identifier, and TLS terminates
+at the front proxy — so swapping the self-signed leaf for a publicly-trusted
+certificate removes this problem entirely, with no code change on our side.
+Publicly-trusted-cert / deployment posture is out of scope here; see #2301
+above for the deployed-posture answer.
 
 Certificates are regenerated only when **missing, within 7 days of expiry, or
 mismatched** (the leaf no longer verifies against the CA). A routine `reload`
