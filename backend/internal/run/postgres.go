@@ -895,15 +895,12 @@ func rowToRun(r rundb.Run) *Run {
 	out.Drive = r.Drive
 	out.SliceIndex = int32PtrToIntPtr(r.SliceIndex)
 	// WorkingDir round-trips through the single shared row mapper (E66.42 /
-	// #2482), so GetRun / ListRuns / GetRunByIdempotencyKey all pick up the
-	// binding from one edit. The frozen sqlc queries that never SELECT the
-	// column (AddRunCost, the Update* set) leave rundb.Run.WorkingDir "" —
-	// safe, exactly as they leave AccountID: those paths don't consume it.
-	// WorkingDir round-trips through the single shared row mapper (E66.42 /
-	// #2482), so GetRun / ListRuns / GetRunByIdempotencyKey all pick up the
-	// binding from one edit. The frozen sqlc queries that never SELECT the
-	// column (AddRunCost, the Update* set) leave rundb.Run.WorkingDir "" —
-	// safe, exactly as they leave AccountID: those paths don't consume it.
+	// #2482). Every Run-returning sqlc query now carries working_dir in its
+	// RETURNING/SELECT list and scans it — CreateRun, GetRun, ListRuns,
+	// GetRunByIdempotencyKey, LockRunForUpdate, and the Update* / AddRunCost /
+	// SetRunPullRequestURL set — so the binding is populated on every read
+	// path. This is UNLIKE AccountID above, which only GetRun / ListRuns select
+	// and the other queries leave "".
 	out.WorkingDir = r.WorkingDir
 	return out
 }

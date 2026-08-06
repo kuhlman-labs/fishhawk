@@ -953,11 +953,18 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		if resp.State == "" {
 			resp.State = "pending"
 		}
-		// Echo the bound working_dir back like the real handler's
-		// persist-then-read (E66.42 / #2482), so the full tool → client request
-		// JSON → handler → response mirror chain is exercised.
-		if resp.WorkingDir == "" {
-			resp.WorkingDir = body.WorkingDir
+		// PERSIST the run (with the bound working_dir from the request body)
+		// keyed by its id, so a subsequent GET /v0/runs/{id} serves the STORED
+		// binding — a genuine store-and-reload the full-chain test reads back
+		// through, distinct from this POST response (E66.42 / #2482). The POST
+		// response deliberately does NOT echo working_dir, so a test asserting
+		// the binding must go through the GET readback, not this response.
+		if id, perr := uuid.Parse(resp.ID); perr == nil {
+			stored := resp
+			stored.WorkingDir = body.WorkingDir
+			fb.mu.Lock()
+			fb.getRunByID[id] = stored
+			fb.mu.Unlock()
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -1670,6 +1677,31 @@ func TestResolveWorkingDirForRun_RunReadFailureStdioDegradesToCwd(t *testing.T) 
 	}
 }
 
+// TestResolveWorkingDirForRun_RunReadFailureStdioExplicitUsedVerbatim pins the
+// OTHER stdio degrade branch the omitted-input sibling above does not cover
+// (#2482, concern 5): when GetRun fails on stdio, an EXPLICIT absolute input is
+// used verbatim (self-validating, no conflict check against the unreadable
+// binding) rather than refused. This is the deliberate stdio carve-out that the
+// HTTP transport does NOT get — over HTTP the same explicit case fails closed,
+// pinned by TestResolveWorkingDirForRun_RunReadFailureFailsClosed.
+func TestResolveWorkingDirForRun_RunReadFailureStdioExplicitUsedVerbatim(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil) // stdio (httpTransport:false)
+	runID := uuid.New()
+	fb.mu.Lock()
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+	fb.mu.Unlock()
+
+	explicit := t.TempDir() // absolute
+	got, err := r.resolveWorkingDirForRun(context.Background(), runID, explicit)
+	if err != nil {
+		t.Fatalf("stdio explicit input should be used verbatim on a read failure, got error %v", err)
+	}
+	if got != explicit {
+		t.Errorf("stdio explicit degrade = %q, want the explicit input %q verbatim", got, explicit)
+	}
+}
+
 // TestStartRun_HTTPLocalRunnerRequiresWorkingDir (C5): an HTTP-transport
 // start_run with runner_kind=local and no working_dir is refused AND NO POST
 // /v0/runs reached the backend (a never-dialed seam — error identity alone
@@ -1724,12 +1756,109 @@ func TestStartRun_HTTPLocalRunnerRequiresWorkingDir(t *testing.T) {
 	})
 }
 
+// TestStartRun_HTTPRelativeWorkingDirRefusedAnyRunnerKind is the security
+// control for the daemon-cwd shape (#2479 / #2482): over the HTTP transport a
+// RELATIVE working_dir is refused for a NON-local runner_kind too, because the
+// start-time runner_kind is only a hint (#1346) and filepath.Abs would
+// otherwise resolve the relative path against the fishhawkd daemon's own cwd
+// and persist it as the run's absolute binding — inheritable by a later local
+// dispatch. The refuse case asserts a never-dialed seam (no POST /v0/runs), so
+// error identity alone cannot pass it; the paired absolute-input case asserts a
+// SUCCESS with the value passed through unchanged (not daemon-cwd-joined), so
+// the control cannot pass by refusing everything. Deleting the generalized
+// relative-refusal turns the refuse case red (the relative value is
+// absolutized and POSTed instead of refused).
+func TestStartRun_HTTPRelativeWorkingDirRefusedAnyRunnerKind(t *testing.T) {
+	inlineSpec := minimalWorkflowSpecYAML(t)
+
+	t.Run("github_actions_relative_refused_never_dialed", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = true
+
+		_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+			RunnerKind: "github_actions", WorkingDir: "./sub",
+			WorkflowSpec: inlineSpec, WorkflowSHA: "deadbeef",
+		})
+		if err == nil {
+			t.Fatal("expected a refusal for a relative working_dir over HTTP with runner_kind=github_actions")
+		}
+		if !strings.Contains(err.Error(), "working_dir") || !strings.Contains(err.Error(), "absolute") {
+			t.Errorf("error should name working_dir and require an absolute path; got %v", err)
+		}
+		// Never-dialed seam: no POST /v0/runs reached the backend, so the
+		// relative value was never absolutized-against-daemon-cwd and persisted.
+		fb.mu.Lock()
+		body := fb.createRunBody
+		fb.mu.Unlock()
+		if body.Repo != "" {
+			t.Errorf("POST /v0/runs was dialed despite the refusal (createRunBody=%+v)", body)
+		}
+	})
+
+	t.Run("omitted_runner_kind_relative_refused", func(t *testing.T) {
+		// runner_kind omitted defaults to github_actions on the backend, so an
+		// HTTP relative value on the default path must be refused too.
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = true
+
+		_, _, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+			WorkingDir: "./sub", WorkflowSpec: inlineSpec, WorkflowSHA: "deadbeef",
+		})
+		if err == nil {
+			t.Fatal("expected a refusal for a relative working_dir over HTTP with runner_kind omitted")
+		}
+		fb.mu.Lock()
+		body := fb.createRunBody
+		fb.mu.Unlock()
+		if body.Repo != "" {
+			t.Errorf("POST /v0/runs was dialed despite the refusal (createRunBody=%+v)", body)
+		}
+	})
+
+	t.Run("github_actions_absolute_succeeds_passthrough", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = true
+
+		wd := t.TempDir() // absolute
+		_, out, err := r.startRun(context.Background(), nil, StartRunInput{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+			RunnerKind: "github_actions", WorkingDir: wd,
+			WorkflowSpec: inlineSpec, WorkflowSHA: "deadbeef",
+		})
+		if err != nil {
+			t.Fatalf("an absolute working_dir over HTTP with runner_kind=github_actions must succeed, got %v", err)
+		}
+		if out.Run.ID == "" {
+			t.Error("expected a created run id")
+		}
+		// The absolute value is passed through unchanged (cleaned, not
+		// daemon-cwd-joined).
+		fb.mu.Lock()
+		sent := fb.createRunBody.WorkingDir
+		fb.mu.Unlock()
+		if sent != wd {
+			t.Errorf("POST /v0/runs body working_dir = %q, want %q unchanged", sent, wd)
+		}
+	})
+}
+
 // TestStartRun_WorkingDirRoundTripsThroughToolSurface (Condition 2 / #2482) is
-// the missing end-to-end SUCCESS test: it drives start_run over the tool surface
-// with a bound absolute path and asserts the value is readable back through the
-// full chain — the tool → the client's JSON request → the HTTP handler → the
-// response mirror. A broken tools.go-to-client mapping or a client serialization
-// slip (the #371-class hand-maintained wire mirror) fails here.
+// the end-to-end SUCCESS test: it drives start_run over the tool surface with a
+// bound absolute path, then reads the binding back through a DISTINCT GET
+// /v0/runs/{id} round-trip — the fake persisted it on create, so the readback
+// goes through store-and-reload, NOT this call's own POST response echo. That
+// makes the assertion non-vacuous: it fails if persistence is disconnected (the
+// create never stored the value) OR if readback is disconnected (the client GET
+// mirror drops the json tag), the #371-class hand-maintained wire-mirror trap
+// this run's step 5 names. The full persist→Postgres→read half of the chain is
+// pinned independently by run.TestCreateRun_PersistsWorkingDir (real pgtest)
+// and server.TestCreateRun_WorkingDirRoundTripsOverHTTP; this test covers the
+// MCP tool → client JSON request → HTTP handler → readback seam above them.
 func TestStartRun_WorkingDirRoundTripsThroughToolSurface(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
@@ -1744,16 +1873,30 @@ func TestStartRun_WorkingDirRoundTripsThroughToolSurface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("startRun: %v", err)
 	}
-	// The client's JSON request carried working_dir to the backend.
+	// The client's JSON request carried working_dir to the backend (the
+	// tool→client serialization half).
 	fb.mu.Lock()
 	sent := fb.createRunBody.WorkingDir
 	fb.mu.Unlock()
 	if sent != wd {
 		t.Errorf("POST /v0/runs body working_dir = %q, want %q (tool→client mapping)", sent, wd)
 	}
-	// The response mirror decoded the persisted value back.
-	if out.Run.WorkingDir != wd {
-		t.Errorf("StartRunOutput.Run.WorkingDir = %q, want %q (client mirror decode)", out.Run.WorkingDir, wd)
+
+	// Read the binding back through a genuine GET /v0/runs/{id} — the persisted
+	// value the fake stored on create, decoded by the client Run mirror. This
+	// is NOT out.Run (the POST response, which deliberately omits working_dir):
+	// a create that failed to persist, or a GET mirror that drops the tag,
+	// fails here.
+	runID, perr := uuid.Parse(out.Run.ID)
+	if perr != nil {
+		t.Fatalf("start_run returned a non-UUID run id %q: %v", out.Run.ID, perr)
+	}
+	got, err := r.api.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("GetRun readback: %v", err)
+	}
+	if got.WorkingDir != wd {
+		t.Errorf("GetRun readback WorkingDir = %q, want %q (persist→readback through the client mirror)", got.WorkingDir, wd)
 	}
 }
 

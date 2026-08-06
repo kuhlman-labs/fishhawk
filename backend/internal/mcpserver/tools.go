@@ -2371,22 +2371,33 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		return nil, StartRunOutput{}, errors.New("workflow_id is required")
 	}
 
-	// (1a) start_run admission control (E66.42 / #2482). Over the HTTP
-	// transport a local run's working_dir binds the checkout every later
-	// runner-spawning verb inherits — refuse an omitted or non-absolute value
-	// BEFORE any spec discovery or backend round-trip, with an error naming
-	// the agent-side remedy. github_actions / gitlab_ci runs spawn no local
-	// runner and have no checkout to bind, so they are untouched. runner_kind
+	// (1a) start_run admission control over the HTTP transport (E66.42 / #2482).
+	// The serving process's cwd is the fishhawkd daemon's own long-lived
+	// checkout, not the caller's project. Refuse BEFORE any spec discovery or
+	// backend round-trip, with an error naming the agent-side remedy.
+	//
+	// A local run REQUIRES a working_dir — it binds the checkout every later
+	// runner-spawning verb inherits — so an omitted value is refused. runner_kind
 	// here is the caller-supplied hint (#1346), which is correct for this
 	// purpose: an agent that asks for a local run must supply its checkout.
-	if r.httpTransport && in.RunnerKind == driveRunnerKindLocal {
-		if in.WorkingDir == "" {
+	//
+	// A RELATIVE working_dir is refused for ANY runner_kind (the #2479
+	// security fix for the daemon-cwd shape): the filepath.Abs below would
+	// resolve it against the daemon cwd and persist it as the run's ABSOLUTE
+	// binding, which the server-side non-absolute 400 (runs.go) then never
+	// catches. Because runner_kind at start is only a hint (#1346), a run
+	// created as github_actions is not structurally prevented from a later
+	// local dispatch that would inherit the poisoned binding — so the
+	// github_actions / gitlab_ci path cannot be trusted to make a relative
+	// value harmless. An absolute value is self-consistent and passes through.
+	if r.httpTransport {
+		if in.RunnerKind == driveRunnerKindLocal && in.WorkingDir == "" {
 			return nil, StartRunOutput{}, errors.New(
 				"working_dir is required for a local run over the HTTP MCP transport: resolve your own checkout (you are running inside one) and pass its absolute path — it binds the run and every later stage inherits it")
 		}
-		if !filepath.IsAbs(in.WorkingDir) {
+		if in.WorkingDir != "" && !filepath.IsAbs(in.WorkingDir) {
 			return nil, StartRunOutput{}, fmt.Errorf(
-				"working_dir %q must be an absolute path for a local run over the HTTP MCP transport: resolve your own checkout and pass its absolute path — it binds the run and every later stage inherits it", in.WorkingDir)
+				"working_dir %q must be an absolute path over the HTTP MCP transport: a relative path resolves against the fishhawkd host's cwd, not your project, so it is refused for any runner_kind; resolve your own checkout and pass its absolute path — it binds the run and every later stage inherits it", in.WorkingDir)
 		}
 	}
 
@@ -2511,9 +2522,12 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 
 	// Resolve the checkout binding to an absolute path so the run row records
 	// a concrete directory the later verbs can inherit (E66.42 / #2482). Over
-	// HTTP + local the admission control above already proved it absolute;
-	// this makes a stdio relative path absolute too. Empty stays empty (an
-	// unbound run — refused over HTTP by the inheriting verbs, cwd on stdio).
+	// HTTP the admission control above already refused every non-absolute value
+	// (for ANY runner_kind), so filepath.Abs here only cleans an
+	// already-absolute path and never joins against the daemon cwd; on stdio it
+	// resolves a relative path against the caller's own project cwd. Empty
+	// stays empty (an unbound run — refused over HTTP by the inheriting verbs,
+	// cwd on stdio).
 	boundWorkingDir := in.WorkingDir
 	if boundWorkingDir != "" {
 		abs, aerr := filepath.Abs(boundWorkingDir)
