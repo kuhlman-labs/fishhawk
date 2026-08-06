@@ -93,6 +93,13 @@ type CreateRunParams struct {
 	// runner reads it back off the prompt-fetch response to route the
 	// child onto its own sole-writer slice branch.
 	SliceIndex *int
+	// WorkingDir binds the local checkout the run's local stages execute
+	// in, recorded ONCE at start_run and inherited by every later
+	// runner-spawning verb (E66.42 / #2482). Empty means 'no binding' — a
+	// github_actions run has no local checkout, and a legacy row carries the
+	// migration 0065 '' default. Persisted verbatim; the MCP layer, not this
+	// layer, owns the transport-conditional absolute-path validation.
+	WorkingDir string
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

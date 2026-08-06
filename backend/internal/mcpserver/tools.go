@@ -128,6 +128,87 @@ func (r *runResolver) resolveWorkingDir(in string) (string, error) {
 	return abs, nil
 }
 
+// resolveWorkingDirForRun is the run-aware working_dir resolver the four
+// runner-spawning verbs (dispatch_stage, run_stage, run_children, drive_run)
+// call in place of the bare resolveWorkingDir (E66.42 / #2482). It layers the
+// run's start_run-bound checkout onto the #2479 transport-conditional gate so a
+// driving loop passes the path ONCE and every later verb inherits it. The
+// precedence ladder:
+//
+//   - Explicit non-empty input: validate it through resolveWorkingDir exactly
+//     as #2479 does, then REFUSE when the run carries a non-empty binding that
+//     differs after filepath.Clean on both sides — executing a run's later
+//     stage against a different checkout is the #1866 contamination shape and
+//     the run branch lineage is already anchored to the original tree. The
+//     refusal names both paths, both remedies, and the symlink caveat.
+//   - Empty input with a non-empty binding: feed the BINDING through
+//     resolveWorkingDir so the absolute check, the cleaning and the error text
+//     are byte-identical to the explicit path — inheritance cannot bypass the
+//     gate (a relative or empty binding is refused just like an explicit one).
+//   - Empty input AND empty binding: fall through to resolveWorkingDir(""),
+//     which refuses over HTTP per #2479 and resolves the process cwd on stdio.
+//
+// The run read FAILS CLOSED over the HTTP transport (Condition 1 / #2482): a
+// GetRun failure there means the binding — the property the conflict and
+// inheritance checks depend on — is UNKNOWN, so a conflicting or omitted value
+// must be refused rather than executed, regardless of whether an explicit input
+// was supplied. On stdio a read failure degrades to today's behavior: an
+// explicit value is self-validating and an omitted value resolves to the
+// process cwd.
+func (r *runResolver) resolveWorkingDirForRun(ctx context.Context, runUUID uuid.UUID, in string) (string, error) {
+	boundDir, readErr := r.runBoundWorkingDir(ctx, runUUID)
+	if readErr != nil {
+		if r.httpTransport {
+			return "", fmt.Errorf(
+				"cannot read run %s to resolve its bound working_dir; refusing over the HTTP MCP transport rather than risk executing against the wrong checkout (Condition 1 / #2482): %w", runUUID, readErr)
+		}
+		// stdio degrade: an unreadable run leaves the binding empty, so an
+		// explicit input is used verbatim and an omitted input falls through
+		// to the process cwd below (today's behavior).
+		boundDir = ""
+	}
+
+	if in != "" {
+		resolved, err := r.resolveWorkingDir(in)
+		if err != nil {
+			return "", err
+		}
+		if boundDir != "" && filepath.Clean(boundDir) != filepath.Clean(resolved) {
+			return "", conflictingWorkingDirError(boundDir, resolved)
+		}
+		return resolved, nil
+	}
+	if boundDir != "" {
+		// Inherit: run the binding through the SAME gate an explicit path
+		// takes, so a relative/empty binding is refused identically.
+		return r.resolveWorkingDir(boundDir)
+	}
+	return r.resolveWorkingDir("")
+}
+
+// runBoundWorkingDir reads the run's bound working_dir (E66.42 / #2482),
+// returning "" for an unbound run and propagating a read error so the caller
+// can fail closed over HTTP.
+func (r *runResolver) runBoundWorkingDir(ctx context.Context, runUUID uuid.UUID) (string, error) {
+	runObj, err := r.api.GetRun(ctx, runUUID)
+	if err != nil {
+		return "", err
+	}
+	return runObj.WorkingDir, nil
+}
+
+// conflictingWorkingDirError renders the refusal for an explicit working_dir
+// that conflicts with the run's start_run binding (E66.42 / #2482, Condition 3
+// / #2482). It names both paths, both remedies, and — Condition 3(b) — states
+// that paths are compared without resolving symlinks, so an operator who hits
+// the macOS /tmp → /private/tmp case understands the refusal from the error
+// text alone rather than the plan artifact.
+func conflictingWorkingDirError(bound, requested string) error {
+	return fmt.Errorf(
+		"working_dir %q conflicts with the checkout this run was bound to at start_run (%q); a run's later stage must execute against the checkout its branch lineage is anchored to (#1866). Omit working_dir to inherit the binding, or start a new run for a different checkout. Paths are compared without resolving symlinks, so on macOS /tmp and /private/tmp read as different",
+		requested, bound)
+}
+
 // registerTools wires every MCP tool onto srv. Called once at
 // server startup; the SDK keeps the handlers alive for the
 // lifetime of the stdio session. Registration order is the fixed
@@ -2099,13 +2180,17 @@ type StartRunInput struct {
 	// server auto-discovers the file and fills this for them.
 	WorkflowSpec string `json:"workflow_spec,omitempty" jsonschema:"inline YAML body of .fishhawk/workflows.yaml; auto-discovered from working_dir when empty"`
 
-	// WorkingDir is the directory the MCP server walks (up to the
-	// .git boundary) looking for `.fishhawk/workflows.yaml`. The
-	// agent passes the checkout it's working in; the resolved
-	// spec's bytes + computed SHA ride along on the create call.
-	// Skipped when WorkflowSpec is already set or when the agent
-	// passes WorkflowSHA explicitly (legacy "no checkout" path).
-	WorkingDir string `json:"working_dir,omitempty" jsonschema:"checkout directory to search for .fishhawk/workflows.yaml; auto-discovery only runs when set"`
+	// WorkingDir is the absolute path to the checkout this run executes
+	// in. It is bound to the run here at start_run and every later
+	// runner-spawning verb (run_stage, dispatch_stage, run_children,
+	// drive_run) INHERITS it, so it is passed ONCE (E66.42 / #2482). It is
+	// REQUIRED over the HTTP transport for a local run — the serving process's
+	// cwd is the daemon's own checkout, not yours. The description is written
+	// as an instruction to the calling agent (which is running inside a
+	// checkout) rather than a field description. The MCP server also walks up
+	// from this directory to `.fishhawk/workflows.yaml` to auto-discover the
+	// spec; that discovery only runs when this is set.
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this run executes in. REQUIRED over the HTTP transport when runner_kind is local. It is bound to the run here and the later runner-spawning verbs (run_stage, dispatch_stage, run_children, drive_run) INHERIT it, so you pass it once. YOU — the calling agent — resolve your own checkout (you are running inside one); do NOT ask the operator for a path. Also the directory the server searches for .fishhawk/workflows.yaml"`
 
 	// SpecFile overrides the walk-up auto-discovery with an
 	// explicit path. Used when the spec lives outside the
@@ -2286,6 +2371,36 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		return nil, StartRunOutput{}, errors.New("workflow_id is required")
 	}
 
+	// (1a) start_run admission control over the HTTP transport (E66.42 / #2482).
+	// The serving process's cwd is the fishhawkd daemon's own long-lived
+	// checkout, not the caller's project. Refuse BEFORE any spec discovery or
+	// backend round-trip, with an error naming the agent-side remedy.
+	//
+	// A local run REQUIRES a working_dir — it binds the checkout every later
+	// runner-spawning verb inherits — so an omitted value is refused. runner_kind
+	// here is the caller-supplied hint (#1346), which is correct for this
+	// purpose: an agent that asks for a local run must supply its checkout.
+	//
+	// A RELATIVE working_dir is refused for ANY runner_kind (the #2479
+	// security fix for the daemon-cwd shape): the filepath.Abs below would
+	// resolve it against the daemon cwd and persist it as the run's ABSOLUTE
+	// binding, which the server-side non-absolute 400 (runs.go) then never
+	// catches. Because runner_kind at start is only a hint (#1346), a run
+	// created as github_actions is not structurally prevented from a later
+	// local dispatch that would inherit the poisoned binding — so the
+	// github_actions / gitlab_ci path cannot be trusted to make a relative
+	// value harmless. An absolute value is self-consistent and passes through.
+	if r.httpTransport {
+		if in.RunnerKind == driveRunnerKindLocal && in.WorkingDir == "" {
+			return nil, StartRunOutput{}, errors.New(
+				"working_dir is required for a local run over the HTTP MCP transport: resolve your own checkout (you are running inside one) and pass its absolute path — it binds the run and every later stage inherits it")
+		}
+		if in.WorkingDir != "" && !filepath.IsAbs(in.WorkingDir) {
+			return nil, StartRunOutput{}, fmt.Errorf(
+				"working_dir %q must be an absolute path over the HTTP MCP transport: a relative path resolves against the fishhawkd host's cwd, not your project, so it is refused for any runner_kind; resolve your own checkout and pass its absolute path — it binds the run and every later stage inherits it", in.WorkingDir)
+		}
+	}
+
 	// (2) Parse the explicit issue argument up front so a typo
 	// surfaces before any disk walk or backend round-trip.
 	issueNumber, err := resolveIssueRef(in.Issue)
@@ -2405,6 +2520,23 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		}
 	}
 
+	// Resolve the checkout binding to an absolute path so the run row records
+	// a concrete directory the later verbs can inherit (E66.42 / #2482). Over
+	// HTTP the admission control above already refused every non-absolute value
+	// (for ANY runner_kind), so filepath.Abs here only cleans an
+	// already-absolute path and never joins against the daemon cwd; on stdio it
+	// resolves a relative path against the caller's own project cwd. Empty
+	// stays empty (an unbound run — refused over HTTP by the inheriting verbs,
+	// cwd on stdio).
+	boundWorkingDir := in.WorkingDir
+	if boundWorkingDir != "" {
+		abs, aerr := filepath.Abs(boundWorkingDir)
+		if aerr != nil {
+			return nil, StartRunOutput{}, fmt.Errorf("resolve working_dir %q to an absolute path: %w", in.WorkingDir, aerr)
+		}
+		boundWorkingDir = abs
+	}
+
 	// (8) Hand off to the backend.
 	created, idempotent, err := r.api.StartRun(ctx, StartRunParams{
 		Repo:           in.Repo,
@@ -2414,6 +2546,7 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 		TriggerRef:     triggerRef,
 		IdempotencyKey: in.IdempotencyKey,
 		RunnerKind:     in.RunnerKind,
+		WorkingDir:     boundWorkingDir,
 		WorkflowSpec:   string(specBytes),
 		IssueContext:   issueContext,
 		BudgetOverride: in.BudgetOverride,

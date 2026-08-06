@@ -2819,3 +2819,37 @@ func TestRunStage_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 		t.Errorf("argv missing --working-dir %q: %v", dir, (*calls)[0])
 	}
 }
+
+// TestRunStage_InheritsBoundWorkingDir (E66.42 / #2482): run_stage called over
+// HTTP with working_dir OMITTED inherits the run's start_run binding — the argv
+// carries --working-dir <bound> and resolved_working_dir echoes it.
+func TestRunStage_InheritsBoundWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	calls := captureAllArgv(t)
+
+	bound := t.TempDir()
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedRunWorkingDir(fb, runID, bound)
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+		// working_dir OMITTED — inherits the binding.
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.ResolvedWorkingDir != bound {
+		t.Errorf("resolved_working_dir = %q, want inherited %q", out.ResolvedWorkingDir, bound)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(*calls))
+	}
+	if !strings.Contains(strings.Join((*calls)[0], " "), "--working-dir "+bound) {
+		t.Errorf("argv missing inherited --working-dir %q: %v", bound, (*calls)[0])
+	}
+}

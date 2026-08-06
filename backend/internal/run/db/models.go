@@ -133,6 +133,7 @@ type Run struct {
 	RunnerKindResolved     bool               `json:"runner_kind_resolved"`
 	UpstreamRunID          *uuid.UUID         `json:"upstream_run_id"`
 	AccountID              *uuid.UUID         `json:"account_id"`
+	WorkingDir             string             `json:"working_dir"`
 }
 
 type ScopeAmendment struct {

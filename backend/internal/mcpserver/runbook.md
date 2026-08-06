@@ -91,6 +91,48 @@ hints read "nothing to run" even though work is pending. **Always pass
 `runner_kind:local`** when driving the local loop. A run already started with
 the wrong kind cannot be retagged — cancel it and start fresh.
 
+### working_dir is bound once at start_run and inherited thereafter
+
+`working_dir` is the absolute path to the checkout a run executes in. Pass it to
+`fishhawk_start_run` — as the **calling agent** you resolve your own checkout
+(you are running inside one) rather than asking the operator for a path — and it
+is **bound to the run**. Every later runner-spawning verb (`fishhawk_run_stage`,
+`fishhawk_dispatch_stage`, `fishhawk_run_children`, `fishhawk_drive_run`)
+**inherits** the binding, so you omit `working_dir` on those calls and the run's
+`next_actions` already carry it in their params
+([E66.42 / #2482](https://github.com/kuhlman-labs/fishhawk/issues/2482)).
+
+The precedence ladder each of those verbs applies:
+
+1. **Explicit value** — validated exactly as [#2479](https://github.com/kuhlman-labs/fishhawk/issues/2479)
+   validates it (absolute over HTTP), then **refused when it conflicts** with the
+   run's binding after path cleaning. Executing a run's later stage against a
+   different checkout is the [#1866](https://github.com/kuhlman-labs/fishhawk/issues/1866)
+   contamination shape and the branch lineage is already anchored to the original
+   tree. The refusal names both paths, both remedies (omit to inherit, or start a
+   new run for a different checkout), and notes that paths are compared **without
+   resolving symlinks** — so on macOS `/tmp` and `/private/tmp` read as a conflict.
+2. **Omitted with a binding** — inherits the binding, run through the same
+   absolute/cleaning gate as an explicit path, so a relative or empty binding is
+   refused identically.
+3. **Omitted and unbound** — refused over the HTTP transport (the #2479 rule; the
+   server's cwd is the daemon's own checkout), resolved to the process cwd on
+   stdio.
+
+**Admission at start_run:** over the HTTP transport a `runner_kind:local` run
+**requires** an absolute `working_dir` — an omitted or relative value is refused
+before any spec discovery or backend round-trip. `github_actions` / `gitlab_ci`
+runs spawn no local runner and have no checkout to bind, so they are untouched.
+An unbound run (a legacy row, or one created without a binding) keeps today's
+behavior: the inheriting verbs refuse an omitted `working_dir` over HTTP exactly
+as they did before this change.
+
+**Read failure fails closed over HTTP:** if a verb cannot read the run to learn
+its binding, it refuses over HTTP rather than risk executing against the wrong
+checkout — regardless of whether you supplied an explicit value (an explicit path
+is self-validating, but its non-conflict with the binding is not). On stdio the
+same read failure degrades to today's behavior.
+
 ### Local-drive fixup needs an explicit dispatch_stage
 
 On a local-drive run, `fishhawk_fixup_stage` re-opens the implement stage to

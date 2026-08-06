@@ -1548,3 +1548,80 @@ func TestDispatchStage_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 		t.Errorf("argv missing --working-dir %q: %v", dir, (*calls)[0])
 	}
 }
+
+// --- E66.42 / #2482: working_dir bound at start_run, inherited here ---
+
+// TestDispatchStage_InheritsBoundWorkingDir is the full end-to-end inheritance
+// vehicle: an httptest backend serving a run whose working_dir is a bound
+// absolute path, an HTTP-transport resolver, dispatch_stage called with
+// working_dir OMITTED, asserting the spawn recorder received --working-dir
+// <bound> and the tool output's resolved_working_dir is <bound>.
+func TestDispatchStage_InheritsBoundWorkingDir(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	calls := captureAllArgv(t)
+
+	bound := t.TempDir() // absolute
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedRunWorkingDir(fb, runID, bound)
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+		// working_dir OMITTED — inherits the run's binding.
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.ResolvedWorkingDir != bound {
+		t.Errorf("resolved_working_dir = %q, want the inherited binding %q", out.ResolvedWorkingDir, bound)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected 1 spawn, got %d", len(*calls))
+	}
+	if !strings.Contains(strings.Join((*calls)[0], " "), "--working-dir "+bound) {
+		t.Errorf("argv missing inherited --working-dir %q: %v", bound, (*calls)[0])
+	}
+}
+
+// TestDispatchStage_UnboundRunOverHTTPStillRefuses (C1): a run whose working_dir
+// is "" (the legacy pre-change row), called with the parameter omitted over
+// HTTP, is refused naming working_dir AND the spawn seam is NEVER called — the
+// counterfactual proving inheritance did not reintroduce the daemon-cwd
+// fallback. Deleting the ladder's fall-through-to-resolveWorkingDir("") refusal
+// turns it red.
+func TestDispatchStage_UnboundRunOverHTTPStillRefuses(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true
+	calls := captureAllArgv(t)
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	seedRunWorkingDir(fb, runID, "") // explicit empty binding — the unbound legacy row
+	seedStageOfType(fb, runID, stageID, "implement", "awaiting_host_dispatch")
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+		// working_dir omitted AND the run is unbound.
+	})
+	if err == nil {
+		t.Fatal("expected a refusal for an omitted working_dir on an unbound run over HTTP")
+	}
+	if !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("error should name working_dir; got %v", err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("spawn seam called despite the refusal: %v", *calls)
+	}
+	if n := fb.hostDispatchCalledByID[stageID]; n != 0 {
+		t.Errorf("host-dispatch marker called %d times, want 0 (refusal commits no state)", n)
+	}
+	if out.LogPath != "" {
+		t.Errorf("log_path = %q, want empty (no spawn)", out.LogPath)
+	}
+}

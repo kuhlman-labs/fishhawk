@@ -51,6 +51,81 @@ func TestCreateRun_HappyPath(t *testing.T) {
 	}
 }
 
+// TestCreateRun_WorkingDirRoundTripsOverHTTP pins the working_dir binding
+// (E66.42 / #2482) across the HTTP seam: a POST carrying an absolute working_dir
+// is persisted and echoed back on the 201 body — the wire-JSON → run domain →
+// response path.
+func TestCreateRun_WorkingDirRoundTripsOverHTTP(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	const wd = "/Users/dev/src/fishhawk"
+	body := `{
+		"repo": "kuhlman-labs/fishhawk",
+		"workflow_id": "feature_change",
+		"workflow_sha": "abc123",
+		"trigger_source": "cli",
+		"runner_kind": "local",
+		"working_dir": "` + wd + `"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var got runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if got.WorkingDir != wd {
+		t.Errorf("response WorkingDir = %q, want %q", got.WorkingDir, wd)
+	}
+	// The handler actually threaded it to the repo, not just echoed the request.
+	if repo.lastCreateRunParams.WorkingDir != wd {
+		t.Errorf("CreateRunParams.WorkingDir = %q, want %q", repo.lastCreateRunParams.WorkingDir, wd)
+	}
+}
+
+// TestCreateRun_RejectsRelativeWorkingDir is the C6 control: POST /v0/runs with a
+// relative working_dir is a 400 naming the field, AND no run row exists
+// afterwards. The second assertion reads COMMITTED STATE (the fake's run store)
+// rather than error identity — a control that fired and then rolled back would
+// return a byte-identical error, so the store read is what proves the rejection
+// committed nothing. Deleting the server-side validation turns it red.
+func TestCreateRun_RejectsRelativeWorkingDir(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	body := `{
+		"repo": "kuhlman-labs/fishhawk",
+		"workflow_id": "feature_change",
+		"workflow_sha": "abc123",
+		"trigger_source": "cli",
+		"working_dir": "./sub"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "working_dir") {
+		t.Errorf("error body does not name working_dir: %s", w.Body.String())
+	}
+	// Committed-state assertion: no run row was created.
+	repo.mu.Lock()
+	n := len(repo.runs)
+	repo.mu.Unlock()
+	if n != 0 {
+		t.Errorf("run store has %d rows after a rejected create, want 0", n)
+	}
+}
+
 func TestCreateRun_OptionalTriggerRef(t *testing.T) {
 	repo := newFakeRepo()
 	s := newServer(t, repo)

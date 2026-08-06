@@ -99,6 +99,7 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		Drive:                  p.Drive,
 		SliceIndex:             intPtrToInt32Ptr(p.SliceIndex),
 		UpstreamRunID:          p.UpstreamRunID,
+		WorkingDir:             p.WorkingDir,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -893,6 +894,14 @@ func rowToRun(r rundb.Run) *Run {
 	out.ResolvedModel = r.ResolvedModel
 	out.Drive = r.Drive
 	out.SliceIndex = int32PtrToIntPtr(r.SliceIndex)
+	// WorkingDir round-trips through the single shared row mapper (E66.42 /
+	// #2482). Every Run-returning sqlc query now carries working_dir in its
+	// RETURNING/SELECT list and scans it — CreateRun, GetRun, ListRuns,
+	// GetRunByIdempotencyKey, LockRunForUpdate, and the Update* / AddRunCost /
+	// SetRunPullRequestURL set — so the binding is populated on every read
+	// path. This is UNLIKE AccountID above, which only GetRun / ListRuns select
+	// and the other queries leave "".
+	out.WorkingDir = r.WorkingDir
 	return out
 }
 

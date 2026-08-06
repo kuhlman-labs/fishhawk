@@ -241,7 +241,7 @@ const driveRunnerKindLocal = "local"
 // DriveRunInput is the fishhawk_drive_run tool's input (#1700).
 type DriveRunInput struct {
 	RunID        string `json:"run_id" jsonschema:"Fishhawk run UUID; the local runner_kind:local run to drive between human gates"`
-	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) this is REQUIRED and must be an absolute path — the server's cwd is the daemon's own checkout, so an omitted or relative value is refused. On the stdio transport it defaults to the client-spawned process's own directory (resolved to an absolute path)"`
+	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"GitHub repo as owner/name; auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR; defaults to main"`
 	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, sibling to this binary, then PATH"`
@@ -362,8 +362,11 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 	// act is recorded and no runner is spawned on a refused call. Fold the
 	// resolved ABSOLUTE dir back onto `in` so every downstream consumer — the
 	// composeRunnerArgv dispatch literal, the best-effort repo detection, and the
-	// driveDecisionActions next_actions params — carries it.
-	workingDir, err := r.resolveWorkingDir(in.WorkingDir)
+	// driveDecisionActions next_actions params — carries it. Run-aware (E66.42 /
+	// #2482): an omitted parameter inherits the run's start_run binding (the
+	// INHERITED value is what folds back onto `in` and reaches driveDecisionActions);
+	// a conflicting explicit value is refused; a run-read failure fails closed over HTTP.
+	workingDir, err := r.resolveWorkingDirForRun(ctx, runUUID, in.WorkingDir)
 	if err != nil {
 		return nil, DriveRunOutput{}, err
 	}

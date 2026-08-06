@@ -21,6 +21,10 @@ Reconciliation: the trace handler reconciles via `trace.go::reconcileRunnerKind`
 - The mismatch guardrail is post-execution AUDIT only this slice; a pre-dispatch host-endpoint block (the issue's level-1) is a deferred follow-up.
 - Best-effort throughout: any reconciliation error WARN-logs and never unwinds the stored trace.
 
+## `working_dir` binding (E66.42 / #2482)
+
+`runs.working_dir` (migration `0065_runs_working_dir`, `TEXT NOT NULL DEFAULT ''`) records the local checkout a run's local (host-spawned) stages execute in, bound ONCE at `fishhawk_start_run` so every later runner-spawning MCP verb inherits it instead of re-typing the absolute path (the #2479 refusal otherwise costs a path on every call). Threaded through `CreateRunParams.WorkingDir` → `postgres.CreateRun` → `rowToRun` (the single shared mapper, so `GetRun` / `ListRuns` / `GetRunByIdempotencyKey` all pick it up from one edit) and echoed on `GET /v0/runs/{id}` as `working_dir`. Empty is 'no binding' — exactly ONE unbound value (not NULL-vs-empty), which is the state the MCP resolver's #2479 refusal still catches; a `github_actions` run has no local checkout to bind. No CHECK constraint: absolute-path validation is transport-conditional and lives in the MCP layer (`resolveWorkingDirForRun`), not the database. The sqlc `db` package was hand-edited (brew `sqlc generate` churns all 14 db packages); the 9 Run-returning queries gained the column in their SELECT/RETURNING lists and row scans, and the other 13 db packages' frozen `Run` models legitimately never scan it.
+
 ## Host-dispatch park state (`awaiting_host_dispatch`, #1912)
 
 `awaiting_host_dispatch` splits the old conflated local `dispatched` state into two explicit signals, resolving the #1905 no-spawn-evidence ambiguity at the source:

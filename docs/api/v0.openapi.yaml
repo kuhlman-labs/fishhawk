@@ -819,6 +819,16 @@ components:
             from the trace manifest at cost-rollup time. Empty string for
             legacy/unstamped runs.
           example: claude-opus-4-8
+        working_dir:
+          type: string
+          description: |
+            The run's bound local checkout (E66.42 / #2482): the absolute
+            path the run's local (host-spawned) stages execute in, bound
+            once at start_run and inherited by every later runner-spawning
+            MCP verb. Omitted when the run carries no binding — a
+            `github_actions` run has no local checkout, and a legacy row
+            predates the column.
+          example: /Users/dev/src/fishhawk
         concerns:
           $ref: '#/components/schemas/RunConcerns'
           description: |
@@ -5198,6 +5208,23 @@ paths:
                     E22 / #389) passes `local` to mint a run that
                     runs on the operator's workstation instead of
                     GitHub Actions.
+                working_dir:
+                  type: string
+                  description: |
+                    Optional. Absolute path to the local checkout the
+                    run's local (host-spawned) stages execute in
+                    (E66.42 / #2482). Bound once here and inherited by
+                    every later runner-spawning MCP verb, so the path
+                    is supplied once instead of re-typed on each call.
+                    Server-side validation is minimal and
+                    transport-agnostic — the daemon cannot know a plain
+                    REST caller's transport — so it rejects only a
+                    value that is non-empty and not absolute (a 400
+                    naming `working_dir`); the MCP layer adds the
+                    transport-conditional required/absolute admission on
+                    top. Omitted leaves the run unbound (a
+                    `github_actions` run has no local checkout to bind).
+                    Echoed back as `working_dir` on the Run.
                 workflow_spec:
                   type: string
                   description: |

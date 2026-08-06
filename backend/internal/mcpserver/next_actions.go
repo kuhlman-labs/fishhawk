@@ -83,6 +83,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 			na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 		}
 		foldLiveValidationAdvisory(run, na)
+		foldWorkingDirParams(run, na)
 		return na
 	}
 
@@ -103,7 +104,42 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		na = fallback
 	}
 	foldLiveValidationAdvisory(run, na)
+	foldWorkingDirParams(run, na)
 	return na
+}
+
+// workingDirInheritingActions is the closed set of next-action verbs that take
+// a working_dir parameter and inherit the run's start_run binding (E66.42 /
+// #2482). foldWorkingDirParams stamps the binding onto exactly these.
+var workingDirInheritingActions = map[string]struct{}{
+	"fishhawk_run_stage":      {},
+	"fishhawk_dispatch_stage": {},
+	"fishhawk_run_children":   {},
+	"fishhawk_drive_run":      {},
+}
+
+// foldWorkingDirParams stamps the run's bound working_dir (E66.42 / #2482) onto
+// the params of every emitted action whose verb is one of the four
+// runner-spawning verbs, so a driving loop propagates the binding without
+// re-deriving it. A no-op when the run carries no binding — an unbound run keeps
+// today's params rather than advertising an empty-string path the agent would
+// pass verbatim (which would then be refused as non-absolute over HTTP). na is
+// mutated in place; a nil na (only the nil-run early return upstream) is a
+// no-op. One fold at the end of nextActionsFor beats editing ~15 call sites and
+// cannot miss a future one.
+func foldWorkingDirParams(run *Run, na *NextActions) {
+	if na == nil || run.WorkingDir == "" {
+		return
+	}
+	for i := range na.Actions {
+		if _, ok := workingDirInheritingActions[na.Actions[i].Action]; !ok {
+			continue
+		}
+		if na.Actions[i].Params == nil {
+			na.Actions[i].Params = map[string]string{}
+		}
+		na.Actions[i].Params["working_dir"] = run.WorkingDir
+	}
 }
 
 // liveValidationGuidance renders the operator live-validation guidance string
