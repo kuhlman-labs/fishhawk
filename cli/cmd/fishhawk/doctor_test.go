@@ -897,7 +897,7 @@ func TestRunDoctor_VerifyRungRendersAndFails(t *testing.T) {
 	writeRepoFile(t, repo, "build/artifact", "prebuilt\n")
 
 	var stdout, stderr strings.Builder
-	got := runDoctor([]string{"--working-dir", repo, "--token", "fhk_test"}, &stdout, &stderr)
+	got := runDoctor([]string{"--working-dir", repo, "--token", "fhk_test", "--run-verify-command"}, &stdout, &stderr)
 
 	out := stdout.String()
 	if !strings.Contains(out, verifyRungLabel) {
@@ -908,6 +908,51 @@ func TestRunDoctor_VerifyRungRendersAndFails(t *testing.T) {
 	}
 	if got == exitOK {
 		t.Errorf("runDoctor = exitOK, want non-zero when the verify rung fails:\n%s", out)
+	}
+}
+
+// TestRunDoctor_VerifyRungRequiresOptIn drives runDoctor with the SAME repo
+// and stubs as the test above but WITHOUT --run-verify-command: the rung must
+// render as a warn that names the flag, the run must exit 0 on that rung's
+// account, and no subprocess may be spawned.
+//
+// This is the flag-wiring counterfactual — it fails if doctor.go stops routing
+// through checkVerifyCommandGated, which the check-level test cannot see. It
+// asserts committed filesystem state (the marker the command would create), so
+// a gate that returned a different-looking result while still executing cannot
+// pass it.
+func TestRunDoctor_VerifyRungRequiresOptIn(t *testing.T) {
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/healthz"):
+			return fakeHTTPResponse(http.StatusOK, `{"status":"ok","version":"v0.0.0-test"}`), nil
+		case strings.HasSuffix(req.URL.Path, "/v0/onboarding/readiness"):
+			return fakeHTTPResponse(http.StatusOK, allGreenReadinessJSON), nil
+		default:
+			return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+		}
+	})
+	withFakeDoctorLookPath(t, func(name string) (string, error) { return "/usr/bin/" + name, nil })
+	withFakeDoctorRunOutput(t, func(name string, _ ...string) (string, error) {
+		return fmt.Sprintf("%s ok", name), nil
+	})
+
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "opt-in-marker")
+	repo := newVerifyRepo(t, specWithCommand("touch "+marker, "15m"))
+
+	var stdout, stderr strings.Builder
+	runDoctor([]string{"--working-dir", repo, "--token", "fhk_test"}, &stdout, &stderr)
+
+	out := stdout.String()
+	if !strings.Contains(out, verifyRungLabel) {
+		t.Errorf("stdout missing the %q rung:\n%s", verifyRungLabel, out)
+	}
+	if !strings.Contains(out, "--run-verify-command") {
+		t.Errorf("stdout does not name --run-verify-command:\n%s", out)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("marker %s exists — doctor spawned the spec's command without --run-verify-command", marker)
 	}
 }
 

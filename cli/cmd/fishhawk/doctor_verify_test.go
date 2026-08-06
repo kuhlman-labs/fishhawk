@@ -133,6 +133,74 @@ func assertWorktreeGone(t *testing.T, repoDir, worktree string) {
 	}
 }
 
+// --- default-deny opt-in gate ------------------------------------------------
+
+// TestCheckVerifyCommandGated_DefaultDoesNotExecute is the counterfactual
+// vehicle for the opt-in gate: with NEITHER flag set the rung must warn and
+// spawn no subprocess at all.
+//
+// The assertion reads COMMITTED STATE — the marker file the spec's command
+// would create — rather than the returned error, because a gate that never
+// fired would return a rung result that merely LOOKS different; only the
+// filesystem proves no code ran. The command is `touch <marker>`, which exits 0
+// in the fresh worktree, so deleting the gate turns this test's status
+// assertion green-to-red AND materializes the marker: the test cannot pass
+// without the control.
+func TestCheckVerifyCommandGated_DefaultDoesNotExecute(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	repo := newVerifyRepo(t, specWithCommand("touch "+marker, "15m"))
+
+	r := checkVerifyCommandGated(repo, false, false, verifyTestDeadline)
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn; detail: %s", r.status, r.detail)
+	}
+	if !strings.Contains(r.remediate, "--run-verify-command") {
+		t.Errorf("remediate = %q, want it to name --run-verify-command", r.remediate)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("marker %s exists — a subprocess was spawned without --run-verify-command", marker)
+	}
+}
+
+// TestCheckVerifyCommandGated_OptInExecutes: --run-verify-command runs the
+// command. Without this the gate could be a blanket refusal and the
+// default-deny test above would still pass.
+func TestCheckVerifyCommandGated_OptInExecutes(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	repo := newVerifyRepo(t, specWithCommand("touch "+marker, "15m"))
+
+	r := checkVerifyCommandGated(repo, true, false, verifyTestDeadline)
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok; detail: %s", r.status, r.detail)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("marker %s absent — the command did not run under --run-verify-command: %v", marker, err)
+	}
+	assertWorktreeGone(t, repo, doctorVerifyWorktreeFor(t, repo))
+}
+
+// TestCheckVerifyCommandGated_SkipWinsOverOptIn: both flags set -> skipped,
+// no subprocess. Pinning the precedence keeps --skip-verify-command a reliable
+// per-invocation override of a wrapper script that opts in.
+func TestCheckVerifyCommandGated_SkipWinsOverOptIn(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "marker")
+	repo := newVerifyRepo(t, specWithCommand("touch "+marker, "15m"))
+
+	r := checkVerifyCommandGated(repo, true, true, verifyTestDeadline)
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn; detail: %s", r.status, r.detail)
+	}
+	if !strings.Contains(r.detail, "--skip-verify-command") {
+		t.Errorf("detail = %q, want it to name --skip-verify-command", r.detail)
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("marker %s exists — --skip-verify-command did not win over --run-verify-command", marker)
+	}
+}
+
 // --- outcome-table branch coverage -------------------------------------------
 
 // TestCheckVerifyCommand_SkippedByFlag: --skip-verify-command warns and

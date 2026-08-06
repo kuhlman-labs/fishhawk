@@ -55,9 +55,14 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		"run only the environment-free spec rungs (schema validity + execution-path coverage); "+
 			"skips all docker/backend/token/MCP/git/gh/onboarding checks. Use to validate a freshly "+
 			"scaffolded repo with no local Fishhawk environment.")
+	runVerify := fs.Bool("run-verify-command", false,
+		"execute the `verify command` rung, which runs the spec's configured "+
+			"executor.verify.command in a throwaway detached git worktree at HEAD. OFF by "+
+			"default: that command string comes from the inspected repository's committed "+
+			"spec, so doctor never executes code from a checkout you have not reviewed unless "+
+			"you ask for it by name")
 	skipVerify := fs.Bool("skip-verify-command", false,
-		"skip the `verify command` rung, which executes the spec's configured "+
-			"executor.verify.command in a throwaway git worktree at HEAD")
+		"force the `verify command` rung to be skipped; wins over --run-verify-command")
 	verifyTimeout := fs.Duration("verify-timeout", defaultVerifyTimeout,
 		"cap on how long the `verify command` rung lets each configured command run; "+
 			"the spec's own executor.verify.timeout wins when it is shorter")
@@ -100,7 +105,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			checkToken(*cf.backendURL, *cf.token),
 			checkSpec(*workingDir),
 			checkExecutionPath(*workingDir),
-			checkVerifyCommand(*workingDir, *skipVerify, *verifyTimeout),
+			checkVerifyCommandGated(*workingDir, *runVerify, *skipVerify, *verifyTimeout),
 			checkRunnerBinary(*runnerBinary, *workingDir),
 			checkMCPRegistration(),
 			checkGitOrigin(*workingDir),

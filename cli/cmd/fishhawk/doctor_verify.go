@@ -466,9 +466,51 @@ func outputTail(s string) string {
 	return tail
 }
 
+// checkVerifyCommandGated is the doctor entry point for the `verify command`
+// rung, and the DEFAULT-DENY gate in front of it.
+//
+// Every other doctor rung reads bytes or queries a service; this one executes a
+// command string supplied by the checkout under inspection. `doctor` is the
+// first thing an operator runs against a repository — including one they have
+// just cloned and not yet read — so executing that string by default would make
+// `fishhawk doctor` a code-execution primitive for any repository whose
+// `.fishhawk/workflows.yaml` an attacker controls. Under Fishhawk's
+// lethal-trifecta and uncontrolled-egress threat model the credential stripping
+// in sanitizeVerifyEnv bounds what the child can STEAL, but nothing in the CLI
+// bounds what it can SEND: the child inherits the operator's network position,
+// and the operator's machine is a strictly higher-value execution context than
+// the runner's. So execution is off unless the operator asks for it by name.
+//
+// Precedence: --skip-verify-command wins over --run-verify-command, so an alias
+// or wrapper script that opts in can always be overridden on one invocation.
+// Both non-executing paths are a warn that names the flag which changes the
+// outcome — the rung stays visible on every `doctor` run rather than silently
+// disappearing, which is what #2485 is about.
+func checkVerifyCommandGated(workingDir string, optIn, skip bool, maxTimeout time.Duration) checkResult {
+	if skip {
+		return checkVerifyCommand(workingDir, true, maxTimeout)
+	}
+	if !optIn {
+		return checkResult{
+			label:  verifyRungLabel,
+			detail: "not executed (opt-in)",
+			status: "warn",
+			remediate: "this rung EXECUTES the command your repository's committed " +
+				".fishhawk/workflows.yaml configures as executor.verify.command, so it is off by " +
+				"default and never runs code from a checkout you have not reviewed; pass " +
+				"--run-verify-command to execute it in a throwaway detached worktree at HEAD",
+		}
+	}
+	return checkVerifyCommand(workingDir, false, maxTimeout)
+}
+
 // checkVerifyCommand is the `verify command` doctor rung: it EXECUTES the
 // spec's configured `executor.verify.command` in a throwaway detached git
 // worktree at HEAD and reports the result before any run is started.
+//
+// It is reached only through checkVerifyCommandGated, which owns the
+// default-deny opt-in gate; `skip` here is the explicit --skip-verify-command
+// opt-out.
 //
 // The outcome table, exhaustively:
 //
