@@ -7889,6 +7889,82 @@ func TestGetRunStatus_ConcernsBlock_PropagatesEndToEnd(t *testing.T) {
 	}
 }
 
+// seedShortSummaryWireFixture seeds a run whose /v0/runs/{id} response carries
+// a concern item with a literal short_summary WIRE key set to a distinctive
+// sentinel — injected as a RAW map overlay, NOT a re-encoded RunConcernItem —
+// so the fixture is ASYMMETRIC: the wire key is fixed regardless of the mirror
+// struct's json tag. A typo'd or missing tag on RunConcernItem.ShortSummary
+// then decodes to "" and the assertions go RED, which a symmetric (struct
+// re-encoded) fixture could not detect. The sentinel is unequal to every other
+// field on the item. Returns the run id and the sentinel value. (#2488)
+func seedShortSummaryWireFixture(t *testing.T) (*fakeBackend, *httptest.Server, uuid.UUID, string) {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	sentinel := "SENTINEL-short-summary-value-9f3a7c"
+	// No typed Concerns on the row: the raw overlay is the sole source of the
+	// concerns block, so the wire "short_summary" key comes from this literal
+	// map, independent of the RunConcernItem json tag under test.
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.getRunExtraByID[runID] = map[string]any{
+		"concerns": map[string]any{
+			"open":     1,
+			"by_state": map[string]any{"raised": 1},
+			"items": []any{
+				map[string]any{
+					"id":            uuid.NewString(),
+					"stage_kind":    "implement",
+					"severity":      "low",
+					"category":      "scope",
+					"state":         "raised",
+					"short_summary": sentinel,
+				},
+			},
+		},
+	}
+	return fb, srv, runID, sentinel
+}
+
+// TestGetRunStatus_ShortSummaryCrossesWireMirror is the asymmetric json-tag /
+// decode seam test (#2488): the fake backend serves a raw short_summary wire
+// value that could only have come from the wire, and the decoded
+// RunConcernItem.ShortSummary must equal it — pinning that the hand-maintained
+// mirror tag byte-matches the server's `short_summary`.
+func TestGetRunStatus_ShortSummaryCrossesWireMirror(t *testing.T) {
+	_, srv, runID, sentinel := seedShortSummaryWireFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Run.Concerns == nil || len(out.Run.Concerns.Items) != 1 {
+		t.Fatalf("Run.Concerns = %+v, want one item", out.Run.Concerns)
+	}
+	if got := out.Run.Concerns.Items[0].ShortSummary; got != sentinel {
+		t.Errorf("ShortSummary = %q, want %q — a mismatched/missing json tag decodes to \"\"", got, sentinel)
+	}
+}
+
+// TestGetRunStatus_ShortSummarySurvivesProseFlagOff drives the tool with
+// include_review_prose:false (the default) against the same fixture and
+// asserts the sentinel short_summary is still present — proving the label
+// lives OUTSIDE the prose gate (#2488). No byte-bound assertion here: the
+// fixture is literal JSON that never reaches the server truncation helper.
+func TestGetRunStatus_ShortSummarySurvivesProseFlagOff(t *testing.T) {
+	_, srv, runID, sentinel := seedShortSummaryWireFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), IncludeReviewProse: false})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Run.Concerns == nil || len(out.Run.Concerns.Items) != 1 {
+		t.Fatalf("Run.Concerns = %+v, want one item", out.Run.Concerns)
+	}
+	if got := out.Run.Concerns.Items[0].ShortSummary; got != sentinel {
+		t.Errorf("ShortSummary = %q under include_review_prose:false, want %q (field must survive the prose gate)", got, sentinel)
+	}
+}
+
 // TestGetRunStatus_NoConcernsBlock_NilField: a run with no open concerns
 // (backend omits the key) decodes to a nil pointer, never a zero block.
 func TestGetRunStatus_NoConcernsBlock_NilField(t *testing.T) {

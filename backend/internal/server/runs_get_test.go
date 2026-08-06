@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -2596,4 +2598,273 @@ workflows:
 			t.Errorf("extra reads: artifact %d, run %d — want 0/0", ar.calls, rr.calls)
 		}
 	})
+}
+
+// TestConcernShortSummary pins the pure helper's contract (#2488), one case
+// per enumerated mode. The helper is server-only; every bound/omission claim
+// is exercised here where it actually runs, not in the MCP mirror (which
+// truncates nothing).
+func TestConcernShortSummary(t *testing.T) {
+	cases := []struct {
+		name string
+		note string
+		want string // "" means: assert via the mode-specific checks below, not equality
+		mode string // "eq" | "bounded" | "utf8"
+	}{
+		{
+			name: "multi-line multi-space note collapses to one line",
+			note: "foo  bar\nqux\t baz",
+			want: "foo bar qux baz",
+			mode: "eq",
+		},
+		{
+			name: "short note comes back as the whole collapsed note",
+			note: "a short reviewer note",
+			want: "a short reviewer note",
+			mode: "eq",
+		},
+		{
+			name: "exactly 100 bytes returned uncut and unmarked",
+			note: strings.Repeat("a", 100),
+			want: strings.Repeat("a", 100),
+			mode: "eq",
+		},
+		{
+			name: "101 bytes is cut and marked",
+			note: strings.Repeat("a", 101),
+			want: strings.Repeat("a", 97) + "...",
+			mode: "eq",
+		},
+		{
+			name: "400 bytes yields at most 100 bytes",
+			note: strings.Repeat("a", 400),
+			mode: "bounded",
+		},
+		{
+			// A run of 3-byte CJK runes whose byte budget (97) lands mid-rune:
+			// byte 97 is the 2nd byte of the 33rd '世', so a naive cut would emit
+			// U+FFFD. The continuation-byte backtrack must land on a boundary.
+			name: "mid-rune byte cut backtracks to valid UTF-8",
+			note: strings.Repeat("世", 40), // 120 bytes
+			mode: "utf8",
+		},
+		{
+			name: "empty note yields empty string",
+			note: "",
+			want: "",
+			mode: "eq",
+		},
+		{
+			name: "whitespace-only note yields empty string",
+			note: " \n\t ",
+			want: "",
+			mode: "eq",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := concernShortSummary(tc.note)
+			switch tc.mode {
+			case "eq":
+				if got != tc.want {
+					t.Errorf("concernShortSummary(%q) = %q, want %q", tc.note, got, tc.want)
+				}
+			case "bounded":
+				if len(got) > concernShortSummaryMaxBytes {
+					t.Errorf("len = %d bytes, want <= %d", len(got), concernShortSummaryMaxBytes)
+				}
+				if !strings.HasSuffix(got, concernShortSummaryMarker) {
+					t.Errorf("got %q, want a trailing %q for an over-bound note", got, concernShortSummaryMarker)
+				}
+			case "utf8":
+				if len(got) > concernShortSummaryMaxBytes {
+					t.Errorf("len = %d bytes, want <= %d", len(got), concernShortSummaryMaxBytes)
+				}
+				if !utf8.ValidString(got) {
+					t.Errorf("got %q is not valid UTF-8 (mid-rune cut not backtracked)", got)
+				}
+				if strings.ContainsRune(got, utf8.RuneError) {
+					t.Errorf("got %q contains U+FFFD (mid-rune cut emitted a replacement char)", got)
+				}
+				if !strings.HasSuffix(got, concernShortSummaryMarker) {
+					t.Errorf("got %q, want a trailing %q for an over-bound note", got, concernShortSummaryMarker)
+				}
+			}
+		})
+	}
+}
+
+// TestGetRun_ConcernShortSummaryBounded drives the REAL GET /v0/runs/{id}
+// handler with a 400-byte single-token note and asserts the item's
+// short_summary is bounded to at most 100 bytes, marked, single-line, and a
+// prefix of the collapsed note. This is the server-side authority for the
+// bound claim (counterfactual (i) deletes the truncation branch and runs it).
+func TestGetRun_ConcernShortSummaryBounded(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	note := strings.Repeat("a", 400)
+	seedConcernRow(t, cr, got.ID, uuid.New(), "implement", 10, note)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Concerns == nil || len(resp.Concerns.Items) != 1 {
+		t.Fatalf("concerns = %+v, want one item:\n%s", resp.Concerns, w.Body.String())
+	}
+	ss := resp.Concerns.Items[0].ShortSummary
+	if len(ss) > concernShortSummaryMaxBytes {
+		t.Errorf("short_summary = %d bytes, want <= %d", len(ss), concernShortSummaryMaxBytes)
+	}
+	if !strings.HasSuffix(ss, concernShortSummaryMarker) {
+		t.Errorf("short_summary = %q, want a trailing %q", ss, concernShortSummaryMarker)
+	}
+	if strings.ContainsAny(ss, "\n\t") || strings.Contains(ss, "  ") {
+		t.Errorf("short_summary = %q, want a single collapsed line", ss)
+	}
+	collapsed := strings.Join(strings.Fields(note), " ")
+	if !strings.HasPrefix(collapsed, strings.TrimSuffix(ss, concernShortSummaryMarker)) {
+		t.Errorf("short_summary %q is not a prefix of the collapsed note", ss)
+	}
+}
+
+// TestGetRun_ConcernShortSummaryPerItem seeds TWO concerns with different
+// notes and asserts each item's short_summary is derived from ITS OWN note
+// (equals that note's collapsed form) and is non-empty. It makes NO claim
+// that differing concerns are distinguishable by label — the UUID is identity.
+func TestGetRun_ConcernShortSummaryPerItem(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	noteA := "first concern:   the integration test is missing"
+	noteB := "second concern\nthe error path is untested"
+	a := seedConcernRow(t, cr, got.ID, uuid.New(), "implement", 10, noteA)
+	b := seedConcernRow(t, cr, got.ID, uuid.New(), "implement", 11, noteB)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block missing:\n%s", w.Body.String())
+	}
+	byID := map[uuid.UUID]string{}
+	for _, item := range resp.Concerns.Items {
+		byID[item.ID] = item.ShortSummary
+	}
+	if got := byID[a.ID]; got != strings.Join(strings.Fields(noteA), " ") || got == "" {
+		t.Errorf("concern A short_summary = %q, want its own collapsed note", got)
+	}
+	if got := byID[b.ID]; got != strings.Join(strings.Fields(noteB), " ") || got == "" {
+		t.Errorf("concern B short_summary = %q, want its own collapsed note", got)
+	}
+}
+
+// TestGetRun_ConcernShortSummaryOmittedWhenNoteBlank seeds a whitespace-only
+// note and asserts the short_summary KEY is absent from the decoded item
+// object (not merely empty). This is the server-side authority for the
+// omission claim (counterfactual (ii) deletes ,omitempty and runs it).
+func TestGetRun_ConcernShortSummaryOmittedWhenNoteBlank(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	seedConcernRow(t, cr, got.ID, uuid.New(), "implement", 10, " \n\t ")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var raw struct {
+		Concerns struct {
+			Items []map[string]any `json:"items"`
+		} `json:"concerns"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(raw.Concerns.Items) != 1 {
+		t.Fatalf("items = %d, want 1:\n%s", len(raw.Concerns.Items), w.Body.String())
+	}
+	if _, present := raw.Concerns.Items[0]["short_summary"]; present {
+		t.Errorf("short_summary key present for a blank-note concern, want absent:\n%s", w.Body.String())
+	}
+}
+
+// TestGetRun_ConcernShortSummaryEndToEndMCP is the CONDITION-1 end-to-end
+// integration through the real server-to-MCP seam: the REAL GET
+// /v0/runs/{id} handler's marshalled bytes are decoded into the MCP wire
+// mirror (mcpserver.Run), and short_summary must arrive populated and
+// bounded. It composes the two halves the handler tests and the mcpserver
+// seam test each cover in isolation — proving the real payload and the real
+// consumer integrate, not merely that each side works against its own
+// fixture. internal/server does not import mcpserver in non-test code (no
+// import cycle), but the package's test binary can, exactly as
+// mcproute_test.go does.
+func TestGetRun_ConcernShortSummaryEndToEndMCP(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	note := strings.Repeat("a", 400)
+	seedConcernRow(t, cr, got.ID, uuid.New(), "implement", 10, note)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	// Decode the REAL handler bytes into the MCP wire mirror — not a
+	// hand-authored fixture, not the fake backend's re-encoding of the mirror.
+	var mirror mcpserver.Run
+	if err := json.Unmarshal(w.Body.Bytes(), &mirror); err != nil {
+		t.Fatalf("decode into mcpserver.Run mirror: %v", err)
+	}
+	if mirror.Concerns == nil || len(mirror.Concerns.Items) != 1 {
+		t.Fatalf("mirror concerns = %+v, want one item:\n%s", mirror.Concerns, w.Body.String())
+	}
+	ss := mirror.Concerns.Items[0].ShortSummary
+	if ss == "" {
+		t.Fatal("short_summary did not cross the server->MCP mirror (decoded empty) — a json-tag mismatch would do this")
+	}
+	if len(ss) > concernShortSummaryMaxBytes {
+		t.Errorf("short_summary = %d bytes, want <= %d", len(ss), concernShortSummaryMaxBytes)
+	}
+	if !strings.HasSuffix(ss, concernShortSummaryMarker) {
+		t.Errorf("short_summary = %q, want a trailing %q for the 400-byte note", ss, concernShortSummaryMarker)
+	}
 }

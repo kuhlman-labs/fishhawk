@@ -193,8 +193,9 @@ type RunLiveValidation struct {
 
 // RunConcerns mirrors the backend's run-status concerns block (#964):
 // the run's OPEN review concerns (states raised, addressed_pending,
-// reopened). Note text is intentionally elided — read the originating
-// *_reviewed audit entry for the full note.
+// reopened). Each item carries a BOUNDED note-derived short_summary label
+// (at most 100 bytes, one line; #2488); the gate view and the originating
+// *_reviewed audit entry remain the surfaces for the full untruncated note.
 type RunConcerns struct {
 	Open    int              `json:"open" jsonschema:"number of open review concerns on the run"`
 	ByState map[string]int   `json:"by_state,omitempty" jsonschema:"open-concern count per lifecycle state (raised, addressed_pending, reopened)"`
@@ -210,6 +211,12 @@ type RunConcernItem struct {
 	Severity  string `json:"severity"`
 	Category  string `json:"category"`
 	State     string `json:"state" jsonschema:"raised, addressed_pending, or reopened"`
+	// ShortSummary is the bounded note-derived recognition label (#2488). The
+	// json tag MUST byte-match the server's short_summary or the field decodes
+	// to "" silently — this is the hand-maintained wire mirror the seam test
+	// pins. Omitted for a concern whose note is blank after whitespace
+	// collapsing.
+	ShortSummary string `json:"short_summary,omitempty" jsonschema:"bounded (at most 100 bytes, one line) note-derived recognition label for reading concerns at a glance; equal to the whole collapsed note when it fits, marked with a trailing ... when cut, absent when the note is blank. A recognition label, NOT a unique key — id remains the addressing key for fishhawk_fixup_stage concern_ids; two concerns with a long shared note prefix may share a label"`
 }
 
 // IssueContext mirrors the OpenAPI shape: the GitHub issue payload
