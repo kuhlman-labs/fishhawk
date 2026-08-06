@@ -49,11 +49,13 @@ fishhawk export       [--from RFC3339] [--to RFC3339] [--repo owner/name] [--run
 fishhawk init         [--preset low|medium|high] [--working-dir D] [--budget-usd N] [--single-reviewer] [--human-gates ids] [--force] [--repo owner/name]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
 fishhawk migrate-spec [path] [--out PATH | --in-place | --report-only]   # workflow-v1 -> v2 codemod
-fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only]
+fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only] [--skip-verify-command] [--verify-timeout D]
 fishhawk version
 ```
 
 `doctor` runs the local-loop preflight: it checks the Docker stack (daemon, postgres, minio), backend reachability + token acceptance, the committed workflow spec, the runner binary, MCP registration, the git remote/working tree, `gh` auth, and cross-binary version/schema drift. Each rung prints `ok` / `warn` / `fail` plus a remediation hint; the command exits non-zero if any rung fails (warnings alone still exit 0).
+
+Since E48.58 / #2485 `doctor` also runs a **verify command** rung that actually EXECUTES the spec's configured `executor.verify.command` — every distinct one — in a throwaway detached git worktree at HEAD, the same shape the runner provisions for its committed-tree verify gate. A fresh worktree materializes only *tracked* files, so a command that depends on a gitignored build artifact, a downloaded toolchain, a generated protobuf, or a `//go:embed`ed binary fails here in seconds instead of after an implement pass has been paid for. A non-zero exit or a timeout is a **fail** naming which command failed, its exit status, the throwaway worktree path, and a bounded tail of the captured output; an absent verify block, an unresolvable spec, an unavailable git worktree, or `--skip-verify-command` is a **warn**, never a fail (the preset explicitly permits removing the verify block). `--verify-timeout` (default `5m`) caps how long *each* command may run — the spec's own `executor.verify.timeout` wins only when it is shorter, so a preset's `15m` gate cannot silently turn `doctor` into a quarter-hour command. **This rung executes a command read from the repository's committed workflow spec**, which is the same trust boundary `doctor` already sits behind (an operator-invoked preflight in the operator's own checkout, running the same string the runner executes during every implement stage) — but it does mean `doctor` on a freshly cloned untrusted repository runs that repository's test command. `--skip-verify-command` is the opt-out.
 
 `--spec-only` runs just the two environment-free rungs — **workflow spec present** (schema validity) and **execution path configured** (every stage declares an executor *on the resolved document*, so a workflow-v2 stage that inherits its executor from a `defaults` block or an `extends` base counts) — and skips every docker/backend/token/MCP/git/gh/onboarding rung. It is the fresh-repo quick-validate path: a repo whose sole Fishhawk artifact is a generated `.fishhawk/workflows.yaml` exits 0 with no local Fishhawk environment, while a missing or schema-invalid spec still fails closed (exit non-zero). Use it right after `fishhawk init` to confirm the scaffolded spec is valid before wiring up the backend, token, and execution path.
 
@@ -198,6 +200,33 @@ documented above. Implementation notes:
 - No backend changes were needed: E29.4 ships every server-side probe.
 - `--spec-only` (E36.1 / #1639) restricts the run to the two environment-free rungs — `checkSpec` (schema validity) +
   `checkExecutionPath` (per-stage executor coverage) — and skips every docker/backend/token/MCP/git/gh/onboarding rung.
+  `checkVerifyCommand` is deliberately NOT in that set: it provisions a git worktree and spawns a subprocess, so it is
+  neither environment-free nor byte-only.
+
+## Verify-command rung internals (E48.58 / #2485)
+
+`cmd/fishhawk/doctor_verify.go` is the `verify command` rung. Four pieces:
+
+- `collectVerifyCommands(workingDir)` reads the RESOLVED document (`spec.ResolveReuse` before the shallow `yaml.v3`
+  decode, for the same reason `checkExecutionPath` does — #2340: a workflow-v2 stage may inherit its whole executor,
+  verify block included, from a `defaults` block or an `extends` base) and returns the DISTINCT non-empty
+  `executor.verify.command` values in a deterministic (sorted workflow name, then stage) order, plus a
+  `verifySpecState` distinguishing no-spec / read-error / resolve-error / parse-error / no-verify-block /
+  empty-command from the runnable case. Each state maps to exactly one warn branch.
+- `provisionDoctorWorktree(ctx, workingDir)` resolves the shared gitdir with
+  `git rev-parse --path-format=absolute --git-common-dir` — **the `--path-format=absolute` is load-bearing**: a bare
+  `--git-common-dir` returns the RELATIVE `.git` even under `-C <dir>`, which resolved against the doctor process's
+  cwd would provision the worktree, and point `cmd.Dir`, at the wrong checkout entirely. It pins HEAD once and runs
+  `git worktree add --detach <common>/fishhawk-worktrees/doctor-verify-<pid> <pinned sha>`. The returned cleanup runs
+  on every exit path (pass, fail, timeout), never depends on the caller's possibly-cancelled context, and is safe to
+  call twice. A leftover from a SIGKILLed doctor is reclaimed best-effort by `worktree remove --force` + `prune`, never
+  by an `os.RemoveAll` of a directory the rung did not create.
+- `runVerifyInWorktree` mirrors the runner's `runBoundedGateCommand` containment shape: a bounded child context,
+  `SysProcAttr{Setpgid: true}`, and a `cmd.Cancel` that SIGKILLs the whole process GROUP — SIGKILL to the direct child
+  alone leaves grandchildren holding the inherited stdout pipe and `CombinedOutput` then blocks past the deadline.
+- `checkVerifyCommand` composes them. Per the #2485 approval condition it runs EVERY distinct command with the
+  timeout cap applied PER COMMAND, is ok only when all pass, and on any non-zero exit or timeout FAILs naming which
+  command (and which stage) failed.
 
 Operator guide: `docs/onboarding.md`.
 

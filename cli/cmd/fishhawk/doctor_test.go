@@ -868,3 +868,65 @@ func TestRunDoctor_AllPass(t *testing.T) {
 		t.Errorf("stdout missing summary: %q", out)
 	}
 }
+
+// TestRunDoctor_VerifyRungRendersAndFails drives runDoctor itself — not just
+// the check function — against a repo whose committed verify command reads a
+// gitignored artifact present only in the operator checkout. The network
+// rungs are stubbed; the rendered output must carry the new rung's label and
+// the process must exit non-zero.
+func TestRunDoctor_VerifyRungRendersAndFails(t *testing.T) {
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/healthz"):
+			return fakeHTTPResponse(http.StatusOK, `{"status":"ok","version":"v0.0.0-test"}`), nil
+		case strings.HasSuffix(req.URL.Path, "/v0/onboarding/readiness"):
+			return fakeHTTPResponse(http.StatusOK, allGreenReadinessJSON), nil
+		default:
+			return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+		}
+	})
+	withFakeDoctorLookPath(t, func(name string) (string, error) { return "/usr/bin/" + name, nil })
+	withFakeDoctorRunOutput(t, func(name string, _ ...string) (string, error) {
+		return fmt.Sprintf("%s ok", name), nil
+	})
+
+	repo := newVerifyRepo(t,
+		specWithCommand("cat build/artifact", "15m"),
+		verifyRepoFile{path: ".gitignore", contents: "build/\n"},
+	)
+	writeRepoFile(t, repo, "build/artifact", "prebuilt\n")
+
+	var stdout, stderr strings.Builder
+	got := runDoctor([]string{"--working-dir", repo, "--token", "fhk_test"}, &stdout, &stderr)
+
+	out := stdout.String()
+	if !strings.Contains(out, verifyRungLabel) {
+		t.Errorf("stdout missing the %q rung:\n%s", verifyRungLabel, out)
+	}
+	if !strings.Contains(out, "No such file or directory") && !strings.Contains(out, "exited") {
+		t.Errorf("stdout does not render the verify failure:\n%s", out)
+	}
+	if got == exitOK {
+		t.Errorf("runDoctor = exitOK, want non-zero when the verify rung fails:\n%s", out)
+	}
+}
+
+// TestRunDoctor_SpecOnlyExcludesVerifyRung: --spec-only is the byte-only,
+// environment-free path, so it must NOT provision a worktree or spawn the
+// spec's command. Asserted on committed filesystem state (the marker file the
+// command would have created), not on the rendered text.
+func TestRunDoctor_SpecOnlyExcludesVerifyRung(t *testing.T) {
+	markerDir := t.TempDir()
+	marker := filepath.Join(markerDir, "spec-only-marker")
+	repo := newVerifyRepo(t, specWithCommand("touch "+marker, "15m"))
+
+	var stdout, stderr strings.Builder
+	runDoctor([]string{"--spec-only", "--working-dir", repo}, &stdout, &stderr)
+
+	if strings.Contains(stdout.String(), verifyRungLabel) {
+		t.Errorf("--spec-only rendered the %q rung:\n%s", verifyRungLabel, stdout.String())
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("--spec-only spawned the verify command (marker %s exists)", marker)
+	}
+}

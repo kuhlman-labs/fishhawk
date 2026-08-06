@@ -160,6 +160,8 @@ workflows:
             # Replace with your repository's test command (run via
             # sh -c after the agent exits). This is optional — remove the
             # whole verify block if your project has no test entrypoint.
+            # This runs in a fresh worktree — gitignored build artifacts
+            # and downloaded dependencies will not be present.
             command: "make test"
             timeout: "15m"
             max_iterations: 1

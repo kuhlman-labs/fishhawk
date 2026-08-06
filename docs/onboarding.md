@@ -13,6 +13,7 @@ command exits non-zero if any rung **fails**; warnings alone still exit 0.
 
 ```
 fishhawk doctor [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only]
+                [--skip-verify-command] [--verify-timeout D]
 ```
 
 Beyond the local-loop rungs (Docker stack, backend reachability, token
@@ -21,9 +22,35 @@ acceptance, spec presence, runner binary, MCP registration, git remote/tree,
 the per-repo prerequisites that make a repo *look* onboarded but wedge on the
 first run.
 
+### `verify command` (E48.58 / #2485)
+
+This rung EXECUTES every distinct `executor.verify.command` the spec
+configures, in a throwaway detached git worktree at HEAD — the same shape the
+runner provisions for its committed-tree verify gate. A fresh worktree
+materializes only **tracked** files, so a command that depends on a gitignored
+build artifact, a downloaded toolchain, a generated protobuf, or a
+`//go:embed`ed binary fails here in seconds rather than after an implement pass
+has been paid for.
+
+- A non-zero exit or a timeout is a **fail**, naming which command failed, its
+  exit status, the throwaway worktree path, and a bounded tail of the output.
+- An absent verify block, an unresolvable spec, an unavailable git worktree, or
+  `--skip-verify-command` is a **warn**, never a fail: the preset explicitly
+  permits removing the verify block, and `fishhawk validate` / **workflow spec
+  present** remain the authorities on a broken spec.
+- `--verify-timeout` (default `5m`) caps how long *each* command may run; the
+  spec's own `executor.verify.timeout` wins only when it is shorter, so a
+  preset's `15m` gate cannot turn `doctor` into a quarter-hour command.
+- The rung runs a command read from the repository's committed spec — the same
+  trust boundary `doctor` already sits behind, but note that running `doctor`
+  in a freshly cloned untrusted repo executes that repo's test command.
+  `--skip-verify-command` is the opt-out.
+
 ### `--spec-only`
 
-`--spec-only` restricts `doctor` to the two environment-free rungs —
+`--spec-only` restricts `doctor` to the two environment-free rungs (the
+`verify command` rung is excluded: it provisions a worktree and spawns a
+subprocess, so it is neither environment-free nor byte-only) —
 **workflow spec present** (schema validity) and **execution path configured**
 (every stage declares an executor) — and skips every docker/backend/token/MCP/
 git/gh/onboarding rung. It is the fresh-repo quick-validate path: a repo whose
@@ -120,6 +147,11 @@ fishhawk init [--preset low|medium|high] [--working-dir D] \
    - the implement stage's `executor.verify.command: "make test"` → your
      repository's test command (run via `sh -c` after the agent exits), or
      remove the whole `verify` block if your project has no test entrypoint.
+     It runs in a **fresh worktree**, so gitignored build artifacts and
+     downloaded dependencies will not be present — a command that needs
+     `node_modules/`, a downloaded toolchain, or a generated file must fetch or
+     build it itself. Plain `fishhawk doctor` now proves this by executing the
+     command in a throwaway worktree before any run is started.
 
    The placeholder is schema-valid as shipped, so `fishhawk doctor
    --spec-only` passes on the freshly-scaffolded spec before you customize

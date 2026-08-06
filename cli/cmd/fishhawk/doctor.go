@@ -55,6 +55,12 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		"run only the environment-free spec rungs (schema validity + execution-path coverage); "+
 			"skips all docker/backend/token/MCP/git/gh/onboarding checks. Use to validate a freshly "+
 			"scaffolded repo with no local Fishhawk environment.")
+	skipVerify := fs.Bool("skip-verify-command", false,
+		"skip the `verify command` rung, which executes the spec's configured "+
+			"executor.verify.command in a throwaway git worktree at HEAD")
+	verifyTimeout := fs.Duration("verify-timeout", defaultVerifyTimeout,
+		"cap on how long the `verify command` rung lets each configured command run; "+
+			"the spec's own executor.verify.timeout wins when it is shorter")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
@@ -65,6 +71,10 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	// schema-valid and declares an executor for every stage exits 0
 	// without any local Fishhawk environment; a missing/invalid spec
 	// still fails closed via checkSpec.
+	//
+	// checkVerifyCommand is deliberately EXCLUDED here: it provisions a
+	// git worktree and executes a subprocess, so it is neither
+	// environment-free nor byte-only.
 	var checks []checkResult
 	if *specOnly {
 		checks = []checkResult{
@@ -90,6 +100,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			checkToken(*cf.backendURL, *cf.token),
 			checkSpec(*workingDir),
 			checkExecutionPath(*workingDir),
+			checkVerifyCommand(*workingDir, *skipVerify, *verifyTimeout),
 			checkRunnerBinary(*runnerBinary, *workingDir),
 			checkMCPRegistration(),
 			checkGitOrigin(*workingDir),
