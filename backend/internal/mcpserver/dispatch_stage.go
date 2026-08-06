@@ -115,8 +115,9 @@ full events list, diff_summary, and next_actions in one call.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage (this tool is local-only by design, ADR-024 Q5).
-A future native MCP Tasks (invocationMode:async) mode is a later transport
-refinement that would layer onto this same handle.
+A future native MCP Tasks mode would layer onto this same handle, but it is
+unavailable today — the io.modelcontextprotocol/tasks extension (SEP-2663)
+is experimental and unimplemented in the pinned go-sdk (go-sdk#626).
 `),
 	}, resolver.dispatchStage)
 }

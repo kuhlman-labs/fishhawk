@@ -238,10 +238,11 @@ plan_stage_wait_status / implement_stage_wait_status while the status is
 non-terminal. This synchronous-with-progress call is the NEGOTIATED FALLBACK
 for clients that prefer to block (or for short stages): it runs the stage to
 completion and returns the terminal outcome, also surfacing stage_wait_status
-on the handle. A future native MCP Tasks (invocationMode:async) mode — gated
-on ADR-033 transport + MCP Tasks leaving experimental — will let this call
-return a handle immediately and poll to terminal; that mode is NOT available
-today.
+on the handle. A future native MCP Tasks mode — which would let this call
+return a handle immediately and poll to terminal — is NOT available today:
+Tasks now lives in the experimental io.modelcontextprotocol/tasks extension
+(SEP-2663) outside the core spec, and the pinned go-sdk has no Tasks support
+(go-sdk#626).
 
 Mirrors the CLI's "fishhawk runner start" verb. Pair with
 fishhawk_start_run + fishhawk_approve_plan for the full

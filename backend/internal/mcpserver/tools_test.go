@@ -2356,6 +2356,96 @@ func TestRetryStageDescription_DocumentsAcceptanceReopenArm(t *testing.T) {
 	}
 }
 
+// TestStageWaitDescriptions_NameCurrentTasksBlocker is the #2495 done-means
+// test: it asserts the WIRE-VISIBLE descriptions of fishhawk_run_stage,
+// fishhawk_dispatch_stage, and fishhawk_get_run_status no longer cite the
+// stale native-MCP-Tasks deferral gate (invocationMode, ADR-033, "MCP Tasks
+// GA"/"leaving experimental") and instead name the real blocker — the
+// experimental io.modelcontextprotocol/tasks extension (SEP-2663) is
+// unimplemented in the pinned go-sdk (go-sdk#626). A comment-only or no-op
+// touch of any of the three description sites leaves the stale strings in
+// place and fails this test, which the scope-completeness presence gate
+// cannot catch on its own (#1169).
+func TestStageWaitDescriptions_NameCurrentTasksBlocker(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+
+	descByName := make(map[string]string, len(res.Tools))
+	for _, tool := range res.Tools {
+		descByName[tool.Name] = tool.Description
+	}
+
+	tasksTools := []string{"fishhawk_run_stage", "fishhawk_dispatch_stage", "fishhawk_get_run_status"}
+	for _, name := range tasksTools {
+		desc, ok := descByName[name]
+		if !ok || desc == "" {
+			t.Errorf("%s: not registered/visible over ListTools", name)
+			continue
+		}
+		lower := strings.ToLower(desc)
+
+		if strings.Contains(lower, "invocationmode") {
+			t.Errorf("%s: description still contains %q (stale field, deleted from the current Tasks extension design):\n%s", name, "invocationMode", desc)
+		}
+		if strings.Contains(desc, "ADR-033") {
+			t.Errorf("%s: description still contains %q (the ADR-033 transport gate is satisfied — E66/#2388 shipped MCP over HTTP):\n%s", name, "ADR-033", desc)
+		}
+		if strings.Contains(desc, "MCP Tasks GA") {
+			t.Errorf("%s: description still contains %q (no such core-spec milestone exists — Tasks moved to a standalone extension):\n%s", name, "MCP Tasks GA", desc)
+		}
+		if strings.Contains(lower, "leaving experimental") {
+			t.Errorf("%s: description still contains %q (stale gate phrasing):\n%s", name, "leaving experimental", desc)
+		}
+		if !strings.Contains(desc, "io.modelcontextprotocol/tasks") {
+			t.Errorf("%s: description missing %q (the real blocker — the extension Tasks now lives in):\n%s", name, "io.modelcontextprotocol/tasks", desc)
+		}
+		if !strings.Contains(desc, "go-sdk#626") {
+			t.Errorf("%s: description missing %q (the upstream tracking issue for Tasks support in the pinned go-sdk):\n%s", name, "go-sdk#626", desc)
+		}
+		if !strings.Contains(lower, "available today") {
+			t.Errorf("%s: description missing an \"available today\" phrasing (operator-relevant unavailability fact, binding approval condition 1):\n%s", name, desc)
+		}
+	}
+
+	// fishhawk_run_stage's negotiated-fallback framing must survive the
+	// rewrite verbatim — it is the load-bearing distinction between the
+	// blessed poll-fishhawk_get_run_status path and this synchronous opt-in.
+	runStageDesc := descByName["fishhawk_run_stage"]
+	if !strings.Contains(strings.ToLower(runStageDesc), "negotiated fallback") {
+		t.Errorf("fishhawk_run_stage: description missing %q (must be preserved by the rewrite):\n%s", "negotiated fallback", runStageDesc)
+	}
+
+	// fishhawk_dispatch_stage's note must remain exactly ONE sentence
+	// (binding approval condition 2). Sentence-splitting the whole
+	// description is brittle; a single "MCP Tasks" occurrence is a stable
+	// proxy because the note is the description's only mention of Tasks.
+	dispatchDesc := descByName["fishhawk_dispatch_stage"]
+	if got := strings.Count(dispatchDesc, "MCP Tasks"); got != 1 {
+		t.Errorf("fishhawk_dispatch_stage: description contains %d occurrences of %q, want exactly 1 (the Tasks note must stay one sentence):\n%s", got, "MCP Tasks", dispatchDesc)
+	}
+}
+
 // --- get_plan (E19.4 / #344) ---
 
 // samplePlanContent returns a small but complete standard_v1
