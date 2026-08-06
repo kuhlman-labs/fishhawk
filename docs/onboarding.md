@@ -45,6 +45,13 @@ has been paid for.
   trust boundary `doctor` already sits behind, but note that running `doctor`
   in a freshly cloned untrusted repo executes that repo's test command.
   `--skip-verify-command` is the opt-out.
+- That child gets a **stripped environment**, the same default-deny allow-list
+  the runner applies to the identical `sh -c <verifyCmd>` gate child (ADR-029 /
+  #650 item 4): it sees `PATH`/`HOME`/locale/temp essentials and the
+  `GO*`/`CGO_*` toolchain vars (with any URL userinfo redacted out of
+  `GOPROXY`-style values), and never your `FISHHAWK_API_TOKEN`, forge token, or
+  agent API keys. Spec-supplied code plus network plus the invoking process's
+  credentials is the shape the stripping exists to break.
 
 ### `--spec-only`
 

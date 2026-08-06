@@ -19,6 +19,7 @@ import (
 //
 //	verifyTestDeadline  =  2s  — the rung's effective per-command timeout.
 //	verifyTestBound     = 30s  — the elapsed upper bound the test asserts.
+//	verifyTestLooseCap  = 60s  — a doctor cap deliberately LOOSER than the bound.
 //	verifyTestWedge     = 120s — how long the wedging command / grandchild lives.
 //
 // bound/deadline = 15x: a 2s deadline fires at 2s even under 5x load, and
@@ -27,9 +28,13 @@ import (
 // wedge/bound = 4x: when the group-kill control is deleted the grandchild
 // holds the output pipe for 120s, which is 4x past the bound, so the assertion
 // lands RED on the control's absence rather than on a marginal timing race.
+// looseCap/bound = 2x: when the spec-timeout min() is deleted the 60s cap
+// applies instead of the 2s spec value, which is 2x past the bound — enough to
+// land RED without doubling the suite's worst-case runtime.
 const (
 	verifyTestDeadline = 2 * time.Second
 	verifyTestBound    = 30 * time.Second
+	verifyTestLooseCap = 60 * time.Second
 	verifyTestWedge    = "120"
 )
 
@@ -450,6 +455,148 @@ func TestCheckVerifyCommand_UnparseableSpecTimeoutFallsBackToCap(t *testing.T) {
 	}
 }
 
+// TestCheckVerifyCommand_SpecTimeoutShorterThanCapWins is the OTHER direction
+// of the per-command min(): the doctor cap is verifyTestLooseCap but the spec
+// declares the much shorter verifyTestDeadline, so the SPEC value must bound
+// the command — the behavior cli/README.md and docs/onboarding.md both
+// document ("the spec's own executor.verify.timeout wins only when it is
+// shorter"). Deleting the `c.timeout < effective` branch leaves the loose cap
+// in force, which this test catches twice over: the detail would name the cap
+// rather than the spec value, and the call would outlive verifyTestBound.
+func TestCheckVerifyCommand_SpecTimeoutShorterThanCapWins(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("sleep "+verifyTestWedge, verifyTestDeadline.String()))
+
+	start := time.Now()
+	r := checkVerifyCommand(repo, false, verifyTestLooseCap)
+	elapsed := time.Since(start)
+
+	if r.status != "fail" || !strings.Contains(r.detail, "timed out") {
+		t.Fatalf("status = %q detail = %q, want a timeout fail", r.status, r.detail)
+	}
+	if !strings.Contains(r.detail, verifyTestDeadline.String()) {
+		t.Errorf("detail = %q, want it to name the SPEC timeout %s, not the looser cap %s",
+			r.detail, verifyTestDeadline, verifyTestLooseCap)
+	}
+	if elapsed > verifyTestBound {
+		t.Errorf("took %s, want under %s — the shorter spec timeout did not bound the command",
+			elapsed, verifyTestBound)
+	}
+}
+
+// TestCheckVerifyCommand_NonPositiveTimeoutFallsBackToDefault pins the
+// `if maxTimeout <= 0 { maxTimeout = defaultVerifyTimeout }` guard, reachable
+// from the CLI via `--verify-timeout 0`. Without the guard the child context is
+// constructed with an already-elapsed deadline, so even `true` never runs and
+// the rung reports a timeout fail.
+func TestCheckVerifyCommand_NonPositiveTimeoutFallsBackToDefault(t *testing.T) {
+	for _, max := range []time.Duration{0, -1 * time.Second} {
+		t.Run(max.String(), func(t *testing.T) {
+			repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+			r := checkVerifyCommand(repo, false, max)
+			if r.status != "ok" {
+				t.Errorf("status = %q with maxTimeout=%s, want ok (the default cap applies); "+
+					"detail: %s; hint: %s", r.status, max, r.detail, r.remediate)
+			}
+		})
+	}
+}
+
+// --- credential stripping (implement-review security concern) -----------------
+
+// TestCheckVerifyCommand_ChildDoesNotInheritCredentials is the end-to-end
+// counterfactual vehicle for the cmd.Env control: the command string is read
+// from the repository's committed spec, so the child must NOT see the doctor
+// process's credentials. The secret is seeded into the doctor process's own
+// environment and the command echoes it back through the rung's captured
+// output, so a child that inherits os.Environ() surfaces the marker verbatim in
+// the remediation. The same command also proves PATH survived, so the fix
+// cannot be a blanket empty environment that silently breaks every command.
+func TestCheckVerifyCommand_ChildDoesNotInheritCredentials(t *testing.T) {
+	const secret = "leak-marker-do-not-inherit"
+	t.Setenv("FISHHAWK_API_TOKEN", secret)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", secret)
+
+	repo := newVerifyRepo(t, specWithCommand(
+		`echo "token=[$FISHHAWK_API_TOKEN] aws=[$AWS_SECRET_ACCESS_KEY] path=[${PATH:+set}]"; exit 1`,
+		"15m"))
+
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	if r.status != "fail" {
+		t.Fatalf("status = %q, want fail; detail: %s; hint: %s", r.status, r.detail, r.remediate)
+	}
+	if strings.Contains(r.remediate, secret) {
+		t.Errorf("the verify child inherited a credential from the doctor process:\n%s", r.remediate)
+	}
+	if !strings.Contains(r.remediate, "token=[] aws=[] path=[set]") {
+		t.Errorf("remediate = %q, want the credentials empty AND PATH still set", r.remediate)
+	}
+}
+
+// TestSanitizeVerifyEnv pins the default-deny allow-list itself: an explicitly
+// denied key, an unrecognized key (the default-deny case that keeps a
+// LATER-introduced secret out without a list edit), the system essentials and
+// GO*/CGO_*/LC_* prefixes that must survive, a malformed entry, and userinfo
+// redaction on a credentialed GOPROXY list.
+func TestSanitizeVerifyEnv(t *testing.T) {
+	got := sanitizeVerifyEnv([]string{
+		"FISHHAWK_API_TOKEN=secret",
+		"GITHUB_TOKEN=secret",
+		"ANTHROPIC_API_KEY=secret",
+		"AWS_SECRET_ACCESS_KEY=secret",
+		"FISHHAWK_SOME_FUTURE_SECRET=secret",
+		"PATH=/usr/bin",
+		"HOME=/home/op",
+		"LC_ALL=C",
+		"CGO_ENABLED=0",
+		"GOFLAGS=-mod=mod",
+		"GOPROXY=https://u:p@proxy.example/mod,direct",
+		"NOEQUALS",
+		"=novalue",
+	})
+	set := map[string]string{}
+	for _, kv := range got {
+		k, v, _ := strings.Cut(kv, "=")
+		set[k] = v
+	}
+	for _, dropped := range []string{
+		"FISHHAWK_API_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY",
+		"AWS_SECRET_ACCESS_KEY", "FISHHAWK_SOME_FUTURE_SECRET", "NOEQUALS", "",
+	} {
+		if v, ok := set[dropped]; ok {
+			t.Errorf("key %q survived sanitization with value %q", dropped, v)
+		}
+	}
+	for k, want := range map[string]string{
+		"PATH": "/usr/bin", "HOME": "/home/op", "LC_ALL": "C",
+		"CGO_ENABLED": "0", "GOFLAGS": "-mod=mod",
+	} {
+		if set[k] != want {
+			t.Errorf("%s = %q, want %q", k, set[k], want)
+		}
+	}
+	if set["GOPROXY"] != "https://proxy.example/mod,direct" {
+		t.Errorf("GOPROXY = %q, want the userinfo stripped and the entry order preserved", set["GOPROXY"])
+	}
+}
+
+// TestRedactVerifyGoEnvUserinfo covers the redaction helper's own branches:
+// both GOPROXY separators, a non-URL value, a schemeless value, and a
+// credential-free URL (which must pass through unchanged).
+func TestRedactVerifyGoEnvUserinfo(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"off", "off"},
+		{"direct", "direct"},
+		{"user:pass@host", "user:pass@host"},
+		{"https://proxy.example/mod", "https://proxy.example/mod"},
+		{"https://u:p@a.example|https://v:q@b.example", "https://a.example|https://b.example"},
+		{"https://u:p@a.example,direct", "https://a.example,direct"},
+	} {
+		if got := redactVerifyGoEnvUserinfo(tc.in); got != tc.want {
+			t.Errorf("redactVerifyGoEnvUserinfo(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 // TestCheckVerifyCommand_DefaultsInheritedVerifyBlock (binding condition 5):
 // a spec whose executor — verify block included — is inherited via a
 // workflow-level `defaults` block must EXECUTE the rung (ok or fail), never
@@ -489,8 +636,15 @@ workflows:
 // stages declaring DIFFERENT commands both run, and a failure in the SECOND
 // fails the rung naming that command — the first passing must not
 // short-circuit the check.
+//
+// The FIRST command's execution is asserted directly, via a marker file it
+// creates OUTSIDE the throwaway worktree (so the worktree's removal cannot
+// erase the evidence). Asserting only the second command's failure would leave
+// the binding "run EVERY distinct command" behavior unpinned: a loop that ran
+// only the LAST candidate would produce a byte-identical checkResult.
 func TestCheckVerifyCommand_EveryDistinctCommandRuns(t *testing.T) {
-	repo := newVerifyRepo(t, `version: "2"
+	marker := filepath.Join(t.TempDir(), "first-ran")
+	repo := newVerifyRepo(t, fmt.Sprintf(`version: "2"
 workflows:
   feature_change:
     stages:
@@ -499,7 +653,7 @@ workflows:
         executor:
           agent: claude-code
           verify:
-            command: "true"
+            command: "touch %s"
             timeout: "15m"
       - id: second
         type: implement
@@ -508,10 +662,13 @@ workflows:
           verify:
             command: "echo second-marker; exit 5"
             timeout: "15m"
-`)
+`, marker))
 	r := checkVerifyCommand(repo, false, verifyTestDeadline)
 	if r.status != "fail" {
 		t.Fatalf("status = %q, want fail (the second command exits 5); detail: %s", r.status, r.detail)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("marker %s absent (%v) — the FIRST command never executed", marker, err)
 	}
 	if !strings.Contains(r.detail, "second-marker") || !strings.Contains(r.detail, "exited 5") {
 		t.Errorf("detail = %q, want it to name WHICH command failed and its exit status", r.detail)

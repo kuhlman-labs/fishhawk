@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -255,6 +256,146 @@ func provisionDoctorWorktree(ctx context.Context, workingDir string) (string, fu
 	return target, cleanup, nil
 }
 
+// --- credential stripping for the spec-supplied child ------------------------
+//
+// This rung executes a command string read from the repository's committed
+// workflow spec. That is the same `sh -c <verifyCmd>` child the RUNNER executes
+// during every implement stage — and the runner does NOT let it inherit the
+// runner's process environment, for the reason ADR-029 (#650) item 4 states:
+// agent-authored code plus network plus the invoking process's credentials is
+// the lethal-trifecta shape. Running the same string from `doctor` without the
+// same stripping would move that execution to the OPERATOR's machine while
+// handing the child the operator's `FISHHAWK_API_TOKEN`, GitHub token, and
+// agent API keys — a strictly larger exfiltration surface than the runner's,
+// which is what makes the stripping load-bearing here and not merely tidy.
+//
+// The policy mirrors runner/cmd/fishhawk-runner/gateenv.go: DEFAULT-DENY
+// (allow-list), so a credential env var introduced later is dropped
+// automatically, plus an explicit known-secret denylist as belt-and-suspenders.
+// The two lists are deliberately duplicated rather than shared: `cli` and
+// `runner` are separate Go modules and the runner's copy lives in package main.
+
+// verifyEnvAllowExact is the set of system-essential variable names a verify
+// command needs to run at all: PATH to find its interpreter and tools, HOME for
+// the default GOPATH/GOCACHE when those are unset, plus the usual
+// locale/terminal/temp essentials.
+var verifyEnvAllowExact = map[string]struct{}{
+	"PATH":    {},
+	"HOME":    {},
+	"USER":    {},
+	"LOGNAME": {},
+	"SHELL":   {},
+	"TMPDIR":  {},
+	"TMP":     {},
+	"TEMP":    {},
+	"TERM":    {},
+	"TZ":      {},
+	"LANG":    {},
+	"CC":      {},
+	"CXX":     {},
+}
+
+// verifyEnvAllowPrefix lists key prefixes admitted wholesale: every GO* var
+// (GOPATH/GOCACHE/GOMODCACHE/GOPROXY/GOFLAGS/GOTOOLCHAIN/…), every CGO_* var,
+// and every LC_* locale var. Dropping the GO* prefix would turn a real verify
+// failure into a spurious one on any host with a private module proxy or a
+// non-default toolchain.
+var verifyEnvAllowPrefix = []string{"GO", "CGO_", "LC_"}
+
+// verifyEnvDeny is the explicit known-secret denylist layered on top of the
+// default-deny allow-list. These keys are dropped unconditionally.
+var verifyEnvDeny = map[string]struct{}{
+	"FISHHAWK_GITHUB_TOKEN": {},
+	"FISHHAWK_GITLAB_TOKEN": {},
+	"GITHUB_TOKEN":          {},
+	"GH_TOKEN":              {},
+	"ANTHROPIC_API_KEY":     {},
+	"OPENAI_API_KEY":        {},
+	"FISHHAWK_API_TOKEN":    {},
+}
+
+// sanitizedVerifyEnv returns the allow-listed environment assigned to the
+// verify child's cmd.Env. Assigning a non-nil cmd.Env replaces the child's
+// environment wholesale (os/exec.Cmd.Env: "If Env is nil, the new process uses
+// the current process's environment"), so the child sees only these entries.
+func sanitizedVerifyEnv() []string {
+	return sanitizeVerifyEnv(os.Environ())
+}
+
+// sanitizeVerifyEnv applies the default-deny allow-list to base (a slice of
+// "KEY=VALUE" entries). It is the testable inner core of sanitizedVerifyEnv.
+func sanitizeVerifyEnv(base []string) []string {
+	out := make([]string, 0, len(base))
+	for _, kv := range base {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
+			// No '=' (malformed) or an empty key — not a usable assignment.
+			continue
+		}
+		key := kv[:eq]
+		if _, denied := verifyEnvDeny[key]; denied {
+			continue
+		}
+		if !verifyEnvAllowed(key) {
+			continue
+		}
+		if strings.HasPrefix(key, "GO") {
+			// GOPROXY/GOSUMDB may embed operator credentials in a URL; strip
+			// the userinfo before the value reaches spec-supplied code.
+			out = append(out, key+"="+redactVerifyGoEnvUserinfo(kv[eq+1:]))
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+// verifyEnvAllowed reports whether key is on the allow-list (exact match or an
+// allowed prefix).
+func verifyEnvAllowed(key string) bool {
+	if _, ok := verifyEnvAllowExact[key]; ok {
+		return true
+	}
+	for _, p := range verifyEnvAllowPrefix {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// redactVerifyGoEnvUserinfo strips embedded URL userinfo from a GO* env value.
+// The value may be a list of proxy entries separated by ',' (fall through on
+// 404/410) or '|' (fall through on any error) per the GOPROXY protocol
+// (https://go.dev/ref/mod#goproxy-protocol); both separators and the entry
+// order are preserved exactly.
+func redactVerifyGoEnvUserinfo(value string) string {
+	var b strings.Builder
+	start := 0
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c == ',' || c == '|' {
+			b.WriteString(redactVerifyURLEntryUserinfo(value[start:i]))
+			b.WriteByte(c)
+			start = i + 1
+		}
+	}
+	b.WriteString(redactVerifyURLEntryUserinfo(value[start:]))
+	return b.String()
+}
+
+// redactVerifyURLEntryUserinfo returns entry with any embedded URL userinfo
+// removed. net/url.Parse populates URL.User only when the entry has a scheme,
+// so non-URL forms (off, direct, a bare 'user:pass@host', or a parse error)
+// pass through verbatim.
+func redactVerifyURLEntryUserinfo(entry string) string {
+	u, err := url.Parse(entry)
+	if err != nil || u.Scheme == "" || u.User == nil {
+		return entry
+	}
+	u.User = nil
+	return u.String()
+}
+
 // runVerifyInWorktree executes `sh -c command` in dir under a bounded
 // context, returning the exit code (-1 when the command could not be run
 // or was killed), the combined output, and whether the deadline fired.
@@ -271,6 +412,9 @@ func runVerifyInWorktree(ctx context.Context, dir, command string, timeout time.
 
 	cmd := exec.CommandContext(childCtx, "sh", "-c", command) //nolint:gosec
 	cmd.Dir = dir
+	// The command string comes from the repository's committed spec, so the
+	// child never inherits the doctor process's credentials (see above).
+	cmd.Env = sanitizedVerifyEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -289,7 +433,12 @@ func runVerifyInWorktree(ctx context.Context, dir, command string, timeout time.
 			exitCode = -1
 		}
 	}
-	timedOut := errors.Is(childCtx.Err(), context.DeadlineExceeded)
+	// The deadline is only a TIMEOUT verdict when it actually cost the command
+	// its run. Classifying on childCtx.Err() alone races: a command that exits
+	// 0 microseconds before the deadline fires would be reported timedOut with
+	// exitCode 0, turning a real pass into a spurious preflight fail. Requiring
+	// cmdErr != nil removes that window — a successful run never carries one.
+	timedOut := cmdErr != nil && errors.Is(childCtx.Err(), context.DeadlineExceeded)
 	return exitCode, string(output), timedOut
 }
 
