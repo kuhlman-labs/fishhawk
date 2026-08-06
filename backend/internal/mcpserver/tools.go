@@ -1554,8 +1554,9 @@ poll_interval_seconds (30s) — re-call get_run_status on that cadence until
 the status goes terminal. (The interval is dropped once the run itself is
 terminal, so the wait never strands.) fishhawk_run_stage's
 synchronous-with-progress call is the negotiated fallback for clients that
-prefer to block; a future native MCP Tasks (invocationMode:async) mode is
-deferred (ADR-033 transport + MCP Tasks GA).
+prefer to block; a future native MCP Tasks mode is unavailable today — the
+experimental io.modelcontextprotocol/tasks extension (SEP-2663) is
+unimplemented in the pinned go-sdk (go-sdk#626).
 
 When the workflow declares an acceptance stage (E31.9 / ADR-049) the response
 also carries acceptance_stage_wait_status (same StageWaitStatus shape; omitted
