@@ -5364,6 +5364,34 @@ func TestDeployGate_RequiredUpstreamCIGreenMet(t *testing.T) {
 	}
 }
 
+// TestDeployCIGreen_NilSnapshot_NotSatisfied pins the call-site guard
+// narrowing (#2497): deployCIGreen dropped its own `RequiredChecksSnapshot
+// == nil` guard and now resolves the nil-snapshot verdict through
+// aggregateCIGreen (which returns nil → unsatisfied). A deploy run whose
+// evaluated upstream carries a NIL snapshot but has a passing implement-stage
+// check must still report the ci_green pre-flight signal as NOT satisfied —
+// the guard narrowing must not silently flip a fail-closed deploy gate to
+// fail-open. The passing check is seeded by construction so the RED (if the
+// nil arm were removed) lands on the refusal assertion, not on setup.
+func TestDeployCIGreen_NilSnapshot_NotSatisfied(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	scs := newFakeStageCheckRepo()
+	s.cfg.StageCheckRepo = scs
+
+	stage, runRow := seedDeployRun(rr, "release", deploySpecUpstreamCIGreen)
+	// Deliberately NO RequiredChecksSnapshot on the run (nil — the common
+	// local path), yet a green implement-stage check is recorded.
+	runRow.RequiredChecksSnapshot = nil
+	implStage := rr.seedStageOnRun(runRow.ID, run.StageTypeImplement, run.StageStateSucceeded)
+	success := "success"
+	scs.byKey[scs.keyFor(implStage.ID, "ci/build")] = &stagecheck.Check{
+		StageID: implStage.ID, Name: "ci/build", Status: "completed", Conclusion: &success,
+	}
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	assertDeployRefused(t, w, rr, au, stage, "deploy_upstream_not_satisfied")
+}
+
 // seedUpstreamRun points a deploy run's UpstreamRunID at a freshly-seeded
 // upstream feature_change run (E23.11 / #1417) and returns the upstream run so
 // the caller can furnish its ci_green / review_merged state. The deploy run

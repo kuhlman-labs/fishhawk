@@ -118,7 +118,7 @@ func (s *Server) reevaluateCIPolicyForPR(
 			slog.String("error", err.Error()))
 		return
 	}
-	newCI := aggregateCIGreen(parent.RequiredChecksSnapshot.Contexts, checks)
+	newCI := aggregateCIGreen(parent.RequiredChecksSnapshot, checks)
 
 	if priorCIGreenEqual(prior.Applied.CIGreen, newCI) {
 		return
@@ -203,27 +203,40 @@ func (s *Server) latestPolicyEvaluatedPayload(ctx context.Context, runID, stageI
 	return nil, nil
 }
 
-// aggregateCIGreen folds the latest stage_checks state for a set
-// of required check names into a single ci_green value.
+// aggregateCIGreen folds the latest stage_checks state for a run's
+// required-checks snapshot into a single ci_green value.
 //
-//   - true: every required check has reported and every one is in
-//     the pass bucket.
+//   - true:  a present snapshot whose every required check has
+//     reported and is in the pass bucket. A present-but-EMPTY
+//     Contexts list also folds to true — a repository that
+//     genuinely declares zero required checks is vacuously green.
 //   - false: at least one required check is in the fail bucket
 //     (failure is decisive — we don't wait for siblings).
-//   - nil:  no fails recorded yet but at least one required check
-//     hasn't reported terminally.
+//   - nil:   UNKNOWN. Either the snapshot is absent (snap == nil —
+//     "we never looked up branch protection"; an absent snapshot is
+//     NOT a pass, #2497), or no fails are recorded yet but at least
+//     one declared required check hasn't reported terminally.
+//
+// The nil-snapshot arm is the #2497 fix: it distinguishes "zero
+// required checks are declared" (a present empty snapshot → green)
+// from "we never looked" (absent snapshot → unknown). Previously the
+// caller passed snap.Contexts, so a nil snapshot folded to the same
+// vacuous true as an empty declared list.
 //
 // `fishhawk_audit_complete` is excluded — it's Fishhawk's own
 // derived check (#229) and would create a circular dependency if
 // folded into ci_green.
-func aggregateCIGreen(required []string, checks []*stagecheck.Check) *bool {
+func aggregateCIGreen(snap *run.RequiredChecksSnapshot, checks []*stagecheck.Check) *bool {
+	if snap == nil {
+		return nil
+	}
 	latestByName := make(map[string]*stagecheck.Check, len(checks))
 	for _, c := range checks {
 		latestByName[c.Name] = c
 	}
 	sawFail := false
 	sawPending := false
-	for _, name := range required {
+	for _, name := range snap.Contexts {
 		if name == auditCompleteCheckName {
 			continue
 		}

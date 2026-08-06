@@ -610,3 +610,71 @@ func TestReevaluateCIPolicy_VerificationSignalAbsent_ViolatesOnReeval(t *testing
 		t.Errorf("Violations = %+v, want the missing-verification-evidence violation", got.Violations)
 	}
 }
+
+// TestAggregateCIGreen_Table pins the empty-vs-nil boundary from both
+// sides (#2497). aggregateCIGreen takes the *run.RequiredChecksSnapshot
+// itself, not a bare []string, so an ABSENT snapshot (nil) folds to nil
+// (UNKNOWN — we never looked up branch protection) while a present-but-
+// empty Contexts list stays vacuously true (a repo that genuinely
+// declares zero required checks).
+func TestAggregateCIGreen_Table(t *testing.T) {
+	pass := &stagecheck.Check{Name: "ci_pass", Status: "completed", Conclusion: ptrStr("success")}
+	fail := &stagecheck.Check{Name: "ci_pass", Status: "completed", Conclusion: ptrStr("failure")}
+
+	cases := []struct {
+		name   string
+		snap   *run.RequiredChecksSnapshot
+		checks []*stagecheck.Check
+		want   *bool
+	}{
+		{
+			// The #2497 regression AND the counterfactual vehicle: a nil
+			// snapshot with an observed passing check that is not declared
+			// anywhere must NOT fold to green. Deleting the `if snap == nil
+			// { return nil }` arm makes this return a non-nil true and the
+			// case go RED. Bad state is seeded by construction (a nil
+			// pointer literal), not by calling the control in setup.
+			name:   "nil snapshot with a passing check is unknown",
+			snap:   nil,
+			checks: []*stagecheck.Check{pass},
+			want:   nil,
+		},
+		{
+			name:   "present but empty snapshot is vacuously green",
+			snap:   &run.RequiredChecksSnapshot{Contexts: nil},
+			checks: nil,
+			want:   boolPtr(true),
+		},
+		{
+			name:   "present snapshot all pass is green",
+			snap:   &run.RequiredChecksSnapshot{Contexts: []string{"ci_pass"}},
+			checks: []*stagecheck.Check{pass},
+			want:   boolPtr(true),
+		},
+		{
+			name:   "one declared check failing is red",
+			snap:   &run.RequiredChecksSnapshot{Contexts: []string{"ci_pass"}},
+			checks: []*stagecheck.Check{fail},
+			want:   boolPtr(false),
+		},
+		{
+			name:   "one declared check unreported is unknown",
+			snap:   &run.RequiredChecksSnapshot{Contexts: []string{"ci_pass"}},
+			checks: nil,
+			want:   nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := aggregateCIGreen(tc.snap, tc.checks)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("aggregateCIGreen = %v, want nil (unknown)", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("aggregateCIGreen = nil, want %v", *tc.want)
+			case tc.want != nil && got != nil && *got != *tc.want:
+				t.Fatalf("aggregateCIGreen = %v, want %v", *got, *tc.want)
+			}
+		})
+	}
+}

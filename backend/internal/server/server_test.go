@@ -1026,3 +1026,219 @@ func TestServer_LiftedListenAddrBindsConfigAddr(t *testing.T) {
 		t.Fatalf("Start = %v; the lifted off-host bind failed its real bind/verify sequence", err)
 	}
 }
+
+// --- #2497: required-checks resolution (nil vs empty snapshot) -------------
+
+// seedSnapshotRun re-seeds the harness run with the given required-checks
+// snapshot pointer (nil = absent = unresolved). Keeps Drive on and the
+// running state so ObserveParkedReviewForDrive processes it.
+func (h *driveObserverHarness) seedSnapshotRun(snap *run.RequiredChecksSnapshot) {
+	h.repo.seedRun(&run.Run{
+		ID: h.runID, Drive: true, State: run.StateRunning,
+		RequiredChecksSnapshot: snap,
+	})
+}
+
+// lastAdvance returns the final drive advance stamped this tick.
+func (h *driveObserverHarness) lastAdvance(t *testing.T) drive.Advance {
+	t.Helper()
+	advances := h.driveAdvances(t)
+	if len(advances) == 0 {
+		t.Fatal("no drive advances stamped")
+	}
+	return advances[len(advances)-1]
+}
+
+// TestObserveParkedReview_NilSnapshot_StampsUnresolvedDetail is the wording
+// counterfactual vehicle (#2497). A nil snapshot (the common local-loop path)
+// still stamps checks_green_awaiting_merge with action merge_pr — so the local
+// loop is NOT wedged and delegation's may_merge input is preserved — but the
+// Event and next_action.Detail carry the unresolved phrasing and make no
+// "green" claim. Deleting the unresolved branch of checksMergeDetail /
+// checksEvidencePhrase (hardcoding the green string) turns these assertions
+// RED.
+func TestObserveParkedReview_NilSnapshot_StampsUnresolvedDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedSnapshotRun(nil) // absent snapshot: protection never looked up
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	adv := h.lastAdvance(t)
+	if adv.Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("rule = %q, want checks_green_awaiting_merge (local loop must not wedge)", adv.Rule)
+	}
+	if adv.To != "awaiting_merge" {
+		t.Errorf("To = %q, want awaiting_merge", adv.To)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "merge_pr" {
+		t.Fatalf("NextAction = %+v, want merge_pr (delegation may_merge input preserved)", adv.NextAction)
+	}
+	if strings.Contains(adv.NextAction.Detail, "green") {
+		t.Errorf("Detail = %q, must not claim checks are green on an unresolved run", adv.NextAction.Detail)
+	}
+	if !strings.Contains(adv.NextAction.Detail, "not resolved") {
+		t.Errorf("Detail = %q, want the unresolved-checks wording", adv.NextAction.Detail)
+	}
+	if strings.Contains(adv.Event, "green") {
+		t.Errorf("Event = %q, must not claim green on an unresolved run", adv.Event)
+	}
+	if !strings.Contains(adv.Event, "not resolved") {
+		t.Errorf("Event = %q, want the unresolved-checks wording", adv.Event)
+	}
+}
+
+// TestObserveParkedReview_EmptySnapshot_StampsGreenPhrasing pins the
+// non-regression the issue's done-means requires: a present-but-EMPTY snapshot
+// (a repo that genuinely declares zero required checks) is vacuously green and
+// advances normally with the green phrasing — the empty case must NOT inherit
+// the unresolved wording.
+func TestObserveParkedReview_EmptySnapshot_StampsGreenPhrasing(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedSnapshotRun(&run.RequiredChecksSnapshot{Contexts: nil})
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	adv := h.lastAdvance(t)
+	if adv.Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("rule = %q, want checks_green_awaiting_merge", adv.Rule)
+	}
+	if !strings.Contains(adv.NextAction.Detail, "required checks are green") {
+		t.Errorf("Detail = %q, want the green phrasing for a genuinely-zero-required-checks repo", adv.NextAction.Detail)
+	}
+	if strings.Contains(adv.NextAction.Detail, "not resolved") {
+		t.Errorf("Detail = %q, an empty (present) snapshot must not carry the unresolved wording", adv.NextAction.Detail)
+	}
+}
+
+// TestObserveParkedReview_AllChecksPass_StampsGreenPhrasing pins a present
+// snapshot whose single required context is recorded StatePass: green phrasing.
+func TestObserveParkedReview_AllChecksPass_StampsGreenPhrasing(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedSnapshotRun(&run.RequiredChecksSnapshot{Contexts: []string{"ci_pass"}})
+	h.scs.seed(h.stage.ID, "ci_pass", stagecheck.StatePass)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	adv := h.lastAdvance(t)
+	if adv.Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("rule = %q, want checks_green_awaiting_merge", adv.Rule)
+	}
+	if !strings.Contains(adv.NextAction.Detail, "required checks are green") {
+		t.Errorf("Detail = %q, want the green phrasing on an all-pass snapshot", adv.NextAction.Detail)
+	}
+}
+
+// TestObserveParkedReview_UnreportedRequiredCheck_StampsNothing pins the
+// total-Actions-outage posture the issue reports, once a snapshot EXISTS: a
+// present snapshot whose required context has no row at all is unknown (not
+// green, not failed) — the observer stamps only reviews_settled_gate, never
+// awaiting_merge or ci_failed.
+func TestObserveParkedReview_UnreportedRequiredCheck_StampsNothing(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedSnapshotRun(&run.RequiredChecksSnapshot{Contexts: []string{"ci_pass"}})
+	// No row seeded for ci_pass: unreported.
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 1 || advances[0].Rule != drive.RuleReviewsSettledGate {
+		t.Fatalf("run_auto_advanced = %+v, want only reviews_settled_gate on an unreported required check", advances)
+	}
+}
+
+// TestObserveParkedReview_FailedRequiredCheck_StampsCIFailed pins that the
+// resolved-and-red mirror survives the `resolved && !green` refactor: a present
+// snapshot whose required context is StateFail still stamps ci_failed.
+func TestObserveParkedReview_FailedRequiredCheck_StampsCIFailed(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedSnapshotRun(&run.RequiredChecksSnapshot{Contexts: []string{"ci_pass"}})
+	h.scs.seed(h.stage.ID, "ci_pass", stagecheck.StateFail)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	adv := h.lastAdvance(t)
+	if adv.Rule != drive.RuleCIFailed {
+		t.Fatalf("rule = %q, want ci_failed on a red required check", adv.Rule)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "classify_ci_failure" {
+		t.Errorf("NextAction = %+v, want classify_ci_failure", adv.NextAction)
+	}
+}
+
+// TestObserveParkedReview_NilSnapshot_AcceptancePending_UnresolvedDetail pins
+// binding approval condition 1: a nil-snapshot run on an acceptance-declaring
+// workflow with a pending acceptance stage stamps acceptance_pending whose
+// Event and Detail carry the unresolved phrasing (no "green" claim). Every
+// local run has a nil snapshot, so this is the common local acceptance path.
+func TestObserveParkedReview_NilSnapshot_AcceptancePending_UnresolvedDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	// seedAcceptanceObserverRun re-seeds WITHOUT a snapshot (nil).
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateRunning))
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	adv := h.lastAdvance(t)
+	if adv.Rule != drive.RuleAcceptancePending {
+		t.Fatalf("rule = %q, want acceptance_pending", adv.Rule)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "await_acceptance" {
+		t.Fatalf("NextAction = %+v, want await_acceptance", adv.NextAction)
+	}
+	if strings.Contains(adv.NextAction.Detail, "green") {
+		t.Errorf("Detail = %q, must not claim green on an unresolved acceptance park", adv.NextAction.Detail)
+	}
+	if !strings.Contains(adv.NextAction.Detail, "not resolved") {
+		t.Errorf("Detail = %q, want the unresolved-checks wording", adv.NextAction.Detail)
+	}
+	if strings.Contains(adv.Event, "green") {
+		t.Errorf("Event = %q, must not claim green on an unresolved acceptance park", adv.Event)
+	}
+}
+
+// TestObserveParkedReview_NilSnapshot_AcceptanceTriage_UnresolvedDetail and
+// _OutcomeUnknown_ pin condition 1 across the other two acceptance parks: on a
+// nil-snapshot run each carries the unresolved phrasing in its Detail.
+func TestObserveParkedReview_NilSnapshot_AcceptanceTriage_UnresolvedDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	seedAcceptanceOutcome(h.au, h.runID, 30, acceptanceVerdictFailed)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	adv := h.lastAdvance(t)
+	if adv.Rule != drive.RuleAcceptanceTriage {
+		t.Fatalf("rule = %q, want acceptance_triage", adv.Rule)
+	}
+	if strings.Contains(adv.NextAction.Detail, "green") {
+		t.Errorf("Detail = %q, must not claim green on an unresolved acceptance_triage park", adv.NextAction.Detail)
+	}
+	if !strings.Contains(adv.NextAction.Detail, "not resolved") {
+		t.Errorf("Detail = %q, want the unresolved-checks wording", adv.NextAction.Detail)
+	}
+}
+
+func TestObserveParkedReview_NilSnapshot_AcceptanceOutcomeUnknown_UnresolvedDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded)) // terminal, no verdict
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	adv := h.lastAdvance(t)
+	if adv.Rule != drive.RuleAcceptanceOutcomeUnknown {
+		t.Fatalf("rule = %q, want acceptance_settled_outcome_unknown", adv.Rule)
+	}
+	if strings.Contains(adv.NextAction.Detail, "green") {
+		t.Errorf("Detail = %q, must not claim green on an unresolved acceptance_outcome_unknown park", adv.NextAction.Detail)
+	}
+	if !strings.Contains(adv.NextAction.Detail, "not resolved") {
+		t.Errorf("Detail = %q, want the unresolved-checks wording", adv.NextAction.Detail)
+	}
+}

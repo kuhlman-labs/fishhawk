@@ -3183,7 +3183,7 @@ func (s *Server) deployCIGreen(ctx context.Context, runRow *run.Run) bool {
 	if evalRun == nil {
 		return false
 	}
-	if evalRun.RequiredChecksSnapshot == nil || s.cfg.StageCheckRepo == nil {
+	if s.cfg.StageCheckRepo == nil {
 		return false
 	}
 	implStage := s.findImplementStage(ctx, evalRun.ID)
@@ -3198,7 +3198,12 @@ func (s *Server) deployCIGreen(ctx context.Context, runRow *run.Run) bool {
 		)
 		return false
 	}
-	g := aggregateCIGreen(evalRun.RequiredChecksSnapshot.Contexts, checks)
+	// A nil RequiredChecksSnapshot now resolves through aggregateCIGreen
+	// returning nil (unknown, #2497), which `g != nil && *g` maps to false
+	// — the same fail-closed verdict the removed `== nil` guard gave, but
+	// routed through the single chokepoint so the aggregate's nil arm is
+	// reachable from a caller and counterfactually testable.
+	g := aggregateCIGreen(evalRun.RequiredChecksSnapshot, checks)
 	return g != nil && *g
 }
 

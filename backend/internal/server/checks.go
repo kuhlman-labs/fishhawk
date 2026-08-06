@@ -109,6 +109,16 @@ func (s *Server) handleListStageChecks(w http.ResponseWriter, r *http.Request) {
 	// pre-dates the snapshot wiring or skipped protection lookup
 	// (CLI / UI flow) renders an empty declared list and the SPA
 	// falls back to "no checks declared yet".
+	//
+	// #2497: this response's `declared: []` cannot distinguish an
+	// ABSENT snapshot (protection was never looked up — greenness
+	// unknown) from a present-but-EMPTY one (a repo that genuinely
+	// declares zero required checks — vacuously green); telling them
+	// apart would need a new API field, deliberately NOT added here.
+	// So consumers MUST NOT read an empty declared list as evidence
+	// that required checks are green. The surface that DOES make the
+	// nil-vs-empty distinction is reviewChecksResolution (server.go),
+	// whose tri-state gates the drive awaiting_merge stamp.
 	declared := []string{}
 	sources := []string{}
 	runRow, runErr := s.cfg.RunRepo.GetRun(r.Context(), stage.RunID)
