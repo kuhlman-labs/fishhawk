@@ -162,8 +162,10 @@ fishhawk init [--preset low|medium|high] [--working-dir D] \
      It runs in a **fresh worktree**, so gitignored build artifacts and
      downloaded dependencies will not be present — a command that needs
      `node_modules/`, a downloaded toolchain, or a generated file must fetch or
-     build it itself. Plain `fishhawk doctor` now proves this by executing the
-     command in a throwaway worktree before any run is started.
+     build it itself. `fishhawk doctor --run-verify-command` proves this by
+     executing the command in a throwaway worktree before any run is started;
+     plain `doctor` only warns, because execution is opt-in (see the
+     `verify command` rung above).
 
    The placeholder is schema-valid as shipped, so `fishhawk doctor
    --spec-only` passes on the freshly-scaffolded spec before you customize
