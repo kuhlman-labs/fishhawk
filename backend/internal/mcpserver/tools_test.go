@@ -9266,3 +9266,391 @@ func TestStartRun_AppliesToOverride_DefaultsOff(t *testing.T) {
 		t.Errorf("override defaulted on: %+v", fb.createRunBody)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ADR-077 / #2508 — response byte budget, driven through the REAL handler
+// ---------------------------------------------------------------------------
+
+// worstCase knobs one adversarial failed-run shape.
+type worstCase struct {
+	name              string
+	stages            int
+	failureReasonLen  int
+	nextActions       int
+	nextActionFieldLn int
+	auditEntries      int
+	auditArrayLen     int
+	autoAdvanced      int
+	concerns          int
+	securityFindings  int
+	freeTextPoison    bool
+}
+
+// newWorstCaseFailedRun seeds the observed failure shape on the shared
+// fakeBackend seam. Every knob is independently adversarial.
+func newWorstCaseFailedRun(t *testing.T, c worstCase) (*httptest.Server, uuid.UUID) {
+	t.Helper()
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+
+	poison := ""
+	if c.freeTextPoison {
+		poison = "<script>&</script>  \x00\x1f\xff\xc0\xaf " + strings.Repeat("日本 ", 200)
+	}
+
+	run := Run{
+		ID: runID.String(), Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+		State: "failed", TriggerSource: "issue",
+		IssueContext: &IssueContext{
+			Title: "an issue" + poison, Body: strings.Repeat("issue body "+poison, 200),
+			URL: "https://example/issues/1", Number: 2508,
+			Comments: []IssueComment{{Author: "a", Body: strings.Repeat("comment "+poison, 200), CreatedAt: "t"}},
+		},
+		LiveValidation: &RunLiveValidation{PendingCriteriaCount: 2, WalkRef: "#2509"},
+	}
+	for i := 0; i < 4; i++ {
+		run.ReviewAuthority = append(run.ReviewAuthority, RunReviewAuthority{
+			Stage: fmt.Sprintf("s%d", i), StageType: "implement", Authority: "advisory", Source: "derived",
+		})
+	}
+	if c.concerns > 0 {
+		run.Concerns = &RunConcerns{Open: c.concerns, ByState: map[string]int{"raised": c.concerns}}
+		for i := 0; i < c.concerns; i++ {
+			run.Concerns.Items = append(run.Concerns.Items, RunConcernItem{
+				ID: uuid.NewString(), StageKind: "implement", Severity: "high",
+				Category: "correctness", State: "raised",
+			})
+		}
+	}
+	fb.getRunByID[runID] = run
+	if c.autoAdvanced > 0 {
+		var advances []any
+		for i := 0; i < c.autoAdvanced; i++ {
+			advances = append(advances, map[string]any{
+				"rule": "reviews_settled_gate", "from": "implement_reviewed",
+				"to": "awaiting_merge", "ts": "2026-08-01T00:00:00Z",
+			})
+		}
+		fb.getRunExtraByID[runID] = map[string]any{"drive": true, "auto_advanced": advances}
+	}
+
+	reason := strings.Repeat("boom "+poison, 1+c.failureReasonLen/8)
+	var stages []Stage
+	for i := 0; i < c.stages; i++ {
+		st := Stage{
+			ID: uuid.NewString(), RunID: runID.String(), Sequence: i + 1,
+			Type: "implement", Executor: StageExecutor{Kind: "agent", Ref: "claude"},
+			State: "failed", FailureCategory: strptr("category_a"),
+		}
+		if c.failureReasonLen > 0 {
+			r := reason
+			st.FailureReason = &r
+		}
+		stages = append(stages, st)
+	}
+	if len(stages) > 0 {
+		stages[0].Type = "plan"
+		stages[0].State = "succeeded"
+		stages[0].FailureCategory = nil
+		stages[0].FailureReason = nil
+	}
+	fb.stagesByRun[runID] = stages
+
+	for i := 0; i < c.auditEntries; i++ {
+		payload := map[string]any{"detail": "d"}
+		if c.auditArrayLen > 0 {
+			// Purely STRUCTURAL bulk: a long array of short strings, which
+			// truncateAuditPayloadStrings does not touch.
+			arr := make([]any, c.auditArrayLen)
+			for j := range arr {
+				arr[j] = "s"
+			}
+			payload["rows"] = arr
+		}
+		seedRecentAuditPayload(fb, runID, "cost_recorded", payload)
+	}
+	for i := 0; i < 3; i++ {
+		seedImplementReviewAudit(fb, runID, PlanReview{
+			ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory",
+			Verdict:  "approve_with_concerns",
+			Concerns: []PlanReviewConcern{{Severity: "high", Category: "security", Note: strings.Repeat("note "+poison, 50)}},
+			FreeForm: strings.Repeat("prose "+poison, 50),
+		})
+	}
+	if c.securityFindings > 0 {
+		var findings []securityscan.Finding
+		for i := 0; i < c.securityFindings; i++ {
+			findings = append(findings, securityscan.Finding{
+				Number: i, RuleID: "go/sql-injection", Severity: "high",
+				Description: strings.Repeat("desc "+poison, 20),
+				Path:        "backend/internal/x.go", StartLine: i, State: "open", HTMLURL: "https://example/alert",
+			})
+		}
+		seedSecurityFindingsAudit(fb, runID, findings)
+	}
+	seedCacheEfficiency(fb, runID, CacheEfficiency{
+		CacheReadRatio: 0.5, ReuseFactor: 2, NetSavingsUSD: 16.75,
+		Stages: []CacheEfficiencyStage{
+			{Source: "agent", FreshInputTokens: 2_000_000, CacheReadRatio: 0.5, NetSavingsUSD: 4.0},
+			{Source: "implement_review", CacheReadRatio: 0.5, NetSavingsUSD: 4.5},
+			{Source: "plan_review", CacheReadRatio: 0.75, ReuseFactor: 3.0, NetSavingsUSD: 12.25},
+		},
+	})
+	seedRunCost(fb, runID, RunCost{
+		TotalCostUSD: 12.5,
+		Stages: []RunCostStage{
+			{Source: "agent", CostUSD: 10.0},
+			{Source: "implement_review", CostUSD: 1.5},
+			{Source: "plan_review", CostUSD: 1.0},
+		},
+	})
+	seedRunLatency(fb, runID, RunLatency{
+		TotalWaitOnHumanSeconds: 900, WallClockSeconds: 3600,
+		Gates: []LatencyGate{{Gate: "plan_approval", WaitSeconds: 900}},
+	})
+	seedBudget(fb, runID, BudgetStatus{Tier: "ok", Period: "week"})
+	return srv, runID
+}
+
+var worstCases = []worstCase{
+	{name: "12 stages with 40KB failure reasons", stages: 12, failureReasonLen: 40 * 1024, auditEntries: 10},
+	{name: "400 stages", stages: 400, failureReasonLen: 64, auditEntries: 10},
+	{name: "200 next_actions with 8KB fields", stages: 4, failureReasonLen: 8 * 1024, nextActions: 200, nextActionFieldLn: 8 * 1024, auditEntries: 10},
+	{name: "50 structurally-bulky audit payloads", stages: 4, auditEntries: 50, auditArrayLen: 400},
+	{name: "300 auto_advanced transitions", stages: 4, autoAdvanced: 300, auditEntries: 10},
+	{name: "200 open concerns", stages: 4, concerns: 200, auditEntries: 10},
+	{name: "150 security findings", stages: 4, securityFindings: 150, auditEntries: 10},
+	{name: "free text with invalid UTF-8, U+2028/9 and HTML bytes", stages: 6, failureReasonLen: 4096, auditEntries: 20, freeTextPoison: true},
+	{name: "payload deliberately past the budget", stages: 30, failureReasonLen: 20 * 1024, auditEntries: 40, auditArrayLen: 200},
+	{name: "everything maximal at once", stages: 40, failureReasonLen: 20 * 1024, auditEntries: 50, auditArrayLen: 400,
+		autoAdvanced: 300, concerns: 200, securityFindings: 150, freeTextPoison: true},
+}
+
+// TestGetRunStatus_WorstCaseFailedRun_UnderBudget is the cross-boundary
+// end-to-end proof: it drives the REAL fishhawk_get_run_status handler (never
+// boundRunStatusOutput alone — a ladder-only test cannot fail when the ladder
+// is correct but UNWIRED) across a table of independently adversarial
+// failed-run fixtures.
+func TestGetRunStatus_WorstCaseFailedRun_UnderBudget(t *testing.T) {
+	for _, c := range worstCases {
+		t.Run(c.name, func(t *testing.T) {
+			srv, runID := newWorstCaseFailedRun(t, c)
+			r := newResolver(srv, nil)
+			_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{
+				RunID: runID.String(), AuditLimit: 200,
+			})
+			if err != nil {
+				t.Fatalf("getRunStatus: %v", err)
+			}
+			raw, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			budget := runStatusByteBudget(envFuncFromMap(nil))
+			if len(raw) > budget {
+				t.Errorf("response = %d bytes, want <= the %d-byte budget", len(raw), budget)
+			}
+
+			// The diagnosis core survives every tier including the floor.
+			if out.Run.ID != runID.String() {
+				t.Errorf("run.id = %q, want %q (never elided)", out.Run.ID, runID.String())
+			}
+			if out.Run.State != "failed" {
+				t.Errorf("run.state = %q, want failed (never elided)", out.Run.State)
+			}
+			if len(out.Stages) == 0 {
+				t.Fatal("every stage row was dropped — the failing stage's state and failure_category are never elided")
+			}
+			sawFailing := false
+			for _, s := range out.Stages {
+				if s.State == "failed" && s.FailureCategory != nil && *s.FailureCategory != "" {
+					sawFailing = true
+				}
+			}
+			if !sawFailing {
+				t.Errorf("no stage row carries the failing state + failure_category: %+v", out.Stages)
+			}
+			if out.NextActions == nil || out.NextActions.State == "" {
+				t.Errorf("next_actions presence is never elided, got %+v", out.NextActions)
+			}
+
+			// Every emitted entry satisfies its class/pointer invariant.
+			if out.Elisions != nil {
+				if err := validateWireElisions(out.Elisions); err != nil {
+					t.Errorf("emitted elisions violate their own classification: %v", err)
+				}
+				if out.Elisions.Budget != budget {
+					t.Errorf("elisions.budget = %d, want the effective %d", out.Elisions.Budget, budget)
+				}
+			}
+		})
+	}
+}
+
+// TestGetRunStatus_UnderBudget_ByteIdenticalNoElisionsBlock proves the bound is
+// INERT on the happy path: an ordinary small run's marshalled response is
+// byte-identical before and after the ladder, and the wire carries no
+// "elisions" key.
+func TestGetRunStatus_UnderBudget_ByteIdenticalNoElisionsBlock(t *testing.T) {
+	_, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), AuditLimit: 10})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Elisions != nil {
+		t.Fatalf("an under-budget response must carry no elisions block, got %+v", out.Elisions)
+	}
+	raw := mustMarshal(t, out)
+	if strings.Contains(string(raw), `"elisions"`) {
+		t.Errorf("under-budget wire bytes carry an elisions key: %s", raw)
+	}
+	// Byte-identical: running the ladder again over the same output is a no-op.
+	again, err := boundRunStatusOutput(out, runID.String(), runStatusByteBudget(envFuncFromMap(nil)))
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if string(mustMarshal(t, again)) != string(raw) {
+		t.Errorf("the ladder is not inert under budget")
+	}
+}
+
+// TestListAudit_ForwardsSinceSequence asserts the anchor reaches the outbound
+// query, so a get_run_status elision pointer is genuinely CALLABLE rather than
+// decorative.
+func TestListAudit_ForwardsSinceSequence(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.perRunAuditByRun[runID] = []AuditEntry{{ID: uuid.NewString(), Sequence: 8, RunID: runID.String(), Category: "cost_recorded"}}
+	r := newResolver(srv, nil)
+
+	if _, _, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: runID.String(), SinceSequence: 7}); err != nil {
+		t.Fatalf("listAudit: %v", err)
+	}
+	fb.mu.Lock()
+	q := fb.perRunAuditLastQueryByID[runID]
+	fb.mu.Unlock()
+	if !strings.Contains(q, "since_sequence=7") {
+		t.Errorf("outbound query %q does not carry since_sequence=7 — the elision pointer would be decorative", q)
+	}
+
+	// Zero drops from the query string (the REST filter is strictly-greater-
+	// than, so zero is a no-op that yields the whole chain).
+	if _, _, err := r.listAudit(context.Background(), nil, ListAuditInput{RunID: runID.String()}); err != nil {
+		t.Fatalf("listAudit: %v", err)
+	}
+	fb.mu.Lock()
+	q = fb.perRunAuditLastQueryByID[runID]
+	fb.mu.Unlock()
+	if strings.Contains(q, "since_sequence") {
+		t.Errorf("outbound query %q carries since_sequence at the zero anchor", q)
+	}
+}
+
+// TestGetRunStatus_PopulatedElisions_PassesSDKOutputSchemaValidation closes the
+// boundary the fakeBackend seam can NEVER reach: go-sdk validates the
+// marshalled tool output against the reflected output schema INSIDE the
+// handler, and jsonschema-go forbids additional properties while skipping
+// unexported fields. That constraint is what forced the exported wire DTO, so
+// leaving it unverified would leave the design's own premise untested.
+func TestGetRunStatus_PopulatedElisions_PassesSDKOutputSchemaValidation(t *testing.T) {
+	rows := []struct {
+		name    string
+		fixture worstCase
+		env     map[string]string
+	}{
+		// An over-budget fixture the ladder reduces WITHOUT reaching the floor,
+		// so the block carries entries of all three classes with non-empty
+		// Pointer / OmittedCount fields.
+		{name: "default budget (tiered elisions, all three classes)", fixture: worstCases[0], env: nil},
+		// The FLOOR budget: the Aggregate=true shape is the one most likely to
+		// trip a schema mismatch and is never exercised by an under-budget call.
+		{name: "floor budget (two aggregate elisions)", fixture: worstCases[len(worstCases)-1], env: map[string]string{runStatusBudgetEnvVar: "1"}},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			ctx := context.Background()
+			backend, runID := newWorstCaseFailedRun(t, row.fixture)
+			cfg := config{backendURL: backend.URL, apiToken: "tok-test"}
+			srv := buildServer(cfg)
+			registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(row.env)})
+
+			client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+			serverTransport, clientTransport := mcp.NewInMemoryTransports()
+			serverSession, err := srv.Connect(ctx, serverTransport, nil)
+			if err != nil {
+				t.Fatalf("server connect: %v", err)
+			}
+			defer serverSession.Close()
+			clientSession, err := client.Connect(ctx, clientTransport, nil)
+			if err != nil {
+				t.Fatalf("client connect: %v", err)
+			}
+			defer clientSession.Close()
+
+			res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+				Name:      "fishhawk_get_run_status",
+				Arguments: map[string]any{"run_id": runID.String(), "audit_limit": 200},
+			})
+			if err != nil {
+				if strings.Contains(err.Error(), "validating tool output") {
+					t.Fatalf("the elisions block failed the SDK's output-schema validation: %v", err)
+				}
+				t.Fatalf("CallTool: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+			}
+			for _, c := range res.Content {
+				if tc, ok := c.(*mcp.TextContent); ok && strings.Contains(tc.Text, "validating tool output") {
+					t.Fatalf("tool result carries an output-schema validation error: %s", tc.Text)
+				}
+			}
+
+			structured, err := json.Marshal(res.StructuredContent)
+			if err != nil {
+				t.Fatalf("marshal structured content: %v", err)
+			}
+			var out GetRunStatusOutput
+			if err := json.Unmarshal(structured, &out); err != nil {
+				t.Fatalf("decode tool output %s: %v", structured, err)
+			}
+			if out.Elisions == nil || len(out.Elisions.Fields) == 0 {
+				t.Fatalf("the round-tripped response carries no populated elisions block: %s", structured)
+			}
+			if err := validateWireElisions(out.Elisions); err != nil {
+				t.Errorf("round-tripped elisions violate their own classification: %v", err)
+			}
+			classes := map[string]bool{}
+			var sawPointer, sawCount bool
+			for _, f := range out.Elisions.Fields {
+				classes[f.Class] = true
+				if f.Pointer != "" {
+					sawPointer = true
+				}
+				if f.OmittedCount > 0 {
+					sawCount = true
+				}
+			}
+			if row.env == nil {
+				for _, want := range []string{"stored", "oversized_capable", "computed"} {
+					if !classes[want] {
+						t.Errorf("round-tripped elisions carry no %q entry: %s", want, structured)
+					}
+				}
+				if !sawPointer || !sawCount {
+					t.Errorf("round-tripped elisions carry no non-empty Pointer / OmittedCount: %s", structured)
+				}
+			} else {
+				if len(out.Elisions.Fields) != 2 {
+					t.Errorf("floor budget produced %d entries, want the two aggregates", len(out.Elisions.Fields))
+				}
+				for _, f := range out.Elisions.Fields {
+					if !f.Aggregate {
+						t.Errorf("floor entry %q crossed the SDK boundary without its Aggregate flag", f.Field)
+					}
+				}
+			}
+		})
+	}
+}

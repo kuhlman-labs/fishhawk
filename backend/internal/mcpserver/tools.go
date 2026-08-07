@@ -1487,6 +1487,12 @@ type GetRunStatusOutput struct {
 	// fails the snapshot). Omitted when the run has no findings (no scan
 	// yet, a clean scan, or a clean re-scan after a fix-up cleared them).
 	SecurityFindings []SecurityFinding `json:"security_findings,omitempty" jsonschema:"unresolved high-severity code-scanning (CodeQL/SAST) findings on the implement diff (#1096), from the newest scan. A SEPARATE signal from implement-review concerns — held by its own merge gate and routed to its own fix-up pass, never consuming a design-concern budget. Omitted when the run has no findings (no scan, a clean scan, or a clean re-scan after a fix-up)"`
+	// Elisions records what the response byte budget removed (ADR-077 /
+	// #2508). omitempty, so an UNDER-budget response is byte-identical to the
+	// pre-#2508 wire and the block never appears on the happy path. See
+	// bound.go for the tier ladder, the three-class honesty contract and the
+	// SDK constraint that forces the exported DTO.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the response was reduced to fit the tool-result byte budget (ADR-077). Each entry names an omitted field path and its class: a 'stored' entry's pointer returns AT LEAST the omitted content; an 'oversized_capable' entry points at an unbounded REST surface because the value can itself be arbitrarily large; a 'computed' entry carries NO pointer because the value was derived at read time and never stored — recomputation is not retrieval. budget is the EFFECTIVE (post-clamp) budget the ladder honoured. The run/stage diagnosis core (run.id, run.state, each stage's state + failure_category) and next_actions presence are never elided"`
 }
 
 // SecurityFinding is one high-severity code-scanning finding on the MCP
@@ -1824,7 +1830,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		collapseCacheEfficiencyStages(cacheEfficiency)
 	}
 
-	return nil, GetRunStatusOutput{
+	assembled := GetRunStatusOutput{
 		Run:                       *runRow,
 		Stages:                    stages,
 		RecentAudit:               recent,
@@ -1844,7 +1850,19 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 		NextActions:               nextActions,
 		ChildrenStatus:            childrenStatus,
 		SecurityFindings:          securityFindings,
-	}, nil
+	}
+
+	// Response byte bound (ADR-077 / #2508). Runs at ONE call site, AFTER the
+	// #1727/#1749 compaction above and regardless of the include_* flags: those
+	// levers are opt-in projections, this is a bound BY CONSTRUCTION. Inert
+	// under budget (the output is returned unchanged with no elisions block).
+	// A validateWireElisions failure is a programming defect — a DTO that
+	// misclassifies its own elisions — and is surfaced, never swallowed.
+	bounded, err := boundRunStatusOutput(assembled, runID.String(), runStatusByteBudget(r.getenv))
+	if err != nil {
+		return nil, GetRunStatusOutput{}, fmt.Errorf("bound run status response: %w", err)
+	}
+	return nil, bounded, nil
 }
 
 // securityFindingsFor distills the run's unresolved high-severity
@@ -2037,8 +2055,13 @@ type ListAuditInput struct {
 	RunID    string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
 	Category string `json:"category,omitempty" jsonschema:"single category filter (e.g. 'approval_submitted', 'plan_generated', 'ci_failure_retry_dispatched')"`
 	StageID  string `json:"stage_id,omitempty" jsonschema:"scope entries to a specific stage UUID"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"max items per page (default 50, capped at 200)"`
-	Cursor   string `json:"cursor,omitempty" jsonschema:"pagination cursor returned by a prior list call as next_cursor"`
+	// SinceSequence is the anchor a get_run_status elision pointer names
+	// (ADR-077 / #2508): the filter is STRICTLY GREATER THAN, so zero (the
+	// default) yields the whole chain — which is what makes the pointer's
+	// "returns at least the omitted content" promise hold.
+	SinceSequence int64  `json:"since_sequence,omitempty" jsonschema:"return only entries with sequence STRICTLY GREATER THAN this value; zero (the default) yields the whole chain. This is the anchor a fishhawk_get_run_status elisions pointer names"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"max items per page (default 50, capped at 200)"`
+	Cursor        string `json:"cursor,omitempty" jsonschema:"pagination cursor returned by a prior list call as next_cursor"`
 }
 
 // ListAuditOutput mirrors the OpenAPI paginated list envelope.
@@ -2072,6 +2095,10 @@ Inputs:
   - run_id    (required) — Fishhawk run UUID.
   - category  — single category filter (e.g. 'approval_submitted').
   - stage_id  — scope to a stage's entries.
+  - since_sequence — return only entries with sequence STRICTLY GREATER
+                THAN this value; zero (the default) yields the whole
+                chain. This is the anchor a fishhawk_get_run_status
+                elisions pointer names (ADR-077).
   - limit     — default 50, capped at 200. For deeper paging use
                 the returned next_cursor.
   - cursor    — opaque pagination token from a prior call.
@@ -2098,10 +2125,11 @@ func (r *runResolver) listAudit(ctx context.Context, _ *mcp.CallToolRequest, in 
 	}
 	limit := clampListAuditLimit(in.Limit)
 	items, nextCursor, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
-		Category: in.Category,
-		StageID:  in.StageID,
-		Limit:    limit,
-		Cursor:   in.Cursor,
+		Category:      in.Category,
+		StageID:       in.StageID,
+		SinceSequence: in.SinceSequence,
+		Limit:         limit,
+		Cursor:        in.Cursor,
 	})
 	if err != nil {
 		return nil, ListAuditOutput{}, fmt.Errorf("list audit: %w", err)
