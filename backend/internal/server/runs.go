@@ -345,9 +345,11 @@ type runAutoAdvancePayload struct {
 }
 
 // runConcernsPayload summarizes a run's OPEN review concerns (#964).
-// Items carries id/stage_kind/severity/category/state only — the note
-// text is intentionally elided (bounded payload); read the originating
-// *_reviewed audit entry for the full note.
+// Each item carries id/stage_kind/severity/category/state/has_suggested_patch
+// plus a BOUNDED note-derived short_summary recognition label (at most 100
+// bytes, one line; #2488) so one default get_run_status call maps each
+// concern id to a recognisable defect. The gate view and the originating
+// *_reviewed audit entry remain the surfaces for the full untruncated note.
 type runConcernsPayload struct {
 	Open    int                 `json:"open"`
 	ByState map[string]int      `json:"by_state"`
@@ -363,9 +365,21 @@ type runConcernPayload struct {
 	State     string    `json:"state"`
 	// HasSuggestedPatch reports whether the reviewer attached a mechanical
 	// suggested_patch to this concern (#1165). Only the boolean is
-	// surfaced — the diff text stays elided like the note, keeping the
-	// payload bounded; the fix-up apply path reads the patch server-side.
+	// surfaced — the diff text itself stays elided, keeping the payload
+	// bounded; the fix-up apply path reads the patch server-side. (Unlike
+	// the note, which this payload now surfaces as a bounded short_summary
+	// label, the diff text is not reflected here at all.)
 	HasSuggestedPatch bool `json:"has_suggested_patch"`
+	// ShortSummary is a bounded, note-derived recognition label for this
+	// concern (#2488): the reviewer note whitespace-collapsed to a single
+	// line, at most concernShortSummaryMaxBytes bytes, with a trailing
+	// concernShortSummaryMarker when the note is cut; equal to the whole
+	// collapsed note when it already fits. OMITTED (omitempty) when the note
+	// is empty or whitespace-only — i.e. non-blank AFTER whitespace
+	// collapsing, so nothing is fabricated. A label keyed for READING; the
+	// UUID above remains identity, so two concerns whose notes share a long
+	// prefix MAY share a label — route fix-ups by id, never by this.
+	ShortSummary string `json:"short_summary,omitempty"`
 }
 
 // runDelegationPayload is the operator_agent delegation surface on the
@@ -2157,6 +2171,53 @@ func nextActionStale(action string, stages []*run.Stage) bool {
 	return false // no matching stage row → fail toward surfacing
 }
 
+const (
+	// concernShortSummaryMaxBytes bounds each concern item's note-derived
+	// short_summary label to 100 bytes total (marker included), preserving
+	// the #1727/#1749 bounded-payload invariant while giving one default
+	// get_run_status call a recognisable per-concern label (#2488).
+	concernShortSummaryMaxBytes = 100
+	// concernShortSummaryMarker is appended when the collapsed note is cut.
+	concernShortSummaryMarker = "..."
+)
+
+// concernShortSummary derives the bounded one-line recognition label from a
+// reviewer note. It is pure string manipulation — no model inference on this
+// read path. Contract, in order:
+//
+//   - Whitespace is ALWAYS collapsed: strings.Fields splits on every run of
+//     whitespace (newlines, tabs, carriage returns, repeated spaces) and the
+//     join with a single space + implicit trim yields exactly one line for
+//     every note, short or long alike.
+//   - "Non-empty" here means NON-BLANK AFTER WHITESPACE COLLAPSING: a note
+//     that is empty or whitespace-only collapses to "" and returns "", so the
+//     omitempty json tag drops the key — there is nothing to derive and
+//     nothing is fabricated.
+//   - A note that already fits the bound IS its own label; returning the whole
+//     collapsed note is intended behaviour, not a leak.
+//   - A longer note is cut to concernShortSummaryMaxBytes-len(marker) bytes and
+//     the marker is appended, so the result is at most 100 bytes in total.
+func concernShortSummary(note string) string {
+	collapsed := strings.Join(strings.Fields(note), " ")
+	if collapsed == "" {
+		return ""
+	}
+	if len(collapsed) <= concernShortSummaryMaxBytes {
+		return collapsed
+	}
+	// Budget: 100 - len("...") = 97 bytes of note text + a 3-byte ASCII marker
+	// = at most 100 bytes. The UTF-8 backtrack below only ever REMOVES bytes,
+	// so the 100-byte ceiling holds strictly.
+	cut := concernShortSummaryMaxBytes - len(concernShortSummaryMarker)
+	// Backtrack off any UTF-8 continuation byte (b&0xC0 == 0x80) so the cut
+	// never lands mid-rune and never emits U+FFFD; the cut > 0 guard stops a
+	// pathological all-continuation prefix walking below index 0.
+	for cut > 0 && collapsed[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return collapsed[:cut] + concernShortSummaryMarker
+}
+
 // buildRunConcernsPayload renders the open-concern summary for the
 // single-run read. Returns nil (field omitted) when there is nothing
 // open.
@@ -2178,6 +2239,7 @@ func buildRunConcernsPayload(open []*concern.Concern) *runConcernsPayload {
 			Category:          c.Category,
 			State:             string(c.State),
 			HasSuggestedPatch: c.SuggestedPatch != "",
+			ShortSummary:      concernShortSummary(c.Note),
 		})
 	}
 	return out

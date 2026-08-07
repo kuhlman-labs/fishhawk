@@ -1252,9 +1252,11 @@ components:
         `addressed_pending`, `reopened`. Every `plan_reviewed` /
         `implement_reviewed` verdict's concerns are persisted with
         server-minted stable UUIDs; this block surfaces what is still
-        unresolved plus the IDs fix-up routing needs, in one read. Note
-        text is intentionally elided (bounded payload) — read the
-        originating `*_reviewed` audit entry for the full note.
+        unresolved plus the IDs fix-up routing needs, in one read. Each
+        item carries a BOUNDED note-derived `short_summary` label (at most
+        100 bytes, one line; #2488) — the gate view and the originating
+        `*_reviewed` audit entry remain the surfaces for the full
+        untruncated note.
       required: [open, by_state, items]
       properties:
         open:
@@ -1316,9 +1318,21 @@ components:
           description: |
             Whether the reviewer attached a mechanical `suggested_patch`
             (a unified diff) to this concern (#1165). Only the boolean is
-            surfaced — the diff text stays elided like the note. A routed
+            surfaced — the diff text itself is not reflected here. A routed
             fix-up whose concerns all carry a patch can be resolved by the
             near-deterministic apply path instead of a full agent loop.
+        short_summary:
+          type: string
+          maxLength: 100
+          description: |
+            Bounded note-derived recognition label for this concern (#2488):
+            the reviewer note whitespace-collapsed to a single line and
+            bounded to at most 100 bytes, with a trailing `...` when cut;
+            equal to the whole collapsed note when it already fits. OMITTED
+            when the note is empty or whitespace-only (blank after
+            collapsing). A recognition label, NOT a unique key — `id` remains
+            the addressing key, and two concerns with a long shared note
+            prefix may share a label.
 
     GateView:
       type: object

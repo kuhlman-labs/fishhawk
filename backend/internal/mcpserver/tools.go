@@ -1355,7 +1355,7 @@ type GetRunStatusInput struct {
 	// keeping every operator-playbook field. Mirrors
 	// ListRunsInput.IncludeIssueContext.
 	IncludeIssueContext bool `json:"include_issue_context,omitempty" jsonschema:"include the run's full issue_context (issue body + all comments) in the response; omitted by default to stay within the tool-result token budget. Set true only when the issue payload is actually needed"`
-	IncludeReviewProse  bool `json:"include_review_prose,omitempty" jsonschema:"include reviewer free-text prose (implement_reviews[] free_form + concern notes, and recent_audit review-payload free_form) in the response; omitted by default to stay within the tool-result token budget. Verdicts/severities/concern keys are always present regardless of this flag"`
+	IncludeReviewProse  bool `json:"include_review_prose,omitempty" jsonschema:"include reviewer free-text prose (implement_reviews[] free_form + concern notes, and recent_audit review-payload free_form) in the response; omitted by default to stay within the tool-result token budget. Verdicts/severities/concern keys are always present regardless of this flag, as is the run.concerns block's per-item short_summary (a bounded note-derived label, present even when this flag is false)"`
 	// IncludeAuditHashes restores each recent_audit entry's verifier-only
 	// hash-chain fields (entry_hash + prev_hash) AND its full untruncated
 	// payload string values together — one verifier/forensic concern, not
@@ -1589,11 +1589,15 @@ layer that was configured but not wired on the backend.
 The run row also carries run.concerns when the run has OPEN review
 concerns (#964): the open count, a by_state breakdown (raised /
 addressed_pending / reopened), and items[] with each concern's STABLE id,
-stage_kind, severity, category, and state. Those ids are the primary
-addressing scheme for fishhawk_fixup_stage's concern_ids parameter
-(positional indices are deprecated). Note text is elided — read the
-originating plan_reviewed / implement_reviewed audit entry for the full
-note.
+stage_kind, severity, category, state, and a bounded note-derived
+short_summary label. Those ids are the primary addressing scheme for
+fishhawk_fixup_stage's concern_ids parameter (positional indices are
+deprecated). short_summary is a RECOGNITION label (at most 100 bytes, one
+line), present regardless of include_review_prose, so one default call maps
+each id to a recognisable defect — it is NOT a unique key (two concerns with
+a long shared note prefix may share a label; route fix-ups by id). The gate
+view and the originating plan_reviewed / implement_reviewed audit entry
+remain the surfaces for the full untruncated note.
 
 Also returns review_action_hint when the implement review landed with
 unresolved approve_with_concerns concerns and the bounded fix-up budget
