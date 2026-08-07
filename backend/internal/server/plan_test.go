@@ -1065,6 +1065,157 @@ func TestShipPlan_ScopeRetry_SeamToPromptRender(t *testing.T) {
 	}
 }
 
+// categoryListFailAuditFake errors on ListForRunByCategory for ONE category,
+// leaving every other read (plan_revised, …) working — so the budget-read
+// failure is exercised without breaking the rest of the ship.
+type categoryListFailAuditFake struct {
+	*storingAuditFake
+	failCategory string
+	listCalls    int
+}
+
+func (a *categoryListFailAuditFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.failCategory {
+		a.listCalls++
+		return nil, fmt.Errorf("list %s unavailable", category)
+	}
+	return a.storingAuditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestShipPlan_ScopeRetry_BudgetReadError_Parks is the COUNTERFACTUAL for the
+// FAIL-CLOSED budget read. countScopeRetries used to swallow a read error and
+// report 0, so a PERSISTENT audit-list failure would grant a refusal on every
+// corrective ship — the one-shot budget would never exhaust and the plan would
+// never degrade to park-with-evidence, breaking the bounded-refusal contract.
+// Restoring the swallow (return 0, nil on error) makes the first ship refuse
+// and this test goes red on BOTH the entry count and the stage state.
+//
+// The failure is seeded BY CONSTRUCTION (a repo that errors on the
+// plan_scope_retry list), not by driving the gate into its own guard, so the
+// RED lands on the behavioural assertion. Both ships are identical undeclared
+// narrowings — the same input paired with itself — so nothing but the guard
+// can distinguish them.
+func TestShipPlan_ScopeRetry_BudgetReadError_Parks(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	art, sf := newFakeArtifactRepo(), newSigningFake()
+	inner := newStoringAuditFake()
+	au := &categoryListFailAuditFake{storingAuditFake: inner, failCategory: categoryPlanScopeRetry}
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+		AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
+	runRow, planStage, priv := seedRefusalStage(t, rr, art, inner, sf)
+
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	if au.listCalls == 0 {
+		t.Fatal("the plan_scope_retry budget was never read; the fault never fired")
+	}
+	if n := countScopeRetryEntries(t, inner, runRow.ID); n != 0 {
+		t.Errorf("plan_scope_retry entries = %d, want 0 (an unreadable budget is an unbounded one — refuse to refuse)", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (degrade to park-with-evidence)", got)
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Errorf("run state = failed; the degrade must never fail the run terminally")
+	}
+	// The regression evidence is still recorded, so the reviewers see the drop
+	// and revise.go still refunds the operator's pass.
+	if entry := lastScopeRegressionEntry(t, inner.auditFake); !entry.Regressed {
+		t.Errorf("Regressed = false; the degraded path must still record the regression for the refund")
+	}
+}
+
+// TestShipPlan_ScopeRetry_OverConsumedBudget_StillExhausts pins the direction
+// the count→append race can move the budget. The window is not atomic, so two
+// concurrent ships can both read 0 and both record a refusal — audit-first
+// ordering means the budget is OVER-consumed, never under-consumed. This
+// asserts the property that makes that safe: with the budget over-consumed
+// (two entries, as a race would leave it), the next undeclared narrowing still
+// parks and writes no third entry. A `==` budget comparison instead of `>=`
+// would make an over-consumed budget refuse forever; that mutation goes red
+// here.
+func TestShipPlan_ScopeRetry_OverConsumedBudget_StillExhausts(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+	// Two entries: the state a lost count→append race leaves behind.
+	seedScopeRetryEntry(t, au, runRow.ID, planStage.ID, []string{"b/a.go", "b/b.go", "b/c.go"})
+	seedScopeRetryEntry(t, au, runRow.ID, planStage.ID, []string{"b/a.go", "b/b.go", "b/c.go"})
+
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 2 {
+		t.Errorf("plan_scope_retry entries = %d, want 2 (an over-consumed budget must stay exhausted)", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", got)
+	}
+}
+
+// TestShipPlan_ScopeRetry_FailureReasonCapped is the COUNTERFACTUAL for the
+// FailStage reason cap. Nothing bounds how many paths a revise can drop, and
+// the reason is persisted onto the stage and surfaced back to agents and
+// operators, so it is capped at maxSchemaValidationErrorBytes exactly as the
+// sibling schema-retry path caps its validation_error. Deleting the cap makes
+// the recorded reason grow past the bound and this test goes red.
+//
+// The reason is observable only while the stage is still failed, so the
+// RetryStage leg is faulted BY CONSTRUCTION to hold it there — the cap runs
+// before RetryStage either way.
+func TestShipPlan_ScopeRetry_FailureReasonCapped(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	fault := &scopeRetryFaultRepo{recordingOrchestratorRepo: rr, retryStageErr: fmt.Errorf("retry-stage unavailable")}
+	art, sf, au := newFakeArtifactRepo(), newSigningFake(), newStoringAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+		AuditRepo: au, RunRepo: fault, ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: fault}})
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	// A base scoping 600 long paths, revised down to one — 599 undeclared
+	// removals, far past the 4000-byte cap.
+	many := make([]string, 600)
+	for i := range many {
+		many[i] = fmt.Sprintf("backend/internal/verylongpackagename/subpackage/file_%04d_with_a_long_name.go", i)
+	}
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, removalPlanBody(t, many, nil))
+
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, removalPlanBody(t, many[:1], nil), "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	got := rr.stagesByID[planStage.ID]
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed (the RetryStage fault holds the reason)", got.State)
+	}
+	if got.FailureReason == nil {
+		t.Fatal("stage carries no failure reason")
+	}
+	reason := *got.FailureReason
+	if len(reason) > maxSchemaValidationErrorBytes+len("...[truncated]") {
+		t.Errorf("failure reason = %d bytes, want <= %d (the cap is missing)",
+			len(reason), maxSchemaValidationErrorBytes+len("...[truncated]"))
+	}
+	if !strings.HasSuffix(reason, "...[truncated]") {
+		t.Errorf("an over-cap reason is not marked truncated: %q", reason[max(0, len(reason)-64):])
+	}
+	if !strings.HasPrefix(reason, "plan_scope_regression_retry: undeclared scope narrowing dropped ") {
+		t.Errorf("the capped reason lost its identifying prefix: %q", reason[:min(80, len(reason))])
+	}
+}
+
 // fakePlanReviewer records each Review invocation and returns a canned verdict.
 type fakePlanReviewer struct {
 	mu      sync.Mutex

@@ -988,22 +988,30 @@ func (s *Server) trySchemaRetry(r *http.Request, runID, stageID uuid.UUID, repor
 
 // countScopeRetries counts the run's plan_scope_retry audit entries — the
 // in-run scope-retry budget counter (#2516), the exact read shape
-// countSchemaRetries uses. Returns 0 on any error or when the AuditRepo is
-// unconfigured (best-effort). A nil count degrades to "no retries recorded",
-// which is the conservative choice HERE too: at worst the budget gate grants
-// one extra refusal rather than admitting a narrowed plan.
-func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) int {
+// countSchemaRetries uses.
+//
+// It FAILS CLOSED: a read error returns the error, and tryScopeRetry then
+// refuses to refuse (falls through to park-with-evidence). Treating an
+// unreadable count as "no retries recorded" would make a PERSISTENT audit-list
+// failure grant a refusal on EVERY corrective ship — the one-shot budget would
+// never exhaust and the plan would never degrade to park-with-evidence, which
+// is the bound this gate is required to hold. Losing one legitimate refusal to
+// a transient read error is strictly the cheaper failure: the plan still parks
+// at the gate with the regression evidence and the refunded revise pass.
+// An unconfigured AuditRepo returns (0, nil) — tryScopeRetry rejects that case
+// on its own precondition before ever counting.
+func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) (int, error) {
 	if s.cfg.AuditRepo == nil {
-		return 0
+		return 0, nil
 	}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryPlanScopeRetry)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: count scope retries failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
-		return 0
+		return 0, err
 	}
-	return len(entries)
+	return len(entries), nil
 }
 
 // tryScopeRetry REFUSES a revise pass whose new plan UNDECLAREDLY narrows the
@@ -1021,7 +1029,23 @@ func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) int {
 // Preconditions (any false → return false → fall through):
 //   - Orchestrator and AuditRepo are wired (needed to re-dispatch and to
 //     record/count the budget).
+//   - countScopeRetries READS the budget successfully. A read error fails
+//     CLOSED (no refusal): an unreadable budget is an unbounded one, and a
+//     persistent audit-list failure would otherwise grant a refusal on every
+//     corrective ship, so the nominal one-shot would never exhaust.
 //   - countScopeRetries < maxPlanScopeRetries (budget remaining).
+//
+// The count→append window is NOT atomic, so two ships racing on the same run
+// can both read 0 and both record a refusal. The audit-first ordering keeps
+// that bounded in the direction that matters: each racing ship commits its own
+// entry BEFORE mutating any state, so the budget is over-consumed, never
+// under-consumed — the comparison is `>=`, so the next ship sees a count over
+// the cap and falls through to park-with-evidence. A race can therefore cost
+// an extra re-dispatch; it can never make the refusal unbounded. (The stage
+// transitions themselves are CAS-guarded, so at most one racer's re-open
+// wins; the loser's FailStage/RetryStage error returns false and falls
+// through.) Making the budget strictly one-shot under concurrency needs a
+// unique constraint on (run_id, category) — deliberately out of scope here.
 //
 // On a granted refusal, in order (audit-first, mirroring trySchemaRetry and
 // handleRetryStage so the retry intent is durable even if a later step
@@ -1057,7 +1081,12 @@ func (s *Server) tryScopeRetry(r *http.Request, runID, stageID uuid.UUID, regres
 	if s.cfg.Orchestrator == nil || s.cfg.AuditRepo == nil {
 		return false
 	}
-	attempt := s.countScopeRetries(r.Context(), runID)
+	attempt, cerr := s.countScopeRetries(r.Context(), runID)
+	if cerr != nil {
+		// Fail closed: an unreadable budget is an UNBOUNDED budget, and a
+		// persistent read failure would refuse every corrective ship.
+		return false
+	}
 	if attempt >= maxPlanScopeRetries {
 		return false
 	}
@@ -1105,10 +1134,18 @@ func (s *Server) tryScopeRetry(r *http.Request, runID, stageID uuid.UUID, regres
 		return false
 	}
 
-	// Re-open: running/dispatched → failed (transient A) → pending.
-	if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureA,
-		"plan_scope_regression_retry: undeclared scope narrowing dropped "+
-			strings.Join(regression.UndeclaredRemovals, ", ")); ferr != nil {
+	// Re-open: running/dispatched → failed (transient A) → pending. The
+	// recorded reason names the dropped paths and is CAPPED at
+	// maxSchemaValidationErrorBytes, exactly as the sibling schema-retry path
+	// caps its validation_error: nothing bounds how many paths a revise can
+	// drop, and a stage failure reason is surfaced back to agents and
+	// operators, so it must never outgrow the prompt-injection cap.
+	reason := "plan_scope_regression_retry: undeclared scope narrowing dropped " +
+		strings.Join(regression.UndeclaredRemovals, ", ")
+	if len(reason) > maxSchemaValidationErrorBytes {
+		reason = reason[:maxSchemaValidationErrorBytes] + "...[truncated]"
+	}
+	if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureA, reason); ferr != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"plan upload: transition to failed-A for scope retry failed",
 			slog.String("run_id", runID.String()),

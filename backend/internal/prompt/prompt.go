@@ -1447,6 +1447,60 @@ func writeCounterfactualDiscipline(b *strings.Builder) {
 		"same treatment as one the plan named (#2444).\n")
 }
 
+// maxScopePathBytes caps ONE rendered carry-forward / dropped path (#2516).
+// A repo path is short; anything near this is already pathological, and the
+// cap keeps a single crafted entry from consuming the prompt.
+const maxScopePathBytes = 512
+
+// sanitizeScopePath renders one plan-supplied path as a SINGLE safe list-item
+// line (#2516). The paths in RevisionBaseScopeFiles and
+// ScopeRestoration.UndeclaredRemovals are derived server-side from the machine
+// diff of two plans, but their CONTENT is planner-authored — i.e. untrusted —
+// and it lands inside Fishhawk's own trusted, binding prompt sections. Written
+// raw, a path carrying a newline would end its "- " list item and land
+// attacker-chosen text at column 0, where it can impersonate a trusted section
+// banner for an agent that holds arbitrary repository commands.
+//
+// So every line terminator and control character is escaped to a visible
+// two-character form (the path stays readable and matchable, it just cannot
+// break the line), triple-backtick/tilde fences are broken exactly as
+// neutralizeLine breaks them so a path cannot open or close a framing block,
+// and the result is length-capped. The transform neutralizes STRUCTURE, not
+// content. It is pure and deterministic, so the package's byte-identical
+// replay invariant holds; an ordinary path (no control characters, no fence)
+// passes through byte-unchanged, which is why every existing render is
+// untouched.
+func sanitizeScopePath(p string) string {
+	if len(p) > maxScopePathBytes {
+		p = strings.ToValidUTF8(p[:maxScopePathBytes], "") + "...[truncated]"
+	}
+	var sb strings.Builder
+	sb.Grow(len(p))
+	for _, r := range p {
+		switch {
+		case r == '\n':
+			sb.WriteString(`\n`)
+		case r == '\r':
+			sb.WriteString(`\r`)
+		case r == '\t':
+			sb.WriteString(`\t`)
+		case r == '\u2028' || r == '\u2029':
+			// Unicode line separators: line terminators to some renderers.
+			fmt.Fprintf(&sb, `\u%04x`, r)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&sb, `\x%02x`, r)
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	s := strings.ReplaceAll(sb.String(), "```", "`` `")
+	s = strings.ReplaceAll(s, "~~~", "~~ ~")
+	if strings.TrimSpace(s) == "" {
+		return "(empty path)"
+	}
+	return s
+}
+
 // maxScopeCarryForwardPaths caps how many paths the Revision-base-scope
 // carry-forward list and the Scope-restoration dropped list each render
 // (#2516), bounding the plan prompt like the sibling channels' byte caps.
@@ -2230,7 +2284,7 @@ func buildPlan(t Trigger) string {
 				"refuses it and re-dispatches this stage.\n\n")
 			for _, p := range paths {
 				b.WriteString("- ")
-				b.WriteString(p)
+				b.WriteString(sanitizeScopePath(p))
 				b.WriteString("\n")
 			}
 			if truncated {
@@ -2270,7 +2324,7 @@ func buildPlan(t Trigger) string {
 			"loss rather than a review comment.\n\n")
 		for _, p := range dropped {
 			b.WriteString("- ")
-			b.WriteString(p)
+			b.WriteString(sanitizeScopePath(p))
 			b.WriteString("\n")
 		}
 		if truncated {

@@ -3515,6 +3515,22 @@ func (s *Server) loadRevisionBasePlan(ctx context.Context, runID uuid.UUID) *str
 // Best-effort and warn-only throughout: an unwired AuditRepo, an audit read
 // error, an undecodable payload, or a missing/unparseable plan artifact
 // yields (nil, nil) and the prompt renders exactly as it does today.
+//
+// The audit-read-error and undecodable-payload legs deliberately return
+// (nil, nil) rather than falling through to the artifact derivation. Both
+// mean "a refusal MAY be recorded and I cannot read it" — and on a corrective
+// re-dispatch the newest plan artifact is the REFUSED narrowed plan, so the
+// fallback would render the narrowed set under the "authoritative scope set"
+// heading and instruct the planner to cement the very drop the refusal
+// rejected. Rendering nothing is strictly better than rendering that.
+//
+// NOTE on the artifact fallback: it does not itself test for a revise, so on
+// ANY plan-stage prompt build with a plan artifact present it returns that
+// artifact's scoped union. The "first-pass plan prompts stay byte-unchanged"
+// guarantee therefore lives at the RENDERER: buildPlan writes the
+// carry-forward list only inside its `RevisionConstraint != nil` block, and a
+// first-pass dispatch records no plan_revised entry so that constraint is nil.
+// Pinned by TestGetStagePrompt_Plan_NonRevise_NoCarryForwardSection.
 func (s *Server) loadScopeCarryForward(ctx context.Context, runID, stageID uuid.UUID) ([]string, *prompt.ScopeRestoration) {
 	if s.cfg.AuditRepo == nil {
 		return nil, nil
@@ -3525,9 +3541,9 @@ func (s *Server) loadScopeCarryForward(ctx context.Context, runID, stageID uuid.
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		// Fall through to the artifact derivation below rather than
-		// abandoning the carry-forward set entirely.
-		entries = nil
+		// A refusal may be recorded and unreadable; the artifact fallback
+		// would render the REFUSED plan's narrowed scope as authoritative.
+		return nil, nil
 	}
 	for i := len(entries) - 1; i >= 0; i-- {
 		if entries[i].StageID != nil && *entries[i].StageID != stageID {
@@ -3538,7 +3554,13 @@ func (s *Server) loadScopeCarryForward(ctx context.Context, runID, stageID uuid.
 			UndeclaredRemovals []string `json:"undeclared_removals"`
 		}
 		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
-			continue
+			// Same hazard as the read error: this stage HAS a refusal entry,
+			// it is just unreadable. Never fall through to the artifact.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: undecodable plan_scope_retry payload",
+				slog.String("run_id", runID.String()),
+				slog.String("error", err.Error()),
+			)
+			return nil, nil
 		}
 		if len(payload.RequiredScopeFiles) == 0 && len(payload.UndeclaredRemovals) == 0 {
 			continue
