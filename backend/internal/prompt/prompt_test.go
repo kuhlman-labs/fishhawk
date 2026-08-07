@@ -4229,7 +4229,12 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// checklist (items 8-12 + intro) adds: like criterion #7, this block is in
 	// the current (trimmed) prompt AND would be in the untrimmed version, so the
 	// baseline moves with it (3999 + 838).
-	const preTrimBaselineLen = 4837
+	//
+	// #2486 raised it by the 192 bytes the REPOSITORY ACCESS section adds (here,
+	// the ungrounded diff-only wording, since this fixture is ungrounded): the
+	// block is in the current (trimmed) prompt AND would be in the untrimmed
+	// version, so the baseline moves with it (4837 + 192).
+	const preTrimBaselineLen = 5029
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
@@ -7482,5 +7487,102 @@ func TestBuild_Acceptance_OutOfScopeNoCriteriaSanctionedPass(t *testing.T) {
 	}
 	if strings.Contains(got, "WARNING: no acceptance criteria") {
 		t.Errorf("0-criteria + out_of_scope must NOT render the loud warning:\n%s", got)
+	}
+}
+
+// TestBuild_ReviewGrounding_GroundedNamesTreeAndCommit pins the #2486 grounded
+// posture on BOTH review prompts: the REPOSITORY ACCESS section names the tree
+// and its short commit, permits reading/searching the working directory, and
+// binds evidence-citing. It also proves the ungrounded diff-only wording is
+// absent when grounded.
+func TestBuild_ReviewGrounding_GroundedNamesTreeAndCommit(t *testing.T) {
+	const commit = "abcdef0123456789abcdef0123456789abcdef01"
+	for _, kind := range []string{"plan_review", "implement_review"} {
+		got, err := Build(kind, Trigger{
+			Repo:             "kuhlman-labs/example",
+			ApprovedPlan:     fixturePlan(),
+			Diff:             "- A pkg/bar/foo.go\n",
+			ReviewTreeCommit: commit,
+		})
+		if err != nil {
+			t.Fatalf("Build(%s): %v", kind, err)
+		}
+		for _, w := range []string{
+			"REPOSITORY ACCESS",
+			"TRACKED files exported at commit abcdef012345",
+			"READ and SEARCH access",
+			"reading and searching files within the provided working directory",
+		} {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s grounded prompt missing %q:\n%s", kind, w, got)
+			}
+		}
+		if strings.Contains(got, "DIFF-ONLY") {
+			t.Errorf("%s grounded prompt must not carry the diff-only wording:\n%s", kind, got)
+		}
+		if strings.Contains(got, "- Invoke any tools.\n") {
+			t.Errorf("%s grounded prompt must not forbid all tools:\n%s", kind, got)
+		}
+	}
+}
+
+// TestBuild_ReviewGrounding_UngroundedIsDiffOnly pins the honest degrade path:
+// an empty ReviewTreeCommit yields a DIFF-ONLY notice and forbids all tools on
+// BOTH review prompts.
+func TestBuild_ReviewGrounding_UngroundedIsDiffOnly(t *testing.T) {
+	for _, kind := range []string{"plan_review", "implement_review"} {
+		got, err := Build(kind, Trigger{
+			Repo:         "kuhlman-labs/example",
+			ApprovedPlan: fixturePlan(),
+			Diff:         "- A pkg/bar/foo.go\n",
+		})
+		if err != nil {
+			t.Fatalf("Build(%s): %v", kind, err)
+		}
+		if !strings.Contains(got, "DIFF-ONLY") {
+			t.Errorf("%s ungrounded prompt missing the diff-only notice:\n%s", kind, got)
+		}
+		if !strings.Contains(got, "- Invoke any tools.\n") {
+			t.Errorf("%s ungrounded prompt must forbid all tools:\n%s", kind, got)
+		}
+		if strings.Contains(got, "REPOSITORY ACCESS\n=================\n\nYour working directory holds") {
+			t.Errorf("%s ungrounded prompt must not claim a tree:\n%s", kind, got)
+		}
+	}
+}
+
+// TestBuild_ReviewGrounding_SkipDisclosure is the C3 pin: the grounded prompt
+// discloses skipped entries (naming count and kind) when the export omitted any,
+// and omits the disclosure when nothing was skipped.
+func TestBuild_ReviewGrounding_SkipDisclosure(t *testing.T) {
+	const commit = "abcdef0123456789abcdef0123456789abcdef01"
+	withSkips, err := Build("implement_review", Trigger{
+		Repo:                          "kuhlman-labs/example",
+		ApprovedPlan:                  fixturePlan(),
+		Diff:                          "- A x\n",
+		ReviewTreeCommit:              commit,
+		ReviewTreeSkippedSymlinks:     3,
+		ReviewTreeSkippedInstructions: 2,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, w := range []string{"NOT exhaustive", "3 symbolic/hard link(s)", "2 agent-instruction file(s)"} {
+		if !strings.Contains(withSkips, w) {
+			t.Errorf("skip disclosure missing %q:\n%s", w, withSkips)
+		}
+	}
+
+	noSkips, err := Build("implement_review", Trigger{
+		Repo:             "kuhlman-labs/example",
+		ApprovedPlan:     fixturePlan(),
+		Diff:             "- A x\n",
+		ReviewTreeCommit: commit,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(noSkips, "NOT exhaustive") {
+		t.Errorf("grounded prompt with no skips must not disclose incompleteness:\n%s", noSkips)
 	}
 }

@@ -3086,3 +3086,166 @@ func TestMcpRouteServerConfig(t *testing.T) {
 		t.Errorf("APIToken = %q, want fhk_x", cfg.APIToken)
 	}
 }
+
+// resolveReviewGroundingConfig mirrors runServe's --review-grounding and
+// --reviewer-env-passthrough flag wiring (#2486) and the handoff into
+// server.Config, so the env > flag resolution AND the Config wiring are
+// unit-testable without booting the server. It builds the two Config fields
+// exactly as runServe builds them (ReviewGroundingDisabled = !review-grounding).
+func resolveReviewGroundingConfig(t *testing.T, args []string) server.Config {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	grounding := fs.Bool("review-grounding",
+		envOrBool("FISHHAWKD_REVIEW_GROUNDING", true), "test")
+	passthrough := fs.String("reviewer-env-passthrough",
+		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""), "test")
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return server.Config{
+		ReviewGroundingDisabled: !*grounding,
+		ReviewerEnvPassthrough:  parseReviewerEnvPassthrough(*passthrough),
+	}
+}
+
+// TestResolveReviewGroundingConfig pins the #2486 env vars: grounding is ON when
+// unset (ReviewGroundingDisabled false), OFF when FISHHAWKD_REVIEW_GROUNDING is
+// false, and the passthrough list parses to trimmed, case-preserving names.
+func TestResolveReviewGroundingConfig(t *testing.T) {
+	t.Run("grounding on by default", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "")
+		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", "")
+		cfg := resolveReviewGroundingConfig(t, nil)
+		if cfg.ReviewGroundingDisabled {
+			t.Error("unset FISHHAWKD_REVIEW_GROUNDING must leave grounding ON")
+		}
+		if len(cfg.ReviewerEnvPassthrough) != 0 {
+			t.Errorf("passthrough = %v, want empty", cfg.ReviewerEnvPassthrough)
+		}
+	})
+
+	t.Run("kill switch via env", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "false")
+		cfg := resolveReviewGroundingConfig(t, nil)
+		if !cfg.ReviewGroundingDisabled {
+			t.Error("FISHHAWKD_REVIEW_GROUNDING=false must disable grounding")
+		}
+	})
+
+	t.Run("passthrough parses case-preserving trimmed names", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", " AWS_REGION , , BEDROCK_ENDPOINT ")
+		cfg := resolveReviewGroundingConfig(t, nil)
+		want := []string{"AWS_REGION", "BEDROCK_ENDPOINT"}
+		if len(cfg.ReviewerEnvPassthrough) != len(want) {
+			t.Fatalf("passthrough = %v, want %v", cfg.ReviewerEnvPassthrough, want)
+		}
+		for i := range want {
+			if cfg.ReviewerEnvPassthrough[i] != want[i] {
+				t.Errorf("passthrough[%d] = %q, want %q", i, cfg.ReviewerEnvPassthrough[i], want[i])
+			}
+		}
+	})
+}
+
+// TestEnvOrBool pins the #2486 fix-up parse: a boolean env var honours the
+// operator-friendly ParseBool forms (1, TRUE, t, True and their false
+// counterparts), not only the exact string "true". An unset or unrecognized
+// value falls back to the default. The old `== "true"` comparison silently
+// disabled grounding for =1 / =TRUE; this is the counterfactual vehicle for that
+// footgun.
+func TestEnvOrBool(t *testing.T) {
+	const key = "FISHHAWKD_REVIEW_GROUNDING"
+	cases := []struct {
+		val  string
+		def  bool
+		want bool
+	}{
+		{"", true, true},        // unset → default
+		{"", false, false},      // unset → default
+		{"true", false, true},   // canonical true
+		{"false", true, false},  // canonical false
+		{"1", false, true},      // the footgun: 1 must mean ON
+		{"0", true, false},      // 0 must mean OFF
+		{"TRUE", false, true},   // upper case must mean ON
+		{"True", false, true},   // title case must mean ON
+		{"t", false, true},      // ParseBool short form
+		{"garbage", true, true}, // unrecognized → default (true)
+		{"garbage", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.val+"/"+map[bool]string{true: "def-on", false: "def-off"}[tc.def], func(t *testing.T) {
+			t.Setenv(key, tc.val)
+			if got := envOrBool(key, tc.def); got != tc.want {
+				t.Errorf("envOrBool(%q, %v) = %v, want %v", tc.val, tc.def, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestServe_ReviewGroundingWiring pins the REAL runServe handoff (#2486 fix-up)
+// by driving runServe itself and reading the "review grounding configured" log
+// line, which logs the RESOLVED cfg fields. This closes the gap the mirror-only
+// TestResolveReviewGroundingConfig left: deleting either
+// `cfg.ReviewGroundingDisabled = !*reviewGrounding` or the passthrough assignment
+// from runServe changes the logged value and fails here. bootstrapAbortFlag
+// aborts startup at the invalid --review-resolution, which runs AFTER the
+// grounding block, so the log line is observable.
+func TestServe_ReviewGroundingWiring(t *testing.T) {
+	const line = "review grounding configured"
+
+	// Grounding ships DORMANT (#2522): reviewer reads are not confined to the
+	// export, so an unset env var must resolve to disabled=true. This subtest is
+	// the pin on that default — flipping serve.go's envOrBool default back to
+	// true reddens it, so the dormant posture cannot be undone silently.
+	t.Run("unset: grounding OFF, no passthrough", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "")
+		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", "")
+		code, log := serveWithProfile(t, bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, line) || !strings.Contains(log, `"disabled":true`) {
+			t.Errorf("unset must resolve to disabled=true (grounding dormant, #2522):\n%s", log)
+		}
+		if !strings.Contains(log, `"env_passthrough":0`) {
+			t.Errorf("unset passthrough must resolve to env_passthrough=0:\n%s", log)
+		}
+	})
+
+	t.Run("kill switch env disables", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "false")
+		code, log := serveWithProfile(t, bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, line) || !strings.Contains(log, `"disabled":true`) {
+			t.Errorf("FISHHAWKD_REVIEW_GROUNDING=false must resolve to disabled=true:\n%s", log)
+		}
+	})
+
+	t.Run("operator-friendly =1 keeps grounding on", func(t *testing.T) {
+		// The concern-5 footgun end to end: =1 must mean ON (disabled=false), not
+		// silently disable grounding as the old `== \"true\"` comparison did.
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "1")
+		code, log := serveWithProfile(t, bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, line) || !strings.Contains(log, `"disabled":false`) {
+			t.Errorf("FISHHAWKD_REVIEW_GROUNDING=1 must keep grounding ON (disabled=false):\n%s", log)
+		}
+	})
+
+	t.Run("passthrough count wired through", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "")
+		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", "AWS_REGION,BEDROCK_ENDPOINT")
+		code, log := serveWithProfile(t, bootstrapAbortFlag)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
+		}
+		if !strings.Contains(log, line) || !strings.Contains(log, `"env_passthrough":2`) {
+			t.Errorf("passthrough must resolve to env_passthrough=2 in the real handoff:\n%s", log)
+		}
+	})
+}

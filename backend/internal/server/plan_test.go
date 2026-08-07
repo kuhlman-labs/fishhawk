@@ -1522,7 +1522,7 @@ func TestPlanReviewLoop_AgentVersionMismatchBlocksDispatch(t *testing.T) {
 	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex", agentVersion: ">=0.30 <0.31"}
 
 	hasRejection := s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	if !hasRejection {
 		t.Error("hasRejection = false, want true (an out-of-range codex reviewer blocks under gating)")
@@ -1558,7 +1558,7 @@ func TestPlanReviewLoop_AgentVersionInRangeDispatches(t *testing.T) {
 	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex", agentVersion: ">=0.30 <0.31"}
 
 	hasRejection := s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	if hasRejection {
 		t.Error("hasRejection = true, want false (an in-range approve must not block)")
@@ -1590,7 +1590,7 @@ func TestPlanReviewLoop_FiresPageClassHook(t *testing.T) {
 		model:   "gpt-5.5",
 	}
 	s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	if !rec.pagedRun(runID) {
 		t.Errorf("plan-review site did not invoke the page-class hook; paged=%v", rec.pageClass)
@@ -1614,7 +1614,7 @@ func TestPlanReviewLoop_ApproveSkipsPageClassHook(t *testing.T) {
 		model:   "gpt-5.5",
 	}
 	s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	if rec.pagedRun(runID) {
 		t.Errorf("plan-review site fired the page-class hook on an all-approve loop; paged=%v", rec.pageClass)
@@ -1637,7 +1637,7 @@ func TestPlanReviewLoop_AgentVersionUnprobeableDegrades(t *testing.T) {
 	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex", agentVersion: ">=0.30 <0.31"}
 
 	hasRejection := s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{inv}, planreview.AuthorityGating, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	if hasRejection {
 		t.Error("hasRejection = true, want false (an unprobeable CLI must degrade to proceed, never block)")
@@ -1686,7 +1686,7 @@ func TestPlanReviewLoop_StampsReviewerProvenance(t *testing.T) {
 	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex"}
 
 	s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{inv}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{inv}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	reviewed := au.entriesByCategory("plan_reviewed")
 	if len(reviewed) != 1 {
@@ -1722,7 +1722,7 @@ func TestPlanReviewLoop_ProvenanceUnknownVersionDegrades(t *testing.T) {
 	inv := reviewerInvocation{reviewer: rev, provider: "codex", specModel: "gpt-5-codex"}
 
 	s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{inv}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{inv}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	if n := len(au.entriesByCategory("plan_review_failed")); n != 0 {
 		t.Fatalf("plan_review_failed entries = %d, want 0 (an unknown version degrades, never fails)", n)
@@ -1759,7 +1759,7 @@ func TestPlanReviewLoop_NonProbingReviewerOmitsProvenance(t *testing.T) {
 	}
 	s.runPlanReviewLoop(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: rev, provider: "anthropic"}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+		planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	reviewed := au.entriesByCategory("plan_reviewed")
 	if len(reviewed) != 1 {
@@ -4125,7 +4125,7 @@ func TestPlanReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 		model: "gpt-5.5",
 	}
 	s.runPlanReviewLoop(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", planreview.DefaultReviewBudget, "")
 
 	reviewed := au.entriesByCategory("plan_reviewed")
 	if len(reviewed) != 1 {

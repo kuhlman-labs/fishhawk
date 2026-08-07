@@ -1440,8 +1440,40 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 			trig.IssueNumber = n
 		}
 	}
+
+	// Resolve the per-invocation reviewer list (#955) BEFORE building the prompt
+	// so the grounding decision (#2486) can key on whether every reviewer in the
+	// loop implements the grounding capability. The plan review runs BEFORE the
+	// plan-approval gate, so the operator's review_model override is not yet
+	// resolved and does not apply here (#1416 condition 3) — the no-override
+	// wrapper keeps the plan review byte-identical to today.
+	invocations := s.resolveReviewerInvocations(reviewersCfg)
+
+	// Review grounding (#2486): when the whole loop is grounding-capable, export
+	// the working dir's resolved HEAD (no change exists yet at plan stage) as a
+	// read-only tree and name that commit in the prompt. exportReviewTree returns
+	// an empty treeDir + no-op cleanup on every degrade (kill switch, no working
+	// dir, export failure), so the prompt then renders the diff-only clause and
+	// the loop runs ungrounded. cleanup ownership is decided at dispatch below
+	// (C6): the synchronous gating path defers it in this scope; the detached
+	// advisory path hands it into the goroutine so the export survives the
+	// detached reviewers' lifetime.
+	var treeDir string
+	treeCleanup := func() {}
+	if allInvocationsGrounded(invocations) {
+		dir, commit, stats, cleanup := s.exportReviewTree(ctx, runRow, "HEAD")
+		if dir != "" {
+			treeDir = dir
+			treeCleanup = cleanup
+			trig.ReviewTreeCommit = commit
+			trig.ReviewTreeSkippedSymlinks = stats.Symlinks
+			trig.ReviewTreeSkippedInstructions = stats.Instructions
+		}
+	}
+
 	promptText, err := prompt.Build("plan_review", trig)
 	if err != nil {
+		treeCleanup()
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: build prompt failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
@@ -1460,13 +1492,8 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// WARN-log and continue on append failure so dispatch is never blocked.
 	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount(), "")
 
-	// Resolve the per-invocation reviewer list (#955) up front so the
-	// detached goroutine closes over fully-resolved adapters, never the
-	// spec config or request-scoped state. The plan review runs BEFORE the
-	// plan-approval gate, so the operator's review_model override is not yet
-	// resolved and does not apply here (#1416 condition 3) — the no-override
-	// wrapper keeps the plan review byte-identical to today.
-	invocations := s.resolveReviewerInvocations(reviewersCfg)
+	// invocations were resolved above (before the prompt build) so the grounding
+	// decision could key on the loop's capability set.
 
 	// Detach the reviewer context from the request lifecycle (#584).
 	// context.WithoutCancel keeps the parent's values but is NOT
@@ -1488,18 +1515,29 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// Advisory: dispatch detached so the upload returns promptly. The
 	// goroutine closes over only already-resolved values (built prompt,
 	// IDs, authority, author model) — never r or request-scoped state.
+	//
+	// Cleanup ownership (#2486, C6): the DETACHED goroutine owns treeCleanup —
+	// deferred INSIDE the goroutine, not in this dispatch scope. A defer here
+	// would remove the export as soon as runPlanReviews returns (immediately, on
+	// the advisory path) while the detached reviewers still hold it as their
+	// working directory. Deferring in the goroutine keeps the export alive for the
+	// whole detached review and removes it exactly when the loop returns.
 	if authority != planreview.AuthorityGating {
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget)
+			defer treeCleanup()
+			s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir)
 		}()
 		return false
 	}
 
 	// Gating: run synchronously so the failed-B transition lands before
-	// the trace handler advances the stage.
-	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget)
+	// the trace handler advances the stage. Cleanup is owned by THIS scope
+	// (deferred) because the loop runs to completion before runPlanReviews
+	// returns, so the export is live for every reviewer and removed right after.
+	defer treeCleanup()
+	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir)
 	if hasRejection {
 		cat := run.FailureB
 		reason := "plan_review_rejected: agent review verdict reject under gating authority"
@@ -1910,7 +1948,7 @@ func reviewerAgentVersionMismatch(inv reviewerInvocation, probedVersion string) 
 // ctx is the detached review context: per-invocation errors (including a
 // reviewer whose provider failed to resolve) are WARN-logged and skipped
 // so a transient reviewer failure doesn't strand the loop.
-func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget) bool {
+func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget, treeDir string) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	// pagedRejectAppended tracks whether THIS loop appended a page-class
@@ -1985,7 +2023,7 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 		// at its own cfg.Timeout. cancel() is called directly each turn (not a
 		// deferred stack) so deadlines don't accumulate across reviewers.
 		invocationCtx, cancel := context.WithTimeout(ctx, budget)
-		verdict, model, err := inv.reviewer.Review(invocationCtx, promptText)
+		verdict, model, err := s.invokeReview(invocationCtx, inv, promptText, treeDir)
 		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err != nil {

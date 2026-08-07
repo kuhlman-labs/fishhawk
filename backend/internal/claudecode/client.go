@@ -8,11 +8,32 @@
 //
 // The adapter shells out to `claude --print --output-format json --model
 // <model> -p <prompt>` and decodes the single JSON envelope the CLI emits.
-// Unlike the runner's streaming claudecode adapter, this is inference-only:
-// the review prompt forbids tool use, so there is no --verbose/stream-json,
-// no --dangerously-skip-permissions, and no --add-dir. cmd.Output() captures
-// the whole response in one buffer, sidestepping the StdoutPipe read race the
-// streaming adapter must handle.
+// cmd.Output() captures the whole response in one buffer, sidestepping the
+// StdoutPipe read race the streaming adapter must handle.
+//
+// The adapter runs one of two postures per invocation (#2486):
+//
+//   - UNGROUNDED (treeDir == ""): the diff-only posture. The child runs from a
+//     fresh EMPTY scratch directory — NOT the process working directory. This
+//     adapter used to leave cmd.Dir unset, so the reviewer inherited fishhawkd's
+//     cwd (the operator's live checkout, including uncommitted changes, .env, and
+//     .git); read-only built-in tools need no permission prompt, so an ungrounded
+//     reviewer was accidentally grounded against whatever directory the daemon
+//     sat in. Pinning an empty scratch cwd makes ungrounded genuinely diff-only.
+//   - GROUNDED (treeDir != ""): the child runs from the caller-supplied EXPORTED
+//     read-only tree (reviewsandbox.ExportTree — tracked files at one commit, no
+//     .git) with --add-dir <tree>, and the toolset restricted to Read,Grep,Glob
+//     via --tools plus --allowed-tools so print mode never hits an unanswerable
+//     permission prompt. --tools bounds only the BUILT-IN toolset, so the grounded
+//     argv ALSO pins an EMPTY MCP server set (--strict-mcp-config plus --mcp-config
+//     {"mcpServers":{}}) — otherwise the operator's MCP tools (browser, Gmail,
+//     GitHub) load past --tools and break the never-network property. Neither
+//     posture passes --dangerously-skip-permissions or --permission-mode
+//     bypassPermissions.
+//
+// Either posture seeds the child environment from reviewsandbox.Env — the
+// enumerated ClaudeAllow list plus the operator passthrough — never a wholesale
+// os.Environ(), so a tool-enabled reviewer never holds the daemon's secrets.
 package claudecode
 
 import (
@@ -28,6 +49,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/procgroup"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewsandbox"
 )
 
 // DefaultBinary is the executable name resolved against PATH when
@@ -69,6 +91,13 @@ type Config struct {
 	// review, #606) and deterministic faults (binary-missing,
 	// envelope-decode, bad verdict) are never retried.
 	MaxRetries int
+	// EnvPassthrough is the operator-configured list of EXACT environment
+	// variable names appended to reviewsandbox.ClaudeAllow when scrubbing the
+	// child environment (#2486) — the documented escape hatch for a deployment
+	// whose auth needs a variable the minimal allow-list omits (Bedrock/Vertex
+	// routing, an unusual proxy/CA-bundle var), named explicitly rather than
+	// admitted by a prefix. Empty is the default — only the allow-list survives.
+	EnvPassthrough []string
 }
 
 // Client wraps the `claude` CLI for one-shot inference calls.
@@ -126,10 +155,20 @@ type cliUsage struct {
 // operator's existing ANTHROPIC_API_KEY or subscription auth is used with
 // zero new plumbing.
 func (c *Client) Inference(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, err error) {
+	return c.InferenceInTree(ctx, prompt, "")
+}
+
+// InferenceInTree is Inference with an optional grounding tree (#2486). When
+// treeDir is non-empty the child runs from that exported read-only tree with the
+// toolset restricted to Read,Grep,Glob (the GROUNDED posture); when empty it runs
+// from a fresh empty scratch dir with no tool grant (the UNGROUNDED, genuinely
+// diff-only posture). Inference delegates here with an empty treeDir so the two
+// postures share one code path.
+func (c *Client) InferenceInTree(ctx context.Context, prompt, treeDir string) (responseText, model string, usage planreview.Usage, err error) {
 	maxAttempts := c.cfg.MaxRetries + 1
 
 	for attempt := 1; ; attempt++ {
-		text, mdl, u, retryable, ierr := c.invokeOnce(ctx, prompt)
+		text, mdl, u, retryable, ierr := c.invokeOnce(ctx, prompt, treeDir)
 		if ierr == nil {
 			return text, mdl, u, nil
 		}
@@ -153,7 +192,7 @@ func (c *Client) Inference(ctx context.Context, prompt string) (responseText, mo
 // crash class — an *exec.ExitError that is NOT a per-attempt timeout (an
 // external/OOM SIGKILL). A timeout-kill (a slow review, #606) and every
 // deterministic fault return retryable=false so the loop fails fast.
-func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, retryable bool, err error) {
+func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (responseText, model string, usage planreview.Usage, retryable bool, err error) {
 	// Honour a caller-supplied deadline. The server now computes a size-aware
 	// per-invocation budget (#747) and applies it as a ctx deadline at the
 	// review call site; capping it again with c.cfg.Timeout would defeat the
@@ -173,12 +212,56 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		cmdFn = exec.CommandContext
 	}
 
+	// Workspace posture (#2486). In BOTH postures cmd.Dir is set to a directory
+	// we control — NEVER left unset (which would inherit fishhawkd's cwd, the
+	// operator's live checkout, and accidentally ground a diff-only review). The
+	// GROUNDED case runs from the caller-owned exported tree (removed by the
+	// caller when the loop returns — this path creates/removes NOTHING). The
+	// UNGROUNDED case runs from a fresh EMPTY scratch dir created and removed
+	// here. FAIL CLOSED on MkdirTemp error in the ungrounded case rather than
+	// silently falling back to the process cwd.
+	workDir := treeDir
+	if workDir == "" {
+		scratchDir, serr := os.MkdirTemp("", "fishhawk-claude-review-")
+		if serr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("claudecode: create scratch workspace dir: %w", serr)
+		}
+		defer func() { _ = os.RemoveAll(scratchDir) }()
+		workDir = scratchDir
+	}
+
 	args := []string{
 		"--print",
 		"--output-format", "json",
 		"--model", c.cfg.Model,
-		"-p", prompt,
 	}
+	// Grounded posture (#2486): grant the reviewer read+search of the exported
+	// tree, restrict the AVAILABLE built-in toolset to Read,Grep,Glob (no Bash,
+	// no Write/Edit, no WebFetch/WebSearch) via --tools, and pre-approve exactly
+	// those via --allowed-tools so print mode never reaches an unanswerable
+	// permission prompt. Pinned against Claude Code 2.1.224. Never
+	// --dangerously-skip-permissions and never --permission-mode bypassPermissions.
+	//
+	// --tools bounds only the BUILT-IN toolset; MCP tools are not built-ins, so
+	// they load from the operator's config and survive the --tools restriction
+	// (verified live: a grounded child enumerated GitHub/Gmail/browser MCP tools
+	// despite --tools Read,Grep,Glob). Browser automation and Gmail are network
+	// egress and data exfiltration, which defeat this design's never-network
+	// property. So the grounded argv ALSO pins an EMPTY MCP server set:
+	// --strict-mcp-config makes --mcp-config the sole source of MCP config
+	// (ignoring the operator's ~/.claude and project .mcp.json), and the empty
+	// {"mcpServers":{}} document loads zero MCP servers. Grounding (the sentinel
+	// tree read) is preserved with both flags on. Ungrounded argv is unchanged.
+	if treeDir != "" {
+		args = append(args,
+			"--add-dir", treeDir,
+			"--tools", "Read,Grep,Glob",
+			"--allowed-tools", "Read", "Grep", "Glob",
+			"--strict-mcp-config",
+			"--mcp-config", `{"mcpServers":{}}`,
+		)
+	}
+	args = append(args, "-p", prompt)
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
 	// Harden the subprocess so the review deadline actually terminates a wedged
 	// reviewer (#1805): the child leads its own process group, a deadline-fired
@@ -187,8 +270,15 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	// member escaped the kill. Must be applied after the cmd is built and before
 	// cmd.Output().
 	procgroup.Harden(cmd, killGrace)
+	cmd.Dir = workDir
+	// Seed the child environment from the SCRUBBED allow-list, not a wholesale
+	// os.Environ() (#2486): a tool-enabled reviewer processing untrusted diff/issue
+	// text must never hold FISHHAWKD_DATABASE_URL, GITHUB_TOKEN, or unrelated API
+	// keys. reviewsandbox.Env keeps only ClaudeAllow ∪ the operator passthrough
+	// (model reachability, host auth-config discovery, corporate egress). The
+	// `if cmd.Env == nil` seam lets tests inject env.
 	if cmd.Env == nil {
-		cmd.Env = os.Environ()
+		cmd.Env = reviewsandbox.Env(os.Environ(), reviewsandbox.ClaudeAllow, c.cfg.EnvPassthrough)
 	}
 	// Capture stderr into our own buffer. Because cmd.Stderr is now non-nil,
 	// cmd.Output() no longer populates exitErr.Stderr — so diagnostics must

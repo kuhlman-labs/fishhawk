@@ -358,3 +358,23 @@ pointing at `fishhawk_fixup_stage` (route the concerns back to the agent) vs app
 
 **Prompt-caching strategy**: the `implement_review` prompt is split at `prompt.ImplementReviewSplitMarker` (`"\n### Diff under review\n\n"`), same pattern as `PlanReviewSplitMarker` — the role-constraint preamble is the cacheable prefix, the variable diff/plan/issue content follows.
 
+
+### Review grounding + environment scrub (#2486)
+
+Both review adapters (`backend/internal/claudecode`, `backend/internal/codex`)
+seed the reviewer subprocess from `reviewsandbox.Env` — a per-adapter allow-list
+(`ClaudeAllow` / `CodexAllow`) ∪ operator passthrough — NOT a wholesale
+`os.Environ()`, so a tool-enabled reviewer never holds `FISHHAWKD_DATABASE_URL`,
+`GITHUB_TOKEN`, or unrelated API keys. When the whole review loop is
+grounding-capable (`allInvocationsGrounded` — every reviewer implements the
+optional `ReviewGrounded`; the anthropic SDK adapter does not, so a mixed panel
+is ungrounded for everyone), the server exports the reviewed commit as a
+read-only tree (`reviewsandbox.ExportTree`) and the adapters run grounded (codex:
+`--sandbox read-only --ignore-rules`; claude: `--add-dir` + `--tools Read,Grep,Glob`),
+so a reviewer can confirm diff-invisible facts. Long-form contract:
+`backend/internal/reviewsandbox/README.md`.
+
+| Env var | Default | Effect |
+|---|---|---|
+| `FISHHAWKD_REVIEW_GROUNDING` | `true` | Kill switch. `false` reverts both adapters to the diff-only (ungrounded) posture and the prompts to diff-only wording, without a rollback. The environment scrub is independent of this flag and always applied. |
+| `FISHHAWKD_REVIEWER_ENV_PASSTHROUGH` | (empty) | Comma-separated EXACT env var names appended to each adapter's scrub allow-list — the escape hatch for a Bedrock/Vertex/proxy deployment whose auth vars the minimal list omits. Named explicitly, never by prefix. |

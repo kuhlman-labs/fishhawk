@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -234,5 +235,26 @@ func TestReviewer_ReviewerBinaryPath(t *testing.T) {
 	ro := NewReviewer(Config{Binary: override})
 	if got := ro.ReviewerBinaryPath(); got != override {
 		t.Errorf("ReviewerBinaryPath() = %q, want the override %q", got, override)
+	}
+}
+
+// TestReviewGrounded_RoutesTreeDir asserts ReviewGrounded threads treeDir into
+// the subprocess as its working directory (#2486) and returns the verdict; the
+// grounded argv/cwd wiring is pinned in detail by client_test.go.
+func TestReviewGrounded_RoutesTreeDir(t *testing.T) {
+	treeDir := t.TempDir()
+	var cmd *exec.Cmd
+	r := NewReviewer(testConfig())
+	r.client.Cmd = capturingHelper("happy", true, nil, &cmd)
+
+	verdict, _, err := r.ReviewGrounded(context.Background(), "review", treeDir)
+	if err != nil {
+		t.Fatalf("ReviewGrounded: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want approve", verdict.Verdict)
+	}
+	if cmd.Dir != treeDir {
+		t.Errorf("cmd.Dir = %q, want the tree %q", cmd.Dir, treeDir)
 	}
 }

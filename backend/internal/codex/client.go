@@ -8,14 +8,31 @@
 // The adapter shells out to `codex exec --json --skip-git-repo-check <prompt>`
 // for inference-only review and reads one JSON event per line from stdout. The
 // flag shape and JSONL event schema below were pinned against the installed
-// Codex CLI (codex-cli 0.137.0), the same version the runner executor adapter
-// pinned (runner/internal/agent/codex). Unlike that streaming executor, this is
-// inference-only: the review prompt forbids tool use, so there is no heartbeat,
-// no process-group kill, and no --dangerously-bypass-approvals-and-sandbox — a
-// real `codex exec --json --skip-git-repo-check` of a review prompt from a
-// non-repo dir returns cleanly without blocking on approvals or sandbox setup.
+// Codex CLI (codex-cli 0.137.0, --sandbox/--ignore-rules pinned against 0.144.1),
+// the same family the runner executor adapter pinned (runner/internal/agent/codex).
 // cmd.Output() captures the whole response in one buffer, sidestepping the
 // StdoutPipe read race the streaming adapter must handle.
+//
+// The adapter runs one of two postures per invocation (#2486):
+//
+//   - UNGROUNDED (treeDir == ""): the historical posture. The child runs from a
+//     fresh EMPTY scratch dir with no --sandbox flag, so a diff-only reviewer
+//     has nothing to explore. --skip-git-repo-check pins the non-repo-cwd
+//     execution.
+//   - GROUNDED (treeDir != ""): the child runs from an EXPORTED read-only source
+//     tree (reviewsandbox.ExportTree — tracked files at one commit, no .git) so
+//     the reviewer can confirm diff-invisible facts by reading and searching the
+//     tree. --sandbox read-only makes the previously-implicit default EXPLICIT
+//     and --ignore-rules stops an execpolicy .rules file inside the reviewed
+//     tree from widening the posture. NOTE: codex's read-only sandbox grants
+//     read-only SHELL execution (with no network), not merely file reads — it is
+//     the narrowest posture the codex CLI can express, so "never shell" is met
+//     only in the sense that nothing can write or reach the network. Neither
+//     posture passes --dangerously-bypass-approvals-and-sandbox.
+//
+// Either posture seeds the child environment from reviewsandbox.Env — the
+// enumerated CodexAllow list plus the operator passthrough — never a wholesale
+// os.Environ(), so a tool-enabled reviewer never holds the daemon's secrets.
 package codex
 
 import (
@@ -31,6 +48,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/procgroup"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewsandbox"
 )
 
 // DefaultBinary is the executable name resolved against PATH when
@@ -86,6 +104,14 @@ type Config struct {
 	// NewClient. A per-attempt timeout and deterministic faults (binary-missing,
 	// no-agent-message, bad-verdict) are never retried.
 	MaxRetries int
+	// EnvPassthrough is the operator-configured list of EXACT environment
+	// variable names appended to reviewsandbox.CodexAllow when scrubbing the
+	// child environment (#2486). It is the documented escape hatch for a
+	// deployment whose auth needs a variable the minimal allow-list omits
+	// (Bedrock/Vertex routing, an unusual proxy/CA-bundle var), named
+	// explicitly rather than admitted by a prefix. Empty is the default —
+	// only the allow-list survives.
+	EnvPassthrough []string
 }
 
 // Client wraps the `codex` CLI for one-shot inference calls.
@@ -159,10 +185,19 @@ type usageBlock struct {
 // child inherits os.Environ() so the operator's existing OPENAI_API_KEY or
 // ChatGPT-login auth is used with zero new plumbing.
 func (c *Client) Inference(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, err error) {
+	return c.InferenceInTree(ctx, prompt, "")
+}
+
+// InferenceInTree is Inference with an optional grounding tree (#2486). When
+// treeDir is non-empty the child runs from that exported read-only tree under
+// the codex read-only sandbox (the GROUNDED posture); when empty it keeps the
+// historical empty-scratch-dir UNGROUNDED posture. Inference delegates here with
+// an empty treeDir so the two postures share one code path.
+func (c *Client) InferenceInTree(ctx context.Context, prompt, treeDir string) (responseText, model string, usage planreview.Usage, err error) {
 	maxAttempts := c.cfg.MaxRetries + 1
 
 	for attempt := 1; ; attempt++ {
-		text, mdl, u, retryable, ierr := c.invokeOnce(ctx, prompt)
+		text, mdl, u, retryable, ierr := c.invokeOnce(ctx, prompt, treeDir)
 		if ierr == nil {
 			return text, mdl, u, nil
 		}
@@ -185,7 +220,7 @@ func (c *Client) Inference(ctx context.Context, prompt string) (responseText, mo
 // *exec.ExitError that is NOT a per-attempt timeout (an external/OOM SIGKILL). A
 // timeout-kill and every deterministic fault return retryable=false so the loop
 // fails fast. Mirrors claudecode.Client.invokeOnce.
-func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, retryable bool, err error) {
+func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (responseText, model string, usage planreview.Usage, retryable bool, err error) {
 	// Honour a caller-supplied deadline. The server computes a size-aware
 	// per-invocation budget (#747) and applies it as a ctx deadline at the
 	// review call site; capping it again with c.cfg.Timeout would defeat the
@@ -203,25 +238,33 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		cmdFn = exec.CommandContext
 	}
 
-	// Workspace bound (#995): run the child from a fresh EMPTY scratch
-	// directory. `codex exec` in non-interactive mode runs read-only shell
-	// commands without approval, so a reviewer that decides to explore its cwd
-	// reads whatever fishhawkd's inherited cwd holds (the repo checkout, in the
-	// dogfood loop) across many turns — each turn re-sending the full growing
-	// conversation (~400k input tokens per review). The prompt forbids tool use
-	// but cannot prevent it; an empty cwd makes exploration fruitless. Review
-	// invocations review the provided artifact and need no repo access —
-	// --skip-git-repo-check already pins the non-repo-cwd execution posture.
+	// Workspace posture (#995, #2486). Two cases:
 	//
-	// FAIL CLOSED on MkdirTemp error: a review that silently regains an
-	// unbounded workspace defeats the bound, so the invocation errors instead
-	// (the #955 per-invocation failure path degrades the advisory review
-	// gracefully — terminal *_review_failed entry, loop continues).
-	scratchDir, err := os.MkdirTemp("", "fishhawk-codex-review-")
-	if err != nil {
-		return "", "", planreview.Usage{}, false, fmt.Errorf("codex: create scratch workspace dir: %w", err)
+	//   UNGROUNDED (treeDir == ""): run the child from a fresh EMPTY scratch
+	//   directory. `codex exec` in non-interactive mode runs read-only shell
+	//   commands without approval, so a reviewer that decides to explore its cwd
+	//   reads whatever it holds; an empty cwd makes exploration fruitless. This
+	//   scratch dir is created and removed HERE.
+	//
+	//   GROUNDED (treeDir != ""): run the child from the caller-supplied exported
+	//   read-only tree (reviewsandbox.ExportTree). The tree is owned by the caller
+	//   (removed when the review loop returns), so this path creates and removes
+	//   NOTHING — it must not RemoveAll a directory it does not own.
+	//
+	// FAIL CLOSED on MkdirTemp error in the ungrounded case: a review that
+	// silently regains an unbounded workspace defeats the bound, so the
+	// invocation errors instead (the #955 per-invocation failure path degrades
+	// the advisory review gracefully — terminal *_review_failed entry, loop
+	// continues).
+	workDir := treeDir
+	if workDir == "" {
+		scratchDir, serr := os.MkdirTemp("", "fishhawk-codex-review-")
+		if serr != nil {
+			return "", "", planreview.Usage{}, false, fmt.Errorf("codex: create scratch workspace dir: %w", serr)
+		}
+		defer func() { _ = os.RemoveAll(scratchDir) }()
+		workDir = scratchDir
 	}
-	defer func() { _ = os.RemoveAll(scratchDir) }()
 
 	// Structured outputs (#1324/#1330): constrain the model's final response via
 	// `codex exec --output-schema <FILE>` (pinned against codex-cli 0.140.0, which
@@ -264,9 +307,18 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	//                           stream this adapter parses).
 	//   --skip-git-repo-check — Codex refuses to run outside a git repo by
 	//                           default; cmd.Dir is a fresh non-repo scratch
-	//                           dir (above), so this is required. A real run
+	//                           dir OR the exported tree (which carries no .git),
+	//                           so this is required in BOTH postures. A real run
 	//                           from a non-repo dir returns cleanly without
 	//                           the executor's --dangerously-bypass flags.
+	//   --sandbox read-only   — GROUNDED posture only (#2486): make the
+	//                           previously-implicit read-only default EXPLICIT,
+	//                           pinned against codex-cli 0.144.1. It grants
+	//                           read-only SHELL (not merely file read) with no
+	//                           network — the narrowest posture the CLI expresses.
+	//   --ignore-rules        — GROUNDED posture only: ignore an execpolicy
+	//                           .rules file inside the reviewed tree so a
+	//                           repo-resident rules file cannot widen the posture.
 	//   --output-schema <FILE> — constrains the model's final response to the
 	//                           planreview.StrictVerdictSchemaJSON() strict
 	//                           variant written to schemaPath above (#1324/#1330,
@@ -290,6 +342,14 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 		"--skip-git-repo-check",
 		"--output-schema", schemaPath,
 	}
+	// Grounded posture (#2486): make the read-only sandbox EXPLICIT (pinned
+	// against codex-cli 0.144.1) and ignore any execpolicy .rules file inside the
+	// reviewed tree so a repo-resident rules file cannot widen the posture. Only
+	// added when a grounding tree is provided; the ungrounded empty-scratch path
+	// stays byte-for-byte as before.
+	if treeDir != "" {
+		args = append(args, "--sandbox", "read-only", "--ignore-rules")
+	}
 	if c.cfg.Model != "" {
 		args = append(args, "--model", c.cfg.Model)
 	}
@@ -305,16 +365,19 @@ func (c *Client) invokeOnce(ctx context.Context, prompt string) (responseText, m
 	// force-closes the parent-side pipe fd if a group member escaped the kill.
 	// Must be applied after the cmd is built and before cmd.Output().
 	procgroup.Harden(cmd, killGrace)
-	cmd.Dir = scratchDir
-	// Seed with os.Environ() when the Cmd builder left env nil (production), so
-	// the operator's existing OPENAI_API_KEY / ChatGPT-login auth and PATH are
-	// inherited. Then layer the configured API key on top. A subprocess's
-	// os.Getenv returns the FIRST matching entry, so a plain append would be
-	// shadowed by any inherited OPENAI_API_KEY — strip existing entries from the
-	// seed before appending the configured one so cfg.APIKey actually wins. An
-	// empty cfg.APIKey is skipped, leaving the inherited env untouched.
+	cmd.Dir = workDir
+	// Seed the child environment from the SCRUBBED allow-list, not a wholesale
+	// os.Environ() (#2486): a tool-enabled reviewer processing untrusted diff/issue
+	// text must never hold FISHHAWKD_DATABASE_URL, GITHUB_TOKEN, or unrelated API
+	// keys. reviewsandbox.Env keeps only CodexAllow ∪ the operator passthrough
+	// (model reachability, host auth-config discovery, corporate egress). Then
+	// layer the configured API key on top: a subprocess's os.Getenv returns the
+	// FIRST matching entry, so a plain append would be shadowed by any inherited
+	// OPENAI_API_KEY — appendEnvOverride strips existing entries before appending
+	// so cfg.APIKey actually wins. An empty cfg.APIKey is skipped, leaving the
+	// scrubbed env untouched. The `if cmd.Env == nil` seam lets tests inject env.
 	if cmd.Env == nil {
-		cmd.Env = os.Environ()
+		cmd.Env = reviewsandbox.Env(os.Environ(), reviewsandbox.CodexAllow, c.cfg.EnvPassthrough)
 	}
 	if c.cfg.APIKey != "" {
 		cmd.Env = appendEnvOverride(cmd.Env, "OPENAI_API_KEY", c.cfg.APIKey)

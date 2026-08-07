@@ -194,3 +194,28 @@ The dominant defect class in agent-written control tests: a test that passes whe
 The wording is deliberately NOT gated on the change looking security-relevant or being Go — #2453 was a zsh tooling change with no production surface and produced the same shape. The framing is economic, not protective: the heterogeneous reviewers already catch these post-hoc; what the rule saves is fix-up passes (#2436 spent 3 of 3 and four review rounds on this class). Cost is paid honestly on every render — the plan-stage rule is 1578 bytes on every plan prompt, the implement/fix-up block 1466 bytes once per implement pass and once per fix-up pass.
 
 Pinned by four tests in `prompt_test.go`: `TestBuild_Plan_CounterfactualAttainabilityRule`, `TestBuild_Implement_CounterfactualDiscipline_Rendered`, `TestBuild_Implement_CounterfactualDiscipline_RenderedOnFixup` (the #2453 fix-up-path pin), and `TestBuild_Implement_CounterfactualDiscipline_DistinctFromFailureModeHeading` (a presence+absence pair over the same fix-up string). Because `_Rendered` and `_RenderedOnFixup` drive two different builders through two different call sites, deleting either single call site reddens exactly one of them.
+
+## Review grounding — conditional repository-access clause (#2486)
+
+Both review prompts (`buildPlanReview`, `buildImplementReview`) render a
+`REPOSITORY ACCESS` section whose content is keyed on `Trigger.ReviewTreeCommit`
+(`writeReviewToolClause` + `writeReviewRepoAccess`):
+
+- **Grounded** (`ReviewTreeCommit` non-empty): the tool MUST-NOT bullet permits
+  reading and searching files within the provided working directory, and the
+  section names the tree and its short commit, states the reviewer has read+search
+  but no shell-write and no network, and binds evidence-citing (a "is this symbol
+  called / branch reachable / constant defined" question must be resolved against
+  the tree and cited, not hedged). When the export skipped entries
+  (`Trigger.ReviewTreeSkippedSymlinks` / `ReviewTreeSkippedInstructions` > 0) it
+  discloses the tree is NOT exhaustive and names the count and kind (C3), so a
+  tree-wide "not found" is not mistaken for proof.
+- **Ungrounded** (`ReviewTreeCommit` empty — the degrade path): the bullet forbids
+  all tools and the section states plainly that no repository tree is available and
+  the review is DIFF-ONLY, so the reviewer scopes its confidence to the diff.
+
+The server sets `ReviewTreeCommit` (and the skip counts) only when the whole review
+loop is grounding-capable and the `reviewsandbox.ExportTree` export succeeded; the
+SHA is the one `ExportTree` resolved and archived (C4). The supplemental
+base-rebase re-invoke prompt renders no diff and is always ungrounded. Pinned by
+`TestBuild_ReviewGrounding_*` in `prompt_test.go`.

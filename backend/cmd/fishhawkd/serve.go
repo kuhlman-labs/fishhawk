@@ -229,6 +229,11 @@ type planReviewerOptions struct {
 	planReviewMaxTokens       int
 	planReviewMaxRetries      int
 	planReviewTimeout         time.Duration
+	// reviewerEnvPassthrough is the operator-configured list of EXACT env var
+	// names appended to each subprocess adapter's scrub allow-list (#2486). It
+	// governs the claudecode and codex adapters only — the anthropic SDK adapter
+	// spawns no subprocess. Empty is the default (built-in allow-list only).
+	reviewerEnvPassthrough []string
 	// modelBaseURL / modelAPIKey are the region-scoped inference endpoint and
 	// credential (ADR-062, E44.7 / #1831). They govern the Anthropic SDK
 	// adapter only — the claudecode and codex adapters are subprocesses whose
@@ -357,10 +362,11 @@ func (p *planReviewerSet) newAnthropic(model string) server.PlanReviewer {
 
 func (p *planReviewerSet) newClaudeCode(model string) server.PlanReviewer {
 	reviewer := claudecode.NewReviewer(claudecode.Config{
-		Binary:    p.opts.localClaudeBinary,
-		Model:     model,
-		MaxTokens: p.opts.planReviewMaxTokens,
-		Timeout:   p.opts.planReviewTimeout,
+		Binary:         p.opts.localClaudeBinary,
+		Model:          model,
+		MaxTokens:      p.opts.planReviewMaxTokens,
+		Timeout:        p.opts.planReviewTimeout,
+		EnvPassthrough: p.opts.reviewerEnvPassthrough,
 	})
 	// Apply the env-resolved retry budget past NewClient's zero->1
 	// normalisation: an explicit 0 means retry disabled (single attempt),
@@ -381,6 +387,7 @@ func (p *planReviewerSet) newCodex(model, reasoningEffort string) server.PlanRev
 		ReasoningEffort: reasoningEffort,
 		MaxTokens:       p.opts.planReviewMaxTokens,
 		Timeout:         p.opts.planReviewTimeout,
+		EnvPassthrough:  p.opts.reviewerEnvPassthrough,
 	})
 	reviewer.SetMaxRetries(p.opts.planReviewMaxRetries)
 	return reviewer
@@ -1390,6 +1397,21 @@ func runServe(args []string, logSink io.Writer) int {
 		envOrDuration("FISHHAWKD_REVIEW_BUDGET_CAP", planreview.DefaultReviewBudget.Cap),
 		"hard ceiling on the size-aware review budget (#747), bounding the worst-case "+
 			"synchronous gating wait for a very large diff. A non-positive value disables the ceiling")
+	reviewGrounding := fs.Bool("review-grounding",
+		envOrBool("FISHHAWKD_REVIEW_GROUNDING", false),
+		"ground plan-/implement-review agents against an exported read-only source tree (#2486): "+
+			"the reviewer can read and search the repository's tracked files at the reviewed commit to "+
+			"confirm diff-invisible facts. OFF by default (#2522): reviewer reads are NOT confined to "+
+			"the export — cmd.Dir and --add-dir select a working directory, they do not jail reads, so a "+
+			"grounded reviewer can read any file the daemon user can read and its verdict text is an "+
+			"egress path. Set FISHHAWKD_REVIEW_GROUNDING=true to opt in on a trusted single-tenant host. "+
+			"The environment scrub is independent of this flag and always applied")
+	reviewerEnvPassthrough := fs.String("reviewer-env-passthrough",
+		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""),
+		"comma-separated list of EXACT environment variable names appended to each review adapter's "+
+			"scrub allow-list (#2486). The escape hatch for a Bedrock/Vertex/proxy deployment whose auth "+
+			"vars the minimal allow-list omits; named explicitly, never by prefix. Empty (the default) "+
+			"keeps only the built-in allow-list")
 	spendAlertMultiple := fs.Float64("spend-alert-multiple",
 		envOrFloat("FISHHAWKD_SPEND_ALERT_MULTIPLE", spendalert.DefaultMultiple),
 		"warn-only spend-anomaly threshold (#649): the trace handler emits a spend_alert audit "+
@@ -1609,6 +1631,7 @@ func runServe(args []string, logSink io.Writer) int {
 		planReviewMaxTokens:       *planReviewMaxTokens,
 		planReviewMaxRetries:      *planReviewMaxRetries,
 		planReviewTimeout:         *planReviewTimeout,
+		reviewerEnvPassthrough:    parseReviewerEnvPassthrough(*reviewerEnvPassthrough),
 		modelBaseURL:              *modelBaseURL,
 		modelAPIKey:               *modelAPIKey,
 		homeRegion:                *homeRegion,
@@ -1618,6 +1641,26 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 	cfg.PlanReviewers = planReviewers
+
+	// Review grounding (#2486): grounding is OFF unless FISHHAWKD_REVIEW_GROUNDING
+	// is true. It ships DORMANT because reviewer reads are not confined to the
+	// exported tree (#2522) — verified live: claude reads out-of-tree absolute
+	// paths and codex lists ~/.ssh — so enabling it is an explicit operator
+	// choice for a trusted single-tenant host, not a default posture. The
+	// environment scrub is NOT gated on this flag and always applies.
+	// The passthrough list is also carried on the
+	// server config so the grounding-side wiring and the adapter-side scrub read
+	// the same operator input.
+	cfg.ReviewGroundingDisabled = !*reviewGrounding
+	cfg.ReviewerEnvPassthrough = parseReviewerEnvPassthrough(*reviewerEnvPassthrough)
+	// Log the RESOLVED config fields (not the raw flags) so the real runServe
+	// handoff is observable end to end: a serve-driven test reads this line, so
+	// deleting either assignment above changes the logged value and fails that
+	// test rather than leaving the mirror-only unit test green (#2486 fix-up).
+	logger.Info("review grounding configured",
+		slog.Bool("disabled", cfg.ReviewGroundingDisabled),
+		slog.Int("env_passthrough", len(cfg.ReviewerEnvPassthrough)),
+		slog.String("ref", "#2486"))
 
 	// Refinement drafting agent (E34.2 / #1593). Reuses the local-claude
 	// reviewer options: when the local claude adapter is configured, the E34.1
@@ -2984,6 +3027,39 @@ func parseInstallationHostAllowlist(raw string) []string {
 	var out []string
 	for _, part := range strings.Split(raw, ",") {
 		entry := strings.ToLower(strings.TrimSpace(part))
+		if entry == "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// envOrBool resolves a boolean env var via strconv.ParseBool so the operator-
+// friendly forms (1, t, T, TRUE, True as well as their false counterparts) are
+// honoured, not only the exact string "true" (#2486 fix-up). The old
+// `== "true"` comparison silently disabled grounding for FISHHAWKD_REVIEW_GROUNDING=1
+// or =TRUE — a footgun for a boolean env var. An unset or UNRECOGNIZED value
+// falls back to def (matching every other envOr* helper, which ignore an
+// unparseable value rather than aborting boot).
+func envOrBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+// parseReviewerEnvPassthrough splits a comma-separated
+// FISHHAWKD_REVIEWER_ENV_PASSTHROUGH value into trimmed, empties-dropped
+// environment variable NAMES (#2486). Case is preserved — env var names are
+// case-sensitive, so unlike the host allowlist this must not lower-case. An
+// empty or all-whitespace value yields nil (only the built-in allow-list).
+func parseReviewerEnvPassthrough(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		entry := strings.TrimSpace(part)
 		if entry == "" {
 			continue
 		}
