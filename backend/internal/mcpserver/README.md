@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 232 identifiers, not 3
+## Exported surface: why 234 identifiers, not 3
 
-The package presents **232** exported top-level identifiers, but only the three
-above are intended entry points. The other 229 are the tool I/O
+The package presents **234** exported top-level identifiers, but only the three
+above are intended entry points. The other 231 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema, so **unexporting them would break tool registration**. In `package
@@ -49,7 +49,7 @@ main` their exportedness was cosmetic; the move to a library package makes it
 real. They are deliberately NOT unexported (that refusal is correct — see
 #2408); instead `export_surface_test.go` pins the full sorted surface against a
 baseline generated from the tree, so a NEW export is caught in either direction
-while the pre-existing 229 are grandfathered.
+while the pre-existing 231 are grandfathered.
 
 ## Tool reference and internals
 
@@ -703,6 +703,62 @@ Inputs:
 Returns the egress outcome (`report.action` `created`\|`occurrence`, `fingerprint`, upstream `number`/`url`, `destination`), a transparency preview of the product facts that were attached (`diagnostics`), and `free_text_included`.
 
 **Auth:** the first **write** tool that drives an egress on the run's chain — the backend requires the run's **own** run-bound agent token (an operator token or a foreign run's token is rejected with `run_not_entitled`). Error surfaces propagated as tool errors: `validation_failed` (400), `authentication_required` (401), `run_not_entitled` (403 — only the run's own run-bound token may file), `product_feedback_disabled` (403 — the per-repo kill-switch), `run_not_found` (404), `provider_unimplemented` (501), `product_report_failed` (502). The CLI mirror is `fishhawk report-issue`.
+
+## Response byte budget (`fishhawk_get_run_status`, ADR-077 / [#2508](https://github.com/kuhlman-labs/fishhawk/issues/2508))
+
+`fishhawk_get_run_status` is bounded to **32,768 marshalled bytes BY CONSTRUCTION** (`bound.go`). This is a **bound**, not another opt-in projection: the `#1727`/`#1749` `include_*` levers still apply first, and the ladder runs after them regardless of which flags were passed.
+
+**Why 32 KiB, and why it is a proxy.** The client rejects on **tokens** (`result (N characters) exceeds maximum allowed tokens`); fishhawkd cannot tokenize, so a byte budget is necessarily a proxy. The threshold was bracketed by driving `fishhawk_list_audit` through the real MCP client: **42,280 chars succeeded**; **54,262**, **81,530** and an independent **75,963** failed — measured threshold `42,280 < T < 54,262`. 32 KiB is the largest confirmed success less ~20%. It bounds the **inner** response; the server never sees the transport envelope, so the headroom absorbs it. A client with a materially different tokenizer is a **re-measurement**, not a design change.
+
+**Override and the below-floor CLAMP.** `FISHHAWKD_MCP_RUN_STATUS_BUDGET_BYTES` overrides the default. Absent / unparseable / non-positive each fall back to the default with its own logged reason. A value **below** `minimalRunStatusMaxBytes` (the floor) is **CLAMPED UP**, never accepted-and-silently-not-honoured — convergence can only ever guarantee `max(budget, floor)`. Clamping rather than rejecting is deliberate: the override exists to serve a client with a *lower* limit, and bouncing it back to 32 KiB would leave that client worse off. The clamp is announced on **two** surfaces — a one-line log naming requested/floor/effective, and the elisions block's own `budget` field, which reports the **effective** (post-clamp) value so the wire never claims a bound the ladder did not honour.
+
+**Three elision classes (the honesty contract).**
+
+| Class | Meaning | Pointer |
+|---|---|---|
+| `stored` | the content exists in durable storage | required — a `fishhawk_list_audit(...)` / `fishhawk_get_gate_view(...)` / `GET /v0/...` surface |
+| `oversized_capable` | stored, but the value can itself be arbitrarily large | required, and **must** be an unbounded **REST** path — pointing an oversized `failure_reason` back at `fishhawk_get_run_status` is circular, because that call caps the same value again |
+| `computed` | derived at read time, never stored | **none** — recomputation is not retrieval |
+
+**The ONE pointer promise:** a pointer returns **AT LEAST** the omitted content. There is deliberately no second exact/superset promise anywhere in code, comments, docs or tests — that distinction was tried and immediately produced a defect. Every audit pointer is **anchored** by `since_sequence` so it returns the *dropped* set rather than a bare newest-N. `since_sequence=0` is the anchor because the client omits the parameter at zero and the REST filter is strictly-greater-than, so zero yields the whole chain — a superset the at-least contract permits. `fishhawk_list_audit` gained a `since_sequence` input in the same change so the pointer is genuinely callable.
+
+**Tier ladder** (fixed, least-actionable-first; a tier whose target is absent records nothing). After **each** tier the in-progress elisions block is attached and the **whole** output is re-marshalled — a **measured** re-check, never arithmetic, so the block's own bytes are inside every measurement:
+
+| Tier | Target | Class | Surface |
+|---|---|---|---|
+| T1 | `cost` / `cache_efficiency` / `latency` / `budget` | computed | — |
+| T2 | `children_status` per-child detail (phase + counts retained) | computed | — |
+| T3 | `security_findings` | stored | `fishhawk_list_audit(category=implement_security_findings)` |
+| T4 | the whole `implement_reviews` slice | stored (**two** entries, one per originating category) | `fishhawk_list_audit(category=implement_reviewed)` + `(implement_review_skipped)` |
+| T5 | `recent_audit` capped to the newest N | stored | anchored `fishhawk_list_audit` |
+| T6 | `recent_audit` dropped entirely | stored | anchored `fishhawk_list_audit` |
+| T7 | each stage's `failure_reason` capped | oversized_capable | `GET /v0/runs/<id>/stages` |
+| T8 | `run.issue_context` | oversized_capable | `GET /v0/runs/<id>` |
+| T9 | `run.concerns.items`, `run.review_authority`, `run.live_validation`, `drive_status.auto_advanced` (stored) + `review_action_hint`, `implement_review_merge_hint`, `next_actions.actions` cap (computed) | mixed | gate view / REST / audit |
+
+T1–T9 touch **none** of `run.id`, `run.state`, any stage's `state` or `failure_category`, or `next_actions` presence.
+
+**Skeleton, then the constant-size floor.** Below T9 the response is projected to a fixed retained set (run id/state/workflow_id; per stage type/state/failure_category + a capped failure_reason; the three `*_stage_wait_status` blocks; `next_actions` presence) and **every** omission is itemised **per field** — including omissions **nested inside a retained composite** (`run.issue_context`, `run.concerns.items`, `run.review_authority`, `run.live_validation`, `stages[].executor`, `next_actions.actions`). Below the skeleton, `minimalRunStatus` returns a constant-size output pinned under `minimalRunStatusMaxBytes` with **exactly two aggregate entries** — one `stored` whose pointer names the **union** of every surface its members would have named, one `computed` with no pointer. **Diagnosis outranks itemisation** at and below the skeleton: an operator reaches these tiers precisely when something went badly wrong.
+
+**The path-keyed classification table is the single source.** `runStatusPathTable` is keyed by dotted **path** (`cost`, `run.concerns.items`, `stages[].failure_reason`, `next_actions.actions`, …) and carries each path's tier, class and retrieval surface(s). The tiers read it, the skeleton's nested itemisation reads it, the floor's union is **computed by folding it** (so the aggregate cannot drift from its members — it necessarily includes the `fishhawk_get_gate_view` surface T9 uses, and absorbs any surface a future tier introduces), and the reflection pin diffs against it. `TestEveryResponsePathIsClassified` walks `GetRunStatusOutput` **plus** the retained composites `Run`, `Stage`, `NextActions` and `RunConcerns`, so a new **nested** field (the commonest real case — `Run` gaining a mirrored backend field, as `LiveValidation` and `ReviewAuthority` both did) cannot silently bypass the budget. **The walk is only as deep as `retainedCompositeTypes()`**: a new nested composite *promoted into the retained set* needs adding there; a new field on a type a tier already elides wholesale correctly needs no entry.
+
+**Two types, not one — and why you must not "simplify" them.** The internal accumulator (`elidedField`, `elisionLedger`) keeps **all** fields unexported with **constructor-only** access, and the constructors make the invalid states unrepresentable *by signature*: `newStoredElision` takes the pointer as a **required** parameter; `newOversizedCapableElision` takes a distinct `unboundedPointer` produced only by `pointerREST`, so handing it a bounded `fishhawk_*` pointer is a **compile** error; `newComputedElision` takes **no** pointer parameter at all. The **exported** `Elisions` / `ElidedField` DTO is a pure **projection** produced at exactly one call site, `(elisionLedger).wire()`.
+
+That split is forced by the SDK, not by taste. `modelcontextprotocol/go-sdk` v1.7.0 validates the **marshalled** tool output against the reflected output schema **inside** the handler (`mcp/server.go:422` `applySchema(outJSON, outputResolved, true)`; `:424` wraps a failure as `validating tool output`), and `google/jsonschema-go` v0.4.3 both sets `AdditionalProperties = falseSchema()` on every reflected struct (`jsonschema/infer.go:246`) and **skips unexported fields** (`jsonschema/util.go:434`). An all-unexported wire type with a custom `MarshalJSON` therefore emits keys the schema declares no properties for and forbids as additional — breaking the tool **at runtime**. `TestGetRunStatus_PopulatedElisions_PassesSDKOutputSchemaValidation` drives a real `mcp.NewClient` `CallTool` over `mcp.NewInMemoryTransports` (including a floor-budget row, so the two-aggregate shape crosses too) and is the regression catch.
+
+Because a composite literal can still build a malformed DTO no constructor vetted, **`validateWireElisions` runs over the projected DTO immediately before `wire()` returns** and fails **loudly** — naming the offending field and the invariant — on a computed entry with a pointer, a stored entry without one, an oversized-capable entry pointing at a `fishhawk_*` tool, any pointer containing `include_`, an unrecognised class, a negative `omitted_count`, or an aggregate above the floor tier. It never silently normalises; the handler surfaces the error rather than shipping a DTO that lies about its own classification. `TestProjectionIsSoleProducerOfWireDTO` parses the package and fails any second construction path.
+
+**No `include_*` flag may ever appear in a pointer.** Repeating a flag is circular: the same deterministic ladder elides the restored content again on the re-read. This is pinned as an explicit negative assertion.
+
+**Capping is on MARSHALLED cost, not raw bytes.** `jsonEncodedLen` returns the exact encoded length (two-byte short escapes; six-byte `\u00XX` for other control bytes; six-byte forms for `<` `>` `&` and U+2028/U+2029; and `\ufffd` for each **invalid UTF-8** byte — an inflation factor reaching 6x), verified **differentially against the real encoder**. `capJSONString(s, budget)` guarantees `len(json.Marshal(result)) <= max(budget, 2)`; the `max(budget, 2)` floor makes a sub-minimum or negative budget **defined** (no JSON string encodes smaller than `""`). It stops at an invalid byte, so the result is always valid UTF-8 and always a rune-boundary prefix. `compact.go`'s raw-byte `truncateOversizedString` / `auditPayloadStringCap` are **deliberately untouched** (#1749) — a raw-byte cap is not a size bound under escaping.
+
+**Determinism.** Anywhere the ladder retains a bounded subset of a **map**, keys are sorted first: Go map iteration order is unspecified and would otherwise make the same input produce two different responses and two different sizes.
+
+**The ladder is NOT size-monotonic**, and no test asserts otherwise: attaching the growing elisions block can make a later measurement larger than an earlier one. Convergence comes from the constant-size floor, not from monotonicity. Tier tests therefore measure the **domain payload** with the elisions block excluded.
+
+**There is no `fields_list_capped` signal, deliberately.** The ladder never caps the fields **list**: list bloat (a per-stage T7 entry explosion on a 400-stage run, say) falls through to the skeleton — which discards the tier ledger and builds a fresh fixed-size one — and then to the floor's exactly-two aggregates. A flag no code path can set is a schema surface that lies to its reader, so the convergence behaviour is documented rather than advertised as a signal that can never fire.
+
+**Inert below budget.** The `elisions` field is `omitempty` and an under-budget response is returned **unchanged**, so its wire bytes are byte-identical to the pre-#2508 shape and `TestGetRunStatus_CompactDefault_UnderSizeBudget` stays green unmodified. The byte-identity claim is proved by `TestBound_UnderBudget_ReturnsTheInputBytesUnchanged`, whose baseline is marshalled from the **input** before the ladder runs — re-running the ladder over its own already-bounded output would assert only **idempotence**, which a first-pass mutation emitting no elisions satisfies. The handler-level twin asserts what it actually can: no `elisions` key on the wire, and bytes that do not vary with the budget.
 
 ## Auth split (runner `fhm_*` vs operator `fhk_*` tokens)
 

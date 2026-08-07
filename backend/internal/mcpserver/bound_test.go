@@ -1,0 +1,975 @@
+package mcpserver
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+)
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return raw
+}
+
+func strptr(s string) *string { return &s }
+
+// domainPayloadBytes measures the response with the elisions METADATA excluded,
+// so a tier's reduction is measured on the domain payload alone. The whole
+// response is deliberately NOT size-monotonic (attaching a growing elisions
+// block can enlarge a later measurement), so no test asserts otherwise.
+func domainPayloadBytes(t *testing.T, out GetRunStatusOutput) int {
+	t.Helper()
+	shallow := out
+	shallow.Elisions = nil
+	return len(mustMarshal(t, shallow))
+}
+
+// maximalRunStatusOutput builds a response where EVERY tier's target is
+// present, so the ladder can be driven end to end without the handler.
+func maximalRunStatusOutput(runID string) GetRunStatusOutput {
+	now := time.Unix(1700000000, 0).UTC()
+	out := GetRunStatusOutput{
+		Run: Run{
+			ID: runID, Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
+			WorkflowSHA: strings.Repeat("f", 40), TriggerSource: "issue",
+			TriggerRef: strptr("#2508"), State: "failed",
+			PullRequestURL: strptr("https://example/pull/1"),
+			RetryAttempt:   1, MaxRetriesSnapshot: 2, RunnerKind: "local",
+			IssueContext: &IssueContext{
+				Title: "an issue", Body: strings.Repeat("issue body text ", 400),
+				URL: "https://example/issues/1", Number: 2508,
+				Comments: []IssueComment{{Author: "a", Body: strings.Repeat("comment ", 400), CreatedAt: "t"}},
+			},
+			Concerns:       &RunConcerns{Open: 3, ByState: map[string]int{"raised": 2, "reopened": 1}},
+			LiveValidation: &RunLiveValidation{PendingCriteriaCount: 2, WalkRef: "#2509"},
+			WorkingDir:     "/tmp/checkout",
+			CreatedAt:      now, UpdatedAt: now,
+		},
+		ImplementReviewMergeHint: "the implement review is still pending",
+		Budget:                   &BudgetStatus{Tier: "ok"},
+		CacheEfficiency:          &CacheEfficiency{CacheReadRatio: 0.5, ReuseFactor: 2},
+		Cost:                     &RunCost{TotalCostUSD: 12.5},
+		Latency:                  &RunLatency{TotalWaitOnHumanSeconds: 900},
+		ReviewActionHint:         &ReviewActionHint{Concerns: 3, Message: "route the concerns back with fishhawk_fixup_stage"},
+		DriveStatus:              &DriveStatus{Drive: true, DerivedStatus: "ci_failed"},
+		NextActions:              &NextActions{State: "implement_failed_category_a"},
+		ChildrenStatus:           &ChildrenStatus{IntegrationPhase: "running_children", Total: 4},
+	}
+	for i := 0; i < 12; i++ {
+		out.Run.Concerns.Items = append(out.Run.Concerns.Items, RunConcernItem{
+			ID: uuid.NewString(), StageKind: "implement", Severity: "high", Category: "correctness", State: "raised",
+		})
+	}
+	for i := 0; i < 4; i++ {
+		out.Run.ReviewAuthority = append(out.Run.ReviewAuthority, RunReviewAuthority{
+			Stage: fmt.Sprintf("s%d", i), StageType: "implement", Authority: "advisory", Source: "derived",
+		})
+	}
+	for i := 0; i < 8; i++ {
+		reason := strings.Repeat("failure reason <prose> ", 300)
+		out.Stages = append(out.Stages, Stage{
+			ID: uuid.NewString(), RunID: runID, Sequence: i + 1, Type: "implement",
+			Executor: StageExecutor{Kind: "agent", Ref: "claude"}, State: "failed",
+			StartedAt: &now, EndedAt: &now,
+			FailureCategory: strptr("category_a"), FailureReason: &reason,
+			CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	for i := 0; i < 20; i++ {
+		out.RecentAudit = append(out.RecentAudit, AuditEntry{
+			ID: uuid.NewString(), Sequence: int64(20 - i), RunID: runID,
+			Category: "cost_recorded", Payload: map[string]any{"detail": strings.Repeat("x", 200)},
+		})
+	}
+	for i := 0; i < 6; i++ {
+		out.ImplementReviews = append(out.ImplementReviews, PlanReview{
+			ReviewerKind: "agent", Authority: "advisory", Verdict: "approve_with_concerns",
+		})
+	}
+	for i := 0; i < 10; i++ {
+		out.SecurityFindings = append(out.SecurityFindings, SecurityFinding{
+			Number: i, RuleID: "go/sql-injection", Severity: "high",
+		})
+	}
+	for i := 0; i < 12; i++ {
+		out.DriveStatus.AutoAdvanced = append(out.DriveStatus.AutoAdvanced, RunAutoAdvance{Rule: "reviews_settled_gate", From: "a", To: "b", Timestamp: now})
+	}
+	for i := 0; i < 20; i++ {
+		out.NextActions.Actions = append(out.NextActions.Actions, SuggestedAction{
+			Action: "fishhawk_fixup_stage", Precondition: "p", Consumes: "fixup_budget", Reason: "r",
+		})
+	}
+	for i := 0; i < 4; i++ {
+		out.ChildrenStatus.Children = append(out.ChildrenStatus.Children, ChildStatus{RunID: uuid.NewString(), SliceIndex: i, State: "running"})
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// the cap primitive
+// ---------------------------------------------------------------------------
+
+// adversarialStrings is the differential table: every cost class the encoder
+// treats specially, INCLUDING several distinct invalid UTF-8 byte sequences
+// written as literal bytes (never produced by calling the code under test).
+var adversarialStrings = []string{
+	"",
+	"plain ascii",
+	`quo"te`,
+	`back\slash`,
+	"\x00\x01\x02\x1f",
+	"tab\there\nnewline\rcr",
+	"<script> & </script>",
+	" line sep para sep",
+	"日本語のテキスト",
+	"emoji 🐟🦅",
+	"\xff",           // lone invalid byte
+	"\x80",           // lone continuation byte
+	"a\xe2\x28\xa1b", // truncated multi-byte lead
+	"\xc0\xaf",       // overlong encoding
+	"\xed\xa0\x80",   // surrogate half
+	"mix<\x00日\xffz \"\\",
+}
+
+func TestJSONEncodedLen_MatchesEncoder_Differential(t *testing.T) {
+	for i, s := range adversarialStrings {
+		want := len(mustMarshal(t, s))
+		if got := jsonEncodedLen(s); got != want {
+			t.Errorf("case %d %q: jsonEncodedLen = %d, encoder = %d", i, s, got, want)
+		}
+	}
+}
+
+func TestCapJSONString_EncodedLengthContract(t *testing.T) {
+	for i, s := range adversarialStrings {
+		for b := -1; b <= 64; b++ {
+			got := capJSONString(s, b)
+			limit := b
+			if limit < 2 {
+				limit = 2
+			}
+			if n := len(mustMarshal(t, got)); n > limit {
+				t.Fatalf("case %d %q budget %d: encoded %d > max(budget,2)=%d (result %q)", i, s, b, n, limit, got)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("case %d %q budget %d: result is not valid UTF-8: %q", i, s, b, got)
+			}
+			if !strings.HasPrefix(s, got) {
+				t.Fatalf("case %d %q budget %d: result %q is not a prefix of the input", i, s, b, got)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the tier ladder
+// ---------------------------------------------------------------------------
+
+func TestElisionTier_ReducesDomainPayload(t *testing.T) {
+	runID := uuid.NewString()
+	for k, tier := range runStatusTiers {
+		out := maximalRunStatusOutput(runID)
+		led := &elisionLedger{budget: 1}
+		// Apply every earlier tier so tier k sees the state it really runs on.
+		for j := 0; j < k; j++ {
+			led.tier = runStatusTiers[j].name
+			runStatusTiers[j].apply(&out, runID, led)
+		}
+		before := domainPayloadBytes(t, out)
+		led.tier = tier.name
+		tier.apply(&out, runID, led)
+		after := domainPayloadBytes(t, out)
+		if after >= before {
+			t.Errorf("tier %s: domain payload %d -> %d, want a strict decrease", tier.name, before, after)
+		}
+	}
+}
+
+func TestBound_ConvergesAtAnyBudget(t *testing.T) {
+	runID := uuid.NewString()
+	budgets := []int{0, 1, 2, 64, minimalRunStatusMaxBytes - 1, minimalRunStatusMaxBytes,
+		6 * 1024, 16 * 1024, runStatusByteBudgetDefault, 1 << 20}
+	for _, b := range budgets {
+		out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, b)
+		if err != nil {
+			t.Fatalf("budget %d: %v", b, err)
+		}
+		limit := b
+		if limit < minimalRunStatusMaxBytes {
+			limit = minimalRunStatusMaxBytes
+		}
+		if n := len(mustMarshal(t, out)); n > limit {
+			t.Errorf("budget %d: bounded response = %d bytes, want <= max(budget, %d) = %d", b, n, minimalRunStatusMaxBytes, limit)
+		}
+	}
+}
+
+// TestBound_UnderBudget_ReturnsTheInputBytesUnchanged is the PRE-bound vs
+// POST-bound byte-identity proof, and the baseline is what makes it one: the
+// wire bytes are captured from the INPUT, BEFORE boundRunStatusOutput runs.
+//
+// Re-running the ladder over an ALREADY-bounded response instead would assert
+// only IDEMPOTENCE, which a first-pass mutation emitting no elisions satisfies
+// — an unconditional cap of an already-capped string is byte-stable on the
+// second pass. So the handler-level test cannot carry this claim (its output has
+// already been through the ladder) and this one does.
+//
+// The budget is the fixture's own marshalled length, which also pins the
+// comparison as `n <= budget` rather than `n < budget`.
+func TestBound_UnderBudget_ReturnsTheInputBytesUnchanged(t *testing.T) {
+	runID := uuid.NewString()
+	in := maximalRunStatusOutput(runID)
+
+	// Non-vacuity: the fixture must carry the targets every tier would mutate,
+	// or "unchanged" would be trivially true.
+	if in.Run.IssueContext == nil || in.Cost == nil || in.ChildrenStatus == nil ||
+		len(in.RecentAudit) <= recentAuditTierCap || len(in.SecurityFindings) == 0 ||
+		len(in.NextActions.Actions) <= nextActionsTierCap {
+		t.Fatalf("the fixture does not carry every tier's target — an unchanged result would prove nothing: %+v", in)
+	}
+	var sawLongFailureReason bool
+	for _, s := range in.Stages {
+		if s.FailureReason != nil && jsonEncodedLen(*s.FailureReason) > failureReasonTierCap {
+			sawLongFailureReason = true
+		}
+	}
+	if !sawLongFailureReason {
+		t.Fatal("the fixture carries no over-cap failure_reason — T7 would be a no-op regardless of the early return")
+	}
+
+	before := mustMarshal(t, in) // the genuine PRE-bound wire
+
+	got, err := boundRunStatusOutput(in, runID, len(before))
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if got.Elisions != nil {
+		t.Errorf("an under-budget response must carry no elisions block, got %+v", got.Elisions)
+	}
+	if after := string(mustMarshal(t, got)); after != string(before) {
+		t.Errorf("the ladder mutated an at-budget response: %d pre-bound bytes -> %d post-bound bytes", len(before), len(after))
+	}
+}
+
+// TestFloor_IsConstantSizeUnderAdversarialInput pins the floor's own bound for
+// adversarial inputs, and that the floor sits below the default budget.
+func TestFloor_IsConstantSizeUnderAdversarialInput(t *testing.T) {
+	if minimalRunStatusMaxBytes >= runStatusByteBudgetDefault {
+		t.Fatalf("floor %d must be below the default budget %d", minimalRunStatusMaxBytes, runStatusByteBudgetDefault)
+	}
+	cases := []struct{ name, category, state string }{
+		{"megabyte category", strings.Repeat("z", 1<<20), "failed"},
+		{"invalid utf8", "\xff\xfe" + strings.Repeat("\x00", 4096), "failed"},
+		{"html + separators", strings.Repeat("<&> ", 4096), "failed"},
+	}
+	for _, tc := range cases {
+		out, err := minimalRunStatusFrom(uuid.NewString(), tc.state, "implement", tc.state, tc.category, true, 8)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if n := len(mustMarshal(t, out)); n > minimalRunStatusMaxBytes {
+			t.Errorf("%s: floor = %d bytes, want <= %d", tc.name, n, minimalRunStatusMaxBytes)
+		}
+	}
+}
+
+func TestBound_DeterministicAcrossRepeatedRuns(t *testing.T) {
+	runID := uuid.NewString()
+	first, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, 6*1024)
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	want := mustMarshal(t, first)
+	for i := 0; i < 50; i++ {
+		got, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, 6*1024)
+		if err != nil {
+			t.Fatalf("bound %d: %v", i, err)
+		}
+		if string(mustMarshal(t, got)) != string(want) {
+			t.Fatalf("iteration %d produced different bytes — map iteration order leaked into the elision", i)
+		}
+	}
+}
+
+// TestEveryResponsePathIsClassified is the NESTED-AWARE reflection pin. It
+// walks GetRunStatusOutput and, recursively, the retained composites (Run,
+// Stage, NextActions, RunConcerns) and fails when any field — top-level OR
+// nested — is absent from runStatusPathTable.
+func TestEveryResponsePathIsClassified(t *testing.T) {
+	for _, path := range classifiedResponsePaths() {
+		if _, ok := pathClassificationFor(path); !ok {
+			t.Errorf("response path %q is not classified in runStatusPathTable — assign it a tier (or the %q marker) so it cannot silently bypass the byte budget", path, tierNever)
+		}
+	}
+	// The walk must actually reach the nested levels, or the pin is vacuous.
+	for _, must := range []string{"run.issue_context", "run.concerns.items", "stages[].executor", "next_actions.actions"} {
+		found := false
+		for _, p := range classifiedResponsePaths() {
+			if p == must {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the reflection walk did not reach nested path %q", must)
+		}
+	}
+	// And the table must not carry a row for a composite the walk recurses
+	// into (that would classify a container instead of its fields).
+	for path := range retainedCompositeTypes() {
+		if _, ok := pathClassificationFor(path); ok {
+			t.Errorf("path %q is a retained composite; classify its FIELDS, not the container", path)
+		}
+	}
+	_ = reflect.TypeOf(GetRunStatusOutput{})
+}
+
+// ---------------------------------------------------------------------------
+// class / pointer invariants
+// ---------------------------------------------------------------------------
+
+// bandedElisions drives the whole matrix: every tier band from a generous
+// budget down to the floor, returning each band's emitted elisions.
+func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
+	t.Helper()
+	out := map[int]*Elisions{}
+	for _, b := range []int{28 * 1024, 20 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
+		bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, b)
+		if err != nil {
+			t.Fatalf("budget %d: %v", b, err)
+		}
+		if bounded.Elisions == nil {
+			t.Fatalf("budget %d produced no elisions block", b)
+		}
+		out[b] = bounded.Elisions
+	}
+	return out
+}
+
+func TestElisions_ComputedCarryNoPointer(t *testing.T) {
+	runID := uuid.NewString()
+	seen := map[string]bool{}
+	for b, el := range bandedElisions(t, runID) {
+		for _, f := range el.Fields {
+			if f.Class != string(classComputed) {
+				continue
+			}
+			seen[f.Field] = true
+			if f.Pointer != "" {
+				t.Errorf("budget %d: computed entry %q carries pointer %q — recomputation is not retrieval", b, f.Field, f.Pointer)
+			}
+		}
+	}
+	for _, must := range []string{"cost", "cache_efficiency", "latency", "budget", "children_status", "next_actions.actions"} {
+		if !seen[must] {
+			t.Errorf("expected a computed elision for %q across the tier bands", must)
+		}
+	}
+}
+
+func TestElisions_StoredCarriesRetrievingPointer(t *testing.T) {
+	runID := uuid.NewString()
+	for b, el := range bandedElisions(t, runID) {
+		for _, f := range el.Fields {
+			if f.Class != string(classStored) {
+				continue
+			}
+			if f.Pointer == "" {
+				t.Errorf("budget %d: stored entry %q carries no pointer", b, f.Field)
+				continue
+			}
+			if strings.Contains(f.Pointer, "include_") {
+				t.Errorf("budget %d: stored entry %q pointer %q names an include_* flag — repeating a flag is circular", b, f.Field, f.Pointer)
+			}
+			if !strings.Contains(f.Pointer, runID) {
+				t.Errorf("budget %d: stored entry %q pointer %q does not embed the run under test", b, f.Field, f.Pointer)
+			}
+			for _, part := range strings.Split(f.Pointer, "; ") {
+				switch {
+				case strings.HasPrefix(part, "fishhawk_list_audit(run_id="),
+					strings.HasPrefix(part, "fishhawk_get_gate_view(run_id="),
+					strings.HasPrefix(part, "GET /v0/runs/"):
+				default:
+					t.Errorf("budget %d: stored entry %q pointer part %q is not one of the three constructor forms", b, f.Field, part)
+				}
+			}
+		}
+	}
+}
+
+func TestElisions_OversizedCapablePointsAtUnboundedSurface(t *testing.T) {
+	runID := uuid.NewString()
+	seen := 0
+	for b, el := range bandedElisions(t, runID) {
+		for _, f := range el.Fields {
+			if f.Class != string(classOversizedCapable) {
+				continue
+			}
+			seen++
+			if !strings.HasPrefix(f.Pointer, "GET /v0/") {
+				t.Errorf("budget %d: oversized_capable entry %q pointer %q is not a REST path", b, f.Field, f.Pointer)
+			}
+			if strings.Contains(f.Pointer, "fishhawk_") {
+				t.Errorf("budget %d: oversized_capable entry %q points at a bounded MCP tool (%q) — that call caps the same value again", b, f.Field, f.Pointer)
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("no oversized_capable elision was emitted across the tier bands")
+	}
+}
+
+func TestElisions_DroppedSetCarriesCount(t *testing.T) {
+	runID := uuid.NewString()
+	fixture := maximalRunStatusOutput(runID)
+	want := map[string]int{
+		"security_findings":          len(fixture.SecurityFindings),
+		"implement_reviews":          len(fixture.ImplementReviews),
+		"run.concerns.items":         len(fixture.Run.Concerns.Items),
+		"run.review_authority":       len(fixture.Run.ReviewAuthority),
+		"drive_status.auto_advanced": len(fixture.DriveStatus.AutoAdvanced),
+		"children_status":            len(fixture.ChildrenStatus.Children),
+		"next_actions.actions":       len(fixture.NextActions.Actions) - nextActionsTierCap,
+	}
+	out := fixture
+	led := &elisionLedger{budget: 1}
+	for _, tier := range runStatusTiers {
+		led.tier = tier.name
+		tier.apply(&out, runID, led)
+	}
+	got := map[string]int{}
+	for _, e := range led.entries {
+		if _, tracked := want[e.field]; tracked {
+			got[e.field] = e.omittedCount
+		}
+	}
+	for field, n := range want {
+		if got[field] != n {
+			t.Errorf("elision %q omitted_count = %d, want the true dropped count %d", field, got[field], n)
+		}
+	}
+	// recent_audit is dropped in two steps (T5 caps, T6 drops the rest); the
+	// two counts must sum to the original length.
+	sum := 0
+	for _, e := range led.entries {
+		if e.field == "recent_audit" {
+			sum += e.omittedCount
+		}
+	}
+	if sum != len(fixture.RecentAudit) {
+		t.Errorf("recent_audit omitted counts sum to %d, want %d", sum, len(fixture.RecentAudit))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pointer retrieval semantics (the at-least promise), through the API seam
+// ---------------------------------------------------------------------------
+
+// followAuditPointer parses a rendered fishhawk_list_audit pointer and drives
+// the REAL listAudit tool through it, paginating exhaustively.
+func followAuditPointer(t *testing.T, r *runResolver, pointer string) []AuditEntry {
+	t.Helper()
+	inner := strings.TrimSuffix(strings.TrimPrefix(pointer, "fishhawk_list_audit("), ")")
+	in := ListAuditInput{}
+	for _, kv := range strings.Split(inner, ", ") {
+		k, v, _ := strings.Cut(kv, "=")
+		switch k {
+		case "run_id":
+			in.RunID = v
+		case "category":
+			in.Category = v
+		case "since_sequence":
+			n, err := strconv.ParseInt(v, 10, 64)
+			if err != nil {
+				t.Fatalf("pointer %q: bad since_sequence: %v", pointer, err)
+			}
+			in.SinceSequence = n
+		default:
+			t.Fatalf("pointer %q: unrecognised parameter %q", pointer, k)
+		}
+	}
+	var all []AuditEntry
+	for {
+		_, out, err := r.listAudit(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("follow %q: %v", pointer, err)
+		}
+		all = append(all, out.Items...)
+		if out.NextCursor == "" {
+			break
+		}
+		in.Cursor = out.NextCursor
+	}
+	return all
+}
+
+func TestElisionPointers_ReturnAtLeastOmittedContent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	r := newResolver(srv, nil)
+
+	// The stored chain the pointers must reach: 20 cost_recorded rows plus the
+	// two implement-review categories.
+	var chain []AuditEntry
+	for i := 0; i < 20; i++ {
+		chain = append(chain, AuditEntry{ID: uuid.NewString(), Sequence: int64(i + 1), RunID: runID.String(), Category: "cost_recorded"})
+	}
+	chain = append(chain,
+		AuditEntry{ID: uuid.NewString(), Sequence: 21, RunID: runID.String(), Category: "implement_reviewed"},
+		AuditEntry{ID: uuid.NewString(), Sequence: 22, RunID: runID.String(), Category: "implement_reviewed"},
+		AuditEntry{ID: uuid.NewString(), Sequence: 23, RunID: runID.String(), Category: "implement_review_skipped"},
+	)
+	fb.perRunAuditByRun[runID] = chain
+
+	fixture := maximalRunStatusOutput(runID.String())
+	// Mirror the audit rows the response carries onto the stored chain's ids,
+	// so containment is checkable by id.
+	fixture.RecentAudit = nil
+	for i := 19; i >= 0; i-- { // time-descending, as the handler returns
+		fixture.RecentAudit = append(fixture.RecentAudit, chain[i])
+	}
+
+	// --- T4: the union of the two category-exact pointers covers every
+	// dropped implement_reviews row (equality holds here, asserted as a bonus).
+	out := fixture
+	led := &elisionLedger{budget: 1, tier: "T4"}
+	tierImplementReviews(&out, runID.String(), led)
+	if len(led.entries) != 2 {
+		t.Fatalf("T4 emitted %d entries, want one per originating category", len(led.entries))
+	}
+	union := map[string]bool{}
+	for _, e := range led.entries {
+		for _, row := range followAuditPointer(t, r, e.pointer) {
+			union[row.ID] = true
+		}
+	}
+	for _, want := range chain[20:] {
+		if !union[want.ID] {
+			t.Errorf("T4 pointer union misses stored implement-review row %s (%s)", want.ID, want.Category)
+		}
+	}
+	if len(union) != 3 {
+		t.Errorf("T4 pointer union returned %d rows, want exactly the 3 implement-review rows (equality bonus)", len(union))
+	}
+
+	// --- T6: the anchored pointer's exhaustively-paginated result contains
+	// every dropped recent_audit entry.
+	out6 := fixture
+	led6 := &elisionLedger{budget: 1, tier: "T6"}
+	tierRecentAuditDrop(&out6, runID.String(), led6)
+	got6 := map[string]bool{}
+	for _, row := range followAuditPointer(t, r, led6.entries[0].pointer) {
+		got6[row.ID] = true
+	}
+	for _, want := range fixture.RecentAudit {
+		if !got6[want.ID] {
+			t.Errorf("T6 pointer misses dropped recent_audit entry %s", want.ID)
+		}
+	}
+
+	// --- T5: superset-containment PLUS the explicit negative that the pointer
+	// is NOT a bare newest-N — the returned set includes an entry OLDER than
+	// the retained window, which a newest-N call would exclude.
+	out5 := fixture
+	led5 := &elisionLedger{budget: 1, tier: "T5"}
+	tierRecentAuditCap(&out5, runID.String(), led5)
+	retained := map[string]bool{}
+	for _, e := range out5.RecentAudit {
+		retained[e.ID] = true
+	}
+	var oldestRetainedSeq int64 = 1 << 62
+	for _, e := range out5.RecentAudit {
+		if e.Sequence < oldestRetainedSeq {
+			oldestRetainedSeq = e.Sequence
+		}
+	}
+	got5 := followAuditPointer(t, r, led5.entries[0].pointer)
+	ids5 := map[string]bool{}
+	sawOlder := false
+	for _, row := range got5 {
+		ids5[row.ID] = true
+		if row.Sequence < oldestRetainedSeq {
+			sawOlder = true
+		}
+	}
+	for _, want := range fixture.RecentAudit {
+		if !ids5[want.ID] {
+			t.Errorf("T5 pointer is not a superset: misses %s", want.ID)
+		}
+	}
+	if !sawOlder {
+		t.Error("T5 pointer returned no entry older than the retained window — it behaves like a bare newest-N, which would exclude exactly the dropped set")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the floor's derived union
+// ---------------------------------------------------------------------------
+
+func TestFloor_StoredAggregateUnionCoversEverySurface(t *testing.T) {
+	runID := uuid.NewString()
+
+	// DERIVE the expected union: bound a maximal fixture through the tiers AND
+	// the skeleton and collect the Pointer of every stored / oversized-capable
+	// entry the ladder actually emits. Never a fixed list.
+	want := map[string]bool{}
+	collect := func(el *Elisions) {
+		for _, f := range el.Fields {
+			if f.Aggregate || f.Pointer == "" {
+				continue
+			}
+			if f.Class == string(classStored) || f.Class == string(classOversizedCapable) {
+				want[f.Pointer] = true
+			}
+		}
+	}
+	out := maximalRunStatusOutput(runID)
+	led := &elisionLedger{budget: 1}
+	for _, tier := range runStatusTiers {
+		led.tier = tier.name
+		tier.apply(&out, runID, led)
+	}
+	tiered, err := led.wire()
+	if err != nil {
+		t.Fatalf("tier wire: %v", err)
+	}
+	collect(tiered)
+	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, 1)
+	if err != nil {
+		t.Fatalf("skeleton: %v", err)
+	}
+	collect(sk.Elisions)
+	if len(want) == 0 {
+		t.Fatal("derived no surfaces from the ladder — the derivation itself is vacuous")
+	}
+
+	floor, err := minimalRunStatus(maximalRunStatusOutput(runID), runID, minimalRunStatusMaxBytes)
+	if err != nil {
+		t.Fatalf("floor: %v", err)
+	}
+	if floor.Elisions == nil || len(floor.Elisions.Fields) != 2 {
+		t.Fatalf("floor must emit EXACTLY two aggregate entries, got %#v", floor.Elisions)
+	}
+	var stored, computed *ElidedField
+	for i := range floor.Elisions.Fields {
+		f := &floor.Elisions.Fields[i]
+		if !f.Aggregate {
+			t.Errorf("floor entry %q is not marked aggregate", f.Field)
+		}
+		switch f.Class {
+		case string(classStored):
+			stored = f
+		case string(classComputed):
+			computed = f
+		}
+	}
+	if stored == nil || computed == nil {
+		t.Fatalf("floor must emit one stored aggregate (with a pointer) and one computed aggregate (without): %#v", floor.Elisions.Fields)
+	}
+	if computed.Pointer != "" {
+		t.Errorf("floor computed aggregate carries pointer %q", computed.Pointer)
+	}
+	have := map[string]bool{}
+	for _, part := range strings.Split(stored.Pointer, "; ") {
+		have[part] = true
+	}
+	for surface := range want {
+		if !have[surface] {
+			t.Errorf("floor stored aggregate union omits surface %q that a tier/skeleton entry named", surface)
+		}
+	}
+	// The gate-view surface specifically: this is the one the prior
+	// hand-written floor union omitted while T9 assigned it.
+	if !have[pointerGateView(runID).String()] {
+		t.Errorf("floor stored aggregate union omits the gate-view surface %q that T9's run.concerns pointer uses", pointerGateView(runID).String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the skeleton
+// ---------------------------------------------------------------------------
+
+func TestSkeleton_ItemisesNestedOmissions(t *testing.T) {
+	runID := uuid.NewString()
+	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, 1)
+	if err != nil {
+		t.Fatalf("skeleton: %v", err)
+	}
+	byField := map[string]ElidedField{}
+	for _, f := range sk.Elisions.Fields {
+		if f.Aggregate {
+			t.Errorf("skeleton entry %q is an aggregate — aggregates are the floor tier's exception, not the skeleton's", f.Field)
+		}
+		byField[f.Field] = f
+	}
+	// Each nested omission inside a RETAINED composite gets its OWN entry with
+	// its own class and pointer, never one opaque line.
+	for _, path := range []string{
+		"run.issue_context", "run.concerns.items", "run.review_authority",
+		"run.live_validation", "stages[].executor", "next_actions.actions",
+	} {
+		f, ok := byField[path]
+		if !ok {
+			t.Errorf("skeleton did not itemise nested omission %q", path)
+			continue
+		}
+		row := mustPath(path)
+		if f.Class != string(row.Class) {
+			t.Errorf("skeleton entry %q class = %q, want the table's %q", path, f.Class, row.Class)
+		}
+		if row.Class == classComputed && f.Pointer != "" {
+			t.Errorf("skeleton entry %q is computed but carries pointer %q", path, f.Pointer)
+		}
+		if row.Class != classComputed && f.Pointer == "" {
+			t.Errorf("skeleton entry %q is %s but carries no pointer", path, row.Class)
+		}
+	}
+	// The diagnosis core survives.
+	if sk.Run.ID == "" || sk.Run.State == "" || len(sk.Stages) == 0 || sk.NextActions == nil {
+		t.Errorf("skeleton dropped the diagnosis core: %#v", sk)
+	}
+}
+
+// TestSkeletonTier_IsReachedAndItemisesPerField is C2's vehicle. Convergence
+// CANNOT falsify the skeleton (the floor alone still converges and still
+// satisfies the final-size assertion), so the skeleton's counterfactual asserts
+// it is REACHED at a mid-band budget and itemises PER FIELD.
+func TestSkeletonTier_IsReachedAndItemisesPerField(t *testing.T) {
+	runID := uuid.NewString()
+	// The band is DERIVED, not guessed: exactly the skeleton's own size. It is
+	// necessarily above the floor and below anything T1..T9 can reach on the
+	// maximal fixture (the skeleton is a strict subset of the T9 residue).
+	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, 1<<30)
+	if err != nil {
+		t.Fatalf("skeleton: %v", err)
+	}
+	band := len(mustMarshal(t, sk))
+	if band <= minimalRunStatusMaxBytes {
+		t.Fatalf("derived band %d is not above the floor %d", band, minimalRunStatusMaxBytes)
+	}
+	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, band)
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if out.Elisions == nil {
+		t.Fatal("no elisions block at the skeleton band")
+	}
+	if out.Elisions.Tier != "skeleton" {
+		t.Fatalf("tier at budget %d = %q, want skeleton (the ladder must not fall straight through to the floor)", band, out.Elisions.Tier)
+	}
+	if len(out.Elisions.Fields) <= 2 {
+		t.Fatalf("skeleton emitted %d entries, want strictly more than the floor's two aggregates", len(out.Elisions.Fields))
+	}
+	for _, f := range out.Elisions.Fields {
+		if f.Aggregate {
+			t.Errorf("skeleton entry %q is aggregated rather than itemised", f.Field)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Q2-REVISED: the projection's validation pass and its sole-producer discipline
+// ---------------------------------------------------------------------------
+
+// TestWireElisions_ValidationRejectsMalformed drives every named invariant
+// THROUGH wire() — the projection path — by seeding the internal accumulator
+// with a raw elidedField composite literal (legal in-package, and exactly the
+// residual hole the validation pass closes, since no constructor can spell
+// these). Deleting the validateWireElisions call from wire() turns every case
+// red, which a test calling validateWireElisions directly could not show.
+func TestWireElisions_ValidationRejectsMalformed(t *testing.T) {
+	cases := []struct {
+		name      string
+		tier      string
+		entry     elidedField
+		wantInErr []string
+	}{
+		{
+			name: "computed with a pointer", tier: "T1",
+			entry:     elidedField{field: "cost", reason: "r", class: classComputed, pointer: "GET /v0/runs/x"},
+			wantInErr: []string{"cost", "computed"},
+		},
+		{
+			name: "stored without a pointer", tier: "T3",
+			entry:     elidedField{field: "security_findings", reason: "r", class: classStored},
+			wantInErr: []string{"security_findings", "stored"},
+		},
+		{
+			name: "oversized_capable pointing at a fishhawk_* tool", tier: "T8",
+			entry:     elidedField{field: "run.issue_context", reason: "r", class: classOversizedCapable, pointer: "fishhawk_get_run_status(run_id=x)"},
+			wantInErr: []string{"run.issue_context", "oversized_capable"},
+		},
+		{
+			name: "pointer naming an include_ flag", tier: "T5",
+			entry:     elidedField{field: "recent_audit", reason: "r", class: classStored, pointer: "fishhawk_get_run_status(include_audit_hashes=true)"},
+			wantInErr: []string{"recent_audit", "include_"},
+		},
+		{
+			name: "unrecognised class", tier: "T2",
+			entry:     elidedField{field: "children_status", reason: "r", class: elisionClass("summarised")},
+			wantInErr: []string{"children_status", "summarised"},
+		},
+		{
+			name: "negative omitted_count", tier: "T3",
+			entry:     elidedField{field: "security_findings", reason: "r", class: classStored, pointer: "GET /v0/runs/x", omittedCount: -1},
+			wantInErr: []string{"security_findings", "omitted_count"},
+		},
+		{
+			name: "aggregate above the floor", tier: "T9",
+			entry:     elidedField{field: "*", reason: "r", class: classComputed, aggregate: true},
+			wantInErr: []string{"aggregate", "T9"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			led := &elisionLedger{budget: 1024, tier: tc.tier}
+			led.add(tc.entry)
+			got, err := led.wire()
+			if err == nil {
+				t.Fatalf("wire() accepted a malformed DTO (%s) and returned %#v", tc.name, got)
+			}
+			// REJECTED, not silently normalised: no repaired DTO comes back.
+			if got != nil {
+				t.Errorf("wire() returned a value alongside the error — the malformed DTO must be rejected, not normalised: %#v", got)
+			}
+			for _, want := range tc.wantInErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q — the error must identify the offending field and the invariant it broke", err, want)
+				}
+			}
+		})
+	}
+	// The well-formed control: the same path accepts a constructor-built entry.
+	ok := &elisionLedger{budget: 1024, tier: "T3"}
+	ok.add(newStoredElision("security_findings", "r", pointerListAudit("run", "implement_security_findings", 0), 3))
+	if _, err := ok.wire(); err != nil {
+		t.Fatalf("wire() rejected a well-formed ledger: %v", err)
+	}
+}
+
+// TestProjectionIsSoleProducerOfWireDTO parses the package's own .go files and
+// asserts every composite literal of Elisions / ElidedField outside the test
+// files occurs inside wire() / wireField(). A second construction path bypasses
+// the validation pass, so it must fail the package tests.
+func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
+	// Enumerate the package DIRECTORY, not a hard-coded file list, or a newly
+	// added production file would escape the discipline. _test.go files are
+	// excluded: this file's malformed-DTO cases build the wire type by
+	// composite literal ON PURPOSE.
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	fset := token.NewFileSet()
+	allowedIn := map[string]bool{"wire": true, "wireField": true}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		var enclosing string
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				enclosing = node.Name.Name
+			case *ast.CompositeLit:
+				id, ok := node.Type.(*ast.Ident)
+				if !ok || (id.Name != "Elisions" && id.Name != "ElidedField") {
+					return true
+				}
+				if !allowedIn[enclosing] {
+					t.Errorf("%s:%d: %s composite literal in %q — the wire DTO has exactly one producer, (elisionLedger).wire()/wireField(), so every entry passes validateWireElisions",
+						name, fset.Position(node.Pos()).Line, id.Name, enclosing)
+				}
+			}
+			return true
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the budget override contract
+// ---------------------------------------------------------------------------
+
+func TestRunStatusByteBudget_OverrideBranches(t *testing.T) {
+	// The table is keyed by the getenv FUNC, not by an env map, so the
+	// nil-getenv guard gets its own NAMED branch case. A resolver built without
+	// an environment seam reaches it, and envFuncFromMap(nil) — a non-nil func
+	// over an empty map — does NOT: it lands on "absent" instead, leaving the
+	// nil branch covered only incidentally.
+	cases := []struct {
+		name   string
+		getenv func(string) string
+		want   int
+	}{
+		{"nil getenv (no environment seam at all)", nil, runStatusByteBudgetDefault},
+		{"absent", envFuncFromMap(nil), runStatusByteBudgetDefault},
+		{"unparseable", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "not-a-number"}), runStatusByteBudgetDefault},
+		{"non-positive", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "0"}), runStatusByteBudgetDefault},
+		{"negative", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "-4096"}), runStatusByteBudgetDefault},
+		{"honoured above the floor", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "8192"}), 8192},
+		{"clamped below the floor", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1024"}), minimalRunStatusMaxBytes},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := runStatusByteBudget(tc.getenv); got != tc.want {
+				t.Fatalf("runStatusByteBudget = %d, want %d", got, tc.want)
+			}
+		})
+	}
+
+	// The clamp is REPORTED, not merely applied: the elisions block's Budget
+	// field carries the EFFECTIVE (post-clamp) value, so the wire never claims
+	// a bound the ladder did not honour.
+	runID := uuid.NewString()
+	effective := runStatusByteBudget(envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1024"}))
+	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, effective)
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if out.Elisions == nil {
+		t.Fatal("no elisions block at the clamped budget")
+	}
+	if out.Elisions.Budget != minimalRunStatusMaxBytes {
+		t.Errorf("elisions.budget = %d, want the EFFECTIVE clamped budget %d (never the requested 1024)", out.Elisions.Budget, minimalRunStatusMaxBytes)
+	}
+}
+
+// TestFloorSurfaceUnion_IsSortedAndDeduplicated pins the fold's determinism.
+func TestFloorSurfaceUnion_IsSortedAndDeduplicated(t *testing.T) {
+	u := floorStoredSurfaceUnion("run-1")
+	if !sort.StringsAreSorted(u) {
+		t.Errorf("floor union is not sorted: %v", u)
+	}
+	seen := map[string]bool{}
+	for _, s := range u {
+		if seen[s] {
+			t.Errorf("floor union carries duplicate surface %q", s)
+		}
+		seen[s] = true
+	}
+}
