@@ -42,9 +42,13 @@ commit SHA** (C4 — resolved ONCE here and handed back so the caller names in t
 prompt the exact commit that was archived, never a second HEAD resolution), the
 extraction `Stats`, and a cleanup closure the caller MUST call.
 
-Export-not-mount gives the reviewer MORE context and LESS exposure than pointing
-it at the live checkout: only **tracked files at that commit** — no `.git`, no
-untracked files, no other branches, no operator-personal working-tree state. Both
+Export-not-mount gives the reviewer a cleaner WORKING DIRECTORY than pointing it
+at the live checkout: only **tracked files at that commit** — no `.git`, no
+untracked files, no other branches, no operator-personal working-tree state.
+Read this precisely: the export bounds what is CONVENIENT, **not** what is
+REACHABLE. It is not a jail — see "Accepted residual risks" below and #2522.
+An earlier draft of this file (and ADR-078) claimed export-not-mount gives
+"LESS exposure"; that claim was wrong and is corrected here. Both
 git children run under `Env(os.Environ(), BaseAllow, nil)`, inheriting no repo
 credentials. On ANY error (unresolvable ref, git absent, not a work tree, a
 bounds violation, a traversal entry, a non-zero git exit) it removes its own
@@ -172,9 +176,20 @@ config MCP servers with out-of-sandbox egress, this becomes a real gap. Kept
 deliberately as a residual pending a codex-side MCP-clear (openai/codex#13076)
 or the OS-sandbox confinement tracked with #611.
 
-## Kill switch
+## Grounding ships DORMANT — `FISHHAWKD_REVIEW_GROUNDING` defaults to FALSE
 
-`FISHHAWKD_REVIEW_GROUNDING=false` disables grounding (both adapters revert to
-their diff-only posture and the prompts to diff-only wording) without a rollback.
-The environment scrub is INDEPENDENT of this flag and is always applied — it has
-no plausible reason to roll back.
+Grounding is **off by default** (#2522). Reviewer reads are not confined to the
+export, so enabling it hands a reviewer that is processing untrusted diff content
+the ability to read any file the daemon user can read, with its verdict text as
+an egress path into the audit log and PR comments. Verified live against the
+shipped argv: claude read an out-of-tree absolute path with `permission_denials:
+[]`, and codex read the same file AND listed `~/.ssh`, returning `id_ed25519`.
+
+Set `FISHHAWKD_REVIEW_GROUNDING=true` to opt in. That is a deliberate operator
+choice appropriate only for a trusted single-tenant host, and it should be
+revisited before multi-tenancy (E44). The default flips to on once #2522 lands
+confinement; the `serve_test.go` "unset: grounding OFF" subtest pins the current
+default so it cannot be undone silently.
+
+The environment scrub is INDEPENDENT of this flag and is ALWAYS applied — it has
+no plausible reason to roll back, and it stands on its own merits.

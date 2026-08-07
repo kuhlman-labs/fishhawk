@@ -1398,12 +1398,14 @@ func runServe(args []string, logSink io.Writer) int {
 		"hard ceiling on the size-aware review budget (#747), bounding the worst-case "+
 			"synchronous gating wait for a very large diff. A non-positive value disables the ceiling")
 	reviewGrounding := fs.Bool("review-grounding",
-		envOrBool("FISHHAWKD_REVIEW_GROUNDING", true),
+		envOrBool("FISHHAWKD_REVIEW_GROUNDING", false),
 		"ground plan-/implement-review agents against an exported read-only source tree (#2486): "+
 			"the reviewer can read and search the repository's tracked files at the reviewed commit to "+
-			"confirm diff-invisible facts. On by default; set FISHHAWKD_REVIEW_GROUNDING=false to disable "+
-			"the behaviour change (both adapters revert to a diff-only posture) without a rollback. The "+
-			"environment scrub is independent of this flag and always applied")
+			"confirm diff-invisible facts. OFF by default (#2522): reviewer reads are NOT confined to "+
+			"the export — cmd.Dir and --add-dir select a working directory, they do not jail reads, so a "+
+			"grounded reviewer can read any file the daemon user can read and its verdict text is an "+
+			"egress path. Set FISHHAWKD_REVIEW_GROUNDING=true to opt in on a trusted single-tenant host. "+
+			"The environment scrub is independent of this flag and always applied")
 	reviewerEnvPassthrough := fs.String("reviewer-env-passthrough",
 		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""),
 		"comma-separated list of EXACT environment variable names appended to each review adapter's "+
@@ -1640,8 +1642,13 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 	cfg.PlanReviewers = planReviewers
 
-	// Review grounding (#2486): grounding is ON unless FISHHAWKD_REVIEW_GROUNDING
-	// is false (the kill switch). The passthrough list is also carried on the
+	// Review grounding (#2486): grounding is OFF unless FISHHAWKD_REVIEW_GROUNDING
+	// is true. It ships DORMANT because reviewer reads are not confined to the
+	// exported tree (#2522) — verified live: claude reads out-of-tree absolute
+	// paths and codex lists ~/.ssh — so enabling it is an explicit operator
+	// choice for a trusted single-tenant host, not a default posture. The
+	// environment scrub is NOT gated on this flag and always applies.
+	// The passthrough list is also carried on the
 	// server config so the grounding-side wiring and the adapter-side scrub read
 	// the same operator input.
 	cfg.ReviewGroundingDisabled = !*reviewGrounding

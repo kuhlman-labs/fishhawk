@@ -3194,15 +3194,19 @@ func TestEnvOrBool(t *testing.T) {
 func TestServe_ReviewGroundingWiring(t *testing.T) {
 	const line = "review grounding configured"
 
-	t.Run("unset: grounding on, no passthrough", func(t *testing.T) {
+	// Grounding ships DORMANT (#2522): reviewer reads are not confined to the
+	// export, so an unset env var must resolve to disabled=true. This subtest is
+	// the pin on that default — flipping serve.go's envOrBool default back to
+	// true reddens it, so the dormant posture cannot be undone silently.
+	t.Run("unset: grounding OFF, no passthrough", func(t *testing.T) {
 		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "")
 		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", "")
 		code, log := serveWithProfile(t, bootstrapAbortFlag)
 		if code != exitFailure {
 			t.Fatalf("runServe exit = %d, want %d; log:\n%s", code, exitFailure, log)
 		}
-		if !strings.Contains(log, line) || !strings.Contains(log, `"disabled":false`) {
-			t.Errorf("unset must resolve to disabled=false in the real handoff:\n%s", log)
+		if !strings.Contains(log, line) || !strings.Contains(log, `"disabled":true`) {
+			t.Errorf("unset must resolve to disabled=true (grounding dormant, #2522):\n%s", log)
 		}
 		if !strings.Contains(log, `"env_passthrough":0`) {
 			t.Errorf("unset passthrough must resolve to env_passthrough=0:\n%s", log)
