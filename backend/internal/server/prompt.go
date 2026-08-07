@@ -1176,6 +1176,16 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		if trigger.RevisionConstraint != nil {
 			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
 		}
+		// Scope carry-forward + restoration (#2516): the revision base rides
+		// above as raw JSON TRUNCATED at 4000 bytes, so on a large plan the
+		// planner cannot see the scope it is told to preserve. Thread the
+		// ENUMERATED carry-forward path set (and, after a refusal, the
+		// dropped-path restoration notice) as their own channels. Best-effort:
+		// both stay nil when nothing is recorded, keeping first-pass plan
+		// prompts byte-unchanged. Set on BOTH prompt handlers so the signed
+		// prompt and the render preview stay byte-identical.
+		trigger.RevisionBaseScopeFiles, trigger.ScopeRestoration =
+			s.loadScopeCarryForward(r.Context(), runRow.ID, stage.ID)
 		// File-count constraint (#2053): resolve the implement-stage
 		// max_files_changed cap from the workflow spec and inject it into the
 		// plan prompt as a hard planning constraint. resolveImplementConstraints
@@ -1657,6 +1667,16 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		if trigger.RevisionConstraint != nil {
 			trigger.RevisionBasePlan = s.loadRevisionBasePlan(r.Context(), runRow.ID)
 		}
+		// Scope carry-forward + restoration (#2516): the revision base rides
+		// above as raw JSON TRUNCATED at 4000 bytes, so on a large plan the
+		// planner cannot see the scope it is told to preserve. Thread the
+		// ENUMERATED carry-forward path set (and, after a refusal, the
+		// dropped-path restoration notice) as their own channels. Best-effort:
+		// both stay nil when nothing is recorded, keeping first-pass plan
+		// prompts byte-unchanged. Set on BOTH prompt handlers so the signed
+		// prompt and the render preview stay byte-identical.
+		trigger.RevisionBaseScopeFiles, trigger.ScopeRestoration =
+			s.loadScopeCarryForward(r.Context(), runRow.ID, stage.ID)
 		// File-count constraint (#2053): resolve the implement-stage
 		// max_files_changed cap from the workflow spec and inject it into the
 		// plan prompt as a hard planning constraint. resolveImplementConstraints
@@ -3475,6 +3495,78 @@ func (s *Server) loadRevisionBasePlan(ctx context.Context, runID uuid.UUID) *str
 	}
 	base := string(raw)
 	return &base
+}
+
+// loadScopeCarryForward resolves the two scope channels a re-dispatched plan
+// prompt carries (#2516): the ENUMERATED carry-forward path set (every path
+// the revision base scoped, which the revised plan must carry forward or
+// declare in scope_removals) and, when the previous revision was REFUSED for
+// an undeclared narrowing, the restoration notice naming the dropped paths.
+//
+// The resolution order is LOAD-BEARING. The newest plan_scope_retry entry for
+// the stage wins: its required_scope_files IS the authoritative carry-forward
+// set (server-derived at refusal time from the base minus the declared
+// removals) and its undeclared_removals is the refusal notice. ONLY when no
+// such entry exists does it fall back to deriving the set from the newest
+// plan artifact. That order matters because on a corrective re-dispatch the
+// newest plan artifact is the REFUSED narrowed plan — deriving carry-forward
+// from it would cement the very drop the retry exists to undo.
+//
+// Best-effort and warn-only throughout: an unwired AuditRepo, an audit read
+// error, an undecodable payload, or a missing/unparseable plan artifact
+// yields (nil, nil) and the prompt renders exactly as it does today.
+func (s *Server) loadScopeCarryForward(ctx context.Context, runID, stageID uuid.UUID) ([]string, *prompt.ScopeRestoration) {
+	if s.cfg.AuditRepo == nil {
+		return nil, nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryPlanScopeRetry)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list plan_scope_retry for carry-forward failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		// Fall through to the artifact derivation below rather than
+		// abandoning the carry-forward set entirely.
+		entries = nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		if entries[i].StageID != nil && *entries[i].StageID != stageID {
+			continue
+		}
+		var payload struct {
+			RequiredScopeFiles []string `json:"required_scope_files"`
+			UndeclaredRemovals []string `json:"undeclared_removals"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if len(payload.RequiredScopeFiles) == 0 && len(payload.UndeclaredRemovals) == 0 {
+			continue
+		}
+		var restoration *prompt.ScopeRestoration
+		if len(payload.UndeclaredRemovals) > 0 {
+			restoration = &prompt.ScopeRestoration{UndeclaredRemovals: payload.UndeclaredRemovals}
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"prompt: loaded scope carry-forward from plan_scope_retry entry",
+			slog.String("run_id", runID.String()),
+			slog.Int("required_scope_files", len(payload.RequiredScopeFiles)),
+			slog.Int("undeclared_removals", len(payload.UndeclaredRemovals)),
+		)
+		return payload.RequiredScopeFiles, restoration
+	}
+
+	// No refusal recorded for this stage: this is an ordinary revise, so the
+	// carry-forward set is the newest plan artifact's own scoped path union.
+	p, err := s.loadApprovedPlanForRun(ctx, runID)
+	if err != nil || p == nil {
+		return nil, nil
+	}
+	paths := scopedPaths(p)
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	return paths, nil
 }
 
 // resolveApprovalConditions returns the binding approve-with-conditions text

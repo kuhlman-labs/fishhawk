@@ -65,6 +65,7 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "decomposition": { "rationale": "...", "sub_plans": [...] },
   "model_recommendation": { "implement_model": "...", "rationale": "...", "complexity_assessed": "low|medium|high" },
   "surface_sweep_exemptions": [ { "pattern": "...", "sibling": "...", "reason": "..." } ],
+  "scope_removals": [ { "path": "...", "reason": "..." } ],
   "over_cap": false,
   "split_proposal": { "rationale": "...", "phases": [ { "title": "...", "scope": { "files": [...] }, "depends_on": [] }, ... ] }
 }
@@ -342,6 +343,30 @@ The plan's optional, machine-readable declarations that a surface-sweep **lockst
 **When to use.** Only when you scope a lockstep pattern's trigger but a listed sibling genuinely needs no change — most commonly a purely data-driven addition to a shared render file that adds no new coupling. Do not use it to skip a sibling that actually must move in lockstep.
 
 **How the sweep honors it.** The sweep suppresses a missing-sibling finding only when the pattern's entire missing set is covered by matching `(pattern, sibling)` exemptions; a partial exemption still fires a finding for the remaining uncovered siblings (the true positive is preserved). A declared top-level exemption also applies to every decomposition sub-plan's own scope. Each **applied** exemption is recorded in the `plan_surface_sweep` audit payload (`applied_exemptions`) and rendered into the plan-review prompt's gate evidence, so a reviewer can challenge a bogus reason — the reviewer-visibility guardrail. A non-matching, non-firing, or already-scoped-sibling exemption is a harmless no-op and is not recorded as applied. The whole array is additive-optional within `standard_v1.x`; a plan that omits it validates and sweeps exactly as before.
+
+### `scope_removals`
+
+The plan's optional, machine-readable declarations that a path present in the **revision base** plan is **deliberately dropped** by this revision (#2516). A `fishhawk_revise_plan` pass regenerates the WHOLE plan artifact, so a narrowly-scoped revision constraint can drop files the prior plan scoped even when it says "keep everything else". The plan gate diffs the new plan's scoped paths against the revision base and **REFUSES** an undeclared narrowing — it re-dispatches the plan stage once with the enumerated carry-forward set rather than admitting the narrowed plan to review. A matching `scope_removals` entry suppresses that refusal for exactly the declared path.
+
+```json
+{
+  "scope_removals": [
+    {
+      "path": "backend/internal/server/legacy_shim.go",
+      "reason": "The operator's constraint replaces the shim with the direct call path, so this file is no longer touched by the revised design."
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `path` | string (≥ 1 char) | yes | Repo-relative path, present in the revision base plan's scope, that this revision deliberately drops. |
+| `reason` | string (≥ 1 char) | yes | Why the revision constraint genuinely obsoletes the path. Rendered to plan reviewers as a **challengeable** justification, so a bogus reason is never silent. |
+
+**When to use.** Only when the revision constraint genuinely obsoletes a file the prior plan scoped — the constraint replaces the mechanism that file implemented, or moves the work to a different seam. Do NOT use it to shed files the revised design still needs: the declaration explains a drop, it does not exempt the planner from the check. The refusal stays computed from the machine diff of the two plans.
+
+**What the gate does with it.** The gate subtracts declared paths from the dropped set: a drop is suppressed for exactly the declared path, and every OTHER dropped path still refuses. When the whole narrowing is declared, the pass is no longer counted as a regression (it no longer refunds the revise budget — a declared drop is not a mistake) and the plan parks at the approval gate as normal, with `declared_removals` recorded in the `plan_scope_regression` audit payload. An entry naming a path that was NOT dropped is a harmless no-op. The whole array is additive-optional within `standard_v1.x`; a plan that omits it validates and diffs exactly as before.
 
 ### `over_cap`
 

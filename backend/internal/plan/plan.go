@@ -57,6 +57,21 @@ type Plan struct {
 	// plan declares none (the sweep reduces to its prior behavior). JSON tags
 	// mirror the surface-sweep-exemption $def in the schema.
 	SurfaceSweepExemptions []SurfaceSweepExemption `json:"surface_sweep_exemptions,omitempty"`
+	// ScopeRemovals carries the plan's optional machine-readable declarations
+	// that a path present in the REVISION BASE plan is deliberately dropped by
+	// this revision (#2516) — the structured form of "the constraint genuinely
+	// obsoletes this file". The plan-gate scope-regression sweep REFUSES an
+	// undeclared narrowing (bounded in-run re-dispatch); a matching entry
+	// suppresses the refusal for exactly that path, with the reason riding in
+	// the plan artifact reviewers read so a bogus reason stays challengeable.
+	// The refusal itself stays computed from the machine diff — a declaration
+	// explains a drop, it never exempts the planner from the check. An entry
+	// naming a path that was NOT dropped is a harmless no-op, so semanticCheck
+	// adds no coupling (exactly as an unmatched SurfaceSweepExemption is).
+	// Additive-optional within standard_v1; the field must exist on the struct
+	// because plan.Parse strict-decodes with DisallowUnknownFields. JSON tags
+	// mirror the scope-removal $def in the schema.
+	ScopeRemovals []ScopeRemoval `json:"scope_removals,omitempty"`
 	// OverCap is the planner's optional SELF-DECLARATION HINT that scope.files
 	// exceeds the resolved implement-stage max_files_changed cap (#2053).
 	// Additive-optional within standard_v1; the field must exist on the struct
@@ -124,6 +139,16 @@ type SurfaceSweepExemption struct {
 	Pattern string `json:"pattern"`
 	Sibling string `json:"sibling"`
 	Reason  string `json:"reason"`
+}
+
+// ScopeRemoval is one entry in Plan.ScopeRemovals (#2516): a declaration that
+// the named Path, present in the revision base plan's scope, is deliberately
+// dropped by this revision, with the Reason surfaced to plan reviewers as a
+// challengeable justification. Path is the repo-relative path; Reason is why
+// the revision constraint genuinely obsoletes it.
+type ScopeRemoval struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
 }
 
 // ModelRecommendation is the agent's optional recommendation for the

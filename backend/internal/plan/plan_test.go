@@ -1,6 +1,7 @@
 package plan_test
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -578,6 +579,82 @@ func TestParse_SurfaceSweepExemptionMissingReason_IsSchemaError(t *testing.T) {
 				"pattern": "actor @-mention render surfaces",
 				"sibling": "backend/internal/issuecomment/notifier.go",
 			},
+		}
+	})
+	_, err := plan.Parse(marshalFixture(t, m))
+	var se *plan.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %v, want *SchemaError for a missing required reason", err)
+	}
+}
+
+// --- scope_removals (#2516) ---
+
+// TestParse_ScopeRemovals_RoundTrips covers the additive top-level
+// scope_removals array: a plan carrying it validates against the schema and
+// STRICT-decodes (DisallowUnknownFields) each {path, reason} into the typed
+// Plan.ScopeRemovals. The strict decode is the point — without the struct
+// field a schema-admitted plan would fail to parse.
+func TestParse_ScopeRemovals_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["scope_removals"] = []any{
+			map[string]any{
+				"path":   "backend/internal/server/legacy_shim.go",
+				"reason": "the constraint replaces the shim with the direct call path",
+			},
+			map[string]any{
+				"path":   "backend/internal/server/legacy_shim_test.go",
+				"reason": "its subject file is dropped by this revision",
+			},
+		}
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := len(p.ScopeRemovals), 2; got != want {
+		t.Fatalf("ScopeRemovals len = %d, want %d", got, want)
+	}
+	if p.ScopeRemovals[0].Path != "backend/internal/server/legacy_shim.go" {
+		t.Errorf("ScopeRemovals[0].Path = %q", p.ScopeRemovals[0].Path)
+	}
+	if p.ScopeRemovals[0].Reason != "the constraint replaces the shim with the direct call path" {
+		t.Errorf("ScopeRemovals[0].Reason = %q", p.ScopeRemovals[0].Reason)
+	}
+	if p.ScopeRemovals[1].Path != "backend/internal/server/legacy_shim_test.go" {
+		t.Errorf("ScopeRemovals[1].Path = %q", p.ScopeRemovals[1].Path)
+	}
+}
+
+// TestParse_WithoutScopeRemovals_StillValidates confirms the field is
+// additive-optional: the minimal valid plan parses and the typed slice is nil
+// (so it marshals back out omitted, per the omitempty tag). Failure here
+// would indicate an accidental required promotion.
+func TestParse_WithoutScopeRemovals_StillValidates(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.ScopeRemovals != nil {
+		t.Errorf("ScopeRemovals = %+v, want nil (field omitted)", p.ScopeRemovals)
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Contains(raw, []byte("scope_removals")) {
+		t.Errorf("re-marshalled plan carries scope_removals; omitempty is not holding: %s", raw)
+	}
+}
+
+// TestParse_ScopeRemovalMissingReason_IsSchemaError pins the required-fields
+// contract on the scope-removal $def: an entry omitting reason (the
+// load-bearing challengeable justification a reviewer reads) is rejected at
+// validation, so a declaration can never suppress a refusal wordlessly.
+func TestParse_ScopeRemovalMissingReason_IsSchemaError(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["scope_removals"] = []any{
+			map[string]any{"path": "backend/internal/server/legacy_shim.go"},
 		}
 	})
 	_, err := plan.Parse(marshalFixture(t, m))
@@ -1441,7 +1518,10 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
 // standard_v1.x, or for an ANNOTATION-only description correction that changes
-// no validation behavior — most recently the #2347 skip_expected /
+// no validation behavior — most recently the #2516 top-level scope_removals
+// field (the machine-readable declaration that a revision deliberately drops a
+// revision-base-scoped path, which the plan gate's undeclared-narrowing
+// refusal subtracts). Before that: the #2347 skip_expected /
 // requires_live_validation description fix (their prose still promised the
 // all-skip short-circuit produced a "passed" verdict after it began recording
 // not_validated; no property, type, or conditional changed). Before that: the
@@ -1455,7 +1535,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "ad6c5677e2f6ba71d176bbe7d21928c7e3dafbc76d95b300833a186d65328fae"
+	const wantHash = "3438f508e1bd4b03f44d2af41598af21660c36818a90e618178debff09ed6895"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
