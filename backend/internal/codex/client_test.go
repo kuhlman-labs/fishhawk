@@ -1154,6 +1154,17 @@ func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 			t.Errorf("argv %q contains a dangerous flag %q", argv, a)
 		}
 	}
+	// Regression (#2486 MCP fix-up): pin that NO MCP server config reaches the
+	// codex child. `codex exec` reports NONE for MCP tools today, so — unlike the
+	// claude adapter — no MCP pin is added here. This assertion exists so a future
+	// codex-cli change that starts loading the operator's MCP servers (whether via
+	// a flag or a `-c mcp_servers=...` config override) fails a test rather than
+	// silently regaining network egress. Any argv token mentioning "mcp" trips it.
+	for _, a := range argv {
+		if strings.Contains(strings.ToLower(a), "mcp") {
+			t.Errorf("codex argv %q must carry no MCP server config, found %q", argv, a)
+		}
+	}
 }
 
 // TestInvokeUngrounded_CodexNoSandboxFlag pins that the UNGROUNDED codex argv

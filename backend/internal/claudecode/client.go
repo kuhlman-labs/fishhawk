@@ -24,8 +24,12 @@
 //     read-only tree (reviewsandbox.ExportTree — tracked files at one commit, no
 //     .git) with --add-dir <tree>, and the toolset restricted to Read,Grep,Glob
 //     via --tools plus --allowed-tools so print mode never hits an unanswerable
-//     permission prompt. Neither posture passes --dangerously-skip-permissions
-//     or --permission-mode bypassPermissions.
+//     permission prompt. --tools bounds only the BUILT-IN toolset, so the grounded
+//     argv ALSO pins an EMPTY MCP server set (--strict-mcp-config plus --mcp-config
+//     {"mcpServers":{}}) — otherwise the operator's MCP tools (browser, Gmail,
+//     GitHub) load past --tools and break the never-network property. Neither
+//     posture passes --dangerously-skip-permissions or --permission-mode
+//     bypassPermissions.
 //
 // Either posture seeds the child environment from reviewsandbox.Env — the
 // enumerated ClaudeAllow list plus the operator passthrough — never a wholesale
@@ -237,11 +241,24 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	// those via --allowed-tools so print mode never reaches an unanswerable
 	// permission prompt. Pinned against Claude Code 2.1.224. Never
 	// --dangerously-skip-permissions and never --permission-mode bypassPermissions.
+	//
+	// --tools bounds only the BUILT-IN toolset; MCP tools are not built-ins, so
+	// they load from the operator's config and survive the --tools restriction
+	// (verified live: a grounded child enumerated GitHub/Gmail/browser MCP tools
+	// despite --tools Read,Grep,Glob). Browser automation and Gmail are network
+	// egress and data exfiltration, which defeat this design's never-network
+	// property. So the grounded argv ALSO pins an EMPTY MCP server set:
+	// --strict-mcp-config makes --mcp-config the sole source of MCP config
+	// (ignoring the operator's ~/.claude and project .mcp.json), and the empty
+	// {"mcpServers":{}} document loads zero MCP servers. Grounding (the sentinel
+	// tree read) is preserved with both flags on. Ungrounded argv is unchanged.
 	if treeDir != "" {
 		args = append(args,
 			"--add-dir", treeDir,
 			"--tools", "Read,Grep,Glob",
 			"--allowed-tools", "Read", "Grep", "Glob",
+			"--strict-mcp-config",
+			"--mcp-config", `{"mcpServers":{}}`,
 		)
 	}
 	args = append(args, "-p", prompt)

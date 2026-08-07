@@ -98,11 +98,28 @@ reviewers' lifetime and is removed exactly when the loop returns.
 - The per-adapter config-dir passthroughs (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`)
   are KEPT, not redirected to a throwaway dir: redirecting them can break
   subscription-based host auth (the dogfood loop's common posture). The residual
-  is that a grounded reviewer may load the operator's personal agent config from
-  those dirs. Kept deliberately; recorded here as the trade-off.
+  is that a grounded reviewer may load the operator's personal agent
+  INSTRUCTIONS from those dirs. Kept deliberately; recorded here as the trade-off.
 - codex's read-only sandbox grants read-only SHELL execution (no network), not
   merely file reads — the narrowest posture the codex CLI can express. "Never
   shell" is met only in the sense that nothing can write or reach the network.
+
+## Closed — operator MCP tools no longer inherited (#2486 fix-up)
+
+Inheriting the operator's MCP TOOLS was formerly a residual and is now CLOSED —
+do NOT describe it as an accepted residual. The grounded claude-code adapter's
+`--tools Read,Grep,Glob` bounds only the BUILT-IN toolset; MCP tools are not
+built-ins, so they loaded from the operator's config and survived the
+restriction (verified live — a grounded child enumerated browser/Gmail/GitHub
+MCP tools, which are network egress and data exfiltration that defeat the
+never-network property). The grounded claude argv now ALSO pins an EMPTY MCP
+server set: `--strict-mcp-config` makes `--mcp-config` the sole source of MCP
+config (ignoring `~/.claude` and project `.mcp.json`) and the empty
+`{"mcpServers":{}}` document loads zero servers; grounding (the tree read) is
+preserved with both flags on. The codex adapter adds NO such flags — `codex
+exec` reports NONE for MCP tools today — but a grounded codex argv test pins
+that no MCP server config reaches the codex child so a future codex-cli change
+fails a test rather than silently regaining egress.
 
 ## Kill switch
 

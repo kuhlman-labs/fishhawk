@@ -91,7 +91,11 @@ func capturingHelper(mode string, passEnv bool, argv *[]string, capturedCmd **ex
 
 // TestInvokeGrounded_ClaudeArgvAndCwd pins the GROUNDED claude posture (#2486):
 // cmd.Dir is the exported tree and the argv carries --add-dir/--tools/
-// --allowed-tools while NEVER carrying any --dangerously-* flag.
+// --allowed-tools plus the empty-MCP-config pin (--strict-mcp-config and
+// --mcp-config {"mcpServers":{}}) while NEVER carrying any --dangerously-* flag.
+// The MCP pin is load-bearing: --tools bounds only the BUILT-IN toolset, so
+// without these flags the operator's MCP tools (browser, Gmail, GitHub) load
+// past the restriction and defeat the never-network property (#2486 fix-up).
 func TestInvokeGrounded_ClaudeArgvAndCwd(t *testing.T) {
 	treeDir := t.TempDir()
 	var argv []string
@@ -108,6 +112,8 @@ func TestInvokeGrounded_ClaudeArgvAndCwd(t *testing.T) {
 	assertContainsPair(t, argv, "--add-dir", treeDir)
 	assertContains(t, argv, "--tools", "Read,Grep,Glob")
 	assertContains(t, argv, "--allowed-tools", "Read", "Grep", "Glob")
+	assertContains(t, argv, "--strict-mcp-config")
+	assertContainsPair(t, argv, "--mcp-config", `{"mcpServers":{}}`)
 	assertNoDangerous(t, argv)
 }
 

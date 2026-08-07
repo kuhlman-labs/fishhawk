@@ -116,6 +116,20 @@ func TestContract_GroundedPromptMatchesAdapterGrant(t *testing.T) {
 		clArgv[i+1] != "Read" || clArgv[i+2] != "Grep" || clArgv[i+3] != "Glob" {
 		t.Errorf("claude grounded argv missing --allowed-tools Read Grep Glob: %v", clArgv)
 	}
+	// The built-in --tools restriction does NOT bound MCP tools: those load from
+	// the operator's config and survive it (verified live — a grounded child
+	// enumerated browser/Gmail/GitHub MCP tools). So the grounded argv must also
+	// pin an EMPTY MCP server set — --strict-mcp-config (make --mcp-config the
+	// sole source) plus --mcp-config {"mcpServers":{}} (zero servers) — or the
+	// never-network property this whole change rests on is defeated. Assert BOTH
+	// next to the --tools/--allowed-tools grant so deleting either fails this
+	// cross-boundary contract (#2486 MCP fix-up).
+	if !slices.Contains(clArgv, "--strict-mcp-config") {
+		t.Errorf("claude grounded argv missing --strict-mcp-config: %v", clArgv)
+	}
+	if i := slices.Index(clArgv, "--mcp-config"); i < 0 || i+1 >= len(clArgv) || clArgv[i+1] != `{"mcpServers":{}}` {
+		t.Errorf("claude grounded argv missing --mcp-config {\"mcpServers\":{}}: %v", clArgv)
+	}
 }
 
 // TestContract_UngroundedPromptMatchesAdapterPosture pins the degrade side: an
@@ -155,6 +169,10 @@ func TestContract_UngroundedPromptMatchesAdapterPosture(t *testing.T) {
 	_, _, _, _ = cl.InferenceInTree(context.Background(), p, "")
 	if slices.Contains(clArgv, "--add-dir") {
 		t.Errorf("ungrounded claude argv must not carry --add-dir: %v", clArgv)
+	}
+	// The grounded-only MCP pin must not leak into the diff-only posture.
+	if slices.Contains(clArgv, "--strict-mcp-config") || slices.Contains(clArgv, "--mcp-config") {
+		t.Errorf("ungrounded claude argv must not carry the grounded-only MCP flags: %v", clArgv)
 	}
 	// C2: the ungrounded claude cwd is a fresh empty scratch dir, not empty string
 	// and not the tree.
