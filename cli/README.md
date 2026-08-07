@@ -49,11 +49,15 @@ fishhawk export       [--from RFC3339] [--to RFC3339] [--repo owner/name] [--run
 fishhawk init         [--preset low|medium|high] [--working-dir D] [--budget-usd N] [--single-reviewer] [--human-gates ids] [--force] [--repo owner/name]
 fishhawk validate     [path]                   # default: .fishhawk/workflows.yaml
 fishhawk migrate-spec [path] [--out PATH | --in-place | --report-only]   # workflow-v1 -> v2 codemod
-fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only]
+fishhawk doctor       [--repo owner/name] [--working-dir D] [--runner-binary P] [--spec-only] [--run-verify-command] [--skip-verify-command] [--verify-timeout D]
 fishhawk version
 ```
 
 `doctor` runs the local-loop preflight: it checks the Docker stack (daemon, postgres, minio), backend reachability + token acceptance, the committed workflow spec, the runner binary, MCP registration, the git remote/working tree, `gh` auth, and cross-binary version/schema drift. Each rung prints `ok` / `warn` / `fail` plus a remediation hint; the command exits non-zero if any rung fails (warnings alone still exit 0).
+
+Since E48.58 / #2485 `doctor` also carries a **verify command** rung that, under `--run-verify-command`, actually EXECUTES the spec's configured `executor.verify.command` — every distinct one — in a throwaway detached git worktree at HEAD, the same shape the runner provisions for its committed-tree verify gate. A fresh worktree materializes only *tracked* files, so a command that depends on a gitignored build artifact, a downloaded toolchain, a generated protobuf, or a `//go:embed`ed binary fails here in seconds instead of after an implement pass has been paid for. A non-zero exit or a timeout is a **fail** naming which command failed, its exit status, the throwaway worktree path, and a bounded tail of the captured output; an absent verify block, an unresolvable spec, an unavailable git worktree, an absent `--run-verify-command`, or `--skip-verify-command` is a **warn**, never a fail (the preset explicitly permits removing the verify block). `--verify-timeout` (default `5m`) caps how long *each* command may run — the spec's own `executor.verify.timeout` wins only when it is shorter, so a preset's `15m` gate cannot silently turn `doctor` into a quarter-hour command.
+
+**This rung executes a command read from the repository's committed workflow spec, so execution is opt-in and off by default.** Every other rung reads bytes or queries a service; this one runs a string supplied by the checkout under inspection, and `doctor` is what an operator runs *first* — including against a repository they have just cloned and not yet read. Running it by default would make `fishhawk doctor` a code-execution primitive for anyone who controls a repo's `.fishhawk/workflows.yaml`, on the operator's own machine — a strictly higher-value execution context than the runner's, and one where nothing in the CLI bounds the child's network egress. So the rung warns until you pass `--run-verify-command`, and `--skip-verify-command` is the opt-out that wins over it (so an alias or wrapper script that opts in can be overridden on a single invocation). When it does run, that child gets a **stripped environment** — the same default-deny allow-list the runner applies to the identical `sh -c <verifyCmd>` gate child (ADR-029 / #650 item 4) — so it sees `PATH`/`HOME`/locale/temp essentials plus the `GO*`/`CGO_*`/`LC_*` toolchain vars (with URL userinfo redacted out of `GOPROXY`-style values) and never the operator's `FISHHAWK_API_TOKEN`, forge token, or agent API keys.
 
 `--spec-only` runs just the two environment-free rungs — **workflow spec present** (schema validity) and **execution path configured** (every stage declares an executor *on the resolved document*, so a workflow-v2 stage that inherits its executor from a `defaults` block or an `extends` base counts) — and skips every docker/backend/token/MCP/git/gh/onboarding rung. It is the fresh-repo quick-validate path: a repo whose sole Fishhawk artifact is a generated `.fishhawk/workflows.yaml` exits 0 with no local Fishhawk environment, while a missing or schema-invalid spec still fails closed (exit non-zero). Use it right after `fishhawk init` to confirm the scaffolded spec is valid before wiring up the backend, token, and execution path.
 
@@ -198,6 +202,45 @@ documented above. Implementation notes:
 - No backend changes were needed: E29.4 ships every server-side probe.
 - `--spec-only` (E36.1 / #1639) restricts the run to the two environment-free rungs — `checkSpec` (schema validity) +
   `checkExecutionPath` (per-stage executor coverage) — and skips every docker/backend/token/MCP/git/gh/onboarding rung.
+  `checkVerifyCommand` is deliberately NOT in that set: it provisions a git worktree and spawns a subprocess, so it is
+  neither environment-free nor byte-only.
+
+## Verify-command rung internals (E48.58 / #2485)
+
+`cmd/fishhawk/doctor_verify.go` is the `verify command` rung. Four pieces:
+
+- `collectVerifyCommands(workingDir)` reads the RESOLVED document (`spec.ResolveReuse` before the shallow `yaml.v3`
+  decode, for the same reason `checkExecutionPath` does — #2340: a workflow-v2 stage may inherit its whole executor,
+  verify block included, from a `defaults` block or an `extends` base) and returns the DISTINCT non-empty
+  `executor.verify.command` values in a deterministic (sorted workflow name, then stage) order, plus a
+  `verifySpecState` distinguishing no-spec / read-error / resolve-error / parse-error / no-verify-block /
+  empty-command from the runnable case. Each state maps to exactly one warn branch.
+- `provisionDoctorWorktree(ctx, workingDir)` resolves the shared gitdir with
+  `git rev-parse --path-format=absolute --git-common-dir` — **the `--path-format=absolute` is load-bearing**: a bare
+  `--git-common-dir` returns the RELATIVE `.git` even under `-C <dir>`, which resolved against the doctor process's
+  cwd would provision the worktree, and point `cmd.Dir`, at the wrong checkout entirely. It pins HEAD once and runs
+  `git worktree add --detach <common>/fishhawk-worktrees/doctor-verify-<pid> <pinned sha>`. The returned cleanup runs
+  on every exit path (pass, fail, timeout), never depends on the caller's possibly-cancelled context, and is safe to
+  call twice. A leftover from a SIGKILLed doctor is reclaimed best-effort by `worktree remove --force` + `prune`, never
+  by an `os.RemoveAll` of a directory the rung did not create.
+- `runVerifyInWorktree` mirrors the runner's `runBoundedGateCommand` containment shape: a bounded child context,
+  `SysProcAttr{Setpgid: true}`, and a `cmd.Cancel` that SIGKILLs the whole process GROUP — SIGKILL to the direct child
+  alone leaves grandchildren holding the inherited stdout pipe and `CombinedOutput` then blocks past the deadline.
+  It also assigns `cmd.Env = sanitizedVerifyEnv()`, mirroring `runner/cmd/fishhawk-runner/gateenv.go`'s default-deny
+  allow-list (ADR-029 / #650 item 4) so the spec-supplied child never inherits the doctor process's credentials; the
+  two copies are duplicated rather than shared because `cli` and `runner` are separate modules and the runner's lives
+  in package `main`. A timeout is classified only when `cmdErr != nil`, so a command that exits 0 as the deadline
+  fires is not misreported as a timeout fail.
+- `checkVerifyCommand` composes them. Per the #2485 approval condition it runs EVERY distinct command with the
+  timeout cap applied PER COMMAND, is ok only when all pass, and on any non-zero exit or timeout FAILs naming which
+  command (and which stage) failed.
+- `checkVerifyCommandGated` is the DEFAULT-DENY gate in front of it and the only thing `doctor.go` calls. Execution
+  requires `--run-verify-command`; `--skip-verify-command` wins over it. The gate exists because this is the one rung
+  that executes a string supplied by the checkout under inspection, and `doctor` is what an operator runs FIRST — on a
+  repository they may have cloned and not yet read. `sanitizeVerifyEnv` bounds what that child can steal but nothing in
+  the CLI bounds what it can send, and the operator's machine is a higher-value execution context than the runner's,
+  so under Fishhawk's lethal-trifecta and uncontrolled-egress threat model the default is not to run it. Both
+  non-executing paths are a warn naming the flag that changes the outcome, so the rung stays visible on every run.
 
 Operator guide: `docs/onboarding.md`.
 

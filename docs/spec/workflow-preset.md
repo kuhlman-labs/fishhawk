@@ -176,7 +176,7 @@ before its first run:
 
 | Placeholder | Where | Replace with |
 |---|---|---|
-| `make test` | implement stage `executor.verify.command` | Your repository's test command (run via `sh -c` after the agent exits). `verify` is optional — remove the whole block if your project has no test entrypoint — but if present, `command` must be a non-empty string. |
+| `make test` | implement stage `executor.verify.command` | Your repository's test command (run via `sh -c` after the agent exits). This runs in a fresh worktree — gitignored build artifacts and downloaded dependencies will not be present, so a command that needs them must fetch or build them itself; `fishhawk doctor --run-verify-command` executes it in a throwaway worktree to prove that before any run is started (E48.58 / #2485). `verify` is optional — remove the whole block if your project has no test entrypoint — but if present, `command` must be a non-empty string. |
 
 The placeholder is schema-valid as shipped, so a generated preset
 passes validation (and `fishhawk doctor --spec-only`) before the operator

@@ -750,3 +750,50 @@ func TestApplyBudgetLimitMissingBlock(t *testing.T) {
 		t.Fatal("applyBudgetLimit must error when budgets block is absent")
 	}
 }
+
+// freshWorktreeCaveatSentence is the caveat every shipped preset must carry
+// immediately above its verify `command:`. It is wrapped across two comment
+// lines in the YAML, so assertions normalize comment markers and whitespace
+// before matching (see normalizeComments).
+const freshWorktreeCaveatSentence = "This runs in a fresh worktree — gitignored build artifacts " +
+	"and downloaded dependencies will not be present."
+
+// normalizeComments strips the leading `#` marker from every line and
+// collapses all runs of whitespace to a single space, so a sentence wrapped
+// across consecutive comment lines matches as one string.
+func normalizeComments(s string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimPrefix(trimmed, "#")
+		b.WriteString(strings.TrimSpace(trimmed))
+		b.WriteString(" ")
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// TestGeneratedPresetsCarryFreshWorktreeCaveat is the done-means for the
+// E48.58 / #2485 preset change (a comment-only edit compiles to nothing, so
+// a shipped-bytes assertion is the only thing that can enforce it): the
+// SHIPPED bytes of every generated preset must explain that the verify
+// command runs in a fresh worktree where gitignored artifacts are absent,
+// and must still pass ValidateBytes. A no-op touch of a preset path that
+// satisfied the scope-completeness gate fails here.
+func TestGeneratedPresetsCarryFreshWorktreeCaveat(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			data, err := Generate(p, Deltas{})
+			if err != nil {
+				t.Fatalf("Generate(%q): %v", p, err)
+			}
+			if !strings.Contains(normalizeComments(string(data)), freshWorktreeCaveatSentence) {
+				t.Errorf("generated preset %q does not carry the fresh-worktree caveat %q:\n%s",
+					p, freshWorktreeCaveatSentence, data)
+			}
+			if err := ValidateBytes(data); err != nil {
+				t.Fatalf("preset %q with the caveat does not validate: %v", p, err)
+			}
+		})
+	}
+}
