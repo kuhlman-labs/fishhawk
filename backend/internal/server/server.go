@@ -1167,13 +1167,21 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 	if started && !settled {
 		return
 	}
-	if !s.reviewChecksGreen(ctx, runRow, stage) {
+	green, checksResolved := s.reviewChecksResolution(ctx, runRow, stage)
+	if checksResolved && !green {
 		// Negative mirror (#1045): review evidence is complete but a
 		// required check concluded red → park in the derived ci_failed
 		// state with a classify next action naming the failed check(s). A
 		// merely-pending check (none failed) returns silently — only a
 		// terminal red trips ci_failed, so a still-running check can never
-		// over-claim a failure.
+		// over-claim a failure. Guarded on checksResolved: an UNRESOLVED
+		// run (nil snapshot, #2497) deliberately falls THROUGH to the
+		// acceptance gate and the awaiting_merge stamp rather than parking
+		// — the local MCP loop never captures a snapshot, so parking would
+		// suppress checks_green_awaiting_merge on every local run and wedge
+		// merge_run (delegation.evalGatesResolvedCIGreen keys may_merge on
+		// that rule). reviewChecksFailed already returns nil for a nil
+		// snapshot, so this mirror is unreachable when unresolved anyway.
 		if failed := s.reviewChecksFailed(ctx, runRow, stage); len(failed) > 0 {
 			if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleCIFailed) {
 				return
@@ -1229,10 +1237,10 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 				Rule:  drive.RuleAcceptancePending,
 				From:  "review:awaiting_approval",
 				To:    "acceptance_pending",
-				Event: "review evidence terminal and required PR checks green; acceptance stage has not settled a verdict",
+				Event: "review evidence terminal and " + checksEvidencePhrase(checksResolved) + "; acceptance stage has not settled a verdict",
 				NextAction: &drive.NextAction{
 					Action: "await_acceptance",
-					Detail: "required checks are green but the acceptance stage has not settled; dispatch/await the acceptance stage before merging (ADR-049 decision #6)",
+					Detail: checksAcceptanceLead(checksResolved) + "; the acceptance stage has not settled — dispatch/await the acceptance stage before merging (ADR-049 decision #6)",
 					PRURL:  prURL,
 				},
 			})
@@ -1247,10 +1255,10 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 				Rule:  drive.RuleAcceptanceOutcomeUnknown,
 				From:  "review:awaiting_approval",
 				To:    "acceptance_settled_outcome_unknown",
-				Event: "review evidence terminal and required PR checks green; acceptance stage settled with no recorded verdict",
+				Event: "review evidence terminal and " + checksEvidencePhrase(checksResolved) + "; acceptance stage settled with no recorded verdict",
 				NextAction: &drive.NextAction{
 					Action: "read_acceptance_audit",
-					Detail: "the acceptance stage settled but no acceptance_outcome_recorded verdict is visible; read the audit trail (fail toward read, not toward merge)",
+					Detail: checksAcceptanceLead(checksResolved) + "; the acceptance stage settled but no acceptance_outcome_recorded verdict is visible — read the audit trail (fail toward read, not toward merge)",
 					PRURL:  prURL,
 				},
 			})
@@ -1265,10 +1273,10 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 				Rule:  drive.RuleAcceptanceTriage,
 				From:  "review:awaiting_approval",
 				To:    "acceptance_triage",
-				Event: "review evidence terminal and required PR checks green; newest acceptance verdict failed",
+				Event: "review evidence terminal and " + checksEvidencePhrase(checksResolved) + "; newest acceptance verdict failed",
 				NextAction: &drive.NextAction{
 					Action: "read_acceptance_triage",
-					Detail: "the acceptance verdict failed; read the acceptance_triage_decided disposition and arbitrate before merging",
+					Detail: checksAcceptanceLead(checksResolved) + "; the acceptance verdict failed — read the acceptance_triage_decided disposition and arbitrate before merging",
 					PRURL:  prURL,
 				},
 			})
@@ -1299,10 +1307,10 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		Rule:  drive.RuleChecksGreenAwaitingMerge,
 		From:  "review:awaiting_approval",
 		To:    "awaiting_merge",
-		Event: "review evidence terminal and required PR checks green",
+		Event: "review evidence terminal and " + checksEvidencePhrase(checksResolved),
 		NextAction: &drive.NextAction{
 			Action: "merge_pr",
-			Detail: "all gates resolved and required checks are green; review and merge the PR",
+			Detail: checksMergeDetail(checksResolved),
 			PRURL:  prURL,
 		},
 	})
@@ -1374,37 +1382,91 @@ func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) (con
 	return configured, terminal, true, true
 }
 
-// reviewChecksGreen reports whether every required check from the
-// run's create-time snapshot (#251) has a green latest state recorded
-// against the review stage — the stage the check_run ingest path
-// writes rows for. An empty snapshot is vacuously green: no required
-// checks were declared, and branch protection (when any) still
-// enforces at merge time. Conservative on any gap: an unwired
-// StageCheckRepo, a missing row, or a non-pass state all report not
-// green, so the derived awaiting_merge can never overstate readiness.
-func (s *Server) reviewChecksGreen(ctx context.Context, runRow *run.Run, stage *run.Stage) bool {
-	if runRow.RequiredChecksSnapshot == nil || len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
-		return true
+// reviewChecksResolution is the tri-state resolution of the run's
+// required checks against the review stage (#2497). It distinguishes
+// "we never looked up branch protection" (resolved=false) from "zero
+// required checks are declared" (resolved=true, green=true) — the
+// vacuous-truth hole the old bool reviewChecksGreen collapsed by
+// returning true for BOTH a nil AND an empty snapshot.
+//
+//   - resolved=false: ONLY when the snapshot is absent
+//     (RequiredChecksSnapshot == nil) — protection was never looked
+//     up, so greenness is unknown. Every local MCP run has a nil
+//     snapshot, so this is the common local path.
+//   - (true, true): a present snapshot with zero Contexts (a repo
+//     that genuinely declares zero required checks — legitimately
+//     green), or a present snapshot whose every declared context has
+//     a StatePass row.
+//   - (false, true): a present snapshot with at least one declared
+//     context that is not StatePass, or an unwired StageCheckRepo —
+//     resolved but not (yet) green. Conservative on any gap: a
+//     missing row or a non-pass state reports not green, so the
+//     derived awaiting_merge can never overstate readiness.
+//
+// An ABSENT snapshot is never reported green — that is the #2497 fix.
+func (s *Server) reviewChecksResolution(ctx context.Context, runRow *run.Run, stage *run.Stage) (green bool, resolved bool) {
+	if runRow.RequiredChecksSnapshot == nil {
+		return false, false
+	}
+	if len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
+		return true, true
 	}
 	if s.cfg.StageCheckRepo == nil {
-		return false
+		return false, true
 	}
 	for _, name := range runRow.RequiredChecksSnapshot.Contexts {
 		check, err := s.cfg.StageCheckRepo.LatestForStageAndName(ctx, stage.ID, name)
 		if err != nil || check.State != stagecheck.StatePass {
-			return false
+			return false, true
 		}
 	}
-	return true
+	return true, true
+}
+
+// checksEvidencePhrase is the audit Event clause describing the
+// required-checks evidence for a drive stamp (#2497). When the checks
+// were resolved it asserts greenness as before; when they were not
+// resolved (nil snapshot) it states so honestly rather than claiming
+// green on a run where nothing was looked up.
+func checksEvidencePhrase(resolved bool) string {
+	if resolved {
+		return "required PR checks green"
+	}
+	return "required checks were not resolved for this run (no protection snapshot)"
+}
+
+// checksMergeDetail is the next_action.Detail for a merge-eligible
+// drive stamp (#2497). Resolved runs keep today's phrasing; an
+// unresolved run tells the operator the checks were never resolved and
+// must be verified on the PR before merging.
+func checksMergeDetail(resolved bool) string {
+	if resolved {
+		return "all gates resolved and required checks are green; review and merge the PR"
+	}
+	return "all gates resolved; required checks were not resolved for this run (no protection snapshot) — verify CI on the PR before merging"
+}
+
+// checksAcceptanceLead is the leading required-checks clause on an
+// acceptance-park next_action.Detail (#2497). Threaded through ALL
+// THREE acceptance parks — pending, outcome_unknown, triage (binding
+// approval condition 1) — because every local run has a nil snapshot,
+// so an operator parked at any of them must be told the checks were
+// never resolved rather than that they are green.
+func checksAcceptanceLead(resolved bool) string {
+	if resolved {
+		return "required checks are green"
+	}
+	return "required checks were not resolved for this run (no protection snapshot) and must be verified on the PR before merging"
 }
 
 // reviewChecksFailed returns the required-check contexts whose latest
 // state recorded against the review stage is stagecheck.StateFail — the
-// red mirror of reviewChecksGreen (#1045). Only StateFail counts as
+// red mirror of reviewChecksResolution (#1045). Only StateFail counts as
 // red: a StatePending (in-flight) or StateNotTracked (no row) check is
 // not failed, so a still-running check can never trip ci_failed.
-// Conservative on any gap: an empty snapshot or an unwired
-// StageCheckRepo returns nil, so ci_failed can never be over-claimed.
+// Conservative on any gap: a nil OR empty snapshot or an unwired
+// StageCheckRepo returns nil, so ci_failed can never be over-claimed
+// (in particular an unresolved run never mirrors a failure — #2497).
 func (s *Server) reviewChecksFailed(ctx context.Context, runRow *run.Run, stage *run.Stage) []string {
 	if runRow.RequiredChecksSnapshot == nil || len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
 		return nil
