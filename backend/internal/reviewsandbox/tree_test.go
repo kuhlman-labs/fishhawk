@@ -299,6 +299,39 @@ func TestExportTree_NotARepoDegrades(t *testing.T) {
 	}
 }
 
+// TestExportTree_BoundExceededDegrades_LiveGitChild exercises archiveInto's
+// early-abort branch (extractTar fails a bound mid-stream → cancel the git child
+// blocked writing to the now-unread pipe → Wait reaps it) with a REAL git-archive
+// subprocess, not an in-memory tar. The tracked file is large enough that its
+// archive output overflows the OS pipe buffer, so the git child is still writing
+// when extractTar aborts on the tiny byte bound — the exact pipe-abort/reap
+// ordering the branch exists for. The prior coverage drove that branch only
+// through extractTar directly, never against a live child (#2486 fix-up).
+func TestExportTree_BoundExceededDegrades_LiveGitChild(t *testing.T) {
+	gitOrSkip(t)
+	repo := t.TempDir()
+	runGit(t, repo, "init", "-q")
+	// 1 MiB tracked file: git archive's output far exceeds the ~64 KiB pipe
+	// buffer, guaranteeing the child is mid-write when extractTar aborts.
+	big := strings.Repeat("x", 1<<20)
+	if err := os.WriteFile(filepath.Join(repo, "big.txt"), []byte(big), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repo, "add", "big.txt")
+	runGit(t, repo, "commit", "-q", "-m", "big")
+
+	dir, _, _, _, err := ExportTree(context.Background(), repo, "HEAD", Limits{MaxFiles: 1000, MaxBytes: 50})
+	if err == nil {
+		t.Fatal("expected a byte-bound error from the live git-archive child, got nil")
+	}
+	if !strings.Contains(err.Error(), "byte total") {
+		t.Errorf("err = %v, want a byte-total-bound error surfaced from archiveInto", err)
+	}
+	if dir != "" {
+		t.Errorf("dir = %q, want empty on a bound-exceeded degrade (partial export removed)", dir)
+	}
+}
+
 // TestExportTree_GitAbsentDegrades pins the git-absent degrade by stripping PATH
 // so the `git` binary cannot be resolved.
 func TestExportTree_GitAbsentDegrades(t *testing.T) {

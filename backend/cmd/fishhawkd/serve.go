@@ -1398,7 +1398,7 @@ func runServe(args []string, logSink io.Writer) int {
 		"hard ceiling on the size-aware review budget (#747), bounding the worst-case "+
 			"synchronous gating wait for a very large diff. A non-positive value disables the ceiling")
 	reviewGrounding := fs.Bool("review-grounding",
-		envOr("FISHHAWKD_REVIEW_GROUNDING", "true") == "true",
+		envOrBool("FISHHAWKD_REVIEW_GROUNDING", true),
 		"ground plan-/implement-review agents against an exported read-only source tree (#2486): "+
 			"the reviewer can read and search the repository's tracked files at the reviewed commit to "+
 			"confirm diff-invisible facts. On by default; set FISHHAWKD_REVIEW_GROUNDING=false to disable "+
@@ -1646,6 +1646,14 @@ func runServe(args []string, logSink io.Writer) int {
 	// the same operator input.
 	cfg.ReviewGroundingDisabled = !*reviewGrounding
 	cfg.ReviewerEnvPassthrough = parseReviewerEnvPassthrough(*reviewerEnvPassthrough)
+	// Log the RESOLVED config fields (not the raw flags) so the real runServe
+	// handoff is observable end to end: a serve-driven test reads this line, so
+	// deleting either assignment above changes the logged value and fails that
+	// test rather than leaving the mirror-only unit test green (#2486 fix-up).
+	logger.Info("review grounding configured",
+		slog.Bool("disabled", cfg.ReviewGroundingDisabled),
+		slog.Int("env_passthrough", len(cfg.ReviewerEnvPassthrough)),
+		slog.String("ref", "#2486"))
 
 	// Refinement drafting agent (E34.2 / #1593). Reuses the local-claude
 	// reviewer options: when the local claude adapter is configured, the E34.1
@@ -3018,6 +3026,22 @@ func parseInstallationHostAllowlist(raw string) []string {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// envOrBool resolves a boolean env var via strconv.ParseBool so the operator-
+// friendly forms (1, t, T, TRUE, True as well as their false counterparts) are
+// honoured, not only the exact string "true" (#2486 fix-up). The old
+// `== "true"` comparison silently disabled grounding for FISHHAWKD_REVIEW_GROUNDING=1
+// or =TRUE — a footgun for a boolean env var. An unset or UNRECOGNIZED value
+// falls back to def (matching every other envOr* helper, which ignore an
+// unparseable value rather than aborting boot).
+func envOrBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
 }
 
 // parseReviewerEnvPassthrough splits a comma-separated

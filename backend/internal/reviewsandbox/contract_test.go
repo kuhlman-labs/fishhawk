@@ -102,6 +102,20 @@ func TestContract_GroundedPromptMatchesAdapterGrant(t *testing.T) {
 	if i := slices.Index(clArgv, "--add-dir"); i < 0 || i+1 >= len(clArgv) || clArgv[i+1] != treeDir {
 		t.Errorf("claude grounded argv missing --add-dir <tree>: %v", clArgv)
 	}
+	// The read+search grant is the substance of the grounded contract, not just
+	// the directory: --add-dir alone lets a reviewer SEE the tree, but the
+	// restricted toolset (--tools) plus the pre-approval (--allowed-tools) is what
+	// actually lets print mode read/search it without stalling on an unanswerable
+	// permission prompt. Assert BOTH so deleting the tool grant in the adapter
+	// fails this cross-boundary contract rather than leaving the prompt's
+	// read-and-search claim silently unbacked (#2486 test_vacuity fix-up).
+	if i := slices.Index(clArgv, "--tools"); i < 0 || i+1 >= len(clArgv) || clArgv[i+1] != "Read,Grep,Glob" {
+		t.Errorf("claude grounded argv missing --tools Read,Grep,Glob: %v", clArgv)
+	}
+	if i := slices.Index(clArgv, "--allowed-tools"); i < 0 || i+3 >= len(clArgv) ||
+		clArgv[i+1] != "Read" || clArgv[i+2] != "Grep" || clArgv[i+3] != "Glob" {
+		t.Errorf("claude grounded argv missing --allowed-tools Read Grep Glob: %v", clArgv)
+	}
 }
 
 // TestContract_UngroundedPromptMatchesAdapterPosture pins the degrade side: an

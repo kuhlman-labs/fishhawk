@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -30,17 +32,27 @@ type groundingFakeReviewer struct {
 	release            chan struct{}
 	verdict            *planreview.ReviewVerdict
 	model              string
+	// err, when non-nil, is returned from the review call instead of a verdict —
+	// the reviewer-transport-failure branch (#2486 C6 failure path). The record
+	// still runs first, so treeDir is captured before the error returns.
+	err error
+	// blockOnCtx makes the review BLOCK until its per-invocation context is
+	// cancelled (the deadline fires), then return ctx.Err() — the branch where the
+	// subprocess still holds the export as its cwd when the deadline kills it, so
+	// cleanup ordering (deadline kill vs RemoveAll of a live child's working dir)
+	// is exercised (#2486 C6 deadline path). It takes precedence over release.
+	blockOnCtx bool
 }
 
-func (g *groundingFakeReviewer) Review(_ context.Context, promptText string) (*planreview.ReviewVerdict, string, error) {
-	return g.record("", promptText, false)
+func (g *groundingFakeReviewer) Review(ctx context.Context, promptText string) (*planreview.ReviewVerdict, string, error) {
+	return g.record(ctx, "", promptText, false)
 }
 
-func (g *groundingFakeReviewer) ReviewGrounded(_ context.Context, promptText, treeDir string) (*planreview.ReviewVerdict, string, error) {
-	return g.record(treeDir, promptText, true)
+func (g *groundingFakeReviewer) ReviewGrounded(ctx context.Context, promptText, treeDir string) (*planreview.ReviewVerdict, string, error) {
+	return g.record(ctx, treeDir, promptText, true)
 }
 
-func (g *groundingFakeReviewer) record(treeDir, promptText string, grounded bool) (*planreview.ReviewVerdict, string, error) {
+func (g *groundingFakeReviewer) record(ctx context.Context, treeDir, promptText string, grounded bool) (*planreview.ReviewVerdict, string, error) {
 	g.mu.Lock()
 	g.treeDir = treeDir
 	g.prompt = promptText
@@ -53,8 +65,17 @@ func (g *groundingFakeReviewer) record(treeDir, promptText string, grounded bool
 	if g.started != nil {
 		close(g.started)
 	}
+	// Deadline branch: honour the per-invocation context so a tiny review budget
+	// actually times the reviewer out while it still holds the export as its cwd.
+	if g.blockOnCtx {
+		<-ctx.Done()
+		return nil, "", ctx.Err()
+	}
 	if g.release != nil {
 		<-g.release
+	}
+	if g.err != nil {
+		return nil, "", g.err
 	}
 	v := g.verdict
 	if v == nil {
@@ -275,6 +296,140 @@ func TestImplementReviewGrounded_KillSwitchDegrades(t *testing.T) {
 	}
 	if !strings.Contains(reviewer.prompt, "DIFF-ONLY") {
 		t.Errorf("kill-switch review prompt must be diff-only:\n%s", reviewer.prompt)
+	}
+}
+
+// TestImplementReviewGrounded_CleanupOnReviewerError is the C6 failure-branch pin
+// the acceptance criterion names ("removed ... including when a reviewer errors"):
+// a grounded reviewer that returns an error must still leave the export removed
+// after the detached loop returns, not leaked (#2486 fix-up). The happy-path
+// lifecycle test alone did not exercise this branch.
+func TestImplementReviewGrounded_CleanupOnReviewerError(t *testing.T) {
+	repo, headSHA := gitFixtureRepo(t)
+
+	reviewer := &groundingFakeReviewer{
+		model: "claude-sonnet-4-6",
+		err:   errors.New("reviewer transport failed"),
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	runRow.WorkingDir = repo
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "foo.go", Status: policy.StatusModified}}}
+	s.runImplementReviews(context.Background(), runRow.ID, implStage.ID, diff, nil, headSHA, nil)
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	treeDir := reviewer.treeDir
+	reviewer.mu.Unlock()
+	if treeDir == "" {
+		t.Fatal("reviewer received no tree — grounded path not taken, so the error branch is untested")
+	}
+	if _, err := os.Stat(treeDir); !os.IsNotExist(err) {
+		t.Errorf("export dir not removed after the grounded reviewer errored: %v", err)
+	}
+}
+
+// TestImplementReviewGrounded_CleanupOnDeadline is the C6 failure-branch pin for
+// the second required path ("...or its deadline fires"): the per-invocation
+// deadline fires mid-review while the fake reviewer still holds the export as its
+// cwd, and the export MUST still be removed after the detached loop returns — the
+// one branch where cleanup ordering (deadline kill vs RemoveAll of a live child's
+// working directory) could misbehave (#2486 fix-up). A tiny review-budget floor
+// forces the deadline.
+func TestImplementReviewGrounded_CleanupOnDeadline(t *testing.T) {
+	repo, headSHA := gitFixtureRepo(t)
+
+	reviewer := &groundingFakeReviewer{
+		model:      "claude-sonnet-4-6",
+		blockOnCtx: true,
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	runRow.WorkingDir = repo
+	// Tiny per-invocation floor (PerKB/Cap zeroed) so the applied review budget is
+	// ~20ms and the reviewer's blocked-on-ctx wait times out mid-review.
+	s.cfg.ReviewBudget = planreview.ReviewBudget{Floor: 20 * time.Millisecond}
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "foo.go", Status: policy.StatusModified}}}
+	s.runImplementReviews(context.Background(), runRow.ID, implStage.ID, diff, nil, headSHA, nil)
+	s.waitBackgroundReviews()
+
+	reviewer.mu.Lock()
+	treeDir := reviewer.treeDir
+	grounded := reviewer.reviewGroundedHit
+	reviewer.mu.Unlock()
+	if treeDir == "" || !grounded {
+		t.Fatalf("reviewer was not grounded (treeDir=%q grounded=%v) — the deadline branch is untested", treeDir, grounded)
+	}
+	if _, err := os.Stat(treeDir); !os.IsNotExist(err) {
+		t.Errorf("export dir not removed after the reviewer's deadline fired: %v", err)
+	}
+}
+
+// specImplementMixedAdvisoryReviewers declares a heterogeneous implement-stage
+// panel (one anthropic reviewer + one codex reviewer, advisory) so a MIXED
+// capability panel can be driven through the real runImplementReviews loop.
+var specImplementMixedAdvisoryReviewers = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+            - provider: codex
+              model: gpt-5.5
+          human: 1
+`)
+
+// TestImplementReviewGrounded_MixedPanelUngroundedThroughLoop drives the
+// mixed-capability rule through the REAL loop (the plan's verification section
+// promised it, beyond the unit-level TestAllInvocationsGrounded): a panel with
+// one grounding-capable reviewer and one that is not must run EVERYONE ungrounded
+// — no tree is exported and both get the diff-only prompt — so the prompt never
+// claims a tree half the panel cannot read (#2486 fix-up).
+func TestImplementReviewGrounded_MixedPanelUngroundedThroughLoop(t *testing.T) {
+	repo, headSHA := gitFixtureRepo(t)
+
+	capable := &groundingFakeReviewer{model: "claude-opus-4-8"}
+	incapable := &plainFakeReviewer{}
+	set := fakeReviewerSet{
+		def: capable,
+		providers: map[string]PlanReviewer{
+			"anthropic": capable,
+			"codex":     incapable,
+		},
+	}
+	s, _, _, _, runRow, implStage := newImplementReviewServerWithSet(t, set, specImplementMixedAdvisoryReviewers)
+	runRow.WorkingDir = repo
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "foo.go", Status: policy.StatusModified}}}
+	s.runImplementReviews(context.Background(), runRow.ID, implStage.ID, diff, nil, headSHA, nil)
+	s.waitBackgroundReviews()
+
+	capable.mu.Lock()
+	grounded := capable.reviewGroundedHit
+	treeDir := capable.treeDir
+	capablePrompt := capable.prompt
+	capable.mu.Unlock()
+	if grounded || treeDir != "" {
+		t.Errorf("mixed panel must run the capable reviewer ungrounded: grounded=%v treeDir=%q", grounded, treeDir)
+	}
+	if !strings.Contains(capablePrompt, "DIFF-ONLY") {
+		t.Errorf("mixed panel prompt must be diff-only:\n%s", capablePrompt)
+	}
+	if !strings.Contains(incapable.prompt, "DIFF-ONLY") {
+		t.Errorf("mixed panel prompt for the incapable reviewer must be diff-only:\n%s", incapable.prompt)
 	}
 }
 
