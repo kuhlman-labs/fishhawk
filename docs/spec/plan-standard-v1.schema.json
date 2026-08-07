@@ -79,6 +79,11 @@
       "items": { "$ref": "#/$defs/surface-sweep-exemption" },
       "description": "Optional (#1544). Machine-readable declarations that a surface-sweep lockstep pattern's named sibling correctly needs no change in this plan — the structured form of the prose 'justify why a sibling needs no change' escape hatch. The plan-gate surface sweep honors a matching (pattern, sibling) entry to suppress the would-be missing-sibling finding, and records the applied exemption in the audit payload + plan-review evidence so a bogus reason stays reviewer-challengeable (never silent). A non-matching or non-firing entry is a harmless no-op."
     },
+    "scope_removals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/scope-removal" },
+      "description": "Optional (#2516). Machine-readable declarations that a path present in the REVISION BASE plan is deliberately dropped by this revision — the structured form of 'this file is genuinely obsoleted by the constraint'. The plan-gate scope-regression sweep REFUSES a revision that narrows scope without declaring the drop (bounded in-run re-dispatch); a matching entry suppresses the refusal for exactly that path, with the reason surfaced to reviewers as a challengeable justification (never silent). An entry naming a path that was NOT dropped is a harmless no-op."
+    },
     "over_cap": {
       "type": "boolean",
       "description": "Optional (#2053). A planner SELF-DECLARATION HINT that scope.files exceeds the resolved implement-stage max_files_changed cap. Advisory only: the plan-gate over-cap advisory is derived SERVER-SIDE from len(scope.files) vs the resolved cap and does NOT depend on this flag — no enforcement or detection path may branch on over_cap to decide whether a plan is over-cap. Set it true as a courtesy when you must emit a single plan whose scope genuinely exceeds the cap; omitting it (or setting it false) never suppresses the server's count-derived advisory."
@@ -432,6 +437,25 @@
           "type": "string",
           "minLength": 1,
           "description": "Why the sibling correctly needs no change. Rendered to plan reviewers as a challengeable justification, so a bogus reason is not silent."
+        }
+      }
+    },
+
+    "scope-removal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "reason"],
+      "description": "One machine-readable scope removal (#2516): a declaration that the named path, present in the revision base plan, is deliberately dropped by this revision. The plan-gate scope-regression sweep suppresses the undeclared-narrowing refusal for exactly this path; every OTHER dropped path still refuses. The reason is surfaced to reviewers in the plan artifact as a challengeable justification.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative path, present in the revision base plan's scope, that this revision deliberately drops."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the revision constraint genuinely obsoletes this path. Rendered to plan reviewers as a challengeable justification, so a bogus reason is not silent."
         }
       }
     }

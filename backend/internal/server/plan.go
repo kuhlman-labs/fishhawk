@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -182,6 +183,28 @@ const categoryPlanSchemaRetry = "plan_schema_retry"
 // plan_schema_retry audit entry, mirroring buildPlan's maxFeedbackBytes
 // so the recorded error never outgrows the prompt-injection cap.
 const maxSchemaValidationErrorBytes = 4000
+
+// maxPlanScopeRetries bounds the in-run scope-retry budget (#2516),
+// mirroring maxPlanSchemaRetries. On the first UNDECLARED scope narrowing
+// the plan stage is REFUSED — re-opened and re-dispatched once with the
+// enumerated carry-forward set fed back — and a second narrowing exhausts
+// the budget, degrading to EXACTLY the prior behaviour (the plan proceeds
+// to review carrying the regression evidence, and the revise handler
+// refunds the operator's pass). A refusal must never become a new way to
+// lose a plan, so exhaustion parks rather than failing the run terminally.
+// The budget is tracked by counting plan_scope_retry audit entries.
+const maxPlanScopeRetries = 1
+
+// categoryPlanScopeRetry is the audit-log category for the chained entry
+// tryScopeRetry writes when it refuses a plan whose revision UNDECLAREDLY
+// narrowed the revision base's scope (#2516). Like plan_schema_retry, the
+// entry is BOTH the budget counter (countScopeRetries counts them) and the
+// feedback source: loadScopeCarryForward reads the newest entry's
+// required_scope_files back into the re-dispatched plan prompt as the
+// enumerated carry-forward set, and its undeclared_removals as the refusal
+// notice. The payload-key contract is exercised end-to-end by the
+// cross-boundary seam test.
+const categoryPlanScopeRetry = "plan_scope_retry"
 
 // handleShipPlan implements POST /v0/runs/{run_id}/plan.
 //
@@ -559,6 +582,29 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// the plan-review prompt's gate-evidence section like the gates above.
 	acceptance := s.runAcceptancePrecheck(r.Context(), runID, stageID, body)
 
+	// Plan-gate undeclared-narrowing REFUSAL (#2516). The sweep above is
+	// advisory: it records the drop, but the narrowed plan still walks to the
+	// gate, spending a reviewer pass and an operator revise pass on a plan
+	// whose only remedy is another revise that can drop again. Refuse it
+	// instead — tryScopeRetry re-opens and re-dispatches the plan stage ONCE
+	// with the enumerated carry-forward set, so ZERO reviewer passes and ZERO
+	// revise passes are spent. Regressed now keys on the UNDECLARED removals,
+	// so a narrowing the plan DECLARED in scope_removals never reaches here.
+	//
+	// Setting gatingRejected reuses the existing advancement suppression, so
+	// the refused stage never walks to awaiting_approval and no plan-ready
+	// ping fires; the artifact is already stored and audited, so the operator
+	// can inspect the refused plan via fishhawk_get_plan (matching the
+	// over-cap reject's documented behaviour). UNLIKE the over-cap reject
+	// below, this is NOT terminal: on false (budget spent, or any
+	// precondition/transition failure) it falls through UNCHANGED to today's
+	// behaviour — the plan proceeds to review with the regression evidence
+	// and revise.go's refund gives the operator their pass back.
+	gatingRejected := false
+	if regression != nil && regression.Regressed {
+		gatingRejected = s.tryScopeRetry(r, runID, stageID, regression, regressionBase)
+	}
+
 	// Plan-gate over-cap split rejection (E50.3 / #2055): the
 	// SERVER-AUTHORITATIVE, count-derived HARD reject — the E50 keystone. When
 	// scope.files exceeds the resolved implement-stage max_files_changed cap BY
@@ -584,10 +630,15 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// ADDITIONAL in-artifact defensive layer (surfaced via runPlanReviews'
 	// plan.Parse path), NOT this authoritative gate. A json.Unmarshal failure on
 	// schema-valid bytes is an internal inconsistency: skip the gate (fail open).
-	gatingRejected := false
+	//
+	// Skipped when the scope refusal above already re-opened the stage (#2516):
+	// a stage is failed once, and layering the terminal category-B reject onto
+	// a stage already re-opened to pending would destroy the recoverable
+	// refusal. The refused plan is re-dispatched; its successor is evaluated
+	// against this gate when it ships.
 	var parsedForCap plan.Plan
 	capDecoded := json.Unmarshal(body, &parsedForCap) == nil
-	if capDecoded {
+	if capDecoded && !gatingRejected {
 		if reason := s.overCapSplitRejection(r.Context(), runID, &parsedForCap); reason != "" {
 			s.emitReviewFailed(r.Context(), runID, stageID, "plan_review_failed", planreview.AuthorityGating, "", reason, false)
 			cat := run.FailureB
@@ -932,6 +983,206 @@ func (s *Server) trySchemaRetry(r *http.Request, runID, stageID uuid.UUID, repor
 		slog.String("run_id", runID.String()),
 		slog.String("stage_id", stageID.String()),
 		slog.Int("attempt", attempt+1))
+	return true
+}
+
+// countScopeRetries counts the run's plan_scope_retry audit entries — the
+// in-run scope-retry budget counter (#2516), the exact read shape
+// countSchemaRetries uses.
+//
+// It FAILS CLOSED: a read error returns the error, and tryScopeRetry then
+// refuses to refuse (falls through to park-with-evidence). Treating an
+// unreadable count as "no retries recorded" would make a PERSISTENT audit-list
+// failure grant a refusal on EVERY corrective ship — the one-shot budget would
+// never exhaust and the plan would never degrade to park-with-evidence, which
+// is the bound this gate is required to hold. Losing one legitimate refusal to
+// a transient read error is strictly the cheaper failure: the plan still parks
+// at the gate with the regression evidence and the refunded revise pass.
+// An unconfigured AuditRepo returns (0, nil) — tryScopeRetry rejects that case
+// on its own precondition before ever counting.
+func (s *Server) countScopeRetries(ctx context.Context, runID uuid.UUID) (int, error) {
+	if s.cfg.AuditRepo == nil {
+		return 0, nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, categoryPlanScopeRetry)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan upload: count scope retries failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return 0, err
+	}
+	return len(entries), nil
+}
+
+// tryScopeRetry REFUSES a revise pass whose new plan UNDECLAREDLY narrows the
+// revision base's scope, attempting a bounded in-run re-dispatch of the plan
+// stage (#2516). It is modelled on trySchemaRetry (above) and shares its
+// audit-first ordering. It returns true when the refusal took effect (the
+// caller suppresses stage advancement, so the narrowed plan never reaches
+// awaiting_approval and spends ZERO reviewer passes) and false when the
+// caller should fall through to today's behaviour: admit the plan to review
+// carrying the regression evidence, with the revise handler refunding the
+// operator's pass. Budget exhaustion therefore degrades to the prior
+// park-with-evidence, NEVER to a terminal fail — a refusal must not become a
+// new way to lose a plan.
+//
+// Preconditions (any false → return false → fall through):
+//   - Orchestrator and AuditRepo are wired (needed to re-dispatch and to
+//     record/count the budget).
+//   - countScopeRetries READS the budget successfully. A read error fails
+//     CLOSED (no refusal): an unreadable budget is an unbounded one, and a
+//     persistent audit-list failure would otherwise grant a refusal on every
+//     corrective ship, so the nominal one-shot would never exhaust.
+//   - countScopeRetries < maxPlanScopeRetries (budget remaining).
+//
+// The count→append window is NOT atomic, so two ships racing on the same run
+// can both read 0 and both record a refusal. The audit-first ordering keeps
+// that bounded in the direction that matters: each racing ship commits its own
+// entry BEFORE mutating any state, so the budget is over-consumed, never
+// under-consumed — the comparison is `>=`, so the next ship sees a count over
+// the cap and falls through to park-with-evidence. A race can therefore cost
+// an extra re-dispatch; it can never make the refusal unbounded. (The stage
+// transitions themselves are CAS-guarded, so at most one racer's re-open
+// wins; the loser's FailStage/RetryStage error returns false and falls
+// through.) Making the budget strictly one-shot under concurrency needs a
+// unique constraint on (run_id, category) — deliberately out of scope here.
+//
+// On a granted refusal, in order (audit-first, mirroring trySchemaRetry and
+// handleRetryStage so the retry intent is durable even if a later step
+// fails):
+//  1. Append a chained plan_scope_retry audit entry carrying run_id,
+//     stage_id, attempt, undeclared_removals, and required_scope_files — the
+//     base-scoped union MINUS the declared removals, i.e. the exact
+//     enumerated set the corrected plan must cover. This entry is BOTH the
+//     budget counter and the feedback source loadScopeCarryForward reads
+//     back into the re-dispatched plan prompt.
+//  2. Re-open the stage: FailStage(FailureA) walks it running/dispatched →
+//     failed (transient category A, never B), then RetryStage(pending) walks
+//     failed → pending and clears the transient failure metadata.
+//  3. Orchestrator.Advance re-dispatches.
+//
+// The per-step return contract mirrors trySchemaRetry's ACTUAL behaviour,
+// and each leg leaves a DIFFERENT observable state:
+//   - AppendChained failure → false. Nothing mutated; the caller's
+//     fall-through parks the stage at awaiting_approval with the evidence.
+//   - FailStage failure → false. The plan_scope_retry entry is already
+//     committed and the budget consumed, but the stage never left its state,
+//     so the fall-through still parks it at awaiting_approval.
+//   - RetryStage failure → false. The entry is committed AND the stage is
+//     left at failed (transient category A, operator-recoverable via
+//     retry_stage). It does NOT reach awaiting_approval.
+//   - Advance failure → LOG AND RETURN TRUE. The stage is already re-opened
+//     to pending, so returning false would fall through to normal
+//     advancement holding a pending stage — the stranded state. The refusal
+//     stands; only the auto-dispatch is missing, which on the local runner
+//     is the normal case anyway (ADR-024: the operator re-drives with a
+//     fresh fishhawk_run_stage --stage plan).
+func (s *Server) tryScopeRetry(r *http.Request, runID, stageID uuid.UUID, regression *ScopeRegressionPayload, base *plan.Plan) bool {
+	if s.cfg.Orchestrator == nil || s.cfg.AuditRepo == nil {
+		return false
+	}
+	attempt, cerr := s.countScopeRetries(r.Context(), runID)
+	if cerr != nil {
+		// Fail closed: an unreadable budget is an UNBOUNDED budget, and a
+		// persistent read failure would refuse every corrective ship.
+		return false
+	}
+	if attempt >= maxPlanScopeRetries {
+		return false
+	}
+
+	// required_scope_files is derived SERVER-SIDE from the revision base
+	// minus the declared removals — never asserted by the planner — so the
+	// re-dispatched prompt enumerates exactly what the corrected plan must
+	// carry forward.
+	declared := make(map[string]bool, len(regression.DeclaredRemovals))
+	for _, p := range regression.DeclaredRemovals {
+		declared[p] = true
+	}
+	required := []string{}
+	for _, p := range scopedPaths(base) {
+		if declared[p] {
+			continue
+		}
+		required = append(required, p)
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":               runID.String(),
+		"stage_id":             stageID.String(),
+		"attempt":              attempt + 1,
+		"undeclared_removals":  regression.UndeclaredRemovals,
+		"required_scope_files": required,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  categoryPlanScopeRetry,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		// Without the budget/feedback entry the refusal is neither bounded
+		// nor steerable — fall through to the prior park-with-evidence
+		// rather than re-dispatching blind.
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: append plan_scope_retry audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+		return false
+	}
+
+	// Re-open: running/dispatched → failed (transient A) → pending. The
+	// recorded reason names the dropped paths and is CAPPED at
+	// maxSchemaValidationErrorBytes, exactly as the sibling schema-retry path
+	// caps its validation_error: nothing bounds how many paths a revise can
+	// drop, and a stage failure reason is surfaced back to agents and
+	// operators, so it must never outgrow the prompt-injection cap.
+	reason := "plan_scope_regression_retry: undeclared scope narrowing dropped " +
+		strings.Join(regression.UndeclaredRemovals, ", ")
+	if len(reason) > maxSchemaValidationErrorBytes {
+		reason = reason[:maxSchemaValidationErrorBytes] + "...[truncated]"
+	}
+	if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureA, reason); ferr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: transition to failed-A for scope retry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", ferr.Error()))
+		return false
+	}
+	if _, rerr := s.cfg.RunRepo.RetryStage(r.Context(), stageID, run.StageStatePending); rerr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: re-open stage to pending for scope retry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", rerr.Error()))
+		return false
+	}
+
+	// Drive the orchestrator to re-dispatch the now-pending plan stage.
+	// Best-effort: a failure here logs but still returns TRUE — the stage is
+	// re-opened and the entry recorded, so the refusal stands and an
+	// operator (or a fresh fishhawk_run_stage) can re-drive it. Returning
+	// false here would fall through to normal advancement holding a pending
+	// stage.
+	if _, aerr := s.cfg.Orchestrator.Advance(r.Context(), runID); aerr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"plan upload: orchestrator advance after scope retry re-open failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
+
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+		"plan upload: refused undeclared scope narrowing, scheduled in-run scope retry",
+		slog.String("run_id", runID.String()),
+		slog.String("stage_id", stageID.String()),
+		slog.Int("attempt", attempt+1),
+		slog.Int("undeclared_removals", len(regression.UndeclaredRemovals)),
+		slog.Int("required_scope_files", len(required)))
 	return true
 }
 

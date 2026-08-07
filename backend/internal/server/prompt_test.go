@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -2238,6 +2239,246 @@ func TestLoadPriorSchemaValidationError_ListError_ReturnsNil(t *testing.T) {
 	if got := s.loadPriorSchemaValidationError(context.Background(), uuid.New()); got != nil {
 		t.Errorf("got %q, want nil (list error degrades to nil)", *got)
 	}
+}
+
+// --- loadScopeCarryForward unit tests (#2516) ---
+
+// makeScopeRetryEntry builds a plan_scope_retry audit entry carrying the
+// server-derived carry-forward set and the refusal's dropped paths.
+func makeScopeRetryEntry(runID, stageID uuid.UUID, required, undeclared []string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":               runID.String(),
+		"stage_id":             stageID.String(),
+		"attempt":              1,
+		"required_scope_files": required,
+		"undeclared_removals":  undeclared,
+	})
+	rid, sid := runID, stageID
+	return &audit.Entry{ID: uuid.New(), Category: categoryPlanScopeRetry, RunID: &rid, StageID: &sid, Payload: payload}
+}
+
+// newCarryForwardServer wires the three dependencies loadScopeCarryForward
+// touches: an audit repo (the retry-entry channel), plus a run repo + artifact
+// repo (the newest-plan-artifact fallback). artifactScope, when non-empty,
+// seeds a plan artifact on the stage scoping exactly those paths.
+func newCarryForwardServer(t *testing.T, runID, stageID uuid.UUID, entries []*audit.Entry, artifactScope []string) *Server {
+	t.Helper()
+	rr := newPromptRunRepo()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: stageID, RunID: runID, Type: run.StageTypePlan}},
+	}
+	art := newFakeArtifactRepo()
+	if len(artifactScope) > 0 {
+		art = seedNarrowedPlanArtifact(t, stageID, artifactScope)
+	}
+	ar := &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entries}}
+	return New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, ArtifactRepo: art})
+}
+
+// TestLoadScopeCarryForward_PrefersRetryEntryOverNewestArtifact is the
+// COUNTERFACTUAL for the load-bearing resolution ORDER. Both channels are
+// seeded: a plan_scope_retry entry naming the FULL base set, AND a newer
+// (narrowed) plan artifact — which on a corrective re-dispatch is the REFUSED
+// plan. Deleting the retry-entry-first branch returns the narrowed set,
+// cementing the very drop the retry exists to undo.
+func TestLoadScopeCarryForward_PrefersRetryEntryOverNewestArtifact(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	full := []string{"b/a.go", "b/b.go", "b/c.go"}
+	s := newCarryForwardServer(t, runID, stageID,
+		[]*audit.Entry{makeScopeRetryEntry(runID, stageID, full, []string{"b/c.go"})},
+		[]string{"b/a.go", "b/b.go"}) // the REFUSED narrowed artifact
+
+	got, restoration := s.loadScopeCarryForward(context.Background(), runID, stageID)
+	if !reflect.DeepEqual(got, full) {
+		t.Errorf("carry-forward = %v, want %v (the retry entry's set, not the refused artifact's)", got, full)
+	}
+	if restoration == nil {
+		t.Fatal("restoration = nil, want the refusal notice")
+	}
+	if !reflect.DeepEqual(restoration.UndeclaredRemovals, []string{"b/c.go"}) {
+		t.Errorf("UndeclaredRemovals = %v, want [b/c.go]", restoration.UndeclaredRemovals)
+	}
+}
+
+// TestLoadScopeCarryForward_NewestRetryEntryWins: entries arrive ASC by ts, so
+// the newest refusal's set must win over an older one.
+func TestLoadScopeCarryForward_NewestRetryEntryWins(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s := newCarryForwardServer(t, runID, stageID, []*audit.Entry{
+		makeScopeRetryEntry(runID, stageID, []string{"old/one.go"}, []string{"old/two.go"}),
+		makeScopeRetryEntry(runID, stageID, []string{"new/one.go"}, []string{"new/two.go"}),
+	}, nil)
+
+	got, restoration := s.loadScopeCarryForward(context.Background(), runID, stageID)
+	if !reflect.DeepEqual(got, []string{"new/one.go"}) {
+		t.Errorf("carry-forward = %v, want [new/one.go] (newest entry wins)", got)
+	}
+	if restoration == nil || !reflect.DeepEqual(restoration.UndeclaredRemovals, []string{"new/two.go"}) {
+		t.Errorf("restoration = %+v, want [new/two.go]", restoration)
+	}
+}
+
+// TestLoadScopeCarryForward_ArtifactFallback: with NO retry entry (an ordinary
+// revise that was never refused), the carry-forward set is derived from the
+// newest plan artifact and there is no restoration notice.
+func TestLoadScopeCarryForward_ArtifactFallback(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s := newCarryForwardServer(t, runID, stageID, nil, []string{"b/a.go", "b/b.go"})
+
+	got, restoration := s.loadScopeCarryForward(context.Background(), runID, stageID)
+	if !reflect.DeepEqual(got, []string{"b/a.go", "b/b.go"}) {
+		t.Errorf("carry-forward = %v, want the artifact's scope union", got)
+	}
+	if restoration != nil {
+		t.Errorf("restoration = %+v, want nil (no refusal was recorded)", restoration)
+	}
+}
+
+// TestLoadScopeCarryForward_ForeignStageEntryIgnored: a plan_scope_retry entry
+// belonging to a DIFFERENT stage must not be read as this stage's refusal —
+// it falls through to the artifact derivation.
+func TestLoadScopeCarryForward_ForeignStageEntryIgnored(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s := newCarryForwardServer(t, runID, stageID,
+		[]*audit.Entry{makeScopeRetryEntry(runID, uuid.New(), []string{"other/one.go"}, []string{"other/two.go"})},
+		[]string{"b/a.go"})
+
+	got, restoration := s.loadScopeCarryForward(context.Background(), runID, stageID)
+	if !reflect.DeepEqual(got, []string{"b/a.go"}) {
+		t.Errorf("carry-forward = %v, want the artifact fallback [b/a.go]", got)
+	}
+	if restoration != nil {
+		t.Errorf("restoration = %+v, want nil for a foreign stage's entry", restoration)
+	}
+}
+
+// seedNarrowedPlanArtifact returns an artifact repo holding ONE plan artifact
+// on the stage scoping exactly the given paths — on a corrective re-dispatch
+// this stands in for the REFUSED narrowed plan, the artifact the carry-forward
+// loader must never derive its set from.
+func seedNarrowedPlanArtifact(t *testing.T, stageID uuid.UUID, paths []string) *fakeArtifactRepo {
+	t.Helper()
+	art := newFakeArtifactRepo()
+	files := make([]any, 0, len(paths))
+	for _, f := range paths {
+		files = append(files, map[string]any{"path": f, "operation": "modify"})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": files}
+	})
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal artifact plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID: stageID, Kind: artifact.KindPlan, SchemaVersion: &sv,
+		Content: body, ContentHash: "h",
+	}); err != nil {
+		t.Fatalf("seed artifact: %v", err)
+	}
+	return art
+}
+
+// TestGetStagePrompt_Plan_NonRevise_NoCarryForwardSection pins where the
+// "first-pass plan prompts stay byte-unchanged" guarantee actually lives. The
+// artifact fallback in loadScopeCarryForward does NOT test for a revise, so on
+// an ordinary plan-stage prompt build with a plan artifact present it DOES
+// return that artifact's scoped union — the loader is not the gate. The gate
+// is the renderer: buildPlan writes the carry-forward list only inside its
+// `RevisionConstraint != nil` block, and a first-pass dispatch records no
+// plan_revised entry. Both halves are asserted here so a future refactor that
+// moves the render out of that block fails loudly instead of silently starting
+// to render the set on non-revise dispatches.
+func TestGetStagePrompt_Plan_NonRevise_NoCarryForwardSection(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	rr := newPromptRunRepo()
+	rr.runRow = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: "manual"}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan}
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {rr.stage}}
+	art := seedNarrowedPlanArtifact(t, stageID, []string{"b/a.go", "b/b.go"})
+	// No plan_revised entry and no plan_scope_retry entry: a non-revise build.
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: newSigningFake(),
+		ArtifactRepo: art, AuditRepo: &feedbackAuditRepo{}})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	// The loader itself is NOT the gate — it returns the artifact's union.
+	paths, restoration := s.loadScopeCarryForward(context.Background(), runID, stageID)
+	if !reflect.DeepEqual(paths, []string{"b/a.go", "b/b.go"}) {
+		t.Errorf("loader returned %v; this test's premise is that the loader does NOT gate on revise", paths)
+	}
+	if restoration != nil {
+		t.Errorf("restoration = %+v, want nil (no refusal was recorded)", restoration)
+	}
+
+	// The RENDERER is: with no revision constraint, neither section appears.
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt-render status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var pr promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &pr); err != nil {
+		t.Fatalf("decode prompt response: %v", err)
+	}
+	for _, marker := range []string{"Revision base scope", "### Scope restoration"} {
+		if strings.Contains(pr.Prompt, marker) {
+			t.Errorf("a non-revise plan prompt rendered %q:\n%s", marker, pr.Prompt)
+		}
+	}
+}
+
+// TestLoadScopeCarryForward_Degrades covers each best-effort degrade leg:
+// every one yields (nil, nil) so the prompt renders exactly as it does today.
+func TestLoadScopeCarryForward_Degrades(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+
+	t.Run("nil AuditRepo", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"})
+		if paths, r := s.loadScopeCarryForward(context.Background(), runID, stageID); paths != nil || r != nil {
+			t.Errorf("got (%v, %+v), want (nil, nil)", paths, r)
+		}
+	})
+
+	// Both unreadable-refusal legs below seed the REFUSED narrowed artifact —
+	// the harmful combination. An earlier version of each leg fell through to
+	// the artifact derivation, which on a corrective re-dispatch renders the
+	// REFUSED plan's narrowed scope under the "authoritative scope set"
+	// heading, instructing the planner to cement the very drop the refusal
+	// rejected. Seeding no artifact (as the first version of these subtests
+	// did) asserts (nil, nil) without ever exercising that. Restoring the
+	// fall-through returns [b/a.go b/b.go] and both go red.
+	t.Run("audit list error yields nil, never the refused artifact", func(t *testing.T) {
+		rr := newPromptRunRepo()
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			runID: {{ID: stageID, RunID: runID, Type: run.StageTypePlan}},
+		}
+		art := seedNarrowedPlanArtifact(t, stageID, []string{"b/a.go", "b/b.go"})
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art,
+			AuditRepo: &feedbackAuditRepo{listErr: errors.New("boom")}})
+		if paths, r := s.loadScopeCarryForward(context.Background(), runID, stageID); paths != nil || r != nil {
+			t.Errorf("got (%v, %+v), want (nil, nil) — the refused artifact must NOT become the carry-forward set", paths, r)
+		}
+	})
+
+	t.Run("undecodable payload yields nil, never the refused artifact", func(t *testing.T) {
+		rid, sid := runID, stageID
+		bad := &audit.Entry{ID: uuid.New(), Category: categoryPlanScopeRetry,
+			RunID: &rid, StageID: &sid, Payload: json.RawMessage(`{not json`)}
+		s := newCarryForwardServer(t, runID, stageID, []*audit.Entry{bad},
+			[]string{"b/a.go", "b/b.go"}) // the REFUSED narrowed artifact
+		if paths, r := s.loadScopeCarryForward(context.Background(), runID, stageID); paths != nil || r != nil {
+			t.Errorf("got (%v, %+v), want (nil, nil) — the refused artifact must NOT become the carry-forward set", paths, r)
+		}
+	})
+
+	t.Run("no entry and no artifact", func(t *testing.T) {
+		s := newCarryForwardServer(t, runID, stageID, nil, nil)
+		if paths, r := s.loadScopeCarryForward(context.Background(), runID, stageID); paths != nil || r != nil {
+			t.Errorf("got (%v, %+v), want (nil, nil)", paths, r)
+		}
+	})
 }
 
 // TestGetStagePrompt_Implement_EchoesScopeFiles verifies that the

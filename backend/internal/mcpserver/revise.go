@@ -82,14 +82,24 @@ revise_ceiling_reached error (the override no longer helps — reject and
 start a fresh run). A run-bound token may revise only its own run's
 stages.
 
-Scope-regression refund: a revise regenerates the WHOLE plan, so a
-narrowly-scoped constraint can silently DROP files the prior plan scoped.
-The advisory plan_scope_regression gate diffs the new plan's scoped paths
-(top-level + decomposition sub-plan scopes) against the revision base and
-surfaces any dropped files to the reviewers and the plan gate. A revise
-pass that drops files does NOT consume the normal revise budget — the
-operator gets a free recovery pass to put them back — while the hard
-ceiling still counts every pass, so total work stays bounded.
+Scope-regression refusal: a revise regenerates the WHOLE plan, so a
+narrowly-scoped constraint can drop files the prior plan scoped. That drop
+is neither silent nor accepted. The plan gate diffs the new plan's scoped
+paths (top-level + decomposition sub-plan + split_proposal phase scopes)
+against the revision base and REFUSES a narrowing the plan did not declare:
+the narrowed plan never reaches review or the approval gate — the plan
+stage is re-dispatched ONCE with the enumerated carry-forward path set and
+the dropped-file list, so ZERO reviewer passes and ZERO revise passes are
+spent. A narrowing IS admitted when the plan declares it in the top-level
+scope_removals array ({path, reason}); the reason rides in the plan
+artifact so reviewers can challenge it.
+
+Residual operator-facing consequence: the refusal budget is ONE pass per
+run. Once it is spent, a further undeclared narrowing degrades to the prior
+behaviour — the plan reaches the gate carrying the regression evidence, and
+the pass does NOT consume the normal revise budget, so you get a free
+recovery pass to put the files back. The hard ceiling still counts every
+pass, so total work stays bounded.
 
 Inputs:
   - run_id     : the run whose plan stage to revise.

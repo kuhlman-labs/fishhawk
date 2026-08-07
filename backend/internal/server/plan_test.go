@@ -425,6 +425,797 @@ func TestShipPlan_SchemaRetry_SeamToPromptRender(t *testing.T) {
 	}
 }
 
+// --- plan-gate undeclared-narrowing REFUSAL (#2516) ---
+
+// scopeRetryFaultRepo injects a failure into exactly ONE of tryScopeRetry's
+// two stage transitions so each fail-open leg can be asserted on its own
+// committed state. FailStage drives through TransitionStageFrom (the repo has
+// the StageCASTransitioner capability), so the failStageErr hook lives there.
+type scopeRetryFaultRepo struct {
+	*recordingOrchestratorRepo
+	failStageErr  error
+	retryStageErr error
+}
+
+func (r *scopeRetryFaultRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if r.failStageErr != nil && to == run.StageStateFailed {
+		return nil, r.failStageErr
+	}
+	return r.recordingOrchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+func (r *scopeRetryFaultRepo) RetryStage(ctx context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	if r.retryStageErr != nil {
+		return nil, r.retryStageErr
+	}
+	return r.recordingOrchestratorRepo.RetryStage(ctx, id, to)
+}
+
+// advanceFailRepo is the Orchestrator's OWN run repository, wired separately
+// from the server's RunRepo so Orchestrator.Advance fails while every other
+// repo read/write in the handler succeeds — isolating the Advance leg.
+type advanceFailRepo struct {
+	*recordingOrchestratorRepo
+	err error
+}
+
+func (r *advanceFailRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	return r.recordingOrchestratorRepo.GetRun(ctx, id)
+}
+
+// categoryFailAuditFake errors on AppendChained for ONE category, leaving
+// every other append (plan_generated, plan_scope_regression, …) working — so
+// the AppendChained fail-open leg is exercised without breaking the ship.
+type categoryFailAuditFake struct {
+	*storingAuditFake
+	failCategory string
+}
+
+func (a *categoryFailAuditFake) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == a.failCategory {
+		return nil, fmt.Errorf("append %s failed", p.Category)
+	}
+	return a.storingAuditFake.AppendChained(ctx, p)
+}
+
+// seedReviseBase makes the NEXT plan ship read as a REVISE pass against
+// baseBody: it records the plan_revised audit entry handleShipPlan's
+// countRevisePasses guard requires, and stores baseBody as the stage's plan
+// artifact so loadApprovedPlanForRun resolves it as the revision base.
+func seedReviseBase(t *testing.T, art *fakeArtifactRepo, au *storingAuditFake, runID, stageID uuid.UUID, baseBody []byte) {
+	t.Helper()
+	sv := "standard_v1"
+	if _, err := art.Create(context.Background(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       baseBody,
+		ContentHash:   fmt.Sprintf("base-%s", stageID),
+	}); err != nil {
+		t.Fatalf("seed base plan artifact: %v", err)
+	}
+	payload, _ := json.Marshal(map[string]any{"conditions": "keep everything else"})
+	kind := audit.ActorKind("human")
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Category:  CategoryPlanRevised,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("seed plan_revised: %v", err)
+	}
+}
+
+// seedScopeRetryEntry appends a plan_scope_retry entry directly, pre-loading
+// the #2516 budget so the exhausted branch is reached deterministically.
+func seedScopeRetryEntry(t *testing.T, au *storingAuditFake, runID, stageID uuid.UUID, required []string) {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":               runID.String(),
+		"stage_id":             stageID.String(),
+		"attempt":              1,
+		"undeclared_removals":  []string{"b/c.go"},
+		"required_scope_files": required,
+	})
+	kind := audit.ActorKind("system")
+	if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Category:  categoryPlanScopeRetry,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("seed plan_scope_retry: %v", err)
+	}
+}
+
+// countScopeRetryEntries reads the run's plan_scope_retry entries back
+// through the repo — the COMMITTED state, not the HTTP response. The ship
+// responds 201 either way, so a response-only assertion would pass under a
+// deletion of the control.
+func countScopeRetryEntries(t *testing.T, au *storingAuditFake, runID uuid.UUID) int {
+	t.Helper()
+	entries, err := au.ListForRunByCategory(context.Background(), runID, categoryPlanScopeRetry)
+	if err != nil {
+		t.Fatalf("list plan_scope_retry: %v", err)
+	}
+	return len(entries)
+}
+
+// narrowingBase is the revision base every refusal test diffs against:
+// {b/a.go, b/b.go, b/c.go}.
+func narrowingBase(t *testing.T) []byte {
+	t.Helper()
+	return removalPlanBody(t, []string{"b/a.go", "b/b.go", "b/c.go"}, nil)
+}
+
+// TestShipPlan_UndeclaredNarrowing_RefusesAndReopens is the #2516 done-means
+// COUNTERFACTUAL: a revise pass shipping a plan that drops b/c.go without
+// declaring it is REFUSED — a plan_scope_retry entry lands carrying the full
+// carry-forward set, the stage is re-opened (never awaiting_approval), and
+// the run is not failed. Deleting the tryScopeRetry call site in
+// handleShipPlan makes the stage advance to awaiting_approval with no entry.
+// Every assertion reads COMMITTED state back through the repo: the ship
+// responds 201 either way, so a response-only assertion would pass under the
+// deletion.
+func TestShipPlan_UndeclaredNarrowing_RefusesAndReopens(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil) // drops b/c.go
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+
+	// COMMITTED stage state first, so a deleted control lands its RED on the
+	// behavioural assertion rather than only on the audit-row count (which
+	// t.Fatal would short-circuit).
+	if rr.sawTransitionTo(run.StageStateAwaitingApproval) {
+		t.Errorf("stage transitioned to awaiting_approval; the refusal must spend ZERO reviewer passes\ntransitions: %+v", rr.stageTransitions)
+	}
+	got := rr.stagesByID[planStage.ID]
+	if got.State != run.StageStateDispatched {
+		t.Errorf("stage state = %q, want dispatched (re-opened then orchestrator-advanced on the local path)", got.State)
+	}
+	if got.FailureCategory != nil {
+		t.Errorf("stage still carries failure category %q; RetryStage must clear the transient A", *got.FailureCategory)
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Errorf("run state = failed; a refusal must never become a new way to lose a plan")
+	}
+
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 1 {
+		t.Fatalf("plan_scope_retry entries = %d, want 1 (the refusal must be recorded)", n)
+	}
+	entries, _ := au.ListForRunByCategory(context.Background(), runRow.ID, categoryPlanScopeRetry)
+	var stored struct {
+		UndeclaredRemovals []string `json:"undeclared_removals"`
+		RequiredScopeFiles []string `json:"required_scope_files"`
+		Attempt            int      `json:"attempt"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &stored); err != nil {
+		t.Fatalf("unmarshal plan_scope_retry payload: %v", err)
+	}
+	if len(stored.UndeclaredRemovals) != 1 || stored.UndeclaredRemovals[0] != "b/c.go" {
+		t.Errorf("undeclared_removals = %v, want [b/c.go]", stored.UndeclaredRemovals)
+	}
+	// required_scope_files is the base union: EVERY base-scoped path, including
+	// the ones the narrowing kept — the enumerated carry-forward set.
+	for _, want := range []string{"b/a.go", "b/b.go", "b/c.go"} {
+		if !containsString(stored.RequiredScopeFiles, want) {
+			t.Errorf("required_scope_files = %v, missing %q", stored.RequiredScopeFiles, want)
+		}
+	}
+	if stored.Attempt != 1 {
+		t.Errorf("attempt = %d, want 1", stored.Attempt)
+	}
+}
+
+// TestShipPlan_DeclaredRemoval_NotRefused is the COUNTERFACTUAL for the
+// declared-removal subtraction: the SAME drop, declared in scope_removals,
+// must park at the gate as it does today with NO plan_scope_retry entry.
+// Deleting the declared-removal subtraction in scope_regression.go makes the
+// declared drop refuse. The declaring plan is built BY CONSTRUCTION (base
+// minus b/c.go, plus an entry naming exactly b/c.go), not by round-tripping
+// the gate's own matcher, so the RED lands on the behavioural assertion.
+func TestShipPlan_DeclaredRemoval_NotRefused(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+
+	declared := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, []map[string]any{
+		{"path": "b/c.go", "reason": "the constraint replaces this seam entirely"},
+	})
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, declared, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 0 {
+		t.Errorf("plan_scope_retry entries = %d, want 0 (a DECLARED drop must not refuse)", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (a declared narrowing parks normally)", got)
+	}
+	// The declaration is recorded, reviewer-visible, and not counted as a regression.
+	entry := lastScopeRegressionEntry(t, au.auditFake)
+	if entry.Regressed {
+		t.Errorf("Regressed = true for a fully-declared narrowing; the budget refund must not fire")
+	}
+	if !containsString(entry.DeclaredRemovals, "b/c.go") {
+		t.Errorf("declared_removals = %v, want to name b/c.go", entry.DeclaredRemovals)
+	}
+}
+
+// TestShipPlan_ScopeRetryBudgetExhausted_Parks is the COUNTERFACTUAL for the
+// retry BOUND: with one plan_scope_retry already recorded, a SECOND
+// undeclared narrowing parks at the gate (today's behaviour + the regression
+// evidence + the refunded revise budget) and writes NO second entry. Deleting
+// the `attempt >= maxPlanScopeRetries` guard produces two entries and a second
+// re-open. Exhaustion must degrade, never fail the run terminally.
+func TestShipPlan_ScopeRetryBudgetExhausted_Parks(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+	seedScopeRetryEntry(t, au, runRow.ID, planStage.ID, []string{"b/a.go", "b/b.go", "b/c.go"})
+
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 1 {
+		t.Errorf("plan_scope_retry entries = %d, want 1 (no new entry once the budget is spent)", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (exhaustion degrades to park-with-evidence)", got)
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Errorf("run state = failed; exhaustion must degrade, not fail terminally like the over-cap reject")
+	}
+	// The regression evidence is still recorded for the reviewers/operator, and
+	// still flags the pass as regressing so revise.go refunds the budget.
+	entry := lastScopeRegressionEntry(t, au.auditFake)
+	if !entry.Regressed {
+		t.Errorf("Regressed = false; the exhausted path must still record the regression for the refund")
+	}
+}
+
+// TestShipPlan_ScopeRetry_AdvanceFailure_StillRefuses covers the Advance leg
+// (binding approval condition 2). Advance is best-effort: the stage is
+// ALREADY re-opened to pending when it runs, so returning false here would
+// fall through to normal advancement holding a pending stage — the stranded
+// state. The refusal must stand: the entry exists, the stage is pending (NOT
+// awaiting_approval, NOT failed), and tryScopeRetry returned true so the
+// caller suppressed advancement.
+func TestShipPlan_ScopeRetry_AdvanceFailure_StillRefuses(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	sf := newSigningFake()
+	au := newStoringAuditFake()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		SigningRepo:  sf,
+		TraceStore:   newTraceStoreFake(),
+		AuditRepo:    au,
+		RunRepo:      rr,
+		ArtifactRepo: art,
+		// The orchestrator gets its OWN failing repo so ONLY Advance breaks.
+		Orchestrator: &orchestrator.Orchestrator{Runs: &advanceFailRepo{
+			recordingOrchestratorRepo: rr,
+			err:                       fmt.Errorf("advance unavailable"),
+		}},
+	})
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 1 {
+		t.Errorf("plan_scope_retry entries = %d, want 1 (the refusal stands through an Advance failure)", n)
+	}
+	got := rr.stagesByID[planStage.ID].State
+	if got != run.StageStatePending {
+		t.Errorf("stage state = %q, want pending (re-opened; Advance never ran)", got)
+	}
+	if got == run.StageStateAwaitingApproval {
+		t.Errorf("stage reached awaiting_approval; returning false on an Advance failure would strand a pending stage")
+	}
+	if got == run.StageStateFailed {
+		t.Errorf("stage state = failed; RetryStage must have cleared the transient A")
+	}
+	// tryScopeRetry returned true → the caller suppressed advancement, so the
+	// stage never walked to the gate.
+	if rr.sawTransitionTo(run.StageStateAwaitingApproval) {
+		t.Errorf("stage transitioned to awaiting_approval\ntransitions: %+v", rr.stageTransitions)
+	}
+}
+
+// TestShipPlan_ScopeRetry_FailOpenLegs asserts the LEG-SPECIFIC committed
+// outcome of every fail-open branch tryScopeRetry enumerates (binding
+// approval condition 1). Each leg leaves a DIFFERENT state, so a single
+// uniform "awaiting_approval with no entry" expectation would be wrong:
+//
+//   - nil Orchestrator / nil AuditRepo / AppendChained failure: nothing
+//     mutated → the fall-through parks the stage at awaiting_approval, no
+//     entry.
+//   - FailStage failure: the entry IS committed and the budget IS consumed,
+//     but the stage never left its state → fall-through parks it at
+//     awaiting_approval.
+//   - RetryStage failure: the entry is committed AND the stage is left at
+//     failed (transient category A, operator-recoverable via retry_stage) —
+//     it does NOT reach awaiting_approval.
+//
+// Every assertion reads committed state back through the repo, not the HTTP
+// response (which is 201 on every leg).
+func TestShipPlan_ScopeRetry_FailOpenLegs(t *testing.T) {
+	type legResult struct {
+		wantEntries int
+		wantState   run.StageState
+	}
+	cases := []struct {
+		name string
+		// build wires a server for the leg and returns it plus the shared
+		// repos, having already seeded the run/stage/revision base.
+		build func(t *testing.T) (*Server, *recordingOrchestratorRepo, *storingAuditFake, *run.Run, *run.Stage, ed25519.PrivateKey)
+		want  legResult
+	}{
+		{
+			name: "nil orchestrator parks at the gate",
+			build: func(t *testing.T) (*Server, *recordingOrchestratorRepo, *storingAuditFake, *run.Run, *run.Stage, ed25519.PrivateKey) {
+				rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+				art, sf, au := newFakeArtifactRepo(), newSigningFake(), newStoringAuditFake()
+				s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+					AuditRepo: au, RunRepo: rr, ArtifactRepo: art}) // no Orchestrator
+				runRow, st, priv := seedRefusalStage(t, rr, art, au, sf)
+				return s, rr, au, runRow, st, priv
+			},
+			want: legResult{wantEntries: 0, wantState: run.StageStateAwaitingApproval},
+		},
+		{
+			name: "plan_scope_retry append failure parks at the gate",
+			build: func(t *testing.T) (*Server, *recordingOrchestratorRepo, *storingAuditFake, *run.Run, *run.Stage, ed25519.PrivateKey) {
+				rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+				art, sf := newFakeArtifactRepo(), newSigningFake()
+				inner := newStoringAuditFake()
+				au := &categoryFailAuditFake{storingAuditFake: inner, failCategory: categoryPlanScopeRetry}
+				s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+					AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+					Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
+				runRow, st, priv := seedRefusalStage(t, rr, art, inner, sf)
+				return s, rr, inner, runRow, st, priv
+			},
+			want: legResult{wantEntries: 0, wantState: run.StageStateAwaitingApproval},
+		},
+		{
+			name: "FailStage failure commits the entry but parks at the gate",
+			build: func(t *testing.T) (*Server, *recordingOrchestratorRepo, *storingAuditFake, *run.Run, *run.Stage, ed25519.PrivateKey) {
+				rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+				fault := &scopeRetryFaultRepo{recordingOrchestratorRepo: rr, failStageErr: fmt.Errorf("fail-stage unavailable")}
+				art, sf, au := newFakeArtifactRepo(), newSigningFake(), newStoringAuditFake()
+				s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+					AuditRepo: au, RunRepo: fault, ArtifactRepo: art,
+					Orchestrator: &orchestrator.Orchestrator{Runs: fault}})
+				runRow, st, priv := seedRefusalStage(t, rr, art, au, sf)
+				return s, rr, au, runRow, st, priv
+			},
+			// The entry IS committed and the budget IS consumed; the stage
+			// never left its state, so the fall-through parks it.
+			want: legResult{wantEntries: 1, wantState: run.StageStateAwaitingApproval},
+		},
+		{
+			name: "RetryStage failure leaves the stage failed-A, not at the gate",
+			build: func(t *testing.T) (*Server, *recordingOrchestratorRepo, *storingAuditFake, *run.Run, *run.Stage, ed25519.PrivateKey) {
+				rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+				fault := &scopeRetryFaultRepo{recordingOrchestratorRepo: rr, retryStageErr: fmt.Errorf("retry-stage unavailable")}
+				art, sf, au := newFakeArtifactRepo(), newSigningFake(), newStoringAuditFake()
+				s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+					AuditRepo: au, RunRepo: fault, ArtifactRepo: art,
+					Orchestrator: &orchestrator.Orchestrator{Runs: fault}})
+				runRow, st, priv := seedRefusalStage(t, rr, art, au, sf)
+				return s, rr, au, runRow, st, priv
+			},
+			// Entry committed AND the stage is left at failed (transient A,
+			// operator-recoverable via retry_stage). It does NOT park.
+			want: legResult{wantEntries: 1, wantState: run.StageStateFailed},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, au, runRow, planStage, priv := tc.build(t)
+			narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+			wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+			if wp.Code != http.StatusCreated {
+				t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+			}
+			if n := countScopeRetryEntries(t, au, runRow.ID); n != tc.want.wantEntries {
+				t.Errorf("plan_scope_retry entries = %d, want %d", n, tc.want.wantEntries)
+			}
+			if got := rr.stagesByID[planStage.ID].State; got != tc.want.wantState {
+				t.Errorf("stage state = %q, want %q", got, tc.want.wantState)
+			}
+			if rr.runs[runRow.ID].State == run.StateFailed {
+				t.Errorf("run state = failed; no fail-open leg may fail the run terminally")
+			}
+		})
+	}
+}
+
+// TestShipPlan_ScopeRetry_NilAuditRepo_Parks covers the remaining precondition
+// leg: without an AuditRepo the gate cannot record or count the budget. It is
+// its own test because handleShipPlan 500s on a nil AuditRepo BEFORE reaching
+// the refusal (the plan_generated append is mandatory) — so the leg is
+// asserted on tryScopeRetry directly, which is where the precondition lives.
+func TestShipPlan_ScopeRetry_NilAuditRepo_Parks(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr}}) // no AuditRepo
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	regression := &ScopeRegressionPayload{UndeclaredRemovals: []string{"b/c.go"}, Regressed: true}
+	if s.tryScopeRetry(req, runRow.ID, planStage.ID, regression, basePlan([]string{"b/a.go", "b/c.go"}, nil)) {
+		t.Error("tryScopeRetry = true with no AuditRepo; want false (cannot record or bound the refusal)")
+	}
+	// Nothing was mutated: the stage is untouched, so the caller's
+	// fall-through parks it normally.
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateRunning {
+		t.Errorf("stage state = %q, want running (unmutated)", got)
+	}
+}
+
+// TestShipPlan_NonReviseShip_NoRefusal is the first SKIP leg: a plain
+// (non-revise) plan ship has no revision base, so runScopeRegression returns
+// nil and the refusal never fires — a first-pass plan parks at the gate
+// exactly as before.
+func TestShipPlan_NonReviseShip_NoRefusal(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv,
+		removalPlanBody(t, []string{"b/a.go"}, nil), "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 0 {
+		t.Errorf("plan_scope_retry entries = %d, want 0 on a non-revise ship", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", got)
+	}
+}
+
+// TestShipPlan_SupersetRevise_NoRefusal is the second SKIP leg: a revise whose
+// new scope is a strict SUPERSET of the base drops nothing, so Regressed is
+// false and the plan parks at the gate.
+func TestShipPlan_SupersetRevise_NoRefusal(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+
+	widened := removalPlanBody(t, []string{"b/a.go", "b/b.go", "b/c.go", "b/d.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, widened, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 0 {
+		t.Errorf("plan_scope_retry entries = %d, want 0 on a widening revise", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", got)
+	}
+}
+
+// seedRefusalStage seeds a run + gated plan stage + revision base and issues a
+// signing key — the shared setup every fail-open leg needs.
+func seedRefusalStage(t *testing.T, rr *recordingOrchestratorRepo, art *fakeArtifactRepo, au *storingAuditFake, sf *signingFake) (*run.Run, *run.Stage, ed25519.PrivateKey) {
+	t.Helper()
+	runRow := rr.seedRun()
+	st := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	st.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, st.ID, narrowingBase(t))
+	return runRow, st, priv
+}
+
+// TestShipPlan_ScopeRetry_SuppressesOverCapReject is the COUNTERFACTUAL for
+// the `!gatingRejected` guard this pass added to the over-cap gate. A stage is
+// failed once: layering the over-cap reject's TERMINAL category-B failure onto
+// a stage the refusal already re-opened to pending would convert a
+// recoverable refusal into a lost plan — exactly what the refusal exists to
+// prevent. The shipped plan is BOTH an undeclared narrowing (drops e.go) AND
+// over the resolved cap of 3 by count (4 files, no split_proposal), so both
+// gates would fire. Deleting the `&& !gatingRejected` clause fails the stage
+// category-B and advances the run to terminal failed.
+func TestShipPlan_ScopeRetry_SuppressesOverCapReject(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specGatingReviewersWithConstraints // max_files_changed: 3
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	base := removalPlanBody(t, []string{"b/a.go", "b/b.go", "b/c.go", "b/d.go", "b/e.go"}, nil)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, base)
+
+	// 4 files (> cap 3, no split_proposal) AND drops b/e.go undeclared.
+	overCapNarrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go", "b/c.go", "b/d.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, overCapNarrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 1 {
+		t.Fatalf("plan_scope_retry entries = %d, want 1 (the refusal must fire first)", n)
+	}
+	// The over-cap reject must NOT have run on top of the refusal.
+	if n := countAuditCategory(au.auditFake, "plan_review_failed"); n != 0 {
+		t.Errorf("plan_review_failed entries = %d, want 0 (the terminal over-cap reject must be suppressed)", n)
+	}
+	if got := rr.stagesByID[planStage.ID]; got.State == run.StageStateFailed {
+		t.Errorf("stage state = failed; the over-cap reject destroyed the recoverable refusal")
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Errorf("run state = failed; a refusal must stay recoverable, never terminal")
+	}
+}
+
+// TestShipPlan_ScopeRetry_SeamToPromptRender is the cross-boundary seam test
+// (binding approval condition 3). Testing the audit persistence and the prompt
+// rendering separately does not establish that a REAL refusal's persisted
+// required_scope_files reaches the re-dispatched plan prompt — so this drives a
+// real undeclared-narrowing refusal through the real ship path, then builds the
+// plan prompt through the REAL server-side path (handleGetStagePromptRender →
+// loadScopeCarryForward → prompt.Build), and asserts the rendered text names
+// EVERY carry-forward path the refusal recorded. No Trigger field is
+// hand-constructed: the wiring IS the subject.
+func TestShipPlan_ScopeRetry_SeamToPromptRender(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+
+	// Writer: a real revise ship that drops b/c.go → the gate refuses.
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+
+	// Pull the EXACT set that was persisted, so the assertion pins the
+	// writer↔reader payload-key contract rather than a fixed string.
+	entries, _ := au.ListForRunByCategory(context.Background(), runRow.ID, categoryPlanScopeRetry)
+	if len(entries) != 1 {
+		t.Fatalf("plan_scope_retry entries = %d, want 1", len(entries))
+	}
+	var stored struct {
+		RequiredScopeFiles []string `json:"required_scope_files"`
+		UndeclaredRemovals []string `json:"undeclared_removals"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &stored); err != nil {
+		t.Fatalf("unmarshal stored payload: %v", err)
+	}
+	if len(stored.RequiredScopeFiles) == 0 {
+		t.Fatal("stored required_scope_files is empty")
+	}
+
+	// Reader + render: fetch the re-opened plan stage's prompt through the
+	// real HTTP handler.
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/stages/%s/prompt-render", planStage.ID), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("prompt-render status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var pr promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &pr); err != nil {
+		t.Fatalf("decode prompt response: %v", err)
+	}
+	if !strings.Contains(pr.Prompt, "Revision base scope (BINDING") {
+		t.Errorf("rendered prompt missing the enumerated carry-forward heading:\n%s", pr.Prompt)
+	}
+	// EVERY carry-forward path the refusal recorded must appear — including
+	// the DROPPED one, which is the whole point of the channel.
+	for _, want := range stored.RequiredScopeFiles {
+		if !strings.Contains(pr.Prompt, want) {
+			t.Errorf("rendered prompt missing carry-forward path %q:\n%s", want, pr.Prompt)
+		}
+	}
+	if !strings.Contains(pr.Prompt, "### Scope restoration (binding — this revision was REFUSED)") {
+		t.Errorf("rendered prompt missing the Scope restoration section:\n%s", pr.Prompt)
+	}
+	for _, want := range stored.UndeclaredRemovals {
+		if !strings.Contains(pr.Prompt, want) {
+			t.Errorf("rendered prompt missing dropped path %q:\n%s", want, pr.Prompt)
+		}
+	}
+}
+
+// categoryListFailAuditFake errors on ListForRunByCategory for ONE category,
+// leaving every other read (plan_revised, …) working — so the budget-read
+// failure is exercised without breaking the rest of the ship.
+type categoryListFailAuditFake struct {
+	*storingAuditFake
+	failCategory string
+	listCalls    int
+}
+
+func (a *categoryListFailAuditFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.failCategory {
+		a.listCalls++
+		return nil, fmt.Errorf("list %s unavailable", category)
+	}
+	return a.storingAuditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestShipPlan_ScopeRetry_BudgetReadError_Parks is the COUNTERFACTUAL for the
+// FAIL-CLOSED budget read. countScopeRetries used to swallow a read error and
+// report 0, so a PERSISTENT audit-list failure would grant a refusal on every
+// corrective ship — the one-shot budget would never exhaust and the plan would
+// never degrade to park-with-evidence, breaking the bounded-refusal contract.
+// Restoring the swallow (return 0, nil on error) makes the first ship refuse
+// and this test goes red on BOTH the entry count and the stage state.
+//
+// The failure is seeded BY CONSTRUCTION (a repo that errors on the
+// plan_scope_retry list), not by driving the gate into its own guard, so the
+// RED lands on the behavioural assertion. Both ships are identical undeclared
+// narrowings — the same input paired with itself — so nothing but the guard
+// can distinguish them.
+func TestShipPlan_ScopeRetry_BudgetReadError_Parks(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	art, sf := newFakeArtifactRepo(), newSigningFake()
+	inner := newStoringAuditFake()
+	au := &categoryListFailAuditFake{storingAuditFake: inner, failCategory: categoryPlanScopeRetry}
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+		AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
+	runRow, planStage, priv := seedRefusalStage(t, rr, art, inner, sf)
+
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	if au.listCalls == 0 {
+		t.Fatal("the plan_scope_retry budget was never read; the fault never fired")
+	}
+	if n := countScopeRetryEntries(t, inner, runRow.ID); n != 0 {
+		t.Errorf("plan_scope_retry entries = %d, want 0 (an unreadable budget is an unbounded one — refuse to refuse)", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (degrade to park-with-evidence)", got)
+	}
+	if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+		t.Errorf("run state = failed; the degrade must never fail the run terminally")
+	}
+	// The regression evidence is still recorded, so the reviewers see the drop
+	// and revise.go still refunds the operator's pass.
+	if entry := lastScopeRegressionEntry(t, inner.auditFake); !entry.Regressed {
+		t.Errorf("Regressed = false; the degraded path must still record the regression for the refund")
+	}
+}
+
+// TestShipPlan_ScopeRetry_OverConsumedBudget_StillExhausts pins the direction
+// the count→append race can move the budget. The window is not atomic, so two
+// concurrent ships can both read 0 and both record a refusal — audit-first
+// ordering means the budget is OVER-consumed, never under-consumed. This
+// asserts the property that makes that safe: with the budget over-consumed
+// (two entries, as a race would leave it), the next undeclared narrowing still
+// parks and writes no third entry. A `==` budget comparison instead of `>=`
+// would make an over-consumed budget refuse forever; that mutation goes red
+// here.
+func TestShipPlan_ScopeRetry_OverConsumedBudget_StillExhausts(t *testing.T) {
+	s, rr, art, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, narrowingBase(t))
+	// Two entries: the state a lost count→append race leaves behind.
+	seedScopeRetryEntry(t, au, runRow.ID, planStage.ID, []string{"b/a.go", "b/b.go", "b/c.go"})
+	seedScopeRetryEntry(t, au, runRow.ID, planStage.ID, []string{"b/a.go", "b/b.go", "b/c.go"})
+
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	if n := countScopeRetryEntries(t, au, runRow.ID); n != 2 {
+		t.Errorf("plan_scope_retry entries = %d, want 2 (an over-consumed budget must stay exhausted)", n)
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", got)
+	}
+}
+
+// TestShipPlan_ScopeRetry_FailureReasonCapped is the COUNTERFACTUAL for the
+// FailStage reason cap. Nothing bounds how many paths a revise can drop, and
+// the reason is persisted onto the stage and surfaced back to agents and
+// operators, so it is capped at maxSchemaValidationErrorBytes exactly as the
+// sibling schema-retry path caps its validation_error. Deleting the cap makes
+// the recorded reason grow past the bound and this test goes red.
+//
+// The reason is observable only while the stage is still failed, so the
+// RetryStage leg is faulted BY CONSTRUCTION to hold it there — the cap runs
+// before RetryStage either way.
+func TestShipPlan_ScopeRetry_FailureReasonCapped(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	fault := &scopeRetryFaultRepo{recordingOrchestratorRepo: rr, retryStageErr: fmt.Errorf("retry-stage unavailable")}
+	art, sf, au := newFakeArtifactRepo(), newSigningFake(), newStoringAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+		AuditRepo: au, RunRepo: fault, ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: fault}})
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	// A base scoping 600 long paths, revised down to one — 599 undeclared
+	// removals, far past the 4000-byte cap.
+	many := make([]string, 600)
+	for i := range many {
+		many[i] = fmt.Sprintf("backend/internal/verylongpackagename/subpackage/file_%04d_with_a_long_name.go", i)
+	}
+	seedReviseBase(t, art, au, runRow.ID, planStage.ID, removalPlanBody(t, many, nil))
+
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, removalPlanBody(t, many[:1], nil), "")
+	if wp.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+	}
+	got := rr.stagesByID[planStage.ID]
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed (the RetryStage fault holds the reason)", got.State)
+	}
+	if got.FailureReason == nil {
+		t.Fatal("stage carries no failure reason")
+	}
+	reason := *got.FailureReason
+	if len(reason) > maxSchemaValidationErrorBytes+len("...[truncated]") {
+		t.Errorf("failure reason = %d bytes, want <= %d (the cap is missing)",
+			len(reason), maxSchemaValidationErrorBytes+len("...[truncated]"))
+	}
+	if !strings.HasSuffix(reason, "...[truncated]") {
+		t.Errorf("an over-cap reason is not marked truncated: %q", reason[max(0, len(reason)-64):])
+	}
+	if !strings.HasPrefix(reason, "plan_scope_regression_retry: undeclared scope narrowing dropped ") {
+		t.Errorf("the capped reason lost its identifying prefix: %q", reason[:min(80, len(reason))])
+	}
+}
+
 // fakePlanReviewer records each Review invocation and returns a canned verdict.
 type fakePlanReviewer struct {
 	mu      sync.Mutex

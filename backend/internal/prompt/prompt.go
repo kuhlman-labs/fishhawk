@@ -313,6 +313,16 @@ type FixupConcern struct {
 	AcceptanceDerived bool
 }
 
+// ScopeRestoration is the plan gate's refusal notice for a revision that
+// UNDECLAREDLY narrowed the revision base's scope (#2516). UndeclaredRemovals
+// is the set of base-scoped paths the refused revision dropped without a
+// matching scope_removals declaration — server-derived from the machine diff
+// of the two plans, never asserted by the planner. buildPlan renders it as a
+// binding "Scope restoration" section on the corrective re-dispatch.
+type ScopeRestoration struct {
+	UndeclaredRemovals []string
+}
+
 // Trigger captures the bits of the originating event needed to
 // construct an issue-driven prompt. Empty IssueTitle / IssueBody
 // for non-issue triggers; for v0, those triggers all come from
@@ -460,6 +470,23 @@ type Trigger struct {
 	// on a normal plan dispatch and tolerated nil even on a revise (the
 	// section then omits the base block and still binds the constraint).
 	RevisionBasePlan *string
+	// RevisionBaseScopeFiles is the ENUMERATED carry-forward set for a
+	// `revise` re-open (#2516): every path the revision base scoped (top-level
+	// scope.files UNION each decomposition sub-plan and split-phase scope),
+	// derived SERVER-SIDE and never asserted by the planner. RevisionBasePlan
+	// above rides as raw JSON TRUNCATED at 4000 bytes, so on a large plan the
+	// planner told to preserve the untouched parts literally cannot see the
+	// scope it must keep; this list is the authoritative scope set the
+	// Revision constraint section binds the planner to. Nil/empty on a normal
+	// plan dispatch, so those prompts stay byte-unchanged.
+	RevisionBaseScopeFiles []string
+	// ScopeRestoration is set when the plan gate REFUSED the previous revision
+	// for UNDECLAREDLY narrowing the revision base's scope (#2516). When
+	// non-nil, buildPlan renders a dedicated "### Scope restoration (binding —
+	// this revision was REFUSED)" section naming the dropped paths and the two
+	// admissible remedies. Nil on a normal plan dispatch and on a revise that
+	// was not refused.
+	ScopeRestoration *ScopeRestoration
 	// FixupConcerns carries the operator-selected implement-review concerns
 	// for a bounded fix-up pass (#762). Each entry is one rendered concern
 	// (severity/category/note) plus a provenance marker. When non-empty,
@@ -1420,6 +1447,69 @@ func writeCounterfactualDiscipline(b *strings.Builder) {
 		"same treatment as one the plan named (#2444).\n")
 }
 
+// maxScopePathBytes caps ONE rendered carry-forward / dropped path (#2516).
+// A repo path is short; anything near this is already pathological, and the
+// cap keeps a single crafted entry from consuming the prompt.
+const maxScopePathBytes = 512
+
+// sanitizeScopePath renders one plan-supplied path as a SINGLE safe list-item
+// line (#2516). The paths in RevisionBaseScopeFiles and
+// ScopeRestoration.UndeclaredRemovals are derived server-side from the machine
+// diff of two plans, but their CONTENT is planner-authored — i.e. untrusted —
+// and it lands inside Fishhawk's own trusted, binding prompt sections. Written
+// raw, a path carrying a newline would end its "- " list item and land
+// attacker-chosen text at column 0, where it can impersonate a trusted section
+// banner for an agent that holds arbitrary repository commands.
+//
+// So every line terminator and control character is escaped to a visible
+// two-character form (the path stays readable and matchable, it just cannot
+// break the line), triple-backtick/tilde fences are broken exactly as
+// neutralizeLine breaks them so a path cannot open or close a framing block,
+// and the result is length-capped. The transform neutralizes STRUCTURE, not
+// content. It is pure and deterministic, so the package's byte-identical
+// replay invariant holds; an ordinary path (no control characters, no fence)
+// passes through byte-unchanged, which is why every existing render is
+// untouched.
+func sanitizeScopePath(p string) string {
+	if len(p) > maxScopePathBytes {
+		p = strings.ToValidUTF8(p[:maxScopePathBytes], "") + "...[truncated]"
+	}
+	var sb strings.Builder
+	sb.Grow(len(p))
+	for _, r := range p {
+		switch {
+		case r == '\n':
+			sb.WriteString(`\n`)
+		case r == '\r':
+			sb.WriteString(`\r`)
+		case r == '\t':
+			sb.WriteString(`\t`)
+		case r == '\u2028' || r == '\u2029':
+			// Unicode line separators: line terminators to some renderers.
+			fmt.Fprintf(&sb, `\u%04x`, r)
+		case r < 0x20 || r == 0x7f:
+			fmt.Fprintf(&sb, `\x%02x`, r)
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	s := strings.ReplaceAll(sb.String(), "```", "`` `")
+	s = strings.ReplaceAll(s, "~~~", "~~ ~")
+	if strings.TrimSpace(s) == "" {
+		return "(empty path)"
+	}
+	return s
+}
+
+// maxScopeCarryForwardPaths caps how many paths the Revision-base-scope
+// carry-forward list and the Scope-restoration dropped list each render
+// (#2516), bounding the plan prompt like the sibling channels' byte caps.
+// A plan whose scope exceeds it is far past the implement-stage file cap
+// already; the overflow is reported with an explicit truncation marker that
+// still instructs the planner to carry the unlisted paths forward, so a cap
+// never reads as permission to drop.
+const maxScopeCarryForwardPaths = 200
+
 // maxFixupConcernBytes bounds the rendered size of each fix-up concern block
 // (trusted and untrusted-acceptance alike), like ApprovalConditions' 4000-byte
 // cap. The tail is dropped with a truncation marker.
@@ -2171,6 +2261,38 @@ func buildPlan(t Trigger) string {
 			b.WriteString(base)
 			b.WriteString("\n\n")
 		}
+		// Enumerated carry-forward set (#2516). The base-plan blob above is
+		// TRUNCATED, so on a large plan the planner cannot see the scope it is
+		// being told to preserve — the mechanism the observed silent drops are
+		// consistent with. This list is derived server-side from the revision
+		// base and is the AUTHORITATIVE scope set: say so plainly, right after
+		// the blob it supersedes. Capped like the sibling channels.
+		if len(t.RevisionBaseScopeFiles) > 0 {
+			paths := t.RevisionBaseScopeFiles
+			truncated := false
+			if len(paths) > maxScopeCarryForwardPaths {
+				paths = paths[:maxScopeCarryForwardPaths]
+				truncated = true
+			}
+			fmt.Fprintf(&b, "Revision base scope (BINDING — %d paths, the authoritative scope set):\n\n",
+				len(t.RevisionBaseScopeFiles))
+			b.WriteString("The prior-plan blob above is TRUNCATED at 4000 bytes, so it may not show the whole " +
+				"scope. THIS LIST — not that blob — is the revision base's scope. The revised plan MUST carry " +
+				"EVERY path below forward into scope.files (or into the owning decomposition sub-plan / " +
+				"split_proposal phase scope), unless it DECLARES the drop in the top-level scope_removals " +
+				"array with a reason. A path that simply disappears is a scope regression: the plan gate " +
+				"refuses it and re-dispatches this stage.\n\n")
+			for _, p := range paths {
+				b.WriteString("- ")
+				b.WriteString(sanitizeScopePath(p))
+				b.WriteString("\n")
+			}
+			if truncated {
+				fmt.Fprintf(&b, "- ...[%d more paths truncated — carry them forward too]\n",
+					len(t.RevisionBaseScopeFiles)-maxScopeCarryForwardPaths)
+			}
+			b.WriteString("\n")
+		}
 		constraint := *t.RevisionConstraint
 		const maxConstraintBytes = 4000
 		if len(constraint) > maxConstraintBytes {
@@ -2179,6 +2301,44 @@ func buildPlan(t Trigger) string {
 		b.WriteString("Operator constraint (MANDATORY — wins on conflict with the prior plan):\n\n")
 		b.WriteString(constraint)
 		b.WriteString("\n\n")
+	}
+
+	// Scope restoration (#2516): the plan gate REFUSED the previous revision
+	// for dropping base-scoped paths without declaring them. Rendered on the
+	// corrective re-dispatch, independent of the Revision constraint block
+	// above so a refusal notice never depends on the constraint loader also
+	// succeeding. Nil on a normal plan dispatch and on a revise that was not
+	// refused, so those prompts stay byte-unchanged.
+	if t.ScopeRestoration != nil && len(t.ScopeRestoration.UndeclaredRemovals) > 0 {
+		dropped := t.ScopeRestoration.UndeclaredRemovals
+		truncated := false
+		if len(dropped) > maxScopeCarryForwardPaths {
+			dropped = dropped[:maxScopeCarryForwardPaths]
+			truncated = true
+		}
+		b.WriteString("### Scope restoration (binding — this revision was REFUSED)\n\n")
+		b.WriteString("Your previous revision was NOT admitted to review. It dropped the following paths, " +
+			"which the revision base scoped, without declaring the drop. A revision regenerates the WHOLE " +
+			"plan, so files the constraint never mentioned can fall out of scope — and a file missing from " +
+			"scope.files is excluded from the implement commit, which is how this becomes a silent data " +
+			"loss rather than a review comment.\n\n")
+		for _, p := range dropped {
+			b.WriteString("- ")
+			b.WriteString(sanitizeScopePath(p))
+			b.WriteString("\n")
+		}
+		if truncated {
+			fmt.Fprintf(&b, "- ...[%d more paths truncated]\n",
+				len(t.ScopeRestoration.UndeclaredRemovals)-maxScopeCarryForwardPaths)
+		}
+		b.WriteString("\nExactly two remedies are admissible, per path:\n\n" +
+			"1. RESTORE it into scope (top-level scope.files, or the owning decomposition sub-plan / " +
+			"split_proposal phase scope). This is the default — prefer it whenever the path is still " +
+			"touched by the revised design.\n" +
+			"2. DECLARE the drop in the top-level scope_removals array as {\"path\": \"...\", " +
+			"\"reason\": \"...\"}, where the reason states why the constraint genuinely obsoletes the " +
+			"path. Reviewers read the reason and can challenge it, so do NOT use a declaration to shed a " +
+			"file the revised design still needs.\n\n")
 	}
 
 	writeIssueContext(&b, t)
@@ -3953,6 +4113,8 @@ var trustedMarkers = []string{
 	"Approval conditions",
 	"Fix-up concerns",
 	"Revision constraint",
+	"Revision base scope",
+	"Scope restoration",
 }
 
 // sanitizeUntrustedComment neutralizes prompt-injection-shaped structure

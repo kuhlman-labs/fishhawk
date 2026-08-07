@@ -129,6 +129,7 @@ var KnownCategories = map[string]struct{}{
 	"plan_scope_cap_override_acknowledged":    {},
 	"plan_scope_precheck":                     {},
 	"plan_scope_regression":                   {},
+	"plan_scope_retry":                        {},
 	"plan_surface_sweep":                      {},
 	"plan_test_sweep":                         {},
 	"plan_warnings":                           {},

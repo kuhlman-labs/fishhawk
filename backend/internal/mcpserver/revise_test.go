@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // --- fishhawk_revise_plan (E22.X / #1099) ---
@@ -141,5 +142,65 @@ func TestRevisePlan_CeilingReached_PropagatesAs409(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "revise_ceiling_reached") {
 		t.Errorf("err = %v, want revise_ceiling_reached", err)
+	}
+}
+
+// TestRevisePlanDescription_DocumentsScopeRefusal pins the #2516 description
+// change on the WIRE-VISIBLE tool description: the old text warned that a
+// narrowly-scoped constraint can "silently DROP" files the prior plan scoped,
+// which is no longer true — the gate REFUSES an undeclared narrowing and
+// admits one only when the plan declares it in scope_removals. Without this
+// pin the description could silently drift back to describing the old
+// accepted-drop behaviour, which is the operator-facing surface that decides
+// whether a driving agent trusts a revise with the rest of its scope.
+func TestRevisePlanDescription_DocumentsScopeRefusal(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_revise_plan" {
+			desc = tool.Description
+			break
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_revise_plan not registered/visible over ListTools")
+	}
+	lower := strings.ToLower(desc)
+	for _, want := range []string{
+		"refuses",        // the gate refuses, it does not merely surface
+		"scope_removals", // the machine-readable declaration channel
+		"carry-forward",  // the enumerated set the re-dispatch carries
+		"zero reviewer",  // no reviewer pass is spent on a refused plan
+		"budget",         // the residual one-shot refusal budget
+	} {
+		if !strings.Contains(lower, strings.ToLower(want)) {
+			t.Errorf("fishhawk_revise_plan description missing %q (scope-refusal contract, #2516):\n%s", want, desc)
+		}
+	}
+	// The stale claim must be gone: a drop is no longer silent.
+	if strings.Contains(lower, "silently drop") {
+		t.Errorf("description still claims a revise can 'silently DROP' files; the gate now refuses:\n%s", desc)
 	}
 }
