@@ -852,3 +852,55 @@ func TestOutputTail(t *testing.T) {
 		t.Errorf("outputTail(long line) length = %d, want bounded by %d", len(got), verifyOutputTailBytes)
 	}
 }
+
+// TestCheckVerifyCommand_CommandsDoNotShareAWorktree pins the per-command
+// worktree isolation added for the #2485 implement review's high/correctness
+// concern. Every candidate must run in its OWN freshly provisioned throwaway
+// worktree, so an artifact one command creates cannot satisfy a later one.
+//
+// Why this matters more than tidiness: the whole rung exists to catch a verify
+// command that depends on a gitignored artifact absent from the runner's fresh
+// worktree. If the candidates shared one worktree, command 1 could create that
+// artifact and command 2 would report ok here while still FAILING in the runner
+// (which gives each STAGE its own worktree) — a false green in the rung built
+// to eliminate false greens.
+//
+// The bad state is seeded BY CONSTRUCTION: `contaminant` is untracked and is
+// created only by the first command, inside the worktree. The second command
+// reads it. Under shared provisioning the read succeeds and the rung returns
+// ok; under per-command provisioning the second worktree is a clean checkout
+// where the file does not exist, so the read fails and the rung returns fail.
+//
+// Counterfactual: hoist provisionDoctorWorktree back out of the candidate loop
+// in checkVerifyCommand and this test goes RED (status ok, want fail).
+func TestCheckVerifyCommand_CommandsDoNotShareAWorktree(t *testing.T) {
+	repo := newVerifyRepo(t, `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "echo leaked > contaminant"
+            timeout: "15m"
+      - id: second
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "cat contaminant"
+            timeout: "15m"
+`)
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	if r.status != "fail" {
+		t.Fatalf("status = %q, want fail — the second command read %q, an UNTRACKED file the first "+
+			"command created, so the two candidates shared a worktree and the rung reported a false "+
+			"green for a command that would fail in the runner; detail: %s",
+			r.status, "contaminant", r.detail)
+	}
+	if !strings.Contains(r.detail, "cat contaminant") {
+		t.Errorf("detail = %q, want it to name the SECOND command as the failing one", r.detail)
+	}
+}

@@ -569,40 +569,28 @@ func checkVerifyCommand(workingDir string, skip bool, maxTimeout time.Duration) 
 	}
 
 	ctx := context.Background()
-	worktree, cleanup, err := provisionDoctorWorktree(ctx, workingDir)
-	if err != nil {
-		return checkResult{label: label, detail: "clean worktree unavailable", status: "warn",
-			remediate: "the verify command was not executed: " + err.Error()}
-	}
-	defer cleanup()
 
 	for _, c := range candidates {
-		effective := maxTimeout
-		if c.timeout > 0 && c.timeout < effective {
-			effective = c.timeout
+		// Provision a FRESH worktree PER COMMAND, not once for the whole
+		// loop (#2485 implement review, high/correctness). Sharing one
+		// worktree lets an earlier command leave an untracked artifact
+		// behind that a later command then reads, so the later command
+		// passes here while still failing in the runner — a FALSE GREEN in
+		// the very rung that exists to catch gitignored-dependency
+		// failures. Per-command provisioning is also the faithful model:
+		// the runner gives each STAGE its own worktree, and these
+		// candidates are collected across stages.
+		worktree, cleanup, err := provisionDoctorWorktree(ctx, workingDir)
+		if err != nil {
+			return checkResult{label: label, detail: "clean worktree unavailable", status: "warn",
+				remediate: "the verify command was not executed: " + err.Error()}
 		}
-		exitCode, output, timedOut := runVerifyInWorktree(ctx, worktree, c.command, effective)
-		if timedOut {
-			return checkResult{
-				label:  label,
-				detail: fmt.Sprintf("%q (stage %s) timed out after %s", c.command, c.stage, effective),
-				status: "fail",
-				remediate: fmt.Sprintf("ran in the throwaway worktree %s and exceeded %s; "+
-					"raise executor.verify.timeout or --verify-timeout, or make the command faster. "+
-					"Note %s.\noutput tail:\n%s",
-					worktree, effective, freshWorktreeCaveat, outputTail(output)),
-			}
-		}
-		if exitCode != 0 {
-			return checkResult{
-				label:  label,
-				detail: fmt.Sprintf("%q (stage %s) exited %d", c.command, c.stage, exitCode),
-				status: "fail",
-				remediate: fmt.Sprintf("ran in the throwaway worktree %s: %s, so a command that passes in "+
-					"your checkout can still fail here. Commit whatever it needs, or change the command.\n"+
-					"output tail:\n%s",
-					worktree, freshWorktreeCaveat, outputTail(output)),
-			}
+		res, done := func() (checkResult, bool) {
+			defer cleanup()
+			return runVerifyCandidate(ctx, worktree, c, maxTimeout)
+		}()
+		if done {
+			return res
 		}
 	}
 
@@ -615,4 +603,45 @@ func checkVerifyCommand(workingDir string, skip bool, maxTimeout time.Duration) 
 		detail: strings.Join(names, ", ") + " passed (clean worktree)",
 		status: "ok",
 	}
+}
+
+// runVerifyCandidate executes ONE candidate command in an already-provisioned
+// throwaway worktree. It returns (result, true) when the candidate produced a
+// terminal verdict for the whole rung (timeout or non-zero exit) and
+// (zero, false) when the command passed and the loop should continue.
+//
+// Split out of checkVerifyCommand so each candidate's worktree cleanup can run
+// via defer at the end of ITS OWN iteration rather than accumulating until the
+// enclosing function returns (#2485).
+func runVerifyCandidate(ctx context.Context, worktree string, c verifyCandidate, maxTimeout time.Duration) (checkResult, bool) {
+	const label = "verify command"
+
+	effective := maxTimeout
+	if c.timeout > 0 && c.timeout < effective {
+		effective = c.timeout
+	}
+	exitCode, output, timedOut := runVerifyInWorktree(ctx, worktree, c.command, effective)
+	if timedOut {
+		return checkResult{
+			label:  label,
+			detail: fmt.Sprintf("%q (stage %s) timed out after %s", c.command, c.stage, effective),
+			status: "fail",
+			remediate: fmt.Sprintf("ran in the throwaway worktree %s and exceeded %s; "+
+				"raise executor.verify.timeout or --verify-timeout, or make the command faster. "+
+				"Note %s.\noutput tail:\n%s",
+				worktree, effective, freshWorktreeCaveat, outputTail(output)),
+		}, true
+	}
+	if exitCode != 0 {
+		return checkResult{
+			label:  label,
+			detail: fmt.Sprintf("%q (stage %s) exited %d", c.command, c.stage, exitCode),
+			status: "fail",
+			remediate: fmt.Sprintf("ran in the throwaway worktree %s: %s, so a command that passes in "+
+				"your checkout can still fail here. Commit whatever it needs, or change the command.\n"+
+				"output tail:\n%s",
+				worktree, freshWorktreeCaveat, outputTail(output)),
+		}, true
+	}
+	return checkResult{}, false
 }
