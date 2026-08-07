@@ -120,6 +120,16 @@ func TestHelperProcess(t *testing.T) {
 		// sleep finishes.
 		time.Sleep(300 * time.Millisecond)
 		fmt.Println(`{"type":"result","subtype":"success","is_error":false,"result":"{\"verdict\":\"approve\"}"}`)
+	case "echo_cwd":
+		// The #2486 C2 probe: approve only when this child runs from an EMPTY
+		// directory distinct from the parent test process's cwd (HELPER_PARENT_CWD)
+		// — i.e. the UNGROUNDED claude path set cmd.Dir to a fresh empty scratch
+		// dir, not the inherited process working directory.
+		emitCwdEnvelope()
+	case "env_scrub":
+		// The #2486 scrub probe: approve only when the sentinel secret was DROPPED
+		// from the child env and the passthrough-named probe var SURVIVED.
+		emitScrubEnvelope()
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
 		os.Exit(2)
@@ -804,5 +814,26 @@ func TestReviewer_UsageAbsentDegrades(t *testing.T) {
 	}
 	if verdict.Usage.Known {
 		t.Errorf("Usage.Known = true, want false when the envelope carried no usage object; got %+v", verdict.Usage)
+	}
+}
+
+// TestReviewGrounded_RoutesTreeDir asserts ReviewGrounded threads treeDir into
+// the subprocess as its working directory (#2486) and returns the verdict; the
+// grounded argv/cwd wiring is pinned in detail by client_test.go.
+func TestReviewGrounded_RoutesTreeDir(t *testing.T) {
+	treeDir := t.TempDir()
+	var cmd *exec.Cmd
+	r := NewReviewer(testConfig())
+	r.client.Cmd = capturingHelper("happy", true, nil, &cmd)
+
+	verdict, _, err := r.ReviewGrounded(context.Background(), "review", treeDir)
+	if err != nil {
+		t.Fatalf("ReviewGrounded: %v", err)
+	}
+	if verdict.Verdict != planreview.VerdictApprove {
+		t.Errorf("verdict = %q, want approve", verdict.Verdict)
+	}
+	if cmd.Dir != treeDir {
+		t.Errorf("cmd.Dir = %q, want the tree %q", cmd.Dir, treeDir)
 	}
 }

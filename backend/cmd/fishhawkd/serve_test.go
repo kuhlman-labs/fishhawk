@@ -3086,3 +3086,64 @@ func TestMcpRouteServerConfig(t *testing.T) {
 		t.Errorf("APIToken = %q, want fhk_x", cfg.APIToken)
 	}
 }
+
+// resolveReviewGroundingConfig mirrors runServe's --review-grounding and
+// --reviewer-env-passthrough flag wiring (#2486) and the handoff into
+// server.Config, so the env > flag resolution AND the Config wiring are
+// unit-testable without booting the server. It builds the two Config fields
+// exactly as runServe builds them (ReviewGroundingDisabled = !review-grounding).
+func resolveReviewGroundingConfig(t *testing.T, args []string) server.Config {
+	t.Helper()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	grounding := fs.Bool("review-grounding",
+		envOr("FISHHAWKD_REVIEW_GROUNDING", "true") == "true", "test")
+	passthrough := fs.String("reviewer-env-passthrough",
+		envOr("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", ""), "test")
+	if err := fs.Parse(args); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return server.Config{
+		ReviewGroundingDisabled: !*grounding,
+		ReviewerEnvPassthrough:  parseReviewerEnvPassthrough(*passthrough),
+	}
+}
+
+// TestResolveReviewGroundingConfig pins the #2486 env vars: grounding is ON when
+// unset (ReviewGroundingDisabled false), OFF when FISHHAWKD_REVIEW_GROUNDING is
+// false, and the passthrough list parses to trimmed, case-preserving names.
+func TestResolveReviewGroundingConfig(t *testing.T) {
+	t.Run("grounding on by default", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "")
+		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", "")
+		cfg := resolveReviewGroundingConfig(t, nil)
+		if cfg.ReviewGroundingDisabled {
+			t.Error("unset FISHHAWKD_REVIEW_GROUNDING must leave grounding ON")
+		}
+		if len(cfg.ReviewerEnvPassthrough) != 0 {
+			t.Errorf("passthrough = %v, want empty", cfg.ReviewerEnvPassthrough)
+		}
+	})
+
+	t.Run("kill switch via env", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEW_GROUNDING", "false")
+		cfg := resolveReviewGroundingConfig(t, nil)
+		if !cfg.ReviewGroundingDisabled {
+			t.Error("FISHHAWKD_REVIEW_GROUNDING=false must disable grounding")
+		}
+	})
+
+	t.Run("passthrough parses case-preserving trimmed names", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_REVIEWER_ENV_PASSTHROUGH", " AWS_REGION , , BEDROCK_ENDPOINT ")
+		cfg := resolveReviewGroundingConfig(t, nil)
+		want := []string{"AWS_REGION", "BEDROCK_ENDPOINT"}
+		if len(cfg.ReviewerEnvPassthrough) != len(want) {
+			t.Fatalf("passthrough = %v, want %v", cfg.ReviewerEnvPassthrough, want)
+		}
+		for i := range want {
+			if cfg.ReviewerEnvPassthrough[i] != want[i] {
+				t.Errorf("passthrough[%d] = %q, want %q", i, cfg.ReviewerEnvPassthrough[i], want[i])
+			}
+		}
+	})
+}

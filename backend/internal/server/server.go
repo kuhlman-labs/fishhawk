@@ -405,6 +405,22 @@ type Config struct {
 	// (PerKB), and FISHHAWKD_REVIEW_BUDGET_CAP (Cap) inputs.
 	ReviewBudget planreview.ReviewBudget
 
+	// ReviewGroundingDisabled is the kill switch for review grounding (#2486):
+	// when true the plan- and implement-review loops never export a source tree
+	// and both adapters run in their diff-only posture. serve.go sets it from
+	// FISHHAWKD_REVIEW_GROUNDING=false (grounding is ON by default). It lets an
+	// operator turn off the behaviour change — what a grounded reviewer may read —
+	// without a rollback. The environment scrub is independent of this flag and is
+	// always applied.
+	ReviewGroundingDisabled bool
+
+	// ReviewerEnvPassthrough is the operator-configured list of EXACT environment
+	// variable names appended to each review adapter's scrub allow-list (#2486).
+	// serve.go parses it from the comma-separated FISHHAWKD_REVIEWER_ENV_PASSTHROUGH
+	// and hands it into both adapter Configs at construction — the escape hatch for
+	// a Bedrock/Vertex/proxy deployment whose auth vars the minimal allow-list omits.
+	ReviewerEnvPassthrough []string
+
 	// SpendAlertMultiple is the trip threshold for the spend-anomaly
 	// check (#649): the trace handler warns (spend_alert audit entry)
 	// when the current hour's estimated model spend exceeds this

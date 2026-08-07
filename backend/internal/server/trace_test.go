@@ -5722,7 +5722,7 @@ func TestImplementReviewInvocations_FiresPageClassHook(t *testing.T) {
 		model:   "gpt-5.5",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
 
 	if !rec.pagedRun(runID) {
 		t.Errorf("implement-review site did not invoke the page-class hook; paged=%v", rec.pageClass)
@@ -5746,7 +5746,7 @@ func TestImplementReviewInvocations_ApproveSkipsPageClassHook(t *testing.T) {
 		model:   "gpt-5.5",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget)
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
 
 	if rec.pagedRun(runID) {
 		t.Errorf("implement-review site fired the page-class hook on an all-approve loop; paged=%v", rec.pageClass)

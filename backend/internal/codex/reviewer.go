@@ -62,9 +62,19 @@ func (r *Reviewer) SetMaxRetries(n int) {
 // "inference failed" wrapping while a decode failure keeps the "decode verdict
 // JSON" wrapping.
 func (r *Reviewer) Review(ctx context.Context, promptText string) (*planreview.ReviewVerdict, string, error) {
+	return r.ReviewGrounded(ctx, promptText, "")
+}
+
+// ReviewGrounded is Review with an optional grounding tree (#2486): the server's
+// optional groundedReviewer capability. When treeDir is non-empty the codex
+// subprocess runs from that exported read-only tree under the read-only sandbox
+// so the reviewer can confirm diff-invisible facts; when empty it is the
+// historical diff-only posture. Review delegates here with an empty treeDir so
+// the two share exactly ONE code path and cannot drift.
+func (r *Reviewer) ReviewGrounded(ctx context.Context, promptText, treeDir string) (*planreview.ReviewVerdict, string, error) {
 	var inferFailed bool
 	infer := func(ctx context.Context) (string, string, planreview.Usage, error) {
-		responseText, modelName, usage, err := r.client.Inference(ctx, promptText)
+		responseText, modelName, usage, err := r.client.InferenceInTree(ctx, promptText, treeDir)
 		if err != nil {
 			inferFailed = true
 			return "", "", planreview.Usage{}, fmt.Errorf("codex: inference failed: %w", err)

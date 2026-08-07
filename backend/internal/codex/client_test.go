@@ -163,6 +163,23 @@ func TestHelperProcess(t *testing.T) {
 		}
 		fmt.Printf(`{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"verdict\":\"%s\"}"}}`+"\n", verdict)
 		fmt.Println(usageLine)
+	case "env_scrub":
+		// The #2486 scrub probe: approve only when the sentinel secret was DROPPED
+		// from the child env and the passthrough-named probe var SURVIVED.
+		verdict, detail := "approve", ""
+		switch {
+		case os.Getenv(scrubSentinelEnv) != "":
+			verdict, detail = "reject", "sentinel secret reached child: "+scrubSentinelEnv
+		case os.Getenv(scrubProbeEnv) != scrubProbeVal:
+			verdict, detail = "reject", "passthrough probe var missing"
+		}
+		body, _ := json.Marshal(map[string]string{"verdict": verdict, "free_form": detail})
+		line, _ := json.Marshal(map[string]any{
+			"type": "item.completed",
+			"item": map[string]string{"id": "item_0", "type": "agent_message", "text": string(body)},
+		})
+		fmt.Println(string(line))
+		fmt.Println(usageLine)
 	case "error":
 		// Non-zero exit stands in for a subprocess failure; a fixed,
 		// non-secret stderr line is folded into the diagnostic.
@@ -1082,5 +1099,114 @@ func TestReviewerProbeVersion_ForwardsToClient(t *testing.T) {
 	r.client.Cmd = versionHelperCommand("0.42.0")
 	if got := r.ProbeVersion(context.Background()); got != "0.42.0" {
 		t.Errorf("Reviewer.ProbeVersion = %q, want it to forward the client probe (%q)", got, "0.42.0")
+	}
+}
+
+// The #2486 scrub-probe sentinels for the codex adapter (mirrors claudecode).
+const (
+	scrubSentinelEnv = "FISHHAWKD_DATABASE_URL"
+	scrubProbeEnv    = "HELPER_ENV_PROBE"
+	scrubProbeVal    = "present-via-passthrough"
+)
+
+// capturingHelper re-execs the test binary as the `codex` stand-in in the given
+// HELPER_MODE, capturing the ADAPTER's intended argv (binary + flag args) and the
+// built *exec.Cmd so a test can read cmd.Dir after the adapter sets it. When
+// passEnv is false the returned cmd's Env is left nil so the adapter's scrub runs.
+func capturingHelper(mode string, passEnv bool, argv *[]string, capturedCmd **exec.Cmd) func(ctx context.Context, name string, args ...string) *exec.Cmd {
+	return func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if argv != nil {
+			*argv = append([]string{name}, args...)
+		}
+		c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+		if passEnv {
+			c.Env = append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE="+mode)
+		}
+		if capturedCmd != nil {
+			*capturedCmd = c
+		}
+		return c
+	}
+}
+
+// TestInvokeGrounded_CodexArgvAndCwd pins the GROUNDED codex posture (#2486):
+// cmd.Dir is the exported tree and the argv carries --sandbox read-only,
+// --ignore-rules, and --skip-git-repo-check while NEVER carrying any
+// --dangerously-* flag.
+func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
+	treeDir := t.TempDir()
+	var argv []string
+	var cmd *exec.Cmd
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, &argv, &cmd)
+
+	if _, _, _, err := c.InferenceInTree(context.Background(), "review", treeDir); err != nil {
+		t.Fatalf("InferenceInTree(grounded): %v", err)
+	}
+	if cmd.Dir != treeDir {
+		t.Errorf("cmd.Dir = %q, want the exported tree %q", cmd.Dir, treeDir)
+	}
+	assertPair(t, argv, "--sandbox", "read-only")
+	assertHas(t, argv, "--ignore-rules")
+	assertHas(t, argv, "--skip-git-repo-check")
+	for _, a := range argv {
+		if strings.HasPrefix(a, "--dangerously") {
+			t.Errorf("argv %q contains a dangerous flag %q", argv, a)
+		}
+	}
+}
+
+// TestInvokeUngrounded_CodexNoSandboxFlag pins that the UNGROUNDED codex argv
+// carries NO --sandbox flag (byte-for-byte the historical empty-scratch posture)
+// — the grounded-only flags must not leak into a diff-only review.
+func TestInvokeUngrounded_CodexNoSandboxFlag(t *testing.T) {
+	var argv []string
+	c := NewClient(testConfig())
+	c.Cmd = capturingHelper("happy", true, &argv, nil)
+
+	if _, _, _, err := c.InferenceInTree(context.Background(), "review", ""); err != nil {
+		t.Fatalf("InferenceInTree(ungrounded): %v", err)
+	}
+	if slices.Contains(argv, "--sandbox") || slices.Contains(argv, "--ignore-rules") {
+		t.Errorf("ungrounded argv %q must not carry the grounded-only --sandbox/--ignore-rules flags", argv)
+	}
+	assertHas(t, argv, "--skip-git-repo-check")
+}
+
+// TestInference_EnvScrubCodex proves the allow-list scrub AND the passthrough
+// knob at once (#2486): a t.Setenv sentinel secret is DROPPED from the child env
+// while a passthrough-named probe var SURVIVES.
+func TestInference_EnvScrubCodex(t *testing.T) {
+	t.Setenv("GO_HELPER_PROCESS", "1")
+	t.Setenv("HELPER_MODE", "env_scrub")
+	t.Setenv(scrubProbeEnv, scrubProbeVal)
+	t.Setenv(scrubSentinelEnv, "postgres://secret-should-not-leak")
+
+	cfg := testConfig()
+	cfg.EnvPassthrough = []string{"GO_HELPER_PROCESS", "HELPER_MODE", scrubProbeEnv}
+	c := NewClient(cfg)
+	c.Cmd = capturingHelper("env_scrub", false, nil, nil) // leave cmd.Env nil → adapter scrubs
+
+	verdict, _, _, err := c.Inference(context.Background(), "review")
+	if err != nil {
+		t.Fatalf("Inference(env_scrub): %v", err)
+	}
+	if !strings.Contains(verdict, `"approve"`) {
+		t.Errorf("env-scrub verdict = %q, want approve (sentinel dropped, passthrough kept)", verdict)
+	}
+}
+
+func assertHas(t *testing.T, argv []string, want string) {
+	t.Helper()
+	if !slices.Contains(argv, want) {
+		t.Errorf("argv %q missing %q", argv, want)
+	}
+}
+
+func assertPair(t *testing.T, argv []string, flag, value string) {
+	t.Helper()
+	i := slices.Index(argv, flag)
+	if i < 0 || i+1 >= len(argv) || argv[i+1] != value {
+		t.Errorf("argv %q missing %q %q pair", argv, flag, value)
 	}
 }

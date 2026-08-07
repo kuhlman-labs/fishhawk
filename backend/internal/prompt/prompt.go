@@ -679,6 +679,26 @@ type Trigger struct {
 	// (the default, every first review and consolidated review) keeps the
 	// implement-review prompt byte-identical to the pre-#1250 output.
 	SupplementalReinvoke bool
+
+	// ReviewTreeCommit is the resolved commit SHA of the read-only source tree
+	// exported for a GROUNDED review (#2486). When non-empty, buildPlanReview and
+	// buildImplementReview render a REPOSITORY ACCESS section naming the commit
+	// and permitting file reads and searches within the provided working
+	// directory; when empty (the degrade path — grounding disabled, export
+	// failed, or a mixed-capability panel), the prompt states plainly that no
+	// repository tree is available and the review is DIFF-ONLY. The server sets it
+	// from reviewsandbox.ExportTree's resolved SHA (C4) only when the whole loop
+	// is grounding-capable.
+	ReviewTreeCommit string
+	// ReviewTreeSkippedSymlinks and ReviewTreeSkippedInstructions are the counts
+	// of tar entries the export SKIPPED (symlinks/hard links, and
+	// agent-instruction files/dirs) (#2486, C3). When either is > 0 on a grounded
+	// prompt, the REPOSITORY ACCESS section discloses that the tree is NOT
+	// exhaustive and names the counts, so the reviewer never concludes "this
+	// symbol is called nowhere" from an incomplete tree. Both zero (or an
+	// ungrounded prompt) omits the disclosure.
+	ReviewTreeSkippedSymlinks     int
+	ReviewTreeSkippedInstructions int
 }
 
 // GateEvidence is the prompt-side mirror of bundle.GateEvidence (#963):
@@ -2620,6 +2640,64 @@ func buildPlan(t Trigger) string {
 	return b.String()
 }
 
+// writeReviewToolClause writes the tool-use MUST-NOT bullet for a review prompt,
+// branching on whether the review is grounded against an exported source tree
+// (#2486). A grounded review permits reading and searching files within the
+// provided working directory; an ungrounded review forbids all tools.
+func writeReviewToolClause(b *strings.Builder, t Trigger) {
+	if t.ReviewTreeCommit != "" {
+		b.WriteString("- Invoke any tools beyond reading and searching files within the provided working directory.\n\n")
+	} else {
+		b.WriteString("- Invoke any tools.\n\n")
+	}
+}
+
+// writeReviewRepoAccess writes the REPOSITORY ACCESS section for a review prompt
+// (#2486). Grounded: name the exported tree and its commit, state the reviewer
+// has read+search but no shell-write and no network, and bind evidence-citing;
+// when any entry was skipped in the export it discloses the tree is not
+// exhaustive and names the count and kind (C3). Ungrounded: state plainly that
+// no repository tree is available and the review is DIFF-ONLY (the honest
+// degrade path, the issue's option 3).
+func writeReviewRepoAccess(b *strings.Builder, t Trigger) {
+	b.WriteString("REPOSITORY ACCESS\n")
+	b.WriteString("=================\n\n")
+	if t.ReviewTreeCommit == "" {
+		b.WriteString("No repository tree is available for this review: it is DIFF-ONLY. " +
+			"Scope your confidence to the diff and the context provided below, and say so rather than " +
+			"requesting evidence you cannot reach.\n\n")
+		return
+	}
+	b.WriteString("Your working directory holds the repository's TRACKED files exported at commit ")
+	b.WriteString(reviewTreeShortCommit(t.ReviewTreeCommit))
+	b.WriteString(" (no .git, no untracked files). You have READ and SEARCH access to this tree, but no " +
+		"shell-write and no network. A question about whether a symbol is called, a branch is reachable, or a " +
+		"constant is already defined MUST be resolved against this tree and the evidence cited, not hedged.\n")
+	if t.ReviewTreeSkippedSymlinks > 0 || t.ReviewTreeSkippedInstructions > 0 {
+		b.WriteString("NOTE: the exported tree is NOT exhaustive — it omits ")
+		var kinds []string
+		if t.ReviewTreeSkippedSymlinks > 0 {
+			kinds = append(kinds, fmt.Sprintf("%d symbolic/hard link(s)", t.ReviewTreeSkippedSymlinks))
+		}
+		if t.ReviewTreeSkippedInstructions > 0 {
+			kinds = append(kinds, fmt.Sprintf("%d agent-instruction file(s)", t.ReviewTreeSkippedInstructions))
+		}
+		b.WriteString(strings.Join(kinds, " and "))
+		b.WriteString(". Treat a tree-wide \"not found\" as inconclusive for anything those entries might cover.\n")
+	}
+	b.WriteString("\n")
+}
+
+// reviewTreeShortCommit renders a commit SHA for the REPOSITORY ACCESS section,
+// truncated to 12 hex characters when longer so the prompt names a readable
+// short SHA while a caller that already passed a short value is left as-is.
+func reviewTreeShortCommit(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
 // buildPlanReview constructs the constrained prompt for a plan-review agent.
 // The review agent's sole task is to emit a structured verdict JSON — it is
 // explicitly forbidden from re-planning, proposing edits, or producing any
@@ -2642,11 +2720,15 @@ func buildPlanReview(t Trigger) string {
 	b.WriteString("- Re-plan, propose alternative plans, or suggest edits to the plan.\n")
 	b.WriteString("- Produce any prose output outside the JSON verdict object.\n")
 	b.WriteString("- Modify any source files.\n")
-	b.WriteString("- Invoke any tools beyond reading repository files for context.\n\n")
+	writeReviewToolClause(&b, t)
 	b.WriteString("Your entire response MUST be a single JSON object conforming to the verdict schema below. " +
 		"Do not wrap it in markdown code fences, do not add prose before or after it. " +
 		"The JSON must be syntactically valid: comma-separate every member and use no trailing commas. " +
 		"A response that contains anything other than the JSON object will be rejected.\n\n")
+
+	// Repository-access posture (#2486): grounded → name the exported tree and
+	// its commit; ungrounded → state the review is diff-only.
+	writeReviewRepoAccess(&b, t)
 
 	// Plan artifact section — the primary input to the review.
 	if t.ApprovedPlan != nil {
@@ -2944,7 +3026,7 @@ func buildImplementReview(t Trigger) string {
 	b.WriteString("- Re-plan, propose alternative implementations, or suggest edits to the diff.\n")
 	b.WriteString("- Produce any prose output outside the JSON verdict object.\n")
 	b.WriteString("- Modify any source files.\n")
-	b.WriteString("- Invoke any tools beyond reading repository files for context.\n\n")
+	writeReviewToolClause(&b, t)
 	b.WriteString("Your entire response MUST be a single JSON object conforming to the verdict schema below. " +
 		"Do not wrap it in markdown code fences, do not add prose before or after it. " +
 		"The JSON must be syntactically valid: comma-separate every member and use no trailing commas. " +
@@ -2967,6 +3049,12 @@ func buildImplementReview(t Trigger) string {
 		writeSupplementalReinvokeReview(&b, t)
 		return b.String()
 	}
+
+	// Repository-access posture (#2486): grounded → name the exported tree and
+	// its commit (and disclose any skipped entries); ungrounded → state the
+	// review is diff-only. Placed after the supplemental early-return so the
+	// exemption-soundness supplemental prompt, which renders no diff, is unchanged.
+	writeReviewRepoAccess(&b, t)
 
 	// Cache-stable prefix ordering (#1725). The stable / per-run-stable content
 	// leads: the verdict schema, review criteria + decision rule, the approved
