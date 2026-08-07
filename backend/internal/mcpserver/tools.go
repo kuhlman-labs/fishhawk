@@ -1858,6 +1858,14 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// under budget (the output is returned unchanged with no elisions block).
 	// A validateWireElisions failure is a programming defect — a DTO that
 	// misclassifies its own elisions — and is surfaced, never swallowed.
+	//
+	// NO TEST DRIVES THE ERROR BRANCH BELOW, and that is stated rather than
+	// papered over: reaching it needs a malformed elidedField, which the
+	// constructors cannot spell and which only an in-package composite literal
+	// can build — a construction path TestProjectionIsSoleProducerOfWireDTO
+	// forbids outside wire()/wireField(). It is an accepted defensive branch.
+	// The validation itself IS driven, through the projection path, by
+	// TestWireElisions_ValidationRejectsMalformed.
 	bounded, err := boundRunStatusOutput(assembled, runID.String(), runStatusByteBudget(r.getenv))
 	if err != nil {
 		return nil, GetRunStatusOutput{}, fmt.Errorf("bound run status response: %w", err)

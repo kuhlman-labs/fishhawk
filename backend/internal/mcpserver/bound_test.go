@@ -225,6 +225,53 @@ func TestBound_ConvergesAtAnyBudget(t *testing.T) {
 	}
 }
 
+// TestBound_UnderBudget_ReturnsTheInputBytesUnchanged is the PRE-bound vs
+// POST-bound byte-identity proof, and the baseline is what makes it one: the
+// wire bytes are captured from the INPUT, BEFORE boundRunStatusOutput runs.
+//
+// Re-running the ladder over an ALREADY-bounded response instead would assert
+// only IDEMPOTENCE, which a first-pass mutation emitting no elisions satisfies
+// — an unconditional cap of an already-capped string is byte-stable on the
+// second pass. So the handler-level test cannot carry this claim (its output has
+// already been through the ladder) and this one does.
+//
+// The budget is the fixture's own marshalled length, which also pins the
+// comparison as `n <= budget` rather than `n < budget`.
+func TestBound_UnderBudget_ReturnsTheInputBytesUnchanged(t *testing.T) {
+	runID := uuid.NewString()
+	in := maximalRunStatusOutput(runID)
+
+	// Non-vacuity: the fixture must carry the targets every tier would mutate,
+	// or "unchanged" would be trivially true.
+	if in.Run.IssueContext == nil || in.Cost == nil || in.ChildrenStatus == nil ||
+		len(in.RecentAudit) <= recentAuditTierCap || len(in.SecurityFindings) == 0 ||
+		len(in.NextActions.Actions) <= nextActionsTierCap {
+		t.Fatalf("the fixture does not carry every tier's target — an unchanged result would prove nothing: %+v", in)
+	}
+	var sawLongFailureReason bool
+	for _, s := range in.Stages {
+		if s.FailureReason != nil && jsonEncodedLen(*s.FailureReason) > failureReasonTierCap {
+			sawLongFailureReason = true
+		}
+	}
+	if !sawLongFailureReason {
+		t.Fatal("the fixture carries no over-cap failure_reason — T7 would be a no-op regardless of the early return")
+	}
+
+	before := mustMarshal(t, in) // the genuine PRE-bound wire
+
+	got, err := boundRunStatusOutput(in, runID, len(before))
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if got.Elisions != nil {
+		t.Errorf("an under-budget response must carry no elisions block, got %+v", got.Elisions)
+	}
+	if after := string(mustMarshal(t, got)); after != string(before) {
+		t.Errorf("the ladder mutated an at-budget response: %d pre-bound bytes -> %d post-bound bytes", len(before), len(after))
+	}
+}
+
 // TestFloor_IsConstantSizeUnderAdversarialInput pins the floor's own bound for
 // adversarial inputs, and that the floor sits below the default budget.
 func TestFloor_IsConstantSizeUnderAdversarialInput(t *testing.T) {
@@ -869,21 +916,27 @@ func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRunStatusByteBudget_OverrideBranches(t *testing.T) {
+	// The table is keyed by the getenv FUNC, not by an env map, so the
+	// nil-getenv guard gets its own NAMED branch case. A resolver built without
+	// an environment seam reaches it, and envFuncFromMap(nil) — a non-nil func
+	// over an empty map — does NOT: it lands on "absent" instead, leaving the
+	// nil branch covered only incidentally.
 	cases := []struct {
-		name string
-		env  map[string]string
-		want int
+		name   string
+		getenv func(string) string
+		want   int
 	}{
-		{"absent", nil, runStatusByteBudgetDefault},
-		{"unparseable", map[string]string{runStatusBudgetEnvVar: "not-a-number"}, runStatusByteBudgetDefault},
-		{"non-positive", map[string]string{runStatusBudgetEnvVar: "0"}, runStatusByteBudgetDefault},
-		{"negative", map[string]string{runStatusBudgetEnvVar: "-4096"}, runStatusByteBudgetDefault},
-		{"honoured above the floor", map[string]string{runStatusBudgetEnvVar: "8192"}, 8192},
-		{"clamped below the floor", map[string]string{runStatusBudgetEnvVar: "1024"}, minimalRunStatusMaxBytes},
+		{"nil getenv (no environment seam at all)", nil, runStatusByteBudgetDefault},
+		{"absent", envFuncFromMap(nil), runStatusByteBudgetDefault},
+		{"unparseable", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "not-a-number"}), runStatusByteBudgetDefault},
+		{"non-positive", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "0"}), runStatusByteBudgetDefault},
+		{"negative", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "-4096"}), runStatusByteBudgetDefault},
+		{"honoured above the floor", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "8192"}), 8192},
+		{"clamped below the floor", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1024"}), minimalRunStatusMaxBytes},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := runStatusByteBudget(envFuncFromMap(tc.env)); got != tc.want {
+			if got := runStatusByteBudget(tc.getenv); got != tc.want {
 				t.Fatalf("runStatusByteBudget = %d, want %d", got, tc.want)
 			}
 		})

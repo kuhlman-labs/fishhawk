@@ -311,12 +311,18 @@ func (l *elisionLedger) add(entries ...elidedField) {
 // immediately before wire() returns and fails LOUDLY — converting
 // "unrepresentable" into "unbuildable without detection", the strongest form
 // available under the SDK constraint.
+//
+// There is deliberately NO fields_list_capped signal on this DTO. The ladder
+// never caps the fields LIST: list bloat (a per-stage T7 entry explosion, say)
+// falls through to the skeleton, which discards the tier ledger and builds a
+// fresh fixed-size one, and then to the floor's exactly-two aggregates. A flag
+// no code path can ever set is a schema surface that lies to its reader, so the
+// convergence design is stated here instead of advertised as a signal.
 type Elisions struct {
-	Budget           int           `json:"budget" jsonschema:"the EFFECTIVE byte budget the ladder honoured (post-clamp — an override below the convergence floor is clamped up, so this never claims a bound the ladder did not honour)"`
-	Tier             string        `json:"tier" jsonschema:"the deepest reduction tier applied: T1..T9 (ordered least-actionable-first), skeleton (per-field itemised projection), or floor (the constant-size absolute floor)"`
-	Fields           []ElidedField `json:"fields,omitempty" jsonschema:"one entry per omitted field path; at the floor tier exactly two aggregate entries stand in for the per-field list"`
-	FieldsListCapped bool          `json:"fields_list_capped,omitempty" jsonschema:"true when the fields list itself was truncated to fit the budget"`
-	Note             string        `json:"note,omitempty" jsonschema:"one-line operator note about the reduction"`
+	Budget int           `json:"budget" jsonschema:"the EFFECTIVE byte budget the ladder honoured (post-clamp — an override below the convergence floor is clamped up, so this never claims a bound the ladder did not honour)"`
+	Tier   string        `json:"tier" jsonschema:"the deepest reduction tier applied: T1..T9 (ordered least-actionable-first), skeleton (per-field itemised projection), or floor (the constant-size absolute floor)"`
+	Fields []ElidedField `json:"fields,omitempty" jsonschema:"one entry per omitted field path; at the floor tier exactly two aggregate entries stand in for the per-field list"`
+	Note   string        `json:"note,omitempty" jsonschema:"one-line operator note about the reduction"`
 }
 
 // ElidedField is one omitted field path and how (or whether) to get it back.

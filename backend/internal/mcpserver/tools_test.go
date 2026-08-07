@@ -9271,12 +9271,20 @@ func TestStartRun_AppliesToOverride_DefaultsOff(t *testing.T) {
 // ADR-077 / #2508 — response byte budget, driven through the REAL handler
 // ---------------------------------------------------------------------------
 
-// worstCase knobs one adversarial failed-run shape.
+// worstCase knobs one adversarial failed-run shape. EVERY knob is honoured by
+// newWorstCaseFailedRun and asserted on: a knob the seeder silently ignores
+// turns its row into a differently-named copy of another row.
+//
+// There is deliberately no action-COUNT knob. next_actions is a pure function of
+// the run snapshot, computed by nextActionsFor from a fixed state table, so no
+// fixture can make the handler emit 200 actions — the count dimension is driven
+// at the ladder level instead, where maximalRunStatusOutput carries 20 actions
+// and T9's cap is asserted directly. What a fixture CAN drive through the real
+// handler is action SIZE: nextActionFieldLn below.
 type worstCase struct {
 	name              string
 	stages            int
 	failureReasonLen  int
-	nextActions       int
 	nextActionFieldLn int
 	auditEntries      int
 	auditArrayLen     int
@@ -9307,6 +9315,19 @@ func newWorstCaseFailedRun(t *testing.T, c worstCase) (*httptest.Server, uuid.UU
 			Comments: []IssueComment{{Author: "a", Body: strings.Repeat("comment "+poison, 200), CreatedAt: "t"}},
 		},
 		LiveValidation: &RunLiveValidation{PendingCriteriaCount: 2, WalkRef: "#2509"},
+	}
+	// next_actions bulk, driven through the REAL computation: working_dir is
+	// folded onto the params of every runner-spawning action
+	// (foldWorkingDirParams), and walk_ref lands in BOTH the live-validation
+	// advisory's params and its rendered reason (foldLiveValidationAdvisory).
+	// Both are run fields, so the fixture reaches next_actions without hand-
+	// building the block the handler is supposed to compute.
+	if c.nextActionFieldLn > 0 {
+		run.WorkingDir = "/tmp/" + strings.Repeat("d", c.nextActionFieldLn)
+		run.LiveValidation = &RunLiveValidation{
+			PendingCriteriaCount: 2,
+			WalkRef:              "#" + strings.Repeat("9", c.nextActionFieldLn),
+		}
 	}
 	for i := 0; i < 4; i++ {
 		run.ReviewAuthority = append(run.ReviewAuthority, RunReviewAuthority{
@@ -9415,7 +9436,7 @@ func newWorstCaseFailedRun(t *testing.T, c worstCase) (*httptest.Server, uuid.UU
 var worstCases = []worstCase{
 	{name: "12 stages with 40KB failure reasons", stages: 12, failureReasonLen: 40 * 1024, auditEntries: 10},
 	{name: "400 stages", stages: 400, failureReasonLen: 64, auditEntries: 10},
-	{name: "200 next_actions with 8KB fields", stages: 4, failureReasonLen: 8 * 1024, nextActions: 200, nextActionFieldLn: 8 * 1024, auditEntries: 10},
+	{name: "next_actions carrying 8KB working_dir + walk_ref fields", stages: 4, failureReasonLen: 8 * 1024, nextActionFieldLn: 8 * 1024, auditEntries: 10},
 	{name: "50 structurally-bulky audit payloads", stages: 4, auditEntries: 50, auditArrayLen: 400},
 	{name: "300 auto_advanced transitions", stages: 4, autoAdvanced: 300, auditEntries: 10},
 	{name: "200 open concerns", stages: 4, concerns: 200, auditEntries: 10},
@@ -9424,6 +9445,27 @@ var worstCases = []worstCase{
 	{name: "payload deliberately past the budget", stages: 30, failureReasonLen: 20 * 1024, auditEntries: 40, auditArrayLen: 200},
 	{name: "everything maximal at once", stages: 40, failureReasonLen: 20 * 1024, auditEntries: 50, auditArrayLen: 400,
 		autoAdvanced: 300, concerns: 200, securityFindings: 150, freeTextPoison: true},
+}
+
+// getRunStatusPreBound returns what the REAL handler assembles before any
+// reduction: the same call with the budget override raised far above anything
+// the handler can produce, so boundRunStatusOutput takes its `n <= budget` early
+// return. That early return is proved to be a byte-identical no-op — with the
+// baseline captured BEFORE the ladder runs, not by re-running it over its own
+// output — by TestBound_UnderBudget_ReturnsTheInputBytesUnchanged.
+func getRunStatusPreBound(t *testing.T, srv *httptest.Server, runID uuid.UUID, auditLimit int) GetRunStatusOutput {
+	t.Helper()
+	r := newResolver(srv, map[string]string{runStatusBudgetEnvVar: strconv.Itoa(1 << 30)})
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{
+		RunID: runID.String(), AuditLimit: auditLimit,
+	})
+	if err != nil {
+		t.Fatalf("getRunStatus (unreduced): %v", err)
+	}
+	if out.Elisions != nil {
+		t.Fatalf("the unreduced call still reduced the response: %+v", out.Elisions)
+	}
+	return out
 }
 
 // TestGetRunStatus_WorstCaseFailedRun_UnderBudget is the cross-boundary
@@ -9449,6 +9491,27 @@ func TestGetRunStatus_WorstCaseFailedRun_UnderBudget(t *testing.T) {
 			budget := runStatusByteBudget(envFuncFromMap(nil))
 			if len(raw) > budget {
 				t.Errorf("response = %d bytes, want <= the %d-byte budget", len(raw), budget)
+			}
+
+			// NON-VACUITY. A row that never exceeded the budget would assert
+			// nothing about the bound, and a knob the seeder ignored would make
+			// its row a differently-named copy of another. So drive the SAME
+			// handler with the budget raised above anything it can assemble —
+			// the ladder's `n <= budget` early return makes that the unreduced
+			// response — and assert the row's claimed shape is really there.
+			preBound := getRunStatusPreBound(t, srv, runID, 200)
+			preRaw := mustMarshal(t, preBound)
+			if len(preRaw) <= budget {
+				t.Fatalf("the unreduced response is %d bytes, already within the %d-byte budget — this row exercises no tier", len(preRaw), budget)
+			}
+			if out.Elisions == nil {
+				t.Fatalf("an over-budget row produced no elisions block")
+			}
+			if c.nextActionFieldLn > 0 {
+				n := len(mustMarshal(t, preBound.NextActions))
+				if n < c.nextActionFieldLn {
+					t.Errorf("the unreduced next_actions block is %d bytes — this row claims a large next_actions shape but the fixture never produced one (want >= %d)", n, c.nextActionFieldLn)
+				}
 			}
 
 			// The diagnosis core survives every tier including the floor.
@@ -9488,9 +9551,15 @@ func TestGetRunStatus_WorstCaseFailedRun_UnderBudget(t *testing.T) {
 }
 
 // TestGetRunStatus_UnderBudget_ByteIdenticalNoElisionsBlock proves the bound is
-// INERT on the happy path: an ordinary small run's marshalled response is
-// byte-identical before and after the ladder, and the wire carries no
-// "elisions" key.
+// INERT on the happy path, through the real handler: an ordinary small run's
+// wire carries no "elisions" key, and its bytes do not depend on the budget.
+//
+// It deliberately does NOT re-run the ladder over its own already-bounded
+// output: that asserts IDEMPOTENCE, not the pre-bound/post-bound byte identity
+// the design claims, and a first-pass mutation emitting no elisions would sit
+// inside the baseline and stay green. The pre-bound baseline can only be
+// captured where the input still exists — at the ladder level, in
+// TestBound_UnderBudget_ReturnsTheInputBytesUnchanged.
 func TestGetRunStatus_UnderBudget_ByteIdenticalNoElisionsBlock(t *testing.T) {
 	_, srv, runID := seedCompactFixture(t)
 	r := newResolver(srv, nil)
@@ -9505,13 +9574,11 @@ func TestGetRunStatus_UnderBudget_ByteIdenticalNoElisionsBlock(t *testing.T) {
 	if strings.Contains(string(raw), `"elisions"`) {
 		t.Errorf("under-budget wire bytes carry an elisions key: %s", raw)
 	}
-	// Byte-identical: running the ladder again over the same output is a no-op.
-	again, err := boundRunStatusOutput(out, runID.String(), runStatusByteBudget(envFuncFromMap(nil)))
-	if err != nil {
-		t.Fatalf("bound: %v", err)
-	}
-	if string(mustMarshal(t, again)) != string(raw) {
-		t.Errorf("the ladder is not inert under budget")
+	// Budget-independent: the same handler call with the budget raised far above
+	// anything it can assemble returns the SAME bytes, so nothing on this path
+	// is reduced as a function of the budget.
+	if pre := mustMarshal(t, getRunStatusPreBound(t, srv, runID, 10)); string(pre) != string(raw) {
+		t.Errorf("the under-budget response depends on the budget:\n at the default: %s\n unreduced:     %s", raw, pre)
 	}
 }
 

@@ -756,7 +756,9 @@ Because a composite literal can still build a malformed DTO no constructor vette
 
 **The ladder is NOT size-monotonic**, and no test asserts otherwise: attaching the growing elisions block can make a later measurement larger than an earlier one. Convergence comes from the constant-size floor, not from monotonicity. Tier tests therefore measure the **domain payload** with the elisions block excluded.
 
-**Inert below budget.** The `elisions` field is `omitempty` and an under-budget response is returned **unchanged**, so its wire bytes are byte-identical to the pre-#2508 shape and `TestGetRunStatus_CompactDefault_UnderSizeBudget` stays green unmodified.
+**There is no `fields_list_capped` signal, deliberately.** The ladder never caps the fields **list**: list bloat (a per-stage T7 entry explosion on a 400-stage run, say) falls through to the skeleton — which discards the tier ledger and builds a fresh fixed-size one — and then to the floor's exactly-two aggregates. A flag no code path can set is a schema surface that lies to its reader, so the convergence behaviour is documented rather than advertised as a signal that can never fire.
+
+**Inert below budget.** The `elisions` field is `omitempty` and an under-budget response is returned **unchanged**, so its wire bytes are byte-identical to the pre-#2508 shape and `TestGetRunStatus_CompactDefault_UnderSizeBudget` stays green unmodified. The byte-identity claim is proved by `TestBound_UnderBudget_ReturnsTheInputBytesUnchanged`, whose baseline is marshalled from the **input** before the ladder runs — re-running the ladder over its own already-bounded output would assert only **idempotence**, which a first-pass mutation emitting no elisions satisfies. The handler-level twin asserts what it actually can: no `elisions` key on the wire, and bytes that do not vary with the budget.
 
 ## Auth split (runner `fhm_*` vs operator `fhk_*` tokens)
 
