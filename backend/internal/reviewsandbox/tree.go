@@ -53,8 +53,8 @@ type Stats struct {
 	// disclose that the tree omits them.
 	Symlinks int
 	// Instructions is the number of agent-instruction entries SKIPPED (the C1
-	// guard): AGENTS.md / CLAUDE.md / CLAUDE.local.md at any depth, and every
-	// entry under a .claude/ or .codex/ directory.
+	// guard): AGENTS.md / AGENTS.override.md / CLAUDE.md / CLAUDE.local.md at any
+	// depth, and every entry under a .claude/ or .codex/ directory.
 	Instructions int
 }
 
@@ -277,7 +277,13 @@ func safeRel(name string) (string, error) {
 // path is an agent-instruction file or lives under an agent-config directory,
 // enumerated against both CLIs' documented discovery (see README.md):
 //
-//   - AGENTS.md — codex auto-discovers it at every directory level.
+//   - AGENTS.md, AGENTS.override.md — codex auto-discovers BOTH at every
+//     directory level; AGENTS.override.md is codex's local-only override,
+//     checked BEFORE AGENTS.md at each level per codex's documented
+//     instruction-file discovery, so it loads as an instruction exactly like
+//     AGENTS.md and must be skipped too (its omission was the C1 bypass in
+//     #2486's fix-up: a tracked AGENTS.override.md at any depth would otherwise
+//     survive extraction and be auto-discovered from the grounded tree).
 //   - CLAUDE.md, CLAUDE.local.md — claude-code auto-discovers these at every
 //     directory level.
 //   - any component named .claude or .codex — the two CLIs' config/state
@@ -291,7 +297,7 @@ func isAgentInstructionPath(rel string) bool {
 		}
 		if i == len(parts)-1 {
 			switch p {
-			case "AGENTS.md", "CLAUDE.md", "CLAUDE.local.md":
+			case "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md":
 				return true
 			}
 		}

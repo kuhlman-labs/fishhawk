@@ -59,10 +59,14 @@ diff-only review.
   and counted (`Stats.Symlinks`) — a symlink could point outside the tree and a
   link misrepresents the commit.
 - **agent-instruction files (C1)**: SKIPPED and counted (`Stats.Instructions`).
-  Enumerated against both CLIs' documented discovery: `AGENTS.md` (codex),
-  `CLAUDE.md` and `CLAUDE.local.md` (claude-code), at ANY depth, plus everything
-  under a `.claude/` or `.codex/` directory (the CLIs' config/state dirs:
-  settings, commands, agents, skills, `config.toml`). This closes an
+  Enumerated against both CLIs' documented discovery: `AGENTS.md` and
+  `AGENTS.override.md` (codex — the `.override.` variant is codex's local-only
+  override, checked BEFORE `AGENTS.md` at each directory level, so it loads as an
+  instruction exactly like `AGENTS.md`; its omission was the reopened C1 bypass
+  in the #2486 fix-up), `CLAUDE.md` and `CLAUDE.local.md` (claude-code), at ANY
+  depth, plus everything under a `.claude/` or `.codex/` directory (the CLIs'
+  config/state dirs: settings, commands, agents, skills, `config.toml`). This
+  closes an
   approval-laundering channel: this repo's conventions REQUIRE ordinary PRs to
   edit `AGENTS.md`, so without the skip a PR editing it would boot its own
   reviewer running the text under review — no attacker needed, only an agent
@@ -92,6 +96,33 @@ reviewers' lifetime and is removed exactly when the loop returns.
 
 ## Accepted residual risks (advisory-verdicts-only)
 
+- **Grounding is NOT a filesystem jail — out-of-tree reads are not denied.**
+  Neither adapter confines the reviewer's reads to `treeDir`. `cmd.Dir` and
+  `--add-dir` SELECT/ADD a workspace; they do not fence the filesystem. On the
+  codex path `--sandbox read-only` denies writes and network but PERMITS reads
+  filesystem-wide (codex has no read-confining sandbox mode). On the claude path
+  `--tools Read,Grep,Glob` + `--allowed-tools` pre-approve those tools with no
+  per-path restriction, so a Read of an absolute out-of-tree path is not
+  prompted. An untrusted diff can therefore steer either reviewer toward a
+  host-readable file outside `treeDir` (e.g. `~/.ssh`, a sibling checkout), and
+  the content can surface in the ADVISORY verdict. This is why the contract
+  tests assert argv/cwd but do NOT assert that an out-of-tree read is denied:
+  it is not denied, and a test claiming otherwise would be false. What actually
+  bounds the exposure is defence-in-depth, not confinement:
+    - **export-not-mount** minimises what is discoverable *in*-tree (no `.git`,
+      no untracked files, no other branches, no operator working-tree state);
+    - the **env scrub** removes env-resident daemon secrets (it does NOT protect
+      file-resident secrets — see below);
+    - **no network** — codex's read-only sandbox and the claude adapter's
+      empty-MCP set + absence of Bash/WebFetch/WebSearch from `--tools` — cuts
+      the EXFILTRATION leg of the lethal trifecta, so out-of-tree content can
+      reach only the advisory verdict (read by the operator and the model
+      provider), not an attacker-controlled sink;
+    - **advisory-only verdicts** with operator arbitration of every split.
+  A true out-of-tree read DENIAL needs OS-level sandboxing (seccomp/Landlock/
+  Seatbelt bind-mount jail), which is infrastructure this package does not own —
+  tracked with the runner-sandbox work (#611). Tolerable ONLY while verdicts are
+  advisory; revisit before any move to binding reviewer verdicts.
 - A grounded reviewer reads untrusted diff content and repo-resident files. This
   is tolerable ONLY while reviewer verdicts are ADVISORY and an operator
   arbitrates every split. Revisit before any move to binding reviewer verdicts.
@@ -104,22 +135,42 @@ reviewers' lifetime and is removed exactly when the loop returns.
   merely file reads — the narrowest posture the codex CLI can express. "Never
   shell" is met only in the sense that nothing can write or reach the network.
 
-## Closed — operator MCP tools no longer inherited (#2486 fix-up)
+## claude-code: operator MCP tools no longer inherited (#2486 fix-up) — CLOSED
 
-Inheriting the operator's MCP TOOLS was formerly a residual and is now CLOSED —
-do NOT describe it as an accepted residual. The grounded claude-code adapter's
-`--tools Read,Grep,Glob` bounds only the BUILT-IN toolset; MCP tools are not
-built-ins, so they loaded from the operator's config and survived the
-restriction (verified live — a grounded child enumerated browser/Gmail/GitHub
-MCP tools, which are network egress and data exfiltration that defeat the
-never-network property). The grounded claude argv now ALSO pins an EMPTY MCP
-server set: `--strict-mcp-config` makes `--mcp-config` the sole source of MCP
-config (ignoring `~/.claude` and project `.mcp.json`) and the empty
-`{"mcpServers":{}}` document loads zero servers; grounding (the tree read) is
-preserved with both flags on. The codex adapter adds NO such flags — `codex
-exec` reports NONE for MCP tools today — but a grounded codex argv test pins
-that no MCP server config reaches the codex child so a future codex-cli change
-fails a test rather than silently regaining egress.
+For the claude-code adapter, inheriting the operator's MCP TOOLS was formerly a
+residual and is now CLOSED — do NOT describe it as an accepted residual. The
+grounded claude-code adapter's `--tools Read,Grep,Glob` bounds only the BUILT-IN
+toolset; MCP tools are not built-ins, so they loaded from the operator's config
+and survived the restriction (verified live — a grounded child enumerated
+browser/Gmail/GitHub MCP tools, which are network egress and data exfiltration
+that defeat the never-network property). The grounded claude argv now ALSO pins
+an EMPTY MCP server set: `--strict-mcp-config` makes `--mcp-config` the sole
+source of MCP config (ignoring `~/.claude` and project `.mcp.json`) and the
+empty `{"mcpServers":{}}` document loads zero servers; grounding (the tree read)
+is preserved with both flags on.
+
+## codex: operator MCP not adapter-neutralized — RESIDUAL (no-network bounds it)
+
+The codex adapter CANNOT close the MCP channel the same way, and it is a mistake
+to claim it does (the overclaim the #2486 fix-up corrected). codex offers no
+reliable per-invocation MCP-clear: a `[mcp_servers.*]` block in the operator's
+`~/.codex/config.toml` (reached via the passed-through `CODEX_HOME`) is not
+overridable through `-c` today (openai/codex#13076), and the empty-table trick
+the claude path uses has no codex equivalent. So the codex adapter adds NO MCP
+flag, and a grounded codex argv test can pin only that the ADAPTER injects no
+MCP config of its own — it does NOT, and with a subprocess-level fake CANNOT,
+prove the operator's config-resident MCP servers are absent from the child.
+
+What bounds the exposure instead is the read-only sandbox's **no-network**
+guarantee (`--sandbox read-only`): even if codex loaded a config-resident MCP
+server, a network-egress tool it exposed is denied the network. That is the
+load-bearing control the codex grounded-argv test asserts (the `--sandbox
+read-only` pin), NOT the argv MCP scan. Two empirical facts keep the residual
+small today — `codex exec` reports NONE for MCP tools, and codex-run tooling is
+inside the no-network sandbox — but if a future codex-cli begins honoring
+config MCP servers with out-of-sandbox egress, this becomes a real gap. Kept
+deliberately as a residual pending a codex-side MCP-clear (openai/codex#13076)
+or the OS-sandbox confinement tracked with #611.
 
 ## Kill switch
 

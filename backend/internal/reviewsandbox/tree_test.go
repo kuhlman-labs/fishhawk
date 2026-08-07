@@ -135,15 +135,21 @@ func TestExtractTar_SkipsSymlinks(t *testing.T) {
 
 // TestExtractTar_SkipsAgentInstructionFiles is the C1 named guard (exact test
 // name, machine-checked): agent-instruction files and config dirs are SKIPPED
-// and counted, while ordinary files land. Covers AGENTS.md / CLAUDE.md /
-// CLAUDE.local.md at any depth and everything under .claude/ and .codex/.
+// and counted, while ordinary files land. Covers AGENTS.md / AGENTS.override.md
+// / CLAUDE.md / CLAUDE.local.md at any depth and everything under .claude/ and
+// .codex/. The AGENTS.override.md entries (root and nested) pin the #2486
+// fix-up: codex checks the .override. variant BEFORE AGENTS.md at each level, so
+// a tracked AGENTS.override.md at any depth would otherwise survive extraction
+// and reopen the approval-laundering channel C1 made blocking.
 func TestExtractTar_SkipsAgentInstructionFiles(t *testing.T) {
 	dest := t.TempDir()
 	data := buildTar(t, []tarEntry{
 		reg("AGENTS.md", "root codex instructions"),
+		reg("AGENTS.override.md", "root codex override instructions"),
 		reg("CLAUDE.md", "root claude instructions"),
 		reg("CLAUDE.local.md", "local override"),
 		reg("backend/AGENTS.md", "nested codex instructions"),
+		reg("backend/AGENTS.override.md", "nested codex override instructions"),
 		reg("docs/CLAUDE.md", "nested claude instructions"),
 		reg(".claude/settings.json", "{}"),
 		reg(".codex/config.toml", "x=1"),
@@ -154,13 +160,13 @@ func TestExtractTar_SkipsAgentInstructionFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("extractTar: %v", err)
 	}
-	if stats.Instructions != 8 {
-		t.Errorf("stats.Instructions = %d, want 8 agent-instruction skips", stats.Instructions)
+	if stats.Instructions != 10 {
+		t.Errorf("stats.Instructions = %d, want 10 agent-instruction skips", stats.Instructions)
 	}
 	if stats.Files != 1 {
 		t.Errorf("stats.Files = %d, want 1 (only main.go lands)", stats.Files)
 	}
-	for _, skipped := range []string{"AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "backend/AGENTS.md", "docs/CLAUDE.md", ".claude/settings.json", ".codex/config.toml"} {
+	for _, skipped := range []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "backend/AGENTS.md", "backend/AGENTS.override.md", "docs/CLAUDE.md", ".claude/settings.json", ".codex/config.toml"} {
 		if _, serr := os.Stat(filepath.Join(dest, skipped)); !os.IsNotExist(serr) {
 			t.Errorf("agent-instruction path %q was materialized: %v", skipped, serr)
 		}

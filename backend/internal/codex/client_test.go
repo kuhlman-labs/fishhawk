@@ -1133,6 +1133,18 @@ func capturingHelper(mode string, passEnv bool, argv *[]string, capturedCmd **ex
 // cmd.Dir is the exported tree and the argv carries --sandbox read-only,
 // --ignore-rules, and --skip-git-repo-check while NEVER carrying any
 // --dangerously-* flag.
+//
+// The LOAD-BEARING no-network control for codex is `--sandbox read-only`
+// (asserted below): unlike the claude adapter — which pins an EMPTY MCP server
+// set via --strict-mcp-config + --mcp-config {} — codex has NO reliable
+// per-invocation MCP-clear (a repo/global config.toml `[mcp_servers.*]` block is
+// not overridable through `-c` today, openai/codex#13076), so the codex path
+// cannot forbid an operator's config-resident MCP servers from being discovered
+// the way the claude path does. What it CAN and does rely on is the read-only
+// sandbox's no-network guarantee, which denies egress even to a tool codex loads
+// from config. That is why the assertion the reviewer must trust here is the
+// --sandbox read-only pin, NOT an argv MCP scan. See the reviewsandbox README
+// residual for the accepted trade-off and the follow-up.
 func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 	treeDir := t.TempDir()
 	var argv []string
@@ -1146,6 +1158,10 @@ func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 	if cmd.Dir != treeDir {
 		t.Errorf("cmd.Dir = %q, want the exported tree %q", cmd.Dir, treeDir)
 	}
+	// The no-network guarantee (the property that neutralizes MCP-based egress
+	// even if codex loaded a config-resident MCP server) is enforced by
+	// --sandbox read-only. This pin is load-bearing: deleting the grounded
+	// --sandbox flag in client.go turns this red.
 	assertPair(t, argv, "--sandbox", "read-only")
 	assertHas(t, argv, "--ignore-rules")
 	assertHas(t, argv, "--skip-git-repo-check")
@@ -1154,15 +1170,19 @@ func TestInvokeGrounded_CodexArgvAndCwd(t *testing.T) {
 			t.Errorf("argv %q contains a dangerous flag %q", argv, a)
 		}
 	}
-	// Regression (#2486 MCP fix-up): pin that NO MCP server config reaches the
-	// codex child. `codex exec` reports NONE for MCP tools today, so — unlike the
-	// claude adapter — no MCP pin is added here. This assertion exists so a future
-	// codex-cli change that starts loading the operator's MCP servers (whether via
-	// a flag or a `-c mcp_servers=...` config override) fails a test rather than
-	// silently regaining network egress. Any argv token mentioning "mcp" trips it.
+	// A NARROW adapter-hygiene pin, NOT a no-MCP guarantee (the #2486 test-vacuity
+	// fix-up corrected the overclaim): the codex adapter must inject no MCP server
+	// config of its own into the argv. This does NOT — and with a fake helper
+	// CANNOT — prove the operator's config-resident MCP servers are absent from
+	// the child: MCP discovery is config-file-driven (via the passed-through
+	// CODEX_HOME), not argv-driven, and codex offers no reliable per-invocation
+	// clear (openai/codex#13076). The property that actually bounds MCP egress is
+	// the --sandbox read-only pin above; this scan only guards against the adapter
+	// itself acquiring an MCP-enabling `-c mcp_servers=...`/`--mcp-*` flag in a
+	// future edit.
 	for _, a := range argv {
 		if strings.Contains(strings.ToLower(a), "mcp") {
-			t.Errorf("codex argv %q must carry no MCP server config, found %q", argv, a)
+			t.Errorf("codex adapter must inject no MCP config into argv %q, found %q", argv, a)
 		}
 	}
 }
