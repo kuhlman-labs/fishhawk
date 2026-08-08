@@ -419,6 +419,11 @@ type fakeBackend struct {
 	startCampaignItemRunResp   StartCampaignItemRunResult
 	startCampaignItemRunStatus int
 	startCampaignItemRunErr    string
+	// startCampaignItemRunCalls counts how often the POST
+	// /v0/campaigns/{id}/runs handler ran (E48.69 / #2498), so the working_dir
+	// refusal tests can assert an explicit never-dialed seam rather than
+	// inferring it from a zero-value response.
+	startCampaignItemRunCalls int
 }
 
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
@@ -1106,6 +1111,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		var body startCampaignItemRunRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		fb.mu.Lock()
+		fb.startCampaignItemRunCalls++
 		fb.startCampaignItemRunID = id
 		fb.startCampaignItemRunBody = body
 		status := fb.startCampaignItemRunStatus
@@ -1118,10 +1124,24 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			return
 		}
 		if resp.Run.ID == "" {
-			resp.Run = Run{ID: uuid.NewString(), Repo: "x/y", State: "pending", RunnerKind: body.RunnerKind}
+			// Echo the body's working_dir onto the minted run (E48.69 / #2498) so
+			// the run the campaign path binds carries the operator's checkout —
+			// this is the observable the binding test reads back.
+			resp.Run = Run{ID: uuid.NewString(), Repo: "x/y", State: "pending", RunnerKind: body.RunnerKind, WorkingDir: body.WorkingDir}
 		}
 		if resp.Item.ID == "" {
 			resp.Item = CampaignItem{ID: uuid.NewString(), IssueRef: body.IssueRef, State: "running", RunID: resp.Run.ID}
+		}
+		// Persist the minted run so a later GET /v0/runs/{id} — the read
+		// resolveWorkingDirForRun performs to inherit the binding — serves it
+		// back (E48.69 / #2498).
+		if rid, perr := uuid.Parse(resp.Run.ID); perr == nil {
+			fb.mu.Lock()
+			if fb.getRunByID == nil {
+				fb.getRunByID = map[uuid.UUID]Run{}
+			}
+			fb.getRunByID[rid] = resp.Run
+			fb.mu.Unlock()
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})

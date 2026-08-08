@@ -1078,8 +1078,14 @@ func TestStartRunForCampaignIssue_HydratesIssueContext(t *testing.T) {
 	gh := campaignHydrationGitHub(t, http.StatusOK, http.StatusOK)
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rrepo, GitHub: gh})
 
-	if _, err := s.StartRunForCampaignIssue(context.Background(),
-		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local"); err != nil {
+	wd := t.TempDir() // absolute
+	if _, err := s.StartRunForCampaignIssue(context.Background(), StartRunForCampaignIssueParams{
+		Repo:       "kuhlman-labs/fishhawk",
+		IssueRef:   "issue:100",
+		WorkflowID: "feature_change",
+		RunnerKind: "local",
+		WorkingDir: wd,
+	}); err != nil {
 		t.Fatalf("StartRunForCampaignIssue: %v", err)
 	}
 
@@ -1096,6 +1102,11 @@ func TestStartRunForCampaignIssue_HydratesIssueContext(t *testing.T) {
 	if len(ic.Comments) != 1 || ic.Comments[0].Author != "octocat" || ic.Comments[0].Body != "first comment" {
 		t.Errorf("IssueContext.Comments = %+v, want the single fetched comment", ic.Comments)
 	}
+	// The params-struct WorkingDir threads onto the created run row (E48.69 /
+	// #2498), pinning the server-layer binding independently of the HTTP handler.
+	if got := rrepo.lastCreateRunParams.WorkingDir; got != wd {
+		t.Errorf("created run WorkingDir = %q, want the bound %q", got, wd)
+	}
 }
 
 // TestStartRunForCampaignIssue_HydrationDegradesOnFetchError pins the best-effort
@@ -1106,8 +1117,12 @@ func TestStartRunForCampaignIssue_HydrationDegradesOnFetchError(t *testing.T) {
 	gh := campaignHydrationGitHub(t, http.StatusInternalServerError, http.StatusOK)
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rrepo, GitHub: gh})
 
-	created, err := s.StartRunForCampaignIssue(context.Background(),
-		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local")
+	created, err := s.StartRunForCampaignIssue(context.Background(), StartRunForCampaignIssueParams{
+		Repo:       "kuhlman-labs/fishhawk",
+		IssueRef:   "issue:100",
+		WorkflowID: "feature_change",
+		RunnerKind: "local",
+	})
 	if err != nil {
 		t.Fatalf("StartRunForCampaignIssue must still start the run on a GetIssue error: %v", err)
 	}
@@ -1127,8 +1142,12 @@ func TestStartRunForCampaignIssue_HydrationDegradesOnCommentError(t *testing.T) 
 	gh := campaignHydrationGitHub(t, http.StatusOK, http.StatusInternalServerError)
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rrepo, GitHub: gh})
 
-	if _, err := s.StartRunForCampaignIssue(context.Background(),
-		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local"); err != nil {
+	if _, err := s.StartRunForCampaignIssue(context.Background(), StartRunForCampaignIssueParams{
+		Repo:       "kuhlman-labs/fishhawk",
+		IssueRef:   "issue:100",
+		WorkflowID: "feature_change",
+		RunnerKind: "local",
+	}); err != nil {
 		t.Fatalf("StartRunForCampaignIssue: %v", err)
 	}
 	ic := rrepo.lastCreateRunParams.IssueContext
@@ -1140,6 +1159,79 @@ func TestStartRunForCampaignIssue_HydrationDegradesOnCommentError(t *testing.T) 
 	}
 	if len(ic.Comments) != 0 {
 		t.Errorf("IssueContext.Comments = %+v, want empty after the comment-fetch failure", ic.Comments)
+	}
+}
+
+// TestStartRunForCampaignIssue_ErrorBranches pins the pre-flight error returns
+// of the params-struct StartRunForCampaignIssue (E48.69 / #2498 reshaped its body
+// so these branches count as changed): a repo not in owner/name form, a
+// workflow-spec fetch failure, a spec that fails to parse, and a workflow id
+// absent from the parsed spec. Each must surface the naming error rather than
+// minting a run.
+func TestStartRunForCampaignIssue_ErrorBranches(t *testing.T) {
+	cases := []struct {
+		name       string
+		repo       string
+		workflowID string
+		mutate     func(*fakeGitHubForRuns)
+		wantErr    string
+	}{
+		{
+			name:       "bad_repo_form",
+			repo:       "norepo", // no slash — fails strings.Cut before any GitHub call
+			workflowID: "feature_change",
+			wantErr:    "owner/name form",
+		},
+		{
+			name:       "spec_fetch_error",
+			repo:       "kuhlman-labs/fishhawk",
+			workflowID: "feature_change",
+			mutate: func(f *fakeGitHubForRuns) {
+				f.specStatus = http.StatusInternalServerError
+				f.specBody = ""
+			},
+			wantErr: "fetch workflow spec",
+		},
+		{
+			name:       "spec_parse_error",
+			repo:       "kuhlman-labs/fishhawk",
+			workflowID: "feature_change",
+			mutate: func(f *fakeGitHubForRuns) {
+				bad := base64.StdEncoding.EncodeToString([]byte("this: [is not valid yaml"))
+				f.specBody = `{"path":".fishhawk/workflows.yaml","sha":"s","content":"` + bad + `","encoding":"base64","type":"file"}`
+			},
+			wantErr: "parse workflow spec",
+		},
+		{
+			name:       "workflow_not_found",
+			repo:       "kuhlman-labs/fishhawk",
+			workflowID: "ghost_workflow", // valid spec, unknown id
+			wantErr:    "not defined",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rrepo := newFakeRepo()
+			fake := newFakeGitHubForRuns(gatedSpecYAML)
+			if tc.mutate != nil {
+				tc.mutate(fake)
+			}
+			ghSrv := fake.server(t)
+			s := newServerWithGitHub(t, rrepo, ghSrv)
+
+			_, err := s.StartRunForCampaignIssue(context.Background(), StartRunForCampaignIssueParams{
+				Repo:       tc.repo,
+				IssueRef:   "issue:100",
+				WorkflowID: tc.workflowID,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want an error containing %q", err, tc.wantErr)
+			}
+			// No run was minted on any error branch.
+			if rrepo.lastCreateRunParams.Repo != "" {
+				t.Errorf("a run was minted despite the error branch: %+v", rrepo.lastCreateRunParams)
+			}
+		})
 	}
 }
 

@@ -2113,6 +2113,11 @@ type startCampaignItemRunRequest struct {
 	WorkflowID  string `json:"workflow_id"`
 	WorkflowRef string `json:"workflow_ref,omitempty"`
 	RunnerKind  string `json:"runner_kind,omitempty"`
+	// WorkingDir binds the minted run's local checkout (E48.69 / #2498) so the
+	// later runner-spawning verbs inherit it. The MCP tool layer validates it
+	// (required for a local item, absolute for any kind) before this round-trip;
+	// the backend independently 400s a non-absolute value.
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 // StartCampaignItemRunResult mirrors the backend's POST
@@ -2136,14 +2141,17 @@ type StartCampaignItemRunResult struct {
 //   - 409 campaign_not_startable (the campaign is paused or terminal)
 //   - 409 item_not_eligible (the item is blocked on a dependency, already
 //     running, or terminal — the detail names the blocker)
+//   - 400 validation_failed (a non-absolute working_dir; E48.69 / #2498 — the
+//     backend refuses a relative binding the same way POST /v0/runs does)
 //   - 502 campaign_run_start_failed (the installation/spec could not be resolved)
 //   - 503 campaign_repo_unconfigured
-func (c *apiClient) StartCampaignItemRun(ctx context.Context, campaignID uuid.UUID, issueRef, workflowID, workflowRef, runnerKind string) (*StartCampaignItemRunResult, error) {
+func (c *apiClient) StartCampaignItemRun(ctx context.Context, campaignID uuid.UUID, issueRef, workflowID, workflowRef, runnerKind, workingDir string) (*StartCampaignItemRunResult, error) {
 	body, err := json.Marshal(startCampaignItemRunRequest{
 		IssueRef:    issueRef,
 		WorkflowID:  workflowID,
 		WorkflowRef: workflowRef,
 		RunnerKind:  runnerKind,
+		WorkingDir:  workingDir,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal start campaign item run: %w", err)

@@ -3017,6 +3017,107 @@ func TestStartCampaignItemRun_Eligible_CrossBoundary_E2E(t *testing.T) {
 	}
 }
 
+// TestStartCampaignItemRun_BindsWorkingDirOnMintedRun is the E1 cross-boundary
+// done-means for E48.69 / #2498: a POST carrying an absolute working_dir crosses
+// HTTP → StartRunForCampaignIssue → CreateRunForTrigger to a genuinely minted
+// run, and BOTH the 201 body's run.working_dir AND the re-read persisted run row
+// carry the value. Reading the persisted row (not just the response) is the
+// automated form of the issue's control-pair check and the #1169 done-means
+// no-op-touch guard: a comment-only touch of campaigns.go/runs.go fails here.
+//
+// Counterfactual: drop `WorkingDir: req.WorkingDir` from the params struct in
+// handleStartCampaignItemRun (or `WorkingDir: p.WorkingDir` in
+// StartRunForCampaignIssue) → the minted run carries "" → RED on both the body
+// and the persisted-row assertions.
+func TestStartCampaignItemRun_BindsWorkingDirOnMintedRun(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	wd := t.TempDir() // absolute
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local","working_dir":`+strconv.Quote(wd)+`}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body.Run.WorkingDir != wd {
+		t.Errorf("201 body run.working_dir = %q, want the bound %q", body.Run.WorkingDir, wd)
+	}
+	// Re-read the persisted run row so the assertion is on committed state.
+	persisted, ok := rrepo.runs[body.Run.ID]
+	if !ok {
+		t.Fatalf("run %s was not persisted", body.Run.ID)
+	}
+	if persisted.WorkingDir != wd {
+		t.Errorf("persisted run working_dir = %q, want the bound %q", persisted.WorkingDir, wd)
+	}
+}
+
+// TestStartCampaignItemRun_RelativeWorkingDir_Rejected is the M4 REST refusal
+// (E48.69 / #2498): a POST with a relative working_dir returns 400
+// validation_failed naming the field. Because this control's real effect is
+// COMMITTED STATE (a fired-then-rolled-back guard would return a byte-identical
+// error), the test reads state AFTER the call: no run row was minted and the
+// campaign item is still pending with a nil run_id.
+//
+// Counterfactual: delete the `!filepath.IsAbs` guard in handleStartCampaignItemRun
+// → the relative value flows to StartRunForCampaignIssue, a run is minted and the
+// item is linked → RED on the state assertions (a run row appears, the item
+// leaves pending).
+func TestStartCampaignItemRun_RelativeWorkingDir_Rejected(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local","working_dir":"./sub"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error body: %v (body=%s)", err, w.Body.String())
+	}
+	if env.Error.Code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", env.Error.Code)
+	}
+	if env.Error.Details["field"] != "working_dir" {
+		t.Errorf("error details.field = %v, want working_dir", env.Error.Details["field"])
+	}
+	// Committed-state reads: no run minted, item still pending, nil run_id.
+	if len(rrepo.runs) != 0 {
+		t.Errorf("a run was minted despite the 400: %d run rows", len(rrepo.runs))
+	}
+	items, err := crepo.ListCampaignItemsForCampaign(context.Background(), c.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	for _, it := range items {
+		if it.IssueRef != "issue:100" {
+			continue
+		}
+		if it.State != campaign.ItemStatePending {
+			t.Errorf("item state = %q, want still pending after the refusal", it.State)
+		}
+		if it.RunID != nil {
+			t.Errorf("item run_id = %v, want nil (no run linked) after the refusal", it.RunID)
+		}
+	}
+}
+
 // TestStartCampaignItemRun_ReconcileOnRead_SettlesAndAdvances_E2E starts an
 // eligible item, flips its linked run to terminal succeeded, and asserts the
 // status read settles the item done, advances next_action to the now-eligible
@@ -5078,8 +5179,12 @@ func TestCampaignDecomposedParent_ChildrenBindOwnSlice_E2E(t *testing.T) {
 	s.promptIssueGetterOverride = &stubIssueGetter{}
 
 	// runs.go boundary: mint the campaign parent run.
-	parent, err := s.StartRunForCampaignIssue(context.Background(),
-		"kuhlman-labs/fishhawk", "issue:100", "feature_change", "", "local")
+	parent, err := s.StartRunForCampaignIssue(context.Background(), StartRunForCampaignIssueParams{
+		Repo:       "kuhlman-labs/fishhawk",
+		IssueRef:   "issue:100",
+		WorkflowID: "feature_change",
+		RunnerKind: "local",
+	})
 	if err != nil {
 		t.Fatalf("StartRunForCampaignIssue: %v", err)
 	}

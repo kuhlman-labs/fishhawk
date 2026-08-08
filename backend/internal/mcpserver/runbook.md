@@ -338,12 +338,19 @@ GitHub Actions. The response carries the readiness `rollup`
 `resume` (a paged gate is handled), `complete` (terminal). Poll it as your
 drive tick; do not track batch state out-of-band.
 
-**3. Start ONE item — `runner_kind:local` always.**
+**3. Start ONE item — `runner_kind:local` AND `working_dir` always.**
 `fishhawk_start_campaign_item_run` (`campaign_id` + `issue_ref` +
 `workflow_id`) when `next_action` is `start_run`. **Always pass
 `runner_kind:local`** — the same execution/tag-mismatch hazard as
 `fishhawk_start_run` (see the `runner_kind:local` section above): a
-`github_actions`-tagged item never dispatches on this host. The call refuses an
+`github_actions`-tagged item never dispatches on this host. **Pass `working_dir`
+alongside it** — the absolute path to your checkout (you resolve your own, you are
+running inside one). It is REQUIRED for a `local` item (an omitted value is refused,
+not silently defaulted to the client's cwd; a non-absolute value is refused for any
+kind) and it binds the minted run, so **every later verb for that item —
+`fishhawk_drive_run` / `run_stage` / `dispatch_stage` / `run_children` — inherits it
+and you omit `working_dir` on those calls** (E48.69 / #2498; same inheritance the
+solo-run `working_dir` section above describes). The call refuses an
 ineligible item with `item_not_eligible`, naming the blocking dependency; a
 paused/terminal campaign refuses with `campaign_not_startable`; an unknown ref is
 `campaign_item_not_found`. It mints the run, links it to the item, and moves the

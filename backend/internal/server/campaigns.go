@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -1096,6 +1097,13 @@ type startCampaignItemRunRequest struct {
 	WorkflowID  string `json:"workflow_id"`
 	WorkflowRef string `json:"workflow_ref,omitempty"`
 	RunnerKind  string `json:"runner_kind,omitempty"`
+	// WorkingDir binds the minted run's local checkout (E48.69 / #2498) so the
+	// later runner-spawning verbs inherit it. Empty leaves the run unbound (the
+	// github_actions path). When non-empty it must be absolute — the handler
+	// 400s a relative value the same way POST /v0/runs does. The
+	// DisallowUnknownFields decoder makes declaring the field mandatory for it
+	// to be accepted at all.
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 // handleStartCampaignItemRun implements POST /v0/campaigns/{campaign_id}/runs:
@@ -1107,9 +1115,12 @@ type startCampaignItemRunRequest struct {
 // it — never "start the ref" (#1697); every other refusal keeps the generic
 // item_not_eligible detail. On an eligible/restartable item it mints the
 // run via Server.StartRunForCampaignIssue (carrying runner_kind so the local
-// loop gets runner_kind:local), links it with SetCampaignItemRun, transitions
-// the item pending → running, and derives/advances the campaign so a
-// pending campaign moves to running on its first dispatch.
+// loop gets runner_kind:local, and working_dir so the minted run binds the
+// operator's checkout that every later runner-spawning verb inherits — E48.69 /
+// #2498), links it with SetCampaignItemRun, transitions the item pending →
+// running, and derives/advances the campaign so a pending campaign moves to
+// running on its first dispatch. A non-empty non-absolute working_dir 400s
+// validation_failed, mirroring POST /v0/runs.
 //
 // The nil-CampaignRepo guard is checked BEFORE the write-scope check so an
 // unconfigured deployment answers 503 (not 401), matching the other campaign
@@ -1157,6 +1168,18 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 				map[string]any{"field": "runner_kind", "got": req.RunnerKind})
 			return
 		}
+	}
+	// working_dir, when supplied, must be absolute (E48.69 / #2498) — the same
+	// guard handleCreateRun applies at POST /v0/runs, so both run-minting
+	// endpoints refuse a relative binding the same way. A relative value would
+	// resolve against the daemon host's cwd and poison every later inheriting
+	// verb. This is the transport-agnostic REST guard; the actionable
+	// agent-facing 'local requires working_dir' refusal lives in the MCP layer.
+	if req.WorkingDir != "" && !filepath.IsAbs(req.WorkingDir) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"working_dir must be an absolute path",
+			map[string]any{"field": "working_dir", "got": req.WorkingDir})
+		return
 	}
 
 	c, err := s.cfg.CampaignRepo.GetCampaign(r.Context(), id)
@@ -1302,7 +1325,14 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	// gets runner_kind:local. A resolution failure (installation/spec) surfaces
 	// 502 — the same upstream-dependency class as the create handler's
 	// epic_children_query_failed — leaving the item un-started for a retry.
-	runRow, err := s.StartRunForCampaignIssue(r.Context(), c.Repo, req.IssueRef, req.WorkflowID, req.WorkflowRef, req.RunnerKind)
+	runRow, err := s.StartRunForCampaignIssue(r.Context(), StartRunForCampaignIssueParams{
+		Repo:        c.Repo,
+		IssueRef:    req.IssueRef,
+		WorkflowID:  req.WorkflowID,
+		WorkflowRef: req.WorkflowRef,
+		RunnerKind:  req.RunnerKind,
+		WorkingDir:  req.WorkingDir,
+	})
 	if err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "campaign_run_start_failed",
 			"could not start a run for the campaign item",
