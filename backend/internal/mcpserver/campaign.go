@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/google/uuid"
@@ -193,16 +194,20 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 // --- fishhawk_start_campaign_item_run (E26.2 / #1481) ---
 
 // StartCampaignItemRunInput is the fishhawk_start_campaign_item_run tool's
-// input. campaign_id + issue_ref + workflow_id are required; workflow_ref and
-// runner_kind are optional. There is deliberately no idempotency_key — the
-// backend does not dedup this start, and the DAG eligibility gate already
-// refuses a re-start against an already-running item.
+// input. campaign_id + issue_ref + workflow_id are required; workflow_ref,
+// runner_kind and working_dir are optional (working_dir is REQUIRED when
+// runner_kind is local — see startCampaignItemRun's guards). There is
+// deliberately no idempotency_key — the backend does not dedup this start, and
+// the DAG eligibility gate already refuses a re-start against an already-running
+// item.
 type StartCampaignItemRunInput struct {
 	CampaignID  string `json:"campaign_id" jsonschema:"the campaign UUID (from fishhawk_start_campaign)"`
 	IssueRef    string `json:"issue_ref" jsonschema:"the campaign item's issue ref to start (must be one of the campaign's items and currently startable per the DAG: either eligible, or a deps-satisfied cancelled item, which is restarted with a fresh run)"`
 	WorkflowID  string `json:"workflow_id" jsonschema:"the workflow id to run for this issue (e.g. 'feature_change')"`
 	WorkflowRef string `json:"workflow_ref,omitempty" jsonschema:"OPTIONAL git ref to fetch the workflow spec at; omit for the repo's default branch"`
 	RunnerKind  string `json:"runner_kind,omitempty" jsonschema:"OPTIONAL execution backend: 'github_actions' (default) or 'local'. Pass 'local' for the local dogfood loop so the run executes through the local runner"`
+	// WorkingDir binds the minted run's local checkout (E48.69 / #2498).
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this campaign item's run executes in. REQUIRED when runner_kind is local; bound to the minted run so run_stage/dispatch_stage/run_children/drive_run all inherit it with no per-call repetition. YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path. A non-absolute value is refused for any runner_kind"`
 }
 
 // StartCampaignItemRunOutput carries the minted run plus the linked campaign
@@ -235,7 +240,13 @@ fishhawk_get_campaign_status again after starting — the status read settles ea
 run as it reaches terminal and advances the campaign in DAG order.
 
 campaign_id, issue_ref, and workflow_id are required. Pass runner_kind 'local'
-for the local dogfood loop. A write tool: needs an operator token with
+for the local dogfood loop; for a local item working_dir is REQUIRED — the
+absolute path to the checkout this item's run executes in (you resolve your own
+checkout, you are running inside one). working_dir binds the minted run, so
+run_stage/dispatch_stage/run_children/drive_run for that item all inherit it and
+you pass it once. An omitted working_dir on a local item is refused rather than
+falling through to the client's cwd; a non-absolute working_dir is refused for
+any runner_kind. A write tool: needs an operator token with
 write:campaigns scope (a runner-bound token is rejected 403). A running or
 still-blocked item fails item_not_eligible (the detail names the unmet
 dependency); a deps-satisfied autonomy:low (human-led) item fails item_human_led
@@ -259,7 +270,31 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, _ *mcp.CallToolR
 		return nil, StartCampaignItemRunOutput{}, errors.New("workflow_id is required")
 	}
 
-	res, err := r.api.StartCampaignItemRun(ctx, id, in.IssueRef, in.WorkflowID, in.WorkflowRef, in.RunnerKind)
+	// working_dir guards (E48.69 / #2498), fired BEFORE the r.api round-trip so
+	// a refusal dials no backend and mints no run. Both guards are transport-
+	// INDEPENDENT — the issue's proposal 3 asks for a loud refusal rather than
+	// the stdio cwd fall-through, so unlike start_run's HTTP-only admission
+	// check these fire on stdio too.
+	workingDir := strings.TrimSpace(in.WorkingDir)
+	if workingDir == "" && in.RunnerKind == driveRunnerKindLocal {
+		// A local item binds the checkout every later runner-spawning verb
+		// inherits, so an omitted value is refused — never a silent fall-through
+		// to the client process's own cwd (the #1866 contamination shape).
+		return nil, StartCampaignItemRunOutput{}, errors.New(
+			"working_dir is required for a local campaign item run: resolve your own checkout (you are running inside one) and pass its absolute path — it binds the minted run and every later stage verb inherits it")
+	}
+	if workingDir != "" && !filepath.IsAbs(workingDir) {
+		// Refused for ANY runner_kind: a relative value would resolve against
+		// the fishhawkd host's cwd, not the operator's project, and the run's
+		// persisted binding would be poisoned.
+		return nil, StartCampaignItemRunOutput{}, fmt.Errorf(
+			"working_dir %q must be an absolute path: a relative path resolves against the fishhawkd host's cwd, not your project, so it is refused for any runner_kind; resolve your own checkout and pass its absolute path — it binds the minted run and every later stage inherits it", workingDir)
+	}
+	if workingDir != "" {
+		workingDir = filepath.Clean(workingDir)
+	}
+
+	res, err := r.api.StartCampaignItemRun(ctx, id, in.IssueRef, in.WorkflowID, in.WorkflowRef, in.RunnerKind, workingDir)
 	if err != nil {
 		var ae *apiError
 		if errors.As(err, &ae) {

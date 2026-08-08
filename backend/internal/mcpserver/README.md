@@ -991,7 +991,11 @@ per-tool contract). Internals not covered there:
   create + status surfaces round-trip the override back.
 - **Gate-code mapping.** Each verb maps the backend gate codes onto operator-actionable tool errors;
   `fishhawk_start_campaign_item_run` (E26.2 / #1481; `campaign_id` + `issue_ref` + `workflow_id` required, optional
-  `workflow_ref` + `runner_kind` — pass `local` for the local loop) maps `item_not_eligible` / `item_human_led`
+  `workflow_ref` + `runner_kind` — pass `local` for the local loop — and `working_dir` (E48.69 / #2498): the absolute
+  checkout path, REQUIRED for a `local` item, bound onto the minted run so `run_stage` / `dispatch_stage` /
+  `run_children` / `drive_run` all inherit it. The tool refuses a `local` item with no `working_dir` and a
+  non-absolute `working_dir` for any kind on BOTH transports — a strictly stronger rule than `start_run`'s HTTP-only
+  guard) maps `item_not_eligible` / `item_human_led`
   (#1697) / `campaign_item_not_found` / `campaign_not_startable` / `campaign_run_start_failed`.
 - **`next_actions` mapping.** `fishhawk_get_campaign_status` maps `next_action` onto a legal operator move via
   `campaignNextActionsFor`, so the agent never reads an unclassified state. `fishhawk_resume_campaign` is legal only
@@ -1000,7 +1004,8 @@ per-tool contract). Internals not covered there:
   (`docs/spec/operator-role.md`), not hard-coded here.
 - **Batch-as-campaign local drive.** The step-by-step operator procedure for driving a multi-issue batch
   locally as one campaign — `fishhawk_start_campaign` → a `fishhawk_get_campaign_status` drive-tick loop
-  (the single status surface) → `fishhawk_start_campaign_item_run` with `runner_kind:local` per eligible
+  (the single status surface) → `fishhawk_start_campaign_item_run` with `runner_kind:local` AND an absolute
+  `working_dir` (bound onto the minted run, so every later verb for that item inherits it) per eligible
   item → a per-item `fishhawk_drive_run` handoff, one item at a time with a per-item `scripts/dev post-merge`
   before the next item ([#1918](https://github.com/kuhlman-labs/fishhawk/issues/1918) governs the serialize
   rule) — is the `fishhawk://runbook` resource's **Batch-as-campaign (local campaign drive)** section

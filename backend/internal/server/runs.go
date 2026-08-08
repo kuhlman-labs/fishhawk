@@ -1165,52 +1165,58 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 // campaign's runs execute through the local dogfood loop. runner_kind affects
 // only execution dispatch, not spec resolution, so the GitHub fetch below is
 // unaffected by the choice.
-func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, workflowID, workflowRef, runnerKind string) (*run.Run, error) {
+//
+// The inputs travel in a params struct (StartRunForCampaignIssueParams): six
+// adjacent same-typed string parameters are a transposition hazard the compiler
+// cannot catch, and the campaign path now carries a WorkingDir binding
+// (E48.69 / #2498) that the positional signature would only widen.
+func (s *Server) StartRunForCampaignIssue(ctx context.Context, p StartRunForCampaignIssueParams) (*run.Run, error) {
 	if s.cfg.GitHub == nil {
 		return nil, errors.New("campaign run start requires a configured GitHub client")
 	}
-	owner, name, ok := strings.Cut(repo, "/")
+	owner, name, ok := strings.Cut(p.Repo, "/")
 	if !ok || owner == "" || name == "" {
-		return nil, fmt.Errorf("campaign repo %q is not in owner/name form", repo)
+		return nil, fmt.Errorf("campaign repo %q is not in owner/name form", p.Repo)
 	}
 	repoRef := forge.RepoRef{Owner: owner, Name: name}
 
 	instID, err := s.cfg.GitHub.GetRepoInstallation(ctx, repoRef)
 	if err != nil {
-		return nil, fmt.Errorf("resolve installation for %s: %w", repo, err)
+		return nil, fmt.Errorf("resolve installation for %s: %w", p.Repo, err)
 	}
 
-	fc, err := s.cfg.GitHub.GetWorkflowSpec(ctx, forge.FromGitHubInstallationID(instID), repoRef, workflowRef)
+	fc, err := s.cfg.GitHub.GetWorkflowSpec(ctx, forge.FromGitHubInstallationID(instID), repoRef, p.WorkflowRef)
 	if err != nil {
-		return nil, fmt.Errorf("fetch workflow spec for %s: %w", repo, err)
+		return nil, fmt.Errorf("fetch workflow spec for %s: %w", p.Repo, err)
 	}
 	parsed, err := spec.ParseBytes(fc.Content)
 	if err != nil {
-		return nil, fmt.Errorf("parse workflow spec for %s: %w", repo, err)
+		return nil, fmt.Errorf("parse workflow spec for %s: %w", p.Repo, err)
 	}
-	wf, ok := parsed.Workflows[workflowID]
+	wf, ok := parsed.Workflows[p.WorkflowID]
 	if !ok {
-		return nil, fmt.Errorf("workflow %q not defined in %s spec", workflowID, repo)
+		return nil, fmt.Errorf("workflow %q not defined in %s spec", p.WorkflowID, p.Repo)
 	}
 	if len(wf.Stages) == 0 {
-		return nil, fmt.Errorf("workflow %q in %s spec has no stages", workflowID, repo)
+		return nil, fmt.Errorf("workflow %q in %s spec has no stages", p.WorkflowID, p.Repo)
 	}
 
-	triggerRef := issueRef
+	triggerRef := p.IssueRef
 	// Best-effort IssueContext hydration (#1721): parse the issue number and
 	// fetch title/body/url/number + comments so campaign-minted parents carry
 	// the same cached context as CLI/webhook runs. A decomposed parent's
 	// children inherit this to build their headers + degraded prompt context.
 	// Degrades to nil on a parse or fetch failure — hydration never blocks the
 	// start; child scope correctness rests on the SliceIndex linkage instead.
-	issueCtx := s.hydrateCampaignIssueContext(ctx, instID, repoRef, issueRef)
+	issueCtx := s.hydrateCampaignIssueContext(ctx, instID, repoRef, p.IssueRef)
 	return s.CreateRunForTrigger(ctx, CreateRunForTriggerParams{
-		Repo:               repo,
-		WorkflowID:         workflowID,
+		Repo:               p.Repo,
+		WorkflowID:         p.WorkflowID,
 		WorkflowSHA:        fc.SHA,
 		TriggerSource:      run.TriggerGitHubIssue,
 		TriggerRef:         &triggerRef,
-		RunnerKind:         runnerKind,
+		RunnerKind:         p.RunnerKind,
+		WorkingDir:         p.WorkingDir,
 		InstallationID:     &instID,
 		IssueContext:       issueCtx,
 		HaveStageDefs:      true,
@@ -1218,6 +1224,31 @@ func (s *Server) StartRunForCampaignIssue(ctx context.Context, repo, issueRef, w
 		WorkflowSpec:       fc.Content,
 		MaxRetriesSnapshot: webhook.WorkflowMaxRetries(wf),
 	})
+}
+
+// StartRunForCampaignIssueParams carries the inputs StartRunForCampaignIssue
+// resolves a campaign issue's run from (E48.69 / #2498). A params struct rather
+// than positional args: the method previously took six adjacent same-typed
+// strings, a transposition hazard the compiler cannot catch, and the repo
+// already uses this idiom for CreateRunForTriggerParams next door.
+type StartRunForCampaignIssueParams struct {
+	// Repo is the campaign repo as owner/name.
+	Repo string
+	// IssueRef is the campaign item's issue ref to start.
+	IssueRef string
+	// WorkflowID is the workflow to run for the issue.
+	WorkflowID string
+	// WorkflowRef is the git ref to fetch the spec at; empty = the repo's
+	// default branch.
+	WorkflowRef string
+	// RunnerKind selects the execution backend; empty = the repo-layer
+	// github_actions default.
+	RunnerKind string
+	// WorkingDir binds the minted run's local checkout (E48.69 / #2498) so
+	// every later runner-spawning verb inherits it. Empty means an UNBOUND run
+	// — the github_actions / auto-driver case, which spawns no local runner and
+	// so binds no checkout.
+	WorkingDir string
 }
 
 // hydrateCampaignIssueContext best-effort fetches a campaign item's issue into

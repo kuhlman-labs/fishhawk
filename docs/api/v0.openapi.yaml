@@ -2035,6 +2035,15 @@ components:
           type: string
           enum: [github_actions, local]
           description: OPTIONAL execution backend; defaults to `github_actions`. Pass `local` for the local dogfood loop.
+        working_dir:
+          type: string
+          description: >-
+            OPTIONAL absolute path to the checkout this campaign item's run
+            executes in (E48.69 / #2498). When set it binds the minted run so
+            every later runner-spawning verb inherits it. A non-empty
+            non-absolute value is refused with 400 `validation_failed`
+            (`details.field` = `working_dir`), the same guard POST /v0/runs
+            applies. Empty leaves the run unbound (the github_actions path).
 
     StartCampaignItemRunResult:
       type: object

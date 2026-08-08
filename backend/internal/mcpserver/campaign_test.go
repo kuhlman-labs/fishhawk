@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -651,14 +653,16 @@ func TestResumeCampaign_NotFound_MapsActionableError(t *testing.T) {
 
 // TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem drives the whole
 // tool→client→wire→decode chain: the input's issue_ref/workflow_id/workflow_ref/
-// runner_kind reach the POST body (at the campaign-id path), and the {run,item}
-// response decodes back out.
+// runner_kind/working_dir reach the POST body (at the campaign-id path), and the
+// {run,item} response — including the run's echoed working_dir binding (E48.69 /
+// #2498) — decodes back out (E2 of the plan's cross-boundary strategy).
 func TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	id := uuid.New()
 	runID := uuid.NewString()
+	wd := t.TempDir() // an absolute checkout path
 	fb.startCampaignItemRunResp = StartCampaignItemRunResult{
-		Run:  Run{ID: runID, Repo: "kuhlman-labs/fishhawk", State: "pending", RunnerKind: "local"},
+		Run:  Run{ID: runID, Repo: "kuhlman-labs/fishhawk", State: "pending", RunnerKind: "local", WorkingDir: wd},
 		Item: CampaignItem{ID: uuid.NewString(), IssueRef: "issue:100", State: "running", RunID: runID},
 	}
 	r := newResolver(srv, nil)
@@ -669,6 +673,7 @@ func TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem(t *testing.T) {
 		WorkflowID:  "feature_change",
 		WorkflowRef: "main",
 		RunnerKind:  "local",
+		WorkingDir:  wd,
 	})
 	if err != nil {
 		t.Fatalf("startCampaignItemRun: %v", err)
@@ -682,8 +687,14 @@ func TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem(t *testing.T) {
 		fb.startCampaignItemRunBody.RunnerKind != "local" {
 		t.Errorf("backend got body = %+v", fb.startCampaignItemRunBody)
 	}
+	if fb.startCampaignItemRunBody.WorkingDir != wd {
+		t.Errorf("working_dir did not reach the POST body: got %q, want %q", fb.startCampaignItemRunBody.WorkingDir, wd)
+	}
 	if out.Run.ID != runID || out.Run.RunnerKind != "local" {
 		t.Errorf("decoded run = %+v, want id=%s runner_kind=local", out.Run, runID)
+	}
+	if out.Run.WorkingDir != wd {
+		t.Errorf("decoded run working_dir = %q, want the bound %q", out.Run.WorkingDir, wd)
 	}
 	if out.Item.IssueRef != "issue:100" || out.Item.State != "running" || out.Item.RunID != runID {
 		t.Errorf("decoded item = %+v, want issue:100 running linked to %s", out.Item, runID)
@@ -691,8 +702,10 @@ func TestStartCampaignItemRun_HappyPath_PostsBodyDecodesRunItem(t *testing.T) {
 }
 
 // TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty pins that
-// omitting workflow_ref/runner_kind sends empty values (the backend defaults
-// them: default branch + github_actions).
+// omitting workflow_ref/runner_kind/working_dir sends empty values (the backend
+// defaults them: default branch + github_actions, unbound run). runner_kind is
+// omitted here (the github_actions path), so the local-requires-working_dir
+// guard does not fire.
 func TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
@@ -705,8 +718,191 @@ func TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty(t *testing.T
 	if err != nil {
 		t.Fatalf("startCampaignItemRun: %v", err)
 	}
-	if fb.startCampaignItemRunBody.WorkflowRef != "" || fb.startCampaignItemRunBody.RunnerKind != "" {
+	if fb.startCampaignItemRunBody.WorkflowRef != "" || fb.startCampaignItemRunBody.RunnerKind != "" ||
+		fb.startCampaignItemRunBody.WorkingDir != "" {
 		t.Errorf("optional fields not empty: %+v", fb.startCampaignItemRunBody)
+	}
+}
+
+// TestStartCampaignItemRun_LocalRequiresWorkingDir pins the M1 refusal and its
+// M2 negative control (E48.69 / #2498). local + omitted working_dir is refused
+// naming working_dir, and the backend is NEVER dialed (the explicit never-dialed
+// seam, startCampaignItemRunCalls == 0, distinguishes a local refusal from a
+// backend rejection). github_actions + omitted working_dir SUCCEEDS — without
+// this control the M1 guard could pass by refusing everything.
+//
+// Counterfactual: deleting the empty+local guard in startCampaignItemRun dials
+// the backend and returns no error on the local subtest → RED on both the error
+// assertion and the never-dialed assertion.
+func TestStartCampaignItemRun_LocalRequiresWorkingDir(t *testing.T) {
+	t.Run("local_no_working_dir_refused_never_dialed", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+
+		_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+			CampaignID: uuid.NewString(),
+			IssueRef:   "issue:1",
+			WorkflowID: "feature_change",
+			RunnerKind: "local",
+		})
+		if err == nil || !strings.Contains(err.Error(), "working_dir") {
+			t.Fatalf("err = %v, want a refusal naming working_dir", err)
+		}
+		if fb.startCampaignItemRunCalls != 0 {
+			t.Errorf("backend was dialed %d times; a local refusal must never dial the backend", fb.startCampaignItemRunCalls)
+		}
+	})
+
+	t.Run("github_actions_no_working_dir_succeeds", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+
+		_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+			CampaignID: uuid.NewString(),
+			IssueRef:   "issue:1",
+			WorkflowID: "feature_change",
+			RunnerKind: "github_actions",
+		})
+		if err != nil {
+			t.Fatalf("github_actions with no working_dir must succeed, got %v", err)
+		}
+		if fb.startCampaignItemRunCalls != 1 {
+			t.Errorf("backend dialed %d times, want exactly 1 (the negative control proves the guard does not refuse everything)", fb.startCampaignItemRunCalls)
+		}
+	})
+}
+
+// TestStartCampaignItemRun_RelativeWorkingDirRefusedAnyRunnerKind pins the M3
+// refusal (E48.69 / #2498): a relative working_dir is refused for BOTH
+// runner_kind local AND github_actions, naming working_dir and absolute, and the
+// backend is never dialed. Deleting the IsAbs guard lets both through → RED.
+func TestStartCampaignItemRun_RelativeWorkingDirRefusedAnyRunnerKind(t *testing.T) {
+	for _, rk := range []string{"local", "github_actions"} {
+		t.Run(rk, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+
+			_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+				CampaignID: uuid.NewString(),
+				IssueRef:   "issue:1",
+				WorkflowID: "feature_change",
+				RunnerKind: rk,
+				WorkingDir: "./sub", // relative
+			})
+			if err == nil || !strings.Contains(err.Error(), "working_dir") || !strings.Contains(err.Error(), "absolute") {
+				t.Fatalf("err = %v, want a refusal naming working_dir and absolute", err)
+			}
+			if fb.startCampaignItemRunCalls != 0 {
+				t.Errorf("backend was dialed %d times; a relative-path refusal must never dial the backend", fb.startCampaignItemRunCalls)
+			}
+		})
+	}
+}
+
+// TestStartCampaignItemRun_AbsoluteWorkingDirPassedThroughCleaned pins that an
+// absolute (but un-cleaned) working_dir is filepath.Clean'd and passed through to
+// the POST body (E48.69 / #2498) rather than refused.
+func TestStartCampaignItemRun_AbsoluteWorkingDirPassedThroughCleaned(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	base := t.TempDir()
+	uncleaned := base + "/./" // absolute but not cleaned
+	_, _, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(),
+		IssueRef:   "issue:1",
+		WorkflowID: "feature_change",
+		RunnerKind: "local",
+		WorkingDir: uncleaned,
+	})
+	if err != nil {
+		t.Fatalf("absolute working_dir must pass through, got %v", err)
+	}
+	if fb.startCampaignItemRunBody.WorkingDir != filepath.Clean(uncleaned) {
+		t.Errorf("POST body working_dir = %q, want the cleaned %q", fb.startCampaignItemRunBody.WorkingDir, filepath.Clean(uncleaned))
+	}
+}
+
+// TestStartCampaignItemRun_RefusalIsTransportIndependent pins the M5 requirement
+// (E48.69 / #2498, the issue's proposal 3): the working_dir guards fire on BOTH
+// the HTTP transport AND stdio. On stdio the pre-change behavior was a silent
+// fall-through to the client's cwd, so this test goes red against today's code
+// and against any implementation that copies start_run's HTTP-only guard.
+func TestStartCampaignItemRun_RefusalIsTransportIndependent(t *testing.T) {
+	type refusalCase struct {
+		name string
+		in   StartCampaignItemRunInput
+	}
+	// The M1 (local + omitted) and M3 (relative) refusal inputs.
+	cases := []refusalCase{
+		{"local_omitted", StartCampaignItemRunInput{IssueRef: "issue:1", WorkflowID: "feature_change", RunnerKind: "local"}},
+		{"relative_local", StartCampaignItemRunInput{IssueRef: "issue:1", WorkflowID: "feature_change", RunnerKind: "local", WorkingDir: "./sub"}},
+		{"relative_gha", StartCampaignItemRunInput{IssueRef: "issue:1", WorkflowID: "feature_change", RunnerKind: "github_actions", WorkingDir: "./sub"}},
+	}
+	for _, httpTransport := range []bool{false, true} {
+		for _, tc := range cases {
+			t.Run(fmt.Sprintf("http=%v/%s", httpTransport, tc.name), func(t *testing.T) {
+				fb, srv := newFakeBackend(t)
+				r := newResolver(srv, nil)
+				r.httpTransport = httpTransport
+				in := tc.in
+				in.CampaignID = uuid.NewString()
+
+				_, _, err := r.startCampaignItemRun(context.Background(), nil, in)
+				if err == nil || !strings.Contains(err.Error(), "working_dir") {
+					t.Fatalf("err = %v, want a working_dir refusal on transport http=%v", err, httpTransport)
+				}
+				if fb.startCampaignItemRunCalls != 0 {
+					t.Errorf("backend dialed %d times on transport http=%v; the refusal must never dial the backend", fb.startCampaignItemRunCalls, httpTransport)
+				}
+			})
+		}
+	}
+}
+
+// TestStartCampaignItemRun_BindsWorkingDirInheritedByResolver is the DIRECT test
+// of the inheritance leg the operator's binding condition 1 requires (E48.69 /
+// #2498): mint a campaign item run carrying an absolute working_dir, then assert
+// the run-aware resolver resolveWorkingDirForRun — the seam the stage verbs
+// (run_stage/dispatch_stage/run_children/drive_run) call — returns that bound
+// value for an OMITTED input on that run id. This observes the issue's "resolve
+// by inheritance with no per-call repetition" clause directly rather than by
+// composition. The fake backend persists the minted run (POST body.working_dir →
+// getRunByID) so the resolver's GET reads it back.
+//
+// Counterfactual: remove the `WorkingDir: workingDir` binding from the
+// r.api.StartCampaignItemRun call — the minted run then carries no binding, and
+// resolveWorkingDirForRun over HTTP falls through to resolveWorkingDir("") which
+// refuses, so the inherit assertion goes RED (an error instead of the bound dir).
+func TestStartCampaignItemRun_BindsWorkingDirInheritedByResolver(t *testing.T) {
+	_, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	r.httpTransport = true // the inheriting verbs run over HTTP; stdio would fall back to cwd
+
+	wd := t.TempDir()
+	_, out, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(),
+		IssueRef:   "issue:1",
+		WorkflowID: "feature_change",
+		RunnerKind: "local",
+		WorkingDir: wd,
+	})
+	if err != nil {
+		t.Fatalf("startCampaignItemRun: %v", err)
+	}
+	mintedRunID, err := uuid.Parse(out.Run.ID)
+	if err != nil {
+		t.Fatalf("minted run id %q not a UUID: %v", out.Run.ID, err)
+	}
+
+	// Inheritance: an OMITTED input on the minted run resolves to the bound dir
+	// with no per-call repetition.
+	got, err := r.resolveWorkingDirForRun(context.Background(), mintedRunID, "")
+	if err != nil {
+		t.Fatalf("resolveWorkingDirForRun on the minted run with an omitted input must inherit the binding, got %v", err)
+	}
+	if got != filepath.Clean(wd) {
+		t.Errorf("inherited working_dir = %q, want the bound %q", got, filepath.Clean(wd))
 	}
 }
 
