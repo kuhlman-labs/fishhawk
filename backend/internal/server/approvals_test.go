@@ -1641,7 +1641,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, "", "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)
@@ -7634,5 +7634,255 @@ func TestApprovePlan_PredictedRuntimeStamp_UnsatisfiedCapabilityStillApproves(t 
 	}
 	if unstamped.PredictedRuntimeMinutes != 0 {
 		t.Errorf("run.PredictedRuntimeMinutes = %d, want 0 (nothing recorded)", unstamped.PredictedRuntimeMinutes)
+	}
+}
+
+// --- Weak-assertion warnings at the approval gate (#2501 proposal 3) -----
+
+// assertionWarningPlan is the #2501 plan shape used by the HTTP-level warning
+// tests: `checks_unresolved` appears in an approach step naming drive_test.go,
+// while both that file and policy_reeval_test.go are declared scope files. An
+// assertion naming policy_reeval_test.go therefore draws W3 and nothing else.
+func assertionWarningPlan() *plan.Plan {
+	return &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 5, // under the 15m default budget
+		Summary:                 "Pin the driver's unresolved-checks park.",
+		Scope: scopeFiles(
+			"backend/internal/mcpserver/drive_test.go",
+			"backend/internal/server/policy_reeval_test.go",
+		),
+		Approach: []plan.ApproachStep{
+			{Step: 10, Description: "Assert the checks_unresolved stop reason in drive_test.go so the driver's park is pinned."},
+		},
+	}
+}
+
+// decodeApprovalWarnings pulls binding_assertion_warnings off an approve 200
+// body, plus whether the key was present at all.
+func decodeApprovalWarnings(t *testing.T, body string) ([]string, bool) {
+	t.Helper()
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		t.Fatalf("unmarshal approve body: %v\n%s", err, body)
+	}
+	v, ok := raw["binding_assertion_warnings"]
+	if !ok {
+		return nil, false
+	}
+	items, ok := v.([]any)
+	if !ok {
+		t.Fatalf("binding_assertion_warnings is not an array: %v", v)
+	}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		s, ok := it.(string)
+		if !ok {
+			t.Fatalf("binding_assertion_warnings entry is not a string: %v", it)
+		}
+		out = append(out, s)
+	}
+	return out, true
+}
+
+// TestSubmitApproval_BindingAssertionWarnings_SurfacedAndRecorded is the
+// #2501-proposal-3 done-means: a mistyped assertion (the literal is real but
+// paired with a DIFFERENT scope file) draws the W3 warning on the approve 200
+// body AND on the approval_submitted audit payload — while the approval itself
+// is recorded and the stage advances. The warning is advisory, never a refusal.
+func TestSubmitApproval_BindingAssertionWarnings_SurfacedAndRecorded(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, assertionWarningPlan())
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","binding_assertions":[{"type":"test_asserts","path":"backend/internal/server/policy_reeval_test.go","literal":"checks_unresolved"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	warnings, present := decodeApprovalWarnings(t, w.Body.String())
+	if !present || len(warnings) != 1 {
+		t.Fatalf("binding_assertion_warnings on body = %v (present=%v), want exactly 1", warnings, present)
+	}
+	if !strings.Contains(warnings[0], warnKindLiteralOtherPath) {
+		t.Errorf("warning does not name the heuristic %q: %s", warnKindLiteralOtherPath, warnings[0])
+	}
+	if !strings.Contains(warnings[0], "backend/internal/mcpserver/drive_test.go") {
+		t.Errorf("warning does not name the paired path: %s", warnings[0])
+	}
+
+	// Recorded on the approval audit entry next to the declaration it describes.
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	recorded, ok := payload["binding_assertion_warnings"].([]any)
+	if !ok || len(recorded) != 1 {
+		t.Fatalf("audit binding_assertion_warnings = %v, want 1 entry", payload["binding_assertion_warnings"])
+	}
+	if _, ok := payload["binding_assertions"]; !ok {
+		t.Errorf("audit payload lost the binding_assertions declaration the warnings describe")
+	}
+
+	// ADVISORY: the approval was recorded and the stage advanced regardless.
+	rows, err := app.ListForStage(context.Background(), stage.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("approval rows = %d (err=%v), want 1 — a warning must never refuse the approve", len(rows), err)
+	}
+	if stage.State == run.StageStateAwaitingApproval {
+		t.Errorf("stage still awaiting_approval; a warning must not block the advance")
+	}
+}
+
+// TestSubmitApproval_BindingAssertionWarnings_AllThreeStillApproves pins the
+// never-blocks property at its extreme: an approve whose declaration trips all
+// three heuristics still returns 200 with the approval recorded.
+func TestSubmitApproval_BindingAssertionWarnings_AllThreeStillApproves(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, assertionWarningPlan())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","binding_assertions":[`+
+		`{"type":"file_contains","path":"backend/internal/server/not_in_scope.go","literal":"checks_unresolved"},`+
+		`{"type":"file_contains","path":"backend/internal/mcpserver/drive_test.go","literal":"absentEverywhere"},`+
+		`{"type":"test_asserts","path":"backend/internal/server/policy_reeval_test.go","literal":"checks_unresolved"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (warnings never block):\n%s", w.Code, w.Body.String())
+	}
+
+	warnings, _ := decodeApprovalWarnings(t, w.Body.String())
+	joined := strings.Join(warnings, "\n")
+	for _, kind := range []string{warnKindPathNotInScope, warnKindLiteralAbsent, warnKindLiteralOtherPath} {
+		if !strings.Contains(joined, kind) {
+			t.Errorf("warnings missing heuristic %q:\n%s", kind, joined)
+		}
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Fatalf("approval rows = %d (err=%v), want 1", len(rows), err)
+	}
+	if _, ok := findApprovalSubmittedPayload(t, au.appended)["binding_assertion_warnings"]; !ok {
+		t.Errorf("audit payload missing binding_assertion_warnings")
+	}
+}
+
+// TestSubmitApproval_BindingAssertionWarnings_CleanDeclarationQuiet pins the
+// byte-identical quiet path: a correctly-declared assertion (path in scope,
+// literal paired with that same path in the plan) emits NO warnings — neither
+// the response key nor the audit key is present.
+func TestSubmitApproval_BindingAssertionWarnings_CleanDeclarationQuiet(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, assertionWarningPlan())
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","binding_assertions":[{"type":"test_asserts","path":"backend/internal/mcpserver/drive_test.go","literal":"checks_unresolved"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if warnings, present := decodeApprovalWarnings(t, w.Body.String()); present {
+		t.Errorf("clean declaration emitted body warnings: %v", warnings)
+	}
+	if v, ok := findApprovalSubmittedPayload(t, au.appended)["binding_assertion_warnings"]; ok {
+		t.Errorf("clean declaration emitted audit warnings: %v", v)
+	}
+}
+
+// TestSubmitApproval_BindingAssertionWarnings_FailOpenNoPlan pins the fail-open
+// posture: with NO plan artifact to read, the heuristics emit nothing and the
+// approve still succeeds. An advisory surface must never turn a working
+// approval into a diagnostic.
+func TestSubmitApproval_BindingAssertionWarnings_FailOpenNoPlan(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	// Seed the run and plan stage WITHOUT a plan artifact.
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","binding_assertions":[{"type":"file_contains","path":"backend/internal/server/nope.go","literal":"absentEverywhere"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open):\n%s", w.Code, w.Body.String())
+	}
+	if warnings, present := decodeApprovalWarnings(t, w.Body.String()); present {
+		t.Errorf("unloadable plan emitted warnings: %v", warnings)
+	}
+	if v, ok := findApprovalSubmittedPayload(t, au.appended)["binding_assertion_warnings"]; ok {
+		t.Errorf("unloadable plan emitted audit warnings: %v", v)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Fatalf("approval rows = %d (err=%v), want 1 — fail-open must still approve", len(rows), err)
+	}
+}
+
+// TestSubmitApproval_BindingAssertionWarnings_NoDeclarationByteIdentical pins
+// that an approve declaring NO assertions is unchanged: no warning key on the
+// body, and no plan load is even attempted (the response is the bare stage
+// shape existing clients decode).
+func TestSubmitApproval_BindingAssertionWarnings_NoDeclarationByteIdentical(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, _, _ := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, assertionWarningPlan())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "binding_assertion_warnings") {
+		t.Errorf("no-declaration approve emitted the warnings key: %s", w.Body.String())
+	}
+	// Still the plain stage shape.
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal stage response: %v", err)
+	}
+	if got.ID != stage.ID {
+		t.Errorf("stage id = %v, want %v", got.ID, stage.ID)
+	}
+}
+
+// TestSubmitApproval_BindingAssertionWarnings_RejectQuiet pins that the
+// heuristics are approve-only: a reject carrying assertions (which the
+// validator itself skips) emits no warnings.
+func TestSubmitApproval_BindingAssertionWarnings_RejectQuiet(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, assertionWarningPlan())
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"reject","binding_assertions":[{"type":"file_contains","path":"backend/internal/server/nope.go","literal":"absentEverywhere"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if warnings, present := decodeApprovalWarnings(t, w.Body.String()); present {
+		t.Errorf("reject emitted warnings: %v", warnings)
+	}
+	if v, ok := findApprovalSubmittedPayload(t, au.appended)["binding_assertion_warnings"]; ok {
+		t.Errorf("reject emitted audit warnings: %v", v)
+	}
+}
+
+// TestSubmitApproval_BindingAssertionWarnings_FailOpenPlanLoadError is the
+// sibling of the no-plan case: an artifact repository that ERRORS (the
+// perr != nil branch, distinct from a nil plan) also emits nothing and still
+// approves. Without this the log-and-continue branch would be unasserted.
+func TestSubmitApproval_BindingAssertionWarnings_FailOpenPlanLoadError(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, assertionWarningPlan())
+	// Break the artifact read AFTER seeding, so the plan exists but is
+	// unreadable — the load-error branch, not the absent-plan branch.
+	art.listErr = errors.New("db down")
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","binding_assertions":[{"type":"test_asserts","path":"backend/internal/server/policy_reeval_test.go","literal":"checks_unresolved"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (fail-open on a plan load error):\n%s", w.Code, w.Body.String())
+	}
+	if warnings, present := decodeApprovalWarnings(t, w.Body.String()); present {
+		t.Errorf("plan load error emitted warnings: %v", warnings)
+	}
+	if v, ok := findApprovalSubmittedPayload(t, au.appended)["binding_assertion_warnings"]; ok {
+		t.Errorf("plan load error emitted audit warnings: %v", v)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Fatalf("approval rows = %d (err=%v), want 1 — fail-open must still approve", len(rows), err)
 	}
 }

@@ -777,11 +777,19 @@ type approvalRequest struct {
 // stands, the stage state is unchanged, and the backend ran NO gates
 // and emitted NO audit entries; PriorDecision/PriorSubmittedAt carry
 // the EXISTING approval row's provenance.
+// BindingAssertionWarnings carries the backend's ADVISORY weak-assertion
+// heuristics (#2501 proposal 3) when the approve declared
+// binding_assertions and at least one heuristic fired against the approved
+// plan. Absent (nil) on every other approve, including a warning-free one:
+// the backend omits the key, so a clean declaration decodes byte-identically
+// to before. A warning never means the approval was refused — the approval
+// on this same response was recorded.
 type approvalResult struct {
 	Stage
-	DuplicateSubmission bool   `json:"duplicate_submission"`
-	PriorDecision       string `json:"prior_decision"`
-	PriorSubmittedAt    string `json:"prior_submitted_at"`
+	DuplicateSubmission      bool     `json:"duplicate_submission"`
+	PriorDecision            string   `json:"prior_decision"`
+	PriorSubmittedAt         string   `json:"prior_submitted_at"`
+	BindingAssertionWarnings []string `json:"binding_assertion_warnings"`
 }
 
 // SubmitApproval posts an approve or reject decision against the

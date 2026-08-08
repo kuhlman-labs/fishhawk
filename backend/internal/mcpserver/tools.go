@@ -2992,6 +2992,12 @@ type ApprovePlanOutput struct {
 	// same subject already submitted a decision for this stage.
 	DuplicateSubmission bool   `json:"duplicate_submission,omitempty" jsonschema:"true when this submission was a no-op duplicate: the same subject already decided this stage, the prior decision stands, the stage state is unchanged, and NO gates re-ran and NO audit entries were emitted"`
 	PriorDecision       string `json:"prior_decision,omitempty" jsonschema:"on a duplicate submission, the existing approval row's decision (approve|reject) — the decision that actually stands"`
+	// Weak-assertion warnings (#2501 proposal 3): the backend's advisory
+	// heuristics over the declared binding_assertions vs the approved plan.
+	// Empty on every approve that declared no assertions or drew no warning.
+	// ADVISORY — the approval was recorded; read them and decide whether the
+	// declaration was what you meant.
+	BindingAssertionWarnings []string `json:"binding_assertion_warnings,omitempty" jsonschema:"ADVISORY warnings about the declared binding_assertions, computed at the gate against the approved plan — the approval WAS recorded and is not blocked. Each entry names its heuristic: path-not-in-scope (the asserted path is not in the plan's scope.files, so a compliant implement pass will never touch it), literal-absent-from-plan (nothing in the approved plan promises to produce that literal), literal-paired-with-another-path (the literal appears in the plan but only alongside a DIFFERENT scope file than the one asserted — the #2501 typo shape). A warning can be correct-but-intentional; if one names your assertion, re-read the declaration before dispatching implement, because an unsatisfied assertion costs an implement pass"`
 }
 
 // RejectPlanInput mirrors `fishhawk plan reject <run-id> [--reason
@@ -3300,11 +3306,16 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 		}
 		return nil, ApprovePlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
-	return approvalSubmitResult(updated, warn), ApprovePlanOutput{
+	return withBindingAssertionWarnings(approvalSubmitResult(updated, warn), updated.BindingAssertionWarnings), ApprovePlanOutput{
 		Stage:               updated.Stage,
 		StageID:             updated.ID,
 		DuplicateSubmission: updated.DuplicateSubmission,
 		PriorDecision:       updated.PriorDecision,
+		// Advisory weak-assertion warnings (#2501 proposal 3) pass through
+		// verbatim so the operator agent reads them in-band at the gate,
+		// where a mistyped declaration is still cheap to fix. Empty on a
+		// clean declaration.
+		BindingAssertionWarnings: updated.BindingAssertionWarnings,
 	}, nil
 }
 
@@ -3481,6 +3492,31 @@ func approvalSubmitResult(res *approvalResult, warning string) *mcp.CallToolResu
 		return nil
 	}
 	return &mcp.CallToolResult{Content: content}
+}
+
+// withBindingAssertionWarnings appends the backend's advisory weak-assertion
+// warnings (#2501 proposal 3) to an approve result's printed content, so the
+// operator agent READS them at the approval gate rather than discovering the
+// mistyped declaration an implement pass later. It is additive and total: an
+// empty warning list returns res untouched (including a nil res, the
+// no-content case), and a non-empty list on a nil res allocates a fresh
+// result carrying only the warnings.
+//
+// The banner states plainly that the approval was recorded. These are
+// heuristics over plan TEXT, so a warning is regularly correct-but-intentional
+// (an assertion about content the plan describes only in prose); presenting
+// them as a refusal would train the operator to ignore them.
+func withBindingAssertionWarnings(res *mcp.CallToolResult, warnings []string) *mcp.CallToolResult {
+	if len(warnings) == 0 {
+		return res
+	}
+	text := "ADVISORY binding-assertion warnings (the approval WAS recorded and is not blocked; re-read the declaration before dispatching implement — an unsatisfied assertion costs an implement pass):\n  - " +
+		strings.Join(warnings, "\n  - ")
+	if res == nil {
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}
+	}
+	res.Content = append(res.Content, &mcp.TextContent{Text: text})
+	return res
 }
 
 // resolvePlanStage walks the run's stages and returns the one with

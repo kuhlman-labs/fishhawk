@@ -9857,3 +9857,126 @@ func TestGetRunStatus_PopulatedElisions_PassesSDKOutputSchemaValidation(t *testi
 		})
 	}
 }
+
+// --- Weak-assertion warnings on approve (#2501 proposal 3) ---------------
+
+// TestApprovePlan_BindingAssertionWarnings_DecodedAndSurfaced pins the
+// operator-facing half of #2501 proposal 3: the backend's advisory
+// binding_assertion_warnings on the approve 200 body must reach BOTH the
+// structured ApprovePlanOutput and the printed tool text, so the operator
+// agent reads the mistyped declaration at the gate instead of discovering it
+// an implement pass later. Served through approvalsRespBody so the wire decode
+// (client approvalResult) is pinned from the far side.
+func TestApprovePlan_BindingAssertionWarnings_DecodedAndSurfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	stageID := seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	warn := `binding_assertions[0] [literal-paired-with-another-path]: literal \"checks_unresolved\" appears in the approved plan but every plan sentence mentioning it names a different scope file (backend/internal/mcpserver/drive_test.go)`
+	fb.approvalsRespBody = fmt.Sprintf(
+		`{"id":%q,"run_id":%q,"type":"plan","state":"succeeded","binding_assertion_warnings":[%q]}`,
+		stageID.String(), runID.String(), warn)
+
+	res, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "enforce the park assertion",
+		BindingAssertions: []BindingAssertion{
+			{Type: "test_asserts", Path: "backend/internal/server/policy_reeval_test.go", Literal: "checks_unresolved"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if len(out.BindingAssertionWarnings) != 1 || out.BindingAssertionWarnings[0] != warn {
+		t.Fatalf("BindingAssertionWarnings = %v, want [%q]", out.BindingAssertionWarnings, warn)
+	}
+	// The approval is NOT blocked — the stage still came back succeeded.
+	if out.Stage.State != "succeeded" {
+		t.Errorf("State = %q, want succeeded (a warning must not block the approve)", out.Stage.State)
+	}
+	if res == nil || len(res.Content) == 0 {
+		t.Fatal("expected a tool result carrying the advisory warning banner; got nil/empty")
+	}
+	text, ok := res.Content[len(res.Content)-1].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("last content = %T, want *mcp.TextContent", res.Content[len(res.Content)-1])
+	}
+	if !strings.Contains(text.Text, "ADVISORY binding-assertion warnings") {
+		t.Errorf("result text missing the advisory banner: %q", text.Text)
+	}
+	if !strings.Contains(text.Text, "the approval WAS recorded") {
+		t.Errorf("result text must state the approval was recorded: %q", text.Text)
+	}
+	if !strings.Contains(text.Text, "literal-paired-with-another-path") {
+		t.Errorf("result text missing the warning itself: %q", text.Text)
+	}
+}
+
+// TestApprovePlan_NoBindingAssertionWarnings_QuietResult pins the
+// byte-identical quiet path: a 200 body with no binding_assertion_warnings key
+// leaves the output field nil and adds NO content to the tool result (which
+// stays nil when nothing else needed printing).
+func TestApprovePlan_NoBindingAssertionWarnings_QuietResult(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	res, out, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if out.BindingAssertionWarnings != nil {
+		t.Errorf("BindingAssertionWarnings = %v, want nil when the backend sent none", out.BindingAssertionWarnings)
+	}
+	if res != nil {
+		t.Errorf("tool result = %+v, want nil (no banner, no gh warning)", res)
+	}
+}
+
+// TestWithBindingAssertionWarnings covers the helper's three branches
+// directly: an empty list returns the result untouched (including nil), a
+// non-empty list on a nil result allocates one, and a non-empty list on an
+// existing result APPENDS without dropping the content already there.
+func TestWithBindingAssertionWarnings(t *testing.T) {
+	t.Run("empty list leaves nil result nil", func(t *testing.T) {
+		if got := withBindingAssertionWarnings(nil, nil); got != nil {
+			t.Fatalf("got %+v, want nil", got)
+		}
+	})
+	t.Run("empty list leaves an existing result untouched", func(t *testing.T) {
+		res := &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "prior"}}}
+		got := withBindingAssertionWarnings(res, []string{})
+		if len(got.Content) != 1 {
+			t.Fatalf("content len = %d, want 1 (untouched)", len(got.Content))
+		}
+	})
+	t.Run("non-empty list on a nil result allocates one", func(t *testing.T) {
+		got := withBindingAssertionWarnings(nil, []string{"w1", "w2"})
+		if got == nil || len(got.Content) != 1 {
+			t.Fatalf("got %+v, want a result with 1 content entry", got)
+		}
+		text := got.Content[0].(*mcp.TextContent).Text
+		for _, want := range []string{"ADVISORY binding-assertion warnings", "w1", "w2"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("text missing %q: %q", want, text)
+			}
+		}
+	})
+	t.Run("non-empty list appends to existing content", func(t *testing.T) {
+		res := &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "duplicate submission — …"}}}
+		got := withBindingAssertionWarnings(res, []string{"w1"})
+		if len(got.Content) != 2 {
+			t.Fatalf("content len = %d, want 2 (appended, prior kept)", len(got.Content))
+		}
+		if first := got.Content[0].(*mcp.TextContent).Text; !strings.HasPrefix(first, "duplicate submission") {
+			t.Errorf("prior content was dropped or reordered: %q", first)
+		}
+	})
+}

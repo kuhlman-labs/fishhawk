@@ -155,11 +155,18 @@ type approvalRequest struct {
 // is unchanged, and no gates re-ran. prior_decision/prior_submitted_at come
 // from the EXISTING approval row, so they are authentic provenance, not
 // echoes of the new request.
+// BindingAssertionWarnings carries the advisory weak-assertion heuristics
+// (#2501 proposal 3) when the approve declared binding_assertions and at least
+// one heuristic fired. It is omitempty, so a warning-free approve (and every
+// approve that declares no assertions) keeps the byte-identical bare-Stage
+// body. A warning never means the approval was refused — the approval it rides
+// on was recorded.
 type approvalSubmitResponse struct {
 	stageResponse
-	DuplicateSubmission bool   `json:"duplicate_submission,omitempty"`
-	PriorDecision       string `json:"prior_decision,omitempty"`
-	PriorSubmittedAt    string `json:"prior_submitted_at,omitempty"`
+	DuplicateSubmission      bool     `json:"duplicate_submission,omitempty"`
+	PriorDecision            string   `json:"prior_decision,omitempty"`
+	PriorSubmittedAt         string   `json:"prior_submitted_at,omitempty"`
+	BindingAssertionWarnings []string `json:"binding_assertion_warnings,omitempty"`
 }
 
 // duplicateApprovalResponse labels a duplicate submission's 200 body with
@@ -326,11 +333,31 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// declaration flows normally. No enforcement runs here; the runner
 	// evaluates the assertions post-implement (slice 2). Reject/empty
 	// approves skip this and stay byte-identical to today.
+	//
+	// bindingAssertionWarnings carries the ADVISORY weak-assertion heuristics
+	// (#2501 proposal 3) computed against the approved plan once the
+	// declaration is known well-formed. They are recorded on the approval
+	// audit payload and returned on the 200 body; they NEVER refuse the
+	// approve, and a plan that cannot be loaded emits none (fail-open).
+	var bindingAssertionWarnings []string
 	if decision == approval.DecisionApprove && len(req.BindingAssertions) > 0 {
 		if err := validateBindingAssertions(req.BindingAssertions); err != nil {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 				err.Error(), map[string]any{"field": "binding_assertions"})
 			return
+		}
+		approvedPlan, perr := s.loadApprovedPlanForRun(r.Context(), stage.RunID)
+		if perr != nil {
+			// Fail open: an advisory surface must not turn a working
+			// approval into a diagnostic. Log and proceed warning-free.
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "binding-assertion warnings: load plan failed",
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", perr.Error()),
+			)
+		} else {
+			// A nil plan (no artifact / unconfigured repo) is the same
+			// fail-open path — warnBindingAssertions returns nothing.
+			bindingAssertionWarnings = warnBindingAssertions(req.BindingAssertions, approvedPlan)
 		}
 	}
 
@@ -560,6 +587,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		AddScopeFiles:       req.AddScopeFiles,
 		RemoveScopeFiles:    req.RemoveScopeFiles,
 		BindingAssertions:   req.BindingAssertions,
+		AssertionWarnings:   bindingAssertionWarnings,
 		ClaimsConcernIDs:    req.ClaimsConcernIDs,
 		DelegatedRule:       delegatedRule,
 		ResolvedModel:       resolvedModel,
@@ -592,7 +620,10 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeJSON(w, r, http.StatusOK, toStageResponse(result.Stage))
+	s.writeJSON(w, r, http.StatusOK, approvalSubmitResponse{
+		stageResponse:            toStageResponse(result.Stage),
+		BindingAssertionWarnings: bindingAssertionWarnings,
+	})
 }
 
 // gateActionStage names where in approveStageAs a failure occurred, so the
@@ -668,11 +699,17 @@ type approveActionParams struct {
 	AddScopeFiles       []string
 	RemoveScopeFiles    []string
 	BindingAssertions   []bindingAssertion
-	ClaimsConcernIDs    []string
-	DelegatedRule       string
-	ResolvedModel       *ResolvedModel
-	PlanModel           string
-	ReviewModel         string
+	// AssertionWarnings carries the advisory weak-assertion heuristics the
+	// HTTP handler computed for this approve's binding_assertions (#2501
+	// proposal 3), recorded on the approval_submitted audit payload. The
+	// in-process campaign auto-driver leaves it nil — it declares no
+	// assertions — which is the byte-identical no-key path.
+	AssertionWarnings []string
+	ClaimsConcernIDs  []string
+	DelegatedRule     string
+	ResolvedModel     *ResolvedModel
+	PlanModel         string
+	ReviewModel       string
 	// PredicateResolution, when non-nil, carries the forge-resolved
 	// min_permission / member_of values a satisfied approval-gate predicate
 	// resolution produced (E39.5 / #1710). The HTTP handler stashes it from
@@ -815,7 +852,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 				// vote), and the stage stays awaiting_approval until the
 				// baseline is readable again. No predicate_snapshot — nothing
 				// about the effective requirement is known to snapshot.
-				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.AssertionWarnings, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
 				return &approveActionResult{Stage: p.Stage}, nil
 			}
@@ -825,7 +862,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.AssertionWarnings, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -955,7 +992,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.AssertionWarnings, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -1636,7 +1673,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, assertionWarnings []string, claimsConcernIDs []string, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -1710,6 +1747,15 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	// byte-identical to today.
 	if app.Decision == approval.DecisionApprove && len(bindingAssertions) > 0 {
 		auditPayload["binding_assertions"] = bindingAssertions
+	}
+	// Weak-assertion warnings (#2501 proposal 3): record the ADVISORY
+	// heuristics that fired against the approved plan for this declaration, so
+	// the "we warned at the gate" fact is durable in the chain next to the
+	// declaration it describes. Advisory only — the approval on this same row
+	// was recorded, and the key is omitted when nothing fired, so a clean
+	// declaration stays byte-identical to today.
+	if app.Decision == approval.DecisionApprove && len(assertionWarnings) > 0 {
+		auditPayload["binding_assertion_warnings"] = assertionWarnings
 	}
 	// Condition-claim declaration (E48.9 / #1956): record the plan-stage
 	// concern ids this approval's binding condition answers, so the confirming
