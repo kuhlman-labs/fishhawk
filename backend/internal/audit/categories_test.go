@@ -170,3 +170,15 @@ func TestKnownCategories_StagePermissionsDeclared(t *testing.T) {
 		t.Fatal("stage_permissions_declared is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_AcceptanceTriageArbitrated pins the E66.37 / #2474
+// category: the operator-only arbitration endpoint writes it to discharge a
+// paged acceptance triage, and an unregistered category is un-awaitable — an
+// operator could not arm fishhawk_await_audit on their own discharge, and
+// categories_completeness_test.go's AST sweep would fail the build the moment
+// the emit site lands.
+func TestKnownCategories_AcceptanceTriageArbitrated(t *testing.T) {
+	if !IsKnownCategory("acceptance_triage_arbitrated") {
+		t.Fatal("acceptance_triage_arbitrated is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

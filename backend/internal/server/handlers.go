@@ -74,6 +74,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/integrate-wave", s.requireRunAccount(memberWrite, s.handleIntegrateWave))
 	mux.HandleFunc("POST /v0/runs/{run_id}/vouch-commit", s.requireRunAccount(memberWrite, s.handleVouchCommit))
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge", s.requireRunAccount(memberWrite, s.handleMergeRun))
+	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance-arbitration", s.requireRunAccount(memberWrite, s.handleAcceptanceArbitration))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive", s.requireRunAccount(memberWrite, s.handleAutoDrive))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive/acts", s.requireRunAccount(memberWrite, s.handleAutoDriveRecordAct))
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", s.requireRunAccount(readAccess, s.handleListRunStages))

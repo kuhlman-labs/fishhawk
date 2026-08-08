@@ -733,8 +733,9 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// never observe a post-merge (the PR is not even open yet at
 		// implement-stage exit), so mergeObserved is the literal false (#1370).
 		// It holds no recent-audit slice (its own audit read is limit=1 for the
-		// pointer), so the acceptance verdict/disposition signals AND the E38.3
-		// acceptance-skip flag are empty/false here — safe: run_stage never runs
+		// pointer), so the acceptance verdict/disposition signals, the E38.3
+		// acceptance-skip flag AND the E66.37 arbitration flag are empty/false
+		// here — safe: run_stage never runs
 		// the acceptance stage, and the defensive acceptance_settled_outcome_unknown
 		// arm covers an already-settled acceptance stage (E31.9).
 		// A run_stage call executes plan/implement/acceptance, never the
@@ -742,7 +743,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 		// holds no recent-audit slice to derive the release_cut/release_published
 		// signals from — so the release signals are the zero value here (the
 		// release arm is inert). getRunStatus is the surface that computes them.
-		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, false, "", "", releaseSignals{})
+		nextActions = nextActionsFor(&runView.Run, postStages, planReviewStatus, implementReviewStatus, reviewActionHint, runView.driveStatus(), false, false, false, "", "", releaseSignals{})
 	}
 
 	out := RunStageOutput{

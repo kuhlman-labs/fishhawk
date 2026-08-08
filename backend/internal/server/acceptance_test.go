@@ -2400,3 +2400,245 @@ func TestAcceptanceGateState_VerdictWinsOverSkipMarker(t *testing.T) {
 		})
 	}
 }
+
+// --- acceptance arbitration gate classifier (E66.37 / #2474) ----------------
+
+// seedArbitration seeds one acceptance_triage_arbitrated entry naming
+// outcomeSequence — the sequence binding the whole feature turns on.
+func seedArbitration(au *auditFake, runID uuid.UUID, seq, outcomeSequence int64) {
+	rid := runID
+	p, _ := json.Marshal(map[string]any{
+		"run_id": runID.String(), "reason": "operator discharge", "outcome_sequence": outcomeSequence,
+	})
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Category: CategoryAcceptanceTriageArbitrated, Sequence: seq, Payload: p,
+	})
+	au.mu.Unlock()
+}
+
+// TestAcceptanceGateState_FailedWithArbitration: a failed verdict discharged by
+// an arbitration BOUND to it resolves to the merge-eligible acceptance_arbitrated
+// state — and never to acceptance_passed, which would hide the override.
+func TestAcceptanceGateState_FailedWithArbitration(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictFailed)
+	seedArbitration(au, runID, 11, 10)
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateArbitrated {
+		t.Errorf("state = %q, want %q", got, acceptanceGateArbitrated)
+	}
+	if got == acceptanceGatePassed {
+		t.Error("an arbitrated FAILED verdict must never resolve to acceptance_passed")
+	}
+}
+
+// TestAcceptanceGateState_ArbitrationForOlderOutcomeIgnored is the sequence-
+// binding invalidation: an arbitration recorded against outcome 10, then a NEW
+// failed verdict at 30 that no arbitration names, re-wedges the gate at triage.
+func TestAcceptanceGateState_ArbitrationForOlderOutcomeIgnored(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictFailed)
+	seedArbitration(au, runID, 11, 10)
+	seedAcceptanceOutcome(au, runID, 30, acceptanceVerdictFailed) // an acceptance re-run
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateTriage {
+		t.Errorf("state = %q, want %q — a re-run invalidates a prior arbitration by construction", got, acceptanceGateTriage)
+	}
+}
+
+// TestAcceptanceGateState_ArbitrationAppendedAfterNewerVerdictIgnored is binding
+// approval condition 4(b) on the SERVER surface: an arbitration entry appended
+// AFTER a newer verdict (sequence 31 > 30) but NAMING the older outcome (10) is
+// ignored. This is exactly where an ORDERING rule ("an arbitration newer than
+// the verdict correlates") and the payload-EQUALITY rule disagree, so a surface
+// that switched to ordering would go green here while the other stayed red.
+//
+// The MCP twin is TestAcceptanceArbitratedIn_AppendedAfterNewerVerdictIgnored
+// (backend/internal/mcpserver/next_actions_test.go) over the byte-identical
+// fixture: outcome@10 failed, outcome@30 failed, arbitration@31 naming 10.
+func TestAcceptanceGateState_ArbitrationAppendedAfterNewerVerdictIgnored(t *testing.T) {
+	s, au := newAcceptanceGateServer(t)
+	runID := uuid.New()
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictFailed)
+	seedAcceptanceOutcome(au, runID, 30, acceptanceVerdictFailed)
+	seedArbitration(au, runID, 31, 10) // NEWEST entry, but names the OLD outcome
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateTriage {
+		t.Errorf("state = %q, want %q — correlation is payload outcome_sequence EQUALITY, never ordering", got, acceptanceGateTriage)
+	}
+}
+
+// TestAcceptanceGateState_MalformedArbitrationPayloadIgnored: an arbitration
+// whose payload cannot be decoded (or omits outcome_sequence) can never
+// discharge a triage — it is skipped, not treated as a wildcard match.
+//
+// The outcomeSeq axis is what makes the decode guard COUNTERFACTUALLY
+// ATTAINABLE. At a non-zero outcome sequence the equality comparison already
+// refuses an undecodable entry (its zero value cannot equal 10), so deleting the
+// guard changes nothing observable there. At outcome sequence ZERO the two
+// coincide exactly: a guard that reported a malformed payload as (0, ok) would
+// compare 0 == 0 and discharge the triage on an unreadable declaration. That is
+// the aliasing hazard the guard exists to prevent — and the same hazard the
+// arbitration endpoint's `outcome.Recorded` gate closes on the write side.
+func TestAcceptanceGateState_MalformedArbitrationPayloadIgnored(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		payload    []byte
+		outcomeSeq int64
+	}{
+		{"undecodable", []byte(`not json`), 10},
+		{"missing outcome_sequence", []byte(`{"reason":"x"}`), 10},
+		{"undecodable at outcome sequence zero", []byte(`not json`), 0},
+		{"missing outcome_sequence at outcome sequence zero", []byte(`{"reason":"x"}`), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au := newAcceptanceGateServer(t)
+			runID := uuid.New()
+			rid := runID
+			seedAcceptanceOutcome(au, runID, tc.outcomeSeq, acceptanceVerdictFailed)
+			au.seeded = append(au.seeded, &audit.Entry{
+				RunID: &rid, Category: CategoryAcceptanceTriageArbitrated, Sequence: tc.outcomeSeq + 1, Payload: tc.payload,
+			})
+			stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+			got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+			if err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if got != acceptanceGateTriage {
+				t.Errorf("state = %q, want %q", got, acceptanceGateTriage)
+			}
+		})
+	}
+}
+
+// snapshotSupersedingAuditRepo makes the run's audit SNAPSHOT (ListForRun) carry
+// a NEWER acceptance outcome than the category read (ListForRunByCategory) that
+// preceded it — the interleaving binding approval condition 2 exists to close:
+// a concurrent acceptance re-run landing between the gate's two reads. The stale
+// arbitration still names the outcome the first read saw, so a gate WITHOUT
+// read-side revalidation would return acceptance_arbitrated on superseded
+// evidence.
+type snapshotSupersedingAuditRepo struct {
+	*auditFake
+	runID    uuid.UUID
+	newerSeq int64
+}
+
+func (r *snapshotSupersedingAuditRepo) ListForRun(ctx context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	out, err := r.auditFake.ListForRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	rid := r.runID
+	p, _ := json.Marshal(map[string]any{"verdict": acceptanceVerdictFailed})
+	return append(out, &audit.Entry{
+		RunID: &rid, Category: CategoryAcceptanceOutcomeRecorded, Sequence: r.newerSeq, Payload: p,
+	}), nil
+}
+
+// TestAcceptanceGateState_ArbitrationSupersededBetweenReads is binding approval
+// condition 2 + condition 4(a): the outcome is superseded BETWEEN the gate's two
+// reads. The arbitration still matches the outcome the first read saw, so a gate
+// that resolved on the strength of two independent reads would return
+// acceptance_arbitrated — a merge-eligible state on evidence a concurrent re-run
+// already invalidated. The consistent-snapshot revalidation must return
+// acceptance_triage instead.
+func TestAcceptanceGateState_ArbitrationSupersededBetweenReads(t *testing.T) {
+	au := newAuditFake()
+	runID := uuid.New()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &snapshotSupersedingAuditRepo{
+		auditFake: au, runID: runID, newerSeq: 99,
+	}})
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictFailed)
+	seedArbitration(au, runID, 11, 10)
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got != acceptanceGateTriage {
+		t.Errorf("state = %q, want %q — the outcome moved between the two reads, so no arbitration discharges it", got, acceptanceGateTriage)
+	}
+	if got == acceptanceGateArbitrated {
+		t.Error("acceptance_arbitrated resolved on a superseded outcome (fail-OPEN)")
+	}
+}
+
+// snapshotErrAuditRepo fails ONLY the whole-run snapshot read (ListForRun),
+// leaving the per-category verdict read healthy — so the failure is pinned to
+// the arbitration lookup rather than to the verdict read the older tests cover.
+type snapshotErrAuditRepo struct {
+	*auditFake
+	err error
+}
+
+func (r *snapshotErrAuditRepo) ListForRun(_ context.Context, _ uuid.UUID) ([]*audit.Entry, error) {
+	return nil, r.err
+}
+
+// TestAcceptanceGateState_ArbitrationReadErrorPropagates: an unreadable
+// arbitration snapshot is PROPAGATED, never swallowed into a merge-eligible
+// state. Every consumer gates on gerr == nil, so this is what makes the whole
+// feature fail closed on an unreadable chain.
+func TestAcceptanceGateState_ArbitrationReadErrorPropagates(t *testing.T) {
+	au := newAuditFake()
+	runID := uuid.New()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &snapshotErrAuditRepo{
+		auditFake: au, err: errors.New("snapshot boom"),
+	}})
+	seedAcceptanceOutcome(au, runID, 10, acceptanceVerdictFailed)
+	seedArbitration(au, runID, 11, 10)
+	stages := []*run.Stage{acceptanceStage(runID, run.StageStateSucceeded)}
+	got, err := s.acceptanceGateState(context.Background(), acceptanceGateRun(runID, specWithAcceptanceStage), stages)
+	if err == nil {
+		t.Fatal("err = nil, want the propagated arbitration-snapshot read error (fail-closed)")
+	}
+	// The state on an error is the zero value, which acceptanceGateAdmitsMerge
+	// reads as not-declared — precisely why the predicate's contract requires
+	// every caller to gate on `gerr == nil` FIRST. What must never happen is a
+	// POSITIVE merge-eligible state being manufactured from a failed read.
+	if got == acceptanceGateArbitrated || got == acceptanceGatePassed ||
+		got == acceptanceGateNotValidated || got == acceptanceGateSkippedOutOfScope {
+		t.Errorf("state = %q, must never resolve to a merge-eligible state on a read error", got)
+	}
+}
+
+// TestAcceptanceGateAdmitsMerge is the exhaustive table over every gate-state
+// constant — the single predicate the merge endpoint, the delegated merge and
+// the drive presentation all defer to, so a new state can never be admitted by
+// two of them and refused by the third.
+func TestAcceptanceGateAdmitsMerge(t *testing.T) {
+	for _, tc := range []struct {
+		state string
+		want  bool
+	}{
+		{acceptanceGateNotDeclared, true},
+		{acceptanceGatePassed, true},
+		{acceptanceGateSkippedOutOfScope, true},
+		{acceptanceGateNotValidated, true},
+		{acceptanceGateArbitrated, true},
+		{acceptanceGatePending, false},
+		{acceptanceGateOutcomeUnknown, false},
+		{acceptanceGateTriage, false},
+		{"some_future_state", false},
+	} {
+		if got := acceptanceGateAdmitsMerge(tc.state); got != tc.want {
+			t.Errorf("acceptanceGateAdmitsMerge(%q) = %v, want %v", tc.state, got, tc.want)
+		}
+	}
+}

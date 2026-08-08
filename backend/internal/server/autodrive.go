@@ -366,15 +366,17 @@ const (
 // operator merge endpoint converges on by construction.
 func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger) (mergeDispatchOutcome, string, error) {
 	gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
-	// #1877: an out-of-scope skip (acceptanceGateSkippedOutOfScope) is a
-	// legitimate terminal disposition equivalent to a recorded outcome for the
-	// merge gate. #2347: so is a not_validated verdict (acceptanceGateNotValidated)
-	// — the short-circuit settled the stage having verified zero criteria, which
-	// is honest-but-mergeable, not a block. A read error (gerr != nil) admits
-	// nothing — fail-closed.
-	acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared ||
-		gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope ||
-		gateState == acceptanceGateNotValidated)
+	// The admitted set is the SHARED acceptanceGateAdmitsMerge predicate (E66.37
+	// / #2474), so the delegated merge and the operator merge endpoint cannot
+	// drift. #1877: an out-of-scope skip is a legitimate terminal disposition
+	// equivalent to a recorded outcome. #2347: so is a not_validated verdict —
+	// the short-circuit settled the stage having verified zero criteria, which is
+	// honest-but-mergeable, not a block. #2474: so is an ARBITRATED failed
+	// verdict — this widens what a DELEGATED may_merge can land, deliberately:
+	// the arbitration itself is operator-only and run-bound-token-forbidden, so
+	// the operator decision remains the gating act. A read error (gerr != nil)
+	// admits nothing — fail-closed.
+	acceptanceMergeOK := gerr == nil && acceptanceGateAdmitsMerge(gateState)
 	if !acceptanceMergeOK {
 		return mergeDispatchAcceptanceNotReady, gateState, gerr
 	}

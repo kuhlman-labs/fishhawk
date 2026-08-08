@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
@@ -68,7 +69,7 @@ type NextActions struct {
 // every input except run and stages may be nil. For drive-enabled runs
 // with a distilled NextAction, that action is folded in FIRST so drive
 // and next_actions never point different ways.
-func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string, release releaseSignals) *NextActions {
+func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated bool, acceptanceVerdict, acceptanceTriageDisposition string, release releaseSignals) *NextActions {
 	if run == nil {
 		return nil
 	}
@@ -87,7 +88,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		return na
 	}
 
-	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition, release)
+	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
 
 	if drive != nil && drive.NextAction != nil {
 		na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
@@ -205,7 +206,7 @@ func foldLiveValidationAdvisory(run *Run, na *NextActions) {
 
 // classifyNextActions is the state table. Each arm returns a labeled
 // state with >= 1 action; only terminal arms return nil actions.
-func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string, release releaseSignals) *NextActions {
+func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated bool, acceptanceVerdict, acceptanceTriageDisposition string, release releaseSignals) *NextActions {
 	plan := stageByType(stages, "plan")
 	impl := stageByType(stages, "implement")
 	review := stageByType(stages, "review")
@@ -313,7 +314,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// Implement stage arms (the plan gate is behind us, or no plan stage
 	// exists — the resume_run recovery-child shape).
 	if impl != nil && (plan == nil || plan.State == "succeeded") {
-		if a := implementStageNextActions(run, impl, acceptance, implementReviewStatus, hint, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
+		if a := implementStageNextActions(run, impl, acceptance, implementReviewStatus, hint, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition); a != nil {
 			return a
 		}
 	}
@@ -452,7 +453,7 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 // acceptance_triage_decided audit payloads. acceptanceSkippedOutOfScope is the
 // recent-audit-window flag threaded down so the acceptance arm can recognize an
 // E38.3 / #1877 out-of-scope skip as a merge-eligible disposition.
-func implementStageNextActions(run *Run, impl, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceSkippedOutOfScope bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
+func implementStageNextActions(run *Run, impl, acceptance *Stage, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, acceptanceSkippedOutOfScope, acceptanceArbitrated bool, acceptanceVerdict, acceptanceTriageDisposition string) *NextActions {
 	switch impl.State {
 	case "pending", "awaiting_host_dispatch":
 		// pending and awaiting_host_dispatch (#1912) both await a host spawn — the
@@ -530,7 +531,7 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 		// declares an acceptance stage (E31.9 / ADR-049), it gates the merge
 		// — branch to the acceptance arm BEFORE the merge ritual.
 		if acceptance != nil {
-			return acceptanceStageNextActions(run, acceptance, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition)
+			return acceptanceStageNextActions(run, acceptance, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition)
 		}
 		// No acceptance stage: the PR is the next surface — approve and merge.
 		return &NextActions{State: "implement_gate_settled", Actions: mergeRitualActions(run, "the implement review is settled with no open concerns")}
@@ -1071,7 +1072,14 @@ func dispatchOrPollActions(run *Run, stageType string) []SuggestedAction {
 // of the futile retry-reopen read arm. A recorded verdict (passed/failed) always
 // wins over the flag; a marker aged out of the window (flag false) degrades to
 // the read-first outcome-unknown arm (fail toward read, never toward merge).
-func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope bool, verdict, disposition string) *NextActions {
+//
+// arbitrated is the E66.37 / #2474 flag: an operator recorded an
+// acceptance_triage_arbitrated discharge BOUND by outcome_sequence to the newest
+// recorded verdict, so the server gate reads acceptance_arbitrated and the merge
+// verb will succeed. It is checked on the FAILED arm before the paged branch,
+// because an arbitrated failure is merge-eligible while an un-arbitrated one is
+// still the human-arbitration park.
+func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, arbitrated bool, verdict, disposition string) *NextActions {
 	// A non-terminal acceptance stage dispatches (local) or polls
 	// (github_actions), mirroring the plan/implement pending arms. A
 	// running stage is validating against the preview — poll.
@@ -1147,6 +1155,17 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope b
 		return &NextActions{State: "acceptance_not_validated", Actions: mergeRitualActions(run,
 			"the acceptance stage verified ZERO acceptance criteria — it was short-circuited with no runner and no preview because every criterion was skip-expected with a basis, or the plan declared none (#2347). The run is merge-eligible, but this is NOT a validated pass: acknowledge in your merge verdict that acceptance validated nothing")}
 	case acceptanceVerdictFailed:
+		// E66.37 / #2474: an operator arbitration bound to THIS verdict discharges
+		// the paged triage, so the server gate reads acceptance_arbitrated and the
+		// merge verb admits the run. Checked BEFORE the paged branch — otherwise a
+		// discharged run would keep being offered the arbitration it already has.
+		// The correlation rule (payload outcome_sequence EQUALITY against the
+		// newest verdict, in acceptanceArbitratedIn) is the SAME rule the server
+		// gate applies, so this surface can never offer a merge the server 409s.
+		if arbitrated {
+			return &NextActions{State: "acceptance_arbitrated", Actions: mergeRitualActions(run,
+				"the acceptance verdict FAILED and its triage paged, but an operator recorded an acceptance_triage_arbitrated discharge bound to that verdict (E66.37 / #2474) — the merge gate admits the run. This is NOT a validated pass: say in your merge verdict that you are merging on an arbitrated acceptance failure")}
+		}
 		if isAcceptancePagedDisposition(disposition) {
 			return &NextActions{State: "acceptance_triage_paged", Actions: acceptanceTriagePagedActions(run)}
 		}
@@ -1223,11 +1242,18 @@ func acceptanceTriagePagedActions(run *Run) []SuggestedAction {
 			Reason:       "route the acceptance failure back to the implement agent as a manual fix-up pass — consumes the shared fix-up budget the auto-triage also draws on",
 		},
 		{
+			Action:       "fishhawk_arbitrate_acceptance",
+			Params:       map[string]string{"run_id": run.ID, "reason": "<why the change is acceptable despite the failed acceptance verdict>"},
+			Precondition: "you judge the change is acceptable despite the failed verdict (a bad/ambiguous criterion, or a criterion no sandbox-reachable target can validate) — the PAGED triage is discharged by this audited operator declaration, not by leaving the loop and hand-merging. A verdict carrying genuinely FAILED criteria additionally needs acknowledge_failed_criteria:true",
+			Consumes:     consumesNone,
+			Reason:       "record the arbitration that discharges this paged acceptance triage (E66.37 / #2474): it writes an acceptance_triage_arbitrated audit entry bound to this verdict's sequence and flips the merge gate to acceptance_arbitrated, so fishhawk_merge_run then works and your merge verdict stays on the chain. Do this FIRST — the merge verb 409s acceptance_gate_not_passed until it lands",
+		},
+		{
 			Action:       "merge_and_file_follow_up",
 			Params:       prParams(run),
-			Precondition: "you judge the failure is a bad/ambiguous acceptance criterion (class 3) or otherwise works-as-planned — accept and ship",
+			Precondition: "ONLY after fishhawk_arbitrate_acceptance has recorded the discharge for this verdict — until then fishhawk_merge_run refuses with 409 acceptance_gate_not_passed. Use when you judge the failure is a bad/ambiguous acceptance criterion (class 3) or otherwise works-as-planned",
 			Consumes:     consumesNone,
-			Reason:       "accept the change despite the failed acceptance verdict (e.g. a class-3 bad criterion): approve + merge the PR and file a follow-up issue for the disputed criterion",
+			Reason:       "accept the change despite the failed acceptance verdict (e.g. a class-3 bad criterion): approve + merge the PR through the ordinary merge verb and file a follow-up issue for the disputed criterion",
 		},
 		{
 			Action:       "fishhawk_cancel_run",
@@ -1318,6 +1344,82 @@ func acceptanceSkippedOutOfScopeIn(recent []AuditEntry) bool {
 		}
 	}
 	return false
+}
+
+// acceptanceArbitratedIn reports whether the recent-audit slice carries an
+// acceptance_triage_arbitrated entry that discharges the run's NEWEST acceptance
+// verdict (E66.37 / #2474).
+//
+// BINDING APPROVAL CONDITION 3 — ONE CORRELATION RULE, NOT TWO. This is
+// deliberately NOT the ordering idiom latestAcceptanceTriageDisposition uses
+// ("an entry at or below the newest verdict belongs to an older attempt"). The
+// authoritative server gate (server/acceptance.go acceptanceArbitrationDischarges)
+// correlates on payload outcome_sequence EQUALITY against the newest recorded
+// outcome's audit sequence, and an ordering rule DISAGREES with it on exactly
+// the interleaving the write path permits: an arbitration appended AFTER a newer
+// verdict but NAMING an older outcome_sequence is newer by position yet stale by
+// binding. Under an ordering rule this surface would offer a merge the server
+// then 409s — the self-contradiction #2474 documents as its second-worst
+// symptom. So this function applies the SAME equality rule: find the newest
+// acceptance_outcome_recorded entry by SEQUENCE, then require an arbitration
+// whose payload outcome_sequence EQUALS it.
+//
+// Returns false when no verdict is present, no arbitration names it, or any
+// payload is malformed — the safe direction, since a false negative lands the
+// operator in the paged-arbitration arm (which offers the arbitration verb)
+// rather than offering a merge the gate refuses.
+func acceptanceArbitratedIn(recent []AuditEntry) bool {
+	newestOutcome := int64(0)
+	haveOutcome := false
+	for _, e := range recent {
+		if e.Category != auditCategoryAcceptanceOutcomeRecorded {
+			continue
+		}
+		if !haveOutcome || e.Sequence > newestOutcome {
+			newestOutcome, haveOutcome = e.Sequence, true
+		}
+	}
+	if !haveOutcome {
+		return false
+	}
+	for _, e := range recent {
+		if e.Category != auditCategoryAcceptanceTriageArbitrated {
+			continue
+		}
+		if seq, ok := acceptancePayloadInt64(e.Payload, acceptanceArbitrationOutcomeSequenceField); ok && seq == newestOutcome {
+			return true
+		}
+	}
+	return false
+}
+
+// acceptancePayloadInt64 reads an integral field from a decoded-JSON audit
+// payload. AuditEntry.Payload is `any` (a map[string]any after JSON decode), so
+// a JSON number arrives as float64; a json.Number is accepted too in case a
+// future decoder is configured for it. Any non-object payload, missing field,
+// non-numeric value, or non-integral float yields ok=false — a malformed
+// arbitration entry can never discharge a triage.
+func acceptancePayloadInt64(payload any, field string) (int64, bool) {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	switch v := m[field].(type) {
+	case float64:
+		n := int64(v)
+		if float64(n) != v {
+			return 0, false
+		}
+		return n, true
+	case json.Number:
+		n, err := v.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
+	}
 }
 
 // unclassifiedNextActions is the labeled fallback for any non-terminal
@@ -1450,6 +1552,17 @@ const (
 	// emits when it auto-terminates a degenerate acceptance stage (E38.3 /
 	// #1657). MUST match backend/internal/server.CategoryAcceptanceSkippedOutOfScope.
 	auditCategoryAcceptanceSkippedOutOfScope = "acceptance_skipped_out_of_scope"
+	// auditCategoryAcceptanceTriageArbitrated is the operator-only discharge of a
+	// PAGED acceptance triage (E66.37 / #2474). MUST match
+	// backend/internal/server.CategoryAcceptanceTriageArbitrated.
+	auditCategoryAcceptanceTriageArbitrated = "acceptance_triage_arbitrated"
+
+	// acceptanceArbitrationOutcomeSequenceField is the arbitration payload field
+	// carrying the acceptance_outcome_recorded sequence the discharge BINDS to.
+	// It is the write→read seam between the backend endpoint that writes it
+	// (server/acceptance_arbitration.go) and acceptanceArbitratedIn, which keys
+	// the whole correlation on it.
+	acceptanceArbitrationOutcomeSequenceField = "outcome_sequence"
 
 	acceptanceVerdictPassed = "passed"
 	acceptanceVerdictFailed = "failed"
