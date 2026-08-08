@@ -55,11 +55,15 @@ type onboardingReadiness struct {
 // response, degrades to a single WARN — it never crashes the doctor.
 //
 // It also returns a readinessOutcome carrying whether the endpoint answered an
-// AUTHORITATIVE 200 (HTTP 200 AND a decodable body) plus the server's own scope
-// verdict, threaded into the token rung so a server-authenticated credential is
-// not failed by the local /v0/runs heuristic. A 200 whose body does NOT decode
-// leaves answered false, so a broken backend response can never suppress a
-// genuine token failure (binding condition 1).
+// AUTHORITATIVE 200 (HTTP 200 AND a decodable body whose echoed `repo` is
+// non-empty AND equals the requested repo) plus the server's own scope verdict,
+// threaded into the token rung so a server-authenticated credential is not
+// failed by the local /v0/runs heuristic. A decode that succeeds is NOT proof
+// the body is a readiness verdict — `{}`, `null`, and a verdict for a DIFFERENT
+// repo all decode cleanly — so answered is set ONLY on that positive repo-echo
+// marker. Any non-answer (undecodable body, empty or mismatched repo) leaves
+// answered false, so a broken or wrong-repo backend response can never suppress
+// a genuine token failure (binding condition 1 / #2480).
 func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, readinessOutcome) {
 	const label = "onboarding readiness"
 	if repo == "" {
@@ -93,16 +97,34 @@ func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, re
 		}}, readinessOutcome{}
 	}
 	var body onboardingReadiness
-	if decErr := json.NewDecoder(resp.Body).Decode(&body); decErr != nil {
-		// A 200 with an undecodable body is NOT an authoritative answer:
-		// readinessOutcome stays zero so the token rung can still fail.
+	// degradeToWarn returns the single non-authoritative warn rung with a zero
+	// readinessOutcome (answered=false), so a non-answer can never suppress a
+	// genuine token-rung failure (binding condition 1 / #2480).
+	degradeToWarn := func() ([]checkResult, readinessOutcome) {
 		return []checkResult{{
 			label: label, detail: "unparseable readiness response", status: "warn",
 			remediate: "upgrade fishhawkd to a build that serves /v0/onboarding/readiness",
 		}}, readinessOutcome{}
 	}
+	if decErr := json.NewDecoder(resp.Body).Decode(&body); decErr != nil {
+		// A 200 with an undecodable body is NOT an authoritative answer.
+		return degradeToWarn()
+	}
+	// A successful decode is NOT proof the body is a readiness verdict:
+	// onboardingReadiness has no required fields, so `{}`, `{"unrelated":1}`,
+	// and a verdict for a DIFFERENT repo all decode cleanly, and `null` decodes
+	// to the zero value. The endpoint ALWAYS echoes the repo it answered for
+	// (onboarding.go handleGetOnboardingReadiness sets Repo: repo), so require
+	// that positive marker to be non-empty AND to equal the repo argument.
+	// Anything else — empty marker, or a repo that does not match — is NOT
+	// authoritative: degrade to the same single warn, with answered=false, so
+	// the token rung can still fail (binding condition 1 / #2480).
+	if body.Repo == "" || body.Repo != repo {
+		return degradeToWarn()
+	}
 
-	// 200 AND a decodable body: this is the authoritative answer.
+	// 200, a decodable body, AND an echoed repo that matches the request: this
+	// is the authoritative answer.
 	outcome := readinessOutcome{answered: true, scopesAdequate: body.Scopes.Adequate}
 
 	var out []checkResult
