@@ -460,6 +460,98 @@ func TestCheckToken_MalformedReadiness200DoesNotSuppressFail(t *testing.T) {
 	}
 }
 
+// TestCheckToken_WarnDetailReflectsScopeVerdict pins that the recorded server
+// scope verdict (readinessOutcome.scopesAdequate) is a LIVE field, not dead
+// scaffolding (concern #2480, low/correctness): on the readiness-answered warn
+// branch the token rung's detail differs by scopesAdequate. Collapsing the
+// scopesAdequate branch to a constant note makes the two details identical and
+// turns the final assertion red. Both inputs stay warn — the downgrade decision
+// still keys only on answered (binding condition 1), scope is surfaced, not
+// enforced, locally.
+func TestCheckToken_WarnDetailReflectsScopeVerdict(t *testing.T) {
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusForbidden, `{"error":{"code":"forbidden"}}`), nil
+	})
+	cred := doctorCredential{token: "fho_x", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_x")}
+
+	adequate := checkToken("http://localhost:8080", cred, readinessOutcome{answered: true, scopesAdequate: true})
+	if adequate.status != "warn" {
+		t.Fatalf("adequate status = %q, want warn", adequate.status)
+	}
+	if !strings.Contains(adequate.detail, "scopes adequate") || strings.Contains(adequate.detail, "NOT adequate") {
+		t.Errorf("adequate detail = %q, want it to note scopes adequate", adequate.detail)
+	}
+
+	inadequate := checkToken("http://localhost:8080", cred, readinessOutcome{answered: true, scopesAdequate: false})
+	if inadequate.status != "warn" {
+		t.Fatalf("inadequate status = %q, want warn", inadequate.status)
+	}
+	if !strings.Contains(inadequate.detail, "NOT adequate") {
+		t.Errorf("inadequate detail = %q, want it to note scopes NOT adequate", inadequate.detail)
+	}
+	if adequate.detail == inadequate.detail {
+		t.Errorf("scopesAdequate is a dead field: both details are %q", adequate.detail)
+	}
+}
+
+// TestRunDoctor_EnvOnlyTokenReachesProbe pins the previously-untested
+// $FISHHAWK_TOKEN tier (concern #2480, medium/untested-path): with NO --token
+// flag and NO stored credential, a credential present ONLY in $FISHHAWK_TOKEN
+// must be folded into the flag by bindCommonFlags, resolved by
+// resolveDoctorCredential, and carried on the /v0/runs probe's Authorization
+// header. The credstore seam is stubbed to error so the assertion proves the
+// ENV tier, not the stored-credential tier — an env-only operator must not
+// silently drop to unauthenticated probing.
+func TestRunDoctor_EnvOnlyTokenReachesProbe(t *testing.T) {
+	t.Setenv("FISHHAWK_TOKEN", "fhk_env_only")
+	withFakeDoctorCredLoad(t, func(_ string) (credstore.Credential, error) {
+		return credstore.Credential{}, errors.New("no stored credential")
+	})
+	var runsAuth string
+	seenRuns := false
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(req.URL.Path, "/healthz"):
+			return fakeHTTPResponse(http.StatusOK, `{"status":"ok","version":"v0.0.0-test"}`), nil
+		case strings.HasSuffix(req.URL.Path, "/v0/onboarding/readiness"):
+			return fakeHTTPResponse(http.StatusOK, allGreenReadinessJSON), nil
+		case strings.Contains(req.URL.Path, "/v0/runs"):
+			seenRuns = true
+			runsAuth = req.Header.Get("Authorization")
+			return fakeHTTPResponse(http.StatusOK, `{"items":[]}`), nil
+		default:
+			return fakeHTTPResponse(http.StatusOK, `{}`), nil
+		}
+	})
+	withFakeDoctorLookPath(t, func(_ string) (string, error) {
+		return "/usr/local/bin/fishhawk-runner", nil
+	})
+	withFakeDoctorRunOutput(t, func(name string, _ ...string) (string, error) {
+		return fmt.Sprintf("%s ok", name), nil
+	})
+
+	dir := initCleanGitRepo(t)
+	writeValidSpec(t, dir)
+
+	var stdout, stderr strings.Builder
+	// No --token flag: the credential must come from $FISHHAWK_TOKEN alone.
+	run([]string{
+		"doctor",
+		"--backend-url", "http://localhost:8080",
+		"--repo", "kuhlman-labs/fishhawk",
+		"--working-dir", dir,
+		"--runner-binary", "/usr/local/bin/fishhawk-runner",
+	}, &stdout, &stderr)
+
+	if !seenRuns {
+		t.Fatalf("the /v0/runs probe never ran — env-only credential did not reach checkToken\nstdout:\n%s", stdout.String())
+	}
+	if runsAuth != "Bearer fhk_env_only" {
+		t.Errorf("/v0/runs Authorization = %q, want %q (env-only token must reach the probe)\nstdout:\n%s",
+			runsAuth, "Bearer fhk_env_only", stdout.String())
+	}
+}
+
 // --- MCP rung: per-branch behavioral tests (#2480) --------------------------
 
 // TestCheckMCP_HTTPRegistrationByName: an HTTP registration named fishhawk-http

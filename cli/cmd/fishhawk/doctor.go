@@ -108,6 +108,12 @@ func resolveDoctorCredential(backendURL, flagToken string) doctorCredential {
 // when the endpoint returned HTTP 200 AND its body decoded into a readiness
 // payload — a 200 whose body does not decode is NOT an answer, so the token
 // rung must still be able to fail (binding condition 1).
+//
+// scopesAdequate mirrors the server's scopes.adequate verdict. It is surfaced
+// in the token rung's readiness-answered warn detail (branch d) so it is a
+// READ field, not dead scaffolding that would invite a false belief scope
+// adequacy is being consulted locally. It never drives the downgrade decision,
+// which keys ONLY on answered (binding condition 1).
 type readinessOutcome struct {
 	answered       bool
 	scopesAdequate bool
@@ -383,9 +389,17 @@ func checkToken(backendURL string, cred doctorCredential, readiness readinessOut
 	// authoritative readiness endpoint returned a decodable 200 for the SAME
 	// credential. answered is false on a malformed 200, so a broken backend
 	// response can never suppress a genuine token failure (binding condition 1).
+	// The downgrade decision keys ONLY on answered; the recorded server scope
+	// verdict is surfaced in the detail so the operator sees what the
+	// authoritative `token scope adequate` rung will report.
 	if readiness.answered {
+		scopeNote := "readiness reports scopes adequate"
+		if !readiness.scopesAdequate {
+			scopeNote = "readiness reports scopes NOT adequate — see the `token scope adequate` rung"
+		}
 		return checkResult{label: label,
-			detail: fmt.Sprintf("HTTP %d on /v0/runs, but the readiness endpoint authenticated this credential", resp.StatusCode),
+			detail: fmt.Sprintf("HTTP %d on /v0/runs, but the readiness endpoint authenticated this credential (%s)",
+				resp.StatusCode, scopeNote),
 			status: "warn",
 			remediate: "the backend authenticated this credential on the authoritative readiness endpoint; " +
 				"`token scope adequate` (server-side) is the authority on scope"}
