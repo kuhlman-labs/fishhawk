@@ -37,13 +37,14 @@ func findCheck(t *testing.T, results []checkResult, label string) checkResult {
 func TestCheckOnboardingReadiness_AppNotInstalled(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, `{
+			"repo": "owner/name",
 			"app": {"installed": false, "reason": "GitHub App is not installed on the target repository"},
 			"spec": {"source": "unavailable", "note": "app not installed"},
 			"reviewers": [],
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	app := findCheck(t, results, "app installed")
 	if app.status != "fail" {
 		t.Errorf("app status = %q, want fail", app.status)
@@ -62,13 +63,14 @@ func TestCheckOnboardingReadiness_ReviewerUnavailable(t *testing.T) {
 	const hint = "set FISHHAWKD_ANTHROPIC_API_KEY to enable the anthropic reviewer"
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, `{
+			"repo": "owner/name",
 			"app": {"installed": true},
 			"spec": {"source": "fetched", "valid": true},
 			"reviewers": [{"provider": "anthropic", "available": false, "missing_hint": "`+hint+`"}],
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	rv := findCheck(t, results, "reviewer available: anthropic")
 	if rv.status != "fail" {
 		t.Errorf("reviewer status = %q, want fail", rv.status)
@@ -83,13 +85,14 @@ func TestCheckOnboardingReadiness_ReviewerUnavailable(t *testing.T) {
 func TestCheckOnboardingReadiness_ScopeMissing(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, `{
+			"repo": "owner/name",
 			"app": {"installed": true},
 			"spec": {"source": "fetched", "valid": true},
 			"reviewers": [],
 			"scopes": {"adequate": false, "required": ["read:runs","write:runs"], "missing": ["write:runs"]}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	sc := findCheck(t, results, "token scope adequate")
 	if sc.status != "fail" {
 		t.Errorf("scope status = %q, want fail", sc.status)
@@ -107,13 +110,14 @@ func TestCheckOnboardingReadiness_ScopeMissing(t *testing.T) {
 func TestCheckOnboardingReadiness_SpecInvalid(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, `{
+			"repo": "owner/name",
 			"app": {"installed": true},
 			"spec": {"source": "fetched", "valid": false, "error": "stage[0]: missing type"},
 			"reviewers": [],
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	sp := findCheck(t, results, "workflow spec (committed) valid")
 	if sp.status != "fail" {
 		t.Errorf("spec status = %q, want fail", sp.status)
@@ -131,13 +135,14 @@ func TestCheckOnboardingReadiness_SpecInvalid(t *testing.T) {
 func TestCheckOnboardingReadiness_SpecUnavailable(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, `{
+			"repo": "owner/name",
 			"app": {"installed": true},
 			"spec": {"source": "unavailable", "note": "no workflow spec found on the default branch"},
 			"reviewers": [],
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	sp := findCheck(t, results, "workflow spec (committed) valid")
 	if sp.status != "warn" {
 		t.Errorf("spec status = %q, want warn", sp.status)
@@ -150,7 +155,7 @@ func TestCheckOnboardingReadiness_TransportError(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return nil, errors.New("connection refused")
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	if len(results) != 1 || results[0].status != "warn" {
 		t.Fatalf("want a single warn on transport error, got %+v", results)
 	}
@@ -162,7 +167,7 @@ func TestCheckOnboardingReadiness_Non200(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusUnauthorized, `{"error":{"code":"unauthorized"}}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	if len(results) != 1 || results[0].status != "warn" {
 		t.Fatalf("want a single warn on non-200, got %+v", results)
 	}
@@ -178,7 +183,7 @@ func TestCheckOnboardingReadiness_RepoUnresolved(t *testing.T) {
 		t.Fatal("no HTTP call expected when repo is empty")
 		return nil, nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "")
 	if len(results) != 1 || results[0].status != "warn" {
 		t.Fatalf("want a single warn when repo unresolved, got %+v", results)
 	}
@@ -193,7 +198,7 @@ func TestCheckOnboardingReadiness_AllGreen(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, allGreenReadinessJSON), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "kuhlman-labs/fishhawk")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "kuhlman-labs/fishhawk")
 	for _, r := range results {
 		if r.status != "ok" {
 			t.Errorf("rung %q status = %q, want ok (detail: %s)", r.label, r.status, r.detail)
@@ -208,6 +213,85 @@ func TestCheckOnboardingReadiness_AllGreen(t *testing.T) {
 	app := findCheck(t, results, "app installed")
 	if !strings.Contains(app.detail, "42") {
 		t.Errorf("app detail = %q, want the installation id", app.detail)
+	}
+}
+
+// TestCheckOnboardingReadiness_NonAuthoritative200 is the binding-condition-1 /
+// #2480 table: a 200 whose body DECODES cleanly but carries no positive
+// readiness marker FOR THE REQUESTED REPO — `{}`, `{"unrelated":1}`, `null`,
+// and a verdict for a DIFFERENT repo (even with app.installed=true) — must NOT
+// be treated as an answer. "Decoded without error" is not evidence the body is
+// a readiness verdict at all: onboardingReadiness has no required fields, so
+// each of these decodes to the zero value or a foreign verdict. For every one,
+// checkOnboardingReadiness must report answered==false AND a genuine 403 on the
+// /v0/runs probe must remain a token-rung FAIL, never be downgraded to warn.
+//
+// Deleting the `body.Repo == "" || body.Repo != repo` guard in
+// checkOnboardingReadiness turns each case RED: answered becomes true and the
+// token rung downgrades the 403 to warn.
+func TestCheckOnboardingReadiness_NonAuthoritative200(t *testing.T) {
+	const repo = "owner/name"
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"empty object", `{}`},
+		{"unrelated field", `{"unrelated":1}`},
+		{"json null", `null`},
+		{"repo mismatch, app installed", `{"repo":"someone/else","app":{"installed":true}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+				if strings.Contains(req.URL.Path, "/v0/onboarding/readiness") {
+					return fakeHTTPResponse(http.StatusOK, tc.body), nil
+				}
+				// A genuine credential failure on the run-driving surface.
+				return fakeHTTPResponse(http.StatusForbidden, `{"error":{"code":"forbidden"}}`), nil
+			})
+			readinessChecks, outcome := checkOnboardingReadiness("http://localhost:8080", "fho_x", repo)
+			if outcome.answered {
+				t.Fatalf("outcome.answered = true for body %s; a non-authoritative 200 must not be an answer", tc.body)
+			}
+			if len(readinessChecks) != 1 || readinessChecks[0].status != "warn" {
+				t.Fatalf("want a single warn for body %s, got %+v", tc.body, readinessChecks)
+			}
+			cred := doctorCredential{token: "fho_x", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_x")}
+			r := checkToken("http://localhost:8080", cred, outcome)
+			if r.status != "fail" {
+				t.Errorf("checkToken status = %q for body %s, want fail (a non-authoritative readiness 200 must not suppress a 403)", r.status, tc.body)
+			}
+		})
+	}
+}
+
+// TestCheckOnboardingReadiness_AuthoritativeMatchingRepoAnswers is the positive
+// control paired with the table above: a well-formed payload whose echoed repo
+// MATCHES the request is authoritative (answered==true), and a subsequent 403 on
+// /v0/runs downgrades the token rung to warn — proving the repo-echo guard did
+// not simply disable the cascade break the change exists to add.
+func TestCheckOnboardingReadiness_AuthoritativeMatchingRepoAnswers(t *testing.T) {
+	const repo = "owner/name"
+	withFakeDoctorHTTP(t, func(req *http.Request) (*http.Response, error) {
+		if strings.Contains(req.URL.Path, "/v0/onboarding/readiness") {
+			return fakeHTTPResponse(http.StatusOK, `{
+				"repo": "owner/name",
+				"app": {"installed": true},
+				"spec": {"source": "fetched", "valid": true},
+				"reviewers": [],
+				"scopes": {"adequate": true}
+			}`), nil
+		}
+		return fakeHTTPResponse(http.StatusForbidden, `{"error":{"code":"forbidden"}}`), nil
+	})
+	_, outcome := checkOnboardingReadiness("http://localhost:8080", "fho_x", repo)
+	if !outcome.answered {
+		t.Fatalf("outcome.answered = false for a matching-repo payload; want true")
+	}
+	cred := doctorCredential{token: "fho_x", source: "--token / $FISHHAWK_TOKEN", class: classifyCredential("fho_x")}
+	r := checkToken("http://localhost:8080", cred, outcome)
+	if r.status != "warn" {
+		t.Errorf("checkToken status = %q, want warn (an authoritative 200 downgrades a 403)", r.status)
 	}
 }
 
