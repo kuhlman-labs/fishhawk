@@ -949,6 +949,37 @@ func TestGetRun_Drive_SurfacesAutoAdvancedAndNextAction(t *testing.T) {
 	}
 }
 
+// TestGetRun_Drive_SurfacesQualifiedNextActionDetail pins the distillation
+// boundary (#2487, binding condition 2): the read path through
+// getRunResponse must surface the merge next_action.Detail BYTE-FOR-BYTE.
+// The awaiting_merge qualification (a reviewer rejected, so the detail
+// warns rather than reading as an all-clear) is the whole point of the
+// change, and GET /v0/runs could silently drop or rewrite it while every
+// stamp-side test still passed — this seals that gap on the real read path.
+func TestGetRun_Drive_SurfacesQualifiedNextActionDetail(t *testing.T) {
+	s, _, au, seeded := newDriveGetServer(t)
+	pr := "https://github.com/x/y/pull/7"
+	seeded.PullRequestURL = &pr
+
+	const qualifiedDetail = "all blocking gates resolved and required checks are green; 1 advisory reject (latest review round) outstanding — read them with fishhawk_get_gate_view, then merge, route a fix-up with fishhawk_fixup_stage, or waive with fishhawk_waive_concern"
+	seedAutoAdvance(t, au, seeded.ID, 9, time.Now().UTC(), drive.Advance{
+		Rule: drive.RuleChecksGreenAwaitingMerge, From: "review:awaiting_approval", To: "awaiting_merge",
+		Event:      "review evidence terminal and required PR checks green",
+		NextAction: &drive.NextAction{Action: "merge_pr", Detail: qualifiedDetail, PRURL: pr},
+	})
+
+	resp, _ := getRunResponse(t, s, seeded.ID)
+	if resp.NextAction == nil {
+		t.Fatalf("next_action = nil, want the qualified merge next_action")
+	}
+	if resp.NextAction.Detail != qualifiedDetail {
+		t.Errorf("next_action.detail = %q, want the qualified detail surfaced byte-for-byte", resp.NextAction.Detail)
+	}
+	if strings.Contains(resp.NextAction.Detail, "all gates resolved") {
+		t.Errorf("next_action.detail = %q, must NOT collapse to the clean all-clear through distillation", resp.NextAction.Detail)
+	}
+}
+
 // TestGetRun_Drive_TerminalRun_OmitsNextAction pins the staleness
 // guard: a terminal run keeps its auto_advanced history but surfaces
 // no next_action / derived_status — the recorded next step is history,

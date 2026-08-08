@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
@@ -168,6 +169,7 @@ type driveObserverHarness struct {
 	repo  *approvalRunRepo
 	au    *auditFake
 	scs   *fakeStageCheckRepo
+	cr    *fakeConcernRepo
 	stage *run.Stage
 	runID uuid.UUID
 }
@@ -177,23 +179,29 @@ func newDriveObserverHarness(t *testing.T, driveOn bool) *driveObserverHarness {
 	repo := newApprovalRunRepo()
 	au := newAuditFake()
 	scs := newFakeStageCheckRepo()
+	cr := newFakeConcernRepo()
 	s := New(Config{
 		Addr:           "127.0.0.1:0",
 		RunRepo:        repo,
 		AuditRepo:      au,
 		StageCheckRepo: scs,
+		// A wired ConcernRepo with zero concerns keeps every existing
+		// drive-observer case on the clean advisory branch (#2487) — its
+		// exact-string assertions stay green because the clean branch
+		// returns today's phrasing byte-for-byte.
+		ConcernRepo: cr,
 	})
 	stage := repo.seedStage(run.StageStateAwaitingApproval)
 	repo.mu.Lock()
 	stage.Type = run.StageTypeReview
 	repo.mu.Unlock()
 	repo.seedRun(&run.Run{ID: stage.RunID, Drive: driveOn, State: run.StateRunning})
-	return &driveObserverHarness{s: s, repo: repo, au: au, scs: scs, stage: stage, runID: stage.RunID}
+	return &driveObserverHarness{s: s, repo: repo, au: au, scs: scs, cr: cr, stage: stage, runID: stage.RunID}
 }
 
 // seedImplementReviewRound seeds an implement_review_started entry with
 // the given configured-agent count plus n terminal implement_reviewed
-// entries sequenced after it.
+// entries (empty payloads — no reject) sequenced after it.
 func (h *driveObserverHarness) seedImplementReviewRound(t *testing.T, configured, terminal int, baseSeq int64) {
 	t.Helper()
 	payload, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: configured})
@@ -204,6 +212,60 @@ func (h *driveObserverHarness) seedImplementReviewRound(t *testing.T, configured
 	for i := 0; i < terminal; i++ {
 		h.au.seeded = append(h.au.seeded, &audit.Entry{
 			RunID: &rid, Sequence: baseSeq + 1 + int64(i), Category: "implement_reviewed", Payload: []byte(`{}`),
+		})
+	}
+}
+
+// seedImplementReviewRoundWithRejects seeds an implement_review_started
+// entry plus `terminal` implement_reviewed entries sequenced after it, of
+// which the first `rejects` carry a VerdictReject payload and the rest a
+// clean approve payload (#2487). Rejects are seeded BY CONSTRUCTION so the
+// derivation under test — not the test's own setup — decides the count.
+func (h *driveObserverHarness) seedImplementReviewRoundWithRejects(t *testing.T, configured, terminal, rejects int, baseSeq int64) {
+	t.Helper()
+	payload, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: configured})
+	rid := h.runID
+	h.au.seeded = append(h.au.seeded, &audit.Entry{
+		RunID: &rid, Sequence: baseSeq, Category: "implement_review_started", Payload: payload,
+	})
+	for i := 0; i < terminal; i++ {
+		verdict := planreview.VerdictApprove
+		if i < rejects {
+			verdict = planreview.VerdictReject
+		}
+		vp, _ := json.Marshal(planreview.ImplementReviewedPayload{Verdict: verdict})
+		h.au.seeded = append(h.au.seeded, &audit.Entry{
+			RunID: &rid, Sequence: baseSeq + 1 + int64(i), Category: "implement_reviewed", Payload: vp,
+		})
+	}
+}
+
+// seedImplementReviewRoundMalformed seeds an implement_review_started
+// entry plus one implement_reviewed entry carrying a payload that fails
+// to decode as ImplementReviewedPayload (#2487, binding condition 1) — the
+// truncated-review-returned-success failure mode. The round is otherwise
+// terminal (one verdict landed), so the gate would reach awaiting_merge;
+// the malformed payload must force the read-first hedge.
+func (h *driveObserverHarness) seedImplementReviewRoundMalformed(t *testing.T, configured int, baseSeq int64) {
+	t.Helper()
+	payload, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: configured})
+	rid := h.runID
+	h.au.seeded = append(h.au.seeded,
+		&audit.Entry{RunID: &rid, Sequence: baseSeq, Category: "implement_review_started", Payload: payload},
+		// A JSON value that is not an object cannot decode into the
+		// struct — the truncated/garbled payload shape.
+		&audit.Entry{RunID: &rid, Sequence: baseSeq + 1, Category: "implement_reviewed", Payload: []byte(`"truncated`)},
+	)
+}
+
+// seedOpenConcerns seeds n open (raised) concerns on the fake ConcernRepo
+// for the harness run, so ListOpenByRun reports them run-wide (#2487).
+func (h *driveObserverHarness) seedOpenConcerns(n int) {
+	h.cr.mu.Lock()
+	defer h.cr.mu.Unlock()
+	for i := 0; i < n; i++ {
+		h.cr.rows = append(h.cr.rows, &concern.Concern{
+			ID: uuid.New(), RunID: h.runID, State: concern.StateRaised,
 		})
 	}
 }
@@ -356,6 +418,201 @@ func TestObserveParkedReview_ChecksGreen_StampsAwaitingMerge(t *testing.T) {
 	advances := h.driveAdvances(t)
 	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
 		t.Fatalf("run_auto_advanced = %+v, want settled + awaiting_merge", advances)
+	}
+}
+
+// --- Advisory-qualified awaiting_merge detail (#2487) ----------------------
+
+// Legacy clean strings kept byte-for-byte by the clean advisory branch.
+const (
+	cleanMergeDetailResolved   = "all gates resolved and required checks are green; review and merge the PR"
+	cleanMergeDetailUnresolved = "all gates resolved; required checks were not resolved for this run (no protection snapshot) — verify CI on the PR before merging"
+)
+
+// awaitingMergeDetail runs the observer, asserts the no-behaviour-change
+// invariant (Rule/To/Action unchanged — the merge gate keys on the rule,
+// not the prose), and returns the stamped merge detail.
+func (h *driveObserverHarness) awaitingMergeDetail(t *testing.T) string {
+	t.Helper()
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("run_auto_advanced = %+v, want settled + checks_green_awaiting_merge", advances)
+	}
+	adv := advances[1]
+	if adv.To != "awaiting_merge" {
+		t.Errorf("To = %q, want awaiting_merge (prose-only change; state unchanged)", adv.To)
+	}
+	if adv.NextAction == nil || adv.NextAction.Action != "merge_pr" {
+		t.Fatalf("NextAction = %+v, want merge_pr (prose-only change; action unchanged)", adv.NextAction)
+	}
+	return adv.NextAction.Detail
+}
+
+// seedResolvedZeroChecks makes reviewChecksResolution report (green,
+// resolved) = (true, true): a present snapshot declaring zero required
+// checks. Used by the checks-resolved branch cases.
+func (h *driveObserverHarness) seedResolvedZeroChecks() {
+	h.repo.seedRun(&run.Run{
+		ID: h.runID, Drive: true, State: run.StateRunning,
+		RequiredChecksSnapshot: &run.RequiredChecksSnapshot{Contexts: []string{}},
+	})
+}
+
+// TestObserveParkedReview_CleanResolved_KeepsLegacyDetail pins branch (1):
+// zero rejects, zero concerns, checks resolved → today's clean string
+// byte-for-byte (asserted by EQUALITY, not substring).
+func TestObserveParkedReview_CleanResolved_KeepsLegacyDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 0, 10)
+	h.seedResolvedZeroChecks()
+
+	if got := h.awaitingMergeDetail(t); got != cleanMergeDetailResolved {
+		t.Errorf("detail = %q, want the legacy resolved string byte-for-byte", got)
+	}
+}
+
+// TestObserveParkedReview_CleanUnresolved_KeepsLegacyDetail pins branch (2):
+// zero rejects, zero concerns, checks unresolved (nil snapshot) → today's
+// legacy unresolved string by EQUALITY.
+func TestObserveParkedReview_CleanUnresolved_KeepsLegacyDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 0, 10)
+
+	if got := h.awaitingMergeDetail(t); got != cleanMergeDetailUnresolved {
+		t.Errorf("detail = %q, want the legacy unresolved string byte-for-byte", got)
+	}
+}
+
+// TestObserveParkedReview_OneReject_QualifiesDetail pins branch (3): one
+// round-scoped reject, zero concerns → the SINGULAR "1 advisory reject",
+// never "all gates resolved", the "all blocking gates resolved" lead, and
+// the fix-up / waive dispositions.
+func TestObserveParkedReview_OneReject_QualifiesDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 1, 10)
+
+	got := h.awaitingMergeDetail(t)
+	if !strings.Contains(got, "1 advisory reject") {
+		t.Errorf("detail = %q, want it to state the singular '1 advisory reject'", got)
+	}
+	if strings.Contains(got, "advisory rejects") {
+		t.Errorf("detail = %q, want the SINGULAR reject, not the plural", got)
+	}
+	if strings.Contains(got, "all gates resolved") {
+		t.Errorf("detail = %q, must NOT read 'all gates resolved' with a reject outstanding", got)
+	}
+	if !strings.Contains(got, "all blocking gates resolved") {
+		t.Errorf("detail = %q, want the 'all blocking gates resolved' lead", got)
+	}
+	if !strings.Contains(got, "fishhawk_fixup_stage") || !strings.Contains(got, "fishhawk_waive_concern") {
+		t.Errorf("detail = %q, want it to name fishhawk_fixup_stage and fishhawk_waive_concern", got)
+	}
+}
+
+// TestObserveParkedReview_TwoConcerns_QualifiesDetail pins branch (4):
+// zero rejects, two run-wide open concerns → "2 unresolved concerns" and
+// never "all gates resolved".
+func TestObserveParkedReview_TwoConcerns_QualifiesDetail(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 0, 10)
+	h.seedOpenConcerns(2)
+
+	got := h.awaitingMergeDetail(t)
+	if !strings.Contains(got, "2 unresolved concerns") {
+		t.Errorf("detail = %q, want it to state '2 unresolved concerns'", got)
+	}
+	if strings.Contains(got, "all gates resolved") {
+		t.Errorf("detail = %q, must NOT read 'all gates resolved' with concerns outstanding", got)
+	}
+}
+
+// TestObserveParkedReview_RejectsAndConcerns_QualifiesBoth pins branch (5):
+// two rejects + three concerns → BOTH counts present, each with its own
+// scope, and never "all gates resolved".
+func TestObserveParkedReview_RejectsAndConcerns_QualifiesBoth(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 2, 2, 2, 10)
+	h.seedOpenConcerns(3)
+
+	got := h.awaitingMergeDetail(t)
+	if !strings.Contains(got, "2 advisory rejects") {
+		t.Errorf("detail = %q, want '2 advisory rejects'", got)
+	}
+	if !strings.Contains(got, "3 unresolved concerns") {
+		t.Errorf("detail = %q, want '3 unresolved concerns'", got)
+	}
+	if strings.Contains(got, "all gates resolved") {
+		t.Errorf("detail = %q, must NOT read 'all gates resolved'", got)
+	}
+}
+
+// TestObserveParkedReview_NilConcernRepo_HedgesTowardRead pins branch (6):
+// a nil ConcernRepo cannot read the advisory state → the read-first hedge.
+// Asserts POSITIVELY (binding condition 3): NOT "all gates resolved" AND
+// names the gate-view read.
+func TestObserveParkedReview_NilConcernRepo_HedgesTowardRead(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 0, 10)
+	h.s.cfg.ConcernRepo = nil
+
+	got := h.awaitingMergeDetail(t)
+	if strings.Contains(got, "all gates resolved") {
+		t.Errorf("detail = %q, must NOT emit the clean all-clear when the advisory state is unreadable", got)
+	}
+	if !strings.Contains(got, "fishhawk_get_gate_view") {
+		t.Errorf("detail = %q, want the read-first hedge to name fishhawk_get_gate_view", got)
+	}
+}
+
+// TestObserveParkedReview_ConcernRepoError_HedgesTowardRead pins branch (7):
+// a ListOpenByRun error takes the SAME hedge as the nil repo — the two
+// Known=false modes are tested separately, not collapsed.
+func TestObserveParkedReview_ConcernRepoError_HedgesTowardRead(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 0, 10)
+	h.cr.listErr = errors.New("boom")
+
+	got := h.awaitingMergeDetail(t)
+	if strings.Contains(got, "all gates resolved") {
+		t.Errorf("detail = %q, must NOT emit the clean all-clear when ListOpenByRun errors", got)
+	}
+	if !strings.Contains(got, "fishhawk_get_gate_view") {
+		t.Errorf("detail = %q, want the read-first hedge to name fishhawk_get_gate_view", got)
+	}
+}
+
+// TestObserveParkedReview_MalformedVerdict_HedgesTowardRead pins branch (1')
+// (binding condition 1): an UNDECODABLE implement_reviewed payload must NOT
+// contribute zero rejects and fall through to the clean all-clear — the
+// precise defect this issue exists to prevent, arriving through the read
+// path. It forces the SAME read-first hedge the nil/erroring ConcernRepo
+// takes, even though the ConcernRepo here is wired and clean.
+func TestObserveParkedReview_MalformedVerdict_HedgesTowardRead(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundMalformed(t, 1, 10)
+
+	got := h.awaitingMergeDetail(t)
+	if strings.Contains(got, "all gates resolved") {
+		t.Errorf("detail = %q, must NOT emit the clean all-clear when a verdict payload is unreadable", got)
+	}
+	if !strings.Contains(got, "fishhawk_get_gate_view") {
+		t.Errorf("detail = %q, want the read-first hedge to name fishhawk_get_gate_view", got)
+	}
+}
+
+// TestObserveParkedReview_SupersededReject_NotCounted pins branch (8):
+// round-scoping. A reject in a settled EARLIER round followed by a clean
+// newer round must yield the CLEAN string — a superseded reject can never
+// re-qualify a resolved run.
+func TestObserveParkedReview_SupersededReject_NotCounted(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 1, 10) // earlier round: one reject
+	h.seedImplementReviewRoundWithRejects(t, 1, 1, 0, 20) // newer round: clean
+	h.seedResolvedZeroChecks()
+
+	if got := h.awaitingMergeDetail(t); got != cleanMergeDetailResolved {
+		t.Errorf("detail = %q, want the clean resolved string: the earlier round's reject is superseded", got)
 	}
 }
 

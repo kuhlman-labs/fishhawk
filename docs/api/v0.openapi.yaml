@@ -1519,7 +1519,9 @@ components:
             implement stage from the operator host), `run_plan_stage`
             (runner_kind `local` after a plan-gate revise re-opened the
             plan stage — re-dispatch it from the operator host, #1256),
-            and `merge_pr` (all gates resolved, required checks green).
+            and `merge_pr` (the backend parked the run at `awaiting_merge`;
+            the accompanying `detail` states any outstanding advisory
+            reviewer rejects or unresolved concerns — #2487).
             `run_implement_stage` / `run_plan_stage` are now ALSO produced
             by the `retry_stage` and `resume_run`/`recover` re-open paths
             on a `local` run (#1271), not only by plan-approve and revise;
@@ -1527,7 +1529,15 @@ components:
           example: merge_pr
         detail:
           type: string
-          description: One-line elaboration of the action.
+          description: |
+            One-line elaboration of the action. For `merge_pr` it carries
+            the outstanding-advisory qualification (#2487): the clean
+            merge invitation when zero reviewer rejects and zero open
+            concerns remain, otherwise a lead of `all blocking gates
+            resolved` (never `all gates resolved`) that states the
+            round-scoped reject count and the run-wide open-concern count
+            and names the dispositions, or a read-first hedge when the
+            advisory state could not be read.
         pr_url:
           type: string
           description: The pull request the action refers to, when relevant.

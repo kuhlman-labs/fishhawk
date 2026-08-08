@@ -546,7 +546,7 @@ Idempotence (**endpoint-side, #1954**):
 
 Statuses: `merged` (a `pr_merged` / `post_merge_observed` entry landed past the anchor; `next_action` carries the operator post-merge dev-host step, **surfaced not invoked** — ADR-038), `timeout` (resumable — re-invoke; the endpoint's idempotence makes the re-POST safe), `run_terminal` (the run reached failed/cancelled while waiting — the merge will most likely never settle; check `fishhawk_get_run_status`).
 
-A **write** tool needing `write:approvals`; a run-bound agent token is rejected (`run_token_forbidden`, 403). `next_actions`' merge-ritual states (`succeeded_pr_open`, the acceptance-skipped/passed states, and the drive-folded `awaiting_merge`) now emit `approve_pr` then `fishhawk_merge_run`, replacing the bare `merge_pr` + `post_merge` steps.
+A **write** tool needing `write:approvals`; a run-bound agent token is rejected (`run_token_forbidden`, 403). `next_actions`' merge-ritual states (`succeeded_pr_open`, the acceptance-skipped/passed states, and the drive-folded `awaiting_merge`) now emit `approve_pr` then `fishhawk_merge_run`, replacing the bare `merge_pr` + `post_merge` steps. For the drive-folded `awaiting_merge` action, `driveAction` passes the backend's `next_action.detail` through verbatim as the folded merge action's `reason`, so the operator sees the backend's advisory qualification (any outstanding reviewer rejects / open concerns — [#2487](https://github.com/kuhlman-labs/fishhawk/issues/2487)); the action's precondition no longer makes an unconditional "every gate resolved and required checks green" all-clear claim and instead points the reader at that reason/detail.
 
 ## Scope amendment at approval (`fishhawk_approve_plan` → `add_scope_files` / `remove_scope_files`)
 
