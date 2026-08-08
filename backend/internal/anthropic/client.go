@@ -100,10 +100,19 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 // (#681/#1343) — so the caller can attribute reviewer agent cost including
 // cache-aware pricing. The SDK always returns a Usage block on a successful
 // Messages call, so the token counts are authoritative on the happy path.
-// Refusal, max_tokens truncation, and no-text-block responses return a typed
-// error rather than ("", nil); token counts are surfaced on these paths (not
-// zeroed) so cost attribution is preserved. A transport-level error (non-nil
-// err from Messages.New) zeros all four counts.
+// Refusal (naming the refusal category), max_tokens truncation, context-window
+// exhaustion (stop_reason=model_context_window_exceeded), and no-text-block
+// responses return a typed error rather than ("", nil); token counts are
+// surfaced on these paths (not zeroed) so cost attribution is preserved. The
+// stop_reason inspection is an allow-list: end_turn is the only stop reason a
+// healthy review can produce (Fishhawk sends no tools and no stop sequences),
+// so ANY other stop reason — including one a future API adds — fails closed
+// rather than falling through to the content loop and surfacing a partial
+// fragment as success. The one carve-out is an EMPTY stop_reason, which still
+// falls through to today's content loop so a BaseURL-overridden gateway that
+// omits the field is not newly hard-failed on every review; the residual bound
+// this leaves is documented at the carve-out below. A transport-level error
+// (non-nil err from Messages.New) zeros all four counts.
 //
 // When c.schema is non-nil the request carries OutputConfig.Format =
 // json_schema with that per-client schema (#1324/#1326): the Messages API
@@ -157,12 +166,46 @@ func (c *Client) Messages(ctx context.Context, systemText, userText string) (res
 	// verdict truncated mid-object is unparseable — failing loud is strictly
 	// better than surfacing an unparseable fragment as ("", nil).
 	if msg.StopReason == anthropicsdk.StopReasonRefusal {
+		// Name the refusal category (SDK 1.61.0 RefusalStopDetails.Category:
+		// cyber / bio / frontier_llm / reasoning_extraction / general_harms) so a
+		// refused review is triageable instead of opaque. StopDetails is a value
+		// type on Message, so reading Category on any response is safe. Explanation
+		// is deliberately NOT surfaced: the SDK marks it unstable and it is
+		// model-authored prose that would land unredacted in an issue comment.
 		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
-			fmt.Errorf("anthropic: model refused to respond (stop_reason=refusal)")
+			fmt.Errorf("anthropic: model refused to respond (stop_reason=refusal, category=%s)", msg.StopDetails.Category)
 	}
 	if msg.StopReason == anthropicsdk.StopReasonMaxTokens {
 		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
 			fmt.Errorf("anthropic: response truncated at max_tokens (%d tokens); increase max_tokens", outTok)
+	}
+	if msg.StopReason == anthropicsdk.StopReasonModelContextWindowExceeded {
+		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
+			fmt.Errorf("anthropic: context window exceeded (%d input tokens); reduce prompt size", inTok)
+	}
+	// Fail-closed catch-all: the SDK's StopReason set is end_turn / max_tokens /
+	// stop_sequence / tool_use / pause_turn / refusal /
+	// model_context_window_exceeded, and Fishhawk sends no tools and no stop
+	// sequences, so end_turn is the only stop reason a healthy review can
+	// produce. Any other value is by construction an incomplete or unexpected
+	// response, so error rather than fall through to the content loop and surface
+	// a partial fragment as success — and a future API-added stop reason now
+	// fails closed here instead of silently repeating the very bug this branch
+	// closes.
+	//
+	// EMPTY stop_reason is deliberately carved out (falls through to the content
+	// loop below). Config supports a BaseURL override (ADR-062 regional cells,
+	// see TestNewClient_ExplicitOptionOverridesConfigBaseURL), and a proxy or
+	// gateway that omits stop_reason would otherwise be newly hard-failed on
+	// EVERY review. ACCEPTED RESIDUAL BOUND: this carve-out means a
+	// non-conformant response with an EMPTY stop_reason AND a PARTIAL text block
+	// still returns that fragment as success — the same silently-wrong-success
+	// failure class #2199 closes, surviving in this one narrow corner. It is a
+	// documented, accepted bound: hard-failing an empty stop_reason would break a
+	// BaseURL-overridden gateway on every review, which is the worse outcome.
+	if msg.StopReason != anthropicsdk.StopReasonEndTurn && msg.StopReason != "" {
+		return "", msg.Model, inTok, outTok, cacheReadTok, cacheWriteTok,
+			fmt.Errorf("anthropic: unrecognized stop_reason=%s; response may be incomplete", msg.StopReason)
 	}
 	for _, block := range msg.Content {
 		if block.Type == "text" {

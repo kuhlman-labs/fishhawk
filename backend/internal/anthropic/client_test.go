@@ -243,6 +243,196 @@ func TestClient_Messages_NoTextBlockReturnsError(t *testing.T) {
 	}
 }
 
+// textContent builds a single-text-block Content list for a fakeAnthropicResp.
+func textContent(text string) []struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+} {
+	return []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{{Type: "text", Text: text}}
+}
+
+// usage100x20 is the shared non-zero Usage block: 100 input / 20 output. Tests
+// on the error paths assert these survive so cost attribution is preserved.
+func usage100x20() struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+} {
+	return struct {
+		InputTokens              int `json:"input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	}{InputTokens: 100, OutputTokens: 20}
+}
+
+// TestClient_Messages_ContextWindowExceededWithPartialTextReturnsError is test
+// (a): stop_reason=model_context_window_exceeded WITH a partial text block must
+// return the context-window error (naming the input-token count) with an empty
+// responseText — the truncated fragment must NOT surface as success — while the
+// non-zero token counts survive so cost attribution is preserved.
+func TestClient_Messages_ContextWindowExceededWithPartialTextReturnsError(t *testing.T) {
+	resp := fakeAnthropicResp{
+		ID:         "msg_test",
+		Type:       "message",
+		Role:       "assistant",
+		Content:    textContent(`{"partial`), // truncated mid-object
+		Model:      "claude-sonnet-4-6",
+		StopReason: "model_context_window_exceeded",
+		Usage:      usage100x20(),
+	}
+	srv := fakeRespServer(t, resp)
+
+	c := NewClient(testConfig(), option.WithBaseURL(srv.URL))
+	text, _, inTok, outTok, _, _, err := c.Messages(context.Background(), "sys", "user")
+	if err == nil {
+		t.Fatal("Messages: got nil error for stop_reason=model_context_window_exceeded, want non-nil")
+	}
+	// Error IDENTITY, not mere existence: the fail-closed catch-all also returns
+	// AN error under a deletion of this branch, so assert the specific
+	// context-window substrings so the counterfactual lands here (condition 3).
+	if !strings.Contains(err.Error(), "context window exceeded") {
+		t.Errorf("error = %q, want it to contain 'context window exceeded'", err)
+	}
+	if !strings.Contains(err.Error(), "reduce prompt size") {
+		t.Errorf("error = %q, want it to contain 'reduce prompt size'", err)
+	}
+	if !strings.Contains(err.Error(), "100") {
+		t.Errorf("error = %q, want it to name the input-token count 100", err)
+	}
+	if text != "" {
+		t.Errorf("responseText = %q, want empty string (partial fragment must not surface as success)", text)
+	}
+	if inTok != 100 || outTok != 20 {
+		t.Errorf("token counts = in %d / out %d, want 100/20 (cost attribution must survive the error path)", inTok, outTok)
+	}
+}
+
+// TestClient_Messages_ContextWindowExceededNoContentReturnsError is test (b):
+// the same stop reason with NO content blocks must return the context-window
+// error specifically, NOT the misattributing "no text block" message (the
+// triage-misattribution mode #2199 names).
+func TestClient_Messages_ContextWindowExceededNoContentReturnsError(t *testing.T) {
+	resp := fakeAnthropicResp{
+		ID:         "msg_test",
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "claude-sonnet-4-6",
+		StopReason: "model_context_window_exceeded",
+		Usage:      usage100x20(),
+	}
+	srv := fakeRespServer(t, resp)
+
+	c := NewClient(testConfig(), option.WithBaseURL(srv.URL))
+	text, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user")
+	if err == nil {
+		t.Fatal("Messages: got nil error for stop_reason=model_context_window_exceeded, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "context window exceeded") {
+		t.Errorf("error = %q, want the context-window error", err)
+	}
+	if strings.Contains(err.Error(), "no text block") {
+		t.Errorf("error = %q, must NOT be the misattributing 'no text block' error", err)
+	}
+	if text != "" {
+		t.Errorf("responseText = %q, want empty string", text)
+	}
+}
+
+// TestClient_Messages_UnrecognizedStopReasonReturnsError is test (c): an
+// unrecognized stop reason ("pause_turn") WITH a partial text block must return
+// the fail-closed catch-all error naming that stop reason, with an empty
+// responseText so the fragment is never surfaced as success.
+func TestClient_Messages_UnrecognizedStopReasonReturnsError(t *testing.T) {
+	resp := fakeAnthropicResp{
+		ID:         "msg_test",
+		Type:       "message",
+		Role:       "assistant",
+		Content:    textContent(`{"partial`),
+		Model:      "claude-sonnet-4-6",
+		StopReason: "pause_turn",
+		Usage:      usage100x20(),
+	}
+	srv := fakeRespServer(t, resp)
+
+	c := NewClient(testConfig(), option.WithBaseURL(srv.URL))
+	text, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user")
+	if err == nil {
+		t.Fatal("Messages: got nil error for an unrecognized stop_reason, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "pause_turn") {
+		t.Errorf("error = %q, want it to name the unrecognized stop_reason 'pause_turn'", err)
+	}
+	if text != "" {
+		t.Errorf("responseText = %q, want empty string (fragment must not surface as success)", text)
+	}
+}
+
+// TestClient_Messages_EmptyStopReasonFallsThrough is test (d): an EMPTY
+// stop_reason with a well-formed text block falls through the catch-all to the
+// content loop and returns the text with a nil error — pinning the deliberate
+// gateway carve-out as a positive assertion so it cannot be silently widened or
+// narrowed later.
+func TestClient_Messages_EmptyStopReasonFallsThrough(t *testing.T) {
+	resp := fakeAnthropicResp{
+		ID:         "msg_test",
+		Type:       "message",
+		Role:       "assistant",
+		Content:    textContent(`{"verdict":"approve"}`),
+		Model:      "claude-sonnet-4-6",
+		StopReason: "", // gateway omitted the field
+		Usage:      usage100x20(),
+	}
+	srv := fakeRespServer(t, resp)
+
+	c := NewClient(testConfig(), option.WithBaseURL(srv.URL))
+	text, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user")
+	if err != nil {
+		t.Fatalf("Messages: got error for empty stop_reason, want the text returned (carve-out): %v", err)
+	}
+	if text != `{"verdict":"approve"}` {
+		t.Errorf("responseText = %q, want the well-formed text returned through the carve-out", text)
+	}
+}
+
+// TestClient_Messages_RefusalErrorNamesCategory is test (e): stop_reason=refusal
+// carrying stop_details.category="general_harms" must return an error containing
+// "general_harms" alongside the pre-existing "refused" / "stop_reason=refusal"
+// substrings, so a refused review is triageable.
+func TestClient_Messages_RefusalErrorNamesCategory(t *testing.T) {
+	resp := fakeAnthropicResp{
+		ID:         "msg_test",
+		Type:       "message",
+		Role:       "assistant",
+		Model:      "claude-sonnet-4-6",
+		StopReason: "refusal",
+		StopDetails: &struct {
+			Category string `json:"category"`
+		}{Category: "general_harms"},
+		Usage: usage100x20(),
+	}
+	srv := fakeRespServer(t, resp)
+
+	c := NewClient(testConfig(), option.WithBaseURL(srv.URL))
+	_, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user")
+	if err == nil {
+		t.Fatal("Messages: got nil error for stop_reason=refusal, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "general_harms") {
+		t.Errorf("error = %q, want it to name the refusal category 'general_harms'", err)
+	}
+	if !strings.Contains(err.Error(), "refused") {
+		t.Errorf("error = %q, want it to contain 'refused'", err)
+	}
+	if !strings.Contains(err.Error(), "stop_reason=refusal") {
+		t.Errorf("error = %q, want it to contain 'stop_reason=refusal'", err)
+	}
+}
+
 // observedRequest is what the region-scoped inference endpoint saw.
 type observedRequest struct {
 	host   string
