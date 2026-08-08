@@ -33,7 +33,9 @@ import "sort"
 // added escalation_fired, written at the ONE server-side escalation resolver
 // both enforcement seams reach. E53.5 / #2228 added stage_permissions_declared,
 // written ONCE per run at run creation when the workflow declares any stage
-// `permissions` or `egress` block (declaration-only, enforced: false). When a
+// `permissions` or `egress` block (declaration-only, enforced: false). E66.37 /
+// #2474 added acceptance_triage_arbitrated, the operator-only discharge of a
+// paged acceptance triage (server/acceptance_arbitration.go). When a
 // new canonical category is introduced, add it here so operators can await
 // it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -44,6 +46,7 @@ var KnownCategories = map[string]struct{}{
 	"acceptance_recorded":                     {},
 	"acceptance_reopened":                     {},
 	"acceptance_skipped_out_of_scope":         {},
+	"acceptance_triage_arbitrated":            {},
 	"acceptance_triage_decided":               {},
 	"anchor_ping_posted":                      {},
 	"api_token_issued":                        {},

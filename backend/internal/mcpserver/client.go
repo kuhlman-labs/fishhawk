@@ -1563,6 +1563,64 @@ func (c *apiClient) VouchCommit(ctx context.Context, runID uuid.UUID, sha, reaso
 	return &res, nil
 }
 
+// acceptanceArbitrationRequest mirrors the backend's
+// `POST /v0/runs/{run_id}/acceptance-arbitration` body
+// (`backend/internal/server/acceptance_arbitration.go::acceptanceArbitrationRequest`).
+// reason is required; acknowledge_failed_criteria is required only when the
+// discharged verdict carries genuinely FAILED criteria.
+type acceptanceArbitrationRequest struct {
+	Reason                    string `json:"reason"`
+	AcknowledgeFailedCriteria bool   `json:"acknowledge_failed_criteria"`
+}
+
+// ArbitrateAcceptanceResult mirrors the backend's acceptance-arbitration 200
+// body (E66.37 / #2474): the recorded discharge. OutcomeSequence is the
+// acceptance_outcome_recorded sequence the arbitration is BOUND to — a later
+// re-run's higher-sequence verdict invalidates it by construction, which is why
+// the field is surfaced rather than hidden.
+type ArbitrateAcceptanceResult struct {
+	RunID               string `json:"run_id"`
+	AcceptanceGateState string `json:"acceptance_gate_state"`
+	OutcomeSequence     int64  `json:"outcome_sequence"`
+	ArbitrationSequence int64  `json:"arbitration_sequence"`
+	AlreadyRecorded     bool   `json:"already_recorded"`
+}
+
+// ArbitrateAcceptance records the operator arbitration that discharges a PAGED
+// acceptance triage (E66.37 / #2474), via
+// `POST /v0/runs/{run_id}/acceptance-arbitration`. After it lands the acceptance
+// gate reads acceptance_arbitrated and the ordinary merge verb admits the run,
+// so the operator never has to leave the loop and hand-merge (losing the
+// merge_verdict_recorded entry). Operator-token-only (write:approvals); a
+// run-bound agent token is rejected outright. 4xx/5xx surfaces:
+//   - 400 validation_failed (empty reason)
+//   - 403 run_token_forbidden (a run-bound agent token attempted the arbitration)
+//   - 403 insufficient_scope (token lacks write:approvals)
+//   - 404 run_not_found
+//   - 409 acceptance_arbitration_not_applicable (the gate is not parked at
+//     acceptance_triage, or the correlated triage disposition did not page —
+//     an auto-routed class-1/2 verdict keeps its automatic route)
+//   - 409 acceptance_arbitration_requires_acknowledgement (the verdict carries
+//     failed criteria and acknowledge_failed_criteria was not set)
+//   - 409 acceptance_outcome_superseded (a newer acceptance verdict landed
+//     while this arbitration was being evaluated — re-read and arbitrate the
+//     current one)
+//   - 503 acceptance_arbitration_unconfigured (run/audit repositories not wired)
+func (c *apiClient) ArbitrateAcceptance(ctx context.Context, runID uuid.UUID, reason string, acknowledgeFailedCriteria bool) (*ArbitrateAcceptanceResult, error) {
+	body, err := json.Marshal(acceptanceArbitrationRequest{
+		Reason:                    reason,
+		AcknowledgeFailedCriteria: acknowledgeFailedCriteria,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal acceptance-arbitration: %w", err)
+	}
+	var res ArbitrateAcceptanceResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/acceptance-arbitration", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // AutoDriveOutcome mirrors the backend's POST /v0/runs/{run_id}/auto-drive
 // 200 body (#1700): the AutoDriveRunGate result the local drive verb switches
 // on. A non-observe-only outcome is exactly one of three kinds — Acted (a

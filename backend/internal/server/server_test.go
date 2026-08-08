@@ -848,6 +848,61 @@ func TestObserveParkedReview_AcceptanceTriage_ParksNoMerge(t *testing.T) {
 	}
 }
 
+// TestObserveParkedReview_AcceptanceArbitrated_StampsAwaitingMerge pins the
+// E66.37 / #2474 arm on the DRIVE presentation surface: once an operator
+// arbitration discharges the failed verdict the gate reads acceptance_arbitrated,
+// which is NOT one of the switch's parking cases, so the observer must fall
+// through to checks_green_awaiting_merge / merge_pr instead of re-stamping the
+// acceptance_triage park. Without this the run's derived_status would keep
+// telling the operator to arbitrate a triage they already discharged.
+func TestObserveParkedReview_AcceptanceArbitrated_StampsAwaitingMerge(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	seedAcceptanceOutcome(h.au, h.runID, 30, acceptanceVerdictFailed)
+	seedArbitration(h.au, h.runID, 31, 30)
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleChecksGreenAwaitingMerge {
+		t.Fatalf("run_auto_advanced = %+v, want settled + checks_green_awaiting_merge on an arbitrated acceptance", advances)
+	}
+	if advances[1].NextAction == nil || advances[1].NextAction.Action != "merge_pr" {
+		t.Errorf("NextAction = %+v, want merge_pr", advances[1].NextAction)
+	}
+	for _, a := range advances {
+		if a.To == "acceptance_triage" {
+			t.Error("an arbitrated acceptance failure must NOT re-park in acceptance_triage (#2474)")
+		}
+	}
+}
+
+// TestObserveParkedReview_AcceptanceArbitrationSuperseded_ParksTriage pins the
+// invalidation on the same surface: an acceptance re-run recorded a NEWER failed
+// verdict the prior arbitration does not name, so the observer parks at
+// acceptance_triage again rather than presenting a merge the gate would refuse.
+func TestObserveParkedReview_AcceptanceArbitrationSuperseded_ParksTriage(t *testing.T) {
+	h := newDriveObserverHarness(t, true)
+	h.seedImplementReviewRound(t, 1, 1, 10)
+	h.seedAcceptanceObserverRun(stageStatePtr(run.StageStateSucceeded))
+	seedAcceptanceOutcome(h.au, h.runID, 30, acceptanceVerdictFailed)
+	seedArbitration(h.au, h.runID, 31, 30)
+	seedAcceptanceOutcome(h.au, h.runID, 40, acceptanceVerdictFailed) // re-run
+
+	h.s.ObserveParkedReviewForDrive(context.Background(), h.stage, driveObserverPRURL)
+
+	advances := h.driveAdvances(t)
+	if len(advances) != 2 || advances[1].Rule != drive.RuleAcceptanceTriage {
+		t.Fatalf("run_auto_advanced = %+v, want settled + acceptance_triage after a superseding re-run", advances)
+	}
+	for _, a := range advances {
+		if a.Rule == drive.RuleChecksGreenAwaitingMerge {
+			t.Fatal("awaiting_merge must NOT stamp on a superseded arbitration")
+		}
+	}
+}
+
 // TestObserveParkedReview_AcceptanceSkippedOutOfScope_StampsAwaitingMerge pins
 // the E38.3 / #1877 arm: a terminal acceptance stage settled via the
 // out-of-scope skip marker (no verdict) is a legitimate merge-eligible

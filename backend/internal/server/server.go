@@ -1301,10 +1301,16 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		return
 	default:
 		// acceptanceGatePassed / acceptanceGateNotDeclared /
-		// acceptanceGateSkippedOutOfScope / acceptanceGateNotValidated: the merge
+		// acceptanceGateSkippedOutOfScope / acceptanceGateNotValidated /
+		// acceptanceGateArbitrated: the merge
 		// is not (or no longer) acceptance-gated — fall through to the
 		// RuleChecksGreenAwaitingMerge stamp below (derived status awaiting_merge,
-		// merge_pr next_action). An out-of-scope skip (E38.3 / #1877) is a
+		// merge_pr next_action). This default arm's membership is the same set the
+		// shared acceptanceGateAdmitsMerge predicate admits; acceptanceGateArbitrated
+		// (E66.37 / #2474) is a deliberate merge-eligible arm — a FAILED verdict
+		// whose PAGED triage an operator discharged with an audited, sequence-bound
+		// acceptance_triage_arbitrated entry, so the run leaves the acceptance_triage
+		// park for awaiting_merge. An out-of-scope skip (E38.3 / #1877) is a
 		// legitimate terminal disposition equivalent to a recorded pass, so it
 		// intentionally lands here rather than parking in
 		// acceptance_settled_outcome_unknown; a not_validated short-circuit verdict

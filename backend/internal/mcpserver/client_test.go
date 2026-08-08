@@ -1160,3 +1160,46 @@ func TestStartRun_W1_OverrideOmittedWhenUnset(t *testing.T) {
 		}
 	}
 }
+
+// TestArbitrateAcceptance_ClientWireShape pins the acceptance-arbitration
+// request/response wire contract (E66.37 / #2474). A mistyped json tag on
+// outcome_sequence would silently decode to 0, which is exactly the value that
+// aliases "no outcome recorded" in the correlation rule — so this is pinned
+// rather than assumed.
+func TestArbitrateAcceptance_ClientWireShape(t *testing.T) {
+	var gotPath string
+	var received map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &received)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run_id":"r","acceptance_gate_state":"acceptance_arbitrated","outcome_sequence":60,"arbitration_sequence":62,"already_recorded":true}`))
+	}))
+	defer ts.Close()
+
+	runID := uuid.New()
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	res, err := c.ArbitrateAcceptance(context.Background(), runID, "class-5 all-skip", true)
+	if err != nil {
+		t.Fatalf("ArbitrateAcceptance: %v", err)
+	}
+	if gotPath != "/v0/runs/"+runID.String()+"/acceptance-arbitration" {
+		t.Errorf("path = %q", gotPath)
+	}
+	if received["reason"] != "class-5 all-skip" {
+		t.Errorf("reason on the wire = %v", received["reason"])
+	}
+	if received["acknowledge_failed_criteria"] != true {
+		t.Errorf("acknowledge_failed_criteria on the wire = %v, want true", received["acknowledge_failed_criteria"])
+	}
+	if res.AcceptanceGateState != "acceptance_arbitrated" {
+		t.Errorf("acceptance_gate_state = %q", res.AcceptanceGateState)
+	}
+	if res.OutcomeSequence != 60 || res.ArbitrationSequence != 62 {
+		t.Errorf("sequences = %d/%d, want 60/62", res.OutcomeSequence, res.ArbitrationSequence)
+	}
+	if !res.AlreadyRecorded {
+		t.Error("already_recorded = false, want true")
+	}
+}

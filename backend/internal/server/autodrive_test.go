@@ -1959,3 +1959,48 @@ func TestAutoDriveRunGate_EscalationCeiling_NoAutoApprove(t *testing.T) {
 		}
 	})
 }
+
+// TestAutoDriveRunGate_Merge_AcceptanceArbitrated_Merges pins the deliberate
+// widening named in the plan's risk list (E66.37 / #2474): admitting
+// acceptance_arbitrated in dispatchAcceptanceGatedMerge means a DELEGATED
+// auto-drive merge can also land on an arbitrated gate. That is intended — the
+// arbitration itself is operator-only and run-bound-token-forbidden, so the
+// operator decision remains the gating act — and pinning it here makes the
+// choice explicit rather than incidental.
+func TestAutoDriveRunGate_Merge_AcceptanceArbitrated_Merges(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, acceptanceVerdictFailed)
+	seedArbitration(au, runRow.ID, 7, 6)
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if !out.Acted || out.Action != delegation.ActionMerge {
+		t.Fatalf("outcome = %+v, want acted merge on an arbitrated acceptance failure", out)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 — an arbitrated acceptance must not block the delegated merge", merger.called)
+	}
+}
+
+// TestAutoDriveRunGate_Merge_AcceptanceArbitrationSuperseded_ObserveOnly pins the
+// other half: once an acceptance re-run records a NEWER verdict the prior
+// arbitration no longer names it, so the delegated merge falls back to
+// observe-only. The delegated path must not land a merge on a stale discharge.
+func TestAutoDriveRunGate_Merge_AcceptanceArbitrationSuperseded_ObserveOnly(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runRow := seedAcceptanceMergeRun(t, repo, au, run.StageStateSucceeded, acceptanceVerdictFailed)
+	seedArbitration(au, runRow.ID, 7, 6)
+	seedAcceptanceOutcome(au, runRow.ID, 50, acceptanceVerdictFailed) // re-run
+
+	merger := &fakeMerger{}
+	out, err := s.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), merger, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || merger.called != 0 {
+		t.Errorf("outcome=%+v merger.called=%d, want observe-only + 0 merges (superseded arbitration)", out, merger.called)
+	}
+}

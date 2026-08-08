@@ -874,3 +874,55 @@ func TestMergeRun_ReinvokeAfter502_ReQueues(t *testing.T) {
 		t.Errorf("merger called %d times, want 2 (failed dispatch + successful re-queue)", merger.called)
 	}
 }
+
+// TestMergeRun_AcceptanceArbitrated_Proceeds pins the E66.37 / #2474 merge
+// admission: a FAILED acceptance verdict whose paged triage an operator
+// discharged is merge-eligible, and the merge still records the operator's
+// merge_verdict_recorded entry — which is the whole point of the verb. Before
+// this the operator's only route was to leave the blessed path and hand-merge,
+// losing that entry.
+func TestMergeRun_AcceptanceArbitrated_Proceeds(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR,
+		[]byte(autoDriveAcceptanceSpecYAML), acceptanceMergeStages(runID, run.StageStateSucceeded))
+	seedAcceptanceOutcome(au, runID, 6, acceptanceVerdictFailed)
+	seedArbitration(au, runID, 7, 6)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "merging on an arbitrated acceptance failure"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 — an arbitrated acceptance failure is merge-eligible (#2474):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (arbitrated acceptance proceeds)", merger.called)
+	}
+	if rows := mergeVerdictRows(au); len(rows) != 1 {
+		t.Fatalf("merge_verdict_recorded rows = %d, want 1 — the audited merge verdict is the reason to stay on the blessed path", len(rows))
+	}
+}
+
+// TestMergeRun_AcceptanceArbitrationForOlderOutcome_Blocks pins the invalidation
+// at the MERGE surface: an acceptance re-run recorded a NEWER failed verdict, so
+// the prior arbitration no longer names the current outcome and the merge is
+// refused again. Without the sequence binding this would merge on a stale
+// discharge.
+func TestMergeRun_AcceptanceArbitrationForOlderOutcome_Blocks(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR,
+		[]byte(autoDriveAcceptanceSpecYAML), acceptanceMergeStages(runID, run.StageStateSucceeded))
+	seedAcceptanceOutcome(au, runID, 6, acceptanceVerdictFailed)
+	seedArbitration(au, runID, 7, 6)
+	seedAcceptanceOutcome(au, runID, 20, acceptanceVerdictFailed) // re-run
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 || len(mergeVerdictRows(au)) != 0 {
+		t.Errorf("merger.called=%d rows=%d, want 0/0 (a superseded arbitration must not admit a merge)",
+			merger.called, len(mergeVerdictRows(au)))
+	}
+}

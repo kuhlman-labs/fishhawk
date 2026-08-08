@@ -170,9 +170,15 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fail-closed guard: the acceptance gate must admit the merge (ADR-049
-	// decision #6). Read the stages once and classify. Any pending / failed /
-	// outcome-unknown / read-error state → 409; passed / not-declared /
-	// skipped-out-of-scope / not-validated proceed. not-validated (#2347) is the
+	// decision #6). Read the stages once and classify, then defer the admitted
+	// set to the SHARED acceptanceGateAdmitsMerge predicate so this endpoint, the
+	// delegated merge, and the drive presentation cannot drift (E66.37 / #2474).
+	// Any pending / un-arbitrated-failed / outcome-unknown / read-error state →
+	// 409; passed / not-declared / skipped-out-of-scope / not-validated /
+	// arbitrated proceed. arbitrated (#2474) is a FAILED verdict whose paged
+	// triage an operator discharged on the audit chain — merge-eligible because
+	// the override is itself an audited operator act, not because the evidence
+	// changed. not-validated (#2347) is the
 	// short-circuited zero-criteria-verified outcome: merge-ELIGIBLE by design,
 	// because a change with no live target must not be stranded — the operator
 	// reads the distinction from the run's next_actions state and status comment,
@@ -185,16 +191,14 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	gateState, gerr := s.acceptanceGateState(r.Context(), runRow, stages)
-	acceptanceMergeOK := gerr == nil && (gateState == acceptanceGateNotDeclared ||
-		gateState == acceptanceGatePassed || gateState == acceptanceGateSkippedOutOfScope ||
-		gateState == acceptanceGateNotValidated)
+	acceptanceMergeOK := gerr == nil && acceptanceGateAdmitsMerge(gateState)
 	if !acceptanceMergeOK {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: acceptance gate does not admit the merge",
 			slog.String("run_id", runID.String()),
 			slog.String("acceptance_gate_state", gateState),
 			slog.Bool("acceptance_read_error", gerr != nil))
 		s.writeError(w, r, http.StatusConflict, "acceptance_gate_not_passed",
-			"the acceptance gate does not admit a merge (must be passed, not-declared, skipped-out-of-scope, or not-validated)",
+			"the acceptance gate does not admit a merge (must be passed, not-declared, skipped-out-of-scope, not-validated, or arbitrated — POST /v0/runs/{run_id}/acceptance-arbitration to discharge a PAGED triage)",
 			map[string]any{"run_id": runID.String(), "acceptance_gate_state": gateState})
 		return
 	}

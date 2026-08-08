@@ -257,6 +257,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerVerifyRun(srv, resolver)
 	registerVouchCommit(srv, resolver)
 	registerMergeRun(srv, resolver)
+	registerArbitrateAcceptance(srv, resolver)
 	registerReportProductIssue(srv, resolver)
 	registerReleaseNotes(srv, resolver)
 	registerDoctor(srv, resolver)
@@ -1751,6 +1752,12 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// slice (the mergeObservedIn idiom) to relabel the merge-eligible
 	// succeeded_acceptance_skipped_out_of_scope state.
 	acceptanceSkippedOutOfScope := acceptanceSkippedOutOfScopeIn(recent)
+	// E66.37 (#2474): an operator arbitration that DISCHARGES the newest failed
+	// verdict, correlated by payload outcome_sequence EQUALITY exactly as the
+	// authoritative server gate does (binding condition 3) — read off the SAME
+	// recent slice. An entry aged out of the window degrades to the paged arm
+	// (which offers the arbitration verb), never to a merge the server refuses.
+	acceptanceArbitrated := acceptanceArbitratedIn(recent)
 	// Release-workflow loop signals (E33.5 / #1590): computed only for a
 	// delegating WorkflowID == "release" run (cost-gated — an ordinary run pays
 	// no extra round-trips) and threaded into the classifier so the release arm
@@ -1759,7 +1766,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	if runRow.WorkflowID == "release" {
 		release = r.releaseSignalsFor(ctx, stages, recent)
 	}
-	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceVerdict, acceptanceTriageDisposition, release)
+	nextActions := nextActionsFor(runRow, stages, planReviewStatus, implementReviewStatus, reviewActionHint, view.driveStatus(), mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
 
 	// Best-effort decomposed-parent children status (#1147). Cost-gated so an
 	// ordinary run pays nothing: only a decomposed parent (no parent_run_id,

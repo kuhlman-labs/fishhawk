@@ -1759,7 +1759,7 @@ func TestDriveRun_DerivedAcceptancePending_AgreementTable(t *testing.T) {
 			stg(driveImplID, "implement", "succeeded", 1),
 			stg(driveAccID, "acceptance", "pending", 2),
 		},
-		nil, nil, nil, nil, false, false, "", "", releaseSignals{})
+		nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
 	if accNA == nil || accNA.State != derivedAcceptancePending {
 		t.Fatalf("next_actions acceptance state = %+v, want state == derivedAcceptancePending (%q) — producer/consumer literal drift", accNA, derivedAcceptancePending)
 	}
@@ -1906,7 +1906,7 @@ func TestDriveRun_DerivedAcceptancePending_AgreementTable(t *testing.T) {
 			// Drive the classifier over the equivalent inputs and pin its state —
 			// the producer half of the cross-surface taxonomy pin.
 			na := nextActionsFor(&Run{State: "running", RunnerKind: "local"}, tc.naStages,
-				nil, tc.naReviewStatus, nil, nil, false, false, "", "", releaseSignals{})
+				nil, tc.naReviewStatus, nil, nil, false, false, false, "", "", releaseSignals{})
 			if na == nil {
 				t.Fatalf("nextActionsFor returned nil for %s", tc.name)
 			}

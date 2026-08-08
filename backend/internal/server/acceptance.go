@@ -928,24 +928,87 @@ const (
 	// wants to treat the two differently can, and a future gate that must
 	// distinguish them does not have to re-derive the basis from the payload.
 	acceptanceGateNotValidated = "acceptance_not_validated"
+	// acceptanceGateArbitrated is the THIRD merge-eligible terminal disposition
+	// (E66.37 / #2474), beside skipped-out-of-scope and not-validated: the newest
+	// acceptance verdict FAILED, its triage disposition PAGED (no automatic route
+	// fired), and an operator recorded an acceptance_triage_arbitrated discharge
+	// BOUND BY SEQUENCE to that exact verdict.
+	//
+	// It is deliberately NOT acceptanceGatePassed: nothing about the evidence
+	// changed — the operator overrode a failed verdict and said why on the audit
+	// chain, which is a materially different claim from "acceptance passed". The
+	// distinguishing signal is carried by the state STRING so every consumer (the
+	// merge handler, the delegated merge, the drive presentation, the MCP
+	// next_actions surface) can render the override honestly.
+	//
+	// Sequence binding is the invalidation mechanism: a later acceptance re-run
+	// records a NEW outcome at a HIGHER sequence that no prior arbitration names,
+	// so the gate drops back to acceptanceGateTriage by construction.
+	acceptanceGateArbitrated = "acceptance_arbitrated"
 )
 
-// latestAcceptanceVerdict returns the verdict on the newest (highest-Sequence)
-// acceptance_outcome_recorded audit entry for the run, whether ANY such entry
-// exists (recorded), and a read error. recorded=false with a nil error means
-// the acceptance stage has shipped no verdict yet. A recorded entry whose
-// payload cannot be decoded is reported as (verdict="", recorded=true, nil) so
-// the caller treats it as a settled-outcome-unknown hole, never a pass. The
-// audit read error is PROPAGATED (never swallowed) so acceptanceGateState can
-// fail closed — the binding condition forbids resolving an unreadable
-// acceptance outcome to passed/merge.
-func (s *Server) latestAcceptanceVerdict(ctx context.Context, runID uuid.UUID) (verdict string, recorded bool, err error) {
+// acceptanceGateAdmitsMerge reports whether an acceptanceGateState value admits
+// a merge (E66.37 / #2474). It is the SINGLE predicate the three merge-adjacent
+// consumers share — the operator merge endpoint (merge_run.go), the delegated
+// may_merge arm (dispatchAcceptanceGatedMerge), and the drive presentation's
+// fall-through — so a new merge-eligible state can never be admitted by two of
+// them and refused by the third.
+//
+// The admitted set: not-declared (the workflow declares no acceptance stage),
+// passed (a validated pass), skipped-out-of-scope (E38.3 / #1877), not-validated
+// (#2347, zero criteria verified), and arbitrated (#2474, an operator discharged
+// a paged triage). Everything else — pending, triage, settled-outcome-unknown,
+// and any future state — is refused.
+//
+// Callers must STILL gate on a nil read error themselves: this predicate sees
+// only the state string, and acceptanceGateState returns ("", err) on a read
+// failure, which this function would otherwise admit as not-declared.
+func acceptanceGateAdmitsMerge(state string) bool {
+	switch state {
+	case acceptanceGateNotDeclared, acceptanceGatePassed,
+		acceptanceGateSkippedOutOfScope, acceptanceGateNotValidated,
+		acceptanceGateArbitrated:
+		return true
+	default:
+		return false
+	}
+}
+
+// acceptanceOutcome is the decoded newest acceptance_outcome_recorded entry for
+// a run (E66.37 / #2474). Recorded=false means the acceptance stage has shipped
+// no verdict yet; Recorded=true with an empty Verdict is the recorded-but-
+// unreadable hole. Sequence is the audit sequence the arbitration verb BINDS to,
+// so a later re-run's higher-sequence outcome invalidates a prior arbitration by
+// construction.
+type acceptanceOutcome struct {
+	Verdict         string
+	Sequence        int64
+	CriteriaFailed  int
+	CriteriaSkipped int
+	StageID         *uuid.UUID
+	Recorded        bool
+}
+
+// latestAcceptanceOutcome returns the newest (highest-Sequence)
+// acceptance_outcome_recorded audit entry for the run, decoded, plus a read
+// error. It is the single reader behind both latestAcceptanceVerdict (the gate's
+// verdict axis) and the arbitration endpoint (which additionally needs the
+// sequence to bind to, the failed-criteria count to gate the acknowledgement on,
+// and the acceptance stage the outcome was scoped to).
+//
+// A recorded entry whose payload cannot be decoded is reported with an empty
+// Verdict and Recorded=true so the caller treats it as a settled-outcome-unknown
+// hole, never a pass — byte-for-byte the prior posture. The audit read error is
+// PROPAGATED (never swallowed) so acceptanceGateState can fail closed: the
+// binding condition forbids resolving an unreadable acceptance outcome to
+// passed/merge.
+func (s *Server) latestAcceptanceOutcome(ctx context.Context, runID uuid.UUID) (acceptanceOutcome, error) {
 	if s.cfg.AuditRepo == nil {
-		return "", false, nil
+		return acceptanceOutcome{}, nil
 	}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryAcceptanceOutcomeRecorded)
 	if err != nil {
-		return "", false, err
+		return acceptanceOutcome{}, err
 	}
 	var latest *audit.Entry
 	for _, e := range entries {
@@ -954,18 +1017,116 @@ func (s *Server) latestAcceptanceVerdict(ctx context.Context, runID uuid.UUID) (
 		}
 	}
 	if latest == nil {
-		return "", false, nil
+		return acceptanceOutcome{}, nil
 	}
+	out := acceptanceOutcome{Sequence: latest.Sequence, StageID: latest.StageID, Recorded: true}
 	var p struct {
-		Verdict string `json:"verdict"`
+		Verdict         string `json:"verdict"`
+		CriteriaFailed  int    `json:"criteria_failed"`
+		CriteriaSkipped int    `json:"criteria_skipped"`
 	}
 	if uerr := json.Unmarshal(latest.Payload, &p); uerr != nil {
 		// A malformed outcome payload is a recorded-but-unreadable verdict:
 		// treat it as an outcome-unknown hole (recorded, empty verdict), never
 		// a pass.
-		return "", true, nil
+		return out, nil
 	}
-	return p.Verdict, true, nil
+	out.Verdict = p.Verdict
+	out.CriteriaFailed = p.CriteriaFailed
+	out.CriteriaSkipped = p.CriteriaSkipped
+	return out, nil
+}
+
+// latestAcceptanceVerdict is the thin verdict-axis wrapper over
+// latestAcceptanceOutcome, kept so the pre-existing callers are untouched.
+// recorded=false with a nil error means the acceptance stage has shipped no
+// verdict yet; the read error is PROPAGATED so callers fail closed.
+func (s *Server) latestAcceptanceVerdict(ctx context.Context, runID uuid.UUID) (verdict string, recorded bool, err error) {
+	out, err := s.latestAcceptanceOutcome(ctx, runID)
+	if err != nil {
+		return "", false, err
+	}
+	return out.Verdict, out.Recorded, nil
+}
+
+// acceptanceArbitrationDischarges reports whether a paged acceptance triage has
+// been discharged by an operator arbitration BOUND to the outcome at
+// expectedSequence (E66.37 / #2474).
+//
+// Binding approval condition 2 (READ-SIDE REVALIDATION). The naive shape — read
+// the newest outcome, then read the arbitrations — resolves acceptance_arbitrated
+// on the strength of TWO INDEPENDENT reads, so a concurrent acceptance re-run
+// landing between them can supersede the outcome the first read saw while the
+// arbitration still matches it. The condition offered a consistent snapshot as
+// the preferred remedy over optimistic revalidation, and audit.Repository
+// provides one: ListForRun is a SINGLE query returning every entry for the run.
+// So this reads ONE snapshot and evaluates BOTH halves inside it —
+//
+//	(a) the newest acceptance_outcome_recorded entry in the snapshot must STILL
+//	    be the one at expectedSequence (the caller's outcome has not been
+//	    superseded), and
+//	(b) some acceptance_triage_arbitrated entry in that SAME snapshot must carry
+//	    payload outcome_sequence EQUAL to it.
+//
+// — which closes the interleaving window by construction rather than papering
+// over it: there is no instant between the two observations because there is
+// only one observation. A snapshot whose newest outcome has moved returns false,
+// and the gate falls back to acceptanceGateTriage.
+//
+// Correlation is payload outcome_sequence EQUALITY, never ordering. An
+// arbitration appended AFTER a newer verdict but NAMING an older outcome is
+// therefore ignored — the rule the MCP classifier mirrors exactly (binding
+// condition 3) so the two surfaces cannot disagree.
+//
+// The read error is PROPAGATED so acceptanceGateState fails closed (never a
+// merge-eligible state on unknown evidence).
+func (s *Server) acceptanceArbitrationDischarges(ctx context.Context, runID uuid.UUID, expectedSequence int64) (bool, error) {
+	if s.cfg.AuditRepo == nil {
+		return false, nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRun(ctx, runID)
+	if err != nil {
+		return false, err
+	}
+	newestOutcome := int64(0)
+	haveOutcome := false
+	for _, e := range entries {
+		if e.Category != CategoryAcceptanceOutcomeRecorded {
+			continue
+		}
+		if !haveOutcome || e.Sequence > newestOutcome {
+			newestOutcome, haveOutcome = e.Sequence, true
+		}
+	}
+	// Read-side revalidation: the outcome the caller classified is no longer the
+	// newest one in this snapshot (a concurrent re-run superseded it), so no
+	// arbitration can discharge it. Fail closed to triage.
+	if !haveOutcome || newestOutcome != expectedSequence {
+		return false, nil
+	}
+	for _, e := range entries {
+		if e.Category != CategoryAcceptanceTriageArbitrated {
+			continue
+		}
+		if seq, ok := arbitrationOutcomeSequence(e.Payload); ok && seq == newestOutcome {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// arbitrationOutcomeSequence decodes the outcome_sequence an
+// acceptance_triage_arbitrated payload BINDS to. An undecodable payload or an
+// absent field reports ok=false, so a malformed arbitration entry can never
+// discharge a triage (it is skipped, not treated as a wildcard match).
+func arbitrationOutcomeSequence(payload []byte) (int64, bool) {
+	var p struct {
+		OutcomeSequence *int64 `json:"outcome_sequence"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil || p.OutcomeSequence == nil {
+		return 0, false
+	}
+	return *p.OutcomeSequence, true
 }
 
 // acceptanceGateState is the single server-side acceptance-gate classifier
@@ -981,7 +1142,11 @@ func (s *Server) latestAcceptanceVerdict(ctx context.Context, runID uuid.UUID) (
 //     (#2347: the pre-spawn short-circuit settled the stage having verified ZERO
 //     criteria). Merge-eligible, but a distinct state so the operator surface can
 //     say so rather than reporting a pass.
-//   - acceptanceGateTriage        — newest recorded verdict is failed.
+//   - acceptanceGateTriage        — newest recorded verdict is failed and no
+//     operator arbitration discharges it.
+//   - acceptanceGateArbitrated    — newest recorded verdict is failed BUT an
+//     operator recorded an acceptance_triage_arbitrated discharge bound to that
+//     exact outcome sequence (E66.37 / #2474). Merge-eligible; NOT a pass.
 //   - acceptanceGateSkippedOutOfScope — no readable verdict, the acceptance
 //     stage is terminal, AND it carries a stage-scoped
 //     acceptance_skipped_out_of_scope marker (E38.3 / #1877 auto-terminated
@@ -1002,15 +1167,28 @@ func (s *Server) acceptanceGateState(ctx context.Context, runRow *run.Run, stage
 	if _, ok := s.resolveAcceptanceStageSpec(ctx, runRow); !ok {
 		return acceptanceGateNotDeclared, nil
 	}
-	verdict, recorded, err := s.latestAcceptanceVerdict(ctx, runRow.ID)
+	outcome, err := s.latestAcceptanceOutcome(ctx, runRow.ID)
 	if err != nil {
 		return "", err
 	}
-	if recorded {
-		switch verdict {
+	if outcome.Recorded {
+		switch outcome.Verdict {
 		case acceptanceVerdictPassed:
 			return acceptanceGatePassed, nil
 		case acceptanceVerdictFailed:
+			// E66.37 / #2474: a failed verdict is merge-eligible ONLY when an
+			// operator arbitration discharges THIS outcome (sequence-bound, read
+			// from one consistent audit snapshot per binding condition 2). No
+			// matching arbitration — or one naming a superseded outcome — leaves
+			// the run in triage exactly as before. FAIL-CLOSED: the snapshot read
+			// error is propagated, never resolved to a merge-eligible state.
+			arbitrated, aerr := s.acceptanceArbitrationDischarges(ctx, runRow.ID, outcome.Sequence)
+			if aerr != nil {
+				return "", aerr
+			}
+			if arbitrated {
+				return acceptanceGateArbitrated, nil
+			}
 			return acceptanceGateTriage, nil
 		case acceptanceVerdictNotValidated:
 			// #2347: a short-circuited stage that verified zero criteria. Merge-

@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -744,5 +746,237 @@ func TestAcceptanceSeam_CriteriaLessBehavioralPlan_PrecheckFlags(t *testing.T) {
 	entry := lastAcceptancePrecheckEntry(t, seam.au)
 	if hasAcceptanceFinding(entry, acceptanceRuleNoBlockingCriterion) == nil {
 		t.Fatalf("want a no_blocking_criterion finding for a criteria-less behavioral plan; got %+v", entry.Findings)
+	}
+}
+
+// --- acceptance arbitration cross-boundary walk (E66.37 / #2474) ------------
+
+// seqAuditRepo stamps a MONOTONIC sequence on every appended entry. The shared
+// auditFake rebuilds entries on read without one, so every appended row reads
+// back at sequence 0 — which would make the arbitration's outcome_sequence
+// binding vacuous and hide the invalidation this walk exists to prove. The
+// wrapper is deliberately thin: it delegates all writes to the underlying fake
+// (so triagePayload / countAppendedByCategory keep working) and only re-derives
+// the read projection with sequences attached.
+//
+// Lock order is r.mu → auditFake.mu everywhere, so the wrapper cannot deadlock
+// against the fake it wraps.
+type seqAuditRepo struct {
+	*auditFake
+	mu   sync.Mutex
+	next int64
+	seqs []int64 // seqs[i] is the sequence assigned to auditFake.appended[i]
+}
+
+func newSeqAuditRepo(au *auditFake) *seqAuditRepo { return &seqAuditRepo{auditFake: au, next: 1000} }
+
+func (r *seqAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, err := r.auditFake.AppendChained(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	r.next++
+	r.seqs = append(r.seqs, r.next)
+	e.Sequence = r.next
+	return e, nil
+}
+
+func (r *seqAuditRepo) entriesFor(runID uuid.UUID) []*audit.Entry {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.auditFake.mu.Lock()
+	defer r.auditFake.mu.Unlock()
+	var out []*audit.Entry
+	for _, e := range r.seeded {
+		if e.RunID != nil && *e.RunID == runID {
+			out = append(out, e)
+		}
+	}
+	for i := range r.appended {
+		ap := r.appended[i]
+		if ap.RunID != runID {
+			continue
+		}
+		rid := ap.RunID
+		seq := int64(0)
+		if i < len(r.seqs) {
+			seq = r.seqs[i]
+		}
+		out = append(out, &audit.Entry{
+			RunID: &rid, StageID: ap.StageID, Timestamp: ap.Timestamp,
+			Category: ap.Category, Payload: ap.Payload, Sequence: seq,
+		})
+	}
+	return out
+}
+
+func (r *seqAuditRepo) ListForRun(_ context.Context, runID uuid.UUID) ([]*audit.Entry, error) {
+	return r.entriesFor(runID), nil
+}
+
+func (r *seqAuditRepo) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	var out []*audit.Entry
+	for _, e := range r.entriesFor(runID) {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// arbitrationSeamServer rebuilds the seam's Server with a merge seam wired and
+// the sequencing audit repo in place, and gives the run a PR so the merge verb
+// has something to queue. Every repo except the audit projection is shared with
+// the seam, so one store carries the whole walk.
+func arbitrationSeamServer(t *testing.T, seam *exampleAcceptanceSeam) (*Server, *seqAuditRepo, *fakeMerger) {
+	t.Helper()
+	pr := "https://github.com/kuhlman-labs/fishhawk/pull/2474"
+	seam.rr.getRuns[seam.runID].PullRequestURL = &pr
+	sa := newSeqAuditRepo(seam.au)
+	merger := &fakeMerger{}
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: seam.rr, SigningRepo: seam.sf,
+		ArtifactRepo: seam.ar, AuditRepo: sa, GateMerger: merger,
+	})
+	return s, sa, merger
+}
+
+// allSkipVerdictBytes builds a class-5 all-skip failed verdict. The optional
+// marker makes a RE-shipped verdict content-hash-distinct so the ship handler
+// takes the fresh-create path rather than its idempotent replay.
+func allSkipVerdictBytes(t *testing.T, marker string) []byte {
+	t.Helper()
+	return failedAcceptanceBytes(t, "assertion_fail", []acceptanceCriterionResult{
+		{ID: "ac-create", Result: "skipped", ExpectationBasis: "closing the issue needs GitHub; the egress sandbox is default-deny" + marker},
+		{ID: "ac-list", Result: "skipped", ExpectationBasis: "webhook trigger unreachable from the localhost preview" + marker},
+	})
+}
+
+// gateStateOf reads the acceptance gate exactly as the merge surfaces do.
+func gateStateOf(t *testing.T, s *Server, seam *exampleAcceptanceSeam) string {
+	t.Helper()
+	runRow := seam.rr.getRuns[seam.runID]
+	stages := seam.rr.stagesByRunID[seam.runID]
+	state, err := s.acceptanceGateState(context.Background(), runRow, stages)
+	if err != nil {
+		t.Fatalf("acceptanceGateState: %v", err)
+	}
+	return state
+}
+
+// TestAcceptanceSeam_ArbitrationDischargesPagedTriageAndAdmitsMerge is the
+// issue's DONE-MEANS walked end to end over one shared audit store, crossing
+// ship → triage → gate → arbitration endpoint → merge endpoint:
+//
+//	class-5 all-skip verdict → externally_unvalidatable_paged →
+//	gate acceptance_triage → POST /merge 409 acceptance_gate_not_passed →
+//	POST /acceptance-arbitration 200 → gate acceptance_arbitrated →
+//	POST /merge 200 with merge_verdict_recorded on the chain.
+//
+// It fails on a no-op or partial implementation where each per-layer unit test
+// would still pass, and it asserts the SHIPPED observable behavior — including
+// the audit entry whose loss (to a hand-merge) is the whole reason #2474 exists.
+func TestAcceptanceSeam_ArbitrationDischargesPagedTriageAndAdmitsMerge(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+	s, _, merger := arbitrationSeamServer(t, seam)
+
+	w := shipAcceptanceRequest(t, s, seam.runID, seam.acceptanceID, seam.priv, allSkipVerdictBytes(t, ""), "")
+	if w.Code != 201 {
+		t.Fatalf("ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	payload := triagePayload(t, seam.au)
+	for _, want := range []string{`"class":"5"`, `"disposition":"externally_unvalidatable_paged"`} {
+		if !strings.Contains(payload, want) {
+			t.Fatalf("triage payload missing %s:\n%s", want, payload)
+		}
+	}
+	if got := gateStateOf(t, s, seam); got != acceptanceGateTriage {
+		t.Fatalf("gate = %q, want %q before arbitration", got, acceptanceGateTriage)
+	}
+
+	// The wedge this issue documents: the blessed merge verb refuses.
+	blocked := postMergeRun(t, s, seam.runID, mergeRunRequest{Verdict: "ship it"}, withMergeOperator)
+	if blocked.Code != 409 || !strings.Contains(blocked.Body.String(), "acceptance_gate_not_passed") {
+		t.Fatalf("pre-arbitration merge = %d %s, want 409 acceptance_gate_not_passed", blocked.Code, blocked.Body.String())
+	}
+	if merger.called != 0 {
+		t.Fatalf("merger called %d times before arbitration, want 0", merger.called)
+	}
+
+	// The discharge.
+	arb := postArbitration(t, s, seam.runID,
+		acceptanceArbitrationRequest{Reason: "every criterion needs an external trigger the sandbox cannot produce"},
+		withMergeOperator)
+	if arb.Code != 200 {
+		t.Fatalf("arbitration status = %d, want 200:\n%s", arb.Code, arb.Body.String())
+	}
+	var arbResp acceptanceArbitrationResponse
+	if err := json.Unmarshal(arb.Body.Bytes(), &arbResp); err != nil {
+		t.Fatalf("unmarshal arbitration: %v", err)
+	}
+	if arbResp.OutcomeSequence == 0 {
+		t.Fatal("outcome_sequence = 0 — the arbitration must BIND to a real recorded outcome")
+	}
+	if n := countAppendedByCategory(seam.au, CategoryAcceptanceTriageArbitrated); n != 1 {
+		t.Fatalf("acceptance_triage_arbitrated entries = %d, want 1", n)
+	}
+
+	if got := gateStateOf(t, s, seam); got != acceptanceGateArbitrated {
+		t.Fatalf("gate = %q, want %q after arbitration", got, acceptanceGateArbitrated)
+	}
+
+	merged := postMergeRun(t, s, seam.runID, mergeRunRequest{Verdict: "merging on an arbitrated acceptance failure"}, withMergeOperator)
+	if merged.Code != 200 {
+		t.Fatalf("post-arbitration merge = %d:\n%s", merged.Code, merged.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times after arbitration, want 1", merger.called)
+	}
+	if n := countAppendedByCategory(seam.au, CategoryMergeVerdictRecorded); n != 1 {
+		t.Errorf("merge_verdict_recorded entries = %d, want 1 — the audited merge verdict a hand-merge would have lost", n)
+	}
+
+}
+
+// TestAcceptanceSeam_ArbitrationInvalidatedByAcceptanceRerun is the invalidation
+// half of the done-means: after a discharge, a NEW acceptance verdict lands at a
+// HIGHER sequence that no arbitration names, so the gate re-wedges at
+// acceptance_triage and the merge verb refuses again. That is what makes the
+// arbitration a decision about ONE verdict rather than a standing waiver.
+func TestAcceptanceSeam_ArbitrationInvalidatedByAcceptanceRerun(t *testing.T) {
+	exampleBytes, _ := readAcceptanceExampleSpec(t)
+	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+	s, _, merger := arbitrationSeamServer(t, seam)
+
+	if w := shipAcceptanceRequest(t, s, seam.runID, seam.acceptanceID, seam.priv, allSkipVerdictBytes(t, ""), ""); w.Code != 201 {
+		t.Fatalf("first ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if arb := postArbitration(t, s, seam.runID,
+		acceptanceArbitrationRequest{Reason: "externally unvalidatable"}, withMergeOperator); arb.Code != 200 {
+		t.Fatalf("arbitration status = %d, want 200:\n%s", arb.Code, arb.Body.String())
+	}
+	if got := gateStateOf(t, s, seam); got != acceptanceGateArbitrated {
+		t.Fatalf("gate = %q, want %q after arbitration", got, acceptanceGateArbitrated)
+	}
+
+	// A fresh acceptance run records a NEW verdict (content-hash-distinct, so
+	// the ship handler takes the fresh-create path).
+	if w := shipAcceptanceRequest(t, s, seam.runID, seam.acceptanceID, seam.priv,
+		allSkipVerdictBytes(t, " (re-run)"), ""); w.Code != 201 {
+		t.Fatalf("second ship status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	if got := gateStateOf(t, s, seam); got != acceptanceGateTriage {
+		t.Fatalf("gate = %q, want %q — a re-run must invalidate the prior arbitration", got, acceptanceGateTriage)
+	}
+	blocked := postMergeRun(t, s, seam.runID, mergeRunRequest{Verdict: "ship it"}, withMergeOperator)
+	if blocked.Code != 409 {
+		t.Fatalf("merge after re-run = %d, want 409:\n%s", blocked.Code, blocked.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (a superseded arbitration must not admit a merge)", merger.called)
 	}
 }

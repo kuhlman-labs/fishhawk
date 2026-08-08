@@ -2244,7 +2244,11 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// one-call review-gate decision read (open concerns with full notes, round
 	// history, fix-up claims, re-review confirmations) — taking the total
 	// 44 -> 45.
-	const wantToolCount = 45
+	//
+	// E66.37 (#2474) adds exactly ONE tool — fishhawk_arbitrate_acceptance, the
+	// operator-only discharge of a PAGED acceptance triage that un-wedges the
+	// merge gate — taking the total 45 -> 46.
+	const wantToolCount = 46
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -2277,6 +2281,27 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawGateView {
 		t.Error("fishhawk_get_gate_view is not registered/visible over ListTools")
+	}
+
+	// fishhawk_arbitrate_acceptance (#2474) must be wire-visible AND its
+	// description must state what it is NOT — a registration regression would
+	// leave a paged operator with no blessed discharge, and a description that
+	// omitted the auto-routed carve-out would invite an operator to try to skip a
+	// fix-up the loop already dispatched.
+	var arbitrateDesc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_arbitrate_acceptance" {
+			arbitrateDesc = tool.Description
+			break
+		}
+	}
+	if arbitrateDesc == "" {
+		t.Error("fishhawk_arbitrate_acceptance is not registered/visible over ListTools")
+	}
+	for _, want := range []string{"AUTO-ROUTED", "NOT a re-run", "NOT a pass", "acceptance_arbitrated"} {
+		if !strings.Contains(arbitrateDesc, want) {
+			t.Errorf("fishhawk_arbitrate_acceptance description must mention %q; got:\n%s", want, arbitrateDesc)
+		}
 	}
 
 	// fishhawk_revive_run (#1915) must be wire-visible AND its description must
