@@ -36,7 +36,13 @@ type fakeAnthropicResp struct {
 	} `json:"content"`
 	Model      string `json:"model"`
 	StopReason string `json:"stop_reason"`
-	Usage      struct {
+	// StopDetails is a POINTER with omitempty so every existing non-refusal
+	// fixture serializes byte-identically (a nil pointer is omitted entirely);
+	// a refusal test sets it to put a category on the wire.
+	StopDetails *struct {
+		Category string `json:"category"`
+	} `json:"stop_details,omitempty"`
+	Usage struct {
 		InputTokens              int `json:"input_tokens"`
 		OutputTokens             int `json:"output_tokens"`
 		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
