@@ -743,9 +743,13 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 	run := naRun("running")
 	run.PullRequestURL = &prURL
 	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	// A QUALIFIED drive detail — the shape the backend now stamps when a
+	// reviewer has rejected (#2487). The passthrough is what carries the
+	// warning to the operator, so it must surface verbatim as the reason.
+	const qualifiedDetail = "all blocking gates resolved and required checks are green; 2 advisory rejects (latest review round) outstanding — read them with fishhawk_get_gate_view, then merge, route a fix-up with fishhawk_fixup_stage, or waive with fishhawk_waive_concern"
 	drive := &DriveStatus{
 		Drive:      true,
-		NextAction: &RunNextAction{Action: "merge_pr", Detail: "all gates resolved", PRURL: prURL},
+		NextAction: &RunNextAction{Action: "merge_pr", Detail: qualifiedDetail, PRURL: prURL},
 	}
 
 	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, drive, false, false, "", "", releaseSignals{})
@@ -755,8 +759,13 @@ func TestNextActions_DriveActionFoldsFirst(t *testing.T) {
 	if na.Actions[0].Action != "fishhawk_merge_run" {
 		t.Errorf("actions[0] = %q, want the drive next_action merge_pr translated to fishhawk_merge_run", na.Actions[0].Action)
 	}
-	if na.Actions[0].Reason != "all gates resolved" {
-		t.Errorf("actions[0].reason = %q, want the drive detail", na.Actions[0].Reason)
+	if na.Actions[0].Reason != qualifiedDetail {
+		t.Errorf("actions[0].reason = %q, want the qualified drive detail verbatim", na.Actions[0].Reason)
+	}
+	// #2487: the precondition no longer makes the unconditional all-clear
+	// claim — the qualification is carried by the passed-through detail.
+	if strings.Contains(na.Actions[0].Precondition, "every gate resolved and required checks green") {
+		t.Errorf("actions[0].precondition = %q, want it to drop the unconditional all-clear claim (#2487)", na.Actions[0].Precondition)
 	}
 	if na.Actions[0].Params["pr_url"] != prURL {
 		t.Errorf("actions[0].params.pr_url = %q, want %q", na.Actions[0].Params["pr_url"], prURL)

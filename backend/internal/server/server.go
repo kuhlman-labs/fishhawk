@@ -1145,10 +1145,11 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		return
 	}
 
-	configured, terminal, started, ok := s.implementReviewRound(ctx, runRow)
-	if !ok {
+	roundState := s.implementReviewRound(ctx, runRow)
+	if !roundState.ok {
 		return
 	}
+	configured, terminal, started := roundState.configured, roundState.terminal, roundState.started
 
 	settled := started && planreview.Settled(configured, terminal)
 	if settled && !s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleReviewsSettledGate) {
@@ -1319,6 +1320,7 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 	if s.drive.Recorded(ctx, stage.RunID, &stage.ID, drive.RuleChecksGreenAwaitingMerge) {
 		return
 	}
+	adv := s.advisoryOutstandingFor(ctx, stage.RunID, roundState.rejects, roundState.verdictsUnreadable)
 	s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
 		Rule:  drive.RuleChecksGreenAwaitingMerge,
 		From:  "review:awaiting_approval",
@@ -1326,28 +1328,59 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		Event: "review evidence terminal and " + checksEvidencePhrase(checksResolved),
 		NextAction: &drive.NextAction{
 			Action: "merge_pr",
-			Detail: checksMergeDetail(checksResolved),
+			Detail: checksMergeDetail(checksResolved, adv),
 			PRURL:  prURL,
 		},
 	})
 }
 
+// implementRoundState is the LATEST implement-review round's derived
+// state, returned by implementReviewRound. configured/terminal/started/ok
+// carry the original (#1060) gate signals; rejects and verdictsUnreadable
+// (#2487) add the round-scoped advisory-reject derivation used to qualify
+// the awaiting_merge next_action.Detail.
+type implementRoundState struct {
+	// configured is the round's configured implement-reviewer count;
+	// terminal is how many terminal entries (implement_reviewed /
+	// _failed / _skipped) landed after the latest started entry.
+	configured, terminal int
+	// rejects is the number of implement_reviewed entries in THIS round
+	// whose decoded Verdict == VerdictReject. Round-scoped by
+	// construction (only entries above the latest started sequence are
+	// counted), so a reject a later fix-up round superseded does not
+	// count.
+	rejects int
+	// started is true when an implement_review_started entry exists; ok
+	// is false on any audit read failure (the poll-driven caller skips
+	// and retries next tick).
+	started, ok bool
+	// verdictsUnreadable is set when an implement_reviewed payload in
+	// this round failed to decode (#2487, binding condition 1). A broken
+	// verdict read must NOT contribute zero rejects and fall through to
+	// the clean all-clear — it forces the same read-first hedge the
+	// nil/erroring ConcernRepo takes, so Known cannot stay true on the
+	// strength of the concern read alone while the verdict read is broken.
+	verdictsUnreadable bool
+}
+
 // implementReviewRound reports the run's LATEST implement-review
 // round: whether one was dispatched (an implement_review_started entry
-// exists), how many agents it was configured with, and how many
-// terminal entries (implement_reviewed / _failed / _skipped) landed
-// after it. Rounds are delimited by started entries — a fix-up re-park
+// exists), how many agents it was configured with, how many terminal
+// entries (implement_reviewed / _failed / _skipped) landed after it, and
+// how many of the round's implement_reviewed verdicts were rejects
+// (#2487). Rounds are delimited by started entries — a fix-up re-park
 // dispatches a fresh round whose started entry supersedes the prior
 // one, so a settled FIRST round can never satisfy the gate while the
-// re-review is still in flight. ok=false on any audit read failure
-// (the poll-driven caller skips and retries next tick).
-func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) (configured, terminal int, started, ok bool) {
+// re-review is still in flight, and a reject the prior round recorded is
+// never counted against the fresh one. ok=false on any audit read
+// failure (the poll-driven caller skips and retries next tick).
+func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) implementRoundState {
 	startedEntries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, "implement_review_started")
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "drive: list implement_review_started failed",
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("error", err.Error()))
-		return 0, 0, false, false
+		return implementRoundState{}
 	}
 	if len(startedEntries) == 0 {
 		// No round dispatched yet. Resolve the configured agent count
@@ -1360,7 +1393,7 @@ func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) (con
 		if cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement); cfg != nil {
 			configuredFromSpec = cfg.AgentCount()
 		}
-		return configuredFromSpec, 0, false, true
+		return implementRoundState{configured: configuredFromSpec, ok: true}
 	}
 	latest := startedEntries[0]
 	for _, e := range startedEntries {
@@ -1369,14 +1402,15 @@ func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) (con
 		}
 	}
 
+	st := implementRoundState{started: true, ok: true}
 	var startedPayload planreview.ReviewStartedPayload
 	if uerr := json.Unmarshal(latest.Payload, &startedPayload); uerr == nil {
-		configured = startedPayload.ConfiguredAgents
+		st.configured = startedPayload.ConfiguredAgents
 	}
-	if configured == 0 {
+	if st.configured == 0 {
 		// Pre-#600-payload or malformed entry: fall back to the spec.
 		if cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement); cfg != nil {
-			configured = cfg.AgentCount()
+			st.configured = cfg.AgentCount()
 		}
 	}
 
@@ -1387,15 +1421,83 @@ func (s *Server) implementReviewRound(ctx context.Context, runRow *run.Run) (con
 				slog.String("run_id", runRow.ID.String()),
 				slog.String("category", cat),
 				slog.String("error", lerr.Error()))
-			return 0, 0, false, false
+			return implementRoundState{}
 		}
 		for _, e := range entries {
-			if e.Sequence > latest.Sequence {
-				terminal++
+			if e.Sequence <= latest.Sequence {
+				continue
+			}
+			st.terminal++
+			if cat != "implement_reviewed" {
+				continue
+			}
+			// Decode the verdict to count round-scoped advisory rejects
+			// (#2487). A payload that fails to decode does NOT silently
+			// contribute zero rejects (binding condition 1): it flags the
+			// round's verdict read as unreadable so the caller hedges toward
+			// read rather than emitting a clean all-clear on a broken read
+			// (a truncated review response returning as success is a known
+			// live failure mode). The terminal count is unaffected — the
+			// entry still exists as a terminal verdict.
+			var reviewed planreview.ImplementReviewedPayload
+			if uerr := json.Unmarshal(e.Payload, &reviewed); uerr != nil {
+				st.verdictsUnreadable = true
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "drive: decode implement_reviewed verdict failed; hedging awaiting_merge detail toward read",
+					slog.String("run_id", runRow.ID.String()),
+					slog.String("error", uerr.Error()))
+				continue
+			}
+			if reviewed.Verdict == planreview.VerdictReject {
+				st.rejects++
 			}
 		}
 	}
-	return configured, terminal, true, true
+	return st
+}
+
+// advisoryOutstanding is the run's outstanding advisory-verdict state at
+// awaiting_merge stamp time (#2487): the round-scoped reject count and
+// the run-wide open-concern count, plus Known — false when the state
+// could not be read (a nil/erroring ConcernRepo OR an unreadable verdict
+// payload) and the detail must degrade to an explicit read-first hedge
+// rather than a clean all-clear.
+type advisoryOutstanding struct {
+	// Rejects is round-scoped (the latest implement-review round);
+	// Concerns is run-wide across both stage kinds. The two windows
+	// differ deliberately (#2487, binding condition 4); the detail
+	// wording names each scope so the side-by-side counts do not imply a
+	// shared window.
+	Rejects, Concerns int
+	Known             bool
+}
+
+// advisoryOutstandingFor derives the outstanding advisory-verdict state
+// for the awaiting_merge stamp (#2487). It does NOT change control flow —
+// an unknown advisory state still stamps RuleChecksGreenAwaitingMerge
+// with Action merge_pr (the local MCP loop and delegation's may_merge
+// both key on that rule firing); only the Detail prose degrades to the
+// read-first hedge. Known=false when the verdict read was broken
+// (verdictsUnreadable, binding condition 1), when ConcernRepo is nil, or
+// when ListOpenByRun errors — the run's established "fail toward read,
+// not toward merge" posture.
+func (s *Server) advisoryOutstandingFor(ctx context.Context, runID uuid.UUID, rejects int, verdictsUnreadable bool) advisoryOutstanding {
+	if verdictsUnreadable {
+		// A broken verdict read must not leave Known true on the strength
+		// of the concern read alone (binding condition 1).
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "drive: advisory rejects unreadable; hedging awaiting_merge detail toward read",
+			slog.String("run_id", runID.String()))
+		return advisoryOutstanding{Known: false}
+	}
+	if s.cfg.ConcernRepo == nil {
+		return advisoryOutstanding{Known: false}
+	}
+	open, err := s.cfg.ConcernRepo.ListOpenByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "drive: list open concerns for awaiting_merge detail failed; hedging toward read",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return advisoryOutstanding{Known: false}
+	}
+	return advisoryOutstanding{Rejects: rejects, Concerns: len(open), Known: true}
 }
 
 // reviewChecksResolution is the tri-state resolution of the run's
@@ -1452,14 +1554,71 @@ func checksEvidencePhrase(resolved bool) string {
 }
 
 // checksMergeDetail is the next_action.Detail for a merge-eligible
-// drive stamp (#2497). Resolved runs keep today's phrasing; an
-// unresolved run tells the operator the checks were never resolved and
-// must be verified on the PR before merging.
-func checksMergeDetail(resolved bool) string {
-	if resolved {
-		return "all gates resolved and required checks are green; review and merge the PR"
+// drive stamp (#2497, #2487). It composes a checks lead with an advisory
+// qualifier so the last sentence an operator reads before merging can
+// never read as an all-clear while a reviewer has rejected or a concern
+// is unresolved. Three branches:
+//
+//   - Known with zero rejects AND zero concerns: TODAY'S TWO STRINGS
+//     byte-for-byte (a clean run gets no noisier — #2487 keeps the clean
+//     sentence).
+//   - Known with a non-zero count: the lead becomes "all blocking gates
+//     resolved" (the phrase "all gates resolved" MUST NOT appear), the
+//     counts are stated with their distinct scopes, and the line names
+//     the dispositions rather than only the merge.
+//   - Known==false: the advisory state could not be read (a nil/erroring
+//     ConcernRepo or an unreadable verdict payload) — degrade to an
+//     explicit read-first hedge naming the gate view, matching the run's
+//     "fail toward read, not toward merge" posture.
+func checksMergeDetail(resolved bool, adv advisoryOutstanding) string {
+	if adv.Known && adv.Rejects == 0 && adv.Concerns == 0 {
+		if resolved {
+			return "all gates resolved and required checks are green; review and merge the PR"
+		}
+		return "all gates resolved; required checks were not resolved for this run (no protection snapshot) — verify CI on the PR before merging"
 	}
-	return "all gates resolved; required checks were not resolved for this run (no protection snapshot) — verify CI on the PR before merging"
+	lead := "all blocking gates resolved" + checksMergeChecksClause(resolved)
+	if !adv.Known {
+		return lead + "; the outstanding advisory verdicts could not be read — read the gate view (fishhawk_get_gate_view) before merging"
+	}
+	return lead + "; " + advisoryCountsPhrase(adv.Rejects, adv.Concerns) +
+		" outstanding — read them with fishhawk_get_gate_view, then merge, route a fix-up with fishhawk_fixup_stage, or waive with fishhawk_waive_concern"
+}
+
+// checksMergeChecksClause is the required-checks clause shared by the
+// qualified checksMergeDetail branches (#2487). It mirrors the clean
+// strings' checks wording so the qualified detail reads consistently.
+func checksMergeChecksClause(resolved bool) string {
+	if resolved {
+		return " and required checks are green"
+	}
+	return "; required checks were not resolved for this run (no protection snapshot)"
+}
+
+// advisoryCountsPhrase renders the non-zero advisory counts for the
+// qualified checksMergeDetail (#2487). Each count names its own scope —
+// the reject count is round-scoped (the latest implement-review round)
+// and the concern count is run-wide across both stage kinds (binding
+// condition 4) — so the side-by-side counts never imply a shared window.
+// A zero half is omitted entirely; at least one half is non-zero by the
+// caller's contract.
+func advisoryCountsPhrase(rejects, concerns int) string {
+	var parts []string
+	if rejects > 0 {
+		parts = append(parts, fmt.Sprintf("%d advisory %s (latest review round)", rejects, pluralize(rejects, "reject", "rejects")))
+	}
+	if concerns > 0 {
+		parts = append(parts, fmt.Sprintf("%d unresolved %s (run-wide)", concerns, pluralize(concerns, "concern", "concerns")))
+	}
+	return strings.Join(parts, " and ")
+}
+
+// pluralize returns singular when n == 1 and plural otherwise.
+func pluralize(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 // checksAcceptanceLead is the leading required-checks clause on an

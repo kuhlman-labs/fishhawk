@@ -4811,12 +4811,17 @@ func TestGetRunStatus_DriveStatus_PropagatesEndToEnd(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	// The QUALIFIED detail shape the backend now stamps when a reviewer has
+	// rejected (#2487) — the same literal shape the server-side tests pin
+	// from the backend side, so a wording change the MCP layer would swallow
+	// is visible on both halves of the seam.
+	const qualifiedDetail = "all blocking gates resolved and required checks are green; 1 advisory reject (latest review round) outstanding — read them with fishhawk_get_gate_view, then merge, route a fix-up with fishhawk_fixup_stage, or waive with fishhawk_waive_concern"
 	fb.getRunExtraByID[runID] = map[string]any{
 		"drive":          true,
 		"derived_status": "awaiting_merge",
 		"next_action": map[string]any{
 			"action": "merge_pr",
-			"detail": "all gates resolved and required checks are green",
+			"detail": qualifiedDetail,
 			"pr_url": "https://github.com/x/y/pull/42",
 		},
 		"auto_advanced": []map[string]any{
@@ -4844,6 +4849,11 @@ func TestGetRunStatus_DriveStatus_PropagatesEndToEnd(t *testing.T) {
 	if ds.NextAction == nil || ds.NextAction.Action != "merge_pr" || ds.NextAction.PRURL != "https://github.com/x/y/pull/42" {
 		t.Errorf("next_action = %+v, want merge_pr with the PR URL", ds.NextAction)
 	}
+	// #2487: the qualified detail survives the HTTP decode into
+	// DriveStatus.NextAction.Detail byte-for-byte.
+	if ds.NextAction.Detail != qualifiedDetail {
+		t.Errorf("next_action.detail = %q, want the qualified detail decoded unchanged", ds.NextAction.Detail)
+	}
 	if len(ds.AutoAdvanced) != 2 {
 		t.Fatalf("auto_advanced = %+v, want 2 entries", ds.AutoAdvanced)
 	}
@@ -4868,6 +4878,12 @@ func TestGetRunStatus_DriveStatus_PropagatesEndToEnd(t *testing.T) {
 	}
 	if out.NextActions.Actions[0].Action != "fishhawk_merge_run" {
 		t.Errorf("next_actions.actions[0] = %q, want the drive merge_pr translated to fishhawk_merge_run", out.NextActions.Actions[0].Action)
+	}
+	// #2487: the qualified detail folds into the merge action's reason
+	// unchanged — the passthrough is what carries the reject warning to the
+	// operator, so a change to the backend wording is visible here too.
+	if out.NextActions.Actions[0].Reason != qualifiedDetail {
+		t.Errorf("next_actions.actions[0].reason = %q, want the qualified detail folded through unchanged", out.NextActions.Actions[0].Reason)
 	}
 }
 

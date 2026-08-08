@@ -1370,7 +1370,7 @@ func driveAction(run *Run, da *RunNextAction) SuggestedAction {
 		return SuggestedAction{
 			Action:       "fishhawk_merge_run",
 			Params:       params,
-			Precondition: "drive-mode (#1023): the backend parked the run at awaiting_merge with every gate resolved and required checks green",
+			Precondition: "drive-mode (#1023): the backend parked the run at awaiting_merge; read the accompanying reason/detail for any outstanding advisory rejects or unresolved concerns before merging (#2487)",
 			Consumes:     consumesNone,
 			Reason:       reason,
 		}
