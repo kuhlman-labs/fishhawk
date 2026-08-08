@@ -13057,8 +13057,16 @@ func TestOpenPRAndShipArtifact_MissingScopePlusBinding_StaysCategoryB(t *testing
 
 	var logSink strings.Builder
 	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", bindings, nil, nil)
-	if !errors.Is(err, gitops.ErrBindingAssertionUnsatisfied) {
+	// #2501: both gates now RECORD rather than return, so the compound is
+	// resolved by parkResult()'s compound arm — an UNTYPED wrap of the
+	// ErrScopeFilesMissing sentinel naming BOTH shortfalls. Both sentinels map
+	// to category-B, so the classification is unchanged; what matters (and is
+	// asserted below) is that no park is reported and origin stays untouched.
+	if !errors.Is(err, gitops.ErrScopeFilesMissing) {
 		t.Fatalf("a compound (missing + binding) failure must stay category-B, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "b.txt") || !strings.Contains(err.Error(), "NOT-PRESENT-LITERAL") {
+		t.Errorf("the compound message must name both shortfalls, got: %v", err)
 	}
 	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
 		t.Error("a compound failure must NOT report a park")
@@ -16863,5 +16871,378 @@ func TestRun_NoDiffCoverage_EmitsNoEvent(t *testing.T) {
 		if ev.Kind == "diff_coverage" {
 			t.Fatalf("a stage with no declared constraint emitted a diff_coverage event: %s", ev.Data)
 		}
+	}
+}
+
+// goldenExemptPromptJSON is the CROSS-MODULE GOLDEN FIXTURE for the
+// scope-completeness exempt prompt-response fields (#2501).
+//
+// PEER COPY: backend/internal/server/prompt_test.go holds a BYTE-IDENTICAL
+// literal under the same name. The backend test asserts the three-key
+// projection of its marshalled promptResponse EQUALS this JSON; the runner test
+// below DECODES it as a fetched prompt. A single-process end-to-end that
+// carries the payload the whole way is impossible here — the runner and the
+// backend are separate Go modules and neither may import the other (import
+// direction is one-way and there is no shared wire package) — so the shared
+// BYTES are the seam. Keep the two literals verbatim-identical: a backend tag
+// change forces an edit to the backend copy, and this copy then fails to
+// decode, so the drift surfaces in the RUNNER test rather than only in a
+// backend assertion.
+const goldenExemptPromptJSON = `{"held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
+
+// TestGoldenExemptPrompt_DecodesIntoFetchedPrompt is the runner half of the
+// #2501 cross-module seam: the exact bytes the backend emits for an
+// exempt-resolved park decode into the three FetchedPrompt fields the runner's
+// zero-re-run branch keys off. A tag drift on either side breaks THIS test.
+func TestGoldenExemptPrompt_DecodesIntoFetchedPrompt(t *testing.T) {
+	var fp upload.FetchedPrompt
+	if err := json.Unmarshal([]byte(goldenExemptPromptJSON), &fp); err != nil {
+		t.Fatalf("decode golden exempt prompt: %v", err)
+	}
+	if !fp.OpenPRFromHeldCommit {
+		t.Error("open_pr_from_held_commit must decode true — without it the runner re-runs the agent from the top")
+	}
+	if fp.HeldCommitSHA != "1111111111111111111111111111111111111111" {
+		t.Errorf("held_commit_sha = %q", fp.HeldCommitSHA)
+	}
+	if fp.HeldCommitBranch != "fishhawk/run-11112222/stage-99990000" {
+		t.Errorf("held_commit_branch = %q", fp.HeldCommitBranch)
+	}
+}
+
+// TestAssertionShortfall_ParksThenExemptOpensPRWithNoAgentReRun is the #2501
+// end-to-end promise, in two phases over the real local-bare-remote harness.
+//
+// PHASE 1: a standalone implement pass whose ONLY committed-tree gate failure
+// is an unsatisfied binding assertion PARKS — outcome scope_park carrying the
+// unsatisfied assertion, the gate-verified commit pushed to the run branch, and
+// NO PR opened.
+//
+// PHASE 2: run() re-enters with a fetched prompt carrying the exempt fields
+// DECODED FROM THE GOLDEN FIXTURE (held_commit_sha replaced with phase 1's real
+// held SHA, so the continuity is genuine rather than fixture-to-fixture). A PR
+// IS opened whose head is phase 1's held branch and whose artifact head is
+// phase 1's held SHA, and the agent invoker call count is ZERO across phase 2 —
+// the agent is never re-invoked, which is the whole point of the park.
+func TestAssertionShortfall_ParksThenExemptOpensPRWithNoAgentReRun(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	// a.txt IS touched (it is the in-scope edit) but does not contain the
+	// declared literal → the assertion is the SOLE gate failure.
+	bindings := []upload.BindingAssertion{{Type: "file_contains", Path: "a.txt", Literal: "NOT-PRESENT-LITERAL"}}
+
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	var logSink strings.Builder
+	if perr := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", bindings, nil, nil); perr != nil {
+		t.Fatalf("assertion-only shortfall must PARK (nil error), got: %v\n%s", perr, logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("phase 1: OpenPR must not run on the park")
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+		t.Fatalf("phase 1: must report a scope_park, got: %+v", fu.gotPRArgs)
+	}
+	if len(fu.gotPRArgs.MissingPaths) != 0 {
+		t.Errorf("phase 1: an assertion-only park must carry no missing_paths, got %v", fu.gotPRArgs.MissingPaths)
+	}
+	got := fu.gotPRArgs.UnsatisfiedAssertions
+	if len(got) != 1 || got[0].Type != "file_contains" || got[0].Path != "a.txt" || got[0].Literal != "NOT-PRESENT-LITERAL" {
+		t.Fatalf("phase 1: park report must carry the unsatisfied assertion, got %+v", got)
+	}
+	heldSHA := fu.gotPRArgs.HeadSHA
+	if heldSHA == "" || fu.gotPRArgs.Branch != branch {
+		t.Fatalf("phase 1: park must pin the held commit on the run branch, got %+v", fu.gotPRArgs)
+	}
+	// The gate-verified commit really is on the remote branch (it must survive
+	// the runner exit for the exempt resolution to open a PR from it).
+	tip, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "refs/heads/"+branch).Output()
+	if rerr != nil {
+		t.Fatalf("phase 1: park must push the held commit to %s: %v", branch, rerr)
+	}
+	if strings.TrimSpace(string(tip)) != heldSHA {
+		t.Fatalf("phase 1: remote tip %q != held SHA %q", strings.TrimSpace(string(tip)), heldSHA)
+	}
+
+	// ---- PHASE 2: the exempt re-dispatch, driven through run(). ----
+	var golden upload.FetchedPrompt
+	if uerr := json.Unmarshal([]byte(goldenExemptPromptJSON), &golden); uerr != nil {
+		t.Fatalf("decode golden exempt prompt: %v", uerr)
+	}
+	if !golden.OpenPRFromHeldCommit || golden.HeldCommitBranch != branch {
+		t.Fatalf("golden fixture must carry the exempt signal for this run's branch: %+v", golden)
+	}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fpr2 := withFakePROpenerOnly(t)
+	fu2 := newFakeUploader(t)
+	fu2.promptResp = &upload.FetchedPrompt{
+		StageID:    "99990000-aaaa-bbbb-cccc-ddddeeeeffff",
+		StageType:  "implement",
+		Prompt:     "unused — the exempt path never reads it",
+		PromptHash: "deadbeef",
+		// Decoded from the golden; only the SHA is swapped for phase 1's REAL
+		// held commit so the two phases are genuinely chained.
+		OpenPRFromHeldCommit: golden.OpenPRFromHeldCommit,
+		HeldCommitBranch:     golden.HeldCommitBranch,
+		HeldCommitSHA:        heldSHA,
+	}
+	withFakeUploader(t, fu2)
+
+	var stderr strings.Builder
+	if code := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "99990000-aaaa-bbbb-cccc-ddddeeeeffff",
+		"--github-repo", "test-owner/test-repo",
+		"--base-branch", "main",
+		"--fetch-prompt",
+	}, &stderr); code != exitOK {
+		t.Fatalf("phase 2: run = %d, want exitOK:\n%s", code, stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("phase 2: the agent invoker was called %d time(s); the exempt path must re-run NO agent", invoker.callIdx)
+	}
+	if fpr2.gotArgs == nil {
+		t.Fatal("phase 2: the exempt resolution must open a PR from the held commit")
+	}
+	if fpr2.gotArgs.Head != branch {
+		t.Errorf("phase 2: PR head = %q, want phase 1's held branch %q", fpr2.gotArgs.Head, branch)
+	}
+	if fu2.gotPRArgs == nil || fu2.gotPRArgs.Outcome != "" {
+		t.Fatalf("phase 2: must ship the success PR artifact, got %+v", fu2.gotPRArgs)
+	}
+	var artifact struct {
+		HeadSHA string `json:"head_sha"`
+	}
+	if uerr := json.Unmarshal(fu2.gotPRArgs.Body, &artifact); uerr != nil {
+		t.Fatalf("phase 2: decode artifact: %v", uerr)
+	}
+	if artifact.HeadSHA != heldSHA {
+		t.Errorf("phase 2: opened-PR artifact head = %q, want phase 1's held SHA %q", artifact.HeadSHA, heldSHA)
+	}
+}
+
+// assertionCompoundHarness is the shared fixture for the four #2501 COMPOUND
+// branches: an unsatisfied binding assertion co-occurring with one other
+// committed-tree gate failure. Every case must keep today's category-B abort —
+// a park is reserved for a SOLE shortfall — and every case reads the REMOTE REF
+// after the call, because the control's effect is committed state: an error
+// identity alone is byte-identical whether or not origin was written.
+func assertionCompoundHarness(t *testing.T, verifyCmd string) (cfg config, bare, branch string, fpr *fakePROpener, fu *fakeUploader, issued *upload.IssuedKey) {
+	t.Helper()
+	repo, bare, branch := verifiedTreeRepo(t)
+	fpr = withFakePROpenerOnly(t)
+	fu = newFakeUploader(t)
+	var err error
+	issued, err = fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return verifiedTreeCfg(repo, verifyCmd), bare, branch, fpr, fu, issued
+}
+
+// unsatisfiedBinding is the deliberately-unsatisfiable assertion every compound
+// case pairs its second gate failure with: a.txt IS committed but never
+// contains this literal, so the shortfall is real and seeded BY CONSTRUCTION
+// (not by calling the control inside the test's own setup).
+var unsatisfiedBinding = []upload.BindingAssertion{{Type: "file_contains", Path: "a.txt", Literal: "NOT-PRESENT-LITERAL"}}
+
+func assertCompoundStaysCategoryB(t *testing.T, err error, bare, branch string, fpr *fakePROpener, fu *fakeUploader, log string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("a compound failure must NOT park — it must abort category-B\n%s", log)
+	}
+	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
+		t.Errorf("a compound failure must NOT report a park, got: %+v", fu.gotPRArgs)
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on a category-B abort")
+	}
+	if out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+branch).CombinedOutput(); gerr == nil {
+		t.Errorf("origin must be untouched on the category-B abort, but branch %s exists: %s", branch, out)
+	}
+}
+
+// TestAssertionCompound_PlusMissingScopeFile_StaysCategoryB: the compound arm of
+// parkResult(). BOTH shortfalls are recorded, so the terminal resolver returns
+// an UNTYPED sentinel wrap that neither errors.As in CommitAndPush matches, and
+// the push aborts before origin is touched.
+func TestAssertionCompound_PlusMissingScopeFile_StaysCategoryB(t *testing.T) {
+	cfg, bare, branch, fpr, fu, issued := assertionCompoundHarness(t, "true")
+	// b.txt is declared but never edited → the missing-scope shortfall.
+	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "b.txt", Operation: "modify"})
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	var log strings.Builder
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, verifiedTree, "", unsatisfiedBinding, nil, nil)
+	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
+	// The compound message names BOTH shortfalls so the operator sees why it did
+	// not park, and it wraps a plain sentinel (never the typed park value).
+	if !errors.Is(err, gitops.ErrScopeFilesMissing) {
+		t.Errorf("compound error must still classify category-B via the sentinel, got: %v", err)
+	}
+	var typed *gitops.BindingAssertionsUnsatisfiedError
+	if errors.As(err, &typed) {
+		t.Error("the compound arm must NOT return the typed park error — that is what would let it park")
+	}
+	var typedScope *gitops.ScopeFilesMissingError
+	if errors.As(err, &typedScope) {
+		t.Error("the compound arm must NOT return the typed scope park error either")
+	}
+	if !strings.Contains(err.Error(), "b.txt") || !strings.Contains(err.Error(), "NOT-PRESENT-LITERAL") {
+		t.Errorf("compound message must name both shortfalls, got: %v", err)
+	}
+}
+
+// TestAssertionCompound_PlusCreatedOutOfScope_StaysCategoryB: the
+// created-out-of-scope gate runs BEFORE the recording points and RETURNS, so it
+// is covered by the sole-failure guarantee without any parkResult() arm.
+func TestAssertionCompound_PlusCreatedOutOfScope_StaysCategoryB(t *testing.T) {
+	cfg, bare, branch, fpr, fu, issued := assertionCompoundHarness(t, "true")
+	// A net-new untracked file outside scope.files.
+	mustWrite(t, filepath.Join(cfg.workingDir, "created.txt"), "net-new, undeclared\n")
+	var log strings.Builder
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil)
+	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
+	if !errors.Is(err, gitops.ErrCreatedOutOfScope) {
+		t.Errorf("err = %v, want ErrCreatedOutOfScope", err)
+	}
+}
+
+// TestAssertionCompound_PlusCompileGateFailure_StaysCategoryB: the compile/test
+// gate runs AFTER the assertion recording point and RETURNS, so the recorded
+// assertion shortfall never reaches parkResult().
+func TestAssertionCompound_PlusCompileGateFailure_StaysCategoryB(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	cfg, bare, branch, fpr, fu, issued := assertionCompoundHarness(t, "true")
+	// Seed the compile failure BY CONSTRUCTION: the base commit carries a
+	// compiling module whose _test.go asserts impl conforms to Doer; the
+	// in-scope edit REMOVES the Do() method, so the scope-only COMMITTED tree
+	// fails `go vet` while the assertion shortfall is already recorded.
+	seedCompileFailingModule(t, cfg.workingDir)
+	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "mod/doer.go", Operation: "modify"})
+	var log strings.Builder
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil)
+	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
+	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) && !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Errorf("err = %v, want a committed-tree compile/test gate failure", err)
+	}
+}
+
+// seedCompileFailingModule commits a compiling one-package Go module into the
+// fixture repo's base and then breaks it in the WORKING tree, so the scope-only
+// committed tree the compile gate builds fails `go vet`.
+func seedCompileFailingModule(t *testing.T, repo string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "doer.go"),
+		"package mod\n\ntype Doer interface{ Do() }\n\ntype impl struct{}\n\nfunc (impl) Do() {}\n")
+	mustWrite(t, filepath.Join(repo, "mod", "doer_test.go"), "package mod\n\nvar _ Doer = impl{}\n")
+	mustWrite(t, filepath.Join(repo, "drift.txt"), "tracked, undeclared\n")
+	for _, args := range [][]string{{"add", "go.work", "mod", "drift.txt"}, {"commit", "-m", "compiling base module"}, {"push", "origin", "main"}} {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// The in-scope edit drops the conformance method → the committed tree breaks.
+	mustWrite(t, filepath.Join(repo, "mod", "doer.go"),
+		"package mod\n\ntype Doer interface{ Do() }\n\ntype impl struct{}\n")
+	// A dirty-but-UNDECLARED tracked file, so the commit carries scope drift —
+	// the compile gate's fast path returns early on an empty drift set.
+	mustWrite(t, filepath.Join(repo, "drift.txt"), "modified, still undeclared\n")
+}
+
+// TestAssertionCompound_PlusVerifiedTreeMismatch_StaysCategoryB: the #960
+// verified-tree invariant runs LAST, after the assertion recording point, and
+// RETURNS on a mismatch whose strict re-verify does not pass. A bogus
+// verifiedTreeSHA can never equal the real committed tree, and the re-verify
+// command fails, so the invariant fires with an assertion shortfall pending.
+func TestAssertionCompound_PlusVerifiedTreeMismatch_StaysCategoryB(t *testing.T) {
+	cfg, bare, branch, fpr, fu, issued := assertionCompoundHarness(t, "false")
+	bogusTree := "0000000000000000000000000000000000000000"
+	var log strings.Builder
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, bogusTree, "", unsatisfiedBinding, nil, nil)
+	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
+	// The sentinel is asserted EXACTLY, with no compile/test-gate alternative:
+	// admitting ErrCommitWouldNotCompile / ErrCommittedTestsFailed here would let
+	// this case pass on a gate that aborts BEFORE the mismatch branch, making it
+	// a duplicate of the compile-failure case that pins nothing about the
+	// verified-tree path.
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Errorf("err = %v, want the verified-tree category-B abort (ErrPushedTreeNotVerified)", err)
+	}
+	// ...and the two events prove the COMPOUND actually formed: the assertion
+	// shortfall was recorded first, and the verified-tree branch then executed
+	// on that pending shortfall. Without these, an earlier-returning gate would
+	// satisfy the error assertion alone on some future refactor.
+	if !strings.Contains(log.String(), `"event":"binding_assertion_unsatisfied"`) {
+		t.Errorf("the assertion shortfall must be RECORDED before the verified-tree gate runs:\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), `"event":"verified_tree_mismatch"`) ||
+		!strings.Contains(log.String(), `"verified_tree_sha":"`+bogusTree+`"`) {
+		t.Errorf("the verified-tree MISMATCH branch must have executed (its event names the bogus tree):\n%s", log.String())
+	}
+	// A compound must never reach parkResult(): the typed park error is what
+	// would let an unaccepted commit park instead of aborting.
+	var typed *gitops.BindingAssertionsUnsatisfiedError
+	if errors.As(err, &typed) {
+		t.Error("the verified-tree abort must NOT surface the typed assertion park error")
+	}
+}
+
+// TestFixupPass_NeverEvaluatesBindingAssertions resolves the fix-up-path
+// question explicitly (#2501): the binding-assertion gate is guarded
+// `!isFixup && !isDecomposed`, so on a FIX-UP pass assertions are never
+// evaluated and no assertion park is reachable — today's behavior, byte-
+// identical. Asserted behaviorally: a deliberately-unsatisfied declared
+// assertion neither emits the binding_assertion_unsatisfied trace event nor
+// parks; the fix-up push succeeds.
+func TestFixupPass_NeverEvaluatesBindingAssertions(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.fixup = true
+	cfg.fixupBranch = branch
+	// A fix-up commits onto an EXISTING PR branch, so seed it on the remote.
+	pushCmd := exec.Command("git", "-C", repo, "push", "origin", "main:refs/heads/"+branch)
+	if out, perr := pushCmd.CombinedOutput(); perr != nil {
+		t.Fatalf("seed fix-up branch: %v\n%s", perr, out)
+	}
+
+	var log strings.Builder
+	perr := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil)
+	if perr != nil {
+		t.Fatalf("a fix-up pass must not fail on an unevaluated binding assertion: %v\n%s", perr, log.String())
+	}
+	if strings.Contains(log.String(), `"event":"binding_assertion_unsatisfied"`) {
+		t.Errorf("a fix-up pass must never EVALUATE binding assertions:\n%s", log.String())
+	}
+	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
+		t.Errorf("a fix-up pass must never park on an assertion, got: %+v", fu.gotPRArgs)
 	}
 }

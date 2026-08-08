@@ -170,3 +170,41 @@ func TestDecideScopeCompleteness_BackendErrorsSurfaced(t *testing.T) {
 		})
 	}
 }
+
+// TestDecideScopeCompleteness_AssertionClassParkResult pins the #2501 second
+// shortfall class at the MCP surface: an exempt decision on a park whose
+// shortfall is an unsatisfied binding assertion (empty MissingPaths) threads
+// through unchanged and surfaces the pending-then-dispatch state the backend
+// now returns.
+func TestDecideScopeCompleteness_AssertionClassParkResult(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.decideScopeCompletenessResp[runID] = ScopeCompletenessDecisionResult{
+		RunID:         runID.String(),
+		StageID:       uuid.New().String(),
+		Decision:      "exempt",
+		State:         "pending",
+		HeldCommitSHA: "abc123",
+		RunBranch:     "fishhawk/run-x",
+		// No MissingPaths: the shortfall was an unsatisfied binding assertion.
+	}
+
+	_, out, err := r.decideScopeCompleteness(context.Background(), nil, DecideScopeCompletenessInput{
+		RunID:    runID.String(),
+		Decision: "exempt",
+		Reason:   "the operator-authored literal was wrong, not the implement output",
+	})
+	if err != nil {
+		t.Fatalf("decideScopeCompleteness: %v", err)
+	}
+	if out.Result.Decision != "exempt" || out.Result.HeldCommitSHA != "abc123" {
+		t.Errorf("result = %+v, want exempt with the held SHA", out.Result)
+	}
+	if len(out.Result.MissingPaths) != 0 {
+		t.Errorf("an assertion-class park must carry no missing paths, got %v", out.Result.MissingPaths)
+	}
+	if out.Result.State != "pending" {
+		t.Errorf("State = %q, want pending (#2501: exempt resumes in place for an agent-free re-dispatch)", out.Result.State)
+	}
+}

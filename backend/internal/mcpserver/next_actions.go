@@ -490,22 +490,24 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 				"the implement stage is executing — re-poll until implement_stage_wait_status goes terminal")},
 		}
 	case "awaiting_scope_decision":
-		// #1231: the implement stage's ONLY committed-tree gate failure was
-		// the #1151 scope-completeness "missing declared scope file(s)" check
-		// and verify otherwise passed, so the runner pushed the gate-verified
-		// commit to the run branch (no PR) and PARKED here instead of failing
-		// category-B. The legal next move is the in-band operator decision:
-		// exempt (open the PR from the held commit with NO agent re-run) or
-		// fail (fall through to category-B). The missing declared paths + held
-		// SHA are on the scope_completeness_parked audit entry.
+		// #1231, generalized by #2501: the implement stage's ONLY committed-tree
+		// gate failure was a shortfall of EITHER class — the #1151
+		// missing-declared-scope-file check or the #1171 binding-assertion
+		// check — and verify otherwise passed, so the runner pushed the
+		// gate-verified commit to the run branch (no PR) and PARKED here instead
+		// of failing category-B. The legal next move is the in-band operator
+		// decision: exempt (return the stage to dispatch so the held commit's PR
+		// opens with NO agent re-run) or fail (fall through to category-B). The
+		// shortfall (missing_paths / unsatisfied_assertions) + held SHA are on
+		// the scope_completeness_parked audit entry.
 		return &NextActions{
 			State: "implement_awaiting_scope_decision",
 			Actions: []SuggestedAction{{
 				Action:       "fishhawk_decide_scope_completeness",
 				Params:       map[string]string{"run_id": run.ID, "decision": "exempt|fail"},
-				Precondition: "the implement stage parked at awaiting_scope_decision (its sole gate failure was the #1151 missing-declared-scope-file check; the gate-verified commit is already on the run branch). Read the missing paths + held SHA from the scope_completeness_parked audit entry first",
+				Precondition: "the implement stage parked at awaiting_scope_decision (its SOLE committed-tree gate shortfall was the #1151 missing-declared-scope-file check OR an #1171 unsatisfied binding assertion; the gate-verified commit is already on the run branch). Read the shortfall (missing_paths / unsatisfied_assertions) + held SHA from the scope_completeness_parked audit entry first",
 				Consumes:     consumesNone,
-				Reason:       "decide in-band: exempt accepts the already-committed tree and opens the PR from the held commit with NO agent re-run (zero re-run); fail falls through to today's category-B fail-and-restore",
+				Reason:       "decide in-band: exempt accepts the already-committed tree and returns the stage to dispatch, so the held commit's PR opens with NO agent re-run (on a local run, dispatch the stage to spawn the runner); fail falls through to today's category-B fail-and-restore",
 			}},
 		}
 	case "awaiting_approval", "succeeded":

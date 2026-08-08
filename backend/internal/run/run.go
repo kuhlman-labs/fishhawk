@@ -679,13 +679,16 @@ type Stage struct {
 }
 
 // ScopeCompletenessPark is the durable payload an implement stage carries
-// while parked in awaiting_scope_decision (#1231). It pins exactly what
-// the runner held when the scope-completeness "missing declared scope
-// file(s)" check was the SOLE committed-tree gate failure: the verified
-// commit already pushed to the run branch, the tree it verified, and the
-// declared scope.files that the agent never touched. The operator's
-// exempt decision opens the PR from HeldCommitSHA with no agent re-run;
-// the fail decision drops to today's category-B.
+// while parked in awaiting_scope_decision (#1231, generalized by #2501). It
+// pins exactly what the runner held when the SOLE committed-tree gate
+// shortfall — of EITHER class: the "missing declared scope file(s)" check
+// (#1151) or the unsatisfied-binding-assertion check (#1171) — held up an
+// otherwise-green implement pass: the verified commit already pushed to the run
+// branch, the tree it verified, and the shortfall itself. Exactly one of
+// MissingPaths / UnsatisfiedAssertions is populated; a compound failure never
+// parks (it keeps today's category-B abort). The operator's exempt decision
+// opens the PR from HeldCommitSHA with no agent re-run; the fail decision drops
+// to today's category-B.
 //
 // The JSON tags are the byte-identical cross-module wire contract with
 // the runner's park-report upload struct (runner/internal/upload —
@@ -704,8 +707,28 @@ type ScopeCompletenessPark struct {
 	// reflects the identical tree.
 	VerifiedTreeSHA string `json:"verified_tree_sha"`
 	// MissingPaths are the declared scope.files the agent never touched —
-	// the sole gate shortfall that triggered the park. Repo-relative.
+	// the #1151 gate shortfall class. Repo-relative. Empty on an
+	// assertion-class park.
 	MissingPaths []string `json:"missing_paths"`
+	// UnsatisfiedAssertions are the operator-declared binding assertions the
+	// committed tree did not satisfy — the #1171 gate shortfall class (#2501).
+	// Empty on a missing-scope-class park, so a pre-#2501 park row round-trips
+	// through this struct unchanged (the column is JSONB — no migration).
+	UnsatisfiedAssertions []UnsatisfiedAssertion `json:"unsatisfied_assertions,omitempty"`
+}
+
+// UnsatisfiedAssertion is one operator-declared binding assertion the held
+// commit did not satisfy (#2501). The JSON tags (type/path/literal) are the
+// byte-identical cross-module wire contract with the runner's
+// upload.BindingAssertionReport, following the same ScopeExemption duplication
+// pattern as ScopeCompletenessPark itself. Keep the two in lockstep.
+type UnsatisfiedAssertion struct {
+	// Type is the declared assertion type (v0: file_contains / test_asserts).
+	Type string `json:"type"`
+	// Path is the repo-relative file the assertion was evaluated against.
+	Path string `json:"path"`
+	// Literal is the substring the committed content of Path did not contain.
+	Literal string `json:"literal"`
 }
 
 // GateKind names the two flavors of gate the workflow spec admits:

@@ -508,7 +508,7 @@ MCP surface: `fishhawk_get_plan` adds `test_sweep` (`TestSweep{findings[], scann
 
 - A non-empty set renders a high-priority `operator_scope_path_undelivered` warning in the prompt's gate-evidence section (`prompt.GateEvidence.OperatorScopeUndelivered`, allocate-if-nil) AND appends one deterministic advisory `operator_scope_path_undelivered` audit entry (payload `{undelivered_paths, undelivered_count, operator_added_count}`) BEFORE any reviewer verdict — so a dropped operator-required edit (E23.9/E23.10) is visible pre-review instead of only at the reject→fixup round-trip.
 - Advisory + best-effort: a nil `ScopeAmendmentRepo` or `ListByRun` error contributes nothing and never blocks the review; an all-delivered commit keeps the prompt byte-identical and emits no entry.
-- The complementary BLOCKING gate for a FULLY-untouched concrete DECLARED scope path is the runner's #1151/#1231 scope-completeness park (`gitops.MissingScopeFiles`; the scope-completeness invariant in `docs/ARCHITECTURE.md`); this is the advisory pre-review surface for the partial / operator-added case.
+- The complementary BLOCKING gate for a FULLY-untouched concrete DECLARED scope path is the runner's #1151/#1231/#2501 scope-completeness park (`gitops.MissingScopeFiles`; the scope-completeness invariant in `docs/ARCHITECTURE.md`); this is the advisory pre-review surface for the partial / operator-added case.
 - Audit-kind note in `docs/issue-comment-surfaces.md`.
 
 ## Re-review convergence: settled ledger + re-litigation guard (#1913)
@@ -1921,3 +1921,13 @@ Still recorded, not acted on:
   failure would pin a briefly-unreachable legitimate CIMD host as invalid for the
   whole TTL; the limiter already bounds repeated bad ids. Filed as its own design
   question rather than folded in here.
+
+## Scope-completeness exempt emission gate (#2501)
+
+`prompt.go::resolveHeldCommitExemption` decides whether an implement-stage prompt response carries the three zero-re-run fields — `open_pr_from_held_commit`, `held_commit_sha`, `held_commit_branch` — that make the runner skip the agent, the committed-tree gates, and the commit/push entirely and open the PR from the commit a scope-completeness park already held on the run branch.
+
+- **Newest-entry-wins.** It resolves the NEWEST audit entry for the stage across all three `scope_completeness_*` categories (`_parked` / `_exempted` / `_failed`), comparing by `Entry.Sequence` and filtering on `entry.StageID == stage.ID`. Only an `exempted` newest entry emits. A stage that RE-parked after an earlier exempt therefore emits nothing — the later `parked` entry wins and the runner takes its ordinary agent path.
+- **Fail-closed.** This gate is the only thing standing between the widened `awaiting_scope_decision → pending` transition edge (which any caller can drive) and a PR opened from a commit no operator accepted. So every uncertain branch WARN-logs and emits nothing: a nil `AuditRepo`, any `ListForRunByCategory` error, no entry for the stage, a non-implement stage, a stage with no `ScopeCompletenessPark`, and a park whose `HeldCommitSHA`/`RunBranch` is empty.
+- **Both handlers.** Wired into `handleGetStagePrompt` (the runner-facing dispatch path) AND `handleGetStagePromptRender` (the SPA preview), per that handler's byte-consistency convention.
+- **The decision handler writes the proof before it opens the door.** Because the gate reads the audit chain, `scope_completeness.go::exemptScopeCompleteness` appends the `scope_completeness_exempted` entry BEFORE transitioning the stage out of `awaiting_scope_decision` (and therefore before the `Orchestrator.Advance` that can spawn a runner): a runner whose prompt fetch raced the append would read the older `parked` entry, get no held-commit fields, and re-invoke the agent — the full re-run the park exists to avoid. For the same reason the append is BLOCKING there: a failure returns 500 `exemption_unrecorded` and leaves the stage parked (re-POST the decision) rather than dispatching a stage whose exemption cannot be proven. `failScopeCompleteness` keeps its best-effort append — nothing reads the `failed` entry as authorization and its transition is terminal.
+- The three json tags are the byte-identical cross-module wire contract with `runner/internal/upload/upload.go`'s `FetchedPrompt` decoder; a golden fixture duplicated across the two modules' tests (`goldenExemptPromptJSON`) is the seam, since the runner and the backend are separate Go modules and no single-process end-to-end can span them.

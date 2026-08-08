@@ -2055,6 +2055,11 @@ func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
 		RunBranch:       "fishhawk/run-aaa/slice-0",
 		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
 		MissingPaths:    []string{"backend/internal/foo/foo_test.go", "docs/foo.md"},
+		// #2501: the second shortfall class rides the same JSONB column.
+		UnsatisfiedAssertions: []run.UnsatisfiedAssertion{
+			{Type: "file_contains", Path: "backend/internal/foo/foo.go", Literal: "ALPHA"},
+			{Type: "test_asserts", Path: "backend/internal/foo/foo_test.go", Literal: "BETA"},
+		},
 	}
 
 	stage, won, err := pk.ParkScopeCompletenessAndAppend(ctx, running.ID, park, parkParams(r.ID, running.ID, []byte(`{"k":"v"}`)))
@@ -2085,6 +2090,16 @@ func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
 		len(got.ScopeCompletenessPark.MissingPaths) != 2 {
 		t.Errorf("ScopeCompletenessPark = %+v, want %+v", got.ScopeCompletenessPark, park)
 	}
+	// #2501: the assertion-class shortfall survives the JSONB write/read with
+	// Type/Path/Literal intact and order preserved.
+	gotAssertions := got.ScopeCompletenessPark.UnsatisfiedAssertions
+	if len(gotAssertions) != 2 {
+		t.Fatalf("UnsatisfiedAssertions = %+v, want 2 entries", gotAssertions)
+	}
+	if gotAssertions[0] != park.UnsatisfiedAssertions[0] || gotAssertions[1] != park.UnsatisfiedAssertions[1] {
+		t.Errorf("UnsatisfiedAssertions = %+v, want %+v (order-preserving, fields intact)",
+			gotAssertions, park.UnsatisfiedAssertions)
+	}
 
 	// Exactly one scope_completeness_parked entry persisted in the same tx.
 	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, "scope_completeness_parked")
@@ -2093,6 +2108,47 @@ func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("scope_completeness_parked entries = %d, want 1", len(entries))
+	}
+}
+
+// TestPostgres_ParkScopeCompletenessAndAppend_AssertionOnlyRoundTrip pins the
+// #2501 assertion-CLASS park: a park carrying an EMPTY MissingPaths and a
+// non-empty UnsatisfiedAssertions round-trips through the JSONB column intact.
+func TestPostgres_ParkScopeCompletenessAndAppend_AssertionOnlyRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	pk, ok := repo.(scopeCompletenessParker)
+	if !ok {
+		t.Fatal("postgres repo does not implement ParkScopeCompletenessAndAppend")
+	}
+	ctx := context.Background()
+
+	r, running := seedRunningImplementStage(t, repo)
+	park := run.ScopeCompletenessPark{
+		HeldCommitSHA:   "3333333333333333333333333333333333333333",
+		RunBranch:       "fishhawk/run-bbb/stage-0",
+		VerifiedTreeSHA: "4444444444444444444444444444444444444444",
+		UnsatisfiedAssertions: []run.UnsatisfiedAssertion{
+			{Type: "file_contains", Path: "docs/api/v0.md", Literal: "unsatisfied_assertions"},
+		},
+	}
+	if _, won, err := pk.ParkScopeCompletenessAndAppend(ctx, running.ID, park, parkParams(r.ID, running.ID, []byte(`{}`))); err != nil || !won {
+		t.Fatalf("park: won=%v err=%v", won, err)
+	}
+	got, err := repo.GetStage(ctx, running.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.ScopeCompletenessPark == nil {
+		t.Fatal("persisted ScopeCompletenessPark = nil")
+	}
+	if len(got.ScopeCompletenessPark.MissingPaths) != 0 {
+		t.Errorf("assertion-only park must persist no missing paths, got %v", got.ScopeCompletenessPark.MissingPaths)
+	}
+	if len(got.ScopeCompletenessPark.UnsatisfiedAssertions) != 1 ||
+		got.ScopeCompletenessPark.UnsatisfiedAssertions[0] != park.UnsatisfiedAssertions[0] {
+		t.Errorf("UnsatisfiedAssertions = %+v, want %+v",
+			got.ScopeCompletenessPark.UnsatisfiedAssertions, park.UnsatisfiedAssertions)
 	}
 }
 

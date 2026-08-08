@@ -2446,12 +2446,15 @@ components:
             reports a fix-up re-dispatch that produced NO changes (no new commit
             landed; `branch` + `base_sha` required, `head_sha` omitted because
             the branch tip is unchanged, `pr_number`/`pr_url`/`title` absent).
-            `scope_park` (#1231) reports a missing-declared-scope-file-ONLY gate
-            outcome: the runner pushed its verified commit to the run branch and
-            parks the implement stage in `awaiting_scope_decision` (no PR;
-            `branch` + `head_sha` + `base_sha` + `verified_tree_sha` +
-            non-empty `missing_paths` required, `pr_number`/`pr_url`/`title`
-            absent).
+            `scope_park` (#1231, second shortfall class added by #2501)
+            reports a SOLE-shortfall gate outcome — either a
+            missing-declared-scope-file shortfall (#1151) or an unsatisfied
+            binding assertion (#1171): the runner pushed its verified commit to
+            the run branch and parks the implement stage in
+            `awaiting_scope_decision` (no PR; `branch` + `head_sha` +
+            `base_sha` + `verified_tree_sha` required, plus AT LEAST ONE of
+            non-empty `missing_paths` / `unsatisfied_assertions`;
+            `pr_number`/`pr_url`/`title` absent).
         category:
           type: string
           enum: [B, C]
@@ -2473,8 +2476,30 @@ components:
           items: { type: string }
           description: |
             Present only on the `scope_park` variant (#1231). The declared
-            `scope.files` the agent never touched — the sole gate shortfall that
-            triggered the park. Repo-relative; must be non-empty.
+            `scope.files` the agent never touched — the missing-scope shortfall
+            class. Repo-relative. Absent on an assertion-class park; at least
+            one of `missing_paths` / `unsatisfied_assertions` must be non-empty.
+        unsatisfied_assertions:
+          type: array
+          description: |
+            Present only on the `scope_park` variant (#2501). The
+            operator-declared binding assertions (#1171) the held commit did not
+            satisfy — the second shortfall class. Absent on a missing-scope-class
+            park; at least one of `missing_paths` / `unsatisfied_assertions`
+            must be non-empty.
+          items:
+            type: object
+            required: [type, path, literal]
+            properties:
+              type:
+                type: string
+                description: The declared assertion type (`file_contains` / `test_asserts`).
+              path:
+                type: string
+                description: Repo-relative file the assertion was evaluated against.
+              literal:
+                type: string
+                description: The substring the committed content of `path` did not contain.
         apply_path:
           type: string
           enum: [applied, agent, apply_failed_fellback, apply_failed_reset_failed]
@@ -9472,6 +9497,31 @@ paths:
                       and when backend-side ledger resolution fails — the
                       runner then treats the target as unverifiable and
                       warns-and-proceeds.
+                  open_pr_from_held_commit:
+                    type: boolean
+                    description: |
+                      True ONLY when this implement stage's scope-completeness
+                      park (#1231) was resolved `exempt` and the newest
+                      `scope_completeness_*` audit entry for the stage is
+                      `exempted` (#2501). The runner then skips the agent, the
+                      committed-tree gates, and the commit/push entirely and
+                      opens the PR from `held_commit_branch` at
+                      `held_commit_sha` — the zero-re-run resolution. Absent on
+                      every other dispatch, including a park still undecided
+                      and a park resolved `fail`, so those can never skip the
+                      agent.
+                  held_commit_sha:
+                    type: string
+                    description: |
+                      The gate-verified commit the park pushed to the run
+                      branch (#2501). Present only alongside
+                      `open_pr_from_held_commit: true`.
+                  held_commit_branch:
+                    type: string
+                    description: |
+                      The run branch the held commit sits on (ADR-035
+                      sole-writer). Present only alongside
+                      `open_pr_from_held_commit: true`.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -9664,6 +9714,15 @@ paths:
                   acceptance_expected_head_sha:
                     type: string
                     description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when ledger resolution fails (the runner then warns-and-proceeds as unverifiable).
+                  open_pr_from_held_commit:
+                    type: boolean
+                    description: True ONLY when this implement stage's scope-completeness park (#1231) was resolved `exempt` (#2501) — the runner then opens the PR from the held commit with NO agent re-invocation. Absent on every other dispatch, including an undecided or `fail`-decided park.
+                  held_commit_sha:
+                    type: string
+                    description: The gate-verified commit the park pushed to the run branch; present only alongside a true `open_pr_from_held_commit` (#2501).
+                  held_commit_branch:
+                    type: string
+                    description: The run branch the held commit sits on (ADR-035 sole-writer); present only alongside a true `open_pr_from_held_commit` (#2501).
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
@@ -12690,13 +12749,18 @@ paths:
         (403 `self_decision`): the implement agent that produced the
         parked commit must never decide its own exemption.
 
-        On `exempt` the stage resumes `running` so the held commit's PR
-        is opened with NO agent re-run (a `push_and_open_pr` dispatch
-        opens the PR from the held commit), and a
-        `scope_completeness_exempted` audit entry is appended. On `fail`
-        the stage fails category-B (today's restore path) and a
-        `scope_completeness_failed` entry is appended. A stage not
-        currently parked returns 409 (`stage_not_parked`).
+        On `exempt` the `scope_completeness_exempted` audit entry is
+        appended FIRST and the stage then resumes to `pending` (#2501),
+        so the orchestrator re-dispatches it and the runner opens the
+        held commit's PR with NO agent re-run. That entry is the prompt
+        emission gate's authorization proof for the held commit, so the
+        ordering is load-bearing (a runner started by the follow-on
+        advance must not race the append) and an append failure refuses
+        the decision with 500 `exemption_unrecorded`, leaving the stage
+        parked. On `fail` the stage fails category-B (today's restore
+        path) and a `scope_completeness_failed` entry is appended
+        best-effort. A stage not currently parked returns 409
+        (`stage_not_parked`).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -12720,7 +12784,11 @@ paths:
         '200':
           description: |
             The resolved decision. On `exempt`, `held_commit_sha` /
-            `run_branch` name the commit the PR is opened from.
+            `run_branch` name the commit the PR is opened from, `state` is
+            `pending` (the stage returns to dispatch so the re-dispatched runner
+            opens that PR with no agent re-run, #2501), and
+            `missing_paths` / `unsatisfied_assertions` echo which shortfall
+            class was exempted.
           content:
             application/json:
               schema:
@@ -12740,6 +12808,20 @@ paths:
                   run_branch:
                     type: string
                     description: Present on `exempt` — the run branch the held commit sits on.
+                  missing_paths:
+                    type: array
+                    items: { type: string }
+                    description: Present on `exempt` for a missing-scope-class park (#2501) — the declared paths the held commit never touched.
+                  unsatisfied_assertions:
+                    type: array
+                    description: Present on `exempt` for an assertion-class park (#2501) — the declared binding assertions the held commit did not satisfy.
+                    items:
+                      type: object
+                      required: [type, path, literal]
+                      properties:
+                        type: { type: string }
+                        path: { type: string }
+                        literal: { type: string }
         '400':
           description: Malformed run_id, decision not exempt/fail, or empty reason.
           content:
@@ -12766,6 +12848,16 @@ paths:
           description: |
             `stage_not_parked` — the implement stage is not parked
             awaiting a scope-completeness decision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `exemption_unrecorded` — the `scope_completeness_exempted`
+            audit entry could not be appended, so the exemption the
+            prompt emission gate reads as authorization does not exist
+            (#2501). The decision is refused and the stage is left
+            parked in `awaiting_scope_decision`; re-POST it.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

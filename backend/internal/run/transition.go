@@ -104,9 +104,15 @@ func ValidRunRetryTransition(from, to State) bool {
 //	check; the verified commit is held on the run branch and the run
 //	parks for an operator exempt-or-fail decision (#1231).
 //
-// AwaitingScopeDecision → Running: operator exempted; the stage resumes to
+// AwaitingScopeDecision → Pending: operator exempted; the stage resumes in
 //
-//	open the PR from the held commit with NO agent re-run.
+//	place so the orchestrator re-dispatches it to open the PR from the held
+//	commit with NO agent re-run (#2501) — the same resume-in-place shape
+//	AwaitingInput → Pending already carries.
+//
+// AwaitingScopeDecision → Running: retained base-table edge (the exempt
+//
+//	handler no longer uses it — a `running` stage is not dispatch-admissible).
 //
 // AwaitingScopeDecision → Failed: operator failed it — today's category-B
 //
@@ -190,7 +196,20 @@ var stageTransitions = map[StageState]map[StageState]struct{}{
 		StageStateCancelled: {},
 	},
 	StageStateAwaitingScopeDecision: {
-		StageStateRunning:   {}, // operator exempted → resume to open the PR from the held commit (no agent re-run, #1231)
+		// operator exempted → resume in place for a re-dispatch that opens the PR
+		// from the held commit with NO agent re-run (#2501). The prior refusal of
+		// this edge ("never rewinds to a fresh dispatch") was correct only while a
+		// fresh dispatch MEANT an agent re-run; the prompt response now carries the
+		// open_pr_from_held_commit / held_commit_sha / held_commit_branch fields
+		// for an exempt-resolved park, so the re-dispatch is provably agent-free
+		// and the runner short-circuits to openHeldCommitPR. Routing through
+		// pending (rather than the older direct → running) is what makes the
+		// orchestrator's uniform dispatch reachable at all: host_dispatch.go's
+		// admission switch accepts only {pending, awaiting_host_dispatch}, so a
+		// `running` stage is refused dispatch_not_admissible and NO runner ever
+		// spawns. Mirrors the AwaitingInput → Pending resume-in-place edge.
+		StageStatePending:   {},
+		StageStateRunning:   {}, // retained: the base table is permissive (the exempt handler no longer uses this edge)
 		StageStateFailed:    {}, // operator failed it → category-B, today's restore path
 		StageStateCancelled: {},
 	},

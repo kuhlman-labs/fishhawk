@@ -614,16 +614,26 @@ E22.X / [#961](https://github.com/kuhlman-labs/fishhawk/issues/961) adds the **m
 
 ## Scope-completeness park (`fishhawk_decide_scope_completeness`)
 
-E22.X / [#1231](https://github.com/kuhlman-labs/fishhawk/issues/1231) adds a **zero-re-run** recovery for the case the [#1229](https://github.com/kuhlman-labs/fishhawk/issues/1229) one-re-run exempt lever otherwise served: an implement stage whose **only** committed-tree gate failure is the [#1151](https://github.com/kuhlman-labs/fishhawk/issues/1151) scope-completeness "missing declared scope file(s)" check, while the committed tree otherwise passed verify (created-out-of-scope, binding-assertion, compile/test, and verified-tree gates all green).
+E22.X / [#1231](https://github.com/kuhlman-labs/fishhawk/issues/1231), generalized to a second shortfall class by [#2501](https://github.com/kuhlman-labs/fishhawk/issues/2501), is a **zero-re-run** recovery for the case the [#1229](https://github.com/kuhlman-labs/fishhawk/issues/1229) one-re-run exempt lever otherwise served: an implement stage whose **only** committed-tree gate shortfall is one of
 
-**Park, not category-B.** Instead of fail-and-restore, the runner pushes the **gate-verified commit** to the run branch (no PR opened — ADR-035 sole-writer preserved: the run writes its own branch) and PARKS the implement stage in a new `awaiting_scope_decision` state, carrying the held commit SHA, run branch, verified tree SHA, and the missing declared paths. The park leaves the gate waiting for an in-band operator decision over the [#1232](https://github.com/kuhlman-labs/fishhawk/issues/1232)/[#1235](https://github.com/kuhlman-labs/fishhawk/issues/1235) non-blocking dispatch substrate. Any compound failure (missing **plus** another gate) keeps today's category-B unchanged.
+- the [#1151](https://github.com/kuhlman-labs/fishhawk/issues/1151) scope-completeness "missing declared scope file(s)" check, or
+- an [#1171](https://github.com/kuhlman-labs/fishhawk/issues/1171) unsatisfied operator-declared **binding assertion**,
+
+while the committed tree otherwise passed verify (created-out-of-scope, compile/test, and verified-tree gates all green).
+
+**Park, not category-B.** Instead of fail-and-restore, the runner pushes the **gate-verified commit** to the run branch (no PR opened — ADR-035 sole-writer preserved: the run writes its own branch) and PARKS the implement stage in `awaiting_scope_decision`, carrying the held commit SHA, run branch, verified tree SHA, and the shortfall itself (`missing_paths` **or** `unsatisfied_assertions` — exactly one).
+
+**The sole-failure guarantee is structural, not a promise.** Both gates RECORD their shortfall and keep running; the runner's terminal resolver emits the typed park error only at a pass point where every other gate is green. A COMPOUND failure — either shortfall plus another gate, or *both* shortfalls together — returns an UNTYPED sentinel wrap that `CommitAndPush`'s `errors.As` cannot match, so the push aborts category-B **before origin is touched**, byte-identically to today.
 
 **Operator loop:**
 
-1. Observe the park: `fishhawk_get_run_status` surfaces the `implement_awaiting_scope_decision` next action; `fishhawk_list_audit` on category `scope_completeness_parked` carries the missing paths + held SHA.
+1. Observe the park: `fishhawk_get_run_status` surfaces the `implement_awaiting_scope_decision` next action; `fishhawk_list_audit` on category `scope_completeness_parked` carries the shortfall (`missing_paths` / `unsatisfied_assertions`) + held SHA.
 2. Decide: `fishhawk_decide_scope_completeness {run_id, decision: exempt|fail, reason}`.
-   - `exempt` — the backend opens the PR from the **exact held commit** with **NO agent re-invocation** (the already-committed tree is accepted as-is; the implement-review gate proceeds). Appends `scope_completeness_exempted`.
+   - `exempt` — the stage returns to **dispatch** (`pending`, then the orchestrator advances it; on a local run it parks at `awaiting_host_dispatch` for your `fishhawk_dispatch_stage`). The re-dispatched runner opens the PR from the **exact held commit** with **NO agent re-invocation**: the prompt response carries `open_pr_from_held_commit` / `held_commit_sha` / `held_commit_branch`, and the runner short-circuits to its held-commit PR-open before the agent invoker is even selected. Appends `scope_completeness_exempted`.
    - `fail` — the stage falls through to today's category-B fail-and-restore. Appends `scope_completeness_failed`.
+3. Spawn the runner (local runs): `fishhawk_dispatch_stage` on the implement stage. The PR opens from the held commit with zero agent re-run.
+
+**Emission is fail-closed.** The three exempt prompt fields are served ONLY when the newest `scope_completeness_*` audit entry for the stage is `exempted` (`server/prompt.go::resolveHeldCommitExemption`). A park still undecided, a `fail`-decided park, a stage RE-parked after an earlier exempt, an unreadable audit chain, and a park missing its held-commit coordinates all emit nothing — so a stage moved into `pending` by any other caller can never open a PR from a commit no operator accepted.
 
 **Auth.** Operator-only (`write:stages`); the backend rejects run-bound agent tokens (`run_token_forbidden`), so the agent whose stage parked can never decide its own park (mirrors `fishhawk_decide_scope_amendment`). `reason` is required and non-empty; an invalid `decision` (anything but `exempt`/`fail`) or empty `reason` is caught before the HTTP hop. The endpoint returns 409 (`scope_completeness_not_parked`) when the stage is not parked in `awaiting_scope_decision`. It wraps `POST /v0/runs/{run_id}/scope-completeness/decision`.
 

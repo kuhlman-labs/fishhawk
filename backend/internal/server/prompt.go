@@ -262,6 +262,25 @@ type promptResponse struct {
 	// the expectation and the runner's identity gate degrades to
 	// unverifiable-warn on every dispatch.
 	AcceptanceExpectedHeadSHA string `json:"acceptance_expected_head_sha,omitempty"`
+	// OpenPRFromHeldCommit / HeldCommitSHA / HeldCommitBranch are the
+	// scope-completeness EXEMPT resolution fields (#1231's zero-re-run promise,
+	// finally emitted by #2501). They are served ONLY when the implement stage's
+	// park was resolved `exempt` (resolveHeldCommitExemption below): the runner
+	// then skips the agent, the gates, and CommitAndPush entirely and opens the
+	// PR from HeldCommitBranch at HeldCommitSHA. All three omitempty, so every
+	// other dispatch — including a park still UNDECIDED and a park resolved
+	// `fail` — is byte-identical to today and can never skip the agent.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (open_pr_from_held_commit /
+	// held_commit_sha / held_commit_branch) MUST stay byte-identical to the
+	// runner's upload.FetchedPrompt decoder (runner/internal/upload/upload.go,
+	// the OpenPRFromHeldCommit / HeldCommitSHA / HeldCommitBranch fields) — the
+	// same independent-struct-by-tag convention as ScopeExemptions (#1229) and
+	// BindingAssertions (#1171). A tag drift here silently re-runs the agent
+	// from the top, which is the ~$23/~50-minute loss #2501 exists to eliminate.
+	OpenPRFromHeldCommit bool   `json:"open_pr_from_held_commit,omitempty"`
+	HeldCommitSHA        string `json:"held_commit_sha,omitempty"`
+	HeldCommitBranch     string `json:"held_commit_branch,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -1253,6 +1272,15 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
 		s.logModelResolution(r.Context(), runRow.ID, rm)
+		// Scope-completeness EXEMPT resolution (#2501): emit the held-commit
+		// fields ONLY for a park whose newest decision entry is `exempted`, so the
+		// re-dispatched runner opens the PR from the held commit with no agent
+		// re-run. Fail-closed — see resolveHeldCommitExemption.
+		if heldSHA, heldBranch, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage); exempt {
+			resp.OpenPRFromHeldCommit = true
+			resp.HeldCommitSHA = heldSHA
+			resp.HeldCommitBranch = heldBranch
+		}
 	}
 	// Plan-stage model routing (#1416): resolve the plan-model ladder and carry
 	// the resolved value to the runner, which pins it onto the plan agent spawn
@@ -1743,6 +1771,14 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	if stage.Type == run.StageTypeImplement {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
+		// Scope-completeness EXEMPT resolution (#2501), same derivation as the
+		// dispatch path so the rendered (SPA-readable) prompt response stays
+		// byte-consistent with the runner-facing one.
+		if heldSHA, heldBranch, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage); exempt {
+			resp.OpenPRFromHeldCommit = true
+			resp.HeldCommitSHA = heldSHA
+			resp.HeldCommitBranch = heldBranch
+		}
 	}
 	// Plan-stage model routing (#1416), same derivation as the dispatch path so
 	// the rendered (SPA-readable) prompt response stays byte-consistent with the
@@ -3001,6 +3037,82 @@ func (s *Server) resolveAcceptanceExpectedHeadSHAWalkingParents(ctx context.Cont
 		slog.String("run_id", r.ID.String()),
 		slog.Int("max_depth", retryPlanChainDepth))
 	return ""
+}
+
+// scopeCompletenessDecisionCategories are the three audit kinds that record a
+// scope-completeness park's lifecycle. resolveHeldCommitExemption resolves the
+// NEWEST entry across all three (not just the exempted one) so a stage that
+// parked AGAIN after an earlier exempt emits nothing.
+var scopeCompletenessDecisionCategories = []string{
+	CategoryScopeCompletenessParked,
+	CategoryScopeCompletenessExempted,
+	CategoryScopeCompletenessFailed,
+}
+
+// resolveHeldCommitExemption is the emission GATE for the three exempt
+// prompt-response fields (#2501). It returns ok=true — and the held commit's
+// SHA + branch — only when ALL of the following hold:
+//
+//   - the stage is an implement stage carrying a ScopeCompletenessPark, and
+//   - the NEWEST audit entry for THIS stage across the three
+//     scope_completeness_* categories is `exempted`.
+//
+// The newest-wins rule across all three categories is what makes a re-park
+// after an earlier exempt emit nothing: the later `parked` entry wins and the
+// runner takes its ordinary agent path.
+//
+// FAIL-CLOSED, deliberately. This gate is the only thing standing between a
+// parked stage reachable in `pending` through the widened
+// awaiting_scope_decision → pending edge and a PR opened from a commit no
+// operator accepted, so every uncertain branch — a nil AuditRepo, a list
+// error, no entry for the stage, an empty held SHA/branch — WARN-logs and
+// returns ok=false rather than emitting on an unproven exemption.
+func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run, stage *run.Stage) (sha, branch string, ok bool) {
+	if stage == nil || stage.Type != run.StageTypeImplement || stage.ScopeCompletenessPark == nil {
+		return "", "", false
+	}
+	if s.cfg.AuditRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: audit repository unconfigured; omitting held-commit exempt fields",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()))
+		return "", "", false
+	}
+	var newest *audit.Entry
+	var newestCategory string
+	for _, cat := range scopeCompletenessDecisionCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: list scope-completeness audit entries failed; omitting held-commit exempt fields",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()))
+			return "", "", false
+		}
+		for _, e := range entries {
+			if e.StageID == nil || *e.StageID != stage.ID {
+				continue
+			}
+			if newest == nil || e.Sequence > newest.Sequence {
+				newest = e
+				newestCategory = cat
+			}
+		}
+	}
+	if newest == nil || newestCategory != CategoryScopeCompletenessExempted {
+		return "", "", false
+	}
+	park := stage.ScopeCompletenessPark
+	if park.HeldCommitSHA == "" || park.RunBranch == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: exempt-resolved park carries no held commit; omitting held-commit exempt fields",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()))
+		return "", "", false
+	}
+	return park.HeldCommitSHA, park.RunBranch, true
 }
 
 // resolveNewestReportedHeadSHA is the shared reported-head ledger walk behind

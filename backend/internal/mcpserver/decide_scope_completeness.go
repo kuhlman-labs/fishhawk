@@ -12,18 +12,19 @@ import (
 // fishhawk_decide_scope_completeness (E22.X / #1231) is the operator
 // decision verb for the zero-re-run scope-completeness PARK.
 //
-// When an implement stage's ONLY committed-tree gate failure is the #1151
-// scope-completeness "missing declared scope file(s)" check and the tree
-// otherwise passed verify, the runner does NOT fail category-B. Instead it
-// pushes the verified commit to the run branch (no PR) and parks the stage
+// When an implement stage's ONLY committed-tree gate failure is a shortfall
+// of EITHER class — the #1151 scope-completeness "missing declared scope
+// file(s)" check or an #1171 unsatisfied binding assertion (#2501) — and the
+// tree otherwise passed verify, the runner does NOT fail category-B. Instead
+// it pushes the verified commit to the run branch (no PR) and parks the stage
 // in awaiting_scope_decision, carrying the held commit SHA, run branch,
-// verified tree SHA, and the missing declared paths. This verb resolves the
-// park in-band:
+// verified tree SHA, and the shortfall itself (missing_paths /
+// unsatisfied_assertions). This verb resolves the park in-band:
 //
-//   - decision=exempt: the backend opens the PR from the EXACT held commit
-//     with NO agent re-invocation (zero re-run), accepting the
-//     already-committed tree. Supersedes #1229's one-re-run exempt lever
-//     for the missing-declared-scope-file class specifically.
+//   - decision=exempt: the stage returns to dispatch and the re-dispatched
+//     runner opens the PR from the EXACT held commit with NO agent
+//     re-invocation (zero re-run), accepting the already-committed tree.
+//     Supersedes #1229's one-re-run exempt lever for both shortfall classes.
 //   - decision=fail: the stage falls through to today's category-B
 //     fail-and-restore path.
 //
@@ -58,20 +59,25 @@ Resolve an implement stage parked in awaiting_scope_decision (#1231):
 exempt the already-committed tree, or fail it to category-B.
 
 The runner parks the stage HERE — instead of failing category-B — only
-when the SOLE committed-tree gate failure is the #1151 scope-completeness
-"missing declared scope file(s)" check and verify otherwise passed. It has
-already pushed the gate-verified commit to the run branch (no PR opened).
+when the SOLE committed-tree gate shortfall is the #1151 scope-completeness
+"missing declared scope file(s)" check OR an #1171 unsatisfied binding
+assertion, and verify otherwise passed. It has already pushed the
+gate-verified commit to the run branch (no PR opened). A COMPOUND failure
+(a shortfall plus any other gate) never parks — it keeps category-B.
 
-On decision=exempt the backend opens the PR from the EXACT held commit
-with NO agent re-invocation (zero re-run): the held tree is accepted as-is
-and the implement-review gate proceeds. On decision=fail the stage falls
-through to today's category-B fail-and-restore.
+On decision=exempt the stage returns to dispatch (pending; on a local run it
+then parks at awaiting_host_dispatch for your fishhawk_dispatch_stage), and
+the re-dispatched runner opens the PR from the EXACT held commit with NO
+agent re-invocation (zero re-run): the held tree is accepted as-is and the
+implement-review gate proceeds. On decision=fail the stage falls through to
+today's category-B fail-and-restore.
 
 Operator-only: the backend rejects run-bound agent tokens
 (run_token_forbidden), so the agent whose stage parked can never decide its
 own park. Read the parked record first (fishhawk_get_run_status surfaces
 the awaiting_scope_decision next action, or fishhawk_list_audit on category
-scope_completeness_parked carries the missing paths + held SHA).
+scope_completeness_parked carries the shortfall — missing_paths and/or
+unsatisfied_assertions — plus the held SHA).
 
 Returns the decided park record. Tool errors:
   - invalid run_id UUID (caught before the HTTP hop)

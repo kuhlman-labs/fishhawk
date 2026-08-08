@@ -2205,3 +2205,70 @@ func TestFetchPrompt_DiffCoverageOmittedWhenAbsent(t *testing.T) {
 		t.Errorf("DiffCoverage = %+v, want nil when absent", got.DiffCoverage)
 	}
 }
+
+// TestShipPullRequest_ScopeParkGoldenBytes pins BOTH park wire shapes as GOLDEN
+// BYTES (#2501). The scope-only case is the regression guard: adding the
+// omitempty tag to MissingPaths plus a new UnsatisfiedAssertions field must
+// leave a pre-#2501 park's signed body byte-identical. The assertion-only case
+// pins the new shape: the lowercase type/path/literal keys, and NO missing_paths
+// key at all (an accidental non-omitempty tag would ship `"missing_paths":null`
+// and is caught here).
+func TestShipPullRequest_ScopeParkGoldenBytes(t *testing.T) {
+	shipPark := func(t *testing.T, args ShipPullRequestArgs) string {
+		t.Helper()
+		var receivedBody []byte
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+			receivedBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(ShipPullRequestResult{ID: "art-1"})
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+		_, priv, _ := ed25519.GenerateKey(nil)
+		args.PrivateKey = priv
+		if _, err := c.ShipPullRequest(context.Background(), args); err != nil {
+			t.Fatalf("ShipPullRequest: %v", err)
+		}
+		return string(receivedBody)
+	}
+
+	// Scope-only park: byte-identical to the pre-#2501 body.
+	scopeOnly := shipPark(t, ShipPullRequestArgs{
+		RunID:        "run-abc",
+		StageID:      "stage-xyz",
+		Outcome:      "scope_park",
+		Branch:       "fishhawk/run-abc/stage-xyz",
+		HeadSHA:      "deadbeef",
+		BaseSHA:      "feedface",
+		TreeSHA:      "treesha1",
+		MissingPaths: []string{"backend/internal/run/run.go"},
+	})
+	wantScopeOnly := `{"outcome":"scope_park","branch":"fishhawk/run-abc/stage-xyz","head_sha":"deadbeef","base_sha":"feedface","verified_tree_sha":"treesha1","missing_paths":["backend/internal/run/run.go"]}`
+	if scopeOnly != wantScopeOnly {
+		t.Errorf("scope-only park body drifted from the pre-#2501 bytes:\n got: %s\nwant: %s", scopeOnly, wantScopeOnly)
+	}
+
+	// Assertion-only park: unsatisfied_assertions present, missing_paths ABSENT.
+	assertionOnly := shipPark(t, ShipPullRequestArgs{
+		RunID:   "run-abc",
+		StageID: "stage-xyz",
+		Outcome: "scope_park",
+		Branch:  "fishhawk/run-abc/stage-xyz",
+		HeadSHA: "deadbeef",
+		BaseSHA: "feedface",
+		TreeSHA: "treesha1",
+		UnsatisfiedAssertions: []BindingAssertionReport{
+			{Type: "file_contains", Path: "backend/internal/run/run.go", Literal: "UnsatisfiedAssertion"},
+		},
+	})
+	wantAssertionOnly := `{"outcome":"scope_park","branch":"fishhawk/run-abc/stage-xyz","head_sha":"deadbeef","base_sha":"feedface","verified_tree_sha":"treesha1","unsatisfied_assertions":[{"type":"file_contains","path":"backend/internal/run/run.go","literal":"UnsatisfiedAssertion"}]}`
+	if assertionOnly != wantAssertionOnly {
+		t.Errorf("assertion-only park body:\n got: %s\nwant: %s", assertionOnly, wantAssertionOnly)
+	}
+	if strings.Contains(assertionOnly, `"missing_paths"`) {
+		t.Errorf("an assertion-only park must omit missing_paths entirely: %s", assertionOnly)
+	}
+}
