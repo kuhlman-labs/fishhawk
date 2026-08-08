@@ -539,6 +539,21 @@ type FetchedPrompt struct {
 	// Non-empty only when OpenPRFromHeldCommit is true. The runner opens the PR
 	// with this branch as head.
 	HeldCommitBranch string `json:"held_commit_branch,omitempty"`
+	// HeldCommitResumeKind discriminates WHICH held-commit resolution the three
+	// fields above carry (#2169). Empty is the legacy #1231 scope-completeness
+	// exempt resolution — the runner's open-PR path stays byte-identical there.
+	// "pr_open" is the PR-open CHECKPOINT resume: a previous implement pass
+	// already pushed its gate-verified commit and then failed opening the PR (or
+	// shipping the artifact), so this retry re-attempts ONLY the idempotent
+	// adopt-then-create OpenPR from the checkpointed head — with an added
+	// remote-tip guard, because unlike the park the checkpoint is not backed by a
+	// persisted park row. Empty on every other dispatch.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (held_commit_resume_kind) MUST
+	// stay byte-identical to the backend's promptResponse.HeldCommitResumeKind
+	// (backend/internal/server/prompt.go). Same independent-struct-by-tag
+	// convention as the three fields above.
+	HeldCommitResumeKind string `json:"held_commit_resume_kind,omitempty"`
 	// EgressTargetHosts is the acceptance stage's full spec-declared
 	// egress.target_hosts list (E31.4 / #1532 grammar), served ONLY on
 	// acceptance-stage prompt responses (E31.7 / #1535). It is the
@@ -1272,6 +1287,21 @@ type pullRequestFailureBody struct {
 	Outcome  string `json:"outcome"`
 	Category string `json:"category"`
 	Reason   string `json:"reason"`
+	// Branch/HeadSHA/BaseSHA/VerifiedTreeSHA are the PR-open CHECKPOINT (#2169):
+	// the coordinates of the commit this stage ALREADY pushed before the failure.
+	// Populated only when the failure happened AFTER a successful CommitAndPush
+	// (a PR-open or artifact-ship failure), so the backend can record them into
+	// the pull_request_failed audit payload and a later retry_stage resumes from
+	// the pushed branch WITHOUT re-invoking the implement agent. Every field is
+	// omitempty, so a pre-push failure report (mint/commit/push itself) marshals
+	// bytes byte-identical to the legacy {outcome,category,reason} shape — which
+	// is what keeps the existing signed-digest expectations intact. The json tags
+	// match the backend's pullRequestBody decode struct, which already carries
+	// all four for the pushed / scope_park variants.
+	Branch          string `json:"branch,omitempty"`
+	HeadSHA         string `json:"head_sha,omitempty"`
+	BaseSHA         string `json:"base_sha,omitempty"`
+	VerifiedTreeSHA string `json:"verified_tree_sha,omitempty"`
 }
 
 // pullRequestChildPushBody is the success-report wire shape ShipPullRequest
@@ -1372,6 +1402,12 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			Outcome:  args.Outcome,
 			Category: args.Category,
 			Reason:   TruncateReason(args.Reason, MaxFailureReportReasonBytes),
+			// PR-open checkpoint (#2169), omitted entirely when the caller armed
+			// none (a pre-push failure).
+			Branch:          args.Branch,
+			HeadSHA:         args.HeadSHA,
+			BaseSHA:         args.BaseSHA,
+			VerifiedTreeSHA: args.TreeSHA,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
@@ -1515,10 +1551,18 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			// truncatable reason, so it fails fast as before.
 			if args.Outcome == "failed" && resp.StatusCode >= 400 && resp.StatusCode < 500 && !aggressiveRetried {
 				aggressiveRetried = true
+				// The checkpoint MUST ride the aggressive re-marshal too (#2169):
+				// dropping it here would make a 413-retried failure report lose the
+				// pushed coordinates and silently degrade the retry back to a full
+				// agent re-run — the exact cost this change exists to remove.
 				marshalled, mErr := json.Marshal(pullRequestFailureBody{
-					Outcome:  args.Outcome,
-					Category: args.Category,
-					Reason:   TruncateReason(args.Reason, AggressiveFailureReportReasonBytes),
+					Outcome:         args.Outcome,
+					Category:        args.Category,
+					Reason:          TruncateReason(args.Reason, AggressiveFailureReportReasonBytes),
+					Branch:          args.Branch,
+					HeadSHA:         args.HeadSHA,
+					BaseSHA:         args.BaseSHA,
+					VerifiedTreeSHA: args.TreeSHA,
 				})
 				if mErr != nil {
 					return nil, fmt.Errorf("upload: marshal aggressive pull-request failure body: %w", mErr)

@@ -244,3 +244,49 @@ drives a fetched prompt carrying the config through `run()` to a
 `diff_coverage` event in the uploaded bundle, and
 `TestRun_NoDiffCoverage_EmitsNoEvent` pins the other half: a stage with no
 declared constraint runs no command and emits no event.
+
+## PR-open checkpoint resume (E48.46 / #2169)
+
+A sustained GitHub outage used to cost the whole implement pass. The commit was
+already pushed to the run branch, but `OpenPR` failed, the stage failed
+category-C, and `retry_stage` re-ran the agent from the top — a ~$4-6 pass plus
+fresh reviews, to redo work that was already on origin. The checkpoint closes
+that: after a post-push failure the retry re-attempts only the idempotent
+`OpenPR`.
+
+- **Arm after push.** `openPRAndShipArtifact` records a `pushCheckpoint`
+  (`branch`, `head_sha`, `base_sha`, `verified_tree_sha`) into its caller-supplied
+  out-parameter at the moment `CommitAndPush` has succeeded AND the standalone
+  open-PR path is selected — after the `--no-pr`, no-changes, fix-up,
+  decomposed-child, and scope-park early returns. It emits
+  `pr_open_checkpoint_armed` so the trace shows why a later retry resumed. A
+  failure BEFORE the push (mint token, commit, push itself) leaves it ZERO: an
+  un-pushed stage must never claim a resumable branch.
+- **Ride the failure report.** `run()` passes the checkpoint to
+  `reportPullRequestFailure`, which puts the four coordinates on the existing
+  `{outcome:"failed"}` body. Every field is `omitempty`, so a pre-push failure
+  report is byte-identical to the pre-#2169 shape. The backend records them into
+  the `pull_request_failed` audit payload (both-or-nothing on branch+head_sha).
+- **Resume before the agent.** The backend's `resolvePushCheckpointResume` serves
+  the `open_pr_from_held_commit` trio plus `held_commit_resume_kind: "pr_open"`
+  on the retry dispatch. `run()` short-circuits into `openHeldCommitPR` at its
+  existing pre-agent branch — the position is what guarantees the agent invoker
+  is never spawned — and that function selects its trace event
+  (`pr_open_resume_pr_opened`) and failure reason (`pr_open_resume`) from the
+  kind. The EMPTY kind is the legacy #1231 scope-completeness exempt resolution
+  and stays byte-identical (`scope_completeness_pr_opened` /
+  `scope_exempt_open_pr`).
+- **Remote-tip guard, resume kind only.** Unlike the park, the checkpoint is
+  backed by the audit chain rather than a persisted stage row, so before opening
+  anything the resume re-reads the run branch's tip via
+  `gitops.RemoteBranchTip`. A tip that is empty (branch gone), different (an
+  operator `fishhawk_reset_run_branch` moved it), or unreadable (ls-remote error)
+  fails the stage category-C and opens NO PR — never an artifact whose `head_sha`
+  lies about what the PR points at. On a match it emits
+  `pr_open_resume_tip_verified`.
+- **Repeatable.** A resume that itself fails re-reports the SAME checkpoint, so a
+  ~30-minute outage spanning several `retry_stage` calls resumes every time
+  rather than silently degrading back to a full agent re-run.
+  `TestImplementPROpenOutage_ResumesWithoutAgentReinvocation` drives three passes
+  (fail → resume-fail → resume-succeed) and asserts the agent invoker was called
+  EXACTLY ONCE across all three.

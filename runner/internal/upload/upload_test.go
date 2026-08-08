@@ -1508,6 +1508,58 @@ func TestFetchPrompt_OpenPRFromHeldCommitOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesHeldCommitResumeKind confirms the client decodes the
+// PR-open checkpoint resume discriminator (#2169). The runner switches its
+// remote-tip guard and its repeatable-resume reporting on this exact string, so
+// a tag drift across the module boundary must fail here.
+func TestFetchPrompt_DecodesHeldCommitResumeKind(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"open_pr_from_held_commit": true,
+		"held_commit_sha": "deadbeef",
+		"held_commit_branch": "fishhawk/run-abc/stage-xyz",
+		"held_commit_resume_kind": "pr_open"
+	}`
+	c := quickClient(srv)
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.HeldCommitResumeKind != "pr_open" {
+		t.Errorf("HeldCommitResumeKind = %q, want pr_open", got.HeldCommitResumeKind)
+	}
+}
+
+// TestFetchPrompt_HeldCommitResumeKindEmptyWhenAbsent: a legacy #1231 exempt
+// dispatch carries no resume kind, which is exactly what keeps the runner on the
+// byte-identical scope-exempt open-PR path.
+func TestFetchPrompt_HeldCommitResumeKindEmptyWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"open_pr_from_held_commit": true,
+		"held_commit_sha": "deadbeef",
+		"held_commit_branch": "fishhawk/run-abc/stage-xyz"
+	}`
+	c := quickClient(srv)
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.HeldCommitResumeKind != "" {
+		t.Errorf("HeldCommitResumeKind = %q, want empty on a legacy exempt dispatch", got.HeldCommitResumeKind)
+	}
+}
+
 // acceptanceFakeBackend mounts a /v0/runs/{run_id}/acceptance handler
 // with configurable response shape (E31.7 / #1535). Separate from
 // fakeBackend so the per-test plumbing stays focused, mirroring

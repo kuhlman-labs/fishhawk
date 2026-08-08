@@ -1500,6 +1500,54 @@ func RemoteHasBranch(ctx context.Context, repoDir, remote, branch, pushToken str
 	return strings.TrimSpace(out) != "", nil
 }
 
+// RemoteBranchTip returns the current commit SHA of refs/heads/<branch> on the
+// named remote (defaulting to DefaultRemote), the exported package-level twin of
+// observeRemoteHead for callers with no *Pusher in scope. It queries the remote
+// DIRECTLY (`git ls-remote --heads <remote> refs/heads/<branch>`) rather than a
+// local tracking ref, so a branch pushed by an earlier runner process — or moved
+// by an operator between two dispatches of the same stage — is observed as it
+// actually is on origin.
+//
+// Contract, mirroring RemoteHasBranch's ls-remote semantics:
+//
+//   - branch present  → (<40-hex sha>, nil)
+//   - branch ABSENT   → ("", nil). `git ls-remote` exits 0 with EMPTY stdout for
+//     a no-match, so absence is derived from the output, never the exit code.
+//   - ls-remote FAILS → ("", err). The error is NOT swallowed: the caller must
+//     distinguish a genuinely-absent branch from a transient network/auth fault
+//     and fail loud rather than mistaking the fault for a moved branch.
+//
+// Consumer: the PR-open checkpoint resume (#2169). Before re-opening a PR from a
+// checkpointed head, the runner requires the run branch's remote tip to still
+// EQUAL that head — an empty tip (branch gone), a different tip (an operator
+// fishhawk_reset_run_branch moved it), or an ls-remote error all fail the stage
+// category-C WITHOUT opening a PR, so a resume can never ship an artifact whose
+// head_sha lies about what the PR actually points at.
+//
+// Auth mirrors RemoteHasBranch: a non-empty pushToken against an http(s) remote
+// authenticates per-invocation via AuthEnvForRemote; anything else falls back to
+// ambient auth (#1951).
+func RemoteBranchTip(ctx context.Context, repoDir, remote, branch, pushToken string) (string, error) {
+	if branch == "" {
+		return "", errors.New("gitops: branch required")
+	}
+	remote = orDefault(remote, DefaultRemote)
+	authEnv := AuthEnvForRemote(ctx, repoDir, remote, pushToken)
+	out, err := (&Pusher{}).runOutEnv(ctx, repoDir, authEnv, "ls-remote", "--heads", remote, "refs/heads/"+branch)
+	if err != nil {
+		return "", fmt.Errorf("gitops: ls-remote %s %s: %w", remote, branch, err)
+	}
+	line := strings.TrimSpace(out)
+	if line == "" {
+		return "", nil
+	}
+	// Format: "<sha>\trefs/heads/<branch>". Take the leading SHA field.
+	if fields := strings.Fields(line); len(fields) > 0 {
+		return fields[0], nil
+	}
+	return "", nil
+}
+
 // observeRemoteHead returns the current commit SHA of refs/heads/<branch> on
 // the remote reachable at remoteURL, or "" when the branch does not exist
 // there. It queries the remote DIRECTLY (`git ls-remote <remoteURL>

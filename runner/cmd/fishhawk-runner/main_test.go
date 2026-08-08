@@ -12394,7 +12394,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_FailedReverifyBlocksPush(t *
 
 	// The re-verify command fails → the push must be blocked.
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified", err)
 	}
@@ -12438,7 +12438,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_PassingReverifyPushes(t *tes
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	logs := logSink.String()
@@ -12608,7 +12608,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_TreeDeltaFailOpen(t *testing
 	// The re-verify passes ("true"), so the byte-identical push decision is:
 	// push proceeds, PR opens — exactly as PassingReverifyPushes. A fail-open
 	// helper must not change that.
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("a diff-tree failure must not block the push: %v\n%s", err, logSink.String())
 	}
 	logs := logSink.String()
@@ -12674,7 +12674,7 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMatch_NoReverify(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, countCmd), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if lines := countLines(t, counter); lines != 1 {
@@ -12707,7 +12707,7 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_NoOp(t *testing.T) {
 	moveBareMain(t, bare)
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "false"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("empty verifiedTreeSHA must disable the check, got: %v\n%s", err, logSink.String())
 	}
 	for _, ev := range []string{"verified_tree_match", "verified_tree_mismatch", "pushed_tree_reverified", "verify_run"} {
@@ -12746,7 +12746,7 @@ func TestOpenPRAndShipArtifact_ScopeExemption_AllExemptedPasses(t *testing.T) {
 
 	exemptions := []scopeExemption{{Path: "b.txt", Reason: "already correct, no change needed"}}
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions, nil, nil); err != nil {
 		t.Fatalf("all-exempted shortfall must pass the gate, got: %v\n%s", err, logSink.String())
 	}
 	if strings.Contains(logSink.String(), `"event":"scope_files_missing"`) {
@@ -12801,7 +12801,7 @@ func TestOpenPRAndShipArtifact_SupplementalExemptions_SerializedForBackendDecode
 		{Path: "backend/internal/foo/foo_test.go", Reason: "coupled test already correct after re-invoke"},
 	}
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, supplemental); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, supplemental, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if fu.gotPRArgs == nil {
@@ -12872,7 +12872,7 @@ func TestOpenPRAndShipArtifact_NoSupplemental_OmitsKey(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
 	}
 	if fu.gotPRArgs == nil {
@@ -12955,7 +12955,7 @@ func TestOpenPRAndShipArtifact_ScopeExemption_PartialParks(t *testing.T) {
 
 	exemptions := []scopeExemption{{Path: "b.txt", Reason: "already correct"}}
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, exemptions, nil, nil); err != nil {
 		t.Fatalf("partial-exemption missing-scope-only must PARK (nil error), got: %v\n%s", err, logSink.String())
 	}
 	// Park reports scope_completeness_parked carrying the unexempted remainder;
@@ -13012,7 +13012,7 @@ func TestOpenPRAndShipArtifact_MissingScopeOnly_Parks(t *testing.T) {
 	}
 
 	var logSink strings.Builder
-	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil); err != nil {
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
 		t.Fatalf("missing-scope-only must PARK (nil error), got: %v\n%s", err, logSink.String())
 	}
 	if fpr.gotArgs != nil {
@@ -13056,7 +13056,7 @@ func TestOpenPRAndShipArtifact_MissingScopePlusBinding_StaysCategoryB(t *testing
 	bindings := []upload.BindingAssertion{{Type: "file_contains", Path: "a.txt", Literal: "NOT-PRESENT-LITERAL"}}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", bindings, nil, nil)
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", bindings, nil, nil, nil)
 	// #2501: both gates now RECORD rather than return, so the compound is
 	// resolved by parkResult()'s compound arm — an UNTYPED wrap of the
 	// ErrScopeFilesMissing sentinel naming BOTH shortfalls. Both sentinels map
@@ -13100,7 +13100,7 @@ func TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent(t *testing.T) {
 		backendURL: "https://api.fishhawk.test",
 	}
 	var logSink strings.Builder
-	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", &logSink, fu, issued); code != exitOK {
+	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil {
@@ -13144,7 +13144,7 @@ func TestOpenHeldCommitPR_MissingHeldFields_ReportsFailure(t *testing.T) {
 	}
 	var logSink strings.Builder
 	// held SHA / branch deliberately empty → fail-closed.
-	if code := openHeldCommitPR(context.Background(), cfg, "", "", &logSink, fu, issued); code != exitFailure {
+	if code := openHeldCommitPR(context.Background(), cfg, "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("missing held fields must fail, exit = %d", code)
 	}
 	if fpr.gotArgs != nil {
@@ -13259,7 +13259,7 @@ exit 0
 	}
 
 	var logSink strings.Builder
-	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil)
+	err = openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
 	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
 		t.Fatalf("err = %v, want ErrPushedTreeNotVerified\n%s", err, logSink.String())
 	}
@@ -16943,7 +16943,7 @@ func TestAssertionShortfall_ParksThenExemptOpensPRWithNoAgentReRun(t *testing.T)
 	}
 
 	var logSink strings.Builder
-	if perr := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", bindings, nil, nil); perr != nil {
+	if perr := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", bindings, nil, nil, nil); perr != nil {
 		t.Fatalf("assertion-only shortfall must PARK (nil error), got: %v\n%s", perr, logSink.String())
 	}
 	if fpr.gotArgs != nil {
@@ -17087,7 +17087,7 @@ func TestAssertionCompound_PlusMissingScopeFile_StaysCategoryB(t *testing.T) {
 		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
 	}
 	var log strings.Builder
-	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, verifiedTree, "", unsatisfiedBinding, nil, nil)
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, verifiedTree, "", unsatisfiedBinding, nil, nil, nil)
 	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
 	// The compound message names BOTH shortfalls so the operator sees why it did
 	// not park, and it wraps a plain sentinel (never the typed park value).
@@ -17115,7 +17115,7 @@ func TestAssertionCompound_PlusCreatedOutOfScope_StaysCategoryB(t *testing.T) {
 	// A net-new untracked file outside scope.files.
 	mustWrite(t, filepath.Join(cfg.workingDir, "created.txt"), "net-new, undeclared\n")
 	var log strings.Builder
-	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil)
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil, nil)
 	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
 	if !errors.Is(err, gitops.ErrCreatedOutOfScope) {
 		t.Errorf("err = %v, want ErrCreatedOutOfScope", err)
@@ -17137,7 +17137,7 @@ func TestAssertionCompound_PlusCompileGateFailure_StaysCategoryB(t *testing.T) {
 	seedCompileFailingModule(t, cfg.workingDir)
 	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "mod/doer.go", Operation: "modify"})
 	var log strings.Builder
-	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil)
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil, nil)
 	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
 	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) && !errors.Is(err, gitops.ErrCommittedTestsFailed) {
 		t.Errorf("err = %v, want a committed-tree compile/test gate failure", err)
@@ -17181,7 +17181,7 @@ func TestAssertionCompound_PlusVerifiedTreeMismatch_StaysCategoryB(t *testing.T)
 	cfg, bare, branch, fpr, fu, issued := assertionCompoundHarness(t, "false")
 	bogusTree := "0000000000000000000000000000000000000000"
 	var log strings.Builder
-	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, bogusTree, "", unsatisfiedBinding, nil, nil)
+	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, bogusTree, "", unsatisfiedBinding, nil, nil, nil)
 	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
 	// The sentinel is asserted EXACTLY, with no compile/test-gate alternative:
 	// admitting ErrCommitWouldNotCompile / ErrCommittedTestsFailed here would let
@@ -17235,7 +17235,7 @@ func TestFixupPass_NeverEvaluatesBindingAssertions(t *testing.T) {
 	}
 
 	var log strings.Builder
-	perr := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil)
+	perr := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", unsatisfiedBinding, nil, nil, nil)
 	if perr != nil {
 		t.Fatalf("a fix-up pass must not fail on an unevaluated binding assertion: %v\n%s", perr, log.String())
 	}
@@ -17244,5 +17244,614 @@ func TestFixupPass_NeverEvaluatesBindingAssertions(t *testing.T) {
 	}
 	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
 		t.Errorf("a fix-up pass must never park on an assertion, got: %+v", fu.gotPRArgs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PR-open checkpoint resume (E48.46 / #2169)
+// ---------------------------------------------------------------------------
+
+// checkpointCfg is the openHeldCommitPR config for the resume tests: a real repo
+// with a bare origin (so the remote-tip guard queries a real remote) and the
+// rewritten github URL the fixture installs.
+func checkpointCfg(repo string) config {
+	return config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		workingDir: repo,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+	}
+}
+
+// seedRunBranch creates branch on the fixture's bare origin at the given
+// committish and returns its resolved SHA.
+func seedRunBranch(t *testing.T, repo, branch, at string) string {
+	t.Helper()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	runGit("push", "origin", at+":refs/heads/"+branch)
+	out, err := exec.Command("git", "-C", repo, "rev-parse", at).Output()
+	if err != nil {
+		t.Fatalf("rev-parse %s: %v", at, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestOpenPRAndShipArtifact_CheckpointArmedOnPROpenFailure (r1): a PR-open
+// failure AFTER a successful push arms the checkpoint, and the failure report
+// composed exactly as run() composes it carries all four coordinates.
+func TestOpenPRAndShipArtifact_CheckpointArmedOnPROpenFailure(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fpr.err = errors.New("open PR: 503 from api.github.com")
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	var logSink strings.Builder
+	var checkpoint pushCheckpoint
+	prErr := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, &checkpoint)
+	if prErr == nil {
+		t.Fatalf("expected the PR-open failure to surface:\n%s", logSink.String())
+	}
+	if !checkpoint.armed() {
+		t.Fatalf("checkpoint not armed after a successful push:\n%s", logSink.String())
+	}
+	if checkpoint.Branch != branch {
+		t.Errorf("checkpoint branch = %q, want %q", checkpoint.Branch, branch)
+	}
+	if len(checkpoint.HeadSHA) != 40 {
+		t.Errorf("checkpoint head_sha = %q, want the pushed commit", checkpoint.HeadSHA)
+	}
+	if !strings.Contains(logSink.String(), `"event":"pr_open_checkpoint_armed"`) {
+		t.Errorf("missing pr_open_checkpoint_armed trace event:\n%s", logSink.String())
+	}
+	// Compose the failure report exactly as run() does.
+	if rerr := reportPullRequestFailure(context.Background(), cfg, &logSink, fu, issued, "C", prErr.Error(), &checkpoint); rerr != nil {
+		t.Fatalf("reportPullRequestFailure: %v", rerr)
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" {
+		t.Fatalf("expected a failed report, got %+v", fu.gotPRArgs)
+	}
+	if fu.gotPRArgs.Branch != branch || fu.gotPRArgs.HeadSHA != checkpoint.HeadSHA {
+		t.Errorf("failure report checkpoint = %q/%q, want %q/%q",
+			fu.gotPRArgs.Branch, fu.gotPRArgs.HeadSHA, branch, checkpoint.HeadSHA)
+	}
+	if fu.gotPRArgs.BaseSHA == "" {
+		t.Error("failure report dropped base_sha")
+	}
+}
+
+// TestOpenPRAndShipArtifact_CheckpointArmedOnShipFailure (r2): the PR opens but
+// the artifact ship fails — the checkpoint is still armed, because the resume's
+// idempotent adopt-by-head OpenPR (#2167) recovers that case too.
+func TestOpenPRAndShipArtifact_CheckpointArmedOnShipFailure(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fu.prErr = errors.New("ship pull-request: 503")
+	var logSink strings.Builder
+	var checkpoint pushCheckpoint
+	prErr := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, &checkpoint)
+	if prErr == nil {
+		t.Fatalf("expected the ship failure to surface:\n%s", logSink.String())
+	}
+	if !checkpoint.armed() || checkpoint.Branch != branch {
+		t.Errorf("checkpoint = %+v, want armed on %q", checkpoint, branch)
+	}
+}
+
+// TestOpenPRAndShipArtifact_NoCheckpointOnPrePushFailure (r3) is the arming
+// CONTROL: a failure BEFORE the push (CommitAndPush errors) leaves the
+// checkpoint ZERO, so an un-pushed stage can never claim a resumable branch.
+func TestOpenPRAndShipArtifact_NoCheckpointOnPrePushFailure(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	fp := &fakePusher{err: errors.New("push: bad credentials")}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	var logSink strings.Builder
+	var checkpoint pushCheckpoint
+	prErr := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, &checkpoint)
+	if prErr == nil {
+		t.Fatal("expected the push failure to surface")
+	}
+	if checkpoint.armed() {
+		t.Errorf("a pre-push failure must leave the checkpoint zero, got %+v", checkpoint)
+	}
+	if strings.Contains(logSink.String(), "pr_open_checkpoint_armed") {
+		t.Errorf("a pre-push failure must not emit the arm event:\n%s", logSink.String())
+	}
+	// And the report composed as run() composes it carries nothing.
+	if rerr := reportPullRequestFailure(context.Background(), cfg, &logSink, fu, issued, "C", prErr.Error(), &checkpoint); rerr != nil {
+		t.Fatalf("reportPullRequestFailure: %v", rerr)
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Branch != "" || fu.gotPRArgs.HeadSHA != "" {
+		t.Errorf("a pre-push failure report must carry no checkpoint, got %+v", fu.gotPRArgs)
+	}
+}
+
+// TestOpenHeldCommitPR_ResumeSkipsAgentAndOpensPR (r4): a pr_open resume whose
+// remote tip still matches opens the PR from the checkpointed head and ships an
+// artifact whose head_sha IS that head. The agent invoker is not reachable from
+// this entry point at all — the run()-level proof is the cross-boundary test.
+func TestOpenHeldCommitPR_ResumeSkipsAgentAndOpensPR(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	headSHA := seedRunBranch(t, repo, branch, "HEAD")
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointCfg(repo), headSHA, branch, resumeKindPROpen, &logSink, fu, issued); code != exitOK {
+		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs == nil || fpr.gotArgs.Head != branch {
+		t.Fatalf("resume must open a PR from the checkpointed branch, got %+v", fpr.gotArgs)
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "" {
+		t.Fatalf("resume must ship the success PR artifact, got %+v", fu.gotPRArgs)
+	}
+	var artifact struct {
+		HeadSHA string `json:"head_sha"`
+	}
+	if uerr := json.Unmarshal(fu.gotPRArgs.Body, &artifact); uerr != nil {
+		t.Fatalf("decode artifact: %v", uerr)
+	}
+	if artifact.HeadSHA != headSHA {
+		t.Errorf("artifact head_sha = %q, want the checkpointed head %q", artifact.HeadSHA, headSHA)
+	}
+	if !strings.Contains(logSink.String(), `"event":"pr_open_resume_pr_opened"`) {
+		t.Errorf("missing pr_open_resume_pr_opened event:\n%s", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"event":"pr_open_resume_tip_verified"`) {
+		t.Errorf("missing pr_open_resume_tip_verified event:\n%s", logSink.String())
+	}
+}
+
+// TestOpenHeldCommitPR_ResumeAdoptsExistingPR (r4b): the ship-failed recovery
+// shape. #2167's OpenPR adopts an existing PR for the same head instead of
+// creating a duplicate, so a resume after "PR opened, artifact ship failed"
+// still ships the artifact. The fake opener stands in for that adopt arm by
+// returning the already-open PR; the assertion is that the artifact ships with
+// the adopted PR's number.
+func TestOpenHeldCommitPR_ResumeAdoptsExistingPR(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	headSHA := seedRunBranch(t, repo, branch, "HEAD")
+	fpr := withFakePROpenerOnly(t)
+	fpr.result = &gitops.OpenPRResult{PRNumber: 7, PRURL: "https://github.com/x/y/pull/7"}
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointCfg(repo), headSHA, branch, resumeKindPROpen, &logSink, fu, issued); code != exitOK {
+		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	var artifact struct {
+		PRNumber int    `json:"pr_number"`
+		HeadSHA  string `json:"head_sha"`
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("no artifact shipped on the adopt path")
+	}
+	if uerr := json.Unmarshal(fu.gotPRArgs.Body, &artifact); uerr != nil {
+		t.Fatalf("decode artifact: %v", uerr)
+	}
+	if artifact.PRNumber != 7 || artifact.HeadSHA != headSHA {
+		t.Errorf("adopted artifact = #%d/%q, want #7/%q", artifact.PRNumber, artifact.HeadSHA, headSHA)
+	}
+}
+
+// TestOpenHeldCommitPR_ResumeStaleRemoteTipFailsClosed is COUNTERFACTUAL (4),
+// the remote-tip guard. Its effect is a REFUSAL TO ACT, so the assertions are on
+// OBSERVED STATE — the PR opener recorded ZERO calls and no artifact was shipped
+// — not on error identity. The bare remote is seeded at a DIFFERENT commit than
+// the checkpoint BY CONSTRUCTION, and the PR opener is a reachable in-test fake
+// that would succeed if called, so a deleted guard cannot fail for the same
+// reason the guard would.
+func TestOpenHeldCommitPR_ResumeStaleRemoteTipFailsClosed(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	// The branch on origin points at HEAD; the checkpoint names a DIFFERENT,
+	// real commit (an operator fishhawk_reset_run_branch shape).
+	seedRunBranch(t, repo, branch, "HEAD")
+	staleSHA := "4444444444444444444444444444444444444444"
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	code := openHeldCommitPR(context.Background(), checkpointCfg(repo), staleSHA, branch, resumeKindPROpen, &logSink, fu, issued)
+	if code != exitFailure {
+		// Errorf, not Fatalf: the OBSERVED-STATE assertions below are the real
+		// counterfactual vehicle and must still run when the guard is absent.
+		t.Errorf("a moved run branch must fail the resume, exit = %d\n%s", code, logSink.String())
+	}
+	// OBSERVED STATE, not error identity:
+	if fpr.gotArgs != nil {
+		t.Errorf("no PR may be opened when the remote tip does not match, got %+v", fpr.gotArgs)
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("no report was shipped at all")
+	}
+	if fu.gotPRArgs.Outcome != "failed" {
+		t.Errorf("expected a failed report and NO pull_request artifact, got %+v", fu.gotPRArgs)
+	}
+	if len(fu.gotPRArgs.Body) != 0 {
+		t.Errorf("no pull_request artifact may be shipped on a stale tip, got %s", fu.gotPRArgs.Body)
+	}
+	if !strings.Contains(fu.gotPRArgs.Reason, staleSHA) {
+		t.Errorf("the failure reason must name the checkpointed head, got %q", fu.gotPRArgs.Reason)
+	}
+}
+
+// TestOpenHeldCommitPR_ResumeVanishedBranchFailsClosed: the branch is gone from
+// origin entirely (ls-remote exit 0, empty stdout). Same refusal-to-act shape.
+func TestOpenHeldCommitPR_ResumeVanishedBranchFailsClosed(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	// Deliberately do NOT seed the branch on origin.
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	code := openHeldCommitPR(context.Background(), checkpointCfg(repo),
+		"5555555555555555555555555555555555555555", branch, resumeKindPROpen, &logSink, fu, issued)
+	if code != exitFailure {
+		t.Errorf("a vanished run branch must fail the resume, exit = %d\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Errorf("no PR may be opened when the branch is gone, got %+v", fpr.gotArgs)
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || len(fu.gotPRArgs.Body) != 0 {
+		t.Errorf("expected a failed report with no artifact, got %+v", fu.gotPRArgs)
+	}
+}
+
+// TestOpenHeldCommitPR_ResumeLsRemoteErrorFailsClosed (r5b): a remote-query
+// FAILURE (unconfigured remote) is not a moved branch — it fails loud without
+// opening a PR rather than degrading to an unverified open.
+func TestOpenHeldCommitPR_ResumeLsRemoteErrorFailsClosed(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	seedRunBranch(t, repo, branch, "HEAD")
+	// Remove origin so ls-remote ERRORS rather than reporting an absent branch.
+	if out, err := exec.Command("git", "-C", repo, "remote", "remove", "origin").CombinedOutput(); err != nil {
+		t.Fatalf("git remote remove: %v\n%s", err, out)
+	}
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	code := openHeldCommitPR(context.Background(), checkpointCfg(repo),
+		"6666666666666666666666666666666666666666", branch, resumeKindPROpen, &logSink, fu, issued)
+	if code != exitFailure {
+		t.Fatalf("an ls-remote error must fail the resume, exit = %d\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Errorf("no PR may be opened when the tip cannot be verified, got %+v", fpr.gotArgs)
+	}
+}
+
+// TestOpenHeldCommitPR_ResumeFailureReportCarriesCheckpoint is COUNTERFACTUAL
+// (5), the repeatable-resume control: a resume that itself fails re-reports the
+// SAME checkpoint, so the NEXT retry_stage resumes rather than degrading back to
+// a full agent re-run.
+func TestOpenHeldCommitPR_ResumeFailureReportCarriesCheckpoint(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	headSHA := seedRunBranch(t, repo, branch, "HEAD")
+	fpr := withFakePROpenerOnly(t)
+	fpr.err = errors.New("open PR: 503 from api.github.com")
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointCfg(repo), headSHA, branch, resumeKindPROpen, &logSink, fu, issued); code != exitFailure {
+		t.Fatalf("a failing resume must exit failure, exit = %d\n%s", code, logSink.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" {
+		t.Fatalf("expected a failed report, got %+v", fu.gotPRArgs)
+	}
+	if fu.gotPRArgs.Branch != branch || fu.gotPRArgs.HeadSHA != headSHA {
+		t.Errorf("a failed resume must RE-REPORT the checkpoint, got %q/%q want %q/%q",
+			fu.gotPRArgs.Branch, fu.gotPRArgs.HeadSHA, branch, headSHA)
+	}
+}
+
+// TestOpenHeldCommitPR_LegacyExemptPathUnchanged (r7): the #1231 exempt
+// dispatch (resume kind EMPTY) still emits scope_completeness_pr_opened, does
+// NOT consult the remote tip (the branch here is deliberately absent from
+// origin, which would fail the resume guard), and reports without a checkpoint.
+func TestOpenHeldCommitPR_LegacyExemptPathUnchanged(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointCfg(repo), "deadbeefcafef00d", branch, "", &logSink, fu, issued); code != exitOK {
+		t.Fatalf("legacy exempt exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs == nil {
+		t.Fatal("the legacy exempt path must still open a PR")
+	}
+	if !strings.Contains(logSink.String(), `"event":"scope_completeness_pr_opened"`) {
+		t.Errorf("legacy exempt event drifted:\n%s", logSink.String())
+	}
+	if strings.Contains(logSink.String(), "pr_open_resume_tip_verified") {
+		t.Errorf("the legacy exempt path must not consult the remote tip:\n%s", logSink.String())
+	}
+}
+
+// TestOpenHeldCommitPR_LegacyExemptFailureReportsNoCheckpoint: the legacy
+// exempt path's failure report carries NO checkpoint, keeping #1231's audit
+// shape unchanged.
+func TestOpenHeldCommitPR_LegacyExemptFailureReportsNoCheckpoint(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fpr.err = errors.New("open PR: 503")
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointCfg(repo), "deadbeefcafef00d", branch, "", &logSink, fu, issued); code != exitFailure {
+		t.Fatalf("exit = %d, want exitFailure", code)
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Branch != "" || fu.gotPRArgs.HeadSHA != "" {
+		t.Errorf("the legacy exempt failure report must carry no checkpoint, got %+v", fu.gotPRArgs)
+	}
+	if !strings.Contains(logSink.String(), `"reason":"scope_exempt_open_pr"`) {
+		t.Errorf("legacy exempt failure reason drifted:\n%s", logSink.String())
+	}
+}
+
+// checkpointMiniBackend is an httptest backend speaking the REAL /prompt and
+// /pull-request wire shapes for the #2169 cross-boundary test. It is deliberately
+// NOT a hand-rolled in-process fake for those two hops: the runner's failure
+// report is marshalled by the real upload.Client and decoded here from the wire,
+// and the prompt response is served as JSON and decoded by the real
+// upload.Client — so a tag drift on either side fails this test.
+//
+// Its backend-side rule mirrors backend/internal/server: record a push_checkpoint
+// on a failed report carrying BOTH branch and head_sha, drop it once a success
+// report lands (the pull_request_opened-is-newest self-invalidation), and serve
+// the held-commit fields + held_commit_resume_kind while a checkpoint stands.
+type checkpointMiniBackend struct {
+	mu sync.Mutex
+
+	stageID string
+	// checkpoint is the recorded push_checkpoint (nil when none stands).
+	checkpoint *pushCheckpoint
+	// failedBodies records every failure report body as received on the wire.
+	failedBodies []map[string]any
+	// prArtifacts counts shipped success (pull_request artifact) bodies.
+	prArtifacts int
+}
+
+func (b *checkpointMiniBackend) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", func(w http.ResponseWriter, r *http.Request) {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		resp := map[string]any{
+			"stage_id":    b.stageID,
+			"stage_type":  "implement",
+			"prompt":      "implement the thing",
+			"prompt_hash": "h",
+		}
+		if b.checkpoint != nil {
+			resp["open_pr_from_held_commit"] = true
+			resp["held_commit_sha"] = b.checkpoint.HeadSHA
+			resp["held_commit_branch"] = b.checkpoint.Branch
+			resp["held_commit_resume_kind"] = "pr_open"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		b.mu.Lock()
+		switch body["outcome"] {
+		case "failed":
+			b.failedBodies = append(b.failedBodies, body)
+			branch, _ := body["branch"].(string)
+			head, _ := body["head_sha"].(string)
+			base, _ := body["base_sha"].(string)
+			if branch != "" && head != "" {
+				b.checkpoint = &pushCheckpoint{Branch: branch, HeadSHA: head, BaseSHA: base}
+			} else {
+				b.checkpoint = nil
+			}
+		case nil:
+			// Success artifact: pull_request_opened becomes newest, so the
+			// checkpoint self-invalidates.
+			b.prArtifacts++
+			b.checkpoint = nil
+		}
+		b.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "00000000-0000-0000-0000-000000000bbb", "stage_id": r.URL.Query().Get("stage_id"),
+			"content_hash": "cafebabe", "pr_number": 42, "pr_url": "https://github.com/x/y/pull/42",
+		})
+	})
+	return mux
+}
+
+// checkpointHybridClient routes ShipPullRequest and FetchPrompt — the two hops
+// the #2169 checkpoint crosses — through the REAL upload.Client against the mini
+// backend, and everything else (signing key, MCP token, trace, installation
+// token) through the ordinary in-process fake.
+type checkpointHybridClient struct {
+	*fakeUploader
+	real *upload.Client
+}
+
+func (c *checkpointHybridClient) ShipPullRequest(ctx context.Context, args upload.ShipPullRequestArgs) (*upload.ShipPullRequestResult, error) {
+	a := args
+	c.gotPRArgs = &a
+	return c.real.ShipPullRequest(ctx, args)
+}
+
+func (c *checkpointHybridClient) FetchPrompt(ctx context.Context, args upload.FetchPromptArgs) (*upload.FetchedPrompt, error) {
+	a := args
+	c.gotPromptArgs = &a
+	return c.real.FetchPrompt(ctx, args)
+}
+
+// TestImplementPROpenOutage_ResumesWithoutAgentReinvocation is the #2169
+// done-means in one assertion, across THREE passes (binding condition 2): a
+// sustained PR-open outage that spans several retry_stage calls must never
+// silently degrade back to a full agent re-run.
+//
+//	pass 1 — the agent runs, the commit is pushed, OpenPR fails → the failure
+//	         report carries the checkpoint;
+//	pass 2 — the retry RESUMES off that checkpoint (no agent), OpenPR fails
+//	         again → the failure report RE-carries the checkpoint;
+//	pass 3 — the next retry resumes off the RE-reported checkpoint, OpenPR
+//	         succeeds, the pull_request artifact ships.
+//
+// The assertion that matters: the agent invoker was called EXACTLY ONCE across
+// all three passes. Per-layer unit tests cannot cover this seam — it spans
+// runner failure-report bytes → backend audit payload → backend prompt response
+// → runner short-circuit.
+func TestImplementPROpenOutage_ResumesWithoutAgentReinvocation(t *testing.T) {
+	repo, _, branch := verifiedTreeRepo(t)
+	implementEnv(t, "test-owner/test-repo", "main")
+	// The run branch as the (faked) push left it on origin: the resume's
+	// remote-tip guard reads this for real.
+	headSHA := seedRunBranch(t, repo, branch, "HEAD")
+
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	// The push is faked (the seam under test is the checkpoint round-trip, not
+	// the push), but its reported head is the REAL tip the guard will observe.
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{HeadSHA: headSHA, BaseSHA: "base-sha-def"}}
+	fpr := &fakePROpener{err: errors.New("open PR: 503 from api.github.com")}
+	withFakeGitOps(t, fp, fpr)
+
+	mini := &checkpointMiniBackend{stageID: verifiedTreeStageID}
+	srv := httptest.NewServer(mini.handler())
+	t.Cleanup(srv.Close)
+
+	fu := newFakeUploader(t)
+	hybrid := &checkpointHybridClient{fakeUploader: fu, real: upload.New(srv.URL)}
+	origNew := newUploadClient
+	newUploadClient = func(_ string) uploadClient { return hybrid }
+	t.Cleanup(func() { newUploadClient = origNew })
+
+	drive := func() int {
+		var stderr strings.Builder
+		code := run([]string{
+			"--run-id", verifiedTreeRunID,
+			"--backend-url", srv.URL,
+			"--workflow", "feature_change", "--stage", "implement",
+			"--stage-id", verifiedTreeStageID,
+			"--working-dir", repo,
+			"--fetch-prompt", "--upload-trace",
+		}, &stderr)
+		t.Logf("pass output:\n%s", stderr.String())
+		return code
+	}
+
+	// PASS 1 — agent runs, push lands, OpenPR fails.
+	if code := drive(); code != exitFailure {
+		t.Fatalf("pass 1 exit = %d, want exitFailure", code)
+	}
+	if invoker.callIdx != 1 {
+		t.Fatalf("pass 1 agent invocations = %d, want 1", invoker.callIdx)
+	}
+	mini.mu.Lock()
+	if len(mini.failedBodies) != 1 {
+		mini.mu.Unlock()
+		t.Fatalf("pass 1 failure reports = %d, want 1", len(mini.failedBodies))
+	}
+	if got := mini.failedBodies[0]["head_sha"]; got != headSHA {
+		mini.mu.Unlock()
+		t.Fatalf("pass 1 failure report head_sha = %v, want %q", got, headSHA)
+	}
+	if mini.checkpoint == nil {
+		mini.mu.Unlock()
+		t.Fatal("pass 1 recorded no checkpoint")
+	}
+	mini.mu.Unlock()
+
+	// PASS 2 — resume off the checkpoint; the outage is still up.
+	if code := drive(); code != exitFailure {
+		t.Fatalf("pass 2 exit = %d, want exitFailure", code)
+	}
+	if invoker.callIdx != 1 {
+		t.Fatalf("pass 2 re-invoked the agent: invocations = %d, want still 1", invoker.callIdx)
+	}
+	mini.mu.Lock()
+	if len(mini.failedBodies) != 2 {
+		mini.mu.Unlock()
+		t.Fatalf("pass 2 failure reports = %d, want 2", len(mini.failedBodies))
+	}
+	if got := mini.failedBodies[1]["head_sha"]; got != headSHA {
+		mini.mu.Unlock()
+		t.Fatalf("pass 2 must RE-report the checkpoint, head_sha = %v", got)
+	}
+	if mini.checkpoint == nil {
+		mini.mu.Unlock()
+		t.Fatal("pass 2 lost the checkpoint — a third retry would re-run the agent")
+	}
+	mini.mu.Unlock()
+
+	// PASS 3 — the outage clears; the resume opens the PR and ships.
+	fpr.err = nil
+	if code := drive(); code != exitOK {
+		t.Fatalf("pass 3 exit = %d, want exitOK", code)
+	}
+	if invoker.callIdx != 1 {
+		t.Errorf("agent invocations across all three passes = %d, want EXACTLY 1", invoker.callIdx)
+	}
+	if fp.calls != 1 {
+		t.Errorf("CommitAndPush calls across all three passes = %d, want 1 (the resume must not re-commit)", fp.calls)
+	}
+	mini.mu.Lock()
+	defer mini.mu.Unlock()
+	if mini.prArtifacts != 1 {
+		t.Errorf("pull_request artifacts shipped = %d, want 1", mini.prArtifacts)
+	}
+	if mini.checkpoint != nil {
+		t.Errorf("a successful resume must self-invalidate the checkpoint, got %+v", mini.checkpoint)
 	}
 }

@@ -9144,3 +9144,241 @@ func TestPromptRenderExemptFields_EmissionGate(t *testing.T) {
 		assertNoExemptKeys(t, keys, "/prompt-render on a FAIL-decided park")
 	})
 }
+
+// checkpointEntry builds a pull_request_failed audit entry carrying a
+// push_checkpoint payload (#2169). branch/sha are injected verbatim so the
+// half-populated cases can be seeded BY CONSTRUCTION rather than by driving the
+// recording control.
+func checkpointEntry(stageID uuid.UUID, seq int64, branch, headSHA string) *audit.Entry {
+	id := stageID
+	payload := fmt.Sprintf(
+		`{"category":"C","reason":"open PR: 503","push_checkpoint":{"branch":%q,"head_sha":%q,"base_sha":"2222222222222222222222222222222222222222","verified_tree_sha":"3333333333333333333333333333333333333333"}}`,
+		branch, headSHA)
+	return &audit.Entry{Sequence: seq, StageID: &id, Category: "pull_request_failed", Payload: []byte(payload)}
+}
+
+// plainFailedEntry is a pull_request_failed entry with NO push_checkpoint — the
+// pre-push failure shape.
+func plainFailedEntry(stageID uuid.UUID, seq int64) *audit.Entry {
+	id := stageID
+	return &audit.Entry{Sequence: seq, StageID: &id, Category: "pull_request_failed",
+		Payload: []byte(`{"category":"C","reason":"commit+push: boom"}`)}
+}
+
+// categoryEntry is a payload-less entry of an arbitrary category, for the
+// newest-wins matrix.
+func categoryEntry(stageID uuid.UUID, category string, seq int64) *audit.Entry {
+	id := stageID
+	return &audit.Entry{Sequence: seq, StageID: &id, Category: category, Payload: []byte(`{}`)}
+}
+
+const checkpointBranch = "fishhawk/run-11112222/stage-99990000"
+const checkpointHeadSHA = "1111111111111111111111111111111111111111"
+
+// assertNoResumeKeys asserts the three held-commit fields AND the resume kind
+// are all ABSENT from the marshalled prompt body — the fail-closed observable.
+func assertNoResumeKeys(t *testing.T, keys map[string]json.RawMessage, why string) {
+	t.Helper()
+	for _, k := range []string{
+		"open_pr_from_held_commit", "held_commit_sha", "held_commit_branch", "held_commit_resume_kind",
+	} {
+		if raw, ok := keys[k]; ok {
+			t.Errorf("%s: key %q must be ABSENT from the marshalled body, got %s", why, k, raw)
+		}
+	}
+}
+
+// checkpointResumeServer builds a bare Server + run/stage pair for the direct
+// unit cases the /prompt fixture cannot stage (a fix-up dispatch needs a concern
+// repo; a non-implement stage needs a different fixture shape).
+func checkpointResumeServer(t *testing.T, entries []*audit.Entry) (*Server, *run.Run, *run.Stage) {
+	t.Helper()
+	runID := uuid.New()
+	stageID := uuid.New()
+	au := &exemptAuditFake{}
+	for _, e := range entries {
+		id := stageID
+		e.StageID = &id
+		au.entries = append(au.entries, e)
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	return s, &run.Run{ID: runID}, &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+}
+
+// TestResolvePushCheckpointResume_EmitsOnNewestCheckpoint is the #2169 happy
+// path, asserted on BOTH emission surfaces: when the newest entry for the stage
+// is a checkpoint-bearing pull_request_failed, the runner-facing /prompt AND the
+// SPA-readable /prompt-render both emit the three held-commit fields plus the
+// pr_open resume kind, so the runner short-circuits before the agent spawn.
+func TestResolvePushCheckpointResume_EmitsOnNewestCheckpoint(t *testing.T) {
+	stageID := uuid.New() // placeholder; the helpers rewrite StageID
+
+	assertEmits := func(t *testing.T, keys map[string]json.RawMessage, surface string) {
+		t.Helper()
+		for k, want := range map[string]string{
+			"open_pr_from_held_commit": `true`,
+			"held_commit_sha":          `"` + checkpointHeadSHA + `"`,
+			"held_commit_branch":       `"` + checkpointBranch + `"`,
+			"held_commit_resume_kind":  `"pr_open"`,
+		} {
+			raw, ok := keys[k]
+			if !ok {
+				t.Errorf("%s: key %q missing from the emitted body", surface, k)
+				continue
+			}
+			if string(raw) != want {
+				t.Errorf("%s: %s = %s, want %s", surface, k, raw, want)
+			}
+		}
+	}
+
+	t.Run("prompt", func(t *testing.T) {
+		// park is nil: the #1231 exempt gate declines, so the checkpoint gate decides.
+		keys := exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+		}, nil)
+		assertEmits(t, keys, "/prompt")
+	})
+
+	t.Run("prompt_render", func(t *testing.T) {
+		keys := exemptRenderKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+		})
+		assertEmits(t, keys, "/prompt-render")
+	})
+}
+
+// TestResolvePushCheckpointResume_FailClosedMatrix executes every fail-closed
+// branch of the #2169 gate that the /prompt fixture can stage, each asserting
+// the three held-commit fields AND the resume kind are ABSENT.
+func TestResolvePushCheckpointResume_FailClosedMatrix(t *testing.T) {
+	stageID := uuid.New() // placeholder; exemptPromptKeys rewrites StageID
+
+	t.Run("no_entry_for_stage", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, nil, nil),
+			"an implement stage with no audit entries at all")
+	})
+
+	t.Run("newest_failed_carries_no_checkpoint", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			plainFailedEntry(stageID, 5),
+		}, nil), "a pre-push pull_request_failed carrying no checkpoint")
+	})
+
+	t.Run("newest_is_pull_request_opened", func(t *testing.T) {
+		// The self-invalidation property: once the resume SUCCEEDS a
+		// pull_request_opened becomes newest, so a later retry re-runs the agent
+		// rather than re-opening a PR that already exists.
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+			categoryEntry(stageID, "pull_request_opened", 6),
+		}, nil), "a stage whose resume already succeeded (pull_request_opened newest)")
+	})
+
+	t.Run("newest_is_scope_park_entry", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+			categoryEntry(stageID, CategoryScopeCompletenessParked, 6),
+		}, nil), "a stage that PARKED after an earlier PR-open failure")
+	})
+
+	t.Run("newest_is_fixup_pushed", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+			categoryEntry(stageID, "fixup_pushed", 6),
+		}, nil), "a stage whose newest record is a fix-up push")
+	})
+
+	t.Run("newest_is_child_pushed", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+			categoryEntry(stageID, "child_pushed", 6),
+		}, nil), "a stage whose newest record is a decomposed-child push")
+	})
+
+	t.Run("checkpoint_missing_head_sha", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, ""),
+		}, nil), "a checkpoint with an empty head_sha")
+	})
+
+	t.Run("checkpoint_missing_branch", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, "", checkpointHeadSHA),
+		}, nil), "a checkpoint with an empty branch")
+	})
+
+	t.Run("undecodable_payload", func(t *testing.T) {
+		id := stageID
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			{Sequence: 5, StageID: &id, Category: "pull_request_failed", Payload: []byte(`{"push_checkpoint":`)},
+		}, nil), "an undecodable pull_request_failed payload")
+	})
+
+	t.Run("nil_audit_repo", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeysWithAudit(t, nil, nil),
+			"a server with NO AuditRepo configured")
+	})
+
+	t.Run("audit_repo_list_error", func(t *testing.T) {
+		assertNoResumeKeys(t, exemptPromptKeys(t, nil, []*audit.Entry{
+			checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+		}, errors.New("audit read exploded")), "an AuditRepo list error")
+	})
+}
+
+// TestResolvePushCheckpointResume_FixupDispatch is the fix-up CONTROL (#2169):
+// a fix-up exists to re-invoke the agent on routed review concerns, so resuming
+// would skip the very work requested. Driven directly because staging a fix-up
+// dispatch through the /prompt fixture needs a concern repository.
+func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
+	stageID := uuid.New()
+	s, runRow, stage := checkpointResumeServer(t, []*audit.Entry{
+		checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+	})
+	// Control off (fixup=false) the checkpoint IS resumable — so the assertion
+	// below isolates the guard rather than a missing fixture.
+	if _, _, ok := s.resolvePushCheckpointResume(t.Context(), runRow, stage, false); !ok {
+		t.Fatal("fixture is wrong: a non-fix-up dispatch must resolve this checkpoint")
+	}
+	sha, branch, ok := s.resolvePushCheckpointResume(t.Context(), runRow, stage, true)
+	if ok || sha != "" || branch != "" {
+		t.Errorf("a fix-up dispatch must NOT resume, got %q/%q/%t", sha, branch, ok)
+	}
+}
+
+// TestResolvePushCheckpointResume_NonImplementStage: only an implement stage can
+// carry a PR-open checkpoint, so every other stage type refuses.
+func TestResolvePushCheckpointResume_NonImplementStage(t *testing.T) {
+	stageID := uuid.New()
+	s, runRow, stage := checkpointResumeServer(t, []*audit.Entry{
+		checkpointEntry(stageID, 5, checkpointBranch, checkpointHeadSHA),
+	})
+	stage.Type = run.StageTypePlan
+	sha, branch, ok := s.resolvePushCheckpointResume(t.Context(), runRow, stage, false)
+	if ok || sha != "" || branch != "" {
+		t.Errorf("a non-implement stage must NOT resume, got %q/%q/%t", sha, branch, ok)
+	}
+	if _, _, nilOK := s.resolvePushCheckpointResume(t.Context(), runRow, nil, false); nilOK {
+		t.Error("a nil stage must NOT resume")
+	}
+}
+
+// TestPromptHeldCommit_ExemptWinsOverPushCheckpoint is the PRECEDENCE control:
+// a stage that is BOTH exempt-resolved (#1231) and checkpoint-bearing (#2169)
+// emits the EXEMPT resolution — the golden three fields with an ABSENT resume
+// kind — so the two resolutions can never both set the held-commit fields and
+// #1231 keeps precedence.
+func TestPromptHeldCommit_ExemptWinsOverPushCheckpoint(t *testing.T) {
+	stageID := uuid.New() // placeholder; exemptPromptKeys rewrites StageID
+	keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		// NEWER than the exempt decision, and resumable on its own.
+		checkpointEntry(stageID, 3, checkpointBranch, checkpointHeadSHA),
+	}, nil)
+	assertGoldenExemptProjection(t, keys, "/prompt")
+	if raw, ok := keys["held_commit_resume_kind"]; ok {
+		t.Errorf("an exempt-resolved park must emit NO resume kind, got %s", raw)
+	}
+}

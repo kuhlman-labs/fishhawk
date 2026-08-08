@@ -2455,6 +2455,20 @@ components:
             `base_sha` + `verified_tree_sha` required, plus AT LEAST ONE of
             non-empty `missing_paths` / `unsatisfied_assertions`;
             `pr_number`/`pr_url`/`title` absent).
+
+            PR-OPEN CHECKPOINT (#2169), `failed` variant only: when the failure
+            happened AFTER a successful push (a PR-open or artifact-ship
+            failure), the runner ALSO sends `branch` + `head_sha` + `base_sha` +
+            `verified_tree_sha` on the failure body. All four are optional and
+            omitted entirely on a pre-push failure, so that report is
+            byte-identical to the pre-#2169 shape. When BOTH `branch` and
+            `head_sha` are present the handler records a `push_checkpoint`
+            object into the `pull_request_failed` audit payload and a later
+            `retry_stage` resumes from the pushed branch with no agent
+            re-invocation (see `held_commit_resume_kind` on the prompt
+            responses). A half-populated pair records NO checkpoint and still
+            returns 200 with the stage failed — rejecting it would strand the
+            stage in `running`.
         category:
           type: string
           enum: [B, C]
@@ -9522,6 +9536,25 @@ paths:
                       The run branch the held commit sits on (ADR-035
                       sole-writer). Present only alongside
                       `open_pr_from_held_commit: true`.
+                  held_commit_resume_kind:
+                    type: string
+                    enum: [pr_open]
+                    description: |
+                      Discriminates WHICH held-commit resolution the three
+                      fields above carry (#2169). ABSENT on every
+                      scope-completeness `exempt` resolution (#1231/#2501),
+                      which keeps the runner's open-PR path byte-identical.
+                      `pr_open` marks the PR-open CHECKPOINT resume: a
+                      previous implement pass pushed its gate-verified commit
+                      and then failed opening the PR (or shipping the
+                      artifact), so this dispatch re-attempts ONLY the
+                      idempotent adopt-then-create `OpenPR`. On that kind the
+                      runner additionally requires the run branch's REMOTE TIP
+                      to still equal `held_commit_sha` and fails the stage
+                      category-C without opening anything otherwise — the
+                      checkpoint is backed by the audit chain rather than a
+                      persisted park row. An exempt resolution always wins, so
+                      the two can never both be served.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -9723,6 +9756,10 @@ paths:
                   held_commit_branch:
                     type: string
                     description: The run branch the held commit sits on (ADR-035 sole-writer); present only alongside a true `open_pr_from_held_commit` (#2501).
+                  held_commit_resume_kind:
+                    type: string
+                    enum: [pr_open]
+                    description: Discriminates WHICH held-commit resolution the three fields above carry (#2169). Absent on every scope-completeness `exempt` resolution (#1231/#2501); `pr_open` marks the PR-open CHECKPOINT resume, where a previous pass already pushed its commit and only the idempotent `OpenPR` is re-attempted (the runner also re-verifies the branch's remote tip on that kind). An exempt resolution always wins, so the two are never both served.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

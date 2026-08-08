@@ -1340,13 +1340,32 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	}
 
 	stageID := stage.ID
-	auditPayload, _ := json.Marshal(map[string]any{
+	payloadFields := map[string]any{
 		"run_id":      runID.String(),
 		"stage_id":    stageID.String(),
 		"category":    pr.Category,
 		"reason":      pr.Reason,
 		"auth_method": authMethod,
-	})
+	}
+	// PR-open checkpoint (#2169): the runner arms these coordinates only once
+	// CommitAndPush has SUCCEEDED, so a failure report carrying them means the
+	// gate-verified commit is already on the run branch and the retry can resume
+	// from it with no agent re-invocation (resolvePushCheckpointResume in
+	// prompt.go is the reader). Recorded only when BOTH branch and head_sha are
+	// present: a half-populated report is a runner bug, and a checkpoint missing
+	// either coordinate is not resumable. The partial case records NOTHING rather
+	// than rejecting the report — validate()'s `failed` arm is deliberately left
+	// permissive, because a 400 here would strand the implement stage in `running`
+	// until the SLA watchdog reaps it, turning a runner bug into a hung run.
+	if pr.Outcome == "failed" && pr.Branch != "" && pr.HeadSHA != "" {
+		payloadFields["push_checkpoint"] = map[string]any{
+			"branch":            pr.Branch,
+			"head_sha":          pr.HeadSHA,
+			"base_sha":          pr.BaseSHA,
+			"verified_tree_sha": pr.VerifiedTreeSHA,
+		}
+	}
+	auditPayload, _ := json.Marshal(payloadFields)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,

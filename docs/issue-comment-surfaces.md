@@ -1199,11 +1199,25 @@ Notes:
   commit/push/PR-open step failed after the trace gate left the implement stage in
   `running`. The actor is the request's `actorKind`/`actorSubject` (`system`, or
   operator on the bearer path) and the payload is `{run_id, stage_id, category,
-  reason, auth_method}`. It pins the runner's failure category (C retryable via
+  reason, auth_method}`, plus an OPTIONAL `push_checkpoint` object (#2169). It
+  pins the runner's failure category (C retryable via
   `failed → pending`, B parks for re-scope) and reason into the chain so the run
   never reaches `review:awaiting_approval` with a null PR. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+  `push_checkpoint` (`{branch, head_sha, base_sha, verified_tree_sha}`) is
+  present ONLY on a `pull_request_failed` entry whose report arrived AFTER a
+  successful push — a PR-open or artifact-ship failure — and only when the report
+  carried BOTH `branch` and `head_sha` (a half-populated report records nothing;
+  the handler still returns 200 with the stage failed, because rejecting it would
+  strand the stage in `running`). It is the durable PR-open CHECKPOINT: the
+  prompt gate `server/prompt.go::resolvePushCheckpointResume` reads the NEWEST
+  entry for the stage and, when it is a checkpoint-bearing `pull_request_failed`,
+  serves `open_pr_from_held_commit` + `held_commit_sha` + `held_commit_branch` +
+  `held_commit_resume_kind:"pr_open"` on the retry dispatch, so the runner
+  re-attempts only the idempotent `OpenPR` with NO agent re-invocation. No new
+  audit kind is introduced — the key rides the existing `pull_request_failed`
+  entry, which remains an internal audit kind and not a comment surface.
 - The detached-dispatch reaper failure kind — `dispatch_reaper_failed` (#1747) —
   is an **internal, audit-only kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method.

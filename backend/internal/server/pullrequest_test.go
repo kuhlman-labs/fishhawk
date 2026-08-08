@@ -2217,3 +2217,132 @@ func TestPullRequestBody_ScopeParkAcceptsEitherShortfall(t *testing.T) {
 		t.Error("a scope_park carrying NEITHER shortfall must still be rejected")
 	}
 }
+
+// prFailedCheckpointPayload posts a failed report with the given body and
+// returns the recorded pull_request_failed audit payload decoded as a map. It
+// fails the test if the handler did not return 200, if the stage is not failed,
+// or if no pull_request_failed entry was written — so every checkpoint assertion
+// below rides on a report that actually landed.
+func prFailedCheckpointPayload(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+
+	priv, _ := sf.issue(t, runRow.ID)
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, raw, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("stage.State = %q, want failed", got.State)
+	}
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category != "pull_request_failed" {
+			continue
+		}
+		var payload map[string]any
+		if uerr := json.Unmarshal(e.Payload, &payload); uerr != nil {
+			t.Fatalf("decode pull_request_failed payload: %v", uerr)
+		}
+		return payload
+	}
+	t.Fatal("no pull_request_failed audit entry recorded")
+	return nil
+}
+
+// TestPullRequestFailed_CheckpointRecorded is the #2169 record half: a failure
+// report carrying BOTH branch and head_sha writes a push_checkpoint object into
+// the pull_request_failed audit payload with the exact coordinates, which is
+// what resolvePushCheckpointResume later reads to skip the agent. It also proves
+// the DisallowUnknownFields decoder accepts the checkpoint-bearing body (the
+// four fields already exist on pullRequestBody) — an unknown field would 400.
+func TestPullRequestFailed_CheckpointRecorded(t *testing.T) {
+	payload := prFailedCheckpointPayload(t, map[string]any{
+		"outcome":           "failed",
+		"category":          "C",
+		"reason":            "open PR: 503 from api.github.com",
+		"branch":            "fishhawk/run-abcd1234/stage-ef567890",
+		"head_sha":          "1111111111111111111111111111111111111111",
+		"base_sha":          "2222222222222222222222222222222222222222",
+		"verified_tree_sha": "3333333333333333333333333333333333333333",
+	})
+	ck, ok := payload["push_checkpoint"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload carries no push_checkpoint object: %v", payload)
+	}
+	for key, want := range map[string]string{
+		"branch":            "fishhawk/run-abcd1234/stage-ef567890",
+		"head_sha":          "1111111111111111111111111111111111111111",
+		"base_sha":          "2222222222222222222222222222222222222222",
+		"verified_tree_sha": "3333333333333333333333333333333333333333",
+	} {
+		if ck[key] != want {
+			t.Errorf("push_checkpoint.%s = %v, want %q", key, ck[key], want)
+		}
+	}
+}
+
+// TestPullRequestFailed_NoCheckpointWhenAbsent: a pre-push failure (no pushed
+// coordinates) writes a payload with NO push_checkpoint key at all, so the
+// resume gate stays fail-closed and the audit shape is unchanged from #742.
+func TestPullRequestFailed_NoCheckpointWhenAbsent(t *testing.T) {
+	payload := prFailedCheckpointPayload(t, map[string]any{
+		"outcome":  "failed",
+		"category": "C",
+		"reason":   "commit+push: network unreachable",
+	})
+	if _, present := payload["push_checkpoint"]; present {
+		t.Errorf("a pre-push failure must record NO push_checkpoint key: %v", payload)
+	}
+}
+
+// TestPullRequestFailed_PartialCheckpointNotRecorded is the both-or-nothing
+// CONTROL (#2169). A half-populated checkpoint is a runner bug; recording it
+// would advertise a resumable branch the backend cannot identify. The bad state
+// is seeded BY CONSTRUCTION as a body literal (never via the control itself), and
+// the test asserts BOTH halves of the deliberate design choice: no
+// push_checkpoint key AND a 200 with the stage failed — validate()'s `failed` arm
+// stays permissive, because a 400 here would strand the stage in `running`.
+func TestPullRequestFailed_PartialCheckpointNotRecorded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{
+			name: "head_sha_without_branch",
+			body: map[string]any{
+				"outcome": "failed", "category": "C", "reason": "open PR: 503",
+				"head_sha": "1111111111111111111111111111111111111111",
+			},
+		},
+		{
+			name: "branch_without_head_sha",
+			body: map[string]any{
+				"outcome": "failed", "category": "C", "reason": "open PR: 503",
+				"branch": "fishhawk/run-abcd1234/stage-ef567890",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// prFailedCheckpointPayload already asserts 200 + stage failed.
+			payload := prFailedCheckpointPayload(t, tc.body)
+			if _, present := payload["push_checkpoint"]; present {
+				t.Errorf("a half-populated checkpoint must NOT be recorded: %v", payload)
+			}
+		})
+	}
+}
