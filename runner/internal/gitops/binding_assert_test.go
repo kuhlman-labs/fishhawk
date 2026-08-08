@@ -3,6 +3,7 @@ package gitops
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,5 +103,46 @@ func TestErrBindingAssertionUnsatisfiedIsWrappable(t *testing.T) {
 	wrapped := errors.Join(ErrBindingAssertionUnsatisfied, errors.New("detail"))
 	if !errors.Is(wrapped, ErrBindingAssertionUnsatisfied) {
 		t.Error("wrapped error does not match ErrBindingAssertionUnsatisfied")
+	}
+}
+
+// TestBindingAssertionsUnsatisfiedError_Contract pins the typed carrier the
+// #2501 park mechanism keys on: BOTH branches of the single Error() rule
+// (Message verbatim when non-empty, the sentinel text when empty), the
+// errors.Is unwrap that keeps every existing category-B classification working,
+// and errors.As extracting the order-preserving Unsatisfied set with
+// Type/Path/Literal intact.
+func TestBindingAssertionsUnsatisfiedError_Contract(t *testing.T) {
+	unsatisfied := []BindingAssertionResult{
+		{Type: "file_contains", Path: "a.go", Literal: "ALPHA"},
+		{Type: "test_asserts", Path: "b_test.go", Literal: "BETA"},
+	}
+	withMsg := &BindingAssertionsUnsatisfiedError{Unsatisfied: unsatisfied, Message: "full narrative"}
+	if got := withMsg.Error(); got != "full narrative" {
+		t.Errorf("Error() with a Message must return it verbatim, got %q", got)
+	}
+	empty := &BindingAssertionsUnsatisfiedError{Unsatisfied: unsatisfied}
+	if got := empty.Error(); got != ErrBindingAssertionUnsatisfied.Error() {
+		t.Errorf("Error() with an empty Message must return the sentinel text, got %q", got)
+	}
+
+	// errors.Is keeps the existing category-B mapping working through the type.
+	if !errors.Is(error(withMsg), ErrBindingAssertionUnsatisfied) {
+		t.Error("the typed error must unwrap to ErrBindingAssertionUnsatisfied")
+	}
+	// ...including through an outer wrap.
+	if !errors.Is(fmt.Errorf("commit+push: %w", error(withMsg)), ErrBindingAssertionUnsatisfied) {
+		t.Error("a wrapped typed error must still match the sentinel")
+	}
+
+	var extracted *BindingAssertionsUnsatisfiedError
+	if !errors.As(fmt.Errorf("commit+push: %w", error(withMsg)), &extracted) {
+		t.Fatal("errors.As must extract the typed error through a wrap")
+	}
+	if len(extracted.Unsatisfied) != 2 {
+		t.Fatalf("Unsatisfied len = %d, want 2", len(extracted.Unsatisfied))
+	}
+	if extracted.Unsatisfied[0] != unsatisfied[0] || extracted.Unsatisfied[1] != unsatisfied[1] {
+		t.Errorf("Unsatisfied must be order-preserving with fields intact, got %+v", extracted.Unsatisfied)
 	}
 }

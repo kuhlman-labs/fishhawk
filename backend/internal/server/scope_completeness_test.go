@@ -69,16 +69,20 @@ func TestDecideScopeCompleteness_Exempt(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.Decision != "exempt" || resp.State != string(run.StageStateRunning) {
-		t.Errorf("response = %+v, want exempt/running", resp)
+	if resp.Decision != "exempt" || resp.State != string(run.StageStatePending) {
+		t.Errorf("response = %+v, want exempt/pending (#2501: a `running` stage is not dispatch-admissible)", resp)
 	}
 	if resp.HeldCommitSHA != "1111111111111111111111111111111111111111" {
 		t.Errorf("response held_commit_sha = %q, want the parked held commit", resp.HeldCommitSHA)
 	}
 
 	got, _ := rr.GetStage(context.Background(), stage.ID)
-	if got.State != run.StageStateRunning {
-		t.Errorf("stage state = %q, want running (exempt resumes for PR-open, not failure)", got.State)
+	// #2501: the resolved state must be DISPATCH-ADMISSIBLE. host_dispatch.go's
+	// admission switch accepts only {pending, awaiting_host_dispatch}, so the
+	// pre-#2501 `running` transition was a dead end on both runner kinds and no
+	// runner ever spawned to open the held commit's PR.
+	if !dispatchAdmissible(got.State) {
+		t.Errorf("stage state = %q, want a DISPATCH-ADMISSIBLE state (pending / awaiting_host_dispatch)", got.State)
 	}
 	// Zero-re-run at this layer: the decision endpoint must NOT fail the stage
 	// (the full agent-called-once invariant is asserted by the cross-layer
@@ -104,6 +108,79 @@ func TestDecideScopeCompleteness_Exempt(t *testing.T) {
 
 // TestDecideScopeCompleteness_Fail drops the parked stage to category-B
 // (today's restore path) and appends the scope_completeness_failed entry.
+// dispatchAdmissible mirrors host_dispatch.go's admission switch: the states a
+// runner can actually be dispatched from. A stage the exempt decision leaves in
+// any OTHER state can never spawn a runner, which is the #2501 dead end.
+func dispatchAdmissible(st run.StageState) bool {
+	return st == run.StageStatePending || st == run.StageStateAwaitingHostDispatch
+}
+
+// TestDecideScopeCompleteness_ExemptAssertionClassPark pins the SECOND
+// shortfall class (#2501): a park carrying only unsatisfied binding assertions
+// resolves exempt exactly like a missing-scope park, echoes the assertions on
+// the response, and carries them into the exempted audit payload.
+func TestDecideScopeCompleteness_ExemptAssertionClassPark(t *testing.T) {
+	s, rr, au, runRow, stage := scopeCompletenessServer(t)
+	stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
+		HeldCommitSHA:   "1111111111111111111111111111111111111111",
+		RunBranch:       "fishhawk/run-aaa/slice-0",
+		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
+		UnsatisfiedAssertions: []run.UnsatisfiedAssertion{
+			{Type: "file_contains", Path: "backend/internal/run/run.go", Literal: "UnsatisfiedAssertion"},
+		},
+	}
+
+	w := postScopeCompletenessDecision(t, s, runRow.ID,
+		`{"decision":"exempt","reason":"the operator-authored literal was wrong, not the implement output"}`,
+		operatorWriteStages)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var resp scopeCompletenessDecisionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.UnsatisfiedAssertions) != 1 || resp.UnsatisfiedAssertions[0].Literal != "UnsatisfiedAssertion" {
+		t.Errorf("response must echo the exempted assertion shortfall, got %+v", resp.UnsatisfiedAssertions)
+	}
+	if len(resp.MissingPaths) != 0 {
+		t.Errorf("an assertion-class park must echo no missing paths, got %v", resp.MissingPaths)
+	}
+	got, _ := rr.GetStage(context.Background(), stage.ID)
+	if !dispatchAdmissible(got.State) {
+		t.Errorf("stage state = %q, want a DISPATCH-ADMISSIBLE state", got.State)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var payload map[string]any
+	_ = json.Unmarshal(au.appended[0].Payload, &payload)
+	if payload["unsatisfied_assertions"] == nil {
+		t.Errorf("exempted audit payload must carry unsatisfied_assertions, got %v", payload)
+	}
+}
+
+// TestDecideScopeCompleteness_FailIsNotReachableInPending is the operator's
+// added assertion (#2501 binding condition 2): the widened
+// awaiting_scope_decision → pending edge must NOT make a FAIL-decided park
+// reachable in pending. A fail lands the stage FAILED, full stop — otherwise a
+// rejected park could be re-dispatched into the exempt path.
+func TestDecideScopeCompleteness_FailIsNotReachableInPending(t *testing.T) {
+	s, rr, _, runRow, stage := scopeCompletenessServer(t)
+	w := postScopeCompletenessDecision(t, s, runRow.ID,
+		`{"decision":"fail","reason":"the shortfall is load-bearing; re-scope"}`,
+		operatorWriteStages)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	got, _ := rr.GetStage(context.Background(), stage.ID)
+	if got.State != run.StageStateFailed {
+		t.Fatalf("stage state = %q, want failed", got.State)
+	}
+	if dispatchAdmissible(got.State) {
+		t.Errorf("a FAIL-decided park must NOT be reachable in a dispatch-admissible state, got %q", got.State)
+	}
+}
+
 func TestDecideScopeCompleteness_Fail(t *testing.T) {
 	s, rr, au, runRow, stage := scopeCompletenessServer(t)
 

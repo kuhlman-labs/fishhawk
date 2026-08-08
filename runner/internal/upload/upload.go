@@ -1245,6 +1245,14 @@ type ShipPullRequestArgs struct {
 	TreeSHA      string
 	MissingPaths []string
 
+	// UnsatisfiedAssertions carries the SECOND scope_park shortfall class
+	// (#2501): the operator-declared binding assertions the held commit did not
+	// satisfy. Exactly one of MissingPaths / UnsatisfiedAssertions is populated
+	// on a park report (a compound failure never parks — it keeps the category-B
+	// abort). Dropped via omitempty below, so a pure missing-scope park's signed
+	// bytes stay byte-identical to the pre-#2501 body.
+	UnsatisfiedAssertions []BindingAssertionReport
+
 	// ApplyPath carries the near-deterministic fix-up apply provenance (#1165)
 	// for the Outcome=="fixup_pushed" report: "applied" (a clean git-apply of
 	// every routed concern's suggested_patch, no agent), "agent" (no apply-list
@@ -1297,12 +1305,31 @@ type pullRequestChildPushBody struct {
 // / #771 and ScopeExemption / #1229). Kept here so the runner owns the bytes it
 // signs.
 type pullRequestScopeParkBody struct {
-	Outcome      string   `json:"outcome"`
-	Branch       string   `json:"branch"`
-	HeadSHA      string   `json:"head_sha"`
-	BaseSHA      string   `json:"base_sha"`
-	TreeSHA      string   `json:"verified_tree_sha"`
-	MissingPaths []string `json:"missing_paths"`
+	Outcome string `json:"outcome"`
+	Branch  string `json:"branch"`
+	HeadSHA string `json:"head_sha"`
+	BaseSHA string `json:"base_sha"`
+	TreeSHA string `json:"verified_tree_sha"`
+	// MissingPaths carries omitempty (#2501) so an ASSERTION-only park omits the
+	// key entirely rather than shipping `"missing_paths":null`. A missing-scope
+	// park always populates it, so those bodies stay byte-identical.
+	MissingPaths []string `json:"missing_paths,omitempty"`
+	// UnsatisfiedAssertions is the second shortfall class (#2501), appended LAST
+	// and omitempty so a pure missing-scope park's bytes are unchanged.
+	UnsatisfiedAssertions []BindingAssertionReport `json:"unsatisfied_assertions,omitempty"`
+}
+
+// BindingAssertionReport is one unsatisfied operator-declared binding assertion
+// carried on a scope_park report (#2501). The json tags (type/path/literal) are
+// byte-identical to the backend's run.UnsatisfiedAssertion / the server's
+// scope_park decode struct, the runner↔backend wire contract for the
+// assertion-class park — the same independent-struct-by-tag convention as
+// BindingAssertion (#1171) and ScopeExemption (#1229). A tag drift silently
+// empties the park payload the operator reads before deciding.
+type BindingAssertionReport struct {
+	Type    string `json:"type"`
+	Path    string `json:"path"`
+	Literal string `json:"literal"`
 }
 
 // ShipPullRequestResult is what the backend echoes back. Idempotent
@@ -1377,12 +1404,13 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		// than the (absent) PR artifact. The backend records the park payload and
 		// transitions the implement stage to awaiting_scope_decision.
 		marshalled, err := json.Marshal(pullRequestScopeParkBody{
-			Outcome:      args.Outcome,
-			Branch:       args.Branch,
-			HeadSHA:      args.HeadSHA,
-			BaseSHA:      args.BaseSHA,
-			TreeSHA:      args.TreeSHA,
-			MissingPaths: args.MissingPaths,
+			Outcome:               args.Outcome,
+			Branch:                args.Branch,
+			HeadSHA:               args.HeadSHA,
+			BaseSHA:               args.BaseSHA,
+			TreeSHA:               args.TreeSHA,
+			MissingPaths:          args.MissingPaths,
+			UnsatisfiedAssertions: args.UnsatisfiedAssertions,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request scope-park body: %w", err)

@@ -113,11 +113,17 @@ func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 		{StageStateAwaitingInput, StageStateFailed, true},
 		{StageStateAwaitingInput, StageStateCancelled, true},
 		{StageStateAwaitingInput, StageStateDispatched, false}, // resume routes through pending
-		// awaiting_scope_decision → running (exempt resume) | failed (category-B) | cancelled (#1231)
-		{StageStateAwaitingScopeDecision, StageStateRunning, true},    // operator exempted → resume to open the PR from the held commit
-		{StageStateAwaitingScopeDecision, StageStateFailed, true},     // operator failed it → category-B
-		{StageStateAwaitingScopeDecision, StageStateCancelled, true},  // manual halt
-		{StageStateAwaitingScopeDecision, StageStatePending, false},   // never rewinds to a fresh dispatch
+		// awaiting_scope_decision → pending (exempt resume-in-place) | running | failed (category-B) | cancelled (#1231/#2501)
+		{StageStateAwaitingScopeDecision, StageStateRunning, true},   // retained base-table edge (the exempt handler no longer uses it)
+		{StageStateAwaitingScopeDecision, StageStateFailed, true},    // operator failed it → category-B
+		{StageStateAwaitingScopeDecision, StageStateCancelled, true}, // manual halt
+		// #2501: the prior refusal ("never rewinds to a fresh dispatch") held only
+		// while a fresh dispatch MEANT an agent re-run. The prompt response now
+		// carries the exempt held-commit fields, so the re-dispatch is provably
+		// agent-free — and pending is the only state host_dispatch.go's admission
+		// switch accepts, so without this edge no runner ever spawns for an
+		// exempt-resolved park. Mirrors awaiting_input → pending.
+		{StageStateAwaitingScopeDecision, StageStatePending, true},
 		{StageStateAwaitingScopeDecision, StageStateSucceeded, false}, // success only via the runner's PR-open, not the decision
 		{StageStateAwaitingScopeDecision, StageStateDispatched, false},
 		// pending → awaiting_deploy_approval (deploy stage parks pre-execution, ADR-038 / #1384)

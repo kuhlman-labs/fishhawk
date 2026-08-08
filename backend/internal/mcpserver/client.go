@@ -1802,12 +1802,17 @@ func (c *apiClient) IntegrateWave(ctx context.Context, id uuid.UUID) (*Integrate
 // ScopeCompletenessDecisionResult mirrors the backend's scope-completeness
 // decision 200 body (`backend/internal/server/scope_completeness.go` — SLICE
 // 1, #1231): the resolved park record. State is the implement stage's
-// resulting state (running/succeeded on exempt as the held commit's PR opens,
-// failed on a category-B fail). HeldCommitSHA is the exact gate-verified
-// commit the runner pushed to the run branch at park time; PullRequestURL is
-// set only on exempt, when the backend opens the PR from that held commit
-// with NO agent re-invocation. MissingPaths echoes the declared scope paths
-// the #1151 shortfall gate flagged. Repeated here rather than imported — the
+// resulting state: `pending` on exempt (#2501 — the stage resumes in place and
+// the orchestrator re-dispatches it, so the runner opens the held commit's PR
+// with no agent re-run; on a local run it then parks at
+// awaiting_host_dispatch for the operator's spawn), `failed` on a category-B
+// fail. HeldCommitSHA is the exact gate-verified commit the runner pushed to
+// the run branch at park time; PullRequestURL is set only once that
+// re-dispatched runner has opened the PR from that held commit with NO agent
+// re-invocation. MissingPaths echoes the declared scope paths the #1151
+// shortfall gate flagged (empty on an assertion-class park, #2501, whose
+// shortfall is read from the scope_completeness_* audit entry's
+// unsatisfied_assertions). Repeated here rather than imported — the
 // MCP server's apiClient is deliberately a thin local copy (import direction
 // is `cli → backend`, not the reverse). MUST stay byte-identical with the
 // backend handler's response shape.

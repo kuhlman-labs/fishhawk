@@ -17,6 +17,50 @@ import (
 // re-scope/re-plan), the same chain as ErrScopeFilesMissing.
 var ErrBindingAssertionUnsatisfied = errors.New("gitops: declared binding assertion(s) not satisfied by the committed tree")
 
+// BindingAssertionsUnsatisfiedError is the typed carrier for the
+// binding-assertion shortfall (#2501), mirroring *ScopeFilesMissingError
+// field-for-field. Unwrap returns the ErrBindingAssertionUnsatisfied sentinel,
+// so every existing errors.Is(err, ErrBindingAssertionUnsatisfied)
+// classification — including the runner's category-B mapping — keeps working
+// unchanged.
+//
+// The runner returns it from the verifyCommit closure ONLY after every OTHER
+// committed-tree gate (created-out-of-scope, missing-declared-scope-file,
+// compile/test, verified-tree) has already passed, so when CommitAndPush sees
+// it with ParkOnAssertionShortfall set it is provably the SOLE gate failure —
+// the unsatisfied-binding-assertion-ONLY class. That class PARKS for an
+// operator exempt/fail decision rather than failing category-B: CommitAndPush
+// pushes the verified commit to the run branch anyway (so the held commit
+// survives the runner exit and a later exempt resolution can open the PR from
+// it, ADR-035) and surfaces AssertionShortfall instead of aborting. Any
+// compound failure (an unsatisfied assertion + another gate) never reaches this
+// type because the runner's terminal resolver returns an UNTYPED sentinel wrap
+// instead, keeping today's category-B.
+//
+// Error() has ONE rule, byte-identical to ScopeFilesMissingError.Error(): it
+// returns Message VERBATIM when Message is non-empty, and the
+// ErrBindingAssertionUnsatisfied sentinel text when Message is empty.
+type BindingAssertionsUnsatisfiedError struct {
+	// Unsatisfied is the order-preserving list of declared assertions the
+	// committed tree did not satisfy.
+	Unsatisfied []BindingAssertionResult
+	// Message is the full human-readable gate message. Error returns it
+	// verbatim so the runner's failure-report narrative is byte-identical to
+	// the pre-#2501 wrap.
+	Message string
+}
+
+func (e *BindingAssertionsUnsatisfiedError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return ErrBindingAssertionUnsatisfied.Error()
+}
+
+// Unwrap returns the ErrBindingAssertionUnsatisfied sentinel so
+// errors.Is(err, ErrBindingAssertionUnsatisfied) holds for the typed error.
+func (*BindingAssertionsUnsatisfiedError) Unwrap() error { return ErrBindingAssertionUnsatisfied }
+
 // BindingAssertion is one operator-declared deterministic check to evaluate
 // against a committed tree. It mirrors the wire fields the runner decodes from
 // the prompt-response (upload.BindingAssertion); the caller converts so this
