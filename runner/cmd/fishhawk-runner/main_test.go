@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -12243,6 +12244,97 @@ func withFakePROpenerOnly(t *testing.T) *fakePROpener {
 	return fpr
 }
 
+// wireGoldenHeldCommitPath resolves the repo-relative held-commit PR artifact
+// fixture (#2563): ONE file, read by BOTH modules' tests — this package asserts
+// the bytes openHeldCommitPR ships equal it, and backend/internal/server POSTs
+// the SAME file through the real /pull-request handler (real
+// DisallowUnknownFields decode + real validate()). One artifact, two readers, so
+// a runner/backend drift is impossible BY CONSTRUCTION rather than by the
+// byte-identical-literal convention (#2501) that hid THIS bug. #2558 tracks the
+// shared wire package that would make the seam compile-enforced.
+//
+// The path is anchored to THIS test source file via runtime.Caller, NOT to the
+// process cwd: TestMain chdirs every test into a throwaway git repo, so a
+// cwd-relative path would not resolve. runtime.Caller yields
+// <repo>/runner/cmd/fishhawk-runner/main_test.go; three dirs up is the repo
+// root, the same anchor the backend test uses from its own source file.
+func wireGoldenHeldCommitPath(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "held_commit_pr_artifact.json")
+}
+
+// Fixed golden inputs for the held-commit artifact. openHeldCommitPR marshals a
+// map (json.Marshal sorts keys), so these produce deterministic bytes; the
+// backend test asserts the fixture's base_sha equals wireGoldenHeldCommitBaseSHA.
+const (
+	wireGoldenHeldCommitBranch  = "fishhawk/run-46ffa7d4/held"
+	wireGoldenHeldCommitHeadSHA = "1a2b3c4d5e6f70819aabbccddeeff00112233445"
+	wireGoldenHeldCommitBaseSHA = "00ffeeddccbbaa9988776655443322110ffeeddc"
+)
+
+// TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden is the runner half of the
+// cross-module parity seam (#2563). It drives the REAL openHeldCommitPR with
+// fixed inputs and asserts the shipped artifact body is byte-identical to the
+// shared fixture. This is the drift detector: adding a field to (or removing
+// one from) the artifact body map changes these bytes and reddens this test,
+// forcing a fixture regeneration — after which the backend's golden POST test
+// re-decodes the SAME bytes through DisallowUnknownFields and fails if the new
+// field is not a recognized pullRequestBody key. That is the property the
+// two-byte-identical-literals pattern could not enforce.
+//
+// Regenerate the fixture after an intentional body change with
+// FISHHAWK_REGEN_WIRE_GOLDEN=1 go test -run ArtifactBodyMatchesWireGolden.
+func TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden(t *testing.T) {
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Guarantee the fallback PR title/body (no agent-authored file leaks in
+	// from another run), so the produced bytes are deterministic.
+	_ = os.Remove(pullRequestDescriptionPath(verifiedTreeRunID, verifiedTreeStageID))
+	_ = os.Remove(legacyPullRequestDescriptionPath)
+	cfg := config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), cfg,
+		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA,
+		&logSink, fu, issued); code != exitOK {
+		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest not called")
+	}
+	produced := fu.gotPRArgs.Body
+	goldenPath := wireGoldenHeldCommitPath(t)
+
+	if os.Getenv("FISHHAWK_REGEN_WIRE_GOLDEN") == "1" {
+		if werr := os.WriteFile(goldenPath, produced, 0o644); werr != nil {
+			t.Fatalf("regen wire golden: %v", werr)
+		}
+		t.Logf("regenerated %s (%d bytes)", goldenPath, len(produced))
+		return
+	}
+
+	want, rerr := os.ReadFile(goldenPath)
+	if rerr != nil {
+		t.Fatalf("read wire golden %s: %v (regenerate with FISHHAWK_REGEN_WIRE_GOLDEN=1)", goldenPath, rerr)
+	}
+	if !bytes.Equal(produced, want) {
+		t.Errorf("shipped artifact body drifted from the shared wire fixture.\nproduced: %s\ngolden:   %s\n(regenerate intentionally with FISHHAWK_REGEN_WIRE_GOLDEN=1)", produced, want)
+	}
+}
+
 // TestRunVerifyGateCommitted_ReturnsVerifiedTreeSHA: on a pass the single-shot
 // gate returns the throwaway commit's tree object hash (#960) and stamps the
 // verify_run event with tree_sha. The returned hash must equal the tree of an
@@ -13100,7 +13192,7 @@ func TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent(t *testing.T) {
 		backendURL: "https://api.fishhawk.test",
 	}
 	var logSink strings.Builder
-	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", &logSink, fu, issued); code != exitOK {
+	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "cafef00ddeadbeef", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil {
@@ -13115,6 +13207,7 @@ func TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent(t *testing.T) {
 	}
 	var artifact struct {
 		HeadSHA string `json:"head_sha"`
+		BaseSHA string `json:"base_sha"`
 		Branch  string `json:"branch"`
 	}
 	if uerr := json.Unmarshal(fu.gotPRArgs.Body, &artifact); uerr != nil {
@@ -13122,6 +13215,11 @@ func TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent(t *testing.T) {
 	}
 	if artifact.HeadSHA != "deadbeefcafef00d" {
 		t.Errorf("opened-PR artifact head = %q, want the held commit SHA", artifact.HeadSHA)
+	}
+	// #2563: the artifact must carry base_sha (the backend's success-arm
+	// validate() requires it) sourced from the exempt resolution's base SHA.
+	if artifact.BaseSHA != "cafef00ddeadbeef" {
+		t.Errorf("opened-PR artifact base_sha = %q, want the exempt base SHA", artifact.BaseSHA)
 	}
 }
 
@@ -13143,8 +13241,9 @@ func TestOpenHeldCommitPR_MissingHeldFields_ReportsFailure(t *testing.T) {
 		backendURL: "https://api.fishhawk.test",
 	}
 	var logSink strings.Builder
-	// held SHA / branch deliberately empty → fail-closed.
-	if code := openHeldCommitPR(context.Background(), cfg, "", "", &logSink, fu, issued); code != exitFailure {
+	// held SHA / branch deliberately empty → fail-closed (base SHA present so
+	// the RED lands on the branch/SHA guard, not the #2563 base-SHA guard).
+	if code := openHeldCommitPR(context.Background(), cfg, "", "", "cafef00ddeadbeef", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("missing held fields must fail, exit = %d", code)
 	}
 	if fpr.gotArgs != nil {
@@ -13152,6 +13251,58 @@ func TestOpenHeldCommitPR_MissingHeldFields_ReportsFailure(t *testing.T) {
 	}
 	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" {
 		t.Errorf("must report a failed outcome so the stage lands failed, got: %+v", fu.gotPRArgs)
+	}
+}
+
+// TestOpenHeldCommitPR_MissingBaseSHAOpensNoPR is the #2563 no-orphan guard: an
+// exempt dispatch that reaches openHeldCommitPR with a populated held
+// branch/SHA but an EMPTY base SHA must refuse BEFORE calling the forge — a
+// category-C failure report and, crucially, NO PR opened. The base SHA is
+// supplied empty BY CONSTRUCTION (the argument is ""), never by invoking the
+// guard in the test's own setup. The load-bearing assertion is on the fake PR
+// opener's recorded calls AFTER the call returns: "no orphan" is committed
+// external state (a PR on the forge), so an error-identity check alone would
+// pass for the wrong reason (a control that fired-then-rolled-back returns a
+// byte-identical error). See #2562: the live bug left PR #2562 open behind a
+// failed stage precisely because no such guard existed.
+func TestOpenHeldCommitPR_MissingBaseSHAOpensNoPR(t *testing.T) {
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+	}
+	var logSink strings.Builder
+	// held branch + SHA present, base SHA empty by construction → the #2563
+	// no-orphan guard must fire.
+	code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "", &logSink, fu, issued)
+
+	// THE load-bearing assertion, and it is FIRST and non-fatal so nothing masks
+	// it: no PR was opened on the forge (committed external state, read AFTER the
+	// call returns). This is what the operator's condition (b) demands — an
+	// error/exit check alone would pass for the wrong reason against a real
+	// backend, where the ship (not the guard) would fail category-B AFTER the PR
+	// is already open, orphaning it (#2562). Deleting the guard reddens THIS line.
+	if fpr.gotArgs != nil {
+		t.Errorf("no PR may be opened when the base SHA is absent, but OpenPR was called: %+v", fpr.gotArgs)
+	}
+	// Secondary: the guard refuses before the forge, so no success ship either.
+	if code != exitFailure {
+		t.Errorf("missing base SHA must fail, exit = %d\n%s", code, logSink.String())
+	}
+	// The failure is reported category C (retryable) naming the missing field.
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "failed" || fu.gotPRArgs.Category != "C" {
+		t.Errorf("must report a category-C failed outcome, got: %+v", fu.gotPRArgs)
+	}
+	if !strings.Contains(logSink.String(), "held_commit_base_sha") {
+		t.Errorf("failure reason must name held_commit_base_sha:\n%s", logSink.String())
 	}
 }
 
@@ -16888,7 +17039,10 @@ func TestRun_NoDiffCoverage_EmitsNoEvent(t *testing.T) {
 // change forces an edit to the backend copy, and this copy then fails to
 // decode, so the drift surfaces in the RUNNER test rather than only in a
 // backend assertion.
-const goldenExemptPromptJSON = `{"held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
+//
+// held_commit_base_sha (#2563) is the fourth exempt field; it sorts first in
+// the map-marshalled backend projection.
+const goldenExemptPromptJSON = `{"held_commit_base_sha":"3333333333333333333333333333333333333333","held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
 
 // TestGoldenExemptPrompt_DecodesIntoFetchedPrompt is the runner half of the
 // #2501 cross-module seam: the exact bytes the backend emits for an
@@ -16907,6 +17061,11 @@ func TestGoldenExemptPrompt_DecodesIntoFetchedPrompt(t *testing.T) {
 	}
 	if fp.HeldCommitBranch != "fishhawk/run-11112222/stage-99990000" {
 		t.Errorf("held_commit_branch = %q", fp.HeldCommitBranch)
+	}
+	// #2563: the fourth exempt field must decode too — without it the runner's
+	// no-orphan guard refuses the resume.
+	if fp.HeldCommitBaseSHA != "3333333333333333333333333333333333333333" {
+		t.Errorf("held_commit_base_sha = %q", fp.HeldCommitBaseSHA)
 	}
 }
 
@@ -16991,10 +17150,14 @@ func TestAssertionShortfall_ParksThenExemptOpensPRWithNoAgentReRun(t *testing.T)
 		Prompt:     "unused — the exempt path never reads it",
 		PromptHash: "deadbeef",
 		// Decoded from the golden; only the SHA is swapped for phase 1's REAL
-		// held commit so the two phases are genuinely chained.
+		// held commit so the two phases are genuinely chained. The base SHA
+		// (#2563) is what the backend's resolveHeldCommitExemption resolves from
+		// the park; here it is supplied directly so the runner's no-orphan guard
+		// is satisfied and the artifact ships it.
 		OpenPRFromHeldCommit: golden.OpenPRFromHeldCommit,
 		HeldCommitBranch:     golden.HeldCommitBranch,
 		HeldCommitSHA:        heldSHA,
+		HeldCommitBaseSHA:    golden.HeldCommitBaseSHA,
 	}
 	withFakeUploader(t, fu2)
 
@@ -17024,12 +17187,18 @@ func TestAssertionShortfall_ParksThenExemptOpensPRWithNoAgentReRun(t *testing.T)
 	}
 	var artifact struct {
 		HeadSHA string `json:"head_sha"`
+		BaseSHA string `json:"base_sha"`
 	}
 	if uerr := json.Unmarshal(fu2.gotPRArgs.Body, &artifact); uerr != nil {
 		t.Fatalf("phase 2: decode artifact: %v", uerr)
 	}
 	if artifact.HeadSHA != heldSHA {
 		t.Errorf("phase 2: opened-PR artifact head = %q, want phase 1's held SHA %q", artifact.HeadSHA, heldSHA)
+	}
+	// #2563: the exempt resume must ship the base SHA it was handed — the
+	// artifact the backend's success-arm validate() requires.
+	if artifact.BaseSHA != golden.HeldCommitBaseSHA {
+		t.Errorf("phase 2: opened-PR artifact base_sha = %q, want the exempt base SHA %q", artifact.BaseSHA, golden.HeldCommitBaseSHA)
 	}
 }
 

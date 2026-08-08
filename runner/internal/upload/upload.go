@@ -539,6 +539,17 @@ type FetchedPrompt struct {
 	// Non-empty only when OpenPRFromHeldCommit is true. The runner opens the PR
 	// with this branch as head.
 	HeldCommitBranch string `json:"held_commit_branch,omitempty"`
+	// HeldCommitBaseSHA is the base commit the held commit was built on (#2563).
+	// Non-empty only when OpenPRFromHeldCommit is true. The runner ships it as
+	// the pull-request artifact's base_sha, which the backend's success-arm
+	// validate() REQUIRES — without it the exempt resume opens the PR and then
+	// always fails category-B, orphaning the PR (#2562). When this is empty on an
+	// exempt dispatch the runner refuses the resume BEFORE calling the forge
+	// (category-C, no orphaned PR) rather than opening one it cannot ship. The
+	// wire tag (held_commit_base_sha) is byte-identical to the backend's
+	// prompt-response promptResponse.HeldCommitBaseSHA — the same cross-module
+	// convention as the three exempt fields above.
+	HeldCommitBaseSHA string `json:"held_commit_base_sha,omitempty"`
 	// EgressTargetHosts is the acceptance stage's full spec-declared
 	// egress.target_hosts list (E31.4 / #1532 grammar), served ONLY on
 	// acceptance-stage prompt responses (E31.7 / #1535). It is the

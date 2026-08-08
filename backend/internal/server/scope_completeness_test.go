@@ -498,6 +498,13 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 		t.Fatalf("persisted park = %+v, want the held commit + one unsatisfied assertion",
 			parked.ScopeCompletenessPark)
 	}
+	// #2563: the base SHA the runner reported must persist on the park (the
+	// value the exempt resume ships as the artifact's base_sha), proven through
+	// the real JSONB write/read — this is what makes every park recorded from
+	// now on resumable without the audit fallback.
+	if got := parked.ScopeCompletenessPark.BaseSHA; got != "3333333333333333333333333333333333333333" {
+		t.Errorf("persisted park base_sha = %q, want the reported base SHA", got)
+	}
 
 	// (3) The operator exempts it through the real decision handler.
 	dw := postScopeCompletenessDecision(t, s, realRun.ID,
