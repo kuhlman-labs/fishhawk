@@ -134,6 +134,57 @@ func TestGetRun_EchoesWorkingDir(t *testing.T) {
 	}
 }
 
+// TestGetRun_EchoesPredictedRuntimeMinutes asserts GET /v0/runs/{id} projects
+// the stamped predicted_runtime_minutes (E48.62 / #2489) onto the read surface,
+// and omits it (omitempty) for an unstamped run.
+//
+// This is the WIRE-KEY assertion, not a struct-field one: the MCP client
+// decodes this exact response body, and a json-tag typo on either side would
+// pass every per-layer unit test while the feature silently read zero in
+// production. So the raw body is searched for the literal key, not just the
+// decoded field.
+func TestGetRun_EchoesPredictedRuntimeMinutes(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+
+	seeded, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	// The value is stamped at plan approval, not at create, so seed it
+	// directly onto the row the read path returns.
+	seeded.PredictedRuntimeMinutes = 115
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", seeded.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"predicted_runtime_minutes":115`) {
+		t.Errorf("body missing the predicted_runtime_minutes wire key: %s", w.Body.String())
+	}
+	var resp runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.PredictedRuntimeMinutes != 115 {
+		t.Errorf("PredictedRuntimeMinutes = %d, want 115", resp.PredictedRuntimeMinutes)
+	}
+
+	// An unstamped run omits the field (omitempty) — the legacy / pre-approval
+	// state the MCP derivation reads as zero and handles with its elapsed
+	// fallback.
+	plain, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", plain.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), "predicted_runtime_minutes") {
+		t.Errorf("unstamped run body should omit predicted_runtime_minutes: %s", w.Body.String())
+	}
+}
+
 // TestGetRun_EchoesRunnerKindResolved asserts GET /v0/runs/{id} projects the
 // run's runner_kind_resolved lock flag (#1346/#1348/#1355) onto the read
 // surface, always present (false for legacy/un-resolved rows) so the

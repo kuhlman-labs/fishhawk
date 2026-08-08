@@ -1030,6 +1030,14 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 		// failure logs and never unwinds the approval; a plan with no marked
 		// criterion no-ops.
 		s.fileOrLinkLiveValidationWalk(ctx, advanced)
+		// On-approval predicted-runtime stamp (E48.62 / #2489): cache the
+		// approved plan's predicted_runtime_minutes onto the run row so the
+		// MCP surface can derive its advertised stage-wait poll cadence from
+		// a plain column instead of an artifact fetch per status read.
+		// Best-effort like the three above — a failure logs and never unwinds
+		// the approval the gate already recorded; a plan with no prediction
+		// (or a RunRepo that does not implement the setter) no-ops.
+		s.recordPlanPredictedRuntime(ctx, advanced)
 	}
 
 	// Plan-comment re-render (#377): a plan-stage approve or reject re-fires
@@ -1258,6 +1266,65 @@ func campaignOperatorIdentity() Identity {
 		Subject: operatorrole.CampaignActorSubject,
 		TokenID: "operator-agent-campaign",
 		Scopes:  operatorrole.CampaignActorScopes(),
+	}
+}
+
+// runPredictionRecorder is the narrow OPTIONAL capability the on-approval
+// predicted-runtime stamp (E48.62 / #2489) needs from the wired RunRepo. It is
+// declared here, at the CONSUMER, and type-asserted at runtime — the exact
+// pattern runCostRecorder (trace.go) already uses for AddRunCost.
+//
+// Deliberately NOT a method on run.Repository. The interface is implemented by
+// two dozen test doubles across webhook, childcompletion, dispatchwatchdog,
+// reactionpoller, orchestrator and internal/server, none of which stamp or read
+// a prediction; widening it would force a no-op stub into every one of them for
+// a value nothing gates on. The concrete *postgresRepo carries the setter and
+// the assertion finds it; a Config wired with a repo that lacks it silently
+// records nothing and the advertised cadence falls back to the elapsed-based
+// branch.
+type runPredictionRecorder interface {
+	SetRunPredictedRuntimeMinutes(ctx context.Context, runID uuid.UUID, minutes int) (*run.Run, error)
+}
+
+// recordPlanPredictedRuntime caches the approved plan's
+// predicted_runtime_minutes onto the run row after a plan-gate approval
+// (E48.62 / #2489), so the MCP stage-wait poll cadence derives from a plain
+// column instead of an artifact fetch per status read.
+//
+// Best-effort throughout — it runs in the same post-advance neighbourhood as
+// recordDrivePlanApproved / fileSplitProposalChildren, so it must never unwind
+// an approval the gate already recorded. It no-ops when: no RunRepo is wired,
+// the wired RunRepo does not satisfy runPredictionRecorder, the approved plan
+// cannot be loaded (or the artifact subsystem is unwired, which yields a nil
+// plan), or the plan carries a non-positive prediction. A setter failure logs
+// at WARN and returns.
+func (s *Server) recordPlanPredictedRuntime(ctx context.Context, stage *run.Stage) {
+	if s.cfg.RunRepo == nil {
+		return
+	}
+	recorder, ok := s.cfg.RunRepo.(runPredictionRecorder)
+	if !ok {
+		return
+	}
+	approvedPlan, err := s.loadApprovedPlanForRun(ctx, stage.RunID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"predicted-runtime stamp: load approved plan failed",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if approvedPlan == nil || approvedPlan.PredictedRuntimeMinutes <= 0 {
+		return
+	}
+	if _, err := recorder.SetRunPredictedRuntimeMinutes(ctx, stage.RunID, approvedPlan.PredictedRuntimeMinutes); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"predicted-runtime stamp failed",
+			slog.String("run_id", stage.RunID.String()),
+			slog.Int("predicted_runtime_minutes", approvedPlan.PredictedRuntimeMinutes),
+			slog.String("error", err.Error()),
+		)
 	}
 }
 

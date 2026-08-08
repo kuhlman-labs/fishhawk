@@ -329,7 +329,7 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	// delegating run (release.IsRelease false) skips this and reaches the deploy
 	// arm unchanged. Display-only — like every other arm it never gates the run.
 	if release.IsRelease {
-		if a := releaseStageNextActions(run, release); a != nil {
+		if a := releaseStageNextActions(run, release, stageByType(stages, "deploy")); a != nil {
 			return a
 		}
 	}
@@ -347,6 +347,11 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	if len(stages) == 0 {
 		return &NextActions{
 			State: "stages_pending",
+			// The bare FLOOR, not the derived cadence (E48.62 / #2489): no
+			// stage row exists yet, so there is no started_at to derive
+			// elapsed from and nothing has begun consuming the prediction.
+			// Polling tightly is correct — the caller is waiting for the
+			// stages to materialize, which is a sub-second event.
 			Actions: []SuggestedAction{pollAction(run,
 				suggestedStageWaitPollIntervalSeconds,
 				"the run has no stage rows yet — re-poll until the stages materialize")},
@@ -365,7 +370,7 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 		return &NextActions{
 			State: "plan_running",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, plan),
 				"the plan stage is executing — re-poll until plan_stage_wait_status goes terminal")},
 		}
 	case "awaiting_input":
@@ -435,11 +440,11 @@ func planStageNextActions(run *Run, plan *Stage, planReviewStatus *ReviewStatus)
 		return &NextActions{
 			State: "plan_dispatched",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, plan),
 				"the plan stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until plan_stage_wait_status goes terminal")},
 		}
 	default: // pending | awaiting_host_dispatch | awaiting_children
-		return &NextActions{State: "plan_pending", Actions: dispatchOrPollActions(run, "plan")}
+		return &NextActions{State: "plan_pending", Actions: dispatchOrPollActions(run, "plan", plan)}
 	}
 }
 
@@ -459,14 +464,14 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 		// pending and awaiting_host_dispatch (#1912) both await a host spawn — the
 		// operator host dispatches. Post-#1912 'dispatched' is a distinct state (a
 		// spawn attempt exists), routed to poll-only below.
-		return &NextActions{State: "implement_pending", Actions: dispatchOrPollActions(run, "implement")}
+		return &NextActions{State: "implement_pending", Actions: dispatchOrPollActions(run, "implement", impl)}
 	case "dispatched":
 		// A spawn attempt exists (#1912) — a runner is in flight. Poll rather than
 		// offering a dispatch that would double-drive the stage.
 		return &NextActions{
 			State: "implement_dispatched",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, impl),
 				"the implement stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until implement_stage_wait_status goes terminal (fishhawk_drive_run auto-re-dispatches a probed-dead runner; a live-but-unregistered process stops for inspection with NO re-dispatch, and only an unprobeable/UNKNOWN result — pgrep unavailable — hands back a manual re-dispatch)")},
 		}
 	case "awaiting_children":
@@ -481,7 +486,7 @@ func implementStageNextActions(run *Run, impl, acceptance *Stage, implementRevie
 		return &NextActions{
 			State: "implement_running",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, impl),
 				"the implement stage is executing — re-poll until implement_stage_wait_status goes terminal")},
 		}
 	case "awaiting_scope_decision":
@@ -585,7 +590,7 @@ func deployStageNextActions(run *Run, deploy *Stage) *NextActions {
 		return &NextActions{
 			State: "deploy_in_flight",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, deploy),
 				"the deploy intent was approved and the external pipeline is running — the backend deployreconciler is polling it to terminal; re-poll until the deploy stage settles")},
 		}
 	case "dispatched", "running":
@@ -594,7 +599,7 @@ func deployStageNextActions(run *Run, deploy *Stage) *NextActions {
 		return &NextActions{
 			State: "deploy_in_flight",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, deploy),
 				"the deploy stage is advancing through the backend toward the external pipeline — re-poll until it settles")},
 		}
 	default: // pending
@@ -605,7 +610,7 @@ func deployStageNextActions(run *Run, deploy *Stage) *NextActions {
 		return &NextActions{
 			State: "deploy_initializing",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, deploy),
 				"the deploy stage has not yet parked at its pre-execution approval gate — re-poll until it reaches awaiting_deploy_approval (the backend parks it at creation)")},
 		}
 	}
@@ -660,7 +665,7 @@ type releaseSignals struct {
 // delegating posture, called out in the awaiting_cut reason. States are checked
 // most-advanced-first so the freshest signal wins. Every arm carries >= 1
 // action, so the arm never returns an empty list.
-func releaseStageNextActions(run *Run, sig releaseSignals) *NextActions {
+func releaseStageNextActions(run *Run, sig releaseSignals, deploy *Stage) *NextActions {
 	switch {
 	case sig.Published:
 		// The notes are live on the GitHub Release (a release_published audit
@@ -668,7 +673,7 @@ func releaseStageNextActions(run *Run, sig releaseSignals) *NextActions {
 		return &NextActions{
 			State: "published",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, deploy),
 				"the release notes are published to the GitHub Release (a release_published audit entry exists) — the release loop is complete; re-poll until the run resolves")},
 		}
 	case sig.Cut && deployInFlight(sig.DeployState):
@@ -678,7 +683,7 @@ func releaseStageNextActions(run *Run, sig releaseSignals) *NextActions {
 		return &NextActions{
 			State: "pipeline_running",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, deploy),
 				"the version is cut and the release tag was pushed (a human git action); the external release pipeline is running (deploy stage in flight) — re-poll until it settles, then publish the notes")},
 		}
 	case sig.Cut:
@@ -754,6 +759,11 @@ func awaitingChildrenActions(run *Run) []SuggestedAction {
 			Consumes:     consumesNone,
 			Reason:       "fan out ALL still-pending decomposed children concurrently (idempotent: in-flight and terminal children are left untouched); a child failure is data, not an error",
 		},
+		// The bare FLOOR, not the derived cadence (E48.62 / #2489): this arm
+		// holds no stage of its own (the parent's implement stage is parked,
+		// and the interesting progress is on the CHILD runs, each carrying
+		// its own prediction and its own elapsed). Deriving from the parked
+		// parent would advertise a cadence for the wrong thing.
 		pollAction(run, suggestedStageWaitPollIntervalSeconds,
 			"the parent is awaiting_children — re-poll and read the children_status block for each child's live state and the fan-in/integration phase (running_children, ready_to_integrate, integrated, or integration_conflict)"),
 	}
@@ -998,10 +1008,14 @@ func ciFailedNextActions(run *Run, stages []Stage, hint *ReviewActionHint) *Next
 // identically (ADR-037), so defaulting implement to dispatch has no
 // downside (#1247). The plan stage (no amendments) keeps the single
 // run_stage action unchanged.
-func dispatchOrPollActions(run *Run, stageType string) []SuggestedAction {
+// stage is the pending stage the actions are for; it supplies the started_at
+// the poll cadence is derived from (E48.62 / #2489). Pass nil when no stage row
+// is in hand — the derivation then yields the floor, which is the honest answer
+// for something that has not started.
+func dispatchOrPollActions(run *Run, stageType string, stage *Stage) []SuggestedAction {
 	if run.RunnerKind == "github_actions" {
 		return []SuggestedAction{pollAction(run,
-			suggestedStageWaitPollIntervalSeconds,
+			derivedStageWaitPollInterval(run, stage),
 			fmt.Sprintf("runner_kind github_actions auto-dispatches the %s stage — nothing to run from the operator host; re-poll until it starts", stageType))}
 	}
 	if stageType == "implement" {
@@ -1088,7 +1102,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 			return &NextActions{
 				State: "acceptance_running",
 				Actions: []SuggestedAction{pollAction(run,
-					suggestedStageWaitPollIntervalSeconds,
+					derivedStageWaitPollInterval(run, acceptance),
 					"the acceptance stage is validating the change against the running preview — re-poll until acceptance_stage_wait_status goes terminal, then read the acceptance_outcome_recorded verdict")},
 			}
 		}
@@ -1098,12 +1112,12 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 			return &NextActions{
 				State: "acceptance_dispatched",
 				Actions: []SuggestedAction{pollAction(run,
-					suggestedStageWaitPollIntervalSeconds,
+					derivedStageWaitPollInterval(run, acceptance),
 					"the acceptance stage is dispatched — a spawn attempt exists (#1912) and a runner is in flight; re-poll until acceptance_stage_wait_status goes terminal")},
 			}
 		}
 		// pending | awaiting_host_dispatch (#1912): the operator host dispatches.
-		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance")}
+		return &NextActions{State: "acceptance_pending", Actions: dispatchOrPollActions(run, "acceptance", acceptance)}
 	}
 
 	// E38.3 / #1877: a succeeded verdict-less acceptance stage that carries the
@@ -1178,7 +1192,7 @@ func acceptanceStageNextActions(run *Run, acceptance *Stage, skippedOutOfScope, 
 		return &NextActions{
 			State: "acceptance_triage_rerouting",
 			Actions: []SuggestedAction{pollAction(run,
-				suggestedStageWaitPollIntervalSeconds,
+				derivedStageWaitPollInterval(run, acceptance),
 				"the acceptance verdict failed and deterministic server-side triage auto-routed it (fixup_dispatched re-opens implement; retry_dispatched re-opens acceptance) — re-poll; the re-opened stage's dispatch arm serves the next move. On the local runner an auto-routed re-open never spawns the runner, so fishhawk_dispatch_stage the re-opened implement (after fixup_dispatched) or acceptance (after retry_dispatched) stage")},
 		}
 	default:
@@ -1213,7 +1227,7 @@ func acceptanceOutcomeUnknownActions(run *Run, acceptance *Stage) *NextActions {
 				Consumes:     consumesNone,
 				Reason:       "re-open the settled-outcome-unknown acceptance stage for a re-run (operator token only): the reopen lands the stage in pending, so on the local runner the acceptance_pending arm's fishhawk_dispatch_stage then spawns the actual re-run",
 			},
-			pollAction(run, suggestedStageWaitPollIntervalSeconds,
+			pollAction(run, derivedStageWaitPollInterval(run, acceptance),
 				"re-poll fishhawk_get_run_status with a larger audit_limit to surface the acceptance_outcome_recorded / acceptance_triage_decided entries"),
 		},
 	}
@@ -1434,7 +1448,14 @@ func unclassifiedNextActions(run *Run, stages []Stage) *NextActions {
 	return &NextActions{
 		State: "unclassified",
 		Actions: []SuggestedAction{
-			pollAction(run, suggestedStageWaitPollIntervalSeconds,
+			// Derived from whichever stage is still live (E48.62 / #2489). The
+			// arm has no ONE stage by definition, but an unclassified run is
+			// still making progress somewhere, and advertising a flat 30s here
+			// while every classified arm widens would be the visible
+			// contradiction this parity pass exists to remove. Falls back to
+			// the floor when every stage is terminal (firstNonTerminalStage
+			// returns nil).
+			pollAction(run, derivedStageWaitPollInterval(run, firstNonTerminalStage(stages)),
 				desc+" did not match the next-actions state table — re-poll while the run settles"),
 			{
 				Action:       "file_product_issue",
@@ -1511,6 +1532,19 @@ func prParams(run *Run) map[string]string {
 		return nil
 	}
 	return map[string]string{"pr_url": *run.PullRequestURL}
+}
+
+// firstNonTerminalStage returns the first stage that can still make progress,
+// or nil when every stage is terminal. Used by the unclassified fallback arm
+// (E48.62 / #2489), which has no single stage of its own but should still
+// advertise a cadence derived from whatever is actually still running.
+func firstNonTerminalStage(stages []Stage) *Stage {
+	for i := range stages {
+		if !stageStateIsTerminal(stages[i].State) {
+			return &stages[i]
+		}
+	}
+	return nil
 }
 
 // stageByType returns the first stage of the given type, or nil.

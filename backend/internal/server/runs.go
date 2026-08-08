@@ -95,9 +95,18 @@ type runResponse struct {
 	// (omitempty) for a run with no binding — a github_actions run, or a
 	// legacy row that predates the column. The MCP client mirror decodes
 	// this field; the json tag MUST byte-match its counterpart.
-	WorkingDir string    `json:"working_dir,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	WorkingDir string `json:"working_dir,omitempty"`
+	// PredictedRuntimeMinutes echoes the approved plan's
+	// predicted_runtime_minutes, stamped onto the run row at plan approval
+	// (E48.62 / #2489). Omitted (omitempty) when unstamped: a legacy row, or
+	// a run whose plan has not been approved yet. Advisory — the MCP surface
+	// derives its advertised stage-wait poll cadence from it and nothing
+	// gates on it. The MCP client mirror decodes this field; the json tag
+	// MUST byte-match its counterpart or the cadence silently degrades to the
+	// elapsed-based fallback with no error.
+	PredictedRuntimeMinutes int       `json:"predicted_runtime_minutes,omitempty"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
 	// Concerns is the run's OPEN review-concern summary (#964): count,
 	// per-state breakdown, and the stable IDs fishhawk_fixup_stage's
 	// concern_ids addressing needs. Populated by handleGetRun ONLY —
@@ -500,27 +509,28 @@ type issueCommentPayload struct {
 
 func toRunResponse(r *run.Run) runResponse {
 	resp := runResponse{
-		ID:                 r.ID,
-		Repo:               r.Repo,
-		WorkflowID:         r.WorkflowID,
-		WorkflowSHA:        r.WorkflowSHA,
-		TriggerSource:      string(r.TriggerSource),
-		TriggerRef:         r.TriggerRef,
-		State:              string(r.State),
-		ParentRunID:        r.ParentRunID,
-		DecomposedFrom:     r.DecomposedFrom,
-		UpstreamRunID:      r.UpstreamRunID,
-		PullRequestURL:     r.PullRequestURL,
-		RetryAttempt:       r.RetryAttempt,
-		MaxRetriesSnapshot: r.MaxRetriesSnapshot,
-		RunnerKind:         r.RunnerKind,
-		RunnerKindResolved: r.RunnerKindResolved,
-		Drive:              r.Drive,
-		CostUSDTotal:       r.CostUSDTotal,
-		ResolvedModel:      r.ResolvedModel,
-		WorkingDir:         r.WorkingDir,
-		CreatedAt:          r.CreatedAt,
-		UpdatedAt:          r.UpdatedAt,
+		ID:                      r.ID,
+		Repo:                    r.Repo,
+		WorkflowID:              r.WorkflowID,
+		WorkflowSHA:             r.WorkflowSHA,
+		TriggerSource:           string(r.TriggerSource),
+		TriggerRef:              r.TriggerRef,
+		State:                   string(r.State),
+		ParentRunID:             r.ParentRunID,
+		DecomposedFrom:          r.DecomposedFrom,
+		UpstreamRunID:           r.UpstreamRunID,
+		PullRequestURL:          r.PullRequestURL,
+		RetryAttempt:            r.RetryAttempt,
+		MaxRetriesSnapshot:      r.MaxRetriesSnapshot,
+		RunnerKind:              r.RunnerKind,
+		RunnerKindResolved:      r.RunnerKindResolved,
+		Drive:                   r.Drive,
+		CostUSDTotal:            r.CostUSDTotal,
+		ResolvedModel:           r.ResolvedModel,
+		WorkingDir:              r.WorkingDir,
+		PredictedRuntimeMinutes: r.PredictedRuntimeMinutes,
+		CreatedAt:               r.CreatedAt,
+		UpdatedAt:               r.UpdatedAt,
 	}
 	if r.IssueContext != nil {
 		resp.IssueContext = &issueContextPayload{

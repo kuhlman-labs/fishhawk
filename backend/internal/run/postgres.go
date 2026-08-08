@@ -372,6 +372,38 @@ func (r *postgresRepo) AddRunCost(ctx context.Context, id uuid.UUID, deltaUSD fl
 	return rowToRun(row), nil
 }
 
+// SetRunPredictedRuntimeMinutes stamps the approved plan's
+// predicted_runtime_minutes onto the run row (E48.62 / #2489). The MCP
+// surface derives its advertised stage-wait poll cadence from it, so caching
+// the prediction as a plain column spares every status read an artifact
+// fetch.
+//
+// Like AddRunCost above, deliberately NOT part of the run.Repository
+// interface: the approval handler consumes it through an optional capability
+// assertion (runPredictionRecorder in internal/server/approvals.go), so the
+// two dozen test fakes that neither stamp nor read a prediction need no stub.
+//
+// NOT check-then-write, and deliberately not a conditional UPDATE. The value
+// is derived solely from the IMMUTABLE approved plan artifact, so a
+// re-approval writes the same bytes: there is no observed-then-written state
+// to race and a concurrent second caller cannot lose an update that differed.
+// A reviewer can check that property against the artifact's immutability
+// rather than re-deriving it from the UPDATE's isolation level.
+func (r *postgresRepo) SetRunPredictedRuntimeMinutes(ctx context.Context, id uuid.UUID, minutes int) (*Run, error) {
+	q := rundb.New(r.pool)
+	row, err := q.SetRunPredictedRuntimeMinutes(ctx, rundb.SetRunPredictedRuntimeMinutesParams{
+		ID:                      id,
+		PredictedRuntimeMinutes: int32(minutes), //nolint:gosec // plan-validated minute count; never near int32 range
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("set run predicted runtime minutes: %w", err)
+	}
+	return rowToRun(row), nil
+}
+
 // SumWorkflowCostInRange sums runs.cost_usd_total across every run of
 // one workflow in a repo whose created_at falls in the half-open
 // calendar period [from, to) (ADR-030 advisory budgets, #688). The
@@ -902,6 +934,13 @@ func rowToRun(r rundb.Run) *Run {
 	// path. This is UNLIKE AccountID above, which only GetRun / ListRuns select
 	// and the other queries leave "".
 	out.WorkingDir = r.WorkingDir
+	// PredictedRuntimeMinutes rides the same single shared row mapper (E48.62
+	// / #2489): every Run-returning sqlc query carries
+	// predicted_runtime_minutes in its RETURNING/SELECT list and scans it, so
+	// the stamped prediction is populated on every read path (GetRun,
+	// ListRuns, GetRunByIdempotencyKey, LockRunForUpdate, and the Update* /
+	// AddRunCost / SetRun* set). 0 is the unstamped state, not an error.
+	out.PredictedRuntimeMinutes = int(r.PredictedRuntimeMinutes)
 	return out
 }
 
