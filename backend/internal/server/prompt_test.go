@@ -8942,6 +8942,17 @@ func exemptPromptKeys(t *testing.T, park *run.ScopeCompletenessPark, entries []*
 func exemptPromptKeysWithAudit(t *testing.T, park *run.ScopeCompletenessPark,
 	auditFor func(stageID uuid.UUID) audit.Repository) map[string]json.RawMessage {
 	t.Helper()
+	s, runID, stageID, priv := exemptPromptFixture(t, park, auditFor)
+	return exemptBodyKeys(t, promptRequest(t, s, runID, stageID, priv, ""), "/prompt")
+}
+
+// exemptPromptFixture builds the implement-stage server both emission-gate
+// surfaces drive: the signed runner-facing /prompt endpoint and the unsigned
+// SPA-readable /prompt-render endpoint. Shared so the two surfaces are proven
+// against the SAME park + audit state rather than two hand-built ones.
+func exemptPromptFixture(t *testing.T, park *run.ScopeCompletenessPark,
+	auditFor func(stageID uuid.UUID) audit.Repository) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+	t.Helper()
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
 	runID := uuid.New()
@@ -8959,16 +8970,61 @@ func exemptPromptKeysWithAudit(t *testing.T, park *run.ScopeCompletenessPark,
 	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, ScopeCompletenessPark: park}
 	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, AuditRepo: au})
 	s.promptIssueGetterOverride = &stubIssueGetter{issue: &githubclient.Issue{Number: 42, Title: "t", Body: "b", State: "open"}}
+	return s, runID, stageID, priv
+}
 
-	w := promptRequest(t, s, runID, stageID, priv, "")
+func exemptBodyKeys(t *testing.T, w *httptest.ResponseRecorder, surface string) map[string]json.RawMessage {
+	t.Helper()
 	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		t.Fatalf("%s status = %d, want 200:\n%s", surface, w.Code, w.Body.String())
 	}
 	var keys map[string]json.RawMessage
 	if err := json.Unmarshal(w.Body.Bytes(), &keys); err != nil {
-		t.Fatalf("decode prompt body: %v", err)
+		t.Fatalf("decode %s body: %v", surface, err)
 	}
 	return keys
+}
+
+// exemptRenderKeys is exemptPromptKeys' /prompt-render sibling: same park +
+// audit state, driven through the UNSIGNED render handler, whose emission is a
+// separate wiring call into the shared gate.
+func exemptRenderKeys(t *testing.T, park *run.ScopeCompletenessPark, entries []*audit.Entry) map[string]json.RawMessage {
+	t.Helper()
+	s, _, stageID, _ := exemptPromptFixture(t, park, func(sid uuid.UUID) audit.Repository {
+		au := &exemptAuditFake{}
+		for _, e := range entries {
+			id := sid
+			e.StageID = &id
+			au.entries = append(au.entries, e)
+		}
+		return au
+	})
+	return exemptBodyKeys(t, promptRenderRequest(t, s, stageID), "/prompt-render")
+}
+
+// assertGoldenExemptProjection projects exactly the three golden keys out of an
+// emitted body and compares BYTES against the cross-module fixture. A renamed
+// or dropped key leaves the projection short and fails here; the runner's peer
+// copy then fails to decode.
+func assertGoldenExemptProjection(t *testing.T, keys map[string]json.RawMessage, surface string) {
+	t.Helper()
+	var golden map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(goldenExemptPromptJSON), &golden); err != nil {
+		t.Fatal(err)
+	}
+	projection := map[string]json.RawMessage{}
+	for k := range golden {
+		if raw, ok := keys[k]; ok {
+			projection[k] = raw
+		}
+	}
+	got, err := json.Marshal(projection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != goldenExemptPromptJSON {
+		t.Errorf("%s: emitted exempt-field projection drifted from the cross-module golden fixture:\n got: %s\nwant: %s", surface, got, goldenExemptPromptJSON)
+	}
 }
 
 func assertNoExemptKeys(t *testing.T, keys map[string]json.RawMessage, why string) {
@@ -9024,27 +9080,7 @@ func TestPromptExemptFields_EmissionGate(t *testing.T) {
 			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
 			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
 		}, nil)
-		// Project exactly the three golden keys out of the emitted body and
-		// compare BYTES against the cross-module fixture. A renamed or dropped
-		// key leaves the projection short and fails here; the runner's peer copy
-		// then fails to decode.
-		projection := map[string]json.RawMessage{}
-		var golden map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(goldenExemptPromptJSON), &golden); err != nil {
-			t.Fatal(err)
-		}
-		for k := range golden {
-			if raw, ok := keys[k]; ok {
-				projection[k] = raw
-			}
-		}
-		got, err := json.Marshal(projection)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(got) != goldenExemptPromptJSON {
-			t.Errorf("emitted exempt-field projection drifted from the cross-module golden fixture:\n got: %s\nwant: %s", got, goldenExemptPromptJSON)
-		}
+		assertGoldenExemptProjection(t, keys, "/prompt")
 	})
 
 	t.Run("re_parked_after_exempt", func(t *testing.T) {
@@ -9077,5 +9113,34 @@ func TestPromptExemptFields_EmissionGate(t *testing.T) {
 			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
 		}, nil)
 		assertNoExemptKeys(t, keys, "an exempt-resolved park with no held commit SHA/branch")
+	})
+}
+
+// TestPromptRenderExemptFields_EmissionGate covers the SECOND wiring call into
+// the #2501 gate: resolveHeldCommitExemption is invoked from BOTH
+// handleGetStagePrompt and handleGetStagePromptRender, and every case above
+// drives only the runner-facing /prompt path. The gate's decision logic is
+// shared and exhaustively executed there, so what is at risk here is the thin
+// wiring call itself — a render handler that never populated the fields (or
+// populated them unconditionally) would leave the SPA preview disagreeing with
+// what the runner is served. Both directions are asserted: the emitting case
+// against the same cross-module golden bytes, and one refusing case.
+func TestPromptRenderExemptFields_EmissionGate(t *testing.T) {
+	stageID := uuid.New() // placeholder; exemptRenderKeys rewrites StageID
+
+	t.Run("exempt_decided_emits_the_golden_projection", func(t *testing.T) {
+		keys := exemptRenderKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		})
+		assertGoldenExemptProjection(t, keys, "/prompt-render")
+	})
+
+	t.Run("fail_decided", func(t *testing.T) {
+		keys := exemptRenderKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessFailed, 2),
+		})
+		assertNoExemptKeys(t, keys, "/prompt-render on a FAIL-decided park")
 	})
 }

@@ -17183,9 +17183,30 @@ func TestAssertionCompound_PlusVerifiedTreeMismatch_StaysCategoryB(t *testing.T)
 	var log strings.Builder
 	err := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, bogusTree, "", unsatisfiedBinding, nil, nil)
 	assertCompoundStaysCategoryB(t, err, bare, branch, fpr, fu, log.String())
-	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) && !errors.Is(err, gitops.ErrCommitWouldNotCompile) &&
-		!errors.Is(err, gitops.ErrCommittedTestsFailed) {
-		t.Errorf("err = %v, want the verified-tree (or the compile gate that precedes it) category-B abort", err)
+	// The sentinel is asserted EXACTLY, with no compile/test-gate alternative:
+	// admitting ErrCommitWouldNotCompile / ErrCommittedTestsFailed here would let
+	// this case pass on a gate that aborts BEFORE the mismatch branch, making it
+	// a duplicate of the compile-failure case that pins nothing about the
+	// verified-tree path.
+	if !errors.Is(err, gitops.ErrPushedTreeNotVerified) {
+		t.Errorf("err = %v, want the verified-tree category-B abort (ErrPushedTreeNotVerified)", err)
+	}
+	// ...and the two events prove the COMPOUND actually formed: the assertion
+	// shortfall was recorded first, and the verified-tree branch then executed
+	// on that pending shortfall. Without these, an earlier-returning gate would
+	// satisfy the error assertion alone on some future refactor.
+	if !strings.Contains(log.String(), `"event":"binding_assertion_unsatisfied"`) {
+		t.Errorf("the assertion shortfall must be RECORDED before the verified-tree gate runs:\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), `"event":"verified_tree_mismatch"`) ||
+		!strings.Contains(log.String(), `"verified_tree_sha":"`+bogusTree+`"`) {
+		t.Errorf("the verified-tree MISMATCH branch must have executed (its event names the bogus tree):\n%s", log.String())
+	}
+	// A compound must never reach parkResult(): the typed park error is what
+	// would let an unaccepted commit park instead of aborting.
+	var typed *gitops.BindingAssertionsUnsatisfiedError
+	if errors.As(err, &typed) {
+		t.Error("the verified-tree abort must NOT surface the typed assertion park error")
 	}
 }
 
