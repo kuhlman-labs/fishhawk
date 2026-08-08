@@ -111,6 +111,17 @@ type pullRequestBody struct {
 	VerifiedTreeSHA string   `json:"verified_tree_sha,omitempty"`
 	MissingPaths    []string `json:"missing_paths,omitempty"`
 
+	// UnsatisfiedAssertions is the SECOND scope_park shortfall class (#2501):
+	// the operator-declared binding assertions (#1171) the held commit did not
+	// satisfy. Exactly one of MissingPaths / UnsatisfiedAssertions is present on
+	// a park report — a compound failure never parks, it keeps the runner's
+	// category-B abort. Declared here (with omitempty) so the
+	// DisallowUnknownFields decoder ACCEPTS the assertion-class body at all; the
+	// runner omits it on every other variant so those bodies stay byte-identical.
+	// The json tags (type/path/literal) mirror run.UnsatisfiedAssertion and the
+	// runner's upload.BindingAssertionReport byte-for-byte.
+	UnsatisfiedAssertions []unsatisfiedAssertion `json:"unsatisfied_assertions,omitempty"`
+
 	// ApplyPath is the near-deterministic fix-up apply provenance (#1165/#1213),
 	// present only on the Outcome=="fixup_pushed" report: "applied" (a clean
 	// git-apply of every routed concern's suggested_patch, no agent), "agent"
@@ -202,11 +213,14 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
-	// Scope-completeness park variant (#1231): the implement stage's ONLY
-	// committed-tree gate failure was the missing-declared-scope-file
-	// check. The runner pushed the verified commit to the run branch (no
-	// PR); require the commit coordinates, the verified tree, and at least
-	// one missing path so the park payload pins exactly what is held.
+	// Scope-completeness park variant (#1231, second class added by #2501): the
+	// implement stage's ONLY committed-tree gate failure was the
+	// missing-declared-scope-file check OR the binding-assertion check. The
+	// runner pushed the verified commit to the run branch (no PR); require the
+	// commit coordinates, the verified tree, and AT LEAST ONE shortfall so the
+	// park payload pins exactly what is held. A park carrying NEITHER is a runner
+	// bug, not a legitimate state, so it is still rejected — the control is
+	// relaxed to "at least one of the two", not removed.
 	if p.Outcome == "scope_park" {
 		switch {
 		case p.Branch == "":
@@ -217,8 +231,8 @@ func (p *pullRequestBody) validate() error {
 			return errors.New("base_sha is required for a scope_park outcome")
 		case p.VerifiedTreeSHA == "":
 			return errors.New("verified_tree_sha is required for a scope_park outcome")
-		case len(p.MissingPaths) == 0:
-			return errors.New("missing_paths must be non-empty for a scope_park outcome")
+		case len(p.MissingPaths) == 0 && len(p.UnsatisfiedAssertions) == 0:
+			return errors.New("at least one of missing_paths / unsatisfied_assertions must be non-empty for a scope_park outcome")
 		}
 		return nil
 	}
@@ -1167,17 +1181,20 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		RunBranch:       pr.Branch,
 		VerifiedTreeSHA: pr.VerifiedTreeSHA,
 		MissingPaths:    pr.MissingPaths,
+		// #2501: the assertion-class shortfall rides the same JSONB payload.
+		UnsatisfiedAssertions: toRunUnsatisfiedAssertions(pr.UnsatisfiedAssertions),
 	}
 
 	auditPayload, _ := json.Marshal(map[string]any{
-		"run_id":            runID.String(),
-		"stage_id":          stageID.String(),
-		"branch":            pr.Branch,
-		"head_sha":          pr.HeadSHA,
-		"base_sha":          pr.BaseSHA,
-		"verified_tree_sha": pr.VerifiedTreeSHA,
-		"missing_paths":     pr.MissingPaths,
-		"auth_method":       authMethod,
+		"run_id":                 runID.String(),
+		"stage_id":               stageID.String(),
+		"branch":                 pr.Branch,
+		"head_sha":               pr.HeadSHA,
+		"base_sha":               pr.BaseSHA,
+		"verified_tree_sha":      pr.VerifiedTreeSHA,
+		"missing_paths":          pr.MissingPaths,
+		"unsatisfied_assertions": pr.UnsatisfiedAssertions,
+		"auth_method":            authMethod,
 	})
 	appendParams := audit.ChainAppendParams{
 		RunID:        runID,

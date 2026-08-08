@@ -2832,3 +2832,29 @@ func TestNextActions_StagelessArmsKeepTheFloor(t *testing.T) {
 		t.Errorf("awaiting_children poll = %d, want %d (the floor)", got, suggestedStageWaitPollIntervalSeconds)
 	}
 }
+
+// TestNextActions_AwaitingScopeDecision_GeneralizedToBothShortfallClasses pins
+// the #2501 generalization: the awaiting_scope_decision arm no longer names the
+// #1151 missing-declared-scope-file check as the ONLY reason a stage parks (an
+// unsatisfied binding assertion parks it too), and the reason states that
+// exempt RETURNS THE STAGE TO DISPATCH rather than opening the PR instantly.
+func TestNextActions_AwaitingScopeDecision_GeneralizedToBothShortfallClasses(t *testing.T) {
+	run := naRun("running")
+	// A park carrying ONLY unsatisfied assertions presents identically at this
+	// layer (the state is the signal), so the same arm must still fire.
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_scope_decision")}
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "implement_awaiting_scope_decision" {
+		t.Fatalf("state = %+v, want implement_awaiting_scope_decision for an assertion-class park too", na)
+	}
+	dec := findAction(t, na, "fishhawk_decide_scope_completeness")
+	if !strings.Contains(dec.Precondition, "binding assertion") {
+		t.Errorf("precondition must name the SECOND shortfall class; got %q", dec.Precondition)
+	}
+	if !strings.Contains(dec.Precondition, "unsatisfied_assertions") {
+		t.Errorf("precondition must point the operator at the unsatisfied_assertions payload key; got %q", dec.Precondition)
+	}
+	if !strings.Contains(dec.Reason, "returns the stage to dispatch") {
+		t.Errorf("reason must state that exempt returns the stage to dispatch (not that the PR opens instantly); got %q", dec.Reason)
+	}
+}

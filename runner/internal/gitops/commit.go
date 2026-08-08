@@ -375,6 +375,23 @@ type CommitAndPushArgs struct {
 	// false everywhere else keeps the strict #1151 category-B gate byte-identical.
 	ParkOnScopeShortfall bool
 
+	// ParkOnAssertionShortfall is the binding-assertion sibling of
+	// ParkOnScopeShortfall (#2501): when VerifyCommit returns a
+	// *BindingAssertionsUnsatisfiedError — which the runner emits ONLY after
+	// every other committed-tree gate has passed, so it is the SOLE failure —
+	// CommitAndPush PUSHES the verified commit to the run branch anyway and
+	// reports the unsatisfied assertions via
+	// CommitAndPushResult.AssertionShortfall instead of aborting the push. The
+	// held commit must survive the runner exit so a later operator exempt
+	// resolution can open the PR from that exact head (ADR-035: the same run
+	// writing its own branch, no re-commit). Any OTHER VerifyCommit error
+	// (including a plain ErrBindingAssertionUnsatisfied wrap that is not the
+	// typed *BindingAssertionsUnsatisfiedError) still aborts the push BEFORE
+	// origin is touched, unchanged. Set only on the standalone open-PR implement
+	// push; false everywhere else keeps the strict #1171 category-B gate
+	// byte-identical.
+	ParkOnAssertionShortfall bool
+
 	// VerifyCommit, when non-nil, is invoked AFTER the scope-only commit
 	// is created and BEFORE the push, with the new HEAD SHA and the scope
 	// drift (dirty-but-undeclared paths excluded from the commit). A
@@ -429,6 +446,15 @@ type CommitAndPushResult struct {
 	// scope-completeness park carrying these paths instead of opening a PR.
 	// Always empty otherwise, so the existing success path is byte-identical.
 	ScopeShortfall []string
+
+	// AssertionShortfall lists the declared binding assertions the pushed commit
+	// did NOT satisfy (#2501), the sibling of ScopeShortfall. Non-empty ONLY when
+	// ParkOnAssertionShortfall was set AND the binding-assertion gate was the sole
+	// committed-tree failure: the verified commit WAS pushed to the run branch
+	// (HeadSHA/TreeSHA are populated) but NO PR is implied — the caller reports a
+	// scope-completeness park carrying these assertions instead of opening a PR.
+	// Always empty otherwise, so the existing success path is byte-identical.
+	AssertionShortfall []BindingAssertionResult
 }
 
 // CommitAndPush configures a bot author, creates Branch, stages
@@ -643,21 +669,29 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	// commit excluded — the candidate build-required set the callback
 	// reports in its error.
 	var scopeShortfall []string
+	var assertionShortfall []BindingAssertionResult
 	if args.VerifyCommit != nil {
 		if err := args.VerifyCommit(ctx, headSHA, scopeDrift); err != nil {
-			// Scope-completeness park (#1231): a *ScopeFilesMissingError is the
-			// runner's signal that the missing-declared-scope-file gate was the
-			// SOLE committed-tree failure (the closure runs every other gate
-			// first). When the caller opted into ParkOnScopeShortfall, DON'T
-			// abort — fall through to the push so the verified commit lands on
-			// the run branch, and surface the missing paths so the caller reports
-			// a scope-completeness park rather than opening a PR. Any other error
-			// (including a plain ErrScopeFilesMissing wrap that is NOT the typed
-			// value) still aborts before origin is touched.
+			// Scope-completeness park (#1231, generalized to a second shortfall
+			// class by #2501): a *ScopeFilesMissingError (or a
+			// *BindingAssertionsUnsatisfiedError) is the runner's signal that
+			// THAT gate was the SOLE committed-tree failure (the closure runs
+			// every other gate first, and returns an UNTYPED sentinel wrap for a
+			// compound failure). When the caller opted into the matching park
+			// flag, DON'T abort — fall through to the push so the verified commit
+			// lands on the run branch, and surface the shortfall so the caller
+			// reports a scope-completeness park rather than opening a PR. Any
+			// other error — including a plain ErrScopeFilesMissing /
+			// ErrBindingAssertionUnsatisfied wrap that is NOT the typed value —
+			// still aborts before origin is touched.
 			var smErr *ScopeFilesMissingError
-			if args.ParkOnScopeShortfall && errors.As(err, &smErr) {
+			var baErr *BindingAssertionsUnsatisfiedError
+			switch {
+			case args.ParkOnScopeShortfall && errors.As(err, &smErr):
 				scopeShortfall = smErr.Missing
-			} else {
+			case args.ParkOnAssertionShortfall && errors.As(err, &baErr):
+				assertionShortfall = baErr.Unsatisfied
+			default:
 				return nil, err
 			}
 		}
@@ -730,6 +764,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		BaseSHA:        baseSHA,
 		ScopeDrift:     scopeDrift,
 		ScopeShortfall: scopeShortfall,
+		// AssertionShortfall is the #2501 sibling of ScopeShortfall: non-empty
+		// only on an unsatisfied-binding-assertion-ONLY park.
+		AssertionShortfall: assertionShortfall,
 	}, nil
 }
 

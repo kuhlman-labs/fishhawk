@@ -21,29 +21,61 @@ const (
 	// CategoryScopeCompletenessParked is written by the pull-request park
 	// handler (server/pullrequest.go::parkScopeCompletenessStage) when the
 	// runner reports {outcome:"scope_park"}: the implement stage's ONLY
-	// committed-tree gate failure was the missing-declared-scope-file
-	// check, the verified commit is held on the run branch, and the stage
-	// parked in awaiting_scope_decision. Payload carries {run_id, stage_id,
-	// branch, head_sha, base_sha, verified_tree_sha, missing_paths,
-	// auth_method}.
+	// committed-tree gate failure was a shortfall of EITHER class — the
+	// missing-declared-scope-file check (#1151) or the binding-assertion
+	// check (#1171, #2501) — the verified commit is held on the run branch,
+	// and the stage parked in awaiting_scope_decision. Payload carries
+	// {run_id, stage_id, branch, head_sha, base_sha, verified_tree_sha,
+	// missing_paths, unsatisfied_assertions, auth_method}.
 	CategoryScopeCompletenessParked = "scope_completeness_parked"
 
 	// CategoryScopeCompletenessExempted is written by the decision handler
 	// on an `exempt` decision: the operator accepted the already-committed
-	// tree, so the held commit's PR is opened with NO agent re-run. Payload
-	// carries {run_id, stage_id, decision, reason, decided_by,
-	// held_commit_sha, run_branch, verified_tree_sha, missing_paths,
+	// tree, so the stage returns to dispatch and the held commit's PR is
+	// opened with NO agent re-run. Payload carries {run_id, stage_id,
+	// decision, reason, decided_by, held_commit_sha, run_branch,
+	// verified_tree_sha, missing_paths, unsatisfied_assertions,
 	// gate_evidence}. The gate_evidence field reuses the #1153 channel so a
-	// downstream implement-review gate sees the missing-file shortfall was
-	// operator-exempted rather than re-failing on it.
+	// downstream implement-review gate sees the shortfall (of either class)
+	// was operator-exempted rather than re-failing on it.
 	CategoryScopeCompletenessExempted = "scope_completeness_exempted"
 
 	// CategoryScopeCompletenessFailed is written by the decision handler on
 	// a `fail` decision: the operator rejected the exemption, so the stage
 	// fails category-B (today's restore path). Payload carries {run_id,
-	// stage_id, decision, reason, decided_by, missing_paths}.
+	// stage_id, decision, reason, decided_by, missing_paths,
+	// unsatisfied_assertions}.
 	CategoryScopeCompletenessFailed = "scope_completeness_failed"
 )
+
+// unsatisfiedAssertion is one operator-declared binding assertion (#1171) the
+// held commit did not satisfy — the SECOND scope-completeness park shortfall
+// class (#2501).
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (type/path/literal) MUST stay
+// byte-identical to the runner's upload.BindingAssertionReport
+// (runner/internal/upload/upload.go) and to run.UnsatisfiedAssertion, the
+// durable JSONB shape. Same independent-struct-by-tag convention as
+// scopeExemption (#1229) and bindingAssertion (#1171).
+type unsatisfiedAssertion struct {
+	Type    string `json:"type"`
+	Path    string `json:"path"`
+	Literal string `json:"literal"`
+}
+
+// toRunUnsatisfiedAssertions maps the decoded park-report entries into the
+// durable domain shape. nil in, nil out — a missing-scope-class park's park
+// payload is byte-identical to the pre-#2501 row.
+func toRunUnsatisfiedAssertions(in []unsatisfiedAssertion) []run.UnsatisfiedAssertion {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]run.UnsatisfiedAssertion, 0, len(in))
+	for _, a := range in {
+		out = append(out, run.UnsatisfiedAssertion{Type: a.Type, Path: a.Path, Literal: a.Literal})
+	}
+	return out
+}
 
 // scopeCompletenessDecisionRequest is the JSON body of POST
 // /v0/runs/{run_id}/scope-completeness/decision.
@@ -61,6 +93,11 @@ type scopeCompletenessDecisionResponse struct {
 	State         string    `json:"state"`
 	HeldCommitSHA string    `json:"held_commit_sha,omitempty"`
 	RunBranch     string    `json:"run_branch,omitempty"`
+	// MissingPaths / UnsatisfiedAssertions echo the resolved park's shortfall
+	// (#2501) so the operator's client sees WHICH class was exempted without a
+	// second audit read. Exactly one is populated.
+	MissingPaths          []string                   `json:"missing_paths,omitempty"`
+	UnsatisfiedAssertions []run.UnsatisfiedAssertion `json:"unsatisfied_assertions,omitempty"`
 }
 
 // handleDecideScopeCompleteness implements POST
@@ -73,10 +110,10 @@ type scopeCompletenessDecisionResponse struct {
 // own exemption; the decision is an operator action.
 //
 // The implement stage MUST currently be parked in awaiting_scope_decision
-// (409 otherwise). On `exempt` the stage resumes running so the held
-// commit's PR can be opened with no agent re-run (the push_and_open_pr
-// dispatch + the runner's PR-open from the held commit are the sibling
-// slices); on `fail` the stage drops to today's category-B restore path.
+// (409 otherwise). On `exempt` the stage resumes to PENDING and the run is
+// advanced, so the orchestrator re-dispatches it and the runner opens the
+// held commit's PR with no agent re-run (#2501); on `fail` the stage drops
+// to today's category-B restore path.
 func (s *Server) handleDecideScopeCompleteness(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "scope_completeness_unconfigured",
@@ -179,18 +216,39 @@ func (s *Server) resolveParkedScopeStage(r *http.Request, runID uuid.UUID) (*run
 }
 
 // exemptScopeCompleteness resolves an `exempt` decision: it resumes the
-// parked implement stage to running so the held commit's PR can be opened
-// with NO agent re-run (the push_and_open_pr dispatch + the runner's
-// held-commit PR-open are the sibling slices), and appends a
-// scope_completeness_exempted audit entry pinning the held commit and the
-// gate_evidence marker. Best-effort audit, mirroring the pull-request
-// handlers: the transition is the durable state change.
+// parked implement stage to PENDING and advances the run, so the orchestrator
+// re-dispatches the stage uniformly (a local run parks at
+// awaiting_host_dispatch for the operator's spawn; a github_actions run
+// dispatches the workflow). The re-dispatch is agent-FREE: the prompt response
+// carries open_pr_from_held_commit / held_commit_sha / held_commit_branch for
+// an exempt-resolved park (prompt.go::resolveHeldCommitExemption), and the
+// runner short-circuits to openHeldCommitPR before the agent invoker is wired.
+//
+// Pending, NOT Running (#2501): host_dispatch.go's admission switch accepts
+// only {pending, awaiting_host_dispatch} and refuses a `running` stage with
+// dispatch_not_admissible, and no orchestrator path dispatches a running stage
+// either — so the pre-#2501 Running transition was a dead end on BOTH runner
+// kinds and no runner ever spawned to open the held commit's PR.
+//
+// It also appends a scope_completeness_exempted audit entry pinning the held
+// commit and the gate_evidence marker. Best-effort audit + advance, mirroring
+// failScopeCompleteness: the transition is the durable state change.
 func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, reason, decidedBy string) {
-	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, run.StageStateRunning, nil); err != nil {
+	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, run.StageStatePending, nil); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"resume parked stage failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	if s.cfg.Orchestrator != nil {
+		if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"scope-completeness exempt decision: orchestrator advance failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()))
+		}
 	}
 
 	s.writeScopeCompletenessDecisionAudit(r, runID, stage, CategoryScopeCompletenessExempted, reason, decidedBy)
@@ -199,11 +257,13 @@ func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request,
 	resp := scopeCompletenessDecisionResponse{
 		StageID:  stage.ID,
 		Decision: "exempt",
-		State:    string(run.StageStateRunning),
+		State:    string(run.StageStatePending),
 	}
 	if park := stage.ScopeCompletenessPark; park != nil {
 		resp.HeldCommitSHA = park.HeldCommitSHA
 		resp.RunBranch = park.RunBranch
+		resp.MissingPaths = park.MissingPaths
+		resp.UnsatisfiedAssertions = park.UnsatisfiedAssertions
 	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
@@ -257,6 +317,9 @@ func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid
 	}
 	if park := stage.ScopeCompletenessPark; park != nil {
 		payloadMap["missing_paths"] = park.MissingPaths
+		// #2501: carry the assertion-class shortfall beside missing_paths on
+		// BOTH the exempted and failed entries.
+		payloadMap["unsatisfied_assertions"] = park.UnsatisfiedAssertions
 		if category == CategoryScopeCompletenessExempted {
 			payloadMap["held_commit_sha"] = park.HeldCommitSHA
 			payloadMap["run_branch"] = park.RunBranch

@@ -8875,3 +8875,181 @@ func TestResolveDiffCoverageConfig_MostRestrictiveWins(t *testing.T) {
 		t.Errorf("resolved = %+v, want the 95%% entry", got)
 	}
 }
+
+// goldenExemptPromptJSON is the CROSS-MODULE GOLDEN FIXTURE for the
+// scope-completeness exempt prompt-response fields (#2501).
+//
+// PEER COPY: runner/cmd/fishhawk-runner/main_test.go holds a BYTE-IDENTICAL
+// literal under the same name. THIS test asserts the three-key projection of
+// the marshalled promptResponse EQUALS these bytes; the runner test DECODES the
+// same literal as its fetched prompt. A single-process end-to-end that carries
+// the payload the whole way is impossible here — the runner and the backend are
+// separate Go modules and neither may import the other (import direction is
+// one-way and there is no shared wire package) — so the shared BYTES are the
+// seam. Keep the two literals verbatim-identical: a tag change here forces an
+// edit to this copy, and the runner's copy then fails to decode, so the drift
+// surfaces in the RUNNER test rather than only in a backend assertion.
+const goldenExemptPromptJSON = `{"held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
+
+// exemptAuditFake serves ListForRunByCategory from an in-memory,
+// sequence-ordered entry list so the emission-gate tests can compose any
+// ordering of scope_completeness_parked / _exempted / _failed entries. listErr
+// drives the fail-closed read-error branch.
+type exemptAuditFake struct {
+	auditCapture
+	entries []*audit.Entry
+	listErr error
+}
+
+func (a *exemptAuditFake) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.listErr != nil {
+		return nil, a.listErr
+	}
+	var out []*audit.Entry
+	for _, e := range a.entries {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func scopeDecisionEntry(stageID uuid.UUID, category string, seq int64) *audit.Entry {
+	id := stageID
+	return &audit.Entry{Sequence: seq, StageID: &id, Category: category, Payload: []byte(`{}`)}
+}
+
+// exemptPromptCase drives the REAL /prompt handler for an implement stage in
+// the given park/audit state and returns the marshalled body's top-level keys.
+func exemptPromptKeys(t *testing.T, park *run.ScopeCompletenessPark, entries []*audit.Entry, listErr error) map[string]json.RawMessage {
+	t.Helper()
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	au := &exemptAuditFake{listErr: listErr}
+	runID := uuid.New()
+	stageID := uuid.New()
+	for _, e := range entries {
+		id := stageID
+		e.StageID = &id
+		au.entries = append(au.entries, e)
+	}
+	priv, _ := sf.issue(t, runID)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, ScopeCompletenessPark: park}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, AuditRepo: au})
+	s.promptIssueGetterOverride = &stubIssueGetter{issue: &githubclient.Issue{Number: 42, Title: "t", Body: "b", State: "open"}}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &keys); err != nil {
+		t.Fatalf("decode prompt body: %v", err)
+	}
+	return keys
+}
+
+func assertNoExemptKeys(t *testing.T, keys map[string]json.RawMessage, why string) {
+	t.Helper()
+	for _, k := range []string{"open_pr_from_held_commit", "held_commit_sha", "held_commit_branch"} {
+		if raw, ok := keys[k]; ok {
+			t.Errorf("%s: key %q must be ABSENT from the marshalled body, got %s", why, k, raw)
+		}
+	}
+}
+
+func exemptPark() *run.ScopeCompletenessPark {
+	return &run.ScopeCompletenessPark{
+		HeldCommitSHA:   "1111111111111111111111111111111111111111",
+		RunBranch:       "fishhawk/run-11112222/stage-99990000",
+		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
+		UnsatisfiedAssertions: []run.UnsatisfiedAssertion{
+			{Type: "file_contains", Path: "a.go", Literal: "ALPHA"},
+		},
+	}
+}
+
+// TestPromptExemptFields_EmissionGate executes EVERY emission case of the
+// #2501 held-commit gate against RAW JSON KEYS of the marshalled body (the tag
+// is the contract, not the Go struct). The gate is the only thing standing
+// between the widened awaiting_scope_decision → pending edge and a PR opened
+// from a commit no operator accepted, so each case is asserted, not reasoned
+// about.
+func TestPromptExemptFields_EmissionGate(t *testing.T) {
+	stageID := uuid.New() // placeholder; exemptPromptKeys rewrites StageID
+
+	t.Run("ordinary_implement_dispatch", func(t *testing.T) {
+		assertNoExemptKeys(t, exemptPromptKeys(t, nil, nil, nil), "an ordinary implement dispatch (no park)")
+	})
+
+	t.Run("parked_but_undecided", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		}, nil)
+		assertNoExemptKeys(t, keys, "a parked-but-UNDECIDED stage")
+	})
+
+	t.Run("fail_decided", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessFailed, 2),
+		}, nil)
+		assertNoExemptKeys(t, keys, "a FAIL-decided park")
+	})
+
+	t.Run("exempt_decided_emits_the_golden_projection", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		}, nil)
+		// Project exactly the three golden keys out of the emitted body and
+		// compare BYTES against the cross-module fixture. A renamed or dropped
+		// key leaves the projection short and fails here; the runner's peer copy
+		// then fails to decode.
+		projection := map[string]json.RawMessage{}
+		var golden map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(goldenExemptPromptJSON), &golden); err != nil {
+			t.Fatal(err)
+		}
+		for k := range golden {
+			if raw, ok := keys[k]; ok {
+				projection[k] = raw
+			}
+		}
+		got, err := json.Marshal(projection)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != goldenExemptPromptJSON {
+			t.Errorf("emitted exempt-field projection drifted from the cross-module golden fixture:\n got: %s\nwant: %s", got, goldenExemptPromptJSON)
+		}
+	})
+
+	t.Run("re_parked_after_exempt", func(t *testing.T) {
+		// The parked entry is NEWER than the exempted one → newest-wins refuses.
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 3),
+		}, nil)
+		assertNoExemptKeys(t, keys, "a stage RE-PARKED after an earlier exempt")
+	})
+
+	t.Run("audit_repo_list_error_fails_closed", func(t *testing.T) {
+		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		}, errors.New("audit read exploded"))
+		assertNoExemptKeys(t, keys, "an AuditRepo list error (fail-closed)")
+	})
+
+	t.Run("exempted_but_park_carries_no_held_commit", func(t *testing.T) {
+		keys := exemptPromptKeys(t, &run.ScopeCompletenessPark{VerifiedTreeSHA: "t"}, []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		}, nil)
+		assertNoExemptKeys(t, keys, "an exempt-resolved park with no held commit SHA/branch")
+	})
+}

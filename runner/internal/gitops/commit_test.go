@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -4701,3 +4702,119 @@ func TestDriftCleanup_EndToEnd_PreservesOperatorEdit(t *testing.T) {
 // Make sure `errors` is used so a refactor that drops the import
 // stays caught by go vet/imports tooling.
 var _ = errors.New
+
+// TestCommitAndPush_ParkOnAssertionShortfall_PushesAndReportsShortfall pins the
+// #2501 park mechanism: when VerifyCommit returns a
+// *BindingAssertionsUnsatisfiedError — the runner's signal that the
+// binding-assertion gate was the SOLE gate failure — AND
+// ParkOnAssertionShortfall is set, CommitAndPush PUSHES the verified commit to
+// the run branch anyway (so the held commit survives for an exempt resolution)
+// and surfaces the unsatisfied assertions via AssertionShortfall instead of
+// aborting.
+func TestCommitAndPush_ParkOnAssertionShortfall_PushesAndReportsShortfall(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:                  repo,
+		Branch:                   "fishhawk/park/assert",
+		CommitMessage:            "Scoped commit",
+		RemoteURL:                bare,
+		ScopeFiles:               []string{"README.md"},
+		ParkOnAssertionShortfall: true,
+		VerifyCommit: func(_ context.Context, headSHA string, _ []string) error {
+			if headSHA == "" {
+				t.Error("VerifyCommit got empty headSHA")
+			}
+			return &BindingAssertionsUnsatisfiedError{
+				Unsatisfied: []BindingAssertionResult{{Type: "file_contains", Path: "a.go", Literal: "ALPHA"}},
+				Message:     "gitops: declared binding assertion(s) not satisfied by the committed tree: detail",
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("park must NOT return an error (it pushes + reports the shortfall), got: %v", err)
+	}
+	if len(res.AssertionShortfall) != 1 || res.AssertionShortfall[0].Path != "a.go" ||
+		res.AssertionShortfall[0].Literal != "ALPHA" || res.AssertionShortfall[0].Type != "file_contains" {
+		t.Errorf("AssertionShortfall = %+v, want the single declared assertion", res.AssertionShortfall)
+	}
+	if len(res.ScopeShortfall) != 0 {
+		t.Errorf("an assertion-only park must leave ScopeShortfall empty, got %v", res.ScopeShortfall)
+	}
+	if res.HeadSHA == "" || res.TreeSHA == "" {
+		t.Errorf("park must populate HeadSHA/TreeSHA for the held commit, got %+v", res)
+	}
+	out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/assert").Output()
+	if gerr != nil {
+		t.Fatalf("park must push the held commit to the run branch: %v", gerr)
+	}
+	if strings.TrimSpace(string(out)) != res.HeadSHA {
+		t.Errorf("pushed branch sha = %q, want held HeadSHA %q", strings.TrimSpace(string(out)), res.HeadSHA)
+	}
+}
+
+// TestCommitAndPush_ParkOnAssertionShortfall_FalseAborts pins that the SAME
+// typed *BindingAssertionsUnsatisfiedError aborts the push (category-B, origin
+// untouched) when ParkOnAssertionShortfall is NOT set — the strict #1171
+// behavior for fix-ups and decomposed children stays byte-identical. It reads
+// the REMOTE REF after the call, because the control's effect is committed
+// state: the error identity alone would be byte-identical whether or not the
+// guard fired.
+func TestCommitAndPush_ParkOnAssertionShortfall_FalseAborts(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/park/assertnoflag",
+		CommitMessage: "Scoped commit",
+		RemoteURL:     bare,
+		ScopeFiles:    []string{"README.md"},
+		// ParkOnAssertionShortfall deliberately false.
+		VerifyCommit: func(_ context.Context, _ string, _ []string) error {
+			return &BindingAssertionsUnsatisfiedError{
+				Unsatisfied: []BindingAssertionResult{{Type: "file_contains", Path: "a.go", Literal: "ALPHA"}},
+				Message:     "shortfall",
+			}
+		},
+	})
+	if !errors.Is(err, ErrBindingAssertionUnsatisfied) {
+		t.Fatalf("without ParkOnAssertionShortfall the typed error must abort category-B, got: %v", err)
+	}
+	if res != nil {
+		t.Errorf("aborted push must return a nil result, got %+v", res)
+	}
+	if out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/assertnoflag").CombinedOutput(); gerr == nil {
+		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
+	}
+}
+
+// TestCommitAndPush_ParkOnAssertionShortfall_PlainWrapAborts pins the
+// typed-value-ONLY park property (#2501): a plain fmt.Errorf("%w: …") wrap of
+// the ErrBindingAssertionUnsatisfied sentinel is NOT the typed value, so it
+// still aborts the push before origin is touched even with the park flag set.
+// This is what makes the runner's COMPOUND arm (an untyped sentinel wrap) fail
+// category-B structurally rather than by promise.
+func TestCommitAndPush_ParkOnAssertionShortfall_PlainWrapAborts(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:                  repo,
+		Branch:                   "fishhawk/park/assertplain",
+		CommitMessage:            "Scoped commit",
+		RemoteURL:                bare,
+		ScopeFiles:               []string{"README.md"},
+		ParkOnAssertionShortfall: true,
+		VerifyCommit: func(_ context.Context, _ string, _ []string) error {
+			return fmt.Errorf("%w: plain wrap, not the typed value", ErrBindingAssertionUnsatisfied)
+		},
+	})
+	if !errors.Is(err, ErrBindingAssertionUnsatisfied) {
+		t.Fatalf("a plain sentinel wrap must abort category-B, got: %v", err)
+	}
+	if res != nil {
+		t.Errorf("aborted push must return a nil result, got %+v", res)
+	}
+	if out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/assertplain").CombinedOutput(); gerr == nil {
+		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
+	}
+}

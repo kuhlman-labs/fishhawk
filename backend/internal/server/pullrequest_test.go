@@ -1487,6 +1487,9 @@ func TestShipPullRequest_ScopeParkOutcome_RejectsMissingCoords(t *testing.T) {
 		`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","missing_paths":["x"]}`,                      // missing verified_tree_sha
 		`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t"}`,                    // missing missing_paths
 		`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t","missing_paths":[]}`, // empty missing_paths
+		// #2501: the relaxed "at least one of" control. NEITHER shortfall present
+		// is still a runner bug, not a legitimate park, so it must still 400.
+		`{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t","unsatisfied_assertions":[]}`,
 	} {
 		w := shipPRRequest(t, s, runID, stageID, priv, []byte(body), "")
 		if w.Code != http.StatusBadRequest {
@@ -2183,5 +2186,34 @@ func TestShipPullRequest_FixupPush_BackstopReReview_DuplicateReport_NoDoubleDisp
 	defer reviewer.mu.Unlock()
 	if len(reviewer.calls) != 1 {
 		t.Errorf("reviewer invocations = %d, want 1 (no double review on redelivery)", len(reviewer.calls))
+	}
+}
+
+// TestPullRequestBody_ScopeParkAcceptsEitherShortfall pins the #2501 relaxation
+// of the scope_park validate() control from "missing_paths non-empty" to "at
+// least one of the two non-empty": an ASSERTION-only park (no missing_paths at
+// all) is accepted, a missing-scope-only park is still accepted, and a park
+// carrying NEITHER is still rejected.
+func TestPullRequestBody_ScopeParkAcceptsEitherShortfall(t *testing.T) {
+	decode := func(body string) error {
+		var pr pullRequestBody
+		dec := json.NewDecoder(strings.NewReader(body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&pr); err != nil {
+			return err
+		}
+		return pr.validate()
+	}
+	assertionOnly := `{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t","unsatisfied_assertions":[{"type":"file_contains","path":"a.go","literal":"ALPHA"}]}`
+	if err := decode(assertionOnly); err != nil {
+		t.Errorf("an assertion-only scope_park must decode AND validate, got: %v", err)
+	}
+	scopeOnly := `{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t","missing_paths":["x.go"]}`
+	if err := decode(scopeOnly); err != nil {
+		t.Errorf("a missing-scope-only scope_park must still validate, got: %v", err)
+	}
+	neither := `{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t"}`
+	if err := decode(neither); err == nil {
+		t.Error("a scope_park carrying NEITHER shortfall must still be rejected")
 	}
 }
