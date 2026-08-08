@@ -448,17 +448,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// Function-scoped like implementModel: produced and consumed within run().
 	var planModel string
 
-	// exemptOpenPR / exemptHeldSHA / exemptHeldBranch carry the operator EXEMPT
-	// resolution of a scope-completeness park (#1231) from the fetched prompt to
-	// the early zero-re-run branch below. When exemptOpenPR is true the stage's
-	// gate-verified commit already sits on exemptHeldBranch at exemptHeldSHA (the
-	// park pushed it), so the runner skips the agent, the gates, and CommitAndPush
-	// and opens the PR from that exact held commit. Function-scoped like
-	// fixupExpectedHeadSHA: produced and consumed entirely within run().
+	// exemptOpenPR / exemptHeldSHA / exemptHeldBranch / exemptHeldBaseSHA carry
+	// the operator EXEMPT resolution of a scope-completeness park (#1231) from
+	// the fetched prompt to the early zero-re-run branch below. When exemptOpenPR
+	// is true the stage's gate-verified commit already sits on exemptHeldBranch
+	// at exemptHeldSHA (the park pushed it), so the runner skips the agent, the
+	// gates, and CommitAndPush and opens the PR from that exact held commit,
+	// shipping exemptHeldBaseSHA as the artifact's base_sha (#2563).
+	// Function-scoped like fixupExpectedHeadSHA: produced and consumed entirely
+	// within run().
 	var (
-		exemptOpenPR     bool
-		exemptHeldSHA    string
-		exemptHeldBranch string
+		exemptOpenPR      bool
+		exemptHeldSHA     string
+		exemptHeldBranch  string
+		exemptHeldBaseSHA string
 	)
 
 	// bindingAssertions is the fetched prompt's binding_assertions (#1171):
@@ -546,7 +549,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -594,6 +597,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptOpenPR = openPRFromHeldCommit
 		exemptHeldSHA = heldCommitSHA
 		exemptHeldBranch = heldCommitBranch
+		exemptHeldBaseSHA = heldCommitBaseSHA
 		fixupExpectedHeadSHA = expectedHeadSHA
 		fixupApplyPatches = applyPatches
 		bindingAssertions = promptBindingAssertions
@@ -723,7 +727,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// CommitAndPush, no gates, no trace bundle: the commit and its verified
 	// tree are unchanged from the park.
 	if exemptOpenPR {
-		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, logSink, client, issuedKey)
+		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, logSink, client, issuedKey)
 	}
 
 	if cfg.promptFile == "" {
@@ -2723,13 +2727,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -2737,20 +2741,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", nil, nil, "", nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -5798,7 +5802,7 @@ func mintBaseAuthToken(ctx context.Context, cfg config, client uploadClient, iss
 // reports a "failed" outcome to /pull-request so the dispatched stage the trace
 // gate left in `running` lands `failed` rather than hanging — symmetric with
 // openPRAndShipArtifact's failure path, minus the (absent) commit.
-func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
+func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
 	fail := func(category, reason string) int {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"runner_failed","reason":"scope_exempt_open_pr","detail":%q}`+"\n", reason)
@@ -5815,6 +5819,18 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch strin
 	}
 	if heldBranch == "" || heldSHA == "" {
 		return fail("C", "exempt open-PR: backend did not advertise held_commit_branch/held_commit_sha")
+	}
+	// NO-ORPHAN GUARD (#2563): the backend's success-arm validate() REQUIRES
+	// base_sha, so an exempt resume without it would open the PR on the forge
+	// and then always fail category-B shipping the artifact — leaving the PR
+	// orphaned behind a failed stage (#2562). Refuse BEFORE minting the token
+	// or calling the forge: fail category-C naming the missing field rather
+	// than opening a PR we cannot ship. The backend gate
+	// (resolveHeldCommitExemption) already omits every exempt field when it
+	// cannot resolve a base SHA, so reaching here with an empty one is a
+	// wire/version anomaly, not a normal path.
+	if heldBaseSHA == "" {
+		return fail("C", "exempt open-PR: backend did not advertise held_commit_base_sha")
 	}
 	if client == nil {
 		client = newUploadClient(cfg.backendURL)
@@ -5855,17 +5871,26 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch strin
 	}
 	// The opened PR head is the held commit (#1231): the branch tip is heldSHA,
 	// unchanged since the park pushed it (ADR-035 sole-writer — no other writer
-	// touches the run branch). Stamp it so the audit chain proves
-	// opened-PR-head == held-commit without re-resolving the remote tip.
+	// touches the run branch). Stamp head_sha AND base_sha (#2563) so the audit
+	// chain records exactly what was shipped and proves opened-PR-head ==
+	// held-commit without re-resolving the remote tip.
+	//
+	// The park's verified_tree_sha is DELIBERATELY NOT on this event: it is
+	// known only to the BACKEND (run.ScopeCompletenessPark.VerifiedTreeSHA) and
+	// is not carried on the exempt prompt-response wire, so the runner has no
+	// value to stamp. Adding a fifth wire field purely to echo it into a log
+	// event that no gate consumes is unjustified surface (#2563 binding
+	// condition 2); base_sha IS plumbed because the artifact requires it.
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"scope_completeness_pr_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"branch":%q}`+"\n",
-		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, heldSHA, branch)
+		`{"event":"scope_completeness_pr_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"base_sha":%q,"branch":%q}`+"\n",
+		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, heldSHA, heldBaseSHA, branch)
 
 	artifactBody, _ := json.Marshal(map[string]any{
 		"pr_number": prRes.PRNumber,
 		"pr_url":    prRes.PRURL,
 		"branch":    branch,
 		"head_sha":  heldSHA,
+		"base_sha":  heldBaseSHA,
 		"title":     title,
 		"body":      body,
 	})

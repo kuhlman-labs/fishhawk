@@ -9522,6 +9522,19 @@ paths:
                       The run branch the held commit sits on (ADR-035
                       sole-writer). Present only alongside
                       `open_pr_from_held_commit: true`.
+                  held_commit_base_sha:
+                    type: string
+                    description: |
+                      The base commit the held commit was built on (#2563).
+                      The runner ships it as the pull-request artifact's
+                      `base_sha`, which the backend's success-arm validation
+                      requires — without it the exempt resume opens the PR and
+                      then always fails. Resolved from the park's persisted
+                      base SHA, or (for a legacy park) the newest
+                      `scope_completeness_parked` audit payload's `base_sha`;
+                      present only alongside `open_pr_from_held_commit: true`,
+                      and the exempt fields are all omitted when no base SHA
+                      resolves (fail-closed).
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -9723,6 +9736,9 @@ paths:
                   held_commit_branch:
                     type: string
                     description: The run branch the held commit sits on (ADR-035 sole-writer); present only alongside a true `open_pr_from_held_commit` (#2501).
+                  held_commit_base_sha:
+                    type: string
+                    description: The base commit the held commit was built on (#2563); the runner ships it as the pull-request artifact's required `base_sha`. Resolved from the park's persisted base SHA or a legacy park's newest `scope_completeness_parked` audit `base_sha`; present only alongside a true `open_pr_from_held_commit`, and the exempt fields are all omitted when no base SHA resolves (fail-closed).
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

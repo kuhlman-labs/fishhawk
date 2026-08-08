@@ -781,6 +781,59 @@ func TestFetchPrompt_ImplementModelOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesHeldCommitBaseSHA confirms the client decodes the
+// backend's held_commit_base_sha exempt field (#2563) into
+// FetchedPrompt.HeldCommitBaseSHA — the base SHA openHeldCommitPR ships as the
+// artifact's base_sha. A tag drift here is exactly the cross-module wire break
+// #2563 exists to close.
+func TestFetchPrompt_DecodesHeldCommitBaseSHA(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"open_pr_from_held_commit": true,
+		"held_commit_sha": "1111111111111111111111111111111111111111",
+		"held_commit_branch": "fishhawk/run-abc/held",
+		"held_commit_base_sha": "2222222222222222222222222222222222222222"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.HeldCommitBaseSHA != "2222222222222222222222222222222222222222" {
+		t.Errorf("HeldCommitBaseSHA = %q, want the wire value", got.HeldCommitBaseSHA)
+	}
+}
+
+// TestFetchPrompt_HeldCommitBaseSHAOmittedWhenAbsent confirms HeldCommitBaseSHA
+// decodes to the empty string on a non-exempt prompt (the field omitted), so a
+// normal implement dispatch is byte-identical and the runner never mistakes it
+// for an exempt resume.
+func TestFetchPrompt_HeldCommitBaseSHAOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.HeldCommitBaseSHA != "" {
+		t.Errorf("HeldCommitBaseSHA = %q, want empty when absent", got.HeldCommitBaseSHA)
+	}
+}
+
 // TestFetchPrompt_DecodesPlanModel confirms the client decodes the backend's
 // plan_model response field (#1416) into FetchedPrompt.PlanModel, the wire value
 // the runner pins onto a plan-stage agent spawn as --model.

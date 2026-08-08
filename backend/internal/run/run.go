@@ -706,6 +706,14 @@ type ScopeCompletenessPark struct {
 	// passed on. Recorded so the resolution can assert the opened PR head
 	// reflects the identical tree.
 	VerifiedTreeSHA string `json:"verified_tree_sha"`
+	// BaseSHA is the base commit the held commit was built on — the merge
+	// target the exempt resolution ships as the pull-request artifact's
+	// base_sha (#2563). Recorded on the park so the zero-re-run exempt resume
+	// has the value the backend's success-arm validate() requires; a pre-#2563
+	// park row decodes with an empty BaseSHA (the column is JSONB — no
+	// migration) and the exempt resolution falls back to the newest
+	// scope_completeness_parked audit entry's base_sha.
+	BaseSHA string `json:"base_sha,omitempty"`
 	// MissingPaths are the declared scope.files the agent never touched —
 	// the #1151 gate shortfall class. Repo-relative. Empty on an
 	// assertion-class park.

@@ -1180,7 +1180,13 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		HeldCommitSHA:   pr.HeadSHA,
 		RunBranch:       pr.Branch,
 		VerifiedTreeSHA: pr.VerifiedTreeSHA,
-		MissingPaths:    pr.MissingPaths,
+		// #2563: persist the base commit the held commit was built on so the
+		// exempt resume ships it as the artifact's base_sha. The scope_park
+		// validate() arm already requires pr.BaseSHA to be non-empty, so every
+		// park recorded from now on carries it; pre-#2563 rows fall back to the
+		// scope_completeness_parked audit payload's base_sha.
+		BaseSHA:      pr.BaseSHA,
+		MissingPaths: pr.MissingPaths,
 		// #2501: the assertion-class shortfall rides the same JSONB payload.
 		UnsatisfiedAssertions: toRunUnsatisfiedAssertions(pr.UnsatisfiedAssertions),
 	}

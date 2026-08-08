@@ -2054,7 +2054,10 @@ func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
 		HeldCommitSHA:   "1111111111111111111111111111111111111111",
 		RunBranch:       "fishhawk/run-aaa/slice-0",
 		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
-		MissingPaths:    []string{"backend/internal/foo/foo_test.go", "docs/foo.md"},
+		// #2563: the base commit the held commit was built on rides the same
+		// JSONB column (no migration) — the exempt resume ships it as base_sha.
+		BaseSHA:      "5555555555555555555555555555555555555555",
+		MissingPaths: []string{"backend/internal/foo/foo_test.go", "docs/foo.md"},
 		// #2501: the second shortfall class rides the same JSONB column.
 		UnsatisfiedAssertions: []run.UnsatisfiedAssertion{
 			{Type: "file_contains", Path: "backend/internal/foo/foo.go", Literal: "ALPHA"},
@@ -2087,6 +2090,7 @@ func TestPostgres_ParkScopeCompletenessAndAppend_RoundTrip(t *testing.T) {
 	if got.ScopeCompletenessPark.HeldCommitSHA != park.HeldCommitSHA ||
 		got.ScopeCompletenessPark.RunBranch != park.RunBranch ||
 		got.ScopeCompletenessPark.VerifiedTreeSHA != park.VerifiedTreeSHA ||
+		got.ScopeCompletenessPark.BaseSHA != park.BaseSHA ||
 		len(got.ScopeCompletenessPark.MissingPaths) != 2 {
 		t.Errorf("ScopeCompletenessPark = %+v, want %+v", got.ScopeCompletenessPark, park)
 	}

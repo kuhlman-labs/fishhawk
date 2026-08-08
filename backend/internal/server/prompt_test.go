@@ -8880,7 +8880,7 @@ func TestResolveDiffCoverageConfig_MostRestrictiveWins(t *testing.T) {
 // scope-completeness exempt prompt-response fields (#2501).
 //
 // PEER COPY: runner/cmd/fishhawk-runner/main_test.go holds a BYTE-IDENTICAL
-// literal under the same name. THIS test asserts the three-key projection of
+// literal under the same name. THIS test asserts the four-key projection of
 // the marshalled promptResponse EQUALS these bytes; the runner test DECODES the
 // same literal as its fetched prompt. A single-process end-to-end that carries
 // the payload the whole way is impossible here — the runner and the backend are
@@ -8889,7 +8889,11 @@ func TestResolveDiffCoverageConfig_MostRestrictiveWins(t *testing.T) {
 // seam. Keep the two literals verbatim-identical: a tag change here forces an
 // edit to this copy, and the runner's copy then fails to decode, so the drift
 // surfaces in the RUNNER test rather than only in a backend assertion.
-const goldenExemptPromptJSON = `{"held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
+//
+// held_commit_base_sha (#2563) is the fourth exempt field; alphabetically it
+// sorts first in the map-marshalled projection. exemptPark() carries the
+// matching BaseSHA so the emission gate resolves it from the park field.
+const goldenExemptPromptJSON = `{"held_commit_base_sha":"3333333333333333333333333333333333333333","held_commit_branch":"fishhawk/run-11112222/stage-99990000","held_commit_sha":"1111111111111111111111111111111111111111","open_pr_from_held_commit":true}`
 
 // exemptAuditFake serves ListForRunByCategory from an in-memory,
 // sequence-ordered entry list so the emission-gate tests can compose any
@@ -8917,6 +8921,14 @@ func (a *exemptAuditFake) ListForRunByCategory(_ context.Context, _ uuid.UUID, c
 func scopeDecisionEntry(stageID uuid.UUID, category string, seq int64) *audit.Entry {
 	id := stageID
 	return &audit.Entry{Sequence: seq, StageID: &id, Category: category, Payload: []byte(`{}`)}
+}
+
+// scopeDecisionEntryPayload is scopeDecisionEntry with an explicit payload, used
+// to drive the #2563 base-SHA audit-fallback (a scope_completeness_parked entry
+// carrying base_sha) and the undecodable-payload fail-closed branch.
+func scopeDecisionEntryPayload(stageID uuid.UUID, category string, seq int64, payload string) *audit.Entry {
+	id := stageID
+	return &audit.Entry{Sequence: seq, StageID: &id, Category: category, Payload: []byte(payload)}
 }
 
 // exemptPromptCase drives the REAL /prompt handler for an implement stage in
@@ -9029,7 +9041,7 @@ func assertGoldenExemptProjection(t *testing.T, keys map[string]json.RawMessage,
 
 func assertNoExemptKeys(t *testing.T, keys map[string]json.RawMessage, why string) {
 	t.Helper()
-	for _, k := range []string{"open_pr_from_held_commit", "held_commit_sha", "held_commit_branch"} {
+	for _, k := range []string{"open_pr_from_held_commit", "held_commit_sha", "held_commit_branch", "held_commit_base_sha"} {
 		if raw, ok := keys[k]; ok {
 			t.Errorf("%s: key %q must be ABSENT from the marshalled body, got %s", why, k, raw)
 		}
@@ -9041,6 +9053,7 @@ func exemptPark() *run.ScopeCompletenessPark {
 		HeldCommitSHA:   "1111111111111111111111111111111111111111",
 		RunBranch:       "fishhawk/run-11112222/stage-99990000",
 		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
+		BaseSHA:         "3333333333333333333333333333333333333333",
 		UnsatisfiedAssertions: []run.UnsatisfiedAssertion{
 			{Type: "file_contains", Path: "a.go", Literal: "ALPHA"},
 		},
@@ -9113,6 +9126,51 @@ func TestPromptExemptFields_EmissionGate(t *testing.T) {
 			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
 		}, nil)
 		assertNoExemptKeys(t, keys, "an exempt-resolved park with no held commit SHA/branch")
+	})
+
+	// ---- #2563 base-SHA source modes. The exempt case above (which uses
+	// exemptPark, carrying BaseSHA) already covers the park-field source. ----
+
+	t.Run("base_from_parked_audit_fallback_unblocks_legacy_park", func(t *testing.T) {
+		// A pre-#2563 legacy park: held commit + branch present, but BaseSHA
+		// EMPTY (the field did not exist when it parked). The base SHA must
+		// resolve from the newest scope_completeness_parked audit payload — the
+		// mode that makes an already-parked row (e.g. #2169's) resumable. The
+		// payload base_sha equals the golden's so the full projection emits.
+		legacy := exemptPark()
+		legacy.BaseSHA = ""
+		keys := exemptPromptKeys(t, legacy, []*audit.Entry{
+			scopeDecisionEntryPayload(stageID, CategoryScopeCompletenessParked, 1,
+				`{"base_sha":"3333333333333333333333333333333333333333"}`),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		}, nil)
+		assertGoldenExemptProjection(t, keys, "/prompt (audit fallback)")
+	})
+
+	t.Run("no_base_in_park_or_audit_fails_closed", func(t *testing.T) {
+		// Held commit + branch present, but neither the park field NOR the
+		// parked audit payload carries base_sha → fail closed, every exempt key
+		// (base included) omitted, so the runner takes its ordinary agent path
+		// rather than a resume guaranteed to fail category-B.
+		legacy := exemptPark()
+		legacy.BaseSHA = ""
+		keys := exemptPromptKeys(t, legacy, []*audit.Entry{
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1), // payload {}
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		}, nil)
+		assertNoExemptKeys(t, keys, "an exempt park with no base SHA in the park field or the parked audit payload")
+	})
+
+	t.Run("undecodable_parked_payload_fails_closed", func(t *testing.T) {
+		// The park field is empty and the parked audit payload is unparseable →
+		// fail closed rather than emit on an unresolvable base SHA.
+		legacy := exemptPark()
+		legacy.BaseSHA = ""
+		keys := exemptPromptKeys(t, legacy, []*audit.Entry{
+			scopeDecisionEntryPayload(stageID, CategoryScopeCompletenessParked, 1, `{not-json`),
+			scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+		}, nil)
+		assertNoExemptKeys(t, keys, "an exempt park whose parked audit payload is undecodable")
 	})
 }
 

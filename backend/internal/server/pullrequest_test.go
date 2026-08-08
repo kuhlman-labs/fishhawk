@@ -11,6 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -108,6 +111,117 @@ func TestShipPullRequest_HappyPath(t *testing.T) {
 	}
 	if got := au.appended[0].Category; got != "pull_request_opened" {
 		t.Errorf("audit category = %q", got)
+	}
+}
+
+// wireGoldenHeldCommitBytes reads the SHARED held-commit PR artifact fixture
+// (#2563) — the SAME file the runner test asserts openHeldCommitPR produces
+// (runner/cmd/fishhawk-runner/main_test.go). One artifact, two readers: the
+// runner pins the bytes it ships to this file and THIS backend test decodes the
+// same bytes through the real DisallowUnknownFields + validate() path, so a
+// runner field the backend rejects fails HERE — the automated cross-module
+// parity the two-byte-identical-literals pattern (#2501) could not provide, and
+// which #2558 will make compile-enforced with a shared wire package.
+//
+// The path is anchored to THIS test source via runtime.Caller (not cwd): the
+// backend suite runs under pgtest with an unspecified cwd. runtime.Caller yields
+// <repo>/backend/internal/server/pullrequest_test.go; three dirs up is the repo
+// root, the same anchor the runner test uses from its own source file.
+func wireGoldenHeldCommitBytes(t *testing.T) []byte {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the wire golden fixture path")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "held_commit_pr_artifact.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared wire golden %s: %v", path, err)
+	}
+	return b
+}
+
+// TestShipPullRequest_HeldCommitGoldenBodyValidates is the BACKEND half of the
+// cross-module parity seam (#2563): the exact bytes the runner's exempt path
+// ships (the shared testdata/wire fixture) MUST decode through the real
+// /pull-request handler (real DisallowUnknownFields + real validate()) as a
+// valid success body, and record base_sha onto the pull_request_opened audit
+// entry. This is the property THIS issue exists to establish: an exempt resume's
+// artifact is accepted rather than opening the PR and then failing category-B
+// (#2562). If a future runner field is not a recognized pullRequestBody key,
+// DisallowUnknownFields rejects the golden here.
+func TestShipPullRequest_HeldCommitGoldenBodyValidates(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+	golden := wireGoldenHeldCommitBytes(t)
+
+	// The golden's base_sha (the value the runner shipped) — the audit entry
+	// must record exactly this.
+	var fields struct {
+		BaseSHA string `json:"base_sha"`
+	}
+	if err := json.Unmarshal(golden, &fields); err != nil {
+		t.Fatalf("decode golden base_sha: %v", err)
+	}
+	if fields.BaseSHA == "" {
+		t.Fatal("shared wire golden carries no base_sha — the seam is meaningless")
+	}
+
+	w := shipPRRequest(t, s, runID, stageID, priv, golden, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("held-commit golden status = %d, want 201 (the runner's artifact must validate):\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("artifacts = %d, want 1", len(ar.all))
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != "pull_request_opened" {
+		t.Fatalf("want one pull_request_opened audit entry, got %+v", au.appended)
+	}
+	var payload struct {
+		BaseSHA string `json:"base_sha"`
+	}
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("decode audit payload: %v", err)
+	}
+	if payload.BaseSHA != fields.BaseSHA {
+		t.Errorf("pull_request_opened base_sha = %q, want the golden's %q", payload.BaseSHA, fields.BaseSHA)
+	}
+}
+
+// TestShipPullRequest_HeldCommitGoldenMissingBaseSHA_400 is the negative twin:
+// the SAME golden with ONLY base_sha stripped must be rejected 400
+// pull_request_invalid with the identity "base_sha is required" — pinning the
+// exact failure the live bug produced (#2562/#2563). The malformed body is the
+// golden paired with ITSELF-minus-one-field (not a different clean body), so the
+// RED lands on the validate() guard, not on an incidental mismatch.
+func TestShipPullRequest_HeldCommitGoldenMissingBaseSHA_400(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, _, _ := newPRServer(t, runID, stageID)
+	priv, _ := sf.issue(t, runID)
+
+	var m map[string]any
+	if err := json.Unmarshal(wireGoldenHeldCommitBytes(t), &m); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	delete(m, "base_sha")
+	stripped, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := shipPRRequest(t, s, runID, stageID, priv, stripped, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "pull_request_invalid") {
+		t.Errorf("body missing pull_request_invalid:\n%s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "base_sha is required") {
+		t.Errorf("error identity must be \"base_sha is required\":\n%s", w.Body.String())
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("artifacts = %d, want 0 on a rejected body", len(ar.all))
 	}
 }
 
