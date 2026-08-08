@@ -2455,6 +2455,21 @@ components:
             `base_sha` + `verified_tree_sha` required, plus AT LEAST ONE of
             non-empty `missing_paths` / `unsatisfied_assertions`;
             `pr_number`/`pr_url`/`title` absent).
+
+            On the `failed` variant, `branch`, `head_sha`, `base_sha`, and
+            `verified_tree_sha` are OPTIONAL and together form the PR-OPEN
+            CHECKPOINT (#2169): the coordinates of a gate-verified commit the
+            runner had ALREADY pushed to the run branch before the failure (a
+            PR-open failure, or an artifact-ship failure once the PR was open).
+            The handler records them into the `pull_request_failed` audit
+            payload as `push_checkpoint`, and the next dispatch's `/prompt`
+            then serves the held-commit fields with
+            `held_commit_resume_kind: pr_open` so the retry re-attempts only the
+            idempotent `OpenPR` — no agent re-invocation. A checkpoint is
+            recorded only when BOTH `branch` and `head_sha` are non-empty; a
+            partial one records nothing and is NOT a 400 (rejecting it would
+            strand the implement stage in `running`). A PRE-push failure omits
+            all four, which is byte-identical to the pre-#2169 failure body.
         category:
           type: string
           enum: [B, C]
@@ -9535,6 +9550,27 @@ paths:
                       present only alongside `open_pr_from_held_commit: true`,
                       and the exempt fields are all omitted when no base SHA
                       resolves (fail-closed).
+                  held_commit_resume_kind:
+                    type: string
+                    enum: [pr_open]
+                    description: |
+                      DISCRIMINATES which recovery the four held-commit fields
+                      above encode (#2169). ABSENT for the legacy #1231
+                      scope-completeness `exempt` resolution — byte-identical
+                      to every response before this field existed. `pr_open`
+                      for the PR-OPEN CHECKPOINT resume: the implement stage
+                      already committed and PUSHED and then failed opening the
+                      PR or shipping the artifact (typically a sustained forge
+                      outage), and the newest audit entry for the stage is a
+                      `pull_request_failed` carrying a complete
+                      `push_checkpoint`. The runner then re-attempts only the
+                      idempotent adopt-then-create `OpenPR` from the pushed
+                      head, with no agent re-invocation, and additionally
+                      verifies the run branch's REMOTE TIP still equals
+                      `held_commit_sha` before touching the forge — a
+                      checkpointed commit passed no operator gate the way a
+                      park did. An exempt resolution always WINS over a
+                      checkpoint, so the two can never both be emitted.
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -9739,6 +9775,10 @@ paths:
                   held_commit_base_sha:
                     type: string
                     description: The base commit the held commit was built on (#2563); the runner ships it as the pull-request artifact's required `base_sha`. Resolved from the park's persisted base SHA or a legacy park's newest `scope_completeness_parked` audit `base_sha`; present only alongside a true `open_pr_from_held_commit`, and the exempt fields are all omitted when no base SHA resolves (fail-closed).
+                  held_commit_resume_kind:
+                    type: string
+                    enum: [pr_open]
+                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint.
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':

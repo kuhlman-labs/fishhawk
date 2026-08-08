@@ -834,6 +834,74 @@ func TestFetchPrompt_HeldCommitBaseSHAOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// TestFetchPrompt_DecodesHeldCommitResumeKind confirms the client decodes the
+// backend's held_commit_resume_kind discriminator (#2169) into
+// FetchedPrompt.HeldCommitResumeKind. That value is what selects the resume's
+// remote-tip guard and repeatable-resume report over the legacy #1231 exempt
+// behavior, so a tag drift here silently downgrades a checkpoint resume to an
+// unguarded exempt open.
+func TestFetchPrompt_DecodesHeldCommitResumeKind(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"open_pr_from_held_commit": true,
+		"held_commit_sha": "1111111111111111111111111111111111111111",
+		"held_commit_branch": "fishhawk/run-abc/held",
+		"held_commit_base_sha": "2222222222222222222222222222222222222222",
+		"held_commit_resume_kind": "pr_open"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.HeldCommitResumeKind != "pr_open" {
+		t.Errorf("HeldCommitResumeKind = %q, want \"pr_open\"", got.HeldCommitResumeKind)
+	}
+}
+
+// TestFetchPrompt_HeldCommitResumeKindOmittedWhenAbsent confirms the kind
+// decodes to the empty string when the backend omits it — a legacy #1231
+// exempt resolution and every ordinary dispatch — so the runner keeps its
+// pre-#2169 behavior on both.
+func TestFetchPrompt_HeldCommitResumeKindOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	fb.promptBody = `{
+		"stage_id": "stage-abc",
+		"stage_type": "implement",
+		"prompt": "p",
+		"prompt_hash": "h",
+		"open_pr_from_held_commit": true,
+		"held_commit_sha": "1111111111111111111111111111111111111111",
+		"held_commit_branch": "fishhawk/run-abc/held",
+		"held_commit_base_sha": "2222222222222222222222222222222222222222"
+	}`
+	c := quickClient(srv)
+
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{
+		StageID:    "stage-abc",
+		PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.HeldCommitResumeKind != "" {
+		t.Errorf("HeldCommitResumeKind = %q, want empty when the backend omits it", got.HeldCommitResumeKind)
+	}
+	if !got.OpenPRFromHeldCommit {
+		t.Error("the legacy exempt trio must still decode")
+	}
+}
+
 // TestFetchPrompt_DecodesPlanModel confirms the client decodes the backend's
 // plan_model response field (#1416) into FetchedPrompt.PlanModel, the wire value
 // the runner pins onto a plan-stage agent spawn as --model.

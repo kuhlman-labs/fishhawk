@@ -577,3 +577,112 @@ func TestShipPullRequest_FixupPushedOutcome_MarshalsApplyPath(t *testing.T) {
 		t.Errorf("child-push body must omit apply_path when unset (omitempty): %s", pf2.receivedBody)
 	}
 }
+
+// TestShipPullRequest_FailedBodyCarriesCheckpoint pins the PR-open checkpoint
+// wire shape (#2169): a failed ship whose caller supplied the pushed
+// coordinates POSTs a body carrying all four of them, so the backend can record
+// a push_checkpoint and a later retry_stage can resume the PR open with no
+// agent re-invocation.
+func TestShipPullRequest_FailedBodyCarriesCheckpoint(t *testing.T) {
+	pf, srv := newPRFakeBackend(t)
+	priv := makePRKey(t)
+	if _, err := quickPRClient(srv).ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: "failed", Category: "C", Reason: "open PR: 503 from the forge",
+		Branch: "fishhawk/run-2169/stage-abc", HeadSHA: "headsha2169", BaseSHA: "basesha2169",
+		TreeSHA: "treesha2169",
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(pf.receivedBody, &sent); err != nil {
+		t.Fatalf("unmarshal failure body: %v", err)
+	}
+	for key, want := range map[string]string{
+		"outcome":           "failed",
+		"category":          "C",
+		"branch":            "fishhawk/run-2169/stage-abc",
+		"head_sha":          "headsha2169",
+		"base_sha":          "basesha2169",
+		"verified_tree_sha": "treesha2169",
+	} {
+		if got, _ := sent[key].(string); got != want {
+			t.Errorf("failure body %s = %q, want %q (full body: %s)", key, got, want, pf.receivedBody)
+		}
+	}
+}
+
+// TestShipPullRequest_FailedBodyByteIdenticalWithoutCheckpoint is the
+// omitempty control (#2169): a failed ship carrying NONE of the checkpoint
+// coordinates — every PRE-push failure — must marshal the EXACT legacy
+// {outcome,category,reason} bytes. Asserted on the bytes rather than on a
+// decoded struct, because the signed digest covers the bytes: a stray
+// `"branch":""` would change every pre-push failure report's signature and its
+// stored payload for no reason.
+func TestShipPullRequest_FailedBodyByteIdenticalWithoutCheckpoint(t *testing.T) {
+	pf, srv := newPRFakeBackend(t)
+	priv := makePRKey(t)
+	if _, err := quickPRClient(srv).ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: "failed", Category: "B", Reason: "commit would not compile",
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	const want = `{"outcome":"failed","category":"B","reason":"commit would not compile"}`
+	if got := string(pf.receivedBody); got != want {
+		t.Errorf("pre-push failure body must be byte-identical to the legacy shape\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestShipPullRequest_AggressiveRetryPreservesCheckpoint pins the SECOND
+// marshal site (#2169): the bounded post-4xx aggressive re-marshal rebuilds the
+// failure body from scratch, so it must re-carry the checkpoint. Dropping it
+// there would make a 413-retried failure report silently un-resumable and fall
+// the retry back to a full agent re-run. Also verifies the re-marshalled bytes'
+// signature, since the retry re-signs.
+func TestShipPullRequest_AggressiveRetryPreservesCheckpoint(t *testing.T) {
+	priv := makePRKey(t)
+	pub := priv.Public().(ed25519.PublicKey)
+	var bodies [][]byte
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		verifyPRSig(t, pub, raw, r.Header.Get("X-Fishhawk-Signature"))
+		bodies = append(bodies, raw)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			_, _ = io.WriteString(w, `{"error":{"code":"body_too_large"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(ShipPullRequestResult{StageID: r.URL.Query().Get("stage_id")})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := New(srv.URL)
+	c.MaxRetries = 3
+	c.Backoff = time.Millisecond
+
+	if _, err := c.ShipPullRequest(context.Background(), ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: "failed", Category: "C", Reason: "open PR: " + strings.Repeat("x", 200*1024),
+		Branch: "fishhawk/run-2169/stage-abc", HeadSHA: "headsha2169", BaseSHA: "basesha2169",
+		TreeSHA: "treesha2169",
+	}); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("calls = %d, want exactly 2 (413 then one aggressive retry)", len(bodies))
+	}
+	var sent pullRequestFailureBody
+	if err := json.Unmarshal(bodies[1], &sent); err != nil {
+		t.Fatalf("unmarshal aggressive body: %v", err)
+	}
+	if sent.Branch != "fishhawk/run-2169/stage-abc" || sent.HeadSHA != "headsha2169" {
+		t.Errorf("aggressive retry dropped the checkpoint: branch=%q head_sha=%q", sent.Branch, sent.HeadSHA)
+	}
+	if sent.BaseSHA != "basesha2169" || sent.VerifiedTreeSHA != "treesha2169" {
+		t.Errorf("aggressive retry dropped base/tree: base_sha=%q verified_tree_sha=%q", sent.BaseSHA, sent.VerifiedTreeSHA)
+	}
+}

@@ -62,6 +62,15 @@ type pullRequestBody struct {
 	// instead of creating a PR artifact, so the run never strands at
 	// review:awaiting_approval with a null PR.
 	//
+	// A "failed" report MAY additionally carry the PR-open checkpoint (#2169) on
+	// the already-declared Branch / HeadSHA / BaseSHA / VerifiedTreeSHA fields
+	// above: the coordinates of a gate-verified commit CommitAndPush already
+	// pushed before the failure (a PR-open or artifact-ship failure). No new
+	// decode field is needed — the runner simply populates the existing ones —
+	// and failPullRequestStage records them as the pull_request_failed payload's
+	// push_checkpoint so a retry_stage can resume the PR open with no agent
+	// re-run. All four stay absent on a PRE-push failure.
+	//
 	// When Outcome=="pushed" the body is a decomposed-child push-success
 	// report (#771): the child committed + pushed onto the shared parent
 	// branch but opened no PR (the parent run opens one consolidated PR after
@@ -1346,13 +1355,35 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	}
 
 	stageID := stage.ID
-	auditPayload, _ := json.Marshal(map[string]any{
+	payloadFields := map[string]any{
 		"run_id":      runID.String(),
 		"stage_id":    stageID.String(),
 		"category":    pr.Category,
 		"reason":      pr.Reason,
 		"auth_method": authMethod,
-	})
+	}
+	// PR-OPEN CHECKPOINT (#2169). A failure the runner reported AFTER
+	// CommitAndPush already landed the gate-verified commit carries the pushed
+	// coordinates, so record them into this entry. resolvePushCheckpointResume
+	// reads them back at the next dispatch and re-dispatches the stage to
+	// re-attempt only the idempotent OpenPR — no agent re-invocation.
+	//
+	// BOTH branch AND head_sha are required. A half-populated report is a runner
+	// bug, and a checkpoint missing either coordinate cannot be resumed (there is
+	// nothing to probe, or nothing to compare the tip against), so record NOTHING
+	// rather than a partial one the gate would have to re-validate. Deliberately
+	// NOT enforced in validate(): a 400 there would strand the implement stage in
+	// `running` until the SLA watchdog reaps it, converting a runner bug into a
+	// hung run. Recording nothing degrades to today's full agent re-run instead.
+	if pr.Outcome == "failed" && pr.Branch != "" && pr.HeadSHA != "" {
+		payloadFields["push_checkpoint"] = map[string]any{
+			"branch":            pr.Branch,
+			"head_sha":          pr.HeadSHA,
+			"base_sha":          pr.BaseSHA,
+			"verified_tree_sha": pr.VerifiedTreeSHA,
+		}
+	}
+	auditPayload, _ := json.Marshal(payloadFields)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,

@@ -1199,11 +1199,31 @@ Notes:
   commit/push/PR-open step failed after the trace gate left the implement stage in
   `running`. The actor is the request's `actorKind`/`actorSubject` (`system`, or
   operator on the bearer path) and the payload is `{run_id, stage_id, category,
-  reason, auth_method}`. It pins the runner's failure category (C retryable via
-  `failed → pending`, B parks for re-scope) and reason into the chain so the run
-  never reaches `review:awaiting_approval` with a null PR. Listed here only so a
+  reason, auth_method}`, plus the optional `push_checkpoint` key below. It pins
+  the runner's failure category (C retryable via `failed → pending`, B parks for
+  re-scope) and reason into the chain so the run never reaches
+  `review:awaiting_approval` with a null PR. Listed here only so a
   future reader grepping the audit categories doesn't mistake it for a comment
   surface.
+  The **`push_checkpoint`** payload key (#2169) is the PR-OPEN CHECKPOINT:
+  `{branch, head_sha, base_sha, verified_tree_sha}`, present ONLY when the
+  reported failure happened AFTER `CommitAndPush` already landed the
+  gate-verified commit on the run branch (a PR-open failure, or an artifact-ship
+  failure once the PR was open), and only when the report carries BOTH a
+  non-empty `branch` and `head_sha` — a half-populated report records no
+  checkpoint at all, and `validate()` is deliberately NOT tightened to reject
+  one, because a 400 there would strand the implement stage in `running`. It is
+  read back at the next dispatch by
+  `server/prompt.go::resolvePushCheckpointResume`, which — when this entry is
+  still the stage's NEWEST across `pull_request_failed` /
+  `pull_request_opened` / the three `scope_completeness_*` kinds /
+  `fixup_pushed` / `child_pushed` — emits the held-commit prompt fields plus
+  `held_commit_resume_kind:"pr_open"` so the runner re-attempts ONLY the
+  idempotent `OpenPR` from the pushed head, with no agent re-invocation. A
+  pre-push failure omits the key entirely, keeping that payload byte-identical
+  to the pre-#2169 shape. `pull_request_failed` remains an internal audit kind
+  either way: the checkpoint adds a payload key, not a comment surface, and
+  nothing in `issuecomment` posts it.
 - The detached-dispatch reaper failure kind — `dispatch_reaper_failed` (#1747) —
   is an **internal, audit-only kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method.
