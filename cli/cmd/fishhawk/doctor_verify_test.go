@@ -647,6 +647,123 @@ func TestSanitizeVerifyEnv(t *testing.T) {
 	}
 }
 
+// --- #2504: GOOGLE_* no longer rides the bare "GO" allow-prefix --------------
+
+// TestVerifyEnvAllowed_RejectsGoogleCredentialKeys is the DIRECT counterfactual
+// vehicle for control 1 (the narrowed allow rule). verifyEnvAllowed does not
+// consult the denylist, so restoring "GO" to verifyEnvAllowPrefix turns this red
+// on its own — the layered GOOGLE_ deny cannot mask an allow-list regression.
+func TestVerifyEnvAllowed_RejectsGoogleCredentialKeys(t *testing.T) {
+	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT"} {
+		if verifyEnvAllowed(k) {
+			t.Errorf("verifyEnvAllowed(%q) = true, want false — the allow-list must not admit Google credential keys", k)
+		}
+	}
+}
+
+// TestVerifyEnvDenied_GooglePrefix is the DIRECT counterfactual vehicle for
+// control 2 (the GOOGLE_ deny prefix). Deleting the "GOOGLE_" entry from
+// verifyEnvDenyPrefix turns this red on its own while the narrowed allow-list
+// still stands. It also asserts every existing exact denylist key stays denied
+// and that a legitimate toolchain var (GOPATH) is NOT swept up by the prefix.
+func TestVerifyEnvDenied_GooglePrefix(t *testing.T) {
+	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_ANYTHING"} {
+		if !verifyEnvDenied(k) {
+			t.Errorf("verifyEnvDenied(%q) = false, want true", k)
+		}
+	}
+	for k := range verifyEnvDeny {
+		if !verifyEnvDenied(k) {
+			t.Errorf("existing denylist key %q is no longer denied", k)
+		}
+	}
+	if verifyEnvDenied("GOPATH") {
+		t.Error("verifyEnvDenied(GOPATH) = true, want false — a legitimate toolchain var must not be denied")
+	}
+}
+
+// TestSanitizeVerifyEnv_DropsGoogleCredentials is the end-to-end pin over
+// sanitizeVerifyEnv: both Google credential keys are dropped while PATH and the
+// toolchain vars survive with their values intact.
+func TestSanitizeVerifyEnv_DropsGoogleCredentials(t *testing.T) {
+	base := []string{
+		"GOOGLE_API_KEY=leak-api",
+		"GOOGLE_APPLICATION_CREDENTIALS=/path/creds.json",
+		"PATH=/usr/bin:/bin",
+		"GOPATH=/home/op/go",
+		"GOPROXY=https://proxy.example.com",
+	}
+	got := sanitizeVerifyEnv(base)
+	set := map[string]string{}
+	for _, kv := range got {
+		k, v, _ := strings.Cut(kv, "=")
+		set[k] = v
+	}
+	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"} {
+		if _, present := set[k]; present {
+			t.Errorf("%s survived sanitizeVerifyEnv, want it dropped", k)
+		}
+	}
+	for k, v := range map[string]string{
+		"PATH":    "/usr/bin:/bin",
+		"GOPATH":  "/home/op/go",
+		"GOPROXY": "https://proxy.example.com",
+	} {
+		if set[k] != v {
+			t.Errorf("%s = %q, want %q", k, set[k], v)
+		}
+	}
+}
+
+// TestVerifyEnvAllowsGoToolchainVars is the OVER-NARROWING guard: every name in
+// verifyEnvAllowGo must survive sanitizeVerifyEnv with its value byte-intact, so
+// an over-narrow set (a legitimate toolchain var dropped) red-lines here rather
+// than surfacing later as a spurious verify failure.
+func TestVerifyEnvAllowsGoToolchainVars(t *testing.T) {
+	for key := range verifyEnvAllowGo {
+		val := "value-for-" + key
+		got := sanitizeVerifyEnv([]string{key + "=" + val})
+		set := map[string]string{}
+		for _, kv := range got {
+			k, v, _ := strings.Cut(kv, "=")
+			set[k] = v
+		}
+		if set[key] != val {
+			t.Errorf("Go toolchain var %s = %q, want %q — sanitizeVerifyEnv dropped or altered an allow-listed name", key, set[key], val)
+		}
+	}
+}
+
+// TestCheckVerifyCommand_ChildDoesNotInheritGoogleCredentials is the
+// operator-machine end-to-end counterfactual for the Google-credential leak: the
+// command string is read from the committed spec, so the verify child must NOT
+// see the doctor process's Google credentials. Distinctive markers are seeded
+// into GOOGLE_API_KEY and GOOGLE_APPLICATION_CREDENTIALS, the command echoes both
+// plus PATH and exits 1, and the remediation must carry neither marker AND report
+// PATH still set — so the fix cannot be a blanket empty environment that silently
+// breaks every verify command.
+func TestCheckVerifyCommand_ChildDoesNotInheritGoogleCredentials(t *testing.T) {
+	const apiMarker = "google-api-leak-marker-do-not-inherit"
+	const credMarker = "google-creds-leak-marker-do-not-inherit"
+	t.Setenv("GOOGLE_API_KEY", apiMarker)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credMarker)
+
+	repo := newVerifyRepo(t, specWithCommand(
+		`echo "google_key=[$GOOGLE_API_KEY] google_creds=[$GOOGLE_APPLICATION_CREDENTIALS] path=[${PATH:+set}]"; exit 1`,
+		"15m"))
+
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	if r.status != "fail" {
+		t.Fatalf("status = %q, want fail; detail: %s; hint: %s", r.status, r.detail, r.remediate)
+	}
+	if strings.Contains(r.remediate, apiMarker) || strings.Contains(r.remediate, credMarker) {
+		t.Errorf("the verify child inherited a Google credential from the doctor process:\n%s", r.remediate)
+	}
+	if !strings.Contains(r.remediate, "google_key=[] google_creds=[] path=[set]") {
+		t.Errorf("remediate = %q, want the Google credentials empty AND PATH still set", r.remediate)
+	}
+}
+
 // TestRedactVerifyGoEnvUserinfo covers the redaction helper's own branches:
 // both GOPROXY separators, a non-URL value, a schemeless value, and a
 // credential-free URL (which must pass through unchanged).

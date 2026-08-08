@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSanitizeEnv_StripsSecretsKeepsToolchain feeds sanitizeEnv a base slice
@@ -201,6 +207,335 @@ func TestWithIsolatedLintCache(t *testing.T) {
 			t.Errorf("unrelated %s = %q, want %q", k, gotMap[k], v)
 		}
 	}
+}
+
+// --- #2504: GOOGLE_* no longer rides the bare "GO" allow-prefix --------------
+
+// TestGateEnvAllowed_RejectsGoogleCredentialKeys is the DIRECT counterfactual
+// vehicle for control 1 (the narrowed allow rule). gateEnvAllowed does not
+// consult the denylist, so restoring "GO" to gateEnvAllowPrefix turns this red
+// on its own — the layered GOOGLE_ deny cannot mask an allow-list regression.
+func TestGateEnvAllowed_RejectsGoogleCredentialKeys(t *testing.T) {
+	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT"} {
+		if gateEnvAllowed(k) {
+			t.Errorf("gateEnvAllowed(%q) = true, want false — the allow-list must not admit Google credential keys", k)
+		}
+	}
+}
+
+// TestGateEnvDenied_GooglePrefix is the DIRECT counterfactual vehicle for
+// control 2 (the GOOGLE_ deny prefix). Deleting the "GOOGLE_" entry from
+// gateEnvDenyPrefix turns this red on its own while the narrowed allow-list
+// still stands. It also asserts every existing exact denylist key stays denied
+// and that a legitimate toolchain var (GOPATH) is NOT swept up by the prefix.
+func TestGateEnvDenied_GooglePrefix(t *testing.T) {
+	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_ANYTHING"} {
+		if !gateEnvDenied(k) {
+			t.Errorf("gateEnvDenied(%q) = false, want true", k)
+		}
+	}
+	for k := range gateEnvDeny {
+		if !gateEnvDenied(k) {
+			t.Errorf("existing denylist key %q is no longer denied", k)
+		}
+	}
+	if gateEnvDenied("GOPATH") {
+		t.Error("gateEnvDenied(GOPATH) = true, want false — a legitimate toolchain var must not be denied")
+	}
+}
+
+// TestSanitizeEnv_DropsGoogleCredentials is the end-to-end pin over sanitizeEnv:
+// both Google credential keys are dropped while PATH and the toolchain vars
+// survive with their values intact.
+func TestSanitizeEnv_DropsGoogleCredentials(t *testing.T) {
+	base := []string{
+		"GOOGLE_API_KEY=leak-api",
+		"GOOGLE_APPLICATION_CREDENTIALS=/path/creds.json",
+		"PATH=/usr/bin:/bin",
+		"GOPATH=/home/runner/go",
+		"GOPROXY=https://proxy.example.com",
+	}
+	got := sanitizeEnv(base)
+	gotMap := envSliceToMap(t, got)
+	for _, k := range []string{"GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"} {
+		if _, present := gotMap[k]; present {
+			t.Errorf("%s survived sanitizeEnv, want it dropped", k)
+		}
+	}
+	for k, v := range map[string]string{
+		"PATH":    "/usr/bin:/bin",
+		"GOPATH":  "/home/runner/go",
+		"GOPROXY": "https://proxy.example.com",
+	} {
+		if gotMap[k] != v {
+			t.Errorf("%s = %q, want %q", k, gotMap[k], v)
+		}
+	}
+}
+
+// TestGateEnvAllowsGoToolchainVars is the OVER-NARROWING guard: every name in
+// gateEnvAllowGo must survive sanitizeEnv with its value byte-intact, so an
+// over-narrow set (a legitimate toolchain var dropped) red-lines here rather
+// than surfacing later as an infra-shaped gate failure.
+func TestGateEnvAllowsGoToolchainVars(t *testing.T) {
+	for key := range gateEnvAllowGo {
+		val := "value-for-" + key
+		got := sanitizeEnv([]string{key + "=" + val})
+		gotMap := envSliceToMap(t, got)
+		if gotMap[key] != val {
+			t.Errorf("Go toolchain var %s = %q, want %q — sanitizeEnv dropped or altered an allow-listed name", key, gotMap[key], val)
+		}
+	}
+}
+
+// TestSanitizedGateEnv_StripsLiveGoogleCredential seeds GOOGLE_API_KEY into the
+// live process env and asserts sanitizedGateEnv() drops it while keeping PATH.
+func TestSanitizedGateEnv_StripsLiveGoogleCredential(t *testing.T) {
+	t.Setenv("GOOGLE_API_KEY", "live-google-leak-canary")
+	got := sanitizedGateEnv()
+	for _, kv := range got {
+		if strings.HasPrefix(kv, "GOOGLE_API_KEY=") {
+			t.Fatalf("sanitizedGateEnv leaked GOOGLE_API_KEY: %q", kv)
+		}
+	}
+	if os.Getenv("PATH") != "" {
+		sawPath := false
+		for _, kv := range got {
+			if strings.HasPrefix(kv, "PATH=") {
+				sawPath = true
+				break
+			}
+		}
+		if !sawPath {
+			t.Error("sanitizedGateEnv dropped PATH, which must be preserved")
+		}
+	}
+}
+
+// TestRunBoundedGateCommand_ChildDoesNotInheritGoogleCredentials (binding
+// condition 1) observes a REAL CHILD PROCESS environment, not just the
+// sanitizer's return value. It drives the runner's actual gate-command path —
+// runBoundedGateCommand assigns withIsolatedLintCache(sanitizedGateEnv(), …) to
+// cmd.Env and spawns `sh -c <command>` — so a regression that broke the wiring
+// of the sanitized slice into exec.Cmd.Env (not just the sanitizer) would leak
+// the seeded Google credentials into the child's captured output and fail here.
+// The command also echoes PATH, so the fix cannot be a blanket empty
+// environment that silently breaks every gate command.
+//
+// The preview-probe spawn site (previewprobe.go::runPreviewCommand) consumes the
+// SAME sanitizedGateEnv() base (appending only two non-secret FISHHAWK_PREVIEW_*
+// vars), so it shares this wiring; a leak there would require sanitizedGateEnv
+// itself to regress, which this test and the sanitizer pins above both catch.
+func TestRunBoundedGateCommand_ChildDoesNotInheritGoogleCredentials(t *testing.T) {
+	const apiMarker = "google-api-leak-marker-4f2a"
+	const credMarker = "google-creds-leak-marker-9b7c"
+	t.Setenv("GOOGLE_API_KEY", apiMarker)
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", credMarker)
+
+	dir := t.TempDir()
+	lintCache := t.TempDir()
+	const command = `echo "google_key=[$GOOGLE_API_KEY] google_creds=[$GOOGLE_APPLICATION_CREDENTIALS] path=[${PATH:+set}]"`
+
+	output, exitCode := runBoundedGateCommand(context.Background(), command, dir, lintCache, 30*time.Second)
+	if exitCode != 0 {
+		t.Fatalf("gate command exited %d; output: %s", exitCode, output)
+	}
+	if strings.Contains(output, apiMarker) || strings.Contains(output, credMarker) {
+		t.Errorf("the gate child inherited a Google credential from the runner process:\n%s", output)
+	}
+	if !strings.Contains(output, "google_key=[] google_creds=[] path=[set]") {
+		t.Errorf("output = %q, want the Google credentials empty AND PATH still set", output)
+	}
+}
+
+// TestGateEnvListsMatchCLICopy is the lockstep divergence detector. The runner
+// and CLI copies live in separate Go modules (both package main) and cannot
+// import each other, so this reads the CLI source through the workspace root and
+// asserts every set — allow-exact, allow-Go, allow-prefix, deny-exact,
+// deny-prefix — is identical to the runner's own. A single-copy edit fails here.
+//
+// Degrade (binding condition 3): it SKIPS only when go.work itself cannot be
+// found (a vendored or module-cache build with no workspace). If go.work IS
+// found but the peer CLI file cannot be read or a literal block cannot be
+// parsed, it FAILS — an unparseable peer is a detector malfunction, not an
+// environment without a workspace. Both branches print the reason.
+func TestGateEnvListsMatchCLICopy(t *testing.T) {
+	root, err := findWorkspaceRoot()
+	if err != nil {
+		t.Skipf("go.work not found from the test working directory (%v); skipping the CLI-copy cross-check", err)
+	}
+	cliPath := filepath.Join(root, "cli", "cmd", "fishhawk", "doctor_verify.go")
+	data, err := os.ReadFile(cliPath) //nolint:gosec // fixed workspace-relative path
+	if err != nil {
+		t.Fatalf("go.work found at %s but the peer CLI file %s could not be read: %v", root, cliPath, err)
+	}
+	src := string(data)
+
+	for _, tc := range []struct {
+		cliVar string
+		want   map[string]struct{}
+	}{
+		{"verifyEnvAllowExact", gateEnvAllowExact},
+		{"verifyEnvAllowGo", gateEnvAllowGo},
+		{"verifyEnvDeny", gateEnvDeny},
+	} {
+		keys, perr := parseVarKeys(src, tc.cliVar)
+		if perr != nil {
+			t.Fatalf("parsing CLI %s from %s: %v", tc.cliVar, cliPath, perr)
+		}
+		if !sameSet(keys, tc.want) {
+			t.Errorf("CLI %s = %v, runner copy = %v — the two copies diverged",
+				tc.cliVar, sortedKeys(keys), sortedMapKeys(tc.want))
+		}
+	}
+
+	for _, tc := range []struct {
+		cliVar string
+		want   []string
+	}{
+		{"verifyEnvAllowPrefix", gateEnvAllowPrefix},
+		{"verifyEnvDenyPrefix", gateEnvDenyPrefix},
+	} {
+		keys, perr := parseVarKeys(src, tc.cliVar)
+		if perr != nil {
+			t.Fatalf("parsing CLI %s from %s: %v", tc.cliVar, cliPath, perr)
+		}
+		if !sameSlice(keys, tc.want) {
+			t.Errorf("CLI %s = %v, runner copy = %v — the two copies diverged", tc.cliVar, keys, tc.want)
+		}
+	}
+}
+
+// findWorkspaceRoot walks up from THIS test's source file looking for go.work,
+// returning the directory that contains it. It anchors on runtime.Caller rather
+// than os.Getwd() because the runner suite's TestMain chdirs into a throwaway
+// temp dir, so the process working directory is not the source tree. In a
+// vendored or module-cache build the embedded source path does not exist on
+// disk, so the stat walk reaches the filesystem root and returns an error —
+// which the caller renders as a SKIP (no workspace), per binding condition 3.
+func findWorkspaceRoot() (string, error) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("runtime.Caller could not locate the test source file")
+	}
+	start := filepath.Dir(thisFile)
+	for dir := start; ; {
+		if _, err := os.Stat(filepath.Join(dir, "go.work")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no go.work at or above %s", start)
+		}
+		dir = parent
+	}
+}
+
+// parseVarKeys extracts the double-quoted keys from a `var <name> = …`
+// declaration in Go source. It handles a single-line composite literal
+// (`var x = []string{"a", "b"}`) and a multi-line one (`var x = map[…]{ … }`),
+// distinguished by whether the declaration line ends with `{`. It returns an
+// error when the declaration is not found, is not terminated, or yields no keys
+// — an unparseable peer must FAIL the detector, not silently pass.
+func parseVarKeys(src, name string) ([]string, error) {
+	lines := strings.Split(src, "\n")
+	startPrefix := "var " + name + " "
+	idx := -1
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), startPrefix) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, fmt.Errorf("declaration %q not found", name)
+	}
+	if strings.HasSuffix(strings.TrimSpace(lines[idx]), "{") {
+		var keys []string
+		for j := idx + 1; j < len(lines); j++ {
+			if strings.TrimSpace(lines[j]) == "}" {
+				return nonEmptyKeys(name, keys)
+			}
+			keys = append(keys, quotedStrings(lines[j])...)
+		}
+		return nil, fmt.Errorf("declaration %q is not terminated by a closing brace", name)
+	}
+	return nonEmptyKeys(name, quotedStrings(lines[idx]))
+}
+
+// nonEmptyKeys guards the "parsed but empty" case so a mis-scanned block FAILS
+// rather than comparing an empty set that would spuriously match nothing.
+func nonEmptyKeys(name string, keys []string) ([]string, error) {
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("declaration %q parsed to zero keys", name)
+	}
+	return keys, nil
+}
+
+// quotedStrings returns every double-quoted substring in s (keys in these
+// declarations carry no escaped quotes).
+func quotedStrings(s string) []string {
+	var out []string
+	var b strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c == '"':
+			if inQuote {
+				out = append(out, b.String())
+				b.Reset()
+			}
+			inQuote = !inQuote
+		case inQuote:
+			b.WriteByte(c)
+		}
+	}
+	return out
+}
+
+// sameSet reports whether keys (deduped) is exactly the key set of want.
+func sameSet(keys []string, want map[string]struct{}) bool {
+	got := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		got[k] = struct{}{}
+	}
+	if len(got) != len(want) {
+		return false
+	}
+	for k := range got {
+		if _, ok := want[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// sameSlice reports whether a and b are equal in length, order, and contents.
+func sameSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedKeys(keys []string) []string {
+	out := append([]string(nil), keys...)
+	sort.Strings(out)
+	return out
+}
+
+func sortedMapKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // countKey returns how many "KEY=..." entries in env have the given key.
