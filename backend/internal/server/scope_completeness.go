@@ -230,11 +230,34 @@ func (s *Server) resolveParkedScopeStage(r *http.Request, runID uuid.UUID) (*run
 // either — so the pre-#2501 Running transition was a dead end on BOTH runner
 // kinds and no runner ever spawned to open the held commit's PR.
 //
-// It also appends a scope_completeness_exempted audit entry pinning the held
-// commit and the gate_evidence marker. Best-effort audit + advance, mirroring
-// failScopeCompleteness: the transition is the durable state change.
+// ORDERING IS LOAD-BEARING (#2501): the scope_completeness_exempted audit entry
+// is appended FIRST, and a failed append REFUSES the decision (500) instead of
+// logging on. That entry is not a record of the decision — since #2501 it IS the
+// functional authorization proof the prompt emission gate reads
+// (prompt.go::resolveHeldCommitExemption), so:
+//
+//   - Appending it before the stage leaves awaiting_scope_decision closes the
+//     window in which the transition + Advance below could spawn a runner whose
+//     prompt fetch raced the append, read the older `parked` entry, emitted no
+//     held-commit fields, and re-invoked the agent — the ~$23/~50-minute re-run
+//     #2501 exists to eliminate.
+//   - Refusing on an append failure keeps the same property when the chain write
+//     fails outright: a stage the gate can never prove exempt is left parked (the
+//     operator can simply re-decide) rather than dispatched into a guaranteed
+//     agent re-run with no exemption recorded in the audit chain.
+//
+// failScopeCompleteness keeps its best-effort append: nothing downstream reads
+// the `failed` entry as authorization, and its stage transition is terminal.
 func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, reason, decidedBy string) {
+	if err := s.writeScopeCompletenessDecisionAudit(r, runID, stage,
+		CategoryScopeCompletenessExempted, reason, decidedBy); err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "exemption_unrecorded",
+			"the exemption could not be recorded in the audit chain; the stage is left parked — re-POST the decision",
+			map[string]any{"error": err.Error()})
+		return
+	}
+
 	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, run.StageStatePending, nil); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"resume parked stage failed", map[string]any{"error": err.Error()})
@@ -251,7 +274,6 @@ func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request,
 		}
 	}
 
-	s.writeScopeCompletenessDecisionAudit(r, runID, stage, CategoryScopeCompletenessExempted, reason, decidedBy)
 	s.notifyStatusUpdate(r.Context(), runID, "scope_exempted")
 
 	resp := scopeCompletenessDecisionResponse{
@@ -290,7 +312,16 @@ func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, r
 		}
 	}
 
-	s.writeScopeCompletenessDecisionAudit(r, runID, stage, CategoryScopeCompletenessFailed, reason, decidedBy)
+	// Best-effort, deliberately (see exemptScopeCompleteness): the `failed` entry
+	// authorizes nothing downstream and the stage is already terminally failed.
+	if err := s.writeScopeCompletenessDecisionAudit(r, runID, stage,
+		CategoryScopeCompletenessFailed, reason, decidedBy); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			CategoryScopeCompletenessFailed+" audit append failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
 	s.notifyStatusUpdate(r.Context(), runID, "scope_failed")
 
 	s.writeJSON(w, r, http.StatusOK, scopeCompletenessDecisionResponse{
@@ -302,10 +333,12 @@ func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, r
 
 // writeScopeCompletenessDecisionAudit appends the exempted/failed decision
 // audit entry, pinning the operator's reason and the parked held-commit
-// coordinates into the chain. Best-effort: a failure logs but doesn't
-// unwind the decision — the stage transition is the durable record.
+// coordinates into the chain. It RETURNS the append error rather than
+// swallowing it (#2501): each caller decides how load-bearing its entry is —
+// exemptScopeCompleteness refuses the decision (the entry is the emission
+// gate's authorization proof), failScopeCompleteness logs and continues.
 func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid.UUID,
-	stage *run.Stage, category, reason, decidedBy string) {
+	stage *run.Stage, category, reason, decidedBy string) error {
 	actorKind := actorKindForSubject(decidedBy)
 	stageID := stage.ID
 	payloadMap := map[string]any{
@@ -340,10 +373,7 @@ func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid
 		ActorSubject: &decidedBy,
 		Payload:      payload,
 	}); err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-			category+" audit append failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()))
+		return err
 	}
+	return nil
 }

@@ -12749,13 +12749,18 @@ paths:
         (403 `self_decision`): the implement agent that produced the
         parked commit must never decide its own exemption.
 
-        On `exempt` the stage resumes `running` so the held commit's PR
-        is opened with NO agent re-run (a `push_and_open_pr` dispatch
-        opens the PR from the held commit), and a
-        `scope_completeness_exempted` audit entry is appended. On `fail`
-        the stage fails category-B (today's restore path) and a
-        `scope_completeness_failed` entry is appended. A stage not
-        currently parked returns 409 (`stage_not_parked`).
+        On `exempt` the `scope_completeness_exempted` audit entry is
+        appended FIRST and the stage then resumes to `pending` (#2501),
+        so the orchestrator re-dispatches it and the runner opens the
+        held commit's PR with NO agent re-run. That entry is the prompt
+        emission gate's authorization proof for the held commit, so the
+        ordering is load-bearing (a runner started by the follow-on
+        advance must not race the append) and an append failure refuses
+        the decision with 500 `exemption_unrecorded`, leaving the stage
+        parked. On `fail` the stage fails category-B (today's restore
+        path) and a `scope_completeness_failed` entry is appended
+        best-effort. A stage not currently parked returns 409
+        (`stage_not_parked`).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -12843,6 +12848,16 @@ paths:
           description: |
             `stage_not_parked` — the implement stage is not parked
             awaiting a scope-completeness decision.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `exemption_unrecorded` — the `scope_completeness_exempted`
+            audit entry could not be appended, so the exemption the
+            prompt emission gate reads as authorization does not exist
+            (#2501). The decision is refused and the stage is left
+            parked in `awaiting_scope_decision`; re-POST it.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

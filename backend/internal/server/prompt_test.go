@@ -8923,15 +8923,32 @@ func scopeDecisionEntry(stageID uuid.UUID, category string, seq int64) *audit.En
 // the given park/audit state and returns the marshalled body's top-level keys.
 func exemptPromptKeys(t *testing.T, park *run.ScopeCompletenessPark, entries []*audit.Entry, listErr error) map[string]json.RawMessage {
 	t.Helper()
+	return exemptPromptKeysWithAudit(t, park, func(stageID uuid.UUID) audit.Repository {
+		au := &exemptAuditFake{listErr: listErr}
+		for _, e := range entries {
+			id := stageID
+			e.StageID = &id
+			au.entries = append(au.entries, e)
+		}
+		return au
+	})
+}
+
+// exemptPromptKeysWithAudit is exemptPromptKeys' audit-repository seam: auditFor
+// builds the repository for the generated stage id, and a NIL auditFor wires the
+// server with NO AuditRepo at all — the unconfigured-chain fail-closed branch of
+// the emission gate, which a typed-nil fake could not reach (a non-nil interface
+// holding a nil pointer passes the handler's `== nil` guard and then derefs).
+func exemptPromptKeysWithAudit(t *testing.T, park *run.ScopeCompletenessPark,
+	auditFor func(stageID uuid.UUID) audit.Repository) map[string]json.RawMessage {
+	t.Helper()
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
-	au := &exemptAuditFake{listErr: listErr}
 	runID := uuid.New()
 	stageID := uuid.New()
-	for _, e := range entries {
-		id := stageID
-		e.StageID = &id
-		au.entries = append(au.entries, e)
+	var au audit.Repository
+	if auditFor != nil {
+		au = auditFor(stageID)
 	}
 	priv, _ := sf.issue(t, runID)
 	triggerRef := "issue:42"
@@ -9037,6 +9054,15 @@ func TestPromptExemptFields_EmissionGate(t *testing.T) {
 			scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 3),
 		}, nil)
 		assertNoExemptKeys(t, keys, "a stage RE-PARKED after an earlier exempt")
+	})
+
+	t.Run("nil_audit_repo_fails_closed", func(t *testing.T) {
+		// The chain is UNREADABLE because it is not configured at all — the
+		// second enumerated fail-closed branch. The park itself looks fully
+		// exempt-worthy (held commit + branch present), so the ONLY thing
+		// withholding the fields is the guard.
+		keys := exemptPromptKeysWithAudit(t, exemptPark(), nil)
+		assertNoExemptKeys(t, keys, "a server with NO AuditRepo configured (fail-closed)")
 	})
 
 	t.Run("audit_repo_list_error_fails_closed", func(t *testing.T) {
