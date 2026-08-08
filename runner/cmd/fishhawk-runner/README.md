@@ -146,6 +146,39 @@ isolated lint cache. Do NOT add a second exec path for a new spec-supplied
 command, and do NOT widen the env allow-list to make a particular coverage
 tool work — that is a separate, explicit decision.
 
+### Gate-env allow-list
+
+`gateenv.go::sanitizedGateEnv` builds the child env for every gate exec site
+(`runBoundedGateCommand`, the compile/vet/test gates, and the preview probe)
+under a **default-deny allow-list**: an entry survives only if it is a system
+essential (`gateEnvAllowExact`: PATH/HOME/locale/temp/CC/CXX), a Go
+toolchain/runtime name (`gateEnvAllowGo`), or a `CGO_*`/`LC_*` prefix
+(`gateEnvAllowPrefix`). A secret added to the runner later is dropped
+automatically because it is not on the list.
+
+The Go rung is an explicit NAME set, **not** a bare `GO` prefix. The old prefix
+also admitted `GOOGLE_API_KEY` / `GOOGLE_APPLICATION_CREDENTIALS` and every
+other `GOOGLE_*` value, and the URL-userinfo redaction (`redactGoEnvUserinfo`)
+does not cover a bare API key — it only rewrites URL-shaped values — so those
+credentials passed into gate children verbatim (#2504). `gateEnvAllowGo` is the
+union of `go env` and the GO-prefixed names in `go help environment`, plus the
+runtime knobs (`GOMAXPROCS`/`GOGC`/`GOTRACEBACK`/`GOMEMLIMIT`) the bare prefix
+used to admit. `GOLANGCI_LINT_CACHE` is on the list, but `withIsolatedLintCache`
+strips any inherited value and appends its own per-invocation cache dir after
+sanitization (#1796), so admitting it is behaviour-neutral on the runner.
+
+Layered on top is a known-secret denylist (`gateEnvDeny`) plus a `GOOGLE_` deny
+**prefix** (`gateEnvDenyPrefix`) — belt-and-suspenders that keeps the Google
+credentials out even if a future allow-rule re-widens. There is no Go toolchain
+variable named `GOOGLE_*`, so the prefix is unambiguous.
+
+The CLI's `verifyEnv*` copy in `cli/cmd/fishhawk/doctor_verify.go` guards the
+`doctor` verify-command rung on the OPERATOR's own machine and is kept in
+lockstep with this file — the same allow-exact, allow-Go, allow-prefix,
+deny-exact and deny-prefix sets — by `TestGateEnvListsMatchCLICopy`, which reads
+the CLI source through the workspace root and fails on any divergence. **Adding
+a Go variable means adding it to BOTH copies**, or that test fails.
+
 **Filesystem isolation: a throwaway checkout.** `runBoundedGateCommand`
 contains the process and the environment; only a separate checkout contains
 the **filesystem**. So the command runs in a disposable

@@ -47,21 +47,89 @@ var gateEnvAllowExact = map[string]struct{}{
 	"CXX":     {},
 }
 
-// gateEnvAllowPrefix lists key prefixes admitted wholesale: every GO* var
-// (GOPATH/GOCACHE/GOMODCACHE/GOPROXY/GOFLAGS/GOTOOLCHAIN/…), every CGO_* var,
-// and every LC_* locale var. Preserving the whole GO* prefix avoids turning a
-// real compile/test failure into an infra-skip from a missing toolchain var.
+// gateEnvAllowGo is the explicit set of Go toolchain / runtime variable names
+// admitted by EXACT match. It replaces an earlier bare "GO" allow-prefix, which
+// was broader than the Go namespace it was written for: GOOGLE_API_KEY,
+// GOOGLE_APPLICATION_CREDENTIALS, and every other GOOGLE_* value matched it and
+// passed through verbatim (the redactGoEnvUserinfo transform only rewrites
+// URL-shaped values, so a bare API key was forwarded unchanged) — #2504. The set
+// is the union of `go env` output and the GO-prefixed names in
+// `go help environment` on the Go toolchain this repo pins, plus the runtime
+// knobs the bare prefix used to admit (GOMAXPROCS/GOGC/GOTRACEBACK/GOMEMLIMIT).
+// GOLANGCI_LINT_CACHE is admitted too so an operator's inherited linter-cache
+// path survives; on the runner withIsolatedLintCache strips any inherited value
+// and appends its own AFTER sanitization (#1796), so admitting it here is
+// behaviour-neutral. Kept sorted, one per line, and pinned IDENTICAL to
+// cli/cmd/fishhawk/doctor_verify.go's verifyEnvAllowGo by
+// TestGateEnvListsMatchCLICopy — adding a Go variable means adding it to BOTH.
+var gateEnvAllowGo = map[string]struct{}{
+	"GO111MODULE":         {},
+	"GO386":               {},
+	"GOAMD64":             {},
+	"GOARCH":              {},
+	"GOARM":               {},
+	"GOARM64":             {},
+	"GOAUTH":              {},
+	"GOBIN":               {},
+	"GOCACHE":             {},
+	"GOCACHEPROG":         {},
+	"GOCOVERDIR":          {},
+	"GODEBUG":             {},
+	"GOENV":               {},
+	"GOEXE":               {},
+	"GOEXPERIMENT":        {},
+	"GOFIPS140":           {},
+	"GOFLAGS":             {},
+	"GOGC":                {},
+	"GOGCCFLAGS":          {},
+	"GOHOSTARCH":          {},
+	"GOHOSTOS":            {},
+	"GOINSECURE":          {},
+	"GOLANGCI_LINT_CACHE": {},
+	"GOMAXPROCS":          {},
+	"GOMEMLIMIT":          {},
+	"GOMIPS":              {},
+	"GOMIPS64":            {},
+	"GOMOD":               {},
+	"GOMODCACHE":          {},
+	"GONOPROXY":           {},
+	"GONOSUMCHECK":        {},
+	"GONOSUMDB":           {},
+	"GOOS":                {},
+	"GOPATH":              {},
+	"GOPPC64":             {},
+	"GOPRIVATE":           {},
+	"GOPROXY":             {},
+	"GORISCV64":           {},
+	"GOROOT":              {},
+	"GOSUMDB":             {},
+	"GOTELEMETRY":         {},
+	"GOTELEMETRYDIR":      {},
+	"GOTMPDIR":            {},
+	"GOTOOLCHAIN":         {},
+	"GOTOOLDIR":           {},
+	"GOTRACEBACK":         {},
+	"GOVCS":               {},
+	"GOVERSION":           {},
+	"GOWASM":              {},
+	"GOWORK":              {},
+	"GO_EXTLINK_ENABLED":  {},
+}
+
+// gateEnvAllowPrefix lists key prefixes admitted wholesale: every CGO_* var and
+// every LC_* locale var. The Go toolchain namespace is NO LONGER a prefix rule
+// (see gateEnvAllowGo) — a bare "GO" prefix also admitted GOOGLE_* credentials.
 //
-// GO* values can be URL-valued (notably GOPROXY/GOSUMDB), and an operator may
-// embed userinfo credentials in that URL (scheme://user:pass@host). Those
-// credentials would otherwise be visible to the agent-authored code the gates
-// execute, re-opening the #940 gap that #931's allow-list preserved. Before a
-// GO* value reaches gate code, sanitizeEnv runs it through redactGoEnvUserinfo,
-// which strips embedded userinfo from each credentialed URL entry while keeping
-// the proxy host/path so dependency resolution still works. Non-URL GO* forms
-// (off, direct, bare host, GOFLAGS, GOPATH, GO111MODULE, …) pass through
-// byte-identical.
-var gateEnvAllowPrefix = []string{"GO", "CGO_", "LC_"}
+// An allowed GO* value can be URL-valued (notably GOPROXY/GOSUMDB), and an
+// operator may embed userinfo credentials in that URL (scheme://user:pass@host).
+// Those credentials would otherwise be visible to the agent-authored code the
+// gates execute, re-opening the #940 gap that #931's allow-list preserved.
+// Before a GO* value reaches gate code, sanitizeEnv runs it through
+// redactGoEnvUserinfo, which strips embedded userinfo from each credentialed URL
+// entry while keeping the proxy host/path so dependency resolution still works.
+// Non-URL GO* forms (off, direct, bare host, GOFLAGS, GOPATH, GO111MODULE, …)
+// pass through byte-identical.
+var gateEnvAllowPrefix = []string{"CGO_", "LC_"}
 
 // gateEnvDeny is the explicit known-secret denylist (belt-and-suspenders on top
 // of the default-deny allow-list). These keys are dropped unconditionally.
@@ -74,6 +142,13 @@ var gateEnvDeny = map[string]struct{}{
 	"OPENAI_API_KEY":        {},
 	"FISHHAWK_API_TOKEN":    {},
 }
+
+// gateEnvDenyPrefix lists key prefixes dropped unconditionally — the
+// belt-and-suspenders layer on top of the default-deny allow-list. There is no
+// Go toolchain variable named GOOGLE_*, so this entry is unambiguous: it keeps
+// GOOGLE_API_KEY / GOOGLE_APPLICATION_CREDENTIALS (and any future GOOGLE_*
+// credential) out of gate children even if a later allow-rule re-widens (#2504).
+var gateEnvDenyPrefix = []string{"GOOGLE_"}
 
 // sanitizedGateEnv returns the allow-listed environment to assign to a gate
 // subprocess's cmd.Env. Assigning a non-nil cmd.Env replaces the child's
@@ -94,7 +169,7 @@ func sanitizeEnv(base []string) []string {
 			continue
 		}
 		key := kv[:eq]
-		if _, denied := gateEnvDeny[key]; denied {
+		if gateEnvDenied(key) {
 			continue
 		}
 		if gateEnvAllowed(key) {
@@ -174,13 +249,35 @@ func withIsolatedLintCache(env []string, cacheDir string) []string {
 	return append(out, "GOLANGCI_LINT_CACHE="+cacheDir)
 }
 
-// gateEnvAllowed reports whether key is on the allow-list (exact match or an
-// allowed prefix).
+// gateEnvAllowed reports whether key is on the allow-list: a system essential
+// (gateEnvAllowExact), a Go toolchain/runtime name (gateEnvAllowGo), or an
+// allowed prefix (gateEnvAllowPrefix). It does NOT consult the denylist — that
+// is a separate layer applied first in sanitizeEnv — so a test that restores a
+// broadening allow-rule turns red on this predicate alone.
 func gateEnvAllowed(key string) bool {
 	if _, ok := gateEnvAllowExact[key]; ok {
 		return true
 	}
+	if _, ok := gateEnvAllowGo[key]; ok {
+		return true
+	}
 	for _, p := range gateEnvAllowPrefix {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// gateEnvDenied reports whether key is on the known-secret denylist: an exact
+// match (gateEnvDeny) or a denied prefix (gateEnvDenyPrefix). It is the
+// belt-and-suspenders layer sanitizeEnv applies BEFORE the allow-list, so a
+// denied key is dropped regardless of any allow-rule.
+func gateEnvDenied(key string) bool {
+	if _, ok := gateEnvDeny[key]; ok {
+		return true
+	}
+	for _, p := range gateEnvDenyPrefix {
 		if strings.HasPrefix(key, p) {
 			return true
 		}

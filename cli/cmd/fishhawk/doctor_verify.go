@@ -274,6 +274,10 @@ func provisionDoctorWorktree(ctx context.Context, workingDir string) (string, fu
 // automatically, plus an explicit known-secret denylist as belt-and-suspenders.
 // The two lists are deliberately duplicated rather than shared: `cli` and
 // `runner` are separate Go modules and the runner's copy lives in package main.
+// They are pinned IDENTICAL — the allow-exact, allow-Go, allow-prefix,
+// deny-exact and deny-prefix sets — by the runner's TestGateEnvListsMatchCLICopy,
+// which reads THIS file through the workspace root; a single-copy edit fails the
+// runner suite. Adding a Go toolchain variable means adding it to BOTH copies.
 
 // verifyEnvAllowExact is the set of system-essential variable names a verify
 // command needs to run at all: PATH to find its interpreter and tools, HOME for
@@ -295,12 +299,81 @@ var verifyEnvAllowExact = map[string]struct{}{
 	"CXX":     {},
 }
 
-// verifyEnvAllowPrefix lists key prefixes admitted wholesale: every GO* var
-// (GOPATH/GOCACHE/GOMODCACHE/GOPROXY/GOFLAGS/GOTOOLCHAIN/…), every CGO_* var,
-// and every LC_* locale var. Dropping the GO* prefix would turn a real verify
-// failure into a spurious one on any host with a private module proxy or a
-// non-default toolchain.
-var verifyEnvAllowPrefix = []string{"GO", "CGO_", "LC_"}
+// verifyEnvAllowGo is the explicit set of Go toolchain / runtime variable names
+// admitted by EXACT match. It replaces an earlier bare "GO" allow-prefix, which
+// was broader than the Go namespace it was written for: GOOGLE_API_KEY,
+// GOOGLE_APPLICATION_CREDENTIALS, and every other GOOGLE_* value matched it and
+// passed through verbatim (the redactVerifyGoEnvUserinfo transform only rewrites
+// URL-shaped values, so a bare API key was forwarded unchanged) — #2504. The set
+// is the union of `go env` output and the GO-prefixed names in
+// `go help environment` on the Go toolchain this repo pins, plus the runtime
+// knobs the bare prefix used to admit (GOMAXPROCS/GOGC/GOTRACEBACK/GOMEMLIMIT).
+// GOLANGCI_LINT_CACHE is admitted so an operator whose verify command runs
+// golangci-lint keeps their inherited cache location — the CLI has no
+// withIsolatedLintCache equivalent, and it is a path, not a secret (#2504). Kept
+// sorted, one per line, and pinned IDENTICAL to
+// runner/cmd/fishhawk-runner/gateenv.go's gateEnvAllowGo by the runner's
+// TestGateEnvListsMatchCLICopy — adding a Go variable means adding it to BOTH.
+var verifyEnvAllowGo = map[string]struct{}{
+	"GO111MODULE":         {},
+	"GO386":               {},
+	"GOAMD64":             {},
+	"GOARCH":              {},
+	"GOARM":               {},
+	"GOARM64":             {},
+	"GOAUTH":              {},
+	"GOBIN":               {},
+	"GOCACHE":             {},
+	"GOCACHEPROG":         {},
+	"GOCOVERDIR":          {},
+	"GODEBUG":             {},
+	"GOENV":               {},
+	"GOEXE":               {},
+	"GOEXPERIMENT":        {},
+	"GOFIPS140":           {},
+	"GOFLAGS":             {},
+	"GOGC":                {},
+	"GOGCCFLAGS":          {},
+	"GOHOSTARCH":          {},
+	"GOHOSTOS":            {},
+	"GOINSECURE":          {},
+	"GOLANGCI_LINT_CACHE": {},
+	"GOMAXPROCS":          {},
+	"GOMEMLIMIT":          {},
+	"GOMIPS":              {},
+	"GOMIPS64":            {},
+	"GOMOD":               {},
+	"GOMODCACHE":          {},
+	"GONOPROXY":           {},
+	"GONOSUMCHECK":        {},
+	"GONOSUMDB":           {},
+	"GOOS":                {},
+	"GOPATH":              {},
+	"GOPPC64":             {},
+	"GOPRIVATE":           {},
+	"GOPROXY":             {},
+	"GORISCV64":           {},
+	"GOROOT":              {},
+	"GOSUMDB":             {},
+	"GOTELEMETRY":         {},
+	"GOTELEMETRYDIR":      {},
+	"GOTMPDIR":            {},
+	"GOTOOLCHAIN":         {},
+	"GOTOOLDIR":           {},
+	"GOTRACEBACK":         {},
+	"GOVCS":               {},
+	"GOVERSION":           {},
+	"GOWASM":              {},
+	"GOWORK":              {},
+	"GO_EXTLINK_ENABLED":  {},
+}
+
+// verifyEnvAllowPrefix lists key prefixes admitted wholesale: every CGO_* var
+// and every LC_* locale var. The Go toolchain namespace is NO LONGER a prefix
+// rule (see verifyEnvAllowGo) — a bare "GO" prefix also admitted GOOGLE_*
+// credentials, which are far more likely to be present on an operator's own
+// machine than on the runner (#2504).
+var verifyEnvAllowPrefix = []string{"CGO_", "LC_"}
 
 // verifyEnvDeny is the explicit known-secret denylist layered on top of the
 // default-deny allow-list. These keys are dropped unconditionally.
@@ -313,6 +386,14 @@ var verifyEnvDeny = map[string]struct{}{
 	"OPENAI_API_KEY":        {},
 	"FISHHAWK_API_TOKEN":    {},
 }
+
+// verifyEnvDenyPrefix lists key prefixes dropped unconditionally — the
+// belt-and-suspenders layer on top of the default-deny allow-list. There is no
+// Go toolchain variable named GOOGLE_*, so this entry is unambiguous: it keeps
+// GOOGLE_API_KEY / GOOGLE_APPLICATION_CREDENTIALS (and any future GOOGLE_*
+// credential) out of the verify child even if a later allow-rule re-widens
+// (#2504).
+var verifyEnvDenyPrefix = []string{"GOOGLE_"}
 
 // sanitizedVerifyEnv returns the allow-listed environment assigned to the
 // verify child's cmd.Env. Assigning a non-nil cmd.Env replaces the child's
@@ -333,7 +414,7 @@ func sanitizeVerifyEnv(base []string) []string {
 			continue
 		}
 		key := kv[:eq]
-		if _, denied := verifyEnvDeny[key]; denied {
+		if verifyEnvDenied(key) {
 			continue
 		}
 		if !verifyEnvAllowed(key) {
@@ -350,13 +431,36 @@ func sanitizeVerifyEnv(base []string) []string {
 	return out
 }
 
-// verifyEnvAllowed reports whether key is on the allow-list (exact match or an
-// allowed prefix).
+// verifyEnvAllowed reports whether key is on the allow-list: a system essential
+// (verifyEnvAllowExact), a Go toolchain/runtime name (verifyEnvAllowGo), or an
+// allowed prefix (verifyEnvAllowPrefix). It does NOT consult the denylist — that
+// is a separate layer applied first in sanitizeVerifyEnv — so a test that
+// restores a broadening allow-rule turns red on this predicate alone.
 func verifyEnvAllowed(key string) bool {
 	if _, ok := verifyEnvAllowExact[key]; ok {
 		return true
 	}
+	if _, ok := verifyEnvAllowGo[key]; ok {
+		return true
+	}
 	for _, p := range verifyEnvAllowPrefix {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// verifyEnvDenied reports whether key is on the known-secret denylist: an exact
+// match (verifyEnvDeny) or a denied prefix (verifyEnvDenyPrefix). It is the
+// belt-and-suspenders layer sanitizeVerifyEnv applies BEFORE the allow-list, so
+// a denied key is dropped regardless of any allow-rule. It mirrors the runner's
+// gateEnvDenied.
+func verifyEnvDenied(key string) bool {
+	if _, ok := verifyEnvDeny[key]; ok {
+		return true
+	}
+	for _, p := range verifyEnvDenyPrefix {
 		if strings.HasPrefix(key, p) {
 			return true
 		}

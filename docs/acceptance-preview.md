@@ -28,7 +28,7 @@ At call time the runner adds two variables to each hook's environment:
 | `FISHHAWK_PREVIEW_SHA` | the expected merge-candidate head SHA (the identity the preview must serve) |
 | `FISHHAWK_PREVIEW_TARGET_HOST` | the first declared `egress.target_hosts` entry (host or `host:port`, scheme-less) |
 
-The hook runs under the credential-stripped `sanitizedGateEnv` allow-list (ADR-029 item 4, shared with the compile/test/verify gates): `PATH`, `HOME`, and `GO*` survive so a Go build works, but the runner's secrets do **not** reach the hook. `FISHHAWK_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN`, `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, and `FISHHAWK_API_TOKEN` are all absent. The provision hook builds and runs untrusted, committed, agent-authored merge-candidate code before the ADR-050 acceptance egress proxy contains anything, so it must never inherit the runner's credentials.
+The hook runs under the credential-stripped `sanitizedGateEnv` allow-list (ADR-029 item 4, shared with the compile/test/verify gates): `PATH`, `HOME`, and the Go toolchain vars (an explicit Go-name set, `gateEnvAllowGo` — NOT a bare `GO*` prefix, which also admitted `GOOGLE_*` credentials, #2504) survive so a Go build works, but the runner's secrets do **not** reach the hook. `FISHHAWK_GITHUB_TOKEN` / `GITHUB_TOKEN` / `GH_TOKEN`, `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, and `FISHHAWK_API_TOKEN` are all absent. The provision hook builds and runs untrusted, committed, agent-authored merge-candidate code before the ADR-050 acceptance egress proxy contains anything, so it must never inherit the runner's credentials.
 
 ## Timeouts
 
