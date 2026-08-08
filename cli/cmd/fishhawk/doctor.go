@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/credstore"
 )
 
 // checkResult holds the outcome of a single doctor rung.
@@ -40,6 +42,75 @@ var doctorLookPath = exec.LookPath
 var doctorRunOutput = func(name string, arg ...string) (string, error) {
 	out, err := exec.Command(name, arg...).Output() //nolint:gosec
 	return strings.TrimSpace(string(out)), err
+}
+
+// doctorCredLoad is the credstore seam for doctor's credential ladder.
+// Tests swap it; production delegates to credstore.Load. Matches the
+// doctorHTTPDo / doctorLookPath / doctorRunOutput seam pattern.
+var doctorCredLoad = credstore.Load
+
+// doctorExecutable is the os.Executable seam for the runner sibling rung.
+// Tests swap it to point at a directory whose fishhawk-runner sibling they
+// control; production delegates to os.Executable.
+var doctorExecutable = os.Executable
+
+// doctorCredential is a bearer credential resolved for the doctor probes,
+// with display metadata. Classification is for DISPLAY ONLY — the backend,
+// not a prefix table, decides whether a credential is valid.
+type doctorCredential struct {
+	token  string
+	source string // where it came from, for the rung detail
+	class  string // display class by prefix
+}
+
+// classifyCredential names a credential class by its prefix, for display.
+// Never used for admission — an unrecognized prefix is still probed.
+func classifyCredential(token string) string {
+	switch {
+	case strings.HasPrefix(token, "fhk_"):
+		return "operator token (fhk_)"
+	case strings.HasPrefix(token, "fhm_"):
+		return "machine token (fhm_)"
+	case strings.HasPrefix(token, "fho_"):
+		return "OAuth access token (fho_)"
+	default:
+		return "unrecognized prefix"
+	}
+}
+
+// resolveDoctorCredential mirrors newClient's ladder (run.go): an explicit
+// --token / $FISHHAWK_TOKEN (already folded into flagToken by
+// bindCommonFlags) wins; when empty, fall back to the stored credential
+// minted by `fishhawk token login` and keyed by the backend URL. Returns a
+// zero doctorCredential (empty token) when no tier resolves one — the token
+// rung degrades that to a warn, never a hard fail.
+func resolveDoctorCredential(backendURL, flagToken string) doctorCredential {
+	if flagToken != "" {
+		return doctorCredential{
+			token:  flagToken,
+			source: "--token / $FISHHAWK_TOKEN",
+			class:  classifyCredential(flagToken),
+		}
+	}
+	if cred, err := doctorCredLoad(backendURL); err == nil && cred.Token != "" {
+		return doctorCredential{
+			token:  cred.Token,
+			source: "stored credential (fishhawk token login)",
+			class:  classifyCredential(cred.Token),
+		}
+	}
+	return doctorCredential{}
+}
+
+// readinessOutcome carries the authoritative server-side readiness verdict
+// into the local token rung so a 200 from GET /v0/onboarding/readiness can
+// never be suppressed by the local /v0/runs heuristic. answered is true ONLY
+// when the endpoint returned HTTP 200 AND its body decoded into a readiness
+// payload — a 200 whose body does not decode is NOT an answer, so the token
+// rung must still be able to fail (binding condition 1).
+type readinessOutcome struct {
+	answered       bool
+	scopesAdequate bool
 }
 
 // runDoctor implements `fishhawk doctor`.
@@ -97,17 +168,24 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			}
 		}
 
+		// Resolve the bearer credential ONCE (the same ladder newClient
+		// uses) and probe onboarding readiness FIRST, so the authoritative
+		// server-side verdict is in hand before the local token rung decides
+		// and the two can never disagree about which credential is in play.
+		cred := resolveDoctorCredential(*cf.backendURL, *cf.token)
+		readinessChecks, readiness := checkOnboardingReadiness(*cf.backendURL, cred.token, resolvedRepo)
+
 		checks = []checkResult{
 			checkDockerDaemon(),
 			checkPostgresContainer(),
 			checkMinioContainer(),
 			checkBackend(*cf.backendURL),
-			checkToken(*cf.backendURL, *cf.token),
+			checkToken(*cf.backendURL, cred, readiness),
 			checkSpec(*workingDir),
 			checkExecutionPath(*workingDir),
 			checkVerifyCommandGated(*workingDir, *runVerify, *skipVerify, *verifyTimeout),
 			checkRunnerBinary(*runnerBinary, *workingDir),
-			checkMCPRegistration(),
+			checkMCPRegistration(*cf.backendURL),
 			checkGitOrigin(*workingDir),
 			checkGitWorkingTree(*workingDir),
 			checkGhCLI(),
@@ -115,7 +193,9 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			checkRunnerSchemaDrift(*cf.backendURL, *runnerBinary, *workingDir),
 			checkCLIVersion(*cf.backendURL),
 		}
-		checks = append(checks, checkOnboardingReadiness(*cf.backendURL, *cf.token, resolvedRepo)...)
+		// Append the readiness rungs LAST so the printed rung ORDER is
+		// unchanged (they still render after the local rungs).
+		checks = append(checks, readinessChecks...)
 	}
 
 	useColor := isTerminal(stdout) && os.Getenv("NO_COLOR") == ""
@@ -260,32 +340,58 @@ func checkBackend(backendURL string) checkResult {
 	return checkResult{label: label, detail: detail, status: "ok"}
 }
 
-// checkToken verifies the token is set, has the fhk_ prefix, and is
-// accepted by the backend's /v0/runs endpoint.
-func checkToken(backendURL, token string) checkResult {
+// checkToken probes the backend with whatever credential resolveDoctorCredential
+// found, whatever its class. The fhk_ prefix no longer gates admission — the
+// backend decides what a valid credential is, so an fho_ OAuth token passes and
+// an unrecognized prefix is still probed. Branches:
+//
+//	(a) no credential resolved from any tier -> WARN (an MCP/OAuth-driven loop
+//	    needs no CLI credential);
+//	(b) a resolved credential the backend accepts (200) -> ok, naming its class
+//	    and source;
+//	(c) a non-200 AND readiness did NOT answer 200 -> fail (the token rung is
+//	    the authority here);
+//	(d) a non-200 BUT readiness answered 200 -> WARN, never fail: the backend
+//	    authenticated this credential on the authoritative readiness endpoint,
+//	    and `token scope adequate` (server-side) is the authority on scope. An
+//	    OAuth/cookie-class identity carries no explicit scope list and can
+//	    legitimately 403 on /v0/runs while being fully adequate per readiness.
+func checkToken(backendURL string, cred doctorCredential, readiness readinessOutcome) checkResult {
 	label := "token valid"
-	if token == "" {
-		token = os.Getenv("FISHHAWK_TOKEN")
-	}
-	if token == "" || !strings.HasPrefix(token, "fhk_") {
-		return checkResult{label: label, detail: "token missing or malformed", status: "fail",
-			remediate: "set --token or $FISHHAWK_TOKEN to a value starting with fhk_"}
+	if cred.token == "" {
+		return checkResult{label: label, detail: "no CLI credential configured", status: "warn",
+			remediate: "run `fishhawk token login`, or set --token / $FISHHAWK_TOKEN; " +
+				"an MCP/OAuth-driven loop does not need a CLI credential"}
 	}
 	req, err := http.NewRequest(http.MethodGet, backendURL+"/v0/runs?limit=0", nil)
 	if err != nil {
 		return checkResult{label: label, detail: err.Error(), status: "fail",
 			remediate: "check --backend-url"}
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+cred.token)
 	resp, err := doctorHTTPDo(req)
 	if err != nil {
 		return checkResult{label: label, detail: err.Error(), status: "fail",
 			remediate: "backend unreachable; run the backend check first"}
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode == http.StatusOK {
+		return checkResult{label: label,
+			detail: fmt.Sprintf("accepted — %s via %s", cred.class, cred.source), status: "ok"}
+	}
+	// (d) The cascade break: a non-200 is downgraded to warn ONLY when the
+	// authoritative readiness endpoint returned a decodable 200 for the SAME
+	// credential. answered is false on a malformed 200, so a broken backend
+	// response can never suppress a genuine token failure (binding condition 1).
+	if readiness.answered {
+		return checkResult{label: label,
+			detail: fmt.Sprintf("HTTP %d on /v0/runs, but the readiness endpoint authenticated this credential", resp.StatusCode),
+			status: "warn",
+			remediate: "the backend authenticated this credential on the authoritative readiness endpoint; " +
+				"`token scope adequate` (server-side) is the authority on scope"}
+	}
+	// (c) Readiness did not answer — the token rung is the authority; fail.
 	switch resp.StatusCode {
-	case http.StatusOK:
-		return checkResult{label: label, detail: "accepted", status: "ok"}
 	case http.StatusUnauthorized:
 		return checkResult{label: label, detail: "HTTP 401 — invalid token", status: "fail",
 			remediate: "reissue via `fishhawkd token issue --subject <login> --scopes read:runs,...`"}
@@ -318,18 +424,33 @@ func checkSpec(workingDir string) checkResult {
 	return checkResult{label: label, detail: detail, status: "ok"}
 }
 
-// resolveRunnerBinary applies the flag > env > PATH > repo bin/ precedence
-// chain for the fishhawk-runner binary. Returns the resolved path or an error
-// when all sources are exhausted.
-func resolveRunnerBinary(flagVal, workingDir string) (string, error) {
+// resolveRunnerBinary mirrors the resolution order the MCP dispatch path uses
+// (backend/internal/mcpserver/run_stage.go): explicit input > $FISHHAWK_RUNNER_BIN
+// > fishhawk-runner SIBLING of the running executable > PATH, then the CLI-only
+// <workingDir>/bin/fishhawk-runner tier as the final rung. It returns the
+// resolved path plus a source tag (for the rung detail), or an error when every
+// tier misses.
+//
+// NOTE the sibling tier resolves next to THIS CLI binary, which is a PROXY for
+// the serving binary's sibling that the dispatch path actually resolves against
+// — the doctor CLI process is not the serving process, so it cannot observe the
+// serving binary's directory. A green from that tier proves a runner sits beside
+// the CLI, which is not the same claim.
+func resolveRunnerBinary(flagVal, workingDir string) (path, source string, err error) {
 	if flagVal != "" {
-		return flagVal, nil
+		return flagVal, "flag", nil
 	}
 	if v := os.Getenv("FISHHAWK_RUNNER_BIN"); v != "" {
-		return v, nil
+		return v, "env", nil
 	}
-	if p, err := doctorLookPath("fishhawk-runner"); err == nil {
-		return p, nil
+	if exe, exeErr := doctorExecutable(); exeErr == nil {
+		sibling := filepath.Join(filepath.Dir(exe), "fishhawk-runner")
+		if fi, statErr := os.Stat(sibling); statErr == nil && !fi.IsDir() {
+			return sibling, "sibling", nil
+		}
+	}
+	if p, lookErr := doctorLookPath("fishhawk-runner"); lookErr == nil {
+		return p, "path", nil
 	}
 	for _, candidate := range []string{
 		filepath.Join(workingDir, "bin", "fishhawk-runner"),
@@ -337,36 +458,151 @@ func resolveRunnerBinary(flagVal, workingDir string) (string, error) {
 	} {
 		fi, statErr := os.Stat(candidate)
 		if statErr == nil && !fi.IsDir() {
-			return candidate, nil
+			return candidate, "repo-bin", nil
 		}
 	}
-	return "", errors.New("fishhawk-runner not found in flag, env, PATH, or repo bin/")
+	return "", "", errors.New("fishhawk-runner not found in flag, env, CLI-sibling, PATH, or repo bin/")
 }
 
-// checkRunnerBinary resolves the fishhawk-runner binary via flag > env > PATH > repo bin/.
+// checkRunnerBinary resolves the fishhawk-runner binary via the dispatch-mirroring
+// order. When every tier misses it WARNS rather than fails: the CLI process is
+// not the serving binary, so it cannot observe the sibling directory an
+// MCP-driven dispatch resolves against — a hard fail would be a false negative
+// for an operator whose runner sits beside the serving binary.
 func checkRunnerBinary(flagVal, workingDir string) checkResult {
 	label := "runner binary found"
-	resolved, err := resolveRunnerBinary(flagVal, workingDir)
+	resolved, source, err := resolveRunnerBinary(flagVal, workingDir)
 	if err != nil {
-		return checkResult{label: label, detail: "not found", status: "fail",
-			remediate: "install fishhawk-runner to PATH or set $FISHHAWK_RUNNER_BIN"}
+		return checkResult{label: label,
+			detail: "not resolvable from this CLI process", status: "warn",
+			remediate: "MCP-driven dispatch also resolves a fishhawk-runner sibling of the SERVING binary, " +
+				"which this CLI process cannot observe; for the local CLI loop, install fishhawk-runner to PATH " +
+				"or set $FISHHAWK_RUNNER_BIN"}
 	}
-	detail := resolved
-	if filepath.Dir(resolved) == filepath.Join(workingDir, "bin") {
+	var detail string
+	switch source {
+	case "repo-bin":
 		detail = resolved + " (via repo bin/)"
+	case "sibling":
+		detail = resolved + " (sibling of this CLI binary, as a proxy for the serving binary's sibling)"
+	default:
+		detail = resolved
 	}
 	return checkResult{label: label, detail: detail, status: "ok"}
 }
 
-// checkMCPRegistration verifies `claude mcp get fishhawk` exits 0.
-func checkMCPRegistration() checkResult {
+// checkMCPRegistration parses `claude mcp list` and recognises a Fishhawk MCP
+// registration in EITHER transport — the stdio shim (`fishhawk: /path/...`) or
+// the HTTP registration (`fishhawk-http: https://host/mcp (HTTP)`) this issue
+// exists to recognise. A registration qualifies when its name is `fishhawk` /
+// `fishhawk-*` OR its target is an http(s) URL whose host:port equals the
+// backend's and whose path ends in `/mcp` (a name-agnostic "points at this
+// backend" test). Both matchers are load-bearing: an HTTP registration on a
+// different port than --backend-url matches only by name, and a non-fishhawk
+// name matches only by URL.
+//
+// Degradation:
+//   - `claude mcp list` succeeds but no registration matches -> a `claude mcp
+//     get` fallback probes BOTH the stdio and HTTP registration names before
+//     declaring the registration absent -> fail with a transport-aware hint.
+//   - `claude mcp list` errors but the `get` fallback resolves -> ok.
+//   - the `claude` CLI is absent or erroring entirely -> WARN, never fail: the
+//     operator may drive from another MCP client (binding condition 4).
+func checkMCPRegistration(backendURL string) checkResult {
 	label := "MCP registered"
-	_, err := doctorRunOutput("claude", "mcp", "get", "fishhawk")
-	if err != nil {
-		return checkResult{label: label, detail: "not registered", status: "fail",
-			remediate: "run: claude mcp add fishhawk -- /path/to/fishhawk-mcp (see docs/mcp/install.md)"}
+	out, listErr := doctorRunOutput("claude", "mcp", "list")
+	if listErr == nil {
+		if detail, ok := matchMCPRegistration(out, backendURL); ok {
+			return checkResult{label: label, detail: detail, status: "ok"}
+		}
+		// list answered but no match — try the get fallback before declaring
+		// the registration genuinely absent.
+		if detail, ok := mcpGetFallback(); ok {
+			return checkResult{label: label, detail: detail, status: "ok"}
+		}
+		return checkResult{label: label, detail: "no fishhawk registration found", status: "fail",
+			remediate: mcpRemediation(backendURL)}
 	}
-	return checkResult{label: label, detail: "fishhawk", status: "ok"}
+	// list errored. The get fallback covers the corner where list is broken but
+	// get works — for BOTH transports (binding condition 2).
+	if detail, ok := mcpGetFallback(); ok {
+		return checkResult{label: label, detail: detail, status: "ok"}
+	}
+	// claude CLI absent or erroring on both list and get -> warn, not fail.
+	return checkResult{label: label, detail: "cannot determine (claude CLI unavailable)", status: "warn",
+		remediate: mcpRemediation(backendURL)}
+}
+
+// matchMCPRegistration scans `claude mcp list` output for a qualifying Fishhawk
+// registration and returns a human detail (naming the matched registration and
+// its transport) plus whether a match was found. The parse is tolerant: split
+// each line on the FIRST ": " (names may contain spaces), strip a trailing
+// " - <status>" and any " (HTTP)" / " (SSE)" transport marker.
+func matchMCPRegistration(listOutput, backendURL string) (string, bool) {
+	backendHostPort := ""
+	if u, err := url.Parse(backendURL); err == nil {
+		backendHostPort = u.Host
+	}
+	for _, line := range strings.Split(listOutput, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		name, target, ok := strings.Cut(line, ": ")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		target = strings.TrimSpace(target)
+		// Strip a trailing " - <status>" (e.g. " - ✔ Connected").
+		if idx := strings.LastIndex(target, " - "); idx >= 0 {
+			target = strings.TrimSpace(target[:idx])
+		}
+		// Strip and record a transport marker; a stdio path carries none.
+		transport := "stdio"
+		for _, m := range []struct{ tag, name string }{{" (HTTP)", "HTTP"}, {" (SSE)", "SSE"}} {
+			if strings.HasSuffix(target, m.tag) {
+				transport = m.name
+				target = strings.TrimSpace(strings.TrimSuffix(target, m.tag))
+				break
+			}
+		}
+		// (i) name match — covers both the stdio `fishhawk` and the HTTP
+		// `fishhawk-http` registrations.
+		if name == "fishhawk" || strings.HasPrefix(name, "fishhawk-") {
+			return fmt.Sprintf("%s (%s)", name, transport), true
+		}
+		// (ii) backend-URL match — a name-agnostic "points at this backend".
+		if backendHostPort != "" {
+			if u, uErr := url.Parse(target); uErr == nil && (u.Scheme == "http" || u.Scheme == "https") &&
+				u.Host == backendHostPort && strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/mcp") {
+				return fmt.Sprintf("%s (%s, matches backend URL)", name, transport), true
+			}
+		}
+	}
+	return "", false
+}
+
+// mcpGetFallback probes `claude mcp get <name>` for BOTH the stdio and HTTP
+// registration names, so a `list`-broken/`get`-working corner still recognises
+// an HTTP-transport registration (binding condition 2). Returns a detail and
+// whether either name resolved.
+func mcpGetFallback() (string, bool) {
+	for _, name := range []string{"fishhawk", "fishhawk-http"} {
+		if _, err := doctorRunOutput("claude", "mcp", "get", name); err == nil {
+			return "registered (" + name + ", via `claude mcp get`)", true
+		}
+	}
+	return "", false
+}
+
+// mcpRemediation names the remedy for the transport in use: the HTTP
+// registration first (the primary onboarding path), the stdio shim second.
+func mcpRemediation(backendURL string) string {
+	return fmt.Sprintf("register the backend's MCP surface — HTTP: "+
+		"`claude mcp add --transport http fishhawk-http %s/mcp`; "+
+		"or the stdio shim: `claude mcp add fishhawk -- /path/to/fishhawk-mcp` (see docs/mcp/install.md)",
+		strings.TrimRight(backendURL, "/"))
 }
 
 // checkGitOrigin verifies the working directory has a git remote named origin.
@@ -416,6 +652,27 @@ func checkGhCLI() checkResult {
 	return checkResult{label: label, detail: detail, status: "ok"}
 }
 
+// isBackendSourceCheckout reports whether workingDir is a checkout whose HEAD
+// could plausibly BE the commit fishhawkd was built from: it carries the
+// fishhawkd source (a backend/cmd/fishhawkd directory) AND a go.work at the
+// root. It uses a structural marker rather than matching the git origin against
+// a hardcoded slug, which keeps a fork or rename of this repo inside the drift
+// check and makes the rung answerable offline. A repo that vendors a directory
+// of that name would be misclassified and get the (spurious) drift warn back —
+// strictly the status quo for such a repo.
+func isBackendSourceCheckout(workingDir string) bool {
+	if workingDir == "" {
+		workingDir = "."
+	}
+	if fi, err := os.Stat(filepath.Join(workingDir, "backend", "cmd", "fishhawkd")); err != nil || !fi.IsDir() {
+		return false
+	}
+	if fi, err := os.Stat(filepath.Join(workingDir, "go.work")); err != nil || fi.IsDir() {
+		return false
+	}
+	return true
+}
+
 // checkBackendSHADrift compares the running backend's git_sha (from /healthz)
 // against the local HEAD commit. A mismatch warns the operator that they may
 // be running a backend built from a different commit.
@@ -426,6 +683,14 @@ func checkGhCLI() checkResult {
 // false-warn on every stamped dev build.
 func checkBackendSHADrift(backendURL, workingDir string) checkResult {
 	label := "backend SHA drift"
+	// Skip outright when the working dir is not the backend's own source
+	// checkout: comparing fishhawkd's build SHA to an unrelated repo's HEAD is
+	// a category error that warns forever and can never be satisfied. This runs
+	// BEFORE any HTTP call.
+	if !isBackendSourceCheckout(workingDir) {
+		return checkResult{label: label,
+			detail: "skipped — working dir is not the backend's source checkout", status: "ok"}
+	}
 	req, err := http.NewRequest(http.MethodGet, backendURL+"/healthz", nil)
 	if err != nil {
 		return checkResult{label: label, detail: err.Error(), status: "warn",
@@ -480,7 +745,7 @@ func checkBackendSHADrift(backendURL, workingDir string) checkResult {
 func checkRunnerSchemaDrift(backendURL, runnerBinary, workingDir string) checkResult {
 	label := "runner schema drift"
 
-	runnerBin, err := resolveRunnerBinary(runnerBinary, workingDir)
+	runnerBin, _, err := resolveRunnerBinary(runnerBinary, workingDir)
 	if err != nil {
 		return checkResult{label: label, detail: "runner binary not found, schema drift not checked", status: "warn",
 			remediate: "install fishhawk-runner or set $FISHHAWK_RUNNER_BIN"}

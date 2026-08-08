@@ -53,13 +53,20 @@ type onboardingReadiness struct {
 // workflow spec's validity. Each failing precondition carries an actionable
 // remediation. A repo that could not be resolved, or any transport / non-200
 // response, degrades to a single WARN — it never crashes the doctor.
-func checkOnboardingReadiness(backendURL, token, repo string) []checkResult {
+//
+// It also returns a readinessOutcome carrying whether the endpoint answered an
+// AUTHORITATIVE 200 (HTTP 200 AND a decodable body) plus the server's own scope
+// verdict, threaded into the token rung so a server-authenticated credential is
+// not failed by the local /v0/runs heuristic. A 200 whose body does NOT decode
+// leaves answered false, so a broken backend response can never suppress a
+// genuine token failure (binding condition 1).
+func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, readinessOutcome) {
 	const label = "onboarding readiness"
 	if repo == "" {
 		return []checkResult{{
 			label: label, detail: "repo not determined", status: "warn",
 			remediate: "pass --repo owner/name (git origin auto-detect found no github.com remote)",
-		}}
+		}}, readinessOutcome{}
 	}
 
 	endpoint := backendURL + "/v0/onboarding/readiness?repo=" + url.QueryEscape(repo)
@@ -68,7 +75,7 @@ func checkOnboardingReadiness(backendURL, token, repo string) []checkResult {
 		return []checkResult{{
 			label: label, detail: err.Error(), status: "warn",
 			remediate: "check --backend-url or $FISHHAWK_BACKEND_URL",
-		}}
+		}}, readinessOutcome{}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := doctorHTTPDo(req)
@@ -76,22 +83,27 @@ func checkOnboardingReadiness(backendURL, token, repo string) []checkResult {
 		return []checkResult{{
 			label: label, detail: "readiness endpoint unreachable", status: "warn",
 			remediate: "backend must be reachable for onboarding readiness checks",
-		}}
+		}}, readinessOutcome{}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return []checkResult{{
 			label: label, detail: fmt.Sprintf("HTTP %d", resp.StatusCode), status: "warn",
 			remediate: "onboarding readiness probe returned non-200; check the token and fishhawkd logs",
-		}}
+		}}, readinessOutcome{}
 	}
 	var body onboardingReadiness
 	if decErr := json.NewDecoder(resp.Body).Decode(&body); decErr != nil {
+		// A 200 with an undecodable body is NOT an authoritative answer:
+		// readinessOutcome stays zero so the token rung can still fail.
 		return []checkResult{{
 			label: label, detail: "unparseable readiness response", status: "warn",
 			remediate: "upgrade fishhawkd to a build that serves /v0/onboarding/readiness",
-		}}
+		}}, readinessOutcome{}
 	}
+
+	// 200 AND a decodable body: this is the authoritative answer.
+	outcome := readinessOutcome{answered: true, scopesAdequate: body.Scopes.Adequate}
 
 	var out []checkResult
 
@@ -178,7 +190,7 @@ func checkOnboardingReadiness(backendURL, token, repo string) []checkResult {
 		})
 	}
 
-	return out
+	return out, outcome
 }
 
 // checkExecutionPath verifies that the committed workflow spec declares an

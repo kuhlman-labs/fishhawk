@@ -22,6 +22,103 @@ acceptance, spec presence, runner binary, MCP registration, git remote/tree,
 the per-repo prerequisites that make a repo *look* onboarded but wedge on the
 first run.
 
+### External repo vs. the fishhawk dev loop
+
+`doctor` is run in two very different contexts, and several rungs only make
+sense in one of them. In the **fishhawk dev loop** you are inside a checkout of
+this repository, driving the local Docker stack; in an **external repo** you are
+onboarding some other project to a running backend, typically over HTTP-MCP and
+OAuth (`fho_` access tokens), with no local Fishhawk build at all. The rungs
+below name which context they apply to:
+
+- **token valid** accepts any credential class the backend accepts (`fhk_`
+  operator, `fhm_` machine, `fho_` OAuth) — the backend, not a prefix table,
+  decides validity — and *warns* rather than fails when no CLI credential is
+  configured, because an MCP/OAuth-driven loop needs none.
+- **runner binary found** and **backend SHA drift** are dev-loop rungs: an
+  external repo has no runner binary beside it and no commit that fishhawkd was
+  built from, so they *warn* / *skip* rather than fail there.
+- **MCP registered** matches an HTTP-transport registration (the primary
+  external-repo path) as well as the stdio shim.
+
+The overriding invariant: a repo whose **GitHub App is not installed still
+FAILS** (non-zero exit). Every relaxation below is scoped by a positive
+server-side signal — never a blanket softening.
+
+### Credential ladder and the token rung
+
+The **token valid** rung resolves a bearer credential with the SAME ladder
+`fishhawk run start` uses (`newClient`): an explicit `--token` / `$FISHHAWK_TOKEN`
+wins; when empty, the stored credential minted by `fishhawk token login` (keyed
+by backend URL) is used. Whatever it finds is probed against the backend — the
+prefix is used only to LABEL the credential class in the rung detail, never to
+admit or reject it. Branches:
+
+- **no credential** in any tier → **warn** (`fishhawk token login`, or
+  `--token` / `$FISHHAWK_TOKEN`; an MCP/OAuth loop needs none) — never a fail.
+- credential the backend **accepts** (200 on `/v0/runs`) → **ok**, naming the
+  class and source.
+- credential the backend **rejects** (401/403/other) AND the readiness endpoint
+  did NOT answer an authoritative 200 → **fail**.
+- credential rejected on `/v0/runs` BUT the readiness endpoint answered an
+  authoritative 200 for the same credential → **warn**, never fail: an
+  OAuth/cookie identity carries no explicit scope list and can legitimately 403
+  on `/v0/runs` while being adequate per readiness. **token scope adequate**
+  (server-side, below) remains the authority on scope.
+
+A successful readiness probe therefore **outranks** the local token rung — but
+"successful" means HTTP 200 **and** a body that decoded into a readiness
+verdict. A 200 whose body does not decode is NOT an answer, so a broken backend
+response can never silently downgrade a genuine credential failure to a warning.
+
+### MCP registration rung
+
+**MCP registered** parses `claude mcp list` and recognises a Fishhawk MCP
+registration in EITHER transport:
+
+- the **stdio** shim (`fishhawk: /path/to/fishhawk-mcp-shim`), and
+- the **HTTP** registration (`fishhawk-http: https://host/mcp (HTTP)`) — the
+  transport this rung was extended to recognise.
+
+A registration qualifies when its **name** is `fishhawk` or `fishhawk-*`, OR its
+**target** is an http(s) URL whose host:port equals the configured
+`--backend-url`'s and whose path ends in `/mcp` (a name-agnostic "points at this
+backend" test). Both matchers are load-bearing: an HTTP registration on a
+different port than `--backend-url` matches only by name; a non-`fishhawk` name
+matches only by URL. On no match the rung **fails** with a transport-aware hint
+that names the HTTP remedy first
+(`claude mcp add --transport http fishhawk-http <backendURL>/mcp`) and the stdio
+shim second. When the `claude` CLI is **absent or erroring**, the rung degrades
+to **warn** ("cannot determine") — never a fail and never a false ok — because
+the operator may drive from another MCP client entirely. A `claude mcp get`
+fallback (probing BOTH the stdio and HTTP names) covers the corner where
+`list` errors but `get` succeeds.
+
+### Runner binary rung
+
+**runner binary found** mirrors the resolution order the MCP dispatch path uses:
+explicit `--runner-binary` > `$FISHHAWK_RUNNER_BIN` > a `fishhawk-runner`
+**sibling of this CLI binary** > PATH > `<working-dir>/bin/fishhawk-runner`. The
+sibling tier resolves next to *this CLI binary* as a **proxy for the serving
+binary's sibling** the dispatch path actually resolves against — the doctor CLI
+process is not the serving process, so a green from that tier proves a runner
+sits beside the CLI, not beside the serving binary. When every tier misses the
+rung **warns** rather than fails (naming the sibling-of-serving-binary case it
+cannot observe), because a hard fail would be a false negative for an
+MCP-driven dispatch whose runner sits beside the serving binary. The
+`$FISHHAWK_RUNNER_BIN` / PATH remedy is still named for the local CLI loop.
+
+### Backend SHA-drift rung
+
+**backend SHA drift** compares fishhawkd's build SHA to the local HEAD. That
+comparison is only meaningful inside the backend's own source checkout, so the
+rung **skips outright** (ok, no remediation, before any HTTP call) when the
+working dir is not one — detected structurally by a `backend/cmd/fishhawkd`
+directory plus a root `go.work`. Comparing a backend build SHA to an unrelated
+repo's HEAD is a category error that would warn forever and can never be
+satisfied. Inside a real backend checkout the rung is unchanged (prefix
+compare, `-dirty` strip, unknown-SHA ok, git-failure warn).
+
 ### `verify command` (E48.58 / #2485)
 
 **Opt-in.** Under `--run-verify-command` this rung EXECUTES every distinct
@@ -122,6 +219,13 @@ response (401/403/5xx), or an unparseable body from the readiness endpoint
 degrades to a single **warning** naming the failure, so a backend that does not
 yet serve `/v0/onboarding/readiness` (or a token that is rejected) leaves the
 rest of the preflight intact.
+
+Only an authoritative readiness answer — HTTP 200 **with** a decodable body —
+grants the readiness endpoint authority over the local token rung (the cascade
+break above). A transport error, a non-200, or a malformed 200 body leaves the
+token rung free to fail on a genuine credential rejection: the relaxation is
+scoped to a positive server-side signal, never inferred from a status code
+alone.
 
 ## `fishhawk init`
 

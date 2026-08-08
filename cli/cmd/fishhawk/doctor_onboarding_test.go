@@ -43,7 +43,7 @@ func TestCheckOnboardingReadiness_AppNotInstalled(t *testing.T) {
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	app := findCheck(t, results, "app installed")
 	if app.status != "fail" {
 		t.Errorf("app status = %q, want fail", app.status)
@@ -68,7 +68,7 @@ func TestCheckOnboardingReadiness_ReviewerUnavailable(t *testing.T) {
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	rv := findCheck(t, results, "reviewer available: anthropic")
 	if rv.status != "fail" {
 		t.Errorf("reviewer status = %q, want fail", rv.status)
@@ -89,7 +89,7 @@ func TestCheckOnboardingReadiness_ScopeMissing(t *testing.T) {
 			"scopes": {"adequate": false, "required": ["read:runs","write:runs"], "missing": ["write:runs"]}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	sc := findCheck(t, results, "token scope adequate")
 	if sc.status != "fail" {
 		t.Errorf("scope status = %q, want fail", sc.status)
@@ -113,7 +113,7 @@ func TestCheckOnboardingReadiness_SpecInvalid(t *testing.T) {
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	sp := findCheck(t, results, "workflow spec (committed) valid")
 	if sp.status != "fail" {
 		t.Errorf("spec status = %q, want fail", sp.status)
@@ -137,7 +137,7 @@ func TestCheckOnboardingReadiness_SpecUnavailable(t *testing.T) {
 			"scopes": {"adequate": true}
 		}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	sp := findCheck(t, results, "workflow spec (committed) valid")
 	if sp.status != "warn" {
 		t.Errorf("spec status = %q, want warn", sp.status)
@@ -150,7 +150,7 @@ func TestCheckOnboardingReadiness_TransportError(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return nil, errors.New("connection refused")
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	if len(results) != 1 || results[0].status != "warn" {
 		t.Fatalf("want a single warn on transport error, got %+v", results)
 	}
@@ -162,7 +162,7 @@ func TestCheckOnboardingReadiness_Non200(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusUnauthorized, `{"error":{"code":"unauthorized"}}`), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
 	if len(results) != 1 || results[0].status != "warn" {
 		t.Fatalf("want a single warn on non-200, got %+v", results)
 	}
@@ -178,7 +178,7 @@ func TestCheckOnboardingReadiness_RepoUnresolved(t *testing.T) {
 		t.Fatal("no HTTP call expected when repo is empty")
 		return nil, nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "")
 	if len(results) != 1 || results[0].status != "warn" {
 		t.Fatalf("want a single warn when repo unresolved, got %+v", results)
 	}
@@ -193,7 +193,7 @@ func TestCheckOnboardingReadiness_AllGreen(t *testing.T) {
 	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
 		return fakeHTTPResponse(http.StatusOK, allGreenReadinessJSON), nil
 	})
-	results := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "kuhlman-labs/fishhawk")
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "kuhlman-labs/fishhawk")
 	for _, r := range results {
 		if r.status != "ok" {
 			t.Errorf("rung %q status = %q, want ok (detail: %s)", r.label, r.status, r.detail)
