@@ -1354,6 +1354,23 @@ const externalRepoNotInstalledReadinessJSON = `{
   "scopes": {"adequate": true, "required": ["read:runs"], "missing": []}
 }`
 
+// externalRepoAllGreenReadinessJSON is a fully-onboarded readiness payload whose
+// echoed repo MATCHES acme/widgets — the repo the headline external-repo test
+// targets. The shared allGreenReadinessJSON echoes kuhlman-labs/fishhawk, so the
+// repo-echo marker would not match under --repo acme/widgets, answered would be
+// false, and the readiness rungs would collapse to a single degraded warn: the
+// headline test would then exercise the DEGRADED path, not the authoritative
+// all-green one. This fixture keeps the authoritative rungs (app installed, spec,
+// reviewer, scopes) actually rendered and ok. It mirrors
+// externalRepoNotInstalledReadinessJSON's repo echo.
+const externalRepoAllGreenReadinessJSON = `{
+  "repo": "acme/widgets",
+  "app": {"installed": true, "installation_id": 42},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [{"provider": "anthropic", "model": "claude-opus-4-8", "available": true}],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []}
+}`
+
 // initCleanGitRepo inits a git repo in a fresh temp dir (no backend-source
 // markers) so runDoctor's git rungs run against a real repo and the SHA-drift
 // rung takes its skip branch.
@@ -1424,7 +1441,7 @@ func TestRunDoctor_ExternalRepoHTTPMCP_NoFailures(t *testing.T) {
 	dir := initCleanGitRepo(t)
 	writeValidSpec(t, dir)
 
-	withFakeDoctorHTTP(t, externalRepoDoctorHTTP(allGreenReadinessJSON))
+	withFakeDoctorHTTP(t, externalRepoDoctorHTTP(externalRepoAllGreenReadinessJSON))
 	withFakeDoctorRunOutput(t, externalRepoDoctorRunOutput())
 	withFakeDoctorLookPath(t, func(_ string) (string, error) {
 		return "/usr/local/bin/fishhawk-runner", nil
@@ -1460,6 +1477,26 @@ func TestRunDoctor_ExternalRepoHTTPMCP_NoFailures(t *testing.T) {
 	}
 	if !strings.Contains(out, "ready for local loop") {
 		t.Errorf("stdout missing 'ready for local loop':\n%s", out)
+	}
+	// Counting absent fails cannot tell a green path from a skipped one: with a
+	// non-matching repo echo, answered would be false and the authoritative rungs
+	// would collapse to a single degraded warn (still zero fails). Assert the
+	// authoritative path was actually EXERCISED — the 'app installed' rung must be
+	// rendered and must not read fail — and that the degraded warn text is absent.
+	appRendered := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "app installed") {
+			appRendered = true
+			if strings.HasSuffix(strings.TrimRight(line, " "), "fail") {
+				t.Errorf("'app installed' rung read fail on a fully-onboarded repo: %q", line)
+			}
+		}
+	}
+	if !appRendered {
+		t.Errorf("'app installed' rung not rendered — the authoritative readiness path was skipped:\n%s", out)
+	}
+	if strings.Contains(out, "unparseable readiness response") {
+		t.Errorf("stdout carries the degraded readiness warning — the authoritative path was not exercised:\n%s", out)
 	}
 }
 
