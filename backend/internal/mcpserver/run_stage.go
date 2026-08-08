@@ -465,7 +465,15 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 						stageState = s.State
 					}
 				}
-				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				// The run row is not in hand at this spawn-path call site, so the
+				// predicted-runtime input is 0 and the derivation takes its
+				// elapsed-based branch (E48.62 / #2489). Deliberate, not an
+				// omission: a freshly dispatched stage has ~0 elapsed, so this
+				// resolves to the floor exactly as it did pre-#2489, and the
+				// operator's NEXT get_run_status poll — which does hold the run
+				// row — carries the derived value. An extra GetRun round-trip
+				// here would buy nothing that poll does not already deliver.
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "", 0, time.Now().UTC())
 				return nil
 			}(); fetchErr != nil {
 				warnings = append(warnings,
@@ -507,7 +515,15 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 						stageState = s.State
 					}
 				}
-				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				// The run row is not in hand at this spawn-path call site, so the
+				// predicted-runtime input is 0 and the derivation takes its
+				// elapsed-based branch (E48.62 / #2489). Deliberate, not an
+				// omission: a freshly dispatched stage has ~0 elapsed, so this
+				// resolves to the floor exactly as it did pre-#2489, and the
+				// operator's NEXT get_run_status poll — which does hold the run
+				// row — carries the derived value. An extra GetRun round-trip
+				// here would buy nothing that poll does not already deliver.
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "", 0, time.Now().UTC())
 				return nil
 			}(); fetchErr != nil {
 				warnings = append(warnings,
@@ -616,7 +632,12 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// ADR-036 backstop is a no-op — pass "" for runState.
 	var stageWaitStatus *StageWaitStatus
 	if stageState != "" {
-		stageWaitStatus = classifyStageWaitStatus(in.Stage, stageState, "")
+		// nil startedAt + 0 predicted minutes (E48.62 / #2489): a synchronous
+		// run_stage return implies a SETTLED stage, so the derivation is not
+		// consulted at all — a terminal status omits the interval. Byte-identical
+		// to pre-#2489 by construction; the non-terminal fallthrough (a stage
+		// that somehow reads non-terminal here) lands on the floor.
+		stageWaitStatus = classifyStageWaitStatus(in.Stage, stageState, "", nil, 0, time.Now().UTC())
 	}
 
 	// Populate DiffSummary: gate on the git_diff runner event being

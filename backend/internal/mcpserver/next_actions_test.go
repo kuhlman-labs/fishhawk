@@ -3,9 +3,11 @@ package mcpserver
 import (
 	"context"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -2733,5 +2735,100 @@ func TestNextActions_AcceptanceArbitratedFlagIgnoredOnNonFailedVerdict(t *testin
 		"passed", "", releaseSignals{})
 	if na == nil || na.State != "acceptance_passed" {
 		t.Fatalf("state = %+v, want acceptance_passed (the arbitration flag is scoped to the failed arm)", na)
+	}
+}
+
+// TestNextActions_PollCadenceMatchesWaitStatus pins the E48.62 / #2489 parity
+// requirement: the poll_interval_seconds a pollAction advertises must be the
+// SAME derived cadence the corresponding *_stage_wait_status carries. Shipping
+// a flat 30s in next_actions while the wait status says 375 would be a visible
+// contradiction on one snapshot.
+//
+// The derived value is read against time.Now() inside the arm, so the
+// assertion compares next_actions against stageWaitStatusFor computed on the
+// same inputs (tolerating a one-second boundary crossing) rather than against a
+// hardcoded literal.
+func TestNextActions_PollCadenceMatchesWaitStatus(t *testing.T) {
+	started := time.Now().UTC().Add(-5400 * time.Second)
+	run := naRun("running")
+	run.PredictedRuntimeMinutes = 115
+
+	impl := naStage("implement", "running")
+	impl.StartedAt = &started
+	stages := []Stage{naStage("plan", "succeeded"), impl}
+
+	na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "implement_running" {
+		t.Fatalf("next actions = %+v, want state implement_running", na)
+	}
+	var advertised string
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_get_run_status" {
+			advertised = a.Params["poll_interval_seconds"]
+		}
+	}
+	if advertised == "" {
+		t.Fatal("no fishhawk_get_run_status poll action found")
+	}
+	got, err := strconv.Atoi(advertised)
+	if err != nil {
+		t.Fatalf("poll_interval_seconds %q is not an integer: %v", advertised, err)
+	}
+	// (115*60 - 5400) / 4 = 375. The floor (30) is what a non-derived arm would
+	// advertise, so the band is deliberately far too narrow to admit it.
+	if got < 374 || got > 375 {
+		t.Errorf("next_actions poll_interval_seconds = %d, want 375 (the derived cadence, not the flat floor)", got)
+	}
+
+	// And it agrees with the wait status computed over the same snapshot.
+	ws := stageWaitStatusFor(stages, "implement", run.State, run.PredictedRuntimeMinutes, time.Now().UTC())
+	if ws == nil {
+		t.Fatal("implement stage wait status is nil")
+	}
+	if diff := ws.PollIntervalSeconds - got; diff < -1 || diff > 1 {
+		t.Errorf("next_actions poll (%d) disagrees with wait status poll (%d)", got, ws.PollIntervalSeconds)
+	}
+}
+
+// TestNextActions_StagelessArmsKeepTheFloor pins the two arms that DELIBERATELY
+// keep the bare floor (E48.62 / #2489): stages_pending (no stage row exists yet,
+// so there is nothing to derive from) and awaiting_children (the parent's stage
+// is parked; the live progress is on the child runs). Both are seeded under a
+// run carrying a 115-minute prediction, so an arm that wrongly derived would
+// advertise 900 here and fail.
+func TestNextActions_StagelessArmsKeepTheFloor(t *testing.T) {
+	pollOf := func(t *testing.T, na *NextActions) int {
+		t.Helper()
+		for _, a := range na.Actions {
+			if a.Action == "fishhawk_get_run_status" {
+				n, err := strconv.Atoi(a.Params["poll_interval_seconds"])
+				if err != nil {
+					t.Fatalf("poll_interval_seconds is not an integer: %v", err)
+				}
+				return n
+			}
+		}
+		t.Fatal("no fishhawk_get_run_status poll action found")
+		return 0
+	}
+
+	run := naRun("running")
+	run.PredictedRuntimeMinutes = 115
+
+	naEmpty := nextActionsFor(run, nil, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if naEmpty == nil || naEmpty.State != "stages_pending" {
+		t.Fatalf("no-stages next actions = %+v, want state stages_pending", naEmpty)
+	}
+	if got := pollOf(t, naEmpty); got != suggestedStageWaitPollIntervalSeconds {
+		t.Errorf("stages_pending poll = %d, want %d (the floor)", got, suggestedStageWaitPollIntervalSeconds)
+	}
+
+	awaiting := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_children")}
+	naChildren := nextActionsFor(run, awaiting, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+	if naChildren == nil || naChildren.State != "implement_awaiting_children" {
+		t.Fatalf("awaiting-children next actions = %+v, want state implement_awaiting_children", naChildren)
+	}
+	if got := pollOf(t, naChildren); got != suggestedStageWaitPollIntervalSeconds {
+		t.Errorf("awaiting_children poll = %d, want %d (the floor)", got, suggestedStageWaitPollIntervalSeconds)
 	}
 }

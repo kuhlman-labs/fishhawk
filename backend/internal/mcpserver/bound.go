@@ -498,6 +498,7 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.runner_kind", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	{Path: "run.runner_kind_resolved", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	{Path: "run.working_dir", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+	{Path: "run.predicted_runtime_minutes", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	{Path: "run.created_at", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	{Path: "run.updated_at", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	{Path: "run.issue_context", Tier: "T8", Class: classOversizedCapable, Surfaces: restRun, Unbounded: unboundedRun},

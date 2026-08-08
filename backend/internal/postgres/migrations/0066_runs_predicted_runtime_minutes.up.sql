@@ -1,0 +1,23 @@
+-- 0066: persist the approved plan's predicted_runtime_minutes on the run row
+-- (E48.62 / #2489). The MCP surface advertises a flat 30s stage-wait poll
+-- cadence today; deriving it from the plan's own prediction turns a
+-- 115-predicted-minute fan-out from ~190 polls into ~7. The prediction lives
+-- only inside the immutable plan ARTIFACT, so the poll-cadence derivation
+-- would need an artifact fetch per status read; stamping it onto the run row
+-- at plan approval makes it a plain column on the row every status read
+-- already loads.
+--
+-- NOT NULL DEFAULT 0 rather than nullable so the Go mapping stays a plain int
+-- and 'no prediction' is exactly ONE value (zero) instead of two (NULL vs 0).
+-- Zero IS the legacy/unstamped state: a pre-#2489 row, or a run whose plan has
+-- not been approved yet — notably the plan stage itself, where no plan exists
+-- to predict from. That state is precisely what the elapsed-based fallback
+-- branch of the derivation handles, so it needs no sentinel of its own.
+--
+-- No CHECK constraint. The plan validator already enforces
+-- predicted_runtime_minutes >= 1 on the artifact, and the column must still
+-- accept 0 for unstamped rows. Advisory throughout: the value drives the
+-- advertised poll cadence and nothing gates on it. Touches runs and nothing
+-- else.
+
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS predicted_runtime_minutes INTEGER NOT NULL DEFAULT 0;

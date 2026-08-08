@@ -829,6 +829,22 @@ components:
             `github_actions` run has no local checkout, and a legacy row
             predates the column.
           example: /Users/dev/src/fishhawk
+        predicted_runtime_minutes:
+          type: integer
+          description: |
+            The approved plan's own `predicted_runtime_minutes`, stamped
+            onto the run row at plan approval from the immutable plan
+            artifact (E48.62 / #2489). Omitted (0) when unstamped — a
+            legacy row, or a run whose plan has not been approved yet
+            (notably while the plan stage itself is running, since no plan
+            exists to predict from).
+
+            Advisory: it drives the MCP surface's advertised stage-wait
+            poll cadence — a quarter of a non-terminal stage's REMAINING
+            predicted runtime, clamped to a 30s floor and a 900s ceiling —
+            and nothing gates on it. A stale, absent or wrong value costs
+            at most a coarser or finer poll interval.
+          example: 115
         concerns:
           $ref: '#/components/schemas/RunConcerns'
           description: |

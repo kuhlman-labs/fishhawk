@@ -466,9 +466,21 @@ type Run struct {
 	// is refused (the #1866 contamination shape). The empty state is what the
 	// #2479 HTTP refusal still catches.
 	WorkingDir string
-	State      State
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// PredictedRuntimeMinutes is the approved plan artifact's
+	// predicted_runtime_minutes, stamped onto the run row at plan approval
+	// (E48.62 / #2489, migration 0066). Zero means UNSTAMPED: a legacy row,
+	// or a run whose plan has not been approved yet — notably while the plan
+	// stage itself is running, since no plan exists to predict from.
+	//
+	// Advisory. It drives the MCP surface's advertised stage-wait poll
+	// cadence (a quarter of the REMAINING predicted runtime, clamped to a 30s
+	// floor and a 900s ceiling) and NOTHING gates on it: a stale, absent or
+	// wildly wrong prediction costs at most a coarser or finer poll interval,
+	// never a run's progress.
+	PredictedRuntimeMinutes int
+	State                   State
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

@@ -68,6 +68,18 @@ UPDATE runs
  WHERE id = $1
 RETURNING *;
 
+-- name: SetRunPredictedRuntimeMinutes :one
+-- Stamps the approved plan's predicted_runtime_minutes onto the run row
+-- (E48.62 / #2489) so the MCP stage-wait poll cadence can be derived from a
+-- plain column instead of an artifact fetch per status read. Idempotent by
+-- construction: the value is read from the IMMUTABLE approved plan artifact,
+-- so a re-approval writes the same bytes — there is no observed-then-written
+-- state and no check-then-write race to serialize.
+UPDATE runs
+   SET predicted_runtime_minutes = $2
+ WHERE id = $1
+RETURNING *;
+
 -- name: SetRunPullRequestURL :one
 -- Backfills the implement-stage PR URL onto the run row when the
 -- pull_request artifact lands (#216). Idempotent: a re-upload with

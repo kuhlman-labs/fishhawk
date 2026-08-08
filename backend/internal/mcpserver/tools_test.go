@@ -8316,6 +8316,81 @@ func TestGetRunStatus_AcceptanceStageWaitStatus_PresentAndOmitted(t *testing.T) 
 	})
 }
 
+// TestGetRunStatus_DerivedStageWaitPollInterval is the DONE-MEANS behavioral
+// test for E48.62 / #2489: get_run_status driven end to end over a run carrying
+// predicted_runtime_minutes: 115 and an implement stage started 5400s ago must
+// advertise the DERIVED cadence — (115*60 - 5400) / 4 = 375 — not the flat 30s
+// constant. A no-op or comment-only touch of stage_wait.go fails here even
+// though the scope-completeness presence gate would pass.
+//
+// The plan stage on the same snapshot is the companion assertion: it is
+// terminal, so its interval is omitted entirely regardless of the prediction.
+func TestGetRunStatus_DerivedStageWaitPollInterval(t *testing.T) {
+	t.Run("prediction drives the implement cadence", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		fb.getRunByID[runID] = Run{
+			ID: runID.String(), Repo: "x/y", WorkflowID: "feature_change",
+			State: "running", PredictedRuntimeMinutes: 115,
+		}
+		implStarted := time.Now().UTC().Add(-5400 * time.Second)
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "succeeded"},
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 2, Type: "implement", State: "running", StartedAt: &implStarted},
+		}
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.ImplementStageWaitStatus == nil {
+			t.Fatal("ImplementStageWaitStatus is nil")
+		}
+		// The snapshot reads time.Now() a few microseconds after the fixture
+		// stamps started_at, so elapsed is 5400s plus a sliver; a whole second
+		// of drift moves the quarter by at most 1. Assert the exact 375 with a
+		// one-second tolerance band rather than a range wide enough to swallow
+		// the floor or the ceiling — 30 and 900 both fail this.
+		if got := out.ImplementStageWaitStatus.PollIntervalSeconds; got < 374 || got > 375 {
+			t.Errorf("implement PollIntervalSeconds = %d, want 375 ((115*60 - 5400) / 4)", got)
+		}
+		if out.PlanStageWaitStatus == nil {
+			t.Fatal("PlanStageWaitStatus is nil")
+		}
+		if out.PlanStageWaitStatus.PollIntervalSeconds != 0 {
+			t.Errorf("plan PollIntervalSeconds = %d, want 0 (terminal omits it even under a prediction)",
+				out.PlanStageWaitStatus.PollIntervalSeconds)
+		}
+	})
+
+	t.Run("unstamped run falls back to the elapsed branch", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		// No PredictedRuntimeMinutes — the plan-stage case by construction, and
+		// the mixed-version degrade when an older backend omits the key.
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+		planStarted := time.Now().UTC().Add(-1304 * time.Second)
+		fb.stagesByRun[runID] = []Stage{
+			{ID: uuid.NewString(), RunID: runID.String(), Sequence: 1, Type: "plan", State: "running", StartedAt: &planStarted},
+		}
+
+		r := newResolver(srv, nil)
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		if out.PlanStageWaitStatus == nil {
+			t.Fatal("PlanStageWaitStatus is nil")
+		}
+		// 1304 / 4 = 326 — the observed long plan stage from #2489, which used
+		// to sit at 30.
+		if got := out.PlanStageWaitStatus.PollIntervalSeconds; got < 326 || got > 327 {
+			t.Errorf("plan PollIntervalSeconds = %d, want 326 (1304 / 4)", got)
+		}
+	})
+}
+
 // TestGetRunStatus_AcceptancePassed_ThreadsRecentAudit exercises the REAL
 // getRunStatus path end-to-end (wire JSON -> payload parse -> classifier ->
 // next_actions) for the cross-boundary seam (#875): the backend writes the

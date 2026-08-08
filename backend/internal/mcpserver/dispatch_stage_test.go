@@ -1625,3 +1625,45 @@ func TestDispatchStage_UnboundRunOverHTTPStillRefuses(t *testing.T) {
 		t.Errorf("log_path = %q, want empty (no spawn)", out.LogPath)
 	}
 }
+
+// TestDispatchStage_PollIntervalStaysAtFloor pins the deliberate call-site
+// decision behind E48.62 / #2489: the spawn path does NOT hold the run row, so
+// it passes a zero prediction and the derivation takes its elapsed branch. A
+// freshly dispatched stage has ~0 elapsed, so the advertised cadence is the
+// floor — byte-identical to pre-#2489 — even when the run itself carries a
+// large prediction. The operator's NEXT get_run_status poll (which does hold
+// the run row) is what carries the derived value.
+//
+// Seeded BY CONSTRUCTION: the run row is stamped with 115 predicted minutes, so
+// a call site that wrongly reached for it would advertise the 900s ceiling here
+// and fail.
+func TestDispatchStage_PollIntervalStaysAtFloor(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "true")
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running",
+		PredictedRuntimeMinutes: 115,
+	}
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.StageWaitStatus == nil {
+		t.Fatal("StageWaitStatus is nil")
+	}
+	if out.StageWaitStatus.PollIntervalSeconds != suggestedStageWaitPollIntervalSeconds {
+		t.Errorf("PollIntervalSeconds = %d, want %d (the spawn path derives from a zero prediction by design)",
+			out.StageWaitStatus.PollIntervalSeconds, suggestedStageWaitPollIntervalSeconds)
+	}
+}

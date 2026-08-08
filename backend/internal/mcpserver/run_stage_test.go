@@ -2853,3 +2853,45 @@ func TestRunStage_InheritsBoundWorkingDir(t *testing.T) {
 		t.Errorf("argv missing inherited --working-dir %q: %v", bound, (*calls)[0])
 	}
 }
+
+// TestRunStage_TerminalStageOmitsPollInterval pins the other half of the
+// E48.62 / #2489 call-site decision: a SYNCHRONOUS run_stage return implies a
+// settled stage, so classifyStageWaitStatus's terminal guard omits the interval
+// entirely and the derivation is never consulted. Byte-identical to pre-#2489.
+//
+// Seeded BY CONSTRUCTION with a 115-minute prediction on the run row, so a
+// derivation that leaked past the terminal guard would surface a non-zero
+// interval here and fail.
+func TestRunStage_TerminalStageOmitsPollInterval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "true")
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running",
+		PredictedRuntimeMinutes: 115,
+	}
+	seedStageOfType(fb, runID, stageID, "plan", "succeeded")
+
+	_, out, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "plan",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if out.StageWaitStatus == nil {
+		t.Fatal("StageWaitStatus is nil")
+	}
+	if out.StageWaitStatus.Status != "succeeded" {
+		t.Errorf("Status = %q, want succeeded", out.StageWaitStatus.Status)
+	}
+	if out.StageWaitStatus.PollIntervalSeconds != 0 {
+		t.Errorf("PollIntervalSeconds = %d, want 0 (a terminal stage omits the interval)",
+			out.StageWaitStatus.PollIntervalSeconds)
+	}
+}

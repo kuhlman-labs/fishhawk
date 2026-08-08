@@ -1132,19 +1132,24 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0065 (#2482, E66.42) is now the latest migration (it adds
-	// runs.working_dir). Roll it back FIRST — it touches only runs — then 0064
+	// 0066 (#2489, E48.62) is now the latest migration (it adds
+	// runs.predicted_runtime_minutes). Roll it back FIRST — it touches only
+	// runs — then 0065 (#2482, E66.42; runs.working_dir), then 0064
 	// (#2437, E66.20; drops oauth_clients.provider), then 0063 (#2433, E66.18;
 	// the four OAuth AS storage tables), then 0062 (the
 	// audit_entries_merge_verdict_recorded_once_idx partial unique index,
 	// index-only), then 0061 (users.provider), so this test's historical
 	// assertions, which pin 0060 as the one-step-rollback target, stay valid.
-	// 0065's own up/down reversal is pinned by
+	// 0066's own up/down reversal is pinned by
+	// TestMigrateDown_RunsPredictedRuntimeMinutesReversal, 0065's by
 	// TestMigrateDown_RunsWorkingDirReversal, 0064's by
 	// TestMigrateDown_OAuthClientsProviderReversal, 0063's by
 	// TestMigrateDown_OAuthASStorageReversal, 0062's by
 	// TestMigrateDown_MergeVerdictUniqueReversal, and 0061's by
 	// TestMigrateDown_UsersProviderReversal below.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065): %v", err)
 	}
@@ -1994,10 +1999,13 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 		t.Fatalf("seed gitlab user: %v", err)
 	}
 
-	// Roll back 0065 (runs.working_dir), 0064 (oauth_clients.provider drop),
-	// 0063 (the OAuth AS storage tables) and 0062 (the index-only merge-verdict
-	// uniqueness) first so the next one-step down targets 0061 — the reversal
-	// under test.
+	// Roll back 0066 (runs.predicted_runtime_minutes), 0065 (runs.working_dir),
+	// 0064 (oauth_clients.provider drop), 0063 (the OAuth AS storage tables) and
+	// 0062 (the index-only merge-verdict uniqueness) first so the next one-step
+	// down targets 0061 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0062): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 to reach 0062): %v", err)
 	}
@@ -2083,9 +2091,12 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 		t.Errorf("index def = %q, want a UNIQUE index (0062)", idxDef)
 	}
 
-	// Roll back 0065 (runs.working_dir), 0064 (oauth_clients.provider drop) and
-	// 0063 (the OAuth AS storage tables) first so the next one-step down targets
-	// 0062 — the reversal under test.
+	// Roll back 0066 (runs.predicted_runtime_minutes), 0065 (runs.working_dir),
+	// 0064 (oauth_clients.provider drop) and 0063 (the OAuth AS storage tables)
+	// first so the next one-step down targets 0062 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0062): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 to reach 0062): %v", err)
 	}
@@ -2192,8 +2203,12 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 		}
 	}
 
-	// Roll back 0065 (runs.working_dir) and 0064 (oauth_clients.provider drop)
-	// first so the next one-step down targets 0063 — the reversal under test.
+	// Roll back 0066 (runs.predicted_runtime_minutes), 0065 (runs.working_dir)
+	// and 0064 (oauth_clients.provider drop) first so the next one-step down
+	// targets 0063 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0063): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 to reach 0063): %v", err)
 	}
@@ -2325,8 +2340,12 @@ func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
 		}
 	}
 
-	// Roll back 0065 (runs.working_dir) first so the next one-step down targets
-	// 0064 — the reversal under test.
+	// Roll back 0066 (runs.predicted_runtime_minutes) and 0065
+	// (runs.working_dir) first so the next one-step down targets 0064 — the
+	// reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0064): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 to reach 0064): %v", err)
 	}
@@ -2360,6 +2379,54 @@ func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_RunsPredictedRuntimeMinutesReversal pins 0066 (#2489,
+// E48.62) in BOTH directions: runs.predicted_runtime_minutes EXISTS after
+// MigrateUp and is GONE after exactly one MigrateDown. Mirrors the 0065
+// reversal shape.
+func TestMigrateDown_RunsPredictedRuntimeMinutesReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	predictedColumn := func() int {
+		var n int
+		if err := pool.QueryRow(context.Background(),
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'runs' AND column_name = 'predicted_runtime_minutes'`).Scan(&n); err != nil {
+			t.Fatalf("query runs.predicted_runtime_minutes: %v", err)
+		}
+		return n
+	}
+
+	if n := predictedColumn(); n != 1 {
+		t.Errorf("runs.predicted_runtime_minutes count after MigrateUp = %d, want 1 (0066 added it)", n)
+	}
+
+	// Exactly one MigrateDown drops the column — 0066 is the head, so no
+	// preparatory step-downs are needed here.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066): %v", err)
+	}
+	if n := predictedColumn(); n != 0 {
+		t.Errorf("runs.predicted_runtime_minutes count after MigrateDown = %d, want 0 (0066 reverted)", n)
+	}
+	// The rollback is an ALTER, not a drop — the runs table itself survives.
+	var runsTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'runs'`).Scan(&runsTable); err != nil {
+		t.Fatalf("query runs table: %v", err)
+	}
+	if runsTable != 1 {
+		t.Errorf("'runs' table count after MigrateDown = %d, want 1 (0066 is an ALTER)", runsTable)
+	}
+}
+
 // TestMigrateDown_RunsWorkingDirReversal pins 0065 (#2482, E66.42) in BOTH
 // directions: runs.working_dir EXISTS after MigrateUp and is GONE after exactly
 // one MigrateDown. Mirrors the 0064 reversal shape.
@@ -2388,7 +2455,12 @@ func TestMigrateDown_RunsWorkingDirReversal(t *testing.T) {
 		t.Errorf("runs.working_dir count after MigrateUp = %d, want 1 (0065 added it)", n)
 	}
 
-	// Exactly one MigrateDown drops the column.
+	// Roll back 0066 (runs.predicted_runtime_minutes) first so the next
+	// one-step down targets 0065 — the reversal under test. Exactly one
+	// MigrateDown then drops the column.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0065): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065): %v", err)
 	}
@@ -2475,6 +2547,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 (drop runs.predicted_runtime_minutes) failed): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 (drop runs.working_dir) failed): %v", err)
 	}
@@ -2601,6 +2676,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 to reach 0053): %v", err)
@@ -2730,7 +2808,8 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 		t.Errorf("re-opened local stage (started_at set) state after backfill = %q, want dispatched (conservatively skipped)", got)
 	}
 
-	// Down reverses the backfill: roll back 0065 (runs.working_dir, inert re:
+	// Down reverses the backfill: roll back 0066 (runs.predicted_runtime_minutes,
+	// inert re: stages) then 0065 (runs.working_dir, inert re:
 	// stages) then 0064 (oauth_clients.provider drop,
 	// inert re: stages) then 0063 (the four OAuth AS storage tables, inert re:
 	// stages) then 0062 (the merge-verdict partial unique index, inert re:
@@ -2742,6 +2821,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// stages) then 0056 (sessions.account_id + origin + auto_join_role, inert
 	// re: stages) then 0055 (account_members + account_id + endpoint
 	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0053): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 to reach 0053): %v", err)
 	}
@@ -2809,13 +2891,16 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	url := startContainer(t)
 
-	// Apply everything, then roll 0065, 0064, 0063, 0062, 0061, 0060, 0059, 0058, 0057, 0056 and 0055
+	// Apply everything, then roll 0066, 0065, 0064, 0063, 0062, 0061, 0060, 0059, 0058, 0057, 0056 and 0055
 	// back so we can seed a
 	// run+installation pair under the pre-0055 schema (accounts + installations
 	// exist at 0052; runs.installation_id exists at 0005; runs.account_id does
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0065 to reach 0054): %v", err)

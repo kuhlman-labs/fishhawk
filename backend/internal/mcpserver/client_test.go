@@ -146,6 +146,39 @@ func TestRunMirror_DecodesWorkingDir(t *testing.T) {
 	}
 }
 
+// TestRunMirror_DecodesPredictedRuntimeMinutes pins the client Run mirror's
+// predicted_runtime_minutes json tag against the backend's runResponse tag
+// (E48.62 / #2489). Same #371-class trap as working_dir above, with a quieter
+// failure: a tag mismatch decodes to zero, the derivation silently falls back
+// to its elapsed branch, and the poll cadence is merely wrong rather than
+// broken. The literal key here is the backend's wire tag.
+//
+// The omitted case is the mixed-version degrade — an older backend that does
+// not emit the key at all — asserted to reach zero (the unstamped state the
+// fallback branch handles) rather than any other sentinel.
+func TestRunMirror_DecodesPredictedRuntimeMinutes(t *testing.T) {
+	const head = `{"id":"11111111-1111-1111-1111-111111111111","repo":"x/y",` +
+		`"workflow_id":"feature_change","workflow_sha":"deadbeef","trigger_source":"cli",` +
+		`"state":"running",`
+	const tail = `"created_at":"2026-08-05T00:00:00Z","updated_at":"2026-08-05T00:00:00Z"}`
+
+	var got Run
+	if err := json.Unmarshal([]byte(head+`"predicted_runtime_minutes":115,`+tail), &got); err != nil {
+		t.Fatalf("decode Run: %v", err)
+	}
+	if got.PredictedRuntimeMinutes != 115 {
+		t.Errorf("Run.PredictedRuntimeMinutes = %d, want 115 (json tag mismatch?)", got.PredictedRuntimeMinutes)
+	}
+
+	var omitted Run
+	if err := json.Unmarshal([]byte(head+tail), &omitted); err != nil {
+		t.Fatalf("decode Run (key omitted): %v", err)
+	}
+	if omitted.PredictedRuntimeMinutes != 0 {
+		t.Errorf("Run.PredictedRuntimeMinutes = %d, want 0 when the key is omitted", omitted.PredictedRuntimeMinutes)
+	}
+}
+
 // TestDeferFiledIssue_DecodesLabelCompleteness pins the same wire contract on
 // the defer path's filed-issue block (#1616).
 func TestDeferFiledIssue_DecodesLabelCompleteness(t *testing.T) {

@@ -1725,11 +1725,17 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// Stage-execution wait status (#879/#880, ADR-037), derived from the
 	// stages slice already fetched above and the run row's state — no extra
 	// round-trip. nil when no stage of that type exists in the run.
-	planStageWaitStatus := stageWaitStatusFor(stages, "plan", runRow.State)
-	implementStageWaitStatus := stageWaitStatusFor(stages, "implement", runRow.State)
+	//
+	// The advertised cadence is DERIVED from the run's stamped approved-plan
+	// prediction plus each stage's own started_at (E48.62 / #2489). now is
+	// captured ONCE here so all three wait statuses on this snapshot measure
+	// elapsed against the same instant and cannot disagree.
+	waitNow := time.Now().UTC()
+	planStageWaitStatus := stageWaitStatusFor(stages, "plan", runRow.State, runRow.PredictedRuntimeMinutes, waitNow)
+	implementStageWaitStatus := stageWaitStatusFor(stages, "implement", runRow.State, runRow.PredictedRuntimeMinutes, waitNow)
 	// Acceptance stage-execution wait status (E31.9), via the same generic
 	// helper — nil (omitted) when the workflow declares no acceptance stage.
-	acceptanceStageWaitStatus := stageWaitStatusFor(stages, "acceptance", runRow.State)
+	acceptanceStageWaitStatus := stageWaitStatusFor(stages, "acceptance", runRow.State, runRow.PredictedRuntimeMinutes, waitNow)
 
 	// Server-suggested next actions (#1024): a pure function over the
 	// run/stage/review/hint/drive data fetched above — no extra

@@ -44,7 +44,7 @@ type DispatchStageOutput struct {
 	RunID              string           `json:"run_id" jsonschema:"the run UUID the stage was dispatched on (the durable ADR-037 handle, with stage_id)"`
 	StageID            string           `json:"stage_id" jsonschema:"the resolved stage UUID the runner was spawned against (the durable ADR-037 handle, with run_id)"`
 	ResolvedWorkingDir string           `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the runner was spawned against, after transport-conditional working_dir resolution (#2479). Echoed so a wrong checkout is visible in the tool result rather than discovered from a contaminated diff"`
-	StageWaitStatus    *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the freshly-dispatched stage's execution wait status (normally pending/running with poll_interval_seconds=30); poll fishhawk_get_run_status on that cadence to terminal. Omitted (with a warning) when the post-dispatch stage fetch failed"`
+	StageWaitStatus    *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the freshly-dispatched stage's execution wait status (normally pending/running, carrying poll_interval_seconds); poll fishhawk_get_run_status on that cadence to terminal — the cadence there is derived from the approved plan's predicted runtime and the stage's elapsed time, so it widens as the run progresses rather than staying flat. Omitted (with a warning) when the post-dispatch stage fetch failed"`
 	RunURL             string           `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
 	LogPath            string           `json:"log_path,omitempty" jsonschema:"path to the detached runner's redirected stdout/stderr log on the MCP host (a diagnostic only; the durable record is the backend state + the signed trace bundle)"`
 	Warnings           []string         `json:"warnings,omitempty"`
@@ -269,7 +269,15 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 				if ferr != nil {
 					return ferr
 				}
-				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				// The run row is not in hand at this spawn-path call site, so the
+				// predicted-runtime input is 0 and the derivation takes its
+				// elapsed-based branch (E48.62 / #2489). Deliberate, not an
+				// omission: a freshly dispatched stage has ~0 elapsed, so this
+				// resolves to the floor exactly as it did pre-#2489, and the
+				// operator's NEXT get_run_status poll — which does hold the run
+				// row — carries the derived value. An extra GetRun round-trip
+				// here would buy nothing that poll does not already deliver.
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "", 0, time.Now().UTC())
 				if stageWaitStatus == nil {
 					return fmt.Errorf("stage %s not found in run %s stage list", resolvedStageID, runUUID)
 				}
@@ -306,7 +314,15 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 				if ferr != nil {
 					return ferr
 				}
-				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+				// The run row is not in hand at this spawn-path call site, so the
+				// predicted-runtime input is 0 and the derivation takes its
+				// elapsed-based branch (E48.62 / #2489). Deliberate, not an
+				// omission: a freshly dispatched stage has ~0 elapsed, so this
+				// resolves to the floor exactly as it did pre-#2489, and the
+				// operator's NEXT get_run_status poll — which does hold the run
+				// row — carries the derived value. An extra GetRun round-trip
+				// here would buy nothing that poll does not already deliver.
+				stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "", 0, time.Now().UTC())
 				return nil
 			}(); fetchErr != nil {
 				warnings = append(warnings,
@@ -387,7 +403,15 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		if ferr != nil {
 			return ferr
 		}
-		stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "")
+		// The run row is not in hand at this spawn-path call site, so the
+		// predicted-runtime input is 0 and the derivation takes its
+		// elapsed-based branch (E48.62 / #2489). Deliberate, not an
+		// omission: a freshly dispatched stage has ~0 elapsed, so this
+		// resolves to the floor exactly as it did pre-#2489, and the
+		// operator's NEXT get_run_status poll — which does hold the run
+		// row — carries the derived value. An extra GetRun round-trip
+		// here would buy nothing that poll does not already deliver.
+		stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "", 0, time.Now().UTC())
 		if stageWaitStatus == nil {
 			return fmt.Errorf("stage %s not found in run %s stage list", resolvedStageID, runUUID)
 		}

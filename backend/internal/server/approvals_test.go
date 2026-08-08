@@ -734,6 +734,12 @@ type orchestratorRepo struct {
 	// driven with a non-zero delta — not silently skipped because the
 	// RunRepo failed to satisfy runCostRecorder (the #647-fixture trap).
 	addRunCostDeltas []float64
+	// predictedRuntimeCalls records every SetRunPredictedRuntimeMinutes call so
+	// the E48.62 / #2489 stamp test can assert the approval path GENUINELY
+	// drove the recorder — not that it silently skipped because the RunRepo
+	// failed to satisfy runPredictionRecorder (the same #647-fixture trap
+	// addRunCostDeltas guards).
+	predictedRuntimeCalls []int
 }
 
 func newOrchestratorRepo() *orchestratorRepo {
@@ -755,6 +761,29 @@ func (r *orchestratorRepo) seedRun() *run.Run {
 	r.runs[id] = rr
 	r.mu.Unlock()
 	return rr
+}
+
+// SetRunPredictedRuntimeMinutes satisfies the approval handler's
+// runPredictionRecorder optional capability (E48.62 / #2489). It records every
+// call so the stamp test can distinguish a real write from a vacuous pass.
+func (r *orchestratorRepo) SetRunPredictedRuntimeMinutes(_ context.Context, id uuid.UUID, minutes int) (*run.Run, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.predictedRuntimeCalls = append(r.predictedRuntimeCalls, minutes)
+	rr, ok := r.runs[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	rr.PredictedRuntimeMinutes = minutes
+	return rr, nil
+}
+
+// predictedRuntimeCallsSnapshot returns a copy of the recorded calls under the
+// lock, so an assertion never races the handler's own goroutines.
+func (r *orchestratorRepo) predictedRuntimeCallsSnapshot() []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]int(nil), r.predictedRuntimeCalls...)
 }
 
 func (r *orchestratorRepo) seedStage(runID uuid.UUID, seq int, state run.StageState) *run.Stage {
@@ -7471,4 +7500,139 @@ workflows:
 			t.Errorf("body = %s, want delegation_not_configured — the clamped class must not be delegated at all", w.Body.String())
 		}
 	})
+}
+
+// --- Predicted-runtime stamp (E48.62 / #2489) ---------------------------
+
+// noPredictionRunRepo hides SetRunPredictedRuntimeMinutes from the wrapped
+// repo. Embedding the run.Repository INTERFACE (not the concrete type) promotes
+// only the interface's own methods, so the optional capability genuinely does
+// not resolve — the degrade branch is exercised by construction rather than by
+// a flag the handler could ignore.
+type noPredictionRunRepo struct{ run.Repository }
+
+// TestApprovePlan_StampsPredictedRuntimeOnRun drives the REAL approval path
+// (POST /v0/stages/{id}/approvals → the shared post-advance tail) and asserts
+// the approved plan artifact's predicted_runtime_minutes lands on the run row.
+// The setter is NEVER called directly: the done-means is that the value arrives
+// through approval, so a test that stamped it itself would prove nothing.
+func TestApprovePlan_StampsPredictedRuntimeOnRun(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, _, _ := newBudgetCheckServer(t, art)
+
+	p := &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 12} // under the 15m default budget
+	r, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	calls := rr.predictedRuntimeCallsSnapshot()
+	if len(calls) != 1 || calls[0] != 12 {
+		t.Fatalf("SetRunPredictedRuntimeMinutes calls = %v, want [12] (the stamp must be driven by the approval path)", calls)
+	}
+	stamped, err := rr.GetRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if stamped.PredictedRuntimeMinutes != 12 {
+		t.Errorf("run.PredictedRuntimeMinutes = %d, want 12", stamped.PredictedRuntimeMinutes)
+	}
+}
+
+// TestApprovePlan_PredictedRuntimeStampSkipped covers the stamp's four
+// no-op branches, each asserting ZERO setter calls: a REJECT decision, an
+// approve on a NON-plan stage, and a plan carrying no prediction. (The
+// unsatisfied-capability degrade has its own test below, since it needs a
+// different RunRepo.)
+func TestApprovePlan_PredictedRuntimeStampSkipped(t *testing.T) {
+	t.Run("reject decision", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, _, _ := newBudgetCheckServer(t, art)
+		_, stage := seedBudgetRun(t, rr, art, &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 12})
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"reject","comment":"wrong fork"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if calls := rr.predictedRuntimeCallsSnapshot(); len(calls) != 0 {
+			t.Errorf("SetRunPredictedRuntimeMinutes calls = %v, want none on a reject", calls)
+		}
+	})
+
+	t.Run("non-plan stage approve", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, _, _ := newBudgetCheckServer(t, art)
+		r := rr.seedRun()
+		stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+		stage.Type = run.StageTypeImplement
+		seedBudgetPlanArtifact(t, art, stage.ID, &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 12})
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if calls := rr.predictedRuntimeCallsSnapshot(); len(calls) != 0 {
+			t.Errorf("SetRunPredictedRuntimeMinutes calls = %v, want none on a non-plan stage", calls)
+		}
+	})
+
+	t.Run("plan carrying no prediction", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, _, _ := newBudgetCheckServer(t, art)
+		// PredictedRuntimeMinutes omitted → 0. A non-positive prediction is
+		// nothing to cache; the derivation's elapsed branch already handles it.
+		_, stage := seedBudgetRun(t, rr, art, &plan.Plan{PlanVersion: "standard_v1"})
+
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if calls := rr.predictedRuntimeCallsSnapshot(); len(calls) != 0 {
+			t.Errorf("SetRunPredictedRuntimeMinutes calls = %v, want none for a prediction-less plan", calls)
+		}
+	})
+}
+
+// TestApprovePlan_PredictedRuntimeStamp_UnsatisfiedCapabilityStillApproves
+// pins the narrow-optional-interface degrade: a Config whose RunRepo does NOT
+// implement runPredictionRecorder records nothing AND the approval still
+// succeeds. That degrade is what keeps the two dozen out-of-scope test doubles
+// compiling untouched, but it can also hide a mis-wiring, so it is asserted as
+// a real branch rather than left implicit.
+func TestApprovePlan_PredictedRuntimeStamp_UnsatisfiedCapabilityStillApproves(t *testing.T) {
+	art := newFakeArtifactRepo()
+	inner := newOrchestratorRepo()
+	hidden := noPredictionRunRepo{Repository: inner}
+	// Prove the wrapper genuinely hides the capability — otherwise this test
+	// would assert the degrade while exercising the happy path.
+	if _, ok := run.Repository(hidden).(runPredictionRecorder); ok {
+		t.Fatal("noPredictionRunRepo unexpectedly satisfies runPredictionRecorder")
+	}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: newFakeApprovalRepo(),
+		RunRepo:      hidden,
+		AuditRepo:    newApprovalAuditFake(),
+		Orchestrator: &orchestrator.Orchestrator{Runs: hidden},
+		ArtifactRepo: art,
+	})
+	r, stage := seedBudgetRun(t, inner, art, &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 12})
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the stamp is best-effort and must never unwind an approval):\n%s",
+			w.Code, w.Body.String())
+	}
+	if calls := inner.predictedRuntimeCallsSnapshot(); len(calls) != 0 {
+		t.Errorf("SetRunPredictedRuntimeMinutes calls = %v, want none (capability not satisfied)", calls)
+	}
+	unstamped, err := inner.GetRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if unstamped.PredictedRuntimeMinutes != 0 {
+		t.Errorf("run.PredictedRuntimeMinutes = %d, want 0 (nothing recorded)", unstamped.PredictedRuntimeMinutes)
+	}
 }

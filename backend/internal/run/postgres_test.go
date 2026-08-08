@@ -2130,3 +2130,79 @@ func TestPostgres_ParkScopeCompletenessAndAppend_LoserCAS(t *testing.T) {
 		t.Errorf("scope_completeness_parked entries = %d, want 1 (loser must not append)", len(entries))
 	}
 }
+
+// predictionRepo is the optional predicted-runtime surface the approval handler
+// consumes via capability assertion (E48.62 / #2489). Like AddRunCost above,
+// SetRunPredictedRuntimeMinutes is deliberately NOT part of run.Repository —
+// widening the interface would force a no-op stub into every one of the two
+// dozen test doubles that implement it. The test asserts for it exactly the way
+// server.recordPlanPredictedRuntime does.
+type predictionRepo interface {
+	SetRunPredictedRuntimeMinutes(ctx context.Context, id uuid.UUID, minutes int) (*run.Run, error)
+}
+
+// TestPostgres_SetRunPredictedRuntimeMinutes drives the real Postgres
+// round-trip for the E48.62 / #2489 stamp: the column defaults to the unstamped
+// 0, the setter persists a value that survives a fresh GetRun, and a repeat
+// write of the same value is idempotent.
+//
+// It is also what validates the HAND-EDITED sqlc output: a mis-ordered or
+// omitted column in any Run-returning Scan fails here immediately rather than
+// silently mapping the wrong field.
+func TestPostgres_SetRunPredictedRuntimeMinutes(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	pr, ok := repo.(predictionRepo)
+	if !ok {
+		t.Fatal("postgres repo does not implement SetRunPredictedRuntimeMinutes")
+	}
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	if r.PredictedRuntimeMinutes != 0 {
+		t.Errorf("fresh run PredictedRuntimeMinutes = %d, want 0 (unstamped)", r.PredictedRuntimeMinutes)
+	}
+	fetched, err := repo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun (unstamped): %v", err)
+	}
+	if fetched.PredictedRuntimeMinutes != 0 {
+		t.Errorf("unstamped GetRun PredictedRuntimeMinutes = %d, want 0", fetched.PredictedRuntimeMinutes)
+	}
+
+	stamped, err := pr.SetRunPredictedRuntimeMinutes(ctx, r.ID, 42)
+	if err != nil {
+		t.Fatalf("SetRunPredictedRuntimeMinutes: %v", err)
+	}
+	if stamped.PredictedRuntimeMinutes != 42 {
+		t.Errorf("returned row PredictedRuntimeMinutes = %d, want 42", stamped.PredictedRuntimeMinutes)
+	}
+	// The returned row could be right while the shared row mapper is wrong on
+	// the READ queries, so re-read through GetRun.
+	fetched, err = repo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun (stamped): %v", err)
+	}
+	if fetched.PredictedRuntimeMinutes != 42 {
+		t.Errorf("stamped GetRun PredictedRuntimeMinutes = %d, want 42", fetched.PredictedRuntimeMinutes)
+	}
+
+	// Idempotent: the value comes from the IMMUTABLE approved plan artifact, so
+	// a re-approval writes the same bytes.
+	if _, err := pr.SetRunPredictedRuntimeMinutes(ctx, r.ID, 42); err != nil {
+		t.Fatalf("SetRunPredictedRuntimeMinutes (repeat): %v", err)
+	}
+	fetched, err = repo.GetRun(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("GetRun (repeat): %v", err)
+	}
+	if fetched.PredictedRuntimeMinutes != 42 {
+		t.Errorf("repeat-stamp GetRun PredictedRuntimeMinutes = %d, want 42", fetched.PredictedRuntimeMinutes)
+	}
+
+	// A missing run is ErrNotFound, not a silent success — the same posture
+	// AddRunCost takes, so the caller's WARN branch has something to log.
+	if _, err := pr.SetRunPredictedRuntimeMinutes(ctx, uuid.New(), 7); !errors.Is(err, run.ErrNotFound) {
+		t.Errorf("SetRunPredictedRuntimeMinutes on missing run = %v, want ErrNotFound", err)
+	}
+}

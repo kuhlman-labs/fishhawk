@@ -20,7 +20,7 @@ UPDATE runs
            ELSE resolved_model
        END
  WHERE id = $3
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
 `
 
 type AddRunCostParams struct {
@@ -67,6 +67,7 @@ func (q *Queries) AddRunCost(ctx context.Context, arg AddRunCostParams) (Run, er
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }
@@ -75,7 +76,7 @@ const createRun = `-- name: CreateRun :one
 
 INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index, upstream_run_id, working_dir)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
 `
 
 type CreateRunParams struct {
@@ -158,6 +159,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }
@@ -226,7 +228,7 @@ func (q *Queries) CreateStage(ctx context.Context, arg CreateStageParams) (Stage
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir FROM runs WHERE id = $1
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes FROM runs WHERE id = $1
 `
 
 func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -261,6 +263,7 @@ func (q *Queries) GetRun(ctx context.Context, id uuid.UUID) (Run, error) {
 		&i.UpstreamRunID,
 		&i.AccountID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }
@@ -280,7 +283,7 @@ func (q *Queries) GetRunAccountID(ctx context.Context, id uuid.UUID) (*uuid.UUID
 }
 
 const getRunByIdempotencyKey = `-- name: GetRunByIdempotencyKey :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes FROM runs
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -324,6 +327,7 @@ func (q *Queries) GetRunByIdempotencyKey(ctx context.Context, arg GetRunByIdempo
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }
@@ -529,7 +533,7 @@ func (q *Queries) ListReviewStagesAwaitingApproval(ctx context.Context) ([]Stage
 }
 
 const listRuns = `-- name: ListRuns :many
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir FROM runs
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, account_id, working_dir, predicted_runtime_minutes FROM runs
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR workflow_id = $2)
    AND ($3::text = '' OR state = $3)
@@ -615,6 +619,7 @@ func (q *Queries) ListRuns(ctx context.Context, arg ListRunsParams) ([]Run, erro
 			&i.UpstreamRunID,
 			&i.AccountID,
 			&i.WorkingDir,
+			&i.PredictedRuntimeMinutes,
 		); err != nil {
 			return nil, err
 		}
@@ -834,7 +839,7 @@ func (q *Queries) ListStagesForRun(ctx context.Context, runID uuid.UUID) ([]Stag
 }
 
 const lockRunForUpdate = `-- name: LockRunForUpdate :one
-SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir FROM runs WHERE id = $1 FOR UPDATE
+SELECT id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes FROM runs WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, error) {
@@ -868,6 +873,7 @@ func (q *Queries) LockRunForUpdate(ctx context.Context, id uuid.UUID) (Run, erro
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }
@@ -996,11 +1002,65 @@ func (q *Queries) RetryStageState(ctx context.Context, arg RetryStageStateParams
 	return i, err
 }
 
+const setRunPredictedRuntimeMinutes = `-- name: SetRunPredictedRuntimeMinutes :one
+UPDATE runs
+   SET predicted_runtime_minutes = $2
+ WHERE id = $1
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
+`
+
+type SetRunPredictedRuntimeMinutesParams struct {
+	ID                      uuid.UUID `json:"id"`
+	PredictedRuntimeMinutes int32     `json:"predicted_runtime_minutes"`
+}
+
+// Stamps the approved plan's predicted_runtime_minutes onto the run row
+// (E48.62 / #2489) so the MCP stage-wait poll cadence can be derived from a
+// plain column instead of an artifact fetch per status read. Idempotent by
+// construction: the value is read from the IMMUTABLE approved plan artifact,
+// so a re-approval writes the same bytes — there is no observed-then-written
+// state and no check-then-write race to serialize.
+func (q *Queries) SetRunPredictedRuntimeMinutes(ctx context.Context, arg SetRunPredictedRuntimeMinutesParams) (Run, error) {
+	row := q.db.QueryRow(ctx, setRunPredictedRuntimeMinutes, arg.ID, arg.PredictedRuntimeMinutes)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.Repo,
+		&i.WorkflowID,
+		&i.WorkflowSha,
+		&i.TriggerSource,
+		&i.TriggerRef,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.InstallationID,
+		&i.IdempotencyKey,
+		&i.ParentRunID,
+		&i.PullRequestUrl,
+		&i.RequiredChecksSnapshot,
+		&i.WorkflowSpec,
+		&i.RetryAttempt,
+		&i.MaxRetriesSnapshot,
+		&i.RunnerKind,
+		&i.IssueContext,
+		&i.DecomposedFrom,
+		&i.CostUsdTotal,
+		&i.ResolvedModel,
+		&i.Drive,
+		&i.SliceIndex,
+		&i.RunnerKindResolved,
+		&i.UpstreamRunID,
+		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
+	)
+	return i, err
+}
+
 const setRunPullRequestURL = `-- name: SetRunPullRequestURL :one
 UPDATE runs
    SET pull_request_url = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
 `
 
 type SetRunPullRequestURLParams struct {
@@ -1043,6 +1103,7 @@ func (q *Queries) SetRunPullRequestURL(ctx context.Context, arg SetRunPullReques
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }
@@ -1085,7 +1146,7 @@ const updateRunState = `-- name: UpdateRunState :one
 UPDATE runs
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
 `
 
 type UpdateRunStateParams struct {
@@ -1124,6 +1185,7 @@ func (q *Queries) UpdateRunState(ctx context.Context, arg UpdateRunStateParams) 
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }
@@ -1133,7 +1195,7 @@ UPDATE runs
    SET runner_kind = $2,
        runner_kind_resolved = true
  WHERE id = $1
-RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir
+RETURNING id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, created_at, updated_at, installation_id, idempotency_key, parent_run_id, pull_request_url, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, cost_usd_total, resolved_model, drive, slice_index, runner_kind_resolved, upstream_run_id, working_dir, predicted_runtime_minutes
 `
 
 type UpdateRunnerKindParams struct {
@@ -1178,6 +1240,7 @@ func (q *Queries) UpdateRunnerKind(ctx context.Context, arg UpdateRunnerKindPara
 		&i.RunnerKindResolved,
 		&i.UpstreamRunID,
 		&i.WorkingDir,
+		&i.PredictedRuntimeMinutes,
 	)
 	return i, err
 }

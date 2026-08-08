@@ -154,9 +154,25 @@ type Run struct {
 	// json tag MUST byte-match the backend's runResponse field or this mirror
 	// silently decodes to empty and every inheriting verb reverts to demanding
 	// the parameter — the #371-class hand-maintained-wire-mirror trap.
-	WorkingDir string    `json:"working_dir,omitempty" jsonschema:"the run's bound local checkout (bound once at start_run; the later runner-spawning verbs inherit it). Omitted when the run carries no binding"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"the run's bound local checkout (bound once at start_run; the later runner-spawning verbs inherit it). Omitted when the run carries no binding"`
+	// PredictedRuntimeMinutes mirrors the backend runResponse
+	// .predicted_runtime_minutes (E48.62 / #2489): the approved plan's own
+	// runtime prediction, stamped onto the run row at plan approval. The
+	// stage-wait poll-cadence derivation reads it to advertise a quarter of
+	// each non-terminal stage's REMAINING predicted runtime instead of a flat
+	// 30s. Zero when unstamped — a legacy row, or a run whose plan is not yet
+	// approved (notably while the plan stage itself runs) — in which case the
+	// derivation falls back to the elapsed-based branch.
+	//
+	// The json tag MUST byte-match the backend's runResponse field or this
+	// mirror silently decodes to zero and the cadence degrades to that
+	// fallback with NO error — the #371-class hand-maintained-wire-mirror
+	// trap. That degrade is also the mixed-version behaviour against an older
+	// backend that omits the key entirely, which is why it is a graceful
+	// fallback rather than a failure.
+	PredictedRuntimeMinutes int       `json:"predicted_runtime_minutes,omitempty" jsonschema:"the approved plan's predicted_runtime_minutes, stamped on the run at plan approval. Drives the advertised stage-wait poll cadence; omitted when the run's plan is not yet approved"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
 }
 
 // RunReviewAuthority mirrors the backend's run-status review_authority entry
