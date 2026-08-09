@@ -145,8 +145,15 @@ func (r *runResolver) resolveWorkingDir(in string) (string, error) {
 //     resolveWorkingDir so the absolute check, the cleaning and the error text
 //     are byte-identical to the explicit path — inheritance cannot bypass the
 //     gate (a relative or empty binding is refused just like an explicit one).
-//   - Empty input AND empty binding: fall through to resolveWorkingDir(""),
-//     which refuses over HTTP per #2479 and resolves the process cwd on stdio.
+//   - Empty input AND empty binding: REFUSE when the run is a decomposition
+//     child whose runner_kind is local (E48.100 / #2547) — the shape that
+//     otherwise silently resolves to the calling process's cwd (#1866), since
+//     a child minted before this change carries no binding to inherit. Unlike
+//     #2479's admission this refusal is transport-INDEPENDENT: the stdio
+//     cwd fall-through is precisely the hole being closed, so refusing only
+//     over HTTP would leave it open where it actually bites. Otherwise fall
+//     through to resolveWorkingDir(""), which refuses over HTTP per #2479 and
+//     resolves the process cwd on stdio.
 //
 // The run read FAILS CLOSED over the HTTP transport (Condition 1 / #2482): a
 // GetRun failure there means the binding — the property the conflict and
@@ -156,7 +163,7 @@ func (r *runResolver) resolveWorkingDir(in string) (string, error) {
 // explicit value is self-validating and an omitted value resolves to the
 // process cwd.
 func (r *runResolver) resolveWorkingDirForRun(ctx context.Context, runUUID uuid.UUID, in string) (string, error) {
-	boundDir, readErr := r.runBoundWorkingDir(ctx, runUUID)
+	runObj, readErr := r.runForWorkingDir(ctx, runUUID)
 	if readErr != nil {
 		if r.httpTransport {
 			return "", fmt.Errorf(
@@ -165,7 +172,11 @@ func (r *runResolver) resolveWorkingDirForRun(ctx context.Context, runUUID uuid.
 		// stdio degrade: an unreadable run leaves the binding empty, so an
 		// explicit input is used verbatim and an omitted input falls through
 		// to the process cwd below (today's behavior).
-		boundDir = ""
+		runObj = nil
+	}
+	var boundDir string
+	if runObj != nil {
+		boundDir = runObj.WorkingDir
 	}
 
 	if in != "" {
@@ -183,18 +194,37 @@ func (r *runResolver) resolveWorkingDirForRun(ctx context.Context, runUUID uuid.
 		// takes, so a relative/empty binding is refused identically.
 		return r.resolveWorkingDir(boundDir)
 	}
+	if err := refuseUnboundLocalDecompositionChild(runUUID, runObj); err != nil {
+		return "", err
+	}
 	return r.resolveWorkingDir("")
 }
 
-// runBoundWorkingDir reads the run's bound working_dir (E66.42 / #2482),
-// returning "" for an unbound run and propagating a read error so the caller
-// can fail closed over HTTP.
-func (r *runResolver) runBoundWorkingDir(ctx context.Context, runUUID uuid.UUID) (string, error) {
+// refuseUnboundLocalDecompositionChild is rung 3's transport-independent
+// refusal (E48.100 / #2547): a decomposition child whose runner_kind is local
+// and that carries NO binding has no checkout to inherit, and falling through
+// to resolveWorkingDir("") would silently execute it against the calling
+// process's own directory (#1866). It returns nil for every other shape — a
+// non-child run, a child on a non-local backend, or a run we could not read.
+func refuseUnboundLocalDecompositionChild(runUUID uuid.UUID, runObj *Run) error {
+	if runObj == nil || runObj.DecomposedFrom == nil || runObj.RunnerKind != driveRunnerKindLocal {
+		return nil
+	}
+	return fmt.Errorf(
+		"run %s is a local decomposition child of run %s and carries no bound working_dir, so its checkout cannot be resolved by inheritance; refusing rather than defaulting to this process's own directory (#1866). Pass working_dir explicitly as an absolute path for this call; children minted after E48.100 / #2547 inherit the parent's binding at mint and need no per-call value",
+		runUUID, *runObj.DecomposedFrom)
+}
+
+// runForWorkingDir reads the run backing the working_dir ladder (E66.42 /
+// #2482, widened by E48.100 / #2547 so rung 3 can key on decomposed_from +
+// runner_kind), propagating a read error so the caller can fail closed
+// over HTTP.
+func (r *runResolver) runForWorkingDir(ctx context.Context, runUUID uuid.UUID) (*Run, error) {
 	runObj, err := r.api.GetRun(ctx, runUUID)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return runObj.WorkingDir, nil
+	return runObj, nil
 }
 
 // conflictingWorkingDirError renders the refusal for an explicit working_dir

@@ -2,9 +2,12 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,8 +24,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
+	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
@@ -1613,6 +1621,403 @@ func seedRunWorkingDir(fb *fakeBackend, runID uuid.UUID, wd string) {
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
 	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y", WorkingDir: wd}
+}
+
+// seedRunShape seeds a run served by GET /v0/runs/{id} carrying an arbitrary
+// decomposed_from / runner_kind / working_dir combination, so the rung-3
+// refusal (E48.100 / #2547) can be driven through the fakeBackend's real JSON
+// round-trip. Bad state is written BY CONSTRUCTION (an empty WorkingDir with a
+// non-nil DecomposedFrom), never produced by calling the control.
+func seedRunShape(fb *fakeBackend, runID uuid.UUID, decomposedFrom *string, runnerKind, wd string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{
+		ID:             runID.String(),
+		State:          "running",
+		Repo:           "x/y",
+		DecomposedFrom: decomposedFrom,
+		RunnerKind:     runnerKind,
+		WorkingDir:     wd,
+	}
+}
+
+// TestResolveWorkingDirForRun_UnboundLocalDecompositionChild is the rung-3
+// refusal table (E48.100 / #2547). Every mode asserts the observable outcome —
+// the returned path or the error text — not merely error-vs-nil:
+//
+//	A REFUSE  unbound local decomposition child, omitted input, stdio.
+//	B ACCEPT  the same child WITH a binding inherits it.
+//	C ACCEPT  the same unbound child with an EXPLICIT absolute input.
+//	D ACCEPT  a NON-child unbound run on stdio still resolves the process cwd.
+//	E ACCEPT  an unbound github_actions decomposition child falls through.
+//	F ACCEPT  an unbound EMPTY-runner_kind decomposition child falls through —
+//	          the exact residual the mcpserver README singles out.
+//
+// Mode A is the counterfactual vehicle and runs on the STDIO transport, where
+// deleting the guard changes the outcome from an error to a cwd resolution
+// (over HTTP the #2479 rule would refuse anyway, making the deletion invisible).
+// Modes B–F staying green under that deletion proves the test is not passing by
+// refusing everything.
+//
+// Mode F is the counterfactual vehicle for the NARROWNESS of the key: the README
+// states the residual is a legacy row that is genuinely local but carries an
+// empty `runner_kind`, and mode E pins only the "github_actions" spelling.
+// Widening the comparison so an empty runner_kind reads as local turns F red
+// while A stays green.
+func TestResolveWorkingDirForRun_UnboundLocalDecompositionChild(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	parentID := uuid.New().String()
+	bound := t.TempDir()
+	explicit := t.TempDir()
+
+	t.Run("A_unbound_local_child_refused", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = false
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "local", "")
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err == nil {
+			t.Fatalf("expected a refusal for an unbound local decomposition child, got %q", got)
+		}
+		if got == cwd {
+			t.Errorf("resolved to the process cwd %q; the refusal must fire instead", cwd)
+		}
+		if !strings.Contains(err.Error(), parentID) {
+			t.Errorf("error should name the parent run id %s; got %v", parentID, err)
+		}
+		if !strings.Contains(err.Error(), "working_dir") {
+			t.Errorf("error should name working_dir; got %v", err)
+		}
+	})
+
+	t.Run("B_bound_local_child_inherits", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = false
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "local", bound)
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("a bound child must inherit, got error %v", err)
+		}
+		if got != bound {
+			t.Errorf("resolved = %q, want the inherited binding %q", got, bound)
+		}
+	})
+
+	t.Run("C_unbound_local_child_explicit_input_accepted", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = false
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "local", "")
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, explicit)
+		if err != nil {
+			t.Fatalf("the explicit-path workaround on a legacy child must survive, got error %v", err)
+		}
+		if got != explicit {
+			t.Errorf("resolved = %q, want the explicit input %q", got, explicit)
+		}
+	})
+
+	t.Run("D_non_child_unbound_falls_through_to_cwd", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = false
+		runID := uuid.New()
+		seedRunShape(fb, runID, nil, "local", "")
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("a non-child unbound run must still resolve the process cwd (#2479 untouched), got error %v", err)
+		}
+		if got != cwd {
+			t.Errorf("resolved = %q, want the process cwd %q", got, cwd)
+		}
+	})
+
+	t.Run("E_unbound_github_actions_child_falls_through", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = false
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "github_actions", "")
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("a github_actions child has no local checkout to bind; must fall through, got error %v", err)
+		}
+		if got != cwd {
+			t.Errorf("resolved = %q, want the process cwd %q", got, cwd)
+		}
+	})
+
+	t.Run("F_unbound_empty_runner_kind_child_falls_through", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = false
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "", "")
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("an empty runner_kind resolves to github_actions, which has no local checkout; the documented residual is that such a child falls through, got error %v", err)
+		}
+		if got != cwd {
+			t.Errorf("resolved = %q, want the process cwd %q", got, cwd)
+		}
+	})
+}
+
+// TestResolveWorkingDirForRun_UnreadableDecompositionChild_TransportDivergence
+// pins the two transports' divergence SIDE BY SIDE on one seeded fault
+// (E48.100 / #2547 review): the run row IS an unbound local decomposition child
+// — the exact shape rung 3 refuses — but GET /v0/runs/{id} answers 500, so
+// resolveWorkingDirForRun cannot classify it. On stdio that degrades to the
+// process cwd and does NOT refuse (you cannot classify a run you could not read,
+// and refusing on any read error would be a broad tightening); over HTTP the
+// Condition-1 fail-closed branch still refuses. Pinning both against the SAME
+// seeded row makes the asymmetry deliberate on its face rather than an oversight.
+//
+// The stdio half is the counterfactual vehicle for the nil-runObj carve-out in
+// refuseUnboundLocalDecompositionChild: making that guard refuse on a nil
+// runObj turns this half red while the rung-3 table above stays green.
+func TestResolveWorkingDirForRun_UnreadableDecompositionChild_TransportDivergence(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	parentID := uuid.New().String()
+
+	// seed writes the unbound-local-child row AND the 500 override, so the row
+	// is genuinely the refusable shape and is genuinely unreadable — bad state
+	// by construction, never produced by calling the control.
+	seed := func(t *testing.T, httpTransport bool) (*runResolver, uuid.UUID) {
+		t.Helper()
+		fb, srv := newFakeBackend(t) // a REACHABLE in-test server, not a dead address
+		r := newResolver(srv, nil)
+		r.httpTransport = httpTransport
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "local", "")
+		fb.mu.Lock()
+		fb.getStatusByID[runID] = http.StatusInternalServerError
+		fb.mu.Unlock()
+		return r, runID
+	}
+
+	t.Run("stdio_degrades_to_cwd", func(t *testing.T) {
+		r, runID := seed(t, false)
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("an unreadable run on stdio must degrade to the process cwd, not refuse; got error %v", err)
+		}
+		if got != cwd {
+			t.Errorf("stdio degrade = %q, want the process cwd %q", got, cwd)
+		}
+	})
+
+	t.Run("http_still_fails_closed", func(t *testing.T) {
+		r, runID := seed(t, true)
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err == nil {
+			t.Fatalf("an unreadable run over HTTP must fail closed (Condition 1 / #2482), got %q", got)
+		}
+		if got == cwd {
+			t.Errorf("returned the process cwd %q over HTTP; must fail closed", cwd)
+		}
+	})
+}
+
+// decomposedPlanForWorkingDirE2E renders a schema-valid standard_v1 plan whose
+// decomposition block carries two scoped sub_plans, so a real Advance fans the
+// seeded parent out into two child runs.
+func decomposedPlanForWorkingDirE2E(t *testing.T) []byte {
+	t.Helper()
+	sub := func(title, file string) map[string]any {
+		return map[string]any{
+			"title":                        title,
+			"scope_hint":                   "scope hint for " + title,
+			"predicted_runtime_minutes":    10,
+			"predicted_runtime_confidence": "high",
+			"scope": map[string]any{
+				"files": []map[string]any{{"path": file, "operation": "create"}},
+			},
+		}
+	}
+	body := map[string]any{
+		"plan_version": "standard_v1",
+		"ticket_reference": map[string]any{
+			"type": "github_issue",
+			"url":  "https://github.com/example/repo/issues/1",
+			"id":   "example/repo#1",
+		},
+		"generated_by": map[string]any{
+			"agent":     "claude-code",
+			"model":     "claude-opus-4-7",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		"summary":                      "test plan with decomposition",
+		"scope":                        map[string]any{"files": []map[string]any{{"path": "x.go", "operation": "create"}}},
+		"approach":                     []map[string]any{{"step": 1, "description": "do it"}},
+		"verification":                 map[string]any{"test_strategy": "run tests", "rollback_plan": "revert"},
+		"predicted_runtime_minutes":    100,
+		"predicted_runtime_confidence": "medium",
+		"decomposition": map[string]any{
+			"rationale": "test decomposition rationale",
+			"sub_plans": []map[string]any{sub("Part A", "a.go"), sub("Part B", "b.go")},
+		},
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// TestResolveWorkingDirForRun_DecomposedChild_E2E is the FULL cross-boundary
+// span the operator's binding condition requires (E48.100 / #2547): the
+// orchestrator mints decomposition children from a parent carrying a
+// working_dir binding, the children land in a REAL Postgres, the REAL
+// server.Handler() serves one of those persisted child rows over
+// GET /v0/runs/{id}, and the REAL MCP api client decodes it into the resolver
+// — which, with the explicit input OMITTED, must resolve the parent's exact
+// working_dir. Neither half alone proves this: the orchestrator integration
+// test stops at the persisted rows, and the resolver's other tests run against
+// fake-seeded rows, so a decode mismatch between the persisted row and the
+// resolver's view would pass both. The unbound parent is the paired control:
+// the same span with no binding mints the legacy null-bound local child, and
+// the rung-3 refusal fires on it — so the bound case cannot pass by resolving
+// everything to the same path, and the refusal is proven against a REAL
+// persisted row rather than only a fake-seeded one.
+//
+// It lives in package mcpserver because resolveWorkingDirForRun is unexported
+// and backend/internal/integration/orchestrator is an EXTERNAL test package
+// (orchestratore2e_test), so the resolver cannot be reached from there. Driving
+// a real server.New over pgtest from this package is the established idiom
+// (TestStartCampaign_NoEpic_E2E_ThroughRealServer).
+func TestResolveWorkingDirForRun_DecomposedChild_E2E(t *testing.T) {
+	bound := t.TempDir()
+	cases := []struct {
+		name        string
+		binding     string
+		wantRefusal bool
+	}{
+		{"bound_parent_child_resolves_parent_dir", bound, false},
+		{"unbound_parent_child_refused", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := pgtest.NewPool(t)
+			ctx := context.Background()
+
+			runRepo := runpkg.NewPostgresRepository(pool)
+			artifactRepo := artifact.NewPostgresRepository(pool)
+			auditRepo := audit.NewPostgresRepository(pool)
+
+			// (1) A parent run carrying the binding, with a succeeded plan
+			// stage and a decomposed plan artifact.
+			parent, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+				Repo:          "kuhlman-labs/fishhawk",
+				WorkflowID:    "feature_change",
+				WorkflowSHA:   "deadbeef",
+				TriggerSource: runpkg.TriggerCLI,
+				RunnerKind:    runpkg.RunnerKindLocal,
+				WorkingDir:    tc.binding,
+			})
+			if err != nil {
+				t.Fatalf("CreateRun parent: %v", err)
+			}
+			planStage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+				RunID: parent.ID, Sequence: 0, Type: runpkg.StageTypePlan,
+				ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+			})
+			if err != nil {
+				t.Fatalf("CreateStage plan: %v", err)
+			}
+			if _, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+				RunID: parent.ID, Sequence: 1, Type: runpkg.StageTypeImplement,
+				ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+			}); err != nil {
+				t.Fatalf("CreateStage implement: %v", err)
+			}
+			for _, to := range []runpkg.StageState{
+				runpkg.StageStateDispatched, runpkg.StageStateRunning, runpkg.StageStateSucceeded,
+			} {
+				if _, err := runRepo.TransitionStage(ctx, planStage.ID, to, nil); err != nil {
+					t.Fatalf("TransitionStage plan to %s: %v", to, err)
+				}
+			}
+			planBytes := decomposedPlanForWorkingDirE2E(t)
+			sum := sha256.Sum256(planBytes)
+			schemaV := "standard_v1"
+			if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+				StageID:       planStage.ID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &schemaV,
+				Content:       planBytes,
+				ContentHash:   hex.EncodeToString(sum[:]),
+			}); err != nil {
+				t.Fatalf("Create plan artifact: %v", err)
+			}
+
+			// (2) Real mint through the orchestrator into real Postgres.
+			o := &orchestrator.Orchestrator{
+				Runs: runRepo, Artifacts: artifactRepo, Audit: auditRepo, Logger: slog.Default(),
+			}
+			outcome, err := o.Advance(ctx, parent.ID)
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if outcome != orchestrator.OutcomeDecomposed {
+				t.Fatalf("Advance outcome = %q, want %q", outcome, orchestrator.OutcomeDecomposed)
+			}
+			children, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parent.ID, Limit: 100})
+			if err != nil {
+				t.Fatalf("ListRuns children: %v", err)
+			}
+			if len(children) != 2 {
+				t.Fatalf("children = %d, want 2", len(children))
+			}
+			for i, child := range children {
+				if child.WorkingDir != tc.binding {
+					t.Fatalf("child %d working_dir read back from Postgres = %q, want %q", i, child.WorkingDir, tc.binding)
+				}
+			}
+
+			// (3) The REAL HTTP surface over those persisted rows, decoded by
+			// the REAL MCP api client into the resolver.
+			srv := server.New(server.Config{RunRepo: runRepo, AuditRepo: auditRepo})
+			httpSrv := httptest.NewServer(srv.Handler())
+			t.Cleanup(httpSrv.Close)
+			r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL})}
+
+			got, err := r.resolveWorkingDirForRun(ctx, children[0].ID, "")
+			if tc.wantRefusal {
+				if err == nil {
+					t.Fatalf("expected the rung-3 refusal for a real persisted unbound local child, got %q", got)
+				}
+				if !strings.Contains(err.Error(), parent.ID.String()) {
+					t.Errorf("refusal should name the parent run id %s; got %v", parent.ID, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveWorkingDirForRun on a real persisted child: %v", err)
+			}
+			if got != tc.binding {
+				t.Errorf("resolved working_dir = %q, want the parent's binding %q", got, tc.binding)
+			}
+		})
+	}
 }
 
 // TestResolveWorkingDirForRun_RelativeBindingRefused (C2): a run bound to the

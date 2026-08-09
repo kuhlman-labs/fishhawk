@@ -96,9 +96,12 @@ func (r *recoverRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*run.
 		MaxRetriesSnapshot:     p.MaxRetriesSnapshot,
 		RunnerKind:             runnerKind,
 		IssueContext:           p.IssueContext,
-		State:                  run.StatePending,
-		CreatedAt:              now,
-		UpdatedAt:              now,
+		// Carry the minted working_dir through (E48.100 / #2547) so the
+		// recovery-inheritance assertion can witness it.
+		WorkingDir: p.WorkingDir,
+		State:      run.StatePending,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	r.mu.Lock()
 	r.runs[rr.ID] = rr
@@ -374,6 +377,49 @@ func TestRecoverRun_HappyPath(t *testing.T) {
 	// (#1770 no-parent-amendments regression).
 	if len(payload.InheritedAmendments) != 0 {
 		t.Errorf("payload inherited_amendments = %+v, want empty (no parent amendments seeded)", payload.InheritedAmendments)
+	}
+}
+
+// TestRecoverRun_InheritsParentWorkingDir pins the sibling mint site of
+// E48.100 / #2547: an operator-recovery child executes against the same
+// checkout the run it recovers is anchored to, so it inherits the parent's
+// #2483 working_dir binding at mint — mirroring the runner_kind inheritance
+// already in handleRecoverRun's CreateRunParams. The unbound case is the
+// paired control, so the bound assertion cannot be satisfied by a constant.
+// Deleting `WorkingDir: parent.WorkingDir` turns the bound case red and
+// leaves the unbound case green.
+func TestRecoverRun_InheritsParentWorkingDir(t *testing.T) {
+	bound := t.TempDir()
+	cases := []struct {
+		name    string
+		binding string
+	}{
+		{"bound_parent_child_inherits", bound},
+		{"unbound_parent_child_empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, _, _ := newRecoverServer(t)
+			parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+			// Seeded by construction, before the handler runs.
+			parent.WorkingDir = tc.binding
+
+			w := postRecover(t, s, parent.ID.String(), `{"reason":"recover after a category-B failure"}`, nil)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+			}
+			var resp runResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			child, err := rr.GetRun(context.Background(), resp.ID)
+			if err != nil {
+				t.Fatalf("GetRun child: %v", err)
+			}
+			if child.WorkingDir != tc.binding {
+				t.Errorf("recovery child working_dir = %q, want %q (inherited from parent)", child.WorkingDir, tc.binding)
+			}
+		})
 	}
 }
 

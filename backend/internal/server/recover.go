@@ -312,6 +312,11 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 		MaxRetriesSnapshot:     parent.MaxRetriesSnapshot,
 		RunnerKind:             parent.RunnerKind,
 		IssueContext:           parent.IssueContext,
+		// Inherit the parent's bound local checkout (E48.100 / #2547),
+		// mirroring the runner_kind inheritance above: a recovery child
+		// executes against the same checkout the run it recovers is anchored
+		// to, so the #2483 binding survives the mint.
+		WorkingDir: parent.WorkingDir,
 	}
 	if idempKey != "" {
 		k := idempKey
