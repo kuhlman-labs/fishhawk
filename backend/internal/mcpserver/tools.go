@@ -291,8 +291,8 @@ type GetActiveRunOutput struct {
 // row. Factored out because getActiveRun returns from three resolution paths
 // and every one of them must be bounded — an unbounded path is exactly the
 // blind spot this change closes.
-func (r *runResolver) boundActiveRun(runRow Run) (GetActiveRunOutput, error) {
-	out, err := boundRunRowOutput(GetActiveRunOutput{Run: runRow}, runRow.ID, mcpResponseByteBudget(r.getenv),
+func (r *runResolver) boundActiveRun(req *mcp.CallToolRequest, runRow Run) (GetActiveRunOutput, error) {
+	out, err := boundRunRowOutput(GetActiveRunOutput{Run: runRow}, runRow.ID, r.responseBudget(req),
 		func(o *GetActiveRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *GetActiveRunOutput, e *Elisions) { o.Elisions = e })
 	if err != nil {
@@ -337,7 +337,7 @@ pull-request URL.
 
 // getActiveRun is the tool handler. Pure-ish on its inputs; only
 // side effects are the HTTP call and reading env.
-func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, in GetActiveRunInput) (*mcp.CallToolResult, GetActiveRunOutput, error) {
+func (r *runResolver) getActiveRun(ctx context.Context, req *mcp.CallToolRequest, in GetActiveRunInput) (*mcp.CallToolResult, GetActiveRunOutput, error) {
 	repo := in.Repo
 	if repo == "" {
 		repo = r.getenv("GITHUB_REPOSITORY")
@@ -361,7 +361,7 @@ func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, 
 		if runRow == nil {
 			return nil, GetActiveRunOutput{}, fmt.Errorf("no Fishhawk run found for %s pull/%d", repo, in.PRNumber)
 		}
-		out, berr := r.boundActiveRun(*runRow)
+		out, berr := r.boundActiveRun(req, *runRow)
 		return nil, out, berr
 	}
 
@@ -380,7 +380,7 @@ func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, 
 		if runRow == nil {
 			return nil, GetActiveRunOutput{}, fmt.Errorf("no Fishhawk run found for trigger_ref=%q", in.TriggerRef)
 		}
-		out, berr := r.boundActiveRun(*runRow)
+		out, berr := r.boundActiveRun(req, *runRow)
 		return nil, out, berr
 	}
 
@@ -396,7 +396,7 @@ func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, 
 		if err != nil {
 			return nil, GetActiveRunOutput{}, fmt.Errorf("get run by FISHHAWK_RUN_ID: %w", err)
 		}
-		out, berr := r.boundActiveRun(*runRow)
+		out, berr := r.boundActiveRun(req, *runRow)
 		return nil, out, berr
 	}
 
@@ -1687,7 +1687,7 @@ Best-effort — never gates the run; omitted for non-decomposed runs.
 }
 
 // getRunStatus is the tool handler.
-func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, in GetRunStatusInput) (*mcp.CallToolResult, GetRunStatusOutput, error) {
+func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest, in GetRunStatusInput) (*mcp.CallToolResult, GetRunStatusOutput, error) {
 	runID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, GetRunStatusOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
@@ -1907,7 +1907,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// forbids outside wire()/wireField(). It is an accepted defensive branch.
 	// The validation itself IS driven, through the projection path, by
 	// TestWireElisions_ValidationRejectsMalformed.
-	bounded, err := boundRunStatusOutput(assembled, runID.String(), mcpResponseByteBudget(r.getenv))
+	bounded, err := boundRunStatusOutput(assembled, runID.String(), r.responseBudget(req))
 	if err != nil {
 		return nil, GetRunStatusOutput{}, fmt.Errorf("bound run status response: %w", err)
 	}
@@ -2185,7 +2185,7 @@ prev_hash are never dropped — this is the hash-chain verifier surface.
 }
 
 // listAudit is the tool handler.
-func (r *runResolver) listAudit(ctx context.Context, _ *mcp.CallToolRequest, in ListAuditInput) (*mcp.CallToolResult, ListAuditOutput, error) {
+func (r *runResolver) listAudit(ctx context.Context, req *mcp.CallToolRequest, in ListAuditInput) (*mcp.CallToolResult, ListAuditOutput, error) {
 	runID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, ListAuditOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
@@ -2216,7 +2216,7 @@ func (r *runResolver) listAudit(ctx context.Context, _ *mcp.CallToolRequest, in 
 	// as get_run_status does.
 	bounded, err := boundListAuditOutput(
 		ListAuditOutput{Items: items, NextCursor: nextCursor},
-		runID.String(), in.Category, mcpResponseByteBudget(r.getenv))
+		runID.String(), in.Category, r.responseBudget(req))
 	if err != nil {
 		return nil, ListAuditOutput{}, fmt.Errorf("bound list audit response: %w", err)
 	}
@@ -2486,7 +2486,7 @@ Returns the canonical Run row + an Idempotent flag.
 //     wasn't already passed inline).
 //  7. validate the trigger_source / issue_context pairing.
 //  8. hand off to apiClient.StartRun.
-func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in StartRunInput) (*mcp.CallToolResult, StartRunOutput, error) {
+func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in StartRunInput) (*mcp.CallToolResult, StartRunOutput, error) {
 	if in.Repo == "" {
 		return nil, StartRunOutput{}, errors.New("repo is required (owner/name)")
 	}
@@ -2698,7 +2698,7 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 	}
 	// Response byte bound (#2510) — see the Elisions field comment: the run
 	// EXISTS by now, so the row is reduced rather than the response rejected.
-	bounded, berr := boundRunRowOutput(out, out.Run.ID, mcpResponseByteBudget(r.getenv),
+	bounded, berr := boundRunRowOutput(out, out.Run.ID, r.responseBudget(req),
 		func(o *StartRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *StartRunOutput, e *Elisions) { o.Elisions = e })
 	if berr != nil {
@@ -2759,7 +2759,7 @@ clean tool error on:
 }
 
 // cancelRun is the tool handler.
-func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in CancelRunInput) (*mcp.CallToolResult, CancelRunOutput, error) {
+func (r *runResolver) cancelRun(ctx context.Context, req *mcp.CallToolRequest, in CancelRunInput) (*mcp.CallToolResult, CancelRunOutput, error) {
 	runID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, CancelRunOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
@@ -2768,7 +2768,7 @@ func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 	if err != nil {
 		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
 	}
-	bounded, berr := boundRunRowOutput(CancelRunOutput{Run: *cancelled}, cancelled.ID, mcpResponseByteBudget(r.getenv),
+	bounded, berr := boundRunRowOutput(CancelRunOutput{Run: *cancelled}, cancelled.ID, r.responseBudget(req),
 		func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
 	if berr != nil {
@@ -3726,7 +3726,7 @@ include_issue_context=true to re-include it when the payload is needed.
 }
 
 // listRuns is the tool handler.
-func (r *runResolver) listRuns(ctx context.Context, _ *mcp.CallToolRequest, in ListRunsInput) (*mcp.CallToolResult, ListRunsOutput, error) {
+func (r *runResolver) listRuns(ctx context.Context, req *mcp.CallToolRequest, in ListRunsInput) (*mcp.CallToolResult, ListRunsOutput, error) {
 	if in.State != "" {
 		if _, ok := validRunStates[in.State]; !ok {
 			return nil, ListRunsOutput{}, fmt.Errorf("state %q is not one of pending, running, succeeded, failed, cancelled", in.State)
@@ -3762,7 +3762,7 @@ func (r *runResolver) listRuns(ctx context.Context, _ *mcp.CallToolRequest, in L
 	// and boundListRunsOutput's cursor rule).
 	bounded, berr := boundListRunsOutput(
 		ListRunsOutput{Items: page.Items, NextCursor: page.NextCursor},
-		mcpResponseByteBudget(r.getenv))
+		r.responseBudget(req))
 	if berr != nil {
 		return nil, ListRunsOutput{}, fmt.Errorf("bound list_runs response: %w", berr)
 	}

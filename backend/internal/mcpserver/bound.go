@@ -79,17 +79,33 @@ const minimalRunStatusMaxBytes = mcpConvergenceFloorBytes
 // Budget field, which reports the EFFECTIVE (post-clamp) value so the wire
 // never claims a bound the ladder did not honour.
 func mcpResponseByteBudget(getenv func(string) string) int {
+	if n, ok := configuredByteBudget(getenv); ok {
+		return n
+	}
+	return mcpResponseByteBudgetDefault
+}
+
+// configuredByteBudget reports whether an operator env override is PRESENT and,
+// if so, its resolved value. It is the clean presence test the discovery ladder
+// (#2509) needs to keep rung 3 distinct from rung 2: the FIRST var present
+// decides — general, then legacy — and its value routes through
+// resolveByteBudget's four named branches, so a present-but-invalid value still
+// reports present (the operator made a deliberate choice) while resolving to the
+// default. It reports (0, false) only when NO override var is set (or there is
+// no environment seam at all), which is what lets resolveResponseBudget fall
+// through to an advertised value or the measured default.
+func configuredByteBudget(getenv func(string) string) (int, bool) {
 	if getenv == nil {
-		return mcpResponseByteBudgetDefault
+		return 0, false
 	}
 	for _, name := range []string{mcpResponseBudgetEnvVar, runStatusBudgetEnvVar} {
 		raw := strings.TrimSpace(getenv(name))
 		if raw == "" {
 			continue
 		}
-		return resolveByteBudget(name, raw)
+		return resolveByteBudget(name, raw), true
 	}
-	return mcpResponseByteBudgetDefault
+	return 0, false
 }
 
 // resolveByteBudget parses ONE override value's named branches. Split out so
@@ -353,9 +369,13 @@ func aggregateComputedElision(field, reason string) elidedField {
 	return elidedField{field: field, reason: reason, class: classComputed, aggregate: true}
 }
 
-// elisionLedger is the append-only accumulator the ladder builds.
+// elisionLedger is the append-only accumulator the ladder builds. budget and
+// source travel together (#2509): the source names which discovery-ladder rung
+// decided the effective budget, and wire() projects both onto the DTO so the
+// response can explain not just how far it was trimmed but WHY that budget held.
 type elisionLedger struct {
 	budget  int
+	source  budgetSource
 	tier    string
 	entries []elidedField
 	note    string
@@ -399,10 +419,11 @@ func (l *elisionLedger) add(entries ...elidedField) {
 // no code path can ever set is a schema surface that lies to its reader, so the
 // convergence design is stated here instead of advertised as a signal.
 type Elisions struct {
-	Budget int           `json:"budget" jsonschema:"the EFFECTIVE byte budget the ladder honoured (post-clamp — an override below the convergence floor is clamped up, so this never claims a bound the ladder did not honour)"`
-	Tier   string        `json:"tier" jsonschema:"the deepest reduction tier applied: T1..T9 (ordered least-actionable-first), skeleton (per-field itemised projection), or floor (the constant-size absolute floor)"`
-	Fields []ElidedField `json:"fields,omitempty" jsonschema:"one entry per omitted field path; at the floor tier exactly two aggregate entries stand in for the per-field list"`
-	Note   string        `json:"note,omitempty" jsonschema:"one-line operator note about the reduction"`
+	Budget       int           `json:"budget" jsonschema:"the EFFECTIVE byte budget the ladder honoured (post-clamp — a budget below the convergence floor is clamped up, so this never claims a bound the ladder did not honour)"`
+	BudgetSource string        `json:"budget_source" jsonschema:"which discovery-ladder rung decided the effective budget (#2509): advertised (the client advertised a tool-result limit on the initialize handshake and it was honoured), advertised_below_floor (the client advertised a limit BELOW the convergence floor — the floor is emitted because convergence cannot promise less, so the smaller advertisement could NOT be honoured), configured (an operator env override), or default (the ADR-077 measured constant)"`
+	Tier         string        `json:"tier" jsonschema:"the deepest reduction tier applied: T1..T9 (ordered least-actionable-first), skeleton (per-field itemised projection), or floor (the constant-size absolute floor)"`
+	Fields       []ElidedField `json:"fields,omitempty" jsonschema:"one entry per omitted field path; at the floor tier exactly two aggregate entries stand in for the per-field list"`
+	Note         string        `json:"note,omitempty" jsonschema:"one-line operator note about the reduction"`
 }
 
 // ElidedField is one omitted field path and how (or whether) to get it back.
@@ -420,7 +441,7 @@ type ElidedField struct {
 // TestProjectionIsSoleProducerOfWireDTO), and it validates its own output
 // before returning it.
 func (l *elisionLedger) wire() (*Elisions, error) {
-	out := &Elisions{Budget: l.budget, Tier: l.tier, Note: l.note}
+	out := &Elisions{Budget: l.budget, BudgetSource: string(l.source), Tier: l.tier, Note: l.note}
 	for _, e := range l.entries {
 		out.Fields = append(out.Fields, e.wireField())
 	}
@@ -451,6 +472,12 @@ const floorTierName = "floor"
 func validateWireElisions(el *Elisions) error {
 	if el == nil {
 		return nil
+	}
+	// The DTO must not ship a budget source it cannot name (#2509): an empty or
+	// unrecognised budget_source would leave an operator unable to tell whether
+	// their advertised limit was honoured, clamped, or ignored.
+	if !validBudgetSource(budgetSource(el.BudgetSource)) {
+		return fmt.Errorf("elisions: budget_source %q is not one of advertised/advertised_below_floor/configured/default", el.BudgetSource)
 	}
 	for _, f := range el.Fields {
 		switch elisionClass(f.Class) {
@@ -892,20 +919,20 @@ func tierResidualBounded(out *GetRunStatusOutput, runID string, led *elisionLedg
 // The ladder is deliberately NOT size-monotonic: attaching the growing elisions
 // block can make a later measurement larger than an earlier one. Convergence
 // comes from the constant-size floor, not from monotonicity.
-func boundRunStatusOutput(out GetRunStatusOutput, runID string, budget int) (GetRunStatusOutput, error) {
+func boundRunStatusOutput(out GetRunStatusOutput, runID string, budget responseBudget) (GetRunStatusOutput, error) {
 	n, err := marshalledLen(out)
 	if err != nil {
 		return out, err
 	}
-	if n <= budget {
+	if n <= budget.bytes {
 		return out, nil
 	}
 
-	led := &elisionLedger{budget: budget, note: "response reduced to fit the tool-result byte budget"}
+	led := &elisionLedger{budget: budget.bytes, source: budget.source, note: "response reduced to fit the tool-result byte budget"}
 	for _, tier := range runStatusTiers {
 		led.tier = tier.name
 		tier.apply(&out, runID, led)
-		fits, err := attachAndMeasure(&out, led, budget)
+		fits, err := attachAndMeasure(&out, led, budget.bytes)
 		if err != nil {
 			return out, err
 		}
@@ -967,7 +994,7 @@ var skeletonRetainedPaths = map[string]struct{}{
 // skeletonRunStatus projects to the retained field set and itemises every
 // omitted PATH from the table. Diagnosis OUTRANKS itemisation at and below this
 // tier: an operator reaches here precisely when something went badly wrong.
-func skeletonRunStatus(out GetRunStatusOutput, runID string, budget int) (GetRunStatusOutput, bool, error) {
+func skeletonRunStatus(out GetRunStatusOutput, runID string, budget responseBudget) (GetRunStatusOutput, bool, error) {
 	sk := GetRunStatusOutput{
 		Run: Run{
 			ID:         out.Run.ID,
@@ -991,7 +1018,8 @@ func skeletonRunStatus(out GetRunStatusOutput, runID string, budget int) (GetRun
 	}
 
 	led := &elisionLedger{
-		budget: budget,
+		budget: budget.bytes,
+		source: budget.source,
 		tier:   "skeleton",
 		note:   "reduced to the diagnosis skeleton; every omission below is itemised with its own class and retrieval surface",
 	}
@@ -1005,7 +1033,7 @@ func skeletonRunStatus(out GetRunStatusOutput, runID string, budget int) (GetRun
 		led.add(elisionForPath(row, runID, "omitted by the diagnosis skeleton (tier "+row.Tier+")", 0))
 	}
 
-	fits, err := attachAndMeasure(&sk, led, budget)
+	fits, err := attachAndMeasure(&sk, led, budget.bytes)
 	if err != nil {
 		return sk, false, err
 	}
@@ -1022,7 +1050,7 @@ func skeletonRunStatus(out GetRunStatusOutput, runID string, budget int) (GetRun
 // elisions — one STORED whose pointer names the UNION of every surface its
 // members would have named individually (derived from runStatusPathTable, so it
 // cannot drift from the tiers), one COMPUTED carrying NO pointer.
-func minimalRunStatus(out GetRunStatusOutput, runID string, budget int) (GetRunStatusOutput, error) {
+func minimalRunStatus(out GetRunStatusOutput, runID string, budget responseBudget) (GetRunStatusOutput, error) {
 	failingType, failingState, failureCategory := diagnosisCore(out)
 	return minimalRunStatusFrom(runID, out.Run.State, failingType, failingState, failureCategory, out.NextActions != nil, budget)
 }
@@ -1047,7 +1075,7 @@ func diagnosisCore(out GetRunStatusOutput) (stageType, stageState, failureCatego
 	return pick.Type, pick.State, fc
 }
 
-func minimalRunStatusFrom(runID, runState, failingStageType, failingStageState, failureCategory string, hasNextActions bool, budget int) (GetRunStatusOutput, error) {
+func minimalRunStatusFrom(runID, runState, failingStageType, failingStageState, failureCategory string, hasNextActions bool, budget responseBudget) (GetRunStatusOutput, error) {
 	fc := capJSONString(failureCategory, floorFieldCap)
 	sk := GetRunStatusOutput{
 		Run: Run{
@@ -1070,7 +1098,8 @@ func minimalRunStatusFrom(runID, runState, failingStageType, failingStageState, 
 	}
 
 	led := &elisionLedger{
-		budget: budget,
+		budget: budget.bytes,
+		source: budget.source,
 		tier:   floorTierName,
 		note:   "reduced to the constant-size floor; the two entries below are AGGREGATES — the floor's explicit exception to per-field itemisation",
 	}

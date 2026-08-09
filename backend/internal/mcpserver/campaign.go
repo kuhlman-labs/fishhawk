@@ -263,7 +263,7 @@ fails campaign_not_startable.
 }
 
 // startCampaignItemRun is the tool handler.
-func (r *runResolver) startCampaignItemRun(ctx context.Context, _ *mcp.CallToolRequest, in StartCampaignItemRunInput) (*mcp.CallToolResult, StartCampaignItemRunOutput, error) {
+func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToolRequest, in StartCampaignItemRunInput) (*mcp.CallToolResult, StartCampaignItemRunOutput, error) {
 	id, err := uuid.Parse(in.CampaignID)
 	if err != nil {
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("campaign_id %q is not a valid UUID: %w", in.CampaignID, err)
@@ -330,7 +330,7 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, _ *mcp.CallToolR
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("start campaign item run: %w", err)
 	}
 	bounded, berr := boundRunRowOutput(
-		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item}, res.Run.ID, mcpResponseByteBudget(r.getenv),
+		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item}, res.Run.ID, r.responseBudget(req),
 		func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e })
 	if berr != nil {

@@ -10155,6 +10155,97 @@ func TestGetRunStatus_PopulatedElisions_PassesSDKOutputSchemaValidation(t *testi
 	}
 }
 
+// getRunStatusBudgetSourceOverSDK drives fishhawk_get_run_status end to end
+// through the real MCP handshake with the given client capabilities and returns
+// the decoded output. This crosses the seam no per-layer unit test can see:
+// handshake -> ServerSession.InitializeParams -> handler -> r.responseBudget ->
+// ladder -> reflected output-schema validation.
+func getRunStatusBudgetSourceOverSDK(t *testing.T, caps *mcp.ClientCapabilities) GetRunStatusOutput {
+	t.Helper()
+	ctx := context.Background()
+	backend, runID := newWorstCaseFailedRun(t, worstCases[0])
+	cfg := config{backendURL: backend.URL, apiToken: "tok-test"}
+	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{Capabilities: caps})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String(), "audit_limit": 200},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	structured, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out GetRunStatusOutput
+	if err := json.Unmarshal(structured, &out); err != nil {
+		t.Fatalf("decode tool output %s: %v", structured, err)
+	}
+	return out
+}
+
+// TestGetRunStatus_AdvertisedLimit_BoundsToAdvertisedBudget is the CROSS-BOUNDARY
+// proof (#2509): a real client advertises a tool-result limit BELOW the 32 KiB
+// default, and the marshalled response is bounded to the ADVERTISED value (not
+// the default), with elisions.budget_source reading "advertised". No per-layer
+// unit can see this handshake -> ServerSession -> handler -> ladder seam.
+func TestGetRunStatus_AdvertisedLimit_BoundsToAdvertisedBudget(t *testing.T) {
+	const advertised = 8192 // below the 32 KiB default, above the 4 KiB floor
+	if advertised >= mcpResponseByteBudgetDefault {
+		t.Fatalf("the advertised limit %d must be below the default %d for this test to distinguish them", advertised, mcpResponseByteBudgetDefault)
+	}
+	caps := &mcp.ClientCapabilities{Extensions: map[string]any{advertisedLimitKey: map[string]any{advertisedBytesSettingsKey: advertised}}}
+	out := getRunStatusBudgetSourceOverSDK(t, caps)
+
+	raw := mustMarshal(t, out)
+	if len(raw) > advertised {
+		t.Errorf("response = %d bytes, want <= the advertised %d (not the %d default)", len(raw), advertised, mcpResponseByteBudgetDefault)
+	}
+	if out.Elisions == nil {
+		t.Fatal("an advertised-limit-reduced response carries no elisions block")
+	}
+	if out.Elisions.BudgetSource != string(sourceAdvertised) {
+		t.Errorf("budget_source = %q, want %q", out.Elisions.BudgetSource, sourceAdvertised)
+	}
+	if out.Elisions.Budget != advertised {
+		t.Errorf("effective budget = %d, want the advertised %d", out.Elisions.Budget, advertised)
+	}
+}
+
+// TestGetRunStatus_NoAdvertisement_BoundsToMeasuredDefault is the no-regression
+// twin: a client advertising NOTHING gets the 32 KiB default, source "default".
+func TestGetRunStatus_NoAdvertisement_BoundsToMeasuredDefault(t *testing.T) {
+	out := getRunStatusBudgetSourceOverSDK(t, nil)
+	raw := mustMarshal(t, out)
+	if len(raw) > mcpResponseByteBudgetDefault {
+		t.Errorf("response = %d bytes, want <= the %d default", len(raw), mcpResponseByteBudgetDefault)
+	}
+	if out.Elisions == nil {
+		t.Fatal("the worst-case fixture exceeds the default budget, so an elisions block must be present")
+	}
+	if out.Elisions.BudgetSource != string(sourceDefault) {
+		t.Errorf("budget_source = %q, want %q", out.Elisions.BudgetSource, sourceDefault)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // #2510 — the bounded surfaces, driven through the real tool HANDLER
 // ---------------------------------------------------------------------------

@@ -92,7 +92,15 @@ func floorForcingRun(runID string) Run {
 func singleRunRows(o *GetActiveRunOutput) []*Run      { return []*Run{&o.Run} }
 func singleRunSet(o *GetActiveRunOutput, e *Elisions) { o.Elisions = e }
 func boundOneRow(out GetActiveRunOutput, budget int) (GetActiveRunOutput, error) {
-	return boundRunRowOutput(out, out.Run.ID, budget, singleRunRows, singleRunSet)
+	return boundRunRowOutput(out, out.Run.ID, fixedBudget(budget), singleRunRows, singleRunSet)
+}
+
+// fixedBudget wraps a bare byte count as a responseBudget for the many bound-*
+// test call sites that predate the discovery ladder (#2509). It reports source
+// "default" — the rung a test that never advertises a capability resolves to —
+// so the wire DTO's budget_source is a valid, expected value.
+func fixedBudget(n int) responseBudget {
+	return responseBudget{bytes: n, source: sourceDefault}
 }
 
 func marshalLen(t *testing.T, v any) int {
@@ -131,7 +139,7 @@ func TestBoundListAudit_AtAdvertisedMaxLimit(t *testing.T) {
 			if n := marshalLen(t, in); n <= budget {
 				t.Fatalf("fixture is only %d bytes — it does not exercise the bound", n)
 			}
-			out, err := boundListAuditOutput(in, runID, "implement_reviewed", budget)
+			out, err := boundListAuditOutput(in, runID, "implement_reviewed", fixedBudget(budget))
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
@@ -200,7 +208,7 @@ func TestBoundListRuns_AtAdvertisedMaxLimit(t *testing.T) {
 	if n := marshalLen(t, in); n <= budget {
 		t.Fatalf("fixture is only %d bytes — it does not exercise the bound", n)
 	}
-	out, err := boundListRunsOutput(in, budget)
+	out, err := boundListRunsOutput(in, fixedBudget(budget))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -225,7 +233,7 @@ func TestBoundedSurfaces_UnderBudgetAreUnchanged(t *testing.T) {
 
 	audit := ListAuditOutput{Items: auditPage(runID, 3, "short"), NextCursor: "cur-1"}
 	before := marshalLen(t, audit)
-	got, err := boundListAuditOutput(audit, runID, "", budget)
+	got, err := boundListAuditOutput(audit, runID, "", fixedBudget(budget))
 	if err != nil {
 		t.Fatalf("bound audit: %v", err)
 	}
@@ -254,7 +262,7 @@ func TestBoundedSurfaces_UnderBudgetAreUnchanged(t *testing.T) {
 	}
 
 	runs := ListRunsOutput{Items: []Run{row.Run}, NextCursor: "cur-1"}
-	gotRuns, err := boundListRunsOutput(runs, budget)
+	gotRuns, err := boundListRunsOutput(runs, fixedBudget(budget))
 	if err != nil {
 		t.Fatalf("bound runs: %v", err)
 	}
@@ -280,7 +288,7 @@ func TestBoundListAudit_ConvergesUnderFloor(t *testing.T) {
 		items[i].ID = strings.Repeat("id-", 400)
 		items[i].RunID = strings.Repeat("run-", 400)
 	}
-	out, err := boundListAuditOutput(ListAuditOutput{Items: items, NextCursor: "cur-1"}, runID, "implement_reviewed", budget)
+	out, err := boundListAuditOutput(ListAuditOutput{Items: items, NextCursor: "cur-1"}, runID, "implement_reviewed", fixedBudget(budget))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -337,7 +345,7 @@ func TestBoundRunRow_FloorCarriesNonOmitemptyFields(t *testing.T) {
 	t.Run("resume_run keeps a TRUE idempotent replay signal", func(t *testing.T) {
 		runID := uuid.NewString()
 		out, err := boundRunRowOutput(
-			ResumeRunOutput{Run: floorForcingRun(runID), Idempotent: true}, runID, budget,
+			ResumeRunOutput{Run: floorForcingRun(runID), Idempotent: true}, runID, fixedBudget(budget),
 			func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
 			func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
 		if err != nil {
@@ -369,7 +377,7 @@ func TestBoundRunRow_FloorCarriesNonOmitemptyFields(t *testing.T) {
 			UpdatedAt: time.Date(2026, 8, 7, 12, 5, 0, 0, time.UTC),
 		}
 		out, err := boundRunRowOutput(
-			StartCampaignItemRunOutput{Run: floorForcingRun(runID), Item: item}, runID, budget,
+			StartCampaignItemRunOutput{Run: floorForcingRun(runID), Item: item}, runID, fixedBudget(budget),
 			func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
 			func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e })
 		if err != nil {
@@ -400,7 +408,7 @@ func TestBoundRunRow_FloorCarriesNonOmitemptyFields(t *testing.T) {
 			{StageID: uuid.NewString(), Type: "acceptance", PriorCategory: "D", PriorReason: "sla timeout", RestoredState: "awaiting_approval"},
 		}
 		out, err := boundRunRowOutput(
-			ReviveRunOutput{Run: floorForcingRun(runID), RestoredStages: stages, NextStep: reviveNextStepHint}, runID, budget,
+			ReviveRunOutput{Run: floorForcingRun(runID), RestoredStages: stages, NextStep: reviveNextStepHint}, runID, fixedBudget(budget),
 			func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
 			func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
 		if err != nil {
@@ -495,7 +503,7 @@ func TestBoundListRuns_ConvergesUnderFloor(t *testing.T) {
 		items = append(items, r)
 	}
 	budget := mcpConvergenceFloorBytes
-	out, err := boundListRunsOutput(ListRunsOutput{Items: items, NextCursor: "cur-1"}, budget)
+	out, err := boundListRunsOutput(ListRunsOutput{Items: items, NextCursor: "cur-1"}, fixedBudget(budget))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -520,7 +528,7 @@ func TestBoundListAudit_BlanksCursorOnTruncation(t *testing.T) {
 	runID := uuid.NewString()
 	const cursor = "eyJzZXEiOjIwMH0="
 	in := ListAuditOutput{Items: auditPage(runID, 200, strings.Repeat("prose ", 300)), NextCursor: cursor}
-	out, err := boundListAuditOutput(in, runID, "implement_reviewed", mcpResponseByteBudgetDefault)
+	out, err := boundListAuditOutput(in, runID, "implement_reviewed", fixedBudget(mcpResponseByteBudgetDefault))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -551,7 +559,7 @@ func TestBoundListRuns_BlanksCursorOnTruncation(t *testing.T) {
 		r.PullRequestURL = &pr
 		items = append(items, r)
 	}
-	out, err := boundListRunsOutput(ListRunsOutput{Items: items, NextCursor: cursor}, mcpResponseByteBudgetDefault)
+	out, err := boundListRunsOutput(ListRunsOutput{Items: items, NextCursor: cursor}, fixedBudget(mcpResponseByteBudgetDefault))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -594,7 +602,7 @@ func TestBoundListRuns_BlanksCursorOnTruncation(t *testing.T) {
 func TestBoundListAudit_SinceSequenceAnchor(t *testing.T) {
 	runID := uuid.NewString()
 	original := auditPage(runID, 200, strings.Repeat("prose ", 300))
-	out, err := boundListAuditOutput(ListAuditOutput{Items: append([]AuditEntry(nil), original...)}, runID, "implement_reviewed", mcpResponseByteBudgetDefault)
+	out, err := boundListAuditOutput(ListAuditOutput{Items: append([]AuditEntry(nil), original...)}, runID, "implement_reviewed", fixedBudget(mcpResponseByteBudgetDefault))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -680,7 +688,7 @@ func TestBoundListAudit_RetainsHashChain(t *testing.T) {
 	for _, row := range sweep {
 		t.Run(row.name, func(t *testing.T) {
 			out, err := boundListAuditOutput(
-				ListAuditOutput{Items: row.items, NextCursor: "cur-1"}, runID, "", row.budget)
+				ListAuditOutput{Items: row.items, NextCursor: "cur-1"}, runID, "", fixedBudget(row.budget))
 			if err != nil {
 				t.Fatalf("bound: %v", err)
 			}
@@ -943,7 +951,7 @@ func TestCapPayloadStrings_IsEscapeAware(t *testing.T) {
 // finds its target missing and correctly records nothing).
 func TestBoundedSurfaces_DegenerateInputs(t *testing.T) {
 	t.Run("empty audit page at a 1-byte budget", func(t *testing.T) {
-		out, err := boundListAuditOutput(ListAuditOutput{NextCursor: "cur-1"}, uuid.NewString(), "", 1)
+		out, err := boundListAuditOutput(ListAuditOutput{NextCursor: "cur-1"}, uuid.NewString(), "", fixedBudget(1))
 		if err != nil {
 			t.Fatalf("bound: %v", err)
 		}
@@ -959,7 +967,7 @@ func TestBoundedSurfaces_DegenerateInputs(t *testing.T) {
 	})
 
 	t.Run("empty runs page at a 1-byte budget", func(t *testing.T) {
-		out, err := boundListRunsOutput(ListRunsOutput{NextCursor: "cur-1"}, 1)
+		out, err := boundListRunsOutput(ListRunsOutput{NextCursor: "cur-1"}, fixedBudget(1))
 		if err != nil {
 			t.Fatalf("bound: %v", err)
 		}
@@ -1069,7 +1077,7 @@ func TestBoundListRuns_R4PointsAtTheEnumeration(t *testing.T) {
 			Concerns: &RunConcerns{Open: 20, ByState: map[string]int{"raised": 20}, Items: concernItems(20)},
 		})
 	}
-	out, err := boundListRunsOutput(ListRunsOutput{Items: items}, mcpResponseByteBudgetDefault)
+	out, err := boundListRunsOutput(ListRunsOutput{Items: items}, fixedBudget(mcpResponseByteBudgetDefault))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -1099,7 +1107,7 @@ func TestRunRowCtx_RowIDFallsBackToTheResponseRunID(t *testing.T) {
 	run := worstCaseIssueRun(runID)
 	run.ID = "" // e.g. a mirror that decoded without an id
 	run.IssueContext.URL = ""
-	out, err := boundRunRowOutput(GetActiveRunOutput{Run: run}, runID, mcpResponseByteBudgetDefault,
+	out, err := boundRunRowOutput(GetActiveRunOutput{Run: run}, runID, fixedBudget(mcpResponseByteBudgetDefault),
 		singleRunRows, singleRunSet)
 	if err != nil {
 		t.Fatalf("bound: %v", err)

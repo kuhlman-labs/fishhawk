@@ -91,7 +91,7 @@ Idempotent=true.
 }
 
 // resumeRun is the tool handler.
-func (r *runResolver) resumeRun(ctx context.Context, _ *mcp.CallToolRequest, in ResumeRunInput) (*mcp.CallToolResult, ResumeRunOutput, error) {
+func (r *runResolver) resumeRun(ctx context.Context, req *mcp.CallToolRequest, in ResumeRunInput) (*mcp.CallToolResult, ResumeRunOutput, error) {
 	parentID, err := uuid.Parse(in.ParentRunID)
 	if err != nil {
 		return nil, ResumeRunOutput{}, fmt.Errorf("parent_run_id %q is not a valid UUID: %w", in.ParentRunID, err)
@@ -140,7 +140,7 @@ func (r *runResolver) resumeRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, ResumeRunOutput{}, fmt.Errorf("recover run: %w", err)
 	}
 	bounded, berr := boundRunRowOutput(
-		ResumeRunOutput{Run: *created, Idempotent: idempotent}, created.ID, mcpResponseByteBudget(r.getenv),
+		ResumeRunOutput{Run: *created, Idempotent: idempotent}, created.ID, r.responseBudget(req),
 		func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
 	if berr != nil {

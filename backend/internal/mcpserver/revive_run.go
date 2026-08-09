@@ -116,7 +116,7 @@ Tool errors:
 // reviveRun is the tool handler. It validates run_id locally (a fast fail
 // before the HTTP hop) and delegates the auth + pre-validation + batch re-park
 // + audit append to the backend (server/revive.go → run.ReviveRun).
-func (r *runResolver) reviveRun(ctx context.Context, _ *mcp.CallToolRequest, in ReviveRunInput) (*mcp.CallToolResult, ReviveRunOutput, error) {
+func (r *runResolver) reviveRun(ctx context.Context, req *mcp.CallToolRequest, in ReviveRunInput) (*mcp.CallToolResult, ReviveRunOutput, error) {
 	runID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, ReviveRunOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
@@ -130,7 +130,7 @@ func (r *runResolver) reviveRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 		RestoredStages: res.RestoredStages,
 		NextStep:       reviveNextStepHint,
 		AuditWarning:   res.AuditWarning,
-	}, res.Run.ID, mcpResponseByteBudget(r.getenv),
+	}, res.Run.ID, r.responseBudget(req),
 		func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
 	if berr != nil {
