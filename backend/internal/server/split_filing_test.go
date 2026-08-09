@@ -17,11 +17,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
@@ -127,6 +129,10 @@ type splitFilingConfig struct {
 	installID           *int64
 	github              *githubclient.Client
 	providerFailOnCall  int
+	// planOverride, when non-nil, seeds this plan artifact instead of the
+	// default splitPlanBytes(withSplitProposal). Used by the #2412 refusal tests
+	// to construct a split_proposal with an over-cap lead phase by construction.
+	planOverride []byte
 }
 
 // splitFilingHarness bundles the wired Server plus the seeded run coordinates.
@@ -277,11 +283,15 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
 
 	sv := "standard_v1"
+	planContent := cfg.planOverride
+	if planContent == nil {
+		planContent = splitPlanBytes(t, cfg.withSplitProposal)
+	}
 	if _, err := art.Create(context.Background(), artifact.CreateParams{
 		StageID:       planStageID,
 		Kind:          artifact.KindPlan,
 		SchemaVersion: &sv,
-		Content:       splitPlanBytes(t, cfg.withSplitProposal),
+		Content:       planContent,
 	}); err != nil {
 		t.Fatalf("seed plan artifact: %v", err)
 	}
@@ -390,6 +400,15 @@ func TestFileSplitProposalChildren_HappyPath_DeleteOnly(t *testing.T) {
 	}
 	if !strings.Contains(c.body, "not automated by this change") {
 		t.Errorf("parent comment must state the parent-close is NOT automated now: %q", c.body)
+	}
+	// #2412 concern: the SUCCESSFUL-filing parent comment must also plainly state
+	// independent landability is unverified — the same caveat every child body
+	// carries, mirrored onto the parent comment.
+	if !strings.Contains(c.body, "Landability is not verified") {
+		t.Errorf("parent comment must mirror the landability caveat: %q", c.body)
+	}
+	if !strings.Contains(c.body, splitfiling.LandabilityCaveat) {
+		t.Errorf("parent comment must carry the exact splitfiling.LandabilityCaveat text: %q", c.body)
 	}
 
 	// One completion marker carrying delete-only + children + #2062 deferral.
@@ -757,5 +776,430 @@ func TestFileSplitProposalChildren_EndToEnd(t *testing.T) {
 	}
 	if got.CapException == nil {
 		t.Error("persisted governed-exception must carry the cap-exception draft")
+	}
+}
+
+// --- #2412 over-cap-phase refusal ---
+
+// overCapPhaseSplitPlanBytes builds a plan whose split_proposal LEAD phase
+// declares leadFiles files (BY CONSTRUCTION, not by calling PhaseCapViolations)
+// so that against the harness cap of 3 a leadFiles>3 phase is over cap. The
+// second phase stays at 1 file (in cap).
+func overCapPhaseSplitPlanBytes(t *testing.T, leadFiles int) []byte {
+	t.Helper()
+	leadScope := make([]plan.ScopeFile, leadFiles)
+	for i := range leadScope {
+		leadScope[i] = plan.ScopeFile{Path: fmt.Sprintf("backend/internal/lead/f%d.go", i), Operation: plan.FileOpModify}
+	}
+	p := &plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "over-cap lead phase",
+		Scope:       plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify}}},
+		Verification: plan.Verification{
+			TestStrategy: "unit", RollbackPlan: "revert the PR",
+			AcceptanceCriteria: []plan.AcceptanceCriterion{{ID: "ac1", Statement: "done"}},
+		},
+		SplitProposal: &plan.SplitProposal{
+			Rationale: "split with an over-cap lead phase",
+			Phases: []plan.SplitPhase{
+				{Title: "expand: over-cap lead", ScopeHint: "expand", Scope: &plan.Scope{Files: leadScope}},
+				{Title: "contract: small", ScopeHint: "contract", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpDelete}}}, DependsOn: []int{0}},
+			},
+		},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// refusalEntries decodes every split_filing_refused payload the audit fake
+// captured FOR THIS RUN, and how many were appended. It filters on RunID as well
+// as Category (#2412 fix-up, condition 1's "wrong RUN association" failure mode):
+// a hook that wrote the marker under a DIFFERENT run must not be counted here, so
+// the committed-state assertions stay decisive on run association and not only on
+// category. A refusal entry appended under any other run is a hard failure.
+func (h *splitFilingHarness) refusalEntries(t *testing.T) ([]splitFilingRefusedPayload, int) {
+	t.Helper()
+	var out []splitFilingRefusedPayload
+	for _, e := range h.au.appended {
+		if e.Category != splitFilingRefusedCategory {
+			continue
+		}
+		if e.RunID != h.runID {
+			t.Errorf("split_filing_refused entry written under run %s, want %s (wrong-run association)", e.RunID, h.runID)
+			continue
+		}
+		var p splitFilingRefusedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode split_filing_refused payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out, len(out)
+}
+
+// TestFileSplitProposalChildren_RefusesOverCapPhase is the counterfactual vehicle
+// for the refusal branch in fileSplitProposalChildren (#2412). Its control's
+// effect is COMMITTED STATE (the hook is best-effort and returns no error), so it
+// asserts state READ AFTER the call: the fake forge recorded ZERO issue-create
+// calls, the audit holds exactly one split_filing_refused entry naming every
+// offending phase and ZERO work_item_filed / split_children_filed entries, and
+// exactly one parent comment naming each offending phase. Deleting the refusal
+// branch files the over-cap child instead — flipping every assertion.
+func TestFileSplitProposalChildren_RefusesOverCapPhase(t *testing.T) {
+	inst := int64(93)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4), // lead phase 4 files > cap 3
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	// ZERO forge issue-create calls.
+	if len(h.provider.reqs) != 0 {
+		t.Errorf("refusal must file ZERO children, filed %d", len(h.provider.reqs))
+	}
+	// Exactly one split_filing_refused entry naming the offending lead phase.
+	refusals, n := h.refusalEntries(t)
+	if n != 1 {
+		t.Fatalf("wrote %d split_filing_refused entries, want exactly 1", n)
+	}
+	ref := refusals[0]
+	if ref.Cap != 3 {
+		t.Errorf("refusal cap = %d, want 3", ref.Cap)
+	}
+	if len(ref.Phases) != 1 || ref.Phases[0].Index != 0 || ref.Phases[0].DeclaredCount != 4 {
+		t.Errorf("refusal phases = %+v, want one entry index=0 declared=4", ref.Phases)
+	}
+	if !strings.Contains(ref.Phases[0].Title, "over-cap lead") {
+		t.Errorf("refusal phase title = %q, want the offending phase title", ref.Phases[0].Title)
+	}
+	// ZERO work_item_filed markers and NO split_children_filed completion marker.
+	if got := h.childMarkerCount(t); got != 0 {
+		t.Errorf("refusal wrote %d work_item_filed markers, want 0", got)
+	}
+	if _, cn := h.completionEntry(t); cn != 0 {
+		t.Errorf("refusal wrote %d split_children_filed entries, want 0", cn)
+	}
+	// Exactly one parent comment naming the offending phase and stating no
+	// children were filed.
+	if len(rec.comments) != 1 {
+		t.Fatalf("posted %d parent comments, want 1", len(rec.comments))
+	}
+	c := rec.comments[0]
+	if c.issue != splitParentIssue {
+		t.Errorf("refusal comment posted on issue %d, want %d", c.issue, splitParentIssue)
+	}
+	if !strings.Contains(c.body, "over-cap lead") || !strings.Contains(c.body, "No children were filed") {
+		t.Errorf("refusal comment must name the offending phase and state no children filed: %q", c.body)
+	}
+	if !strings.Contains(c.body, "irreducible") {
+		t.Errorf("refusal comment must offer the irreducible remedy: %q", c.body)
+	}
+}
+
+// TestFileSplitProposalChildren_PriorRefusalIsNoOp pins the refusal dedup
+// (#2412): a re-approval of a still-over-cap proposal (a prior split_filing_refused
+// marker present) neither duplicates the marker nor re-comments.
+func TestFileSplitProposalChildren_PriorRefusalIsNoOp(t *testing.T) {
+	inst := int64(94)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4),
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage) // first refusal
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage) // re-approval
+
+	if _, n := h.refusalEntries(t); n != 1 {
+		t.Errorf("re-approval must not duplicate the refusal marker, got %d", n)
+	}
+	if len(rec.comments) != 1 {
+		t.Errorf("re-approval must not re-post the refusal comment, got %d", len(rec.comments))
+	}
+	if len(h.provider.reqs) != 0 {
+		t.Errorf("re-approval must still file zero children, got %d", len(h.provider.reqs))
+	}
+}
+
+// TestFileSplitProposalChildren_RefusalMarkerAppendFailureAborts pins the
+// hard-prerequisite marker append (#2412): if the refusal marker append fails,
+// the hook posts NO parent comment (never a comment claiming a refusal the audit
+// does not record) and files no children.
+func TestFileSplitProposalChildren_RefusalMarkerAppendFailureAborts(t *testing.T) {
+	inst := int64(95)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4),
+	})
+	h.au.appendErrCategory = splitFilingRefusedCategory // the refusal marker append fails
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if len(rec.comments) != 0 {
+		t.Errorf("marker-append failure must post no refusal comment, posted %d", len(rec.comments))
+	}
+	if len(h.provider.reqs) != 0 {
+		t.Errorf("refusal path must file zero children, filed %d", len(h.provider.reqs))
+	}
+}
+
+// TestFileSplitProposalChildren_UnresolvedCapStillFiles pins the fail-open branch
+// (#2412): with no implement stage (unresolved cap → capFiles=0), PhaseCapViolations
+// returns nil, so an over-cap-phase proposal files every child exactly as before —
+// the refusal must never fire on an unresolved cap.
+func TestFileSplitProposalChildren_UnresolvedCapStillFiles(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, // withSpec:false → cap unresolved
+		planOverride:      overCapPhaseSplitPlanBytes(t, 4),
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if _, n := h.refusalEntries(t); n != 0 {
+		t.Errorf("unresolved cap must not refuse, wrote %d refusal entries", n)
+	}
+	if len(h.provider.reqs) != 2 {
+		t.Errorf("unresolved cap must file every child (2 phases), filed %d", len(h.provider.reqs))
+	}
+	if _, cn := h.completionEntry(t); cn != 1 {
+		t.Errorf("unresolved cap must write one completion marker, wrote %d", cn)
+	}
+}
+
+// TestFileSplitProposalChildren_AllPhasesInCapUnchanged is the control that a
+// proposal whose phases are ALL within the cap files every child exactly as today
+// and writes no refusal marker (#2412). The default splitPlanBytes carries 3
+// single-file phases against cap 3.
+func TestFileSplitProposalChildren_AllPhasesInCapUnchanged(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if _, n := h.refusalEntries(t); n != 0 {
+		t.Errorf("all-in-cap proposal must write no refusal marker, wrote %d", n)
+	}
+	if len(h.provider.reqs) != 3 {
+		t.Errorf("all-in-cap proposal must file every child (3), filed %d", len(h.provider.reqs))
+	}
+	if _, cn := h.completionEntry(t); cn != 1 {
+		t.Errorf("all-in-cap proposal must write one completion marker, wrote %d", cn)
+	}
+}
+
+// categoryListErrAuditRepo wraps an auditFake and fails ListForRunByCategory ONLY
+// for one category, leaving every other read (and every append) intact. It lets a
+// test exercise refuseSplitFilingOverCapPhase's dedup-list error branch in
+// isolation: the top-of-hook split_children_filed dedup list still succeeds (so
+// the hook reaches the refusal), and only the refusal's own split_filing_refused
+// dedup list fails.
+type categoryListErrAuditRepo struct {
+	*auditFake
+	failCategory string
+}
+
+func (r *categoryListErrAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == r.failCategory {
+		return nil, errors.New("audit: injected ListForRunByCategory error for " + category)
+	}
+	return r.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestFileSplitProposalChildren_RefusalDedupListError_SilentReturn pins the
+// refusal dedup-list failure branch (#2412 fix-up, review concern): when
+// refuseSplitFilingOverCapPhase's ListForRunByCategory(split_filing_refused) read
+// errors, the hook logs and returns WITHOUT writing a refusal marker, posting a
+// parent comment, or filing any child — the same fail-closed posture as the
+// marker-append failure. The counterfactual: delete the `if err != nil { return }`
+// guard and the branch would fall through to append a marker (n==1), flipping the
+// n==0 assertion below.
+func TestFileSplitProposalChildren_RefusalDedupListError_SilentReturn(t *testing.T) {
+	inst := int64(96)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4),
+	})
+	// Swap in an audit repo that fails ONLY the refusal dedup read, so the hook
+	// reaches the refusal branch (its split_children_filed dedup still succeeds)
+	// and errors on the split_filing_refused list.
+	h.s.cfg.AuditRepo = &categoryListErrAuditRepo{auditFake: h.au, failCategory: splitFilingRefusedCategory}
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	// No refusal marker appended (the dedup list errored before the append).
+	if _, n := h.refusalEntries(t); n != 0 {
+		t.Errorf("dedup-list error must write NO refusal marker, wrote %d", n)
+	}
+	// No parent comment (the append never happened, so the comment never posts).
+	if len(rec.comments) != 0 {
+		t.Errorf("dedup-list error must post no parent comment, posted %d", len(rec.comments))
+	}
+	// And zero children filed (refusal path files none regardless).
+	if len(h.provider.reqs) != 0 {
+		t.Errorf("dedup-list error must file zero children, filed %d", len(h.provider.reqs))
+	}
+}
+
+// TestSplitFilingRefused_EndToEndThroughGetPlan is operator binding condition 1's
+// single end-to-end test (#2412 fix-up, review concerns 2+3): it drives the REAL
+// on-approval hook (approveStageAs -> finishApprovalAdvance ->
+// fileSplitProposalChildren -> refuseSplitFilingOverCapPhase) to WRITE the
+// split_filing_refused marker, then reads it back through the REAL
+// fishhawk_get_plan path (mcpserver's getPlan/loadSplitFilingRefusal resolver,
+// driven as a real MCP tool call over the SDK's in-memory transport against the
+// server's live HTTP audit endpoint). One test crosses all three seams the
+// condition named on the ACTUAL production code, not two legs meeting on a shared
+// const:
+//
+//   - WRONG CATEGORY: the hook writes under splitFilingRefusedCategory; the
+//     resolver queries its own "split_filing_refused" literal. A drift surfaces
+//     nothing and fails here.
+//   - WRONG RUN ASSOCIATION: getPlan is called with THIS run's id and the audit
+//     endpoint filters by run, so a hook that wrote the marker under a different
+//     run surfaces nothing. A distractor run seeded with its OWN refusal (a
+//     different declared count) proves the read does not leak across runs.
+//   - PAYLOAD-SHAPE DRIFT: the hook marshals splitFilingRefusedPayload; the
+//     resolver decodes planSplitFilingRefused. A json-tag mismatch drops the
+//     phases and fails the assertions.
+//
+// Unlike the sibling mcpserver TestGetPlan_SplitFilingRefusedRoundTrip (which
+// seeds the audit entry directly to compile-lock the payload/category shape), this
+// test never hand-seeds the refusal — the real hook produces it.
+func TestSplitFilingRefused_EndToEndThroughGetPlan(t *testing.T) {
+	ctx := context.Background()
+
+	provider := &splitFileProvider{name: workmgmt.Default().Provider}
+	workmgmt.Register(provider)
+
+	au := newAuditFake()
+	rr := newPromptRunRepo()
+	art := newFakeArtifactRepo()
+	ar := newFakeApprovalRepo()
+
+	runID := uuid.New()
+	planStageID := uuid.New()
+	trigger := "issue:" + strconv.Itoa(splitParentIssue)
+	rr.getRuns[runID] = &run.Run{
+		ID:           runID,
+		Repo:         "o/r",
+		WorkflowID:   "feature_change",
+		TriggerRef:   &trigger,
+		WorkflowSpec: specImplementPathConstraints, // resolves the implement cap = 3
+	}
+	planStage := &run.Stage{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+	rr.getStages[planStageID] = planStage
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
+	sv := "standard_v1"
+	if _, err := art.Create(ctx, artifact.CreateParams{
+		StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv,
+		Content: overCapPhaseSplitPlanBytes(t, 4), // lead phase 4 files > cap 3
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	// A DISTRACTOR run with its OWN refusal (a DIFFERENT declared count): if the
+	// getPlan read leaked across runs, we would see this count instead.
+	distractRun := uuid.New()
+	distractPayload, _ := json.Marshal(splitFilingRefusedPayload{
+		Reason: "distractor", Cap: 3,
+		Phases: []splitFilingRefusedPhase{{Index: 0, Title: "distractor phase", DeclaredCount: 99}},
+	})
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &distractRun, Category: splitFilingRefusedCategory, Payload: distractPayload,
+	})
+
+	s := New(Config{Addr: "127.0.0.1:0", ApprovalRepo: ar, RunRepo: rr, AuditRepo: au, ArtifactRepo: art})
+
+	// Drive the REAL approval hook. Approval succeeds (the top-level scope is in
+	// cap); the best-effort hook then REFUSES to file the over-cap split.
+	res, err := s.approveStageAs(ctx, campaignOperatorIdentity(), approveActionParams{
+		Stage:    planStage,
+		Decision: approval.DecisionApprove,
+	})
+	if err != nil {
+		t.Fatalf("approveStageAs: %v", err)
+	}
+	if res.Stage == nil || res.Stage.State != run.StageStateSucceeded {
+		t.Fatalf("approve did not advance the plan stage: %+v", res.Stage)
+	}
+
+	// Serve the live backend and read the refusal back through the REAL
+	// fishhawk_get_plan tool over the SDK's in-memory transport.
+	ts := httptest.NewServer(s.Handler())
+	defer ts.Close()
+
+	mcpSrv := mcpserver.NewServer(mcpserver.Config{BackendURL: ts.URL, APIToken: "fhk_unused"})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	ss, err := mcpSrv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("mcp server connect: %v", err)
+	}
+	defer ss.Close()
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "split-e2e", Version: "0"}, nil).
+		Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("mcp client connect: %v", err)
+	}
+	defer cs.Close()
+
+	result, err := cs.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_plan",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_plan: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("fishhawk_get_plan returned error: %+v", result.Content)
+	}
+
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out struct {
+		Status      string `json:"status"`
+		SplitFiling *struct {
+			Children []any `json:"children"`
+			Refused  *struct {
+				Cap    int `json:"cap"`
+				Phases []struct {
+					Index         int    `json:"index"`
+					Title         string `json:"title"`
+					DeclaredCount int    `json:"declared_count"`
+				} `json:"phases"`
+			} `json:"refused"`
+		} `json:"split_filing"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode get_plan output: %v\nraw: %s", err, raw)
+	}
+
+	if out.Status != "available" {
+		t.Fatalf("status = %q, want available\nraw: %s", out.Status, raw)
+	}
+	if out.SplitFiling == nil || out.SplitFiling.Refused == nil {
+		t.Fatalf("split_filing.refused not surfaced through the real getPlan path\nraw: %s", raw)
+	}
+	ref := out.SplitFiling.Refused
+	if ref.Cap != 3 {
+		t.Errorf("refused cap = %d, want 3", ref.Cap)
+	}
+	if len(ref.Phases) != 1 || ref.Phases[0].Index != 0 || ref.Phases[0].DeclaredCount != 4 {
+		t.Errorf("refused phases = %+v, want one entry index=0 declared=4 (this run's real refusal, not the distractor's 99)", ref.Phases)
+	}
+	if len(ref.Phases) == 1 && !strings.Contains(ref.Phases[0].Title, "over-cap lead") {
+		t.Errorf("refused phase title = %q, want the offending lead phase", ref.Phases[0].Title)
+	}
+	if len(out.SplitFiling.Children) != 0 {
+		t.Errorf("a refusal must carry no filed children, got %+v", out.SplitFiling.Children)
 	}
 }

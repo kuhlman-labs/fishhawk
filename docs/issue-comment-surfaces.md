@@ -17,6 +17,7 @@ it.
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
 | Split parent acceptance-carrier (#2057) | _(none at the comment; the sibling `split_children_filed` completion marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` (plan-gate approve of a `split_proposal`-bearing plan) | on completion of split-child filing (all N children durably filed) | No (best-effort; the completion marker is persisted BEFORE this comment, so once it is durable a re-approval no-ops at the `priorCompletion` gate and never re-posts — the one residual is a re-post if the completion-marker append itself fails after the comment posts) |
+| Split filing refusal (#2412) | _(none at the comment; the sibling `split_filing_refused` marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` → `refuseSplitFilingOverCapPhase` (plan-gate approve of a `split_proposal` whose phase is over the implement cap) | on refusal to file any children (a phase declares more files than the resolved `max_files_changed` cap) | No (best-effort; the `split_filing_refused` marker is persisted BEFORE this comment, so once it is durable a re-approval of the still-over-cap proposal no-ops at the prior-refusal gate and never re-posts) |
 | Run rejected (misconfigured) | _(none at notifier; global-chain `run_rejected_misconfigured` on the dispatcher)_ | _(none)_ | `Dispatcher.Handle` reviewer-misconfigured guard (#599) | dispatch refusal (agent-gated plan stage, no reviewer wired) | No (each refusal posts its own comment) |
 | Run not applicable (applies_to) | _(none at notifier; global-chain `run_rejected_applies_to` on the dispatcher)_ | _(none)_ | `Dispatcher.refusedByAppliesTo` applies_to admission gate (E53.10 / #2361) | dispatch refusal (workflow's `applies_to` labels/trigger not satisfied) | No (each refusal posts its own comment) |
 
@@ -546,6 +547,21 @@ Notes:
   (`fishhawk_get_plan` `split_filing`, newest entry wins) and the completion
   marker doubles as the hook's idempotency dedup. Listed here so a future reader
   grepping the audit categories doesn't mistake it for a comment surface.
+- The on-approval split-filing REFUSAL audit kind — `split_filing_refused`
+  (#2412, E32.44), written by the same approval hook
+  (`server/split_filing.go::refuseSplitFilingOverCapPhase`) — is an **internal,
+  system-actor audit kind, not an issue-comment surface** (the parent refusal
+  COMMENT it posts IS a surface — the table row above). It is emitted ONCE per run
+  when the hook DECLINES to file any children because a `split_proposal` phase's
+  own declared `scope.files` count exceeds the resolved implement
+  `max_files_changed` cap (an over-cap phase would itself fail the implement cap,
+  #2410), with a `system` actor and payload `{reason, cap, phases: [{index, title,
+  declared_count}]}`. It is mutually exclusive with `split_children_filed` (a
+  refusal files zero children and writes no completion marker), doubles as the
+  refusal dedup record (a re-approval of a still-over-cap proposal no-ops), and is
+  read back by the MCP surface (`fishhawk_get_plan` `split_filing.refused`, newest
+  entry wins). Listed here so a future reader grepping the audit categories
+  doesn't mistake it for a comment surface.
 - The operator-scope-undelivered audit kind — `operator_scope_path_undelivered`
   (#1407), written by the implement-review assembly path
   (`trace.go::runImplementReviews`) before any reviewer verdict — is an

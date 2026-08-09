@@ -184,13 +184,31 @@ func buildProposal(c ChildSpec, isContract bool) string {
 	} else {
 		fmt.Fprintf(&b, "This is a transitional phase of the split for #%d; it references but does not close the parent.", c.ParentIssue)
 	}
+	b.WriteString("\n\n")
+	b.WriteString(LandabilityCaveat)
 	return b.String()
 }
 
-// buildDoneMeans renders the child done-means section.
+// LandabilityCaveat is the honest statement carried on EVERY filed child body
+// and mirrored into the parent comment (#2412): split-filing checks each phase's
+// declared file count against the implement cap and, when the runner shipped a
+// reachability sweep, Go symbol reachability across phase boundaries — but it
+// does NOT verify independent landability, and specifically does NOT detect
+// PATH-KEYED couplings. It names the exact coupling class that broke run
+// 1d94db6f so the phase author verifies the tree builds before landing the phase
+// alone. Exported so the server hook mirrors ONE sentence into the parent
+// acceptance-carrier comment rather than hand-copying drift-prone prose.
+const LandabilityCaveat = "**Landability is not verified.** Split-filing checks this phase's declared file count against the implement cap and, when the runner shipped a reachability sweep, Go symbol reachability across phase boundaries. It does NOT verify that this phase lands independently, and specifically does NOT detect PATH-KEYED couplings — literal file-path strings in surface-sweep tables, path-keyed maps in tests, and build/rebuild matrices — so a phase that moves or renames files may leave such a coupling dangling and may not be individually green. Verify the tree builds before landing this phase alone (this is the coupling class that broke run 1d94db6f)."
+
+// buildDoneMeans renders the child done-means section. The non-contract phase
+// deliberately no longer asserts "the resulting tree compiles as an
+// at-or-under-cap intermediate" (#2412) — that claim is unsatisfiable on its
+// face for a change like #2410, since split-filing does not verify independent
+// landability (see the landabilityCaveat on every child body). It states only
+// what the phase actually guarantees: its symbol-set scope is migrated.
 func buildDoneMeans(isContract bool) string {
 	if isContract {
 		return "The contract phase deletes the transitional names and the intermediate compiles; the parent's acceptance criteria (carried below) are satisfied."
 	}
-	return "The phase's symbol-set scope is migrated and the resulting tree compiles as an at-or-under-cap intermediate."
+	return "The phase's symbol-set scope is migrated; independent landability of this phase is unverified (see the landability caveat in the body — verify the tree builds before landing this phase alone)."
 }

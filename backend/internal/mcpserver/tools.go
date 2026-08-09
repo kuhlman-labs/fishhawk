@@ -625,7 +625,7 @@ type GetPlanOutput struct {
 	// split_proposal. Carries the contract-phase classification, the filed
 	// children, the #2062 close-parent-watcher deferral, and the drafted
 	// cap-exception when the contract phase is a governed exception.
-	SplitFiling *PlanSplitFiling `json:"split_filing,omitempty" jsonschema:"on-approval split-child filing outcome (#2057, E50.5): present once the approval hook has filed every phased child of an approved split_proposal and emitted the split_children_filed completion marker. contract_classification is delete-only (the transitional name is kept permanently; the contract phase deletes only) or governed-exception (the contract phase's reachability-derived file count exceeds the implement max_files_changed cap, so an atomic rename cannot fit one in-cap PR). children[] lists each filed phased child (phase_index, title, number, url, is_contract) with depends_on edges resolved to sibling #N; contract_child_number is the acceptance-carrier child; deferral_issue is the #2062 close-parent-watcher follow-up (this slice ships no live parent-close — a child issue body carries no functionless Closes line). cap_exception, present only for governed-exception, carries the in-memory-only operator-authored + admin-merged draft (spec_diff raising the cap + pr_body from the atomicity evidence) that rides the audit payload and is NEVER written to .fishhawk/**. Absent when the plan carries no split_proposal, the hook has not yet completed filing, or on older runs predating the pass"`
+	SplitFiling *PlanSplitFiling `json:"split_filing,omitempty" jsonschema:"on-approval split-child filing outcome (#2057, E50.5; refusal #2412): present once the approval hook has filed every phased child of an approved split_proposal (split_children_filed completion marker) OR refused to file any (split_filing_refused marker). contract_classification is delete-only (the transitional name is kept permanently; the contract phase deletes only) or governed-exception (the contract phase's reachability-derived file count exceeds the implement max_files_changed cap, so an atomic rename cannot fit one in-cap PR). children[] lists each filed phased child (phase_index, title, number, url, is_contract) with depends_on edges resolved to sibling #N; contract_child_number is the acceptance-carrier child; deferral_issue is the #2062 close-parent-watcher follow-up (this slice ships no live parent-close — a child issue body carries no functionless Closes line). cap_exception, present only for governed-exception, carries the in-memory-only operator-authored + admin-merged draft (spec_diff raising the cap + pr_body from the atomicity evidence) that rides the audit payload and is NEVER written to .fishhawk/**. refused (#2412), present only when the hook DECLINED to file any children because a split_proposal phase's own declared file count exceeds the resolved implement cap, names each offending phase — no children were filed. Absent when the plan carries no split_proposal, the hook has not yet completed filing or refusing, or on older runs predating the pass"`
 }
 
 // PlanSplitFilingChild is one filed phased child decoded from a
@@ -662,11 +662,40 @@ type PlanSplitCapException struct {
 // latter. DeferralIssue is the #2062 close-parent-watcher follow-up. Mirrors the
 // server splitChildrenFiledPayload wire shape.
 type PlanSplitFiling struct {
-	ContractClassification string                 `json:"contract_classification" jsonschema:"delete-only (transitional name kept permanently; contract phase deletes only) or governed-exception (contract phase overflows the implement max_files_changed cap, so an atomic rename cannot ship as one in-cap PR)"`
+	ContractClassification string                 `json:"contract_classification,omitempty" jsonschema:"delete-only (transitional name kept permanently; contract phase deletes only) or governed-exception (contract phase overflows the implement max_files_changed cap, so an atomic rename cannot ship as one in-cap PR). Empty when the outcome is a refusal (see refused)"`
 	Children               []PlanSplitFilingChild `json:"children,omitempty" jsonschema:"the filed phased children with resolved tracker numbers + URLs and depends_on edges to sibling #N"`
 	ContractChildNumber    int                    `json:"contract_child_number,omitempty" jsonschema:"the terminal contract-phase child's tracker number — the acceptance carrier the parent should be closed against once it lands"`
 	DeferralIssue          int                    `json:"deferral_issue,omitempty" jsonschema:"the #2062 close-parent-watcher follow-up: this slice ships no live parent-close, so the parent is commented to be closed when the contract child lands, automated by #2062 once it ships"`
 	CapException           *PlanSplitCapException `json:"cap_exception,omitempty" jsonschema:"the drafted, in-memory-only cap exception; present only for a governed-exception contract classification"`
+	// Refused is the on-approval REFUSAL outcome (#2412): populated when the hook
+	// declined to file ANY children because a split_proposal phase's own declared
+	// scope.files count exceeded the resolved implement cap. Mutually exclusive
+	// with a filed set — a refusal writes no split_children_filed marker. Its type
+	// is intentionally UNEXPORTED (an exported field of an unexported struct):
+	// jsonschema reflection walks the field's type regardless of the type name's
+	// case, so the tool output schema is identical to an exported type, while the
+	// package's exported-identifier surface stays unchanged (#2412).
+	Refused *planSplitFilingRefused `json:"refused,omitempty" jsonschema:"present when the on-approval hook REFUSED to file any children (#2412) because a split_proposal phase's own declared file count exceeds the resolved implement max_files_changed cap — an over-cap phase would itself fail the implement cap. reason summarizes the refusal, cap is the resolved cap, phases names each offending phase (index, title, declared_count). No children were filed; re-slice the phases under the cap or declare the plan irreducible and re-approve"`
+}
+
+// planSplitFilingRefused is the on-approval refusal outcome decoded from the
+// newest split_filing_refused audit entry (#2412). Present only when the hook
+// declined to file any children because a split_proposal phase's own declared
+// file count exceeded the resolved implement cap. Mirrors the server
+// splitFilingRefusedPayload wire shape. Unexported (see PlanSplitFiling.Refused).
+type planSplitFilingRefused struct {
+	Reason string                        `json:"reason" jsonschema:"operator-facing summary of why no children were filed"`
+	Cap    int                           `json:"cap" jsonschema:"the resolved implement max_files_changed cap the offending phases exceeded"`
+	Phases []planSplitFilingRefusedPhase `json:"phases,omitempty" jsonschema:"each split_proposal phase whose own declared scope.files count exceeds the cap"`
+}
+
+// planSplitFilingRefusedPhase is one over-cap phase decoded from a
+// split_filing_refused audit entry (#2412). Mirrors the server
+// splitFilingRefusedPhase wire shape.
+type planSplitFilingRefusedPhase struct {
+	Index         int    `json:"index" jsonschema:"0-based split_proposal phase index"`
+	Title         string `json:"title" jsonschema:"the phase title"`
+	DeclaredCount int    `json:"declared_count" jsonschema:"the phase's declared scope.files count, which exceeded the cap"`
 }
 
 // PlanReachabilityPhase is one split-proposal phase's declared-vs-derived file
@@ -1289,12 +1318,71 @@ func (r *runResolver) loadReachability(ctx context.Context, runID uuid.UUID) (*P
 // "not present" rather than failing the whole plan fetch, mirroring the sibling
 // loaders' degradation contract.
 //
-// Unlike loadReachability this needs no allow_unknown: split_children_filed is a
-// registered audit.KnownCategory, so the registry-validating GET /audit endpoint
-// accepts the bare category filter.
+// Unlike loadReachability this needs no allow_unknown: split_children_filed and
+// split_filing_refused are both registered audit.KnownCategory strings, so the
+// registry-validating GET /audit endpoint accepts the bare category filter.
+//
+// It also fetches the newest split_filing_refused entry (#2412): when the hook
+// REFUSED to file any children (a split_proposal phase's own file count exceeded
+// the cap), no completion marker is written, so without this a refused run would
+// surface nothing. When a refusal is present it populates the refused sub-object;
+// a completion marker (when present) populates the filed set. The two are
+// mutually exclusive outcomes, but both are merged into one PlanSplitFiling so a
+// caller reads one field.
 func (r *runResolver) loadSplitFiling(ctx context.Context, runID uuid.UUID) (*PlanSplitFiling, error) {
+	sf, filed, err := r.loadSplitFilingCompletion(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	refused, err := r.loadSplitFilingRefusal(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if !filed && refused == nil {
+		return nil, nil
+	}
+	if !filed {
+		sf = PlanSplitFiling{}
+	}
+	sf.Refused = refused
+	return &sf, nil
+}
+
+// loadSplitFilingCompletion fetches the newest split_children_filed entry and
+// decodes it. filed is false (and sf zero) when no completion marker exists or
+// its payload is absent/corrupt (treated as "not present", mirroring the sibling
+// loaders' degradation contract).
+func (r *runResolver) loadSplitFilingCompletion(ctx context.Context, runID uuid.UUID) (sf PlanSplitFiling, filed bool, err error) {
 	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
 		Category: "split_children_filed",
+		Limit:    reviewAuditQueryLimit,
+	})
+	if err != nil {
+		return PlanSplitFiling{}, false, err
+	}
+	if len(entries) == 0 {
+		return PlanSplitFiling{}, false, nil
+	}
+	newest := entries[len(entries)-1]
+	if newest.Payload == nil {
+		return PlanSplitFiling{}, false, nil
+	}
+	raw, merr := json.Marshal(newest.Payload)
+	if merr != nil {
+		return PlanSplitFiling{}, false, nil
+	}
+	if uerr := json.Unmarshal(raw, &sf); uerr != nil {
+		return PlanSplitFiling{}, false, nil
+	}
+	return sf, true, nil
+}
+
+// loadSplitFilingRefusal fetches the newest split_filing_refused entry (#2412)
+// and decodes it into a PlanSplitFilingRefused, or nil when none exists / the
+// payload is absent or corrupt (degradation contract as above).
+func (r *runResolver) loadSplitFilingRefusal(ctx context.Context, runID uuid.UUID) (*planSplitFilingRefused, error) {
+	entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+		Category: "split_filing_refused",
 		Limit:    reviewAuditQueryLimit,
 	})
 	if err != nil {
@@ -1311,11 +1399,11 @@ func (r *runResolver) loadSplitFiling(ctx context.Context, runID uuid.UUID) (*Pl
 	if merr != nil {
 		return nil, nil
 	}
-	var sf PlanSplitFiling
-	if uerr := json.Unmarshal(raw, &sf); uerr != nil {
+	var refused planSplitFilingRefused
+	if uerr := json.Unmarshal(raw, &refused); uerr != nil {
 		return nil, nil
 	}
-	return &sf, nil
+	return &refused, nil
 }
 
 // auditLimitDefault is the default value for the get_run_status

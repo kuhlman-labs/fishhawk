@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -30,6 +31,52 @@ import (
 // never per child; per-child durable progress rides work_item_filed markers so
 // a partial run stays resumable (operator binding condition 1).
 const splitChildrenFiledCategory = "split_children_filed"
+
+// splitFilingRefusedCategory is the audit-log category for the ONE refusal
+// marker fileSplitProposalChildren emits when a split_proposal has a PHASE whose
+// own declared scope.files count exceeds the resolved implement cap (#2412). It
+// is what stops the operator having to close auto-filed children: #2410 (a lead
+// phase of 160 files against a cap of 45) would never have been emitted — the
+// hook files ZERO children, records this marker naming every offending phase, and
+// posts a parent refusal comment. Registered in audit.KnownCategories and
+// surfaced through fishhawk_get_plan (loadSplitFiling's refused sub-object).
+const splitFilingRefusedCategory = "split_filing_refused"
+
+// SplitFilingRefusedCategory is the exported alias of splitFilingRefusedCategory
+// — the audit category the on-approval hook writes its refusal marker under
+// (#2412). The mcpserver getPlan read path queries the literal
+// "split_filing_refused"; the cross-boundary round-trip test seeds under THIS
+// const and reads through that literal, so a drift between the hook's write
+// category and the resolver's read category fails the single end-to-end test.
+const SplitFilingRefusedCategory = splitFilingRefusedCategory
+
+// splitFilingRefusedPhase is one over-cap phase recorded on the refusal marker.
+type splitFilingRefusedPhase struct {
+	Index         int    `json:"index"`
+	Title         string `json:"title"`
+	DeclaredCount int    `json:"declared_count"`
+}
+
+// splitFilingRefusedPayload is the refusal marker's payload shape (#2412),
+// decoded verbatim by fishhawk_get_plan's loadSplitFiling into its refused
+// sub-object. Reason is the operator-facing summary; Cap the resolved implement
+// cap the phases exceeded; Phases names each offending phase.
+type splitFilingRefusedPayload struct {
+	Reason string                    `json:"reason"`
+	Cap    int                       `json:"cap"`
+	Phases []splitFilingRefusedPhase `json:"phases"`
+}
+
+// SplitFilingRefusedPayload is an exported alias of the refusal-marker payload
+// type. It exists so the sibling fishhawk-mcp getPlan round-trip test decodes the
+// hook's ACTUAL payload type — compile-locking the approval-hook-write ↔ MCP-read
+// audit-boundary contract — instead of a hand-copied wire mirror (mirroring the
+// [SplitChildrenFiledPayload] pattern, #2412).
+type SplitFilingRefusedPayload = splitFilingRefusedPayload
+
+// SplitFilingRefusedPhase is an exported alias of the per-phase refusal-marker
+// entry type (see [SplitFilingRefusedPayload]).
+type SplitFilingRefusedPhase = splitFilingRefusedPhase
 
 // splitFilingChild is one filed phased child recorded on the completion marker.
 type splitFilingChild struct {
@@ -173,6 +220,17 @@ func (s *Server) fileSplitProposalChildren(ctx context.Context, stage *run.Stage
 	capFiles := 0
 	if cons, _, ok := s.resolveImplementConstraints(ctx, runRow); ok {
 		capFiles = cons.MaxFilesChanged
+	}
+
+	// #2412 REFUSAL: before building/classifying/filing ANY child, refuse the
+	// whole filing when a phase's OWN declared scope.files count exceeds the
+	// resolved implement cap — an over-cap lead phase (the #2410 case) would
+	// itself fail category-B in its own implement stage, so filing it would just
+	// make the operator close it. capFiles == 0 (unresolved cap) yields no
+	// violations, so filing proceeds exactly as before.
+	if violations := splitfiling.PhaseCapViolations(proposal, capFiles); len(violations) > 0 {
+		s.refuseSplitFilingOverCapPhase(ctx, runRow, owner, name, parentIssue, capFiles, violations)
+		return
 	}
 
 	// Reachability evidence for the contract classification (fail-open to nil).
@@ -480,7 +538,10 @@ func (s *Server) writeSplitChildrenFiledAudit(ctx context.Context, runRow *run.R
 // postSplitParentComment posts the best-effort parent acceptance-carrier comment
 // naming the contract child and stating plainly that the parent is closed when
 // that child lands — automated by follow-up #2062 (E50.6) once it ships. It does
-// NOT claim the parent auto-closes now. Best-effort: a nil client, an absent
+// NOT claim the parent auto-closes now. It also mirrors the landability
+// non-guarantee (#2412): every filed split's parent comment must plainly state
+// independent landability is unverified, so the same caveat carried on each child
+// body rides the parent comment too. Best-effort: a nil client, an absent
 // installation, or a post error logs and returns.
 func (s *Server) postSplitParentComment(ctx context.Context, runRow *run.Run, owner, name string, parentIssue, contractChildNumber int) {
 	if s.cfg.GitHub == nil || runRow.InstallationID == nil {
@@ -491,11 +552,79 @@ func (s *Server) postSplitParentComment(ctx context.Context, runRow *run.Run, ow
 			"The contract-phase child #%d is the acceptance carrier: it carries this issue's acceptance criteria.\n\n"+
 			"Close this parent (#%d) when contract child #%d lands. That parent-close is not automated by this change "+
 			"(a `Closes #%d` line in a child issue body would be functionless — GitHub auto-closes only from a PR/commit "+
-			"and only the enclosing issue); it will be automated by follow-up #%d (E50.6) once it ships.",
-		contractChildNumber, parentIssue, contractChildNumber, parentIssue, splitfiling.DeferralIssue)
+			"and only the enclosing issue); it will be automated by follow-up #%d (E50.6) once it ships.\n\n%s",
+		contractChildNumber, parentIssue, contractChildNumber, parentIssue, splitfiling.DeferralIssue, splitfiling.LandabilityCaveat)
 	repo := forge.RepoRef{Owner: owner, Name: name}
 	if _, err := s.cfg.GitHub.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, parentIssue, body); err != nil {
 		s.logSplitFilingWarn(ctx, runRow.ID, "post parent acceptance-carrier comment failed", err.Error())
+	}
+}
+
+// refuseSplitFilingOverCapPhase records the ONE split_filing_refused marker and
+// posts the parent refusal comment when a split_proposal has an over-cap phase
+// (#2412), filing ZERO children. It dedups symmetrically with the priorCompletion
+// gate: a prior split_filing_refused entry for the run makes the whole branch a
+// no-op, so a re-approval of the still-over-cap proposal neither duplicates the
+// marker nor re-comments. The marker append is a HARD prerequisite exactly like
+// writeSplitChildFiledMarker — on append failure it logs and returns WITHOUT
+// posting the parent comment, so a refusal comment never claims a refusal the
+// audit does not record.
+func (s *Server) refuseSplitFilingOverCapPhase(ctx context.Context, runRow *run.Run, owner, name string, parentIssue, capFiles int, violations []splitfiling.PhaseCapViolation) {
+	// Dedup: a prior refusal for this run means the branch already ran → no-op.
+	prior, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, splitFilingRefusedCategory)
+	if err != nil {
+		s.logSplitFilingWarn(ctx, runRow.ID, "list split_filing_refused failed", err.Error())
+		return
+	}
+	if len(prior) > 0 {
+		return // already refused — idempotent no-op
+	}
+
+	phases := make([]splitFilingRefusedPhase, 0, len(violations))
+	lines := make([]string, 0, len(violations))
+	for _, v := range violations {
+		phases = append(phases, splitFilingRefusedPhase{Index: v.Index, Title: v.Title, DeclaredCount: v.DeclaredCount})
+		lines = append(lines, v.String())
+	}
+	reason := fmt.Sprintf(
+		"refused to file split_proposal children: %d phase(s) declare more files than the implement-stage max_files_changed cap of %d",
+		len(violations), capFiles,
+	)
+
+	// HARD prerequisite: the refusal marker must persist before the parent comment
+	// so no comment claims a refusal the audit does not record.
+	payload, _ := json.Marshal(splitFilingRefusedPayload{Reason: reason, Cap: capFiles, Phases: phases})
+	systemKind := audit.ActorSystem
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runRow.ID,
+		Timestamp: time.Now().UTC(),
+		Category:  splitFilingRefusedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.logSplitFilingWarn(ctx, runRow.ID, "append split_filing_refused audit failed; not posting refusal comment", aerr.Error())
+		return
+	}
+	s.postSplitRefusalComment(ctx, runRow, owner, name, parentIssue, capFiles, lines)
+}
+
+// postSplitRefusalComment posts the best-effort parent comment for a refused
+// split filing (#2412): it names each offending phase (its declared count and
+// the cap), states plainly that NO children were filed, and gives the remedy —
+// re-slice the phases under the cap or declare the change irreducible and
+// re-approve. It also mirrors the landability non-guarantee. Best-effort: a nil
+// client, an absent installation, or a post error logs and returns.
+func (s *Server) postSplitRefusalComment(ctx context.Context, runRow *run.Run, owner, name string, parentIssue, capFiles int, phaseLines []string) {
+	if s.cfg.GitHub == nil || runRow.InstallationID == nil {
+		return
+	}
+	body := fmt.Sprintf(
+		"Fishhawk did **not** file the phased children of this issue's approved split proposal: %d phase(s) declare more files than the implement-stage max_files_changed cap of %d, so a filed child would itself fail the implement cap.\n\n- %s\n\nNo children were filed. Re-slice the offending phase(s) so each is at or under the cap, or — if the change is genuinely compile-atomic and cannot be phased — declare the plan `irreducible` with a rationale, then re-approve.\n\n%s",
+		len(phaseLines), capFiles, strings.Join(phaseLines, "\n- "), splitfiling.LandabilityCaveat,
+	)
+	repo := forge.RepoRef{Owner: owner, Name: name}
+	if _, err := s.cfg.GitHub.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, parentIssue, body); err != nil {
+		s.logSplitFilingWarn(ctx, runRow.ID, "post parent split-filing refusal comment failed", err.Error())
 	}
 }
 

@@ -4679,6 +4679,69 @@ func TestShipPlan_OverCapSplitReject_EndToEnd(t *testing.T) {
 	})
 }
 
+// TestShipPlan_OverCapIrreducibleReachesApproval is the #2412 CROSS-BOUNDARY
+// test: an over-cap-by-count plan (4 scope files vs the implement cap of 3) that
+// carries a well-formed irreducible and NO split_proposal is NOT failed
+// category-B — it settles at awaiting_approval with a plan_warnings entry that
+// carries BOTH the count-derived over-cap advisory AND the irreducible advisory.
+// This proves schema acceptance, plan.Parse semantics (irreducible round-trips),
+// the reject relaxation (overCapSplitRejection widens on Declared()), and the
+// advisory path all agree on ONE artifact — the whole write-side chain the
+// separate unit tests exercise in isolation, driven end to end through the real
+// handleShipPlan. The unchanged over-cap monolith without either field failing
+// category-B is pinned by TestShipPlan_OverCapSplitReject_EndToEnd above.
+func TestShipPlan_OverCapIrreducibleReachesApproval(t *testing.T) {
+	approve := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, approve, specGatingReviewersWithConstraints)
+	priv, _ := sf.issue(t, runID)
+	// 4 files > cap 3, carrying a well-formed irreducible and no split_proposal.
+	body := overCapIrreducibleBody(t, 4, "the method's receiver base type must live in its own package", "Go receiver rule")
+
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+
+	// NOT rejected: the reject relaxation widened the over-cap hard reject into an
+	// advisory because irreducible is declared.
+	if n := countAuditCategory(au, "plan_review_failed"); n != 0 {
+		t.Errorf("plan_review_failed entries = %d, want 0 (irreducible widens the reject)", n)
+	}
+	if n := countAuditCategory(au, "plan_reviewed"); n != 1 {
+		t.Errorf("plan_reviewed entries = %d, want 1 (the reviewer runs on an accepted irreducible plan)", n)
+	}
+	failedB, advanced := stageTransitionSummary(rr, stageID)
+	if failedB {
+		t.Error("over-cap irreducible plan must not be failed-B")
+	}
+	if !advanced {
+		t.Error("over-cap irreducible plan must advance to awaiting_approval")
+	}
+
+	// The plan_warnings entry carries BOTH advisories.
+	entries := planWarningsEntries(t, au)
+	if len(entries) != 1 {
+		t.Fatalf("plan_warnings entries = %d, want 1", len(entries))
+	}
+	warns := entries[0].Warnings
+	if !hasOverCapWarning(warns, 4, 3) {
+		t.Errorf("plan_warnings must carry the count-derived over-cap advisory; got %v", warns)
+	}
+	foundIrr := false
+	for _, wl := range warns {
+		if strings.Contains(wl, "IRREDUCIBLE") && strings.Contains(wl, "does NOT make the change landable") {
+			foundIrr = true
+		}
+	}
+	if !foundIrr {
+		t.Errorf("plan_warnings must carry the irreducible advisory; got %v", warns)
+	}
+}
+
 // --- applies_to `paths` plan gate, wired end to end (E53.3 / #2226) -------
 //
 // The unit-level branch matrix lives in applies_to_plan_gate_test.go. These

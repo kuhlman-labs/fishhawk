@@ -11,6 +11,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 )
 
 // categoryPlanWarnings is the audit-log category for the entry
@@ -93,6 +94,15 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		warnings = append(warnings, w)
 	}
 
+	// #2412 advisories, appended AFTER the count-derived over-cap advisory so the
+	// count advisory is emitted FIRST and unchanged — the ordering is the
+	// observable proof that irreducible/phase-cap advisories do not SUPPRESS the
+	// count-derived over-cap advisory. Both legs fail open on an unresolved cap.
+	warnings = append(warnings, s.phaseCapWarnings(ctx, runID, &parsedPlan)...)
+	if w := s.irreducibleWarning(ctx, runID, &parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
+
 	if len(warnings) == 0 {
 		return nil
 	}
@@ -141,6 +151,69 @@ func (s *Server) overCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan
 			"narrow the scope or split the work into a decomposition before approving.",
 		count, capLimit,
 	)
+}
+
+// phaseCapWarnings emits one plan-gate advisory per split_proposal PHASE whose
+// OWN declared scope.files count exceeds the resolved implement cap (#2412) —
+// the defect #2410 reports, where a split's lead phase is itself over cap and
+// would fail category-B in its own implement stage. It resolves the cap via
+// overCapByCount (so the gate advisory, the count reject, and this advisory
+// never disagree on the resolved cap — take capLimit/ok, ignore over) and calls
+// splitfiling.PhaseCapViolations. Each advisory reuses PhaseCapViolation.String()
+// so the plan-gate advisory, the refusal audit payload, and the parent comment
+// share ONE phrasing.
+//
+// Fail-open: nil when the plan carries no split_proposal or the cap is
+// unresolved (ok=false) — no advisory, plan settle never blocked.
+func (s *Server) phaseCapWarnings(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) []string {
+	if parsedPlan.SplitProposal == nil {
+		return nil
+	}
+	_, capLimit, _, ok := s.overCapByCount(ctx, runID, parsedPlan)
+	if !ok {
+		return nil
+	}
+	violations := splitfiling.PhaseCapViolations(*parsedPlan.SplitProposal, capLimit)
+	if len(violations) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(violations))
+	for _, v := range violations {
+		out = append(out, v.String()+
+			" — a split exists to bring EVERY phase under the cap, so re-slice this phase or declare the change irreducible.")
+	}
+	return out
+}
+
+// irreducibleWarning surfaces the planner's irreducible rationale to the operator
+// as a CHALLENGEABLE claim (#2412). It fires ONLY when the plan is over cap BY
+// COUNT (the same count-derived condition the reject relaxation keys on) AND
+// carries a well-formed Irreducible.Declared() declaration — so it never fires on
+// an under-cap plan (the #2055 flag-independence + under-cap-unaffected
+// guarantee: an under-cap plan returns before the declaration is read). It states
+// plainly that the declaration does NOT make the change landable and that landing
+// it needs a governed max_files_changed raise, because implement re-checks the
+// real diff. Returns "" when not over cap, the cap is unresolved, or no
+// declaration is present (fail-open — plan settle never blocked).
+func (s *Server) irreducibleWarning(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
+	_, capLimit, over, ok := s.overCapByCount(ctx, runID, parsedPlan)
+	if !ok || !over {
+		return ""
+	}
+	if !parsedPlan.Irreducible.Declared() {
+		return ""
+	}
+	msg := fmt.Sprintf(
+		"plan declares itself IRREDUCIBLE at %d files over the implement-stage max_files_changed cap of %d: %s",
+		len(parsedPlan.Scope.Files), capLimit, parsedPlan.Irreducible.Rationale,
+	)
+	if basis := parsedPlan.Irreducible.AtomicityBasis; basis != "" {
+		msg += fmt.Sprintf(" (atomicity basis: %s)", basis)
+	}
+	msg += ". This is a challengeable claim — verify the change genuinely cannot be phased into at-or-under-cap commits. " +
+		"The declaration does NOT make the change landable: the implement stage re-checks max_files_changed against the real diff, " +
+		"so approving this over-cap plan still needs a governed max_files_changed raise."
+	return msg
 }
 
 // overCapByCount is the shared #2053 count determination (E50.3 refactor). It
@@ -194,6 +267,27 @@ func (s *Server) overCapByCount(ctx context.Context, runID uuid.UUID, parsedPlan
 // cap) → "" so an unresolved cap never spuriously blocks a plan. It reuses
 // overCapByCount (and thus resolveImplementConstraints) so the reject and the
 // advisory share one cap resolution with no duplicated logic.
+//
+// IRREDUCIBLE WIDEN-ONLY relaxation (#2412). After the split_proposal
+// short-circuit, a well-formed Irreducible.Declared() ALSO converts the reject
+// into "" — the planner has honestly DECLINED a split for a compile-atomic
+// change rather than fabricating an invalid one. This does NOT violate the #2055
+// contract, and the guarantee is POSITIONAL, not merely intended: the function
+// still reads ONLY the file count and resolved cap to decide the plan IS over
+// cap (the `!ok || !over` return precedes everything, and it still never reads
+// over_cap); `irreducible` is consulted STRICTLY AFTER that decision and ONLY to
+// widen a hard reject into an operator-decidable advisory (irreducibleWarning +
+// the count advisory both still fire in runPlanWarnings). Because the over-cap
+// decision is made first, an under-cap plan returns before the Irreducible field
+// is ever read, so no under-cap plan can change behaviour — the count-blind
+// rejection #2055 banned (reading a field to REJECT a plan the count says is
+// fine) is structurally impossible here.
+//
+// Deliberately NOT hard-rejected here: an over-cap PHASE. An over-cap phase is
+// surfaced as a gate advisory (phaseCapWarnings) and hard-refused at FILING time
+// (fileSplitProposalChildren), which satisfies the issue's "refuses (or flags
+// loudly)" without risking a reject loop for a planner that cannot re-slice and
+// has not reached for irreducible.
 func (s *Server) overCapSplitRejection(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
 	count, capLimit, over, ok := s.overCapByCount(ctx, runID, parsedPlan)
 	if !ok || !over {
@@ -202,10 +296,14 @@ func (s *Server) overCapSplitRejection(ctx context.Context, runID uuid.UUID, par
 	if parsedPlan.SplitProposal != nil {
 		return ""
 	}
+	if parsedPlan.Irreducible.Declared() {
+		return ""
+	}
 	return fmt.Sprintf(
 		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d, "+
-			"and carries no split_proposal — split the work into an expand->migrate->contract split_proposal "+
-			"(each phase at or under the cap) before approving.",
+			"and carries neither a split_proposal nor an irreducible declaration — split the work into an "+
+			"expand->migrate->contract split_proposal (each phase at or under the cap), or if the change is "+
+			"genuinely compile-atomic declare it irreducible with a rationale, before approving.",
 		count, capLimit,
 	)
 }

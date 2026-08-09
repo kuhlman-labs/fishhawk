@@ -127,3 +127,112 @@ func TestDraftCapException_PRBodyFallsBackToPhaseIndexTitle(t *testing.T) {
 		t.Errorf("PR body should fall back to 'phase 3' for an empty title:\n%s", draft.PRBody)
 	}
 }
+
+// --- PhaseCapViolations (#2412) ---
+
+// phaseWithNFiles builds one split phase whose scope declares n files.
+func phaseWithNFiles(title string, n int) plan.SplitPhase {
+	files := make([]plan.ScopeFile, n)
+	for i := range files {
+		files[i] = plan.ScopeFile{Path: fmt.Sprintf("%s/f%d.go", title, i), Operation: plan.FileOpModify}
+	}
+	return plan.SplitPhase{Title: title, Scope: &plan.Scope{Files: files}}
+}
+
+func TestPhaseCapViolations_Table(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		proposal plan.SplitProposal
+		cap      int
+		want     []PhaseCapViolation
+	}{
+		{
+			name: "all under cap",
+			proposal: plan.SplitProposal{Phases: []plan.SplitPhase{
+				phaseWithNFiles("expand", 3), phaseWithNFiles("migrate", 4),
+			}},
+			cap:  10,
+			want: nil,
+		},
+		{
+			name: "phase at cap is not a violation",
+			proposal: plan.SplitProposal{Phases: []plan.SplitPhase{
+				phaseWithNFiles("expand", 10),
+			}},
+			cap:  10,
+			want: nil,
+		},
+		{
+			name: "single over-cap phase",
+			proposal: plan.SplitProposal{Phases: []plan.SplitPhase{
+				phaseWithNFiles("expand", 3), phaseWithNFiles("lead", 12),
+			}},
+			cap:  10,
+			want: []PhaseCapViolation{{Index: 1, Title: "lead", DeclaredCount: 12, Cap: 10}},
+		},
+		{
+			name: "multiple violators returned in phase order",
+			proposal: plan.SplitProposal{Phases: []plan.SplitPhase{
+				phaseWithNFiles("a", 20), phaseWithNFiles("b", 5), phaseWithNFiles("c", 11),
+			}},
+			cap: 10,
+			want: []PhaseCapViolation{
+				{Index: 0, Title: "a", DeclaredCount: 20, Cap: 10},
+				{Index: 2, Title: "c", DeclaredCount: 11, Cap: 10},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := PhaseCapViolations(tc.proposal, tc.cap)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d violations, want %d: %+v", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("violation[%d] = %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestPhaseCapViolations_UnresolvedCapFailsOpen pins the cap <= 0 fail-open
+// guard (#2412): an unresolved cap must NEVER manufacture a violation, even for
+// a phase declaring many files. This is the counterfactual vehicle for the
+// fail-open guard — deleting the `if cap <= 0 { return nil }` line makes the
+// 999-file phase produce a violation against cap 0.
+func TestPhaseCapViolations_UnresolvedCapFailsOpen(t *testing.T) {
+	proposal := plan.SplitProposal{Phases: []plan.SplitPhase{phaseWithNFiles("huge", 999)}}
+	for _, cap := range []int{0, -1} {
+		if got := PhaseCapViolations(proposal, cap); got != nil {
+			t.Errorf("PhaseCapViolations(cap=%d) = %+v, want nil (unresolved cap never manufactures a violation)", cap, got)
+		}
+	}
+}
+
+// TestPhaseCapViolations_NilScopeSkipped confirms a nil/empty phase scope is
+// skipped defensively rather than panicking (checkSplitProposal already rejects
+// it on a validated plan, but the pure function must not assume that).
+func TestPhaseCapViolations_NilScopeSkipped(t *testing.T) {
+	proposal := plan.SplitProposal{Phases: []plan.SplitPhase{
+		{Title: "nil-scope", Scope: nil},
+		{Title: "empty-scope", Scope: &plan.Scope{}},
+		phaseWithNFiles("over", 12),
+	}}
+	got := PhaseCapViolations(proposal, 10)
+	if len(got) != 1 || got[0].Title != "over" {
+		t.Fatalf("want only the 'over' phase flagged, got %+v", got)
+	}
+}
+
+// TestPhaseCapViolation_StringSharedPhrasing pins the ONE shared rendering used
+// by the plan-gate advisory, the refusal payload, and the parent comment.
+func TestPhaseCapViolation_StringSharedPhrasing(t *testing.T) {
+	v := PhaseCapViolation{Index: 1, Title: "lead", DeclaredCount: 12, Cap: 10}
+	s := v.String()
+	for _, want := range []string{"phase 2", `"lead"`, "12 files", "cap of 10", "irreducible"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("String() = %q, want it to contain %q", s, want)
+		}
+	}
+}

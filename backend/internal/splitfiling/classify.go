@@ -70,6 +70,57 @@ func Classify(proposal plan.SplitProposal, evidence []PhaseEvidence, cap int) Co
 	return ClassificationDeleteOnly
 }
 
+// PhaseCapViolation records one split-proposal phase whose OWN declared
+// scope.files count exceeds the resolved implement-stage max_files_changed cap
+// (#2412). This is the defect #2410 reports: a split whose LEAD phase is itself
+// over cap would ship a phase that fails category-B in its own implement stage.
+// Index is the 0-based phase index; Title the phase title; DeclaredCount the
+// phase's scope.files length; Cap the resolved cap it exceeded.
+type PhaseCapViolation struct {
+	Index         int
+	Title         string
+	DeclaredCount int
+	Cap           int
+}
+
+// String renders the operator-facing one-liner for a phase-cap violation. It is
+// the SINGLE phrasing shared by the plan-gate advisory, the refusal audit
+// payload, and the parent refusal comment, so the three never drift.
+func (v PhaseCapViolation) String() string {
+	return fmt.Sprintf(
+		"split_proposal phase %d (%q) declares %d files, exceeding the implement-stage max_files_changed cap of %d — the phase would itself fail the implement cap; re-slice this phase under the cap or declare the change irreducible",
+		v.Index+1, v.Title, v.DeclaredCount, v.Cap,
+	)
+}
+
+// PhaseCapViolations compares each phase's OWN declared scope.files count against
+// the resolved implement cap and returns one PhaseCapViolation per phase over the
+// cap (#2412). It fails OPEN exactly like Classify: cap <= 0 (an UNRESOLVED
+// implement cap) returns nil so an unresolved cap never manufactures a violation.
+// A phase with a nil/empty scope is skipped defensively (checkSplitProposal
+// already requires a non-empty per-phase scope, so this cannot fire on a
+// validated plan). Violations are returned in phase order.
+func PhaseCapViolations(proposal plan.SplitProposal, cap int) []PhaseCapViolation {
+	if cap <= 0 {
+		return nil
+	}
+	var out []PhaseCapViolation
+	for i, ph := range proposal.Phases {
+		if ph.Scope == nil || len(ph.Scope.Files) == 0 {
+			continue
+		}
+		if len(ph.Scope.Files) > cap {
+			out = append(out, PhaseCapViolation{
+				Index:         i,
+				Title:         ph.Title,
+				DeclaredCount: len(ph.Scope.Files),
+				Cap:           cap,
+			})
+		}
+	}
+	return out
+}
+
 // findEvidence returns the PhaseEvidence for the given 0-based phase index.
 func findEvidence(evidence []PhaseEvidence, index int) (PhaseEvidence, bool) {
 	for _, e := range evidence {

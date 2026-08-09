@@ -938,6 +938,11 @@ func TestBuild_Plan_FileCountConstraint_Rendered(t *testing.T) {
 		"over_cap:true",
 		"COURTESY self-declaration",
 		"regardless of the flag",
+		// The #2412 irreducible out is offered when a cap is configured.
+		"COMPILE-ATOMIC",
+		"irreducible object with a rationale",
+		"mutually exclusive with split_proposal",
+		"does NOT by itself make the change landable",
 	} {
 		if !strings.Contains(got, w) {
 			t.Errorf("plan prompt missing %q\n---\n%s", w, got)
@@ -947,7 +952,8 @@ func TestBuild_Plan_FileCountConstraint_Rendered(t *testing.T) {
 
 // TestBuild_Plan_FileCountConstraint_OmittedWhenZero asserts the File-count
 // constraint block is omitted entirely when no cap is configured (#2053), so
-// the prompt is byte-unchanged for uncapped workflows.
+// the prompt is byte-unchanged for uncapped workflows. The #2412 irreducible out
+// lives inside that block, so it too must be absent when no cap is configured.
 func TestBuild_Plan_FileCountConstraint_OmittedWhenZero(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		IssueNumber: 7,
@@ -960,6 +966,9 @@ func TestBuild_Plan_FileCountConstraint_OmittedWhenZero(t *testing.T) {
 	}
 	if strings.Contains(got, "File-count constraint") {
 		t.Errorf("plan prompt should omit the File-count constraint block when the cap is 0\n---\n%s", got)
+	}
+	if strings.Contains(got, "irreducible object with a rationale") {
+		t.Errorf("plan prompt should omit the irreducible out when the cap is 0\n---\n%s", got)
 	}
 }
 

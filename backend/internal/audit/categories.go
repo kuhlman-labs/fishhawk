@@ -40,7 +40,11 @@ import "sort"
 // for a decomposition child parked in awaiting_scope_decision on a
 // build-required scope-drift shortfall — emitted from BOTH the park-time
 // handler (server/pullrequest.go) and, de-duplicated, from
-// orchestrator.maybeAdvanceDecomposedParent when a sibling settles. When a
+// orchestrator.maybeAdvanceDecomposedParent when a sibling settles. E32.44 /
+// #2412 added split_filing_refused, the on-approval hook's refusal marker when a
+// split_proposal has a phase whose own declared scope.files count exceeds the
+// resolved implement cap (the hook files ZERO children rather than emit a lead
+// phase that would itself fail the implement cap). When a
 // new canonical category is introduced, add it here so operators can await
 // it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -188,6 +192,7 @@ var KnownCategories = map[string]struct{}{
 	"slice_integration_failed":                {},
 	"slices_integrated":                       {},
 	"split_children_filed":                    {},
+	"split_filing_refused":                    {},
 	"spend_alert":                             {},
 	"stage_fixup_recovered":                   {},
 	"stage_fixup_triggered":                   {},
