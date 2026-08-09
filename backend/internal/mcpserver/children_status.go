@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/google/uuid"
 )
@@ -45,11 +46,17 @@ type ChildStatus struct {
 	// Blocked is true when a dependency slice has not yet reached state
 	// succeeded — the child is NOT dispatchable until it clears. An
 	// unknown-state dependency (its per-child read failed) counts as blocking,
-	// never as dispatchable.
-	Blocked bool `json:"blocked" jsonschema:"true when a dependency slice has not yet succeeded, so this child cannot be dispatched yet; an unknown-state dependency counts as blocking"`
+	// never as dispatchable. A dependency slice with NO minted sibling (absent
+	// from the parent's child_run_ids) also counts as blocking: host dispatch
+	// refuses that child as not_minted, so the view must not advertise it as
+	// dispatchable.
+	Blocked bool `json:"blocked" jsonschema:"true when a dependency slice has not yet succeeded, so this child cannot be dispatched yet; an unknown-state or not-yet-minted dependency counts as blocking"`
 	// BlockedBy names the run ids of the dependency siblings that have not yet
 	// succeeded, in ascending slice order. Empty when the child is not blocked.
-	BlockedBy []string `json:"blocked_by,omitempty" jsonschema:"the run ids of the not-yet-succeeded dependency siblings blocking this child, in slice order"`
+	// A not-minted dependency slice has no run id to name, so it is reported as
+	// a synthetic "slice N (not_minted)" marker instead — the read-side mirror
+	// of the host-dispatch guard's not_minted refusal.
+	BlockedBy []string `json:"blocked_by,omitempty" jsonschema:"the not-yet-succeeded dependency blockers for this child, in slice order: a minted sibling's run id, or a synthetic \"slice N (not_minted)\" marker for a dependency slice with no minted sibling"`
 }
 
 // ChildrenStatus is the decomposed-parent per-child + integration-phase view
@@ -160,20 +167,38 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 
 	// Second pass (E48.99 / #2546): now that every child's state is known,
 	// resolve each child's blocked-ness from its DependsOn against the sibling
-	// states gathered above. A dependency slice that has not reached
-	// "succeeded" (including an "unknown" read failure) blocks the child, and
-	// its run id is named in BlockedBy — so one get_run_status read answers
-	// "what may I dispatch next". A child with no DependsOn (wave 0, or a
-	// legacy backend that omits slice_depends_on) stays Blocked=false, which
-	// renders exactly as it did before this field existed (back-compat).
+	// states gathered above. Resolve dependencies BY SLICE INDEX through
+	// bySlice (not by slice POSITION), so a plan_decomposed whose child_run_ids
+	// is not dense-in-slice-order never associates a dependency with the wrong
+	// child. A dependency slice that has not reached "succeeded" (including an
+	// "unknown" read failure) blocks the child, and its run id is named in
+	// BlockedBy. A dependency slice with NO minted sibling (absent from
+	// child_run_ids — the not_minted case the host-dispatch guard refuses in
+	// decomposition_dispatch_guard.go) ALSO blocks: the view must not advertise
+	// a dispatch the backend would 409 dependency_not_satisfied, so it is named
+	// by a synthetic "slice N (not_minted)" marker since no run id exists. So
+	// one get_run_status read answers "what may I dispatch next". A child with
+	// no DependsOn (wave 0, or a legacy backend that omits slice_depends_on)
+	// stays Blocked=false, which renders exactly as it did before this field
+	// existed (back-compat).
+	bySlice := make(map[int]int, len(cs.Children)) // slice index -> position in cs.Children
+	for i := range cs.Children {
+		bySlice[cs.Children[i].SliceIndex] = i
+	}
 	for i := range cs.Children {
 		for _, depIdx := range cs.Children[i].DependsOn {
-			if depIdx < 0 || depIdx >= len(cs.Children) {
-				continue // defensive: a dependency index outside the child set
-			}
-			if cs.Children[depIdx].State != "succeeded" {
+			pos, minted := bySlice[depIdx]
+			if !minted {
+				// No sibling minted for this dependency slice: host dispatch
+				// refuses this child (not_minted), so it is NOT dispatchable.
 				cs.Children[i].Blocked = true
-				cs.Children[i].BlockedBy = append(cs.Children[i].BlockedBy, cs.Children[depIdx].RunID)
+				cs.Children[i].BlockedBy = append(cs.Children[i].BlockedBy,
+					fmt.Sprintf("slice %d (not_minted)", depIdx))
+				continue
+			}
+			if cs.Children[pos].State != "succeeded" {
+				cs.Children[i].Blocked = true
+				cs.Children[i].BlockedBy = append(cs.Children[i].BlockedBy, cs.Children[pos].RunID)
 			}
 		}
 	}

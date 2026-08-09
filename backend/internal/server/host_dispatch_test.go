@@ -608,6 +608,44 @@ func TestHostDispatch_DecompositionWave0Child_Admits(t *testing.T) {
 	}
 }
 
+// (17, concern #2546 fix-up) the wave-order guard sits BEFORE the state switch,
+// so it precedes the idempotent already-'dispatched' no-op: a decomposed child
+// already 'dispatched' whose dependency sibling has REGRESSED out of 'succeeded'
+// (revived/re-opened after the original in-order dispatch) is refused 409
+// dependency_not_satisfied on re-dispatch, NOT the documented 200
+// {transitioned:false} dead-runner no-op. Wave order is re-validated even on the
+// re-dispatch path. The regressed dependency (a running sibling) is seeded BY
+// CONSTRUCTION; the committed stage state is read after the call to prove the
+// refusal transitioned nothing. Deleting the guard (or moving it AFTER the
+// switch) makes this call take the idempotent 200 no-op branch → the status
+// assertion goes red.
+func TestHostDispatch_DecompositionAlreadyDispatched_RegressedDependency_Refuses(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	sib := seedGuardChild(rr, parentID, 0, run.StateRunning) // dependency regressed out of succeeded
+	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
+	stage := rr.seedStage(child.ID, 0, run.StageStateDispatched) // already dispatched (dead-runner re-dispatch shape)
+	stage.Type = run.StageTypeImplement
+
+	w := postHostDispatch(t, s, child.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (guard precedes the idempotent no-op):\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "dependency_not_satisfied") {
+		t.Errorf("body missing dependency_not_satisfied: %s", body)
+	}
+	if !strings.Contains(body, sib.ID.String()) {
+		t.Errorf("body should name the blocking sibling %s: %s", sib.ID, body)
+	}
+	// COMMITTED state: the stage stays 'dispatched' — the guard returned before
+	// the switch, so no transition occurred and no 200 no-op body was produced.
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("persisted stage state = %q, want dispatched (unchanged)", cur.State)
+	}
+}
+
 // The guard's read-errored path surfaces as 500 dependency_check_failed at the
 // handler, leaving the stage untouched (retryable, never a silent admit).
 func TestHostDispatch_DecompositionDependencyCheckError_500(t *testing.T) {

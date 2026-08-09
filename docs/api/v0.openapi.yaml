@@ -7188,7 +7188,13 @@ paths:
 
         **Idempotent.** A stage already `dispatched` returns 200 with
         `transitioned: false` — the legal manual re-dispatch of a stage whose
-        spawned runner died; the caller proceeds and re-spawns.
+        spawned runner died; the caller proceeds and re-spawns. The
+        decomposition wave-order guard (below) runs AHEAD of this no-op, so a
+        fan-out child already `dispatched` whose declared dependency has since
+        regressed out of `succeeded` (a revived/re-opened sibling) is refused
+        409 `dependency_not_satisfied` on re-dispatch rather than returning the
+        200 no-op — wave order is re-validated even on the dead-runner
+        re-dispatch path.
 
         **Not admissible.** A `running`, terminal, or any `awaiting_*` gate
         state returns 409 `dispatch_not_admissible` so a live or settled stage
@@ -7254,9 +7260,11 @@ paths:
               reached run state `succeeded`. `details` carries `slice_index`,
               `blocking_slice_index`, `blocking_run_id` (empty when that slice
               has no minted sibling) and `blocking_state` (`not_minted` when
-              absent). The refusal fires BEFORE the state CAS, so the stage
-              stays parked at `awaiting_host_dispatch`; dispatch the named
-              blocking sibling first to clear it.
+              absent). The refusal fires BEFORE the state CAS and ahead of the
+              idempotent no-op, so the stage's state is unchanged (parked at
+              `awaiting_host_dispatch`, or left `dispatched` when a re-dispatch
+              hit a since-regressed dependency); dispatch the named blocking
+              sibling first to clear it.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

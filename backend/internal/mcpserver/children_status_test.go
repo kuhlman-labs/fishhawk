@@ -533,6 +533,40 @@ func TestChildrenStatusFor_UnknownDependencyStateBlocks(t *testing.T) {
 	}
 }
 
+// TestChildrenStatusFor_NotMintedDependencyBlocks (concern #2546 fix-up): a
+// dependency slice with NO minted sibling in child_run_ids (slice index out of
+// range) must render the child BLOCKED, not dispatchable — the read-side mirror
+// of the host-dispatch guard's not_minted refusal. The pre-fix second pass took
+// a `continue` for the out-of-range index and left Blocked=false, advertising a
+// dispatch the backend would 409 dependency_not_satisfied. The not-minted slice
+// is named by the synthetic "slice N (not_minted)" marker (no run id exists).
+func TestChildrenStatusFor_NotMintedDependencyBlocks(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	c0, c1 := uuid.New(), uuid.New()
+	seedChildRun(fb, c0, "succeeded")
+	// slice 1 depends on slice 2, which is NEVER minted (child_run_ids has only
+	// two entries, indices 0 and 1) — the read/write-inconsistency case.
+	seedChildRunDeps(fb, c1, "pending", []int{2})
+	seedPlanDecomposed(fb, parent, []string{c0.String(), c1.String()}, 2)
+
+	cs, err := r.childrenStatusFor(context.Background(), parent, nil)
+	if err != nil {
+		t.Fatalf("childrenStatusFor: %v", err)
+	}
+	if !cs.Children[1].Blocked {
+		t.Errorf("child[1] Blocked = false, want true (its dependency slice 2 was never minted)")
+	}
+	if len(cs.Children[1].BlockedBy) != 1 || cs.Children[1].BlockedBy[0] != "slice 2 (not_minted)" {
+		t.Errorf("child[1].BlockedBy = %v, want [\"slice 2 (not_minted)\"]", cs.Children[1].BlockedBy)
+	}
+	if cs.Children[0].Blocked {
+		t.Errorf("child[0] Blocked = true, want false (wave-0 slice has no dependencies)")
+	}
+}
+
 // TestChildrenStatusFor_LegacyNoDependsOn: a legacy backend that omits
 // slice_depends_on decodes to nil DependsOn, so Blocked is false and the block
 // renders exactly as it did before this field existed (back-compat).
