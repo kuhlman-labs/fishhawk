@@ -550,6 +550,28 @@ type FetchedPrompt struct {
 	// prompt-response promptResponse.HeldCommitBaseSHA — the same cross-module
 	// convention as the three exempt fields above.
 	HeldCommitBaseSHA string `json:"held_commit_base_sha,omitempty"`
+	// HeldCommitResumeKind DISCRIMINATES which recovery the held-commit trio
+	// above encodes (#2169). Empty is the legacy #1231 scope-completeness EXEMPT
+	// resolution, byte-identical to every dispatch before this field existed.
+	// "pr_open" is the PR-open CHECKPOINT resume: the implement stage already
+	// committed and PUSHED (CommitAndPush succeeded) and then failed opening the
+	// PR or shipping the artifact — typically a sustained forge outage — so the
+	// backend re-dispatches the stage to re-attempt ONLY the idempotent
+	// adopt-then-create OpenPR (#2167) from the pushed head, with no agent
+	// re-invocation. The two kinds differ in the runner's behavior: a "pr_open"
+	// resume additionally verifies the run branch's REMOTE TIP still equals
+	// HeldCommitSHA before touching the forge (the held commit was never
+	// operator-reviewed at a park gate, so a branch moved by
+	// fishhawk_reset_run_branch must not produce an artifact whose head_sha
+	// lies), and re-reports the checkpoint on its own failure so a multi-retry
+	// outage never degrades back to a full agent re-run.
+	//
+	// The wire tag (held_commit_resume_kind) is byte-identical to the backend's
+	// promptResponse.HeldCommitResumeKind — the same cross-module
+	// independent-struct-by-tag convention as the four fields above. omitempty,
+	// so a legacy exempt dispatch and every non-resume dispatch stay
+	// byte-identical to today.
+	HeldCommitResumeKind string `json:"held_commit_resume_kind,omitempty"`
 	// EgressTargetHosts is the acceptance stage's full spec-declared
 	// egress.target_hosts list (E31.4 / #1532 grammar), served ONLY on
 	// acceptance-stage prompt responses (E31.7 / #1535). It is the
@@ -1241,8 +1263,14 @@ type ShipPullRequestArgs struct {
 
 	// Branch, HeadSHA, BaseSHA, and FilesChangedCount carry the pushed
 	// commit details for the Outcome=="pushed" child-push (#771) and
-	// Outcome=="fixup_pushed" fix-up (#794) reports. Unused for the "failed"
-	// and empty (success Body) paths.
+	// Outcome=="fixup_pushed" fix-up (#794) reports. Unused for the empty
+	// (success Body) path.
+	//
+	// On the Outcome=="failed" path, Branch/HeadSHA/BaseSHA (plus TreeSHA below,
+	// shipped as verified_tree_sha) are the OPTIONAL PR-open checkpoint (#2169):
+	// they are populated only when the failure happened AFTER CommitAndPush
+	// pushed the gate-verified commit, and are all empty on a pre-push failure —
+	// which keeps that body byte-identical to the pre-#2169 failure shape.
 	Branch            string
 	HeadSHA           string
 	BaseSHA           string
@@ -1283,6 +1311,25 @@ type pullRequestFailureBody struct {
 	Outcome  string `json:"outcome"`
 	Category string `json:"category"`
 	Reason   string `json:"reason"`
+
+	// Branch, HeadSHA, BaseSHA, and VerifiedTreeSHA are the PR-OPEN CHECKPOINT
+	// (#2169): the pushed coordinates of a failure that happened AFTER
+	// CommitAndPush already landed the gate-verified commit on the run branch (a
+	// PR-open failure, or a ship failure once the PR was open). The backend
+	// records them into the pull_request_failed audit payload as push_checkpoint,
+	// and the prompt-time resume gate then re-dispatches the stage to re-attempt
+	// only the idempotent OpenPR from this exact head — no agent re-invocation.
+	//
+	// ALL omitempty, and the runner populates them ONLY once the push succeeded:
+	// a PRE-push failure (mint, commit, or the push itself) leaves every one
+	// empty, so its body marshals BYTE-IDENTICALLY to the legacy
+	// {outcome,category,reason} shape and can never claim a resumable branch.
+	// The backend decodes them off the same pullRequestBody it already uses for
+	// the pushed / scope_park variants, so no new decode field is added.
+	Branch          string `json:"branch,omitempty"`
+	HeadSHA         string `json:"head_sha,omitempty"`
+	BaseSHA         string `json:"base_sha,omitempty"`
+	VerifiedTreeSHA string `json:"verified_tree_sha,omitempty"`
 }
 
 // pullRequestChildPushBody is the success-report wire shape ShipPullRequest
@@ -1383,6 +1430,12 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			Outcome:  args.Outcome,
 			Category: args.Category,
 			Reason:   TruncateReason(args.Reason, MaxFailureReportReasonBytes),
+			// PR-open checkpoint (#2169): empty on every pre-push failure, so the
+			// body stays byte-identical to the legacy shape there.
+			Branch:          args.Branch,
+			HeadSHA:         args.HeadSHA,
+			BaseSHA:         args.BaseSHA,
+			VerifiedTreeSHA: args.TreeSHA,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
@@ -1530,6 +1583,14 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 					Outcome:  args.Outcome,
 					Category: args.Category,
 					Reason:   TruncateReason(args.Reason, AggressiveFailureReportReasonBytes),
+					// The re-marshal MUST carry the PR-open checkpoint (#2169) too:
+					// dropping it here would make a 413-retried failure report
+					// silently un-resumable, falling the retry back to a full agent
+					// re-run — exactly the ~$4-6 loss the checkpoint exists to avoid.
+					Branch:          args.Branch,
+					HeadSHA:         args.HeadSHA,
+					BaseSHA:         args.BaseSHA,
+					VerifiedTreeSHA: args.TreeSHA,
 				})
 				if mErr != nil {
 					return nil, fmt.Errorf("upload: marshal aggressive pull-request failure body: %w", mErr)

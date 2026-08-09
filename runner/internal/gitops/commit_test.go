@@ -4818,3 +4818,110 @@ func TestCommitAndPush_ParkOnAssertionShortfall_PlainWrapAborts(t *testing.T) {
 		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
 	}
 }
+
+// remoteBranchTipRepo builds the on-disk fixture the RemoteBranchTip tests
+// share: a work repo with an `origin` bare remote carrying `main` plus one
+// extra branch, returning the repo dir, the branch name, and that branch's
+// exact tip SHA. Same shape as TestRemoteHasBranch's fixture — a REAL git
+// remote, so the ls-remote exit-code/empty-stdout semantics the contract
+// depends on are exercised for real rather than stubbed.
+func remoteBranchTipRepo(t *testing.T) (repo, branch, tip string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare := filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "init", "--initial-branch=main")
+	mustGit(t, repo, "config", "user.name", "init")
+	mustGit(t, repo, "config", "user.email", "init@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# initial\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "initial")
+	mustGit(t, repo, "init", "--bare", bare)
+	mustGit(t, repo, "remote", "add", "origin", bare)
+	mustGit(t, repo, "push", "origin", "main")
+
+	branch = "fishhawk/run-2169/stage-checkpoint"
+	mustGit(t, repo, "checkout", "-b", branch)
+	if err := os.WriteFile(filepath.Join(repo, "held.txt"), []byte("held commit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "add", "-A")
+	mustGit(t, repo, "commit", "-m", "held commit")
+	mustGit(t, repo, "push", "origin", branch)
+
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip = strings.TrimSpace(string(out))
+	mustGit(t, repo, "checkout", "main")
+	return repo, branch, tip
+}
+
+// TestRemoteBranchTip_ExistingBranch pins the happy path (#2169): an existing
+// remote branch resolves to its exact 40-hex tip SHA, which is what the
+// checkpoint resume compares the checkpointed head against.
+func TestRemoteBranchTip_ExistingBranch(t *testing.T) {
+	repo, branch, want := remoteBranchTipRepo(t)
+	got, err := RemoteBranchTip(context.Background(), repo, "origin", branch, "")
+	if err != nil {
+		t.Fatalf("RemoteBranchTip: %v", err)
+	}
+	if got != want {
+		t.Errorf("RemoteBranchTip = %q, want the branch tip %q", got, want)
+	}
+	if len(got) != 40 {
+		t.Errorf("tip %q is not a 40-hex SHA", got)
+	}
+}
+
+// TestRemoteBranchTip_AbsentBranchReturnsEmptyNoError pins the load-bearing
+// contract distinction (#2169 risk 1): `git ls-remote` exits 0 with EMPTY
+// stdout for a no-match, so an ABSENT branch must be ("", nil) — NOT an error.
+// The resume guard reads the empty tip as "branch gone" and refuses, which is a
+// different verdict from "the probe failed".
+func TestRemoteBranchTip_AbsentBranchReturnsEmptyNoError(t *testing.T) {
+	repo, _, _ := remoteBranchTipRepo(t)
+	got, err := RemoteBranchTip(context.Background(), repo, "origin", "fishhawk/never-created", "")
+	if err != nil {
+		t.Fatalf("an absent branch must NOT error (ls-remote exits 0 with empty stdout), got: %v", err)
+	}
+	if got != "" {
+		t.Errorf("an absent branch must return an empty tip, got %q", got)
+	}
+}
+
+// TestRemoteBranchTip_LsRemoteErrorReturnsError pins the other side of that
+// contract: an ls-remote FAILURE (here an unreachable remote) returns a
+// non-nil error and an empty SHA, so the caller can fail loud instead of
+// mistaking a transient fault for a moved branch.
+func TestRemoteBranchTip_LsRemoteErrorReturnsError(t *testing.T) {
+	repo, branch, _ := remoteBranchTipRepo(t)
+	// Point a second remote at a path that is not a repository.
+	mustGit(t, repo, "remote", "add", "broken", filepath.Join(t.TempDir(), "does-not-exist.git"))
+	got, err := RemoteBranchTip(context.Background(), repo, "broken", branch, "")
+	if err == nil {
+		t.Fatal("an unreachable remote must return an error")
+	}
+	if got != "" {
+		t.Errorf("an errored probe must return an empty tip, got %q", got)
+	}
+}
+
+// TestRemoteBranchTip_EmptyBranchRejected pins the argument guard: an empty
+// branch name errors rather than running an ls-remote for "refs/heads/", which
+// would match nothing and be indistinguishable from an absent branch.
+func TestRemoteBranchTip_EmptyBranchRejected(t *testing.T) {
+	repo, _, _ := remoteBranchTipRepo(t)
+	if _, err := RemoteBranchTip(context.Background(), repo, "origin", "", ""); err == nil {
+		t.Fatal("an empty branch must be rejected")
+	}
+}

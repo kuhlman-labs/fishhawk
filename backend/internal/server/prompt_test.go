@@ -9202,3 +9202,272 @@ func TestPromptRenderExemptFields_EmissionGate(t *testing.T) {
 		assertNoExemptKeys(t, keys, "/prompt-render on a FAIL-decided park")
 	})
 }
+
+// ---------------------------------------------------------------------------
+// PR-open CHECKPOINT resume (#2169): resolvePushCheckpointResume's emission
+// gate. These reuse the #2501 exempt scaffolding above (exemptAuditFake /
+// exemptPromptKeys / exemptRenderKeys / assertNoExemptKeys) because the two
+// gates emit the SAME held-commit fields and must be proven on the same
+// surfaces — with the resume additionally carrying held_commit_resume_kind.
+// ---------------------------------------------------------------------------
+
+const (
+	checkpointHeadSHA = "4444444444444444444444444444444444444444"
+	checkpointBaseSHA = "5555555555555555555555555555555555555555"
+	checkpointBranch  = "fishhawk/run-2169/stage-checkpoint"
+)
+
+// checkpointFailedEntry is a pull_request_failed audit entry carrying a
+// complete push_checkpoint — what the runner's post-push failure report writes.
+func checkpointFailedEntry(seq int64) *audit.Entry {
+	return scopeDecisionEntryPayload(uuid.Nil, "pull_request_failed", seq, `{
+		"category":"C","reason":"open PR: 503",
+		"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+		`","base_sha":"`+checkpointBaseSHA+`","verified_tree_sha":"6666666666666666666666666666666666666666"}}`)
+}
+
+// assertNoResumeKey asserts held_commit_resume_kind is absent, the companion of
+// assertNoExemptKeys for the resume discriminator.
+func assertNoResumeKey(t *testing.T, keys map[string]json.RawMessage, why string) {
+	t.Helper()
+	if raw, ok := keys["held_commit_resume_kind"]; ok {
+		t.Errorf("%s: key %q must be ABSENT from the marshalled body, got %s", why, "held_commit_resume_kind", raw)
+	}
+}
+
+// assertNoResumeEmission is the shared fail-closed assertion for the whole
+// matrix below: NONE of the held-commit fields and NOT the resume kind.
+func assertNoResumeEmission(t *testing.T, keys map[string]json.RawMessage, why string) {
+	t.Helper()
+	assertNoExemptKeys(t, keys, why)
+	assertNoResumeKey(t, keys, why)
+}
+
+// assertResumeEmission asserts the full four-field resume emission.
+func assertResumeEmission(t *testing.T, keys map[string]json.RawMessage, surface string) {
+	t.Helper()
+	for key, want := range map[string]string{
+		"open_pr_from_held_commit": `true`,
+		"held_commit_sha":          `"` + checkpointHeadSHA + `"`,
+		"held_commit_branch":       `"` + checkpointBranch + `"`,
+		"held_commit_base_sha":     `"` + checkpointBaseSHA + `"`,
+		"held_commit_resume_kind":  `"pr_open"`,
+	} {
+		raw, ok := keys[key]
+		if !ok {
+			t.Errorf("%s: %s must be emitted on a checkpoint resume", surface, key)
+			continue
+		}
+		if string(raw) != want {
+			t.Errorf("%s: %s = %s, want %s", surface, key, raw, want)
+		}
+	}
+}
+
+// TestResolvePushCheckpointResume_EmitsOnNewestCheckpoint is the happy path: an
+// implement stage (no park) whose newest audit entry is a checkpoint-bearing
+// pull_request_failed emits all four held-commit fields plus the pr_open resume
+// kind — on the runner-facing /prompt AND the SPA-readable /prompt-render, so
+// the two surfaces stay byte-consistent.
+func TestResolvePushCheckpointResume_EmitsOnNewestCheckpoint(t *testing.T) {
+	entries := []*audit.Entry{checkpointFailedEntry(7)}
+	assertResumeEmission(t, exemptPromptKeys(t, nil, entries, nil), "/prompt")
+	assertResumeEmission(t, exemptRenderKeys(t, nil, []*audit.Entry{checkpointFailedEntry(7)}), "/prompt-render")
+}
+
+// TestResolvePushCheckpointResume_NewestIsPullRequestOpened is the
+// SELF-INVALIDATION property: once a resume succeeds and the PR opens, the
+// pull_request_opened entry is newest, so a later retry must take the ordinary
+// agent path rather than re-opening a PR that already exists.
+func TestResolvePushCheckpointResume_NewestIsPullRequestOpened(t *testing.T) {
+	entries := []*audit.Entry{
+		checkpointFailedEntry(7),
+		scopeDecisionEntry(uuid.Nil, "pull_request_opened", 8),
+	}
+	assertNoResumeEmission(t, exemptPromptKeys(t, nil, entries, nil),
+		"a stage whose newest entry is pull_request_opened has already resumed")
+}
+
+// TestResolvePushCheckpointResume_NewestIsScopeParkEntry pins the
+// newest-entry-must-be-a-checkpoint rule against the scope-completeness classes:
+// a stage that checkpointed and LATER parked is awaiting an operator decision,
+// not a resume. COUNTERFACTUAL (2): deleting the newest-wins rule reddens this.
+func TestResolvePushCheckpointResume_NewestIsScopeParkEntry(t *testing.T) {
+	entries := []*audit.Entry{
+		checkpointFailedEntry(7),
+		scopeDecisionEntry(uuid.Nil, CategoryScopeCompletenessParked, 9),
+	}
+	assertNoResumeEmission(t, exemptPromptKeys(t, nil, entries, nil),
+		"a stage whose newest entry is a scope park must not resume")
+}
+
+// TestResolvePushCheckpointResume_NewestIsFixupPushed and _NewestIsChildPushed
+// name the two remaining invalidator categories the gate walks (operator
+// binding condition 3): each must supersede an older checkpoint. Without them
+// in pushCheckpointCategories the walk would not see them at all and the stale
+// checkpoint would still read as newest.
+func TestResolvePushCheckpointResume_NewestIsFixupPushed(t *testing.T) {
+	entries := []*audit.Entry{
+		checkpointFailedEntry(7),
+		scopeDecisionEntry(uuid.Nil, "fixup_pushed", 11),
+	}
+	assertNoResumeEmission(t, exemptPromptKeys(t, nil, entries, nil),
+		"a stage whose newest entry is fixup_pushed must not resume")
+}
+
+func TestResolvePushCheckpointResume_NewestIsChildPushed(t *testing.T) {
+	entries := []*audit.Entry{
+		checkpointFailedEntry(7),
+		scopeDecisionEntry(uuid.Nil, "child_pushed", 12),
+	}
+	assertNoResumeEmission(t, exemptPromptKeys(t, nil, entries, nil),
+		"a stage whose newest entry is child_pushed must not resume")
+}
+
+// TestResolvePushCheckpointResume_NewestFailedCarriesNoCheckpoint is the
+// PRE-PUSH failure: the ordinary category-B/C failure whose report carried no
+// coordinates. There is nothing on a branch to resume from.
+func TestResolvePushCheckpointResume_NewestFailedCarriesNoCheckpoint(t *testing.T) {
+	entries := []*audit.Entry{
+		scopeDecisionEntryPayload(uuid.Nil, "pull_request_failed", 7,
+			`{"category":"B","reason":"commit would not compile"}`),
+	}
+	assertNoResumeEmission(t, exemptPromptKeys(t, nil, entries, nil),
+		"a pre-push failure report carries no checkpoint")
+}
+
+// TestResolvePushCheckpointResume_IncompleteCheckpoint covers each individually
+// unusable coordinate. head_sha and branch are the resume's own inputs;
+// base_sha is required because the backend's success-arm validate() rejects an
+// artifact without it, so emitting on a base-less checkpoint would open a PR
+// and then always fail category-B, orphaning it (#2562/#2563).
+func TestResolvePushCheckpointResume_IncompleteCheckpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload string
+	}{
+		{"CheckpointMissingHeadSHA", `{"push_checkpoint":{"branch":"b","head_sha":"","base_sha":"c"}}`},
+		{"CheckpointMissingBranch", `{"push_checkpoint":{"branch":"","head_sha":"h","base_sha":"c"}}`},
+		{"CheckpointMissingBaseSHA", `{"push_checkpoint":{"branch":"b","head_sha":"h","base_sha":""}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries := []*audit.Entry{scopeDecisionEntryPayload(uuid.Nil, "pull_request_failed", 7, tc.payload)}
+			assertNoResumeEmission(t, exemptPromptKeys(t, nil, entries, nil),
+				"an incomplete checkpoint must not be resumed")
+		})
+	}
+}
+
+// TestResolvePushCheckpointResume_UndecodablePayload: a pull_request_failed
+// entry whose payload is not JSON fails closed rather than panicking or
+// emitting on a half-read struct.
+func TestResolvePushCheckpointResume_UndecodablePayload(t *testing.T) {
+	entries := []*audit.Entry{scopeDecisionEntryPayload(uuid.Nil, "pull_request_failed", 7, `{not json`)}
+	assertNoResumeEmission(t, exemptPromptKeys(t, nil, entries, nil),
+		"an undecodable payload must fail closed")
+}
+
+// TestResolvePushCheckpointResume_NoEntryForStage: entries exist for the run
+// but none for THIS stage (the per-stage filter), so there is no checkpoint.
+func TestResolvePushCheckpointResume_NoEntryForStage(t *testing.T) {
+	other := uuid.New()
+	e := checkpointFailedEntry(7)
+	// exemptPromptKeys re-stamps StageID onto every entry, so drive the
+	// no-entry-for-this-stage case through the audit seam directly.
+	keys := exemptPromptKeysWithAudit(t, nil, func(_ uuid.UUID) audit.Repository {
+		e.StageID = &other
+		return &exemptAuditFake{entries: []*audit.Entry{e}}
+	})
+	assertNoResumeEmission(t, keys, "a checkpoint belonging to another stage must not resume this one")
+}
+
+// TestResolvePushCheckpointResume_AuditListError: any ListForRunByCategory
+// failure fails closed — an unreadable ledger is not evidence of a checkpoint.
+func TestResolvePushCheckpointResume_AuditListError(t *testing.T) {
+	assertNoResumeEmission(t,
+		exemptPromptKeys(t, nil, []*audit.Entry{checkpointFailedEntry(7)}, errors.New("db down")),
+		"an audit read error must fail closed")
+}
+
+// TestResolvePushCheckpointResume_NilAuditRepo: with no AuditRepo configured
+// the gate cannot read anything, so it emits nothing.
+func TestResolvePushCheckpointResume_NilAuditRepo(t *testing.T) {
+	assertNoResumeEmission(t, exemptPromptKeysWithAudit(t, nil, nil),
+		"an unconfigured audit repository must fail closed")
+}
+
+// TestResolvePushCheckpointResume_NonImplementStage and _FixupDispatch are
+// driven through the gate DIRECTLY: neither state is expressible through the
+// exempt fixture (which hard-wires an implement stage, and derives `fixup` from
+// routed review concerns).
+//
+// _FixupDispatch is COUNTERFACTUAL (3). It matters because a fix-up dispatch
+// exists precisely to re-invoke the agent with the reviewer's concerns; taking
+// the resume short-circuit would open a PR from the UNFIXED commit and report
+// the fix-up as done.
+func TestResolvePushCheckpointResume_NonImplementStage(t *testing.T) {
+	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
+	stage.Type = run.StageTypeReview
+	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); ok {
+		t.Error("a non-implement stage must never resume")
+	}
+}
+
+func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
+	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
+	// Control: the SAME state without the fixup flag DOES resolve, so the RED
+	// below lands on the fixup guard rather than on a broken fixture.
+	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); !ok {
+		t.Fatal("fixture must resolve a checkpoint on a non-fixup dispatch")
+	}
+	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true); ok {
+		t.Error("a fix-up dispatch must re-invoke the agent, never take the resume short-circuit")
+	}
+}
+
+// TestResolvePushCheckpointResume_NilStage: the nil guard.
+func TestResolvePushCheckpointResume_NilStage(t *testing.T) {
+	s, runRow, _ := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
+	if _, _, _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false); ok {
+		t.Error("a nil stage must never resume")
+	}
+}
+
+// checkpointGateFixture builds the minimum a direct resolvePushCheckpointResume
+// call needs: a Server with an audit repo serving entries stamped onto the
+// generated stage id, plus that run/stage pair.
+func checkpointGateFixture(t *testing.T, entries []*audit.Entry) (*Server, *run.Run, *run.Stage) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	au := &exemptAuditFake{}
+	for _, e := range entries {
+		id := stageID
+		e.StageID = &id
+		au.entries = append(au.entries, e)
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	return s, &run.Run{ID: runID}, &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+}
+
+// TestPromptHeldCommit_ExemptWinsOverPushCheckpoint pins the PRECEDENCE: a
+// stage that is BOTH exempt-resolved (#1231/#2501) and checkpoint-bearing
+// (#2169) emits the EXEMPT resolution — the park's coordinates, with an EMPTY
+// resume kind. The operator's exempt decision is a judgment about the held
+// tree; a checkpoint is a mechanical retry hint, so the judgment wins and the
+// two can never both set the fields.
+func TestPromptHeldCommit_ExemptWinsOverPushCheckpoint(t *testing.T) {
+	// ORDERING MATTERS, and it is what makes this a real counterfactual: the
+	// checkpoint entry must be NEWER than the exempt decision, or the checkpoint
+	// gate's own newest-wins rule already excludes it and the precedence branch
+	// is never reached (both gates would return false-then-true and the `else`
+	// would be decorative). With the checkpoint newest, BOTH gates resolve and
+	// only the exempt-wins ordering decides which coordinates are emitted.
+	entries := []*audit.Entry{
+		scopeDecisionEntry(uuid.Nil, CategoryScopeCompletenessExempted, 8),
+		checkpointFailedEntry(9),
+	}
+	keys := exemptPromptKeys(t, exemptPark(), entries, nil)
+	// The exempt park's coordinates, byte-for-byte — NOT the checkpoint's.
+	assertGoldenExemptProjection(t, keys, "/prompt")
+	assertNoResumeKey(t, keys, "an exempt resolution must carry no resume kind")
+}

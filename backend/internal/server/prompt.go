@@ -291,6 +291,23 @@ type promptResponse struct {
 	HeldCommitSHA        string `json:"held_commit_sha,omitempty"`
 	HeldCommitBranch     string `json:"held_commit_branch,omitempty"`
 	HeldCommitBaseSHA    string `json:"held_commit_base_sha,omitempty"`
+	// HeldCommitResumeKind DISCRIMINATES which recovery the four fields above
+	// encode (#2169). Empty is the legacy #1231 scope-completeness EXEMPT
+	// resolution — byte-identical to every response before this field existed.
+	// "pr_open" is the PR-open CHECKPOINT resume (resolvePushCheckpointResume
+	// below): the implement stage already committed and PUSHED and then failed
+	// opening the PR or shipping the artifact, so the runner re-attempts only
+	// the idempotent adopt-then-create OpenPR from the pushed head. The runner
+	// additionally verifies the run branch's remote tip still equals
+	// HeldCommitSHA on that kind, because a checkpointed commit passed no
+	// operator gate the way a park did.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (held_commit_resume_kind) MUST
+	// stay byte-identical to the runner's upload.FetchedPrompt.
+	// HeldCommitResumeKind decoder, same convention as the four fields above. A
+	// tag drift degrades a pr_open resume into the legacy exempt path: still
+	// correct (same branch, same PR) but without the remote-tip guard.
+	HeldCommitResumeKind string `json:"held_commit_resume_kind,omitempty"`
 }
 
 // scopeExemption is one operator scope exemption: a DECLARED scope.files path
@@ -1291,6 +1308,16 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			resp.HeldCommitSHA = heldSHA
 			resp.HeldCommitBranch = heldBranch
 			resp.HeldCommitBaseSHA = heldBaseSHA
+		} else if heldSHA, heldBranch, heldBaseSHA, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
+			// PR-open CHECKPOINT resume (#2169), taken ONLY when the exempt
+			// resolution above returned false. An exempt-resolved park always wins:
+			// #1231 keeps precedence, and the two can never both set the fields (so
+			// the resume kind an exempt emission carries is always empty).
+			resp.OpenPRFromHeldCommit = true
+			resp.HeldCommitSHA = heldSHA
+			resp.HeldCommitBranch = heldBranch
+			resp.HeldCommitBaseSHA = heldBaseSHA
+			resp.HeldCommitResumeKind = resumeKindPROpen
 		}
 	}
 	// Plan-stage model routing (#1416): resolve the plan-model ladder and carry
@@ -1790,6 +1817,15 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			resp.HeldCommitSHA = heldSHA
 			resp.HeldCommitBranch = heldBranch
 			resp.HeldCommitBaseSHA = heldBaseSHA
+		} else if heldSHA, heldBranch, heldBaseSHA, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
+			// PR-open CHECKPOINT resume (#2169), same derivation + same
+			// exempt-wins precedence as the dispatch path so the rendered
+			// (SPA-readable) prompt response stays byte-consistent with it.
+			resp.OpenPRFromHeldCommit = true
+			resp.HeldCommitSHA = heldSHA
+			resp.HeldCommitBranch = heldBranch
+			resp.HeldCommitBaseSHA = heldBaseSHA
+			resp.HeldCommitResumeKind = resumeKindPROpen
 		}
 	}
 	// Plan-stage model routing (#1416), same derivation as the dispatch path so
@@ -3167,6 +3203,150 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 		return "", "", "", false
 	}
 	return park.HeldCommitSHA, park.RunBranch, base, true
+}
+
+// resumeKindPROpen is the held_commit_resume_kind wire value for a PR-open
+// CHECKPOINT resume (#2169). WIRE VALUE: byte-identical to the runner's
+// resumeKindPROpen constant (runner/cmd/fishhawk-runner/main.go), which selects
+// the remote-tip guard and the repeatable-resume report.
+const resumeKindPROpen = "pr_open"
+
+// pushCheckpointCategories is the audit-category set resolvePushCheckpointResume
+// walks to find THIS stage's newest terminal implement outcome. It must contain
+// every category that can SUPERSEDE a checkpoint, not just the one that carries
+// it — a walk over pull_request_failed alone would happily resume a stage that
+// has since opened its PR, parked, or pushed a fix-up. pull_request_failed is
+// the carrier; the rest are the invalidators.
+var pushCheckpointCategories = []string{
+	"pull_request_failed",
+	"pull_request_opened",
+	CategoryScopeCompletenessParked,
+	CategoryScopeCompletenessExempted,
+	CategoryScopeCompletenessFailed,
+	"fixup_pushed",
+	"child_pushed",
+}
+
+// resolvePushCheckpointResume is the emission GATE for the PR-OPEN CHECKPOINT
+// resume (#2169), the sibling of resolveHeldCommitExemption above and modelled
+// directly on it. It returns ok=true — and the checkpointed head SHA + branch +
+// base SHA — only when the NEWEST audit entry for THIS stage across
+// pushCheckpointCategories is a `pull_request_failed` carrying a
+// `push_checkpoint` with a non-empty head_sha, branch, AND base_sha.
+//
+// WHAT IT RECOVERS. The implement agent ran, the committed-tree gates passed,
+// and CommitAndPush pushed the gate-verified commit — and only THEN did the PR
+// open (or the artifact ship) fail, typically a sustained forge outage. Today
+// retry_stage re-runs the whole agent for a ~$4-6, ~50-minute redo of work that
+// is already on the branch. Emitting the held-commit fields sends the runner to
+// its pre-agent short-circuit instead, where it re-attempts only the idempotent
+// adopt-then-create OpenPR (#2167) — which also covers the case where the PR
+// actually opened and only the ship failed (the adopt-by-head arm returns it).
+//
+// NEWEST-WINS IS WHAT MAKES THE GATE SELF-INVALIDATING. Once a resume succeeds,
+// a `pull_request_opened` entry becomes the newest, so a later retry takes the
+// ordinary agent path rather than re-opening a PR that already exists. Same for
+// a stage that parked, was exempted, or pushed a fix-up after the failure.
+//
+// BASE SHA IS REQUIRED, not optional. The backend's success-arm validate()
+// requires base_sha on the shipped artifact, so a resume without one would open
+// the PR and then always fail category-B, orphaning it — the #2563/#2562 defect,
+// which the runner now refuses BEFORE the forge. Failing closed here keeps the
+// two layers agreeing instead of relying on the runner's last-line guard.
+//
+// FAIL-CLOSED on every uncertain branch (WARN-log where a real anomaly is
+// implied, silent where the state is simply ordinary): a nil stage, a
+// non-implement stage, a FIXUP dispatch (a fix-up MUST re-invoke the agent —
+// resuming would skip the very fix the operator requested), a nil AuditRepo, any
+// ListForRunByCategory error, no entry for this stage, a newest entry that is
+// not a checkpoint-bearing pull_request_failed, or an undecodable payload. The
+// cost of a wrong emission is a PR opened from an unintended head; the cost of a
+// wrong omission is today's agent re-run. Those are not symmetric.
+func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (sha, branch, baseSHA string, ok bool) {
+	if stage == nil || stage.Type != run.StageTypeImplement {
+		return "", "", "", false
+	}
+	if fixup {
+		return "", "", "", false
+	}
+	if s.cfg.AuditRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: audit repository unconfigured; omitting push-checkpoint resume fields",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()))
+		return "", "", "", false
+	}
+	// Two walks in one pass: `newest` is the newest entry across EVERY category
+	// (the invalidators included), `newestFailed` the newest pull_request_failed
+	// (the only category that can CARRY a checkpoint). The gate reads the
+	// checkpoint off newestFailed and then requires the two to be the SAME entry
+	// — that identity IS the newest-wins rule, and keeping them separate is what
+	// makes the rule load-bearing rather than incidentally satisfied.
+	var newest, newestFailed *audit.Entry
+	for _, cat := range pushCheckpointCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: list audit entries failed; omitting push-checkpoint resume fields",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()))
+			return "", "", "", false
+		}
+		for _, e := range entries {
+			if e.StageID == nil || *e.StageID != stage.ID {
+				continue
+			}
+			if newest == nil || e.Sequence > newest.Sequence {
+				newest = e
+			}
+			if cat == "pull_request_failed" && (newestFailed == nil || e.Sequence > newestFailed.Sequence) {
+				newestFailed = e
+			}
+		}
+	}
+	if newestFailed == nil {
+		return "", "", "", false
+	}
+	// NEWEST-WINS. A pull_request_failed that is no longer this stage's newest
+	// terminal outcome has been superseded — the PR opened, the stage parked or
+	// was exempted, a fix-up or child push landed — so its checkpoint is stale
+	// and resuming from it would re-open a PR (or open one from a head the run
+	// has moved past). Self-invalidating by construction: a successful resume
+	// writes pull_request_opened, which makes this comparison fail next time.
+	if newest != newestFailed {
+		return "", "", "", false
+	}
+	var payload struct {
+		PushCheckpoint *struct {
+			Branch  string `json:"branch"`
+			HeadSHA string `json:"head_sha"`
+			BaseSHA string `json:"base_sha"`
+		} `json:"push_checkpoint"`
+	}
+	if err := json.Unmarshal(newestFailed.Payload, &payload); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: pull_request_failed payload undecodable; omitting push-checkpoint resume fields",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return "", "", "", false
+	}
+	if payload.PushCheckpoint == nil {
+		// The ordinary pre-push failure: nothing was pushed, so there is nothing
+		// to resume. Not an anomaly — no WARN.
+		return "", "", "", false
+	}
+	cp := payload.PushCheckpoint
+	if cp.HeadSHA == "" || cp.Branch == "" || cp.BaseSHA == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: push_checkpoint incomplete; omitting push-checkpoint resume fields",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()))
+		return "", "", "", false
+	}
+	return cp.HeadSHA, cp.Branch, cp.BaseSHA, true
 }
 
 // resolveNewestReportedHeadSHA is the shared reported-head ledger walk behind

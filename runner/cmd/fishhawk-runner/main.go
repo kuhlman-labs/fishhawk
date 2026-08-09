@@ -457,11 +457,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// shipping exemptHeldBaseSHA as the artifact's base_sha (#2563).
 	// Function-scoped like fixupExpectedHeadSHA: produced and consumed entirely
 	// within run().
+	//
+	// exemptResumeKind (#2169) DISCRIMINATES which recovery those three
+	// coordinates encode: empty is the legacy #1231 park exemption; "pr_open" is
+	// the PR-open CHECKPOINT resume, where the stage already pushed and then
+	// failed opening the PR (or shipping the artifact). Both take the SAME
+	// zero-re-run short-circuit below — the kind only selects openHeldCommitPR's
+	// remote-tip guard, its log events, and whether its failure report
+	// re-carries the checkpoint.
 	var (
 		exemptOpenPR      bool
 		exemptHeldSHA     string
 		exemptHeldBranch  string
 		exemptHeldBaseSHA string
+		exemptResumeKind  string
 	)
 
 	// bindingAssertions is the fetched prompt's binding_assertions (#1171):
@@ -549,7 +558,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		if fetchErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"fetch_prompt","detail":%q}`+"\n", fetchErr.Error())
@@ -598,6 +607,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptHeldSHA = heldCommitSHA
 		exemptHeldBranch = heldCommitBranch
 		exemptHeldBaseSHA = heldCommitBaseSHA
+		exemptResumeKind = heldCommitResumeKind
 		fixupExpectedHeadSHA = expectedHeadSHA
 		fixupApplyPatches = applyPatches
 		bindingAssertions = promptBindingAssertions
@@ -726,8 +736,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// invoker-called-exactly-once across the park+exempt sequence). No
 	// CommitAndPush, no gates, no trace bundle: the commit and its verified
 	// tree are unchanged from the park.
+	//
+	// The PR-open CHECKPOINT resume (#2169, exemptResumeKind == "pr_open")
+	// deliberately reuses this SAME short-circuit rather than building a second
+	// recovery flow: its precondition is identical (a gate-verified commit
+	// already on the run branch) and its position here is exactly what
+	// guarantees the agent invoker is never spawned. openHeldCommitPR branches
+	// on the kind for the extra remote-tip guard that resume needs.
 	if exemptOpenPR {
-		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, logSink, client, issuedKey)
+		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, exemptResumeKind, logSink, client, issuedKey)
 	}
 
 	if cfg.promptFile == "" {
@@ -2311,7 +2328,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		if res.OK && stageType == "implement" {
 			// First (pre-re-invoke) ship: nil supplemental — these exemptions are
 			// already in the sealed bundle's scope_files_exempted gate_evidence event.
-			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions), nil)
+			// prCheckpoint is the #2169 PR-open checkpoint out-parameter: armed only
+			// once CommitAndPush has landed the gate-verified commit on the run
+			// branch, and passed into the failure report below so a retry_stage can
+			// resume the PR open with no agent re-invocation.
+			var prCheckpoint pushCheckpoint
+			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(validatedExemptions, operatorExemptions), nil, &prCheckpoint)
 			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
@@ -2367,7 +2389,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					// review's gate_evidence can NOT be re-fed: it is dispatched at
 					// trace-upload time, strictly before this re-invoke (#1153).
 					supplemental := diffExemptions(reinvokeExemptions, sealedExemptions)
-					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, reinvokeExemptions, supplemental)
+					// The re-invoke ship reuses the SAME checkpoint out-parameter: the
+					// first attempt failed before the push (a base-rebase conflict is a
+					// commit-time failure), so nothing was armed, and the re-invoke's
+					// own push arms it for the report below.
+					prErr = openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, reinvokeExemptions, supplemental, &prCheckpoint)
 				} else {
 					// Re-invoke infra exhaustion (or checkout failure): log and
 					// fall through to the unchanged category-B failure path
@@ -2453,7 +2479,27 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					// Best-effort here: this path already returns exitFailure, so the
 					// detached reaper backstop engages regardless of whether the report
 					// landed. The report error is logged inside reportPullRequestFailure.
-					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error())
+					// Ride the #2169 PR-open checkpoint on the report when the push
+					// already landed, so the backend records the pushed coordinates and
+					// a retry_stage resumes the PR open instead of re-running the whole
+					// implement agent. nil when nothing was armed (a pre-push failure),
+					// which keeps that report byte-identical to today.
+					//
+					// NOTE for a future reader: this `armed` check is belt-and-braces,
+					// NOT the load-bearing control — an unarmed prCheckpoint is the ZERO
+					// value, so passing it would produce the same empty-coordinate report.
+					// Deleting this check alone changes no behavior and reddens no test
+					// (verified by counterfactual). The real control is WHERE
+					// openPRAndShipArtifact writes the checkpoint: after CommitAndPush
+					// succeeds and past every early return. Moving that write earlier
+					// DOES redden TestOpenPRAndShipArtifact_NoCheckpointOnPrePushFailure.
+					// This check is kept as the explicit statement of intent and as a
+					// guard should the struct ever gain a non-empty zero value.
+					var cp *pushCheckpoint
+					if prCheckpoint.armed {
+						cp = &prCheckpoint
+					}
+					_ = reportPullRequestFailure(ctx, cfg, logSink, client, issuedKey, res.FailureCategory, err.Error(), cp)
 				}
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
@@ -2727,13 +2773,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -2741,20 +2787,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("write prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("close prompt temp file: %w", err)
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", nil, nil, "", nil, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -5802,13 +5848,44 @@ func mintBaseAuthToken(ctx context.Context, cfg config, client uploadClient, iss
 // reports a "failed" outcome to /pull-request so the dispatched stage the trace
 // gate left in `running` lands `failed` rather than hanging — symmetric with
 // openPRAndShipArtifact's failure path, minus the (absent) commit.
-func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
+// resumeKind DISCRIMINATES the two recoveries this function serves (#2169):
+//   - "" — the legacy #1231 scope-completeness EXEMPT resolution. Byte-identical
+//     to every pre-#2169 call: the scope_completeness_pr_opened event, the
+//     scope_exempt_open_pr failure reason, no remote-tip probe, and a failure
+//     report that carries no checkpoint.
+//   - "pr_open" — the PR-open CHECKPOINT resume. The stage already committed and
+//     PUSHED and then failed opening the PR or shipping the artifact. Two
+//     behaviors differ. (a) REMOTE-TIP GUARD: unlike an exempt park, this held
+//     commit passed no operator gate, so the run branch's remote tip must STILL
+//     equal heldSHA before the forge is touched — a branch moved by
+//     fishhawk_reset_run_branch would otherwise produce an artifact whose
+//     head_sha lies about what was shipped. An absent, moved, or unreadable tip
+//     fails category C having opened NO PR. (b) REPEATABLE RESUME: the failure
+//     report re-carries the checkpoint, so a resume that itself fails (the
+//     outage is still up) leaves the NEXT retry_stage resumable rather than
+//     silently degrading back to a full agent re-run.
+func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA, resumeKind string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
+	isPROpenResume := resumeKind == resumeKindPROpen
+	failedReason := "scope_exempt_open_pr"
+	if isPROpenResume {
+		failedReason = "pr_open_resume"
+	}
 	fail := func(category, reason string) int {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"runner_failed","reason":"scope_exempt_open_pr","detail":%q}`+"\n", reason)
+			`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n", failedReason, reason)
+		// REPEATABLE RESUME (#2169): re-report the checkpoint on a pr_open resume
+		// so the next retry_stage resumes again. Without this, one failed resume
+		// erases the checkpoint from the newest audit entry and a ~30-minute
+		// outage spanning several retries degrades back to a full agent re-run —
+		// the exact loss this issue exists to eliminate. The legacy exempt path
+		// reports WITHOUT a checkpoint, keeping #1231's audit shape unchanged.
+		var cp *pushCheckpoint
+		if isPROpenResume && heldBranch != "" && heldSHA != "" {
+			cp = &pushCheckpoint{branch: heldBranch, headSHA: heldSHA, baseSHA: heldBaseSHA, armed: true}
+		}
 		// Best-effort: this closure returns exitFailure, so the detached reaper
 		// backstop engages regardless of whether the report landed.
-		_ = reportPullRequestFailure(ctx, cfg, logSink, client, issued, category, reason)
+		_ = reportPullRequestFailure(ctx, cfg, logSink, client, issued, category, reason, cp)
 		return exitFailure
 	}
 	if cfg.runID == "" || cfg.stageID == "" {
@@ -5852,6 +5929,30 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		return fail("C", err.Error())
 	}
 
+	// REMOTE-TIP GUARD (#2169), pr_open resume ONLY. Re-prove the run branch
+	// still points at the checkpointed head BEFORE touching the forge. ADR-035
+	// sole-writer lineage says it should, but an operator
+	// fishhawk_reset_run_branch (or any out-of-band move) breaks that, and this
+	// resume — unlike the #1231 exempt path — opens a PR from a commit no
+	// operator gate ever reviewed. Failing closed here means we never ship a
+	// pull_request artifact whose head_sha claims a tree the branch no longer
+	// carries. Fail loud on an ls-remote ERROR too: a transient probe fault is
+	// not evidence the tip is intact, and the retry is cheap (no agent runs).
+	if isPROpenResume {
+		tip, tipErr := gitops.RemoteBranchTip(ctx, cfg.workingDir, gitops.DefaultRemote, branch, token)
+		switch {
+		case tipErr != nil:
+			return fail("C", fmt.Sprintf("pr-open resume: cannot read remote tip of %s: %v", branch, tipErr))
+		case tip == "":
+			return fail("C", fmt.Sprintf("pr-open resume: branch %s no longer exists on the remote (checkpointed head %s)", branch, heldSHA))
+		case tip != heldSHA:
+			return fail("C", fmt.Sprintf("pr-open resume: branch %s moved (remote tip %s != checkpointed head %s); refusing to open a PR whose head_sha would not match the checkpoint", branch, tip, heldSHA))
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_open_resume_tip_verified","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, heldSHA)
+	}
+
 	title, body := prTitleAndBody(cfg, branch, logSink)
 	// Route through the forge-agnostic dispatch (ADR-058 / E45.5): a
 	// --forge=gitlab exempt resolution opens a merge request via the GitLab
@@ -5881,9 +5982,13 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	// value to stamp. Adding a fifth wire field purely to echo it into a log
 	// event that no gate consumes is unjustified surface (#2563 binding
 	// condition 2); base_sha IS plumbed because the artifact requires it.
+	openedEvent := "scope_completeness_pr_opened"
+	if isPROpenResume {
+		openedEvent = "pr_open_resume_pr_opened"
+	}
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"scope_completeness_pr_opened","run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"base_sha":%q,"branch":%q}`+"\n",
-		cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, heldSHA, heldBaseSHA, branch)
+		`{"event":%q,"run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"base_sha":%q,"branch":%q}`+"\n",
+		openedEvent, cfg.runID, cfg.stageID, prRes.PRNumber, prRes.PRURL, heldSHA, heldBaseSHA, branch)
 
 	artifactBody, _ := json.Marshal(map[string]any{
 		"pr_number": prRes.PRNumber,
@@ -5913,6 +6018,35 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	return exitOK
 }
 
+// resumeKindPROpen is the held_commit_resume_kind discriminator the backend
+// emits for a PR-open CHECKPOINT resume (#2169). Its string value is a WIRE
+// value: it must stay byte-identical to the backend's resumeKindPROpen
+// (backend/internal/server/prompt.go). An unrecognized kind is treated as the
+// legacy #1231 exempt path — degraded but correct (same branch, same PR), which
+// is what makes an old runner against a new backend safe.
+const resumeKindPROpen = "pr_open"
+
+// pushCheckpoint is the PR-open CHECKPOINT (#2169): the coordinates of a
+// gate-verified commit CommitAndPush already pushed to the run branch, captured
+// at the moment the standalone open-PR path commits to opening a PR. Once it is
+// armed, every subsequent failure in the stage (the OpenPR call, the artifact
+// ship) is recoverable WITHOUT re-invoking the implement agent — the branch and
+// its commit survive the runner exit, so a retry_stage need only re-attempt the
+// idempotent adopt-then-create OpenPR (#2167) from headSHA.
+//
+// It rides the {outcome:"failed"} report to the backend, which records it into
+// the pull_request_failed audit payload; the prompt-time resume gate
+// (resolvePushCheckpointResume) reads it back on the retry and re-dispatches the
+// stage with the held-commit fields set. armed distinguishes "the push landed"
+// from the zero value, so a pre-push failure can never claim a resumable branch.
+type pushCheckpoint struct {
+	branch          string
+	headSHA         string
+	baseSHA         string
+	verifiedTreeSHA string
+	armed           bool
+}
+
 // openPRAndShipArtifact is the implement-stage post-processing
 // chain. It commits the agent's edits, pushes a fresh branch via
 // HTTPS, opens a PR via the GitHub REST API, and ships a
@@ -5937,7 +6071,16 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 // scope_files_exempted audit row — the visibility surface for the re-invoke
 // branch. nil on the first (pre-re-invoke) ship and every non-re-invoke ship, so
 // the artifact body stays byte-identical there.
-func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, applyPath string, bindingAssertions []upload.BindingAssertion, scopeExemptions []scopeExemption, supplementalExemptions []scopeExemption) error {
+//
+// checkpoint is the #2169 PR-open checkpoint OUT-parameter: nil-tolerant, and
+// written ONLY once the gate-verified commit is pushed and the standalone
+// open-PR path is selected. The caller passes it into reportPullRequestFailure
+// so a post-push failure report carries the pushed coordinates and a later
+// retry_stage resumes the PR open without re-invoking the agent. It stays
+// zero-valued on every pre-push failure and on every early return that owns its
+// own recovery, which is exactly the control that stops an un-pushed stage from
+// claiming a resumable branch.
+func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, preAgentRef string, preAgentDetached bool, preAgentCaptured bool, preAgentDirty []string, preAgentDirtyCaptured bool, verifiedTreeSHA string, applyPath string, bindingAssertions []upload.BindingAssertion, scopeExemptions []scopeExemption, supplementalExemptions []scopeExemption, checkpoint *pushCheckpoint) error {
 	if cfg.runID == "" || cfg.stageID == "" {
 		return errors.New("upload: --run-id and --stage-id required for implement stage")
 	}
@@ -6584,7 +6727,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			// reaper), while a landed report returns nil and keeps exit 0 (the
 			// backend already terminalized).
 			return reportPullRequestFailure(ctx, cfg, logSink, client, issued, "C",
-				childNoChangesReason(runSliceIndex))
+				childNoChangesReason(runSliceIndex), nil)
 		}
 		// Non-fix-up no-changes (first implement pass, no forward gate): no PR to
 		// open; no artifact to ship. The stage still counts as succeeded — the
@@ -6730,6 +6873,28 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return nil
 	}
 
+	// ARM THE PR-OPEN CHECKPOINT (#2169). Everything above this line that could
+	// fail did so BEFORE the gate-verified commit reached origin (mint, commit,
+	// push) or took an early return that owns its own recovery (--no-pr,
+	// NoChanges, fix-up, decomposed child, scope-completeness park). From here
+	// on the commit IS on the run branch, so any failure — the OpenPR below, or
+	// the artifact ship after it — is resumable: a retry_stage can re-attempt
+	// just the idempotent adopt-then-create OpenPR (#2167) from this exact head
+	// with NO agent re-invocation. Recording the coordinates for the caller is
+	// what makes the failure report carry them.
+	if checkpoint != nil {
+		*checkpoint = pushCheckpoint{
+			branch:          branch,
+			headSHA:         cap.HeadSHA,
+			baseSHA:         cap.BaseSHA,
+			verifiedTreeSHA: verifiedTreeSHA,
+			armed:           true,
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"pr_open_checkpoint_armed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA, cap.BaseSHA, verifiedTreeSHA)
+	}
+
 	prRes, err := openImplementChangeRequest(ctx, cfg, token, gitops.OpenPRArgs{
 		Owner: owner,
 		Repo:  repoName,
@@ -6854,18 +7019,31 @@ func childNoChangesReason(sliceIndex int) string {
 // error to exit non-zero, engaging the detached reaper backstop when the in-band
 // report itself failed. ShipPullRequest truncates the reason to the 32*1024 body
 // cap (#1791), so a normal oversized reason no longer 413s here.
-func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, category, reason string) error {
+//
+// checkpoint, when non-nil, is the #2169 PR-open checkpoint: the coordinates of
+// a commit CommitAndPush already landed on the run branch before the failure.
+// It rides the failure report so the backend can record it and a later
+// retry_stage resumes the PR open with no agent re-invocation. nil on every
+// pre-push failure path, which keeps those report bodies byte-identical.
+func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer, client uploadClient, issued *upload.IssuedKey, category, reason string, checkpoint *pushCheckpoint) error {
 	if issued == nil || client == nil {
 		return nil
 	}
-	if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+	args := upload.ShipPullRequestArgs{
 		RunID:      cfg.runID,
 		StageID:    cfg.stageID,
 		PrivateKey: issued.PrivateKey,
 		Outcome:    "failed",
 		Category:   category,
 		Reason:     reason,
-	}); err != nil {
+	}
+	if checkpoint != nil {
+		args.Branch = checkpoint.branch
+		args.HeadSHA = checkpoint.headSHA
+		args.BaseSHA = checkpoint.baseSHA
+		args.TreeSHA = checkpoint.verifiedTreeSHA
+	}
+	if _, err := client.ShipPullRequest(ctx, args); err != nil {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pull_request_failure_report_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
 			cfg.runID, cfg.stageID, err.Error())
