@@ -28,7 +28,12 @@ type AwaitAuditInput struct {
 	// anchors — e.g. awaiting either implement_reviewed OR fixup_pushed.
 	Categories     []string `json:"categories,omitempty" jsonschema:"OR-semantics list of audit categories; the wait resolves on the first entry matching ANY of them past the anchor. Unioned with category. Each is validated against the known-category registry unless allow_unknown is set"`
 	SinceSequence  int64    `json:"since_sequence,omitempty" jsonschema:"only an entry with sequence strictly greater than this resolves the wait (default 0 = the next entry of the category). Anchor it at the sequence of the event you are waiting past — e.g. the fixup_pushed entry's sequence when waiting for the post-fix-up implement_reviewed verdict"`
-	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'timeout' (default 360). Cap is token-conditional: 600 without a progressToken, 7200 when a progressToken is supplied (the heartbeat keeps the client's idle clock alive). On timeout, re-call with since_sequence = the returned latest_sequence to resume with no gap"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'timeout' (default 360). Cap is 600 by default, raised to 7200 when long_wait=true OR your MCP client supplied a progressToken. On timeout, re-call with since_sequence = the returned latest_sequence to resume with no gap"`
+	// LongWait makes the raised 7200s timeout cap REACHABLE from a tool call
+	// (#2490): the progressToken path is client-supplied MCP request metadata an
+	// agent cannot set, so this boolean is the caller-settable knob that unlocks
+	// the same cap.
+	LongWait bool `json:"long_wait,omitempty" jsonschema:"unlock the 7200s timeout cap WITHOUT a progressToken (default false = 600s cap). There is no keep-alive on this path, so your MCP client's own idle timeout may still cut the call short — but the wait holds no state and is resumable, so a cut-short call is a safe no-op to re-issue"`
 	// AllowUnknown bypasses the known-category validation (#1764) for a
 	// category legitimately absent from the curated registry. Default false:
 	// an unknown category is rejected up front (no wait armed) naming the
@@ -68,6 +73,15 @@ type AwaitAuditOutput struct {
 	WaitedSeconds       float64 `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
 	Message             string  `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses"`
 	PollIntervalSeconds int     `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
+	// Heartbeat reports whether the CLIENT supplied a progressToken and a
+	// per-tick keep-alive was therefore emitted (#2490). A false value is the
+	// operator's evidence their client does not supply one, so the raised cap is
+	// reachable only via long_wait. Present on every return path.
+	Heartbeat bool `json:"heartbeat" jsonschema:"true when your MCP client supplied a progressToken and a per-tick keep-alive was emitted; false means it did not (use long_wait to reach the raised timeout cap)"`
+	// TimeoutCapSeconds is the timeout cap actually applied to this call: 7200
+	// when long_wait or a progressToken was in effect, else 600 (#2490).
+	// Present on every return path.
+	TimeoutCapSeconds int `json:"timeout_cap_seconds" jsonschema:"the timeout cap actually applied to this call (600 by default, 7200 when long_wait or a progressToken was in effect)"`
 }
 
 // registerAwaitAudit wires the fishhawk_await_audit tool (#962): the
@@ -127,16 +141,27 @@ Inputs:
                       (default false).
   - since_sequence  — anchor; default 0 waits for the next entry of the
                       category regardless of history.
-  - timeout_seconds — default 360; cap 600 without a progressToken, 7200
-                      with one.
+  - long_wait       — unlock the 7200s cap from a tool call (default false).
+  - timeout_seconds — default 360; cap 600, or 7200 when long_wait=true OR a
+                      progressToken is present.
 
-Progress heartbeat (#1963): supply a progressToken to receive an MCP
-notifications/progress keep-alive once per poll tick (category + anchor +
-elapsed) AND to unlock the 7200s timeout cap — with the heartbeat resetting the
-client's idle clock, one call with timeout_seconds up to 7200 can wait out a
-full implement pass or review round. WITHOUT a token the 600s cap and the
-gapless re-arm contract are unchanged, and a client/transport per-call timeout
-may still cut a long call short (a safe no-op to re-issue).
+Raising the timeout cap (#1963, #2490): the default cap is 600s; it rises to
+7200s (2h) so one call can wait out a full implement pass or review round.
+There are two ways to reach the raised cap, and only one is settable from a
+tool call:
+
+  - long_wait:true — the REACHABLE knob. Set it plus timeout_seconds up to 7200.
+    There is no keep-alive on this path, so your MCP client's own idle timeout
+    may still cut the call short — a safe no-op to re-issue, since the wait holds
+    no state (the gapless re-arm contract is unchanged).
+  - a progressToken — this is MCP request metadata
+    supplied by your MCP client, not a tool input; you cannot set it from a tool
+    call, and whether your client sends one depends on the client
+    implementation. When present it also drives an MCP notifications/progress
+    keep-alive once per poll tick (category + anchor + elapsed) that resets the
+    client's idle clock. The response's heartbeat field reports whether yours did.
+
+WITHOUT either the 600s cap and the gapless re-arm contract are unchanged.
 
 The returned entry's payload is compact by default (#1727): oversized
 free-text — reviewer free_form prose and issue-context body/comments —
@@ -179,14 +204,17 @@ func (r *runResolver) awaitAudit(ctx context.Context, req *mcp.CallToolRequest, 
 
 	// Progress heartbeat (#1963): capture the client-supplied progressToken
 	// exactly as awaitReview / drive_run do (nil-guarding req and req.Params). A
-	// token unlocks the 7200s cap AND a per-tick keep-alive; a token-less call
-	// keeps the byte-identical 360/600 contract. Opt-in per the MCP spec: no
-	// token (or no session) => no emission.
+	// token unlocks the 7200s cap AND a per-tick keep-alive; long_wait unlocks the
+	// same cap from a tool call WITHOUT emitting (#2490); neither keeps the
+	// byte-identical 360/600 contract. Opt-in per the MCP spec: no token (or no
+	// session) => no emission — long_wait must NOT cause an emission.
 	var progToken any
 	if req != nil && req.Params != nil {
 		progToken = req.Params.GetProgressToken()
 	}
-	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, progToken != nil)
+	heartbeat := progToken != nil
+	capSeconds := effectiveAwaitCap(heartbeat, in.LongWait)
+	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, heartbeat, in.LongWait)
 	start := time.Now()
 
 	// Fast path: an entry may already exist. The endpoint is
@@ -198,13 +226,13 @@ func (r *runResolver) awaitAudit(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, AwaitAuditOutput{}, fmt.Errorf("list audit: %w", err)
 	}
 	if entry != nil {
-		return nil, awaitAuditFoundOutput(entry, in, cats, start), nil
+		return nil, awaitAuditFoundOutput(entry, in, cats, start, heartbeat, capSeconds), nil
 	}
 
 	// Nothing yet: check the run-terminal backstop once before the loop
 	// so a run that is already terminal at call time resolves without a
 	// poll tick (ADR-036 — the wait never strands past a dead run).
-	if out, done := r.awaitAuditRunTerminalBackstop(ctx, runID, in, cats, start); done {
+	if out, done := r.awaitAuditRunTerminalBackstop(ctx, runID, in, cats, start, heartbeat, capSeconds); done {
 		return nil, out, nil
 	}
 
@@ -221,7 +249,7 @@ func (r *runResolver) awaitAudit(ctx context.Context, req *mcp.CallToolRequest, 
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, awaitAuditTimeoutOutput(in, cats, timeout, start), nil
+			return nil, awaitAuditTimeoutOutput(in, cats, timeout, start, heartbeat, capSeconds), nil
 		case <-ticker.C:
 			// Best-effort progress heartbeat once per tick (opt-in): keeps a
 			// long wait from being aborted by the client's idle timeout. Emitted
@@ -243,14 +271,14 @@ func (r *runResolver) awaitAudit(ctx context.Context, req *mcp.CallToolRequest, 
 				// that is a timeout, not a transport failure — return
 				// the gapless re-arm point rather than an error.
 				if pollCtx.Err() != nil {
-					return nil, awaitAuditTimeoutOutput(in, cats, timeout, start), nil
+					return nil, awaitAuditTimeoutOutput(in, cats, timeout, start, heartbeat, capSeconds), nil
 				}
 				return nil, AwaitAuditOutput{}, fmt.Errorf("poll audit: %w", err)
 			}
 			if entry != nil {
-				return nil, awaitAuditFoundOutput(entry, in, cats, start), nil
+				return nil, awaitAuditFoundOutput(entry, in, cats, start, heartbeat, capSeconds), nil
 			}
-			if out, done := r.awaitAuditRunTerminalBackstop(pollCtx, runID, in, cats, start); done {
+			if out, done := r.awaitAuditRunTerminalBackstop(pollCtx, runID, in, cats, start, heartbeat, capSeconds); done {
 				return nil, out, nil
 			}
 		}
@@ -333,7 +361,7 @@ func (r *runResolver) nextAuditEntry(ctx context.Context, runID uuid.UUID, cats 
 // over the backstop. Returns (output, true) to resolve the wait; (zero,
 // false) to keep polling. Best-effort — a GetRun error or a non-terminal
 // run leaves the normal poll/timeout path in charge.
-func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID uuid.UUID, in AwaitAuditInput, cats []string, start time.Time) (AwaitAuditOutput, bool) {
+func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID uuid.UUID, in AwaitAuditInput, cats []string, start time.Time, heartbeat bool, capSeconds int) (AwaitAuditOutput, bool) {
 	runRow, err := r.api.GetRun(ctx, runID)
 	if err != nil || runRow == nil {
 		return AwaitAuditOutput{}, false
@@ -345,7 +373,7 @@ func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID u
 	// still resolves as found.
 	entry, err := r.nextAuditEntry(ctx, runID, cats, in.SinceSequence, in.AllowUnknown)
 	if err == nil && entry != nil {
-		return awaitAuditFoundOutput(entry, in, cats, start), true
+		return awaitAuditFoundOutput(entry, in, cats, start, heartbeat, capSeconds), true
 	}
 	// In-flight-review-aware (#1915): if the wait is on a review-verdict
 	// category (plan_reviewed / implement_reviewed) whose review is still in
@@ -359,9 +387,11 @@ func (r *runResolver) awaitAuditRunTerminalBackstop(ctx context.Context, runID u
 		return AwaitAuditOutput{}, false
 	}
 	return AwaitAuditOutput{
-		Status:         "run_terminal",
-		LatestSequence: in.SinceSequence,
-		WaitedSeconds:  time.Since(start).Seconds(),
+		Status:            "run_terminal",
+		LatestSequence:    in.SinceSequence,
+		WaitedSeconds:     time.Since(start).Seconds(),
+		Heartbeat:         heartbeat,
+		TimeoutCapSeconds: capSeconds,
 		Message: fmt.Sprintf("no %s entry with sequence > %d landed, and run %s has reached terminal state %q — "+
 			"the entry will most likely never land, so the wait resolved instead of holding the session open. "+
 			"Do not re-arm blindly: check fishhawk_get_run_status for the final run state first.",
@@ -412,14 +442,16 @@ func (r *runResolver) reviewCategoryInFlight(ctx context.Context, runID uuid.UUI
 // body/comments stripped unless the caller opted in — the shared
 // backend-fetched AuditEntry is never mutated. LatestSequence is read off
 // the entry before the copy, so the anchor semantics are unaffected.
-func awaitAuditFoundOutput(entry *AuditEntry, in AwaitAuditInput, _ []string, start time.Time) AwaitAuditOutput {
+func awaitAuditFoundOutput(entry *AuditEntry, in AwaitAuditInput, _ []string, start time.Time, heartbeat bool, capSeconds int) AwaitAuditOutput {
 	projected := *entry
 	projected.Payload = compactAuditPayload(entry.Payload, !in.IncludeIssueContext, !in.IncludeReviewProse)
 	return AwaitAuditOutput{
-		Status:         "found",
-		Entry:          &projected,
-		LatestSequence: entry.Sequence,
-		WaitedSeconds:  time.Since(start).Seconds(),
+		Status:            "found",
+		Entry:             &projected,
+		LatestSequence:    entry.Sequence,
+		WaitedSeconds:     time.Since(start).Seconds(),
+		Heartbeat:         heartbeat,
+		TimeoutCapSeconds: capSeconds,
 	}
 }
 
@@ -451,7 +483,7 @@ func categoriesDisplay(cats []string) string {
 // error. LatestSequence == since_sequence (nothing past the anchor was
 // observed — anything observed would have resolved as found), so re-arming
 // from it cannot skip an entry.
-func awaitAuditTimeoutOutput(in AwaitAuditInput, cats []string, timeout int, start time.Time) AwaitAuditOutput {
+func awaitAuditTimeoutOutput(in AwaitAuditInput, cats []string, timeout int, start time.Time, heartbeat bool, capSeconds int) AwaitAuditOutput {
 	return AwaitAuditOutput{
 		Status: "timeout",
 		// LatestSequence == the shared since_sequence anchor: nothing past
@@ -464,6 +496,8 @@ func awaitAuditTimeoutOutput(in AwaitAuditInput, cats []string, timeout int, sta
 		LatestSequence:      in.SinceSequence,
 		WaitedSeconds:       time.Since(start).Seconds(),
 		PollIntervalSeconds: suggestedReviewPollIntervalSeconds,
+		Heartbeat:           heartbeat,
+		TimeoutCapSeconds:   capSeconds,
 		Message: fmt.Sprintf("no %s entry with sequence > %d landed within %ds. The wait holds nothing: re-call "+
 			"fishhawk_await_audit with since_sequence=%d to resume it with no gap, or poll fishhawk_get_run_status "+
 			"every %ds (the authoritative path).",

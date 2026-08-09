@@ -261,9 +261,14 @@ whereas this blocking call holds the session. Reach for run_stage on an
 implement stage only as the compact one-shot when a mid-stage amendment is
 impossible.
 
-Runner output streams as MCP progress notifications ONLY when the
-client supplies a progressToken on the call (opt-in per the MCP
-spec).
+Runner output streams as MCP progress notifications only when a
+progressToken is present on the call. progressToken is MCP request
+metadata supplied by your MCP client, not a tool input — you cannot
+set it from a tool call, so whether live streaming is available is a
+property of your client, not a knob you can reach. The durable signal
+is unaffected either way: every runner event is returned post-hoc in
+the result's events list (set verbose:true for the full list) and in
+the audit log and signed trace bundle regardless.
 
 The final tool result is COMPACT by default: the routine
 stage_progress heartbeats are dropped from the events list (their
@@ -280,9 +285,11 @@ During execution the runner emits periodic stage_progress
 heartbeats (~every 15s) carrying the turn count, elapsed time,
 tokens-so-far, and last event kind, so the driver can distinguish a
 progressing stage from a stalled one (the counters keep ticking on
-elapsed even when turns/tokens stall). With a progressToken these
-arrive live as progress notifications for the operator/client
-watching the run. This is NOT a live mid-call early-cancel signal
+elapsed even when turns/tokens stall). When a progressToken is present
+these arrive live as progress notifications for the operator/client
+watching the run — but progressToken is client-supplied MCP request
+metadata a tool-calling caller cannot set, so treat live arrival as a
+client-dependent bonus, not a knob you can reach. This is NOT a live mid-call early-cancel signal
 for the synchronously-blocked driving agent — the agent sees the
 heartbeats only after the call returns (and as groundwork for a
 future async run_stage).

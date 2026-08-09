@@ -312,12 +312,15 @@ stopped; next_actions names the legal moves at a decision. merge is
 queued-not-landed, so merged is reported only after the webhook-settled
 terminal run state.
 
-Supply a progressToken on the call to receive a keep-alive heartbeat: the
-driver emits an MCP notifications/progress update once per poll iteration
-(run state + earliest non-terminal stage + steps taken + elapsed seconds), so
-a >30-min drive is not aborted by the client's idle timeout. Progress is
-opt-in per the MCP spec — no token means no heartbeat (the return is still
-resumable). At a parked approval gate the driver waits for the stage's
+The driver emits a keep-alive heartbeat — an MCP notifications/progress update
+once per poll iteration (run state + earliest non-terminal stage + steps taken +
+elapsed seconds) — only when a progressToken is present on the call.
+progressToken is MCP request metadata
+supplied by your MCP client, not a tool input a tool-calling caller can set,
+so whether the heartbeat is emitted depends
+on your client. When it is not, the drive is still fully resumable — re-invoke
+with the same run_id — which is the mechanism that makes a >30-min drive safe
+without the heartbeat. At a parked approval gate the driver waits for the stage's
 advisory agent reviews to settle before calling the gate, so a delegated
 approve fires only on settled reviews. A parked implement stage
 (awaiting_host_dispatch) after a delegated plan approval is AUTO-DISPATCHED by

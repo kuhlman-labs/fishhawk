@@ -660,6 +660,18 @@ func TestAwaitAudit_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
 	}
+	// The supplied-progressToken result must report heartbeat=true and the
+	// raised 7200s cap (#2490).
+	if raw, merr := json.Marshal(res.StructuredContent); merr != nil {
+		t.Fatalf("marshal StructuredContent: %v", merr)
+	} else {
+		if !strings.Contains(string(raw), `"heartbeat":true`) {
+			t.Errorf("supplied-token result should report heartbeat=true; got %s", raw)
+		}
+		if !strings.Contains(string(raw), `"timeout_cap_seconds":7200`) {
+			t.Errorf("supplied-token result should report timeout_cap_seconds=7200; got %s", raw)
+		}
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -740,11 +752,80 @@ func TestAwaitAudit_ProgressHeartbeat_NoToken_NoEmission(t *testing.T) {
 	if !strings.Contains(string(raw), `"status":"found"`) {
 		t.Errorf("no-token result should still resolve found; got %s", raw)
 	}
+	// No token and no long_wait: heartbeat=false and the unchanged 600s cap (#2490).
+	if !strings.Contains(string(raw), `"heartbeat":false`) {
+		t.Errorf("no-token result should report heartbeat=false; got %s", raw)
+	}
+	if !strings.Contains(string(raw), `"timeout_cap_seconds":600`) {
+		t.Errorf("no-token result should report timeout_cap_seconds=600; got %s", raw)
+	}
 	time.Sleep(50 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
 	if notes != 0 {
 		t.Errorf("received %d progress notifications with no progressToken; want 0 (opt-in)", notes)
+	}
+}
+
+// TestAwaitAudit_LongWait_NoToken_RaisesCapNoEmission is the #2490 reachability
+// proof at the real MCP boundary for the audit tool: a CallTool that sets
+// long_wait:true but supplies NO progressToken reports the raised 7200s cap with
+// heartbeat=false and receives ZERO progress notifications. The counterfactual
+// vehicle for c2 and c4 on the audit surface.
+func TestAwaitAudit_LongWait_NoToken_RaisesCapNoEmission(t *testing.T) {
+	ctx := context.Background()
+	_, r, runID := awaitAuditHeartbeatFake(t, 2)
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitAudit(server, r)
+
+	var mu sync.Mutex
+	var notes int
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, _ *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			notes++
+			mu.Unlock()
+		},
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	// long_wait:true, NO SetProgressToken.
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_await_audit",
+		Arguments: map[string]any{"run_id": runID.String(), "category": "implement_reviewed", "timeout_seconds": 5, "long_wait": true},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	raw, merr := json.Marshal(res.StructuredContent)
+	if merr != nil {
+		t.Fatalf("marshal StructuredContent: %v", merr)
+	}
+	if !strings.Contains(string(raw), `"timeout_cap_seconds":7200`) {
+		t.Errorf("long_wait result should report the raised timeout_cap_seconds=7200; got %s", raw)
+	}
+	if !strings.Contains(string(raw), `"heartbeat":false`) {
+		t.Errorf("long_wait-without-token result should report heartbeat=false; got %s", raw)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if notes != 0 {
+		t.Errorf("received %d progress notifications with long_wait and no progressToken; want 0 (long_wait must never emit against a token that does not exist)", notes)
 	}
 }
 

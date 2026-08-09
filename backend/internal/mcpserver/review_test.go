@@ -588,10 +588,12 @@ func TestAwaitReview_TimeoutClamped(t *testing.T) {
 	}
 }
 
-// TestClampAwaitTimeoutHeartbeat pins the token-conditional cap (#1963): with
-// heartbeat=false the clamp is BYTE-IDENTICAL to clampAwaitTimeout (the
-// token-less / fishhawk_merge_run contract is unchanged), and with
-// heartbeat=true the default stays 360 while the cap rises to 7200.
+// TestClampAwaitTimeoutHeartbeat pins the token-OR-long_wait cap (#1963, #2490)
+// across all five enumerated regimes (m1–m5). The raised 7200s cap applies when
+// EITHER a progressToken heartbeat is present OR long_wait is set; neither keeps
+// the byte-identical 360 default / 600 cap that fishhawk_merge_run's
+// clampAwaitTimeout call sites depend on. The non-positive -> 360 default is
+// unchanged in every regime.
 func TestClampAwaitTimeoutHeartbeat(t *testing.T) {
 	if awaitHeartbeatTimeoutMax != 7200 {
 		t.Fatalf("awaitHeartbeatTimeoutMax = %d, want 7200", awaitHeartbeatTimeoutMax)
@@ -600,31 +602,60 @@ func TestClampAwaitTimeoutHeartbeat(t *testing.T) {
 		name      string
 		n         int
 		heartbeat bool
+		longWait  bool
 		want      int
 	}{
-		// heartbeat=false is byte-identical to clampAwaitTimeout (600 cap).
-		{"no-hb default", 0, false, 360},
-		{"no-hb over-cap clamps to 600", 99999, false, 600},
-		{"no-hb passthrough", 45, false, 45},
-		// heartbeat=true keeps the 360 default but raises the cap to 7200.
-		{"hb default", 0, true, 360},
-		{"hb passthrough above old cap", 601, true, 601},
-		{"hb at new cap", 7200, true, 7200},
-		{"hb over new cap clamps to 7200", 99999, true, 7200},
+		// (m1) neither opt-in: byte-identical to clampAwaitTimeout (600 cap).
+		{"m1 no-hb no-lw over-cap clamps to 600", 9999, false, false, 600},
+		{"neither passthrough", 45, false, false, 45},
+		// (m2) long_wait alone raises the cap to 7200 (the #2490 reachable knob).
+		{"m2 lw-only over-cap clamps to 7200", 9999, false, true, 7200},
+		{"m2 lw-only passthrough above old cap", 601, false, true, 601},
+		// (m3) progressToken alone raises the cap to 7200.
+		{"m3 hb-only over-cap clamps to 7200", 9999, true, false, 7200},
+		// (m4) both set: no double-widening — still 7200, no interaction bug.
+		{"m4 both over-cap clamps to 7200", 9999, true, true, 7200},
+		{"m4 both at new cap", 7200, true, true, 7200},
+		// (m5) non-positive -> 360 default in EACH of the four regimes.
+		{"m5 default neither", 0, false, false, 360},
+		{"m5 default lw-only", 0, false, true, 360},
+		{"m5 default hb-only", 0, true, false, 360},
+		{"m5 default both", -1, true, true, 360},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := clampAwaitTimeoutHeartbeat(tc.n, tc.heartbeat); got != tc.want {
-				t.Errorf("clampAwaitTimeoutHeartbeat(%d, %v) = %d, want %d", tc.n, tc.heartbeat, got, tc.want)
+			if got := clampAwaitTimeoutHeartbeat(tc.n, tc.heartbeat, tc.longWait); got != tc.want {
+				t.Errorf("clampAwaitTimeoutHeartbeat(%d, %v, %v) = %d, want %d", tc.n, tc.heartbeat, tc.longWait, got, tc.want)
 			}
-			// The heartbeat=false branch must exactly mirror clampAwaitTimeout so
+			// The neither-opt-in branch must exactly mirror clampAwaitTimeout so
 			// the token-less / merge_run cap can never silently diverge.
-			if !tc.heartbeat {
-				if got, want := clampAwaitTimeoutHeartbeat(tc.n, false), clampAwaitTimeout(tc.n); got != want {
-					t.Errorf("heartbeat=false diverged from clampAwaitTimeout for %d: %d vs %d", tc.n, got, want)
+			if !tc.heartbeat && !tc.longWait {
+				if got, want := clampAwaitTimeoutHeartbeat(tc.n, false, false), clampAwaitTimeout(tc.n); got != want {
+					t.Errorf("neither-opt-in diverged from clampAwaitTimeout for %d: %d vs %d", tc.n, got, want)
 				}
 			}
 		})
+	}
+}
+
+// TestEffectiveAwaitCap pins the cap disjunction directly (#2490): 7200 when
+// either signal is set, 600 when neither. This is the seam counterfactual c2
+// deletes (the `|| longWait` disjunct).
+func TestEffectiveAwaitCap(t *testing.T) {
+	cases := []struct {
+		heartbeat bool
+		longWait  bool
+		want      int
+	}{
+		{false, false, awaitReviewTimeoutMax},   // 600
+		{false, true, awaitHeartbeatTimeoutMax}, // 7200 — the reachable knob
+		{true, false, awaitHeartbeatTimeoutMax}, // 7200
+		{true, true, awaitHeartbeatTimeoutMax},  // 7200
+	}
+	for _, tc := range cases {
+		if got := effectiveAwaitCap(tc.heartbeat, tc.longWait); got != tc.want {
+			t.Errorf("effectiveAwaitCap(%v, %v) = %d, want %d", tc.heartbeat, tc.longWait, got, tc.want)
+		}
 	}
 }
 
@@ -709,6 +740,18 @@ func TestAwaitReview_ProgressHeartbeat_RealMCPBoundary(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
 	}
+	// The supplied-progressToken result must report heartbeat=true and the
+	// raised 7200s cap (#2490).
+	if raw, merr := json.Marshal(res.StructuredContent); merr != nil {
+		t.Fatalf("marshal StructuredContent: %v", merr)
+	} else {
+		if !strings.Contains(string(raw), `"heartbeat":true`) {
+			t.Errorf("supplied-token result should report heartbeat=true; got %s", raw)
+		}
+		if !strings.Contains(string(raw), `"timeout_cap_seconds":7200`) {
+			t.Errorf("supplied-token result should report timeout_cap_seconds=7200; got %s", raw)
+		}
+	}
 
 	// Notifications are delivered async; wait for all wantHeartbeats to flush.
 	deadline := time.Now().Add(2 * time.Second)
@@ -789,11 +832,84 @@ func TestAwaitReview_ProgressHeartbeat_NoToken_NoEmission(t *testing.T) {
 	if !strings.Contains(string(raw), `"status":"complete"`) {
 		t.Errorf("no-token result should still resolve complete; got %s", raw)
 	}
+	// No token and no long_wait: heartbeat=false and the unchanged 600s cap (#2490).
+	if !strings.Contains(string(raw), `"heartbeat":false`) {
+		t.Errorf("no-token result should report heartbeat=false; got %s", raw)
+	}
+	if !strings.Contains(string(raw), `"timeout_cap_seconds":600`) {
+		t.Errorf("no-token result should report timeout_cap_seconds=600; got %s", raw)
+	}
 	time.Sleep(50 * time.Millisecond)
 	mu.Lock()
 	defer mu.Unlock()
 	if notes != 0 {
 		t.Errorf("received %d progress notifications with no progressToken; want 0 (opt-in)", notes)
+	}
+}
+
+// TestAwaitReview_LongWait_NoToken_RaisesCapNoEmission is the #2490 reachability
+// proof at the real MCP boundary: a CallTool that sets long_wait:true but
+// supplies NO progressToken reports the raised 7200s cap with heartbeat=false
+// and receives ZERO progress notifications — long_wait widens the cap without
+// ever emitting against a token that does not exist. This is the counterfactual
+// vehicle for c2 (the `|| longWait` disjunct) and c4 (the progToken != nil
+// emission guard).
+func TestAwaitReview_LongWait_NoToken_RaisesCapNoEmission(t *testing.T) {
+	ctx := context.Background()
+	// Timeout is small so the fast path resolves complete quickly; the cap
+	// reported is effectiveAwaitCap, independent of the elapsed wait.
+	_, r, runID := awaitReviewHeartbeatFake(t, 2)
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitReview(server, r)
+
+	var mu sync.Mutex
+	var notes int
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, _ *mcp.ProgressNotificationClientRequest) {
+			mu.Lock()
+			notes++
+			mu.Unlock()
+		},
+	})
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	// long_wait:true, NO SetProgressToken.
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_await_review",
+		Arguments: map[string]any{"run_id": runID.String(), "stage": "implement", "timeout_seconds": 5, "long_wait": true},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	raw, merr := json.Marshal(res.StructuredContent)
+	if merr != nil {
+		t.Fatalf("marshal StructuredContent: %v", merr)
+	}
+	if !strings.Contains(string(raw), `"timeout_cap_seconds":7200`) {
+		t.Errorf("long_wait result should report the raised timeout_cap_seconds=7200; got %s", raw)
+	}
+	if !strings.Contains(string(raw), `"heartbeat":false`) {
+		t.Errorf("long_wait-without-token result should report heartbeat=false; got %s", raw)
+	}
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if notes != 0 {
+		t.Errorf("received %d progress notifications with long_wait and no progressToken; want 0 (long_wait must never emit against a token that does not exist)", notes)
 	}
 }
 
@@ -930,7 +1046,7 @@ func TestAwaitRunTerminalBackstop_NoReviewInFlight_ResolvesEarly(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	st := &ReviewStatus{Stage: "plan", Status: "none"}
-	out, done, tif := r.awaitRunTerminalBackstop(context.Background(), runID, "plan", st, time.Now())
+	out, done, tif := r.awaitRunTerminalBackstop(context.Background(), runID, "plan", st, time.Now(), false, awaitReviewTimeoutMax)
 	if !done {
 		t.Fatal("backstop should resolve early on a terminal run with no review in flight")
 	}
@@ -939,6 +1055,13 @@ func TestAwaitRunTerminalBackstop_NoReviewInFlight_ResolvesEarly(t *testing.T) {
 	}
 	if !strings.Contains(out.Message, "can no longer progress") {
 		t.Errorf("early-resolve message should explain the review can no longer progress: %q", out.Message)
+	}
+	// The observed regime is carried on the early-resolve path too (#2490).
+	if out.Heartbeat {
+		t.Error("Heartbeat should be false (no token passed)")
+	}
+	if out.TimeoutCapSeconds != awaitReviewTimeoutMax {
+		t.Errorf("TimeoutCapSeconds = %d, want %d", out.TimeoutCapSeconds, awaitReviewTimeoutMax)
 	}
 }
 
@@ -954,7 +1077,7 @@ func TestAwaitRunTerminalBackstop_InFlightReview_KeepsPolling(t *testing.T) {
 	r := newResolver(srv, nil)
 
 	st := &ReviewStatus{Stage: "implement", Status: "pending"}
-	_, done, tif := r.awaitRunTerminalBackstop(context.Background(), runID, "implement", st, time.Now())
+	_, done, tif := r.awaitRunTerminalBackstop(context.Background(), runID, "implement", st, time.Now(), false, awaitReviewTimeoutMax)
 	if done {
 		t.Fatal("backstop must NOT resolve early while a review is in flight on a terminal run (#1915)")
 	}
