@@ -2491,6 +2491,108 @@ func TestStageWaitDescriptions_NameCurrentTasksBlocker(t *testing.T) {
 	}
 }
 
+// TestProgressTokenDescriptions_DisclaimClientSupplied is the #2490 done-means
+// test: it asserts the WIRE-VISIBLE descriptions of the four progressToken-
+// citing tools no longer use the caller-imperative "supply a progressToken"
+// phrasing (which sent the reporting operator hunting for a parameter that does
+// not exist) and instead carry the client-supplied disclaimer. For the two
+// await tools it additionally asserts (a) the description names the reachable
+// long_wait knob and the raised 7200 cap, and (b) — binding condition 1 — the
+// WIRE-VISIBLE ListTools INPUT SCHEMA advertises long_wait as a boolean
+// property with a non-empty description, so a tool-calling client can actually
+// discover it. A comment-only or no-op touch of a description site, or a missing
+// jsonschema tag on the input field, fails this test.
+func TestProgressTokenDescriptions_DisclaimClientSupplied(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	descByName := make(map[string]string, len(res.Tools))
+	schemaByName := make(map[string]any, len(res.Tools))
+	for _, tool := range res.Tools {
+		descByName[tool.Name] = tool.Description
+		schemaByName[tool.Name] = tool.InputSchema
+	}
+
+	// All four progressToken-citing tools: no caller-imperative phrasing, plus
+	// the client-supplied disclaimer marker.
+	all := []string{"fishhawk_await_review", "fishhawk_await_audit", "fishhawk_run_stage", "fishhawk_drive_run"}
+	for _, name := range all {
+		desc, ok := descByName[name]
+		if !ok || desc == "" {
+			t.Errorf("%s: not registered/visible over ListTools", name)
+			continue
+		}
+		lower := strings.ToLower(desc)
+		if strings.Contains(lower, "supply a progresstoken") {
+			t.Errorf("%s: description still uses the caller-imperative %q phrasing (progressToken is not a tool input):\n%s", name, "supply a progressToken", desc)
+		}
+		if !strings.Contains(lower, "supplied by your mcp client") {
+			t.Errorf("%s: description missing the %q disclaimer marker:\n%s", name, "supplied by your MCP client", desc)
+		}
+		if !strings.Contains(lower, "not a tool input") {
+			t.Errorf("%s: description missing the %q disclaimer marker:\n%s", name, "not a tool input", desc)
+		}
+	}
+
+	// The two await tools: description names the reachable long_wait knob and
+	// the raised 7200 cap.
+	awaits := []string{"fishhawk_await_review", "fishhawk_await_audit"}
+	for _, name := range awaits {
+		desc := descByName[name]
+		if !strings.Contains(desc, "long_wait") {
+			t.Errorf("%s: description must name the reachable long_wait knob:\n%s", name, desc)
+		}
+		if !strings.Contains(desc, "7200") {
+			t.Errorf("%s: description must name the reachable 7200 cap:\n%s", name, desc)
+		}
+	}
+
+	// Binding condition 1: the WIRE-VISIBLE input schema advertises long_wait as
+	// a boolean with a non-empty description, so a tool-calling client can
+	// discover it — not merely deserialize it when already known.
+	for _, name := range awaits {
+		schema := schemaByName[name]
+		schemaMap, ok := schema.(map[string]any)
+		if !ok {
+			t.Fatalf("%s: registered InputSchema is %T, want a JSON object map", name, schema)
+		}
+		props, ok := schemaMap["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: schema has no properties object; got %v", name, schemaMap["properties"])
+		}
+		lw, ok := props["long_wait"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: long_wait property missing from the advertised input schema — a tool-calling client cannot discover it", name)
+		}
+		if typ, _ := lw["type"].(string); typ != "boolean" {
+			t.Errorf("%s: long_wait schema type = %q, want boolean", name, typ)
+		}
+		if desc, _ := lw["description"].(string); strings.TrimSpace(desc) == "" {
+			t.Errorf("%s: long_wait schema description is empty; want a non-empty description", name)
+		}
+	}
+}
+
 // --- get_plan (E19.4 / #344) ---
 
 // samplePlanContent returns a small but complete standard_v1

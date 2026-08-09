@@ -514,15 +514,16 @@ const (
 	awaitReviewTimeoutMax     = 600
 )
 
-// awaitHeartbeatTimeoutMax is the timeout cap that applies ONLY when the
-// caller supplied a progressToken (#1963). With a progress heartbeat resetting
-// the client's idle clock (the run_stage/run_children/drive_run pattern), one
-// call can wait out a full implement pass — the 50-minute implement budget plus
-// review rounds and CI-gated merge latency — in 7200s (2h). The cap is
-// token-CONDITIONAL on purpose: without a keep-alive the client's own idle
-// timeout would cut a long synchronous call short anyway, so a long token-less
-// wait is a footgun (it holds the MCP session open with nothing keeping the
-// client from timing out), not a feature. A token-less call therefore keeps the
+// awaitHeartbeatTimeoutMax is the RAISED timeout cap (7200s / 2h), reachable
+// two ways (#1963, #2490): a client-supplied progressToken (whose heartbeat
+// resets the client's idle clock), OR the caller-set long_wait input. With a
+// full 2h window one call can wait out a full implement pass — the 50-minute
+// implement budget plus review rounds and CI-gated merge latency. The
+// progressToken path is client metadata a tool-calling agent cannot set (#2490),
+// so long_wait exists to make the raised cap REACHABLE from a tool call. The
+// tradeoff on the long_wait path is explicit: with no keep-alive the client's
+// own idle timeout may still cut the call short — a safe no-op because the wait
+// holds no state and is resumable. A call opting into neither keeps the
 // unchanged 600s cap via clampAwaitTimeout.
 const awaitHeartbeatTimeoutMax = 7200
 
@@ -530,7 +531,12 @@ const awaitHeartbeatTimeoutMax = 7200
 type AwaitReviewInput struct {
 	RunID          string `json:"run_id" jsonschema:"the Fishhawk run UUID"`
 	Stage          string `json:"stage" jsonschema:"which review to wait on: 'plan' or 'implement'"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'pending' (default 360). Cap is token-conditional: 600 without a progressToken, 7200 when a progressToken is supplied (the heartbeat keeps the client's idle clock alive). On timeout the call returns pending + poll_interval_seconds; re-call to resume the wait"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"how long to wait before returning 'pending' (default 360). Cap is 600 by default, raised to 7200 when long_wait=true OR your MCP client supplied a progressToken. On timeout the call returns pending + poll_interval_seconds; re-call to resume the wait"`
+	// LongWait makes the raised 7200s timeout cap REACHABLE from a tool call
+	// (#2490): the progressToken path is client-supplied MCP request metadata an
+	// agent cannot set, so this boolean is the caller-settable knob that unlocks
+	// the same cap.
+	LongWait bool `json:"long_wait,omitempty" jsonschema:"unlock the 7200s timeout cap WITHOUT a progressToken (default false = 600s cap). There is no keep-alive on this path, so your MCP client's own idle timeout may still cut the call short — but the wait holds no state and is resumable, so a cut-short call is a safe no-op to re-issue"`
 }
 
 // AwaitReviewOutput is the fishhawk_await_review response. Status mirrors
@@ -549,6 +555,16 @@ type AwaitReviewOutput struct {
 	// (or an agent switching to fishhawk_get_run_status polling) uses the
 	// server cadence rather than guessing. Omitted on a terminal result.
 	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for the resumable re-call or for switching to fishhawk_get_run_status polling; present only on a pending-after-timeout result"`
+	// Heartbeat reports whether the CLIENT supplied a progressToken and a
+	// per-tick keep-alive was therefore emitted (#2490). It is the operator's
+	// evidence of which regime they got: a false value means their client does
+	// not supply a progressToken, so the raised cap is reachable only via
+	// long_wait. Present on every return path.
+	Heartbeat bool `json:"heartbeat" jsonschema:"true when your MCP client supplied a progressToken and a per-tick keep-alive was emitted; false means it did not (use long_wait to reach the raised timeout cap)"`
+	// TimeoutCapSeconds is the timeout cap actually applied to this call: 7200
+	// when long_wait or a progressToken was in effect, else 600 (#2490).
+	// Present on every return path.
+	TimeoutCapSeconds int `json:"timeout_cap_seconds" jsonschema:"the timeout cap actually applied to this call (600 by default, 7200 when long_wait or a progressToken was in effect)"`
 }
 
 // clampAwaitTimeout applies the default + cap. Non-positive falls back to
@@ -564,23 +580,35 @@ func clampAwaitTimeout(n int) int {
 	return n
 }
 
-// clampAwaitTimeoutHeartbeat is the heartbeat-aware timeout clamp (#1963).
-// When heartbeat is false it delegates to the UNCHANGED clampAwaitTimeout, so
-// token-less await callers — and fishhawk_merge_run's two clampAwaitTimeout
-// call sites, which never opt in — keep today's 360 default / 600 cap
-// byte-identical. When heartbeat is true a progressToken keep-alive is present
-// to reset the client's idle clock, so the default stays 360 but the cap rises
-// to awaitHeartbeatTimeoutMax (7200s), letting one call wait out a full
-// implement pass or review round.
-func clampAwaitTimeoutHeartbeat(n int, heartbeat bool) int {
-	if !heartbeat {
-		return clampAwaitTimeout(n)
+// effectiveAwaitCap returns the timeout cap that applies to an await call
+// (#1963, #2490): the raised awaitHeartbeatTimeoutMax (7200s) when EITHER a
+// progressToken keep-alive is present (heartbeat) OR the caller opted in via
+// long_wait, and the unchanged awaitReviewTimeoutMax (600s) otherwise. The
+// disjunction is the whole point of #2490: the progressToken path is client
+// metadata a tool-calling agent cannot set, so long_wait must independently
+// unlock the same cap. A call opting into neither keeps today's 600s cap.
+func effectiveAwaitCap(heartbeat, longWait bool) int {
+	if heartbeat || longWait {
+		return awaitHeartbeatTimeoutMax
 	}
+	return awaitReviewTimeoutMax
+}
+
+// clampAwaitTimeoutHeartbeat is the heartbeat/long_wait-aware timeout clamp
+// (#1963, #2490). The non-positive -> default (360s) branch is unchanged in
+// EVERY regime. A positive value is clamped against effectiveAwaitCap, so it is
+// byte-identical to clampAwaitTimeout when neither heartbeat nor long_wait is
+// set — keeping token-less await callers and fishhawk_merge_run's two
+// clampAwaitTimeout call sites on today's 360 default / 600 cap — and clamps to
+// 7200s when either is set, letting one call wait out a full implement pass or
+// review round.
+func clampAwaitTimeoutHeartbeat(n int, heartbeat, longWait bool) int {
 	if n <= 0 {
 		return awaitReviewTimeoutDefault
 	}
-	if n > awaitHeartbeatTimeoutMax {
-		return awaitHeartbeatTimeoutMax
+	capSeconds := effectiveAwaitCap(heartbeat, longWait)
+	if n > capSeconds {
+		return capSeconds
 	}
 	return n
 }
@@ -620,24 +648,37 @@ Idempotent / resumable: a timeout returns status "pending" plus
 poll_interval_seconds; the wait holds nothing — re-call to resume it, or
 switch to fishhawk_get_run_status polling.
 
-Progress heartbeat (#1963): supply a progressToken to receive an MCP
-notifications/progress keep-alive once per poll tick (stage + elapsed) AND to
-unlock the 7200s timeout cap — with the heartbeat resetting the client's idle
-clock, one call with timeout_seconds up to 7200 can wait out a full implement
-pass or review round. WITHOUT a token the 600s cap and the resumable-timeout
-re-arm contract are unchanged: the default is a long (360s) synchronous call
-with no keep-alive, so a client/transport per-call timeout may still cut it
-short — that is fine because poll-the-handle is the blessed primary path and a
-cut-short await is a no-op you can re-issue.
+Raising the timeout cap (#1963, #2490): the default cap is 600s; it rises to
+7200s (2h) so one call can wait out a full implement pass or review round.
+There are two ways to reach the raised cap, and only one is settable from a
+tool call:
+
+  - long_wait:true — the REACHABLE knob. Set it plus timeout_seconds up to 7200.
+    There is no keep-alive on this path, so your MCP client's own idle timeout
+    may still cut the call short — that is fine because poll-the-handle is the
+    blessed primary path and a cut-short await is a no-op you can re-issue (the
+    wait holds no state).
+  - a progressToken — this is MCP request metadata
+    supplied by your MCP client, not a tool input; you cannot set it from a tool
+    call, and whether your client sends one depends on the client
+    implementation. When present it also drives an MCP notifications/progress
+    keep-alive once per poll tick (stage + elapsed) that resets the client's idle
+    clock. The response's heartbeat field reports whether yours did.
+
+WITHOUT either the 600s cap and the resumable-timeout re-arm contract are
+unchanged: the default is a long (360s) synchronous call with no keep-alive.
 
 Inputs:
   - run_id          (required) — Fishhawk run UUID.
   - stage           (required) — "plan" or "implement".
-  - timeout_seconds — default 360; cap 600 without a progressToken, 7200 with
-                      one.
+  - long_wait       — unlock the 7200s cap from a tool call (default false).
+  - timeout_seconds — default 360; cap 600, or 7200 when long_wait=true OR a
+                      progressToken is present.
 
 Response: {stage, status, reviews[], waited_seconds, message,
-poll_interval_seconds}. A "failed" status is a definite terminal state: the
+poll_interval_seconds, heartbeat, timeout_cap_seconds}. heartbeat reports
+whether your client supplied a progressToken (a per-tick keep-alive was
+emitted); timeout_cap_seconds is the cap actually applied. A "failed" status is a definite terminal state: the
 reviewer errored or timed out (e.g. it hit FISHHAWKD_PLAN_REVIEW_TIMEOUT)
 and a terminal *_review_failed audit entry was written — reviews[] carries
 the failure reason. A "pending" status after the timeout means the review is
@@ -690,7 +731,7 @@ func runStateIsTerminal(state string) bool {
 // marker exists (#600) with fewer than the configured verdicts landed. The fast-
 // path statuses (none/skipped/failed/complete) never reach this backstop — the
 // caller only invokes it on 'pending'.
-func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.UUID, stage string, st *ReviewStatus, start time.Time) (AwaitReviewOutput, bool, bool) {
+func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.UUID, stage string, st *ReviewStatus, start time.Time, heartbeat bool, timeoutCap int) (AwaitReviewOutput, bool, bool) {
 	runRow, err := r.api.GetRun(ctx, runID)
 	if err != nil || runRow == nil {
 		return AwaitReviewOutput{}, false, false
@@ -705,10 +746,12 @@ func (r *runResolver) awaitRunTerminalBackstop(ctx context.Context, runID uuid.U
 	}
 	// Terminal run, no review in flight — resolve early (#874).
 	return AwaitReviewOutput{
-		Stage:         stage,
-		Status:        st.Status,
-		Reviews:       st.Reviews,
-		WaitedSeconds: time.Since(start).Seconds(),
+		Stage:             stage,
+		Status:            st.Status,
+		Reviews:           st.Reviews,
+		WaitedSeconds:     time.Since(start).Seconds(),
+		Heartbeat:         heartbeat,
+		TimeoutCapSeconds: timeoutCap,
 		Message: fmt.Sprintf("%s review is %q and run %s has reached terminal state %q with no review in flight — "+
 			"the review can no longer progress, so the wait resolved instead of holding the "+
 			"session open. Poll fishhawk_get_run_status for the final run state.",
@@ -728,14 +771,17 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 
 	// Progress heartbeat (#1963): capture the client-supplied progressToken
 	// exactly as drive_run.go does (nil-guarding req and req.Params). A token
-	// unlocks the 7200s cap AND a per-tick keep-alive; a token-less call keeps
-	// the byte-identical 360/600 contract. MCP progress is opt-in per spec: no
-	// token (or no session) => no emission.
+	// unlocks the 7200s cap AND a per-tick keep-alive; long_wait unlocks the same
+	// cap from a tool call WITHOUT emitting (#2490); neither keeps the
+	// byte-identical 360/600 contract. MCP progress is opt-in per spec: no token
+	// (or no session) => no emission — long_wait must NOT cause an emission.
 	var progToken any
 	if req != nil && req.Params != nil {
 		progToken = req.Params.GetProgressToken()
 	}
-	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, progToken != nil)
+	heartbeat := progToken != nil
+	capSeconds := effectiveAwaitCap(heartbeat, in.LongWait)
+	timeout := clampAwaitTimeoutHeartbeat(in.TimeoutSeconds, heartbeat, in.LongWait)
 	start := time.Now()
 
 	// Fast path: terminal / none returns immediately without polling.
@@ -744,7 +790,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 		return nil, AwaitReviewOutput{}, fmt.Errorf("review status: %w", err)
 	}
 	if st.Status != "pending" {
-		return nil, r.awaitTerminalOutput(in.Stage, st, start), nil
+		return nil, r.awaitTerminalOutput(in.Stage, st, start, heartbeat, capSeconds), nil
 	}
 
 	// Pending: poll until a terminal entry lands, the run itself goes
@@ -760,7 +806,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 	// Terminality is captured HERE (with a live context) rather than re-queried
 	// at timeout, where the poll context is already cancelled.
 	terminalInFlight := false
-	if out, done, tif := r.awaitRunTerminalBackstop(ctx, runID, in.Stage, st, start); done {
+	if out, done, tif := r.awaitRunTerminalBackstop(ctx, runID, in.Stage, st, start, heartbeat, capSeconds); done {
 		return nil, out, nil
 	} else if tif {
 		terminalInFlight = true
@@ -779,7 +825,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight), nil
+			return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds), nil
 		case <-ticker.C:
 			// Best-effort progress heartbeat once per tick (opt-in): keeps a
 			// long wait from being aborted by the client's idle timeout. Emitted
@@ -801,12 +847,12 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 				// that is a timeout, not a transport failure — return
 				// pending rather than surfacing the cancellation as an error.
 				if pollCtx.Err() != nil {
-					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight), nil
+					return nil, r.awaitPendingTimeoutOutput(in.Stage, timeout, start, terminalInFlight, heartbeat, capSeconds), nil
 				}
 				return nil, AwaitReviewOutput{}, fmt.Errorf("poll review status: %w", err)
 			}
 			if st.Status != "pending" {
-				return nil, r.awaitTerminalOutput(in.Stage, st, start), nil
+				return nil, r.awaitTerminalOutput(in.Stage, st, start, heartbeat, capSeconds), nil
 			}
 			// Still pending: the review hasn't landed a verdict. If the run
 			// itself has gone terminal with NO review in flight the review
@@ -814,7 +860,7 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 			// keep polling (its verdict is recorded unguarded and WILL land)
 			// but flag terminalInFlight so a timeout names fishhawk_revive_run
 			// (#1915).
-			if out, done, tif := r.awaitRunTerminalBackstop(pollCtx, runID, in.Stage, st, start); done {
+			if out, done, tif := r.awaitRunTerminalBackstop(pollCtx, runID, in.Stage, st, start, heartbeat, capSeconds); done {
 				return nil, out, nil
 			} else if tif {
 				terminalInFlight = true
@@ -825,12 +871,14 @@ func (r *runResolver) awaitReview(ctx context.Context, req *mcp.CallToolRequest,
 
 // awaitTerminalOutput builds the response for a resolved (non-pending)
 // review status.
-func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start time.Time) AwaitReviewOutput {
+func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start time.Time, heartbeat bool, timeoutCap int) AwaitReviewOutput {
 	return AwaitReviewOutput{
-		Stage:         stage,
-		Status:        st.Status,
-		Reviews:       st.Reviews,
-		WaitedSeconds: time.Since(start).Seconds(),
+		Stage:             stage,
+		Status:            st.Status,
+		Reviews:           st.Reviews,
+		WaitedSeconds:     time.Since(start).Seconds(),
+		Heartbeat:         heartbeat,
+		TimeoutCapSeconds: timeoutCap,
 	}
 }
 
@@ -849,12 +897,14 @@ func (*runResolver) awaitTerminalOutput(stage string, st *ReviewStatus, start ti
 // names fishhawk_revive_run instead of the ordinary still-running message. The
 // caller captures terminalInFlight during polling (with a live context) rather
 // than re-querying here, where the poll context is already cancelled.
-func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalInFlight bool) AwaitReviewOutput {
+func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalInFlight bool, heartbeat bool, timeoutCap int) AwaitReviewOutput {
 	out := AwaitReviewOutput{
 		Stage:               stage,
 		Status:              "pending",
 		WaitedSeconds:       time.Since(start).Seconds(),
 		PollIntervalSeconds: suggestedReviewPollIntervalSeconds,
+		Heartbeat:           heartbeat,
+		TimeoutCapSeconds:   timeoutCap,
 	}
 	if terminalInFlight {
 		out.Message = fmt.Sprintf("%s review still pending after %ds and the run has reached a terminal state while the "+

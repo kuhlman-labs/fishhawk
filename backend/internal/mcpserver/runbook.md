@@ -42,12 +42,19 @@ One issue → one run → one PR.
    poll is the authoritative path to a terminal status. Once the review
    settles, read the gate with **`fishhawk_get_gate_view`** (see below) to
    decide fix-up vs merge — one call carrying the full concern notes.
-   For an hour-scale wait (a full implement pass or review round), supply a
-   `progressToken` plus `timeout_seconds` up to **7200** (#1963): the per-tick
-   MCP progress heartbeat keeps the client's idle clock alive, so one call
-   replaces the old 600s re-arm loop. Without a token the cap stays 600s and
-   the resumable re-arm contract is unchanged. The same token-conditional cap +
-   heartbeat applies to `fishhawk_await_audit`.
+   For an hour-scale wait (a full implement pass or review round), set
+   **`long_wait: true`** plus `timeout_seconds` up to **7200** (#1963, #2490):
+   this is the reachable recipe from a tool call — it raises the cap without a
+   `progressToken`, which is client-supplied MCP request metadata a tool-calling
+   agent cannot set. The response's **`heartbeat`** field tells you which regime
+   you got: `false` means your client did not supply a `progressToken` (no
+   per-tick keep-alive, so the client's own idle timeout may still cut the call
+   short — a safe no-op to re-issue, since the wait holds no state), and the
+   **`timeout_cap_seconds`** field reports the cap actually applied. A
+   `progressToken`, if your client supplies one, is a bonus that adds the
+   keep-alive and also raises the cap. Without either the cap stays 600s and the
+   resumable re-arm contract is unchanged. The same `long_wait` opt-in and
+   `heartbeat`/`timeout_cap_seconds` fields apply to `fishhawk_await_audit`.
 6. **Approve the PR, then `fishhawk_merge_run`.** Approve the PR with an
    operator verdict (`gh pr review --approve`, under your own GitHub identity —
    App-identity approval is deferred to E39) before every merge — no
