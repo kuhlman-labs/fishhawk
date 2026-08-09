@@ -1,6 +1,12 @@
 package mcpserver
 
-import "fmt"
+import (
+	"fmt"
+	"reflect"
+	"sort"
+	"strings"
+	"time"
+)
 
 // This file extends the ADR-077 / #2508 response byte bound from
 // fishhawk_get_run_status to the two remaining unbounded MCP surfaces (#2510),
@@ -276,23 +282,208 @@ func runRowFloorLedger(c runRowCtx, budget int, id string) *elisionLedger {
 	led := &elisionLedger{
 		budget: budget,
 		tier:   floorTierName,
-		note:   "reduced to the constant-size floor: the run diagnosis core only. The entry below is an AGGREGATE — the floor tier's explicit exception to per-field itemisation",
+		note:   "reduced to the constant-size floor: the run diagnosis core, plus any response field the schema forbids omitting (carried, with strings capped). The entry below is an AGGREGATE — the floor tier's explicit exception to per-field itemisation",
 	}
 	led.add(aggregateStoredElision("*",
-		"every field of the response outside the run diagnosis core (id, repo, workflow_id, state, runner_kind, pull_request_url, parent_run_id) was omitted; the union of retrieval surfaces below returns at least the omitted content",
+		"every OMITTABLE field of the response outside the run diagnosis core (id, repo, workflow_id, state, runner_kind, pull_request_url, parent_run_id) was omitted; the union of retrieval surfaces below returns at least the omitted content. A field whose schema has no omitempty is NOT omitted — it is carried with its real value, its strings capped and its collections truncated, because emitting the zero value of such a field would fabricate a reading rather than withhold one",
 		surfaces))
 	return led
+}
+
+// ---------------------------------------------------------------------------
+// The floor's TYPE-AWARE carry-through (#2510 fix-up)
+// ---------------------------------------------------------------------------
+
+// floorCarryCollectionCap bounds how many elements of a CARRIED non-omitempty
+// collection the floor keeps, so carrying stays constant-size.
+const floorCarryCollectionCap = 2
+
+// carryNonOmitemptyFields is what stops the floor FALSIFYING data while
+// claiming it omitted it.
+//
+// Building the floor from the ZERO value of T is honest only for a field whose
+// schema carries omitempty: that field's zero value renders as ABSENT, which is
+// exactly what the aggregate elision says happened. A field WITHOUT omitempty
+// is emitted regardless, so zeroing it does not omit it — it publishes a wrong
+// value that reads as real. ResumeRunOutput.Idempotent (`json:"idempotent"`)
+// would render "idempotent": false on a call that genuinely REPLAYED, and an
+// operator acting on that could mint a duplicate recovery run;
+// StartCampaignItemRunOutput.Item (`json:"item"`) would render an all-empty but
+// populated-LOOKING CampaignItem, losing the run↔item linkage.
+//
+// Of the two remedies the concern admits — preserve the true value, or make the
+// floor projection type-aware — this takes the SECOND, which subsumes the
+// first: the projection is driven by the json tag rather than by an enumerated
+// field list, so a field a FUTURE verb adds without omitempty is carried
+// automatically instead of silently joining the falsified set. The constant-size
+// guarantee survives because carrying is a BOUNDED projection (floorCarryValue:
+// every string capped at floorFieldCap, every collection truncated to
+// floorCarryCollectionCap), not a verbatim copy.
+//
+// Fields the ladder itself owns are skipped: the Run row(s), which the caller
+// replaces with the diagnosis core, and the *Elisions block, which set installs.
+func carryNonOmitemptyFields[T any](dst, src *T) {
+	dv := reflect.ValueOf(dst).Elem()
+	sv := reflect.ValueOf(src).Elem()
+	t := dv.Type()
+	if t.Kind() != reflect.Struct {
+		return
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported: never on the wire
+		}
+		if jsonTagOmits(f) {
+			continue
+		}
+		if ladderOwnedFloorField(f.Type) {
+			continue
+		}
+		dv.Field(i).Set(floorCarryValue(sv.Field(i)))
+	}
+}
+
+// jsonTagOmits reports whether a field's zero value is ABSENT on the wire —
+// either because the field is skipped outright (`json:"-"`) or because it
+// carries omitempty. Those are the fields the zero-value floor may honestly
+// leave alone.
+func jsonTagOmits(f reflect.StructField) bool {
+	parts := strings.Split(f.Tag.Get("json"), ",")
+	if parts[0] == "-" && len(parts) == 1 {
+		return true
+	}
+	for _, opt := range parts[1:] {
+		if opt == "omitempty" {
+			return true
+		}
+	}
+	return false
+}
+
+// ladderOwnedFloorField names the field types the run-row ladder installs
+// itself, so the carry-through must not overwrite them.
+func ladderOwnedFloorField(t reflect.Type) bool {
+	switch t {
+	case reflect.TypeOf(Run{}), reflect.TypeOf([]Run(nil)), reflect.TypeOf((*Elisions)(nil)):
+		return true
+	}
+	return false
+}
+
+// floorCarryValue returns a CONSTANT-SIZE-BOUNDED copy of v: strings capped at
+// floorFieldCap, collections truncated to floorCarryCollectionCap, composites
+// projected recursively. A struct with unexported fields (time.Time being the
+// one that actually occurs) is copied verbatim — reflect cannot rebuild it, and
+// every such type here encodes to a fixed-width form anyway.
+func floorCarryValue(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.String:
+		return reflect.ValueOf(capJSONString(v.String(), floorFieldCap)).Convert(v.Type())
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(floorCarryValue(v.Elem()))
+		return out
+	case reflect.Interface:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type())
+		out.Elem().Set(floorCarryValue(v.Elem()))
+		return out.Elem()
+	case reflect.Struct:
+		return floorCarryStruct(v)
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		return floorCarrySlice(v)
+	case reflect.Array:
+		return v
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		return floorCarryMap(v)
+	default:
+		// Bool and every numeric kind: constant-size already, and their zero
+		// value is precisely the falsified reading this function exists to
+		// prevent, so they are carried verbatim.
+		return v
+	}
+}
+
+func floorCarryStruct(v reflect.Value) reflect.Value {
+	t := v.Type()
+	if t == reflect.TypeOf(time.Time{}) || hasUnexportedField(t) {
+		return v
+	}
+	out := reflect.New(t).Elem()
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).PkgPath != "" {
+			continue
+		}
+		out.Field(i).Set(floorCarryValue(v.Field(i)))
+	}
+	return out
+}
+
+func floorCarrySlice(v reflect.Value) reflect.Value {
+	n := min(v.Len(), floorCarryCollectionCap)
+	out := reflect.MakeSlice(v.Type(), n, n)
+	for i := 0; i < n; i++ {
+		out.Index(i).Set(floorCarryValue(v.Index(i)))
+	}
+	return out
+}
+
+// floorCarryMap truncates DETERMINISTICALLY for a string-keyed map (sorted
+// keys), because a nondeterministic floor is not a testable one. A map with any
+// other key kind takes range order, which is bounded but arbitrary — no wired
+// response type has one today.
+func floorCarryMap(v reflect.Value) reflect.Value {
+	out := reflect.MakeMap(v.Type())
+	keys := v.MapKeys()
+	if v.Type().Key().Kind() == reflect.String {
+		sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+	}
+	for i, k := range keys {
+		if i >= floorCarryCollectionCap {
+			break
+		}
+		out.SetMapIndex(floorCarryValue(k), floorCarryValue(v.MapIndex(k)))
+	}
+	return out
+}
+
+func hasUnexportedField(t reflect.Type) bool {
+	for i := 0; i < t.NumField(); i++ {
+		if t.Field(i).PkgPath != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // boundRunRowOutput bounds a response whose heavy content is an embedded run
 // row. rows returns pointers INTO out (so a tier mutates the response in
 // place); set installs the projected elisions block.
 //
-// The floor starts from the ZERO value of T and installs ONLY the first row's
+// The floor starts from the ZERO value of T and installs the first row's
 // diagnosis core, so it is constant-size for ANY response type — which is what
 // makes the guarantee "a mutating verb's success signal does not depend on
 // whether its body fits" hold for cancel_run, start_campaign_item_run and the
 // rest, rather than only for the fields this ladder happens to enumerate.
+//
+// A zero value is an honest OMISSION only for a field the schema lets the
+// encoder drop. carryNonOmitemptyFields therefore re-installs, from the real
+// response, every field whose json tag has no omitempty — bounded, never
+// verbatim — so the floor never publishes a fabricated `"idempotent": false` or
+// an all-empty `"item"` while its aggregate elision claims those fields were
+// omitted. See that function for the full rationale.
 func boundRunRowOutput[T any](out T, runID string, budget int, rows func(*T) []*Run, set func(*T, *Elisions)) (T, error) {
 	n, err := marshalledLen(out)
 	if err != nil {
@@ -317,6 +508,7 @@ func boundRunRowOutput[T any](out T, runID string, budget int, rows func(*T) []*
 	}
 
 	var floor T
+	carryNonOmitemptyFields(&floor, &out)
 	fr, sr := rows(&floor), rows(&out)
 	id := runID
 	if len(fr) > 0 && len(sr) > 0 {
@@ -409,6 +601,12 @@ func boundListRunsOutput(out ListRunsOutput, budget int) (ListRunsOutput, error)
 	}
 
 	// Floor: at most ONE row, projected to the diagnosis core, cursor blanked.
+	// No carryNonOmitemptyFields pass is needed here (nor in listAuditFloor):
+	// the only non-omitempty field on either page type is `items`, which the
+	// floor installs itself, so there is no field whose zero value would be
+	// emitted as though it were real. TestFloorNeverFabricatesNonOmitemptyField
+	// pins that, so a page type that later gains one fails rather than silently
+	// falsifying it.
 	floor := ListRunsOutput{}
 	if len(out.Items) > 0 {
 		floor.Items = []Run{runRowDiagnosisCore(out.Items[0])}

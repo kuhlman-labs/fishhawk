@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -69,6 +70,23 @@ func worstCaseIssueRun(runID string) Run {
 		},
 		Concerns: &RunConcerns{Open: 3},
 	}
+}
+
+// floorForcingRun is worstCaseIssueRun with every RETAINED string inflated too,
+// so the within-row tiers cannot get the row under the convergence floor and the
+// ladder is driven all the way INTO the floor tier. Shared by the convergence
+// pin and the floor-honesty table, which both need the floor actually reached.
+func floorForcingRun(runID string) Run {
+	run := worstCaseIssueRun(runID)
+	run.Repo = strings.Repeat("kuhlman-labs/very-long-repo-name-", 500)
+	run.WorkflowID = strings.Repeat("feature_change_", 500)
+	pr := "https://github.com/kuhlman-labs/fishhawk/pull/" + strings.Repeat("9", 5000)
+	run.PullRequestURL = &pr
+	parent := strings.Repeat("parent-", 500)
+	run.ParentRunID = &parent
+	run.RunnerKind = strings.Repeat("local-", 500)
+	run.WorkflowSHA = strings.Repeat("f", 5000)
+	return run
 }
 
 func singleRunRows(o *GetActiveRunOutput) []*Run      { return []*Run{&o.Run} }
@@ -285,15 +303,7 @@ func TestBoundListAudit_ConvergesUnderFloor(t *testing.T) {
 // claim untested.
 func TestBoundRunRow_ConvergesUnderFloor(t *testing.T) {
 	runID := uuid.NewString()
-	run := worstCaseIssueRun(runID)
-	run.Repo = strings.Repeat("kuhlman-labs/very-long-repo-name-", 500)
-	run.WorkflowID = strings.Repeat("feature_change_", 500)
-	pr := "https://github.com/kuhlman-labs/fishhawk/pull/" + strings.Repeat("9", 5000)
-	run.PullRequestURL = &pr
-	parent := strings.Repeat("parent-", 500)
-	run.ParentRunID = &parent
-	run.RunnerKind = strings.Repeat("local-", 500)
-	run.WorkflowSHA = strings.Repeat("f", 5000)
+	run := floorForcingRun(runID)
 
 	budget := mcpConvergenceFloorBytes
 	out, err := boundOneRow(GetActiveRunOutput{Run: run}, budget)
@@ -308,6 +318,171 @@ func TestBoundRunRow_ConvergesUnderFloor(t *testing.T) {
 	}
 	if out.Run.ID == "" || out.Run.State == "" {
 		t.Errorf("the floor dropped the diagnosis core: %+v", out.Run)
+	}
+}
+
+// TestBoundRunRow_FloorCarriesNonOmitemptyFields is the honesty pin for the
+// generic floor: a field the schema forbids omitting is emitted whatever the
+// floor does with it, so zeroing it does not OMIT it — it publishes a wrong
+// value that reads as real, while the aggregate elision claims it was omitted.
+//
+// Every case drives an output type OTHER than GetActiveRunOutput all the way to
+// the FLOOR tier (floor-clamped budget + a pathological row) — the path no test
+// reached before — and asserts the true value SURVIVED. It is a state
+// assertion, not an error identity: deleting the carryNonOmitemptyFields call
+// leaves boundRunRowOutput returning the same nil error with a falsified body.
+func TestBoundRunRow_FloorCarriesNonOmitemptyFields(t *testing.T) {
+	budget := mcpConvergenceFloorBytes
+
+	t.Run("resume_run keeps a TRUE idempotent replay signal", func(t *testing.T) {
+		runID := uuid.NewString()
+		out, err := boundRunRowOutput(
+			ResumeRunOutput{Run: floorForcingRun(runID), Idempotent: true}, runID, budget,
+			func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
+			func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
+		if err != nil {
+			t.Fatalf("bound: %v", err)
+		}
+		if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+			t.Fatalf("the fixture did not reach the floor tier (%+v) — the honesty assertion would be vacuous", out.Elisions)
+		}
+		if !out.Idempotent {
+			t.Error(`the floor rendered "idempotent": false on a call that genuinely REPLAYED — idempotent has no omitempty, so it is PRESENT and WRONG, not omitted; an operator reading it could mint a duplicate recovery run`)
+		}
+		if n := marshalLen(t, out); n > budget {
+			t.Errorf("floor-budget resume_run = %d bytes, want <= %d", n, budget)
+		}
+		if out.Run.ID == "" {
+			t.Errorf("the floor dropped the diagnosis core: %+v", out.Run)
+		}
+	})
+
+	t.Run("start_campaign_item_run keeps the run<->item linkage", func(t *testing.T) {
+		runID := uuid.NewString()
+		item := CampaignItem{
+			ID:        uuid.NewString(),
+			IssueRef:  "kuhlman-labs/fishhawk#2510",
+			DependsOn: []string{"kuhlman-labs/fishhawk#2508"},
+			RunID:     runID,
+			State:     "running",
+			CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC),
+			UpdatedAt: time.Date(2026, 8, 7, 12, 5, 0, 0, time.UTC),
+		}
+		out, err := boundRunRowOutput(
+			StartCampaignItemRunOutput{Run: floorForcingRun(runID), Item: item}, runID, budget,
+			func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
+			func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e })
+		if err != nil {
+			t.Fatalf("bound: %v", err)
+		}
+		if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+			t.Fatalf("the fixture did not reach the floor tier (%+v) — the honesty assertion would be vacuous", out.Elisions)
+		}
+		if out.Item.ID != item.ID || out.Item.IssueRef != item.IssueRef || out.Item.State != item.State || out.Item.RunID != runID {
+			t.Errorf(`the floor rendered an all-empty but populated-LOOKING "item" (%+v), losing the run<->item linkage; item has no omitempty, so it is PRESENT and WRONG, not omitted`, out.Item)
+		}
+		if len(out.Item.DependsOn) != 1 || out.Item.DependsOn[0] != item.DependsOn[0] {
+			t.Errorf("the carried item lost its dependency edges: %+v", out.Item.DependsOn)
+		}
+		if !out.Item.CreatedAt.Equal(item.CreatedAt) {
+			t.Errorf("the carried item's created_at = %v, want the real %v", out.Item.CreatedAt, item.CreatedAt)
+		}
+		if n := marshalLen(t, out); n > budget {
+			t.Errorf("floor-budget start_campaign_item_run = %d bytes, want <= %d", n, budget)
+		}
+	})
+
+	t.Run("revive_run keeps restored_stages and next_step", func(t *testing.T) {
+		runID := uuid.NewString()
+		stages := []ReviveRestoredStage{
+			{StageID: uuid.NewString(), Type: "implement", PriorCategory: "A", PriorReason: strings.Repeat("agent harness 400. ", 4000), RestoredState: "pending"},
+			{StageID: uuid.NewString(), Type: "review", PriorCategory: "C", PriorReason: strings.Repeat("lineage lock. ", 4000), RestoredState: "pending"},
+			{StageID: uuid.NewString(), Type: "acceptance", PriorCategory: "D", PriorReason: "sla timeout", RestoredState: "awaiting_approval"},
+		}
+		out, err := boundRunRowOutput(
+			ReviveRunOutput{Run: floorForcingRun(runID), RestoredStages: stages, NextStep: reviveNextStepHint}, runID, budget,
+			func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
+			func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
+		if err != nil {
+			t.Fatalf("bound: %v", err)
+		}
+		if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+			t.Fatalf("the fixture did not reach the floor tier (%+v) — the honesty assertion would be vacuous", out.Elisions)
+		}
+		if len(out.RestoredStages) == 0 {
+			t.Error(`the floor rendered "restored_stages": null on a revive that DID re-park stages; the field has no omitempty, so the floor must carry what it can rather than publish an empty answer`)
+		}
+		if len(out.RestoredStages) > floorCarryCollectionCap {
+			t.Errorf("the floor carried %d stages, want at most %d — carrying must stay bounded", len(out.RestoredStages), floorCarryCollectionCap)
+		}
+		if len(out.RestoredStages) > 0 && out.RestoredStages[0].StageID != stages[0].StageID {
+			t.Errorf("the carried stage is not the real one: %+v", out.RestoredStages[0])
+		}
+		if out.NextStep == "" {
+			t.Error(`the floor rendered "next_step": "" — the field has no omitempty, so an empty value reads as "there is no next step"`)
+		}
+		// The carried collection is BOUNDED, not verbatim: two multi-KB
+		// prior_reason strings would blow the constant-size floor on their own.
+		for i, s := range out.RestoredStages {
+			if jsonEncodedLen(s.PriorReason) > floorFieldCap {
+				t.Errorf("carried stage %d kept a %d-byte prior_reason, want it capped at %d", i, jsonEncodedLen(s.PriorReason), floorFieldCap)
+			}
+		}
+		if n := marshalLen(t, out); n > budget {
+			t.Errorf("floor-budget revive_run = %d bytes, want <= %d", n, budget)
+		}
+	})
+}
+
+// TestCarryNonOmitemptyFields_SkipsLadderOwnedFields pins the carry's OTHER
+// half directly, because boundRunRowOutput's own output cannot distinguish it:
+// the diagnosis-core install runs immediately after the carry and overwrites the
+// Run row either way, so a floor-tier assertion stays green with the skip
+// deleted. Asserting on the carry in ISOLATION is what makes the skip real.
+func TestCarryNonOmitemptyFields_SkipsLadderOwnedFields(t *testing.T) {
+	src := GetActiveRunOutput{
+		Run:      worstCaseIssueRun(uuid.NewString()),
+		Elisions: &Elisions{Tier: "R1", Budget: 4096},
+	}
+	var dst GetActiveRunOutput
+	carryNonOmitemptyFields(&dst, &src)
+	if dst.Run.ID != "" || dst.Run.IssueContext != nil {
+		t.Errorf("the carry wrote the Run row, which the ladder installs itself as the diagnosis core: %+v", dst.Run)
+	}
+	if dst.Elisions != nil {
+		t.Errorf("the carry wrote the elisions block, which the ladder's setter installs: %+v", dst.Elisions)
+	}
+}
+
+// TestFloorNeverFabricatesNonOmitemptyField is the forward guard for the two
+// PAGE surfaces, whose floors build their output by hand rather than through
+// carryNonOmitemptyFields. Today the only non-omitempty field on either type is
+// `items`, which those floors install themselves — so there is nothing to
+// falsify. This fails the day one of them gains another, rather than letting the
+// new field ship as a silent zero.
+func TestFloorNeverFabricatesNonOmitemptyField(t *testing.T) {
+	rows := []struct {
+		name     string
+		typ      reflect.Type
+		installs map[string]bool
+	}{
+		{"ListRunsOutput", reflect.TypeOf(ListRunsOutput{}), map[string]bool{"items": true}},
+		{"ListAuditOutput", reflect.TypeOf(ListAuditOutput{}), map[string]bool{"items": true}},
+	}
+	for _, row := range rows {
+		t.Run(row.name, func(t *testing.T) {
+			for i := 0; i < row.typ.NumField(); i++ {
+				f := row.typ.Field(i)
+				if f.PkgPath != "" || jsonTagOmits(f) {
+					continue
+				}
+				name := strings.Split(f.Tag.Get("json"), ",")[0]
+				if !row.installs[name] {
+					t.Errorf("%s.%s (json %q) has no omitempty, so its ZERO value is emitted at the floor as though it were real — carry it like boundRunRowOutput does, or give it omitempty",
+						row.name, f.Name, name)
+				}
+			}
+		})
 	}
 }
 
@@ -548,11 +723,23 @@ func TestPointerIssueURL_RejectedByWireValidation(t *testing.T) {
 		{"a fishhawk_-bearing URL reads as a bounded MCP tool", "https://example.test/fishhawk_list_audit/2510"},
 		{"whitespace breaks the one-token pointer contract", "https://example.test/a b"},
 		{"empty", ""},
+		// The three the prefix check ACCEPTED (#2510 fix-up). Each satisfies
+		// strings.HasPrefix(u, "https://") — or, for the scheme-relative form,
+		// is a syntactically valid URL — yet names no retrievable surface, so
+		// the "absolute, retrievable URL" invariant the guard documents was not
+		// actually established until it started parsing.
+		{"scheme with NO host retrieves nothing", "https://"},
+		{"empty authority with a path retrieves nothing", "https:///kuhlman-labs/fishhawk/issues/2510"},
+		{"a non-http scheme is not a retrievable web surface", "ftp://example.test/issues/2510"},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
+			// Errorf, not Fatalf: the guard-return check and the emitted-pointer
+			// STATE check must both run, so a counterfactual deletion reports
+			// which of the two actually bit rather than short-circuiting on the
+			// first.
 			if _, ok := pointerIssueURL(row.url); ok {
-				t.Fatalf("pointerIssueURL(%q) was accepted", row.url)
+				t.Errorf("pointerIssueURL(%q) was accepted", row.url)
 			}
 			runID := uuid.NewString()
 			run := worstCaseIssueRun(runID)
@@ -588,15 +775,92 @@ func TestPointerIssueURL_RejectedByWireValidation(t *testing.T) {
 // (6) tier behaviour
 // ---------------------------------------------------------------------------
 
-// TestBoundRunRow_TierOrderIsLeastActionableFirst walks a run row down the
-// ladder budget by budget and asserts each tier's observable effect in order:
-// comments go first, then the body is capped, then the whole issue context, then
-// the concern items — and the diagnosis core survives all of them.
+// canonicalRunRowTierOrder is the ladder's least-actionable-first order spelled
+// as a LITERAL, deliberately NOT read out of runRowTiers: a yardstick derived
+// from the thing being measured moves with it, which is precisely how the
+// previous version of this test stayed green under a tier swap.
+var canonicalRunRowTierOrder = []string{"R1", "R2", "R3", "R4", floorTierName}
+
+func canonicalTierPosition(name string) int {
+	for i, n := range canonicalRunRowTierOrder {
+		if n == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestBoundRunRow_TierOrderIsLeastActionableFirst pins the ORDER R1→R2→R3→R4,
+// which the earlier version of this test only named. It accumulated tiers into
+// an unordered map and closed on `len(seen) == 0`, already guaranteed by the
+// preceding `out.Elisions == nil` fatal, so a refactor that swapped R2 before
+// R1 or collapsed R1..R3 stayed green.
+//
+// Two phases, because neither alone bites on every reordering:
+//
+//	Phase A pins POSITION → (name, characteristic effect). Each tier's effect is
+//	stated so that it DISCRIMINATES against its neighbours — position 0 must drop
+//	the comment thread and leave the body, position 1 must cap the body and leave
+//	the comment thread — so swapping two entries flips both checks.
+//
+//	Phase B is the budget sweep the concern asked for: record the settled tier at
+//	each budget in a SLICE, generous → tight, and require the sequence to be
+//	monotonically NON-DECREASING in canonical ladder position. A tighter budget
+//	that settles at an EARLIER tier is the observable signature of a ladder whose
+//	declared order and applied order disagree.
 func TestBoundRunRow_TierOrderIsLeastActionableFirst(t *testing.T) {
 	runID := uuid.NewString()
-	seen := map[string]bool{}
-	for _, budget := range []int{30 * 1024, 12 * 1024, 6 * 1024, 5 * 1024, mcpConvergenceFloorBytes} {
-		out, err := boundOneRow(GetActiveRunOutput{Run: worstCaseIssueRun(runID)}, budget)
+
+	// --- Phase A: position → (name, characteristic effect) -------------------
+	positions := []struct {
+		name   string
+		effect string
+		did    func(*Run) bool
+	}{
+		{"R1", "drop the comment thread and LEAVE the body uncapped", func(r *Run) bool {
+			return r.IssueContext != nil && len(r.IssueContext.Comments) == 0 &&
+				jsonEncodedLen(r.IssueContext.Body) > issueBodyTierCap
+		}},
+		{"R2", "cap the body and LEAVE the comment thread", func(r *Run) bool {
+			return r.IssueContext != nil && len(r.IssueContext.Comments) > 0 &&
+				jsonEncodedLen(r.IssueContext.Body) <= issueBodyTierCap
+		}},
+		{"R3", "drop the whole issue context", func(r *Run) bool { return r.IssueContext == nil }},
+		{"R4", "drop the concern items and RETAIN the counts", func(r *Run) bool {
+			return r.IssueContext != nil && r.Concerns != nil && len(r.Concerns.Items) == 0 && r.Concerns.Open == 7
+		}},
+	}
+	if len(runRowTiers) != len(positions) {
+		t.Fatalf("the ladder declares %d tiers, want the canonical %d (%v) — a collapsed or added tier changes the order this test pins",
+			len(runRowTiers), len(positions), canonicalRunRowTierOrder[:len(positions)])
+	}
+	for i, want := range positions {
+		if runRowTiers[i].name != want.name {
+			t.Errorf("ladder position %d is tier %q, want %q (order: %v)", i, runRowTiers[i].name, want.name, canonicalRunRowTierOrder)
+		}
+		row := worstCaseIssueRun(runID)
+		row.Concerns = &RunConcerns{Open: 7, ByState: map[string]int{"raised": 7}, Items: concernItems(7)}
+		led := &elisionLedger{budget: 1, tier: runRowTiers[i].name}
+		runRowTiers[i].apply([]*Run{&row}, runRowCtx{prefix: "run", runID: runID}, led)
+		if !want.did(&row) {
+			t.Errorf("ladder position %d (declared %q) did not %s — the applied order disagrees with the declared one",
+				i, runRowTiers[i].name, want.effect)
+		}
+	}
+
+	// --- Phase B: generous → tight sweep, recorded in ORDER ------------------
+	// The generous end of the sweep is load-bearing, not padding. R1-alone and
+	// R2-alone each reclaim a comparable slab of this fixture (~56 KB of comment
+	// thread, ~72 KB of body), so a budget above BOTH residuals settles after the
+	// FIRST tier alone — which is the only budget at which the settled tier's
+	// name reveals which entry the ladder ran first. Below that both tiers always
+	// apply and the sweep cannot distinguish their order at all.
+	sweep := []int{96 * 1024, 80 * 1024, 64 * 1024, 30 * 1024, 20 * 1024, 12 * 1024, 6 * 1024, 5 * 1024, mcpConvergenceFloorBytes}
+	observed := make([]string, 0, len(sweep))
+	for _, budget := range sweep {
+		row := worstCaseIssueRun(runID)
+		row.Concerns = &RunConcerns{Open: 40, ByState: map[string]int{"raised": 40}, Items: concernItems(40)}
+		out, err := boundOneRow(GetActiveRunOutput{Run: row}, budget)
 		if err != nil {
 			t.Fatalf("budget %d: %v", budget, err)
 		}
@@ -609,20 +873,46 @@ func TestBoundRunRow_TierOrderIsLeastActionableFirst(t *testing.T) {
 		if out.Elisions == nil {
 			t.Fatalf("budget %d: no elisions block", budget)
 		}
-		seen[out.Elisions.Tier] = true
+		observed = append(observed, out.Elisions.Tier)
 		if out.Run.IssueContext != nil && len(out.Run.IssueContext.Comments) > 0 {
 			t.Errorf("budget %d: tier %s kept the comment thread", budget, out.Elisions.Tier)
 		}
-		if out.Run.IssueContext != nil && jsonEncodedLen(out.Run.IssueContext.Body) > issueBodyTierCap {
+		// The body assertion is keyed to the SETTLED TIER rather than applied
+		// flat, which is strictly stronger than the flat form the sweep's old
+		// budget list happened to make true: a settled R1 must leave the body
+		// UNCAPPED (R2 is the tier that caps it, and a settled R1 means R2 never
+		// ran), and every later tier must have capped it. A flat "always capped"
+		// check cannot tell those two apart, which is exactly the blindness that
+		// let a swapped ladder pass.
+		bodyCapped := out.Run.IssueContext == nil || jsonEncodedLen(out.Run.IssueContext.Body) <= issueBodyTierCap
+		if canonicalTierPosition(out.Elisions.Tier) == 0 && bodyCapped {
+			t.Errorf("budget %d: settled at tier %s yet the issue body is ALREADY capped — position 0 is the comment tier, so a later tier's work ran early",
+				budget, out.Elisions.Tier)
+		}
+		if canonicalTierPosition(out.Elisions.Tier) > 0 && !bodyCapped {
 			t.Errorf("budget %d: tier %s left the issue body uncapped", budget, out.Elisions.Tier)
 		}
 	}
-	// R1 alone already reclaims most of this row, so the sweep is expected to
-	// settle within the tiers rather than reach the floor — that is the ladder
-	// working. The floor itself is driven by TestBoundRunRow_ConvergesUnderFloor,
-	// whose fixture inflates the RETAINED strings the tiers cannot shed.
-	if len(seen) == 0 {
-		t.Error("no tier was recorded across the budget sweep")
+
+	t.Logf("generous->tight tier sweep: %v -> %v", sweep, observed)
+	prev := -1
+	for i, name := range observed {
+		pos := canonicalTierPosition(name)
+		if pos < 0 {
+			t.Fatalf("budget %d settled at tier %q, which is not on the canonical ladder %v", sweep[i], name, canonicalRunRowTierOrder)
+		}
+		if pos < prev {
+			t.Errorf("the sweep runs generous->tight, so the settled tier must never move BACKWARDS along %v; observed %v (budget %d went back to %q)",
+				canonicalRunRowTierOrder, observed, sweep[i], name)
+		}
+		prev = pos
+	}
+	distinct := map[string]bool{}
+	for _, name := range observed {
+		distinct[name] = true
+	}
+	if len(distinct) < 2 {
+		t.Fatalf("the sweep settled at ONE tier for every budget (%v) — the monotonicity assertion would be vacuous", observed)
 	}
 }
 

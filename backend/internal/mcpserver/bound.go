@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	neturl "net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -265,25 +266,45 @@ func pointerREST(path string) unboundedPointer {
 //
 // It reports false — and the caller MUST fall back to pointerREST over the run
 // read — for any URL the wire invariants would reject or that is not actually
-// retrievable: empty, not an absolute http(s) URL (a relative path names no
-// retrievable surface), carrying a "fishhawk_" substring (which
-// validateWireElisions reads as a bounded MCP tool, the circularity the
-// oversized-capable class exists to refuse), or carrying whitespace (a rendered
-// pointer is one token an operator pastes). The guard is deliberately
-// fail-closed toward the REST fallback: an oversized_capable elision must never
-// be spelled without a retrievable unbounded surface.
-func pointerIssueURL(url string) (unboundedPointer, bool) {
-	u := strings.TrimSpace(url)
+// retrievable: empty, unparseable, not an absolute http(s) URL WITH A HOST,
+// carrying a "fishhawk_" substring (which validateWireElisions reads as a
+// bounded MCP tool, the circularity the oversized-capable class exists to
+// refuse), or carrying whitespace (a rendered pointer is one token an operator
+// pastes). The guard is deliberately fail-closed toward the REST fallback: an
+// oversized_capable elision must never be spelled without a retrievable
+// unbounded surface.
+//
+// The absoluteness test PARSES rather than prefix-matching (#2510 fix-up): a
+// bare `strings.HasPrefix(u, "https://")` accepts "https://" and
+// "https:///issues/1", neither of which names a retrievable surface, so the
+// prefix form did not establish the invariant this comment claims. url.Parse
+// plus an explicit scheme-and-host check does.
+//
+// This is a HONESTY guard on a rendered pointer, NOT an egress control. The
+// server never fetches the URL — it is text the operator follows — and the same
+// value is already returned verbatim in issue_context.url, so no new retrieval
+// surface opens here. A loopback or link-local host is therefore left alone
+// deliberately: refusing it would degrade a legitimate self-hosted forge's
+// pointer to the REST fallback while preventing nothing.
+func pointerIssueURL(raw string) (unboundedPointer, bool) {
+	u := strings.TrimSpace(raw)
 	if u == "" {
-		return unboundedPointer{}, false
-	}
-	if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") {
 		return unboundedPointer{}, false
 	}
 	if strings.Contains(u, "fishhawk_") {
 		return unboundedPointer{}, false
 	}
 	if strings.ContainsAny(u, " \t\r\n") {
+		return unboundedPointer{}, false
+	}
+	parsed, err := neturl.Parse(u)
+	if err != nil {
+		return unboundedPointer{}, false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return unboundedPointer{}, false
+	}
+	if parsed.Host == "" {
 		return unboundedPointer{}, false
 	}
 	return pointerREST(u), true
