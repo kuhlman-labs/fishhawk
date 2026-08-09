@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,7 +12,10 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
@@ -515,5 +519,223 @@ func TestHostDispatch_AdmissionWalkInFlight_MarkerBlocksThen409(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "dispatch_not_admissible") {
 		t.Errorf("body missing dispatch_not_admissible: %s", w.Body.String())
+	}
+}
+
+// decomposedHostDispatchServer wires a server whose child (slice 1, depends on
+// slice 0) is parked at awaiting_host_dispatch, its dependency sibling (slice 0)
+// seeded at depSliceState. Reuses the guard-test helpers (same package); the
+// counting repo implements StageCASTransitioner (promoted from orchestratorRepo)
+// so the production CAS path is exercised. Returns the child run id + its
+// implement stage id + the dependency sibling run id.
+func decomposedHostDispatchServer(t *testing.T, depSliceState run.State) (*Server, *guardCountingRepo, uuid.UUID, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	sib := seedGuardChild(rr, parentID, 0, depSliceState)
+	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
+	stage := rr.seedStage(child.ID, 0, run.StageStateAwaitingHostDispatch)
+	stage.Type = run.StageTypeImplement
+	return s, rr, child.ID, stage.ID, sib.ID
+}
+
+// (14) the wave-order refusal drives the REAL route and asserts BOTH the 409
+// body AND — reading COMMITTED state after the call returns — that the stage is
+// STILL awaiting_host_dispatch. Error identity alone is insufficient: a guard
+// placed AFTER the CAS would return a byte-identical 409 with the stage already
+// flipped, so the committed-state read is the load-bearing assertion. The bad
+// state (a pending dependency sibling) is seeded BY CONSTRUCTION.
+func TestHostDispatch_DecompositionDependencyPending_RefusesAndParks(t *testing.T) {
+	s, rr, childRunID, childStageID, sibID := decomposedHostDispatchServer(t, run.StatePending)
+
+	w := postHostDispatch(t, s, childRunID, childStageID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "dependency_not_satisfied") {
+		t.Errorf("body missing dependency_not_satisfied: %s", body)
+	}
+	if !strings.Contains(body, sibID.String()) {
+		t.Errorf("body should name the blocking sibling %s: %s", sibID, body)
+	}
+	if !strings.Contains(body, `"blocking_slice_index":0`) {
+		t.Errorf("body should carry blocking_slice_index 0: %s", body)
+	}
+	// COMMITTED state: the stage must be untouched (the guard refused BEFORE the CAS).
+	cur, _ := rr.GetStage(context.Background(), childStageID)
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("persisted stage state = %q, want awaiting_host_dispatch (no CAS on refusal)", cur.State)
+	}
+}
+
+// (15) the dependency-satisfied child still transitions to dispatched
+// (transitioned:true) — so the guard cannot pass by refusing everything.
+func TestHostDispatch_DecompositionDependencySucceeded_Admits(t *testing.T) {
+	s, rr, childRunID, childStageID, _ := decomposedHostDispatchServer(t, run.StateSucceeded)
+
+	w := postHostDispatch(t, s, childRunID, childStageID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeHostDispatch(t, w)
+	if !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	cur, _ := rr.GetStage(context.Background(), childStageID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("persisted stage state = %q, want dispatched", cur.State)
+	}
+}
+
+// (16, inert-off-path pin) a decomposed child whose slice declares NO
+// dependencies (wave 0) is admitted — the guard does not over-block a
+// dispatchable child.
+func TestHostDispatch_DecompositionWave0Child_Admits(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	child := seedGuardChild(rr, parentID, 0, run.StateRunning) // slice 0, no deps
+	stage := rr.seedStage(child.ID, 0, run.StageStateAwaitingHostDispatch)
+	stage.Type = run.StageTypeImplement
+
+	w := postHostDispatch(t, s, child.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeHostDispatch(t, w)
+	if !resp.Transitioned {
+		t.Errorf("resp = %+v, want transitioned:true (wave-0 child is dispatchable)", resp)
+	}
+}
+
+// The guard's read-errored path surfaces as 500 dependency_check_failed at the
+// handler, leaving the stage untouched (retryable, never a silent admit).
+func TestHostDispatch_DecompositionDependencyCheckError_500(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
+	stage := rr.seedStage(child.ID, 0, run.StageStateAwaitingHostDispatch)
+	stage.Type = run.StageTypeImplement
+	art.listErr = errors.New("artifact store down")
+
+	w := postHostDispatch(t, s, child.ID, stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "dependency_check_failed") {
+		t.Errorf("body missing dependency_check_failed: %s", w.Body.String())
+	}
+	cur, _ := rr.GetStage(context.Background(), stage.ID)
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("persisted stage state = %q, want awaiting_host_dispatch (no CAS on 500)", cur.State)
+	}
+}
+
+// TestHostDispatch_Decomposition_CrossLayer_PgBacked (#2546 verification
+// CROSS-BOUNDARY) exercises the whole span — the postgres run repo's
+// slice_index/decomposed_from column round-trip, the artifact-backed plan
+// authority, and the handler — end to end against the shared testcontainers
+// Postgres. It seeds a real parent run + approved plan artifact + two minted
+// children through the postgres repos, drives POST host-dispatch through the
+// handler, and asserts (a) the refusal leaves the PERSISTED stage row untouched
+// and (b) the same call transitions it to dispatched once the dependency child
+// reaches succeeded — proving the plan authority, the column round-trip, and
+// the handler agree.
+func TestHostDispatch_Decomposition_CrossLayer_PgBacked(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	s := New(Config{RunRepo: runRepo, ArtifactRepo: artRepo})
+
+	newRun := func(sliceIdx *int, parent *uuid.UUID) *run.Run {
+		t.Helper()
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+			TriggerSource: run.TriggerCLI, DecomposedFrom: parent, ParentRunID: parent, SliceIndex: sliceIdx,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return r
+	}
+
+	parent := newRun(nil, nil)
+	planStage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: parent.ID, Sequence: 0, Type: run.StageTypePlan,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create parent plan stage: %v", err)
+	}
+	p := &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "s",
+		Verification: plan.Verification{TestStrategy: "t", RollbackPlan: "r"},
+		Decomposition: &plan.Decomposition{Rationale: "split", SubPlans: []plan.SubPlanSummary{
+			{Title: "A", ScopeHint: "a"},
+			{Title: "B", ScopeHint: "b", DependsOn: []int{0}},
+		}},
+	}
+	pb, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	if _, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: pb,
+	}); err != nil {
+		t.Fatalf("create plan artifact: %v", err)
+	}
+
+	i0, i1 := 0, 1
+	child0 := newRun(&i0, &parent.ID)
+	child1 := newRun(&i1, &parent.ID)
+	child1Stage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: child1.ID, Sequence: 0, Type: run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create child1 implement stage: %v", err)
+	}
+	if _, err := runRepo.TransitionStage(ctx, child1Stage.ID, run.StageStateAwaitingHostDispatch, nil); err != nil {
+		t.Fatalf("park child1 stage: %v", err)
+	}
+
+	// (a) child0 (slice 0) has not succeeded → dispatch of child1 refuses, and
+	// the PERSISTED stage row is untouched.
+	w := postHostDispatch(t, s, child1.ID, child1Stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "dependency_not_satisfied") {
+		t.Errorf("body missing dependency_not_satisfied: %s", w.Body.String())
+	}
+	cur, err := runRepo.GetStage(ctx, child1Stage.ID)
+	if err != nil {
+		t.Fatalf("get child1 stage: %v", err)
+	}
+	if cur.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("persisted stage = %q, want awaiting_host_dispatch (refusal committed no state)", cur.State)
+	}
+
+	// (b) advance child0's RUN to succeeded → the same dispatch admits.
+	if _, err := runRepo.TransitionRun(ctx, child0.ID, run.StateRunning); err != nil {
+		t.Fatalf("child0 → running: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, child0.ID, run.StateSucceeded); err != nil {
+		t.Fatalf("child0 → succeeded: %v", err)
+	}
+	w = postHostDispatch(t, s, child1.ID, child1Stage.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after dependency succeeded:\n%s", w.Code, w.Body.String())
+	}
+	resp := decodeHostDispatch(t, w)
+	if !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	cur, _ = runRepo.GetStage(ctx, child1Stage.ID)
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("persisted stage = %q, want dispatched", cur.State)
 	}
 }

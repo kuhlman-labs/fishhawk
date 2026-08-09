@@ -35,6 +35,21 @@ type ChildStatus struct {
 	RunID      string `json:"run_id" jsonschema:"the child run UUID"`
 	SliceIndex int    `json:"slice_index" jsonschema:"the child's position in the parent's plan_decomposed child_run_ids (slice-index order)"`
 	State      string `json:"state" jsonschema:"the child run's lifecycle state: pending, running, succeeded, failed, or unknown when the per-child read failed"`
+	// DependsOn lists the slice indices this child depends on (E48.99 / #2546),
+	// mirrored from the child run row's slice_depends_on (resolved from the
+	// parent's approved plan on the single-run read). Omitted for a wave-0
+	// child with no declared dependencies, and for a legacy backend that omits
+	// slice_depends_on entirely (nil-decode → Blocked false, so the block
+	// renders exactly as it did before this field existed).
+	DependsOn []int `json:"depends_on,omitempty" jsonschema:"the slice indices this child depends on, from the parent plan's decomposition; omitted for a wave-0 child with no dependencies"`
+	// Blocked is true when a dependency slice has not yet reached state
+	// succeeded — the child is NOT dispatchable until it clears. An
+	// unknown-state dependency (its per-child read failed) counts as blocking,
+	// never as dispatchable.
+	Blocked bool `json:"blocked" jsonschema:"true when a dependency slice has not yet succeeded, so this child cannot be dispatched yet; an unknown-state dependency counts as blocking"`
+	// BlockedBy names the run ids of the dependency siblings that have not yet
+	// succeeded, in ascending slice order. Empty when the child is not blocked.
+	BlockedBy []string `json:"blocked_by,omitempty" jsonschema:"the run ids of the not-yet-succeeded dependency siblings blocking this child, in slice order"`
 }
 
 // ChildrenStatus is the decomposed-parent per-child + integration-phase view
@@ -122,6 +137,10 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 		if childUUID, perr := uuid.Parse(childID); perr == nil {
 			if runRow, gerr := r.api.GetRun(ctx, childUUID); gerr == nil {
 				child.State = runRow.State
+				// slice_depends_on is surfaced on the single-run read GetRun
+				// hits here (E48.99 / #2546); nil for a wave-0 child or a
+				// legacy backend that omits it.
+				child.DependsOn = runRow.SliceDependsOn
 			}
 			// A GetRun error (or an unparseable id) leaves State="unknown" —
 			// best-effort, never fails the snapshot.
@@ -137,6 +156,26 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 			cs.Failed++
 		}
 		cs.Children = append(cs.Children, child)
+	}
+
+	// Second pass (E48.99 / #2546): now that every child's state is known,
+	// resolve each child's blocked-ness from its DependsOn against the sibling
+	// states gathered above. A dependency slice that has not reached
+	// "succeeded" (including an "unknown" read failure) blocks the child, and
+	// its run id is named in BlockedBy — so one get_run_status read answers
+	// "what may I dispatch next". A child with no DependsOn (wave 0, or a
+	// legacy backend that omits slice_depends_on) stays Blocked=false, which
+	// renders exactly as it did before this field existed (back-compat).
+	for i := range cs.Children {
+		for _, depIdx := range cs.Children[i].DependsOn {
+			if depIdx < 0 || depIdx >= len(cs.Children) {
+				continue // defensive: a dependency index outside the child set
+			}
+			if cs.Children[depIdx].State != "succeeded" {
+				cs.Children[i].Blocked = true
+				cs.Children[i].BlockedBy = append(cs.Children[i].BlockedBy, cs.Children[depIdx].RunID)
+			}
+		}
 	}
 
 	// Scan the recent-audit window for the fan-in outcome, tracking the HIGHEST

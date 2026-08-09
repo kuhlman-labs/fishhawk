@@ -228,6 +228,16 @@ func (f *fakeRepo) ListRuns(_ context.Context, fil run.ListRunsFilter) ([]*run.R
 				continue
 			}
 		}
+		// DecomposedFrom arm (#2546): the decomposition wave-order guard's
+		// sibling walk filters on this. Without it every seeded run would
+		// appear as a sibling of any parent, so a guard test could pass for the
+		// wrong reason (the not-minted refusal seeds an unrelated run carrying a
+		// matching slice_index but a DIFFERENT DecomposedFrom to pin this).
+		if fil.DecomposedFrom != nil {
+			if r.DecomposedFrom == nil || *r.DecomposedFrom != *fil.DecomposedFrom {
+				continue
+			}
+		}
 		// Account scoping (ADR-057 / E44.5): a set filter keeps same-account
 		// rows plus untenanted (empty AccountID) rows, mirroring the SQL
 		// (account_id = $ OR account_id IS NULL).

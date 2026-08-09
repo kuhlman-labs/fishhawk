@@ -690,6 +690,51 @@ func TestCreateRun_DeclaredGating_NilReviewer_Rejected(t *testing.T) {
 	}
 }
 
+// TestToRunResponse_SliceIndexShape pins the serialized run-row shape for the
+// decomposition surfaces (E48.99 / #2546): toRunResponse projects slice_index
+// straight off the row (present for a fan-out child as *int so slice 0 is not
+// elided, omitted for a non-child) and NEVER sets slice_depends_on — the
+// deliberate no-N+1 split, since slice_depends_on is populated only by
+// handleGetRun's per-run plan resolve. A refactor that moved the dependency
+// resolve into toRunResponse (leaking it onto the list path) would fail here.
+func TestToRunResponse_SliceIndexShape(t *testing.T) {
+	parentID := uuid.New()
+	idx := 3
+	child := toRunResponse(&run.Run{
+		ID: uuid.New(), Repo: "x/y", DecomposedFrom: &parentID, SliceIndex: &idx,
+	})
+	if child.SliceIndex == nil || *child.SliceIndex != 3 {
+		t.Errorf("child SliceIndex = %v, want 3", child.SliceIndex)
+	}
+	if child.SliceDependsOn != nil {
+		t.Errorf("toRunResponse set SliceDependsOn = %v, want nil (only handleGetRun sets it — no N+1)", child.SliceDependsOn)
+	}
+	b, err := json.Marshal(child)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"slice_index":3`) {
+		t.Errorf("serialized child missing slice_index:3: %s", b)
+	}
+	if strings.Contains(string(b), "slice_depends_on") {
+		t.Errorf("serialized child carries slice_depends_on, want omitted: %s", b)
+	}
+
+	// A slice-0 child still carries the field (the *int guards against a
+	// zero-value elision dropping slice 0).
+	zero := 0
+	child0 := toRunResponse(&run.Run{ID: uuid.New(), Repo: "x/y", DecomposedFrom: &parentID, SliceIndex: &zero})
+	if b0, _ := json.Marshal(child0); !strings.Contains(string(b0), `"slice_index":0`) {
+		t.Errorf("slice-0 child must carry slice_index:0: %s", b0)
+	}
+
+	// A non-decomposed run omits slice_index entirely.
+	plain := toRunResponse(&run.Run{ID: uuid.New(), Repo: "x/y"})
+	if b, _ := json.Marshal(plain); strings.Contains(string(b), "slice_index") {
+		t.Errorf("non-child run must omit slice_index: %s", b)
+	}
+}
+
 func TestErrorEnvelope_Shape(t *testing.T) {
 	// Decoding a known 400 confirms the envelope matches OpenAPI's
 	// error schema verbatim. If the field names drift, clients

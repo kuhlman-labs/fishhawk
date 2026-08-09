@@ -62,6 +62,25 @@ type runResponse struct {
 	State          string     `json:"state"`
 	ParentRunID    *uuid.UUID `json:"parent_run_id,omitempty"`
 	DecomposedFrom *uuid.UUID `json:"decomposed_from,omitempty"`
+	// SliceIndex is the decomposed child's 0-based sub_plan position
+	// (E24.1 / #1141), persisted since migration 0034 but only surfaced now
+	// (E48.99 / #2546). Set for a fan-out child, omitted (omitempty, a *int so
+	// slice 0 is not dropped by a zero-value elision) for every non-child run.
+	// Pure projection off the run row in toRunResponse, so it appears on BOTH
+	// GET /v0/runs/{id} and the list endpoint. The MCP client mirror decodes
+	// it; the json tag MUST byte-match its counterpart.
+	SliceIndex *int `json:"slice_index,omitempty"`
+	// SliceDependsOn is the decomposed child's declared dependency slice
+	// indices, resolved from the parent's approved plan
+	// (decomposition.sub_plans[slice_index].depends_on) — the same authority
+	// the host-dispatch wave-order guard reads (E48.99 / #2546). Populated by
+	// handleGetRun ONLY (the single-run-read, best-effort posture shared with
+	// Concerns / DerivedStatus / Delegation): the list endpoint deliberately
+	// never pays the per-row plan load, so there is no N+1. Omitted when the
+	// run is not a resolvable fan-out child, when the slice declares no
+	// dependencies, or best-effort when the plan resolve fails. The MCP client
+	// mirror decodes it; the json tag MUST byte-match its counterpart.
+	SliceDependsOn []int `json:"slice_depends_on,omitempty"`
 	// UpstreamRunID echoes the run's deploy-gate cross-run reference
 	// (E23.11 / #1417): the upstream feature_change run whose ci_green /
 	// review_merged a standalone deploy-only release run's required_upstream
@@ -518,6 +537,7 @@ func toRunResponse(r *run.Run) runResponse {
 		State:                   string(r.State),
 		ParentRunID:             r.ParentRunID,
 		DecomposedFrom:          r.DecomposedFrom,
+		SliceIndex:              r.SliceIndex,
 		UpstreamRunID:           r.UpstreamRunID,
 		PullRequestURL:          r.PullRequestURL,
 		RetryAttempt:            r.RetryAttempt,
@@ -1557,6 +1577,19 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// spec declares no operator_agent block, on terminal runs, and
 	// best-effort on any evaluation failure.
 	resp.Delegation = s.buildDelegationPayload(r.Context(), got)
+	// slice_depends_on (E48.99 / #2546): the decomposed child's declared
+	// dependency slice indices, resolved from the parent's approved plan — the
+	// same authority the host-dispatch wave-order guard reads. Single-run read
+	// ONLY (the list endpoint never pays the per-row plan load: the deliberate
+	// no-N+1 split). Best-effort, same posture as Concerns / Delegation: a
+	// resolve error warn-logs and omits the field rather than failing the read;
+	// a run that is not a resolvable fan-out child leaves it nil.
+	if deps, resolved, derr := s.resolveSliceDependencies(r.Context(), got); derr != nil {
+		s.cfg.Logger.Warn("resolve slice dependencies failed; omitting slice_depends_on",
+			"run_id", runID.String(), "error", derr.Error())
+	} else if resolved {
+		resp.SliceDependsOn = deps
+	}
 	// Escalations surface (E53.4 / #2227): single-run read ONLY, same posture
 	// as Delegation. Omitted (nil) when the workflow declares no escalations
 	// (ZERO extra reads on that path), when none fired, or when the evaluation

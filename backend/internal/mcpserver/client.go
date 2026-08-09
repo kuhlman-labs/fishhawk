@@ -100,14 +100,36 @@ func (e *apiError) Error() string {
 // though the JSON payload itself is a string. Tools that need a
 // typed UUID parse the string locally (e.g. `uuid.Parse(in.RunID)`).
 type Run struct {
-	ID                 string  `json:"id"`
-	Repo               string  `json:"repo"`
-	WorkflowID         string  `json:"workflow_id"`
-	WorkflowSHA        string  `json:"workflow_sha"`
-	TriggerSource      string  `json:"trigger_source"`
-	TriggerRef         *string `json:"trigger_ref"`
-	State              string  `json:"state"`
-	ParentRunID        *string `json:"parent_run_id"`
+	ID            string  `json:"id"`
+	Repo          string  `json:"repo"`
+	WorkflowID    string  `json:"workflow_id"`
+	WorkflowSHA   string  `json:"workflow_sha"`
+	TriggerSource string  `json:"trigger_source"`
+	TriggerRef    *string `json:"trigger_ref"`
+	State         string  `json:"state"`
+	ParentRunID   *string `json:"parent_run_id"`
+	// DecomposedFrom mirrors the backend runResponse.decomposed_from: the
+	// parent run this row was minted as a fan-out child of (E48.99 / #2546).
+	// nil for a non-decomposed run. The json tag MUST byte-match the backend
+	// or the field silently decodes to nil (the #371 hand-maintained-wire-
+	// mirror trap).
+	DecomposedFrom *string `json:"decomposed_from,omitempty"`
+	// SliceIndex mirrors the backend runResponse.slice_index: the decomposed
+	// child's 0-based sub_plan position (E24.1 / #1141, surfaced by #2546).
+	// nil for a non-child run. A *int so slice 0 is not confused with absent.
+	// The json tag MUST byte-match the backend or the field silently decodes
+	// to nil.
+	SliceIndex *int `json:"slice_index,omitempty"`
+	// SliceDependsOn mirrors the backend runResponse.slice_depends_on: the
+	// decomposed child's declared dependency slice indices, resolved from the
+	// parent's approved plan (E48.99 / #2546). The backend emits it on the
+	// SINGLE-run read only (handleGetRun) — the list endpoint omits it (the
+	// no-N+1 split) — so it is populated when this Run came from GetRun and nil
+	// otherwise. childrenStatusFor reads it to compute per-child blocked /
+	// blocked_by. An OLDER backend omits it entirely (nil-decode, the
+	// mixed-version degrade). The json tag MUST byte-match the backend or the
+	// field silently decodes to nil.
+	SliceDependsOn     []int   `json:"slice_depends_on,omitempty"`
 	UpstreamRunID      *string `json:"upstream_run_id,omitempty"`
 	PullRequestURL     *string `json:"pull_request_url"`
 	RetryAttempt       int     `json:"retry_attempt"`
@@ -173,6 +195,26 @@ type Run struct {
 	PredictedRuntimeMinutes int       `json:"predicted_runtime_minutes,omitempty" jsonschema:"the approved plan's predicted_runtime_minutes, stamped on the run at plan approval. Drives the advertised stage-wait poll cadence; omitted when the run's plan is not yet approved"`
 	CreatedAt               time.Time `json:"created_at"`
 	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+// init classifies the decomposition-lineage Run fields this change adds
+// (decomposed_from / slice_index / slice_depends_on, E48.99 / #2546) in
+// runStatusPathTable — the ONE source the byte-budget ladder, the floor's
+// surface union and the nested-aware reflection pin all read. The pin walks
+// Run{} structurally, so every wire field MUST be classified or it silently
+// bypasses the budget; because the table literal lives in bound.go, the rows
+// are appended here, next to the fields they mirror. Package-level var
+// initialisation completes before any init() runs, so the append sees the
+// fully-built table. Each is a small scalar mirrored from the backend run row
+// and surfaced by the single-run REST read, so they classify exactly like
+// run.parent_run_id: stored, retrievable from GET /v0/runs/{id}, retained
+// through T1..T9 and dropped (itemised) only at the diagnosis skeleton.
+func init() {
+	runStatusPathTable = append(runStatusPathTable,
+		pathClassification{Path: "run.decomposed_from", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		pathClassification{Path: "run.slice_index", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		pathClassification{Path: "run.slice_depends_on", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+	)
 }
 
 // RunReviewAuthority mirrors the backend's run-status review_authority entry
@@ -995,10 +1037,31 @@ type HostDispatchResult struct {
 //     a run LOCKED to a non-local runner_kind, or a non-host-spawn stage (a
 //     human-executed or auto-merge review-gate stage) — none of which is ever
 //     host-spawned (#1912 fix-up)
+//   - 409 dependency_not_satisfied — the decomposition wave-order guard
+//     (E48.99 / #2546): this run is a fan-out child whose declared dependency
+//     slice has not reached run state 'succeeded'. Annotated here ONCE (below)
+//     as a deliberate ordering refusal, so every host-spawn verb
+//     (fishhawk_dispatch_stage, fishhawk_run_stage, fishhawk_drive_run,
+//     fishhawk_run_children) inherits it with no per-call-site edit.
+//   - 500 dependency_check_failed — the guard's parent-plan / sibling read
+//     errored (retryable), never a silent admit.
 func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
 	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
 	var res HostDispatchResult
 	if err := c.do(ctx, http.MethodPost, path, nil, &res); err != nil {
+		// Annotate the wave-order refusal ONCE, at the client, as a deliberate
+		// ordering refusal rather than an opaque infrastructure failure. The
+		// wrap preserves the *apiError in the chain (%w), so callers that
+		// errors.As for it — and every host-spawn verb, which fails closed on
+		// ANY non-nil error — are unchanged. The blocking sibling is named in
+		// the wrapped error's message + details; fishhawk_get_run_status's
+		// children[] block answers "what may I dispatch next".
+		var ae *apiError
+		if errors.As(err, &ae) && ae.Code == "dependency_not_satisfied" {
+			return nil, fmt.Errorf(
+				"dispatch refused by the decomposition wave-order guard: this fan-out child depends on a sibling slice that has not succeeded yet — dispatch the blocking sibling first (see fishhawk_get_run_status children[] depends_on/blocked/blocked_by): %w",
+				err)
+		}
 		return nil, err
 	}
 	return &res, nil
