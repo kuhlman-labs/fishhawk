@@ -2748,6 +2748,61 @@ func (c *apiClient) ListRunStages(ctx context.Context, runID uuid.UUID) ([]Stage
 	return res.Items, nil
 }
 
+// awaitStagePerCallWaitSeconds is the per-iteration ?wait long-poll the
+// fishhawk_await_stage handler hands to GetRunStageWait (#2491). It is
+// deliberately below TWO ceilings: the backend's own maxRunStageWaitSeconds
+// (30) cap on the ?wait long-poll, AND — the binding one — the apiClient short
+// client's 30s timeout (c.http). A per-call ?wait of 30 would let the backend
+// hold the connection right up to the client's own deadline, so a held
+// long-poll would race the client timeout and surface as a transport error
+// rather than a clean settled/unsettled read. 15s is the same value
+// cli/cmd/fishhawk/watch.go uses, and it leaves a full 15s of client-timeout
+// headroom over the longest held ?wait.
+const awaitStagePerCallWaitSeconds = 15
+
+// RunStageWait is the MCP-server-side projection of the GET
+// /v0/runs/{run_id}/stages/{stage_id} response's wait envelope (#1252,
+// surfaced by fishhawk_await_stage #2491). It is a PURPOSE-BUILT struct, NOT
+// an embed of the package's Stage type: the backend's runStageWaitResponse
+// embeds the canonical stage shape (which carries its OWN `state` json tag)
+// and adds a TOP-LEVEL state/terminal envelope, so embedding Stage would
+// shadow-collide on the `state` key and hide the top-level `terminal` flag.
+// Only the fields fishhawk_await_stage needs are projected; the mirror in
+// cli/internal/httpclient projects the same envelope for `fishhawk run watch`.
+type RunStageWait struct {
+	ID              string     `json:"id"`
+	RunID           string     `json:"run_id"`
+	Type            string     `json:"type"`
+	State           string     `json:"state"`
+	Terminal        bool       `json:"terminal"`
+	FailureCategory *string    `json:"failure_category,omitempty"`
+	FailureReason   *string    `json:"failure_reason,omitempty"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+}
+
+// GetRunStageWait calls GET /v0/runs/{run_id}/stages/{stage_id}, decoding the
+// top-level {state, terminal, failure_*} wait envelope (#1252). A positive
+// waitSeconds appends the opt-in bounded server-side long-poll (?wait=<n>) so
+// the call returns the moment the stage SETTLES (terminal OR parked); a
+// non-positive value omits the query for an immediate single read. The value
+// is clamped to awaitStagePerCallWaitSeconds so a caller can never hand the
+// backend a ?wait that would race the short client's 30s deadline. Routed
+// through c.do (the 30s short client).
+func (c *apiClient) GetRunStageWait(ctx context.Context, runID, stageID uuid.UUID, waitSeconds int) (*RunStageWait, error) {
+	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String()
+	if waitSeconds > 0 {
+		if waitSeconds > awaitStagePerCallWaitSeconds {
+			waitSeconds = awaitStagePerCallWaitSeconds
+		}
+		path += "?wait=" + strconv.Itoa(waitSeconds)
+	}
+	var res RunStageWait
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // Artifact is the wire shape with content inline. The backend
 // returns content directly on the listStageArtifacts endpoint (per
 // the OpenAPI Artifact schema), so the MCP tool doesn't need a

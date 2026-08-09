@@ -47,7 +47,15 @@ type DispatchStageOutput struct {
 	StageWaitStatus    *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the freshly-dispatched stage's execution wait status (normally pending/running, carrying poll_interval_seconds); poll fishhawk_get_run_status on that cadence to terminal — the cadence there is derived from the approved plan's predicted runtime and the stage's elapsed time, so it widens as the run progresses rather than staying flat. Omitted (with a warning) when the post-dispatch stage fetch failed"`
 	RunURL             string           `json:"run_url,omitempty" jsonschema:"direct link to the run-detail view"`
 	LogPath            string           `json:"log_path,omitempty" jsonschema:"path to the detached runner's redirected stdout/stderr log on the MCP host (a diagnostic only; the durable record is the backend state + the signed trace bundle)"`
-	Warnings           []string         `json:"warnings,omitempty"`
+
+	// NextStep points at the terminal wait to make on the handle this dispatch
+	// just returned (#2491): fishhawk_await_stage with (run_id, stage_id, stage)
+	// pre-filled. Populated on every successful dispatch so the handle comes with
+	// the call to make on it. Left nil on the NeedsTarget pre-spawn refusal — no
+	// runner was spawned, so there is nothing to await.
+	NextStep *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single terminal wait to call on the returned (run_id, stage_id) handle: fishhawk_await_stage, params pre-filled. Absent on the needs_target pre-spawn refusal (no runner was spawned)"`
+
+	Warnings []string `json:"warnings,omitempty"`
 
 	// NeedsTarget is the pre-spawn acceptance refusal (E48.6 / #1953): set only
 	// when the acceptance-admission endpoint reported the plan needs live
@@ -98,9 +106,11 @@ non-terminal stage_wait_status IMMEDIATELY instead of blocking to terminal.
 Workflow after dispatch:
 
   1. fishhawk_dispatch_stage --stage implement ...   (returns the handle now)
-  2. poll fishhawk_get_run_status on the advertised poll_interval_seconds (30s)
-     until the stage's implement_stage_wait_status goes terminal.
-  3. between polls, when a scope_amendment_pending surfaces, call
+  2. fishhawk_await_stage --stage implement ...      (one terminal wait on the
+     handle — returned as next_step, pre-filled with run_id + stage_id).
+     Hand-polling fishhawk_get_run_status on the advertised poll_interval_seconds
+     is the documented fallback, not the primary path.
+  3. between polls/waits, when a scope_amendment_pending surfaces, call
      fishhawk_decide_scope_amendment — so the runner's amendment poll resolves
      before its window elapses, with no failed-stage retry.
 
@@ -112,6 +122,14 @@ fishhawk_run_stage is the synchronous-with-progress opt-in — the right verb fo
 plan/review stages, or the compact one-shot for an implement stage when a
 mid-stage amendment is impossible — and it blocks to terminal returning the
 full events list, diff_summary, and next_actions in one call.
+
+The real trade-off, stated plainly: dispatch's advantage is that in-band
+mid-stage scope-amendment channel, NOT the non-blocking part. A client that
+BACKGROUNDS long tool calls already gets clean async semantics from the
+blocking verbs (fishhawk_run_stage / fishhawk_run_children) for free — so such
+a client should not reach for dispatch just to wait. When you do dispatch,
+fishhawk_await_stage is the single terminal wait to call on the handle; it
+needs no poll loop.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage (this tool is local-only by design, ADR-024 Q5).
@@ -428,6 +446,26 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		StageWaitStatus:    stageWaitStatus,
 		RunURL:             r.api.baseURL + "/runs/" + runUUID.String(),
 		LogPath:            logPath,
+		NextStep:           awaitStageNextStep(runUUID.String(), resolvedStageID, in.Stage),
 		Warnings:           warnings,
 	}, nil
+}
+
+// awaitStageNextStep builds the fishhawk_await_stage pointer a successful
+// dispatch returns (#2491): the durable (run_id, stage_id) handle the dispatch
+// just minted, pre-filled into the one terminal wait to call on it. Reuses the
+// existing SuggestedAction shape from next_actions.go rather than inventing a
+// new one, so the resolved (not raw-input) ids are what a client re-issues.
+func awaitStageNextStep(runID, stageID, stage string) *SuggestedAction {
+	return &SuggestedAction{
+		Action: "fishhawk_await_stage",
+		Params: map[string]string{
+			"run_id":   runID,
+			"stage_id": stageID,
+			"stage":    stage,
+		},
+		Precondition: "a runner was dispatched on this (run_id, stage_id) handle",
+		Consumes:     "none",
+		Reason:       "block until the dispatched stage settles, instead of hand-polling fishhawk_get_run_status",
+	}
 }
