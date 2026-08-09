@@ -211,7 +211,7 @@ func TestBound_ConvergesAtAnyBudget(t *testing.T) {
 	budgets := []int{0, 1, 2, 64, minimalRunStatusMaxBytes - 1, minimalRunStatusMaxBytes,
 		6 * 1024, 16 * 1024, mcpResponseByteBudgetDefault, 1 << 20}
 	for _, b := range budgets {
-		out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, b)
+		out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(b))
 		if err != nil {
 			t.Fatalf("budget %d: %v", b, err)
 		}
@@ -260,7 +260,7 @@ func TestBound_UnderBudget_ReturnsTheInputBytesUnchanged(t *testing.T) {
 
 	before := mustMarshal(t, in) // the genuine PRE-bound wire
 
-	got, err := boundRunStatusOutput(in, runID, len(before))
+	got, err := boundRunStatusOutput(in, runID, fixedBudget(len(before)))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -284,7 +284,7 @@ func TestFloor_IsConstantSizeUnderAdversarialInput(t *testing.T) {
 		{"html + separators", strings.Repeat("<&> ", 4096), "failed"},
 	}
 	for _, tc := range cases {
-		out, err := minimalRunStatusFrom(uuid.NewString(), tc.state, "implement", tc.state, tc.category, true, 8)
+		out, err := minimalRunStatusFrom(uuid.NewString(), tc.state, "implement", tc.state, tc.category, true, fixedBudget(8))
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
@@ -296,13 +296,13 @@ func TestFloor_IsConstantSizeUnderAdversarialInput(t *testing.T) {
 
 func TestBound_DeterministicAcrossRepeatedRuns(t *testing.T) {
 	runID := uuid.NewString()
-	first, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, 6*1024)
+	first, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(6*1024))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
 	want := mustMarshal(t, first)
 	for i := 0; i < 50; i++ {
-		got, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, 6*1024)
+		got, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(6*1024))
 		if err != nil {
 			t.Fatalf("bound %d: %v", i, err)
 		}
@@ -354,7 +354,7 @@ func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 	t.Helper()
 	out := map[int]*Elisions{}
 	for _, b := range []int{28 * 1024, 20 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
-		bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, b)
+		bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(b))
 		if err != nil {
 			t.Fatalf("budget %d: %v", b, err)
 		}
@@ -644,7 +644,7 @@ func TestFloor_StoredAggregateUnionCoversEverySurface(t *testing.T) {
 		}
 	}
 	out := maximalRunStatusOutput(runID)
-	led := &elisionLedger{budget: 1}
+	led := &elisionLedger{budget: 1, source: sourceDefault}
 	for _, tier := range runStatusTiers {
 		led.tier = tier.name
 		tier.apply(&out, runID, led)
@@ -654,7 +654,7 @@ func TestFloor_StoredAggregateUnionCoversEverySurface(t *testing.T) {
 		t.Fatalf("tier wire: %v", err)
 	}
 	collect(tiered)
-	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, 1)
+	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, fixedBudget(1))
 	if err != nil {
 		t.Fatalf("skeleton: %v", err)
 	}
@@ -663,7 +663,7 @@ func TestFloor_StoredAggregateUnionCoversEverySurface(t *testing.T) {
 		t.Fatal("derived no surfaces from the ladder — the derivation itself is vacuous")
 	}
 
-	floor, err := minimalRunStatus(maximalRunStatusOutput(runID), runID, minimalRunStatusMaxBytes)
+	floor, err := minimalRunStatus(maximalRunStatusOutput(runID), runID, fixedBudget(minimalRunStatusMaxBytes))
 	if err != nil {
 		t.Fatalf("floor: %v", err)
 	}
@@ -711,7 +711,7 @@ func TestFloor_StoredAggregateUnionCoversEverySurface(t *testing.T) {
 
 func TestSkeleton_ItemisesNestedOmissions(t *testing.T) {
 	runID := uuid.NewString()
-	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, 1)
+	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, fixedBudget(1))
 	if err != nil {
 		t.Fatalf("skeleton: %v", err)
 	}
@@ -759,7 +759,7 @@ func TestSkeletonTier_IsReachedAndItemisesPerField(t *testing.T) {
 	// The band is DERIVED, not guessed: exactly the skeleton's own size. It is
 	// necessarily above the floor and below anything T1..T9 can reach on the
 	// maximal fixture (the skeleton is a strict subset of the T9 residue).
-	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, 1<<30)
+	sk, _, err := skeletonRunStatus(maximalRunStatusOutput(runID), runID, fixedBudget(1<<30))
 	if err != nil {
 		t.Fatalf("skeleton: %v", err)
 	}
@@ -767,7 +767,7 @@ func TestSkeletonTier_IsReachedAndItemisesPerField(t *testing.T) {
 	if band <= minimalRunStatusMaxBytes {
 		t.Fatalf("derived band %d is not above the floor %d", band, minimalRunStatusMaxBytes)
 	}
-	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, band)
+	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(band))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}
@@ -842,7 +842,7 @@ func TestWireElisions_ValidationRejectsMalformed(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			led := &elisionLedger{budget: 1024, tier: tc.tier}
+			led := &elisionLedger{budget: 1024, source: sourceDefault, tier: tc.tier}
 			led.add(tc.entry)
 			got, err := led.wire()
 			if err == nil {
@@ -860,10 +860,115 @@ func TestWireElisions_ValidationRejectsMalformed(t *testing.T) {
 		})
 	}
 	// The well-formed control: the same path accepts a constructor-built entry.
-	ok := &elisionLedger{budget: 1024, tier: "T3"}
+	ok := &elisionLedger{budget: 1024, source: sourceDefault, tier: "T3"}
 	ok.add(newStoredElision("security_findings", "r", pointerListAudit("run", "implement_security_findings", 0), 3))
 	if _, err := ok.wire(); err != nil {
 		t.Fatalf("wire() rejected a well-formed ledger: %v", err)
+	}
+}
+
+// TestWireElisions_RejectsBadBudgetSource pins the #2509 arm of
+// validateWireElisions: a DTO must not ship a budget_source it cannot name. An
+// empty or unrecognised source is rejected, and every legitimate source is
+// accepted. The bad inputs are seeded BY CONSTRUCTION (a ledger with an empty /
+// bogus source carrying an otherwise well-formed entry), so the RED lands on the
+// source assertion, not on fixture setup. Deleting the validBudgetSource arm from
+// validateWireElisions turns the reject cases green.
+func TestWireElisions_RejectsBadBudgetSource(t *testing.T) {
+	entry := newStoredElision("security_findings", "r", pointerListAudit("run", "implement_security_findings", 0), 3)
+
+	bad := []struct {
+		name   string
+		source budgetSource
+	}{
+		{"empty", budgetSource("")},
+		{"unrecognised", budgetSource("guessed")},
+	}
+	for _, tc := range bad {
+		t.Run("rejects "+tc.name, func(t *testing.T) {
+			led := &elisionLedger{budget: 1024, source: tc.source, tier: "T3"}
+			led.add(entry)
+			got, err := led.wire()
+			if err == nil {
+				t.Fatalf("wire() accepted budget_source %q and returned %#v", tc.source, got)
+			}
+			if got != nil {
+				t.Errorf("wire() returned a value alongside the error — a bad source must be rejected, not normalised: %#v", got)
+			}
+			if !strings.Contains(err.Error(), "budget_source") {
+				t.Errorf("error %q does not name budget_source", err)
+			}
+		})
+	}
+
+	for _, src := range []budgetSource{sourceAdvertised, sourceAdvertisedBelowFloor, sourceConfigured, sourceDefault} {
+		t.Run("accepts "+string(src), func(t *testing.T) {
+			led := &elisionLedger{budget: 1024, source: src, tier: "T3"}
+			led.add(entry)
+			if _, err := led.wire(); err != nil {
+				t.Fatalf("wire() rejected valid budget_source %q: %v", src, err)
+			}
+		})
+	}
+}
+
+// TestElisions_ReportsBudgetSource is the DONE-MEANS pin (#2509): the source
+// string is a config-shaped value the compiler cannot enforce, so a comment-only
+// or no-op touch of the resolver would pass a scope-presence check but fail here.
+// It drives the real run-status ladder for each source and asserts the LITERAL
+// shipped string on the marshalled wire.
+func TestElisions_ReportsBudgetSource(t *testing.T) {
+	runID := uuid.NewString()
+	cases := []struct {
+		budget responseBudget
+		want   string
+	}{
+		{responseBudget{bytes: 16384, source: sourceAdvertised}, `"budget_source":"advertised"`},
+		{responseBudget{bytes: 20000, source: sourceConfigured}, `"budget_source":"configured"`},
+		{responseBudget{bytes: 16384, source: sourceDefault}, `"budget_source":"default"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.want, func(t *testing.T) {
+			out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, tc.budget)
+			if err != nil {
+				t.Fatalf("bound: %v", err)
+			}
+			if out.Elisions == nil {
+				t.Fatalf("the fixture did not exceed %d bytes — no elisions block to carry the source", tc.budget.bytes)
+			}
+			raw := string(mustMarshal(t, out))
+			if !strings.Contains(raw, tc.want) {
+				t.Errorf("marshalled wire does not carry %s: %s", tc.want, raw)
+			}
+		})
+	}
+}
+
+// TestElisions_BelowFloorAdvertisement_ReportsCouldNotHonour is BINDING
+// CONDITION 2's wire-level pin: when a client advertises a limit below the
+// convergence floor, the response emits the floor but SAYS on the wire that the
+// smaller advertisement could not be honoured (source advertised_below_floor,
+// never advertised). The budget is resolved through the REAL ladder from an
+// advertised-below-floor capability, so the whole path is exercised.
+func TestElisions_BelowFloorAdvertisement_ReportsCouldNotHonour(t *testing.T) {
+	runID := uuid.NewString()
+	budget := resolveResponseBudget(extCaps(float64(2048)), noEnv)
+	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, budget)
+	if err != nil {
+		t.Fatalf("bound: %v", err)
+	}
+	if out.Elisions == nil {
+		t.Fatal("the fixture did not exceed the floor budget — no elisions block")
+	}
+	raw := string(mustMarshal(t, out))
+	if !strings.Contains(raw, `"budget_source":"advertised_below_floor"`) {
+		t.Errorf("wire must say the advertised limit could not be honoured (advertised_below_floor): %s", raw)
+	}
+	if strings.Contains(raw, `"budget_source":"advertised"`) {
+		t.Errorf("wire must NOT present the floor as honouring the smaller advertisement: %s", raw)
+	}
+	if out.Elisions.Budget != mcpConvergenceFloorBytes {
+		t.Errorf("effective budget = %d, want the floor %d", out.Elisions.Budget, mcpConvergenceFloorBytes)
 	}
 }
 
@@ -960,7 +1065,7 @@ func TestMCPResponseByteBudget_OverrideBranches(t *testing.T) {
 	// a bound the ladder did not honour.
 	runID := uuid.NewString()
 	effective := mcpResponseByteBudget(envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1024"}))
-	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, effective)
+	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(effective))
 	if err != nil {
 		t.Fatalf("bound: %v", err)
 	}

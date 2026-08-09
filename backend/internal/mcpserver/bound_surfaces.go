@@ -274,13 +274,14 @@ func runRowDiagnosisCore(run Run) Run {
 
 // runRowFloorLedger builds the floor's aggregate entries — the floor tier's
 // explicit exception to per-field itemisation.
-func runRowFloorLedger(c runRowCtx, budget int, id string) *elisionLedger {
+func runRowFloorLedger(c runRowCtx, budget responseBudget, id string) *elisionLedger {
 	surfaces := []string{unboundedRuns().String()}
 	if !c.page {
 		surfaces = []string{unboundedRun(c.rowID(id)).String(), pointerGateView(c.rowID(id)).String()}
 	}
 	led := &elisionLedger{
-		budget: budget,
+		budget: budget.bytes,
+		source: budget.source,
 		tier:   floorTierName,
 		note:   "reduced to the constant-size floor: the run diagnosis core, plus any response field the schema forbids omitting (carried, with strings capped). The entry below is an AGGREGATE — the floor tier's explicit exception to per-field itemisation",
 	}
@@ -484,21 +485,21 @@ func hasUnexportedField(t reflect.Type) bool {
 // verbatim — so the floor never publishes a fabricated `"idempotent": false` or
 // an all-empty `"item"` while its aggregate elision claims those fields were
 // omitted. See that function for the full rationale.
-func boundRunRowOutput[T any](out T, runID string, budget int, rows func(*T) []*Run, set func(*T, *Elisions)) (T, error) {
+func boundRunRowOutput[T any](out T, runID string, budget responseBudget, rows func(*T) []*Run, set func(*T, *Elisions)) (T, error) {
 	n, err := marshalledLen(out)
 	if err != nil {
 		return out, err
 	}
-	if n <= budget {
+	if n <= budget.bytes {
 		return out, nil
 	}
 
 	c := runRowCtx{prefix: "run", runID: runID}
-	led := &elisionLedger{budget: budget, note: "response reduced to fit the tool-result byte budget"}
+	led := &elisionLedger{budget: budget.bytes, source: budget.source, note: "response reduced to fit the tool-result byte budget"}
 	for _, tier := range runRowTiers {
 		led.tier = tier.name
 		tier.apply(rows(&out), c, led)
-		fits, ferr := attachAndMeasureOut(&out, led, budget, set)
+		fits, ferr := attachAndMeasureOut(&out, led, budget.bytes, set)
 		if ferr != nil {
 			return out, ferr
 		}
@@ -545,7 +546,7 @@ func boundRunRowOutput[T any](out T, runID string, budget int, rows func(*T) []*
 // admits: drop trailing rows, blank the cursor, and point the stored elision at
 // the UNBOUNDED REST enumeration (GET /v0/runs) — never at the now-bounded
 // fishhawk_list_runs, which would cap the same page again.
-func boundListRunsOutput(out ListRunsOutput, budget int) (ListRunsOutput, error) {
+func boundListRunsOutput(out ListRunsOutput, budget responseBudget) (ListRunsOutput, error) {
 	set := func(o *ListRunsOutput, e *Elisions) { o.Elisions = e }
 	rows := func(o *ListRunsOutput) []*Run {
 		ptrs := make([]*Run, len(o.Items))
@@ -559,16 +560,16 @@ func boundListRunsOutput(out ListRunsOutput, budget int) (ListRunsOutput, error)
 	if err != nil {
 		return out, err
 	}
-	if n <= budget {
+	if n <= budget.bytes {
 		return out, nil
 	}
 
 	c := runRowCtx{prefix: "items[]", page: true}
-	led := &elisionLedger{budget: budget, note: "response reduced to fit the tool-result byte budget"}
+	led := &elisionLedger{budget: budget.bytes, source: budget.source, note: "response reduced to fit the tool-result byte budget"}
 	for _, tier := range runRowTiers {
 		led.tier = tier.name
 		tier.apply(rows(&out), c, led)
-		fits, ferr := attachAndMeasureOut(&out, led, budget, set)
+		fits, ferr := attachAndMeasureOut(&out, led, budget.bytes, set)
 		if ferr != nil {
 			return out, ferr
 		}
@@ -591,7 +592,7 @@ func boundListRunsOutput(out ListRunsOutput, budget int) (ListRunsOutput, error)
 			newStoredElision("items", fmt.Sprintf(
 				"%d trailing rows were dropped to fit the byte budget, and next_cursor was BLANKED because the backend's cursor is positioned after the FULL page — returning it here would silently skip the dropped rows. Re-read the enumeration from the unbounded REST surface below",
 				total-keep), unboundedRuns().retrievalPointer, total-keep))
-		fits, ferr := attachAndMeasureOut(&out, led, budget, set)
+		fits, ferr := attachAndMeasureOut(&out, led, budget.bytes, set)
 		if ferr != nil {
 			return out, ferr
 		}
@@ -635,18 +636,18 @@ func boundListRunsOutput(out ListRunsOutput, budget int) (ListRunsOutput, error)
 // fishhawk_list_audit is the VERIFIER surface for the audit hash chain
 // (client.go's comment on AuditEntry.EntryHash says so explicitly), and dropping
 // the chain to save bytes would break verification rather than shrink it.
-func boundListAuditOutput(out ListAuditOutput, runID, category string, budget int) (ListAuditOutput, error) {
+func boundListAuditOutput(out ListAuditOutput, runID, category string, budget responseBudget) (ListAuditOutput, error) {
 	set := func(o *ListAuditOutput, e *Elisions) { o.Elisions = e }
 
 	n, err := marshalledLen(out)
 	if err != nil {
 		return out, err
 	}
-	if n <= budget {
+	if n <= budget.bytes {
 		return out, nil
 	}
 
-	led := &elisionLedger{budget: budget, note: "response reduced to fit the tool-result byte budget"}
+	led := &elisionLedger{budget: budget.bytes, source: budget.source, note: "response reduced to fit the tool-result byte budget"}
 
 	// A1: cap every oversized payload string value, escape-aware.
 	led.tier = "A1"
@@ -661,7 +662,7 @@ func boundListAuditOutput(out ListAuditOutput, runID, category string, budget in
 			"oversized payload string values capped to %d encoded bytes each (%d elided in total); an audit payload can itself be arbitrarily large, so the untruncated entries are read from the UNBOUNDED REST audit walk — re-calling this now-bounded tool would cap the same values again",
 			auditPayloadTierCap, elided), unboundedRunAudit(runID), elided))
 	}
-	fits, err := attachAndMeasureOut(&out, led, budget, set)
+	fits, err := attachAndMeasureOut(&out, led, budget.bytes, set)
 	if err != nil {
 		return out, err
 	}
@@ -684,7 +685,7 @@ func boundListAuditOutput(out ListAuditOutput, runID, category string, budget in
 				"%d trailing entries were dropped to fit the byte budget, and next_cursor was BLANKED because the backend's cursor is positioned after the FULL page — returning it here would silently skip the dropped entries. The pointer below is anchored at the last kept sequence, so it returns exactly the dropped set",
 				total-keep),
 				pointerListAudit(runID, category, out.Items[keep-1].Sequence), total-keep))
-		fits, ferr := attachAndMeasureOut(&out, led, budget, set)
+		fits, ferr := attachAndMeasureOut(&out, led, budget.bytes, set)
 		if ferr != nil {
 			return out, ferr
 		}
@@ -701,7 +702,7 @@ func boundListAuditOutput(out ListAuditOutput, runID, category string, budget in
 // max(budget, mcpConvergenceFloorBytes). Every retained non-hash string is
 // capped; the hashes are never capped, because a truncated hash is not a
 // smaller hash, it is a broken one.
-func listAuditFloor(out ListAuditOutput, runID, category string, budget, total int) (ListAuditOutput, error) {
+func listAuditFloor(out ListAuditOutput, runID, category string, budget responseBudget, total int) (ListAuditOutput, error) {
 	floor := ListAuditOutput{}
 	anchor := int64(0)
 	if len(out.Items) > 0 {
@@ -719,7 +720,8 @@ func listAuditFloor(out ListAuditOutput, runID, category string, budget, total i
 		floor.Items = []AuditEntry{kept}
 	}
 	led := &elisionLedger{
-		budget: budget,
+		budget: budget.bytes,
+		source: budget.source,
 		tier:   floorTierName,
 		note:   "reduced to the constant-size floor: one entry with its hash chain intact and its payload dropped. The entry below is an AGGREGATE — the floor tier's explicit exception to per-field itemisation",
 	}
