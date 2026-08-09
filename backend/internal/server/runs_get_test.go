@@ -351,6 +351,72 @@ func TestLineageComplete_ChildScanTruncationGuard(t *testing.T) {
 	}
 }
 
+// TestGetRun_SliceIndexAndDependsOn (E48.99 / #2546) asserts the single-run
+// read surfaces slice_index (a pure row projection) AND slice_depends_on
+// (resolved from the parent's approved plan) for a decomposed child, and omits
+// both for a non-child run. The raw body is searched for the literal wire keys
+// because the MCP client decodes this exact body — a json-tag typo would pass
+// the struct-field assertion while decoding to nil in production.
+func TestGetRun_SliceIndexAndDependsOn(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", child.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"slice_index":1`) {
+		t.Errorf("body missing slice_index wire key: %s", body)
+	}
+	if !strings.Contains(body, `"slice_depends_on":[0]`) {
+		t.Errorf("body missing slice_depends_on wire key: %s", body)
+	}
+	var resp runResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.SliceIndex == nil || *resp.SliceIndex != 1 {
+		t.Errorf("SliceIndex = %v, want 1", resp.SliceIndex)
+	}
+	if len(resp.SliceDependsOn) != 1 || resp.SliceDependsOn[0] != 0 {
+		t.Errorf("SliceDependsOn = %v, want [0]", resp.SliceDependsOn)
+	}
+
+	// A non-decomposed run omits BOTH fields (omitempty).
+	plain := rr.seedRun()
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", plain.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if strings.Contains(w.Body.String(), "slice_index") || strings.Contains(w.Body.String(), "slice_depends_on") {
+		t.Errorf("non-child run body should omit slice fields: %s", w.Body.String())
+	}
+}
+
+// TestGetRun_SliceDependsOn_BestEffortOmit: a plan-resolve failure omits
+// slice_depends_on (best-effort) while the read still 200s and slice_index (off
+// the row) is unaffected.
+func TestGetRun_SliceDependsOn_BestEffortOmit(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	child := seedGuardChild(rr, parentID, 1, run.StateRunning)
+	art.listErr = errors.New("artifact store down")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", child.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (best-effort):\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "slice_depends_on") {
+		t.Errorf("slice_depends_on should be omitted on a resolve failure: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"slice_index":1`) {
+		t.Errorf("slice_index (a row projection) should still surface: %s", w.Body.String())
+	}
+}
+
 func TestGetRun_NotFound(t *testing.T) {
 	s := newServer(t, newFakeRepo())
 	id := uuid.New()

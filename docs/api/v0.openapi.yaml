@@ -704,6 +704,30 @@ components:
             semantic — both can be non-nil on a child whose CI failed
             and re-dispatched. SPA breadcrumb: "decomposed sub-plan of
             <parent short id>".
+        slice_index:
+          type: [integer, "null"]
+          description: |
+            The decomposed child's 0-based sub_plan position (E24.1 /
+            #1141, surfaced by E48.99 / #2546) — its slot in the parent
+            plan's `decomposition.sub_plans` and in the `plan_decomposed`
+            `child_run_ids`. Persisted since migration 0034 and only now
+            surfaced; a pure projection of the run row, so it appears on
+            BOTH `GET /v0/runs/{id}` and the list endpoint. Null for a
+            non-decomposed run.
+        slice_depends_on:
+          type: array
+          items:
+            type: integer
+          description: |
+            The decomposed child's declared dependency slice indices,
+            resolved from the parent's approved plan
+            (`decomposition.sub_plans[slice_index].depends_on`) — the same
+            authority the host-dispatch wave-order guard reads (E48.99 /
+            #2546). SINGLE-RUN READ ONLY: `GET /v0/runs/{id}` surfaces it;
+            the list endpoint deliberately omits it (no per-row plan load,
+            the no-N+1 split). Omitted when the run is not a resolvable
+            fan-out child, when the slice declares no dependencies, or
+            best-effort when the plan resolve fails.
         upstream_run_id:
           type: [string, "null"]
           format: uuid
@@ -7164,7 +7188,13 @@ paths:
 
         **Idempotent.** A stage already `dispatched` returns 200 with
         `transitioned: false` — the legal manual re-dispatch of a stage whose
-        spawned runner died; the caller proceeds and re-spawns.
+        spawned runner died; the caller proceeds and re-spawns. The
+        decomposition wave-order guard (below) runs AHEAD of this no-op, so a
+        fan-out child already `dispatched` whose declared dependency has since
+        regressed out of `succeeded` (a revived/re-opened sibling) is refused
+        409 `dependency_not_satisfied` on re-dispatch rather than returning the
+        200 no-op — wave order is re-validated even on the dead-runner
+        re-dispatch path.
 
         **Not admissible.** A `running`, terminal, or any `awaiting_*` gate
         state returns 409 `dispatch_not_admissible` so a live or settled stage
@@ -7218,9 +7248,33 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            `dispatch_not_admissible` — the stage is in a `running`, terminal,
-            or `awaiting_*` gate state, so a fresh spawn marker cannot be
-            applied.
+            One of two refusals:
+
+            - `dispatch_not_admissible` — the stage is in a `running`,
+              terminal, or `awaiting_*` gate state, a run locked to a
+              non-local `runner_kind`, or a non-host-spawn stage, so a fresh
+              spawn marker cannot be applied.
+            - `dependency_not_satisfied` — the decomposition wave-order guard
+              (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
+              + `slice_index` set) whose declared dependency slice has not
+              reached run state `succeeded`. `details` carries `slice_index`,
+              `blocking_slice_index`, `blocking_run_id` (empty when that slice
+              has no minted sibling) and `blocking_state` (`not_minted` when
+              absent). The refusal fires BEFORE the state CAS and ahead of the
+              idempotent no-op, so the stage's state is unchanged (parked at
+              `awaiting_host_dispatch`, or left `dispatched` when a re-dispatch
+              hit a since-regressed dependency); dispatch the named blocking
+              sibling first to clear it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `dependency_check_failed` — the wave-order guard could not resolve
+            the run's parent plan or list its decomposition siblings to
+            validate wave order (E48.99 / #2546). Retryable: the guard fails
+            closed on a read error rather than admitting out of order, and
+            commits no state.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

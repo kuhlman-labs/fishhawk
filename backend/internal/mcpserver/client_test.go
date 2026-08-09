@@ -705,7 +705,76 @@ func TestHostDispatchStage_WireShape(t *testing.T) {
 		if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict || ae.Code != "dispatch_not_admissible" {
 			t.Errorf("err = %v, want *apiError with 409 dispatch_not_admissible", err)
 		}
+		// A non-dependency 4xx is NOT annotated — the message stays the raw
+		// apiError, with none of the wave-order guidance.
+		if strings.Contains(err.Error(), "wave-order guard") {
+			t.Errorf("dispatch_not_admissible must not gain the wave-order annotation: %v", err)
+		}
 	})
+
+	// The wave-order refusal (409 dependency_not_satisfied) is annotated ONCE at
+	// the client as a deliberate ordering refusal (#2546): the error still
+	// errors.As into *apiError (so every fail-closed caller is unchanged) AND its
+	// message carries the "dispatch the blocking sibling first" guidance pointing
+	// at fishhawk_get_run_status children[]. Deleting the annotation makes the
+	// message the raw apiError and drops the guidance — the counterfactual.
+	t.Run("409 dependency_not_satisfied is annotated as an ordering refusal", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"dependency_not_satisfied","message":"slice 1 is blocked on dependency slice 0 (run abc, state pending)","details":{"blocking_run_id":"abc"}}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		_, err := c.HostDispatchStage(context.Background(), runID, stageID)
+		if err == nil {
+			t.Fatal("expected an error on 409 dependency_not_satisfied")
+		}
+		// Still typed — callers that switch on Code are unchanged.
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.Code != "dependency_not_satisfied" {
+			t.Errorf("err = %v, want the *apiError preserved in the chain", err)
+		}
+		// Annotated with the ordering guidance.
+		if !strings.Contains(err.Error(), "dispatch the blocking sibling first") ||
+			!strings.Contains(err.Error(), "fishhawk_get_run_status") {
+			t.Errorf("err = %v, want the wave-order ordering guidance pointing at get_run_status children[]", err)
+		}
+	})
+}
+
+// TestRunMirror_DecodesDecompositionFields pins the client Run mirror's
+// decomposed_from / slice_index / slice_depends_on json tags against the
+// backend runResponse tags (E48.99 / #2546). A tag drift decodes the field to
+// nil — the #371-class trap that lets childrenStatusFor silently report a
+// blocked child as dispatchable. The omitted case is the mixed-version degrade
+// (an older backend that omits the keys → nil).
+func TestRunMirror_DecodesDecompositionFields(t *testing.T) {
+	const head = `{"id":"11111111-1111-1111-1111-111111111111","repo":"x/y",` +
+		`"workflow_id":"feature_change","workflow_sha":"deadbeef","trigger_source":"cli","state":"running",`
+	const tail = `"created_at":"2026-08-05T00:00:00Z","updated_at":"2026-08-05T00:00:00Z"}`
+
+	var got Run
+	body := head + `"decomposed_from":"22222222-2222-2222-2222-222222222222","slice_index":1,"slice_depends_on":[0],` + tail
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode Run: %v", err)
+	}
+	if got.DecomposedFrom == nil || *got.DecomposedFrom != "22222222-2222-2222-2222-222222222222" {
+		t.Errorf("Run.DecomposedFrom = %v, want the decoded parent (json tag mismatch?)", got.DecomposedFrom)
+	}
+	if got.SliceIndex == nil || *got.SliceIndex != 1 {
+		t.Errorf("Run.SliceIndex = %v, want 1 (json tag mismatch?)", got.SliceIndex)
+	}
+	if len(got.SliceDependsOn) != 1 || got.SliceDependsOn[0] != 0 {
+		t.Errorf("Run.SliceDependsOn = %v, want [0] (json tag mismatch?)", got.SliceDependsOn)
+	}
+
+	var omitted Run
+	if err := json.Unmarshal([]byte(head+tail), &omitted); err != nil {
+		t.Fatalf("decode Run (keys omitted): %v", err)
+	}
+	if omitted.DecomposedFrom != nil || omitted.SliceIndex != nil || omitted.SliceDependsOn != nil {
+		t.Errorf("older-backend Run = %+v, want all decomposition fields nil (mixed-version degrade)", omitted)
+	}
 }
 
 // TestReviveRun_WireShape pins the tool -> client -> HTTP boundary for

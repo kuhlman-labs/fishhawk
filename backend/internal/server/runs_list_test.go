@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -231,6 +232,68 @@ func TestListRuns_RepoError(t *testing.T) {
 	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs", nil))
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+// TestListRuns_SliceIndexPresent_DependsOnAbsent (E48.99 / #2546) pins the
+// deliberate no-N+1 split: slice_index (a pure row projection) rides the list
+// row for a decomposed child, but slice_depends_on (which needs a per-row plan
+// load) is ABSENT — a later refactor that quietly added a per-row plan load
+// would break this.
+func TestListRuns_SliceIndexPresent_DependsOnAbsent(t *testing.T) {
+	repo := newFakeRepo()
+	child := seedRun(repo, "x/y", "feature_change", run.StateRunning, time.Now().UTC())
+	parentID := uuid.New()
+	idx := 2
+	child.DecomposedFrom = &parentID
+	child.SliceIndex = &idx
+	s := newServer(t, repo)
+
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(got.Items))
+	}
+	if si, ok := got.Items[0]["slice_index"]; !ok || si != float64(2) {
+		t.Errorf("list row slice_index = %v (present=%v), want 2", si, ok)
+	}
+	if _, present := got.Items[0]["slice_depends_on"]; present {
+		t.Error("list row carries slice_depends_on — the list path must stay free of the per-row plan load (no N+1)")
+	}
+}
+
+// TestFakeRepo_ListRuns_DecomposedFromFilter pins the step-5 fake fix (#2546):
+// fakeRepo.ListRuns must honour the DecomposedFrom filter the wave-order guard's
+// sibling walk depends on. Without the arm every seeded run appears as a sibling
+// of any parent, so a guard test could pass for the wrong reason. A decoy run
+// under a DIFFERENT parent must be excluded. (The guard's own tests run against
+// orchestratorRepo, which can serve the plan load fakeRepo cannot; this pins the
+// fakeRepo arm directly so the edit is load-bearing.)
+func TestFakeRepo_ListRuns_DecomposedFromFilter(t *testing.T) {
+	repo := newFakeRepo()
+	parentA, parentB := uuid.New(), uuid.New()
+	childA := seedRun(repo, "x/y", "w", run.StateRunning, time.Now().UTC())
+	childA.DecomposedFrom = &parentA
+	decoy := seedRun(repo, "x/y", "w", run.StateRunning, time.Now().UTC())
+	decoy.DecomposedFrom = &parentB
+
+	got, err := repo.ListRuns(context.Background(), run.ListRunsFilter{
+		DecomposedFrom: &parentA, Limit: 100,
+	})
+	if err != nil {
+		t.Fatalf("ListRuns: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != childA.ID {
+		t.Errorf("ListRuns(DecomposedFrom=A) = %d rows, want only childA %s (decoy under B must be excluded)", len(got), childA.ID)
 	}
 }
 

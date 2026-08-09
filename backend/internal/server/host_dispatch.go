@@ -168,6 +168,29 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Decomposition wave-order guard (#2546). For a fan-out child carrying
+	// decomposed_from + slice_index this resolves the child's declared
+	// dependencies from the parent's approved plan and refuses when a
+	// dependency slice has not reached run state 'succeeded'. It sits AFTER the
+	// eligibility checks and BEFORE the state switch/CAS below, inside the
+	// held stage-admission lock, so a refusal commits NO state and the stage
+	// stays parked at awaiting_host_dispatch. Non-child runs (the parent's own
+	// re-dispatch, every non-decomposed run) take the inert admit path with no
+	// extra reads. Fail-OPEN on ABSENT dependency data (no plan / no
+	// decomposition / out-of-range slice — refusing there would wedge every
+	// legitimate dispatch behind an unresolvable plan) but fail-CLOSED on an
+	// ERRORED read (retryable 500, never a silent admit).
+	if depErr, derr := s.guardDecompositionWaveOrder(r.Context(), runRow); derr != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
+			"could not resolve the run's decomposition dependencies to validate wave order",
+			map[string]any{"run_id": runID.String(), "error": derr.Error()})
+		return
+	} else if depErr != nil {
+		s.writeError(w, r, http.StatusConflict, "dependency_not_satisfied",
+			depErr.message(), depErr.details())
+		return
+	}
+
 	switch stage.State {
 	case run.StageStateDispatched:
 		// Idempotent no-op: a spawn attempt already exists. The manual

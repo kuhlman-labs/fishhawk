@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/google/uuid"
 )
@@ -26,15 +27,37 @@ const (
 )
 
 // ChildStatus is one decomposed child's live lifecycle state, paired with
-// its slice index (its position in the parent's plan_decomposed child_run_ids,
-// the same ordering fishhawk_run_children dispatches in). State mirrors the
-// child run's lifecycle state — pending/running/succeeded/failed — or
-// "unknown" when the per-child GetRun failed (best-effort: a child read
-// failure never fails the parent snapshot).
+// its slice index (the child run row's authoritative slice_index — its
+// sub_plan position in the parent's decomposition — falling back to the
+// position in child_run_ids only for an older backend that omits the field).
+// State mirrors the child run's lifecycle state —
+// pending/running/succeeded/failed — or "unknown" when the per-child GetRun
+// failed (best-effort: a child read failure never fails the parent snapshot).
 type ChildStatus struct {
 	RunID      string `json:"run_id" jsonschema:"the child run UUID"`
-	SliceIndex int    `json:"slice_index" jsonschema:"the child's position in the parent's plan_decomposed child_run_ids (slice-index order)"`
+	SliceIndex int    `json:"slice_index" jsonschema:"the child's authoritative slice index from its run row (its sub_plan position in the parent's decomposition); falls back to the position in child_run_ids only for an older backend that omits slice_index"`
 	State      string `json:"state" jsonschema:"the child run's lifecycle state: pending, running, succeeded, failed, or unknown when the per-child read failed"`
+	// DependsOn lists the slice indices this child depends on (E48.99 / #2546),
+	// mirrored from the child run row's slice_depends_on (resolved from the
+	// parent's approved plan on the single-run read). Omitted for a wave-0
+	// child with no declared dependencies, and for a legacy backend that omits
+	// slice_depends_on entirely (nil-decode → Blocked false, so the block
+	// renders exactly as it did before this field existed).
+	DependsOn []int `json:"depends_on,omitempty" jsonschema:"the slice indices this child depends on, from the parent plan's decomposition; omitted for a wave-0 child with no dependencies"`
+	// Blocked is true when a dependency slice has not yet reached state
+	// succeeded — the child is NOT dispatchable until it clears. An
+	// unknown-state dependency (its per-child read failed) counts as blocking,
+	// never as dispatchable. A dependency slice with NO minted sibling (absent
+	// from the parent's child_run_ids) also counts as blocking: host dispatch
+	// refuses that child as not_minted, so the view must not advertise it as
+	// dispatchable.
+	Blocked bool `json:"blocked" jsonschema:"true when a dependency slice has not yet succeeded, so this child cannot be dispatched yet; an unknown-state or not-yet-minted dependency counts as blocking"`
+	// BlockedBy names the run ids of the dependency siblings that have not yet
+	// succeeded, in ascending slice order. Empty when the child is not blocked.
+	// A not-minted dependency slice has no run id to name, so it is reported as
+	// a synthetic "slice N (not_minted)" marker instead — the read-side mirror
+	// of the host-dispatch guard's not_minted refusal.
+	BlockedBy []string `json:"blocked_by,omitempty" jsonschema:"the not-yet-succeeded dependency blockers for this child, in slice order: a minted sibling's run id, or a synthetic \"slice N (not_minted)\" marker for a dependency slice with no minted sibling"`
 }
 
 // ChildrenStatus is the decomposed-parent per-child + integration-phase view
@@ -118,10 +141,27 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 		Total:    len(pd.ChildRunIDs),
 	}
 	for i, childID := range pd.ChildRunIDs {
+		// SliceIndex defaults to the loop position and is overwritten below by
+		// the child run row's authoritative slice_index when the GetRun hits and
+		// carries it. The positional fallback covers only an OLDER backend that
+		// does not send slice_index (nil-decode) — a dense-in-slice-order
+		// child_run_ids, where position and slice index coincide anyway.
 		child := ChildStatus{RunID: childID, SliceIndex: i, State: "unknown"}
 		if childUUID, perr := uuid.Parse(childID); perr == nil {
 			if runRow, gerr := r.api.GetRun(ctx, childUUID); gerr == nil {
 				child.State = runRow.State
+				// slice_depends_on is surfaced on the single-run read GetRun
+				// hits here (E48.99 / #2546); nil for a wave-0 child or a
+				// legacy backend that omits it.
+				child.DependsOn = runRow.SliceDependsOn
+				// Prefer the run row's authoritative slice_index over the loop
+				// position: a non-dense child_run_ids (slice 0 never minted)
+				// otherwise mis-keys the bySlice map below. nil only for an
+				// older backend that omits the field — then the positional
+				// fallback stands.
+				if runRow.SliceIndex != nil {
+					child.SliceIndex = *runRow.SliceIndex
+				}
 			}
 			// A GetRun error (or an unparseable id) leaves State="unknown" —
 			// best-effort, never fails the snapshot.
@@ -137,6 +177,44 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 			cs.Failed++
 		}
 		cs.Children = append(cs.Children, child)
+	}
+
+	// Second pass (E48.99 / #2546): now that every child's state is known,
+	// resolve each child's blocked-ness from its DependsOn against the sibling
+	// states gathered above. Resolve dependencies BY SLICE INDEX through
+	// bySlice (not by slice POSITION), so a plan_decomposed whose child_run_ids
+	// is not dense-in-slice-order never associates a dependency with the wrong
+	// child. A dependency slice that has not reached "succeeded" (including an
+	// "unknown" read failure) blocks the child, and its run id is named in
+	// BlockedBy. A dependency slice with NO minted sibling (absent from
+	// child_run_ids — the not_minted case the host-dispatch guard refuses in
+	// decomposition_dispatch_guard.go) ALSO blocks: the view must not advertise
+	// a dispatch the backend would 409 dependency_not_satisfied, so it is named
+	// by a synthetic "slice N (not_minted)" marker since no run id exists. So
+	// one get_run_status read answers "what may I dispatch next". A child with
+	// no DependsOn (wave 0, or a legacy backend that omits slice_depends_on)
+	// stays Blocked=false, which renders exactly as it did before this field
+	// existed (back-compat).
+	bySlice := make(map[int]int, len(cs.Children)) // slice index -> position in cs.Children
+	for i := range cs.Children {
+		bySlice[cs.Children[i].SliceIndex] = i
+	}
+	for i := range cs.Children {
+		for _, depIdx := range cs.Children[i].DependsOn {
+			pos, minted := bySlice[depIdx]
+			if !minted {
+				// No sibling minted for this dependency slice: host dispatch
+				// refuses this child (not_minted), so it is NOT dispatchable.
+				cs.Children[i].Blocked = true
+				cs.Children[i].BlockedBy = append(cs.Children[i].BlockedBy,
+					fmt.Sprintf("slice %d (not_minted)", depIdx))
+				continue
+			}
+			if cs.Children[pos].State != "succeeded" {
+				cs.Children[i].Blocked = true
+				cs.Children[i].BlockedBy = append(cs.Children[i].BlockedBy, cs.Children[pos].RunID)
+			}
+		}
 	}
 
 	// Scan the recent-audit window for the fan-in outcome, tracking the HIGHEST
