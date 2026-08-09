@@ -106,6 +106,23 @@
           "description": "Ordered list of phases. At least two required; the canonical shape is expand->migrate->contract."
         }
       }
+    },
+    "irreducible": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rationale"],
+      "description": "Optional (#2412). The structured way for a planner facing a COMPILE-ATOMIC change to DECLINE proposing a split_proposal instead of fabricating one it knows is invalid — PRESENCE of this object (with a non-empty rationale) is the declaration, the schema-idiomatic form of the issue's `irreducible: true`. Three load-bearing semantics: (a) it is the honest DECLINE of a split for a change that cannot be phased into independently-landable at-or-under-cap commits (e.g. a Go method whose receiver base type must live in the method's own package); (b) UNLIKE over_cap (hint-only — no enforcement path may read it) this field IS read by the plan gate: a well-formed irreducible with NO split_proposal converts the count-derived over-cap HARD REJECT into a surfaced, operator-decidable advisory, and it NEVER suppresses the count-derived over-cap advisory itself (that advisory still fires; a SECOND advisory surfaces this rationale as a challengeable claim); (c) it does NOT make the change landable — the implement stage re-checks max_files_changed against the REAL diff, so an approved irreducible over-cap plan still needs a governed spec raise. Mutually exclusive with split_proposal: a plan both declining and proposing a split is contradictory and is rejected by plan.Parse.",
+      "properties": {
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the change is compile-atomic and cannot be phased into independently-landable at-or-under-cap commits. Surfaced to the operator at the plan gate as a CHALLENGEABLE claim — a bare unjustified declaration is exactly the flag this field refuses, so the rationale is required. (A whitespace-only rationale satisfies minLength:1 but is rejected semantically by plan.Parse as not a declaration.)"
+        },
+        "atomicity_basis": {
+          "type": "string",
+          "description": "Optional. The language/toolchain rule that makes the change atomic — e.g. 'Go requires a method's receiver base type in the method's own package'. Rendered alongside the rationale in the plan-gate advisory when present."
+        }
+      }
     }
   },
 

@@ -67,7 +67,8 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "surface_sweep_exemptions": [ { "pattern": "...", "sibling": "...", "reason": "..." } ],
   "scope_removals": [ { "path": "...", "reason": "..." } ],
   "over_cap": false,
-  "split_proposal": { "rationale": "...", "phases": [ { "title": "...", "scope": { "files": [...] }, "depends_on": [] }, ... ] }
+  "split_proposal": { "rationale": "...", "phases": [ { "title": "...", "scope": { "files": [...] }, "depends_on": [] }, ... ] },
+  "irreducible": { "rationale": "...", "atomicity_basis": "..." }
 }
 ```
 
@@ -401,6 +402,27 @@ The optional ordered-phase split a plan carries when `scope.files` exceeds the r
 
 There is deliberately **no** `over_cap: true ⇒ split_proposal present` coupling in the plan-package semantic validator. Because that validator has no view of the resolved cap, such a check was count-blind — it rejected an **under-cap** plan that merely set the `over_cap` hint, turning the advisory into a server rejection across every `plan.Parse` caller (the plan reviewers plus the fail-open scope/surface/test gate checks) and breaking the under-cap-unaffected guarantee (#2055 fixup). The count-derived server reject above is the sole authoritative over-cap enforcement; the semantic validator only checks the **structure** of a `split_proposal` that is present (see below).
 
+**Per-phase cap validation + landability non-guarantee (#2412).** When the on-approval hook files the phased children of a `split_proposal`, it first checks **each phase's** declared `scope.files` count against the resolved implement cap. If any phase is itself over cap, the hook files **zero** children and records a `split_filing_refused` marker rather than emitting a lead phase that would fail category-B in its own implement stage (#2410's 160-files-against-45 case). Independently, split-filing does **not** verify a phase's **independent landability**: it checks file counts and (when the runner shipped a reachability sweep) Go symbol reachability, but it does **not** detect **path-keyed couplings** — literal file-path strings in surface-sweep tables, path-keyed maps in tests, and build/rebuild matrices — so a phase that moves or renames files may leave such a coupling dangling and may not be individually green. Every filed child body and the parent comment state this plainly, and the non-contract phase done-means no longer asserts the resulting tree "compiles as an at-or-under-cap intermediate".
+
+### `irreducible`
+
+The optional structured way for a planner facing a **compile-atomic** change to **DECLINE** proposing a `split_proposal` instead of fabricating one it knows is invalid (#2412). The **presence** of the object (with a non-empty `rationale`) is the declaration — the schema-idiomatic form of the triggering issue's `irreducible: true`. `atomicity_basis` optionally names the language/toolchain rule that makes the change atomic.
+
+```json
+{
+  "irreducible": {
+    "rationale": "the method's receiver base type must live in its own package, so the change cannot be phased into at-or-under-cap commits",
+    "atomicity_basis": "Go requires a method's receiver base type in the method's own package"
+  }
+}
+```
+
+**Read by the gate — the contrast with hint-only `over_cap`.** Unlike `over_cap` (which no enforcement path may read), `irreducible` **is** read by exactly one enforcement site (`server.overCapSplitRejection`): a well-formed `irreducible` with no `split_proposal` **converts the count-derived over-cap HARD REJECT into a surfaced advisory** the operator decides at the gate. The read is **positional widen-only** — the reject function decides the plan **is** over cap from `len(scope.files)` vs the resolved cap *first*, and consults `irreducible` only afterwards, so an under-cap plan returns before the field is ever read and no under-cap plan can change behaviour (reconciling this with #2055's rule that reading a plan field must not make the gate *reject* a plan the count says is fine).
+
+**It never suppresses the count-derived over-cap advisory.** The declaration does not silence the deterministic `len(scope.files)`-vs-cap advisory; that advisory still fires, and a **second** advisory surfaces the `irreducible` rationale (and `atomicity_basis`) to the operator as a **challengeable** claim. The plan-gate advisory ordering — count-derived advisory first, then the irreducible advisory — is the observable proof of non-suppression.
+
+**It does not make the change landable.** Approving an `irreducible` over-cap plan does not bypass the cap: the implement stage re-checks `max_files_changed` against the **real diff**, so landing it still needs a governed `max_files_changed` raise. `irreducible` is **mutually exclusive** with `split_proposal` — a plan both declining and proposing a split is contradictory and is rejected by `plan.Parse`. Additive-optional within `standard_v1.x`; a plan that omits it validates and gates exactly as before.
+
 ## Validation rules beyond the schema
 
 JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
@@ -414,6 +436,7 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - `decomposition.sub_plans[*].depends_on` must form a valid DAG: every index in `[0, len(sub_plans))`, never self-referential, and free of cycles. `plan.Waves` validates this and returns `*SemanticError` on violation (#1258). The waves it derives are not yet consumed by dispatch (slice B, #1278).
 - `over_cap` is hint-only: the plan-package semantic validator enforces **no** `over_cap ⇒ split_proposal` coupling. A plan self-declaring `over_cap: true` without a `split_proposal` parses cleanly — the count-blind coupling that once rejected it also rejected under-cap plans that merely set the hint, so it was removed (#2055 fixup). The authoritative over-cap enforcement is the server-side count-derived reject (`overCapSplitRejection`), which never reads `over_cap`.
 - `split_proposal.phases[*].title` must be unique within the array, every phase must declare a non-empty `scope.files`, and `split_proposal.phases[*].depends_on` must form a valid DAG (every index in `[0, len(phases))`, never self-referential, free of cycles — reusing the same Kahn sort as `plan.Waves`). Each returns `*SemanticError` on violation (semantic check `checkSplitProposal` in the plan package, #2055).
+- `irreducible` is **mutually exclusive** with `split_proposal`: a plan carrying both returns `*SemanticError` (a plan cannot both decline and propose a split). And an `irreducible` whose `rationale` is blank/whitespace-only — which the schema's `minLength: 1` admits (a single space) — returns `*SemanticError`: an unjustified declaration is exactly the bare flag the design refuses (semantic check `checkIrreducible` in the plan package, #2412). `irreducible` adds **no** cap-aware logic to the semantic validator (it still has no view of the resolved cap), so no under-cap plan changes behaviour; the cap-aware relaxation lives at the server gate (`overCapSplitRejection`).
 
 These cross-references aren't expressible in JSON Schema cleanly.
 

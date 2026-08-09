@@ -2395,6 +2395,21 @@ func buildPlan(t Trigger) string {
 				"regardless of the flag). Do NOT silently emit an over-cap monolith.\n\n",
 			t.MaxFilesChanged, t.MaxFilesChanged, t.MaxFilesChanged,
 		)
+		// The irreducible out (#2412): a compile-atomic change that genuinely
+		// cannot be phased into independently-landable at-or-under-cap commits must
+		// NOT fabricate a split_proposal it knows is invalid — declare irreducible
+		// instead. Mutually exclusive with split_proposal; does not by itself make
+		// the change landable (implement re-checks the real diff, so it still needs
+		// a governed cap raise).
+		b.WriteString(
+			"If the change is genuinely COMPILE-ATOMIC and cannot be phased into independently-landable " +
+				"at-or-under-cap commits (e.g. a Go method whose receiver base type must live in the method's " +
+				"own package), do NOT fabricate a split_proposal you know is invalid. Instead declare the " +
+				"top-level irreducible object with a rationale (and optionally atomicity_basis naming the " +
+				"language/toolchain rule). irreducible is mutually exclusive with split_proposal; the operator " +
+				"ratifies the declaration at the plan gate. It does NOT by itself make the change landable — " +
+				"the implement stage re-checks max_files_changed against the real diff, so an approved " +
+				"irreducible over-cap plan still needs a governed cap raise.\n\n")
 	}
 
 	// Step zero (#1057): the plannability / needs-direction gate. The planner

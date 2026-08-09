@@ -288,6 +288,14 @@ func semanticCheck(p *Plan) error {
 	if err := checkSplitProposal(p.SplitProposal); err != nil {
 		return err
 	}
+	// irreducible STRUCTURAL invariants (#2412). Like checkSplitProposal these are
+	// valid on a non-decomposed plan, so they precede the decomposition early
+	// return. checkIrreducible adds NO cap-aware logic (semanticCheck still has no
+	// view of the resolved cap), so no under-cap plan changes behaviour — the
+	// cap-aware relaxation lives at the server gate (overCapSplitRejection).
+	if err := checkIrreducible(p); err != nil {
+		return err
+	}
 	if p.Decomposition == nil {
 		return nil
 	}
@@ -430,6 +438,36 @@ func checkSplitProposal(sp *SplitProposal) error {
 	if _, err := wavesFromDependsOn(dependsOn, "phase"); err != nil {
 		return &SemanticError{
 			Message: fmt.Sprintf("split_proposal.phases: invalid depends_on: %v", err),
+		}
+	}
+	return nil
+}
+
+// checkIrreducible validates a plan's optional irreducible declaration (#2412).
+// Two hard-rejection branches:
+//   - irreducible present AND split_proposal present → contradictory: the plan
+//     both DECLINES a split and PROPOSES one, so it cannot be honored either way;
+//   - irreducible present with a blank/whitespace-only rationale → the schema's
+//     minLength:1 admits a single space, but an unjustified declaration is exactly
+//     the bare flag the design refuses (over_cap without a reason), so it is
+//     rejected here.
+//
+// A nil Irreducible is a no-op (the field is additive-optional). This adds NO
+// cap-aware logic — semanticCheck has no view of the resolved cap, so no
+// under-cap plan changes behaviour; the cap-aware widen-only relaxation lives at
+// the server gate (overCapSplitRejection).
+func checkIrreducible(p *Plan) error {
+	if p.Irreducible == nil {
+		return nil
+	}
+	if p.SplitProposal != nil {
+		return &SemanticError{
+			Message: "irreducible: a plan cannot carry both irreducible and split_proposal — irreducible DECLINES a split for a compile-atomic change while split_proposal PROPOSES one; drop whichever does not apply",
+		}
+	}
+	if strings.TrimSpace(p.Irreducible.Rationale) == "" {
+		return &SemanticError{
+			Message: "irreducible.rationale: an irreducible declaration must carry a non-blank rationale explaining why the change is compile-atomic — a blank rationale is a bare unjustified flag; state why the change cannot be phased into at-or-under-cap commits",
 		}
 	}
 	return nil

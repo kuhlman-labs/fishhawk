@@ -20,6 +20,7 @@ package plan
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -99,6 +100,24 @@ type Plan struct {
 	// declares no split. JSON tags mirror the split_proposal / split-phase $defs
 	// in the schema.
 	SplitProposal *SplitProposal `json:"split_proposal,omitempty"`
+	// Irreducible is the plan's optional structured DECLINE-A-SPLIT declaration
+	// for a compile-atomic over-cap change (#2412). It is the deliberate CONTRAST
+	// to the adjacent OverCap block: OverCap is HINT-ONLY and unreadable by
+	// enforcement, whereas Irreducible IS read by exactly one enforcement site —
+	// server.overCapSplitRejection — and there ONLY to WIDEN acceptance (it
+	// converts the count-derived over-cap hard reject into an operator-decidable
+	// advisory when no split_proposal is present), never to reject. Because it can
+	// only widen, it cannot become the count-blind coupling #2055's fixup removed:
+	// an under-cap plan is decided over/under by the count first and never reaches
+	// the Irreducible read. It NEVER suppresses the count-derived over-cap
+	// advisory, and it does NOT make the change landable — the implement stage
+	// re-checks max_files_changed against the real diff, so an approved irreducible
+	// over-cap plan still needs a governed spec raise. Mutually exclusive with
+	// SplitProposal (semanticCheck rejects the pairing). Additive-optional within
+	// standard_v1; the field must exist on the struct because plan.Parse
+	// strict-decodes with DisallowUnknownFields. JSON tags mirror the irreducible
+	// $def in the schema.
+	Irreducible *Irreducible `json:"irreducible,omitempty"`
 }
 
 // SplitProposal is the plan's optional ordered-phase split (#2055, E50.3): the
@@ -127,6 +146,31 @@ type SplitPhase struct {
 	// non-negative, non-self, acyclic) reusing the Waves Kahn sort. Omitted/
 	// empty means no dependency.
 	DependsOn []int `json:"depends_on,omitempty"`
+}
+
+// Irreducible is the plan's optional structured DECLINE-A-SPLIT declaration
+// (#2412): a compile-atomic over-cap change the planner cannot phase into
+// independently-landable at-or-under-cap commits. Rationale is required and
+// non-blank (why the change is atomic); AtomicityBasis optionally names the
+// language/toolchain rule (e.g. Go requiring a method's receiver base type in
+// the method's own package). JSON tags mirror the irreducible $def in the
+// schema.
+type Irreducible struct {
+	Rationale      string `json:"rationale"`
+	AtomicityBasis string `json:"atomicity_basis,omitempty"`
+}
+
+// Declared reports whether the receiver is a WELL-FORMED irreducible
+// declaration: non-nil AND carrying a non-whitespace Rationale. It is the ONE
+// shared definition of a valid declaration so every consumer (the plan-gate
+// reject relaxation, the plan-gate advisory, the planner prompt) agrees — a nil
+// receiver or a whitespace-only rationale is not a declaration. The schema's
+// minLength:1 admits a single space, so this trims before deciding; the
+// semantic validator (checkIrreducible) rejects the whitespace-only case
+// outright, but Declared stays defensive because it is called from enforcement
+// paths that consume a plan without re-running semanticCheck.
+func (i *Irreducible) Declared() bool {
+	return i != nil && strings.TrimSpace(i.Rationale) != ""
 }
 
 // SurfaceSweepExemption is one entry in Plan.SurfaceSweepExemptions (#1544):

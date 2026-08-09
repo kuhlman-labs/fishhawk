@@ -188,3 +188,44 @@ func TestBuildChildSpecs_SinglePhaseIsContract(t *testing.T) {
 		t.Errorf("single contract child should carry the parent acceptance criteria")
 	}
 }
+
+// TestBuildChildSpecs_BodyStatesLandabilityUnverified pins the landability
+// honesty change (#2412): EVERY filed child body (contract and non-contract)
+// carries the landability caveat and names the path-keyed coupling class that
+// broke run 1d94db6f. This is a rendered-text change compilation cannot enforce
+// and a comment-only touch would satisfy at the scope-completeness gate, so it
+// is asserted behaviorally.
+func TestBuildChildSpecs_BodyStatesLandabilityUnverified(t *testing.T) {
+	specs := BuildChildSpecs(BuildInput{Proposal: threePhaseProposal(), ParentIssue: 2100})
+	if len(specs) == 0 {
+		t.Fatal("expected specs")
+	}
+	for i, s := range specs {
+		if !strings.Contains(s.Proposal, "Landability is not verified") {
+			t.Errorf("specs[%d] body should carry the landability caveat: %q", i, s.Proposal)
+		}
+		for _, want := range []string{"path-keyed", "surface-sweep", "rebuild matrices", "1d94db6f"} {
+			if !strings.Contains(s.Proposal, want) {
+				t.Errorf("specs[%d] body should name %q (the path-keyed coupling class): %q", i, want, s.Proposal)
+			}
+		}
+	}
+}
+
+// TestBuildDoneMeans_NonContractDropsCompilesClaim pins that the non-contract
+// done-means no longer asserts the unsatisfiable "compiles as an at-or-under-cap
+// intermediate" claim (#2412), while the contract done-means is unchanged.
+func TestBuildDoneMeans_NonContractDropsCompilesClaim(t *testing.T) {
+	specs := BuildChildSpecs(BuildInput{Proposal: threePhaseProposal(), ParentIssue: 2100})
+	for i, s := range specs {
+		if s.IsContract {
+			continue
+		}
+		if strings.Contains(s.DoneMeans, "compiles as an at-or-under-cap intermediate") {
+			t.Errorf("non-contract specs[%d] done-means must not assert the unsatisfiable compiles claim: %q", i, s.DoneMeans)
+		}
+		if !strings.Contains(s.DoneMeans, "unverified") {
+			t.Errorf("non-contract specs[%d] done-means should state independent landability is unverified: %q", i, s.DoneMeans)
+		}
+	}
+}

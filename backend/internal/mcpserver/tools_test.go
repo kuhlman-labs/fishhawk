@@ -10063,6 +10063,111 @@ func TestGetPlan_SplitFiling_EndToEndRoundTrip(t *testing.T) {
 	}
 }
 
+// seedSplitFilingRefusedAudit adds a split_filing_refused audit entry to the
+// fake's per-run audit map, seeding under the server's EXPORTED category const
+// (server.SplitFilingRefusedCategory) — the SAME symbol the on-approval hook
+// writes under. The resolver reads its own literal "split_filing_refused"; if the
+// hook's write-category const and the resolver's read-literal ever drift, this
+// seed lands under a category the resolver never queries and the round-trip fails.
+func seedSplitFilingRefusedAudit(fb *fakeBackend, runID uuid.UUID, payload any) {
+	body, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(body, &decoded)
+	entry := AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: server.SplitFilingRefusedCategory,
+		Payload:  decoded,
+	}
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
+}
+
+// TestGetPlan_SplitFilingRefusedRoundTrip is the CONDITION 1 cross-layer end-to-end:
+// the refusal value crosses the approval hook's WRITE, audit persistence, and the
+// MCP READ, and this single test locks all three seams on shared exported symbols.
+// The WRITE-side payload is the server's OWN exported type
+// (server.SplitFilingRefusedPayload — the exact struct refuseSplitFilingOverCapPhase
+// marshals, so a json-tag drift on either side fails to compile or fails the
+// round-trip), seeded under the server's exported category const
+// (server.SplitFilingRefusedCategory — the same symbol the hook writes under),
+// and read back through the ACTUAL getPlan/loadSplitFilingRefusal resolver (which
+// queries its own "split_filing_refused" literal). So a WRONG category name (write
+// const vs read literal), a WRONG run association (entry keyed by a different run),
+// or a payload-shape mismatch each fails THIS one test — the exact three failure
+// modes condition 1 names. The real hook's PRODUCTION of this payload + category at
+// run time is separately driven with committed-state assertions in the sibling
+// backend/internal/server/split_filing_test.go
+// (TestFileSplitProposalChildren_RefusesOverCapPhase); the two legs meet on the
+// exported const + payload alias this test round-trips.
+func TestGetPlan_SplitFilingRefusedRoundTrip(t *testing.T) {
+	wire := server.SplitFilingRefusedPayload{
+		Reason: "refused to file split_proposal children: 1 phase(s) declare more files than the implement-stage max_files_changed cap of 3",
+		Cap:    3,
+		Phases: []server.SplitFilingRefusedPhase{
+			{Index: 0, Title: "expand: over-cap lead", DeclaredCount: 4},
+		},
+	}
+	recorded, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatalf("marshal wire payload: %v", err)
+	}
+	var asAny any
+	if err := json.Unmarshal(recorded, &asAny); err != nil {
+		t.Fatal(err)
+	}
+
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+	seedSplitFilingRefusedAudit(fb, runID, asAny)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling == nil {
+		t.Fatal("SplitFiling should be populated for a refusal")
+	}
+	if out.SplitFiling.Refused == nil {
+		t.Fatal("SplitFiling.Refused should surface the refusal")
+	}
+	ref := out.SplitFiling.Refused
+	if ref.Cap != 3 {
+		t.Errorf("refused cap = %d, want 3", ref.Cap)
+	}
+	if len(ref.Phases) != 1 || ref.Phases[0].Index != 0 || ref.Phases[0].DeclaredCount != 4 {
+		t.Errorf("refused phases = %+v, want one entry index=0 declared=4", ref.Phases)
+	}
+	if !strings.Contains(ref.Phases[0].Title, "over-cap lead") {
+		t.Errorf("refused phase title = %q, want the offending phase title", ref.Phases[0].Title)
+	}
+	// A refusal writes no completion marker, so the filed set stays empty.
+	if len(out.SplitFiling.Children) != 0 {
+		t.Errorf("a refusal must carry no filed children, got %+v", out.SplitFiling.Children)
+	}
+}
+
+// TestGetPlan_SplitFilingRefused_AbsentWhenNoEntry confirms the refused sub-object
+// is omitted when neither a completion nor a refusal marker exists (#2412).
+func TestGetPlan_SplitFilingRefused_AbsentWhenNoEntry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling != nil {
+		t.Errorf("SplitFiling should be nil when no marker exists, got %+v", out.SplitFiling)
+	}
+}
+
 // TestStartRun_AppliesToOverride_ForwardedToBackend is the registry-coupling
 // half of E53.3 / #2226: the two new fishhawk_start_run parameters must cross
 // the MCP input → StartRunParams → createRunRequest → JSON body seam. The

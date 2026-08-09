@@ -716,3 +716,223 @@ workflows:
 		t.Errorf("want no reject when the workflow has no implement stage (fail-open); got %q", reason)
 	}
 }
+
+// --- irreducible (#2412) ---
+
+// overCapIrreducibleBody builds a schema-valid standard_v1 plan whose scope.files
+// has numFiles entries and which carries an irreducible declaration with the
+// given rationale (and optional atomicity_basis). It deliberately does NOT run
+// semanticCheck (Validate is schema-only), so a blank/whitespace-only rationale
+// — rejected by plan.Parse but admitted by the schema's minLength:1 for a space —
+// is still produced for the gate to judge (mirroring handleShipPlan's
+// json.Unmarshal decode path).
+func overCapIrreducibleBody(t *testing.T, numFiles int, rationale, basis string) []byte {
+	t.Helper()
+	fileMaps := make([]any, 0, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fileMaps = append(fileMaps, map[string]any{
+			"path":      fmt.Sprintf("backend/internal/baz/f%d.go", i),
+			"operation": "modify",
+		})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": fileMaps}
+	})
+	irr := map[string]any{"rationale": rationale}
+	if basis != "" {
+		irr["atomicity_basis"] = basis
+	}
+	m["irreducible"] = irr
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return body
+}
+
+// TestOverCapSplitRejection_IrreducibleAccepted is the counterfactual vehicle for
+// the Irreducible.Declared() short-circuit in overCapSplitRejection (#2412): an
+// over-cap-by-count plan carrying a well-formed irreducible and NO split_proposal
+// is ACCEPTED (no reject reason). Deleting the `if parsedPlan.Irreducible.Declared()
+// { return "" }` line makes the same plan reject again.
+func TestOverCapSplitRejection_IrreducibleAccepted(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+	p := unmarshalPlan(t, overCapIrreducibleBody(t, 3, "the method's receiver base type must live in its own package", "Go receiver rule"))
+
+	if reason := s.overCapSplitRejection(context.Background(), runRow.ID, p); reason != "" {
+		t.Errorf("want no reject for an over-cap plan carrying a well-formed irreducible; got %q", reason)
+	}
+}
+
+// TestOverCapSplitRejection_BlankRationaleStillRejects pins the per-failure-mode
+// branch that a whitespace-only rationale is NOT a declaration (#2412): the
+// over-cap reject STILL fires. This is the observable proof that Declared()
+// trims — a blank rationale is exactly the bare flag the design refuses, so it
+// must not widen the reject into an advisory.
+func TestOverCapSplitRejection_BlankRationaleStillRejects(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+	p := unmarshalPlan(t, overCapIrreducibleBody(t, 3, "   ", ""))
+
+	reason := s.overCapSplitRejection(context.Background(), runRow.ID, p)
+	if reason == "" {
+		t.Fatal("want the over-cap reject to STILL fire for a whitespace-only irreducible rationale (not a declaration)")
+	}
+	if !strings.Contains(reason, "declares 3 files") || !strings.Contains(reason, "cap of 2") {
+		t.Errorf("reason = %q, want it to name count=3 and cap=2", reason)
+	}
+}
+
+// TestRunPlanWarnings_IrreducibleDoesNotSuppressOverCapAdvisory is the
+// counterfactual vehicle for the advisory ordering/independence in runPlanWarnings
+// (#2412): an over-cap plan carrying irreducible emits the count-derived over-cap
+// advisory (present AND FIRST) even with irreducible declared, plus the irreducible
+// advisory. Deleting the unconditional overCapWarning append turns it red — the
+// ordering is the observable proof irreducible never SUPPRESSES the count advisory.
+func TestRunPlanWarnings_IrreducibleDoesNotSuppressOverCapAdvisory(t *testing.T) {
+	const capLimit = 2
+	s, au, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+	body := overCapIrreducibleBody(t, 3, "compile-atomic: receiver base type must live in its own package", "Go receiver rule")
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil {
+		t.Fatal("want a non-nil result for an over-cap irreducible plan")
+	}
+	if len(got.Warnings) < 2 {
+		t.Fatalf("want at least 2 warnings (count-derived + irreducible), got %v", got.Warnings)
+	}
+	// The count-derived over-cap advisory must be present AND emitted FIRST.
+	if !hasOverCapWarning(got.Warnings[:1], 3, capLimit) {
+		t.Errorf("count-derived over-cap advisory must be first; warnings = %v", got.Warnings)
+	}
+	// The irreducible advisory must also be present, surfacing the rationale as a
+	// challengeable claim and stating the declaration does not make it landable.
+	foundIrr := false
+	for _, w := range got.Warnings {
+		if strings.Contains(w, "IRREDUCIBLE") && strings.Contains(w, "does NOT make the change landable") {
+			foundIrr = true
+		}
+	}
+	if !foundIrr {
+		t.Errorf("want an irreducible advisory naming the non-landability; warnings = %v", got.Warnings)
+	}
+	// The recorded entry mirrors the returned warnings.
+	entries := planWarningsEntries(t, au)
+	if len(entries) != 1 {
+		t.Fatalf("plan_warnings entries = %d, want 1", len(entries))
+	}
+}
+
+// TestRunPlanWarnings_IrreducibleUnderCapIsNoOp pins the per-failure-mode branch
+// that an UNDER-cap plan carrying irreducible produces NO advisory and no
+// behaviour change (#2412) — the #2055 under-cap-unaffected guarantee. The
+// irreducible field is never read for an under-cap plan (the count decides
+// over/under first).
+func TestRunPlanWarnings_IrreducibleUnderCapIsNoOp(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+	body := overCapIrreducibleBody(t, 1, "compile-atomic", "Go receiver rule") // 1 file, cap 2 → under cap
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got != nil {
+		t.Fatalf("want nil result for an under-cap irreducible plan; got %+v", got)
+	}
+	if len(planWarningsEntries(t, au)) != 0 {
+		t.Error("want no plan_warnings entry for an under-cap irreducible plan")
+	}
+}
+
+// splitProposalMapWithPhaseFiles builds a two-phase split_proposal whose first
+// phase declares phase0Files files and second declares phase1Files files.
+func splitProposalMapWithPhaseFiles(phase0Files, phase1Files int) map[string]any {
+	mkFiles := func(prefix string, n int) []any {
+		out := make([]any, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, map[string]any{"path": fmt.Sprintf("%s/f%d.go", prefix, i), "operation": "modify"})
+		}
+		return out
+	}
+	return map[string]any{
+		"rationale": "split expand->contract",
+		"phases": []any{
+			map[string]any{"title": "Expand", "scope": map[string]any{"files": mkFiles("backend/internal/exp", phase0Files)}},
+			map[string]any{"title": "Contract", "depends_on": []any{0}, "scope": map[string]any{"files": mkFiles("backend/internal/con", phase1Files)}},
+		},
+	}
+}
+
+// TestRunPlanWarnings_PhaseCapAdvisoryPerViolatingPhase pins the phaseCapWarnings
+// leg (#2412): a split_proposal with two over-cap phases emits ONE advisory per
+// violating phase naming the phase index, title, declared count, and cap. The
+// top-level scope is kept UNDER cap so the count-derived over-cap advisory does
+// not fire — isolating the phase-cap advisory.
+func TestRunPlanWarnings_PhaseCapAdvisoryPerViolatingPhase(t *testing.T) {
+	const capLimit = 2
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": []any{
+			map[string]any{"path": "backend/internal/top/only.go", "operation": "modify"},
+		}}
+	})
+	// Both phases over cap (3 files each > cap 2).
+	m["split_proposal"] = splitProposalMapWithPhaseFiles(3, 3)
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil {
+		t.Fatal("want a non-nil result with phase-cap advisories")
+	}
+	// No count-derived over-cap advisory (top-level scope is 1 file, under cap 2).
+	if hasOverCapWarning(got.Warnings, 1, capLimit) {
+		t.Errorf("count-derived over-cap advisory should not fire for an under-cap top-level scope; warnings = %v", got.Warnings)
+	}
+	phaseAdvisories := 0
+	for _, w := range got.Warnings {
+		if strings.Contains(w, "split_proposal phase") && strings.Contains(w, "cap of 2") {
+			phaseAdvisories++
+		}
+	}
+	if phaseAdvisories != 2 {
+		t.Errorf("want one phase-cap advisory per over-cap phase (2), got %d; warnings = %v", phaseAdvisories, got.Warnings)
+	}
+}
+
+// TestRunPlanWarnings_PhaseCap_UnresolvedCapNoAdvisory pins the phaseCapWarnings
+// fail-open: with no implement stage (unresolved cap) a split_proposal with an
+// over-cap phase emits NO phase-cap advisory.
+func TestRunPlanWarnings_PhaseCap_UnresolvedCapNoAdvisory(t *testing.T) {
+	specNoImplement := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+	s, _, runRow := newScopePrecheckServer(t, specNoImplement)
+	m := planfixture.Valid()
+	m["split_proposal"] = splitProposalMapWithPhaseFiles(3, 3)
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got != nil {
+		for _, w := range got.Warnings {
+			if strings.Contains(w, "split_proposal phase") {
+				t.Errorf("want no phase-cap advisory when the cap is unresolved; got %q", w)
+			}
+		}
+	}
+}

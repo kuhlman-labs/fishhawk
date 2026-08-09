@@ -1518,7 +1518,10 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
 // standard_v1.x, or for an ANNOTATION-only description correction that changes
-// no validation behavior — most recently the #2516 top-level scope_removals
+// no validation behavior — most recently the #2412 top-level irreducible field
+// (the structured DECLINE-a-split declaration for a compile-atomic over-cap
+// change, which the server gate reads to widen the over-cap reject into an
+// advisory). Before that: the #2516 top-level scope_removals
 // field (the machine-readable declaration that a revision deliberately drops a
 // revision-base-scoped path, which the plan gate's undeclared-narrowing
 // refusal subtracts). Before that: the #2347 skip_expected /
@@ -1535,7 +1538,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "3438f508e1bd4b03f44d2af41598af21660c36818a90e618178debff09ed6895"
+	const wantHash = "05c90d40d7080a0a2f3d98a7f575c8360b4e30b4481bcbdf89b3094a2fbb1274"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -2004,5 +2007,118 @@ func TestParse_SplitProposalExampleFixture_Validates(t *testing.T) {
 	}
 	if p.SplitProposal == nil || len(p.SplitProposal.Phases) != 3 {
 		t.Fatalf("example fixture should carry a 3-phase split_proposal, got %+v", p.SplitProposal)
+	}
+}
+
+// --- irreducible (#2412) ---
+
+// TestParse_Irreducible_RoundTrips covers the additive optional irreducible
+// declaration (#2412): a plan carrying a well-formed irreducible (rationale +
+// atomicity_basis) validates against the schema and decodes into the typed
+// Plan.Irreducible, round-tripping through re-marshal.
+func TestParse_Irreducible_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["irreducible"] = map[string]any{
+			"rationale":       "the method's receiver base type must live in its own package",
+			"atomicity_basis": "Go requires a method's receiver base type in the method's own package",
+		}
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Irreducible == nil {
+		t.Fatal("Irreducible should be non-nil")
+	}
+	if p.Irreducible.Rationale == "" {
+		t.Error("Irreducible.Rationale should be non-empty")
+	}
+	if p.Irreducible.AtomicityBasis == "" {
+		t.Error("Irreducible.AtomicityBasis should round-trip")
+	}
+	if !p.Irreducible.Declared() {
+		t.Error("a well-formed irreducible should report Declared() == true")
+	}
+	if _, err := json.Marshal(p); err != nil {
+		t.Fatalf("re-marshal plan: %v", err)
+	}
+}
+
+// TestParse_WithoutIrreducible_StillValidates confirms the field is optional: a
+// plan omitting irreducible validates and decodes to a nil Irreducible (#2412).
+func TestParse_WithoutIrreducible_StillValidates(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.Irreducible != nil {
+		t.Errorf("Irreducible = %+v, want nil when irreducible is omitted", p.Irreducible)
+	}
+}
+
+// TestSemanticCheck_IrreducibleWithSplitProposalRejected pins the mutual-
+// exclusion branch (#2412): a plan carrying BOTH irreducible and split_proposal
+// is contradictory (it both declines and proposes a split) and is rejected by
+// semanticCheck. This is the counterfactual vehicle for the mutual-exclusion
+// control.
+func TestSemanticCheck_IrreducibleWithSplitProposalRejected(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["irreducible"] = map[string]any{"rationale": "compile-atomic"}
+	}, threePhaseSplitOption())
+	_, err := plan.Parse(marshalFixture(t, m))
+	var sem *plan.SemanticError
+	if !errors.As(err, &sem) {
+		t.Fatalf("err = %v, want *SemanticError for irreducible + split_proposal", err)
+	}
+	if !strings.Contains(sem.Error(), "irreducible") || !strings.Contains(sem.Error(), "split_proposal") {
+		t.Errorf("SemanticError should name both fields, got %q", sem.Error())
+	}
+}
+
+// TestSemanticCheck_IrreducibleBlankRationaleRejected pins the blank-rationale
+// branch (#2412). The fixture rationale is a whitespace-only string that the
+// schema's minLength:1 ADMITS (a single space passes schema validation), so the
+// RED lands on the semantic branch and NOT on schema validation — proving the
+// semantic check, not the schema, refuses the bare unjustified declaration.
+func TestSemanticCheck_IrreducibleBlankRationaleRejected(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["irreducible"] = map[string]any{"rationale": "   "}
+	})
+	// First prove the schema itself accepts the whitespace rationale (minLength:1
+	// is satisfied by a single space), so the rejection below is semantic, not
+	// schema.
+	if err := plan.Validate(marshalFixture(t, m)); err != nil {
+		t.Fatalf("schema Validate should accept a whitespace-only rationale (minLength:1 admits a space), got %v", err)
+	}
+	_, err := plan.Parse(marshalFixture(t, m))
+	var sem *plan.SemanticError
+	if !errors.As(err, &sem) {
+		t.Fatalf("err = %v, want *SemanticError for a blank irreducible.rationale", err)
+	}
+	if !strings.Contains(sem.Error(), "rationale") {
+		t.Errorf("SemanticError should name the rationale, got %q", sem.Error())
+	}
+}
+
+// TestIrreducible_Declared_TruthTable pins the shared Declared() definition of a
+// well-formed declaration (#2412): a nil receiver and a whitespace-only
+// rationale are NOT declarations; a non-blank rationale is.
+func TestIrreducible_Declared_TruthTable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   *plan.Irreducible
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty rationale", &plan.Irreducible{Rationale: ""}, false},
+		{"whitespace rationale", &plan.Irreducible{Rationale: " \t\n"}, false},
+		{"non-blank rationale", &plan.Irreducible{Rationale: "compile-atomic"}, true},
+		{"non-blank with basis", &plan.Irreducible{Rationale: "atomic", AtomicityBasis: "Go receiver rule"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.in.Declared(); got != tc.want {
+				t.Errorf("Declared() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

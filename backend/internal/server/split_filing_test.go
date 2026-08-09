@@ -127,6 +127,10 @@ type splitFilingConfig struct {
 	installID           *int64
 	github              *githubclient.Client
 	providerFailOnCall  int
+	// planOverride, when non-nil, seeds this plan artifact instead of the
+	// default splitPlanBytes(withSplitProposal). Used by the #2412 refusal tests
+	// to construct a split_proposal with an over-cap lead phase by construction.
+	planOverride []byte
 }
 
 // splitFilingHarness bundles the wired Server plus the seeded run coordinates.
@@ -277,11 +281,15 @@ func newSplitFilingHarness(t *testing.T, cfg splitFilingConfig) *splitFilingHarn
 	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {planStage}}
 
 	sv := "standard_v1"
+	planContent := cfg.planOverride
+	if planContent == nil {
+		planContent = splitPlanBytes(t, cfg.withSplitProposal)
+	}
 	if _, err := art.Create(context.Background(), artifact.CreateParams{
 		StageID:       planStageID,
 		Kind:          artifact.KindPlan,
 		SchemaVersion: &sv,
-		Content:       splitPlanBytes(t, cfg.withSplitProposal),
+		Content:       planContent,
 	}); err != nil {
 		t.Fatalf("seed plan artifact: %v", err)
 	}
@@ -757,5 +765,210 @@ func TestFileSplitProposalChildren_EndToEnd(t *testing.T) {
 	}
 	if got.CapException == nil {
 		t.Error("persisted governed-exception must carry the cap-exception draft")
+	}
+}
+
+// --- #2412 over-cap-phase refusal ---
+
+// overCapPhaseSplitPlanBytes builds a plan whose split_proposal LEAD phase
+// declares leadFiles files (BY CONSTRUCTION, not by calling PhaseCapViolations)
+// so that against the harness cap of 3 a leadFiles>3 phase is over cap. The
+// second phase stays at 1 file (in cap).
+func overCapPhaseSplitPlanBytes(t *testing.T, leadFiles int) []byte {
+	t.Helper()
+	leadScope := make([]plan.ScopeFile, leadFiles)
+	for i := range leadScope {
+		leadScope[i] = plan.ScopeFile{Path: fmt.Sprintf("backend/internal/lead/f%d.go", i), Operation: plan.FileOpModify}
+	}
+	p := &plan.Plan{
+		PlanVersion: "standard_v1",
+		Summary:     "over-cap lead phase",
+		Scope:       plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify}}},
+		Verification: plan.Verification{
+			TestStrategy: "unit", RollbackPlan: "revert the PR",
+			AcceptanceCriteria: []plan.AcceptanceCriterion{{ID: "ac1", Statement: "done"}},
+		},
+		SplitProposal: &plan.SplitProposal{
+			Rationale: "split with an over-cap lead phase",
+			Phases: []plan.SplitPhase{
+				{Title: "expand: over-cap lead", ScopeHint: "expand", Scope: &plan.Scope{Files: leadScope}},
+				{Title: "contract: small", ScopeHint: "contract", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpDelete}}}, DependsOn: []int{0}},
+			},
+		},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return b
+}
+
+// refusalEntries decodes every split_filing_refused payload the audit fake
+// captured, and how many were appended.
+func (h *splitFilingHarness) refusalEntries(t *testing.T) ([]splitFilingRefusedPayload, int) {
+	t.Helper()
+	var out []splitFilingRefusedPayload
+	for _, e := range h.au.appended {
+		if e.Category == splitFilingRefusedCategory {
+			var p splitFilingRefusedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode split_filing_refused payload: %v", err)
+			}
+			out = append(out, p)
+		}
+	}
+	return out, len(out)
+}
+
+// TestFileSplitProposalChildren_RefusesOverCapPhase is the counterfactual vehicle
+// for the refusal branch in fileSplitProposalChildren (#2412). Its control's
+// effect is COMMITTED STATE (the hook is best-effort and returns no error), so it
+// asserts state READ AFTER the call: the fake forge recorded ZERO issue-create
+// calls, the audit holds exactly one split_filing_refused entry naming every
+// offending phase and ZERO work_item_filed / split_children_filed entries, and
+// exactly one parent comment naming each offending phase. Deleting the refusal
+// branch files the over-cap child instead — flipping every assertion.
+func TestFileSplitProposalChildren_RefusesOverCapPhase(t *testing.T) {
+	inst := int64(93)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4), // lead phase 4 files > cap 3
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	// ZERO forge issue-create calls.
+	if len(h.provider.reqs) != 0 {
+		t.Errorf("refusal must file ZERO children, filed %d", len(h.provider.reqs))
+	}
+	// Exactly one split_filing_refused entry naming the offending lead phase.
+	refusals, n := h.refusalEntries(t)
+	if n != 1 {
+		t.Fatalf("wrote %d split_filing_refused entries, want exactly 1", n)
+	}
+	ref := refusals[0]
+	if ref.Cap != 3 {
+		t.Errorf("refusal cap = %d, want 3", ref.Cap)
+	}
+	if len(ref.Phases) != 1 || ref.Phases[0].Index != 0 || ref.Phases[0].DeclaredCount != 4 {
+		t.Errorf("refusal phases = %+v, want one entry index=0 declared=4", ref.Phases)
+	}
+	if !strings.Contains(ref.Phases[0].Title, "over-cap lead") {
+		t.Errorf("refusal phase title = %q, want the offending phase title", ref.Phases[0].Title)
+	}
+	// ZERO work_item_filed markers and NO split_children_filed completion marker.
+	if got := h.childMarkerCount(t); got != 0 {
+		t.Errorf("refusal wrote %d work_item_filed markers, want 0", got)
+	}
+	if _, cn := h.completionEntry(t); cn != 0 {
+		t.Errorf("refusal wrote %d split_children_filed entries, want 0", cn)
+	}
+	// Exactly one parent comment naming the offending phase and stating no
+	// children were filed.
+	if len(rec.comments) != 1 {
+		t.Fatalf("posted %d parent comments, want 1", len(rec.comments))
+	}
+	c := rec.comments[0]
+	if c.issue != splitParentIssue {
+		t.Errorf("refusal comment posted on issue %d, want %d", c.issue, splitParentIssue)
+	}
+	if !strings.Contains(c.body, "over-cap lead") || !strings.Contains(c.body, "No children were filed") {
+		t.Errorf("refusal comment must name the offending phase and state no children filed: %q", c.body)
+	}
+	if !strings.Contains(c.body, "irreducible") {
+		t.Errorf("refusal comment must offer the irreducible remedy: %q", c.body)
+	}
+}
+
+// TestFileSplitProposalChildren_PriorRefusalIsNoOp pins the refusal dedup
+// (#2412): a re-approval of a still-over-cap proposal (a prior split_filing_refused
+// marker present) neither duplicates the marker nor re-comments.
+func TestFileSplitProposalChildren_PriorRefusalIsNoOp(t *testing.T) {
+	inst := int64(94)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4),
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage) // first refusal
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage) // re-approval
+
+	if _, n := h.refusalEntries(t); n != 1 {
+		t.Errorf("re-approval must not duplicate the refusal marker, got %d", n)
+	}
+	if len(rec.comments) != 1 {
+		t.Errorf("re-approval must not re-post the refusal comment, got %d", len(rec.comments))
+	}
+	if len(h.provider.reqs) != 0 {
+		t.Errorf("re-approval must still file zero children, got %d", len(h.provider.reqs))
+	}
+}
+
+// TestFileSplitProposalChildren_RefusalMarkerAppendFailureAborts pins the
+// hard-prerequisite marker append (#2412): if the refusal marker append fails,
+// the hook posts NO parent comment (never a comment claiming a refusal the audit
+// does not record) and files no children.
+func TestFileSplitProposalChildren_RefusalMarkerAppendFailureAborts(t *testing.T) {
+	inst := int64(95)
+	rec, gh := newSplitCommentGitHub(t, http.StatusCreated)
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+		installID: &inst, github: gh,
+		planOverride: overCapPhaseSplitPlanBytes(t, 4),
+	})
+	h.au.appendErrCategory = splitFilingRefusedCategory // the refusal marker append fails
+
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if len(rec.comments) != 0 {
+		t.Errorf("marker-append failure must post no refusal comment, posted %d", len(rec.comments))
+	}
+	if len(h.provider.reqs) != 0 {
+		t.Errorf("refusal path must file zero children, filed %d", len(h.provider.reqs))
+	}
+}
+
+// TestFileSplitProposalChildren_UnresolvedCapStillFiles pins the fail-open branch
+// (#2412): with no implement stage (unresolved cap → capFiles=0), PhaseCapViolations
+// returns nil, so an over-cap-phase proposal files every child exactly as before —
+// the refusal must never fire on an unresolved cap.
+func TestFileSplitProposalChildren_UnresolvedCapStillFiles(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, // withSpec:false → cap unresolved
+		planOverride:      overCapPhaseSplitPlanBytes(t, 4),
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if _, n := h.refusalEntries(t); n != 0 {
+		t.Errorf("unresolved cap must not refuse, wrote %d refusal entries", n)
+	}
+	if len(h.provider.reqs) != 2 {
+		t.Errorf("unresolved cap must file every child (2 phases), filed %d", len(h.provider.reqs))
+	}
+	if _, cn := h.completionEntry(t); cn != 1 {
+		t.Errorf("unresolved cap must write one completion marker, wrote %d", cn)
+	}
+}
+
+// TestFileSplitProposalChildren_AllPhasesInCapUnchanged is the control that a
+// proposal whose phases are ALL within the cap files every child exactly as today
+// and writes no refusal marker (#2412). The default splitPlanBytes carries 3
+// single-file phases against cap 3.
+func TestFileSplitProposalChildren_AllPhasesInCapUnchanged(t *testing.T) {
+	h := newSplitFilingHarness(t, splitFilingConfig{
+		withSplitProposal: true, withSpec: true, reachabilityDerived: 2,
+	})
+	h.s.fileSplitProposalChildren(context.Background(), h.planStage)
+
+	if _, n := h.refusalEntries(t); n != 0 {
+		t.Errorf("all-in-cap proposal must write no refusal marker, wrote %d", n)
+	}
+	if len(h.provider.reqs) != 3 {
+		t.Errorf("all-in-cap proposal must file every child (3), filed %d", len(h.provider.reqs))
+	}
+	if _, cn := h.completionEntry(t); cn != 1 {
+		t.Errorf("all-in-cap proposal must write one completion marker, wrote %d", cn)
 	}
 }
