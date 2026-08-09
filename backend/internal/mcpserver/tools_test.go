@@ -10083,23 +10083,21 @@ func seedSplitFilingRefusedAudit(fb *fakeBackend, runID uuid.UUID, payload any) 
 	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
 }
 
-// TestGetPlan_SplitFilingRefusedRoundTrip is the CONDITION 1 cross-layer end-to-end:
-// the refusal value crosses the approval hook's WRITE, audit persistence, and the
-// MCP READ, and this single test locks all three seams on shared exported symbols.
-// The WRITE-side payload is the server's OWN exported type
+// TestGetPlan_SplitFilingRefusedRoundTrip compile-locks the READ side of the
+// refusal contract (#2412): it seeds the server's OWN exported payload type
 // (server.SplitFilingRefusedPayload — the exact struct refuseSplitFilingOverCapPhase
 // marshals, so a json-tag drift on either side fails to compile or fails the
-// round-trip), seeded under the server's exported category const
-// (server.SplitFilingRefusedCategory — the same symbol the hook writes under),
-// and read back through the ACTUAL getPlan/loadSplitFilingRefusal resolver (which
-// queries its own "split_filing_refused" literal). So a WRONG category name (write
-// const vs read literal), a WRONG run association (entry keyed by a different run),
-// or a payload-shape mismatch each fails THIS one test — the exact three failure
-// modes condition 1 names. The real hook's PRODUCTION of this payload + category at
-// run time is separately driven with committed-state assertions in the sibling
-// backend/internal/server/split_filing_test.go
-// (TestFileSplitProposalChildren_RefusesOverCapPhase); the two legs meet on the
-// exported const + payload alias this test round-trips.
+// round-trip) under the server's exported category const
+// (server.SplitFilingRefusedCategory — the same symbol the hook writes under), and
+// reads it back through the ACTUAL getPlan/loadSplitFilingRefusal resolver (which
+// queries its own "split_filing_refused" literal). It deliberately hand-seeds the
+// audit entry rather than driving the hook, so it isolates the resolver decode +
+// category-literal match; the FULL end-to-end — the REAL approval hook writing the
+// marker and this same getPlan path reading it back across all three seams
+// (category, run association, payload shape) — is condition 1's single test
+// TestSplitFilingRefused_EndToEndThroughGetPlan in the sibling
+// backend/internal/server/split_filing_test.go, which drives the production hook
+// and needs no hand-seeded state.
 func TestGetPlan_SplitFilingRefusedRoundTrip(t *testing.T) {
 	wire := server.SplitFilingRefusedPayload{
 		Reason: "refused to file split_proposal children: 1 phase(s) declare more files than the implement-stage max_files_changed cap of 3",
@@ -10165,6 +10163,65 @@ func TestGetPlan_SplitFilingRefused_AbsentWhenNoEntry(t *testing.T) {
 	}
 	if out.SplitFiling != nil {
 		t.Errorf("SplitFiling should be nil when no marker exists, got %+v", out.SplitFiling)
+	}
+}
+
+// TestGetPlan_SplitFiling_CompletionAndRefusalMerge pins loadSplitFiling's merge
+// branch (#2412 fix-up, review concern): completion and refusal are DOCUMENTED as
+// mutually exclusive outcomes, but the loader nonetheless merges both onto one
+// PlanSplitFiling when both entries exist for a run (a defensive belt-and-braces
+// path that was previously untested). With a split_children_filed AND a
+// split_filing_refused entry both present, the single returned PlanSplitFiling
+// carries the completion's filed children/classification AND the refusal's phases
+// — neither outcome silently drops the other.
+func TestGetPlan_SplitFiling_CompletionAndRefusalMerge(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedSplitFilingRun(t, fb, runID)
+	// A completion marker (filed children + classification)...
+	seedSplitFilingAudit(fb, runID, map[string]any{
+		"contract_classification": "delete-only",
+		"children": []map[string]any{
+			{"phase_index": 0, "title": "expand: add NewFoo", "number": 3001, "url": "https://github.com/o/r/issues/3001"},
+		},
+		"contract_child_number": 3001,
+		"deferral_issue":        2062,
+	})
+	// ...AND a refusal marker for the SAME run.
+	refusalWire := server.SplitFilingRefusedPayload{
+		Reason: "refused",
+		Cap:    3,
+		Phases: []server.SplitFilingRefusedPhase{{Index: 0, Title: "over-cap lead", DeclaredCount: 4}},
+	}
+	body, _ := json.Marshal(refusalWire)
+	var refusalAny any
+	if err := json.Unmarshal(body, &refusalAny); err != nil {
+		t.Fatal(err)
+	}
+	seedSplitFilingRefusedAudit(fb, runID, refusalAny)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.SplitFiling == nil {
+		t.Fatal("SplitFiling should be populated when both markers exist")
+	}
+	// Completion side survived the merge.
+	if out.SplitFiling.ContractClassification != "delete-only" {
+		t.Errorf("classification = %q, want delete-only (completion side of the merge)", out.SplitFiling.ContractClassification)
+	}
+	if len(out.SplitFiling.Children) != 1 || out.SplitFiling.Children[0].Number != 3001 {
+		t.Errorf("children = %+v, want the completion's one filed child", out.SplitFiling.Children)
+	}
+	// Refusal side survived the merge.
+	if out.SplitFiling.Refused == nil {
+		t.Fatal("Refused should be populated alongside the completion on the merged object")
+	}
+	if len(out.SplitFiling.Refused.Phases) != 1 || out.SplitFiling.Refused.Phases[0].DeclaredCount != 4 {
+		t.Errorf("refused phases = %+v, want the over-cap phase (declared 4)", out.SplitFiling.Refused.Phases)
 	}
 }
 

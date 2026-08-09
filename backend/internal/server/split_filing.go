@@ -538,7 +538,10 @@ func (s *Server) writeSplitChildrenFiledAudit(ctx context.Context, runRow *run.R
 // postSplitParentComment posts the best-effort parent acceptance-carrier comment
 // naming the contract child and stating plainly that the parent is closed when
 // that child lands — automated by follow-up #2062 (E50.6) once it ships. It does
-// NOT claim the parent auto-closes now. Best-effort: a nil client, an absent
+// NOT claim the parent auto-closes now. It also mirrors the landability
+// non-guarantee (#2412): every filed split's parent comment must plainly state
+// independent landability is unverified, so the same caveat carried on each child
+// body rides the parent comment too. Best-effort: a nil client, an absent
 // installation, or a post error logs and returns.
 func (s *Server) postSplitParentComment(ctx context.Context, runRow *run.Run, owner, name string, parentIssue, contractChildNumber int) {
 	if s.cfg.GitHub == nil || runRow.InstallationID == nil {
@@ -549,8 +552,8 @@ func (s *Server) postSplitParentComment(ctx context.Context, runRow *run.Run, ow
 			"The contract-phase child #%d is the acceptance carrier: it carries this issue's acceptance criteria.\n\n"+
 			"Close this parent (#%d) when contract child #%d lands. That parent-close is not automated by this change "+
 			"(a `Closes #%d` line in a child issue body would be functionless — GitHub auto-closes only from a PR/commit "+
-			"and only the enclosing issue); it will be automated by follow-up #%d (E50.6) once it ships.",
-		contractChildNumber, parentIssue, contractChildNumber, parentIssue, splitfiling.DeferralIssue)
+			"and only the enclosing issue); it will be automated by follow-up #%d (E50.6) once it ships.\n\n%s",
+		contractChildNumber, parentIssue, contractChildNumber, parentIssue, splitfiling.DeferralIssue, splitfiling.LandabilityCaveat)
 	repo := forge.RepoRef{Owner: owner, Name: name}
 	if _, err := s.cfg.GitHub.CreateIssueComment(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo, parentIssue, body); err != nil {
 		s.logSplitFilingWarn(ctx, runRow.ID, "post parent acceptance-carrier comment failed", err.Error())
