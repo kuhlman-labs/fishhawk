@@ -1650,12 +1650,20 @@ func seedRunShape(fb *fakeBackend, runID uuid.UUID, decomposedFrom *string, runn
 //	C ACCEPT  the same unbound child with an EXPLICIT absolute input.
 //	D ACCEPT  a NON-child unbound run on stdio still resolves the process cwd.
 //	E ACCEPT  an unbound github_actions decomposition child falls through.
+//	F ACCEPT  an unbound EMPTY-runner_kind decomposition child falls through —
+//	          the exact residual the mcpserver README singles out.
 //
 // Mode A is the counterfactual vehicle and runs on the STDIO transport, where
 // deleting the guard changes the outcome from an error to a cwd resolution
 // (over HTTP the #2479 rule would refuse anyway, making the deletion invisible).
-// Modes B–E staying green under that deletion proves the test is not passing by
+// Modes B–F staying green under that deletion proves the test is not passing by
 // refusing everything.
+//
+// Mode F is the counterfactual vehicle for the NARROWNESS of the key: the README
+// states the residual is a legacy row that is genuinely local but carries an
+// empty `runner_kind`, and mode E pins only the "github_actions" spelling.
+// Widening the comparison so an empty runner_kind reads as local turns F red
+// while A stays green.
 func TestResolveWorkingDirForRun_UnboundLocalDecompositionChild(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -1748,6 +1756,83 @@ func TestResolveWorkingDirForRun_UnboundLocalDecompositionChild(t *testing.T) {
 		}
 		if got != cwd {
 			t.Errorf("resolved = %q, want the process cwd %q", got, cwd)
+		}
+	})
+
+	t.Run("F_unbound_empty_runner_kind_child_falls_through", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		r.httpTransport = false
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "", "")
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("an empty runner_kind resolves to github_actions, which has no local checkout; the documented residual is that such a child falls through, got error %v", err)
+		}
+		if got != cwd {
+			t.Errorf("resolved = %q, want the process cwd %q", got, cwd)
+		}
+	})
+}
+
+// TestResolveWorkingDirForRun_UnreadableDecompositionChild_TransportDivergence
+// pins the two transports' divergence SIDE BY SIDE on one seeded fault
+// (E48.100 / #2547 review): the run row IS an unbound local decomposition child
+// — the exact shape rung 3 refuses — but GET /v0/runs/{id} answers 500, so
+// resolveWorkingDirForRun cannot classify it. On stdio that degrades to the
+// process cwd and does NOT refuse (you cannot classify a run you could not read,
+// and refusing on any read error would be a broad tightening); over HTTP the
+// Condition-1 fail-closed branch still refuses. Pinning both against the SAME
+// seeded row makes the asymmetry deliberate on its face rather than an oversight.
+//
+// The stdio half is the counterfactual vehicle for the nil-runObj carve-out in
+// refuseUnboundLocalDecompositionChild: making that guard refuse on a nil
+// runObj turns this half red while the rung-3 table above stays green.
+func TestResolveWorkingDirForRun_UnreadableDecompositionChild_TransportDivergence(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	parentID := uuid.New().String()
+
+	// seed writes the unbound-local-child row AND the 500 override, so the row
+	// is genuinely the refusable shape and is genuinely unreadable — bad state
+	// by construction, never produced by calling the control.
+	seed := func(t *testing.T, httpTransport bool) (*runResolver, uuid.UUID) {
+		t.Helper()
+		fb, srv := newFakeBackend(t) // a REACHABLE in-test server, not a dead address
+		r := newResolver(srv, nil)
+		r.httpTransport = httpTransport
+		runID := uuid.New()
+		seedRunShape(fb, runID, &parentID, "local", "")
+		fb.mu.Lock()
+		fb.getStatusByID[runID] = http.StatusInternalServerError
+		fb.mu.Unlock()
+		return r, runID
+	}
+
+	t.Run("stdio_degrades_to_cwd", func(t *testing.T) {
+		r, runID := seed(t, false)
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("an unreadable run on stdio must degrade to the process cwd, not refuse; got error %v", err)
+		}
+		if got != cwd {
+			t.Errorf("stdio degrade = %q, want the process cwd %q", got, cwd)
+		}
+	})
+
+	t.Run("http_still_fails_closed", func(t *testing.T) {
+		r, runID := seed(t, true)
+
+		got, err := r.resolveWorkingDirForRun(context.Background(), runID, "")
+		if err == nil {
+			t.Fatalf("an unreadable run over HTTP must fail closed (Condition 1 / #2482), got %q", got)
+		}
+		if got == cwd {
+			t.Errorf("returned the process cwd %q over HTTP; must fail closed", cwd)
 		}
 	})
 }
