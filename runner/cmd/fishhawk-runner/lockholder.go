@@ -201,10 +201,12 @@ func verifyLockHolderIdentity(pid int, runID string) error {
 // whether a signal may be delivered at all. The group-leader test inside
 // signalLockHolder only chooses group-signal vs single-pid signal.
 //
-// Only when all five pass does it signal TERM, poll for death up to
-// lockHolderTermGrace, escalate to KILL, and poll up to lockHolderKillGrace. A
-// holder that survives both leaves the lockfile INTACT and returns
-// errHolderSurvivedKill. Mirrors scripts/dev's _down_port_fallback (#965/#1018):
+// Only when all five pass does it hand pid to terminateLockHolder: TERM, poll
+// for death up to lockHolderTermGrace, escalate to KILL, poll up to
+// lockHolderKillGrace — treating an ESRCH from a holder that exited naturally
+// in the meantime as success. A holder that survives both leaves the lockfile
+// INTACT and returns errHolderSurvivedKill.
+// Mirrors scripts/dev's _down_port_fallback (#965/#1018):
 // refuse rather than kill what you cannot identify.
 //
 // Returns the holder's observed run state (empty when it could not be read) so
@@ -231,21 +233,63 @@ func evictTerminalLockHolder(ctx context.Context, lockPath, root string, pid int
 		return state, idErr
 	}
 
-	if sigErr := signalLockHolder(pid, syscall.SIGTERM); sigErr != nil {
-		return state, fmt.Errorf("%w: TERM: %v", errHolderSurvivedKill, sigErr)
-	}
-	if !waitProcessGone(pid, lockHolderTermGrace) {
-		if sigErr := signalLockHolder(pid, syscall.SIGKILL); sigErr != nil {
-			return state, fmt.Errorf("%w: KILL: %v", errHolderSurvivedKill, sigErr)
-		}
-		if !waitProcessGone(pid, lockHolderKillGrace) {
-			return state, errHolderSurvivedKill
-		}
+	if termErr := terminateLockHolder(pid); termErr != nil {
+		return state, termErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"lineage_lock_evicted","root":%q,"holder_pid":%d,"holder_run_id":%q,"holder_state":%q}`+"\n",
 		root, pid, holderRunID, state)
 	return state, nil
+}
+
+// terminateLockHolder runs the AUTHORIZED signal sequence against pid: TERM,
+// wait lockHolderTermGrace, KILL, wait lockHolderKillGrace. It returns nil once
+// the holder is confirmed gone, and errHolderSurvivedKill otherwise — the
+// refusal that leaves the lockfile INTACT.
+//
+// A holder can exit NATURALLY in the window between the identity check and
+// either signal (its stage simply finished). The kernel then fails the delivery
+// with ESRCH, and treating that as a failure would re-create the very wedge
+// this reclaim exists to remove: the lockfile would be preserved over a pid
+// that is already dead, so the first post-cancel same-lineage dispatch would
+// still be refused. A holder that is gone is the eviction's GOAL reached
+// without us — see holderAlreadyExited.
+func terminateLockHolder(pid int) error {
+	if sigErr := signalLockHolder(pid, syscall.SIGTERM); sigErr != nil {
+		if holderAlreadyExited(pid, sigErr) {
+			return nil
+		}
+		return fmt.Errorf("%w: TERM: %v", errHolderSurvivedKill, sigErr)
+	}
+	if waitProcessGone(pid, lockHolderTermGrace) {
+		return nil
+	}
+	if sigErr := signalLockHolder(pid, syscall.SIGKILL); sigErr != nil {
+		if holderAlreadyExited(pid, sigErr) {
+			return nil
+		}
+		return fmt.Errorf("%w: KILL: %v", errHolderSurvivedKill, sigErr)
+	}
+	if !waitProcessGone(pid, lockHolderKillGrace) {
+		return errHolderSurvivedKill
+	}
+	return nil
+}
+
+// holderAlreadyExited reports whether a FAILED signal delivery means the holder
+// is already gone rather than still holding the lineage.
+//
+// Both halves are load-bearing. The errno must be ESRCH ("no such process"):
+// any other failure — EPERM, or the Windows errSignalUnsupported stub — is a
+// signal we could not deliver to a process that may well be alive, and must
+// keep the fail-closed refusal. And liveness is RE-PROBED, so an ESRCH reported
+// for a pid that is somehow still alive (a seam, a platform quirk) is not
+// mistaken for a clean exit.
+func holderAlreadyExited(pid int, sigErr error) bool {
+	if !errors.Is(sigErr, syscall.ESRCH) {
+		return false
+	}
+	return !processAlive(pid)
 }
 
 // waitProcessGone polls processAlive until pid is gone or the grace elapses.

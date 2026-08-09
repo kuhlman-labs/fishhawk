@@ -46,11 +46,22 @@ func scaledD(base time.Duration) time.Duration { return base * lockTestScale() }
 // unprovable holder is left ALIVE, which only a live process can show.
 func startSleeper(t *testing.T) int {
 	t.Helper()
+	return startSleeperInGroup(t, 0)
+}
+
+// startSleeperInGroup starts a REAL long-lived child and returns its pid. pgid
+// 0 puts the child in its OWN new group (so it LEADS that group, pgid == pid,
+// the shape every spawned runner has); a non-zero pgid JOINS the child to that
+// existing group, which makes it a NON-leader (pgid != pid) — the only way to
+// exercise signalLockHolder's single-pid fallback without signalling a group
+// the test itself belongs to.
+func startSleeperInGroup(t *testing.T, pgid int) int {
+	t.Helper()
 	if _, err := exec.LookPath("sleep"); err != nil {
 		t.Skip("sleep not available")
 	}
 	cmd := exec.Command("sleep", "120")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: pgid}
 	if err := cmd.Start(); err != nil {
 		t.Skipf("cannot start a child process: %v", err)
 	}
@@ -562,6 +573,219 @@ func TestAcquireLineageLock_EvictsCancelledRunnerHolder(t *testing.T) {
 	} {
 		if !strings.Contains(log.String(), want) {
 			t.Errorf("eviction log missing %s:\n%s", want, log.String())
+		}
+	}
+}
+
+// killHolderNow SIGKILLs pid for real and blocks until it is genuinely gone
+// (startSleeperInGroup's goroutine reaps it, so it does not linger as a zombie
+// that signal 0 would still report alive). Bounded: a stuck kill fails the test
+// rather than hanging it.
+func killHolderNow(t *testing.T, pid int) {
+	t.Helper()
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	if !waitProcessGone(pid, scaledD(2*time.Second)) {
+		t.Fatalf("holder pid %d did not exit after SIGKILL", pid)
+	}
+}
+
+// TestAcquireLineageLock_HolderExitsBeforeSignalLands covers the race the
+// eviction flow introduces: a fully provable holder can exit NATURALLY in the
+// window between the identity check and either signal (its stage simply
+// finished). The delivery then fails ESRCH, and treating that as a failure
+// would preserve the lockfile over an ALREADY-DEAD pid — the #2545 wedge
+// re-created by its own fix, with the first post-cancel same-lineage dispatch
+// still refused.
+//
+// The seam makes the interleaving deterministic rather than timing-dependent:
+// for the signal under test it kills the holder for real, waits for the process
+// to be genuinely gone, and only THEN returns ESRCH — exactly what the kernel
+// reports for a holder that beat us to the exit. Every other signal is recorded
+// and NOT delivered, so the holder really does survive it.
+//
+// The refusal cases pin the two halves of holderAlreadyExited independently:
+// an ESRCH reported for a holder that is still ALIVE keeps the fail-closed
+// refusal (the liveness re-probe), and a NON-ESRCH delivery failure keeps it
+// even over a dead holder (the errno test — an EPERM, or the Windows
+// errSignalUnsupported stub, is a signal we could not deliver, and on Windows
+// processAlive cannot answer; that dead holder is reclaimed by the ordinary
+// stale-lock path on the next acquire, so the conservative refusal costs one
+// dispatch, not a wedge).
+func TestAcquireLineageLock_HolderExitsBeforeSignalLands(t *testing.T) {
+	const holderRun = "44444444-5555-6666-7777-888888888888"
+	cases := []struct {
+		name string
+		// failOn is the signal whose delivery fails, with failErr.
+		failOn  syscall.Signal
+		failErr error
+		// reallyExit makes the holder genuinely dead before that failure.
+		reallyExit bool
+		// deliverOn is the signal the seam actually DELIVERS (killing the
+		// holder) and reports success for. Every other signal is recorded and
+		// not delivered, so the holder survives it.
+		deliverOn    syscall.Signal
+		wantAdmitted bool
+	}{
+		{
+			name:         "holder exits before TERM lands",
+			failOn:       syscall.SIGTERM,
+			failErr:      syscall.ESRCH,
+			reallyExit:   true,
+			wantAdmitted: true,
+		},
+		{
+			name:         "holder exits before the escalated KILL lands",
+			failOn:       syscall.SIGKILL,
+			failErr:      syscall.ESRCH,
+			reallyExit:   true,
+			wantAdmitted: true,
+		},
+		{
+			name:         "ESRCH from a holder that is STILL ALIVE refuses",
+			failOn:       syscall.SIGTERM,
+			failErr:      syscall.ESRCH,
+			reallyExit:   false,
+			wantAdmitted: false,
+		},
+		{
+			name:         "non-ESRCH delivery failure refuses even over a dead holder",
+			failOn:       syscall.SIGTERM,
+			failErr:      syscall.EPERM,
+			reallyExit:   true,
+			wantAdmitted: false,
+		},
+		{
+			name:         "non-ESRCH failure of the escalated KILL refuses",
+			failOn:       syscall.SIGKILL,
+			failErr:      syscall.EPERM,
+			reallyExit:   false,
+			wantAdmitted: false,
+		},
+		{
+			// The ordinary escalation: the holder ignores TERM and dies on KILL.
+			name:         "holder survives TERM and dies on the escalated KILL",
+			deliverOn:    syscall.SIGKILL,
+			wantAdmitted: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := initRepo(t)
+			pid := startSleeper(t)
+			const root = "dddd4444"
+			lockPath := plantLock(t, repo, root, pid, holderRun)
+			stubProcessArgv(t, runnerArgvFor(holderRun), nil)
+
+			origSignal := signalLockHolder
+			signalLockHolder = func(p int, sig syscall.Signal) error {
+				switch sig {
+				case tc.failOn:
+					if tc.reallyExit {
+						killHolderNow(t, p)
+					}
+					return tc.failErr
+				case tc.deliverOn:
+					killHolderNow(t, p)
+					return nil
+				default:
+					return nil // recorded, deliberately NOT delivered
+				}
+			}
+			t.Cleanup(func() { signalLockHolder = origSignal })
+
+			origTerm, origKill := lockHolderTermGrace, lockHolderKillGrace
+			lockHolderTermGrace = scaledD(60 * time.Millisecond)
+			lockHolderKillGrace = scaledD(60 * time.Millisecond)
+			t.Cleanup(func() { lockHolderTermGrace, lockHolderKillGrace = origTerm, origKill })
+
+			var log strings.Builder
+			release, err := acquireLineageLock(context.Background(), repo, root, "run-next",
+				&fakeRunStateClient{state: runStateCancelled}, &log)
+
+			if !tc.wantAdmitted {
+				if err == nil {
+					release()
+					t.Fatal("acquire ADMITTED under a delivery failure that must refuse")
+				}
+				if !errors.Is(err, errHolderSurvivedKill) {
+					t.Errorf("error = %v, want it to wrap %v", err, errHolderSurvivedKill)
+				}
+				if alive := processAlive(pid); alive == tc.reallyExit {
+					t.Errorf("holder pid %d alive = %v, want %v — the seam did not stage the case it claims",
+						pid, alive, !tc.reallyExit)
+				}
+				if _, statErr := os.Stat(lockPath); statErr != nil {
+					t.Errorf("lockfile broken under a refused eviction: %v", statErr)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("acquire REFUSED over an already-dead holder — the #2545 wedge re-created: %v", err)
+			}
+			defer release()
+			if processAlive(pid) {
+				t.Errorf("holder pid %d still alive; the test's own kill did not land", pid)
+			}
+			if got := readLockPID(lockPath); got != os.Getpid() {
+				t.Errorf("lock pid after eviction = %d, want this process %d", got, os.Getpid())
+			}
+			if got := readLockRunID(lockPath); got != "run-next" {
+				t.Errorf("lock run id after eviction = %q, want run-next", got)
+			}
+			if !strings.Contains(log.String(), `"event":"lineage_lock_evicted"`) {
+				t.Errorf("eviction log missing lineage_lock_evicted:\n%s", log.String())
+			}
+		})
+	}
+}
+
+// TestSignalLockHolder_NonGroupLeaderSignalsOnlyThatPid exercises the REAL
+// signalLockHolder (no seam) on its non-leader fallback: a pid that does not
+// lead its group must be signalled ALONE, never as `-pgid`, which would reach
+// a group the holder merely belongs to — up to and including our own.
+//
+// The two children are arranged so the failure is observable WITHOUT signalling
+// the test's own group: the leader starts a fresh group, the member JOINS it
+// (pgid == leader, so the member is a non-leader). Signalling the member must
+// kill the member and leave the leader alive; a `-pgid` regression kills the
+// leader instead of this process.
+func TestSignalLockHolder_NonGroupLeaderSignalsOnlyThatPid(t *testing.T) {
+	leader := startSleeper(t)
+	member := startSleeperInGroup(t, leader)
+
+	pgid, err := syscall.Getpgid(member)
+	if err != nil {
+		t.Skipf("cannot read pgid of pid %d: %v", member, err)
+	}
+	if pgid != leader || member == leader {
+		t.Skipf("could not construct a non-leader child: member=%d pgid=%d leader=%d", member, pgid, leader)
+	}
+
+	if sigErr := signalLockHolder(member, syscall.SIGKILL); sigErr != nil {
+		t.Fatalf("signalLockHolder(non-leader pid %d) = %v, want nil", member, sigErr)
+	}
+	if !waitProcessGone(member, scaledD(2*time.Second)) {
+		t.Fatalf("non-leader pid %d survived the signal", member)
+	}
+	if !processAlive(leader) {
+		t.Fatalf("signalling non-leader pid %d also killed pid %d: the whole GROUP was signalled", member, leader)
+	}
+}
+
+// TestSignalLockHolder_RejectsNonPositivePid pins the guard that keeps a
+// non-positive pid out of kill(2), where 0 means "this process's whole group"
+// and -1 means "every process we may signal".
+//
+// Signal 0 deliberately: it is the no-delivery permission probe, so DELETING
+// the guard makes both calls return nil and this test goes RED on the
+// assertion — rather than the counterfactual signalling the test runner's own
+// process group.
+func TestSignalLockHolder_RejectsNonPositivePid(t *testing.T) {
+	for _, pid := range []int{0, -1} {
+		if err := signalLockHolder(pid, syscall.Signal(0)); !errors.Is(err, syscall.ESRCH) {
+			t.Errorf("signalLockHolder(%d) = %v, want ESRCH", pid, err)
 		}
 	}
 }
