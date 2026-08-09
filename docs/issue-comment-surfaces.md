@@ -1154,7 +1154,12 @@ Notes:
   entry (user actor; payload `{run_id, stage_id, decision, reason, decided_by,
   missing_paths, unsatisfied_assertions, build_required_paths, owning_slices}`)
   when an operator rejects the exemption and the stage drops to
-  category-B. The `gate_evidence` field on the exempted entry reuses the #1153
+  category-B. On BOTH decision entries `build_required_paths` and `owning_slices`
+  are present ONLY when the decided park carries a non-empty build-required
+  class, so a missing-paths or binding-assertion park's decision payload is
+  byte-identical to its pre-#2548 shape; in practice only the `failed` entry can
+  carry them, since `exempt` refuses that class before writing anything.
+  The `gate_evidence` field on the exempted entry reuses the #1153
   channel so a downstream implement-review gate reads the shortfall as
   operator-exempted rather than re-failing on it. Delivery to the operator is
   poll-based via `fishhawk_get_run_status` / `next_actions` (sibling slice); no

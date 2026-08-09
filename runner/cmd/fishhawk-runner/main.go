@@ -6279,10 +6279,24 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		var parkBuildRequiredMessage string
 		// parkResult is the terminal resolver over the three shortfall classes.
 		// The guard is COUNT-BASED (#2548): MORE THAN ONE recorded class is a
-		// COMPOUND failure and returns an UNTYPED sentinel wrap naming every
-		// recorded class, which NO errors.As in CommitAndPush matches, so the
-		// push aborts category-B before origin is touched. Exactly one returns
-		// that class's typed error; zero returns nil.
+		// COMPOUND failure and returns an UNTYPED sentinel wrap, which NO
+		// errors.As in CommitAndPush matches, so the push aborts category-B
+		// before origin is touched. Exactly one returns that class's typed
+		// error; zero returns nil.
+		//
+		// REACHABILITY (#2548 review): only ONE compound is reachable —
+		// missing + assertions. The recording guards are mutually exclusive by
+		// construction: parkMissing and parkAssertions are recorded only under
+		// `!isFixup && !isDecomposed`, while parkBuildRequired is recorded only
+		// under `isDecomposed && !isFixup`. So no compound can involve the new
+		// class, and the reachable compound keeps its pre-#2548 message
+		// verbatim. The count-based guard is retained as the fail-safe for the
+		// unreachable shapes (a future change to either guard must not silently
+		// promote a compound to a typed park), but it is deliberately NOT given
+		// a per-class enumeration it can never print.
+		//
+		// The reachable compound is covered by the #2501 missing+assertions
+		// test; the unreachable arm has no test because it has no input.
 		parkResult := func() error {
 			recorded := 0
 			if len(parkMissing) > 0 {
@@ -6295,30 +6309,25 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 				recorded++
 			}
 			if recorded > 1 {
-				// The missing+assertions pair keeps its pre-#2548 message text
-				// verbatim so the #2501 assertion on it does not shift; a compound
-				// involving the new class gets the generalized enumeration.
-				if len(parkMissing) > 0 && len(parkAssertions) > 0 && len(parkBuildRequired) == 0 {
+				// The reachable compound — missing + assertions — keeps its
+				// pre-#2548 message text verbatim so the #2501 assertion on it
+				// does not shift.
+				if len(parkBuildRequired) == 0 {
 					return fmt.Errorf("%w: compound committed-tree gate failure — %d missing declared scope file(s) (%s) AND %d unsatisfied binding assertion(s) (%s). "+
 						"A park is reserved for a SOLE gate shortfall, so this compound failure keeps the category-B abort: origin was not touched. "+
 						"Recover by making the implement output satisfy the declared condition(s) and touch every declared path, or replan with a corrected scope",
 						gitops.ErrScopeFilesMissing, len(parkMissing), strings.Join(parkMissing, ", "),
 						len(parkAssertions), gitops.FormatUnsatisfied(parkAssertions))
 				}
-				var classes []string
-				if len(parkMissing) > 0 {
-					classes = append(classes, fmt.Sprintf("%d missing declared scope file(s) (%s)", len(parkMissing), strings.Join(parkMissing, ", ")))
-				}
-				if len(parkAssertions) > 0 {
-					classes = append(classes, fmt.Sprintf("%d unsatisfied binding assertion(s) (%s)", len(parkAssertions), gitops.FormatUnsatisfied(parkAssertions)))
-				}
-				if len(parkBuildRequired) > 0 {
-					classes = append(classes, fmt.Sprintf("%d build-required scope-excluded path(s) (%s)", len(parkBuildRequired), strings.Join(parkBuildRequired, ", ")))
-				}
-				return fmt.Errorf("%w: compound committed-tree gate failure — %s. "+
+				// Unreachable by construction (see the reachability note above):
+				// the build-required class cannot be recorded alongside either
+				// other class. Kept as an untyped fail-safe wrap so a future
+				// guard change aborts category-B instead of parking, with no
+				// enumeration pretending to describe a real input.
+				return fmt.Errorf("%w: compound committed-tree gate failure — %d shortfall classes recorded including build-required scope drift (%s). "+
 					"A park is reserved for a SOLE gate shortfall, so this compound failure keeps the category-B abort: origin was not touched. "+
 					"Recover by making the implement output satisfy the declared condition(s) and touch every declared path, or replan with a corrected scope",
-					gitops.ErrScopeFilesMissing, strings.Join(classes, " AND "))
+					gitops.ErrScopeFilesMissing, recorded, strings.Join(parkBuildRequired, ", "))
 			}
 			switch {
 			case len(parkMissing) > 0:
@@ -6478,6 +6487,24 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			// built at all, not a boundary artifact), a test failure with EMPTY
 			// drift (a red tree with no scope-boundary cause), and the flag off
 			// (standalone runs and fix-up passes, byte-identical category-B).
+			//
+			// NOTE for a future reader, stated because an untested conjunct that
+			// looks load-bearing is worse than none: `len(drift) > 0` is
+			// NON-DISCRIMINATING against the CURRENT callee and no test can make
+			// it otherwise. verifyCommittedTreeCompiles returns nil on its own
+			// len(drift)==0 fast path, so `err` here is never non-nil with an
+			// empty drift list and the conjunct can flip no outcome. Verified by
+			// counterfactual: deleting `&& len(drift) > 0` and running the WHOLE
+			// runner/cmd/fishhawk-runner package leaves it green (88s, ok), which
+			// is the observed result — not a red one — and
+			// TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable pins the
+			// mode's OUTCOME (a red, drift-free tree pushes plainly and never
+			// parks) rather than claiming a counterfactual it cannot serve. The
+			// conjunct is kept as the explicit statement of the invariant and as
+			// the guard should that fast path ever move: without it, a callee
+			// that reported ErrCommittedTestsFailed on an empty drift list would
+			// record an empty parkBuildRequired slice, parkResult() would count
+			// zero classes, and the red commit would push reported as succeeded.
 			if parkOnBuildRequiredDrift && errors.Is(err, gitops.ErrCommittedTestsFailed) && len(drift) > 0 {
 				parkBuildRequired = append([]string(nil), drift...)
 				parkBuildRequiredMessage = err.Error()

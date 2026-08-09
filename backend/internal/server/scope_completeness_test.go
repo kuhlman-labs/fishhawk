@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -660,5 +661,164 @@ func TestDecideScopeCompleteness_FailBuildRequiredParkEchoesAttribution(t *testi
 	}
 	if !found {
 		t.Fatalf("want a scope_completeness_failed entry, got %+v", au.appended)
+	}
+}
+
+// TestDecideScopeCompleteness_FailBuildRequiredParkDrivesParentResolution is
+// p4 delivered END TO END, in one test, through the real seam — the earlier
+// split into "server POSTs and asserts the stage failed" plus "orchestrator
+// hand-mutates the child and calls maybeAdvanceDecomposedParent" asserted
+// everything EXCEPT the join, so the one defect that matters (the fail decision
+// transitions the STAGE but never drives the child RUN terminal, leaving the
+// parent waiting forever) would have passed both halves.
+//
+// So: a REAL POST of the `fail` decision on a parked decomposition child, with
+// a REAL *orchestrator.Orchestrator wired into the server, and the assertions
+// walk the whole chain:
+//
+//  1. the child's implement stage lands failed (category B);
+//  2. the child RUN reaches TERMINAL — the seam. failScopeCompleteness's
+//     Advance must run completeRun, which is the only thing that calls
+//     maybeAdvanceDecomposedParent;
+//  3. the parent's awaiting_children stage is RESOLVED rather than left
+//     silently waiting: with every sibling now terminal the parent-side hook
+//     fires and, because a `fail` decision is category B (recoverable in
+//     decomposition, #698/#1081), it emits parent_awaiting_redrive naming the
+//     failed child. That entry IS the resolution for this failure class — the
+//     operator-discoverable re-drive signal — and it exists only if (2) held.
+func TestDecideScopeCompleteness_FailBuildRequiredParkDrivesParentResolution(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := &auditCapture{}
+
+	// Parent: implement parked in awaiting_children.
+	parent := rr.seedRun()
+	parentStage := rr.seedStage(parent.ID, 1, run.StageStateAwaitingChildren)
+	parentStage.Type = run.StageTypeImplement
+
+	// Child slice 0: settled-but-not-terminal, parked on a build-required park.
+	child := rr.seedRun()
+	pid := parent.ID
+	sliceZero := 0
+	child.DecomposedFrom = &pid
+	child.SliceIndex = &sliceZero
+	child.State = run.StateRunning
+	childStage := rr.seedStage(child.ID, 1, run.StageStateAwaitingScopeDecision)
+	childStage.Type = run.StageTypeImplement
+	sliceOne := 1
+	childStage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
+		HeldCommitSHA:      "1111111111111111111111111111111111111111",
+		RunBranch:          "fishhawk/run-aaa/slice-0",
+		VerifiedTreeSHA:    "2222222222222222222222222222222222222222",
+		BuildRequiredPaths: []string{"backend/internal/server/prompt.go"},
+		OwningSlices: []run.BuildRequiredOwner{
+			{Path: "backend/internal/server/prompt.go", SliceIndex: &sliceOne, SliceTitle: "prompt plumbing"},
+		},
+	}
+
+	// Sibling slice 1 already terminal, so the parked child is the LAST
+	// non-terminal sibling — the shape in which an unresolved parent waits
+	// indefinitely.
+	sibling := rr.seedRun()
+	sibIdx := 1
+	sibling.DecomposedFrom = &pid
+	sibling.SliceIndex = &sibIdx
+	sibling.State = run.StateSucceeded
+
+	o := &orchestrator.Orchestrator{Runs: rr, Audit: au}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, Orchestrator: o})
+
+	w := postScopeCompletenessDecision(t, s, child.ID,
+		`{"decision":"fail","reason":"the decomposition boundary cut a coupling; re-plan the slices"}`,
+		operatorWriteStages)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+
+	// (1) the child's stage failed.
+	gotStage, _ := rr.GetStage(context.Background(), childStage.ID)
+	if gotStage.State != run.StageStateFailed {
+		t.Fatalf("child implement stage = %q, want failed", gotStage.State)
+	}
+
+	// (2) THE SEAM: the child RUN went terminal off the back of that decision.
+	gotChild, _ := rr.GetRun(context.Background(), child.ID)
+	if !gotChild.State.IsTerminal() {
+		t.Fatalf("child run state = %q, want terminal — the fail decision must drive the child run terminal, "+
+			"otherwise the parent never leaves awaiting_children", gotChild.State)
+	}
+	if gotChild.State != run.StateFailed {
+		t.Errorf("child run state = %q, want failed", gotChild.State)
+	}
+
+	// (3) the parent-side hook fired and resolved the wait.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var redrive *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "parent_awaiting_redrive" && au.appended[i].RunID == parent.ID {
+			redrive = &au.appended[i]
+		}
+	}
+	if redrive == nil {
+		t.Fatalf("the parent must be resolved off its silent wait once the decision lands; "+
+			"want a parent_awaiting_redrive entry on run %s, got %+v", parent.ID, au.appended)
+	}
+	var payload struct {
+		ParentStageID string   `json:"parent_stage_id"`
+		Children      []string `json:"retryable_child_run_ids"`
+	}
+	if err := json.Unmarshal(redrive.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.ParentStageID != parentStage.ID.String() {
+		t.Errorf("parent_stage_id = %q, want the awaiting_children stage %s", payload.ParentStageID, parentStage.ID)
+	}
+	if len(payload.Children) != 1 || payload.Children[0] != child.ID.String() {
+		t.Errorf("retryable_child_run_ids = %v, want [%s]", payload.Children, child.ID)
+	}
+}
+
+// TestScopeCompletenessDecisionAudit_OlderClassesPayloadUnchanged is the
+// byte-identity pin for the two PRE-#2548 park classes: a missing-paths park's
+// decision entry must NOT grow build_required_paths / owning_slices keys.
+// Writing them unconditionally emitted two JSON nulls onto every older-class
+// payload — invisible to a key-presence-tolerant reader, wire-visible to a
+// consumer diffing bytes. Asserted on both the exempted and failed entries.
+func TestScopeCompletenessDecisionAudit_OlderClassesPayloadUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name, body, category string
+	}{
+		{"exempt", `{"decision":"exempt","reason":"the coupled test file is genuinely already covered"}`, CategoryScopeCompletenessExempted},
+		{"fail", `{"decision":"fail","reason":"the declared edit was dropped"}`, CategoryScopeCompletenessFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, au, runRow, _ := scopeCompletenessServer(t) // park carries MissingPaths only
+			w := postScopeCompletenessDecision(t, s, runRow.ID, tc.body, operatorWriteStages)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+			}
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			var found bool
+			for _, e := range au.appended {
+				if e.Category != tc.category {
+					continue
+				}
+				found = true
+				var payload map[string]any
+				if err := json.Unmarshal(e.Payload, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := payload["build_required_paths"]; ok {
+					t.Errorf("%s payload must not carry build_required_paths for a missing-paths park; got %v", tc.category, payload)
+				}
+				if _, ok := payload["owning_slices"]; ok {
+					t.Errorf("%s payload must not carry owning_slices for a missing-paths park; got %v", tc.category, payload)
+				}
+			}
+			if !found {
+				t.Fatalf("want a %s entry, got %+v", tc.category, au.appended)
+			}
+		})
 	}
 }

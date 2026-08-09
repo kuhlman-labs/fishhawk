@@ -18276,10 +18276,31 @@ func TestVerifyCommit_BuildRequiredDriftRecordedNotReturned(t *testing.T) {
 }
 
 // TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable (r2 / c4) is the
-// drift-EMPTY guard: a committed tree that is red with NO scope drift has no
-// scope-boundary cause, so it is NOT parkable and keeps today's category-B
-// abort with origin untouched. Here every dirty path is declared, so the gate's
-// len(drift)==0 fast path holds and nothing is pushed.
+// drift-EMPTY mode: a committed tree that is RED with NO scope drift has no
+// scope-boundary cause, so it is NOT parkable. The fixture is red BY
+// CONSTRUCTION and the redness is proved before the push (the pre-push `go
+// test` below must FAIL) — the earlier revision of this test declared the
+// corrected seed.go into scope, which made the tree GREEN and left the mode it
+// names unconstructed.
+//
+// Only mod/reg.go is dirty and it is declared, so the drift list is empty; the
+// committed tree therefore carries the base seed.go (registry["x"] = 0) while
+// reg_test.go expects 42.
+//
+// WHAT ACTUALLY HAPPENS, stated exactly: verifyCommittedTreeCompiles returns
+// nil on its len(drift)==0 fast path, so no committed-tree sentinel is raised
+// here at all and the child pushes normally. That is byte-identical to
+// pre-#2548 behaviour and is the assertion this test makes. The category-B
+// abort for a red tree with empty drift is owned by a DIFFERENT gate —
+// runVerifyGateCommitted, the stage-level committed-tree verify, which runs the
+// configured verify command irrespective of drift (cfg.verifyCmd is the no-op
+// "true" in this fixture, so it is deliberately out of the picture here).
+//
+// Consequently this test is NOT a counterfactual vehicle for the
+// `len(drift) > 0` conjunct in the park condition: with the callee's fast path
+// in place that conjunct cannot change any outcome. See the note at the park
+// condition in main.go, which records the observed (green) result of deleting
+// it rather than asserting a redness that does not occur.
 func TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable(t *testing.T) {
 	repo, bare := buildRequiredDriftRepo(t)
 	fu := newFakeUploader(t)
@@ -18289,19 +18310,35 @@ func TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable(t *testing.T) {
 	}
 	runSliceIndex = 0
 	cfg := buildRequiredCfg(repo, true)
-	// Declare seed.go too → zero drift. The committed tree is now GREEN, so the
-	// only admissible outcome is a normal child push, never a park.
-	cfg.scopeFiles = append(cfg.scopeFiles, upload.ScopeFile{Path: "mod/seed.go", Operation: "modify"})
+	// Restore the build-required sibling file to its BASE content so it is not
+	// dirty: drift is now empty AND the tree that gets committed is red.
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 0 }\n")
+
+	// Redness proof. Every dirty path is declared, so the working tree here is
+	// byte-identical to the tree the scope-only commit will carry — a passing
+	// `go test` would mean the fixture silently went green again.
+	redCheck := exec.Command("go", "test", "./...")
+	redCheck.Dir = repo
+	if out, terr := redCheck.CombinedOutput(); terr == nil {
+		t.Fatalf("fixture is not red: `go test ./...` passed on the tree that will be committed\n%s", out)
+	}
 
 	var logSink strings.Builder
 	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
-		t.Fatalf("zero-drift child push: %v\n%s", err, logSink.String())
+		t.Fatalf("a red tree with EMPTY drift must keep today's plain child push: %v\n%s", err, logSink.String())
 	}
 	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "pushed" {
 		t.Fatalf("a zero-drift child must report a plain push, got: %+v", fu.gotPRArgs)
 	}
-	if len(fu.gotPRArgs.BuildRequiredPaths) != 0 {
-		t.Errorf("no drift means no build-required shortfall, got %v", fu.gotPRArgs.BuildRequiredPaths)
+	// THE MODE'S ASSERTION: not parkable. No scope_park outcome, no shortfall.
+	if fu.gotPRArgs.Outcome == "scope_park" || len(fu.gotPRArgs.BuildRequiredPaths) != 0 {
+		t.Errorf("a red tree with EMPTY drift must not park, got outcome=%q paths=%v",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.BuildRequiredPaths)
+	}
+	// The gate never fired, so no test_gate_failed diagnostic was emitted.
+	if strings.Contains(logSink.String(), `"event":"test_gate_failed"`) {
+		t.Errorf("the committed-tree gate short-circuits on empty drift; it must not emit test_gate_failed\n%s", logSink.String())
 	}
 	_ = bare
 }

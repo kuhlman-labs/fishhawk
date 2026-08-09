@@ -4399,7 +4399,10 @@ func seedParkedBuildRequiredSlice(t *testing.T, rs *stubRuns, parentID uuid.UUID
 //   - the parent's awaiting_children stage is NOT resolved to succeeded/failed —
 //     resolving it while a live child holds an undecided park would terminate the
 //     run out from under the decision the park exists to offer; and
-//   - the dispatch top-up still runs (the #1143 event-driven refill is unchanged).
+//   - the dispatch top-up still runs (the #1143 event-driven refill is
+//     unchanged) — ASSERTED, not merely claimed: a pending sibling seeded below
+//     must come out DISPATCHED, so removing or breaking the top-up reddens this
+//     test instead of passing silently.
 func TestMaybeAdvanceDecomposedParent_SurfacesParkedChild(t *testing.T) {
 	o, rs, _ := newOrchestrator(t)
 	au := &recordingAudit{}
@@ -4409,6 +4412,16 @@ func TestMaybeAdvanceDecomposedParent_SurfacesParkedChild(t *testing.T) {
 	parkedChild, parkedStage := seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
 	// A SIBLING settles terminal — the only trigger that reaches this hook.
 	seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	// A PENDING sibling: the #1143 event-driven refill must still dispatch it
+	// while the parked child holds the parent in awaiting_children.
+	pendingChild, pendingStages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	pid := parent.ID
+	pendingIdx := 2
+	pendingChild.DecomposedFrom = &pid
+	pendingChild.SliceIndex = &pendingIdx
+	pendingChild.State = run.StatePending
 
 	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
 
@@ -4452,6 +4465,15 @@ func TestMaybeAdvanceDecomposedParent_SurfacesParkedChild(t *testing.T) {
 	}
 	if auditHasCategory(au, "children_settled") {
 		t.Error("children_settled must NOT be emitted while a child holds an undecided park")
+	}
+
+	// THE DISPATCH TOP-UP, asserted. Surfacing the parked child must not
+	// short-circuit the #1143 refill: the pending sibling is dispatched.
+	if pendingStages[0].State != run.StageStateDispatched {
+		t.Errorf("pending sibling implement stage = %q, want dispatched (the #1143 top-up must still run)", pendingStages[0].State)
+	}
+	if pendingChild.State != run.StateRunning {
+		t.Errorf("pending sibling run state = %q, want running (dispatched)", pendingChild.State)
 	}
 }
 
@@ -4513,12 +4535,19 @@ func TestMaybeAdvanceDecomposedParent_NoSignalForUnparkedNonTerminalChild(t *tes
 }
 
 // TestMaybeAdvanceDecomposedParent_ResolvesAfterParkedChildFails is p4's
-// orchestrator half — THE NOT-INDEFINITE ASSERTION. Once the operator's `fail`
-// decision lands, the parked child's run goes terminal and the parent resolves
-// through the EXISTING unchanged path (failed-C, or the #1081 recoverable
-// re-drive park), i.e. the parent never sits in awaiting_children past the
-// decision. Here the failed child's implement stage carries no failure category,
-// so failedChildrenAllRecoverable is false and the parent resolves to failed-C.
+// orchestrator half, and ONLY that: it hand-sets the child terminal and calls
+// the hook directly, so it pins one branch of maybeAdvanceDecomposedParent —
+// a terminal child whose implement stage carries NO failure category is not
+// recoverable, so the parent resolves to failed-C rather than parking.
+//
+// It deliberately does NOT claim to cover the SEAM (that POSTing `fail`
+// actually drives the child RUN terminal and thereby fires this hook); a test
+// that mutates the state under test cannot detect a wiring defect upstream of
+// it. That seam is asserted end to end, through the real endpoint with a real
+// orchestrator, by
+// server.TestDecideScopeCompleteness_FailBuildRequiredParkDrivesParentResolution
+// — which covers the category-B `fail` decision's actual outcome, the #1081
+// recoverable re-drive park. The two together cover both resolution branches.
 func TestMaybeAdvanceDecomposedParent_ResolvesAfterParkedChildFails(t *testing.T) {
 	o, rs, _ := newOrchestrator(t)
 	au := &recordingAudit{}

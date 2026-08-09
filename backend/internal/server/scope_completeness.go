@@ -396,8 +396,15 @@ func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid
 		// too. In practice only the `failed` entry can carry it — the exempt path
 		// refuses this class before reaching here — which is exactly where the
 		// operator's record of WHICH boundary was cut belongs.
-		payloadMap["build_required_paths"] = park.BuildRequiredPaths
-		payloadMap["owning_slices"] = park.OwningSlices
+		//
+		// GATED on a non-empty class so the two OLDER park classes' entries stay
+		// BYTE-IDENTICAL: writing these unconditionally added two JSON-null keys
+		// to every missing-paths / binding-assertion exempted+failed payload, a
+		// wire-visible change on paths #2548 promised not to touch.
+		if len(park.BuildRequiredPaths) > 0 {
+			payloadMap["build_required_paths"] = park.BuildRequiredPaths
+			payloadMap["owning_slices"] = park.OwningSlices
+		}
 		if category == CategoryScopeCompletenessExempted {
 			payloadMap["held_commit_sha"] = park.HeldCommitSHA
 			payloadMap["run_branch"] = park.RunBranch
