@@ -1101,6 +1101,13 @@ func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID 
 	h, err := detachedRunners.startAndRegister(cmd, runID, stageID)
 	if err != nil {
 		_ = logFile.Close()
+		// No child was forked, so nothing will ever write to this file and the
+		// refusal returns an empty logPath, so nothing will ever read it either.
+		// Leaving it would litter TempDir with one zero-length orphan per
+		// refused re-dispatch of a cancelled run — unbounded over time. Remove
+		// it best-effort: a failure here is not worth failing the refusal over,
+		// which already carries the actionable reason.
+		_ = os.Remove(logPath)
 		return "", err
 	}
 	// The child inherited its own fd for the log at fork; the parent's

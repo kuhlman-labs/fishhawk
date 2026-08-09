@@ -26,6 +26,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // fakeBackend is a thin httptest server that records the last
@@ -10457,7 +10458,9 @@ func TestStartRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
 // runner module (separate Go modules, no dependency edge either way).
 func TestCancelRun_TerminatesDetachedRunner(t *testing.T) {
 	reg := freshRegistry(t)
-	detachedTerminateGrace = 5 * time.Second
+	// Every wall-clock bound in the #2545 tests derives from D(base) so one
+	// factor scales them together on a loaded runner (AGENTS.md / #1984).
+	detachedTerminateGrace = timescale.D(5 * time.Second)
 
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
@@ -10509,7 +10512,10 @@ func TestCancelRun_TerminatesDetachedRunner(t *testing.T) {
 // the failure #2510 removed from this type.
 func TestCancelRun_ReapWarningDoesNotFailTheVerb(t *testing.T) {
 	reg := freshRegistry(t)
-	detachedTerminateGrace = 40 * time.Millisecond
+	// A want-TIMEOUT bound (the survivor must NOT report done inside it), so
+	// short is safe — but it still derives from D(base) like every other bound
+	// in this set rather than being a raw literal.
+	detachedTerminateGrace = timescale.D(40 * time.Millisecond)
 	origSignal := runStageSignalGroup
 	runStageSignalGroup = func(*exec.Cmd, syscall.Signal) {}
 	t.Cleanup(func() { runStageSignalGroup = origSignal })

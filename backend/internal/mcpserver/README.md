@@ -197,6 +197,8 @@ There is no interval in which a started child is unregistered. The reaper gorout
 
 The probe fails closed: absent, erroring, empty-state, or still-`cancelled` all refuse. A NEWER cancel landing while the probe was in flight also refuses (tombstone generations are compared), so the admit can never act on a stale answer.
 
+A refusal also **removes the stage log file** it opened before the registry call. That file is created ahead of `startAndRegister` (the child needs the fd at fork), and the refusal returns an empty `logPath`, so a left-behind file is referenced by nothing — one zero-length orphan in `TempDir` per refused re-dispatch, unbounded over time. Removal is best-effort; a failure there does not change the refusal.
+
 **Honest limitation.** The registry is **per MCP process**. A cancel issued from a different MCP server process than the one that dispatched reaps nothing — `reaped_runners` is 0 and nothing is wrong. The net for that case is runner-side: `runner/cmd/fishhawk-runner`'s lineage-lock holder rule reclaims the lock from a holder it can PROVE is an orphaned runner of a cancelled run (see that package's README).
 
 ### Sibling-in-flight dispatch refusal ([#1872](https://github.com/kuhlman-labs/fishhawk/issues/1872))

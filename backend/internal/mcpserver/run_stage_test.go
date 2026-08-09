@@ -2940,17 +2940,47 @@ func TestComposeRunnerArgv_RunIDFlagAndValueAreAdjacentTokens(t *testing.T) {
 // path itself is gated by the registry: after a cancel tombstone for the run,
 // spawnRunnerStageDetached returns errRunCancelledBeforeSpawn verbatim and
 // forks nothing.
+//
+// It also pins the refusal path's CLEANUP: the stage log file is created before
+// the registry call, so a refusal must remove it. The refusal returns an empty
+// logPath, so a left-behind file is referenced by nothing and would accumulate
+// one zero-length orphan in TempDir per refused re-dispatch. Asserted by
+// globbing this run id's log-name prefix — repeated refusals leave NOTHING.
 func TestSpawnRunnerStageDetached_RefusesAfterCancel(t *testing.T) {
 	reg := freshRegistry(t)
 	const runID = "abababab-abab-abab-abab-abababababab"
 	reg.terminateRunners(runID, nil)
 
-	logPath, err := spawnRunnerStageDetached("/bin/sh", []string{"-c", "sleep 120"},
-		os.Environ(), runID, "stage-1", nil)
-	if !errors.Is(err, errRunCancelledBeforeSpawn) {
-		t.Fatalf("err = %v, want errRunCancelledBeforeSpawn", err)
+	// Sweep any litter an EARLIER run of this test (on the pre-cleanup code)
+	// left behind, so the assertion below observes only this run's refusals.
+	// That five of these were found on the first run of this test is the
+	// concern's own evidence: the orphans really do accumulate.
+	logGlob := filepath.Join(os.TempDir(), "fishhawk-runner-"+runID+"-*.log")
+	if leftover, _ := filepath.Glob(logGlob); len(leftover) != 0 {
+		for _, p := range leftover {
+			_ = os.Remove(p)
+		}
 	}
-	if logPath != "" {
-		t.Errorf("logPath = %q, want empty on a refused spawn", logPath)
+
+	for i := 0; i < 3; i++ {
+		logPath, err := spawnRunnerStageDetached("/bin/sh", []string{"-c", "sleep 120"},
+			os.Environ(), runID, "stage-1", nil)
+		if !errors.Is(err, errRunCancelledBeforeSpawn) {
+			t.Fatalf("refusal %d: err = %v, want errRunCancelledBeforeSpawn", i, err)
+		}
+		if logPath != "" {
+			t.Errorf("refusal %d: logPath = %q, want empty on a refused spawn", i, logPath)
+		}
+	}
+
+	orphans, err := filepath.Glob(logGlob)
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(orphans) != 0 {
+		for _, p := range orphans {
+			t.Cleanup(func() { _ = os.Remove(p) })
+		}
+		t.Errorf("refused spawns left %d orphan log file(s) in TempDir: %v", len(orphans), orphans)
 	}
 }

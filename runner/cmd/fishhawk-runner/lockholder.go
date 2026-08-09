@@ -34,7 +34,8 @@ const runIDArgFlag = "--run-id"
 
 // runnerBinaryName is the basename every fishhawk-runner process carries in
 // argv[0]. runnerIdentityMatches matches it on a path/basename BOUNDARY (see
-// binaryTokenIsRunner), never as a floating substring.
+// binaryTokenIsRunner) and only in argv[0], never as a floating substring and
+// never in a later token.
 const runnerBinaryName = "fishhawk-runner"
 
 // Named refusal reasons for the lineage-lock holder rule. Each is a distinct
@@ -127,26 +128,26 @@ func binaryTokenIsRunner(token string) bool {
 // runnerIdentityMatches reports whether argv (a whole `ps -o args=` line)
 // belongs to a fishhawk-runner process carrying `--run-id <runID>`.
 //
-// The decision is made on TOKEN BOUNDARIES, never substring containment: argv
-// is split on whitespace and the match requires (a) some token whose
-// path/basename is the runner binary, and (b) a token exactly equal to
-// runIDArgFlag whose IMMEDIATELY FOLLOWING token is exactly equal to runID.
-// A longer unrelated argument that merely embeds the flag text or the id text
-// therefore does NOT authorize a signal, and the single-token
-// `--run-id=<id>` form — which composeRunnerArgv never emits — is refused.
+// The decision is made on TOKEN BOUNDARIES, never substring containment, and
+// the binary is proven from argv[0] ALONE: argv is split on whitespace and the
+// match requires (a) the FIRST token — the executable the kernel started, which
+// is what `ps -o args=` renders first — to be the runner binary on a
+// path/basename boundary, and (b) a token exactly equal to runIDArgFlag whose
+// IMMEDIATELY FOLLOWING token is exactly equal to runID.
+//
+// Accepting the binary name in ANY token would authorize an unrelated process
+// that merely mentions it as an ARGUMENT — `/bin/sleep fishhawk-runner
+// --run-id <holder id>` would pass — which is exactly the "unprovable or
+// recycled holder PID must remain untouched" requirement inverted. Likewise a
+// longer unrelated argument that embeds the flag text or the id text does NOT
+// authorize a signal, and the single-token `--run-id=<id>` form — which
+// composeRunnerArgv never emits — is refused.
 func runnerIdentityMatches(argv, runID string) bool {
 	if runID == "" {
 		return false
 	}
 	tokens := strings.Fields(argv)
-	binaryOK := false
-	for _, tok := range tokens {
-		if binaryTokenIsRunner(tok) {
-			binaryOK = true
-			break
-		}
-	}
-	if !binaryOK {
+	if len(tokens) == 0 || !binaryTokenIsRunner(tokens[0]) {
 		return false
 	}
 	for i, tok := range tokens {

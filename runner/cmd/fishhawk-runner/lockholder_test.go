@@ -181,6 +181,19 @@ func TestRunnerIdentityMatches(t *testing.T) {
 			want: false,
 		},
 		{
+			// The binary is proven from argv[0] ALONE. An unrelated executable
+			// that merely mentions the runner name as an ARGUMENT is not a
+			// runner, and must never authorize TERM/KILL against its pid.
+			name: "runner name in a later token (not argv[0]) rejects",
+			argv: "/bin/sleep " + runnerBinaryName + " " + runIDArgFlag + " " + runID,
+			want: false,
+		},
+		{
+			name: "runner name only in a trailing argument rejects",
+			argv: "/usr/bin/tail -f /var/log/" + runnerBinaryName + " " + runIDArgFlag + " " + runID,
+			want: false,
+		},
+		{
 			name: "binary name as a substring of a longer basename rejects",
 			argv: "/opt/bin/evil-" + runnerBinaryName + " " + runIDArgFlag + " " + runID,
 			want: false,
@@ -209,13 +222,20 @@ func TestRunnerIdentityMatches(t *testing.T) {
 	}
 }
 
-// TestComposeRunnerArgvLockstep asserts the matcher accepts EXACTLY the token
-// pair the MCP-side spawn emits. The MCP module renders `--run-id` and the id
-// as two adjacent argv tokens (composeRunnerArgv, pinned on that side by
-// TestComposeRunnerArgv_RunIDFlagAndValueAreAdjacentTokens); this is the runner
-// half of that lockstep, expressed against the shared runIDArgFlag constant so
-// a reshape breaks a test rather than silently disarming the identity check.
-func TestComposeRunnerArgvLockstep(t *testing.T) {
+// TestRunnerIdentityMatches_AcceptsFullSpawnArgvShape asserts the matcher
+// accepts a full runner command line of the shape the MCP-side spawn produces:
+// the binary in argv[0], `--run-id` and the id as two adjacent tokens, and the
+// remaining flags around them.
+//
+// Scope, stated honestly: this is a RUNNER-SIDE test only. It renders the argv
+// from the same runIDArgFlag/runnerBinaryName constants the matcher consumes,
+// so it can NOT detect a reshape of composeRunnerArgv — a reshape on the MCP
+// side would leave it green. The actual cross-module pin is
+// TestComposeRunnerArgv_RunIDFlagAndValueAreAdjacentTokens in
+// backend/internal/mcpserver/run_stage_test.go, which exercises the real
+// composeRunnerArgv (the two modules have no dependency edge either way, so the
+// pin cannot be a single test).
+func TestRunnerIdentityMatches_AcceptsFullSpawnArgvShape(t *testing.T) {
 	const runID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	argv := strings.Join([]string{
 		"/usr/local/bin/" + runnerBinaryName,

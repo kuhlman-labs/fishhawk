@@ -228,9 +228,13 @@ func TestDetachedRegistry_TombstoneExpires(t *testing.T) {
 // canceller, and then waits until the registry's committed-waiter count is
 // non-zero — which happens only once that goroutine has entered the
 // mutex-acquire path and therefore cannot run past Lock until this hold is
-// released. It then holds a scaled beat longer so the parked canceller crosses
-// sync.Mutex's starvation threshold and the mutex is handed to it directly
-// rather than barged past by the spawner.
+// released.
+//
+// That wait is BOUNDED, so the test ASSERTS it actually observed the non-zero
+// count rather than letting the deadline expire: without that assertion an
+// expired bound would fall through to an ordinary cancel-after-registration
+// ordering under which every remaining assertion still passes, and the test
+// would claim an interleaving it never exercised.
 //
 // Because a mutex handoff is a runtime scheduling property rather than a
 // language guarantee, the interleaving is repeated: the child must be reaped on
@@ -256,6 +260,10 @@ func TestDetachedRegistry_CancelDuringSpawn_ReapsChild(t *testing.T) {
 
 			cancelDone := make(chan struct{})
 			var reaped int
+			// contended records whether the bounded wait below actually OBSERVED
+			// the canceller committed to the mutex. The hook runs synchronously on
+			// this goroutine (inside startAndRegister), so a plain bool is safe.
+			contended := false
 			detachedSpawnPreStartHook = func(id string) {
 				go func() {
 					defer close(cancelDone)
@@ -267,9 +275,13 @@ func TestDetachedRegistry_CancelDuringSpawn_ReapsChild(t *testing.T) {
 				// progress until this (lock-holding) hook returns. Bounded, so a
 				// variant that released the lock BEFORE this hook (where the
 				// canceller acquires instantly and the count is already back to
-				// zero) fails on the assertion below instead of spinning forever.
+				// zero) fails on the assertions below instead of spinning forever.
 				deadline := time.Now().Add(timescale.D(2 * time.Second))
-				for reg.waiters.Load() == 0 && time.Now().Before(deadline) {
+				for time.Now().Before(deadline) {
+					if reg.waiters.Load() > 0 {
+						contended = true
+						break
+					}
 					runtime.Gosched()
 				}
 			}
@@ -278,6 +290,15 @@ func TestDetachedRegistry_CancelDuringSpawn_ReapsChild(t *testing.T) {
 			h, err := reg.startAndRegister(cmd, runID, "stage-1")
 			if err != nil {
 				t.Fatalf("startAndRegister: %v", err)
+			}
+			// Without this the deadline could simply expire and the rest of the
+			// test would pass under an ordinary cancel-AFTER-registration
+			// ordering, proving nothing about the contended interleaving it
+			// claims to cover. The wait must have OBSERVED contention.
+			if !contended {
+				t.Fatalf("the canceller never became a committed waiter within the bound; "+
+					"this iteration did not exercise the contended cancel-during-spawn "+
+					"interleaving (waiters=%d)", reg.waiters.Load())
 			}
 			// Production's reaper closes done after Wait; run the same shape here.
 			go func() {
