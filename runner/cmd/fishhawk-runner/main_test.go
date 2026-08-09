@@ -18132,3 +18132,318 @@ func TestImplementPROpenOutage_ResumesWithoutAgentReinvocation(t *testing.T) {
 		t.Errorf("CommitAndPush called %d time(s), want 1 (the resumes must not re-commit)", fp.calls)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #2548 — build-required scope drift on a DECOMPOSED CHILD, the third
+// scope-completeness park class. One fixture, one test per named failure mode.
+// ---------------------------------------------------------------------------
+
+const buildRequiredParentRunID = "aaaabbbbccccddddeeeeffff00001111"
+
+// buildRequiredDriftRepo builds the #2548 live shape: a Go workspace whose
+// scope-only committed tree COMPILES (go vet passes) but whose tests are RED
+// because a build-required file is MODIFIED in the working tree and excluded
+// from the commit as scope drift — exactly the slice-boundary cut the issue
+// documents (slice 0 needed a file slice 1 owns).
+//
+// mod/seed.go is TRACKED and modified (not created), so the created-out-of-scope
+// gate (#818) — which is skipped for decomposed children but NOT for standalone
+// runs — cannot fire and mask the class under test on either path.
+func buildRequiredDriftRepo(t *testing.T) (repo, bare string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not available")
+	}
+	dir := t.TempDir()
+	repo = filepath.Join(dir, "src")
+	bare = filepath.Join(dir, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+
+	mustWrite(t, filepath.Join(repo, "go.work"), "go 1.21\n\nuse ./mod\n")
+	if err := os.MkdirAll(filepath.Join(repo, "mod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(repo, "mod", "go.mod"), "module example.com/mod\n\ngo 1.21\n")
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"),
+		"package mod\n\nvar registry = map[string]int{}\n\n// Get reads the registry.\nfunc Get(k string) int { return registry[k] }\n")
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"),
+		"package mod\n\nimport \"testing\"\n\nfunc TestGet(t *testing.T) {\n\tif Get(\"x\") != 42 {\n\t\tt.Fatalf(\"Get(x) = %d, want 42\", Get(\"x\"))\n\t}\n}\n")
+	// seed.go is the BUILD-REQUIRED file the sibling slice owns. Committed at
+	// the WRONG value, so the scope-only tree's test is red.
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 0 }\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	runGit("init", "--bare", bare)
+	runGit("remote", "add", "origin", bare)
+	runGit("push", "origin", "main")
+	runGit("config", "url."+bare+".insteadOf", "https://github.com/test-owner/test-repo")
+
+	// The agent's in-scope edit (mod/reg.go) plus the out-of-scope
+	// build-required edit (mod/seed.go) it needed but does not own.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"),
+		"package mod\n\nvar registry = map[string]int{}\n\n// Get reads the registry (slice 0's change).\nfunc Get(k string) int { return registry[k] }\n")
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 42 }\n")
+	return repo, bare
+}
+
+// buildRequiredCfg is the config openPRAndShipArtifact sees for the fixture.
+// decomposedFromRunID non-empty is what makes routing.isDecomposed true.
+func buildRequiredCfg(repo string, decomposed bool) config {
+	cfg := config{
+		runID:      verifiedTreeRunID,
+		stageID:    verifiedTreeStageID,
+		workingDir: repo,
+		githubRepo: "test-owner/test-repo",
+		baseBranch: "main",
+		backendURL: "https://api.fishhawk.test",
+		verifyCmd:  "true",
+		scopeFiles: []upload.ScopeFile{{Path: "mod/reg.go", Operation: "modify"}},
+	}
+	if decomposed {
+		cfg.decomposedFromRunID = buildRequiredParentRunID
+	}
+	return cfg
+}
+
+// TestVerifyCommit_BuildRequiredDriftRecordedNotReturned (r1) is the DONE-MEANS
+// runner half: a decomposed child whose committed-tree TEST phase fails with
+// non-empty drift PARKS instead of failing category-B. The gate-verified commit
+// is pushed to the child's own slice branch, the report is outcome=scope_park
+// carrying build_required_paths, and the test_gate_failed trace event is STILL
+// emitted (the record-not-return change must not swallow the diagnostic).
+func TestVerifyCommit_BuildRequiredDriftRecordedNotReturned(t *testing.T) {
+	repo, bare := buildRequiredDriftRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSliceIndex = 0
+	cfg := buildRequiredCfg(repo, true)
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("a decomposed child's build-required-only failure must PARK (nil error), got: %v\n%s", err, logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run on the scope-completeness park")
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+		t.Fatalf("must report a scope_park, got: %+v\n%s", fu.gotPRArgs, logSink.String())
+	}
+	got := fu.gotPRArgs.BuildRequiredPaths
+	if len(got) != 1 || got[0] != "mod/seed.go" {
+		t.Errorf("park report build_required_paths = %v, want [mod/seed.go]", got)
+	}
+	if len(fu.gotPRArgs.MissingPaths) != 0 || len(fu.gotPRArgs.UnsatisfiedAssertions) != 0 {
+		t.Errorf("the other two shortfall classes must stay empty: %+v", fu.gotPRArgs)
+	}
+	// The child's OWN sole-writer slice branch holds the preserved commit.
+	wantBranch := childSliceBranch(buildRequiredParentRunID, 0)
+	if fu.gotPRArgs.Branch != wantBranch || fu.gotPRArgs.HeadSHA == "" {
+		t.Errorf("park report must pin the slice branch + held commit, got branch=%q head=%q want branch %q",
+			fu.gotPRArgs.Branch, fu.gotPRArgs.HeadSHA, wantBranch)
+	}
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+wantBranch).Output(); rerr != nil {
+		t.Errorf("the slice's work must be PRESERVED on %s: %v\n%s", wantBranch, rerr, logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"event":"test_gate_failed"`) {
+		t.Errorf("the test_gate_failed trace event must still be emitted:\n%s", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"build_required_paths":["mod/seed.go"]`) {
+		t.Errorf("the scope_completeness_parked log line must carry build_required_paths:\n%s", logSink.String())
+	}
+}
+
+// TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable (r2 / c4) is the
+// drift-EMPTY mode: a committed tree that is RED with NO scope drift has no
+// scope-boundary cause, so it is NOT parkable. The fixture is red BY
+// CONSTRUCTION and the redness is proved before the push (the pre-push `go
+// test` below must FAIL) — the earlier revision of this test declared the
+// corrected seed.go into scope, which made the tree GREEN and left the mode it
+// names unconstructed.
+//
+// Only mod/reg.go is dirty and it is declared, so the drift list is empty; the
+// committed tree therefore carries the base seed.go (registry["x"] = 0) while
+// reg_test.go expects 42.
+//
+// WHAT ACTUALLY HAPPENS, stated exactly: verifyCommittedTreeCompiles returns
+// nil on its len(drift)==0 fast path, so no committed-tree sentinel is raised
+// here at all and the child pushes normally. That is byte-identical to
+// pre-#2548 behaviour and is the assertion this test makes. The category-B
+// abort for a red tree with empty drift is owned by a DIFFERENT gate —
+// runVerifyGateCommitted, the stage-level committed-tree verify, which runs the
+// configured verify command irrespective of drift (cfg.verifyCmd is the no-op
+// "true" in this fixture, so it is deliberately out of the picture here).
+//
+// Consequently this test is NOT a counterfactual vehicle for the
+// `len(drift) > 0` conjunct in the park condition: with the callee's fast path
+// in place that conjunct cannot change any outcome. See the note at the park
+// condition in main.go, which records the observed (green) result of deleting
+// it rather than asserting a redness that does not occur.
+func TestVerifyCommit_BuildRequiredDriftEmptyDriftNotParkable(t *testing.T) {
+	repo, bare := buildRequiredDriftRepo(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSliceIndex = 0
+	cfg := buildRequiredCfg(repo, true)
+	// Restore the build-required sibling file to its BASE content so it is not
+	// dirty: drift is now empty AND the tree that gets committed is red.
+	mustWrite(t, filepath.Join(repo, "mod", "seed.go"),
+		"package mod\n\nfunc init() { registry[\"x\"] = 0 }\n")
+
+	// Redness proof. Every dirty path is declared, so the working tree here is
+	// byte-identical to the tree the scope-only commit will carry — a passing
+	// `go test` would mean the fixture silently went green again.
+	redCheck := exec.Command("go", "test", "./...")
+	redCheck.Dir = repo
+	if out, terr := redCheck.CombinedOutput(); terr == nil {
+		t.Fatalf("fixture is not red: `go test ./...` passed on the tree that will be committed\n%s", out)
+	}
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("a red tree with EMPTY drift must keep today's plain child push: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "pushed" {
+		t.Fatalf("a zero-drift child must report a plain push, got: %+v", fu.gotPRArgs)
+	}
+	// THE MODE'S ASSERTION: not parkable. No scope_park outcome, no shortfall.
+	if fu.gotPRArgs.Outcome == "scope_park" || len(fu.gotPRArgs.BuildRequiredPaths) != 0 {
+		t.Errorf("a red tree with EMPTY drift must not park, got outcome=%q paths=%v",
+			fu.gotPRArgs.Outcome, fu.gotPRArgs.BuildRequiredPaths)
+	}
+	// The gate never fired, so no test_gate_failed diagnostic was emitted.
+	if strings.Contains(logSink.String(), `"event":"test_gate_failed"`) {
+		t.Errorf("the committed-tree gate short-circuits on empty drift; it must not emit test_gate_failed\n%s", logSink.String())
+	}
+	_ = bare
+}
+
+// TestVerifyCommit_CompileFailureNotParkable (r3) pins that a COMPILE failure
+// (ErrCommitWouldNotCompile) is untouched by the new arm: the new branch is
+// gated on errors.Is(err, ErrCommittedTestsFailed), so a tree that will not
+// build at all keeps its category-B abort with origin untouched. A non-compiling
+// tree is not a slice-boundary artifact and must never be preserved as a park.
+func TestVerifyCommit_CompileFailureNotParkable(t *testing.T) {
+	repo, bare := buildRequiredDriftRepo(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSliceIndex = 0
+	cfg := buildRequiredCfg(repo, true)
+	// The in-scope edit references a symbol only the DRIFT file would declare,
+	// so the scope-only committed tree does not compile.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"),
+		"package mod\n\nvar registry = map[string]int{}\n\nfunc Get(k string) int { return registry[k] + missingHelper() }\n")
+
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil)
+	if !errors.Is(err, gitops.ErrCommitWouldNotCompile) {
+		t.Fatalf("a compile failure must stay category-B, got: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
+		t.Error("a compile failure must NOT report a park")
+	}
+	wantBranch := childSliceBranch(buildRequiredParentRunID, 0)
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+wantBranch).Output(); rerr == nil {
+		t.Errorf("origin must be untouched on the compile-gate abort, but %s exists", wantBranch)
+	}
+}
+
+// TestVerifyCommit_StandaloneBuildRequiredUnchanged (r5 / c5) is the
+// byte-for-byte-unchanged pin for STANDALONE runs: the park flag is
+// isDecomposed && !isFixup, so a standalone run's identical build-required
+// failure keeps today's category-B abort (and its fishhawk_resume_run
+// --add_scope_files in-band recovery), pushing nothing.
+func TestVerifyCommit_StandaloneBuildRequiredUnchanged(t *testing.T) {
+	repo, bare := buildRequiredDriftRepo(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := buildRequiredCfg(repo, false) // decomposedFromRunID empty → standalone
+
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil)
+	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Fatalf("a standalone build-required failure must stay category-B, got: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
+		t.Error("a standalone run must NOT report a build-required park")
+	}
+	standaloneBranch := fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(verifiedTreeRunID), shortID(verifiedTreeStageID))
+	if _, rerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "--verify", "refs/heads/"+standaloneBranch).Output(); rerr == nil {
+		t.Errorf("origin must be untouched on the standalone category-B abort, but %s exists", standaloneBranch)
+	}
+}
+
+// TestVerifyCommit_FixupBuildRequiredUnchanged (r4 / c5) is the same pin for a
+// FIX-UP pass: isFixup forces the flag false even though a fix-up of a
+// decomposed child would otherwise qualify, so the pass keeps today's exact
+// category-B failure with no park report.
+func TestVerifyCommit_FixupBuildRequiredUnchanged(t *testing.T) {
+	repo, bare := buildRequiredDriftRepo(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runSliceIndex = 0
+	cfg := buildRequiredCfg(repo, true)
+	cfg.fixup = true
+	cfg.fixupBranch = "fishhawk/run-parent/slice-0"
+	// The fix-up path rebases from the remote, so the branch must exist there.
+	push := exec.Command("git", "-C", repo, "push", "origin", "main:refs/heads/"+cfg.fixupBranch)
+	if out, perr := push.CombinedOutput(); perr != nil {
+		t.Fatalf("seed fix-up branch: %v\n%s", perr, out)
+	}
+
+	var logSink strings.Builder
+	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil)
+	if !errors.Is(err, gitops.ErrCommittedTestsFailed) {
+		t.Fatalf("a fix-up build-required failure must stay category-B, got: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs != nil && fu.gotPRArgs.Outcome == "scope_park" {
+		t.Error("a fix-up pass must NOT report a build-required park")
+	}
+	// The fix-up branch tip must still be the seeded main commit — nothing pushed.
+	tip, terr := exec.Command("git", "--git-dir="+bare, "rev-parse", "refs/heads/"+cfg.fixupBranch).Output()
+	if terr != nil {
+		t.Fatalf("read fix-up branch tip: %v", terr)
+	}
+	mainTip, merr := exec.Command("git", "--git-dir="+bare, "rev-parse", "refs/heads/main").Output()
+	if merr != nil {
+		t.Fatalf("read main tip: %v", merr)
+	}
+	if strings.TrimSpace(string(tip)) != strings.TrimSpace(string(mainTip)) {
+		t.Errorf("the fix-up branch must be untouched on the category-B abort: tip=%s main=%s", tip, mainTip)
+	}
+	_ = bare
+}

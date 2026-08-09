@@ -2470,15 +2470,17 @@ components:
             reports a fix-up re-dispatch that produced NO changes (no new commit
             landed; `branch` + `base_sha` required, `head_sha` omitted because
             the branch tip is unchanged, `pr_number`/`pr_url`/`title` absent).
-            `scope_park` (#1231, second shortfall class added by #2501)
-            reports a SOLE-shortfall gate outcome — either a
-            missing-declared-scope-file shortfall (#1151) or an unsatisfied
-            binding assertion (#1171): the runner pushed its verified commit to
-            the run branch and parks the implement stage in
+            `scope_park` (#1231, second shortfall class added by #2501, third
+            by #2548) reports a SOLE-shortfall gate outcome — a
+            missing-declared-scope-file shortfall (#1151), an unsatisfied
+            binding assertion (#1171), or, on a DECOMPOSED CHILD only,
+            build-required scope drift (#2548): the runner pushed its verified
+            commit to the run branch (for a child, its own sole-writer slice
+            branch) and parks the implement stage in
             `awaiting_scope_decision` (no PR; `branch` + `head_sha` +
             `base_sha` + `verified_tree_sha` required, plus AT LEAST ONE of
-            non-empty `missing_paths` / `unsatisfied_assertions`;
-            `pr_number`/`pr_url`/`title` absent).
+            non-empty `missing_paths` / `unsatisfied_assertions` /
+            `build_required_paths`; `pr_number`/`pr_url`/`title` absent).
 
             On the `failed` variant, `branch`, `head_sha`, `base_sha`, and
             `verified_tree_sha` are OPTIONAL and together form the PR-OPEN
@@ -2516,16 +2518,17 @@ components:
           description: |
             Present only on the `scope_park` variant (#1231). The declared
             `scope.files` the agent never touched — the missing-scope shortfall
-            class. Repo-relative. Absent on an assertion-class park; at least
-            one of `missing_paths` / `unsatisfied_assertions` must be non-empty.
+            class. Repo-relative. Absent on the other classes' parks; at least
+            one of `missing_paths` / `unsatisfied_assertions` /
+            `build_required_paths` must be non-empty.
         unsatisfied_assertions:
           type: array
           description: |
             Present only on the `scope_park` variant (#2501). The
             operator-declared binding assertions (#1171) the held commit did not
-            satisfy — the second shortfall class. Absent on a missing-scope-class
-            park; at least one of `missing_paths` / `unsatisfied_assertions`
-            must be non-empty.
+            satisfy — the second shortfall class. Absent on the other classes'
+            parks; at least one of `missing_paths` / `unsatisfied_assertions` /
+            `build_required_paths` must be non-empty.
           items:
             type: object
             required: [type, path, literal]
@@ -2539,6 +2542,25 @@ components:
               literal:
                 type: string
                 description: The substring the committed content of `path` did not contain.
+        build_required_paths:
+          type: array
+          items: { type: string }
+          description: |
+            Present only on the `scope_park` variant, and only for a DECOMPOSED
+            CHILD (#2548). The scope-EXCLUDED paths the child's committed tree
+            needed to build — the files a SIBLING slice owns, which the
+            decomposition boundary cut away. Repo-relative. Absent on the other
+            classes' parks; at least one of `missing_paths` /
+            `unsatisfied_assertions` / `build_required_paths` must be non-empty.
+
+            This class is EXEMPT-INELIGIBLE: the held commit's committed tree is
+            red by construction, so `POST .../scope-completeness/decision` with
+            `decision: exempt` is refused 409 `exempt_refused_build_required`.
+            The only admissible decision is `fail`; the held commit stays on the
+            slice branch and recovery is to correct the decomposition and re-run.
+            The backend resolves each path's OWNING sibling slice from the parent
+            plan's `decomposition.sub_plans[i].scope.files` and records it as
+            `owning_slices` on the park and its audit entries.
         apply_path:
           type: string
           enum: [applied, agent, apply_failed_fellback, apply_failed_reset_failed]
@@ -12897,8 +12919,11 @@ paths:
             `run_branch` name the commit the PR is opened from, `state` is
             `pending` (the stage returns to dispatch so the re-dispatched runner
             opens that PR with no agent re-run, #2501), and
-            `missing_paths` / `unsatisfied_assertions` echo which shortfall
-            class was exempted.
+            `missing_paths` / `unsatisfied_assertions` /
+            `build_required_paths` echo which shortfall class was decided.
+            `build_required_paths` + `owning_slices` can appear only on a `fail`
+            response — that class is exempt-INELIGIBLE and its `exempt` is
+            refused 409 `exempt_refused_build_required` (#2548).
           content:
             application/json:
               schema:
@@ -12932,6 +12957,32 @@ paths:
                         type: { type: string }
                         path: { type: string }
                         literal: { type: string }
+                  build_required_paths:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      Present on `fail` for a build-required-class park (#2548) —
+                      the scope-excluded paths the decomposition child's committed
+                      tree needed to build. Never present on `exempt`: that
+                      decision is refused for this class.
+                  owning_slices:
+                    type: array
+                    description: |
+                      Present on `fail` for a build-required-class park (#2548) —
+                      each build-required path attributed to the sibling sub-plan
+                      that declares it in the parent's approved decomposition, so
+                      the operator already knows which boundary to correct.
+                      `slice_index` / `slice_title` are ABSENT when no sub-plan
+                      claims the path (or the parent plan was unresolvable):
+                      attribution is diagnostic and degrades rather than failing
+                      the park.
+                    items:
+                      type: object
+                      required: [path]
+                      properties:
+                        path: { type: string }
+                        slice_index: { type: integer }
+                        slice_title: { type: string }
         '400':
           description: Malformed run_id, decision not exempt/fail, or empty reason.
           content:
@@ -12958,6 +13009,15 @@ paths:
           description: |
             `stage_not_parked` — the implement stage is not parked
             awaiting a scope-completeness decision.
+
+            `exempt_refused_build_required` (#2548) — `decision: exempt` was
+            requested for a build-required scope-drift park. The held commit's
+            committed tree is red because a sibling slice owns a build-required
+            file, so exempting it would open a PR from a red tree. The stage is
+            left parked and NO exempted entry is appended; the only admissible
+            decision is `fail`. `details` carries `shortfall_class`,
+            `build_required_paths`, `owning_slices`, and
+            `admissible_decisions`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

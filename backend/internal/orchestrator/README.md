@@ -61,6 +61,18 @@ The auto-retry / `retry_stage` path is UNCHANGED — it still consults `run.Retr
 
 A genuinely non-recoverable failed child — a D-rejection (approver reject), or a child whose stages can't be listed or whose implement stage carries no category — resolves the parent to `failed-C` (park only when every failure is positively confirmed recoverable, so an unclassifiable child resolves rather than parking indefinitely).
 
+## Park-on-child-scope-decision (E48.101 / #2548)
+
+The SAME hook covers a second parked-parent cause, on a different branch: a decomposition child parked in `awaiting_scope_decision` for a build-required scope-drift shortfall. `awaiting_scope_decision` is in `StageState.IsSettled()` and excluded from `IsTerminal()`, so the child stage is not swept by the SLA reaper and the child RUN stays NON-terminal — it lands in `maybeAdvanceDecomposedParent`'s non-terminal branch, which tops up the dispatch and returns with the parent still in `awaiting_children`.
+
+**The parent deliberately STAYS parked.** Resolving it to `failed-C` while a live child holds an UNDECIDED park would terminate the run out from under the very decision the park exists to offer, leaving a terminal parent with a live child. This is the #698/#1081 recoverable-park shape: parked parent plus one discoverable audit signal.
+
+**What changed is that the wait is no longer silent.** `surfaceParkedChildren` emits `parent_awaiting_child_scope_decision` (system actor) on the PARENT for each such child, with the FULL payload `{parent_stage_id, child_run_id, child_stage_id, child_slice_index, shortfall_class, build_required_paths, owning_slices}` read from the child stage's persisted `ScopeCompletenessPark`. The attribution is the operator value: it names the sibling slice that owns each coupled file. Entries are DE-DUPLICATED by `child_stage_id` against the parent's existing entries of that category, so repeated sibling settles never spam the chain, and an INFO log names the parked child so the parked parent is diagnosable from logs too. The dispatch top-up and the return are unchanged.
+
+**The emission is DUAL, and it has to be.** This hook is reached ONLY from `completeRun` on a child's TERMINAL transition. A parked child does not complete — so if the parked child is the LAST non-terminal sibling, this hook never fires again. `server/pullrequest.go::parkScopeCompletenessStage` therefore emits the same category at PARK TIME; an orchestrator-only fix would leave that case with nothing on the parent's chain.
+
+**Once the operator decides `fail`**, the child stage fails category-B, the child run goes terminal, and the parent resolves through the existing unchanged path (`failed-C`, or the #1081 recoverable re-drive park). The parent never sits in `awaiting_children` past the decision.
+
 ## Consolidated PR on settle (#714 / ADR-032)
 
 In `Advance`, when the next pending stage is `review`, the run is a decomposed parent (`decomposed_from == nil` AND it has decomposed children), and `pull_request_url` is empty, `maybeOpenConsolidatedPR` opens the ONE consolidated PR for the whole decomposition BEFORE dispatching review.

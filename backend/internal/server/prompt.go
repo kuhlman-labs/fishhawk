@@ -3170,6 +3170,22 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 		return "", "", "", false
 	}
 	park := stage.ScopeCompletenessPark
+	// #2548 BUILD-REQUIRED WITHHOLDING GATE — defence in depth behind the
+	// endpoint refusal (server/scope_completeness.go::exemptScopeCompleteness).
+	// A build-required park's held commit has a RED committed tree by
+	// construction, so emitting the held-commit fields would drive a PR-open
+	// from it. The endpoint refuses `exempt` for this class, so an `exempted`
+	// entry should be unreachable — but this gate is the last thing between a
+	// hand-written, legacy, or otherwise-anomalous exempted entry and that PR,
+	// and it fires regardless of how the entry got there.
+	if len(park.BuildRequiredPaths) > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: exempted entry on a build-required scope-drift park; withholding held-commit fields (this class is exempt-ineligible — its committed tree is red)",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.Int("build_required_path_count", len(park.BuildRequiredPaths)))
+		return "", "", "", false
+	}
 	if park.HeldCommitSHA == "" || park.RunBranch == "" {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: exempt-resolved park carries no held commit; omitting held-commit exempt fields",

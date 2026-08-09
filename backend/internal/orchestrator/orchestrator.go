@@ -2451,6 +2451,17 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 	var failedChildren []*run.Run
 	for _, c := range children {
 		if !c.State.IsTerminal() {
+			// #2548 SIBLING-SETTLE parent signal. A child parked in
+			// awaiting_scope_decision for a build-required shortfall is SETTLED
+			// but NOT terminal, so it lands here and the parent stays in
+			// awaiting_children — correctly (resolving the parent to failed-C
+			// while a live child holds an undecided park would terminate the run
+			// out from under the decision the park exists to offer, the #698/#1081
+			// recoverable-park shape) but, before this, SILENTLY. Surface every
+			// such child on the parent's chain, de-duplicated per child stage.
+			// This runs BEFORE the dispatch top-up and the return, both of which
+			// are otherwise unchanged.
+			o.surfaceParkedChildren(ctx, parentRunID, children)
 			// Event-driven refill (E24.3 / #1143): not all children are
 			// terminal yet, so the parent stays parked — but a child just
 			// settled, which may have freed a concurrency slot. Top up the
@@ -2575,6 +2586,154 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: advance parent after children settled failed",
 			slog.String("parent_run_id", parentRunID.String()),
 			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// categoryParentAwaitingChildScopeDecision is the parent-side signal for a
+// child parked awaiting a scope-completeness decision (#2548). WIRE VALUE:
+// byte-identical to server.CategoryParentAwaitingChildScopeDecision, which
+// emits the same category at PARK time. The two emitters are deliberately
+// duplicated rather than shared — package server already imports this package's
+// siblings, and the audit-category registry (backend/internal/audit) hardcodes
+// its strings for the same import-cycle reason.
+const categoryParentAwaitingChildScopeDecision = "parent_awaiting_child_scope_decision"
+
+// shortfallClassBuildRequired mirrors server.ShortfallClassBuildRequired — see
+// the note above.
+const shortfallClassBuildRequired = "build_required"
+
+// surfaceParkedChildren emits one parent_awaiting_child_scope_decision entry per
+// non-terminal child whose implement stage is parked in awaiting_scope_decision
+// for a build-required shortfall, DE-DUPLICATED by child stage id so repeated
+// sibling settles never spam the parent's chain.
+//
+// It is the sibling-settle half of the dual emission (#2548); the park-time half
+// lives in server/pullrequest.go and is what covers the case where the parked
+// child is the LAST non-terminal sibling, since this function is only ever
+// reached from maybeAdvanceDecomposedParent, i.e. from completeRun on some
+// child's TERMINAL transition.
+//
+// The payload is the FULL attribution — shortfall_class, build_required_paths
+// and owning_slices, read from the child stage's persisted
+// ScopeCompletenessPark — not merely "a child is parked". Best-effort
+// throughout: every read/append failure WARN-logs and skips, never unwinding the
+// dispatch top-up or the parent's parked state.
+func (o *Orchestrator) surfaceParkedChildren(ctx context.Context, parentRunID uuid.UUID, children []*run.Run) {
+	if o.Audit == nil {
+		return
+	}
+	// Collect the parked children first so the (single) de-dup read of the
+	// parent's existing entries is paid only when there is something to emit.
+	type parked struct {
+		child *run.Run
+		stage *run.Stage
+	}
+	var pending []parked
+	for _, c := range children {
+		if c.State.IsTerminal() {
+			continue
+		}
+		stages, err := o.Runs.ListStagesForRun(ctx, c.ID)
+		if err != nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list child stages for parked-child signal failed",
+				slog.String("child_run_id", c.ID.String()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		for _, st := range stages {
+			if st.Type != run.StageTypeImplement || st.State != run.StageStateAwaitingScopeDecision {
+				continue
+			}
+			if st.ScopeCompletenessPark == nil || len(st.ScopeCompletenessPark.BuildRequiredPaths) == 0 {
+				continue
+			}
+			pending = append(pending, parked{child: c, stage: st})
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	// De-dup: walk the parent's existing entries of this category and skip any
+	// child stage already recorded. A read failure fails CLOSED on emission
+	// (skip rather than risk a duplicate) — the park-time emission already put
+	// this signal on the chain, so a skipped repeat costs the operator nothing.
+	existing, err := o.Audit.ListForRunByCategory(ctx, parentRunID, categoryParentAwaitingChildScopeDecision)
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: list parent_awaiting_child_scope_decision entries failed; skipping parked-child signal",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("error", err.Error()),
+		)
+		return
+	}
+	recorded := make(map[string]struct{}, len(existing))
+	for _, e := range existing {
+		var p struct {
+			ChildStageID string `json:"child_stage_id"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil || p.ChildStageID == "" {
+			continue
+		}
+		recorded[p.ChildStageID] = struct{}{}
+	}
+
+	var parentStageID *uuid.UUID
+	if stages, err := o.Runs.ListStagesForRun(ctx, parentRunID); err == nil {
+		for _, st := range stages {
+			if st.State == run.StageStateAwaitingChildren {
+				id := st.ID
+				parentStageID = &id
+				break
+			}
+		}
+	}
+
+	systemKind := audit.ActorSystem
+	for _, p := range pending {
+		if _, dup := recorded[p.stage.ID.String()]; dup {
+			continue
+		}
+		payloadMap := map[string]any{
+			"child_run_id":         p.child.ID.String(),
+			"child_stage_id":       p.stage.ID.String(),
+			"shortfall_class":      shortfallClassBuildRequired,
+			"build_required_paths": p.stage.ScopeCompletenessPark.BuildRequiredPaths,
+			"owning_slices":        p.stage.ScopeCompletenessPark.OwningSlices,
+		}
+		if parentStageID != nil {
+			payloadMap["parent_stage_id"] = parentStageID.String()
+		}
+		if p.child.SliceIndex != nil {
+			payloadMap["child_slice_index"] = *p.child.SliceIndex
+		}
+		payload, merr := json.Marshal(payloadMap)
+		if merr != nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: marshal parent_awaiting_child_scope_decision payload failed",
+				slog.String("error", merr.Error()))
+			continue
+		}
+		if _, aerr := o.Audit.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     parentRunID,
+			StageID:   parentStageID,
+			Timestamp: time.Now().UTC(),
+			Category:  categoryParentAwaitingChildScopeDecision,
+			ActorKind: &systemKind,
+			Payload:   payload,
+		}); aerr != nil {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append parent_awaiting_child_scope_decision failed",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("child_run_id", p.child.ID.String()),
+				slog.String("error", aerr.Error()),
+			)
+			continue
+		}
+		recorded[p.stage.ID.String()] = struct{}{}
+		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator parent awaiting a child's scope decision",
+			slog.String("parent_run_id", parentRunID.String()),
+			slog.String("child_run_id", p.child.ID.String()),
+			slog.String("child_stage_id", p.stage.ID.String()),
 		)
 	}
 }

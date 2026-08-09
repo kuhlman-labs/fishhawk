@@ -2453,3 +2453,75 @@ func TestRunState_RejectsEmptyRunID(t *testing.T) {
 		t.Errorf("want error on empty run id")
 	}
 }
+
+// TestShipPullRequest_BuildRequiredScopeParkGoldenBytes is the #2548 sibling of
+// TestShipPullRequest_ScopeParkGoldenBytes. Two assertions, both load-bearing:
+//
+// (u1) a park WITHOUT build-required paths ships a body byte-identical to the
+// pre-#2548 bytes — the omitempty pin. The park body is SIGNED, so a
+// non-omitempty tag shipping `"build_required_paths":null` would change every
+// existing signature and content hash.
+//
+// (u2) a build-required park round-trips the paths under the exact wire key the
+// backend's scope_park decode struct expects; a tag drift silently empties the
+// payload the operator reads before deciding.
+func TestShipPullRequest_BuildRequiredScopeParkGoldenBytes(t *testing.T) {
+	shipPark := func(t *testing.T, args ShipPullRequestArgs) string {
+		t.Helper()
+		var receivedBody []byte
+		mux := http.NewServeMux()
+		mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+			receivedBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(ShipPullRequestResult{ID: "art-1"})
+		})
+		srv := httptest.NewServer(mux)
+		t.Cleanup(srv.Close)
+		c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+		_, priv, _ := ed25519.GenerateKey(nil)
+		args.PrivateKey = priv
+		if _, err := c.ShipPullRequest(context.Background(), args); err != nil {
+			t.Fatalf("ShipPullRequest: %v", err)
+		}
+		return string(receivedBody)
+	}
+
+	// (u1) No build-required paths → byte-identical to the pre-#2548 body.
+	scopeOnly := shipPark(t, ShipPullRequestArgs{
+		RunID:        "run-abc",
+		StageID:      "stage-xyz",
+		Outcome:      "scope_park",
+		Branch:       "fishhawk/run-abc/stage-xyz",
+		HeadSHA:      "deadbeef",
+		BaseSHA:      "feedface",
+		TreeSHA:      "treesha1",
+		MissingPaths: []string{"backend/internal/run/run.go"},
+	})
+	wantScopeOnly := `{"outcome":"scope_park","branch":"fishhawk/run-abc/stage-xyz","head_sha":"deadbeef","base_sha":"feedface","verified_tree_sha":"treesha1","missing_paths":["backend/internal/run/run.go"]}`
+	if scopeOnly != wantScopeOnly {
+		t.Errorf("a park without build-required paths must be byte-identical to the pre-#2548 body:\n got: %s\nwant: %s", scopeOnly, wantScopeOnly)
+	}
+	if strings.Contains(scopeOnly, `"build_required_paths"`) {
+		t.Errorf("omitempty violated — the key must be absent entirely: %s", scopeOnly)
+	}
+
+	// (u2) Build-required-only park: the new key present, the older two absent.
+	buildRequired := shipPark(t, ShipPullRequestArgs{
+		RunID:              "run-abc",
+		StageID:            "stage-xyz",
+		Outcome:            "scope_park",
+		Branch:             "fishhawk/run-parent/slice-0",
+		HeadSHA:            "deadbeef",
+		BaseSHA:            "feedface",
+		TreeSHA:            "treesha1",
+		BuildRequiredPaths: []string{"backend/internal/server/prompt.go"},
+	})
+	wantBuildRequired := `{"outcome":"scope_park","branch":"fishhawk/run-parent/slice-0","head_sha":"deadbeef","base_sha":"feedface","verified_tree_sha":"treesha1","build_required_paths":["backend/internal/server/prompt.go"]}`
+	if buildRequired != wantBuildRequired {
+		t.Errorf("build-required park body:\n got: %s\nwant: %s", buildRequired, wantBuildRequired)
+	}
+	if strings.Contains(buildRequired, `"missing_paths"`) || strings.Contains(buildRequired, `"unsatisfied_assertions"`) {
+		t.Errorf("a build-required-only park must omit the other two shortfall keys: %s", buildRequired)
+	}
+}

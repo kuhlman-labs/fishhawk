@@ -93,11 +93,18 @@ type scopeCompletenessDecisionResponse struct {
 	State         string    `json:"state"`
 	HeldCommitSHA string    `json:"held_commit_sha,omitempty"`
 	RunBranch     string    `json:"run_branch,omitempty"`
-	// MissingPaths / UnsatisfiedAssertions echo the resolved park's shortfall
-	// (#2501) so the operator's client sees WHICH class was exempted without a
-	// second audit read. Exactly one is populated.
+	// MissingPaths / UnsatisfiedAssertions / BuildRequiredPaths echo the resolved
+	// park's shortfall (#2501, third class #2548) so the operator's client sees
+	// WHICH class it decided without a second audit read. Exactly one is
+	// populated. BuildRequiredPaths can only appear on a `fail` response — the
+	// exempt path refuses that class outright.
 	MissingPaths          []string                   `json:"missing_paths,omitempty"`
 	UnsatisfiedAssertions []run.UnsatisfiedAssertion `json:"unsatisfied_assertions,omitempty"`
+	BuildRequiredPaths    []string                   `json:"build_required_paths,omitempty"`
+	// OwningSlices attributes each build-required path to the sibling slice that
+	// declares it, so the operator's `fail` response already names the boundary
+	// to correct before re-running.
+	OwningSlices []run.BuildRequiredOwner `json:"owning_slices,omitempty"`
 }
 
 // handleDecideScopeCompleteness implements POST
@@ -250,6 +257,28 @@ func (s *Server) resolveParkedScopeStage(r *http.Request, runID uuid.UUID) (*run
 // the `failed` entry as authorization, and its stage transition is terminal.
 func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, reason, decidedBy string) {
+	// #2548 EXEMPT REFUSAL for the build-required class. This runs FIRST — before
+	// the load-bearing scope_completeness_exempted append, before the stage
+	// leaves awaiting_scope_decision, before any Advance — because exempt resumes
+	// the stage and drives a PR-open from the held commit, whose committed tree
+	// is RED BY CONSTRUCTION for this class (that redness IS the shortfall the
+	// park records). Opening a PR from it is the one outcome this design says
+	// must never happen. The stage MUST remain parked and NO exempted entry may
+	// be appended, so an operator can still resolve it with the only admissible
+	// decision: `fail`, then correct the decomposition and re-run — the held
+	// commit stays on the slice branch either way.
+	if park := stage.ScopeCompletenessPark; park != nil && len(park.BuildRequiredPaths) > 0 {
+		s.writeError(w, r, http.StatusConflict, "exempt_refused_build_required",
+			"this park is a build-required scope-drift shortfall on a decomposition child: the held commit's committed tree is red because a sibling slice owns a build-required file, so exempting it would open a PR from a red tree. "+
+				"The only admissible decision is \"fail\"; then correct the decomposition (move the coupled file into this slice, or merge the slices) and re-run. The held commit stays on the slice branch.",
+			map[string]any{
+				"shortfall_class":      ShortfallClassBuildRequired,
+				"build_required_paths": park.BuildRequiredPaths,
+				"owning_slices":        park.OwningSlices,
+				"admissible_decisions": []string{"fail"},
+			})
+		return
+	}
 	if err := s.writeScopeCompletenessDecisionAudit(r, runID, stage,
 		CategoryScopeCompletenessExempted, reason, decidedBy); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "exemption_unrecorded",
@@ -324,11 +353,21 @@ func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, r
 	}
 	s.notifyStatusUpdate(r.Context(), runID, "scope_failed")
 
-	s.writeJSON(w, r, http.StatusOK, scopeCompletenessDecisionResponse{
+	resp := scopeCompletenessDecisionResponse{
 		StageID:  stage.ID,
 		Decision: "fail",
 		State:    string(run.StageStateFailed),
-	})
+	}
+	// #2548: echo the decided class so the operator's client sees which shortfall
+	// it failed — and, for the build-required class, which sibling slice owns
+	// each coupled path, i.e. the boundary to correct before re-running.
+	if park := stage.ScopeCompletenessPark; park != nil {
+		resp.MissingPaths = park.MissingPaths
+		resp.UnsatisfiedAssertions = park.UnsatisfiedAssertions
+		resp.BuildRequiredPaths = park.BuildRequiredPaths
+		resp.OwningSlices = park.OwningSlices
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
 // writeScopeCompletenessDecisionAudit appends the exempted/failed decision
@@ -353,6 +392,19 @@ func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid
 		// #2501: carry the assertion-class shortfall beside missing_paths on
 		// BOTH the exempted and failed entries.
 		payloadMap["unsatisfied_assertions"] = park.UnsatisfiedAssertions
+		// #2548: carry the build-required class + its sibling-slice attribution
+		// too. In practice only the `failed` entry can carry it — the exempt path
+		// refuses this class before reaching here — which is exactly where the
+		// operator's record of WHICH boundary was cut belongs.
+		//
+		// GATED on a non-empty class so the two OLDER park classes' entries stay
+		// BYTE-IDENTICAL: writing these unconditionally added two JSON-null keys
+		// to every missing-paths / binding-assertion exempted+failed payload, a
+		// wire-visible change on paths #2548 promised not to touch.
+		if len(park.BuildRequiredPaths) > 0 {
+			payloadMap["build_required_paths"] = park.BuildRequiredPaths
+			payloadMap["owning_slices"] = park.OwningSlices
+		}
 		if category == CategoryScopeCompletenessExempted {
 			payloadMap["held_commit_sha"] = park.HeldCommitSHA
 			payloadMap["run_branch"] = park.RunBranch

@@ -2266,3 +2266,115 @@ func TestPostgres_SetRunPredictedRuntimeMinutes(t *testing.T) {
 		t.Errorf("SetRunPredictedRuntimeMinutes on missing run = %v, want ErrNotFound", err)
 	}
 }
+
+// TestPostgres_ParkScopeCompletenessAndAppend_BuildRequiredRoundTrip is b1, the
+// #2548 durability pin. Two halves:
+//
+//   - a build-required-CLASS park (empty MissingPaths / UnsatisfiedAssertions,
+//     non-empty BuildRequiredPaths + OwningSlices) round-trips through the JSONB
+//     column intact — including the pointer SliceIndex, which is what makes the
+//     unattributed degrade distinguishable from slice 0 — and appends exactly one
+//     scope_completeness_parked entry in the same tx; and
+//   - a PRE-#2548 park row (no build_required_paths key at all) still decodes,
+//     with the new fields nil. The column is JSONB, so there is no migration and
+//     an existing parked stage must keep resolving through the unchanged path.
+func TestPostgres_ParkScopeCompletenessAndAppend_BuildRequiredRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	pk, ok := repo.(scopeCompletenessParker)
+	if !ok {
+		t.Fatal("postgres repo does not implement ParkScopeCompletenessAndAppend")
+	}
+	auditRepo := audit.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r, running := seedRunningImplementStage(t, repo)
+	owningSlice := 1
+	park := run.ScopeCompletenessPark{
+		HeldCommitSHA:      "1111111111111111111111111111111111111111",
+		RunBranch:          "fishhawk/run-parent/slice-0",
+		VerifiedTreeSHA:    "2222222222222222222222222222222222222222",
+		BaseSHA:            "5555555555555555555555555555555555555555",
+		BuildRequiredPaths: []string{"backend/internal/server/prompt.go", "backend/internal/server/reads.go"},
+		OwningSlices: []run.BuildRequiredOwner{
+			{Path: "backend/internal/server/prompt.go", SliceIndex: &owningSlice, SliceTitle: "prompt plumbing"},
+			{Path: "backend/internal/server/reads.go"}, // unattributed — the degrade shape
+		},
+	}
+
+	stage, won, err := pk.ParkScopeCompletenessAndAppend(ctx, running.ID, park,
+		parkParams(r.ID, running.ID, []byte(`{"k":"v"}`)))
+	if err != nil {
+		t.Fatalf("ParkScopeCompletenessAndAppend: %v", err)
+	}
+	if !won || stage.State != run.StageStateAwaitingScopeDecision {
+		t.Fatalf("won=%v state=%q, want true/awaiting_scope_decision", won, stage.State)
+	}
+
+	got, err := repo.GetStage(ctx, running.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	gp := got.ScopeCompletenessPark
+	if gp == nil {
+		t.Fatal("persisted ScopeCompletenessPark = nil")
+	}
+	if len(gp.BuildRequiredPaths) != 2 ||
+		gp.BuildRequiredPaths[0] != "backend/internal/server/prompt.go" ||
+		gp.BuildRequiredPaths[1] != "backend/internal/server/reads.go" {
+		t.Errorf("BuildRequiredPaths = %v, want the two paths order-preserved", gp.BuildRequiredPaths)
+	}
+	if len(gp.MissingPaths) != 0 || len(gp.UnsatisfiedAssertions) != 0 {
+		t.Errorf("a build-required-class park must carry neither older class: %+v", gp)
+	}
+	if len(gp.OwningSlices) != 2 {
+		t.Fatalf("OwningSlices = %+v, want 2 entries", gp.OwningSlices)
+	}
+	if gp.OwningSlices[0].SliceIndex == nil || *gp.OwningSlices[0].SliceIndex != 1 ||
+		gp.OwningSlices[0].SliceTitle != "prompt plumbing" {
+		t.Errorf("OwningSlices[0] = %+v, want slice_index 1 / \"prompt plumbing\"", gp.OwningSlices[0])
+	}
+	// The UNATTRIBUTED entry must survive as nil, not coerce to slice 0 — a
+	// coerced zero would falsely blame the first sub-plan.
+	if gp.OwningSlices[1].SliceIndex != nil || gp.OwningSlices[1].SliceTitle != "" {
+		t.Errorf("OwningSlices[1] = %+v, want an UNATTRIBUTED entry (nil slice_index)", gp.OwningSlices[1])
+	}
+
+	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, "scope_completeness_parked")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("scope_completeness_parked entries = %d, want 1", len(entries))
+	}
+
+	// A PRE-#2548 row: written with only the older keys, it still decodes and
+	// the new fields are nil.
+	r2, running2 := seedRunningImplementStage(t, repo)
+	legacy := run.ScopeCompletenessPark{
+		HeldCommitSHA:   "3333333333333333333333333333333333333333",
+		RunBranch:       "fishhawk/run-aaa/stage-bbb",
+		VerifiedTreeSHA: "4444444444444444444444444444444444444444",
+		BaseSHA:         "6666666666666666666666666666666666666666",
+		MissingPaths:    []string{"docs/foo.md"},
+	}
+	if _, _, err := pk.ParkScopeCompletenessAndAppend(ctx, running2.ID, legacy,
+		parkParams(r2.ID, running2.ID, []byte(`{"k":"v"}`))); err != nil {
+		t.Fatalf("legacy park: %v", err)
+	}
+	gotLegacy, err := repo.GetStage(ctx, running2.ID)
+	if err != nil {
+		t.Fatalf("GetStage(legacy): %v", err)
+	}
+	if gotLegacy.ScopeCompletenessPark == nil {
+		t.Fatal("legacy park did not round-trip")
+	}
+	if gotLegacy.ScopeCompletenessPark.BuildRequiredPaths != nil ||
+		gotLegacy.ScopeCompletenessPark.OwningSlices != nil {
+		t.Errorf("a pre-#2548 park row must decode with the new fields NIL, got %+v",
+			gotLegacy.ScopeCompletenessPark)
+	}
+	if len(gotLegacy.ScopeCompletenessPark.MissingPaths) != 1 {
+		t.Errorf("the legacy shortfall must survive unchanged: %+v", gotLegacy.ScopeCompletenessPark)
+	}
+}

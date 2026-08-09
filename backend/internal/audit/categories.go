@@ -35,7 +35,12 @@ import "sort"
 // written ONCE per run at run creation when the workflow declares any stage
 // `permissions` or `egress` block (declaration-only, enforced: false). E66.37 /
 // #2474 added acceptance_triage_arbitrated, the operator-only discharge of a
-// paged acceptance triage (server/acceptance_arbitration.go). When a
+// paged acceptance triage (server/acceptance_arbitration.go). E48.101 /
+// #2548 added parent_awaiting_child_scope_decision, the parent-side signal
+// for a decomposition child parked in awaiting_scope_decision on a
+// build-required scope-drift shortfall — emitted from BOTH the park-time
+// handler (server/pullrequest.go) and, de-duplicated, from
+// orchestrator.maybeAdvanceDecomposedParent when a sibling settles. When a
 // new canonical category is introduced, add it here so operators can await
 // it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -111,6 +116,7 @@ var KnownCategories = map[string]struct{}{
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},
 	"operator_scope_path_undelivered":         {},
+	"parent_awaiting_child_scope_decision":    {},
 	"parent_awaiting_redrive":                 {},
 	"plan_acceptance_precheck":                {},
 	"plan_add_scope_files_fans_into_slices":   {},

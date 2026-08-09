@@ -131,6 +131,18 @@ type pullRequestBody struct {
 	// runner's upload.BindingAssertionReport byte-for-byte.
 	UnsatisfiedAssertions []unsatisfiedAssertion `json:"unsatisfied_assertions,omitempty"`
 
+	// BuildRequiredPaths is the THIRD scope_park shortfall class (#2548): the
+	// scope-EXCLUDED paths a DECOMPOSED CHILD's committed tree needed to build,
+	// i.e. the files a sibling slice owns that the decomposition boundary cut
+	// away. Exactly one of MissingPaths / UnsatisfiedAssertions /
+	// BuildRequiredPaths is present on a park report — a compound failure never
+	// parks, it keeps the runner's category-B abort. Declared here (with
+	// omitempty) so the DisallowUnknownFields decoder ACCEPTS the build-required
+	// body at all; the runner omits it on every other variant so those bodies
+	// stay byte-identical. Tag mirrors run.ScopeCompletenessPark and the runner's
+	// upload.pullRequestScopeParkBody byte-for-byte.
+	BuildRequiredPaths []string `json:"build_required_paths,omitempty"`
+
 	// ApplyPath is the near-deterministic fix-up apply provenance (#1165/#1213),
 	// present only on the Outcome=="fixup_pushed" report: "applied" (a clean
 	// git-apply of every routed concern's suggested_patch, no agent), "agent"
@@ -222,14 +234,15 @@ func (p *pullRequestBody) validate() error {
 		}
 		return nil
 	}
-	// Scope-completeness park variant (#1231, second class added by #2501): the
-	// implement stage's ONLY committed-tree gate failure was the
-	// missing-declared-scope-file check OR the binding-assertion check. The
-	// runner pushed the verified commit to the run branch (no PR); require the
-	// commit coordinates, the verified tree, and AT LEAST ONE shortfall so the
-	// park payload pins exactly what is held. A park carrying NEITHER is a runner
-	// bug, not a legitimate state, so it is still rejected — the control is
-	// relaxed to "at least one of the two", not removed.
+	// Scope-completeness park variant (#1231, second class added by #2501, third
+	// by #2548): the implement stage's ONLY committed-tree gate failure was the
+	// missing-declared-scope-file check, the binding-assertion check, or — on a
+	// decomposed child — the build-required-drift check. The runner pushed the
+	// verified commit to the run branch (no PR); require the commit coordinates,
+	// the verified tree, and AT LEAST ONE shortfall so the park payload pins
+	// exactly what is held. A park carrying NONE is a runner bug, not a
+	// legitimate state, so it is still rejected — the control is relaxed to "at
+	// least one of the three", not removed.
 	if p.Outcome == "scope_park" {
 		switch {
 		case p.Branch == "":
@@ -240,8 +253,8 @@ func (p *pullRequestBody) validate() error {
 			return errors.New("base_sha is required for a scope_park outcome")
 		case p.VerifiedTreeSHA == "":
 			return errors.New("verified_tree_sha is required for a scope_park outcome")
-		case len(p.MissingPaths) == 0 && len(p.UnsatisfiedAssertions) == 0:
-			return errors.New("at least one of missing_paths / unsatisfied_assertions must be non-empty for a scope_park outcome")
+		case len(p.MissingPaths) == 0 && len(p.UnsatisfiedAssertions) == 0 && len(p.BuildRequiredPaths) == 0:
+			return errors.New("at least one of missing_paths / unsatisfied_assertions / build_required_paths must be non-empty for a scope_park outcome")
 		}
 		return nil
 	}
@@ -1198,9 +1211,30 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		MissingPaths: pr.MissingPaths,
 		// #2501: the assertion-class shortfall rides the same JSONB payload.
 		UnsatisfiedAssertions: toRunUnsatisfiedAssertions(pr.UnsatisfiedAssertions),
+		// #2548: so does the build-required class, plus its sibling-slice
+		// attribution resolved just below.
+		BuildRequiredPaths: pr.BuildRequiredPaths,
 	}
 
-	auditPayload, _ := json.Marshal(map[string]any{
+	// #2548: attribute each build-required path to the sibling slice that owns
+	// it, from the parent's approved decomposition. A best-effort read whose
+	// every degrade yields an unattributed park — never a lost one. Resolved
+	// BEFORE the park write so the persisted payload, the parked audit entry,
+	// and the parent-side signal all carry byte-identical attribution.
+	var childRun *run.Run
+	if len(pr.BuildRequiredPaths) > 0 {
+		if rr, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"scope-completeness park report: load run for build-required attribution failed",
+				slog.String("run_id", runID.String()),
+				slog.String("error", err.Error()))
+		} else {
+			childRun = rr
+		}
+		park.OwningSlices = s.attributeBuildRequiredPaths(r.Context(), childRun, pr.BuildRequiredPaths)
+	}
+
+	payloadMap := map[string]any{
 		"run_id":                 runID.String(),
 		"stage_id":               stageID.String(),
 		"branch":                 pr.Branch,
@@ -1210,7 +1244,18 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		"missing_paths":          pr.MissingPaths,
 		"unsatisfied_assertions": pr.UnsatisfiedAssertions,
 		"auth_method":            authMethod,
-	})
+	}
+	// #2548: GATED on a non-empty class, mirroring
+	// writeScopeCompletenessDecisionAudit, so the two OLDER park classes' PARKED
+	// entries stay BYTE-IDENTICAL. This payload is a raw map, not the omitempty
+	// park struct, so writing the two keys unconditionally emitted two JSON nulls
+	// onto every missing-paths / binding-assertion parked entry — a wire-visible
+	// change on paths #2548 promised not to touch.
+	if len(pr.BuildRequiredPaths) > 0 {
+		payloadMap["build_required_paths"] = pr.BuildRequiredPaths
+		payloadMap["owning_slices"] = park.OwningSlices
+	}
+	auditPayload, _ := json.Marshal(payloadMap)
 	appendParams := audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,
@@ -1229,6 +1274,13 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 				slog.String("stage_id", stageID.String()),
 				slog.String("error", err.Error()))
 		}
+		// #2548 PARK-TIME parent signal: emitted here, not only from the
+		// orchestrator, because maybeAdvanceDecomposedParent is reached ONLY from
+		// completeRun on a child's TERMINAL transition. A parked child does not
+		// complete, so if this child is the LAST non-terminal sibling that hook
+		// never fires again and an orchestrator-only emission would leave the
+		// parent waiting with nothing on its chain.
+		s.emitParentAwaitingChildScopeDecision(r.Context(), childRun, stageID, park)
 		s.notifyStatusUpdate(r.Context(), runID, "scope_parked")
 		s.writeJSON(w, r, http.StatusOK, pullRequestScopeParkResponse{
 			StageID: stageID,
@@ -1257,6 +1309,8 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 			slog.String("error", err.Error()))
 	}
 
+	// #2548 PARK-TIME parent signal — see the parker branch above.
+	s.emitParentAwaitingChildScopeDecision(r.Context(), childRun, stageID, park)
 	s.notifyStatusUpdate(r.Context(), runID, "scope_parked")
 	s.writeJSON(w, r, http.StatusOK, pullRequestScopeParkResponse{
 		StageID: stageID,

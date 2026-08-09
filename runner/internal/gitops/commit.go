@@ -164,6 +164,57 @@ func (*ScopeFilesMissingError) Unwrap() error { return ErrScopeFilesMissing }
 // category-B failure (wrong-shaped output → re-scope/re-plan).
 var ErrCommittedTestsFailed = errors.New("gitops: committed tree tests failed")
 
+// BuildRequiredDriftError is the typed carrier for the THIRD scope-completeness
+// park shortfall class (#2548): build-required scope drift on a DECOMPOSED
+// CHILD. A fan-out slice's scope-only committed tree compiles but its tests are
+// red because a build-required file the slice needed is owned by a SIBLING
+// slice, so the decomposition boundary cut a coupling. Unwrap returns the
+// ErrCommittedTestsFailed sentinel, so every existing
+// errors.Is(err, ErrCommittedTestsFailed) classification — the runner's
+// category-B mapping and its test_gate_failed event selection — keeps its
+// current verdict with no edit.
+//
+// It mirrors *ScopeFilesMissingError / *BindingAssertionsUnsatisfiedError
+// field-for-field, and carries the same sole-failure guarantee: the runner
+// returns it from the verifyCommit closure ONLY at a terminal pass point, when
+// every OTHER committed-tree gate is green, so when CommitAndPush sees it with
+// ParkOnBuildRequiredDrift set it is provably the SOLE gate failure. That class
+// PARKS: CommitAndPush pushes the verified commit to the child's own sole-writer
+// slice branch (so the slice's work survives the runner exit instead of being
+// discarded) and surfaces BuildRequiredShortfall instead of aborting. Any
+// compound failure returns an UNTYPED sentinel wrap from the runner's terminal
+// resolver instead, keeping today's category-B abort.
+//
+// UNLIKE the two older classes this park is NOT exempt-eligible: the held
+// commit's committed tree is RED by construction, and exempting it would open a
+// PR from a red tree. The backend refuses `exempt` for it — the only admissible
+// decision is `fail`, then correct the decomposition and re-run.
+//
+// Error() has ONE rule, byte-identical to ScopeFilesMissingError.Error(): it
+// returns Message VERBATIM when Message is non-empty, and the
+// ErrCommittedTestsFailed sentinel text when Message is empty.
+type BuildRequiredDriftError struct {
+	// Paths is the order-preserving list of scope-EXCLUDED (drift) paths the
+	// committed tree needed to build — the candidate build-required set the
+	// commit dropped.
+	Paths []string
+	// Message is the full human-readable gate message. Error returns it
+	// verbatim so the runner's failure-report narrative is byte-identical to
+	// the pre-#2548 wrap.
+	Message string
+}
+
+func (e *BuildRequiredDriftError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return ErrCommittedTestsFailed.Error()
+}
+
+// Unwrap returns the ErrCommittedTestsFailed sentinel so
+// errors.Is(err, ErrCommittedTestsFailed) holds for the typed error.
+func (*BuildRequiredDriftError) Unwrap() error { return ErrCommittedTestsFailed }
+
 // ErrPushedTreeNotVerified is the verified-SHA-invariant sentinel (#960):
 // a VerifyCommit hook wraps it (via fmt.Errorf("%w: ...")) and returns it
 // BEFORE the push when the staged commit's tree is NOT the tree the
@@ -392,6 +443,22 @@ type CommitAndPushArgs struct {
 	// byte-identical.
 	ParkOnAssertionShortfall bool
 
+	// ParkOnBuildRequiredDrift is the build-required-drift sibling of
+	// ParkOnScopeShortfall / ParkOnAssertionShortfall (#2548): when VerifyCommit
+	// returns a *BuildRequiredDriftError — which the runner emits ONLY after
+	// every OTHER committed-tree gate has passed, so it is the SOLE failure —
+	// CommitAndPush PUSHES the gate-verified commit to the child's own
+	// sole-writer slice branch anyway and reports the build-required paths via
+	// CommitAndPushResult.BuildRequiredShortfall instead of aborting. The slice's
+	// ~25-minute pass survives the runner exit on that branch instead of being
+	// discarded, and the operator gets the paths that broke the boundary. Any
+	// OTHER VerifyCommit error (including a plain ErrCommittedTestsFailed wrap
+	// that is not the typed *BuildRequiredDriftError, and any compound failure)
+	// still aborts the push BEFORE origin is touched, unchanged. Set only on the
+	// DECOMPOSED-CHILD implement push (isDecomposed && !isFixup); false
+	// everywhere else keeps the strict category-B abort byte-identical.
+	ParkOnBuildRequiredDrift bool
+
 	// VerifyCommit, when non-nil, is invoked AFTER the scope-only commit
 	// is created and BEFORE the push, with the new HEAD SHA and the scope
 	// drift (dirty-but-undeclared paths excluded from the commit). A
@@ -455,6 +522,16 @@ type CommitAndPushResult struct {
 	// scope-completeness park carrying these assertions instead of opening a PR.
 	// Always empty otherwise, so the existing success path is byte-identical.
 	AssertionShortfall []BindingAssertionResult
+
+	// BuildRequiredShortfall lists the scope-EXCLUDED paths the pushed commit
+	// needed to build (#2548), the decomposed-child sibling of ScopeShortfall.
+	// Non-empty ONLY when ParkOnBuildRequiredDrift was set AND the committed-tree
+	// TEST gate was the sole committed-tree failure with non-empty drift: the
+	// verified commit WAS pushed to the child's slice branch (HeadSHA/TreeSHA are
+	// populated) but NO PR is implied — the caller reports a scope-completeness
+	// park carrying these paths. Always empty otherwise, so the existing success
+	// path is byte-identical.
+	BuildRequiredShortfall []string
 }
 
 // CommitAndPush configures a bot author, creates Branch, stages
@@ -670,6 +747,7 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	// reports in its error.
 	var scopeShortfall []string
 	var assertionShortfall []BindingAssertionResult
+	var buildRequiredShortfall []string
 	if args.VerifyCommit != nil {
 		if err := args.VerifyCommit(ctx, headSHA, scopeDrift); err != nil {
 			// Scope-completeness park (#1231, generalized to a second shortfall
@@ -684,13 +762,21 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 			// other error — including a plain ErrScopeFilesMissing /
 			// ErrBindingAssertionUnsatisfied wrap that is NOT the typed value —
 			// still aborts before origin is touched.
+			//
+			// #2548 adds a THIRD arm for the decomposed-child build-required
+			// class. The `default: return nil, err` arm STAYS LAST and unchanged,
+			// so an untyped wrap — including a compound one — still aborts before
+			// the push with origin untouched.
 			var smErr *ScopeFilesMissingError
 			var baErr *BindingAssertionsUnsatisfiedError
+			var brErr *BuildRequiredDriftError
 			switch {
 			case args.ParkOnScopeShortfall && errors.As(err, &smErr):
 				scopeShortfall = smErr.Missing
 			case args.ParkOnAssertionShortfall && errors.As(err, &baErr):
 				assertionShortfall = baErr.Unsatisfied
+			case args.ParkOnBuildRequiredDrift && errors.As(err, &brErr):
+				buildRequiredShortfall = brErr.Paths
 			default:
 				return nil, err
 			}
@@ -767,6 +853,9 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// AssertionShortfall is the #2501 sibling of ScopeShortfall: non-empty
 		// only on an unsatisfied-binding-assertion-ONLY park.
 		AssertionShortfall: assertionShortfall,
+		// BuildRequiredShortfall is the #2548 decomposed-child sibling: non-empty
+		// only on a build-required-drift-ONLY park.
+		BuildRequiredShortfall: buildRequiredShortfall,
 	}, nil
 }
 
