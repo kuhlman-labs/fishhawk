@@ -27,14 +27,15 @@ const (
 )
 
 // ChildStatus is one decomposed child's live lifecycle state, paired with
-// its slice index (its position in the parent's plan_decomposed child_run_ids,
-// the same ordering fishhawk_run_children dispatches in). State mirrors the
-// child run's lifecycle state — pending/running/succeeded/failed — or
-// "unknown" when the per-child GetRun failed (best-effort: a child read
-// failure never fails the parent snapshot).
+// its slice index (the child run row's authoritative slice_index — its
+// sub_plan position in the parent's decomposition — falling back to the
+// position in child_run_ids only for an older backend that omits the field).
+// State mirrors the child run's lifecycle state —
+// pending/running/succeeded/failed — or "unknown" when the per-child GetRun
+// failed (best-effort: a child read failure never fails the parent snapshot).
 type ChildStatus struct {
 	RunID      string `json:"run_id" jsonschema:"the child run UUID"`
-	SliceIndex int    `json:"slice_index" jsonschema:"the child's position in the parent's plan_decomposed child_run_ids (slice-index order)"`
+	SliceIndex int    `json:"slice_index" jsonschema:"the child's authoritative slice index from its run row (its sub_plan position in the parent's decomposition); falls back to the position in child_run_ids only for an older backend that omits slice_index"`
 	State      string `json:"state" jsonschema:"the child run's lifecycle state: pending, running, succeeded, failed, or unknown when the per-child read failed"`
 	// DependsOn lists the slice indices this child depends on (E48.99 / #2546),
 	// mirrored from the child run row's slice_depends_on (resolved from the
@@ -140,6 +141,11 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 		Total:    len(pd.ChildRunIDs),
 	}
 	for i, childID := range pd.ChildRunIDs {
+		// SliceIndex defaults to the loop position and is overwritten below by
+		// the child run row's authoritative slice_index when the GetRun hits and
+		// carries it. The positional fallback covers only an OLDER backend that
+		// does not send slice_index (nil-decode) — a dense-in-slice-order
+		// child_run_ids, where position and slice index coincide anyway.
 		child := ChildStatus{RunID: childID, SliceIndex: i, State: "unknown"}
 		if childUUID, perr := uuid.Parse(childID); perr == nil {
 			if runRow, gerr := r.api.GetRun(ctx, childUUID); gerr == nil {
@@ -148,6 +154,14 @@ func (r *runResolver) childrenStatusFor(ctx context.Context, parentID uuid.UUID,
 				// hits here (E48.99 / #2546); nil for a wave-0 child or a
 				// legacy backend that omits it.
 				child.DependsOn = runRow.SliceDependsOn
+				// Prefer the run row's authoritative slice_index over the loop
+				// position: a non-dense child_run_ids (slice 0 never minted)
+				// otherwise mis-keys the bySlice map below. nil only for an
+				// older backend that omits the field — then the positional
+				// fallback stands.
+				if runRow.SliceIndex != nil {
+					child.SliceIndex = *runRow.SliceIndex
+				}
 			}
 			// A GetRun error (or an unparseable id) leaves State="unknown" —
 			// best-effort, never fails the snapshot.

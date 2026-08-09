@@ -449,6 +449,67 @@ func seedChildRunDeps(fb *fakeBackend, childID uuid.UUID, state string, deps []i
 	fb.stagesByRun[childID] = []Stage{{ID: stageID.String(), RunID: childID.String(), Type: "implement", State: state}}
 }
 
+// seedChildRunSliceDeps seeds a child run row carrying BOTH its authoritative
+// slice_index and its slice_depends_on (E48.99 / #2546). It exercises the
+// non-dense child_run_ids case where the run row's slice index diverges from
+// its position in child_run_ids.
+func seedChildRunSliceDeps(fb *fakeBackend, childID uuid.UUID, state string, sliceIdx int, deps []int) {
+	stageID := uuid.New()
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	si := sliceIdx
+	fb.getRunByID[childID] = Run{ID: childID.String(), State: state, Repo: "x/y", SliceIndex: &si, SliceDependsOn: deps}
+	fb.stagesByRun[childID] = []Stage{{ID: stageID.String(), RunID: childID.String(), Type: "implement", State: state}}
+}
+
+// TestChildrenStatusFor_NonDenseSliceIndexResolvesByRunID (concern #2546 fix-up):
+// child_run_ids holds two children whose TRUE slice indices are 1 and 2 (slice 0
+// was never minted), and the slice-2 child depends on slice 1. The dependency
+// must resolve against the slice-1 child BY RUN ID — through the run row's
+// authoritative slice_index — not by loop position. Under the pre-fix positional
+// implementation SliceIndex == position, so the slice-2 child sits at position 1
+// and bySlice maps slice index 1 -> position 1 (itself): it would resolve its
+// dependency against ITSELF (naming its own run id) and report SliceIndex 1. This
+// test discriminates the identity-map defect: it asserts SliceIndex 2 and a
+// blocker naming the slice-1 sibling.
+func TestChildrenStatusFor_NonDenseSliceIndexResolvesByRunID(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	parent := uuid.New()
+	cSlice1, cSlice2 := uuid.New(), uuid.New()
+	// child_run_ids order: [slice-1 child, slice-2 child]; slice 0 never minted.
+	seedChildRunSliceDeps(fb, cSlice1, "running", 1, nil)      // dependency, not succeeded
+	seedChildRunSliceDeps(fb, cSlice2, "pending", 2, []int{1}) // depends on slice 1
+	seedPlanDecomposed(fb, parent, []string{cSlice1.String(), cSlice2.String()}, 2)
+
+	cs, err := r.childrenStatusFor(context.Background(), parent, nil)
+	if err != nil {
+		t.Fatalf("childrenStatusFor: %v", err)
+	}
+	// The slice-2 child is at position 1 in child_run_ids but its authoritative
+	// slice index is 2, not the loop position 1.
+	if cs.Children[1].SliceIndex != 2 {
+		t.Errorf("child[1].SliceIndex = %d, want 2 (authoritative slice_index, not loop position)", cs.Children[1].SliceIndex)
+	}
+	if cs.Children[0].SliceIndex != 1 {
+		t.Errorf("child[0].SliceIndex = %d, want 1 (authoritative slice_index)", cs.Children[0].SliceIndex)
+	}
+	// Its dependency (slice 1) resolves to the slice-1 child by run id, which is
+	// still running → blocked and named by cSlice1's run id (NOT its own id, which
+	// the positional identity map would produce).
+	if !cs.Children[1].Blocked {
+		t.Errorf("child[1] Blocked = false, want true (its dependency slice 1 is still running)")
+	}
+	if len(cs.Children[1].BlockedBy) != 1 || cs.Children[1].BlockedBy[0] != cSlice1.String() {
+		t.Errorf("child[1].BlockedBy = %v, want [%s] (the slice-1 sibling by run id, not self)", cs.Children[1].BlockedBy, cSlice1)
+	}
+	// The slice-1 child has no dependencies → not blocked.
+	if cs.Children[0].Blocked {
+		t.Errorf("child[0] Blocked = true, want false (slice-1 child has no dependencies)")
+	}
+}
+
 // TestChildrenStatusFor_BlockedByUnsucceededDependency is the acceptance
 // criterion for the children-view deliverable (#2546, operator condition 2): a
 // child whose dependency slice has NOT succeeded is reported Blocked with
