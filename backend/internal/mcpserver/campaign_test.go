@@ -1181,3 +1181,39 @@ func TestStartCampaign_NoEpic_E2E_ThroughRealServer(t *testing.T) {
 		t.Errorf("issue:102 depends_on = %v, want [issue:101]", deps)
 	}
 }
+
+// TestStartCampaignItemRun_OversizedRow_BoundedThroughHandler drives the verb
+// that concretely broke on 2026-08-07 at 75,963 characters (#2510). It is a
+// MUTATING verb — the run is minted and the item linked by the time this
+// response renders — so the row is reduced rather than the response rejected,
+// and the elisions block must survive the SDK's in-handler output-schema
+// validation.
+func TestStartCampaignItemRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	campaignID := uuid.New()
+	runID := uuid.NewString()
+	fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+		Run:  worstCaseIssueRun(runID),
+		Item: CampaignItem{ID: uuid.NewString(), IssueRef: "issue:100", State: "running", RunID: runID},
+	}
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerStartCampaignItemRun, "fishhawk_start_campaign_item_run",
+		map[string]any{
+			"campaign_id": campaignID.String(),
+			"issue_ref":   "issue:100",
+			"workflow_id": "feature_change",
+			"runner_kind": "github_actions",
+		})
+
+	var out StartCampaignItemRunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_start_campaign_item_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if out.Run.ID != runID {
+		t.Errorf("the minted run id was lost to the bound: %+v", out.Run)
+	}
+	if out.Item.IssueRef != "issue:100" {
+		t.Errorf("the linked item was lost to the bound: %+v", out.Item)
+	}
+}

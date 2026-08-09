@@ -38,6 +38,10 @@ type ResumeRunInput struct {
 type ResumeRunOutput struct {
 	Run        Run  `json:"run"`
 	Idempotent bool `json:"idempotent" jsonschema:"true when this call replayed against an existing recovery run via idempotency_key; false on fresh create"`
+	// Elisions is the ADR-077 byte-bound block (#2510): present ONLY when the
+	// shared run-row ladder had to reduce the row. Resume is a mutating verb —
+	// the recovery run is already minted when this renders.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
 }
 
 // registerResumeRun wires the fishhawk_resume_run tool (E22.X / #978).
@@ -135,5 +139,12 @@ func (r *runResolver) resumeRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 		}
 		return nil, ResumeRunOutput{}, fmt.Errorf("recover run: %w", err)
 	}
-	return nil, ResumeRunOutput{Run: *created, Idempotent: idempotent}, nil
+	bounded, berr := boundRunRowOutput(
+		ResumeRunOutput{Run: *created, Idempotent: idempotent}, created.ID, mcpResponseByteBudget(r.getenv),
+		func(o *ResumeRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *ResumeRunOutput, e *Elisions) { o.Elisions = e })
+	if berr != nil {
+		return nil, ResumeRunOutput{}, fmt.Errorf("bound resume_run response: %w", berr)
+	}
+	return nil, bounded, nil
 }

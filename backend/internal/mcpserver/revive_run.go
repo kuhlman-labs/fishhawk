@@ -35,6 +35,11 @@ type ReviveRunOutput struct {
 	// provenance record (#1943) — the revive succeeded; investigate the audit
 	// store. Omitted on a clean revive.
 	AuditWarning string `json:"audit_warning,omitempty" jsonschema:"set only when the revive succeeded but the backend failed to append the run_revived chained provenance record — the run IS revived; investigate the audit store. Omitted on a clean revive"`
+	// Elisions is the ADR-077 byte-bound block (#2510): present ONLY when the
+	// shared run-row ladder had to reduce the row. Revive is a mutating verb —
+	// the run is already re-opened when this renders — so the bound keeps the
+	// success signal independent of whether the body fits.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
 }
 
 // registerReviveRun wires the fishhawk_revive_run tool (#1915): the single
@@ -120,10 +125,16 @@ func (r *runResolver) reviveRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 	if err != nil {
 		return nil, ReviveRunOutput{}, fmt.Errorf("revive run: %w", err)
 	}
-	return nil, ReviveRunOutput{
+	bounded, berr := boundRunRowOutput(ReviveRunOutput{
 		Run:            res.Run,
 		RestoredStages: res.RestoredStages,
 		NextStep:       reviveNextStepHint,
 		AuditWarning:   res.AuditWarning,
-	}, nil
+	}, res.Run.ID, mcpResponseByteBudget(r.getenv),
+		func(o *ReviveRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *ReviveRunOutput, e *Elisions) { o.Elisions = e })
+	if berr != nil {
+		return nil, ReviveRunOutput{}, fmt.Errorf("bound revive_run response: %w", berr)
+	}
+	return nil, bounded, nil
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	neturl "net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -15,8 +16,9 @@ import (
 // Byte budget (ADR-077 / #2508)
 // ---------------------------------------------------------------------------
 
-// runStatusByteBudgetDefault bounds the MARSHALLED fishhawk_get_run_status
-// response. The number is evidence-backed, not chosen.
+// mcpResponseByteBudgetDefault bounds a MARSHALLED bounded-surface response —
+// fishhawk_get_run_status (ADR-077 / #2508), fishhawk_list_audit and every verb
+// returning a run row (#2510). The number is evidence-backed, not chosen.
 //
 // The MCP client rejects on TOKENS ("result (N characters) exceeds maximum
 // allowed tokens"), and fishhawkd cannot tokenize, so a byte budget is
@@ -33,24 +35,42 @@ import (
 //
 // This bounds the INNER response only: the server never sees the transport
 // envelope the client actually measures, so the headroom absorbs it.
-const runStatusByteBudgetDefault = 32768
+const mcpResponseByteBudgetDefault = 32768
 
-// runStatusBudgetEnvVar overrides runStatusByteBudgetDefault for a client with
-// a different tokenizer. An override BELOW minimalRunStatusMaxBytes is CLAMPED
-// UP, never accepted-and-silently-not-honoured — see runStatusByteBudget.
-const runStatusBudgetEnvVar = "FISHHAWKD_MCP_RUN_STATUS_BUDGET_BYTES"
+// mcpResponseBudgetEnvVar is the GENERAL override, honoured by every bounded
+// surface. runStatusBudgetEnvVar is the LEGACY, get_run_status-named spelling
+// #2508 shipped; it stays honoured so no operator override breaks, and the
+// general var WINS when both are set. An override BELOW
+// mcpConvergenceFloorBytes is CLAMPED UP, never accepted-and-silently-not-
+// honoured — see mcpResponseByteBudget.
+const (
+	mcpResponseBudgetEnvVar = "FISHHAWKD_MCP_RESPONSE_BUDGET_BYTES"
+	runStatusBudgetEnvVar   = "FISHHAWKD_MCP_RUN_STATUS_BUDGET_BYTES"
+)
 
-// minimalRunStatusMaxBytes is the constant-size absolute floor minimalRunStatus
-// is pinned under. Convergence can only ever guarantee max(budget, this), so it
-// is also the clamp target for a below-floor override.
-const minimalRunStatusMaxBytes = 4096
+// mcpConvergenceFloorBytes is the SHARED convergence floor: the constant size
+// every ladder's floor tier is pinned under. Convergence can only ever
+// guarantee max(budget, this), so it is also the clamp target for a below-floor
+// override.
+const mcpConvergenceFloorBytes = 4096
 
-// runStatusByteBudget resolves the effective budget through the injectable
+// minimalRunStatusMaxBytes is the get_run_status floor minimalRunStatus is
+// pinned under. It IS the shared floor — spelled as its own name because the
+// get_run_status ladder's assertions are about that surface specifically.
+const minimalRunStatusMaxBytes = mcpConvergenceFloorBytes
+
+// mcpResponseByteBudget resolves the effective budget through the injectable
 // getenv seam (runResolver.getenv) rather than os.Getenv, so every branch is
-// testable. Four named branches:
+// testable. The FIRST var present decides — general, then legacy — and its
+// value routes through the same four named branches:
 //
 //	absent / unparseable / non-positive -> the default
-//	below minimalRunStatusMaxBytes      -> CLAMPED UP to the floor
+//	below mcpConvergenceFloorBytes      -> CLAMPED UP to the floor
+//
+// A present-but-invalid general var therefore takes the default rather than
+// falling through to the legacy var: an operator who set the general var chose
+// it, and silently honouring a stale legacy value instead would be a surprise
+// no log line can undo.
 //
 // Clamping (not rejecting) is deliberate: the override exists to serve a client
 // with a LOWER limit, and rejecting it back up to the 32 KiB default would
@@ -58,27 +78,36 @@ const minimalRunStatusMaxBytes = 4096
 // the same breath on TWO surfaces — this log line, and the elisions block's own
 // Budget field, which reports the EFFECTIVE (post-clamp) value so the wire
 // never claims a bound the ladder did not honour.
-func runStatusByteBudget(getenv func(string) string) int {
+func mcpResponseByteBudget(getenv func(string) string) int {
 	if getenv == nil {
-		return runStatusByteBudgetDefault
+		return mcpResponseByteBudgetDefault
 	}
-	raw := strings.TrimSpace(getenv(runStatusBudgetEnvVar))
-	if raw == "" {
-		return runStatusByteBudgetDefault
+	for _, name := range []string{mcpResponseBudgetEnvVar, runStatusBudgetEnvVar} {
+		raw := strings.TrimSpace(getenv(name))
+		if raw == "" {
+			continue
+		}
+		return resolveByteBudget(name, raw)
 	}
+	return mcpResponseByteBudgetDefault
+}
+
+// resolveByteBudget parses ONE override value's named branches. Split out so
+// both env-var spellings share byte-identical branch behaviour and log lines.
+func resolveByteBudget(name, raw string) int {
 	n, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf("mcp: %s=%q is not an integer; using the %d-byte default", runStatusBudgetEnvVar, raw, runStatusByteBudgetDefault)
-		return runStatusByteBudgetDefault
+		log.Printf("mcp: %s=%q is not an integer; using the %d-byte default", name, raw, mcpResponseByteBudgetDefault)
+		return mcpResponseByteBudgetDefault
 	}
 	if n <= 0 {
-		log.Printf("mcp: %s=%d is not positive; using the %d-byte default", runStatusBudgetEnvVar, n, runStatusByteBudgetDefault)
-		return runStatusByteBudgetDefault
+		log.Printf("mcp: %s=%d is not positive; using the %d-byte default", name, n, mcpResponseByteBudgetDefault)
+		return mcpResponseByteBudgetDefault
 	}
-	if n < minimalRunStatusMaxBytes {
+	if n < mcpConvergenceFloorBytes {
 		log.Printf("mcp: %s=%d is below the %d-byte convergence floor; CLAMPED to %d (the elisions block reports the effective budget)",
-			runStatusBudgetEnvVar, n, minimalRunStatusMaxBytes, minimalRunStatusMaxBytes)
-		return minimalRunStatusMaxBytes
+			name, n, mcpConvergenceFloorBytes, mcpConvergenceFloorBytes)
+		return mcpConvergenceFloorBytes
 	}
 	return n
 }
@@ -228,6 +257,57 @@ func pointerGateView(runID string) retrievalPointer {
 // oversized-capable elision may point at.
 func pointerREST(path string) unboundedPointer {
 	return unboundedPointer{retrievalPointer{"GET " + path}}
+}
+
+// pointerIssueURL names the issue itself as the unbounded retrieval surface for
+// an elided issue_context (#2510). It is the most actionable pointer available
+// for that field: the issue body and its comment thread live there in full,
+// unbounded by any Fishhawk projection.
+//
+// It reports false — and the caller MUST fall back to pointerREST over the run
+// read — for any URL the wire invariants would reject or that is not actually
+// retrievable: empty, unparseable, not an absolute http(s) URL WITH A HOST,
+// carrying a "fishhawk_" substring (which validateWireElisions reads as a
+// bounded MCP tool, the circularity the oversized-capable class exists to
+// refuse), or carrying whitespace (a rendered pointer is one token an operator
+// pastes). The guard is deliberately fail-closed toward the REST fallback: an
+// oversized_capable elision must never be spelled without a retrievable
+// unbounded surface.
+//
+// The absoluteness test PARSES rather than prefix-matching (#2510 fix-up): a
+// bare `strings.HasPrefix(u, "https://")` accepts "https://" and
+// "https:///issues/1", neither of which names a retrievable surface, so the
+// prefix form did not establish the invariant this comment claims. url.Parse
+// plus an explicit scheme-and-host check does.
+//
+// This is a HONESTY guard on a rendered pointer, NOT an egress control. The
+// server never fetches the URL — it is text the operator follows — and the same
+// value is already returned verbatim in issue_context.url, so no new retrieval
+// surface opens here. A loopback or link-local host is therefore left alone
+// deliberately: refusing it would degrade a legitimate self-hosted forge's
+// pointer to the REST fallback while preventing nothing.
+func pointerIssueURL(raw string) (unboundedPointer, bool) {
+	u := strings.TrimSpace(raw)
+	if u == "" {
+		return unboundedPointer{}, false
+	}
+	if strings.Contains(u, "fishhawk_") {
+		return unboundedPointer{}, false
+	}
+	if strings.ContainsAny(u, " \t\r\n") {
+		return unboundedPointer{}, false
+	}
+	parsed, err := neturl.Parse(u)
+	if err != nil {
+		return unboundedPointer{}, false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return unboundedPointer{}, false
+	}
+	if parsed.Host == "" {
+		return unboundedPointer{}, false
+	}
+	return pointerREST(u), true
 }
 
 // elidedField is one accumulated omission. ALL FIELDS ARE UNEXPORTED and the

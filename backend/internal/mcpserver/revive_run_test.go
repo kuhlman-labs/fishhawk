@@ -266,3 +266,27 @@ func TestReviveRun_AuditWarning_EndToEndCallTool(t *testing.T) {
 		t.Errorf("decoded AuditWarning = %q, want it to name the run_revived append failure", out.AuditWarning)
 	}
 }
+
+// TestReviveRun_OversizedRow_BoundedThroughHandler drives the revive verb with
+// an oversized run row (#2510). Revive is mutating — the run is already
+// re-opened when this renders — so the bound must keep the success signal
+// (state running + the no-dispatch hint) while shedding the row's bulk.
+func TestReviveRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newReviveFakeBackend(t)
+	runID := uuid.New()
+	run := worstCaseIssueRun(runID.String())
+	run.State = "running"
+	fb.reviveResp[runID] = ReviveRunResult{Run: run}
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerReviveRun, "fishhawk_revive_run",
+		map[string]any{"run_id": runID.String()})
+
+	var out ReviveRunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_revive_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if out.Run.State != "running" {
+		t.Errorf("the revive success signal was lost to the bound: state=%q", out.Run.State)
+	}
+}
