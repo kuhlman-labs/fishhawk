@@ -1972,3 +1972,49 @@ func (c *Client) RunLineageComplete(ctx context.Context, runID string) (bool, er
 		return false, statusError("get run", resp)
 	}
 }
+
+// RunState reads a run's live state off GET /v0/runs/{run_id} (#2545). The
+// runner's lineage-lock reclaim calls it with the run id recorded in a
+// contended lockfile: only a holder whose run the backend reports CANCELLED is
+// evictable, so this read is the authorizing state half of that rule (the argv
+// identity check is the authorizing process half).
+//
+// An absent or empty `state` field returns "" with NO error, which the caller
+// treats as UNKNOWN and refuses on — the same fail-closed posture as a
+// transport error or a 404 (ErrNotFound). Single-attempt and unsigned, exactly
+// like the adjacent RunLineageComplete: the run read is an anonymous GET on the
+// local loop, and every failure mode is already a refusal, so retrying here
+// would only delay the stage.
+func (c *Client) RunState(ctx context.Context, runID string) (string, error) {
+	if runID == "" {
+		return "", errors.New("upload: run_id required")
+	}
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s", c.BaseURL, url.PathEscape(runID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", fmt.Errorf("upload: build run request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("upload: get run: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var out struct {
+			State string `json:"state"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return "", fmt.Errorf("upload: decode run response: %w", err)
+		}
+		return out.State, nil
+	case http.StatusNotFound:
+		return "", ErrNotFound
+	default:
+		return "", statusError("get run", resp)
+	}
+}

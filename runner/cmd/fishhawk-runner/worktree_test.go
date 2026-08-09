@@ -168,19 +168,19 @@ func TestAcquireLineageLock_HeldThenReleased(t *testing.T) {
 	repo := initRepo(t)
 	ctx := context.Background()
 
-	release, err := acquireLineageLock(ctx, repo, "root1234", "run-a", io.Discard)
+	release, err := acquireLineageLock(ctx, repo, "root1234", "run-a", nil, io.Discard)
 	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	// A second acquire while the lock is held by THIS (live) process must
 	// fail loud — a concurrent same-lineage stage is the corruption hazard
 	// the lock exists to catch.
-	if _, err := acquireLineageLock(ctx, repo, "root1234", "run-b", io.Discard); err == nil {
+	if _, err := acquireLineageLock(ctx, repo, "root1234", "run-b", nil, io.Discard); err == nil {
 		t.Fatal("second acquire succeeded while lock held; want loud failure")
 	}
 	release()
 	// After release the lock is reacquirable.
-	release2, err := acquireLineageLock(ctx, repo, "root1234", "run-c", io.Discard)
+	release2, err := acquireLineageLock(ctx, repo, "root1234", "run-c", nil, io.Discard)
 	if err != nil {
 		t.Fatalf("reacquire after release: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestAcquireLineageLock_ReclaimsStale(t *testing.T) {
 	if err := os.WriteFile(lockPath, []byte("2147483647\nold-run\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	release, err := acquireLineageLock(ctx, repo, "stale123", "run-new", io.Discard)
+	release, err := acquireLineageLock(ctx, repo, "stale123", "run-new", nil, io.Discard)
 	if err != nil {
 		t.Fatalf("acquire over stale lock: %v", err)
 	}

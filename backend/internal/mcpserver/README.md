@@ -177,6 +177,30 @@ Detached-spawn properties (differ deliberately from the synchronous `spawnRunner
 
 Restarting the MCP server (`scripts/dev reload`) while a detached stage is in flight **orphans** the runner (reparented to init) but it continues to terminal and stays pollable via `fishhawk_get_run_status` — the intended durability of the `(run_id, stage_id)` handle (ADR-037), not a regression. Requires the `fishhawk-runner` binary to resolve on the MCP host, exactly like `fishhawk_run_stage`.
 
+### Detached-runner registry and cancel reap ([#2545](https://github.com/kuhlman-labs/fishhawk/issues/2545))
+
+`detached_registry.go` tracks the detached children **this MCP process** spawned so `fishhawk_cancel_run` can reap them. Without it, cancelling a run flipped the run state and returned while the runner kept running — still holding its lineage lockfile — and every later same-lineage dispatch failed category-C until an operator killed the process by hand.
+
+**The invariant.** `startAndRegister` is the ONE chokepoint every detached spawn goes through, and its tombstone check, `cmd.Start()` and registration all happen under **one hold** of the registry mutex. That closes the register-after-Start race by construction:
+
+- a cancel that wins the lock records a tombstone and the spawn is **REFUSED before any fork** (`errRunCancelledBeforeSpawn`, returned verbatim by `spawnRunnerStageDetached` so `dispatch_stage` / `drive_run` surface it);
+- a spawn that wins the lock is **registered before it releases**, so a cancel enumerating afterwards always sees the child.
+
+There is no interval in which a started child is unregistered. The reaper goroutine `deregister`s (deferred, so it also runs on the reaper's early returns), which closes the handle's `done` channel; `terminateRunners` waits on that channel rather than polling the pid, because `os/exec`'s `Cmd.Wait` releases the `Cmd`'s resources.
+
+**The reap.** After `CancelRun` returns success (never for a cancel that failed — the tombstone must not outlive a no-op), `cancelRun` calls `terminateRunners`: TERM → `detachedTerminateGrace` → KILL → grace, per registered child. The verb reports `reaped_runners` and, for any child that never exited, a `reap_warnings` entry naming its stage id and pid. **A warning never fails the verb** — the cancel already landed, and turning a landed mutation into a tool error is exactly the failure [#2510](https://github.com/kuhlman-labs/fishhawk/issues/2510) removed from this type.
+
+**The tombstone must not become a new wedge.** It exists ONLY to catch a dispatch already in flight at the moment of cancel — the window between the caller's decision to spawn (host-dispatch marker POST, argv compose, log-file open) and `cmd.Start()`. So:
+
+- its TTL is the **spawn-in-flight timescale, seconds not minutes** (`detachedCancelTombstoneTTL`, default **30s**), pruned on every registry mutation; and
+- the primary release is not the clock at all: the refusal branch **consults the run's live state** via the probe the cancel recorded (`runResolver.runStateProbe` → `GET /v0/runs/{id}`) and **ADMITS immediately** when the run is no longer `cancelled`. An operator who cancels and then revives or retries inside the window gets a normal dispatch, not a fresh refusal.
+
+The probe fails closed: absent, erroring, empty-state, or still-`cancelled` all refuse. A NEWER cancel landing while the probe was in flight also refuses (tombstone generations are compared), so the admit can never act on a stale answer.
+
+A refusal also **removes the stage log file** it opened before the registry call. That file is created ahead of `startAndRegister` (the child needs the fd at fork), and the refusal returns an empty `logPath`, so a left-behind file is referenced by nothing — one zero-length orphan in `TempDir` per refused re-dispatch, unbounded over time. Removal is best-effort; a failure there does not change the refusal.
+
+**Honest limitation.** The registry is **per MCP process**. A cancel issued from a different MCP server process than the one that dispatched reaps nothing — `reaped_runners` is 0 and nothing is wrong. The net for that case is runner-side: `runner/cmd/fishhawk-runner`'s lineage-lock holder rule reclaims the lock from a holder it can PROVE is an orphaned runner of a cancelled run (see that package's README).
+
 ### Sibling-in-flight dispatch refusal ([#1872](https://github.com/kuhlman-labs/fishhawk/issues/1872))
 
 Both host-spawn verbs — `fishhawk_dispatch_stage` and `fishhawk_run_stage` — refuse to spawn a runner while **another stage of the same run is still executing**. Concretely, the dispatch is **blocked** (a non-nil tool error, **zero** runners spawned) when any stage OTHER than the target is `dispatched` or `running`, or when the **target stage itself is `running`** (a live runner already owns it — a second spawn would double-drive it). A sibling parked at **`awaiting_host_dispatch`** ([#1912](https://github.com/kuhlman-labs/fishhawk/issues/1912)) is **NOT** in-flight (no spawn attempt exists yet) and does **not** block — only `{dispatched, running}` siblings do. Dispatching a sibling stage while an implement runner is still in its ship phase (which spends its whole duration `running`) rotates the run's signing key out from under the in-flight runner; the block prevents that contention at admission time. The target stage's own **park** states — `awaiting_host_dispatch` (the plan-approved / retry / fixup local park, #1912) and the legacy/transitional `dispatched` (dead-runner re-dispatch) — are **allowed**, since blocking them would wedge every local dispatch. A stage-list read error **fails open** (a warning, the dispatch proceeds) — the backend's any-unexpired-key signature verify (#1872) is the correctness backstop. The refusal names the in-flight stage's type and state and tells you to wait for it to settle (the implement ship phase ends when its pull-request artifact upload lands).

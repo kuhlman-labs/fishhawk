@@ -717,7 +717,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// run id for the lineage_complete read (best-effort).
 		writeLineageRunID(ctx, baseRepoDir, root,
 			lineageRootFull(cfg.runID, cfg.decomposedFromRunID, cfg.parallelIsolate), logSink)
-		release, lockErr := acquireLineageLock(ctx, baseRepoDir, root, cfg.runID, logSink)
+		// Thread the backend read the lineage-lock holder rule needs (#2545).
+		// Deliberately a type assertion rather than a widened uploadClient
+		// interface: only the production *upload.Client implements RunState, and
+		// a nil/incapable client selects evictTerminalLockHolder's refuse branch,
+		// which is exactly today's fail-loud behavior.
+		var lockStateClient runStateClient
+		if rc, ok := client.(runStateClient); ok {
+			lockStateClient = rc
+		}
+		release, lockErr := acquireLineageLock(ctx, baseRepoDir, root, cfg.runID, lockStateClient, logSink)
 		if lockErr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"runner_failed","reason":"lineage_lock","detail":%q}`+"\n", lockErr.Error())

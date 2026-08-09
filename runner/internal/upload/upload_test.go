@@ -2393,3 +2393,63 @@ func TestShipPullRequest_ScopeParkGoldenBytes(t *testing.T) {
 		t.Errorf("an assertion-only park must omit missing_paths entirely: %s", assertionOnly)
 	}
 }
+
+// --- RunState (#2545) ---
+//
+// Mirrors the RunLineageComplete table above: every branch of the read the
+// runner's lineage-lock reclaim depends on, including the two shapes that must
+// degrade to "unknown → refuse" rather than to a wrong answer.
+
+func TestRunState_ReturnsState(t *testing.T) {
+	c := runLineageServer(t, http.StatusOK, `{"id":"r","state":"cancelled"}`)
+	state, err := c.RunState(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "cancelled" {
+		t.Errorf("state = %q, want cancelled", state)
+	}
+}
+
+// TestRunState_FieldAbsent asserts a response with no `state` returns the empty
+// string and NO error — the caller treats "" as UNKNOWN and refuses to evict,
+// which is the fail-closed posture. Returning an error here would be
+// indistinguishable from a transport failure and lose that distinction.
+func TestRunState_FieldAbsent(t *testing.T) {
+	c := runLineageServer(t, http.StatusOK, `{"id":"r","lineage_complete":false}`)
+	state, err := c.RunState(context.Background(), "run-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		t.Errorf("state = %q, want empty when the field is absent", state)
+	}
+}
+
+func TestRunState_UndecodableBody(t *testing.T) {
+	c := runLineageServer(t, http.StatusOK, `{not json`)
+	if _, err := c.RunState(context.Background(), "run-abc"); err == nil {
+		t.Error("want a decode error on an undecodable body")
+	}
+}
+
+func TestRunState_NotFound(t *testing.T) {
+	c := runLineageServer(t, http.StatusNotFound, `{"error":"run_not_found"}`)
+	if _, err := c.RunState(context.Background(), "run-abc"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestRunState_NonSuccessStatus(t *testing.T) {
+	c := runLineageServer(t, http.StatusInternalServerError, `{"error":"boom"}`)
+	if _, err := c.RunState(context.Background(), "run-abc"); err == nil {
+		t.Error("want an error on a 500")
+	}
+}
+
+func TestRunState_RejectsEmptyRunID(t *testing.T) {
+	c := New("http://unused")
+	if _, err := c.RunState(context.Background(), ""); err == nil {
+		t.Errorf("want error on empty run id")
+	}
+}

@@ -2950,3 +2950,66 @@ func TestGetRun_ConcernShortSummaryEndToEndMCP(t *testing.T) {
 		t.Errorf("short_summary = %q, want a trailing %q for the 400-byte note", ss, concernShortSummaryMarker)
 	}
 }
+
+// TestGetRun_CancelledState_WireLiteral pins the LITERAL vocabulary word a
+// cancelled run serialises as, not merely the presence of the `state` key
+// (#2545).
+//
+// The runner's lineage-lock reclaim evicts an orphaned lock holder ONLY when
+// this endpoint reports its run in exactly this state, and the two live in
+// separate Go modules with no dependency edge — the runner cannot import this
+// vocabulary, it matches on its own single definition of the same literal
+// (runner/cmd/fishhawk-runner/lockholder.go's runStateCancelled). So a
+// key-presence-only pin would leave vocabulary drift — a case change, a
+// spelling change, an enum rename that preserves the field name — silently
+// disarming the reclaim while every test on both sides stayed green.
+//
+// The want value below is therefore a HARD-CODED literal on purpose: writing
+// it as string(run.StateCancelled) would rename itself along with the constant
+// and assert nothing.
+func TestGetRun_CancelledState_WireLiteral(t *testing.T) {
+	// The exact byte string runner/cmd/fishhawk-runner/lockholder.go matches on.
+	const runnerExpectsState = "cancelled"
+
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	got, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	got.State = run.StateCancelled
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// Decode into a bare map so the assertion is about the WIRE, not about the
+	// typed mirror (which would rename in lockstep with the field).
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode run response: %v", err)
+	}
+	raw, ok := body["state"]
+	if !ok {
+		t.Fatalf("response carries no `state` key; the runner's lineage-lock reclaim reads it:\n%s", w.Body.String())
+	}
+	state, ok := raw.(string)
+	if !ok {
+		t.Fatalf("`state` = %T (%v), want a JSON string", raw, raw)
+	}
+	if state != runnerExpectsState {
+		t.Errorf("cancelled run serialises `state` as %q, but the runner's lineage-lock "+
+			"reclaim matches on the literal %q — the reclaim is now a permanent no-op",
+			state, runnerExpectsState)
+	}
+	// And the domain constant itself has not drifted from the wire word.
+	if string(run.StateCancelled) != runnerExpectsState {
+		t.Errorf("run.StateCancelled = %q, want the literal %q the runner matches on",
+			run.StateCancelled, runnerExpectsState)
+	}
+}
