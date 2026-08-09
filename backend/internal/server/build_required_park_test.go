@@ -275,6 +275,39 @@ func assertParentAwaitingPayload(t *testing.T, raw []byte, childRunID, childStag
 	}
 }
 
+// assertBuildRequiredAuditAttribution pins the VALUES of the build-required
+// attribution on a scope_completeness_* audit payload — the paths that broke the
+// boundary and the sibling slice that owns each. A presence-only check
+// ("build_required_paths != nil") stays green when the emitter substitutes a
+// wrong non-empty array, and the audit trail is the operator's only record of
+// WHICH boundary was cut, so the derived audit copies get the same value-level
+// pin the park row and the parent signal already carry.
+func assertBuildRequiredAuditAttribution(t *testing.T, raw []byte, wantPath string, wantSliceIdx int, wantTitle string) {
+	t.Helper()
+	var p struct {
+		BuildRequiredPaths []string `json:"build_required_paths"`
+		OwningSlices       []struct {
+			Path       string `json:"path"`
+			SliceIndex *int   `json:"slice_index"`
+			SliceTitle string `json:"slice_title"`
+		} `json:"owning_slices"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("decode audit payload: %v (%s)", err, raw)
+	}
+	if len(p.BuildRequiredPaths) != 1 || p.BuildRequiredPaths[0] != wantPath {
+		t.Errorf("build_required_paths = %v, want [%s]", p.BuildRequiredPaths, wantPath)
+	}
+	if len(p.OwningSlices) != 1 {
+		t.Fatalf("owning_slices = %+v, want one attributed entry", p.OwningSlices)
+	}
+	got := p.OwningSlices[0]
+	if got.Path != wantPath || got.SliceIndex == nil || *got.SliceIndex != wantSliceIdx || got.SliceTitle != wantTitle {
+		t.Errorf("owning_slices[0] = %+v, want path %q / slice_index %d / title %q",
+			got, wantPath, wantSliceIdx, wantTitle)
+	}
+}
+
 // parkStageListErrRepo makes ListStagesForRun fail so the parent-stage resolution
 // degrade branch of emitParentAwaitingChildScopeDecision is reachable.
 type parkStageListErrRepo struct {

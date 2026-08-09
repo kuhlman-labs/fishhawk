@@ -1234,7 +1234,7 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		park.OwningSlices = s.attributeBuildRequiredPaths(r.Context(), childRun, pr.BuildRequiredPaths)
 	}
 
-	auditPayload, _ := json.Marshal(map[string]any{
+	payloadMap := map[string]any{
 		"run_id":                 runID.String(),
 		"stage_id":               stageID.String(),
 		"branch":                 pr.Branch,
@@ -1243,10 +1243,19 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		"verified_tree_sha":      pr.VerifiedTreeSHA,
 		"missing_paths":          pr.MissingPaths,
 		"unsatisfied_assertions": pr.UnsatisfiedAssertions,
-		"build_required_paths":   pr.BuildRequiredPaths,
-		"owning_slices":          park.OwningSlices,
 		"auth_method":            authMethod,
-	})
+	}
+	// #2548: GATED on a non-empty class, mirroring
+	// writeScopeCompletenessDecisionAudit, so the two OLDER park classes' PARKED
+	// entries stay BYTE-IDENTICAL. This payload is a raw map, not the omitempty
+	// park struct, so writing the two keys unconditionally emitted two JSON nulls
+	// onto every missing-paths / binding-assertion parked entry — a wire-visible
+	// change on paths #2548 promised not to touch.
+	if len(pr.BuildRequiredPaths) > 0 {
+		payloadMap["build_required_paths"] = pr.BuildRequiredPaths
+		payloadMap["owning_slices"] = park.OwningSlices
+	}
+	auditPayload, _ := json.Marshal(payloadMap)
 	appendParams := audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,

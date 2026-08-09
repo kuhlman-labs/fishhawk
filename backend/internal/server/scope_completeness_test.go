@@ -653,11 +653,11 @@ func TestDecideScopeCompleteness_FailBuildRequiredParkEchoesAttribution(t *testi
 			continue
 		}
 		found = true
-		var payload map[string]any
-		_ = json.Unmarshal(e.Payload, &payload)
-		if payload["build_required_paths"] == nil || payload["owning_slices"] == nil {
-			t.Errorf("failed payload must carry build_required_paths + owning_slices, got %v", payload)
-		}
+		// The VALUES, not merely the keys — the failed entry is the operator's
+		// permanent record of which boundary was cut, and a presence-only check
+		// would stay green on a wrong non-empty path or a dropped slice identity.
+		assertBuildRequiredAuditAttribution(t, e.Payload,
+			"backend/internal/server/prompt.go", 1, "prompt plumbing")
 	}
 	if !found {
 		t.Fatalf("want a scope_completeness_failed entry, got %+v", au.appended)

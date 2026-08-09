@@ -2563,11 +2563,12 @@ func TestPullRequest_BuildRequiredScopeParkEndToEnd(t *testing.T) {
 		t.Errorf("the other two shortfall classes must stay empty: %+v", pk)
 	}
 
-	// LAYER 3 — the scope_completeness_parked payload carries both fields.
-	parkedPayload := string(rr.parkCalls[0].append.Payload)
-	if !strings.Contains(parkedPayload, `"build_required_paths"`) || !strings.Contains(parkedPayload, `"owning_slices"`) {
-		t.Errorf("scope_completeness_parked payload must carry build_required_paths + owning_slices: %s", parkedPayload)
-	}
+	// LAYER 3 — the scope_completeness_parked payload carries the attribution
+	// VALUES, not merely the keys: this is the derived copy an operator reads,
+	// and a presence-only check would stay green if the emitter wrote a wrong
+	// non-empty path or dropped the owning slice's identity.
+	assertBuildRequiredAuditAttribution(t, rr.parkCalls[0].append.Payload,
+		"backend/internal/server/prompt.go", 1, "slice 1")
 
 	// LAYER 4 — the PARENT run carries the parent_awaiting_child_scope_decision
 	// signal, emitted at PARK TIME with no sibling transition.
@@ -2586,6 +2587,72 @@ func TestPullRequest_BuildRequiredScopeParkEndToEnd(t *testing.T) {
 		t.Errorf("signal written on run %s, want the PARENT %s", signal.RunID, parent.ID)
 	}
 	assertParentAwaitingPayload(t, signal.Payload, child.ID, implStage.ID, 0, parentStage.ID)
+}
+
+// TestScopeCompletenessParkedAudit_OlderClassesPayloadUnchanged extends the
+// byte-identity pin (TestScopeCompletenessDecisionAudit_OlderClassesPayloadUnchanged,
+// which covers the exempted + failed DECISION entries) to the PARKED entry, the
+// third and last emitter of these keys. parkScopeCompletenessStage builds its
+// payload from a raw map rather than the omitempty park struct, so an
+// unconditional write emitted two JSON nulls onto every missing-paths /
+// binding-assertion parked entry — the exact wire-visible change on paths #2548
+// promised not to touch.
+func TestScopeCompletenessParkedAudit_OlderClassesPayloadUnchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		shortfall map[string]any
+	}{
+		{"missing_paths", map[string]any{"missing_paths": []string{"backend/internal/foo/foo_test.go"}}},
+		{"unsatisfied_assertions", map[string]any{"unsatisfied_assertions": []map[string]string{
+			{"type": "file_contains", "path": "backend/internal/foo/foo.go", "literal": "MaxRetries"},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sf := newSigningFake()
+			rr := &parkRecordingRepo{orchestratorRepo: newOrchestratorRepo()}
+			s := New(Config{
+				Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+				AuditRepo: newAuditFake(), RunRepo: rr,
+				Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+			})
+			runRow := rr.seedRun()
+			implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+			implStage.Type = run.StageTypeImplement
+
+			priv, _ := sf.issue(t, runRow.ID)
+			payload := map[string]any{
+				"outcome":           "scope_park",
+				"branch":            "fishhawk/run-aaaaaaaa/slice-0",
+				"head_sha":          "1111111111111111111111111111111111111111",
+				"base_sha":          "2222222222222222222222222222222222222222",
+				"verified_tree_sha": "3333333333333333333333333333333333333333",
+			}
+			for k, v := range tc.shortfall {
+				payload[k] = v
+			}
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if len(rr.parkCalls) != 1 {
+				t.Fatalf("park calls = %d, want 1", len(rr.parkCalls))
+			}
+			var got map[string]any
+			if err := json.Unmarshal(rr.parkCalls[0].append.Payload, &got); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := got["build_required_paths"]; ok {
+				t.Errorf("parked payload must not carry build_required_paths for a %s park; got %v", tc.name, got)
+			}
+			if _, ok := got["owning_slices"]; ok {
+				t.Errorf("parked payload must not carry owning_slices for a %s park; got %v", tc.name, got)
+			}
+		})
+	}
 }
 
 // TestPullRequestBody_ScopeParkAcceptsBuildRequiredShortfall is c6, the #2548
