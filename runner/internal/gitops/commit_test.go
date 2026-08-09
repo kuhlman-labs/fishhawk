@@ -4925,3 +4925,149 @@ func TestRemoteBranchTip_EmptyBranchRejected(t *testing.T) {
 		t.Fatal("an empty branch must be rejected")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// #2548 — build-required scope drift, the THIRD scope-completeness park class
+// (decomposed children only).
+// ---------------------------------------------------------------------------
+
+// TestBuildRequiredDriftError_UnwrapsToCommittedTestsFailed pins the load-bearing
+// property of the typed carrier: it unwraps to the ErrCommittedTestsFailed
+// sentinel, so EVERY existing errors.Is(err, ErrCommittedTestsFailed)
+// classification site — the runner's category-B mapping and its test_gate_failed
+// event selection — keeps its current verdict with no edit. It also pins
+// Error()'s one rule (Message verbatim, sentinel text when empty) and that
+// errors.As extracts through the pointer receiver.
+func TestBuildRequiredDriftError_UnwrapsToCommittedTestsFailed(t *testing.T) {
+	paths := []string{"backend/internal/server/prompt.go"}
+	withMsg := &BuildRequiredDriftError{Paths: paths, Message: "full narrative"}
+	if !errors.Is(withMsg, ErrCommittedTestsFailed) {
+		t.Fatal("BuildRequiredDriftError must unwrap to ErrCommittedTestsFailed; every existing classification site depends on it")
+	}
+	if withMsg.Error() != "full narrative" {
+		t.Errorf("Error() = %q, want the Message verbatim", withMsg.Error())
+	}
+	empty := &BuildRequiredDriftError{Paths: paths}
+	if empty.Error() != ErrCommittedTestsFailed.Error() {
+		t.Errorf("Error() with empty Message = %q, want the sentinel text %q", empty.Error(), ErrCommittedTestsFailed.Error())
+	}
+	// Wrapped one level deep, errors.As still extracts it (the CommitAndPush arm).
+	var extracted *BuildRequiredDriftError
+	if !errors.As(fmt.Errorf("wrapped: %w", withMsg), &extracted) {
+		t.Fatal("errors.As must extract *BuildRequiredDriftError through a wrap")
+	}
+	if len(extracted.Paths) != 1 || extracted.Paths[0] != paths[0] {
+		t.Errorf("extracted Paths = %v, want %v", extracted.Paths, paths)
+	}
+}
+
+// TestCommitAndPush_ParksOnBuildRequiredDrift is the #2548 park mechanism: with
+// ParkOnBuildRequiredDrift set, a *BuildRequiredDriftError PUSHES the verified
+// commit to the child's slice branch (so the slice's work survives the runner
+// exit instead of being discarded) and surfaces BuildRequiredShortfall instead
+// of aborting. Asserts COMMITTED STATE — the remote ref actually moved.
+func TestCommitAndPush_ParksOnBuildRequiredDrift(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:                  repo,
+		Branch:                   "fishhawk/run-parent/slice-0",
+		CommitMessage:            "Scoped commit",
+		RemoteURL:                bare,
+		ScopeFiles:               []string{"README.md"},
+		ParkOnBuildRequiredDrift: true,
+		VerifyCommit: func(_ context.Context, headSHA string, _ []string) error {
+			if headSHA == "" {
+				t.Error("VerifyCommit got empty headSHA")
+			}
+			return &BuildRequiredDriftError{
+				Paths:   []string{"backend/internal/server/prompt.go", "backend/internal/server/reads.go"},
+				Message: "gitops: committed tree tests failed: detail",
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("park must NOT return an error (it pushes + reports the shortfall), got: %v", err)
+	}
+	want := []string{"backend/internal/server/prompt.go", "backend/internal/server/reads.go"}
+	if len(res.BuildRequiredShortfall) != len(want) {
+		t.Fatalf("BuildRequiredShortfall = %v, want %v", res.BuildRequiredShortfall, want)
+	}
+	for i := range want {
+		if res.BuildRequiredShortfall[i] != want[i] {
+			t.Errorf("BuildRequiredShortfall[%d] = %q, want %q", i, res.BuildRequiredShortfall[i], want[i])
+		}
+	}
+	if len(res.ScopeShortfall) != 0 || len(res.AssertionShortfall) != 0 {
+		t.Errorf("the other two shortfall classes must stay empty, got scope=%v assertions=%v", res.ScopeShortfall, res.AssertionShortfall)
+	}
+	if res.HeadSHA == "" || res.TreeSHA == "" {
+		t.Errorf("park must populate HeadSHA/TreeSHA for the held commit, got %+v", res)
+	}
+	out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/run-parent/slice-0").Output()
+	if gerr != nil {
+		t.Fatalf("park must push the held commit to the slice branch: %v", gerr)
+	}
+	if strings.TrimSpace(string(out)) != res.HeadSHA {
+		t.Errorf("pushed branch sha = %q, want held HeadSHA %q", strings.TrimSpace(string(out)), res.HeadSHA)
+	}
+}
+
+// TestCommitAndPush_BuildRequiredDriftFlagOffAborts pins the flag guard: the
+// SAME typed error with ParkOnBuildRequiredDrift NOT set aborts the push
+// category-B with origin untouched — the byte-identical pre-#2548 behavior for
+// standalone runs and fix-up passes.
+func TestCommitAndPush_BuildRequiredDriftFlagOffAborts(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/park/br-noflag",
+		CommitMessage: "Scoped commit",
+		RemoteURL:     bare,
+		ScopeFiles:    []string{"README.md"},
+		// ParkOnBuildRequiredDrift deliberately false.
+		VerifyCommit: func(_ context.Context, _ string, _ []string) error {
+			return &BuildRequiredDriftError{Paths: []string{"a.go"}, Message: "shortfall"}
+		},
+	})
+	if !errors.Is(err, ErrCommittedTestsFailed) {
+		t.Fatalf("without ParkOnBuildRequiredDrift the typed error must abort category-B, got: %v", err)
+	}
+	if res != nil {
+		t.Errorf("aborted push must return a nil result, got %+v", res)
+	}
+	if out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/br-noflag").CombinedOutput(); gerr == nil {
+		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
+	}
+}
+
+// TestCommitAndPush_UntypedCommittedTestsWrapAborts is the DEFAULT-ARM-STAYS-LAST
+// pin: a plain fmt.Errorf("%w: ...", ErrCommittedTestsFailed) wrap — which is
+// what the runner's terminal resolver returns for a COMPOUND failure — is NOT
+// the typed carrier, so even with ParkOnBuildRequiredDrift set it falls through
+// to `default: return nil, err` and aborts before origin is touched.
+func TestCommitAndPush_UntypedCommittedTestsWrapAborts(t *testing.T) {
+	repo, bare := scopeParkRepo(t)
+	p := &Pusher{}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:                  repo,
+		Branch:                   "fishhawk/park/br-untyped",
+		CommitMessage:            "Scoped commit",
+		RemoteURL:                bare,
+		ScopeFiles:               []string{"README.md"},
+		ParkOnBuildRequiredDrift: true,
+		VerifyCommit: func(_ context.Context, _ string, _ []string) error {
+			return fmt.Errorf("%w: compound committed-tree gate failure", ErrCommittedTestsFailed)
+		},
+	})
+	if !errors.Is(err, ErrCommittedTestsFailed) {
+		t.Fatalf("an untyped sentinel wrap must abort even with the park flag on, got: %v", err)
+	}
+	if res != nil {
+		t.Errorf("aborted push must return a nil result, got %+v", res)
+	}
+	if out, gerr := exec.Command("git", "--git-dir="+bare, "rev-parse", "fishhawk/park/br-untyped").CombinedOutput(); gerr == nil {
+		t.Errorf("origin must be untouched on the aborted push, but the branch exists: %s", out)
+	}
+}

@@ -20,10 +20,12 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -2465,5 +2467,158 @@ func TestPullRequestFailed_PartialCheckpointNotRecorded(t *testing.T) {
 				t.Errorf("stage.State = %q, want failed (a partial checkpoint must never strand the stage in running)", state)
 			}
 		})
+	}
+}
+
+// TestPullRequest_BuildRequiredScopeParkEndToEnd is the #2548 CROSS-BOUNDARY
+// integration test (the cross-boundary rule): scope spans runner wire → HTTP
+// body → domain type → JSONB park → audit → the parent-side signal. It POSTs the
+// EXACT body shape upload.pullRequestScopeParkBody produces for a decomposed
+// child and asserts across ALL those layers in ONE test, so a field threaded
+// through but dropped at any boundary fails here rather than in production.
+//
+// Together with the runner's r1 this is the DONE-MEANS assertion: a decomposed
+// child that would fail category-B today instead preserves its commit and parks
+// WITH slice attribution.
+func TestPullRequest_BuildRequiredScopeParkEndToEnd(t *testing.T) {
+	sf := newSigningFake()
+	ar := newFakeArtifactRepo()
+	au := newAuditFake()
+	rr := &parkRecordingRepo{orchestratorRepo: newOrchestratorRepo()}
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: ar, AuditRepo: au, RunRepo: rr,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+
+	// A real fan-out: parent with an approved decomposition whose slice 1
+	// declares the build-required file, parked in awaiting_children; child at
+	// slice 0 running its implement stage.
+	parent := rr.seedRun()
+	planStage := rr.seedStage(parent.ID, 0, run.StageStateSucceeded) // Type=plan
+	sv := "standard_v1"
+	planJSON, err := json.Marshal(&plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "s",
+		Verification: plan.Verification{TestStrategy: "t", RollbackPlan: "r"},
+		Decomposition: &plan.Decomposition{Rationale: "split", SubPlans: []plan.SubPlanSummary{
+			{Title: "slice 0", ScopeHint: "x", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/server/scope_completeness.go", Operation: "modify"}}}},
+			{Title: "slice 1", ScopeHint: "x", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "backend/internal/server/prompt.go", Operation: "modify"}}}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ar.Create(t.Context(), artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planJSON,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	parentStage := rr.seedStage(parent.ID, 1, run.StageStateAwaitingChildren)
+
+	child := rr.seedRun()
+	pid := parent.ID
+	idx := 0
+	child.DecomposedFrom = &pid
+	child.SliceIndex = &idx
+	implStage := rr.seedStage(child.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+
+	priv, _ := sf.issue(t, child.ID)
+	// The EXACT wire shape the runner ships (upload.pullRequestScopeParkBody).
+	body := []byte(`{"outcome":"scope_park","branch":"fishhawk/run-parent/slice-0",` +
+		`"head_sha":"1111111111111111111111111111111111111111",` +
+		`"base_sha":"2222222222222222222222222222222222222222",` +
+		`"verified_tree_sha":"3333333333333333333333333333333333333333",` +
+		`"build_required_paths":["backend/internal/server/prompt.go"]}`)
+
+	w := shipPRRequest(t, s, child.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// LAYER 1 — the child's implement stage is PARKED, not failed, not succeeded.
+	got, err := rr.GetStage(t.Context(), implStage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("child implement stage = %q, want awaiting_scope_decision", got.State)
+	}
+	if len(ar.all) != 1 { // only the seeded plan artifact; NO PR artifact
+		t.Errorf("artifacts = %d, want only the seeded plan (no PR artifact for a park)", len(ar.all))
+	}
+
+	// LAYER 2 — the persisted ScopeCompletenessPark carries the class + attribution.
+	if len(rr.parkCalls) != 1 {
+		t.Fatalf("park calls = %d, want 1", len(rr.parkCalls))
+	}
+	pk := rr.parkCalls[0].park
+	if len(pk.BuildRequiredPaths) != 1 || pk.BuildRequiredPaths[0] != "backend/internal/server/prompt.go" {
+		t.Errorf("persisted build_required_paths = %v", pk.BuildRequiredPaths)
+	}
+	if len(pk.OwningSlices) != 1 || pk.OwningSlices[0].SliceIndex == nil || *pk.OwningSlices[0].SliceIndex != 1 {
+		t.Fatalf("persisted owning_slices must name slice 1, got %+v", pk.OwningSlices)
+	}
+	if len(pk.MissingPaths) != 0 || len(pk.UnsatisfiedAssertions) != 0 {
+		t.Errorf("the other two shortfall classes must stay empty: %+v", pk)
+	}
+
+	// LAYER 3 — the scope_completeness_parked payload carries both fields.
+	parkedPayload := string(rr.parkCalls[0].append.Payload)
+	if !strings.Contains(parkedPayload, `"build_required_paths"`) || !strings.Contains(parkedPayload, `"owning_slices"`) {
+		t.Errorf("scope_completeness_parked payload must carry build_required_paths + owning_slices: %s", parkedPayload)
+	}
+
+	// LAYER 4 — the PARENT run carries the parent_awaiting_child_scope_decision
+	// signal, emitted at PARK TIME with no sibling transition.
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var signal *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryParentAwaitingChildScopeDecision {
+			signal = &au.appended[i]
+		}
+	}
+	if signal == nil {
+		t.Fatalf("the PARENT must carry a %s entry; got %+v", CategoryParentAwaitingChildScopeDecision, au.appended)
+	}
+	if signal.RunID != parent.ID {
+		t.Errorf("signal written on run %s, want the PARENT %s", signal.RunID, parent.ID)
+	}
+	assertParentAwaitingPayload(t, signal.Payload, child.ID, implStage.ID, 0, parentStage.ID)
+}
+
+// TestPullRequestBody_ScopeParkAcceptsBuildRequiredShortfall is c6, the #2548
+// widening of the validate() shortfall control from "at least one of the two" to
+// "at least one of the THREE". A build-required-ONLY park must decode (the
+// DisallowUnknownFields decoder would otherwise reject the body outright) and
+// validate; a park carrying NONE of the three is still rejected — the control is
+// relaxed, not removed.
+func TestPullRequestBody_ScopeParkAcceptsBuildRequiredShortfall(t *testing.T) {
+	decode := func(body string) error {
+		var pr pullRequestBody
+		dec := json.NewDecoder(strings.NewReader(body))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&pr); err != nil {
+			return err
+		}
+		return pr.validate()
+	}
+	buildRequiredOnly := `{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t","build_required_paths":["backend/internal/server/prompt.go"]}`
+	if err := decode(buildRequiredOnly); err != nil {
+		t.Errorf("a build-required-only scope_park must decode AND validate, got: %v", err)
+	}
+	empty := `{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t","build_required_paths":[]}`
+	if err := decode(empty); err == nil {
+		t.Error("a scope_park with an EMPTY build_required_paths and no other shortfall must be rejected")
+	}
+	none := `{"outcome":"scope_park","branch":"br","head_sha":"h","base_sha":"b","verified_tree_sha":"t"}`
+	if err := decode(none); err == nil {
+		t.Error("a scope_park carrying NONE of the three shortfalls must still be rejected")
+	}
+	// The other required coordinates are unchanged by the widening.
+	noHead := `{"outcome":"scope_park","branch":"br","base_sha":"b","verified_tree_sha":"t","build_required_paths":["x.go"]}`
+	if err := decode(noHead); err == nil {
+		t.Error("head_sha is still required for a scope_park outcome")
 	}
 }

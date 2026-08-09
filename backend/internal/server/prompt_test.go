@@ -9471,3 +9471,55 @@ func TestPromptHeldCommit_ExemptWinsOverPushCheckpoint(t *testing.T) {
 	assertGoldenExemptProjection(t, keys, "/prompt")
 	assertNoResumeKey(t, keys, "an exempt resolution must carry no resume kind")
 }
+
+// TestResolveHeldCommitExemption_WithholdsForBuildRequiredPark is the #2548
+// prompt-gate counterfactual (c2): DEFENCE IN DEPTH behind the endpoint's
+// exempt refusal. A build-required park's held commit has a RED committed tree
+// by construction, so even when an `exempted` entry is somehow the NEWEST for
+// the stage — a hand-written, legacy, or otherwise anomalous entry the endpoint
+// refusal would never have produced — the gate must emit NOTHING.
+//
+// The exempted entry is seeded BY CONSTRUCTION (an audit fixture), never by
+// calling the decision endpoint, so the RED lands on the emission assertion
+// rather than on a fixture-setup failure. Deleting the withholding branch emits
+// all four held-commit fields and turns this red.
+func TestResolveHeldCommitExemption_WithholdsForBuildRequiredPark(t *testing.T) {
+	stageID := uuid.New() // placeholder; exemptPromptKeys rewrites StageID
+
+	sliceOne := 1
+	buildRequiredPark := func() *run.ScopeCompletenessPark {
+		return &run.ScopeCompletenessPark{
+			HeldCommitSHA:      "1111111111111111111111111111111111111111",
+			RunBranch:          "fishhawk/run-parent/slice-0",
+			VerifiedTreeSHA:    "2222222222222222222222222222222222222222",
+			BaseSHA:            "3333333333333333333333333333333333333333",
+			BuildRequiredPaths: []string{"backend/internal/server/prompt.go"},
+			OwningSlices: []run.BuildRequiredOwner{
+				{Path: "backend/internal/server/prompt.go", SliceIndex: &sliceOne, SliceTitle: "prompt plumbing"},
+			},
+		}
+	}
+
+	// Every other precondition of the gate is SATISFIED — held commit, branch,
+	// base SHA, and an `exempted` entry newest for the stage — so the ONLY thing
+	// withholding emission is the build-required branch under test.
+	keys := exemptPromptKeys(t, buildRequiredPark(), []*audit.Entry{
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+	}, nil)
+	assertNoExemptKeys(t, keys, "an exempted entry on a build-required (exempt-INELIGIBLE, red-tree) park")
+
+	// CONTROL: the identical fixture WITHOUT build-required paths DOES emit, so
+	// the assertion above is discriminating the new branch rather than some
+	// unrelated precondition failure.
+	control := buildRequiredPark()
+	control.BuildRequiredPaths = nil
+	control.OwningSlices = nil
+	controlKeys := exemptPromptKeys(t, control, []*audit.Entry{
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessParked, 1),
+		scopeDecisionEntry(stageID, CategoryScopeCompletenessExempted, 2),
+	}, nil)
+	if _, ok := controlKeys["held_commit_sha"]; !ok {
+		t.Fatalf("control: the SAME park without build-required paths must still emit the held-commit fields; got keys %v", controlKeys)
+	}
+}

@@ -703,6 +703,26 @@ Notes:
   parked parent does not spam the chain — discoverability rests on this single
   orchestrator-path entry. Listed here only so a future reader grepping the
   audit categories doesn't mistake it for a comment surface.
+- The fan-out parked-child signal — `parent_awaiting_child_scope_decision`
+  (#2548) — is an **internal, system-actor audit kind, not an issue-comment
+  surface**. Nothing in `issuecomment` posts it; it has no Notifier method. It is
+  the sibling of `parent_awaiting_redrive` above for a DIFFERENT parked-parent
+  cause: a decomposition child parked in `awaiting_scope_decision` on a
+  build-required scope-drift shortfall is SETTLED but NOT terminal, so the parent
+  stays in `awaiting_children` — correctly (resolving it while a live child holds
+  an undecided park would terminate the run out from under the decision the park
+  exists to offer) but, before #2548, silently. Payload
+  `{parent_stage_id, child_run_id, child_stage_id, child_slice_index,
+  shortfall_class, build_required_paths, owning_slices}` — the attribution is the
+  point: it names the sibling slice that owns each coupled file, so the operator
+  is not sent back to reading plans by hand. It is emitted from BOTH triggers:
+  at PARK time (`server/pullrequest.go::parkScopeCompletenessStage`), which is the
+  only cover for the case where the parked child is the LAST non-terminal sibling
+  and no further terminal transition ever fires
+  `maybeAdvanceDecomposedParent` again; and, de-duplicated per child stage, from
+  `orchestrator.go::maybeAdvanceDecomposedParent` when a sibling settles. Listed
+  here only so a future reader grepping the audit categories doesn't mistake it
+  for a comment surface.
 - The consolidated-PR audit kind — `consolidated_pr_opened` (#714 / ADR-032) —
   is an **internal, system-actor audit kind, not an issue-comment surface**.
   Nothing in `issuecomment` posts it to the issue thread; it has no Notifier
@@ -1105,26 +1125,35 @@ Notes:
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.
 - The scope-completeness park/decision audit kinds — `scope_completeness_parked`,
-  `scope_completeness_exempted`, and `scope_completeness_failed` (#1231/#2501) — are
+  `scope_completeness_exempted`, and `scope_completeness_failed` (#1231/#2501/#2548) — are
   **internal audit kinds, not issue-comment surfaces**. Nothing in `issuecomment`
   posts them; they have no Notifier methods.
   `server/pullrequest.go::parkScopeCompletenessStage` writes the parked entry
   (system actor, or operator on the bearer path; payload `{run_id, stage_id,
   branch, head_sha, base_sha, verified_tree_sha, missing_paths,
-  unsatisfied_assertions, auth_method}`)
+  unsatisfied_assertions, build_required_paths, owning_slices, auth_method}`)
   when the runner reports `{outcome:"scope_park"}` — the implement stage's ONLY
-  committed-tree gate shortfall was the missing-declared-scope-file check (#1151)
-  or an unsatisfied binding assertion (#1171/#2501; exactly one of
-  `missing_paths` / `unsatisfied_assertions` is populated) and it
-  pushed the verified commit to the run branch (no PR), parking in
-  `awaiting_scope_decision`. `server/scope_completeness.go::handleDecideScopeCompleteness`
+  committed-tree gate shortfall was the missing-declared-scope-file check (#1151),
+  an unsatisfied binding assertion (#1171/#2501), or — on a DECOMPOSED CHILD only —
+  build-required scope drift (#2548); exactly one of `missing_paths` /
+  `unsatisfied_assertions` / `build_required_paths` is populated — and it
+  pushed the verified commit to the run branch (for a child: its own sole-writer
+  slice branch), parking in
+  `awaiting_scope_decision`. On the build-required class `owning_slices` attributes
+  each path to the sibling sub-plan that declares it in the parent's approved
+  decomposition, so the operator is told WHICH slice boundary was cut; that class is
+  exempt-INELIGIBLE (its committed tree is red by construction) and its only
+  admissible decision is `fail`.
+  `server/scope_completeness.go::handleDecideScopeCompleteness`
   writes the exempted entry (user actor; payload `{run_id, stage_id, decision,
   reason, decided_by, held_commit_sha, run_branch, verified_tree_sha,
-  missing_paths, unsatisfied_assertions, gate_evidence}`) when an operator accepts
+  missing_paths, unsatisfied_assertions, build_required_paths, owning_slices,
+  gate_evidence}`) when an operator accepts
   the already-committed tree — the stage returns to dispatch and the held commit's
   PR is then opened with no agent re-run — and the failed
   entry (user actor; payload `{run_id, stage_id, decision, reason, decided_by,
-  missing_paths, unsatisfied_assertions}`) when an operator rejects the exemption and the stage drops to
+  missing_paths, unsatisfied_assertions, build_required_paths, owning_slices}`)
+  when an operator rejects the exemption and the stage drops to
   category-B. The `gate_evidence` field on the exempted entry reuses the #1153
   channel so a downstream implement-review gate reads the shortfall as
   operator-exempted rather than re-failing on it. Delivery to the operator is

@@ -679,16 +679,36 @@ type Stage struct {
 }
 
 // ScopeCompletenessPark is the durable payload an implement stage carries
-// while parked in awaiting_scope_decision (#1231, generalized by #2501). It
-// pins exactly what the runner held when the SOLE committed-tree gate
-// shortfall — of EITHER class: the "missing declared scope file(s)" check
-// (#1151) or the unsatisfied-binding-assertion check (#1171) — held up an
-// otherwise-green implement pass: the verified commit already pushed to the run
-// branch, the tree it verified, and the shortfall itself. Exactly one of
-// MissingPaths / UnsatisfiedAssertions is populated; a compound failure never
-// parks (it keeps today's category-B abort). The operator's exempt decision
-// opens the PR from HeldCommitSHA with no agent re-run; the fail decision drops
-// to today's category-B.
+// while parked in awaiting_scope_decision (#1231, generalized by #2501 and
+// #2548). It pins exactly what the runner held when the SOLE committed-tree
+// gate shortfall — of ONE of THREE classes — held up an otherwise-green
+// implement pass: the verified commit already pushed to the run branch, the
+// tree it verified, and the shortfall itself. Exactly one of MissingPaths /
+// UnsatisfiedAssertions / BuildRequiredPaths is populated; a compound failure
+// never parks (it keeps today's category-B abort). The three classes are:
+//
+//   - MissingPaths — the "missing declared scope file(s)" check (#1151).
+//     Standalone open-PR pushes only. Exempt-eligible.
+//   - UnsatisfiedAssertions — the unsatisfied-binding-assertion check (#1171,
+//     #2501). Standalone open-PR pushes only. Exempt-eligible.
+//   - BuildRequiredPaths — build-required scope drift (#2548), DECOMPOSED
+//     CHILDREN ONLY. Exempt-INELIGIBLE: the held commit's committed tree is RED
+//     by construction (that is what the park records), so resuming it would
+//     open a PR from a red tree. The server refuses `exempt` for this class
+//     (server/scope_completeness.go) and the prompt emission gate withholds the
+//     held-commit fields independently (server/prompt.go). The only admissible
+//     decision is `fail`; recovery is to correct the decomposition and re-run,
+//     with the slice's work preserved on its sole-writer slice branch.
+//
+// For the two exempt-eligible classes the operator's exempt decision opens the
+// PR from HeldCommitSHA with no agent re-run; the fail decision drops to
+// today's category-B.
+//
+// ROLLBACK PRECONDITION (#2548): reverting the change that introduced
+// BuildRequiredPaths drops the key on decode AND removes both safeguards, so an
+// already-parked build-required row would look like an ordinary park and become
+// EXEMPTIBLE. Resolve every outstanding build-required park with `fail` BEFORE
+// such a revert lands — see backend/internal/server/README.md.
 //
 // The JSON tags are the byte-identical cross-module wire contract with
 // the runner's park-report upload struct (runner/internal/upload —
@@ -723,6 +743,36 @@ type ScopeCompletenessPark struct {
 	// Empty on a missing-scope-class park, so a pre-#2501 park row round-trips
 	// through this struct unchanged (the column is JSONB — no migration).
 	UnsatisfiedAssertions []UnsatisfiedAssertion `json:"unsatisfied_assertions,omitempty"`
+	// BuildRequiredPaths are the scope-EXCLUDED paths a DECOMPOSED CHILD's
+	// committed tree needed to build — the #2548 shortfall class. Repo-relative.
+	// Empty on the two older classes, so a pre-#2548 park row round-trips
+	// through this struct unchanged (the column is JSONB — no migration).
+	// Non-empty makes the park exempt-INELIGIBLE (see the type doc).
+	BuildRequiredPaths []string `json:"build_required_paths,omitempty"`
+	// OwningSlices attributes each build-required path to the sibling sub-plan
+	// that DECLARES it in the parent's approved decomposition — the whole
+	// operator value of this class, since it names which slice boundary was cut
+	// rather than only that a file was out of scope. Resolved at park time from
+	// decomposition.sub_plans[i].scope.files. Persisted (rather than recomputed)
+	// so the orchestrator's parent-side signal carries byte-identical
+	// attribution without re-reading the parent plan. Empty when attribution
+	// degraded — attribution is diagnostic and must never cost the operator the
+	// preserved commit.
+	OwningSlices []BuildRequiredOwner `json:"owning_slices,omitempty"`
+}
+
+// BuildRequiredOwner attributes one build-required path to the decomposition
+// sub-plan that owns it (#2548). SliceIndex is nil and SliceTitle empty when no
+// sub-plan claims the path (or the parent plan/decomposition was unresolvable):
+// an unattributed entry is a legitimate degrade, not an error.
+type BuildRequiredOwner struct {
+	// Path is the repo-relative build-required path.
+	Path string `json:"path"`
+	// SliceIndex is the owning sub-plan's index in decomposition.sub_plans,
+	// nil when unattributed.
+	SliceIndex *int `json:"slice_index,omitempty"`
+	// SliceTitle is the owning sub-plan's title, empty when unattributed.
+	SliceTitle string `json:"slice_title,omitempty"`
 }
 
 // UnsatisfiedAssertion is one operator-declared binding assertion the held

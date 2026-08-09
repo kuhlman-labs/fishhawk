@@ -1292,6 +1292,14 @@ type ShipPullRequestArgs struct {
 	// bytes stay byte-identical to the pre-#2501 body.
 	UnsatisfiedAssertions []BindingAssertionReport
 
+	// BuildRequiredPaths carries the THIRD scope_park shortfall class (#2548):
+	// the scope-EXCLUDED paths a DECOMPOSED CHILD's committed tree needed to
+	// build, i.e. the files a sibling slice owns that the decomposition boundary
+	// cut away. Populated only on a decomposed child's build-required park;
+	// omitted (omitempty on the wire) everywhere else, so every existing SIGNED
+	// body stays byte-identical.
+	BuildRequiredPaths []string
+
 	// ApplyPath carries the near-deterministic fix-up apply provenance (#1165)
 	// for the Outcome=="fixup_pushed" report: "applied" (a clean git-apply of
 	// every routed concern's suggested_patch, no agent), "agent" (no apply-list
@@ -1375,6 +1383,10 @@ type pullRequestScopeParkBody struct {
 	// UnsatisfiedAssertions is the second shortfall class (#2501), appended LAST
 	// and omitempty so a pure missing-scope park's bytes are unchanged.
 	UnsatisfiedAssertions []BindingAssertionReport `json:"unsatisfied_assertions,omitempty"`
+	// BuildRequiredPaths is the third shortfall class (#2548), appended LAST and
+	// omitempty so every pre-#2548 park body — and therefore every signature and
+	// content hash computed over it — is BYTE-IDENTICAL.
+	BuildRequiredPaths []string `json:"build_required_paths,omitempty"`
 }
 
 // BindingAssertionReport is one unsatisfied operator-declared binding assertion
@@ -1475,6 +1487,7 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			TreeSHA:               args.TreeSHA,
 			MissingPaths:          args.MissingPaths,
 			UnsatisfiedAssertions: args.UnsatisfiedAssertions,
+			BuildRequiredPaths:    args.BuildRequiredPaths,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request scope-park body: %w", err)

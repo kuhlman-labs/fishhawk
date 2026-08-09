@@ -4356,3 +4356,308 @@ func TestBackends_ResolvesGitLabCIRun(t *testing.T) {
 func (*stubRuns) GetRunAccountID(_ context.Context, _ uuid.UUID) (string, error) {
 	return "", nil
 }
+
+// ---------------------------------------------------------------------------
+// #2548 — the PARENT-side rule for a child parked awaiting a scope decision.
+// ---------------------------------------------------------------------------
+
+// seedParkedBuildRequiredSlice seeds a NON-terminal decomposed child whose
+// implement stage is parked in awaiting_scope_decision carrying a
+// build-required ScopeCompletenessPark with sibling-slice attribution — the
+// state maybeAdvanceDecomposedParent must surface rather than wait on silently.
+func seedParkedBuildRequiredSlice(t *testing.T, rs *stubRuns, parentID uuid.UUID, installationID *int64, sliceIdx int) (*run.Run, *run.Stage) {
+	t.Helper()
+	child, stages := rs.seed(t, "kuhlman-labs/fishhawk", installationID, []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingScopeDecision},
+	})
+	child.DecomposedFrom = &parentID
+	child.State = run.StateRunning // settled stage, NON-terminal run
+	idx := sliceIdx
+	child.SliceIndex = &idx
+	owningSlice := 1
+	stages[0].ScopeCompletenessPark = &run.ScopeCompletenessPark{
+		HeldCommitSHA:      "1111111111111111111111111111111111111111",
+		RunBranch:          "fishhawk/run-parent/slice-0",
+		VerifiedTreeSHA:    "2222222222222222222222222222222222222222",
+		BaseSHA:            "3333333333333333333333333333333333333333",
+		BuildRequiredPaths: []string{"backend/internal/server/prompt.go"},
+		OwningSlices: []run.BuildRequiredOwner{
+			{Path: "backend/internal/server/prompt.go", SliceIndex: &owningSlice, SliceTitle: "prompt plumbing"},
+		},
+	}
+	return child, stages[0]
+}
+
+// TestMaybeAdvanceDecomposedParent_SurfacesParkedChild is p1. Three assertions,
+// all load-bearing:
+//
+//   - the parent gains a parent_awaiting_child_scope_decision entry whose FULL
+//     payload — child run/stage/slice AND shortfall_class, build_required_paths,
+//     owning_slices — names the boundary that was cut (binding condition 2: an
+//     emission that dropped the attribution would pass an existence-only
+//     assertion while sending the operator back to reading plans by hand);
+//   - the parent's awaiting_children stage is NOT resolved to succeeded/failed —
+//     resolving it while a live child holds an undecided park would terminate the
+//     run out from under the decision the park exists to offer; and
+//   - the dispatch top-up still runs (the #1143 event-driven refill is unchanged).
+func TestMaybeAdvanceDecomposedParent_SurfacesParkedChild(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, parentStages := seedFanInParent(t, rs, int64Ptr(55))
+	parkedChild, parkedStage := seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	// A SIBLING settles terminal — the only trigger that reaches this hook.
+	seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	payload := auditPayload(t, au, "parent_awaiting_child_scope_decision")
+	if payload["child_run_id"] != parkedChild.ID.String() {
+		t.Errorf("child_run_id = %v, want %s", payload["child_run_id"], parkedChild.ID)
+	}
+	if payload["child_stage_id"] != parkedStage.ID.String() {
+		t.Errorf("child_stage_id = %v, want %s", payload["child_stage_id"], parkedStage.ID)
+	}
+	if idx, ok := payload["child_slice_index"].(float64); !ok || int(idx) != 0 {
+		t.Errorf("child_slice_index = %v, want 0", payload["child_slice_index"])
+	}
+	if payload["parent_stage_id"] != parentStages[0].ID.String() {
+		t.Errorf("parent_stage_id = %v, want the awaiting_children stage %s", payload["parent_stage_id"], parentStages[0].ID)
+	}
+	// THE ATTRIBUTION (condition 2) — asserted on the SIBLING-SETTLE path, not
+	// only on the park-time one.
+	if payload["shortfall_class"] != "build_required" {
+		t.Errorf("shortfall_class = %v, want build_required", payload["shortfall_class"])
+	}
+	brp, _ := payload["build_required_paths"].([]any)
+	if len(brp) != 1 || brp[0] != "backend/internal/server/prompt.go" {
+		t.Errorf("build_required_paths = %v, want [backend/internal/server/prompt.go]", payload["build_required_paths"])
+	}
+	owners, _ := payload["owning_slices"].([]any)
+	if len(owners) != 1 {
+		t.Fatalf("owning_slices = %v, want one attributed entry", payload["owning_slices"])
+	}
+	owner, _ := owners[0].(map[string]any)
+	if idx, ok := owner["slice_index"].(float64); !ok || int(idx) != 1 {
+		t.Errorf("owning_slices[0].slice_index = %v, want 1", owner["slice_index"])
+	}
+	if owner["slice_title"] != "prompt plumbing" {
+		t.Errorf("owning_slices[0].slice_title = %v, want \"prompt plumbing\"", owner["slice_title"])
+	}
+
+	// The parent stays PARKED — not resolved out from under the decision.
+	if parentStages[0].State != run.StageStateAwaitingChildren {
+		t.Errorf("parent awaiting_children stage = %q, want it still parked", parentStages[0].State)
+	}
+	if auditHasCategory(au, "children_settled") {
+		t.Error("children_settled must NOT be emitted while a child holds an undecided park")
+	}
+}
+
+// TestMaybeAdvanceDecomposedParent_ParkedChildSignalDeduped is p2: a SECOND
+// sibling settle with the same child still parked appends NO second entry for
+// that child stage, so repeated settles never spam the parent's chain.
+func TestMaybeAdvanceDecomposedParent_ParkedChildSignalDeduped(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var count int
+	for _, e := range au.appended {
+		if e.Category == "parent_awaiting_child_scope_decision" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("parent_awaiting_child_scope_decision entries = %d, want exactly 1 (de-duplicated per child stage)", count)
+	}
+}
+
+// TestMaybeAdvanceDecomposedParent_NoSignalForUnparkedNonTerminalChild pins the
+// no-op guard: an ordinary in-flight child (running, no park) is NOT a parked
+// child, so no signal is emitted and the parent's silent-wait behaviour there is
+// byte-identical to today's. Without this, every ordinary fan-out would grow a
+// spurious "awaiting a scope decision" entry on each sibling settle.
+func TestMaybeAdvanceDecomposedParent_NoSignalForUnparkedNonTerminalChild(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	inFlight, _ := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateRunning},
+	})
+	pid := parent.ID
+	idx := 0
+	inFlight.DecomposedFrom = &pid
+	inFlight.SliceIndex = &idx
+	inFlight.State = run.StateRunning
+	seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	if auditHasCategory(au, "parent_awaiting_child_scope_decision") {
+		t.Errorf("an ordinary in-flight child must NOT emit the parked-child signal: %v", au.appended)
+	}
+}
+
+// TestMaybeAdvanceDecomposedParent_ResolvesAfterParkedChildFails is p4's
+// orchestrator half — THE NOT-INDEFINITE ASSERTION. Once the operator's `fail`
+// decision lands, the parked child's run goes terminal and the parent resolves
+// through the EXISTING unchanged path (failed-C, or the #1081 recoverable
+// re-drive park), i.e. the parent never sits in awaiting_children past the
+// decision. Here the failed child's implement stage carries no failure category,
+// so failedChildrenAllRecoverable is false and the parent resolves to failed-C.
+func TestMaybeAdvanceDecomposedParent_ResolvesAfterParkedChildFails(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	au := &recordingAudit{}
+	o.Audit = au
+
+	parent, parentStages := seedFanInParent(t, rs, int64Ptr(55))
+	parkedChild, parkedStage := seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	// Pre-decision: the parent waits, surfaced.
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+	if parentStages[0].State != run.StageStateAwaitingChildren {
+		t.Fatalf("pre-decision parent stage = %q, want awaiting_children", parentStages[0].State)
+	}
+	if !auditHasCategory(au, "parent_awaiting_child_scope_decision") {
+		t.Fatal("pre-decision: the parked child must be surfaced on the parent's chain")
+	}
+
+	// The operator decides `fail`: the child's stage fails and its run goes
+	// terminal — exactly what failScopeCompleteness + Advance produce.
+	parkedStage.State = run.StageStateFailed
+	parkedChild.State = run.StateFailed
+
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	if parentStages[0].State == run.StageStateAwaitingChildren {
+		t.Fatalf("the parent must NOT stay in awaiting_children past the operator's decision; state = %q", parentStages[0].State)
+	}
+	if parentStages[0].State != run.StageStateFailed {
+		t.Errorf("parent awaiting_children stage = %q, want failed (category-C)", parentStages[0].State)
+	}
+}
+
+// failingAppendAudit is a recordingAudit whose AppendChained always errors —
+// the best-effort degrade branch of surfaceParkedChildren.
+type failingAppendAudit struct {
+	*recordingAudit
+	listErr error
+}
+
+func (f *failingAppendAudit) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("append boom")
+}
+
+func (f *failingAppendAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	return f.recordingAudit.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestSurfaceParkedChildren_DegradeBranches covers EVERY defensive branch of
+// the parent-side signal. Each asserts the same contract: the degrade NEVER
+// unwinds the parent's parked state or the dispatch top-up — the signal is
+// best-effort diagnostics layered on a correctness-neutral wait.
+func TestSurfaceParkedChildren_DegradeBranches(t *testing.T) {
+	t.Run("nil_audit_is_a_no_op", func(t *testing.T) {
+		o, rs, _ := newOrchestrator(t)
+		o.Audit = nil // no audit configured
+		parent, parentStages := seedFanInParent(t, rs, int64Ptr(55))
+		seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+		seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+		o.maybeAdvanceDecomposedParent(context.Background(), parent.ID) // must not panic
+		if parentStages[0].State != run.StageStateAwaitingChildren {
+			t.Errorf("parent stage = %q, want it still parked", parentStages[0].State)
+		}
+	})
+
+	t.Run("child_stage_list_error_skips_that_child", func(t *testing.T) {
+		o, rs, _ := newOrchestrator(t)
+		au := &recordingAudit{}
+		o.Audit = au
+		parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+		parkedChild, _ := seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+		seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+		rs.mu.Lock()
+		if rs.listStagesErrIDs == nil {
+			rs.listStagesErrIDs = map[uuid.UUID]error{}
+		}
+		rs.listStagesErrIDs[parkedChild.ID] = errors.New("stage list boom")
+		rs.mu.Unlock()
+
+		o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+		if auditHasCategory(au, "parent_awaiting_child_scope_decision") {
+			t.Error("an unreadable child must be skipped, not emitted with partial data")
+		}
+	})
+
+	t.Run("dedup_read_error_skips_emission", func(t *testing.T) {
+		// Fails CLOSED on emission: the park-time emission already put this
+		// signal on the chain, so a skipped repeat costs the operator nothing,
+		// whereas emitting blind could duplicate on every sibling settle.
+		o, rs, _ := newOrchestrator(t)
+		au := &failingAppendAudit{recordingAudit: &recordingAudit{}, listErr: errors.New("list boom")}
+		o.Audit = au
+		parent, parentStages := seedFanInParent(t, rs, int64Ptr(55))
+		seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+		seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+		o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+		if parentStages[0].State != run.StageStateAwaitingChildren {
+			t.Errorf("parent stage = %q, want it still parked despite the read failure", parentStages[0].State)
+		}
+	})
+
+	t.Run("append_error_does_not_unwind", func(t *testing.T) {
+		o, rs, _ := newOrchestrator(t)
+		o.Audit = &failingAppendAudit{recordingAudit: &recordingAudit{}}
+		parent, parentStages := seedFanInParent(t, rs, int64Ptr(55))
+		seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+		seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+		o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+		if parentStages[0].State != run.StageStateAwaitingChildren {
+			t.Errorf("parent stage = %q, want it still parked despite the append failure", parentStages[0].State)
+		}
+	})
+
+	t.Run("parent_without_awaiting_children_stage_still_emits", func(t *testing.T) {
+		// The parent may not have reached awaiting_children yet. A nil stage is
+		// NOT an error: the signal is appended run-scoped (no parent_stage_id)
+		// rather than dropped — the operator must learn about the parked child
+		// either way. The parent-resolution path returns early with no
+		// awaiting_children stage, so drive the emitter directly.
+		o, rs, _ := newOrchestrator(t)
+		au := &recordingAudit{}
+		o.Audit = au
+		parent, _ := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), nil) // NO stages
+		parkedChild, _ := seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+
+		o.surfaceParkedChildren(context.Background(), parent.ID, []*run.Run{parkedChild})
+
+		payload := auditPayload(t, au, "parent_awaiting_child_scope_decision")
+		if _, ok := payload["parent_stage_id"]; ok {
+			t.Errorf("parent_stage_id must be ABSENT when the parent has no awaiting_children stage: %v", payload)
+		}
+		if payload["child_run_id"] != parkedChild.ID.String() {
+			t.Errorf("the signal must still name the parked child, got %v", payload["child_run_id"])
+		}
+	})
+}

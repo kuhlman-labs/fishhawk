@@ -6249,6 +6249,12 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// commit. The hook runs inside CommitAndPush after the commit and before
 	// the push, so a failure leaves origin untouched.
 	gateScopeFiles := scopePaths(cfg.scopeFiles)
+	// #2548: the build-required-drift park class is confined to fan-out children.
+	// A standalone run's build-required failure keeps today's category-B abort
+	// and its `fishhawk_resume_run --add_scope_files` IN-BAND recovery (which a
+	// decomposition child has no equivalent of — its coupled file is owned by a
+	// SIBLING slice), and a fix-up pass is byte-for-byte unchanged.
+	parkOnBuildRequiredDrift := isDecomposed && !isFixup
 	verifyCommit := func(ctx context.Context, headSHA string, drift []string) error {
 		// Scope-completeness park deferral (#1231, generalized to a second
 		// shortfall class by #2501). The missing-declared-scope-file gate AND the
@@ -6266,23 +6272,61 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		var parkMessage string
 		var parkAssertions []gitops.BindingAssertionResult
 		var parkAssertionMessage string
-		// parkResult is the terminal resolver with exactly three arms and no
-		// fourth. BOTH shortfalls recorded is a COMPOUND failure: it returns an
-		// UNTYPED sentinel wrap naming both, which neither errors.As in
-		// CommitAndPush matches, so the push aborts category-B before origin is
-		// touched.
+		// #2548: the THIRD shortfall class — build-required scope drift on a
+		// DECOMPOSED CHILD. Recorded at the compile/test gate below and resolved
+		// here identically to the other two.
+		var parkBuildRequired []string
+		var parkBuildRequiredMessage string
+		// parkResult is the terminal resolver over the three shortfall classes.
+		// The guard is COUNT-BASED (#2548): MORE THAN ONE recorded class is a
+		// COMPOUND failure and returns an UNTYPED sentinel wrap naming every
+		// recorded class, which NO errors.As in CommitAndPush matches, so the
+		// push aborts category-B before origin is touched. Exactly one returns
+		// that class's typed error; zero returns nil.
 		parkResult := func() error {
-			switch {
-			case len(parkMissing) > 0 && len(parkAssertions) > 0:
-				return fmt.Errorf("%w: compound committed-tree gate failure — %d missing declared scope file(s) (%s) AND %d unsatisfied binding assertion(s) (%s). "+
+			recorded := 0
+			if len(parkMissing) > 0 {
+				recorded++
+			}
+			if len(parkAssertions) > 0 {
+				recorded++
+			}
+			if len(parkBuildRequired) > 0 {
+				recorded++
+			}
+			if recorded > 1 {
+				// The missing+assertions pair keeps its pre-#2548 message text
+				// verbatim so the #2501 assertion on it does not shift; a compound
+				// involving the new class gets the generalized enumeration.
+				if len(parkMissing) > 0 && len(parkAssertions) > 0 && len(parkBuildRequired) == 0 {
+					return fmt.Errorf("%w: compound committed-tree gate failure — %d missing declared scope file(s) (%s) AND %d unsatisfied binding assertion(s) (%s). "+
+						"A park is reserved for a SOLE gate shortfall, so this compound failure keeps the category-B abort: origin was not touched. "+
+						"Recover by making the implement output satisfy the declared condition(s) and touch every declared path, or replan with a corrected scope",
+						gitops.ErrScopeFilesMissing, len(parkMissing), strings.Join(parkMissing, ", "),
+						len(parkAssertions), gitops.FormatUnsatisfied(parkAssertions))
+				}
+				var classes []string
+				if len(parkMissing) > 0 {
+					classes = append(classes, fmt.Sprintf("%d missing declared scope file(s) (%s)", len(parkMissing), strings.Join(parkMissing, ", ")))
+				}
+				if len(parkAssertions) > 0 {
+					classes = append(classes, fmt.Sprintf("%d unsatisfied binding assertion(s) (%s)", len(parkAssertions), gitops.FormatUnsatisfied(parkAssertions)))
+				}
+				if len(parkBuildRequired) > 0 {
+					classes = append(classes, fmt.Sprintf("%d build-required scope-excluded path(s) (%s)", len(parkBuildRequired), strings.Join(parkBuildRequired, ", ")))
+				}
+				return fmt.Errorf("%w: compound committed-tree gate failure — %s. "+
 					"A park is reserved for a SOLE gate shortfall, so this compound failure keeps the category-B abort: origin was not touched. "+
 					"Recover by making the implement output satisfy the declared condition(s) and touch every declared path, or replan with a corrected scope",
-					gitops.ErrScopeFilesMissing, len(parkMissing), strings.Join(parkMissing, ", "),
-					len(parkAssertions), gitops.FormatUnsatisfied(parkAssertions))
+					gitops.ErrScopeFilesMissing, strings.Join(classes, " AND "))
+			}
+			switch {
 			case len(parkMissing) > 0:
 				return &gitops.ScopeFilesMissingError{Missing: parkMissing, Message: parkMessage}
 			case len(parkAssertions) > 0:
 				return &gitops.BindingAssertionsUnsatisfiedError{Unsatisfied: parkAssertions, Message: parkAssertionMessage}
+			case len(parkBuildRequired) > 0:
+				return &gitops.BuildRequiredDriftError{Paths: parkBuildRequired, Message: parkBuildRequiredMessage}
 			}
 			return nil
 		}
@@ -6420,7 +6464,26 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":%q,"run_id":%q,"stage_id":%q,"head_sha":%q,"drift":%s}`+"\n",
 				event, cfg.runID, cfg.stageID, headSHA, driftJSON)
-			return err
+			// Build-required drift park (#2548), DECOMPOSED CHILDREN ONLY. A
+			// slice whose scope-only committed tree COMPILES but whose tests are
+			// red while it excluded drift is the #2548 case: the decomposition
+			// boundary cut a build-required coupling and the sibling slice owns
+			// the file. RECORD rather than return so the remaining gates
+			// (verified-tree) still run and the park is signaled only when this is
+			// the SOLE failure; the terminal parkResult() converts it into the
+			// typed *gitops.BuildRequiredDriftError.
+			//
+			// Every OTHER case returns err exactly as today: a COMPILE failure
+			// (ErrCommitWouldNotCompile — a red tree the agent could not have
+			// built at all, not a boundary artifact), a test failure with EMPTY
+			// drift (a red tree with no scope-boundary cause), and the flag off
+			// (standalone runs and fix-up passes, byte-identical category-B).
+			if parkOnBuildRequiredDrift && errors.Is(err, gitops.ErrCommittedTestsFailed) && len(drift) > 0 {
+				parkBuildRequired = append([]string(nil), drift...)
+				parkBuildRequiredMessage = err.Error()
+			} else {
+				return err
+			}
 		}
 		// Verified-SHA invariant (#960), the cheap backstop run LAST so the
 		// more specific, more actionable sentinels above report first. The
@@ -6602,6 +6665,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// category-B. False for fix-ups and decomposed children — which never
 		// evaluate assertions at all — keeps their behavior byte-identical.
 		ParkOnAssertionShortfall: !isFixup && !isDecomposed,
+		// Build-required-drift park (#2548), the THIRD class and the ONLY one
+		// scoped to fan-out children: a slice whose scope-only tree is red solely
+		// because a sibling slice owns a build-required file pushes the
+		// gate-verified commit to its own sole-writer slice branch and surfaces
+		// BuildRequiredShortfall instead of discarding the pass at category-B.
+		// False for standalone runs and fix-ups keeps their behavior identical.
+		ParkOnBuildRequiredDrift: parkOnBuildRequiredDrift,
 		// Compile-gate the committed tree before push (#728). Always wired,
 		// including the decomposed-child path (#766, see above) — the gate
 		// runs on every implement push.
@@ -6796,6 +6866,57 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return nil
 	}
 
+	// Scope-completeness park (#1231, second shortfall class added by #2501,
+	// third by #2548): the missing-declared-scope-file gate, the
+	// binding-assertion gate, OR — on a decomposed child — the build-required
+	// drift gate was this implement stage's SOLE committed-tree failure, so
+	// CommitAndPush pushed the gate-verified commit to the run branch (for a
+	// child: its own sole-writer slice branch) but surfaced the shortfall
+	// instead of failing category-B. Report the park to the backend INSTEAD of
+	// opening a PR — the backend records the held-commit payload, transitions
+	// the implement stage to awaiting_scope_decision (a parked judgment, not a
+	// category-B failure), and surfaces an in-band operator decision. The held
+	// commit (cap.HeadSHA on `branch`) survives the runner exit so an exempt
+	// resolution opens the PR from this exact head with no agent re-run
+	// (ADR-035 sole-writer) — except for the build-required class, which is
+	// exempt-INELIGIBLE (its committed tree is red by construction) and whose
+	// preserved commit is instead the slice work `fail` no longer discards. A
+	// report error is category-C (network) and is surfaced like the OpenPR/ship
+	// errors so the failure path reports it.
+	//
+	// ORDERING IS LOAD-BEARING (#2548): this block runs BEFORE the
+	// decomposed-child early return below. Pre-#2548 the isDecomposed block came
+	// first, so a child's shortfall would be swallowed and reported as a plain
+	// successful "pushed" — the stage would go terminal-succeeded with a red
+	// held tree and no park at all.
+	if len(cap.ScopeShortfall) > 0 || len(cap.AssertionShortfall) > 0 || len(cap.BuildRequiredShortfall) > 0 {
+		missingJSON, _ := json.Marshal(cap.ScopeShortfall)
+		unsatisfiedJSON, _ := json.Marshal(cap.AssertionShortfall)
+		buildRequiredJSON, _ := json.Marshal(cap.BuildRequiredShortfall)
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_completeness_parked","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q,"tree_sha":%q,"missing_paths":%s,"unsatisfied_assertions":%s,"build_required_paths":%s}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA, cap.BaseSHA, verifiedTreeSHA, cap.TreeSHA, missingJSON, unsatisfiedJSON, buildRequiredJSON)
+		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
+			RunID:                 cfg.runID,
+			StageID:               cfg.stageID,
+			PrivateKey:            issued.PrivateKey,
+			Outcome:               "scope_park",
+			Branch:                branch,
+			HeadSHA:               cap.HeadSHA,
+			BaseSHA:               cap.BaseSHA,
+			TreeSHA:               verifiedTreeSHA,
+			MissingPaths:          cap.ScopeShortfall,
+			UnsatisfiedAssertions: toBindingAssertionReports(cap.AssertionShortfall),
+			BuildRequiredPaths:    cap.BuildRequiredShortfall,
+		}); err != nil {
+			return fmt.Errorf("report scope-completeness park: %w", err)
+		}
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_completeness_park_reported","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, cap.HeadSHA)
+		return nil
+	}
+
 	// Decomposed children only push their commit onto their own sole-writer
 	// slice branch fishhawk/run-<parent>/slice-<n> (E24.1 / #1141 / ADR-041;
 	// one branch per sub-plan); they never open a PR or ship a pull_request
@@ -6840,45 +6961,6 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			`{"event":"implement_child_push_reported","run_id":%q,"stage_id":%q,"shared_branch":%q,"head_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA,
 		)
-		return nil
-	}
-
-	// Scope-completeness park (#1231, second shortfall class added by #2501):
-	// EITHER the missing-declared-scope-file gate OR the binding-assertion gate
-	// was this standalone implement stage's SOLE committed-tree failure, so
-	// CommitAndPush pushed the gate-verified commit to the run branch but
-	// surfaced ScopeShortfall instead of failing category-B. Report the park to
-	// the backend INSTEAD of opening a PR — the backend records the held-commit
-	// payload, transitions the implement stage to awaiting_scope_decision (a
-	// parked judgment, not a category-B failure), and surfaces an in-band
-	// operator exempt/fail decision. The held commit (cap.HeadSHA on `branch`)
-	// survives the runner exit so an exempt resolution opens the PR from this
-	// exact head with no agent re-run (ADR-035 sole-writer). A report error is
-	// category-C (network) and is surfaced like the OpenPR/ship errors so the
-	// failure path reports it.
-	if len(cap.ScopeShortfall) > 0 || len(cap.AssertionShortfall) > 0 {
-		missingJSON, _ := json.Marshal(cap.ScopeShortfall)
-		unsatisfiedJSON, _ := json.Marshal(cap.AssertionShortfall)
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"scope_completeness_parked","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q,"tree_sha":%q,"missing_paths":%s,"unsatisfied_assertions":%s}`+"\n",
-			cfg.runID, cfg.stageID, branch, cap.HeadSHA, cap.BaseSHA, verifiedTreeSHA, cap.TreeSHA, missingJSON, unsatisfiedJSON)
-		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
-			RunID:                 cfg.runID,
-			StageID:               cfg.stageID,
-			PrivateKey:            issued.PrivateKey,
-			Outcome:               "scope_park",
-			Branch:                branch,
-			HeadSHA:               cap.HeadSHA,
-			BaseSHA:               cap.BaseSHA,
-			TreeSHA:               verifiedTreeSHA,
-			MissingPaths:          cap.ScopeShortfall,
-			UnsatisfiedAssertions: toBindingAssertionReports(cap.AssertionShortfall),
-		}); err != nil {
-			return fmt.Errorf("report scope-completeness park: %w", err)
-		}
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"scope_completeness_park_reported","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
-			cfg.runID, cfg.stageID, branch, cap.HeadSHA)
 		return nil
 	}
 

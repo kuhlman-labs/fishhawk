@@ -551,3 +551,114 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 			got, goldenExemptPromptJSON)
 	}
 }
+
+// TestDecideScopeCompleteness_ExemptRefusedForBuildRequiredPark is the #2548
+// EXEMPT-REFUSAL counterfactual (c1). The control's effect is COMMITTED STATE,
+// not error identity — a refusal that fired and was then rolled back would
+// return a byte-identical error — so this reads the state AFTER the call
+// returns: the stage must STILL be parked in awaiting_scope_decision and NO
+// scope_completeness_exempted entry may exist. Deleting the refusal transitions
+// the stage to pending and appends the entry, so both assertions go red.
+//
+// The park fixture is seeded BY CONSTRUCTION (a park struct written with
+// non-empty BuildRequiredPaths), never by invoking the refusal in setup, so the
+// RED lands on the behavioral assertions and not on a fixture-setup failure.
+func TestDecideScopeCompleteness_ExemptRefusedForBuildRequiredPark(t *testing.T) {
+	s, rr, au, runRow, stage := scopeCompletenessServer(t)
+	sliceOne := 1
+	stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
+		HeldCommitSHA:      "1111111111111111111111111111111111111111",
+		RunBranch:          "fishhawk/run-aaa/slice-0",
+		VerifiedTreeSHA:    "2222222222222222222222222222222222222222",
+		BaseSHA:            "3333333333333333333333333333333333333333",
+		BuildRequiredPaths: []string{"backend/internal/server/prompt.go"},
+		OwningSlices: []run.BuildRequiredOwner{
+			{Path: "backend/internal/server/prompt.go", SliceIndex: &sliceOne, SliceTitle: "prompt plumbing"},
+		},
+	}
+
+	w := postScopeCompletenessDecision(t, s, runRow.ID,
+		`{"decision":"exempt","reason":"ship it anyway"}`,
+		operatorWriteStages)
+	// Deliberately NON-fatal: the load-bearing assertions are the COMMITTED-STATE
+	// ones below, and a t.Fatalf here would stop the counterfactual short of them.
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409; body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "exempt_refused_build_required") {
+		t.Errorf("body must carry the exempt_refused_build_required code: %s", w.Body.String())
+	}
+
+	// COMMITTED STATE, read after the call returns — this is what goes red when
+	// the refusal is deleted.
+	got, err := rr.GetStage(context.Background(), stage.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage state = %q, want it STILL parked in awaiting_scope_decision — the refusal must not resume a red-tree park", got.State)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, e := range au.appended {
+		if e.Category == CategoryScopeCompletenessExempted {
+			t.Fatalf("no scope_completeness_exempted entry may be appended for a build-required park; got %+v", au.appended)
+		}
+	}
+}
+
+// TestDecideScopeCompleteness_FailBuildRequiredParkEchoesAttribution pins the
+// ADMISSIBLE decision for the class: `fail` still works, lands the stage failed,
+// and echoes the class + its sibling-slice attribution so the operator's client
+// already names the boundary to correct before re-running.
+func TestDecideScopeCompleteness_FailBuildRequiredParkEchoesAttribution(t *testing.T) {
+	s, rr, au, runRow, stage := scopeCompletenessServer(t)
+	sliceOne := 1
+	stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
+		HeldCommitSHA:      "1111111111111111111111111111111111111111",
+		RunBranch:          "fishhawk/run-aaa/slice-0",
+		VerifiedTreeSHA:    "2222222222222222222222222222222222222222",
+		BuildRequiredPaths: []string{"backend/internal/server/prompt.go"},
+		OwningSlices: []run.BuildRequiredOwner{
+			{Path: "backend/internal/server/prompt.go", SliceIndex: &sliceOne, SliceTitle: "prompt plumbing"},
+		},
+	}
+
+	w := postScopeCompletenessDecision(t, s, runRow.ID,
+		`{"decision":"fail","reason":"the decomposition boundary cut a coupling; re-plan the slices"}`,
+		operatorWriteStages)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var resp scopeCompletenessDecisionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.BuildRequiredPaths) != 1 || resp.BuildRequiredPaths[0] != "backend/internal/server/prompt.go" {
+		t.Errorf("response must echo build_required_paths, got %v", resp.BuildRequiredPaths)
+	}
+	if len(resp.OwningSlices) != 1 || resp.OwningSlices[0].SliceIndex == nil || *resp.OwningSlices[0].SliceIndex != 1 {
+		t.Errorf("response must echo the owning-slice attribution, got %+v", resp.OwningSlices)
+	}
+	got, _ := rr.GetStage(context.Background(), stage.ID)
+	if got.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", got.State)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var found bool
+	for _, e := range au.appended {
+		if e.Category != CategoryScopeCompletenessFailed {
+			continue
+		}
+		found = true
+		var payload map[string]any
+		_ = json.Unmarshal(e.Payload, &payload)
+		if payload["build_required_paths"] == nil || payload["owning_slices"] == nil {
+			t.Errorf("failed payload must carry build_required_paths + owning_slices, got %v", payload)
+		}
+	}
+	if !found {
+		t.Fatalf("want a scope_completeness_failed entry, got %+v", au.appended)
+	}
+}
