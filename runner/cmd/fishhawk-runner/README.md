@@ -17,6 +17,30 @@ Local loop only — GitHub Actions is per-job-isolated by `actions/checkout`.
 
 The relocation-broken `diff_summary` seam is closed on the `git_diff` wire event (`insertions`/`deletions`, mirrored in `backend/internal/bundle/bundle.go::gitDiffPayload`) and read in `backend/cmd/fishhawk-mcp/run_stage.go` — the MCP server stays worktree-unaware. See the `docs/ARCHITECTURE.md` §4 lifecycle bullet. This extends ADR-035's branch-ownership invariant to tree-ownership.
 
+### Lineage-lock holder contract ([#2545](https://github.com/kuhlman-labs/fishhawk/issues/2545))
+
+`lockholder.go` owns the rule for a CONTENDED lineage lock whose recorded pid is still alive. Before #2545, a live pid was automatically legitimate: cancelling a run left the detached `fishhawk-runner` it spawned alive, still holding the lockfile, so every later same-lineage dispatch failed category-A/C until an operator killed the process by hand.
+
+`evictTerminalLockHolder` will not signal ANYTHING until all five of these are PROVEN, in order. Each refusal is independently observable and separately tested, and every one of them leaves the holder alive and the lockfile intact:
+
+1. a backend client was threaded in (`acquireLineageLock`'s `client` param; nil → refuse);
+2. the lockfile records a holder run id on line 2 (`readLockRunID`);
+3. the backend returns a state for that run — a read error, a 404 and an empty state all refuse;
+4. that state is EXACTLY `cancelled` (`runStateCancelled`). `running`, `failed` AND `succeeded` all refuse: a run flips terminal in the backend BEFORE its runner has necessarily finished post-stage work (PR push, trace upload), so only an explicit operator cancel is evictable;
+5. the pid's REAL argv, read via `ps -o args=`, identifies it as a `fishhawk-runner` carrying `--run-id <that run id>` (`runnerIdentityMatches`).
+
+(5) is the AUTHORIZING control — nothing else decides whether a signal may be delivered. It matches on TOKEN BOUNDARIES, never substring containment: argv is split on whitespace, the binary token must match `fishhawk-runner` on a path/basename boundary, and the `--run-id` token must be exactly equal with the id as the IMMEDIATELY FOLLOWING token. The fused `--run-id=<id>` form and any longer token merely embedding the name or the id are refused. `runIDArgFlag` is the single source of truth the matcher derives from, in lockstep with the MCP side's `composeRunnerArgv`.
+
+The group test inside `signalLockHolder` is only a SIGNAL SELECTOR: a group-leading pid (every runner, spawned `Setpgid`) is signalled as a group so the agent subprocesses go too; a non-leader gets a single-pid signal. On Windows the whole path degrades to refuse.
+
+Once authorized: TERM → `lockHolderTermGrace` → KILL → `lockHolderKillGrace`. A holder that survives BOTH leaves the lockfile INTACT and fails loud — never break a lock a live holder still owns. On confirmed death the runner emits `{"event":"lineage_lock_evicted","root":…,"holder_pid":…,"holder_run_id":…,"holder_state":"cancelled"}`, reclaims the lockfile and retries the acquire.
+
+Every refusal error names the holder pid, its run id and its state, so an operator driving over HTTP MCP can diagnose the wedge without `ps`.
+
+The state vocabulary is read from ONE definition (`runStateCancelled` in `lockholder.go`). The runner and backend are separate Go modules with no dependency edge, so the backend half of that pin is `TestGetRun_CancelledState_WireLiteral` in `backend/internal/server/runs_get_test.go`, which serialises a cancelled run and asserts the wire carries this exact literal. A vocabulary drift turns that test RED instead of silently making this reclaim a permanent no-op.
+
+In practice a TERMed runner exits gracefully and its deferred release removes the lockfile, so this path is normally never reached — it is the net for the SIGKILL / host-crash / cancel-from-a-different-MCP-process cases the MCP-side reap (`backend/internal/mcpserver/detached_registry.go`) cannot cover.
+
 ## Acceptance executor (E31.7 / #1535, ADR-049 #3/#5)
 
 `acceptance.go` — verdict capture/validation/redaction + evidence event for the `stageType=="acceptance"` branch in `main.go::run`.

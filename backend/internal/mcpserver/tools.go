@@ -2724,6 +2724,15 @@ type CancelRunInput struct {
 // fits.
 type CancelRunOutput struct {
 	Run Run `json:"run"`
+	// ReapedRunners is how many detached fishhawk-runner children THIS MCP
+	// process had spawned for the run and confirmed dead as part of the cancel
+	// (#2545). Zero is normal: the run had no live runner, or it was dispatched
+	// by a DIFFERENT MCP process (the registry is per-process; the runner-side
+	// lineage-lock reclaim is the net for that case).
+	ReapedRunners int `json:"reaped_runners" jsonschema:"how many detached runner processes this MCP server spawned for the run and confirmed dead during the cancel; 0 when there were none or the run was dispatched by a different MCP process"`
+	// ReapWarnings names any detached runner that survived TERM and KILL. A
+	// warning NEVER fails the verb — the cancel already landed.
+	ReapWarnings []string `json:"reap_warnings,omitempty" jsonschema:"detached runners that did not exit after TERM and KILL, naming the stage id and pid to kill by hand; the cancel itself still succeeded"`
 	// Elisions is the ADR-077 byte-bound block: present ONLY when the shared
 	// run-row ladder had to reduce the row, absent otherwise.
 	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
@@ -2754,6 +2763,16 @@ clean tool error on:
   - run_not_found (404)
   - invalid_state_transition (409 — the run is already terminal in
     a non-cancelled state like succeeded / failed)
+
+After the state change lands, this verb REAPS the detached
+fishhawk-runner children THIS MCP process spawned for the run
+(TERM, grace, KILL) and reports reaped_runners plus any
+reap_warnings. Without that, a cancelled run's runner stayed alive
+holding its lineage lockfile and wedged every later same-lineage
+dispatch (#2545). A reap warning never fails the verb — the cancel
+already landed. The registry is per-MCP-process: a cancel issued
+from a different process than the one that dispatched reaps
+nothing, and the runner-side lineage-lock reclaim is the net.
 `),
 	}, resolver.cancelRun)
 }
@@ -2768,13 +2787,36 @@ func (r *runResolver) cancelRun(ctx context.Context, req *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
 	}
-	bounded, berr := boundRunRowOutput(CancelRunOutput{Run: *cancelled}, cancelled.ID, r.responseBudget(req),
+	// Reap AFTER the state change lands (#2545): the tombstone must not be
+	// recorded for a cancel that failed. The probe lets a later re-dispatch of a
+	// revived/retried run clear that tombstone immediately instead of waiting
+	// out its TTL. Warnings ride the output; they never fail the verb.
+	reaped, reapWarnings := detachedRunners.terminateRunners(runID.String(), r.runStateProbe)
+	out := CancelRunOutput{Run: *cancelled, ReapedRunners: reaped, ReapWarnings: reapWarnings}
+	bounded, berr := boundRunRowOutput(out, cancelled.ID, r.responseBudget(req),
 		func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
 	if berr != nil {
 		return nil, CancelRunOutput{}, fmt.Errorf("bound cancel_run response: %w", berr)
 	}
 	return nil, bounded, nil
+}
+
+// runStateProbe reads a run's live state for the detached registry's cancel
+// tombstone (#2545). Handed to terminateRunners so a later re-dispatch of the
+// same run id can be ADMITTED the moment the run is no longer cancelled — the
+// tombstone catches a spawn in flight at cancel time and must not outlive that
+// purpose. Any failure returns an error and the caller fails closed.
+func (r *runResolver) runStateProbe(ctx context.Context, runID string) (string, error) {
+	id, err := uuid.Parse(runID)
+	if err != nil {
+		return "", fmt.Errorf("run_id %q is not a valid UUID: %w", runID, err)
+	}
+	row, err := r.api.GetRun(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	return row.State, nil
 }
 
 // ConsolidateSlicesInput is the fishhawk_consolidate_slices tool's input

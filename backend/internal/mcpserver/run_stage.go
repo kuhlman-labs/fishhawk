@@ -1092,9 +1092,16 @@ func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID 
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
-	if err := cmd.Start(); err != nil {
+	// Start THROUGH the detached-runner registry (#2545): the tombstone check,
+	// the fork and the registration all happen under one hold of the registry
+	// mutex, so a cancel can never race past a started-but-unregistered child.
+	// A cancel that already landed refuses the spawn outright —
+	// errRunCancelledBeforeSpawn, returned verbatim so dispatch_stage /
+	// drive_run surface it instead of orphaning a runner for a dead run.
+	h, err := detachedRunners.startAndRegister(cmd, runID, stageID)
+	if err != nil {
 		_ = logFile.Close()
-		return "", fmt.Errorf("spawn fishhawk-runner: %w", err)
+		return "", err
 	}
 	// The child inherited its own fd for the log at fork; the parent's
 	// handle can close so the long-lived MCP server doesn't leak an fd
@@ -1105,7 +1112,11 @@ func spawnRunnerStageDetached(binary string, argv, env []string, runID, stageID 
 	// the tool call returns. No ctx watch — the runner outlives the call. On a
 	// non-zero exit that predates a terminal stage report, parse the runner's
 	// failure and report it so the stage doesn't stay stuck 'dispatched' (#1747).
-	go reapDetachedRunner(cmd, logPath, runID, stageID, report)
+	// Deregistering is DEFERRED so it also runs on the reaper's early returns.
+	go func() {
+		defer detachedRunners.deregister(h)
+		reapDetachedRunner(cmd, logPath, runID, stageID, report)
+	}()
 
 	return logPath, nil
 }

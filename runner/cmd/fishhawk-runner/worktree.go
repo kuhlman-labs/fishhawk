@@ -445,7 +445,17 @@ func canonPath(p string) string {
 // `git add -A` / scoped staging — a file at the worktree root would be.
 // It records pid + run id for diagnosis and is removed by the returned
 // release func (deferred to stage end).
-func acquireLineageLock(ctx context.Context, repoDir, root, runID string, logSink io.Writer) (func(), error) {
+//
+// A LIVE holder is no longer automatically legitimate (#2545). Before this
+// function will signal anything it must PROVE the holder is an orphan of a
+// CANCELLED run — see evictTerminalLockHolder, which owns the whole rule and
+// refuses on every unprovable branch. client is the backend read that rule
+// needs; nil selects the refuse branch, so the fail-loud behavior is exactly
+// today's. When the holder IS proven and confirmed dead, its lockfile is
+// reclaimed and the acquire retried. Anything else fails loud with an error
+// naming the holder pid, its run id and its state, so an operator driving over
+// HTTP MCP can diagnose the wedge without ps.
+func acquireLineageLock(ctx context.Context, repoDir, root, runID string, client runStateClient, logSink io.Writer) (func(), error) {
 	wtDir, err := worktreesDir(ctx, repoDir)
 	if err != nil {
 		return nil, fmt.Errorf("acquireLineageLock: %w", err)
@@ -466,14 +476,32 @@ func acquireLineageLock(ctx context.Context, repoDir, root, runID string, logSin
 		}
 		pid := readLockPID(lockPath)
 		if pid > 0 && processAlive(pid) {
-			return nil, fmt.Errorf(
-				"acquireLineageLock: lineage %s already locked by live pid %d "+
-					"(concurrent same-lineage stage — decomposition stages must run sequentially)",
-				root, pid)
+			// A LIVE holder: evict it ONLY if it is provably an orphaned runner
+			// of a cancelled run. Every unprovable branch refuses, leaving the
+			// holder and its lockfile untouched (#2545).
+			holderRunID := readLockRunID(lockPath)
+			holderState, evictErr := evictTerminalLockHolder(ctx, lockPath, root, pid, client, logSink)
+			if evictErr != nil {
+				if holderRunID == "" {
+					holderRunID = "unknown"
+				}
+				if holderState == "" {
+					holderState = "unknown"
+				}
+				return nil, fmt.Errorf(
+					"acquireLineageLock: lineage %s already locked by live pid %d "+
+						"(run %s, state %s): %w — a concurrent same-lineage stage must run "+
+						"sequentially; if pid %d is an orphaned runner, cancel run %s and retry, "+
+						"or kill pid %d by hand",
+					root, pid, holderRunID, holderState, evictErr, pid, holderRunID, pid)
+			}
+			// Evicted: the holder's run was cancelled and the process is
+			// confirmed dead. Fall through to reclaim its lockfile and retry.
+		} else {
+			// Stale lock from a crashed prior stage — reclaim and retry once.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"lineage_lock_reclaimed","root":%q,"stale_pid":%d}`+"\n", root, pid)
 		}
-		// Stale lock from a crashed prior stage — reclaim and retry once.
-		_, _ = fmt.Fprintf(logSink,
-			`{"event":"lineage_lock_reclaimed","root":%q,"stale_pid":%d}`+"\n", root, pid)
 		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("acquireLineageLock: reclaim stale lock: %w", err)
 		}

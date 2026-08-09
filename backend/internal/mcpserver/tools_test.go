@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -10442,5 +10443,130 @@ func TestStartRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
 	assertBoundedWithElisions(t, "fishhawk_start_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
 	if out.Run.ID != runID.String() {
 		t.Errorf("the created run id was lost to the bound: %+v", out.Run)
+	}
+}
+
+// --- #2545: cancel_run reaps the detached runners this process spawned ---
+
+// TestCancelRun_TerminatesDetachedRunner is the MCP half of the #2545
+// cross-layer contract: a REAL child spawned through the REAL
+// spawnRunnerStageDetached is dead after fishhawk_cancel_run, the registry
+// entry is gone, and the verb reports reaped_runners == 1. The runner half —
+// that a dead holder is sufficient for the NEXT same-lineage acquire to be
+// admitted — is TestLineageLock_CancelledRunHolder_NextDispatchAdmitted in the
+// runner module (separate Go modules, no dependency edge either way).
+func TestCancelRun_TerminatesDetachedRunner(t *testing.T) {
+	reg := freshRegistry(t)
+	detachedTerminateGrace = 5 * time.Second
+
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled", Repo: "x/y"}
+
+	logPath, err := spawnRunnerStageDetached("/bin/sh", []string{"-c", "sleep 120"},
+		os.Environ(), runID.String(), "stage-1", nil)
+	if err != nil {
+		t.Fatalf("spawnRunnerStageDetached: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(logPath) })
+
+	reg.mu.Lock()
+	handles := reg.byRun[runID.String()]
+	reg.mu.Unlock()
+	if len(handles) != 1 {
+		t.Fatalf("registered handles = %d, want 1", len(handles))
+	}
+	pid := handles[0].pid
+
+	_, out, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("cancelRun: %v", err)
+	}
+	if out.Run.State != "cancelled" {
+		t.Errorf("State = %q, want cancelled", out.Run.State)
+	}
+	if out.ReapedRunners != 1 {
+		t.Errorf("ReapedRunners = %d, want 1", out.ReapedRunners)
+	}
+	if len(out.ReapWarnings) != 0 {
+		t.Errorf("ReapWarnings = %v, want none", out.ReapWarnings)
+	}
+	if processStillAlive(pid) {
+		t.Errorf("detached runner pid %d survived the cancel", pid)
+	}
+	reg.mu.Lock()
+	_, stillRegistered := reg.byRun[runID.String()]
+	reg.mu.Unlock()
+	if stillRegistered {
+		t.Errorf("registry entry survived the cancel")
+	}
+}
+
+// TestCancelRun_ReapWarningDoesNotFailTheVerb asserts a runner that survives
+// TERM and KILL yields a warning but the cancel still SUCCEEDS — the state
+// change already landed, and turning a landed mutation into a tool error is
+// the failure #2510 removed from this type.
+func TestCancelRun_ReapWarningDoesNotFailTheVerb(t *testing.T) {
+	reg := freshRegistry(t)
+	detachedTerminateGrace = 40 * time.Millisecond
+	origSignal := runStageSignalGroup
+	runStageSignalGroup = func(*exec.Cmd, syscall.Signal) {}
+	t.Cleanup(func() { runStageSignalGroup = origSignal })
+
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.cancelResp[runID] = Run{ID: runID.String(), State: "cancelled", Repo: "x/y"}
+
+	cmd := exec.Command("sh", "-c", "sleep 120")
+	runStageSetProcessGroup(cmd)
+	h, err := reg.startAndRegister(cmd, runID.String(), "stage-stuck")
+	if err != nil {
+		t.Fatalf("startAndRegister: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	_, out, err := r.cancelRun(context.Background(), nil, CancelRunInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("cancelRun failed for a landed cancel with a stuck runner: %v", err)
+	}
+	if out.Run.State != "cancelled" {
+		t.Errorf("State = %q, want cancelled", out.Run.State)
+	}
+	if out.ReapedRunners != 0 {
+		t.Errorf("ReapedRunners = %d, want 0", out.ReapedRunners)
+	}
+	if len(out.ReapWarnings) != 1 {
+		t.Fatalf("ReapWarnings = %v, want exactly one", out.ReapWarnings)
+	}
+	if !strings.Contains(out.ReapWarnings[0], strconv.Itoa(h.pid)) {
+		t.Errorf("warning %q does not name the surviving pid %d", out.ReapWarnings[0], h.pid)
+	}
+}
+
+// TestRunStateProbe_ReadsLiveState covers the probe cancelRun hands to the
+// tombstone: it returns the run's live state, and fails closed on a bad UUID
+// and on a backend read error.
+func TestRunStateProbe_ReadsLiveState(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running", Repo: "x/y"}
+
+	state, err := r.runStateProbe(context.Background(), runID.String())
+	if err != nil {
+		t.Fatalf("runStateProbe: %v", err)
+	}
+	if state != "running" {
+		t.Errorf("state = %q, want running", state)
+	}
+	if _, err := r.runStateProbe(context.Background(), "not-a-uuid"); err == nil {
+		t.Error("runStateProbe accepted a non-UUID run id")
+	}
+	other := uuid.New()
+	fb.getStatusByID[other] = http.StatusInternalServerError
+	if _, err := r.runStateProbe(context.Background(), other.String()); err == nil {
+		t.Error("runStateProbe returned no error on a backend read failure")
 	}
 }

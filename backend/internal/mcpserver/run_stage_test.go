@@ -2895,3 +2895,62 @@ func TestRunStage_TerminalStageOmitsPollInterval(t *testing.T) {
 			out.StageWaitStatus.PollIntervalSeconds)
 	}
 }
+
+// --- #2545: the spawn-argv shape the runner's identity check depends on ---
+
+// TestComposeRunnerArgv_RunIDFlagAndValueAreAdjacentTokens pins the ONE argv
+// property the runner-side lineage-lock identity check consumes: the run-id
+// flag and the run id are emitted as two ADJACENT argv tokens (never a fused
+// `--run-id=<id>`). The runner proves a lock holder's identity by finding
+// exactly that pair in the holder's real argv (runnerIdentityMatches), so a
+// reshape here would silently disarm the reclaim; this test turns it RED
+// instead.
+func TestComposeRunnerArgv_RunIDFlagAndValueAreAdjacentTokens(t *testing.T) {
+	r := &runResolver{api: &apiClient{baseURL: "http://127.0.0.1:1"}}
+	const runID = "3b790e10-73a4-4513-a52f-34fb4e3fb1d3"
+	argv := r.composeRunnerArgv(RunStageInput{
+		RunID:      runID,
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		WorkingDir: "/tmp/checkout",
+	}, "stage-1", "kuhlman-labs/fishhawk", "main", true)
+
+	idx := -1
+	for i, tok := range argv {
+		if tok == "--run-id" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatalf("argv carries no exact --run-id token: %v", argv)
+	}
+	if idx+1 >= len(argv) || argv[idx+1] != runID {
+		t.Fatalf("argv[%d+1] = %v, want the run id %q as the immediately following token: %v",
+			idx, argv[idx+1:], runID, argv)
+	}
+	for _, tok := range argv {
+		if strings.HasPrefix(tok, "--run-id=") {
+			t.Errorf("argv emits the fused single-token form %q, which the runner's identity matcher refuses", tok)
+		}
+	}
+}
+
+// TestSpawnRunnerStageDetached_RefusesAfterCancel asserts the detached spawn
+// path itself is gated by the registry: after a cancel tombstone for the run,
+// spawnRunnerStageDetached returns errRunCancelledBeforeSpawn verbatim and
+// forks nothing.
+func TestSpawnRunnerStageDetached_RefusesAfterCancel(t *testing.T) {
+	reg := freshRegistry(t)
+	const runID = "abababab-abab-abab-abab-abababababab"
+	reg.terminateRunners(runID, nil)
+
+	logPath, err := spawnRunnerStageDetached("/bin/sh", []string{"-c", "sleep 120"},
+		os.Environ(), runID, "stage-1", nil)
+	if !errors.Is(err, errRunCancelledBeforeSpawn) {
+		t.Fatalf("err = %v, want errRunCancelledBeforeSpawn", err)
+	}
+	if logPath != "" {
+		t.Errorf("logPath = %q, want empty on a refused spawn", logPath)
+	}
+}

@@ -5,16 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // Per-run working-tree isolation — cross-layer integration test (E22.X / #1137).
@@ -109,6 +114,12 @@ type runResult struct {
 // take the same-lineage lock. The returned release MUST be deferred by the
 // caller (stage end). decomposedFrom is "" for a solo run, the parent run id
 // for a decomposed child.
+//
+// The lineage lock is taken with a NIL runStateClient: these flows never
+// contend with a cancelled holder, and nil selects evictTerminalLockHolder's
+// refuse branch — i.e. exactly the pre-#2545 fail-loud behavior. The eviction
+// path is driven with a real client by
+// TestLineageLock_CancelledRunHolder_NextDispatchAdmitted below.
 func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, parallelIsolate bool, client lineageStatusClient) (wt string, release func(), err error) {
 	root := lineageRoot(runID, decomposedFrom, parallelIsolate)
 	// Cross-lineage worktree-admin lock (#1181): serialize the fast
@@ -126,7 +137,7 @@ func provisionFlow(ctx context.Context, repo, runID, decomposedFrom string, para
 	}
 	adminRelease()
 	writeLineageRunID(ctx, repo, root, lineageRootFull(runID, decomposedFrom, parallelIsolate), io.Discard)
-	release, err = acquireLineageLock(ctx, repo, root, runID, io.Discard)
+	release, err = acquireLineageLock(ctx, repo, root, runID, nil, io.Discard)
 	if err != nil {
 		return "", nil, err
 	}
@@ -856,6 +867,184 @@ func TestRun_DecomposedChild_WaveBaseCheckout_CrossBoundary(t *testing.T) {
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("missing %s in run output:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// --- #2545: cancel a run with a live detached runner, next dispatch admitted ---
+
+// TestLockHolderHelperProcess is the re-exec'd holder for the done-means test
+// below. It is NOT a test: it runs only when GO_WANT_HELPER_PROCESS=1, and it
+// exists so the holder is a REAL separate process whose REAL argv — this test
+// binary's own path (basename fishhawk-runner.test) plus `--run-id <id>` —
+// satisfies the production ps-based identity check with no stub anywhere.
+//
+// It takes the REAL lineage lock via acquireLineageLock and then blocks until
+// it is signalled, exactly as an orphaned runner does.
+func TestLockHolderHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		t.Skip("helper process; not a test")
+	}
+	repo := os.Getenv("FISHHAWK_HELPER_REPO")
+	root := os.Getenv("FISHHAWK_HELPER_ROOT")
+	runID := os.Getenv("FISHHAWK_HELPER_RUN_ID")
+	release, err := acquireLineageLock(context.Background(), repo, root, runID, nil, io.Discard)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "helper: acquire lineage lock: %v\n", err)
+		os.Exit(2)
+	}
+	defer release()
+	// Block until signalled. A TERM kills the process without running the
+	// deferred release — which is precisely the orphaned-holder shape.
+	time.Sleep(5 * time.Minute)
+}
+
+// helperArgvRunID extracts the run id the helper was launched with, mirroring
+// the flag pair composeRunnerArgv emits.
+func helperCmd(t *testing.T, repo, root, runID string) *exec.Cmd {
+	t.Helper()
+	// `--` terminates the testing package's own flag parsing, so the run-id
+	// pair rides through as positional args the test binary ignores — while
+	// still appearing in the process's REAL argv as the two adjacent tokens
+	// the production identity check requires.
+	cmd := exec.Command(os.Args[0], "-test.run=TestLockHolderHelperProcess", "--", "--run-id", runID)
+	cmd.Env = append(os.Environ(),
+		"GO_WANT_HELPER_PROCESS=1",
+		"FISHHAWK_HELPER_REPO="+repo,
+		"FISHHAWK_HELPER_ROOT="+root,
+		"FISHHAWK_HELPER_RUN_ID="+runID,
+	)
+	// Own process group, exactly as the MCP side spawns a detached runner, so
+	// the eviction's group-signal path is the one exercised.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	return cmd
+}
+
+// TestLineageLock_CancelledRunHolder_NextDispatchAdmitted is the literal
+// done-means of #2545, end to end with every layer but the backend REAL: a
+// real detached child in its own process group holds a real lineage lockfile
+// written by the production writer; its run is CANCELLED through a fake
+// backend's cancel endpoint (which flips the state that endpoint serves); and
+// the NEXT same-lineage acquire — the thing that used to fail category-C until
+// an operator killed the process by hand — is ADMITTED.
+//
+// Real child, real process group, real lockfile, real `ps` identity read, real
+// signal, real admission. The MCP half (that fishhawk_cancel_run produces this
+// dead-holder precondition) is TestCancelRun_TerminatesDetachedRunner in
+// backend/internal/mcpserver; the two are separate tests only because backend
+// and runner are separate Go modules with no dependency edge in either
+// direction.
+func TestLineageLock_CancelledRunHolder_NextDispatchAdmitted(t *testing.T) {
+	if _, err := exec.LookPath("ps"); err != nil {
+		t.Skip("ps not available")
+	}
+	repo := initRepo(t)
+	const (
+		root      = "d0d0d0d0"
+		holderRun = "d0d0d0d0-1111-2222-3333-444444444444"
+		nextRun   = "e1e1e1e1-1111-2222-3333-444444444444"
+	)
+
+	// A fake backend serving GET /v0/runs/{id} plus the cancel verb that flips
+	// the served state — the ONE layer that is not real here.
+	var (
+		mu    sync.Mutex
+		state = "running"
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		state = "cancelled"
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"` + r.PathValue("run_id") + `","state":"cancelled"}`))
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cur := state
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"` + r.PathValue("run_id") + `","state":"` + cur + `"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	client := upload.New(srv.URL)
+
+	// (1) A REAL detached child takes the REAL lineage lock and blocks.
+	holder := helperCmd(t, repo, root, holderRun)
+	var helperErr strings.Builder
+	holder.Stderr = &helperErr
+	if err := holder.Start(); err != nil {
+		t.Skipf("cannot re-exec the test binary as a holder: %v", err)
+	}
+	waited := make(chan struct{})
+	go func() { defer close(waited); _ = holder.Wait() }()
+	t.Cleanup(func() {
+		_ = holder.Process.Kill()
+		<-waited
+	})
+
+	wtDir, err := worktreesDir(context.Background(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(wtDir, "run-"+root+".lock")
+	deadline := time.Now().Add(30 * time.Second)
+	for readLockPID(lockPath) != holder.Process.Pid {
+		if time.Now().After(deadline) {
+			t.Fatalf("helper never took the lineage lock (lock pid = %d, helper pid = %d)\nhelper stderr:\n%s",
+				readLockPID(lockPath), holder.Process.Pid, helperErr.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := readLockRunID(lockPath); got != holderRun {
+		t.Fatalf("lock run id = %q, want the holder's %q", got, holderRun)
+	}
+
+	// (2) Before the cancel, the SAME acquire must still refuse: the holder's
+	// run is running, so nothing about it is evictable. This is what makes step
+	// (3) an assertion about the CANCEL and not about the lock in general.
+	if release, refuseErr := acquireLineageLock(
+		context.Background(), repo, root, nextRun, client, io.Discard); refuseErr == nil {
+		release()
+		t.Fatal("acquire ADMITTED over a RUNNING holder; want a loud refusal")
+	} else if !errors.Is(refuseErr, errHolderNotCancelled) {
+		t.Fatalf("pre-cancel refusal = %v, want it to wrap %v", refuseErr, errHolderNotCancelled)
+	}
+
+	// (3) Cancel the run — the operator verb whose gap this issue is about.
+	resp, err := http.Post(srv.URL+"/v0/runs/"+holderRun+"/cancel", "application/json", nil)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// (4) The NEXT same-lineage dispatch is ADMITTED.
+	var log strings.Builder
+	release, err := acquireLineageLock(context.Background(), repo, root, nextRun, client, &log)
+	if err != nil {
+		t.Fatalf("next same-lineage acquire REFUSED after the cancel — the #2545 wedge: %v", err)
+	}
+	defer release()
+
+	if got := readLockPID(lockPath); got != os.Getpid() {
+		t.Errorf("lock pid after admission = %d, want this process %d", got, os.Getpid())
+	}
+	if got := readLockRunID(lockPath); got != nextRun {
+		t.Errorf("lock run id after admission = %q, want %q", got, nextRun)
+	}
+	select {
+	case <-waited:
+	case <-time.After(30 * time.Second):
+		t.Errorf("holder pid %d still alive after the eviction", holder.Process.Pid)
+	}
+	for _, want := range []string{
+		`"event":"lineage_lock_evicted"`,
+		`"holder_run_id":"` + holderRun + `"`,
+		`"holder_state":"cancelled"`,
+	} {
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("eviction log missing %s:\n%s", want, log.String())
 		}
 	}
 }
