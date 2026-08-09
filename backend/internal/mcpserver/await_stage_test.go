@@ -444,12 +444,69 @@ func TestAwaitStage_TransportErrorSurfaces(t *testing.T) {
 	}
 }
 
+// TestAwaitStage_PollTransportErrorSurfaces covers the mid-poll transport-error
+// branch: GetRunStageWait failing INSIDE the ticker loop while the poll deadline
+// is still live must surface as a tool error ("poll stage wait"), NOT a
+// fabricated status and NOT the fast-path "read stage wait" error. The fast-path
+// read (read 1) succeeds unsettled; the flip arms a 500 on read 2 (the first
+// poll read) so the failure lands mid-loop with pollCtx.Err()==nil (a large
+// TimeoutSeconds keeps the deadline live), exercising the branch that
+// TestAwaitStage_TransportErrorSurfaces (fast path) and
+// TestAwaitStage_TimeoutIsResumable (deadline-hit disambiguation) do not.
+func TestAwaitStage_PollTransportErrorSurfaces(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	// Arm the 500 on the SECOND read (the first poll read), not the first: the
+	// flip runs under fb.mu before the handler reads the status, so setting the
+	// override here makes read 2 fail while read 1 (fast path) already succeeded.
+	fb.stageWaitFlip = func(sid uuid.UUID, reads int) {
+		if sid == stageID && reads == 2 {
+			fb.stageWaitStatusByStageID[sid] = 500
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	// Large timeout so the deadline stays live when the mid-poll read fails —
+	// this routes through the transport-error return, not the pollCtx.Err()
+	// resumable-timeout branch.
+	_, _, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err == nil {
+		t.Fatal("expected a mid-poll transport error to surface")
+	}
+	if !strings.Contains(err.Error(), "poll stage wait") {
+		t.Errorf("error should name the failed poll read (poll stage wait), not a fabricated status; got %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "read stage wait") {
+		t.Errorf("error should be the mid-poll error, not the fast-path read error; got %q", err.Error())
+	}
+}
+
 // TestAwaitStage_PerCallWaitStaysUnderClientTimeout asserts the ?wait value
-// observed ON THE WIRE never exceeds awaitStagePerCallWaitSeconds (15) — i.e.
-// strictly under the apiClient short-client 30s timeout — AND that at least one
-// poll read carried wait>0 (the poll path was taken). Deleting the clamp / the
-// 15s constant so the wire value goes to 30 fails the <=15 assertion.
+// observed ON THE WIRE never exceeds the INDEPENDENT LITERAL bound 15 — NOT
+// awaitStagePerCallWaitSeconds, which would move the bound WITH the constant and
+// make the comparison unfalsifiable (raise the constant to 30 and `w > constant`
+// can never fire). The literal 15 is strictly under the apiClient short-client's
+// 30s timeout, so a held long-poll can never race that deadline; raising the
+// constant to 30 — the exact regression this guards — drives the wire value to
+// 30 and fails `w > 15`. The test also asserts at least one poll read carried
+// wait>0 (the long-poll path was taken), and separately pins the constant itself
+// at 15. (The integration test at backend/internal/integration/mcp is the
+// cross-package control that CANNOT reference the constant; this unit test now
+// stands on the same independent literal so it holds on a host without Docker.)
 func TestAwaitStage_PerCallWaitStaysUnderClientTimeout(t *testing.T) {
+	// Separately pin the constant so a change to it is loud here too — this is a
+	// named pin, distinct from the wire-value bound below which does NOT depend
+	// on it.
+	if awaitStagePerCallWaitSeconds != 15 {
+		t.Errorf("awaitStagePerCallWaitSeconds = %d, want 15 (must stay strictly under the apiClient's 30s client timeout)", awaitStagePerCallWaitSeconds)
+	}
+
 	fb, srv := newFakeBackend(t)
 	runID := uuid.New()
 	stageID := seedStageWait(fb, runID, "implement", "running", false)
@@ -476,8 +533,12 @@ func TestAwaitStage_PerCallWaitStaysUnderClientTimeout(t *testing.T) {
 	}
 	sawPoll := false
 	for i, w := range waits {
-		if w > awaitStagePerCallWaitSeconds {
-			t.Errorf("read[%d] ?wait = %d on the wire, want <= %d (strictly under the 30s client timeout)", i, w, awaitStagePerCallWaitSeconds)
+		// Bound against the LITERAL 15, not awaitStagePerCallWaitSeconds: an
+		// independent literal is the only form that goes red when the constant is
+		// raised to 30 (which would let a held long-poll race the apiClient's 30s
+		// client timeout and surface as a transport error).
+		if w > 15 {
+			t.Errorf("read[%d] ?wait = %d on the wire, want <= 15 (strictly under the apiClient's 30s client timeout)", i, w)
 		}
 		if w > 0 {
 			sawPoll = true
