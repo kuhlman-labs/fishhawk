@@ -36,7 +36,20 @@ One issue → one run → one PR.
    **`fishhawk_approve_plan`** (approval notes are delivered to the implement
    agent as binding conditions) or **`fishhawk_reject_plan`** with a reason —
    rejection feedback propagates to a fresh planning run.
-4. **`fishhawk_dispatch_stage` (implement)** — execute the approved plan.
+4. **`fishhawk_dispatch_stage` (implement)** — execute the approved plan. The
+   call returns a `next_step` pointing at **`fishhawk_await_stage`** (with
+   `run_id` + `stage_id` pre-filled): call it to block until the stage settles
+   instead of hand-polling `fishhawk_get_run_status`. Which verb to reach for is
+   a trade-off, not a ranking: a client that BACKGROUNDS long tool calls gets
+   clean async semantics from the blocking verbs (`fishhawk_run_stage` /
+   `fishhawk_run_children`) for free and needs no polling; `dispatch_stage`'s
+   real advantage is its in-band mid-stage scope-amendment channel, not the
+   non-blocking part — so it is not a better long-wait path for a backgrounding
+   client. `fishhawk_await_stage` resolves the moment the stage SETTLES
+   (terminal OR parked-for-operator), carrying the RAW stage state out so a
+   parked `awaiting_approval` is distinguishable from a `succeeded` stage; it
+   reuses the same `long_wait` / `heartbeat` / `timeout_cap_seconds` ladder the
+   other await verbs use.
 5. **`fishhawk_await_review`** — block until the implement review reaches a
    terminal verdict. Re-poll `fishhawk_get_run_status` if it times out; that
    poll is the authoritative path to a terminal status. Once the review

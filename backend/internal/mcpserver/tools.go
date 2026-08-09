@@ -222,6 +222,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerGetRunStatus(srv, resolver)
 	registerGetGateView(srv, resolver)
 	registerAwaitAudit(srv, resolver)
+	registerAwaitStage(srv, resolver)
 	registerAwaitReview(srv, resolver)
 	registerListAudit(srv, resolver)
 	registerStartRun(srv, resolver)
@@ -1559,9 +1560,14 @@ await a stage's terminal status: while the status is non-terminal
 (pending/running) the StageWaitStatus carries a server-suggested
 poll_interval_seconds (30s) — re-call get_run_status on that cadence until
 the status goes terminal. (The interval is dropped once the run itself is
-terminal, so the wait never strands.) fishhawk_run_stage's
-synchronous-with-progress call is the negotiated fallback for clients that
-prefer to block; a future native MCP Tasks mode is unavailable today — the
+terminal, so the wait never strands.) A client that BACKGROUNDS long tool
+calls needs no polling at all — the blocking verbs (fishhawk_run_stage /
+fishhawk_run_children) give it clean async semantics for free; and after a
+fishhawk_dispatch_stage, fishhawk_await_stage is the single terminal wait to
+call on the returned (run_id, stage_id) handle. dispatch_stage's real
+advantage is its in-band mid-stage scope-amendment channel, not the
+non-blocking part — so a backgrounding client should not reach for it just to
+wait. A future native MCP Tasks mode is unavailable today — the
 experimental io.modelcontextprotocol/tasks extension (SEP-2663) is
 unimplemented in the pinned go-sdk (go-sdk#626).
 

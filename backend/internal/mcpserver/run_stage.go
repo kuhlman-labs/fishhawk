@@ -261,6 +261,15 @@ whereas this blocking call holds the session. Reach for run_stage on an
 implement stage only as the compact one-shot when a mid-stage amendment is
 impossible.
 
+The real trade-off, stated plainly: a client that BACKGROUNDS long tool calls
+gets clean async semantics from the blocking verbs (this one /
+fishhawk_run_children) for free and needs no polling. dispatch_stage's actual
+advantage is its in-band mid-stage scope-amendment channel, not the
+non-blocking part — a backgrounding client already covers that better — so
+such a client should not reach for dispatch_stage just to wait. When you do
+dispatch, call fishhawk_await_stage on the returned handle: one terminal wait,
+no poll loop.
+
 Runner output streams as MCP progress notifications only when a
 progressToken is present on the call. progressToken is MCP request
 metadata supplied by your MCP client, not a tool input — you cannot

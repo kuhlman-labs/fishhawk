@@ -106,6 +106,23 @@ type fakeBackend struct {
 	// directly (the caller already holds fb.mu, so it must not re-lock).
 	reviewFlip func(category string)
 
+	// #2491 fixtures: GET /v0/runs/{run_id}/stages/{stage_id} wait envelope
+	// (the #1252 endpoint fishhawk_await_stage polls). stageWaitByStageID is
+	// the RunStageWait envelope returned for a stage id. stageWaitReadsByStageID
+	// counts reads per stage id so a test can assert the poll path was taken
+	// (> 1 read). stageWaitWaitsByStageID records every ?wait value observed ON
+	// THE WIRE so the per-call clamp counterfactual asserts <= 15.
+	// stageWaitStatusByStageID overrides the HTTP status for a stage id (the
+	// transport-error test). stageWaitFlip, when non-nil, is invoked under fb.mu
+	// on every stage-wait read with (stage id, running read count) so a test can
+	// settle the stage mid-poll without wall-clock sleeps — it mutates
+	// stageWaitByStageID directly (the caller already holds fb.mu).
+	stageWaitByStageID       map[uuid.UUID]RunStageWait
+	stageWaitReadsByStageID  map[uuid.UUID]int
+	stageWaitWaitsByStageID  map[uuid.UUID][]int
+	stageWaitStatusByStageID map[uuid.UUID]int
+	stageWaitFlip            func(stageID uuid.UUID, reads int)
+
 	// E22.1 fixtures: POST /v0/runs.
 	// createRunBody captures the last decoded request body so tests
 	// can assert what fields were sent.
@@ -449,6 +466,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		perRunAuditNextByRun:          map[uuid.UUID]string{},
 		perRunAuditLastQueryByID:      map[uuid.UUID]string{},
 		perRunAuditCategoryReads:      map[string]int{},
+		stageWaitByStageID:            map[uuid.UUID]RunStageWait{},
+		stageWaitReadsByStageID:       map[uuid.UUID]int{},
+		stageWaitWaitsByStageID:       map[uuid.UUID][]int{},
+		stageWaitStatusByStageID:      map[uuid.UUID]int{},
 		createRunStatus:               http.StatusCreated,
 		recoverStatus:                 http.StatusCreated,
 		cancelResp:                    map[uuid.UUID]Run{},
@@ -1222,6 +1243,42 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.mu.Unlock()
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(listStagesResult{Items: items})
+	})
+	// #2491: the #1252 per-stage wait envelope endpoint fishhawk_await_stage's
+	// GetRunStageWait hits. Records the read count + every ?wait value seen on
+	// the wire, invokes stageWaitFlip so a test can settle the stage mid-poll,
+	// and returns the RunStageWait envelope (top-level state/terminal shape).
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages/{stage_id}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		stageID, perr := uuid.Parse(r.PathValue("stage_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.stageWaitReadsByStageID[stageID]++
+		reads := fb.stageWaitReadsByStageID[stageID]
+		waitVal := 0
+		if raw := r.URL.Query().Get("wait"); raw != "" {
+			if n, aerr := strconv.Atoi(raw); aerr == nil {
+				waitVal = n
+			}
+		}
+		fb.stageWaitWaitsByStageID[stageID] = append(fb.stageWaitWaitsByStageID[stageID], waitVal)
+		if fb.stageWaitFlip != nil {
+			fb.stageWaitFlip(stageID, reads)
+		}
+		status := fb.stageWaitStatusByStageID[stageID]
+		if status == 0 {
+			status = http.StatusOK
+		}
+		env := fb.stageWaitByStageID[stageID]
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if status >= 400 {
+			return
+		}
+		_ = json.NewEncoder(w).Encode(env)
 	})
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", func(w http.ResponseWriter, r *http.Request) {
 		id, perr := uuid.Parse(r.PathValue("run_id"))
@@ -2248,7 +2305,11 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// E66.37 (#2474) adds exactly ONE tool — fishhawk_arbitrate_acceptance, the
 	// operator-only discharge of a PAGED acceptance triage that un-wedges the
 	// merge gate — taking the total 45 -> 46.
-	const wantToolCount = 46
+	//
+	// E48.64 (#2491) adds exactly ONE tool — fishhawk_await_stage, the terminal
+	// wait on the durable (run_id, stage_id) handle fishhawk_dispatch_stage
+	// returns — taking the total 46 -> 47.
+	const wantToolCount = 47
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -2488,6 +2549,140 @@ func TestStageWaitDescriptions_NameCurrentTasksBlocker(t *testing.T) {
 	dispatchDesc := descByName["fishhawk_dispatch_stage"]
 	if got := strings.Count(dispatchDesc, "MCP Tasks"); got != 1 {
 		t.Errorf("fishhawk_dispatch_stage: description contains %d occurrences of %q, want exactly 1 (the Tasks note must stay one sentence):\n%s", got, "MCP Tasks", dispatchDesc)
+	}
+}
+
+// listToolDescriptions connects an in-memory MCP session, registers the full
+// tool set, and returns each tool's wire-visible ListTools description keyed by
+// name. It is the shared setup the description-guidance assertions reuse.
+func listToolDescriptions(t *testing.T) map[string]string {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	descByName := make(map[string]string, len(res.Tools))
+	for _, tool := range res.Tools {
+		descByName[tool.Name] = tool.Description
+	}
+	return descByName
+}
+
+// TestAwaitStage_RegisteredAndAdvertised is the #2491 done-means test: over a
+// real in-memory MCP session, ListTools carries fishhawk_await_stage with a
+// non-empty description and the documented input properties (run_id, stage,
+// stage_id, timeout_seconds, long_wait). A comment-only or no-op touch that
+// failed to register the tool fails here (the wantToolCount 46->47 bump in
+// TestRegisteredToolsHaveWhenLeadingDescriptions catches the count).
+func TestAwaitStage_RegisteredAndAdvertised(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range res.Tools {
+		if tl.Name == "fishhawk_await_stage" {
+			tool = tl
+			break
+		}
+	}
+	if tool == nil {
+		t.Fatal("fishhawk_await_stage is not registered/visible over ListTools")
+	}
+	if strings.TrimSpace(tool.Description) == "" {
+		t.Error("fishhawk_await_stage has an empty description")
+	}
+	// Over the wire the SDK decodes Tool.InputSchema into a JSON object map, so
+	// mirror the existing schema-advertisement pattern (line ~2763).
+	schemaMap, ok := any(tool.InputSchema).(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_await_stage InputSchema is %T, want a JSON object map", tool.InputSchema)
+	}
+	props, ok := schemaMap["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_await_stage schema has no properties object; got %v", schemaMap["properties"])
+	}
+	for _, prop := range []string{"run_id", "stage", "stage_id", "timeout_seconds", "long_wait"} {
+		if _, ok := props[prop]; !ok {
+			t.Errorf("fishhawk_await_stage input schema missing property %q", prop)
+		}
+	}
+}
+
+// TestStageWaitDescriptions_StateBackgroundingTradeoff is the #2491 done-means
+// test: the WIRE-VISIBLE ListTools descriptions of fishhawk_run_stage,
+// fishhawk_dispatch_stage, and fishhawk_get_run_status must each (a) name
+// fishhawk_await_stage as the terminal wait to call on the handle and (b) state
+// the real trade-off — a client that BACKGROUNDS long tool calls prefers the
+// blocking verbs, and dispatch_stage's advantage is its in-band amendment
+// channel — and none of them may still advertise dispatch_stage as the better
+// long-wait path. A comment-only or no-op touch of any of the three sites
+// leaves the stale framing and fails here.
+func TestStageWaitDescriptions_StateBackgroundingTradeoff(t *testing.T) {
+	descByName := listToolDescriptions(t)
+	for _, name := range []string{"fishhawk_run_stage", "fishhawk_dispatch_stage", "fishhawk_get_run_status"} {
+		desc, ok := descByName[name]
+		if !ok || desc == "" {
+			t.Errorf("%s: not registered/visible over ListTools", name)
+			continue
+		}
+		lower := strings.ToLower(desc)
+		if !strings.Contains(desc, "fishhawk_await_stage") {
+			t.Errorf("%s: description must name fishhawk_await_stage as the wait to call on the handle:\n%s", name, desc)
+		}
+		if !strings.Contains(lower, "backgrounds long") {
+			t.Errorf("%s: description must state the backgrounding-client trade-off (a client that BACKGROUNDS long tool calls):\n%s", name, desc)
+		}
+		if !strings.Contains(lower, "blocking verbs") {
+			t.Errorf("%s: description must name the blocking verbs as the backgrounding client's clean async path:\n%s", name, desc)
+		}
+		if !strings.Contains(lower, "in-band") {
+			t.Errorf("%s: description must state dispatch_stage's advantage is its in-band amendment channel:\n%s", name, desc)
+		}
+		// The stale framing — dispatch as the better long-wait path — must be
+		// gone from all three. The rewrite phrases the trade-off without this
+		// substring, so its presence would be a regression.
+		if strings.Contains(lower, "better long-wait") {
+			t.Errorf("%s: description still advertises dispatch_stage as the better long-wait path (stale framing):\n%s", name, desc)
+		}
 	}
 }
 

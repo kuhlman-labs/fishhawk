@@ -78,6 +78,47 @@ func TestDispatchStage_NonBlockingReturnsHandle(t *testing.T) {
 	}
 }
 
+// TestDispatchStage_ReturnsAwaitPointer is the #2491 done-means: a successful
+// dispatch returns next_step pointing at fishhawk_await_stage with the RESOLVED
+// run_id + stage_id (not the raw input) pre-filled, so the durable handle comes
+// with the terminal wait to call on it.
+func TestDispatchStage_ReturnsAwaitPointer(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	withFakeRunner(t, "exit 0")
+
+	runID := uuid.New()
+	stageID := uuid.New()
+	// Auto-resolve the stage id from (run_id, type): the pointer must carry the
+	// RESOLVED id, not a raw input the caller never passed.
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID:      runID.String(),
+		Workflow:   "feature_change",
+		Stage:      "implement",
+		GitHubRepo: "x/y",
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.NextStep == nil {
+		t.Fatal("NextStep = nil; a successful dispatch must return the fishhawk_await_stage pointer")
+	}
+	if out.NextStep.Action != "fishhawk_await_stage" {
+		t.Errorf("NextStep.Action = %q, want fishhawk_await_stage", out.NextStep.Action)
+	}
+	if got := out.NextStep.Params["run_id"]; got != runID.String() {
+		t.Errorf("NextStep.Params[run_id] = %q, want %s", got, runID)
+	}
+	if got := out.NextStep.Params["stage_id"]; got != stageID.String() {
+		t.Errorf("NextStep.Params[stage_id] = %q, want the RESOLVED %s", got, stageID)
+	}
+	if got := out.NextStep.Params["stage"]; got != "implement" {
+		t.Errorf("NextStep.Params[stage] = %q, want implement", got)
+	}
+}
+
 // --- argv parity with the synchronous run_stage path ---
 
 // captureAllArgv records the argv of EVERY runStageCommand invocation (dispatch
@@ -1145,6 +1186,57 @@ func TestDispatchStage_AcceptanceNeedsTarget_NoRecordNoSpawn(t *testing.T) {
 	}
 	if out.LogPath != "" {
 		t.Errorf("LogPath = %q, want empty (no runner spawned)", out.LogPath)
+	}
+	// #2491: no runner was spawned, so there is nothing to await — the
+	// fishhawk_await_stage pointer must be nil on the pre-spawn refusal.
+	if out.NextStep != nil {
+		t.Errorf("NextStep = %+v, want nil on the needs_target pre-spawn refusal", out.NextStep)
+	}
+}
+
+// TestDispatchStage_NeedsTarget_NoAwaitPointer is the #2491 done-means for the
+// nil-pointer half: on the pre-spawn NeedsTarget acceptance refusal (no runner
+// spawned) the dispatch output carries NO fishhawk_await_stage next_step, since
+// there is nothing to await.
+func TestDispatchStage_NeedsTarget_NoAwaitPointer(t *testing.T) {
+	origAttempts := acceptanceQuickProbeAttempts
+	acceptanceQuickProbeAttempts = 1
+	t.Cleanup(func() { acceptanceQuickProbeAttempts = origAttempts })
+
+	target := healthzServer(t, http.StatusOK, `{"git_sha":"abc1234def"}`)
+	targetHost := hostOf(target.URL)
+	target.Close()
+
+	f := &dispatchAutoDriveFake{
+		runID: uuid.New(), stageID: uuid.New(), stageType: "acceptance",
+		admissionNeedsTarget:     true,
+		admissionTargetHosts:     []string{targetHost},
+		admissionExpectedHeadSHA: probeExpectedSHA,
+	}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	r := &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+
+	origCmd := runStageCommand
+	runStageCommand = func(_ string, _ ...string) *exec.Cmd { return exec.Command("sh", "-c", "exit 0") }
+	runStageLookPath = func(_ string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { runStageCommand = origCmd })
+
+	_, out, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "acceptance",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if out.NeedsTarget == nil {
+		t.Fatal("NeedsTarget = nil, want the structured refusal (test precondition)")
+	}
+	if out.NextStep != nil {
+		t.Errorf("NextStep = %+v, want nil on the needs_target refusal", out.NextStep)
 	}
 }
 

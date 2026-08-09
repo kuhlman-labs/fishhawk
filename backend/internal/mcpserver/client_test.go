@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1235,4 +1236,102 @@ func TestArbitrateAcceptance_ClientWireShape(t *testing.T) {
 	if !res.AlreadyRecorded {
 		t.Error("already_recorded = false, want true")
 	}
+}
+
+// TestGetRunStageWait_PathQueryAndEnvelope pins the fishhawk_await_stage api
+// client read (#2491): the GET path is /v0/runs/{run}/stages/{stage}; a
+// positive waitSeconds appends ?wait=<n> and is CLAMPED to
+// awaitStagePerCallWaitSeconds; a non-positive value omits the query; and the
+// top-level {state, terminal, failure_*} envelope decodes into RunStageWait.
+func TestGetRunStageWait_PathQueryAndEnvelope(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+
+	t.Run("wait forwarded and envelope decoded", func(t *testing.T) {
+		var gotMethod, gotPath, gotQuery string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.RawQuery
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"` + stageID.String() + `","run_id":"` + runID.String() +
+				`","type":"implement","state":"failed","terminal":true,"failure_category":"category-a","failure_reason":"boom"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		got, err := c.GetRunStageWait(context.Background(), runID, stageID, 10)
+		if err != nil {
+			t.Fatalf("GetRunStageWait: %v", err)
+		}
+		if gotMethod != http.MethodGet {
+			t.Errorf("method = %q, want GET", gotMethod)
+		}
+		if gotPath != "/v0/runs/"+runID.String()+"/stages/"+stageID.String() {
+			t.Errorf("path = %q", gotPath)
+		}
+		if gotQuery != "wait=10" {
+			t.Errorf("query = %q, want wait=10", gotQuery)
+		}
+		if got.State != "failed" || !got.Terminal {
+			t.Errorf("state/terminal = %q/%v, want failed/true", got.State, got.Terminal)
+		}
+		if got.Type != "implement" {
+			t.Errorf("type = %q, want implement", got.Type)
+		}
+		if got.FailureCategory == nil || *got.FailureCategory != "category-a" {
+			t.Errorf("failure_category = %v, want category-a", got.FailureCategory)
+		}
+		if got.FailureReason == nil || *got.FailureReason != "boom" {
+			t.Errorf("failure_reason = %v, want boom", got.FailureReason)
+		}
+	})
+
+	t.Run("wait clamped to the per-call ceiling", func(t *testing.T) {
+		var gotQuery string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.RawQuery
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"state":"running","terminal":false}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		if _, err := c.GetRunStageWait(context.Background(), runID, stageID, 999); err != nil {
+			t.Fatalf("GetRunStageWait: %v", err)
+		}
+		want := "wait=" + strconv.Itoa(awaitStagePerCallWaitSeconds)
+		if gotQuery != want {
+			t.Errorf("query = %q, want %q (clamped to the per-call ceiling)", gotQuery, want)
+		}
+	})
+
+	t.Run("non-positive wait omits the query", func(t *testing.T) {
+		var gotQuery string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.RawQuery
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"state":"succeeded","terminal":true}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		if _, err := c.GetRunStageWait(context.Background(), runID, stageID, 0); err != nil {
+			t.Fatalf("GetRunStageWait: %v", err)
+		}
+		if gotQuery != "" {
+			t.Errorf("query = %q, want empty (no ?wait for a single read)", gotQuery)
+		}
+	})
+
+	t.Run("http error surfaces as apiError", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"boom"}}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		if _, err := c.GetRunStageWait(context.Background(), runID, stageID, 0); err == nil {
+			t.Fatal("expected an error on a 500 response")
+		}
+	})
 }

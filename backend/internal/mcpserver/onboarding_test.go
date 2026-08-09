@@ -112,6 +112,27 @@ func TestOnboardingInstructions_DirectTheAgentToResolveItsOwnCheckout(t *testing
 	}
 }
 
+// TestOnboardingInstructions_NameAwaitStage is the #2491 onboarding done-means:
+// the initialize instructions must (a) name fishhawk_await_stage on the
+// dispatch step and (b) carry the backgrounding-client trade-off clause — as
+// two independent assertions, so a half-edit that names the verb but drops the
+// trade-off (or vice versa) fails where a bare presence gate would pass.
+func TestOnboardingInstructions_NameAwaitStage(t *testing.T) {
+	got := onboardingInstructions
+	lower := strings.ToLower(got)
+	// (a) The dispatch step names the new terminal-wait verb.
+	if !strings.Contains(got, "fishhawk_await_stage") {
+		t.Errorf("onboardingInstructions must name fishhawk_await_stage on the dispatch step; got:\n%s", got)
+	}
+	// (b) The backgrounding-client trade-off is stated as a separate clause.
+	if !strings.Contains(lower, "backgrounds long") {
+		t.Errorf("onboardingInstructions must state the backgrounding-client trade-off (a client that BACKGROUNDS long tool calls); got:\n%s", got)
+	}
+	if !strings.Contains(lower, "in-band mid-stage scope-amendment channel") {
+		t.Errorf("onboardingInstructions must state dispatch_stage's advantage is its in-band amendment channel; got:\n%s", got)
+	}
+}
+
 // TestStartRunSchema_WorkingDirInstructsTheCaller walks the schema ACTUALLY
 // REGISTERED on the server via a tools/list round-trip (not jsonschema.For on
 // the Go struct — so a registration that overrides the inferred schema is
