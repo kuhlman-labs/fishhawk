@@ -985,9 +985,12 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		RetryAttempt:           p.RetryAttempt,
 		MaxRetriesSnapshot:     p.MaxRetriesSnapshot,
 		RunnerKind:             p.RunnerKind,
-		State:                  run.StatePending,
-		CreatedAt:              time.Now().UTC(),
-		UpdatedAt:              time.Now().UTC(),
+		// Carry the minted working_dir through (E48.100 / #2547) so the
+		// retry-inheritance assertion can witness it.
+		WorkingDir: p.WorkingDir,
+		State:      run.StatePending,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
 	}
 	s.created = append(s.created, r)
 	return r, nil
@@ -2955,6 +2958,45 @@ func seedParentRunForRetry(t *testing.T, runs *stubRuns, repo, specYAML string, 
 	runs.created = append(runs.created, r)
 	runs.mu.Unlock()
 	return r
+}
+
+// TestHandle_CIFailureRetry_InheritsParentWorkingDir pins the sibling mint
+// site of E48.100 / #2547: a CI-failure retry executes against the same
+// checkout the run it retries is anchored to, so the retry child inherits the
+// parent's #2483 working_dir binding at mint. The unbound case is the paired
+// control — an unbound parent still mints an empty binding, so the bound
+// assertion cannot be satisfied by stamping a constant. Deleting
+// `WorkingDir: parent.WorkingDir` from handleCIFailureRetry's CreateRunParams
+// turns the bound case red and leaves the unbound case green.
+func TestHandle_CIFailureRetry_InheritsParentWorkingDir(t *testing.T) {
+	bound := t.TempDir()
+	cases := []struct {
+		name    string
+		binding string
+	}{
+		{"bound_parent_child_inherits", bound},
+		{"unbound_parent_child_empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, runs, _ := newDispatcherWithStubs(t)
+			d.Artifacts = &stubArtifacts{}
+			d.IssueNotifier = &stubIssueNotifier{}
+			parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+			// Seeded by construction, before the handler runs.
+			parent.WorkingDir = tc.binding
+
+			if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 2 {
+				t.Fatalf("runs.created = %d, want 2 (parent + retry child)", len(runs.created))
+			}
+			if got := runs.created[1].WorkingDir; got != tc.binding {
+				t.Errorf("retry child working_dir = %q, want %q (inherited from parent)", got, tc.binding)
+			}
+		})
+	}
 }
 
 func TestHandle_CIFailureRetry_HappyPath_DispatchesChild(t *testing.T) {

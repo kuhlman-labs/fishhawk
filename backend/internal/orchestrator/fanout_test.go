@@ -56,9 +56,13 @@ func (r *fanoutRunsRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*r
 		RunnerKind:     p.RunnerKind,
 		IssueContext:   p.IssueContext,
 		WorkflowSpec:   p.WorkflowSpec,
-		State:          run.StatePending,
-		CreatedAt:      time.Now().UTC(),
-		UpdatedAt:      time.Now().UTC(),
+		// Carry the minted working_dir through (E48.100 / #2547) so the
+		// fan-out inheritance assertion can witness it; a fake that drops
+		// the field makes the assertion pass vacuously.
+		WorkingDir: p.WorkingDir,
+		State:      run.StatePending,
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
 	}
 	r.createdRuns = append(r.createdRuns, rr)
 	r.stubRuns.mu.Lock()
@@ -279,6 +283,14 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 	parentSpec := []byte("workflows:\n  feature_change:\n    policy:\n      max_stage_runtime: 30m\n")
 	parent.WorkflowSpec = parentSpec
 
+	// The parent also carries a bound local checkout (#2483). Every minted
+	// child must inherit it (E48.100 / #2547) so the child's stage verbs
+	// resolve the checkout by inheritance instead of falling through to the
+	// calling process's cwd. TestAdvance_FanoutUnboundParent is the paired
+	// unbound case, so this cannot be satisfied by stamping a constant.
+	parentWorkingDir := t.TempDir()
+	parent.WorkingDir = parentWorkingDir
+
 	planBytes := decomposedPlanBytes(t, []string{"Part A", "Part B", "Part C"})
 	schemaV := "standard_v1"
 	arts := &fakeArtifacts{
@@ -337,6 +349,11 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 		if !bytes.Equal(child.WorkflowSpec, parentSpec) {
 			t.Errorf("child %d workflow_spec = %q, want inherited parent spec %q", i, child.WorkflowSpec, parentSpec)
 		}
+		// working_dir inheritance (E48.100 / #2547): deleting
+		// `WorkingDir: parent.WorkingDir` from the fan-out mint turns this red.
+		if child.WorkingDir != parentWorkingDir {
+			t.Errorf("child %d working_dir = %q, want inherited parent binding %q", i, child.WorkingDir, parentWorkingDir)
+		}
 		// SliceIndex linkage pin (#1721): every child carries a distinct
 		// 0-based sub_plan index even though the parent's IssueContext is nil.
 		if child.SliceIndex == nil {
@@ -386,6 +403,60 @@ func TestAdvance_FanoutDecomposedPlan(t *testing.T) {
 	}
 	if payload.Rationale != "test decomposition rationale" {
 		t.Errorf("payload rationale = %q", payload.Rationale)
+	}
+}
+
+// TestAdvance_FanoutUnboundParentMintsEmptyWorkingDir is the paired unbound
+// case for the working_dir inheritance pin above (E48.100 / #2547): a parent
+// carrying NO binding — the github_actions shape, and every legacy row —
+// mints children with an empty working_dir, unchanged from before the fix. It
+// is what stops the bound assertion being satisfiable by stamping a constant.
+func TestAdvance_FanoutUnboundParentMintsEmptyWorkingDir(t *testing.T) {
+	rs := newFanoutRunsRepo()
+	parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+		{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	planStage := stages[0]
+
+	// Seeded by construction: the parent's binding is left empty.
+	if parent.WorkingDir != "" {
+		t.Fatalf("test precondition: parent.WorkingDir = %q, want empty (unbound shape)", parent.WorkingDir)
+	}
+
+	schemaV := "standard_v1"
+	arts := &fakeArtifacts{
+		byStage: map[uuid.UUID][]*artifact.Artifact{
+			planStage.ID: {{
+				ID:            uuid.New(),
+				StageID:       planStage.ID,
+				Kind:          artifact.KindPlan,
+				SchemaVersion: &schemaV,
+				Content:       decomposedPlanBytes(t, []string{"Part A", "Part B"}),
+				ContentHash:   "deadbeef",
+				CreatedAt:     time.Now().UTC(),
+			}},
+		},
+	}
+
+	o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: &recordingAudit{}}
+	out, err := o.Advance(context.Background(), parent.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if out != OutcomeDecomposed {
+		t.Fatalf("Advance outcome = %q, want %q", out, OutcomeDecomposed)
+	}
+
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if got := len(rs.createdRuns); got != 2 {
+		t.Fatalf("createdRuns = %d, want 2", got)
+	}
+	for i, child := range rs.createdRuns {
+		if child.WorkingDir != "" {
+			t.Errorf("child %d working_dir = %q, want empty (unbound parent)", i, child.WorkingDir)
+		}
 	}
 }
 

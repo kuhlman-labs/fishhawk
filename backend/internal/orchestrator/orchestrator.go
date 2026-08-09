@@ -1923,6 +1923,15 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 			SliceIndex:     &idx,
 			RunnerKind:     parent.RunnerKind,
 			IssueContext:   childCtx,
+			// Inherit the parent's bound local checkout (E48.100 / #2547).
+			// A child executes against the SAME checkout its parent's branch
+			// lineage is anchored to, so the #2483 binding is inherited at
+			// mint rather than re-supplied per stage verb — without this every
+			// fan-out child row is minted working_dir NULL and each child's
+			// stage verbs fall through to the calling process's cwd (#1866).
+			// An unbound parent (github_actions, or a legacy row) yields an
+			// empty child value exactly as before.
+			WorkingDir: parent.WorkingDir,
 			// Inherit the parent's cached workflow spec so the child's
 			// implement-stage prompt resolves the policy max_stage_runtime
 			// (30m for feature_change) instead of the runner's 15m default.

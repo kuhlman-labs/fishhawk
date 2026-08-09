@@ -160,6 +160,14 @@ type parentRunFixture struct {
 // parks the review at awaiting_approval without a workflow_dispatch.
 func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte, installationID *int64, reviewKind runpkg.ExecutorKind, workflowSpec []byte) parentRunFixture {
 	t.Helper()
+	return seedParentRunWithWorkingDir(t, ctx, runRepo, artifactRepo, planBytes, installationID, reviewKind, workflowSpec, "")
+}
+
+// seedParentRunWithWorkingDir is seedParentRun with the parent's #2483
+// working_dir binding threaded in (E48.100 / #2547). An empty workingDir is
+// the unbound shape every other caller seeds.
+func seedParentRunWithWorkingDir(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte, installationID *int64, reviewKind runpkg.ExecutorKind, workflowSpec []byte, workingDir string) parentRunFixture {
+	t.Helper()
 
 	r, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
 		Repo:           "kuhlman-labs/fishhawk",
@@ -168,6 +176,7 @@ func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository,
 		TriggerSource:  runpkg.TriggerCLI,
 		InstallationID: installationID,
 		WorkflowSpec:   workflowSpec,
+		WorkingDir:     workingDir,
 	})
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
@@ -233,6 +242,72 @@ func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository,
 	}
 
 	return parentRunFixture{runID: r.ID}
+}
+
+// TestDecomposition_E2E_ChildrenInheritWorkingDir crosses the orchestrator
+// mint → run.CreateRunParams → the runs.working_dir column → the ListRuns
+// decode (E48.100 / #2547). The fan-out unit test only witnesses the params
+// handed to a fake, so it cannot see a dropped column mapping; here every
+// child row is READ BACK from Postgres and must carry the parent's exact
+// binding. The unbound sibling asserts the same read-back is empty for an
+// unbound parent, so the bound case cannot pass by stamping a constant.
+//
+// The rest of the span — persisted child row → GET /v0/runs/{id} → the MCP
+// resolver — is pinned by TestResolveWorkingDirForRun_DecomposedChild_E2E in
+// backend/internal/mcpserver: resolveWorkingDirForRun is unexported and this
+// is an EXTERNAL test package, so the resolver half cannot be driven from
+// here.
+func TestDecomposition_E2E_ChildrenInheritWorkingDir(t *testing.T) {
+	bound := t.TempDir()
+	cases := []struct {
+		name    string
+		binding string
+	}{
+		{"bound_parent_children_inherit", bound},
+		{"unbound_parent_children_empty", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := pgtest.NewPool(t)
+			ctx := context.Background()
+
+			runRepo := runpkg.NewPostgresRepository(pool)
+			artifactRepo := artifact.NewPostgresRepository(pool)
+			auditRepo := audit.NewPostgresRepository(pool)
+			o := &orchestrator.Orchestrator{
+				Runs:      runRepo,
+				Artifacts: artifactRepo,
+				Audit:     auditRepo,
+				Logger:    slog.Default(),
+			}
+
+			fx := seedParentRunWithWorkingDir(t, ctx, runRepo, artifactRepo,
+				decomposedPlanContent(t), nil, runpkg.ExecutorAgent, nil, tc.binding)
+			parentID := fx.runID
+
+			outcome, err := o.Advance(ctx, parentID)
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if outcome != orchestrator.OutcomeDecomposed {
+				t.Fatalf("Advance outcome = %q, want %q", outcome, orchestrator.OutcomeDecomposed)
+			}
+
+			children, err := runRepo.ListRuns(ctx, runpkg.ListRunsFilter{DecomposedFrom: &parentID, Limit: 100})
+			if err != nil {
+				t.Fatalf("ListRuns children: %v", err)
+			}
+			if got := len(children); got != 2 {
+				t.Fatalf("children = %d, want 2", got)
+			}
+			for i, child := range children {
+				if child.WorkingDir != tc.binding {
+					t.Errorf("child %d working_dir read back from Postgres = %q, want %q",
+						i, child.WorkingDir, tc.binding)
+				}
+			}
+		})
+	}
 }
 
 // TestDecomposition_E2E_HappyPath verifies the full decomposition

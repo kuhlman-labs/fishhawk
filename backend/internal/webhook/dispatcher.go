@@ -1931,6 +1931,11 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 		// Inherit the parent's runner_kind — retries run in the
 		// same backend as the run they're retrying (ADR-022).
 		RunnerKind: parent.RunnerKind,
+		// Inherit the parent's bound local checkout for the same reason
+		// (E48.100 / #2547): a retry executes against the same checkout the
+		// run it retries is anchored to, so the #2483 binding is inherited at
+		// mint instead of being lost and re-resolved from the caller's cwd.
+		WorkingDir: parent.WorkingDir,
 	}
 	if triggerRef != "" {
 		params.TriggerRef = &triggerRef

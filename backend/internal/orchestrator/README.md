@@ -10,7 +10,7 @@ Fishhawk's role is "queue and step out of the way"; GitHub's auto-merge machiner
 
 ## Decomposition fan-out (#455 / ADR-025 D4)
 
-When the next pending stage is `implement` and the approved plan declares `decomposition.sub_plans`, the orchestrator mints one child run per sub-plan (carrying `parent_run_id = parent.id` + `decomposed_from = parent.id` + an issue_context derived from the sub-plan's `scope_hint`), parks the parent's implement stage in the `awaiting_children` state, and emits a `plan_decomposed` audit entry naming the child IDs.
+When the next pending stage is `implement` and the approved plan declares `decomposition.sub_plans`, the orchestrator mints one child run per sub-plan (carrying `parent_run_id = parent.id` + `decomposed_from = parent.id` + an issue_context derived from the sub-plan's `scope_hint` + the parent's `working_dir` binding, inherited at mint so the child's stage verbs resolve the same checkout the parent's branch lineage is anchored to — E48.100 / [#2547](https://github.com/kuhlman-labs/fishhawk/issues/2547)), parks the parent's implement stage in the `awaiting_children` state, and emits a `plan_decomposed` audit entry naming the child IDs.
 
 Children themselves skip the fanout check (a non-nil `decomposed_from` short-circuits the path), so recursion is bounded at one level.
 
