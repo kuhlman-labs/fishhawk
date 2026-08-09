@@ -741,13 +741,15 @@ Returns the egress outcome (`report.action` `created`\|`occurrence`, `fingerprin
 
 **Auth:** the first **write** tool that drives an egress on the run's chain — the backend requires the run's **own** run-bound agent token (an operator token or a foreign run's token is rejected with `run_not_entitled`). Error surfaces propagated as tool errors: `validation_failed` (400), `authentication_required` (401), `run_not_entitled` (403 — only the run's own run-bound token may file), `product_feedback_disabled` (403 — the per-repo kill-switch), `run_not_found` (404), `provider_unimplemented` (501), `product_report_failed` (502). The CLI mirror is `fishhawk report-issue`.
 
-## Response byte budget (`fishhawk_get_run_status`, ADR-077 / [#2508](https://github.com/kuhlman-labs/fishhawk/issues/2508))
+## Response byte budget (the bounded surfaces, ADR-077 / [#2508](https://github.com/kuhlman-labs/fishhawk/issues/2508), [#2510](https://github.com/kuhlman-labs/fishhawk/issues/2510))
+
+Three surface families are bounded to **32,768 marshalled bytes BY CONSTRUCTION**: `fishhawk_get_run_status` (`bound.go`), `fishhawk_list_audit`, and **every verb that returns a run row** (`bound_surfaces.go`) — `fishhawk_get_active_run`, `fishhawk_start_run`, `fishhawk_cancel_run`, `fishhawk_list_runs`, `fishhawk_start_campaign_item_run`, `fishhawk_revive_run`, `fishhawk_resume_run`. `fishhawk_drive_run` needs no bound and the reason is structural, not an oversight: `DriveRunOutput` carries `run_id` / `run_state` only and never embeds a `Run`, so the criterion is "does the response type embed `Run`", not an enumerated list a future verb can fall off.
 
 `fishhawk_get_run_status` is bounded to **32,768 marshalled bytes BY CONSTRUCTION** (`bound.go`). This is a **bound**, not another opt-in projection: the `#1727`/`#1749` `include_*` levers still apply first, and the ladder runs after them regardless of which flags were passed.
 
 **Why 32 KiB, and why it is a proxy.** The client rejects on **tokens** (`result (N characters) exceeds maximum allowed tokens`); fishhawkd cannot tokenize, so a byte budget is necessarily a proxy. The threshold was bracketed by driving `fishhawk_list_audit` through the real MCP client: **42,280 chars succeeded**; **54,262**, **81,530** and an independent **75,963** failed — measured threshold `42,280 < T < 54,262`. 32 KiB is the largest confirmed success less ~20%. It bounds the **inner** response; the server never sees the transport envelope, so the headroom absorbs it. A client with a materially different tokenizer is a **re-measurement**, not a design change.
 
-**Override and the below-floor CLAMP.** `FISHHAWKD_MCP_RUN_STATUS_BUDGET_BYTES` overrides the default. Absent / unparseable / non-positive each fall back to the default with its own logged reason. A value **below** `minimalRunStatusMaxBytes` (the floor) is **CLAMPED UP**, never accepted-and-silently-not-honoured — convergence can only ever guarantee `max(budget, floor)`. Clamping rather than rejecting is deliberate: the override exists to serve a client with a *lower* limit, and bouncing it back to 32 KiB would leave that client worse off. The clamp is announced on **two** surfaces — a one-line log naming requested/floor/effective, and the elisions block's own `budget` field, which reports the **effective** (post-clamp) value so the wire never claims a bound the ladder did not honour.
+**Override and the below-floor CLAMP.** `FISHHAWKD_MCP_RESPONSE_BUDGET_BYTES` (the GENERAL var, #2510) overrides the default on every bounded surface; `FISHHAWKD_MCP_RUN_STATUS_BUDGET_BYTES` is the LEGACY spelling #2508 shipped and stays honoured, so no operator override breaks. The **first present** var decides — general, then legacy — and its value routes through the same named branches, so a present-but-invalid general var takes the **default** rather than silently falling through to a stale legacy value. Both share one default (32 KiB) and one convergence floor (`mcpConvergenceFloorBytes`, 4 KiB). Absent / unparseable / non-positive each fall back to the default with its own logged reason. A value **below** `minimalRunStatusMaxBytes` (the floor) is **CLAMPED UP**, never accepted-and-silently-not-honoured — convergence can only ever guarantee `max(budget, floor)`. Clamping rather than rejecting is deliberate: the override exists to serve a client with a *lower* limit, and bouncing it back to 32 KiB would leave that client worse off. The clamp is announced on **two** surfaces — a one-line log naming requested/floor/effective, and the elisions block's own `budget` field, which reports the **effective** (post-clamp) value so the wire never claims a bound the ladder did not honour.
 
 **Three elision classes (the honesty contract).**
 
@@ -796,6 +798,40 @@ Because a composite literal can still build a malformed DTO no constructor vette
 **There is no `fields_list_capped` signal, deliberately.** The ladder never caps the fields **list**: list bloat (a per-stage T7 entry explosion on a 400-stage run, say) falls through to the skeleton — which discards the tier ledger and builds a fresh fixed-size one — and then to the floor's exactly-two aggregates. A flag no code path can set is a schema surface that lies to its reader, so the convergence behaviour is documented rather than advertised as a signal that can never fire.
 
 **Inert below budget.** The `elisions` field is `omitempty` and an under-budget response is returned **unchanged**, so its wire bytes are byte-identical to the pre-#2508 shape and `TestGetRunStatus_CompactDefault_UnderSizeBudget` stays green unmodified. The byte-identity claim is proved by `TestBound_UnderBudget_ReturnsTheInputBytesUnchanged`, whose baseline is marshalled from the **input** before the ladder runs — re-running the ladder over its own already-bounded output would assert only **idempotence**, which a first-pass mutation emitting no elisions satisfies. The handler-level twin asserts what it actually can: no `elisions` key on the wire, and bytes that do not vary with the budget.
+
+### `fishhawk_list_audit` — the verifier surface (#2510)
+
+`limit` advertises up to **200**, and `limit=55` already returned **54,262 chars** and hard-failed the client. The cap is **deliberately kept at 200** — the issue states the preference outright ("prefer bounding — a hard cap loses the operator's ability to ask for more and get a partial answer") — and the honesty that owes the operator is paid by the ladder:
+
+| Tier | Target | Class | Surface |
+|---|---|---|---|
+| A1 | every oversized payload **string value**, capped escape-aware via `capJSONString` | oversized_capable | `GET /v0/runs/<id>/audit` |
+| A2 | items dropped from the **TAIL** (rows are sequence-ASCENDING, so the kept prefix makes the dropped set exactly `sequence > last kept`) | stored | anchored `fishhawk_list_audit(..., since_sequence=<last kept>)` |
+| floor | exactly ONE entry, payload dropped, **hash chain intact** | stored (aggregate) | anchored walk + `GET /v0/runs/<id>/audit` |
+
+A1 points at the **REST** walk, never back at `fishhawk_list_audit`: re-calling the now-bounded tool would cap the same value again — the circularity `validateWireElisions` exists to catch. `entry_hash` / `prev_hash` are **retained at every tier including the floor**: this is the hash-chain **verifier** surface (see `AuditEntry.EntryHash`'s comment), and dropping the chain to save bytes would break verification rather than shrink it.
+
+**THE CURSOR RULE.** The backend's `next_cursor` is positioned after the **FULL** page it fetched. Returning it alongside a **truncated** item list would make an operator paging by cursor **silently SKIP** every dropped entry — a data-loss bug strictly worse than the hard failure this bound fixes. So the moment any item is dropped, `next_cursor` is **BLANKED** and the `since_sequence` anchor becomes the sole continuation path. **Do not "restore" the cursor** on a later refactor: it is cleared because it is WRONG, not because it is redundant. `TestBoundListAudit_BlanksCursorOnTruncation` asserts the resulting STATE (no cursor after truncation), because an error-identity assertion cannot distinguish a cursor that was cleared from one that was never set.
+
+### The shared run-row ladder (#2510)
+
+Any run row embedding `issue_context` can exceed the limit alone (run `143aea12` = **79,131 bytes**), and several of these verbs are **MUTATING**: a real `fishhawk_cancel_run` failed at **110,397 chars** *after* the server-side cancel had already succeeded, and `fishhawk_start_campaign_item_run` broke at **75,963 chars** with the run already minted. The bound is what decouples a mutating verb's success signal from whether its body fits.
+
+| Tier | Target | Class | Surface |
+|---|---|---|---|
+| R1 | `issue_context.comments` (title / url / number / labels retained — they are what makes the pointer actionable) | oversized_capable | the issue URL, falling back to `GET /v0/runs/<id>` |
+| R2 | `issue_context.body` capped to 512 encoded bytes | oversized_capable | same |
+| R3 | `issue_context` dropped entirely | oversized_capable | same |
+| R4 | `concerns.items` (`open` + `by_state` retained) | stored | `fishhawk_get_gate_view(run_id=…)` |
+| floor | the **diagnosis core** only: id, repo, workflow_id, state, runner_kind, pull_request_url, parent_run_id — **each capped**, so the floor is constant-size for a row with pathologically long *retained* strings, not merely a large issue body | stored (aggregate) | `GET /v0/runs/<id>` + gate view |
+
+The floor starts from the **ZERO value** of the response type and installs only that core, so it is constant-size for **any** response type rather than only for the fields this ladder enumerates.
+
+**`pointerIssueURL`'s guard.** The issue URL is the most actionable unbounded surface for an elided `issue_context`, so it is preferred — but it falls back to the REST run read for any URL that is empty, not absolute `http(s)`, whitespace-bearing, or containing `fishhawk_` (which `validateWireElisions` reads as a bounded MCP tool). An `oversized_capable` elision must never be spelled without a retrievable unbounded surface.
+
+### `fishhawk_list_runs` — the multi-row path
+
+It sheds **within** rows first (R1..R4) and only then drops whole trailing rows. `list_runs` has **no `since_sequence` analogue**, so the `list_audit` remedy does not transfer; this surface takes the other admissible option: **drop trailing rows, BLANK the cursor, and point the stored elision at the UNBOUNDED REST enumeration** (`GET /v0/runs`) — never at the now-bounded `fishhawk_list_runs`. The same cursor rule and the same state-asserting counterfactual (`TestBoundListRuns_BlanksCursorOnTruncation`) apply. The bound runs **after** the `include_issue_context` strip and **regardless** of the flag: the flag is an opt-in projection, this is a bound by construction, so an `include_issue_context=true` enumeration is bounded too. A page can therefore come back with fewer runs than `limit` requested — called out because `list_runs` drives fan-out work, where a silently short page could be misread as "no more runs"; the elisions block always names the drop.
 
 ## Auth split (runner `fhm_*` vs operator `fhk_*` tokens)
 

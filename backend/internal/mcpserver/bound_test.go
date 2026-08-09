@@ -209,7 +209,7 @@ func TestElisionTier_ReducesDomainPayload(t *testing.T) {
 func TestBound_ConvergesAtAnyBudget(t *testing.T) {
 	runID := uuid.NewString()
 	budgets := []int{0, 1, 2, 64, minimalRunStatusMaxBytes - 1, minimalRunStatusMaxBytes,
-		6 * 1024, 16 * 1024, runStatusByteBudgetDefault, 1 << 20}
+		6 * 1024, 16 * 1024, mcpResponseByteBudgetDefault, 1 << 20}
 	for _, b := range budgets {
 		out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, b)
 		if err != nil {
@@ -275,8 +275,8 @@ func TestBound_UnderBudget_ReturnsTheInputBytesUnchanged(t *testing.T) {
 // TestFloor_IsConstantSizeUnderAdversarialInput pins the floor's own bound for
 // adversarial inputs, and that the floor sits below the default budget.
 func TestFloor_IsConstantSizeUnderAdversarialInput(t *testing.T) {
-	if minimalRunStatusMaxBytes >= runStatusByteBudgetDefault {
-		t.Fatalf("floor %d must be below the default budget %d", minimalRunStatusMaxBytes, runStatusByteBudgetDefault)
+	if minimalRunStatusMaxBytes >= mcpResponseByteBudgetDefault {
+		t.Fatalf("floor %d must be below the default budget %d", minimalRunStatusMaxBytes, mcpResponseByteBudgetDefault)
 	}
 	cases := []struct{ name, category, state string }{
 		{"megabyte category", strings.Repeat("z", 1<<20), "failed"},
@@ -915,7 +915,7 @@ func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 // the budget override contract
 // ---------------------------------------------------------------------------
 
-func TestRunStatusByteBudget_OverrideBranches(t *testing.T) {
+func TestMCPResponseByteBudget_OverrideBranches(t *testing.T) {
 	// The table is keyed by the getenv FUNC, not by an env map, so the
 	// nil-getenv guard gets its own NAMED branch case. A resolver built without
 	// an environment seam reaches it, and envFuncFromMap(nil) — a non-nil func
@@ -926,18 +926,31 @@ func TestRunStatusByteBudget_OverrideBranches(t *testing.T) {
 		getenv func(string) string
 		want   int
 	}{
-		{"nil getenv (no environment seam at all)", nil, runStatusByteBudgetDefault},
-		{"absent", envFuncFromMap(nil), runStatusByteBudgetDefault},
-		{"unparseable", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "not-a-number"}), runStatusByteBudgetDefault},
-		{"non-positive", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "0"}), runStatusByteBudgetDefault},
-		{"negative", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "-4096"}), runStatusByteBudgetDefault},
+		{"nil getenv (no environment seam at all)", nil, mcpResponseByteBudgetDefault},
+		{"absent", envFuncFromMap(nil), mcpResponseByteBudgetDefault},
+		{"unparseable", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "not-a-number"}), mcpResponseByteBudgetDefault},
+		{"non-positive", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "0"}), mcpResponseByteBudgetDefault},
+		{"negative", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "-4096"}), mcpResponseByteBudgetDefault},
 		{"honoured above the floor", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "8192"}), 8192},
 		{"clamped below the floor", envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1024"}), minimalRunStatusMaxBytes},
+		// The GENERAL var (#2510) and its precedence over the LEGACY spelling.
+		// Both are operator-observable behaviour, so each gets its own named
+		// branch rather than riding on the legacy cases above.
+		{"general var honoured", envFuncFromMap(map[string]string{mcpResponseBudgetEnvVar: "8192"}), 8192},
+		{"general var clamped below the floor", envFuncFromMap(map[string]string{mcpResponseBudgetEnvVar: "1024"}), mcpConvergenceFloorBytes},
+		{"general var unparseable", envFuncFromMap(map[string]string{mcpResponseBudgetEnvVar: "not-a-number"}), mcpResponseByteBudgetDefault},
+		{"general var non-positive", envFuncFromMap(map[string]string{mcpResponseBudgetEnvVar: "0"}), mcpResponseByteBudgetDefault},
+		{"both set: the general var WINS", envFuncFromMap(map[string]string{
+			mcpResponseBudgetEnvVar: "8192", runStatusBudgetEnvVar: "20000"}), 8192},
+		{"general var present but invalid does NOT fall through to the legacy var", envFuncFromMap(map[string]string{
+			mcpResponseBudgetEnvVar: "not-a-number", runStatusBudgetEnvVar: "20000"}), mcpResponseByteBudgetDefault},
+		{"legacy var alone still honoured (no operator override breaks)", envFuncFromMap(map[string]string{
+			runStatusBudgetEnvVar: "20000"}), 20000},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := runStatusByteBudget(tc.getenv); got != tc.want {
-				t.Fatalf("runStatusByteBudget = %d, want %d", got, tc.want)
+			if got := mcpResponseByteBudget(tc.getenv); got != tc.want {
+				t.Fatalf("mcpResponseByteBudget = %d, want %d", got, tc.want)
 			}
 		})
 	}
@@ -946,7 +959,7 @@ func TestRunStatusByteBudget_OverrideBranches(t *testing.T) {
 	// field carries the EFFECTIVE (post-clamp) value, so the wire never claims
 	// a bound the ladder did not honour.
 	runID := uuid.NewString()
-	effective := runStatusByteBudget(envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1024"}))
+	effective := mcpResponseByteBudget(envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1024"}))
 	out, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, effective)
 	if err != nil {
 		t.Fatalf("bound: %v", err)

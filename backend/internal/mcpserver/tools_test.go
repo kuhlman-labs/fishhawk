@@ -9921,7 +9921,7 @@ func TestGetRunStatus_WorstCaseFailedRun_UnderBudget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("marshal: %v", err)
 			}
-			budget := runStatusByteBudget(envFuncFromMap(nil))
+			budget := mcpResponseByteBudget(envFuncFromMap(nil))
 			if len(raw) > budget {
 				t.Errorf("response = %d bytes, want <= the %d-byte budget", len(raw), budget)
 			}
@@ -10152,5 +10152,204 @@ func TestGetRunStatus_PopulatedElisions_PassesSDKOutputSchemaValidation(t *testi
 				}
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2510 — the bounded surfaces, driven through the real tool HANDLER
+// ---------------------------------------------------------------------------
+
+// callBoundedToolOverSDK drives ONE registered tool end to end through the MCP
+// SDK's in-memory transport and returns its marshalled structured content.
+//
+// This is the seam per-layer unit tests cannot reach: go-sdk validates the
+// MARSHALLED tool output against the REFLECTED output schema INSIDE the handler
+// (and jsonschema-go forbids additional properties while skipping unexported
+// fields), so a mis-tagged or unexported elisions field fails ONLY here. Every
+// #2510 surface gained such a field, so every one is driven through it.
+func callBoundedToolOverSDK(t *testing.T, srv *httptest.Server, env map[string]string,
+	register func(*mcp.Server, *runResolver), name string, args map[string]any) []byte {
+	t.Helper()
+	ctx := context.Background()
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	register(server, newResolver(srv, env))
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+	if err != nil {
+		if strings.Contains(err.Error(), "validating tool output") {
+			t.Fatalf("%s: the elisions block failed the SDK's output-schema validation: %v", name, err)
+		}
+		t.Fatalf("%s CallTool: %v", name, err)
+	}
+	if res.IsError {
+		t.Fatalf("%s returned IsError; content: %+v", name, res.Content)
+	}
+	for _, c := range res.Content {
+		if tc, ok := c.(*mcp.TextContent); ok && strings.Contains(tc.Text, "validating tool output") {
+			t.Fatalf("%s result carries an output-schema validation error: %s", name, tc.Text)
+		}
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("%s: marshal structured content: %v", name, err)
+	}
+	return raw
+}
+
+// assertBoundedWithElisions is the shared assertion for a bounded surface's
+// round-tripped response: under the effective budget, carrying a VALID elisions
+// block.
+func assertBoundedWithElisions(t *testing.T, name string, raw []byte, el *Elisions, budget int) {
+	t.Helper()
+	if len(raw) > budget {
+		t.Errorf("%s round-tripped at %d bytes, want <= %d", name, len(raw), budget)
+	}
+	if el == nil {
+		t.Fatalf("%s: an oversized fixture returned no elisions block: %s", name, raw)
+	}
+	if err := validateWireElisions(el); err != nil {
+		t.Errorf("%s: round-tripped elisions violate their own classification: %v", name, err)
+	}
+	if el.Budget != budget {
+		t.Errorf("%s: elisions.budget = %d, want the effective %d", name, el.Budget, budget)
+	}
+}
+
+// TestListAudit_OversizedPage_BoundedThroughHandler drives fishhawk_list_audit
+// at its advertised maximum through the real handler: the limit=200 page that
+// hard-failed the client now returns partial, bounded, and cursor-blanked.
+func TestListAudit_OversizedPage_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.perRunAuditByRun[runID] = auditPage(runID.String(), listAuditLimitMax, strings.Repeat("reviewer prose. ", 400))
+	fb.perRunAuditNextByRun[runID] = "cursor-after-the-FULL-page"
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerListAudit, "fishhawk_list_audit",
+		map[string]any{"run_id": runID.String(), "limit": listAuditLimitMax})
+
+	var out ListAuditOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_list_audit", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if len(out.Items) == 0 || len(out.Items) >= listAuditLimitMax {
+		t.Fatalf("want a PARTIAL page, got %d of %d entries", len(out.Items), listAuditLimitMax)
+	}
+	if out.NextCursor != "" {
+		t.Errorf("next_cursor = %q survived a truncated page through the handler", out.NextCursor)
+	}
+	for i, e := range out.Items {
+		if e.EntryHash == "" || e.PrevHash == nil {
+			t.Errorf("item %d lost its hash chain through the handler", i)
+		}
+	}
+}
+
+// TestListRuns_OversizedPage_BoundedThroughHandler drives the enumeration with
+// include_issue_context=true — the opt-in that the bound must cover too.
+func TestListRuns_OversizedPage_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	items := make([]Run, 0, listRunsLimitMax)
+	for i := 0; i < listRunsLimitMax; i++ {
+		r := worstCaseIssueRun(uuid.NewString())
+		r.Repo = "kuhlman-labs/" + strings.Repeat("long-repo-segment-", 12)
+		items = append(items, r)
+	}
+	fb.listResp = listRunsResult{Items: items, NextCursor: "cursor-after-the-FULL-page"}
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerListRuns, "fishhawk_list_runs",
+		map[string]any{"limit": listRunsLimitMax, "include_issue_context": true})
+
+	var out ListRunsOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_list_runs", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if len(out.Items) >= listRunsLimitMax && out.NextCursor != "" {
+		t.Errorf("a truncated page kept its cursor: %q", out.NextCursor)
+	}
+	if len(out.Items) < listRunsLimitMax && out.NextCursor != "" {
+		t.Errorf("next_cursor = %q survived a row-dropping truncation through the handler", out.NextCursor)
+	}
+}
+
+// TestGetActiveRun_OversizedRow_BoundedThroughHandler covers the FISHHAWK_RUN_ID
+// resolution path — one of three, all of which route through boundActiveRun.
+func TestGetActiveRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = worstCaseIssueRun(runID.String())
+
+	raw := callBoundedToolOverSDK(t, srv, map[string]string{"FISHHAWK_RUN_ID": runID.String()},
+		registerGetActiveRun, "fishhawk_get_active_run", map[string]any{})
+
+	var out GetActiveRunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_get_active_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if out.Run.ID != runID.String() {
+		t.Errorf("the diagnosis core did not survive: %+v", out.Run)
+	}
+}
+
+// TestCancelRun_OversizedRow_BoundedThroughHandler is the mutating-verb case
+// the issue names: the server-side cancel has ALREADY succeeded when this
+// response renders, so the row is reduced rather than the response rejected.
+func TestCancelRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	cancelled := worstCaseIssueRun(runID.String())
+	cancelled.State = "cancelled"
+	fb.cancelResp[runID] = cancelled
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerCancelRun, "fishhawk_cancel_run",
+		map[string]any{"run_id": runID.String()})
+
+	var out CancelRunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_cancel_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if out.Run.State != "cancelled" {
+		t.Errorf("the cancel success signal was lost to the bound: state=%q", out.Run.State)
+	}
+}
+
+// TestStartRun_OversizedRow_BoundedThroughHandler covers the create verb: the
+// run EXISTS by the time the response renders.
+func TestStartRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.createRunResp = worstCaseIssueRun(runID.String())
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerStartRun, "fishhawk_start_run", map[string]any{
+		"repo":          "kuhlman-labs/fishhawk",
+		"workflow_id":   "feature_change",
+		"workflow_spec": minimalWorkflowSpecYAML(t),
+		"workflow_sha":  "deadbeef",
+		"runner_kind":   "github_actions",
+	})
+
+	var out StartRunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_start_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if out.Run.ID != runID.String() {
+		t.Errorf("the created run id was lost to the bound: %+v", out.Run)
 	}
 }

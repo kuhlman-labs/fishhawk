@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -200,5 +201,28 @@ func TestResumeRun_NotFound_MapsActionableError(t *testing.T) {
 	_, _, err := r.resumeRun(context.Background(), nil, ResumeRunInput{ParentRunID: uuid.NewString()})
 	if err == nil || !strings.Contains(err.Error(), "fishhawk_list_runs") {
 		t.Fatalf("err = %v, want run_not_found mapping pointing at fishhawk_list_runs", err)
+	}
+}
+
+// TestResumeRun_OversizedRow_BoundedThroughHandler drives the recovery verb
+// with an oversized run row (#2510): the recovery run is already minted when
+// this response renders, so the row is reduced rather than the response
+// rejected.
+func TestResumeRun_OversizedRow_BoundedThroughHandler(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	parentID := uuid.New()
+	childID := uuid.NewString()
+	fb.recoverResp = worstCaseIssueRun(childID)
+
+	raw := callBoundedToolOverSDK(t, srv, nil, registerResumeRun, "fishhawk_resume_run",
+		map[string]any{"parent_run_id": parentID.String()})
+
+	var out ResumeRunOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	assertBoundedWithElisions(t, "fishhawk_resume_run", raw, out.Elisions, mcpResponseByteBudgetDefault)
+	if out.Run.ID != childID {
+		t.Errorf("the recovery run id was lost to the bound: %+v", out.Run)
 	}
 }

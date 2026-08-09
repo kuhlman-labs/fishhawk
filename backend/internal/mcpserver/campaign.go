@@ -215,6 +215,11 @@ type StartCampaignItemRunInput struct {
 type StartCampaignItemRunOutput struct {
 	Run  Run          `json:"run"`
 	Item CampaignItem `json:"item"`
+	// Elisions is the ADR-077 byte-bound block (#2510). This is the verb that
+	// concretely broke on 2026-08-07 at 75,963 characters — a mutating verb
+	// whose run had ALREADY been minted when the response failed to render — so
+	// the row is reduced rather than the response rejected.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
 }
 
 // registerStartCampaignItemRun wires the fishhawk_start_campaign_item_run tool
@@ -324,7 +329,14 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, _ *mcp.CallToolR
 		}
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("start campaign item run: %w", err)
 	}
-	return nil, StartCampaignItemRunOutput{Run: res.Run, Item: res.Item}, nil
+	bounded, berr := boundRunRowOutput(
+		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item}, res.Run.ID, mcpResponseByteBudget(r.getenv),
+		func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e })
+	if berr != nil {
+		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("bound start_campaign_item_run response: %w", berr)
+	}
+	return nil, bounded, nil
 }
 
 // registerGetCampaignStatus wires the fishhawk_get_campaign_status tool (read-only).

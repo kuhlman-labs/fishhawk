@@ -280,6 +280,25 @@ type GetActiveRunInput struct {
 // schema-walking.
 type GetActiveRunOutput struct {
 	Run Run `json:"run"`
+	// Elisions is the ADR-077 byte-bound block (#2510): present ONLY when the
+	// shared run-row ladder had to reduce the row (a run whose issue_context
+	// carries a large body plus a long comment thread exceeds the tool-result
+	// budget on its own), absent otherwise.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
+}
+
+// boundActiveRun applies the shared run-row byte bound (#2510) to a resolved
+// row. Factored out because getActiveRun returns from three resolution paths
+// and every one of them must be bounded — an unbounded path is exactly the
+// blind spot this change closes.
+func (r *runResolver) boundActiveRun(runRow Run) (GetActiveRunOutput, error) {
+	out, err := boundRunRowOutput(GetActiveRunOutput{Run: runRow}, runRow.ID, mcpResponseByteBudget(r.getenv),
+		func(o *GetActiveRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *GetActiveRunOutput, e *Elisions) { o.Elisions = e })
+	if err != nil {
+		return GetActiveRunOutput{}, fmt.Errorf("bound get_active_run response: %w", err)
+	}
+	return out, nil
 }
 
 // registerGetActiveRun wires the fishhawk_get_active_run tool. The
@@ -342,7 +361,8 @@ func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, 
 		if runRow == nil {
 			return nil, GetActiveRunOutput{}, fmt.Errorf("no Fishhawk run found for %s pull/%d", repo, in.PRNumber)
 		}
-		return nil, GetActiveRunOutput{Run: *runRow}, nil
+		out, berr := r.boundActiveRun(*runRow)
+		return nil, out, berr
 	}
 
 	// Path 2: trigger_ref → query by trigger_ref. Repo is
@@ -360,7 +380,8 @@ func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, 
 		if runRow == nil {
 			return nil, GetActiveRunOutput{}, fmt.Errorf("no Fishhawk run found for trigger_ref=%q", in.TriggerRef)
 		}
-		return nil, GetActiveRunOutput{Run: *runRow}, nil
+		out, berr := r.boundActiveRun(*runRow)
+		return nil, out, berr
 	}
 
 	// Path 3: FISHHAWK_RUN_ID in env. The in-runner agent (E19.8
@@ -375,7 +396,8 @@ func (r *runResolver) getActiveRun(ctx context.Context, _ *mcp.CallToolRequest, 
 		if err != nil {
 			return nil, GetActiveRunOutput{}, fmt.Errorf("get run by FISHHAWK_RUN_ID: %w", err)
 		}
-		return nil, GetActiveRunOutput{Run: *runRow}, nil
+		out, berr := r.boundActiveRun(*runRow)
+		return nil, out, berr
 	}
 
 	// Path 4: nothing to resolve from. Tell the caller exactly
@@ -1885,7 +1907,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, _ *mcp.CallToolRequest, 
 	// forbids outside wire()/wireField(). It is an accepted defensive branch.
 	// The validation itself IS driven, through the projection path, by
 	// TestWireElisions_ValidationRejectsMalformed.
-	bounded, err := boundRunStatusOutput(assembled, runID.String(), runStatusByteBudget(r.getenv))
+	bounded, err := boundRunStatusOutput(assembled, runID.String(), mcpResponseByteBudget(r.getenv))
 	if err != nil {
 		return nil, GetRunStatusOutput{}, fmt.Errorf("bound run status response: %w", err)
 	}
@@ -2070,6 +2092,16 @@ func clampAuditLimit(n int) int {
 // caps lower (200) because the agent's reasoning window has a
 // practical limit on how many entries it can process per call.
 // Pagination via cursor covers the > 200 case.
+//
+// The 200 cap is DELIBERATELY RETAINED at its advertised value rather than
+// lowered to the ~45 entries that empirically fit (#2510): the issue states the
+// preference outright — "prefer bounding — a hard cap loses the operator's
+// ability to ask for more and get a partial answer". The honesty this owes the
+// operator is paid by boundListAuditOutput instead: a limit=200 call now
+// returns a PARTIAL page plus a since_sequence-anchored elision naming the
+// exact remainder, rather than 172 KB the client rejects outright. That is an
+// operator-visible semantic change to this parameter, documented in the tool
+// description, the limit jsonschema text and the package README.
 const (
 	listAuditLimitDefault = 50
 	listAuditLimitMax     = 200
@@ -2087,17 +2119,23 @@ type ListAuditInput struct {
 	// default) yields the whole chain — which is what makes the pointer's
 	// "returns at least the omitted content" promise hold.
 	SinceSequence int64  `json:"since_sequence,omitempty" jsonschema:"return only entries with sequence STRICTLY GREATER THAN this value; zero (the default) yields the whole chain. This is the anchor a fishhawk_get_run_status elisions pointer names"`
-	Limit         int    `json:"limit,omitempty" jsonschema:"max items per page (default 50, capped at 200)"`
+	Limit         int    `json:"limit,omitempty" jsonschema:"max items per page (default 50, capped at 200). The RESPONSE is byte-bounded: a page that would exceed the tool-result budget comes back PARTIAL, with an elisions block whose since_sequence-anchored pointer names the exact remainder and with next_cursor BLANKED (the backend's cursor is positioned after the full page, so returning it would silently skip the dropped entries)"`
 	Cursor        string `json:"cursor,omitempty" jsonschema:"pagination cursor returned by a prior list call as next_cursor"`
 }
 
 // ListAuditOutput mirrors the OpenAPI paginated list envelope.
 // NextCursor is the opaque token the agent feeds back into the
 // next call to walk past the current page; empty when the page
-// reached the end of the chain.
+// reached the end of the chain — and ALSO blanked whenever the
+// byte bound (#2510) truncated the item list, because the backend's
+// cursor is positioned after the FULL page.
 type ListAuditOutput struct {
 	Items      []AuditEntry `json:"items"`
-	NextCursor string       `json:"next_cursor,omitempty" jsonschema:"opaque pagination cursor; empty when no more pages remain"`
+	NextCursor string       `json:"next_cursor,omitempty" jsonschema:"opaque pagination cursor; empty when no more pages remain, and ALSO empty when the response was truncated to fit the byte budget — in that case continue from the elisions pointer's since_sequence anchor, never from a cursor"`
+	// Elisions is the ADR-077 byte-bound block (#2510): present ONLY when the
+	// ladder had to reduce the page, absent otherwise so an under-budget
+	// response is byte-identical to the pre-bound wire.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the response was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class (stored | oversized_capable | computed) and the retrieval surface that returns AT LEAST the omitted content"`
 }
 
 // registerListAudit wires the fishhawk_list_audit tool. Forwards
@@ -2132,6 +2170,16 @@ Inputs:
 
 Response: items[] (AuditEntry shape) + next_cursor (empty when the
 chain is exhausted).
+
+The response is BYTE-BOUNDED (ADR-077 / #2510). A page that would exceed
+the tool-result budget — limit=200 routinely does — comes back PARTIAL
+rather than hard-failing the client: oversized payload strings are capped
+first, then trailing entries are dropped, and an elisions block names each
+omission with the surface that returns it. When entries were dropped,
+next_cursor is BLANKED and the elisions pointer's since_sequence anchor is
+the continuation path: the backend's cursor is positioned after the FULL
+page, so paging by it would silently skip the dropped entries. entry_hash /
+prev_hash are never dropped — this is the hash-chain verifier surface.
 `),
 	}, resolver.listAudit)
 }
@@ -2161,7 +2209,18 @@ func (r *runResolver) listAudit(ctx context.Context, _ *mcp.CallToolRequest, in 
 	if err != nil {
 		return nil, ListAuditOutput{}, fmt.Errorf("list audit: %w", err)
 	}
-	return nil, ListAuditOutput{Items: items, NextCursor: nextCursor}, nil
+	// Response byte bound (#2510). Inert under budget — the page is returned
+	// unchanged with no elisions block, byte-identical to the pre-bound wire.
+	// A validateWireElisions failure is a programming defect (a DTO that
+	// misclassifies its own elisions) and is surfaced, never swallowed, exactly
+	// as get_run_status does.
+	bounded, err := boundListAuditOutput(
+		ListAuditOutput{Items: items, NextCursor: nextCursor},
+		runID.String(), in.Category, mcpResponseByteBudget(r.getenv))
+	if err != nil {
+		return nil, ListAuditOutput{}, fmt.Errorf("bound list audit response: %w", err)
+	}
+	return nil, bounded, nil
 }
 
 // clampListAuditLimit applies the default + cap. Centralized so
@@ -2308,6 +2367,10 @@ type StartRunOutput struct {
 	// ADR-030), fetched best-effort. Omitted when the workflow declares
 	// no budget or the fetch failed — DISPLAY-ONLY, never gates a run.
 	Budget *BudgetStatus `json:"budget,omitempty" jsonschema:"workflow periodic-budget status for the current calendar period (spend vs limit, tier ok|warn|over); omitted when no budget is configured. Display-only — never blocks the run"`
+	// Elisions is the ADR-077 byte-bound block (#2510). start_run is a MUTATING
+	// verb: the run is already created when this response renders, so the bound
+	// is what keeps the success signal from depending on whether the body fits.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
 }
 
 // fetchBudgetStatus retrieves the run's periodic-budget status
@@ -2633,7 +2696,15 @@ func (r *runResolver) startRun(ctx context.Context, _ *mcp.CallToolRequest, in S
 			Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(warnings, "\n")}},
 		}
 	}
-	return meta, out, nil
+	// Response byte bound (#2510) — see the Elisions field comment: the run
+	// EXISTS by now, so the row is reduced rather than the response rejected.
+	bounded, berr := boundRunRowOutput(out, out.Run.ID, mcpResponseByteBudget(r.getenv),
+		func(o *StartRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *StartRunOutput, e *Elisions) { o.Elisions = e })
+	if berr != nil {
+		return nil, StartRunOutput{}, fmt.Errorf("bound start_run response: %w", berr)
+	}
+	return meta, bounded, nil
 }
 
 // CancelRunInput is the fishhawk_cancel_run tool's input schema
@@ -2644,8 +2715,18 @@ type CancelRunInput struct {
 
 // CancelRunOutput surfaces the post-cancel Run row. State should be
 // `cancelled` on success; the rest of the row is unchanged.
+//
+// The row is BYTE-BOUNDED (#2510). This verb is the reason the bound is framed
+// as "every verb that returns a run row" rather than an enumerated few: a real
+// cancel_run call failed at 110,397 characters AFTER the server-side cancel had
+// ALREADY SUCCEEDED, so the operator saw an error for a mutation that landed.
+// Bounding the row is what decouples the success signal from whether the body
+// fits.
 type CancelRunOutput struct {
 	Run Run `json:"run"`
+	// Elisions is the ADR-077 byte-bound block: present ONLY when the shared
+	// run-row ladder had to reduce the row, absent otherwise.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the run row was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
 }
 
 // registerCancelRun wires the fishhawk_cancel_run tool (E22.2 /
@@ -2687,7 +2768,13 @@ func (r *runResolver) cancelRun(ctx context.Context, _ *mcp.CallToolRequest, in 
 	if err != nil {
 		return nil, CancelRunOutput{}, fmt.Errorf("cancel run: %w", err)
 	}
-	return nil, CancelRunOutput{Run: *cancelled}, nil
+	bounded, berr := boundRunRowOutput(CancelRunOutput{Run: *cancelled}, cancelled.ID, mcpResponseByteBudget(r.getenv),
+		func(o *CancelRunOutput) []*Run { return []*Run{&o.Run} },
+		func(o *CancelRunOutput, e *Elisions) { o.Elisions = e })
+	if berr != nil {
+		return nil, CancelRunOutput{}, fmt.Errorf("bound cancel_run response: %w", berr)
+	}
+	return nil, bounded, nil
 }
 
 // ConsolidateSlicesInput is the fishhawk_consolidate_slices tool's input
@@ -3585,8 +3672,15 @@ type ListRunsInput struct {
 // NextCursor is empty when the page reached the end of the result
 // set.
 type ListRunsOutput struct {
-	Items      []Run  `json:"items"`
-	NextCursor string `json:"next_cursor,omitempty" jsonschema:"opaque pagination cursor; empty when no more pages remain"`
+	Items []Run `json:"items"`
+	// NextCursor is ALSO blanked whenever the byte bound (#2510) dropped whole
+	// trailing rows: the backend's cursor is positioned after the FULL page it
+	// fetched, so returning it alongside a truncated list would make cursor
+	// paging silently skip the dropped runs.
+	NextCursor string `json:"next_cursor,omitempty" jsonschema:"opaque pagination cursor; empty when no more pages remain, and ALSO empty when the response was truncated to fit the byte budget — in that case re-read the enumeration from the elisions pointer's unbounded REST surface, never from a cursor"`
+	// Elisions is the ADR-077 byte-bound block (#2510): present ONLY when the
+	// page had to be reduced, absent otherwise.
+	Elisions *Elisions `json:"elisions,omitempty" jsonschema:"present only when the page was reduced to fit the tool-result byte budget: the effective budget, the deepest tier applied, and one entry per omission with its class and the retrieval surface that returns AT LEAST the omitted content"`
 }
 
 // registerListRuns wires the fishhawk_list_runs tool (E22.5 /
@@ -3660,7 +3754,19 @@ func (r *runResolver) listRuns(ctx context.Context, _ *mcp.CallToolRequest, in L
 			page.Items[i].IssueContext = nil
 		}
 	}
-	return nil, ListRunsOutput{Items: page.Items, NextCursor: page.NextCursor}, nil
+	// Response byte bound (#2510), applied AFTER the include_issue_context
+	// strip and regardless of the flag: the strip is an opt-in projection, this
+	// is a bound BY CONSTRUCTION, so an include_issue_context=true enumeration
+	// is bounded too. It sheds WITHIN rows first and only then drops whole
+	// trailing rows — blanking next_cursor when it does (see the field comment
+	// and boundListRunsOutput's cursor rule).
+	bounded, berr := boundListRunsOutput(
+		ListRunsOutput{Items: page.Items, NextCursor: page.NextCursor},
+		mcpResponseByteBudget(r.getenv))
+	if berr != nil {
+		return nil, ListRunsOutput{}, fmt.Errorf("bound list_runs response: %w", berr)
+	}
+	return nil, bounded, nil
 }
 
 // clampListRunsLimit applies the default + cap. Centralized so the
