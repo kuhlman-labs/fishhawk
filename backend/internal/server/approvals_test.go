@@ -8181,6 +8181,149 @@ func TestSliceAddScopeFiles_NonPlanStageApprove_RecordsNothing(t *testing.T) {
 	}
 }
 
+// newScopeChannelPlanServer builds a PLAN-stage approval fixture wired for the
+// full handler path (approval repo + orchestrator + a plan artifact declaring
+// scopeFiles under the cap-3 specImplementPathConstraints spec), so the #2598
+// control tests can drive a real plan-stage approve carrying add_scope_files
+// and remove_scope_files through every in-block gate and then read the
+// COMMITTED approval_submitted payload.
+func newScopeChannelPlanServer(t *testing.T, scopeFiles []plan.ScopeFile) (*Server, *approvalAuditFake, *run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	app := newFakeApprovalRepo()
+	au := newApprovalAuditFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementPathConstraints
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingApproval)
+	seedBudgetPlanArtifact(t, art, stage.ID, &plan.Plan{
+		PlanVersion: "standard_v1",
+		Scope:       plan.Scope{Files: scopeFiles},
+	})
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: app,
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ArtifactRepo: art,
+	})
+	return s, au, stage
+}
+
+// TestAddScopeFiles_NonPlanStageApprove_RecordsNothing is the flat-channel
+// sibling of TestSliceAddScopeFiles_NonPlanStageApprove_RecordsNothing (#2598):
+// the ONLY gate that validates add_scope_files (checkDecomposedAddScopeFiles,
+// and — for the paths themselves — nothing at all before this fix) runs inside
+// the decision==approve && stage.Type==plan block, so an approve of a NON-plan
+// stage on the same run must record NO add_scope_files key. The assertion reads
+// the COMMITTED audit payload, never the status code: the field is IGNORED off
+// the plan stage rather than refused, so a status-only assertion stays green
+// with the guard deleted.
+func TestAddScopeFiles_NonPlanStageApprove_RecordsNothing(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	// A NON-plan stage on the same run. Implement (rather than deploy) keeps the
+	// fixture free of the deploy gate's write:deploy scope + pre-flight, which
+	// would refuse before the params construction under test is even reached.
+	stage.Type = run.StageTypeImplement
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["/etc/passwd","../x"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the field is ignored off the plan stage, not refused):\n%s",
+			w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got, ok := payload["add_scope_files"]; ok {
+		t.Errorf("a NON-plan-stage approve recorded add_scope_files = %#v; no gate validates this channel off the plan stage, so an ungated list must never reach the approval_submitted payload the prompt builder folds into implement scope", got)
+	}
+}
+
+// TestRemoveScopeFiles_NonPlanStageApprove_RecordsNothing is the removal
+// counterpart, and the sharper of the two exposures (#2598):
+// validateRemoveScopeFiles' would-empty-a-non-empty-scope refusal is
+// plan-block-only, so a non-plan-stage approve naming every scope path would
+// empty the effective scope and re-enable the runner's `git add -A` fallback.
+// The payload must carry none of remove_scope_files / scope_files_before /
+// scope_files_after.
+func TestRemoveScopeFiles_NonPlanStageApprove_RecordsNothing(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypeImplement
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","remove_scope_files":["/etc/passwd","../x"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the field is ignored off the plan stage, not refused):\n%s",
+			w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	for _, key := range []string{"remove_scope_files", "scope_files_before", "scope_files_after"} {
+		if got, ok := payload[key]; ok {
+			t.Errorf("a NON-plan-stage approve recorded %s = %#v; the shape/presence/would-empty gates for this channel run on the plan stage alone, so an ungated removal must never reach the approval_submitted payload", key, got)
+		}
+	}
+}
+
+// TestScopeFileChannels_PlanStageApprove_StillRecords is the CONTROL for the
+// two narrowing tests above: a PLAN-stage approve carrying both fields still
+// records both, so re-homing them onto plan-block locals did not break the
+// supported path. Scope declares two files, the add brings the effective set to
+// three (the cap) and the removal takes it back to two, so every in-block gate
+// passes on the merits rather than by being skipped.
+func TestScopeFileChannels_PlanStageApprove_StillRecords(t *testing.T) {
+	s, au, stage := newScopeChannelPlanServer(t, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	})
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files":["backend/c.go"],"remove_scope_files":["backend/b.go"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got := toStringSlice(payload["add_scope_files"]); !reflect.DeepEqual(got, []string{"backend/c.go"}) {
+		t.Errorf("add_scope_files = %v, want [backend/c.go] — the plan-stage path must still record the flat add", got)
+	}
+	if got := toStringSlice(payload["remove_scope_files"]); !reflect.DeepEqual(got, []string{"backend/b.go"}) {
+		t.Errorf("remove_scope_files = %v, want [backend/b.go] — the plan-stage path must still record the removal", got)
+	}
+}
+
+// TestRemoveScopeFiles_PlanStageApprove_RecordsTrimmedPath pins the #1726
+// normalization the removed `req.RemoveScopeFiles = trimmedRemove` write-back
+// used to provide: a whitespace-padded removal path must be recorded TRIMMED,
+// so the prompt-builder subtraction matches the real scope entry. Moving the
+// value onto a plan-block local must carry the trimming with it.
+func TestRemoveScopeFiles_PlanStageApprove_RecordsTrimmedPath(t *testing.T) {
+	s, au, stage := newScopeChannelPlanServer(t, []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	})
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","remove_scope_files":["  backend/b.go  "]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got := toStringSlice(payload["remove_scope_files"]); !reflect.DeepEqual(got, []string{"backend/b.go"}) {
+		t.Errorf("remove_scope_files = %v, want [backend/b.go] (TRIMMED); the padded input would fail to subtract the real scope entry downstream", got)
+	}
+}
+
 // TestSliceAddScopeFiles_CountsTowardScopeCap pins the cap-headroom
 // interaction (binding condition 4): a slice-targeted add consumes
 // max_files_changed headroom exactly like a flat add, so an add that pushes the

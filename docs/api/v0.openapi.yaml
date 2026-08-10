@@ -10142,8 +10142,11 @@ paths:
                     empty scope (preserves the runner's `git add -A`
                     fallback). Does NOT weaken the policy gate: a folded
                     path matching `forbidden_paths` still fails category-B
-                    against the produced diff. Honored only on `approve`;
-                    ignored on `reject`.
+                    against the produced diff. Honored only on `approve` AND
+                    only on a PLAN stage (#2598): the gates that admit this
+                    channel run there, so an approve of any other stage type
+                    IGNORES the field (still `200`) rather than recording an
+                    ungated list. Ignored on `reject`.
                 remove_scope_files:
                   type: array
                   items:
@@ -10170,8 +10173,12 @@ paths:
                     scope (an empty scope re-enables the runner's `git add -A`
                     fallback and disables scope enforcement). Refused BEFORE any
                     approval row is recorded, so a corrected retry flows
-                    normally. Honored only on `approve`; ignored on `reject`.
-                    Omitting the field is byte-identical to today.
+                    normally. Honored only on `approve` AND only on a PLAN
+                    stage (#2598): the shape/presence/would-empty gates run
+                    there, so an approve of any other stage type IGNORES the
+                    field (still `200`) rather than recording an ungated
+                    removal. Ignored on `reject`. Omitting the field is
+                    byte-identical to today.
                 add_scope_files_to_slice:
                   type: object
                   additionalProperties:

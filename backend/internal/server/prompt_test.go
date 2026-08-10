@@ -9870,3 +9870,308 @@ func TestLoadApprovalSliceAddScopeFiles_BestEffortDegrades(t *testing.T) {
 		}
 	})
 }
+
+// withApprovalStageID stamps the recording stage_id onto an approval_submitted
+// fixture — the key writeApprovalAudit records unconditionally on every real
+// row, and the one approvalEntryStageIsPlan resolves (#2598). The plain
+// makeApproveWith*Entry helpers deliberately omit it so the existing fold
+// fixtures keep exercising the filter's fail-open degrade.
+func withApprovalStageID(t *testing.T, e *audit.Entry, stageID uuid.UUID) *audit.Entry {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal approval fixture payload: %v", err)
+	}
+	payload["stage_id"] = stageID.String()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal approval fixture payload: %v", err)
+	}
+	e.Payload = raw
+	return e
+}
+
+// newStageFilterServer wires a Server whose RunRepo resolves the given stages
+// and whose AuditRepo serves entries for runID, so the #2598 loader-side filter
+// can be driven directly.
+func newStageFilterServer(entries []*audit.Entry, runID uuid.UUID, stages ...*run.Stage) *Server {
+	rr := newPromptRunRepo()
+	for _, st := range stages {
+		rr.getStages[st.ID] = st
+	}
+	return New(Config{
+		Addr:      "127.0.0.1:0",
+		RunRepo:   rr,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: entries}},
+	})
+}
+
+// stageFilterFixture builds the shared two-row fixture the three loader tests
+// use: an OLDER row recorded on a PLAN stage and a NEWER row recorded on an
+// IMPLEMENT stage. Because the loaders scan newest-first, an unfiltered loader
+// returns the implement row's paths; a filtered one skips it and continues to
+// the plan row.
+func stageFilterFixture(runID uuid.UUID) (planStage, implStage *run.Stage) {
+	planStage = &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypePlan}
+	implStage = &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement}
+	return planStage, implStage
+}
+
+// TestLoadApprovalAddScopeFiles_NonPlanStageEntry_NotFolded pins the #2598
+// loader-side second wall for the flat add channel: a row a PRE-fix non-plan
+// approve already wrote must NOT fold, and the scan must continue to the older
+// legitimate plan-stage row rather than stopping at the dropped one.
+func TestLoadApprovalAddScopeFiles_NonPlanStageEntry_NotFolded(t *testing.T) {
+	runID := uuid.New()
+	planStage, implStage := stageFilterFixture(runID)
+	planPaths := []string{"backend/planned.go"}
+
+	s := newStageFilterServer([]*audit.Entry{
+		withApprovalStageID(t, makeApproveWithScopeFilesEntry(runID, planPaths), planStage.ID),
+		withApprovalStageID(t, makeApproveWithScopeFilesEntry(runID, []string{"/etc/passwd"}), implStage.ID),
+	}, runID, planStage, implStage)
+
+	got := s.loadApprovalAddScopeFiles(context.Background(), runID)
+	if !reflect.DeepEqual(got, planPaths) {
+		t.Errorf("loadApprovalAddScopeFiles = %v, want %v — the newer IMPLEMENT-stage row must be skipped and the older plan-stage row must still fold", got, planPaths)
+	}
+}
+
+// TestLoadApprovalRemoveScopeFiles_NonPlanStageEntry_NotFolded is the removal
+// counterpart. This channel is the sharper one: an unfiltered fold of a
+// non-plan removal can empty the effective scope and re-enable the runner's
+// `git add -A` fallback.
+func TestLoadApprovalRemoveScopeFiles_NonPlanStageEntry_NotFolded(t *testing.T) {
+	runID := uuid.New()
+	planStage, implStage := stageFilterFixture(runID)
+	planPaths := []string{"backend/planned.go"}
+
+	s := newStageFilterServer([]*audit.Entry{
+		withApprovalStageID(t, makeApproveWithRemoveScopeFilesEntry(runID, planPaths), planStage.ID),
+		withApprovalStageID(t, makeApproveWithRemoveScopeFilesEntry(runID, []string{"backend/everything.go"}), implStage.ID),
+	}, runID, planStage, implStage)
+
+	got := s.loadApprovalRemoveScopeFiles(context.Background(), runID)
+	if !reflect.DeepEqual(got, planPaths) {
+		t.Errorf("loadApprovalRemoveScopeFiles = %v, want %v — the newer IMPLEMENT-stage row must be skipped and the older plan-stage row must still fold", got, planPaths)
+	}
+}
+
+// TestLoadApprovalSliceAddScopeFiles_NonPlanStageEntry_NotFolded is the
+// per-slice counterpart, closing the same loader-side gap #2515's
+// recording-side fix left open for already-written rows.
+func TestLoadApprovalSliceAddScopeFiles_NonPlanStageEntry_NotFolded(t *testing.T) {
+	runID := uuid.New()
+	planStage, implStage := stageFilterFixture(runID)
+	planMap := map[string][]string{"0": {"backend/planned.go"}}
+
+	s := newStageFilterServer([]*audit.Entry{
+		withApprovalStageID(t, makeApproveWithSliceAddScopeFilesEntry(runID, planMap), planStage.ID),
+		withApprovalStageID(t, makeApproveWithSliceAddScopeFilesEntry(runID, map[string][]string{"0": {"/etc/passwd"}}), implStage.ID),
+	}, runID, planStage, implStage)
+
+	got := s.loadApprovalSliceAddScopeFiles(context.Background(), runID)
+	if !reflect.DeepEqual(got, planMap) {
+		t.Errorf("loadApprovalSliceAddScopeFiles = %v, want %v — the newer IMPLEMENT-stage row must be skipped and the older plan-stage row must still fold", got, planMap)
+	}
+}
+
+// TestApprovalEntryStageIsPlan_FailOpenBranches asserts the observable behavior
+// of EVERY enumerated degrade branch of the #2598 loader-side filter, plus the
+// one positive drop. The filter FAILS OPEN by design: it drops a row only on
+// positive confirmation of a non-plan recording stage, because fail-closed
+// would drop legitimate folds for every hand-built or legacy audit row that
+// omits stage_id. Each case is asserted through loadApprovalAddScopeFiles, so
+// the assertion lands on the fold decision the prompt builder actually consumes.
+func TestApprovalEntryStageIsPlan_FailOpenBranches(t *testing.T) {
+	paths := []string{"backend/folded.go"}
+
+	// entryFor builds the single seeded row for a case; a nil stampStageID
+	// leaves the payload without a stage_id key.
+	newCaseServer := func(t *testing.T, entry *audit.Entry, runID uuid.UUID, rr *promptRunRepo) *Server {
+		t.Helper()
+		cfg := Config{
+			Addr:      "127.0.0.1:0",
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: {entry}}},
+		}
+		if rr != nil {
+			cfg.RunRepo = rr
+		}
+		return New(cfg)
+	}
+
+	t.Run("nil RunRepo folds", func(t *testing.T) {
+		runID := uuid.New()
+		e := withApprovalStageID(t, makeApproveWithScopeFilesEntry(runID, paths), uuid.New())
+		s := newCaseServer(t, e, runID, nil)
+		if got := s.loadApprovalAddScopeFiles(context.Background(), runID); !reflect.DeepEqual(got, paths) {
+			t.Errorf("got %v, want %v — with no RunRepo the filter cannot confirm a non-plan stage and must fail OPEN", got, paths)
+		}
+	})
+
+	t.Run("missing stage_id folds", func(t *testing.T) {
+		runID := uuid.New()
+		// makeApproveWithScopeFilesEntry omits stage_id — the shape every
+		// existing hand-built fold fixture carries.
+		s := newCaseServer(t, makeApproveWithScopeFilesEntry(runID, paths), runID, newPromptRunRepo())
+		if got := s.loadApprovalAddScopeFiles(context.Background(), runID); !reflect.DeepEqual(got, paths) {
+			t.Errorf("got %v, want %v — a payload with no stage_id must fail OPEN", got, paths)
+		}
+	})
+
+	t.Run("unparseable stage_id folds", func(t *testing.T) {
+		runID := uuid.New()
+		e := makeApproveWithScopeFilesEntry(runID, paths)
+		e.Payload = []byte(`{"decision":"approve","stage_id":"not-a-uuid","add_scope_files":["backend/folded.go"]}`)
+		s := newCaseServer(t, e, runID, newPromptRunRepo())
+		if got := s.loadApprovalAddScopeFiles(context.Background(), runID); !reflect.DeepEqual(got, paths) {
+			t.Errorf("got %v, want %v — an unparseable stage_id must fail OPEN", got, paths)
+		}
+	})
+
+	t.Run("GetStage error folds", func(t *testing.T) {
+		runID := uuid.New()
+		rr := newPromptRunRepo()
+		rr.stageErr = errors.New("run store unavailable")
+		e := withApprovalStageID(t, makeApproveWithScopeFilesEntry(runID, paths), uuid.New())
+		s := newCaseServer(t, e, runID, rr)
+		if got := s.loadApprovalAddScopeFiles(context.Background(), runID); !reflect.DeepEqual(got, paths) {
+			t.Errorf("got %v, want %v — a GetStage error must fail OPEN", got, paths)
+		}
+	})
+
+	t.Run("empty resolved stage type folds", func(t *testing.T) {
+		runID := uuid.New()
+		rr := newPromptRunRepo()
+		typeless := &run.Stage{ID: uuid.New(), RunID: runID} // Type deliberately ""
+		rr.getStages[typeless.ID] = typeless
+		e := withApprovalStageID(t, makeApproveWithScopeFilesEntry(runID, paths), typeless.ID)
+		s := newCaseServer(t, e, runID, rr)
+		if got := s.loadApprovalAddScopeFiles(context.Background(), runID); !reflect.DeepEqual(got, paths) {
+			t.Errorf("got %v, want %v — an EMPTY resolved stage type is not positive confirmation of a non-plan stage and must fail OPEN", got, paths)
+		}
+	})
+
+	t.Run("resolved implement stage drops", func(t *testing.T) {
+		runID := uuid.New()
+		rr := newPromptRunRepo()
+		impl := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement}
+		rr.getStages[impl.ID] = impl
+		e := withApprovalStageID(t, makeApproveWithScopeFilesEntry(runID, paths), impl.ID)
+		s := newCaseServer(t, e, runID, rr)
+		if got := s.loadApprovalAddScopeFiles(context.Background(), runID); got != nil {
+			t.Errorf("got %v, want nil — a row positively confirmed as recorded on an IMPLEMENT stage must be dropped", got)
+		}
+	})
+}
+
+// replayApprovalAuditFake is approvalAuditFake plus a working
+// ListForRunByCategory that replays what the handler actually APPENDED. It is
+// what lets the #2598 cross-boundary test drive a real approve through
+// handleSubmitApproval and then read the committed row back through the
+// prompt-side loaders, instead of hand-seeding the row the recording side is
+// supposed to produce.
+type replayApprovalAuditFake struct {
+	*approvalAuditFake
+}
+
+func newReplayApprovalAuditFake() *replayApprovalAuditFake {
+	return &replayApprovalAuditFake{approvalAuditFake: newApprovalAuditFake()}
+}
+
+func (a *replayApprovalAuditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*audit.Entry
+	for _, p := range a.appended {
+		if p.Category != category || p.RunID != runID {
+			continue
+		}
+		rid := p.RunID
+		out = append(out, &audit.Entry{
+			ID: uuid.New(), Category: p.Category, RunID: &rid,
+			StageID: p.StageID, Payload: p.Payload,
+		})
+	}
+	return out, nil
+}
+
+// TestNonPlanStageApprove_ScopeFilesNeverReachImplementPrompt is the #2598
+// CROSS-BOUNDARY seam: HTTP approve handler -> approval_submitted audit payload
+// -> prompt-side fold -> effective implement scope. A real approve of a
+// NON-plan (implement) stage carrying both add_scope_files and
+// remove_scope_files must leave the rendered implement scope untouched — the
+// added path absent, and the planned path NOT subtracted. Per-layer units each
+// pass while the seam leaks, which is exactly what this issue was.
+func TestNonPlanStageApprove_ScopeFilesNeverReachImplementPrompt(t *testing.T) {
+	const plannedFile = "backend/internal/server/prompt.go"
+	const smuggledFile = "/etc/passwd"
+
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newReplayApprovalAuditFake()
+	sf := newSigningFake()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specImplementPathConstraints
+
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateSucceeded)
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "scoped plan",
+		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{{Path: plannedFile, Operation: plan.FileOpModify}},
+		},
+	})
+
+	implStage := rr.seedStage(runRow.ID, 1, run.StageStateAwaitingApproval)
+	implStage.Type = run.StageTypeImplement
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		ApprovalRepo: newFakeApprovalRepo(),
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ArtifactRepo: art,
+		SigningRepo:  sf,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	w := submitApproval(t, s, implStage.ID, fmt.Sprintf(
+		`{"decision":"approve","add_scope_files":[%q],"remove_scope_files":[%q]}`,
+		smuggledFile, plannedFile))
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// The approve advanced the implement stage off the gate; the prompt
+	// endpoint serves only runnable stages, so put it back on the dispatch path
+	// exactly as an operator redrive would. The row under test is already
+	// committed — this touches no control.
+	implStage.State = run.StageStateDispatched
+
+	priv, _ := sf.issue(t, runRow.ID)
+	pw := promptRequest(t, s, runRow.ID, implStage.ID, priv, "")
+	if pw.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", pw.Code, pw.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(pw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt response: %v", err)
+	}
+
+	got := make(map[string]bool, len(resp.ScopeFiles))
+	for _, f := range resp.ScopeFiles {
+		got[f.Path] = true
+	}
+	if got[smuggledFile] {
+		t.Errorf("implement ScopeFiles = %v; a path added by a NON-plan-stage approve reached the effective implement scope, bypassing every plan-gate refusal", resp.ScopeFiles)
+	}
+	if !got[plannedFile] {
+		t.Errorf("implement ScopeFiles = %v; the planned path was subtracted by a NON-plan-stage approve's remove_scope_files — an emptied scope re-enables the runner's `git add -A` fallback and disables scope enforcement", resp.ScopeFiles)
+	}
+}
