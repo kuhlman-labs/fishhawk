@@ -294,6 +294,14 @@ type fakeUploader struct {
 	amendmentsErr    error
 	gotAmendmentArgs *upload.FetchScopeAmendmentsArgs
 
+	// Per-call amendment sequence (#2601). When amendmentsSeq is non-nil the
+	// Nth FetchScopeAmendments call returns the Nth entry (the last entry
+	// repeats once exhausted), so a test can drive an operator decision
+	// landing BETWEEN the fold's fetch and the undecided-detection fetch.
+	// amendmentCalls counts every call, sequence or not.
+	amendmentsSeq  [][]upload.ScopeAmendment
+	amendmentCalls int
+
 	// Canned prompt response. If nil, FetchPrompt returns a default
 	// one matching the requested stage_id.
 	promptResp *upload.FetchedPrompt
@@ -522,8 +530,16 @@ func (f *fakeUploader) FetchMCPToken(_ context.Context, args upload.FetchMCPToke
 func (f *fakeUploader) FetchScopeAmendments(_ context.Context, args upload.FetchScopeAmendmentsArgs) ([]upload.ScopeAmendment, error) {
 	a := args
 	f.gotAmendmentArgs = &a
+	idx := f.amendmentCalls
+	f.amendmentCalls++
 	if f.amendmentsErr != nil {
 		return nil, f.amendmentsErr
+	}
+	if len(f.amendmentsSeq) > 0 {
+		if idx >= len(f.amendmentsSeq) {
+			idx = len(f.amendmentsSeq) - 1
+		}
+		return f.amendmentsSeq[idx], nil
 	}
 	return f.amendments, nil
 }
@@ -13842,6 +13858,610 @@ func TestSyncWriter_ConcurrentLinesParse(t *testing.T) {
 		if err := json.Unmarshal([]byte(l), &m); err != nil {
 			t.Fatalf("interleaved (non-JSON) line: %v (%q)", err, l)
 		}
+	}
+}
+
+// --- #2601 undecided (window-expired) mid-stage scope amendments ---
+
+// undecidedStageID / undecidedOtherStageID are DISTINCT stage ids generated as
+// literals by construction — never derived by calling the filter under test —
+// so a counterfactual deletion of the filter's StageID term lands RED on the
+// behavioural assertion rather than on fixture setup.
+const (
+	undecidedStageID      = "aaaaaaaa-1111-2222-3333-444444444444"
+	undecidedOtherStageID = "bbbbbbbb-5555-6666-7777-888888888888"
+)
+
+// TestUndecidedScopeAmendmentsForStage_ExcludesOtherStage: a row still pending
+// but belonging to an EARLIER stage of the same run must never be attributed to
+// this stage. Counterfactual vehicle for the StageID term of the predicate.
+func TestUndecidedScopeAmendmentsForStage_ExcludesOtherStage(t *testing.T) {
+	items := []upload.ScopeAmendment{
+		{ID: "mine", Status: "pending", StageID: undecidedStageID,
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/mine.go", Operation: "modify"}}},
+		{ID: "theirs", Status: "pending", StageID: undecidedOtherStageID,
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/theirs.go", Operation: "modify"}}},
+	}
+
+	got := undecidedScopeAmendmentsForStage(items, undecidedStageID)
+
+	if len(got) != 1 || got[0].ID != "mine" {
+		t.Fatalf("undecided = %+v, want exactly the row for this stage (mine)", got)
+	}
+}
+
+// TestUndecidedScopeAmendmentsForStage_ExcludesDecided: approved and denied rows
+// are DECISIONS, not expiries. Counterfactual vehicle for the pending-only term.
+func TestUndecidedScopeAmendmentsForStage_ExcludesDecided(t *testing.T) {
+	items := []upload.ScopeAmendment{
+		{ID: "approved", Status: "approved", StageID: undecidedStageID,
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/a.go", Operation: "modify"}}},
+		{ID: "denied", Status: "denied", StageID: undecidedStageID,
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/d.go", Operation: "modify"}}},
+	}
+
+	if got := undecidedScopeAmendmentsForStage(items, undecidedStageID); len(got) != 0 {
+		t.Errorf("undecided = %+v, want none (approved/denied are decisions)", got)
+	}
+}
+
+// TestUndecidedScopeAmendmentsForStage_EmptyStageIDNoMatch: an empty stage id
+// must not match a row whose StageID is also empty — that would mis-attribute
+// another stage's undecided request to this one.
+func TestUndecidedScopeAmendmentsForStage_EmptyStageIDNoMatch(t *testing.T) {
+	items := []upload.ScopeAmendment{
+		{ID: "no-stage", Status: "pending", StageID: "",
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/x.go", Operation: "modify"}}},
+	}
+
+	if got := undecidedScopeAmendmentsForStage(items, ""); len(got) != 0 {
+		t.Errorf("undecided = %+v, want none on the empty-stage-id guard", got)
+	}
+}
+
+// TestEmitUndecidedScopeAmendments_SeamContract pins the runner END of the
+// runner->fishhawk-mcp scope_amendment_undecided seam (#2601). The literal
+// field set asserted here — {event, run_id, stage_id, amendments:[{amendment_id,
+// paths:[{path, operation}]}]} — is the SAME shape the relay test
+// TestRunStageEventMessage_ScopeAmendmentUndecided (backend/internal/mcpserver)
+// decodes. The runner and the backend are separate Go modules with no dependency
+// edge in either direction, so no test can drive the real emitter into the real
+// relay; two hand-copied literals pinned on BOTH ends is the #618 mitigation —
+// a field-name drift on either side breaks one of the pair.
+// Also pins the single-line shape and the policy_event that carries the record
+// into both bundle variants.
+func TestEmitUndecidedScopeAmendments_SeamContract(t *testing.T) {
+	fake := newFakeUploader(t)
+	fake.amendments = []upload.ScopeAmendment{
+		{ID: "amd-7", Status: "pending", StageID: undecidedStageID, Paths: []upload.ScopeAmendmentPath{
+			{Path: "docs/ARCHITECTURE.md", Operation: "modify"},
+			{Path: "x/new.go", Operation: "create"},
+		}},
+		// A decided row and another stage's row must not reach the wire.
+		{ID: "amd-8", Status: "approved", StageID: undecidedStageID,
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/ok.go", Operation: "modify"}}},
+		{ID: "amd-9", Status: "pending", StageID: undecidedOtherStageID,
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/other.go", Operation: "modify"}}},
+	}
+	cfg := config{runID: "run-abc", stageID: undecidedStageID}
+	var log bytes.Buffer
+
+	undecided, events := detectUndecidedScopeAmendments(context.Background(), fake, cfg, "fhm_held", "implement", &log)
+
+	if len(undecided) != 1 || undecided[0].ID != "amd-7" {
+		t.Fatalf("undecided = %+v, want exactly amd-7", undecided)
+	}
+	lines := strings.Split(strings.TrimSpace(log.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("emitted %d lines, want exactly 1: %q", len(lines), log.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("emitted line is not one JSON object: %v (%q)", err, lines[0])
+	}
+	if got["event"] != "scope_amendment_undecided" {
+		t.Errorf("event = %v, want scope_amendment_undecided", got["event"])
+	}
+	if got["run_id"] != "run-abc" || got["stage_id"] != undecidedStageID {
+		t.Errorf("run_id/stage_id = %v/%v", got["run_id"], got["stage_id"])
+	}
+	rows, ok := got["amendments"].([]any)
+	if !ok || len(rows) != 1 {
+		t.Fatalf("amendments = %v, want a 1-element array", got["amendments"])
+	}
+	row, _ := rows[0].(map[string]any)
+	if row["amendment_id"] != "amd-7" {
+		t.Errorf("amendments[0].amendment_id = %v, want amd-7", row["amendment_id"])
+	}
+	paths, ok := row["paths"].([]any)
+	if !ok || len(paths) != 2 {
+		t.Fatalf("amendments[0].paths = %v, want a 2-element array", row["paths"])
+	}
+	first, _ := paths[0].(map[string]any)
+	if first["path"] != "docs/ARCHITECTURE.md" || first["operation"] != "modify" {
+		t.Errorf("paths[0] = %v, want {path:docs/ARCHITECTURE.md, operation:modify}", paths[0])
+	}
+
+	if len(events) != 1 || events[0].Kind != "policy_event" {
+		t.Fatalf("events = %+v, want exactly one policy_event", events)
+	}
+	var payload struct {
+		Check      string `json:"check"`
+		Amendments []struct {
+			AmendmentID string                      `json:"amendment_id"`
+			Paths       []upload.ScopeAmendmentPath `json:"paths"`
+		} `json:"amendments"`
+	}
+	if err := json.Unmarshal(events[0].Payload, &payload); err != nil {
+		t.Fatalf("decode policy_event payload: %v", err)
+	}
+	if payload.Check != "scope_amendment_undecided" {
+		t.Errorf("payload check = %q, want scope_amendment_undecided", payload.Check)
+	}
+	if len(payload.Amendments) != 1 || payload.Amendments[0].AmendmentID != "amd-7" ||
+		len(payload.Amendments[0].Paths) != 2 {
+		t.Errorf("payload amendments = %+v, want amd-7 with its 2 paths", payload.Amendments)
+	}
+}
+
+// TestDetectUndecidedScopeAmendments_FetchErrorFailsOpen: the extra list GET is
+// best-effort. A fetch error logs scope_amendment_undecided_check_failed,
+// reports nothing undecided, and never fails the stage — today's behaviour.
+// The behavioural half (the fix loop still reinvokes) is asserted end to end by
+// TestRun_UndecidedCheckFetchError_FixLoopStillReinvokes.
+func TestDetectUndecidedScopeAmendments_FetchErrorFailsOpen(t *testing.T) {
+	fake := newFakeUploader(t)
+	fake.amendmentsErr = errors.New("backend unreachable")
+	cfg := config{runID: "run-abc", stageID: undecidedStageID}
+	var log bytes.Buffer
+
+	undecided, events := detectUndecidedScopeAmendments(context.Background(), fake, cfg, "fhm_held", "implement", &log)
+
+	if len(undecided) != 0 || events != nil {
+		t.Errorf("fetch error must degrade to nothing; undecided=%+v events=%+v", undecided, events)
+	}
+	if !strings.Contains(log.String(), "scope_amendment_undecided_check_failed") {
+		t.Errorf("log missing scope_amendment_undecided_check_failed: %s", log.String())
+	}
+	if strings.Contains(log.String(), `"event":"scope_amendment_undecided"`) {
+		t.Errorf("a failed check must not emit the undecided signal: %s", log.String())
+	}
+}
+
+// TestDetectUndecidedScopeAmendments_NoOpGuards covers the three clean no-op
+// guards independently: a nil client (no panic, no emit), an empty mcpToken (no
+// fetch at all), and a non-implement stage (no fetch at all).
+func TestDetectUndecidedScopeAmendments_NoOpGuards(t *testing.T) {
+	pending := []upload.ScopeAmendment{
+		{ID: "amd-1", Status: "pending", StageID: undecidedStageID,
+			Paths: []upload.ScopeAmendmentPath{{Path: "pkg/x.go", Operation: "modify"}}},
+	}
+	cfg := config{runID: "run-abc", stageID: undecidedStageID}
+
+	t.Run("nil client", func(t *testing.T) {
+		var log bytes.Buffer
+		undecided, events := detectUndecidedScopeAmendments(context.Background(), nil, cfg, "fhm_held", "implement", &log)
+		if len(undecided) != 0 || events != nil || log.Len() != 0 {
+			t.Errorf("nil client must no-op; undecided=%+v events=%+v log=%q", undecided, events, log.String())
+		}
+	})
+
+	t.Run("empty token", func(t *testing.T) {
+		fake := newFakeUploader(t)
+		fake.amendments = pending
+		var log bytes.Buffer
+		undecided, events := detectUndecidedScopeAmendments(context.Background(), fake, cfg, "", "implement", &log)
+		if len(undecided) != 0 || events != nil || log.Len() != 0 {
+			t.Errorf("empty token must no-op; undecided=%+v events=%+v log=%q", undecided, events, log.String())
+		}
+		if fake.gotAmendmentArgs != nil {
+			t.Error("empty token must not reach the backend")
+		}
+	})
+
+	t.Run("non-implement stage", func(t *testing.T) {
+		fake := newFakeUploader(t)
+		fake.amendments = pending
+		var log bytes.Buffer
+		undecided, events := detectUndecidedScopeAmendments(context.Background(), fake, cfg, "fhm_held", "plan", &log)
+		if len(undecided) != 0 || events != nil || log.Len() != 0 {
+			t.Errorf("non-implement stage must no-op; undecided=%+v events=%+v log=%q", undecided, events, log.String())
+		}
+		if fake.gotAmendmentArgs != nil {
+			t.Error("non-implement stage must not reach the backend")
+		}
+	})
+}
+
+// TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery pins the
+// category-B demote annotation: the captured verify output is preserved as the
+// prefix, and the appended text names the amendment id, the requested path(s)
+// with their operation, the never-DECIDED (not denied) framing, and BOTH
+// recovery verbs. The empty case returns the reason byte-identically.
+func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T) {
+	const reason = "verify command \"go test ./...\" failed:\nFAIL example.com/mod"
+	undecided := []upload.ScopeAmendment{
+		{ID: "amd-42", Status: "pending", StageID: undecidedStageID, Paths: []upload.ScopeAmendmentPath{
+			{Path: "pkg/coupled_test.go", Operation: "modify"},
+			{Path: "pkg/new.go", Operation: "create"},
+		}},
+	}
+
+	got := annotateUndecidedAmendmentFailure(reason, undecided)
+
+	if !strings.HasPrefix(got, reason) {
+		t.Errorf("annotation dropped the captured verify output prefix:\n%s", got)
+	}
+	for _, want := range []string{
+		"amd-42",
+		"pkg/coupled_test.go (modify)",
+		"pkg/new.go (create)",
+		"never DECIDED (not denied",
+		"fishhawk_decide_scope_amendment",
+		"fishhawk_retry_stage",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("annotated reason missing %q:\n%s", want, got)
+		}
+	}
+
+	if plain := annotateUndecidedAmendmentFailure(reason, nil); plain != reason {
+		t.Errorf("no-undecided case must return the reason unchanged, got %q", plain)
+	}
+}
+
+// TestRefreshScopeAmendments_ApprovedAfterExpiryFoldsOnRetry is the property
+// that makes deliberately NOT introducing an `expired` status correct (#2601):
+// the row stays `pending`, so an operator decision arriving AFTER the stage
+// ended is still landable. Attempt 1 sees the row pending and folds nothing;
+// the operator then approves; attempt 2 (the fishhawk_retry_stage re-run, a
+// fresh cfg from the same plan scope) folds the requested paths. Pinned rather
+// than asserted in prose.
+func TestRefreshScopeAmendments_ApprovedAfterExpiryFoldsOnRetry(t *testing.T) {
+	fake := newFakeUploader(t)
+	row := upload.ScopeAmendment{
+		ID: "amd-late", Status: "pending", StageID: undecidedStageID,
+		Paths: []upload.ScopeAmendmentPath{{Path: "pkg/late.go", Operation: "modify"}},
+	}
+	fake.amendments = []upload.ScopeAmendment{row}
+	var log bytes.Buffer
+
+	// Attempt 1: the window expired undecided — nothing folds.
+	first := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	if ev := refreshScopeAmendments(context.Background(), fake, first, "fhm_held", &log); ev != nil {
+		t.Errorf("a pending row must not fold, got %+v", ev)
+	}
+	if len(first.scopeFiles) != 1 {
+		t.Fatalf("scope grew on the undecided attempt: %+v", first.scopeFiles)
+	}
+
+	// The operator decides LATE — after the stage ended.
+	row.Status = "approved"
+	row.DecisionReason = "yes, that file is coupled"
+	fake.amendments = []upload.ScopeAmendment{row}
+
+	// Attempt 2 = fishhawk_retry_stage: the late approval folds.
+	second := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	ev := refreshScopeAmendments(context.Background(), fake, second, "fhm_held", &log)
+	if len(ev) != 1 {
+		t.Fatalf("the late approval must fold on the retried stage, got %+v", ev)
+	}
+	var found bool
+	for _, f := range second.scopeFiles {
+		if f.Path == "pkg/late.go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("retried stage scope = %+v, want pkg/late.go folded", second.scopeFiles)
+	}
+}
+
+// undecidedAmendmentRow builds a pending row for THIS stage requesting an
+// out-of-scope path — the run-7eaadaeb shape.
+func undecidedAmendmentRow(status string) upload.ScopeAmendment {
+	return upload.ScopeAmendment{
+		ID:      "amd-e2e",
+		RunID:   verifyFixRunID,
+		StageID: verifyFixStageID,
+		Status:  status,
+		Paths:   []upload.ScopeAmendmentPath{{Path: "mod/other.go", Operation: "modify"}},
+		Reason:  "the fix needs a file the plan did not declare",
+	}
+}
+
+// pinAmendmentWatchInterval parks the #1035 watcher goroutine's ticker beyond
+// any test duration so its own FetchScopeAmendments calls cannot interleave with
+// the post-invoke fetches these tests count and sequence.
+func pinAmendmentWatchInterval(t *testing.T) {
+	t.Helper()
+	orig := scopeAmendmentWatchInterval
+	scopeAmendmentWatchInterval = time.Hour
+	t.Cleanup(func() { scopeAmendmentWatchInterval = orig })
+}
+
+// undecidedVerifyFixPrompt is the shared e2e fixture: an implement stage with a
+// verify-fix budget of 1 over a committed tree that FAILS verify.
+func undecidedVerifyFixPrompt() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "cd mod && go test ./...",
+		VerifyMaxIterations: 1,
+		ScopeFiles: []upload.ScopeFile{
+			{Path: "mod/reg.go", Operation: "modify"},
+			{Path: "mod/reg_test.go", Operation: "create"},
+		},
+	}
+}
+
+// countBundleEventKind counts trace-bundle events of one kind.
+func countBundleEventKind(events []bundle.Line, kind string) int {
+	n := 0
+	for _, ev := range events {
+		if ev.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRun_UndecidedScopeAmendment_NoVerifyFixReinvoke is the #2601 DONE-MEANS
+// test, driven end to end through the real post-invoke path: the agent exits
+// having filed an amendment for THIS stage that is still `pending` (the
+// operator never answered), and the committed tree fails verify.
+//
+// The verify-fix REINVOKE must be withheld (run 7eaadaeb's futile iterations
+// never spent) while the committed-tree gate STILL RUNS — the stage is never
+// pushed unverified — and the category-B demote reason must name the amendment
+// id and both recovery verbs. The assertions are on COMMITTED STATE (invocation
+// count, verify_run events, no push) rather than on error identity, so deleting
+// the single-shot guard's `|| amendmentsUndecided` term (which would leave NO
+// gate running at all) lands RED here.
+//
+// Paired with TestRun_DeniedScopeAmendment_FixLoopReinvokesAsBefore over the
+// identical fixture: the two paths are asserted to DIFFER observably.
+//
+// RESIDUAL: this seeds a pending row at agent exit; it does not drive the
+// agent's own fifteen-minute poll to expiry, which is a live model following
+// prompt text and not something Go can drive deterministically. The agent-side
+// half of the contract is pinned as TEXT by
+// TestBuild_ScopeAmendment_ExpiryDistinctFromDeny (backend/internal/prompt).
+func TestRun_UndecidedScopeAmendment_NoVerifyFixReinvoke(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	repo := verifyFixBaseRepo(t)
+	// The committed scope-only tree fails verify (empty registry, test wants 42).
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	fu.amendments = []upload.ScopeAmendment{undecidedAmendmentRow("pending")}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	// Errorf, not Fatalf: deleting the single-shot guard's `|| amendmentsUndecided`
+	// term makes the stage SUCCEED with no gate at all, and the assertions below —
+	// on committed state, not error identity — are what must be seen going red.
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitFailure {
+		t.Errorf("run = %d, want exitFailure (blocked on an unanswered operator):\n%s", got, stderr.String())
+	}
+
+	// ZERO fix-agent reinvocations: the initial invocation only.
+	if invoker.callIdx != 1 {
+		t.Errorf("Invoke call count = %d, want 1 (no verify-fix reinvoke under an undecided amendment)", invoker.callIdx)
+	}
+	// The committed-tree gate STILL RAN — the withheld reinvoke must not
+	// degrade into pushing an unverified tree.
+	events := readBundleEvents(t, bundlePath)
+	if n := countBundleEventKind(events, "verify_run"); n < 1 {
+		t.Errorf("verify_run events = %d, want >= 1 (the single-shot committed gate must still run)", n)
+	}
+	if fp.gotArgs != nil {
+		t.Error("CommitAndPush must not run: the committed-tree gate failed")
+	}
+	if fpr.gotArgs != nil {
+		t.Error("OpenPR must not run: the committed-tree gate failed")
+	}
+	// Category B (park for a decision + retry), not the fix loop's category A.
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected a category-B demote:\n%s", stderr.String())
+	}
+	// The in-band signal reached the log sink, and the bundle carries it.
+	if !strings.Contains(stderr.String(), `"event":"scope_amendment_undecided"`) {
+		t.Errorf("missing the scope_amendment_undecided JSONL signal:\n%s", stderr.String())
+	}
+	var sawPolicyEvent bool
+	for _, ev := range events {
+		if ev.Kind == "policy_event" && strings.Contains(string(ev.Data), `"scope_amendment_undecided"`) {
+			sawPolicyEvent = true
+		}
+	}
+	if !sawPolicyEvent {
+		t.Error("bundle missing the scope_amendment_undecided policy_event")
+	}
+	// The demote reason is actionable: the amendment id, the requested path, and
+	// BOTH recovery verbs.
+	for _, want := range []string{"amd-e2e", "mod/other.go", "fishhawk_decide_scope_amendment", "fishhawk_retry_stage"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("failure reason missing %q:\n%s", want, stderr.String())
+		}
+	}
+}
+
+// TestRun_DeniedScopeAmendment_FixLoopReinvokesAsBefore is the explicit-deny
+// twin over the IDENTICAL fixture (#2601): with no PENDING amendment the fix
+// loop must still reinvoke exactly as today, so the suppression can never leak
+// into the ordinary path. The two tests assert the expiry and deny paths DIFFER
+// observably — invocation count 1 vs 2, category B vs A — rather than merely
+// describing them as differing.
+func TestRun_DeniedScopeAmendment_FixLoopReinvokesAsBefore(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	fu.amendments = []upload.ScopeAmendment{undecidedAmendmentRow("denied")}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure (verify never converges):\n%s", got, stderr.String())
+	}
+
+	// Initial + exactly one budgeted fix reinvocation — today's behaviour.
+	if invoker.callIdx != 2 {
+		t.Errorf("Invoke call count = %d, want 2 (initial + 1 fix reinvoke); an explicit denial must not suppress the fix loop", invoker.callIdx)
+	}
+	if !strings.Contains(stderr.String(), `"category":"A"`) {
+		t.Errorf("expected the fix loop's category-A exhaustion:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"scope_amendment_undecided"`) {
+		t.Errorf("a DECIDED amendment must not emit the undecided signal:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "fishhawk_decide_scope_amendment") {
+		t.Errorf("a decided amendment must not carry the undecided recovery annotation:\n%s", stderr.String())
+	}
+}
+
+// TestRun_UndecidedScopeAmendment_GreenStageStaysGreen: an undecided amendment
+// on a stage whose committed tree PASSES verify (the agent adapted in-scope, the
+// b0c3c543 shape) stays green — the event is emitted for the record, the push
+// proceeds, and no failure annotation is applied.
+func TestRun_UndecidedScopeAmendment_GreenStageStaysGreen(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	repo := verifyFixBaseRepo(t)
+	// The committed scope-only tree PASSES verify.
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	fu.amendments = []upload.ScopeAmendment{undecidedAmendmentRow("pending")}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK (a green stage with a pending amendment stays green):\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil || fpr.gotArgs == nil {
+		t.Error("a green stage must still push and open the PR")
+	}
+	if !strings.Contains(stderr.String(), `"event":"scope_amendment_undecided"`) {
+		t.Errorf("the undecided event must be recorded even on a green stage:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "fishhawk_decide_scope_amendment") {
+		t.Errorf("no failure annotation may be applied on the success path:\n%s", stderr.String())
+	}
+}
+
+// TestRun_ScopeAmendmentApprovedInFoldWindow_NotCountedUndecided drives the
+// detection/refresh ORDERING interleaving (#2601, operator condition 1): the
+// amendment is `pending` when the pre-commit fold reads it and `approved` by the
+// time the undecided check reads it — the operator decided inside that window.
+//
+// Detection runs AFTER the fold, so the just-decided amendment can never be
+// counted undecided: NO undecided event is emitted and the fix loop is NOT
+// suppressed. Under the pre-fix ordering (detect first) the first fetch would
+// see `pending` and both assertions below go RED.
+func TestRun_ScopeAmendmentApprovedInFoldWindow_NotCountedUndecided(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	// Fetch #1 (whichever call comes first) sees pending; fetch #2 sees the
+	// operator's decision. The ordering under test decides which is which.
+	fu.amendmentsSeq = [][]upload.ScopeAmendment{
+		{undecidedAmendmentRow("pending")},
+		{undecidedAmendmentRow("approved")},
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	run(verifyFixRunArgs(repo, bundlePath), &stderr)
+
+	if strings.Contains(stderr.String(), `"event":"scope_amendment_undecided"`) {
+		t.Errorf("an amendment decided inside the fold window must not be reported undecided:\n%s", stderr.String())
+	}
+	if invoker.callIdx != 2 {
+		t.Errorf("Invoke call count = %d, want 2 (initial + 1 fix reinvoke); the fix loop must not be suppressed for a decided amendment", invoker.callIdx)
+	}
+	if fu.amendmentCalls < 2 {
+		t.Errorf("FetchScopeAmendments calls = %d, want >= 2 (the fold's fetch and the undecided check's fetch)", fu.amendmentCalls)
+	}
+}
+
+// TestRun_UndecidedCheckFetchError_FixLoopStillReinvokes is the behavioural half
+// of the fail-open contract (#2601): when the extra list GET fails, the runner
+// logs scope_amendment_undecided_check_failed and behaves exactly as it does
+// today — the fix loop still reinvokes. A check that cannot run must never
+// suppress work.
+func TestRun_UndecidedCheckFetchError_FixLoopStillReinvokes(t *testing.T) {
+	pinAmendmentWatchInterval(t)
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetBuggy)
+	mustWrite(t, filepath.Join(repo, "mod", "reg_test.go"), regGetTest)
+
+	invoker := &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}}
+	withFakeInvoker(t, invoker)
+
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = undecidedVerifyFixPrompt()
+	fu.amendmentsErr = errors.New("backend unreachable")
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	run(verifyFixRunArgs(repo, bundlePath), &stderr)
+
+	if !strings.Contains(stderr.String(), "scope_amendment_undecided_check_failed") {
+		t.Errorf("missing the fail-open log line:\n%s", stderr.String())
+	}
+	if invoker.callIdx != 2 {
+		t.Errorf("Invoke call count = %d, want 2 (initial + 1 fix reinvoke); a failed check must not suppress the fix loop", invoker.callIdx)
 	}
 }
 

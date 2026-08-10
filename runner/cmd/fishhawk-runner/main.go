@@ -1811,6 +1811,31 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		amendmentsFolded = len(cfg.scopeFiles) > before
 	}
 
+	// Undecided mid-stage scope amendment (#2601). An amendment this stage filed
+	// that is STILL `pending` at agent exit means the operator never answered and
+	// the agent's ~15-minute wait-poll window expired UNDECIDED — operator
+	// latency, not operator refusal. Emit the distinct
+	// scope_amendment_undecided signal (JSONL line + policy_event, so the
+	// fishhawk-mcp relay surfaces it in-band and the bundle records it) and
+	// withhold the verify-fix REINVOKE below: a fix the agent cannot make
+	// without the un-amended path cannot converge, so run 7eaadaeb's two futile
+	// reinvocations are never spent.
+	//
+	// Placed AFTER the fold, deliberately: the status transition is monotonic, so
+	// a row still `pending` to this fetch cannot have been `approved` at the
+	// fold's fetch, and an amendment folded into THIS stage can never be counted
+	// undecided. Detecting BEFORE the fold would leave that window open and let
+	// the suppression leak into the ordinary path.
+	//
+	// Runs REGARDLESS of res.OK — unlike the res.OK-gated fold: a stage that
+	// FAILED is exactly the case this signal is for.
+	undecidedAmendments, undecidedEvents := []upload.ScopeAmendment(nil), []agent.Event(nil)
+	if stageType == "implement" && !cfg.noPR {
+		undecidedAmendments, undecidedEvents = detectUndecidedScopeAmendments(ctx, client, cfg, mcpBearerToken, stageType, logSink)
+		res.Events = append(res.Events, undecidedEvents...)
+	}
+	amendmentsUndecided := len(undecidedAmendments) > 0
+
 	// Committed-tree verify-fix loop (#651). On the implement push path,
 	// when executor.verify.max_iterations > 0, run the verify command
 	// against the isolated committed SCOPE-ONLY tree (the same drift-
@@ -1832,7 +1857,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// apply path (appliedFixup) already ran its gate and set it, so the two
 	// committed-tree gates below are skipped for that path.
 	if res.OK && !appliedFixup && stageType == "implement" && !cfg.noPR &&
-		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 {
+		cfg.verifyCmd != "" && cfg.verifyMaxIterations > 0 && !amendmentsUndecided {
 		// A POST-commit reset failure (#816) is fatal: the throwaway commit is
 		// still on HEAD, so the stage must NOT proceed to the real push. Demote
 		// to category-B (park for re-scope/re-plan; no self-retry), mirroring
@@ -1881,19 +1906,30 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// loop at max_iterations==0). Placed here — a sibling of runVerifyFixLoop,
 	// OUTSIDE the ADR-023 self-retry for{} loop and BEFORE EmitStage so the
 	// throwaway-commit work is reflected and the demotion happens before
-	// openPRAndShipArtifact. The three verify guards now partition the
-	// cfg.verifyCmd!="" space with no overlap: working-tree in-loop gate =
-	// (plan || --no-pr); this committed single-shot gate = implement &&
-	// !noPR && maxIter==0; fix loop = implement && !noPR && maxIter>0.
+	// openPRAndShipArtifact. The three verify guards still partition the
+	// cfg.verifyCmd!="" space with no overlap and no gap, now on a FOURTH term
+	// (amendmentsUndecided, #2601): working-tree in-loop gate = (plan ||
+	// --no-pr); this committed single-shot gate = implement && !noPR &&
+	// (maxIter==0 || amendmentsUndecided); fix loop = implement && !noPR &&
+	// maxIter>0 && !amendmentsUndecided. An implement stage with an undecided
+	// amendment therefore moves from the fix loop to this gate: the committed
+	// tree is still VERIFIED (a stage is never pushed unverified — that would
+	// fail open to exactly the class #802 closed), only the agent REINVOCATION
+	// is withheld, because a fix requiring a path the operator never granted
+	// cannot converge.
 	if res.OK && !appliedFixup && stageType == "implement" && !cfg.noPR &&
-		cfg.verifyCmd != "" && cfg.verifyMaxIterations == 0 {
+		cfg.verifyCmd != "" && (cfg.verifyMaxIterations == 0 || amendmentsUndecided) {
 		evs, tree, demote := runVerifyGateCommitted(ctx, cfg, logSink)
 		res.Events = append(res.Events, evs...)
 		verifiedTreeSHA = tree
 		if demote != nil {
 			res.OK = false
 			res.FailureCategory = "B"
-			res.FailureReason = demote.Error()
+			// A stage blocked on an unanswered operator says so, with both
+			// recovery verbs, instead of reporting a bare verify failure. Only on
+			// the FAILURE path: a green stage with a pending amendment stays green
+			// (the agent adapted in-scope) and carries the event alone.
+			res.FailureReason = annotateUndecidedAmendmentFailure(demote.Error(), undecidedAmendments)
 			invokeErr = demote
 		}
 	}
@@ -7415,6 +7451,149 @@ func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *confi
 			"added": added,
 		}),
 	}}
+}
+
+// undecidedScopeAmendmentsForStage returns the amendments in items that are
+// still `pending` AND belong to stageID — the rows whose wait-poll window
+// expired with no operator decision (#2601). A pending row belonging to an
+// EARLIER stage of the same run must never influence this stage, which is why
+// the StageID equality is part of the predicate and not merely documented.
+//
+// An empty stageID returns nothing: a row whose StageID is also empty would
+// otherwise match by accident and mis-attribute another stage's undecided
+// request to this one.
+func undecidedScopeAmendmentsForStage(items []upload.ScopeAmendment, stageID string) []upload.ScopeAmendment {
+	if stageID == "" {
+		return nil
+	}
+	var out []upload.ScopeAmendment
+	for _, a := range items {
+		if a.Status != "pending" {
+			continue
+		}
+		if a.StageID != stageID {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// detectUndecidedScopeAmendments reports the scope amendments this implement
+// stage filed that are STILL `pending` at agent exit — the operator never
+// answered and the agent's ~15-minute wait-poll window expired undecided
+// (#2601). Returns the undecided rows plus a single scope_amendment_undecided
+// policy_event for the trace bundle, and writes one JSONL line to logSink so
+// the fishhawk-mcp run_stage relay can surface it in-band to a driving session.
+//
+// ORDERING (load-bearing): the caller MUST invoke this AFTER
+// refreshScopeAmendments has folded approved amendments for this pass. The
+// amendment status transition is monotonic — `pending` becomes `approved` or
+// `denied` and there is no un-approve verb — so a row this fetch reports
+// `pending` cannot have been `approved` at the earlier fold fetch, and an
+// amendment folded into THIS stage can therefore never be counted undecided.
+// Detecting first would leave exactly that window open: an approval landing
+// between the two fetches would be folded into this very stage while the
+// undecided flag stayed set, suppressing a fix loop that would now succeed and
+// emitting a false undecided event.
+// TestRun_ScopeAmendmentApprovedInFoldWindow_NotCountedUndecided drives that
+// interleaving.
+//
+// Its own cheap list GET rather than sharing the fold's fetch: the fold is
+// res.OK-gated, and the failure path — where an undecided amendment matters
+// most — is precisely where the fold does not run.
+//
+// Best-effort and implement-only, mirroring watchScopeAmendments: a nil client,
+// an empty mcpToken, or a non-implement stage is a clean no-op, and a fetch
+// error logs scope_amendment_undecided_check_failed and returns nothing
+// (fail-open to today's behaviour — the stage is never failed because the check
+// could not run).
+func detectUndecidedScopeAmendments(ctx context.Context, client uploadClient, cfg config, mcpToken, stageType string, logSink io.Writer) ([]upload.ScopeAmendment, []agent.Event) {
+	if client == nil || mcpToken == "" || stageType != "implement" {
+		return nil, nil
+	}
+	items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
+		RunID:    cfg.runID,
+		MCPToken: mcpToken,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"scope_amendment_undecided_check_failed","run_id":%q,"stage_id":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, err.Error())
+		return nil, nil
+	}
+	undecided := undecidedScopeAmendmentsForStage(items, cfg.stageID)
+	if len(undecided) == 0 {
+		return nil, nil
+	}
+	// The literal field set {event, run_id, stage_id, amendments:[{amendment_id,
+	// paths}]} is the runner->fishhawk-mcp seam contract, pinned on BOTH ends per
+	// the #618 rule: TestEmitUndecidedScopeAmendments_SeamContract here and
+	// TestRunStageEventMessage_ScopeAmendmentUndecided in
+	// backend/internal/mcpserver. The two modules have no dependency edge in
+	// either direction, so a field-name drift on one side breaks one of the pair.
+	rows := make([]map[string]any, 0, len(undecided))
+	for _, a := range undecided {
+		rows = append(rows, map[string]any{
+			"amendment_id": a.ID,
+			"paths":        a.Paths,
+		})
+	}
+	rowsJSON, _ := json.Marshal(rows)
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"scope_amendment_undecided","run_id":%q,"stage_id":%q,"amendments":%s}`+"\n",
+		cfg.runID, cfg.stageID, rowsJSON)
+	// Mirror the scope_drift / scope_amendments_folded policy_event shape so the
+	// record rides into BOTH bundle variants (PackBytes / redactEvents).
+	return undecided, []agent.Event{{
+		Kind: "policy_event",
+		Payload: agent.MakePayload(map[string]any{
+			"check":      "scope_amendment_undecided",
+			"amendments": rows,
+		}),
+	}}
+}
+
+// annotateUndecidedAmendmentFailure appends the undecided-amendment recovery
+// path to a category-B demote reason (#2601). The bare committed-tree verify
+// failure reads as "the agent wrote broken code", when in fact the stage was
+// blocked on an operator who never answered — so the message names the
+// amendment id(s) and requested path(s), states that the request was never
+// DECIDED (not denied), and gives both recovery verbs in order:
+// fishhawk_decide_scope_amendment then fishhawk_retry_stage, on which an
+// approval folds into the retried stage.
+//
+// Pure and reason-preserving: the captured verify output stays the prefix, so
+// nothing an operator or reviewer reads today is lost.
+func annotateUndecidedAmendmentFailure(reason string, undecided []upload.ScopeAmendment) string {
+	if len(undecided) == 0 {
+		return reason
+	}
+	parts := make([]string, 0, len(undecided))
+	for _, a := range undecided {
+		paths := make([]string, 0, len(a.Paths))
+		for _, p := range a.Paths {
+			if p.Path == "" {
+				continue
+			}
+			if p.Operation != "" {
+				paths = append(paths, fmt.Sprintf("%s (%s)", p.Path, p.Operation))
+			} else {
+				paths = append(paths, p.Path)
+			}
+		}
+		if len(paths) == 0 {
+			parts = append(parts, a.ID)
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s requesting %s", a.ID, strings.Join(paths, ", ")))
+	}
+	return fmt.Sprintf("%s\n\nThis stage filed a mid-stage scope amendment that was never DECIDED (not denied — the "+
+		"operator's decision window expired undecided): %s. The verify-fix reinvoke was withheld because a fix the "+
+		"agent cannot make without an un-amended path cannot converge. The request is still `pending`, so the decision "+
+		"is still landable: decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage — an approval "+
+		"folds the requested paths into the retried stage's effective scope.",
+		reason, strings.Join(parts, "; "))
 }
 
 // scopePaths extracts the repo-relative path list from the resolved

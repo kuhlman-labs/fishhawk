@@ -545,8 +545,8 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			// Skip feeding it to the detector entirely: like an empty
 			// signature it is a no-op — it neither accumulates a streak
 			// nor resets a real one — so a bounded amendment wait reaches
-			// the agent's proceed-as-denied path instead of being killed
-			// early as a category-A loop_detected.
+			// the agent's own decision/EXPIRY branch instead of being
+			// killed early as a category-A loop_detected.
 			if isSanctionedWaitPoll(sig) {
 				continue
 			}
@@ -1008,7 +1008,9 @@ func canonicalInput(raw json.RawMessage) string {
 // (backend/internal/prompt/prompt.go:1020). That bounded long-poll is a
 // deliberately-repeated identical action, so the loop detector (#653) would
 // otherwise count it as a no-progress loop and kill the stage category-A
-// (#1273) before the documented ~15-minute proceed-as-denied window elapses.
+// (#1273) before the documented ~15-minute wait-poll window elapses. (That cap
+// is an EXPIRY, not a denial, since #2601 — the prompt's step-5 branch — so the
+// older "proceed-as-denied window" name for it is retired.)
 // The feed loop skips this signature so it is a no-op for the detector.
 //
 // The match is deliberately NARROW to the documented prompt form: it requires
