@@ -115,7 +115,7 @@ Workflow after dispatch:
   3. on an "amendment_pending" release, call fishhawk_decide_scope_amendment —
      the amendment row and a pre-filled next_step ride out on that response, so
      no companion fishhawk_list_scope_amendments poll is needed. Decide before
-     the runner's ~5-minute amendment window elapses, and no failed-stage retry
+     the runner's ` + amendmentPollWindowAdjective() + ` amendment window elapses, and no failed-stage retry
      is needed. Then re-arm fishhawk_await_stage for the settlement.
 
 This is the DEFAULT verb for a local IMPLEMENT stage (#1247): the implement

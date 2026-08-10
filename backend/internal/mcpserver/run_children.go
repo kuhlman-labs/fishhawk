@@ -76,9 +76,10 @@ type ChildResult struct {
 	// PendingAmendments records any scope_amendment_pending event this child
 	// emitted during its blocking run (#2095 gap #1). run_children holds a single
 	// MCP session and awaits every child, so the child's ?wait long-poll for a
-	// decision cannot be decided in-band and times out to proceed-as-denied; the
-	// event is surfaced here POST-HOC so the operator can recover rather than
-	// discovering a silent timeout. Empty on the common no-amendment path.
+	// decision cannot be decided in-band and expires UNDECIDED (the request stays
+	// pending — an expiry, not a denial); the event is surfaced here POST-HOC so
+	// the operator can recover rather than discovering a silent timeout. Empty on
+	// the common no-amendment path.
 	PendingAmendments []PendingScopeAmendment `json:"pending_amendments,omitempty" jsonschema:"scope amendments this child filed mid-run that timed out UNDECIDED during the blocking fan-out; see the top-level warning for the terminal-state-accurate recovery"`
 }
 
@@ -142,8 +143,9 @@ host, exactly like fishhawk_run_stage.
 
 Because this call holds ONE MCP session and awaits every child, a child that
 files a mid-stage scope amendment cannot have it decided in-band — its long-poll
-times out to proceed-as-denied. Such an amendment is surfaced POST-HOC in that
-child's pending_amendments and in pending_amendment_children, with a
+expires UNDECIDED (the request stays pending — an expiry, not a denial). Such an
+amendment is surfaced POST-HOC in that child's pending_amendments and in
+pending_amendment_children, with a
 terminal-state-accurate recovery in warnings: a FAILED child needs
 fishhawk_decide_scope_amendment THEN fishhawk_retry_stage before a re-run (a bare
 re-invoke is a no-op for it); a SUCCEEDED child already shipped without the
@@ -714,9 +716,10 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 	// Surface any UNDECIDED mid-stage scope amendment a child filed during its
 	// blocking run (#2095 gap #1) with a TERMINAL-STATE-ACCURATE recovery. Because
 	// run_children holds one MCP session and awaits every child, a child's ?wait
-	// long-poll for a decision cannot be answered in-band and times out to
-	// proceed-as-denied; the child then either FAILS (the #2095 incident) or ships
-	// an inferior fallback WITHOUT the amendment. Re-invoking fishhawk_run_children
+	// long-poll for a decision cannot be answered in-band and expires UNDECIDED
+	// (the request stays pending — an expiry, not a denial); the child then either
+	// FAILS (the #2095 incident) or ships an inferior fallback WITHOUT the
+	// amendment. Re-invoking fishhawk_run_children
 	// only re-runs children still in a DISPATCHABLE state — it skips terminal ones
 	// — so the correct recovery verb differs by terminal state:
 	//   - FAILED: decide → fishhawk_retry_stage (failed → dispatchable) → re-run.
@@ -747,8 +750,9 @@ func (r *runResolver) runChildren(ctx context.Context, req *mcp.CallToolRequest,
 		// The scan surfaces the scope_amendment_pending event the runner emits when
 		// it PARKS the request; it does NOT re-read the amendment's current decision
 		// state. Under the single-session blocking premise the child's ?wait
-		// long-poll times out proceed-as-denied, but a second operator session or an
-		// auto-approver could have decided it within the poll window — so the
+		// long-poll times out with the request still pending (an expiry, not a
+		// denial), but a second operator session or an auto-approver could have
+		// decided it within the poll window — so the
 		// wording HEDGES ("appears to have"), and every branch points at
 		// fishhawk_list_scope_amendments to confirm before acting (#2095 low/correctness).
 		const verifyHint = " Verify the amendment's current decision state with fishhawk_list_scope_amendments first — if a second operator session or an auto-approver decided it within the poll window, the child may have already proceeded WITH the decision and no recovery is needed."

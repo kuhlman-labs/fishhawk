@@ -191,7 +191,7 @@ created-out-of-scope gate while anything NOT requested still fails loud
 (#818/#825). On DENY the agent reads your reason and must adapt within
 the original scope or fail loud.
 
-The agent polls for ~15 minutes per request — the figure the implement
+The agent polls for ` + amendmentPollWindowText() + ` per request — the figure the implement
 prompt actually instructs it to follow (backend/internal/prompt/prompt.go;
 this doc said ~5 minutes and understated the window threefold, #2601).
 Decide inside that window and the agent resumes WITH your decision.
