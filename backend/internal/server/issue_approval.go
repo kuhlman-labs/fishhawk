@@ -124,6 +124,23 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	// checks (including fishhawk_audit_complete, published per
 	// #231) report green.
 
+	// Over-cap approve-comment refusal (#2583). The slash-command channel
+	// records p.Comment as the approve decision's comment, which is injected
+	// verbatim as a binding approval condition (#558) and capped at
+	// prompt.MaxApprovalConditionBytes at implement-prompt-build time. Refuse an
+	// over-cap approve BEFORE Submit — recording no approval row — so a binding
+	// instruction is never silently cut on this channel either, keeping the two
+	// operator-facing approval channels consistent. A reject is not refused (its
+	// comment feeds advisory PriorRejectionFeedback, not binding conditions).
+	// Honors the reply-comment silent suppression: a passer-by "+1" that happens
+	// to exceed the cap should not draw an unsolicited reply.
+	if ok, msg, _ := validateApprovalComment(decision, p.Comment); !ok {
+		if !silent {
+			s.replyApproval(ctx, p, msg)
+		}
+		return nil
+	}
+
 	var commentPtr *string
 	if p.Comment != "" {
 		c := p.Comment

@@ -3701,11 +3701,22 @@ func (s *Server) loadLastDecomposeRejectionReason(ctx context.Context, runID uui
 	return false
 }
 
+// CategoryApprovalConditionsTruncated is the audit category emitted when a
+// stored approve-with-conditions comment is truncated at implement-prompt-build
+// time (#2583). Since the approval gate now refuses an over-cap approve comment
+// (handleSubmitApproval / HandleApprovalCommand), this path is reachable ONLY
+// for a comment stored BEFORE the gate existed, or via a channel that bypasses
+// it (e.g. the in-process auto-driver). The entry makes that residual, silent
+// truncation VISIBLE in the run record rather than dropping the tail unseen.
+const CategoryApprovalConditionsTruncated = "approval_conditions_truncated"
+
 // loadApprovalConditions scans the run's approval_submitted audit entries
 // (newest-first) for the first entry where decision=="approve" and the
 // comment payload key is non-empty. Returns the comment string (capped at
-// 4000 bytes) or nil when none is found. Best-effort: WARN-logs and returns
-// nil on any error.
+// prompt.MaxApprovalConditionBytes) or nil when none is found. When the stored
+// comment exceeds the cap it is truncated AND an approval_conditions_truncated
+// audit entry is appended (best-effort) so the residual drop is visible.
+// Best-effort: WARN-logs and returns nil on any error.
 func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *string {
 	if s.cfg.AuditRepo == nil {
 		return nil
@@ -3727,20 +3738,50 @@ func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *s
 			continue
 		}
 		if payload.Decision == "approve" && payload.Comment != "" {
-			c := payload.Comment
-			const maxConditionBytes = 4000
-			if len(c) > maxConditionBytes {
-				c = c[:maxConditionBytes] + "...[truncated]"
-			}
+			c, truncated := prompt.CapText(payload.Comment, prompt.MaxApprovalConditionBytes)
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded approval conditions into implement prompt",
 				slog.String("run_id", runID.String()),
 				slog.Int("comment_bytes", len(payload.Comment)),
+				slog.Bool("truncated", truncated),
 			)
+			if truncated {
+				s.appendApprovalConditionsTruncatedAudit(ctx, runID, len(payload.Comment))
+			}
 			return &c
 		}
 	}
 	return nil
+}
+
+// appendApprovalConditionsTruncatedAudit records the residual truncation of a
+// stored over-cap approve-with-conditions comment (#2583). Best-effort: a
+// WARN-logged append failure never blocks prompt construction, matching the
+// surrounding loader style. Payload records the original size, the cap, and the
+// dropped-byte count, tagged source="approval_submitted" (the channel the
+// truncated comment was read from).
+func (s *Server) appendApprovalConditionsTruncatedAudit(ctx context.Context, runID uuid.UUID, originalBytes int) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"original_bytes": originalBytes,
+		"cap_bytes":      prompt.MaxApprovalConditionBytes,
+		"dropped_bytes":  originalBytes - prompt.MaxApprovalConditionBytes,
+		"source":         "approval_submitted",
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryApprovalConditionsTruncated,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: append approval_conditions_truncated audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // loadClarificationAnswers scans the run's clarification_answered audit
@@ -3774,11 +3815,7 @@ func (s *Server) loadClarificationAnswers(ctx context.Context, runID uuid.UUID) 
 			continue
 		}
 		if payload.Conditions != "" {
-			c := payload.Conditions
-			const maxConditionBytes = 4000
-			if len(c) > maxConditionBytes {
-				c = c[:maxConditionBytes] + "...[truncated]"
-			}
+			c, _ := prompt.CapText(payload.Conditions, prompt.MaxConditionBytes)
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded clarification answers into resumed plan prompt",
 				slog.String("run_id", runID.String()),
@@ -3823,11 +3860,7 @@ func (s *Server) loadRevisionConstraint(ctx context.Context, runID uuid.UUID) *s
 			continue
 		}
 		if payload.Conditions != "" {
-			c := payload.Conditions
-			const maxConditionBytes = 4000
-			if len(c) > maxConditionBytes {
-				c = c[:maxConditionBytes] + "...[truncated]"
-			}
+			c, _ := prompt.CapText(payload.Conditions, prompt.MaxConditionBytes)
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded revision constraint into re-dispatched plan prompt",
 				slog.String("run_id", runID.String()),
@@ -4068,11 +4101,7 @@ func (s *Server) loadRecoveryResumeReason(ctx context.Context, runID uuid.UUID) 
 			continue
 		}
 		if strings.TrimSpace(payload.Reason) != "" {
-			c := payload.Reason
-			const maxConditionBytes = 4000
-			if len(c) > maxConditionBytes {
-				c = c[:maxConditionBytes] + "...[truncated]"
-			}
+			c, _ := prompt.CapText(payload.Reason, prompt.MaxConditionBytes)
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded recovery resume reason into implement prompt conditions",
 				slog.String("run_id", runID.String()),

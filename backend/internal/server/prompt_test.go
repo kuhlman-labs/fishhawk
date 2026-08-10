@@ -10175,3 +10175,110 @@ func TestNonPlanStageApprove_ScopeFilesNeverReachImplementPrompt(t *testing.T) {
 		t.Errorf("implement ScopeFiles = %v; the planned path was subtracted by a NON-plan-stage approve's remove_scope_files — an emptied scope re-enables the runner's `git add -A` fallback and disables scope enforcement", resp.ScopeFiles)
 	}
 }
+
+// --- approval_conditions_truncated audit event (#2583) ---
+
+// appendFailAuditRepo persists nothing on AppendChained — it errors — while
+// keeping the ListForRunByCategory read of its seeded entries working. Used to
+// prove the truncation-audit append is non-fatal (per-failure-mode test 9).
+type appendFailAuditRepo struct {
+	*storingAuditRepo
+	appendErr error
+}
+
+func (a *appendFailAuditRepo) AppendChained(_ context.Context, _ audit.ChainAppendParams) (*audit.Entry, error) {
+	return nil, a.appendErr
+}
+
+// countStoredCategory returns how many entries of the given category the storing
+// fake holds for runID.
+func countStoredCategory(t *testing.T, ar *storingAuditRepo, runID uuid.UUID, category string) int {
+	t.Helper()
+	got, err := ar.ListForRunByCategory(context.Background(), runID, category)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(%s): %v", category, err)
+	}
+	return len(got)
+}
+
+// TestLoadApprovalConditions_OverCap_AppendsTruncatedAudit pins per-failure-mode
+// test 7: a stored over-cap approve_submitted comment is capped at prompt-build
+// time AND appends exactly one approval_conditions_truncated audit entry
+// carrying original_bytes/cap_bytes/dropped_bytes.
+func TestLoadApprovalConditions_OverCap_AppendsTruncatedAudit(t *testing.T) {
+	runID := uuid.New()
+	dropped := 500
+	original := prompt.MaxApprovalConditionBytes + dropped
+	ar := newStoringAuditRepo()
+	ar.byRunID[runID] = []*audit.Entry{makeApproveWithCommentEntry(runID, strings.Repeat("a", original))}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	got := s.loadApprovalConditions(context.Background(), runID)
+	if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+		t.Fatalf("expected a truncated conditions string; got %v", got)
+	}
+
+	entries, err := ar.ListForRunByCategory(context.Background(), runID, CategoryApprovalConditionsTruncated)
+	if err != nil {
+		t.Fatalf("list truncated audit: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("approval_conditions_truncated entries = %d, want exactly 1", len(entries))
+	}
+	var payload struct {
+		OriginalBytes int    `json:"original_bytes"`
+		CapBytes      int    `json:"cap_bytes"`
+		DroppedBytes  int    `json:"dropped_bytes"`
+		Source        string `json:"source"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal truncated payload: %v", err)
+	}
+	if payload.OriginalBytes != original {
+		t.Errorf("original_bytes = %d, want %d", payload.OriginalBytes, original)
+	}
+	if payload.CapBytes != prompt.MaxApprovalConditionBytes {
+		t.Errorf("cap_bytes = %d, want %d", payload.CapBytes, prompt.MaxApprovalConditionBytes)
+	}
+	if payload.DroppedBytes != dropped {
+		t.Errorf("dropped_bytes = %d, want %d", payload.DroppedBytes, dropped)
+	}
+	if payload.Source != "approval_submitted" {
+		t.Errorf("source = %q, want approval_submitted", payload.Source)
+	}
+}
+
+// TestLoadApprovalConditions_UnderCap_NoTruncatedAudit pins per-failure-mode
+// test 8: an under-cap stored comment appends NO approval_conditions_truncated
+// entry.
+func TestLoadApprovalConditions_UnderCap_NoTruncatedAudit(t *testing.T) {
+	runID := uuid.New()
+	ar := newStoringAuditRepo()
+	ar.byRunID[runID] = []*audit.Entry{makeApproveWithCommentEntry(runID, "a short binding condition")}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	got := s.loadApprovalConditions(context.Background(), runID)
+	if got == nil || *got != "a short binding condition" {
+		t.Fatalf("under-cap conditions = %v, want verbatim", got)
+	}
+	if n := countStoredCategory(t, ar, runID, CategoryApprovalConditionsTruncated); n != 0 {
+		t.Errorf("approval_conditions_truncated entries = %d, want 0 for an under-cap comment", n)
+	}
+}
+
+// TestLoadApprovalConditions_TruncatedAuditAppendFailure_NonFatal pins
+// per-failure-mode test 9: a failing AppendChained on the truncation-audit path
+// is non-fatal — the prompt still gets the capped conditions.
+func TestLoadApprovalConditions_TruncatedAuditAppendFailure_NonFatal(t *testing.T) {
+	runID := uuid.New()
+	original := prompt.MaxApprovalConditionBytes + 100
+	store := newStoringAuditRepo()
+	store.byRunID[runID] = []*audit.Entry{makeApproveWithCommentEntry(runID, strings.Repeat("a", original))}
+	ar := &appendFailAuditRepo{storingAuditRepo: store, appendErr: errors.New("audit append boom")}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	got := s.loadApprovalConditions(context.Background(), runID)
+	if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+		t.Fatalf("append failure must not block prompt build; got %v", got)
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -3206,6 +3207,70 @@ func TestProgressTokenDescriptions_DisclaimClientSupplied(t *testing.T) {
 		if desc, _ := lw["description"].(string); strings.TrimSpace(desc) == "" {
 			t.Errorf("%s: long_wait schema description is empty; want a non-empty description", name)
 		}
+	}
+}
+
+// TestApprovePlanReasonDescription_NamesActualCap pins the fishhawk_approve_plan
+// `reason` input description to the CONCRETE prompt.MaxApprovalConditionBytes
+// value (#2583, operator binding condition 2). The cap is declared once in Go
+// but restated in prose across several surfaces; anchoring one machine-checked
+// surface to strconv.Itoa(prompt.MaxApprovalConditionBytes) means the number
+// cannot drift silently — bump the constant without updating this jsonschema tag
+// and this test goes RED. It also asserts the description names the refusal so a
+// caller learns the reason is gate-refused, not truncated.
+func TestApprovePlanReasonDescription_NamesActualCap(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var schema any
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_approve_plan" {
+			schema = tool.InputSchema
+			break
+		}
+	}
+	if schema == nil {
+		t.Fatal("fishhawk_approve_plan not registered/visible over ListTools")
+	}
+	schemaMap, ok := schema.(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_approve_plan InputSchema is %T, want a JSON object map", schema)
+	}
+	props, ok := schemaMap["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_approve_plan schema has no properties object; got %v", schemaMap["properties"])
+	}
+	reasonProp, ok := props["reason"].(map[string]any)
+	if !ok {
+		t.Fatal("fishhawk_approve_plan schema has no 'reason' property")
+	}
+	desc, _ := reasonProp["description"].(string)
+	wantCap := strconv.Itoa(prompt.MaxApprovalConditionBytes)
+	if !strings.Contains(desc, wantCap) {
+		t.Errorf("approve_plan 'reason' description must name the concrete cap %q so the number cannot drift silently; got:\n%s", wantCap, desc)
+	}
+	if !strings.Contains(desc, "validation_failed") {
+		t.Errorf("approve_plan 'reason' description must name the refusal error code 'validation_failed'; got:\n%s", desc)
 	}
 }
 

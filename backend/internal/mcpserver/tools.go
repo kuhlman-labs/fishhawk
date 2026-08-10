@@ -3185,7 +3185,7 @@ func (r *runResolver) retryStage(ctx context.Context, _ *mcp.CallToolRequest, in
 // plan stage internally.
 type ApprovePlanInput struct {
 	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being approved"`
-	Reason string `json:"reason,omitempty" jsonschema:"optional reviewer rationale; injected to the implement agent as binding approval conditions (#558), so use it to amend the plan — also recorded on the approval row as 'comment'"`
+	Reason string `json:"reason,omitempty" jsonschema:"optional reviewer rationale; injected to the implement agent as binding approval conditions (#558), so use it to amend the plan — also recorded on the approval row as 'comment'. Capped at 12000 bytes (measured in bytes, not characters): an over-cap reason is refused 400 validation_failed at the approval gate (naming the byte count, cap, and overflow) rather than silently truncated, so split or tighten the text before a long implement pass. For a machine-checkable clause, prefer binding_assertions instead"`
 	// AddScopeFiles is the structured, authoritative way to add files to the
 	// implement stage's scope at approval time (#824) — preferred over naming
 	// paths in the free-text reason, which is regex-scraped (#730) and silently

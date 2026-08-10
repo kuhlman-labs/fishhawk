@@ -13,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -1206,4 +1207,107 @@ type orchestratorRepoFailingList struct {
 
 func (r *orchestratorRepoFailingList) ListRuns(_ context.Context, _ run.ListRunsFilter) ([]*run.Run, error) {
 	return nil, r.listErr
+}
+
+// slashApprovalFixture stands up the run/stage/repos/notifier a slash-command
+// approval test needs, returning the server, the approval repo (to read
+// committed state), and the GitHub recorder (to read reply text). Mirrors
+// TestHandleApprovalCommand_PlanApprove_PostsSlashReplyAndStatus's setup.
+func slashApprovalFixture(t *testing.T) (*Server, *fakeApprovalRepo, *slashGitHubRecorder) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.TriggerSource = run.TriggerGitHubIssue
+	triggerRef := "issue:42"
+	r.TriggerRef = &triggerRef
+	r.InstallationID = ptrInt64(99)
+	r.Repo = "x/y"
+
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	stage.Type = run.StageTypePlan
+
+	ar := newFakeApprovalRepo()
+	au := newAuditCompleteAuditFake()
+	gh := newSlashGitHubRecorder()
+	o := &orchestrator.Orchestrator{Runs: rr}
+
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: ar,
+		AuditRepo:    au,
+		Orchestrator: o,
+		ExternalURL:  "https://app.fishhawk.example.com",
+	})
+	s.issueNotifier = issuecomment.New(issuecomment.Deps{
+		GitHub:      gh,
+		Runs:        rr,
+		Audit:       au,
+		ExternalURL: "https://app.fishhawk.example.com",
+	})
+	return s, ar, gh
+}
+
+// TestHandleApprovalCommand_OverCapApprove_RefusedNoSubmit pins per-failure-mode
+// test 5 and counterfactual control B: an over-cap `/fishhawk approve` comment
+// is refused BEFORE Submit — ApprovalRepo.Submit is NOT called (committed-state
+// read: len(ar.all)==0) — and a reply names the cap. Deleting the
+// issue_approval.go refusal makes this go RED on the no-Submit assertion (the
+// over-cap comment would be recorded), not merely on reply text.
+func TestHandleApprovalCommand_OverCapApprove_RefusedNoSubmit(t *testing.T) {
+	s, ar, gh := slashApprovalFixture(t)
+
+	n := prompt.MaxApprovalConditionBytes + 1
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Comment:        strings.Repeat("a", n),
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+
+	// COMMITTED-STATE: no approval row recorded.
+	if len(ar.all) != 0 {
+		t.Fatalf("approval rows = %d, want 0 (over-cap slash approve must not Submit)", len(ar.all))
+	}
+	// A reply naming the cap was posted (not silent — this is a slash command).
+	var refusal string
+	for _, c := range gh.calls() {
+		if strings.Contains(c.body, fmt.Sprintf("%d", prompt.MaxApprovalConditionBytes)) {
+			refusal = c.body
+			break
+		}
+	}
+	if refusal == "" {
+		t.Errorf("expected a reply naming the cap %d; got bodies %v",
+			prompt.MaxApprovalConditionBytes, commentBodies(gh.calls()))
+	}
+}
+
+// TestHandleApprovalCommand_AtCapApprove_Recorded pins per-failure-mode test 6:
+// an exactly-at-cap slash approve is recorded normally (the > not >= boundary
+// on the slash channel too).
+func TestHandleApprovalCommand_AtCapApprove_Recorded(t *testing.T) {
+	s, ar, _ := slashApprovalFixture(t)
+
+	n := prompt.MaxApprovalConditionBytes
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Comment:        strings.Repeat("a", n),
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("approval rows = %d, want 1 (at-cap slash approve is admitted)", len(ar.all))
+	}
+	if ar.all[0].Decision != approval.DecisionApprove {
+		t.Errorf("decision = %q, want approve", ar.all[0].Decision)
+	}
 }

@@ -60,6 +60,7 @@ var KnownCategories = map[string]struct{}{
 	"anchor_ping_posted":                      {},
 	"api_token_issued":                        {},
 	"api_token_revoked":                       {},
+	"approval_conditions_truncated":           {},
 	"approval_predicate_rejected":             {},
 	"approval_sla_elapsed":                    {},
 	"approval_submitted":                      {},

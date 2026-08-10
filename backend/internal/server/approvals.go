@@ -24,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -195,6 +196,33 @@ func duplicateApprovalResponse(stage *run.Stage, prior *approval.Approval) appro
 	}
 }
 
+// validateApprovalComment enforces the approve-only binding-conditions byte cap
+// (#2583). It refuses ONLY when decision == approve and the comment exceeds
+// prompt.MaxApprovalConditionBytes, returning an actionable message naming the
+// actual byte count, the cap, and the overflow — mirroring fixup.go's
+// operator_concern refusal wording ("must not be silently truncated as a
+// binding instruction"). The cap is measured in BYTES (len), matching the
+// prompt builder's byte-based CapText, not characters. A reject is never
+// refused: its comment feeds the advisory PriorRejectionFeedback channel, not
+// binding conditions. Returns (true, "", nil) when the comment is admissible.
+func validateApprovalComment(decision approval.Decision, comment string) (ok bool, message string, details map[string]any) {
+	if decision != approval.DecisionApprove {
+		return true, "", nil
+	}
+	if len(comment) <= prompt.MaxApprovalConditionBytes {
+		return true, "", nil
+	}
+	msg := fmt.Sprintf(
+		"approve comment is %d bytes; the maximum is %d (it is injected verbatim as a binding approval condition and must not be silently truncated as a binding instruction). Shorten the text, split it across multiple conditions, or move machine-checkable clauses into binding_assertions",
+		len(comment), prompt.MaxApprovalConditionBytes)
+	return false, msg, map[string]any{
+		"field":          "comment",
+		"bytes":          len(comment),
+		"max_bytes":      prompt.MaxApprovalConditionBytes,
+		"overflow_bytes": len(comment) - prompt.MaxApprovalConditionBytes,
+	}
+}
+
 // handleSubmitApproval implements POST /v0/stages/{stage_id}/approvals.
 //
 // Per the OpenAPI contract:
@@ -241,6 +269,22 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"decision must be 'approve' or 'reject'",
 			map[string]any{"field": "decision", "got": req.Decision})
+		return
+	}
+
+	// Over-cap approve-comment refusal (#2583). An approve comment is injected
+	// verbatim as BINDING approval conditions (#558) and capped at
+	// prompt.MaxApprovalConditionBytes when the implement prompt is built. Refuse
+	// an over-cap approve HERE — a pure input validation with no side effects,
+	// placed before commentPtr is built and the stage is fetched — so the
+	// operator sees the refusal (byte count, cap, overflow, how to shorten)
+	// rather than having the tail of a binding instruction silently dropped at
+	// prompt-build time, mirroring fixup.go's operator_concern refusal. A REJECT
+	// is deliberately NOT refused: its comment feeds the advisory
+	// PriorRejectionFeedback channel, not binding conditions, so an over-cap
+	// reject stays admissible.
+	if ok, msg, details := validateApprovalComment(decision, req.Comment); !ok {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", msg, details)
 		return
 	}
 

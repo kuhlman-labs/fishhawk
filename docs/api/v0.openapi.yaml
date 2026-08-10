@@ -10108,6 +10108,23 @@ paths:
                     #730 prose fold). Use `add_scope_files` to add scope —
                     naming a path here to explain it (e.g. "no edit to
                     `backend/go.mod` is needed") will not mutate scope.
+
+                    APPROVE-ONLY byte cap (#2583): because an `approve`
+                    comment is a BINDING instruction injected verbatim, it
+                    is capped at 12000 BYTES — measured in bytes, NOT
+                    characters (the two diverge for any multibyte UTF-8
+                    input, so this is deliberately not expressed as a
+                    JSON-Schema `maxLength`, which counts characters). An
+                    `approve` comment over the cap is refused
+                    `400 validation_failed` (field `comment`, with `bytes`,
+                    `max_bytes`, and `overflow_bytes` in `details`) BEFORE
+                    any approval row is recorded, rather than being silently
+                    truncated at prompt-build time; split or shorten the
+                    text, or move a machine-checkable clause into
+                    `binding_assertions`. A `reject` comment is EXEMPT from
+                    the cap: it feeds the advisory prior-rejection-feedback
+                    channel, not binding conditions, so it may exceed 12000
+                    bytes.
                 approver_github_login:
                   type: string
                   description: |
@@ -10435,6 +10452,24 @@ paths:
                         description: |
                           When the existing approval row was submitted.
                           Only present alongside `duplicate_submission`.
+        '400':
+          description: |
+            Possible error codes:
+
+            - `validation_failed` — the request body is malformed
+              (bad JSON, unknown fields, an invalid `decision`), OR an
+              `approve` `comment` exceeds the 12000-BYTE binding-condition
+              cap (#2583). The over-cap approve refusal fires BEFORE any
+              approval row is recorded (field `comment`; `details` carries
+              `bytes`, `max_bytes`, and `overflow_bytes`), so a shortened
+              retry flows normally. Measured in bytes, NOT characters — an
+              `approve` comment is a binding instruction injected verbatim,
+              and truncating it would silently drop a condition tail. A
+              `reject` comment is EXEMPT from the cap (advisory
+              prior-rejection feedback, not a binding condition).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |

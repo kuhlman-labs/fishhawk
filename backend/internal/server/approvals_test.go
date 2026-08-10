@@ -8456,3 +8456,145 @@ func TestScopePathsOverlap(t *testing.T) {
 		}
 	}
 }
+
+// --- Approve-comment byte-cap refusal (#2583) ---
+
+// approveBodyWithComment renders a POST-approvals body carrying a comment of
+// exactly n bytes, JSON-escaped.
+func approveBodyWithComment(t *testing.T, decision string, n int) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"decision": decision,
+		"comment":  strings.Repeat("a", n),
+	})
+	if err != nil {
+		t.Fatalf("marshal approve body: %v", err)
+	}
+	return string(body)
+}
+
+// TestSubmitApproval_OverCapApprove_Refused pins per-failure-mode test 1: an
+// approve comment past prompt.MaxApprovalConditionBytes is refused 400
+// validation_failed, the details name field=comment and carry the byte
+// arithmetic, AND — because the control's effect is COMMITTED STATE — no
+// approval row is inserted. The over-cap comment is built BY CONSTRUCTION
+// (strings.Repeat to cap+1) rather than by calling the validator in setup, so
+// the RED under a deleted control lands on the status/no-row assertions.
+func TestSubmitApproval_OverCapApprove_Refused(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	// overBy is a DISTINCTIVE, non-trivial overflow (not 1) so the overflow
+	// assertion below cannot be satisfied vacuously: `strings.Contains(body,
+	// "1")` was trivially true against the actual byte count (which contains a
+	// "1") and nearly any digit-bearing body (#2583 fix-up). The overflow is now
+	// pinned to the STRUCTURED details key, so the arithmetic
+	// bytes-minus-cap==overflow is genuinely asserted.
+	overBy := 137
+	n := prompt.MaxApprovalConditionBytes + overBy
+	w := submitApproval(t, s, stage.ID, approveBodyWithComment(t, "approve", n))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"validation_failed"`) {
+		t.Errorf("body missing validation_failed: %s", body)
+	}
+	if !strings.Contains(body, `"comment"`) {
+		t.Errorf("body missing field=comment: %s", body)
+	}
+	// The details name the actual byte count, the cap, and the overflow — each
+	// pinned to its STRUCTURED JSON key so the assertion is non-vacuous. The
+	// envelope is emitted by a plain json.Encoder (no indent), so keys serialize
+	// as `"<key>":<int>` with no space after the colon. The `"bytes":<n>` match
+	// cannot alias `"max_bytes":<cap>` because the quote immediately precedes
+	// `bytes` only in the former.
+	for _, want := range []string{
+		fmt.Sprintf(`"bytes":%d`, n),
+		fmt.Sprintf(`"max_bytes":%d`, prompt.MaxApprovalConditionBytes),
+		fmt.Sprintf(`"overflow_bytes":%d`, overBy),
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("refusal body missing %q (actual/cap/overflow details); got:\n%s", want, body)
+		}
+	}
+	// COMMITTED-STATE assertion: no approval row inserted, no advance, no audit.
+	if len(ar.all) != 0 {
+		t.Errorf("approval rows = %d, want 0 (over-cap approve must insert no row)", len(ar.all))
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 (refused approve must not advance)", len(rr.transitions))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0 (refused approve emits no audit)", len(au.appended))
+	}
+}
+
+// TestSubmitApproval_AtCapApprove_Recorded pins per-failure-mode test 2: an
+// approve comment of exactly prompt.MaxApprovalConditionBytes bytes is admitted
+// (200), advances the stage, and stores the comment verbatim. This is the >
+// (not >=) boundary — a no-op cap constant would still pass 200 but the
+// paired over-cap test above fails, and the at-cap tail-delivery prompt test
+// pins the render.
+func TestSubmitApproval_AtCapApprove_Recorded(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	n := prompt.MaxApprovalConditionBytes
+	w := submitApproval(t, s, stage.ID, approveBodyWithComment(t, "approve", n))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("approval rows = %d, want 1", len(ar.all))
+	}
+	if ar.all[0].Comment == nil || *ar.all[0].Comment != strings.Repeat("a", n) {
+		t.Errorf("stored comment not verbatim at cap")
+	}
+	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
+		t.Errorf("transitions = %+v, want one succeed", rr.transitions)
+	}
+}
+
+// TestSubmitApproval_UnderCapApprove_Unchanged pins per-failure-mode test 3:
+// an ordinary under-cap approve comment is byte-identical to today.
+func TestSubmitApproval_UnderCapApprove_Unchanged(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"looks good"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 || ar.all[0].Comment == nil || *ar.all[0].Comment != "looks good" {
+		t.Errorf("under-cap approve not recorded verbatim: %+v", ar.all)
+	}
+	if len(rr.transitions) != 1 {
+		t.Errorf("transitions = %d, want 1", len(rr.transitions))
+	}
+}
+
+// TestSubmitApproval_OverCapReject_NotRefused pins per-failure-mode test 4: the
+// documented carve-out. A REJECT comment past the cap is NOT refused — it feeds
+// the advisory PriorRejectionFeedback channel, not binding conditions — so an
+// over-cap reject still records (200, category-D fail). Pinning it stops a later
+// change silently widening the refusal to rejects.
+func TestSubmitApproval_OverCapReject_NotRefused(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	n := prompt.MaxApprovalConditionBytes + 1000
+	w := submitApproval(t, s, stage.ID, approveBodyWithComment(t, "reject", n))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (over-cap reject is exempt):\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Errorf("reject row = %d, want 1 (over-cap reject must record)", len(ar.all))
+	}
+	var got stageResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if got.State != string(run.StageStateFailed) {
+		t.Errorf("State = %q, want failed (reject)", got.State)
+	}
+}
