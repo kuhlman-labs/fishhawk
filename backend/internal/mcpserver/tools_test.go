@@ -315,7 +315,16 @@ type fakeBackend struct {
 	// POST. amendmentsByRun seeds the list response; decideResp seeds the
 	// decided row keyed by amendment id; decideBody captures the last
 	// decoded decision body; *Status / *ErrBody drive error paths.
+	// amendmentsReadsByRun counts list reads per run id so a test can assert
+	// the #2588 await_stage probe cadence. amendmentsFlip, when non-nil, is
+	// invoked under fb.mu on every list read with (run id, read count) BEFORE
+	// the items snapshot, so a test can make an amendment appear (or settle
+	// the awaited stage, driving the settledness-wins interleaving) at the Nth
+	// read without wall-clock sleeps — it mutates the fixtures directly (the
+	// caller already holds fb.mu, so it must not re-lock).
 	amendmentsByRun      map[uuid.UUID][]ScopeAmendmentItem
+	amendmentsReadsByRun map[uuid.UUID]int
+	amendmentsFlip       func(runID uuid.UUID, reads int)
 	amendmentsStatus     int
 	amendmentsErrBody    string
 	decideAmendmentResp  map[uuid.UUID]ScopeAmendmentItem
@@ -506,6 +515,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		deferStatus:                   http.StatusOK,
 		deferCalledByID:               map[uuid.UUID]int{},
 		amendmentsByRun:               map[uuid.UUID][]ScopeAmendmentItem{},
+		amendmentsReadsByRun:          map[uuid.UUID]int{},
 		amendmentsStatus:              http.StatusOK,
 		decideAmendmentResp:           map[uuid.UUID]ScopeAmendmentItem{},
 		decideAmendmentState:          http.StatusOK,
@@ -867,6 +877,10 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			return
 		}
 		fb.mu.Lock()
+		fb.amendmentsReadsByRun[id]++
+		if fb.amendmentsFlip != nil {
+			fb.amendmentsFlip(id, fb.amendmentsReadsByRun[id])
+		}
 		status := fb.amendmentsStatus
 		errBody := fb.amendmentsErrBody
 		items := fb.amendmentsByRun[id]

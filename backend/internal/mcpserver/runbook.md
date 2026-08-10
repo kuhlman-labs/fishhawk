@@ -49,7 +49,11 @@ One issue → one run → one PR.
    (terminal OR parked-for-operator), carrying the RAW stage state out so a
    parked `awaiting_approval` is distinguishable from a `succeeded` stage; it
    reuses the same `long_wait` / `heartbeat` / `timeout_cap_seconds` ladder the
-   other await verbs use.
+   other await verbs use. It ALSO releases on the second condition (#2588): a
+   pending mid-stage scope amendment returns status `amendment_pending` with the
+   amendment row and a pre-filled `fishhawk_decide_scope_amendment` `next_step`,
+   so dispatch's in-band amendment channel is observable from the same wait —
+   decide, then re-arm the wait for the settlement.
 5. **`fishhawk_await_review`** — block until the implement review reaches a
    terminal verdict. Re-poll `fishhawk_get_run_status` if it times out; that
    poll is the authoritative path to a terminal status. Once the review
@@ -531,10 +535,16 @@ When the implement agent discovers a file it must change that is outside the
 approved `scope.files` (a coupled test, a registration table, a doc
 companion), it does not edit it silently — it files an operator-gated
 scope amendment and waits. You decide with `fishhawk_decide_scope_amendment` (or
-`fishhawk_list_scope_amendments` to enumerate pending requests). Watch the
-runner log for `scope_amendment_pending` (the runner-log event), not
-`scope_amendment_requested` (the audit category); missing it lets the agent
-loop on its wait-poll until the stage is killed.
+`fishhawk_list_scope_amendments` to enumerate pending requests).
+
+The PRIMARY signal is `fishhawk_await_stage` (#2588): filing an amendment does
+NOT park the stage — it stays `running` — so the wait carries a second release
+condition and returns status `amendment_pending` with the amendment row (paths,
+reason, cap headroom) and a pre-filled `fishhawk_decide_scope_amendment`
+`next_step`. Decide from that response, then re-arm the wait. The FALLBACK, when
+you are not holding a wait: watch the runner log for `scope_amendment_pending`
+(the runner-log event), not `scope_amendment_requested` (the audit category);
+missing it lets the agent loop on its wait-poll until the stage is killed.
 
 To **add** files at the plan-approval gate, name them explicitly as
 `dir/file.ext` in the approval reason (this folds them into scope) or use the

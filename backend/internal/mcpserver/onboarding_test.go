@@ -133,6 +133,23 @@ func TestOnboardingInstructions_NameAwaitStage(t *testing.T) {
 	}
 }
 
+// TestOnboardingInstructions_AwaitStageObservesAmendments is the #2588
+// onboarding pin: the instructions must state that the amendment channel is
+// OBSERVABLE from the recommended wait (status amendment_pending, no separate
+// fishhawk_list_scope_amendments poll cycle). Before #2588 the claim would have
+// been false — await_stage never released on an amendment — so a revert of the
+// prose fails here rather than leaving the operator hand-polling.
+func TestOnboardingInstructions_AwaitStageObservesAmendments(t *testing.T) {
+	got := onboardingInstructions
+	lower := strings.ToLower(got)
+	if !strings.Contains(lower, "amendment_pending") {
+		t.Errorf("onboardingInstructions must name the amendment_pending release status; got:\n%s", got)
+	}
+	if !strings.Contains(lower, "no separate fishhawk_list_scope_amendments poll") {
+		t.Errorf("onboardingInstructions must state no separate fishhawk_list_scope_amendments poll cycle is needed; got:\n%s", got)
+	}
+}
+
 // TestStartRunSchema_WorkingDirInstructsTheCaller walks the schema ACTUALLY
 // REGISTERED on the server via a tools/list round-trip (not jsonschema.For on
 // the Go struct — so a registration that overrides the inferred schema is
