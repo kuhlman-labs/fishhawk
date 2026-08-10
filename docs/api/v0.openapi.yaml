@@ -7287,6 +7287,22 @@ paths:
               `awaiting_host_dispatch`, or left `dispatched` when a re-dispatch
               hit a since-regressed dependency); dispatch the named blocking
               sibling first to clear it.
+
+              **Consistency of the wave-order check (#2586).** The check is
+              evaluated from a point-in-time read of the sibling runs and is NOT
+              executed in one transaction with the stage transition. For
+              SIBLING-RUN-STATE specifically it is nonetheless not a best-effort
+              approximation: run state `succeeded` is absorbing (a run that has
+              reached it cannot leave it), so a dependency this check saw as
+              satisfied is still satisfied at transition time. The staleness that
+              remains in sibling state is therefore one-directional — a
+              dependency that becomes satisfied inside the window yields a
+              conservative 409 the caller clears by retrying, never an
+              out-of-order dispatch. This does NOT extend to the dependency SET:
+              the declared `depends_on` is read from the parent's approved plan,
+              and a plan revised between that read and the transition can leave
+              the check evaluating a stale dependency set. That case is not
+              covered by the guarantee above.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -135,6 +135,55 @@ func (s *Server) listDecomposedSiblings(ctx context.Context, parentID uuid.UUID)
 // slice declares no dependencies, and one whose every dependency sibling has
 // succeeded. A required read that ERRORS returns (nil, err) so the caller fails
 // closed (retryable) rather than admitting silently.
+//
+// # Atomicity of the predicate vs the CAS (#2586)
+//
+// The ListRuns sibling snapshot below is NOT atomic with the caller's stage CAS
+// in handleHostDispatchStage, and NO lock spans the two rows: the guard reads
+// sibling RUN rows, the caller then writes this child's STAGE row. The
+// stage-admission lock the caller holds is keyed to the stage and does not
+// serialize any sibling-run write. That window is real; what makes it safe is a
+// property of the run state machine, not serialization.
+//
+// Correctness rests on run-state MONOTONICITY: run state 'succeeded' is
+// ABSORBING. runs.state is written by exactly one query (UpdateRunState),
+// reached by exactly two repository methods, each gated inside a
+// SELECT ... FOR UPDATE transaction — TransitionRun (ValidRunTransition refuses
+// any terminal `from`) and RetryRun (ValidRunRetryTransition admits only
+// failed → running); ReviveRun refuses a non-failed run outright, and there is
+// no run-deletion path. See backend/internal/run/transition.go, pinned by
+// run.TestRunSucceededIsAbsorbing and
+// run.TestPostgres_SucceededRunNeverLeavesSucceeded.
+//
+// Consequently, of the ways SIBLING RUN STATE can drift inside the window:
+//
+//   - a dependency REACHING succeeded, or a dependency slice gaining a
+//     freshly-minted (pending) sibling — the guard decides on its stale
+//     snapshot and REFUSES. Fails closed; the cost is a spurious 409 the
+//     operator clears by re-dispatching.
+//   - a dependency LEAVING succeeded — this WOULD admit out of wave order, and
+//     is the direction that would be dangerous. It is unreachable because
+//     succeeded is absorbing. Characterized, not hypothesized, by
+//     TestGuard_Window_DependencyLeavesSucceeded_AdmitsOnSnapshot.
+//
+// Because the enforcement lives in the repository layer under a row lock rather
+// than in an in-process mutex, this argument survives multiple fishhawkd
+// replicas — unlike the #1936 stage-admission fence, whose residual is
+// single-process by construction.
+//
+// SCOPE OF THAT CLAIM — it covers SIBLING-RUN-STATE staleness ONLY. Two
+// residuals are NOT closed by it:
+//
+//   - PLAN-REVISION WINDOW (not covered). The dependency SET itself is read
+//     from the parent's approved plan by resolveSliceDependencies. A parent plan
+//     revised between that read and the caller's CAS can change depends_on, so
+//     the guard can decide against a depends_on that is no longer current. The
+//     absorbing-succeeded argument says nothing about this: it constrains run
+//     STATE, not plan CONTENT. This is an operator-level anomaly (a plan revised
+//     underneath an in-flight fan-out) rather than a race an ordinary caller can
+//     drive, and it is untested and unfixed here.
+//   - SPURIOUS REFUSAL (accepted). The fail-closed direction above yields a 409
+//     that is stale-but-safe; the operator clears it by re-dispatching.
 func (s *Server) guardDecompositionWaveOrder(ctx context.Context, runRow *run.Run) (*sliceDependencyError, error) {
 	dependsOn, resolved, err := s.resolveSliceDependencies(ctx, runRow)
 	if err != nil {

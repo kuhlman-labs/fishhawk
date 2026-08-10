@@ -72,6 +72,52 @@ func TestRunRetryTransitions(t *testing.T) {
 	}
 }
 
+// allRunStates is every declared run State. TestRunSucceededIsAbsorbing
+// quantifies over it, so a NEW state added to run.go without extending this
+// slice weakens that closure test — keep the two in sync.
+var allRunStates = []State{StatePending, StateRunning, StateSucceeded, StateFailed, StateCancelled}
+
+// TestRunSucceededIsAbsorbing is the EXHAUSTIVE closure pin for the
+// absorbing-succeeded property (#2586). TestRunTransitions_AllowedAndForbidden
+// and TestRunRetryTransitions above cover hand-picked pairs; this test
+// quantifies over EVERY declared run State, so a newly-admitted escape edge
+// cannot slip through a gap in a hand-written table.
+//
+// The property matters to a DOWNSTREAM READER: server.guardDecompositionWaveOrder
+// snapshots sibling run states with ListRuns and then CASes a different row (the
+// child's stage). Nothing locks across the two, so the guard's correctness rests
+// on a sibling that has reached `succeeded` never leaving it — see the comment
+// above runRetryTransitions. If this test goes red, that guard's window analysis
+// must be re-derived before the change ships.
+func TestRunSucceededIsAbsorbing(t *testing.T) {
+	// (1) The ordinary transition table: succeeded → X is admissible only for
+	// the idempotent same-state no-op.
+	for _, to := range allRunStates {
+		want := to == StateSucceeded
+		if got := ValidRunTransition(StateSucceeded, to); got != want {
+			t.Errorf("ValidRunTransition(succeeded, %q) = %v, want %v (succeeded is absorbing; only the same-state no-op is admissible)",
+				to, got, want)
+		}
+	}
+
+	// (2) The retry-override table: NO succeeded → X edge exists, including the
+	// same-state pair (ValidRunRetryTransition has no idempotent shortcut).
+	for _, to := range allRunStates {
+		if ValidRunRetryTransition(StateSucceeded, to) {
+			t.Errorf("ValidRunRetryTransition(succeeded, %q) = true, want false (no run-level reopen off succeeded)", to)
+		}
+	}
+
+	// (3) White-box: the table itself carries no succeeded key. This assertion
+	// fails on the TABLE EDIT, not merely on a reachable pair, so a future
+	// out-of-succeeded entry is caught even if some other gate happens to mask
+	// it at the ValidRunRetryTransition seam.
+	if n := len(runRetryTransitions[StateSucceeded]); n != 0 {
+		t.Errorf("runRetryTransitions[succeeded] has %d entries (%v), want 0 — adding one re-opens the #2586 wave-order guard window; see the comment above runRetryTransitions",
+			n, runRetryTransitions[StateSucceeded])
+	}
+}
+
 func TestStageTransitions_AllowedAndForbidden(t *testing.T) {
 	cases := []struct {
 		from, to StageState

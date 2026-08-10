@@ -17,13 +17,24 @@ import (
 
 // guardCountingRepo wraps orchestratorRepo to (a) count ListRuns /
 // ListStagesForRun so the inert fast-path branches can pin "no read happened",
-// and (b) inject a ListRuns error so the sibling-walk fail-closed branch is
-// reachable (orchestratorRepo has no error hook of its own).
+// (b) inject a ListRuns error so the sibling-walk fail-closed branch is
+// reachable (orchestratorRepo has no error hook of its own), and (c) fire a
+// mutation hook INSIDE the guard's check-then-act window (#2586).
 type guardCountingRepo struct {
 	*orchestratorRepo
 	listRunsCalls   int
 	listStagesCalls int
 	listRunsErr     error
+
+	// onListRuns fires AFTER the underlying ListRuns returns and BEFORE the
+	// guard consumes the snapshot — exactly the interval named by #2586 (the
+	// guard's sibling snapshot is not atomic with the caller's stage CAS). It
+	// makes the window's interleavings deterministic: a test mutates sibling
+	// state here with no sleeps, no goroutines, and no timing dependence.
+	// The seam is a TEST-ONLY wrapper around a call the guard already makes;
+	// production code is untouched, which is why the pgtest-backed cross-layer
+	// test is kept as the no-hook corroboration.
+	onListRuns func()
 }
 
 func (r *guardCountingRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
@@ -31,7 +42,22 @@ func (r *guardCountingRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) 
 	if r.listRunsErr != nil {
 		return nil, r.listRunsErr
 	}
-	return r.orchestratorRepo.ListRuns(ctx, f)
+	rows, err := r.orchestratorRepo.ListRuns(ctx, f)
+	// SNAPSHOT FIDELITY (load-bearing for the window tests): orchestratorRepo
+	// returns pointers INTO its own store, but postgresRepo.ListRuns
+	// materializes fresh rows — a true point-in-time value snapshot. Copying
+	// here is what makes the fake model the real window: without it, a mutation
+	// fired by onListRuns would be visible to the guard through the shared
+	// pointer, i.e. the exact OPPOSITE of the production behaviour under test.
+	out := make([]*run.Run, len(rows))
+	for i, row := range rows {
+		cp := *row
+		out[i] = &cp
+	}
+	if r.onListRuns != nil {
+		r.onListRuns()
+	}
+	return out, err
 }
 
 func (r *guardCountingRepo) ListStagesForRun(ctx context.Context, id uuid.UUID) ([]*run.Stage, error) {
@@ -335,6 +361,120 @@ func TestGuard_SiblingListError_FailsClosed(t *testing.T) {
 	}
 	if depErr != nil {
 		t.Errorf("depErr = %+v, want nil when the read errored", depErr)
+	}
+}
+
+// --- WINDOW DIRECTIONS: the check-then-act interval (#2586) ---
+//
+// guardDecompositionWaveOrder's sibling snapshot is NOT atomic with the
+// caller's stage CAS, and no lock spans the two rows. The three tests below
+// enumerate every direction sibling state can drift inside that interval,
+// using the deterministic onListRuns hook (no sleeps, no goroutines). Two are
+// reachable in production and fail closed; the third is the one that would be
+// dangerous, and is unreachable because run state `succeeded` is absorbing
+// (pinned by run.TestRunSucceededIsAbsorbing and
+// run.TestPostgres_SucceededRunNeverLeavesSucceeded).
+
+// (18) WINDOW DIRECTION 1 — a dependency becomes SATISFIED inside the window.
+// The guard decides on its (now stale) snapshot and still refuses. This is the
+// fail-CLOSED direction: the cost is a spurious 409 the operator clears by
+// re-dispatching, never an out-of-order spawn.
+func TestGuard_Window_DependencyReachesSucceeded_StillRefuses(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	sib := seedGuardChild(rr, parentID, 0, run.StatePending)
+	child := seedGuardChild(rr, parentID, 1, run.StatePending)
+
+	// Fire the sibling's pending → succeeded transition INSIDE the window:
+	// after ListRuns returned, before the guard consumes the snapshot.
+	rr.onListRuns = func() { sib.State = run.StateSucceeded }
+
+	depErr, err := s.guardDecompositionWaveOrder(context.Background(), child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if depErr == nil {
+		t.Fatal("guard admitted on a mid-window satisfaction; want a refusal decided on the snapshot (fail closed)")
+	}
+	if depErr.blockingSliceIndex != 0 || depErr.blockingState != string(run.StatePending) {
+		t.Errorf("blocker = (slice %d, state %q), want (0, pending) — the snapshot's view, not the post-window one",
+			depErr.blockingSliceIndex, depErr.blockingState)
+	}
+	// The store really did move on: the refusal is stale, not a mis-seeded fixture.
+	if sib.State != run.StateSucceeded {
+		t.Fatalf("test precondition: sibling state = %q, want the hook to have advanced it to succeeded", sib.State)
+	}
+}
+
+// (19) WINDOW DIRECTION 2 — a dependency slice with no minted sibling gains one
+// inside the window. Still refuses: a freshly minted run starts `pending`, so
+// even a snapshot taken AFTER the mint would refuse. Fail closed again.
+func TestGuard_Window_DependencySiblingMintedLate_StillRefuses(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	child := seedGuardChild(rr, parentID, 1, run.StatePending) // slice 0 not minted yet
+
+	var late *run.Run
+	rr.onListRuns = func() {
+		if late == nil {
+			late = seedGuardChild(rr, parentID, 0, run.StatePending)
+		}
+	}
+
+	depErr, err := s.guardDecompositionWaveOrder(context.Background(), child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if depErr == nil {
+		t.Fatal("guard admitted on a mid-window mint; want a refusal decided on the snapshot")
+	}
+	if depErr.blockingSliceIndex != 0 || depErr.blockingState != notMintedState || depErr.blockingRunID != "" {
+		t.Errorf("blocker = (slice %d, run %q, state %q), want (0, \"\", not_minted) — the snapshot's view",
+			depErr.blockingSliceIndex, depErr.blockingRunID, depErr.blockingState)
+	}
+	if late == nil {
+		t.Fatal("test precondition: the hook never minted the late sibling")
+	}
+}
+
+// (20) WINDOW DIRECTION 3 — the DANGEROUS direction: a dependency LEAVES
+// `succeeded` inside the window, so the guard admits on a snapshot that is no
+// longer true and a slice dispatches out of wave order.
+//
+// This test asserts the admit, and that is deliberate: it records exactly what
+// the guard WOULD do if the invariant were relaxed, rather than claiming an
+// atomicity the code does not implement. In production this interleaving is
+// UNREACHABLE — run state `succeeded` is absorbing (single UpdateRunState write
+// site; both gated callers under SELECT ... FOR UPDATE; ReviveRun refuses a
+// non-failed run; no run deletion), pinned by run.TestRunSucceededIsAbsorbing
+// and run.TestPostgres_SucceededRunNeverLeavesSucceeded. If EITHER of those goes
+// red, this test's admit becomes reachable and the guard needs real
+// serialization across the two rows.
+//
+// The mutation is applied directly to the stored run rather than through
+// TransitionRun precisely BECAUSE the repository refuses it — the test has to
+// construct a state the production state machine will not produce.
+func TestGuard_Window_DependencyLeavesSucceeded_AdmitsOnSnapshot(t *testing.T) {
+	s, rr, art := newGuardServer(t)
+	parentID := seedParentDecompPlan(t, rr, art, [][]int{nil, {0}})
+	sib := seedGuardChild(rr, parentID, 0, run.StateSucceeded)
+	child := seedGuardChild(rr, parentID, 1, run.StatePending)
+
+	rr.onListRuns = func() { sib.State = run.StateFailed }
+
+	depErr, err := s.guardDecompositionWaveOrder(context.Background(), child)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if depErr != nil {
+		t.Fatalf("guard = %+v; want an ADMIT decided on the snapshot. This test documents the one dangerous "+
+			"window direction. It is unreachable in production because `succeeded` is absorbing — see "+
+			"run.TestRunSucceededIsAbsorbing and run.TestPostgres_SucceededRunNeverLeavesSucceeded. A change here "+
+			"means the guard's window analysis must be re-derived, not that this expectation should be updated",
+			depErr)
+	}
+	if sib.State != run.StateFailed {
+		t.Fatalf("test precondition: sibling state = %q, want the hook to have regressed it to failed", sib.State)
 	}
 }
 

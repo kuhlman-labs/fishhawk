@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -669,6 +670,77 @@ func TestHostDispatch_DecompositionDependencyCheckError_500(t *testing.T) {
 	}
 }
 
+// TestHostDispatch_ConcurrentDecomposedDispatch_AdmitsExactlyOne (#2586) is the
+// concurrency demonstration the deferred concern asked to see: N dispatchers
+// racing the SAME fan-out child stage whose dependency has already succeeded.
+// Exactly one call may transition the stage; every other must be either the
+// idempotent 200 {transitioned:false} or a 409 dispatch_not_admissible, and the
+// stage must settle at 'dispatched'.
+//
+// WHAT THIS PINS, precisely: that the stage compare-and-swap admits ONE
+// dispatcher. It is NOT evidence that the per-stage admission lock is what
+// serializes the marker, and that is an OBSERVED result, not a hedge. With the
+// LockStageAdmission acquisition in handleHostDispatchStage deleted, this test
+// still PASSES without -race — the CAS alone produces exactly one
+// transitioned:true. (Under -race the deletion does fail, but on an
+// unsynchronized counter in guardCountingRepo, a test fake, not on a second
+// transition.) So the README and doc-comment claims are scoped to the CAS; do
+// not read an admission-lock guarantee out of this test.
+//
+// Runs under the suite's standard -race, so an unsound in-process lock or map
+// access surfaces as a detected race rather than a flake — a positive signal on
+// the interleavings actually executed, not a proof of absence.
+func TestHostDispatch_ConcurrentDecomposedDispatch_AdmitsExactlyOne(t *testing.T) {
+	s, rr, childRunID, childStageID, _ := decomposedHostDispatchServer(t, run.StateSucceeded)
+	o := &orchestrator.Orchestrator{Runs: rr}
+	s.cfg.Orchestrator = o
+
+	const dispatchers = 8
+	var wg sync.WaitGroup
+	codes := make([]int, dispatchers)
+	transitioned := make([]bool, dispatchers)
+	start := make(chan struct{})
+	for i := range dispatchers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release all goroutines together to widen the overlap
+			w := postHostDispatch(t, s, childRunID, childStageID, withHostDispatchOperator)
+			codes[i] = w.Code
+			if w.Code == http.StatusOK {
+				var resp hostDispatchResponse
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err == nil {
+					transitioned[i] = resp.Transitioned
+				}
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	wins := 0
+	for i, c := range codes {
+		switch {
+		case transitioned[i]:
+			wins++
+		case c == http.StatusOK, c == http.StatusConflict:
+			// idempotent no-op or dispatch_not_admissible — both acceptable losers
+		default:
+			t.Errorf("dispatcher %d: status = %d, want 200 (win or idempotent no-op) or 409", i, c)
+		}
+	}
+	if wins != 1 {
+		t.Errorf("transitioned:true count = %d across %d concurrent dispatchers, want exactly 1", wins, dispatchers)
+	}
+	cur, err := rr.GetStage(context.Background(), childStageID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != run.StageStateDispatched {
+		t.Errorf("persisted stage state = %q, want dispatched", cur.State)
+	}
+}
+
 // TestHostDispatch_Decomposition_CrossLayer_PgBacked (#2546 verification
 // CROSS-BOUNDARY) exercises the whole span — the postgres run repo's
 // slice_index/decomposed_from column round-trip, the artifact-backed plan
@@ -775,5 +847,34 @@ func TestHostDispatch_Decomposition_CrossLayer_PgBacked(t *testing.T) {
 	cur, _ = runRepo.GetStage(ctx, child1Stage.ID)
 	if cur.State != run.StageStateDispatched {
 		t.Errorf("persisted stage = %q, want dispatched", cur.State)
+	}
+
+	// (c) #2586: the dependency predicate the guard just relied on cannot be
+	// falsified after the fact. Attempt to move the satisfied dependency OUT of
+	// succeeded through both write paths the repository exposes and assert each
+	// refuses AND that the committed row still reads succeeded. This is the
+	// end-to-end statement of the absorbing-succeeded property at the layer that
+	// actually persists it — the guard's check-then-act window cannot be exploited
+	// by regressing a dependency, because no caller can regress one.
+	for _, esc := range []struct {
+		name string
+		call func() (*run.Run, error)
+	}{
+		{"TransitionRun→running", func() (*run.Run, error) { return runRepo.TransitionRun(ctx, child0.ID, run.StateRunning) }},
+		{"RetryRun→running", func() (*run.Run, error) { return runRepo.RetryRun(ctx, child0.ID, run.StateRunning) }},
+	} {
+		_, err := esc.call()
+		var ite run.InvalidTransitionError
+		if !errors.As(err, &ite) {
+			t.Errorf("%s on the satisfied dependency: err = %v, want InvalidTransitionError", esc.name, err)
+		}
+		cur0, gerr := runRepo.GetRun(ctx, child0.ID)
+		if gerr != nil {
+			t.Fatalf("get child0: %v", gerr)
+		}
+		if cur0.State != run.StateSucceeded {
+			t.Errorf("dependency run state = %q after %s, want succeeded (a satisfied dependency must not be falsifiable)",
+				cur0.State, esc.name)
+		}
 	}
 }
