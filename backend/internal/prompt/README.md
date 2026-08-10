@@ -103,6 +103,17 @@ This closes the #1083 / #1057-slice-3 category-B trap where the runner dropped t
 
 Standalone runs (`decomposed_from` nil) are unchanged — the child-first read returns exactly `loadApprovalConditions(runRow.ID)` and the fallback never fires.
 
+### Condition caps + the shared `CapText` helper (#2583)
+
+Two exported constants declare the operator-text caps once, replacing the eight duplicated `const maxConditionBytes = 4000` sites the two prompt files carried:
+
+- `MaxApprovalConditionBytes = 12000` — the cap for the **approve-with-conditions** channel (`writeApprovalConditions` + `writeApprovalConditionsReinforcement`, and the two implement-review approval-conditions sections). Because that text is BINDING (#558) and renders up to twice per implement prompt, an over-cap approve comment is now **refused at the approval gate** (`server.handleSubmitApproval` / `server.HandleApprovalCommand`) rather than silently cut, closing the #2583 tail-drop hole. Raised from the historical 4000 so a realistic multi-condition approval (the observed live case was 5345 bytes) is accepted.
+- `MaxConditionBytes = 4000` — the unchanged cap for the sibling operator-text channels that share this rendering path: clarification answers (`loadClarificationAnswers`), the revision constraint (`loadRevisionConstraint`), and the recovery resume reason (`loadRecoveryResumeReason`). These are advisory/bounded and are NOT gate-refused, so their 4000-byte behavior (and its existing `clarification_answer_test.go` pin) is preserved.
+
+`CapText(s, max) (string, bool)` is the one rune-safe truncation helper: it cuts at `max` **bytes** then applies `strings.ToValidUTF8(…, "")` (the `sanitizeScopePath` idiom) so a cut through a multi-byte rune cannot emit invalid UTF-8, appends the byte-identical `...[truncated]` marker, and returns whether it truncated. The boundary is strictly `>`: a string of exactly `max` bytes renders verbatim.
+
+Because the approval gate now refuses an over-cap approve comment, `loadApprovalConditions`' own truncation is reachable only for a comment stored **before** the gate existed (or via a channel that bypasses it). When it does truncate it appends an `approval_conditions_truncated` audit entry (`server.CategoryApprovalConditionsTruncated`, payload `{original_bytes, cap_bytes, dropped_bytes, source}`), best-effort, so the residual drop is visible in the run record rather than silent.
+
 ## Structured scope amendment (#824)
 
 The approval request body carries an optional authoritative `add_scope_files []string` (`server/approvals.go`), recorded on the `approval_submitted` audit payload under `add_scope_files`.

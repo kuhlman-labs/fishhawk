@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
@@ -5502,10 +5503,11 @@ func TestBuild_ImplementReview_ApprovalConditions_AbsentWhenNil(t *testing.T) {
 }
 
 func TestBuild_ImplementReview_ApprovalConditions_Truncated(t *testing.T) {
-	// A condition over the 4000-byte cap is truncated with the suffix,
-	// mirroring buildImplement's cap, so a pathological approval note can't
-	// blow the review prompt.
-	cond := strings.Repeat("y", 4100)
+	// A condition over the MaxApprovalConditionBytes cap is truncated with the
+	// suffix, mirroring buildImplement's cap (both now share the exported
+	// constant, raised from 4000 to 12000 in #2583), so a pathological approval
+	// note can't blow the review prompt.
+	cond := strings.Repeat("y", MaxApprovalConditionBytes+100)
 	got, err := Build("implement_review", Trigger{
 		Repo:               "kuhlman-labs/example",
 		ApprovedPlan:       fixturePlan(),
@@ -7676,5 +7678,121 @@ func TestBuild_ReviewGrounding_SkipDisclosure(t *testing.T) {
 	}
 	if strings.Contains(noSkips, "NOT exhaustive") {
 		t.Errorf("grounded prompt with no skips must not disclose incompleteness:\n%s", noSkips)
+	}
+}
+
+// --- Approval-conditions cap + CapText helper (#2583) ---
+
+// TestCapText_BoundaryAndMarker pins the CapText contract: the boundary is
+// strictly GREATER-THAN the cap (an exactly-at-cap string renders verbatim,
+// operator binding condition 3), an over-cap string gets the byte-identical
+// "...[truncated]" marker, and the cut is rune-safe. Flipping CapText's `<= max`
+// guard to `< max` (the off-by-one counterfactual) makes the at-cap sub-test go
+// RED, because an at-cap string would then be truncated.
+func TestCapText_BoundaryAndMarker(t *testing.T) {
+	const max = 100
+
+	// Exactly-at-cap: returned verbatim, no marker, ok=false.
+	atCap := strings.Repeat("a", max)
+	if got, ok := CapText(atCap, max); got != atCap || ok {
+		t.Errorf("CapText(at-cap) = (%d bytes, ok=%v), want the input unchanged and ok=false", len(got), ok)
+	}
+	if got, _ := CapText(atCap, max); strings.Contains(got, "...[truncated]") {
+		t.Errorf("CapText(at-cap) must not append the truncation marker")
+	}
+
+	// One byte under the cap: unchanged.
+	underCap := strings.Repeat("a", max-1)
+	if got, ok := CapText(underCap, max); got != underCap || ok {
+		t.Errorf("CapText(under-cap) = (%q, ok=%v), want unchanged and ok=false", got, ok)
+	}
+
+	// One byte over the cap: truncated to max bytes + marker, ok=true.
+	overCap := strings.Repeat("a", max+1)
+	got, ok := CapText(overCap, max)
+	if !ok {
+		t.Errorf("CapText(over-cap) ok=false, want true")
+	}
+	if want := strings.Repeat("a", max) + "...[truncated]"; got != want {
+		t.Errorf("CapText(over-cap) = %q, want %q", got, want)
+	}
+}
+
+// TestCapText_RuneSafe covers the rune-safe cut: a cap boundary that falls
+// inside a multi-byte rune must not emit invalid UTF-8. A naive byte slice
+// would leave a partial rune; CapText's strings.ToValidUTF8 drops it.
+func TestCapText_RuneSafe(t *testing.T) {
+	// "€" is 3 bytes (0xE2 0x82 0xAC). Place it so the cap boundary lands one
+	// byte into it: max-1 filler bytes, then the euro, then trailing filler.
+	const max = 100
+	blob := strings.Repeat("a", max-1) + "€" + strings.Repeat("b", 50)
+	got, ok := CapText(blob, max)
+	if !ok {
+		t.Fatalf("CapText did not truncate an over-cap blob")
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("CapText left invalid UTF-8 after a mid-rune cut: %q", got)
+	}
+	if !strings.HasSuffix(got, "...[truncated]") {
+		t.Errorf("CapText(rune-boundary) missing the truncation marker: %q", got)
+	}
+	// The partial euro byte must be gone: the pre-marker body is only the
+	// filler 'a's (the euro's leading byte was dropped by ToValidUTF8).
+	body := strings.TrimSuffix(got, "...[truncated]")
+	if body != strings.Repeat("a", max-1) {
+		t.Errorf("rune-safe cut body = %q (len %d), want %d 'a's with the partial rune dropped", body, len(body), max-1)
+	}
+}
+
+// TestBuild_Implement_ApprovalConditions_AtCapTailIntact pins the at-cap tail
+// delivery (#2583, operator binding conditions 2+3): a marker at the FINAL bytes
+// of an exactly-MaxApprovalConditionBytes-byte conditions blob appears verbatim
+// in BOTH the pre-plan writeApprovalConditions block AND the tail
+// writeApprovalConditionsReinforcement block, with no "...[truncated]" marker.
+// This is the done-means behavioral test: it fails if the cap constant is a
+// no-op or the boundary regresses to >=.
+func TestBuild_Implement_ApprovalConditions_AtCapTailIntact(t *testing.T) {
+	const tail = "ZZZ_TAIL_CONDITION_MARKER_ZZZ"
+	cond := strings.Repeat("a", MaxApprovalConditionBytes-len(tail)) + tail
+	if len(cond) != MaxApprovalConditionBytes {
+		t.Fatalf("fixture is %d bytes, want exactly %d", len(cond), MaxApprovalConditionBytes)
+	}
+	got, err := Build("implement", Trigger{
+		Repo:               "x/y",
+		IssueNumber:        7,
+		ApprovalConditions: &cond,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if strings.Contains(got, "...[truncated]") {
+		t.Errorf("at-cap conditions must render untruncated; found the truncation marker")
+	}
+	// The distinctive tail renders once per approval-conditions block: the
+	// pre-plan block and the tail reinforcement block. Both must carry it.
+	if n := strings.Count(got, tail); n < 2 {
+		t.Errorf("at-cap tail marker appears %d time(s); want >=2 (writeApprovalConditions AND writeApprovalConditionsReinforcement)", n)
+	}
+}
+
+// TestBuild_Implement_ApprovalConditions_OverCapTruncates covers the over-cap
+// implement-path render: a blob past MaxApprovalConditionBytes still gets the
+// "...[truncated]" marker (the residual-truncation path the audit event makes
+// visible on the server side).
+func TestBuild_Implement_ApprovalConditions_OverCapTruncates(t *testing.T) {
+	cond := strings.Repeat("a", MaxApprovalConditionBytes+500)
+	got, err := Build("implement", Trigger{
+		Repo:               "x/y",
+		IssueNumber:        7,
+		ApprovalConditions: &cond,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "...[truncated]") {
+		t.Errorf("over-cap conditions must render the truncation marker:\n%s", got[:200])
+	}
+	if strings.Contains(got, cond) {
+		t.Errorf("untruncated over-cap conditions appeared in the implement prompt")
 	}
 }

@@ -1380,20 +1380,52 @@ func buildImplement(t Trigger) string {
 	return b.String()
 }
 
+// MaxApprovalConditionBytes caps the operator's approve-with-conditions text
+// (#557/#2583). That text is BINDING — it AMENDS the plan and wins on conflict
+// with the plan steps — so an over-cap comment is now REFUSED at the approval
+// gate (server.handleSubmitApproval and server.HandleApprovalCommand) rather
+// than silently cut here, closing the silent-drop hole where a tail condition
+// never reached the implement agent. Raised from the historical 4000 to 12000
+// so a realistic multi-condition approval (the observed live case was 5345
+// bytes) is accepted rather than refused. The conditions text renders up to
+// TWICE per implement prompt (writeApprovalConditions plus
+// writeApprovalConditionsReinforcement), so this bounds each rendering; any
+// residual truncation on this path is only reachable for a comment stored
+// BEFORE the gate existed (or via a channel that bypasses it) and is made
+// visible by a server-side approval_conditions_truncated audit entry.
+const MaxApprovalConditionBytes = 12000
+
+// MaxConditionBytes caps the three sibling operator-text channels that share
+// this rendering path — clarification answers, the revision constraint, and
+// the recovery resume reason — at their historical 4000-byte behavior. These
+// channels are advisory or bounded and are deliberately NOT gate-refused, so
+// their cap is unchanged.
+const MaxConditionBytes = 4000
+
+// CapText returns s truncated to at most max bytes with the byte-identical
+// "...[truncated]" marker appended, and whether it truncated. The cut is
+// rune-safe: strings.ToValidUTF8 drops a trailing partial rune left by slicing
+// at a fixed byte offset, so the result is always valid UTF-8 (the same idiom
+// sanitizeScopePath uses). A string at or under max is returned unchanged with
+// ok=false, so an exactly-at-cap text renders verbatim (the > not >= boundary).
+func CapText(s string, max int) (string, bool) {
+	if len(s) <= max {
+		return s, false
+	}
+	return strings.ToValidUTF8(s[:max], "") + "...[truncated]", true
+}
+
 // writeApprovalConditions renders the binding "### Approval conditions" block
 // (#557) when the operator approved the plan with notes — operator-authored,
-// MANDATORY, and winning on conflict with plan steps. Capped at 4000 bytes.
-// Shared by the full implement prompt and the slim fix-up prompt so the
-// framing and cap stay byte-identical across both paths.
+// MANDATORY, and winning on conflict with plan steps. Capped at
+// MaxApprovalConditionBytes bytes. Shared by the full implement prompt and the
+// slim fix-up prompt so the framing and cap stay byte-identical across both
+// paths.
 func writeApprovalConditions(b *strings.Builder, t Trigger) {
 	if t.ApprovalConditions == nil {
 		return
 	}
-	ac := *t.ApprovalConditions
-	const maxConditionBytes = 4000
-	if len(ac) > maxConditionBytes {
-		ac = ac[:maxConditionBytes] + "...[truncated]"
-	}
+	ac, _ := CapText(*t.ApprovalConditions, MaxApprovalConditionBytes)
 	b.WriteString("### Approval conditions\n\n")
 	b.WriteString("The operator approved this plan with the following conditions. These conditions AMEND the plan, are MANDATORY, and win on conflict with plan steps:\n\n")
 	b.WriteString(ac)
@@ -1403,21 +1435,17 @@ func writeApprovalConditions(b *strings.Builder, t Trigger) {
 // writeApprovalConditionsReinforcement renders the tail "### Binding
 // conditions — confirm each in your PR Notes" block (#1171, ask-1). It
 // restates the operator's approval conditions verbatim and instructs the agent
-// to confirm each one explicitly in its PR Notes, reusing the same 4000-byte
-// cap and nil guard as writeApprovalConditions so it is a byte-identical no-op
-// when no conditions were attached. Repeating the conditions at the END of the
-// prompt — after the agent has read the plan and the task — counters the
-// implement agent disregarding the conditions injected near the top (the #1171
-// failure mode).
+// to confirm each one explicitly in its PR Notes, reusing the same
+// MaxApprovalConditionBytes cap and nil guard as writeApprovalConditions so it
+// is a byte-identical no-op when no conditions were attached. Repeating the
+// conditions at the END of the prompt — after the agent has read the plan and
+// the task — counters the implement agent disregarding the conditions injected
+// near the top (the #1171 failure mode).
 func writeApprovalConditionsReinforcement(b *strings.Builder, t Trigger) {
 	if t.ApprovalConditions == nil {
 		return
 	}
-	ac := *t.ApprovalConditions
-	const maxConditionBytes = 4000
-	if len(ac) > maxConditionBytes {
-		ac = ac[:maxConditionBytes] + "...[truncated]"
-	}
+	ac, _ := CapText(*t.ApprovalConditions, MaxApprovalConditionBytes)
 	b.WriteString("\n### Binding conditions — confirm each in your PR Notes\n\n")
 	b.WriteString("Before you finish, re-read the operator's binding approval conditions below. They are MANDATORY and win on conflict with the plan. In your PR `## Notes` section, add a numbered checklist that restates each condition and states explicitly how your change satisfies it (or, if a condition could not be met, say so and why):\n\n")
 	b.WriteString(ac)
@@ -3295,11 +3323,7 @@ func buildImplementReview(t Trigger) string {
 	// re-review rounds. Nil omits the section, keeping the prompt byte-identical
 	// to today.
 	if t.ApprovalConditions != nil {
-		ac := *t.ApprovalConditions
-		const maxConditionBytes = 4000
-		if len(ac) > maxConditionBytes {
-			ac = ac[:maxConditionBytes] + "...[truncated]"
-		}
+		ac, _ := CapText(*t.ApprovalConditions, MaxApprovalConditionBytes)
 		b.WriteString("### Approval conditions (binding — AMEND the plan, win on conflict)\n\n")
 		b.WriteString("The operator approved the plan with the conditions below. They AMEND the plan, are MANDATORY " +
 			"for the implement agent, and WIN on conflict with the plan text. When the diff implements one of these " +
@@ -3533,11 +3557,7 @@ func writeSupplementalReinvokeReview(b *strings.Builder, t Trigger) {
 	// Approval conditions amend the plan (#558/#1021); an exemption may be
 	// sound only in light of a condition, so the reviewer must see them.
 	if t.ApprovalConditions != nil {
-		ac := *t.ApprovalConditions
-		const maxConditionBytes = 4000
-		if len(ac) > maxConditionBytes {
-			ac = ac[:maxConditionBytes] + "...[truncated]"
-		}
+		ac, _ := CapText(*t.ApprovalConditions, MaxApprovalConditionBytes)
 		b.WriteString("### Approval conditions (binding — AMEND the plan, win on conflict)\n\n")
 		b.WriteString("The operator approved the plan with the conditions below. They AMEND the plan and WIN on " +
 			"conflict with the plan text — judge each exemption's soundness against the amended plan.\n\n")
