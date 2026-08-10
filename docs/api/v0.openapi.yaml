@@ -10172,6 +10172,51 @@ paths:
                     approval row is recorded, so a corrected retry flows
                     normally. Honored only on `approve`; ignored on `reject`.
                     Omitting the field is byte-identical to today.
+                add_scope_files_to_slice:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: string
+                  description: |
+                    Optional PER-SLICE scope add for a DECOMPOSED plan (#2515) —
+                    the counterpart of `add_scope_files`, which is refused
+                    outright there (`422
+                    plan_add_scope_files_fans_into_slices`, #2103) because a
+                    flat add fans into EVERY slice. Each key names ONE sub-plan
+                    — an exact `decomposition.sub_plans[].title` match wins,
+                    otherwise the key must parse as a 0-based decimal index in
+                    range — and its value lists the repo-relative paths folded
+                    into THAT slice's effective `scope.files` only. A trailing
+                    slash marks a directory. The map is canonicalised before
+                    recording (keys become the 0-based index; each path list is
+                    trimmed, deduped and SORTED), so a title-keyed request and
+                    the equivalent index-keyed request record byte-identical
+                    `add_scope_files_to_slice` payloads on `approval_submitted`.
+                    At implement-prompt-build time ONLY the entry keyed to the
+                    requesting child's own `slice_index` is folded, so the path
+                    reaches that slice and no other; a run with no slice index
+                    folds nothing. Per-slice paths consume `max_files_changed`
+                    headroom exactly like a flat add. Refused BEFORE any
+                    approval row is recorded: `422
+                    plan_slice_add_scope_files_requires_decomposed_plan` when
+                    the plan is flat (`details.reason` `plan_not_decomposed` —
+                    use `add_scope_files`) or cannot be confirmed decomposed
+                    (`plan_indeterminate`, fail-closed); `400
+                    validation_failed` (field `add_scope_files_to_slice`) for an
+                    unresolvable or ambiguous key, two keys naming one slice, a
+                    path listed under two slices, a path whose ownership
+                    OVERLAPS a DIFFERENT slice's declared `scope.files`
+                    (identical OR ancestor/descendant directory containment,
+                    compared on path segment boundaries), a non-repo-relative
+                    path, or an empty path list. This channel ADDS a path to one
+                    slice and does NOT MOVE a path already owned by another
+                    slice — that needs a re-plan of the decomposition. Honored
+                    only on `approve` AND only on a PLAN stage: the gate that
+                    validates and canonicalises the map runs there, so an
+                    approve of any other stage type IGNORES the field (still
+                    `200`) rather than recording an ungated map. Ignored on
+                    `reject`. Omitting the field is byte-identical to today.
                 binding_assertions:
                   type: array
                   items:
@@ -10541,9 +10586,11 @@ paths:
               EVERY child slice, so the file lands in every slice's scope,
               violating single-owner-file and guaranteeing an add/add
               fan-in conflict (duplicate, incompatible implementations).
-              There is NO override and NO per-slice add channel — the
-              outcome is categorically broken, not an upper-bound
-              heuristic. `details` includes `stage_id`, `add_scope_files`
+              There is NO override for the FLAT form — the outcome is
+              categorically broken, not an upper-bound heuristic. The
+              per-slice counterpart `add_scope_files_to_slice` (#2515)
+              IS the channel that works on a decomposed plan: it targets
+              exactly one slice per path. `details` includes `stage_id`, `add_scope_files`
               (the requested paths), `slice_count`, and `slices` — an
               ordered `{index, title}` list of every sub-plan that would
               inherit each added path. Refused BEFORE any approval row is
@@ -10557,6 +10604,35 @@ paths:
               indeterminate/nil plan) — `details.reason` is
               `plan_indeterminate` — so an add is never recorded without
               positive confirmation the plan is flat.
+            - `plan_slice_add_scope_files_requires_decomposed_plan` —
+              #2515: the request supplied `add_scope_files_to_slice` but
+              the plan is positively FLAT (`details.reason`
+              `plan_not_decomposed` — use the plain `add_scope_files`
+              field, which is the correct channel there) or its
+              decomposition status could not be positively confirmed
+              (`details.reason` `plan_indeterminate` — a load failure, an
+              absent plan, or an unwired artifact subsystem). FAILS
+              CLOSED, mirroring the categorical posture of
+              `plan_add_scope_files_fans_into_slices` rather than the
+              fail-open upper-bound gates: a slice-targeted add must never
+              be recorded against a plan with no resolvable slices.
+              `details` includes `stage_id` and `reason`. There is no
+              override. Refused BEFORE any approval row is recorded, so a
+              corrected retry flows normally. This is the ONLY new error
+              code the per-slice channel introduces; its shape and
+              ownership refusals reuse `400 validation_failed` with
+              `details.field` = `add_scope_files_to_slice` — an
+              unresolvable or ambiguous slice key, two keys naming one
+              slice, a path listed under two slices, a path whose
+              ownership overlaps a DIFFERENT slice's declared
+              `scope.files` (`details.reason`
+              `path_owned_by_another_slice`, carrying `owning_slice`,
+              `owning_title`, `owning_path`, `overlap_kind`,
+              `channel_semantic` = `add_not_move`, and `remedy` — this
+              channel ADDS and does NOT MOVE, so a path already declared
+              in another slice needs a re-plan of the decomposition, not
+              this field), a non-repo-relative path, or an empty path
+              list.
             - `plan_invalid_model` — #1013: the RESOLVED implement model
               (the ladder of deployment default < spec `executor.model` <
               plan `model_recommendation` < the `implement_model` override)

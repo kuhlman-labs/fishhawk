@@ -3200,6 +3200,13 @@ type ApprovePlanInput struct {
 	// (400) when it is not repo-relative, is absent from the current effective
 	// scope, or would empty a non-empty scope.
 	RemoveScopeFiles []string `json:"remove_scope_files,omitempty" jsonschema:"optional authoritative list of repo-relative paths to REMOVE from the implement stage's scope.files at approval time (the inverse of add_scope_files). Express a scope REPLACE by passing remove_scope_files AND add_scope_files in the SAME approve call — there is no separate replace field. A path is rejected 400 when it is not repo-relative, is not currently in the effective scope, or would empty a non-empty scope (an empty scope disables scope enforcement)"`
+	// AddScopeFilesToSlice is the DECOMPOSED-plan counterpart of AddScopeFiles
+	// (#2515). Flat add_scope_files is refused outright on a decomposed plan
+	// (#2103) because a folded path fans into EVERY slice; this map targets
+	// exactly ONE slice per path, so restoring a dropped file costs one approve
+	// instead of a full revise pass. It ADDS a path to a slice — it does NOT
+	// MOVE a path already owned by another slice.
+	AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice,omitempty" jsonschema:"optional per-slice scope add for a DECOMPOSED plan — the counterpart of add_scope_files, which is refused outright there (422 plan_add_scope_files_fans_into_slices) because a flat add fans into EVERY slice. Keys are the sub-plan TITLE (exact match wins) or its 0-based decimal index; values are repo-relative paths folded into THAT slice's scope.files only (a trailing slash marks a directory). One owner per path: the approve is refused 400 when a path overlaps in ownership — identical OR an ancestor/descendant directory containment — with another key in the same request or with a DIFFERENT slice's declared scope.files, and 422 plan_slice_add_scope_files_requires_decomposed_plan when the plan is flat (use add_scope_files) or cannot be confirmed decomposed. This channel ADDS and does NOT MOVE: a path already declared in another slice's scope needs a re-plan, not this field"`
 	// BindingAssertions is the OPTIONAL list of operator-declared,
 	// deterministic binding-assertion checks (#1171) — the machine-checkable
 	// half of an approval condition. Each is evaluated by the runner
@@ -3524,7 +3531,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.BindingAssertions, in.ClaimsConcernIDs, in.ImplementModel)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.ImplementModel)
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -3574,7 +3581,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan for the rationale. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -3652,7 +3659,7 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		// The deploy pre-flight 422s (deploy_environment_not_allowed,
 		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
@@ -3683,7 +3690,7 @@ func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
 	}
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, "")
 	if err != nil {
 		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
 	}

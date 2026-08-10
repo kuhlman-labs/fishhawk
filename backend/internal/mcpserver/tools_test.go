@@ -11143,3 +11143,55 @@ func TestRunStateProbe_ReadsLiveState(t *testing.T) {
 		t.Error("runStateProbe returned no error on a backend read failure")
 	}
 }
+
+// TestApprovePlan_AddScopeFilesToSlice_PlumbedToSubmitApproval pins the #2515
+// wire seam: ApprovePlanInput.AddScopeFilesToSlice must reach the approvals
+// request body the backend decodes (MCP input -> client approvalRequest -> HTTP
+// body) with keys and paths intact, so the gate resolves the operator's chosen
+// slice rather than a mangled one.
+func TestApprovePlan_AddScopeFilesToSlice_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	perSlice := map[string][]string{
+		"tools slice": {"backend/internal/mcpserver/tools.go"},
+		"1":           {"docs/extra.md"},
+	}
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:                runID.String(),
+		Reason:               "restore the dropped file into the tools slice",
+		AddScopeFilesToSlice: perSlice,
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if !reflect.DeepEqual(fb.approvalsBody.AddScopeFilesToSlice, perSlice) {
+		t.Errorf("add_scope_files_to_slice = %v, want %v", fb.approvalsBody.AddScopeFilesToSlice, perSlice)
+	}
+}
+
+// TestApprovePlan_NoAddScopeFilesToSlice_OmitsFieldOnTheWire confirms the
+// byte-identical no-targeting path: an approve without add_scope_files_to_slice
+// leaves the field nil on the request body the backend decodes (omitempty), so
+// a flat-plan approve is unchanged by #2515.
+func TestApprovePlan_NoAddScopeFilesToSlice_OmitsFieldOnTheWire(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	_, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks good",
+	})
+	if err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.AddScopeFilesToSlice != nil {
+		t.Errorf("add_scope_files_to_slice = %v, want nil when no slice targeting declared", fb.approvalsBody.AddScopeFilesToSlice)
+	}
+}

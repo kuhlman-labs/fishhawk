@@ -1404,3 +1404,49 @@ func TestGetRunStageWait_PathQueryAndEnvelope(t *testing.T) {
 		}
 	})
 }
+
+// TestSubmitApproval_SendsSliceAddScopeFilesBody pins the apiClient half of the
+// #2515 wire contract directly against a real HTTP server: SubmitApproval must
+// POST add_scope_files_to_slice to /v0/stages/{id}/approvals with keys and
+// paths byte-identical to what the caller passed (the backend's
+// DisallowUnknownFields decoder rejects any drift in the field name), and must
+// OMIT the field entirely when the caller passes nil so a flat-plan approve
+// body is unchanged by this change.
+func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
+	stageID := uuid.New()
+	perSlice := map[string][]string{"tools slice": {"backend/internal/mcpserver/tools.go"}}
+
+	var gotMethod, gotPath string
+	var gotRaw map[string]any
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"`+uuid.NewString()+`","state":"succeeded"}`)
+	})
+
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "restore the dropped file",
+		"kuhlman-labs", nil, nil, perSlice, nil, nil, ""); err != nil {
+		t.Fatalf("SubmitApproval: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
+		t.Errorf("request = %s %s, want POST /v0/stages/%s/approvals", gotMethod, gotPath, stageID)
+	}
+	raw, err := json.Marshal(gotRaw["add_scope_files_to_slice"])
+	if err != nil {
+		t.Fatalf("marshal decoded field: %v", err)
+	}
+	if want := `{"tools slice":["backend/internal/mcpserver/tools.go"]}`; string(raw) != want {
+		t.Errorf("add_scope_files_to_slice on the wire = %s, want %s", raw, want)
+	}
+
+	// nil → the key must be absent, not present-and-null.
+	gotRaw = nil
+	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
+		"kuhlman-labs", nil, nil, nil, nil, nil, ""); err != nil {
+		t.Fatalf("SubmitApproval (no slice map): %v", err)
+	}
+	if _, present := gotRaw["add_scope_files_to_slice"]; present {
+		t.Errorf("add_scope_files_to_slice present on a no-targeting approve body: %#v", gotRaw)
+	}
+}

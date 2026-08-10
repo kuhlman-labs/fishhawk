@@ -265,3 +265,208 @@ func equalStringSets(a, b []string) bool {
 	}
 	return true
 }
+
+// decomposedPlanJSON builds a schema-shaped standard_v1 plan body carrying a
+// decomposition whose sub_plans each declare their OWN scope — the shape the
+// per-slice add channel (#2515) resolves keys and ownership against. titles and
+// sliceFiles are positional; the top-level scope is the union.
+func decomposedPlanJSON(summary string, titles []string, sliceFiles [][]string) []byte {
+	union := make([]map[string]any, 0)
+	subs := make([]map[string]any, 0, len(titles))
+	for i, ti := range titles {
+		files := make([]map[string]any, 0, len(sliceFiles[i]))
+		for _, f := range sliceFiles[i] {
+			entry := map[string]any{"path": f, "operation": "modify"}
+			files = append(files, entry)
+			union = append(union, entry)
+		}
+		subs = append(subs, map[string]any{
+			"title":                        ti,
+			"scope_hint":                   "implement " + ti,
+			"scope":                        map[string]any{"files": files},
+			"predicted_runtime_minutes":    10,
+			"predicted_runtime_confidence": "high",
+		})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"plan_version":                 "standard_v1",
+		"ticket_reference":             map[string]any{"type": "github_issue", "url": "https://github.com/x/y/issues/1", "id": "x/y#1"},
+		"generated_by":                 map[string]any{"agent": "claude-code", "model": "claude-opus-4-8", "timestamp": "2026-06-15T00:00:00Z"},
+		"summary":                      summary,
+		"scope":                        map[string]any{"files": union},
+		"approach":                     []map[string]any{{"step": 1, "description": "Do the thing."}},
+		"verification":                 map[string]any{"test_strategy": "Run the tests.", "rollback_plan": "Revert the PR."},
+		"predicted_runtime_minutes":    20,
+		"predicted_runtime_confidence": "high",
+		"decomposition": map[string]any{
+			"rationale": "split for size",
+			"sub_plans": subs,
+		},
+	})
+	return body
+}
+
+// TestE2E_SliceScopeAdd_AtPlanGate is the #2515 cross-component done-means. It
+// drives the seam the per-layer unit tests cannot cover together:
+// fishhawk_approve_plan carrying add_scope_files_to_slice through the REAL
+// fishhawk-mcp binary → the backend approval handler → the approval_submitted
+// audit entry in Postgres → the derived implement prompt-response ScopeFiles of
+// TWO different fan-out children. It asserts the audit payload carries the
+// CANONICAL index-keyed map (the operator keyed by TITLE), the targeted child's
+// scope contains the added path, and the SIBLING child's does not — the
+// single-owner-file guarantee, pinned across the real wire.
+func TestE2E_SliceScopeAdd_AtPlanGate(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	const sliceAFile = "backend/internal/server/prompt.go"
+	const sliceBFile = "backend/internal/mcpserver/tools.go"
+	const addedFile = "backend/internal/mcpserver/README_extra.md"
+	titles := []string{"server slice", "tools slice"}
+
+	// Parent run: decomposed plan artifact on a plan stage parked at the gate.
+	parent, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		WorkflowSpec:  scopeEditWorkflowSpec,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun(parent): %v", err)
+	}
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            parent.ID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &schema,
+		Content:       decomposedPlanJSON("decomposed plan", titles, [][]string{{sliceAFile}, {sliceBFile}}),
+		ContentHash:   "sliceadd" + parent.ID.String()[:8],
+	}); err != nil {
+		t.Fatalf("seed decomposed plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	// Two fan-out children carrying DISTINCT slice_index values, each with an
+	// implement stage — the rows the prompt builder resolves the per-slice fold
+	// against.
+	childStage := make([]uuid.UUID, 2)
+	for i := 0; i < 2; i++ {
+		idx := i
+		child, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo:           "kuhlman-labs/fishhawk",
+			WorkflowID:     "feature_change",
+			WorkflowSHA:    "deadbeef",
+			TriggerSource:  runpkg.TriggerCLI,
+			WorkflowSpec:   scopeEditWorkflowSpec,
+			ParentRunID:    &parent.ID,
+			DecomposedFrom: &parent.ID,
+			SliceIndex:     &idx,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun(child %d): %v", i, err)
+		}
+		st, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:        child.ID,
+			Sequence:     1,
+			Type:         runpkg.StageTypeImplement,
+			ExecutorKind: runpkg.ExecutorAgent,
+			ExecutorRef:  "fishhawk/runner@v1",
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(child %d implement): %v", i, err)
+		}
+		childStage[i] = st.ID
+	}
+
+	// Approve keying by TITLE — the canonicalisation the audit payload must show.
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_approve_plan",
+		Arguments: map[string]any{
+			"run_id": parent.ID.String(),
+			"reason": "restore the dropped doc into the tools slice --override-budget",
+			"add_scope_files_to_slice": map[string]any{
+				"tools slice": []string{addedFile},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool approve (slice add): %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("approve (slice add) returned error: %s", toolContentString(t, result))
+	}
+
+	// Audit: the CANONICAL index-keyed map, even though the operator keyed by title.
+	entries, err := auditRepo.ListForRunByCategory(ctx, parent.ID, "approval_submitted")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(approval_submitted): %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("approval_submitted entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal approval_submitted payload: %v", err)
+	}
+	if len(payload.AddScopeFilesToSlice) != 1 {
+		t.Fatalf("add_scope_files_to_slice = %v, want a single index-keyed entry", payload.AddScopeFilesToSlice)
+	}
+	if !equalStringSets(payload.AddScopeFilesToSlice["1"], []string{addedFile}) {
+		t.Errorf("add_scope_files_to_slice[\"1\"] = %v, want [%s] (canonical index-keyed recording)",
+			payload.AddScopeFilesToSlice, addedFile)
+	}
+
+	// Prompt-response ScopeFiles: present on the TARGETED child, absent on the sibling.
+	targeted := getPromptRenderScopeFiles(t, ctx, httpSrv.URL, childStage[1])
+	sibling := getPromptRenderScopeFiles(t, ctx, httpSrv.URL, childStage[0])
+
+	inTargeted := map[string]bool{}
+	for _, p := range targeted {
+		inTargeted[p] = true
+	}
+	if !inTargeted[addedFile] {
+		t.Errorf("targeted slice-1 child ScopeFiles missing %q: %v", addedFile, targeted)
+	}
+	if !inTargeted[sliceBFile] {
+		t.Errorf("targeted slice-1 child ScopeFiles missing its own planned file %q: %v", sliceBFile, targeted)
+	}
+	for _, p := range sibling {
+		if p == addedFile {
+			t.Errorf("sibling slice-0 child ScopeFiles contains %q — the per-slice add fanned into another slice (single-owner-file violated): %v", addedFile, sibling)
+		}
+	}
+}
