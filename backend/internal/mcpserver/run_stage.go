@@ -1513,6 +1513,59 @@ func runStageEventMessage(payload any) string {
 			return fmt.Sprintf("scope_amendment_pending id=%s paths=%s",
 				id, strings.Join(paths, ", "))
 		}
+		// A scope_amendment_undecided event (#2601) is the runner's post-invoke
+		// signal that an amendment this stage filed was STILL pending when the
+		// agent exited: the operator never answered and the agent's ~15-minute
+		// wait-poll window expired UNDECIDED. Surfacing it in-band is what lets
+		// an operator watching a blocking fishhawk_run_stage learn the request
+		// went unanswered instead of inferring it from a generic verify failure.
+		// The field set {event, amendments:[{amendment_id, paths:[{path,
+		// operation}]}]} is the literal-JSONL seam this relay shares with the
+		// runner emitter (detectUndecidedScopeAmendments, cf. #618) — the two
+		// modules have no dependency edge, so the same shape is asserted on both
+		// ends. Decoding is defensive throughout: a missing or malformed
+		// `amendments` array degrades to the bare event name, never a panic and
+		// never a dropped line.
+		if ev, _ := m["event"].(string); ev == "scope_amendment_undecided" {
+			var rows []string
+			if raw, ok := m["amendments"].([]any); ok {
+				for _, r := range raw {
+					rm, ok := r.(map[string]any)
+					if !ok {
+						continue
+					}
+					id, _ := rm["amendment_id"].(string)
+					if id == "" {
+						continue
+					}
+					var paths []string
+					if rawPaths, ok := rm["paths"].([]any); ok {
+						for _, p := range rawPaths {
+							pm, ok := p.(map[string]any)
+							if !ok {
+								continue
+							}
+							path, _ := pm["path"].(string)
+							if path == "" {
+								continue
+							}
+							if op, _ := pm["operation"].(string); op != "" {
+								paths = append(paths, path+" ("+op+")")
+							} else {
+								paths = append(paths, path)
+							}
+						}
+					}
+					rows = append(rows, fmt.Sprintf("id=%s paths=%s", id, strings.Join(paths, ", ")))
+				}
+			}
+			if len(rows) == 0 {
+				return "scope_amendment_undecided"
+			}
+			return fmt.Sprintf("scope_amendment_undecided %s — never decided (NOT denied); "+
+				"decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
+				strings.Join(rows, "; "))
+		}
 		for _, key := range []string{"kind", "type", "event"} {
 			if v, ok := m[key].(string); ok && v != "" {
 				return v

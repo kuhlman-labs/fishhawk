@@ -1259,6 +1259,83 @@ func TestRunStageEventMessage_ScopeAmendmentPending(t *testing.T) {
 	}
 }
 
+// TestRunStageEventMessage_ScopeAmendmentUndecided pins the runner->relay seam
+// for the window-expired amendment signal (#2601). It feeds the EXACT
+// literal-JSONL line the runner emits from
+// detectUndecidedScopeAmendments — field set {event, run_id, stage_id,
+// amendments:[{amendment_id, paths:[{path, operation}]}]} — and asserts the
+// surfaced message names the amendment id and the requested paths and states
+// the request was never decided, rather than the bare event name the generic
+// fallback would yield.
+//
+// A full emitter-to-relay test is NOT available: the runner and the backend are
+// separate Go modules with no dependency edge in either direction, so nothing
+// can drive the real emitter into the real relay. Per #618 the mitigation is two
+// hand-copied literals asserted on BOTH ends — this test and the runner's
+// TestEmitUndecidedScopeAmendments_SeamContract — so a field-name drift on
+// either side breaks one of the pair.
+func TestRunStageEventMessage_ScopeAmendmentUndecided(t *testing.T) {
+	// The literal line the runner's detectUndecidedScopeAmendments emits.
+	// Keep the field names byte-identical to the runner emitter.
+	const line = `{"event":"scope_amendment_undecided","run_id":"run-1","stage_id":"stage-1","amendments":[{"amendment_id":"amd-7","paths":[{"path":"docs/ARCHITECTURE.md","operation":"modify"},{"path":"x/new.go","operation":"create"}]}]}`
+	var payload any
+	if err := json.Unmarshal([]byte(line), &payload); err != nil {
+		t.Fatalf("unmarshal seam line: %v", err)
+	}
+	got := runStageEventMessage(payload)
+	for _, want := range []string{
+		"scope_amendment_undecided",
+		"id=amd-7",
+		"docs/ARCHITECTURE.md (modify)",
+		"x/new.go (create)",
+		"never decided (NOT denied)",
+		"fishhawk_decide_scope_amendment",
+		"fishhawk_retry_stage",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// TestRunStageEventMessage_UndecidedMalformedDegrades covers the relay's
+// defensive decode branches (#2601): a missing `amendments` key, a non-array
+// value, non-object elements, and a row with no amendment_id each degrade to the
+// bare event name — never a panic, never a dropped line.
+func TestRunStageEventMessage_UndecidedMalformedDegrades(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		line string
+	}{
+		{"missing amendments", `{"event":"scope_amendment_undecided","run_id":"r","stage_id":"s"}`},
+		{"amendments not an array", `{"event":"scope_amendment_undecided","amendments":"amd-7"}`},
+		{"amendments elements not objects", `{"event":"scope_amendment_undecided","amendments":["amd-7",3]}`},
+		{"row without amendment_id", `{"event":"scope_amendment_undecided","amendments":[{"paths":[{"path":"a.go"}]}]}`},
+		{"row with null paths", `{"event":"scope_amendment_undecided","amendments":[{"amendment_id":"","paths":null}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var payload any
+			if err := json.Unmarshal([]byte(tc.line), &payload); err != nil {
+				t.Fatalf("unmarshal fixture: %v", err)
+			}
+			got := runStageEventMessage(payload)
+			if got != "scope_amendment_undecided" {
+				t.Errorf("message = %q, want the bare event name", got)
+			}
+		})
+	}
+
+	// A well-formed row with an id but NO decodable paths still names the id —
+	// the line is never dropped and the operator still gets the actionable id.
+	var payload any
+	if err := json.Unmarshal([]byte(`{"event":"scope_amendment_undecided","amendments":[{"amendment_id":"amd-9","paths":[{"operation":"modify"}]}]}`), &payload); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	if got := runStageEventMessage(payload); !strings.Contains(got, "id=amd-9") {
+		t.Errorf("message = %q, want it to still name the amendment id", got)
+	}
+}
+
 // --- compact-by-default summary (#647) ---
 
 // compactFixtureBody is a fake-runner stderr stream mixing

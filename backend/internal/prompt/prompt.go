@@ -1691,14 +1691,37 @@ func writeFixupPriorDiff(b *strings.Builder, t Trigger) {
 // entry. Documented inline because the agent reads the prompt and nothing
 // else. Shared by the full implement prompt and the slim fix-up prompt — the
 // same scope contract governs the fix-up commit.
+//
+// EXPIRY IS NOT DENIAL (#2601). Step 2 formerly told the agent to "proceed as
+// if denied" when its ~15-minute wait-poll budget elapsed with the request
+// still `pending`, which made operator LATENCY indistinguishable from operator
+// REFUSAL and destroyed the pass (run 7eaadaeb burned two verify-fix
+// reinvocations unable to touch the requested file, then failed). The expiry
+// now has its own branch (step 5), textually distinct from the `denied` branch
+// (step 4): an expiry is the ABSENCE of a decision, so the agent either adapts
+// in-scope AND DISCLOSES that it did so under an unanswered request, or stops
+// immediately and fails loud naming the undecided amendment — never a silent
+// wrong-fix (the #1170 prohibition is carried onto BOTH branches), and never a
+// claim that the operator refused. The request deliberately stays `pending`
+// server-side (no `expired` status), so a late operator decision is still
+// honored on a fishhawk_retry_stage of the same stage, which is what the
+// prompt now tells the agent. The runner-side consequence of an undecided
+// amendment at agent exit lives in
+// runner/cmd/fishhawk-runner/main.go::detectUndecidedScopeAmendments.
+//
+// The ~15-minute figure is the ONE window number: the operator-facing
+// fishhawk_decide_scope_amendment tool doc
+// (backend/internal/mcpserver/scope_amendment.go) quotes the same figure, and
+// this prompt is what the agent actually follows.
 func writeScopeAmendments(b *strings.Builder) {
 	b.WriteString("### Mid-stage scope amendments\n\n")
 	b.WriteString("If, while implementing, you discover a file that MUST change but is not in the effective scope.files (a coupled test, a registration table, a doc companion), do NOT edit it — an undeclared edit is dropped from the commit and an undeclared created file fails the stage. Instead, request an operator-gated scope amendment:\n")
 	b.WriteString("\n")
 	b.WriteString("1. POST `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments` with header `Authorization: Bearer $FISHHAWK_API_TOKEN` and body `{\"paths\": [{\"path\": \"dir/file.ext\", \"operation\": \"modify\"|\"create\"}], \"reason\": \"why each path must change\"}`. Paths are repo-relative; use `create` for net-new files.\n")
-	b.WriteString("2. Await the decision with the bounded long-poll: GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments?wait=30` (same bearer). The `?wait=30` makes the server hold the request up to 30 seconds and return as soon as your request's `status` leaves `pending`; re-issue the wait-poll each time it returns still-`pending`. Keep working on in-scope files while you wait. Loop the wait-poll until your request leaves `pending` OR ~15 minutes total have elapsed; at the ~15-minute cap with no decision, proceed as if denied — and that denied path forbids the silent wrong-fix below just as an explicit denial does.\n")
+	b.WriteString("2. Await the decision with the bounded long-poll: GET `$FISHHAWK_BACKEND_URL/v0/runs/<run_id>/scope-amendments?wait=30` (same bearer). The `?wait=30` makes the server hold the request up to 30 seconds and return as soon as your request's `status` leaves `pending`; re-issue the wait-poll each time it returns still-`pending`. Keep working on in-scope files while you wait. Loop the wait-poll until your request leaves `pending` OR ~15 minutes total have elapsed. Then take the branch that matches what you observed, and note the difference between the two ways the wait can end: a `denied` status is a DECISION — the operator answered no and left you a `decision_reason` (step 4). A request still `pending` at the ~15-minute cap is an EXPIRY — the operator has not answered, your request stays live, and you MUST NOT treat it as a refusal or state that the operator denied it (step 5).\n")
 	b.WriteString("3. On `approved`: the paths are folded into the effective scope — edit them as normal.\n")
-	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope ONLY if the adaptation still satisfies the issue's done-means. A change that keeps `verify` green but leaves the done-means unsatisfied — a comment-only or otherwise no-op touch of an in-scope file substituted for the real edit — is a silent wrong-fix and is FORBIDDEN. If the correct change is genuinely impossible without the denied or timed-out path, STOP and fail loud: surface it in your final response and commit NO done-means-violating implementation, rather than shipping a green-but-wrong workaround of the boundary (run 5aaf89fa / #1170).\n")
+	b.WriteString("4. On `denied` (read the `decision_reason`): adapt within the original scope ONLY if the adaptation still satisfies the issue's done-means. A change that keeps `verify` green but leaves the done-means unsatisfied — a comment-only or otherwise no-op touch of an in-scope file substituted for the real edit — is a silent wrong-fix and is FORBIDDEN. If the correct change is genuinely impossible without the denied path, STOP and fail loud: surface it in your final response and commit NO done-means-violating implementation, rather than shipping a green-but-wrong workaround of the boundary (run 5aaf89fa / #1170).\n")
+	b.WriteString("5. On EXPIRY (still `pending` at the ~15-minute cap — no decision was made; this is NOT a denial and there is no `decision_reason` to read): take exactly one of two paths, and never a third. (i) If an adaptation within the original scope exists that FULLY satisfies the issue's done-means, take it AND DISCLOSE it: state in your final response that you adapted under a scope amendment that was never decided, naming the amendment id and the requested paths, so the reviewer and the operator can see the request went unanswered. (ii) Otherwise STOP IMMEDIATELY — do not keep iterating against the un-amended scope, do not attempt the edit, and commit NO done-means-violating implementation — and state in your final response that the amendment expired undecided, naming the amendment id and the requested paths. A change that keeps `verify` green but leaves the done-means unsatisfied — a comment-only or otherwise no-op touch of an in-scope file substituted for the real edit — is a silent wrong-fix and is FORBIDDEN under an expiry exactly as it is under an explicit denial (run 5aaf89fa / #1170). Never describe an expiry as a denial or as the operator having refused: your request remains `pending`, so a decision that arrives after this stage ends is still honored — an approval folds into the effective scope when the operator re-runs this stage with `fishhawk_retry_stage`.\n")
 	b.WriteString("\n")
 	b.WriteString("You may file at most 2 amendment requests for this stage (denied requests count). Batch every needed path into one request rather than dribbling them. NEVER edit or create a requested file before the approval lands.\n")
 	b.WriteString("\n")

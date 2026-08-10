@@ -7064,10 +7064,10 @@ func TestBuild_ScopeAmendmentSection_ImplementOnly(t *testing.T) {
 		"NEVER edit or create a requested file before the approval lands",
 		// The ?wait long-poll loop replaced the fixed sleep-poll (#1035):
 		// the agent re-issues the bounded wait until a decision lands or its
-		// total budget elapses, then proceeds as if denied at the cap.
+		// total budget elapses. At the cap the request is EXPIRED, not denied
+		// (#2601) — see TestBuild_ScopeAmendment_ExpiryDistinctFromDeny.
 		"scope-amendments?wait=30",
 		"~15 minutes total",
-		"proceed as if denied",
 		// Fail-loud-over-done-means-violation (#1170, run 5aaf89fa): an
 		// in-scope adaptation is acceptable ONLY if it still satisfies the
 		// issue's done-means; a green-but-wrong no-op touch is forbidden and
@@ -7082,6 +7082,15 @@ func TestBuild_ScopeAmendmentSection_ImplementOnly(t *testing.T) {
 		}
 	}
 
+	// The retired proceed-as-denied wording must be GONE from the whole
+	// implement prompt (#2601): an expiry is the absence of a decision, so
+	// instructing the agent to treat it as a refusal is exactly the defect.
+	// This negative assertion is the counterfactual vehicle for the contract
+	// change — a comment-only touch of writeScopeAmendments cannot satisfy it.
+	if strings.Contains(impl, "proceed as if denied") {
+		t.Error("implement prompt still carries the retired \"proceed as if denied\" expiry wording (#2601)")
+	}
+
 	for _, stage := range []string{"plan", "plan_review", "implement_review"} {
 		out, err := Build(stage, trig)
 		if err != nil {
@@ -7090,6 +7099,80 @@ func TestBuild_ScopeAmendmentSection_ImplementOnly(t *testing.T) {
 		if strings.Contains(out, "Mid-stage scope amendments") {
 			t.Errorf("%s prompt must not carry the scope-amendment section", stage)
 		}
+	}
+}
+
+// TestBuild_ScopeAmendment_ExpiryDistinctFromDeny pins the #2601 contract
+// change: the rendered implement prompt carries a `denied` branch AND a
+// separately-worded EXPIRY branch, the expiry branch offers exactly the two
+// sanctioned paths (adapt-and-disclose, or stop immediately), both branches
+// carry the #1170 silent-wrong-fix prohibition, and the expiry branch states
+// that the request stays `pending` so a late decision lands on a retry. The
+// retired "proceed as if denied" wording must be absent.
+func TestBuild_ScopeAmendment_ExpiryDistinctFromDeny(t *testing.T) {
+	impl, err := Build("implement", Trigger{Source: "cli", Repo: "o/r"})
+	if err != nil {
+		t.Fatalf("Build(implement): %v", err)
+	}
+
+	for _, want := range []string{
+		// The DECISION branch (step 4) is unchanged and still present.
+		"4. On `denied` (read the `decision_reason`)",
+		// The EXPIRY branch (step 5) is textually distinct and names the cap.
+		"5. On EXPIRY (still `pending` at the ~15-minute cap",
+		"this is NOT a denial",
+		// Path (i): adapt in-scope only if done-means is fully satisfied, and
+		// DISCLOSE the undecided request.
+		"FULLY satisfies the issue's done-means",
+		"naming the amendment id and the requested paths",
+		// Path (ii): stop immediately, commit nothing done-means-violating.
+		"STOP IMMEDIATELY",
+		"the amendment expired undecided",
+		// The expiry is never reported as a refusal.
+		"MUST NOT treat it as a refusal",
+		"Never describe an expiry as a denial",
+		// The row stays pending, so a late decision is still landable.
+		"your request remains `pending`",
+		"fishhawk_retry_stage",
+	} {
+		if !strings.Contains(impl, want) {
+			t.Errorf("implement prompt missing expiry-contract anchor %q", want)
+		}
+	}
+
+	if strings.Contains(impl, "proceed as if denied") {
+		t.Error("expiry branch must not restore the retired proceed-as-denied wording")
+	}
+
+	// The #1170 silent-wrong-fix prohibition is carried on BOTH branches, not
+	// just the deny branch: an expiry forbids the green-but-wrong no-op touch
+	// exactly as an explicit denial does.
+	const prohibition = "is a silent wrong-fix and is FORBIDDEN"
+	if n := strings.Count(impl, prohibition); n < 2 {
+		t.Errorf("silent-wrong-fix prohibition appears %d time(s), want it on both the deny and expiry branches", n)
+	}
+	if !strings.Contains(impl, "FORBIDDEN under an expiry exactly as it is under an explicit denial") {
+		t.Error("expiry branch missing the explicit parity with the denial prohibition")
+	}
+
+	// The block is shared BYTE-IDENTICALLY with the slim fix-up prompt
+	// (writeScopeAmendments has one caller shape), so the two contracts cannot
+	// drift apart.
+	fixup, err := Build("implement", Trigger{
+		Source: "cli", Repo: "o/r",
+		FixupConcerns: []FixupConcern{{Text: "resolve the reviewer's concern"}},
+	})
+	if err != nil {
+		t.Fatalf("Build(implement fix-up): %v", err)
+	}
+	var b strings.Builder
+	writeScopeAmendments(&b)
+	block := b.String()
+	if !strings.Contains(impl, block) {
+		t.Error("implement prompt does not carry the shared scope-amendment block verbatim")
+	}
+	if !strings.Contains(fixup, block) {
+		t.Error("fix-up prompt does not carry the shared scope-amendment block verbatim (shared-writer contract)")
 	}
 }
 
