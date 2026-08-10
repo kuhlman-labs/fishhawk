@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -27,12 +28,14 @@ func freshRegistry(t *testing.T) *detachedRunnerRegistry {
 	origTTL := detachedCancelTombstoneTTL
 	origGrace := detachedTerminateGrace
 	origHook := detachedSpawnPreStartHook
+	origPreKill := detachedPreKillHook
 	detachedRunners = newDetachedRunnerRegistry()
 	t.Cleanup(func() {
 		detachedRunners = orig
 		detachedCancelTombstoneTTL = origTTL
 		detachedTerminateGrace = origGrace
 		detachedSpawnPreStartHook = origHook
+		detachedPreKillHook = origPreKill
 	})
 	return detachedRunners
 }
@@ -353,6 +356,184 @@ func TestDetachedRegistry_TerminateWarnsOnSurvivor(t *testing.T) {
 	}
 	if !strings.Contains(warnings[0], "stage-warn") || !strings.Contains(warnings[0], strconv.Itoa(h.pid)) {
 		t.Errorf("warning %q does not name the stage id and pid", warnings[0])
+	}
+}
+
+// TestDetachedRegistry_TerminateSkipsAlreadyExitedHandle asserts the pre-TERM
+// skip branch (#2584): a registered handle whose real child has already exited
+// and whose done is closed is SKIPPED — not signalled, not counted in reaped,
+// not warned about. The zero-signal claim is counted through the runStageSignalGroup
+// seam (binding condition 2), not merely inferred from an absent warning.
+func TestDetachedRegistry_TerminateSkipsAlreadyExitedHandle(t *testing.T) {
+	reg := freshRegistry(t)
+	detachedTerminateGrace = timescale.D(3 * time.Second)
+	const runID = "aaaaaaaa-2584-4000-8000-000000000001"
+
+	var signals atomic.Int64
+	origSignal := runStageSignalGroup
+	runStageSignalGroup = func(*exec.Cmd, syscall.Signal) { signals.Add(1) }
+	t.Cleanup(func() { runStageSignalGroup = origSignal })
+
+	// A real short-lived child that has GENUINELY exited: the exited state is
+	// seeded by construction (a child that already ran to completion is
+	// definitionally exited), not by calling the guard inside the setup.
+	cmd := exec.Command("sh", "-c", "exit 0")
+	runStageSetProcessGroup(cmd)
+	h, err := reg.startAndRegister(cmd, runID, "stage-exited")
+	if err != nil {
+		t.Fatalf("startAndRegister: %v", err)
+	}
+	_ = cmd.Wait()
+	// Close done WITHOUT calling deregister. deregister would remove the handle
+	// from reg.byRun before closing done, emptying the snapshot and making the
+	// zero-signal assertion vacuously green (an empty snapshot signals nothing
+	// with or without the guard). This closed-but-still-in-snapshot state is
+	// exactly what a deregister completing after terminateRunners took its
+	// snapshot leaves behind — the precise window the guard exists to handle.
+	h.doneOnce.Do(func() { close(h.done) })
+
+	reaped, warnings := reg.terminateRunners(runID, nil)
+
+	if got := signals.Load(); got != 0 {
+		t.Errorf("signal count = %d, want 0 for an already-exited handle", got)
+	}
+	if reaped != 0 {
+		t.Errorf("reaped = %d, want 0 — an already-exited handle is not reaped by us", reaped)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %v, want none for an already-exited handle", warnings)
+	}
+}
+
+// TestDetachedRegistry_TerminateSkipsHandleThatExitsBeforeKill asserts the
+// pre-KILL skip branch (#2584): a live handle whose child reports exited in the
+// window between the post-TERM grace elapsing and the KILL is skipped. The exit
+// is driven deterministically by detachedPreKillHook, so the recorded signals
+// are exactly [SIGTERM] — no SIGKILL — with reaped 0 and no warning.
+func TestDetachedRegistry_TerminateSkipsHandleThatExitsBeforeKill(t *testing.T) {
+	reg := freshRegistry(t)
+	detachedTerminateGrace = timescale.D(40 * time.Millisecond)
+	const runID = "aaaaaaaa-2584-4000-8000-000000000002"
+
+	// Record each signal but do NOT deliver it, so the child stays alive and the
+	// TERM grace times out, carrying execution into the pre-KILL branch.
+	var (
+		mu   sync.Mutex
+		sigs []syscall.Signal
+	)
+	origSignal := runStageSignalGroup
+	runStageSignalGroup = func(_ *exec.Cmd, sig syscall.Signal) {
+		mu.Lock()
+		sigs = append(sigs, sig)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { runStageSignalGroup = origSignal })
+
+	cmd := longLivedRunnerCmd(t)
+	if _, err := reg.startAndRegister(cmd, runID, "stage-prekill"); err != nil {
+		t.Fatalf("startAndRegister: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+
+	// Fire in the pre-KILL window (after the TERM grace, before the KILL) and
+	// close done: the exact race the guard covers, made deterministic.
+	detachedPreKillHook = func(hh *detachedRunnerHandle) {
+		hh.doneOnce.Do(func() { close(hh.done) })
+	}
+
+	reaped, warnings := reg.terminateRunners(runID, nil)
+
+	mu.Lock()
+	got := append([]syscall.Signal(nil), sigs...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != syscall.SIGTERM {
+		t.Errorf("signals = %v, want exactly [SIGTERM] — no SIGKILL after the child exited pre-KILL", got)
+	}
+	if reaped != 0 {
+		t.Errorf("reaped = %d, want 0 — a handle that exits pre-KILL is skipped, not reaped by us", reaped)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %v, want none for a pre-KILL exit", warnings)
+	}
+}
+
+// TestTerminateRunners_MixedExitedAndLiveHandles is binding condition 1: one run
+// carrying BOTH an already-exited handle and a live handle. The exited one is
+// never signalled; the live one IS signalled and reaped; reaped is exactly 1 and
+// no warning is produced. This is the plan's stated most-plausible real-world
+// trigger — a multi-handle run where one handle's deregister landed after the
+// snapshot — and the per-handle independence it relies on is asserted here
+// rather than argued.
+func TestTerminateRunners_MixedExitedAndLiveHandles(t *testing.T) {
+	reg := freshRegistry(t)
+	detachedTerminateGrace = timescale.D(3 * time.Second)
+	const runID = "aaaaaaaa-2584-4000-8000-000000000003"
+
+	// Record every pid signalled AND actually deliver the signal, so the live
+	// child is genuinely reaped by its real reaper while the assertions can tell
+	// which handles were signalled.
+	var (
+		mu       sync.Mutex
+		signaled []int
+	)
+	origSignal := runStageSignalGroup
+	runStageSignalGroup = func(cmd *exec.Cmd, sig syscall.Signal) {
+		mu.Lock()
+		if cmd.Process != nil {
+			signaled = append(signaled, cmd.Process.Pid)
+		}
+		mu.Unlock()
+		origSignal(cmd, sig)
+	}
+	t.Cleanup(func() { runStageSignalGroup = origSignal })
+
+	// Already-exited handle: a real child run to completion, done closed WITHOUT
+	// deregister so it stays in the snapshot.
+	exitedCmd := exec.Command("sh", "-c", "exit 0")
+	runStageSetProcessGroup(exitedCmd)
+	exited, err := reg.startAndRegister(exitedCmd, runID, "stage-exited")
+	if err != nil {
+		t.Fatalf("startAndRegister exited: %v", err)
+	}
+	_ = exitedCmd.Wait()
+	exited.doneOnce.Do(func() { close(exited.done) })
+
+	// Live handle: a long-lived child with a real reaper closing done after Wait,
+	// so an actually-delivered SIGTERM reaps it inside the grace.
+	liveCmd := longLivedRunnerCmd(t)
+	live, err := reg.startAndRegister(liveCmd, runID, "stage-live")
+	if err != nil {
+		t.Fatalf("startAndRegister live: %v", err)
+	}
+	go func() {
+		defer reg.deregister(live)
+		_ = liveCmd.Wait()
+	}()
+	t.Cleanup(func() { _ = liveCmd.Process.Kill() })
+
+	reaped, warnings := reg.terminateRunners(runID, nil)
+
+	if reaped != 1 {
+		t.Errorf("reaped = %d, want exactly 1 — only the live child is reaped by us", reaped)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %v, want none", warnings)
+	}
+
+	mu.Lock()
+	got := append([]int(nil), signaled...)
+	mu.Unlock()
+	sawLive := false
+	for _, pid := range got {
+		if pid == exited.pid {
+			t.Errorf("the already-exited child pid %d was signalled", exited.pid)
+		}
+		if pid == live.pid {
+			sawLive = true
+		}
+	}
+	if !sawLive {
+		t.Errorf("the live child pid %d was never signalled", live.pid)
 	}
 }
 
