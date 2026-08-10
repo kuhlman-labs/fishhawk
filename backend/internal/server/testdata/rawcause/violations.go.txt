@@ -1,0 +1,38 @@
+// This file is a raw-cause guard FIXTURE, not compiled package code (the .txt
+// extension keeps it out of the build). Each function is one claimed raw-cause
+// SYNTAX at a 5xx writeError call site, so the guard's matcher can be asserted
+// to detect every form. See raw_cause_guard_test.go.
+package rawcausefixture
+
+import (
+	"fmt"
+	"net/http"
+)
+
+// msgDotError: a bare .Error() call in the message argument.
+func msgDotError(s *Server, w http.ResponseWriter, r *http.Request, err error) {
+	s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
+}
+
+// msgSprintf: an fmt.Sprintf whose args embed the error.
+func msgSprintf(s *Server, w http.ResponseWriter, r *http.Request, err error) {
+	s.writeError(w, r, http.StatusBadGateway, "x", fmt.Sprintf("failed: %v", err), nil)
+}
+
+// msgConcat: a + concatenation with a .Error() operand.
+func msgConcat(s *Server, w http.ResponseWriter, r *http.Request, err error) {
+	s.writeError(w, r, http.StatusInternalServerError, "x", "failed: "+err.Error(), nil)
+}
+
+// msgAlias: a single-hop identifier assigned from a cause expression.
+func msgAlias(s *Server, w http.ResponseWriter, r *http.Request, err error) {
+	m := err.Error()
+	s.writeError(w, r, http.StatusInternalServerError, "x", m, nil)
+}
+
+// detailsSmuggle: a cause assigned to an ALLOW-LISTED details key (reason),
+// which the default-deny allow-list would otherwise admit to the client.
+func detailsSmuggle(s *Server, w http.ResponseWriter, r *http.Request, err error) {
+	s.writeError(w, r, http.StatusBadGateway, "x", "a static literal message",
+		map[string]any{"reason": err.Error()})
+}

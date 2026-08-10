@@ -63,6 +63,12 @@ type apiError struct {
 	Code       string
 	Message    string
 	Details    map[string]any
+	// ErrorRef is the 5xx correlation handle (E67.15 / #2587): the backend's
+	// error_ref envelope field, equal to the response X-Request-ID. On a 5xx
+	// the backend redacts the raw cause out of Details and hands it back only
+	// in the operator's server log keyed by this ref; callers surface the ref
+	// so an operator can join the two. Empty on 4xx / a pre-#2587 backend.
+	ErrorRef string
 }
 
 func (e *apiError) Error() string {
@@ -74,13 +80,18 @@ func (e *apiError) Error() string {
 	}
 	// Append the parsed Details map when present so callers that render the
 	// error via %v (e.g. run_children's between-wave integrate-wave transport
-	// warning) surface details.error — the real cause — instead of an opaque
-	// HTTP-status stop. encoding/json marshals map keys in sorted order, so
-	// the suffix is deterministic for tests. A nil/empty map appends nothing.
+	// warning) surface the allow-listed structured detail keys instead of an
+	// opaque HTTP-status stop. encoding/json marshals map keys in sorted order,
+	// so the suffix is deterministic for tests. A nil/empty map appends nothing.
+	// Post-#2587 the raw cause no longer rides Details on a 5xx — it is redacted
+	// server-side; the operator recovers it from the log keyed by error_ref.
 	if len(e.Details) > 0 {
 		if b, err := json.Marshal(e.Details); err == nil {
 			base += "; details: " + string(b)
 		}
+	}
+	if e.ErrorRef != "" {
+		base += " (error_ref=" + e.ErrorRef + ")"
 	}
 	return base
 }
@@ -3025,15 +3036,17 @@ func (c *apiClient) getText(ctx context.Context, path string) (string, error) {
 		ae := &apiError{StatusCode: resp.StatusCode}
 		var env struct {
 			Error struct {
-				Code    string         `json:"code"`
-				Message string         `json:"message"`
-				Details map[string]any `json:"details"`
+				Code     string         `json:"code"`
+				Message  string         `json:"message"`
+				Details  map[string]any `json:"details"`
+				ErrorRef string         `json:"error_ref"`
 			} `json:"error"`
 		}
 		if json.Unmarshal(raw, &env) == nil {
 			ae.Code = env.Error.Code
 			ae.Message = env.Error.Message
 			ae.Details = env.Error.Details
+			ae.ErrorRef = env.Error.ErrorRef
 		}
 		return "", ae
 	}
@@ -3359,15 +3372,17 @@ func (c *apiClient) doWithStatusUsing(client *http.Client, ctx context.Context, 
 		ae := &apiError{StatusCode: resp.StatusCode}
 		var env struct {
 			Error struct {
-				Code    string         `json:"code"`
-				Message string         `json:"message"`
-				Details map[string]any `json:"details"`
+				Code     string         `json:"code"`
+				Message  string         `json:"message"`
+				Details  map[string]any `json:"details"`
+				ErrorRef string         `json:"error_ref"`
 			} `json:"error"`
 		}
 		if json.Unmarshal(raw, &env) == nil {
 			ae.Code = env.Error.Code
 			ae.Message = env.Error.Message
 			ae.Details = env.Error.Details
+			ae.ErrorRef = env.Error.ErrorRef
 		}
 		return resp.StatusCode, ae
 	}

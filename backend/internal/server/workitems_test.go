@@ -971,8 +971,15 @@ func TestFileWorkItem_ApplyError_Unprocessable(t *testing.T) {
 
 // TestFileWorkItem_ProviderFileError_BadGateway asserts a genuinely fatal
 // provider-side failure (CreateIssue / installation resolution — no durable
-// issue exists) surfaces as 502 work_item_filing_failed with the provider
-// cause in details.error.
+// issue exists) surfaces as 502 work_item_filing_failed. Post-#2587 the raw
+// provider cause is REDACTED out of the 5xx body by the writeError chokepoint
+// (it can carry storage / third-party-endpoint internals); the operator gets
+// it from the server log keyed by error_ref instead. This test is the
+// allow-list counterfactual vehicle: deleting redactErrorDetails in writeError
+// makes details.error reappear here and this test go RED. (error_ref presence
+// is proven by TestWriteError_5xxSetsErrorRefFromRequestID and the integration
+// test, which drive the real requestID middleware; the fileWorkItem helper
+// calls the handler directly, so no request id is in scope here.)
 func TestFileWorkItem_ProviderFileError_BadGateway(t *testing.T) {
 	fp := &fakeWorkProvider{fileErr: errors.New("github said no")}
 	registerFakeProvider(t, fp)
@@ -993,10 +1000,14 @@ func TestFileWorkItem_ProviderFileError_BadGateway(t *testing.T) {
 	if env.Error.Code != "work_item_filing_failed" {
 		t.Errorf("code = %q, want work_item_filing_failed", env.Error.Code)
 	}
-	// The provider cause is surfaced in details.error (the apiError.Details
-	// precedent the MCP tool reads to render it).
-	if got, _ := env.Error.Details["error"].(string); !strings.Contains(got, "github said no") {
-		t.Errorf("details.error should carry the provider cause, got %v", env.Error.Details["error"])
+	// The provider cause must NOT reach the caller: the writeError chokepoint
+	// redacts the non-allow-listed "error" key out of the 5xx body (#2587).
+	if got, ok := env.Error.Details["error"]; ok {
+		t.Errorf("details.error must be redacted from a 5xx body, got %v", got)
+	}
+	// And the raw cause must not leak via any other channel of the body.
+	if strings.Contains(rec.Body.String(), "github said no") {
+		t.Errorf("raw provider cause leaked into the 5xx body: %s", rec.Body.String())
 	}
 }
 

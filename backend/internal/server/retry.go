@@ -241,9 +241,12 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 			return
 		case errors.Is(err, run.ErrRetryNotImplemented):
 			// No path returns this as of E8.6, but keep the mapping
-			// so callers that switch on it stay sane.
+			// so callers that switch on it stay sane. Static literal message
+			// (E67.15 / #2587): the sentinel carries no caller-specific text,
+			// and passing err.Error() as the message is a raw-cause syntax the
+			// AST guard flags.
 			s.writeError(w, r, http.StatusNotImplemented, "retry_not_implemented",
-				err.Error(), nil)
+				"stage retry is not implemented for this stage kind", nil)
 			return
 		case errors.Is(err, run.ErrRetryNotApplicable):
 			s.writeError(w, r, http.StatusUnprocessableEntity, "retry_not_applicable",

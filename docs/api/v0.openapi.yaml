@@ -108,6 +108,26 @@ components:
                 Optional code-specific structured fields. The keys
                 under `details` are part of the contract for that
                 specific code.
+
+                5xx CONTRACT (E67.15 / #2587): on a 5xx response, `details`
+                is restricted server-side to a default-deny allow-list of
+                non-sensitive keys (product-owned enums / identifiers /
+                booleans / integers, caller-echoed request fields, static
+                literals). The raw error cause is NEVER placed under
+                `details` on a 5xx — it is recorded only in the operator's
+                server log, keyed by `error_ref`. On a 4xx `details` is
+                returned verbatim.
+            error_ref:
+              type: string
+              description: |
+                Correlation handle set on 5xx responses only (E67.15 /
+                #2587). Equal to the response `X-Request-ID`. The full error
+                cause is redacted from a 5xx body and kept in the operator's
+                server log under this reference, so a caller pairs `error_ref`
+                with the operator to recover the cause. Omitted on 4xx. NOTE:
+                it echoes the caller's own `X-Request-ID` when supplied, so it
+                is a correlation handle, not a server-authenticated identifier.
+              example: 9f8c2a1b7d3e4f56
       examples:
         - error:
             code: run_not_found

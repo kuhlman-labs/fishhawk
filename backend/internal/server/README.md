@@ -3,6 +3,83 @@
 fishhawkd's HTTP surface: route handlers for the v0 REST API and the
 cross-component seams they anchor.
 
+## 5xx information-disclosure chokepoint (`errors.go`, E67.15 / #2587)
+
+`writeError` is the single runtime control that keeps a 5xx caller from seeing
+raw plan/artifact/database/third-party causes while the operator keeps the full
+cause. Because it reads the ACTUAL status int at every call site, no
+endpoint-local code is needed and the runtime-resolved-status sites
+(`derr.status` / `herr.status` / `werr.status` in deploy_rollback.go,
+release_notes.go, defer_concern.go, workitems.go) are handled correctly — which
+a static per-endpoint sweep could not do.
+
+On `status >= 500` it:
+
+1. **Redacts details against a DEFAULT-DENY allow-list** (`redactableDetailKeys`).
+   Every detail key not on the list is dropped from the response. Membership
+   rule: a key is admitted only when its value is a product-owned enum /
+   identifier / boolean / integer, a caller-echoed request field, or a static
+   literal; NEVER a value derived from an error, a subprocess, or a third-party
+   API response. The `error` key is deliberately absent.
+2. **Sets `error_ref`** on the body from the request id the requestID middleware
+   already mints (also echoed as `X-Request-ID`), so the caller gets a
+   correlation handle with no new plumbing. `error_ref` is the caller's own
+   `X-Request-ID` echoed back, so it is a correlation handle, NOT a
+   server-authenticated identifier.
+3. **Logs ONE record joining `error_ref` with the FULL pre-redaction cause** —
+   the client details before redaction plus a dedicated `cause` attribute — so
+   the redaction is lossless for the operator: the caller gets the ref, the log
+   line keyed by that ref gets everything.
+
+4xx responses are byte-identical to the pre-#2587 shape: no allow-list, no
+`error_ref`, details verbatim.
+
+**The `__cause` (`internalCauseKey`) channel.** A handful of 5xx sites used to
+pass the raw cause as the MESSAGE argument (recover.go's three scope-amendment
+500s), which the details redactor cannot see. Those now pass a static literal
+message and hand the cause through `internalCauseKey`, a details key `writeError`
+strips UNCONDITIONALLY — at any status, ignoring the allow-list — and folds into
+the same joined log record. Because the strip is unconditional it is not a new
+disclosure surface if someone forgets the allow-list
+(`TestWriteError_AlwaysStripsInternalCauseKey` pins the strip on a 4xx).
+
+**Per-exemption security finding (why the three prior raw-cause exemptions were
+removed).** The prior plan kept `slice_integration_error`,
+`work_item_filing_failed`, and `product_report_failed` disclosing
+`details.error` on COMPATIBILITY grounds (a consumer read the field). Reading
+the producing paths shows each cause demonstrably can carry storage or
+third-party-endpoint internals: `slice_integration_error` wraps run-storage
+(pgx/Postgres) errors and a go-github base-ref resolution error carrying the
+method, the GHES URL, the status and the API message;
+`work_item_filing_failed` and `product_report_failed` wrap
+`*github.ErrorResponse.Error()`, which embeds the request method, the (GHES)
+URL, and the API message. Compatibility is a requirement, not a safety property;
+it is paid by the `error_ref` migration (consumers read the ref and point at the
+log) rather than by keeping the disclosure surface open.
+
+**The raw-cause AST guard is a TRIPWIRE, not the control** (`raw_cause_guard_test.go`).
+The runtime chokepoint is the control. The guard statically flags known
+raw-cause SYNTAXES at 5xx call sites whose status it can resolve — a `.Error()`
+message, an `fmt.Sprint*/Errorf` embedding an error, a `+` concatenation, a
+single-hop alias, and a cause assigned to an allow-listed details key (the
+smuggle surface the key-based allow-list cannot see on its own). It makes NO
+completeness claim: it cannot see helper-returned strings, cross-function data
+flow, struct-field reads, or multi-hop aliasing, and it REPORTS (never silently
+passes) the runtime-status sites it cannot classify.
+
+**Residual gaps (stated, not implied away).** (a) The allow-list is KEY-based,
+so a future 5xx site could smuggle a cause under an admitted key such as
+`reason`; the guard's details-half check catches this within recognized
+syntaxes, but outside them it is uncovered. (b) The MESSAGE half of a 5xx
+response has no runtime control — the chokepoint cannot tell a static literal
+from a raw cause at runtime — so the six existing message-half sites are fixed by
+hand and the guard catches regressions in known forms; a cause introduced
+through a helper-returned string or a multi-hop alias would reach the client
+undetected. (c) `workitems.go`'s `provider_unimplemented` 501 message carries
+product-owned `*workmgmt.UnknownProviderError` text (safe) and flows through a
+runtime-status `writeError`, so the guard reports it UNCHECKED and it is left
+unchanged; its message is safe and the file is out of this change's scope.
+
 ## Account-ownership authorization (ADR-057 / E44.5, #1829)
 
 Handler authorization is tenant-scoped through ONE centralized middleware layer

@@ -32,6 +32,11 @@ type fakeScopeAmendmentRepo struct {
 	// while the handler's initial list succeeds.
 	listCalls  int
 	failListOn int
+	// createErr, when set, makes Create return it (after path validation), so a
+	// test can drive the createApprovedScopeAmendment DB-failure branch in
+	// recover.go (E67.15 / #2587). Zero value nil leaves Create unchanged, so
+	// every existing test is unaffected.
+	createErr error
 }
 
 func newFakeScopeAmendmentRepo() *fakeScopeAmendmentRepo {
@@ -42,6 +47,11 @@ func (f *fakeScopeAmendmentRepo) Create(_ context.Context, p scopeamendment.Crea
 	paths, err := scopeamendment.ValidatePaths(p.Paths)
 	if err != nil {
 		return nil, err
+	}
+	if f.createErr != nil {
+		// A post-validation failure (a DB error), distinct from the path-validation
+		// error above — the branch a recover.go DB-cause test drives.
+		return nil, f.createErr
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

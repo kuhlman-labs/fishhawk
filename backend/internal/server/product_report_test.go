@@ -203,6 +203,57 @@ func TestProductReport_DedupHit_AppendsOccurrence(t *testing.T) {
 	assertProductReportAudit(t, af, runID, resp.Fingerprint, "occurrence")
 }
 
+// TestProductReport_UnknownFeedbackProvider_501Redacts drives the
+// provider_unimplemented branch (product_report.go): the repo's conventions
+// name a feedback provider that is not registered, so workmgmt.GetFeedback
+// returns an *UnknownProviderError. Post-#2587 the branch passes a STATIC
+// literal message (never unk.Error(), a raw-cause syntax) while the
+// product-owned facts ride the allow-listed provider/registered detail keys.
+// Asserts the 501 code, the static message, the allow-listed details, and that
+// no raw cause string leaks.
+func TestProductReport_UnknownFeedbackProvider_501Redacts(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		c := workmgmt.Default()
+		c.Provider = "no-such-feedback-provider"
+		c.ProductFeedback = &workmgmt.ProductFeedback{Enabled: true}
+		return c, nil
+	}
+	defer func() { conventionsLoader = prev }()
+
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), "")
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+	}
+	if env.Error.Code != "provider_unimplemented" {
+		t.Errorf("code = %q, want provider_unimplemented", env.Error.Code)
+	}
+	if env.Error.Message != "the resolved feedback provider is not implemented" {
+		t.Errorf("message = %q, want the static literal", env.Error.Message)
+	}
+	if env.Error.Details["provider"] != "no-such-feedback-provider" {
+		t.Errorf("details.provider = %v, want the allow-listed provider id", env.Error.Details["provider"])
+	}
+	if _, ok := env.Error.Details["registered"]; !ok {
+		t.Errorf("details missing the allow-listed registered key: %v", env.Error.Details)
+	}
+	// No raw provider-error text (e.g. "unknown provider") may ride the message.
+	if strings.Contains(env.Error.Message, "unknown") {
+		t.Errorf("static message must not embed the raw provider error: %q", env.Error.Message)
+	}
+	if fp.filed {
+		t.Error("provider_unimplemented must file nothing")
+	}
+}
+
 // TestProductReport_KillSwitch_Returns403 asserts the per-repo kill-switch
 // returns 403 and files nothing.
 func TestProductReport_KillSwitch_Returns403(t *testing.T) {

@@ -184,8 +184,12 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		var unk *workmgmt.UnknownProviderError
 		if errors.As(err, &unk) {
+			// Static literal message (E67.15 / #2587): the same product-owned
+			// facts ride the allow-listed provider/registered detail keys, so
+			// nothing is lost, and unk.Error() as the message is a raw-cause
+			// syntax the AST guard flags.
 			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
-				unk.Error(),
+				"the resolved feedback provider is not implemented",
 				map[string]any{"provider": unk.ID, "registered": unk.Known})
 			return
 		}

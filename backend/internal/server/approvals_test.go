@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -7465,34 +7467,56 @@ workflows:
         require:
           max_autonomy: low
 `
-	call := func(t *testing.T, specYAML string) *httptest.ResponseRecorder {
+	call := func(t *testing.T, specYAML string) (*httptest.ResponseRecorder, *bytes.Buffer) {
 		t.Helper()
 		s, _, rr, _, _ := newApprovalServerWithIdentity(t,
 			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
 		s.cfg.ConcernRepo = newFakeConcernRepo()
+		// Capture the operator log and inject a request id so the redacted-cause
+		// contract can be proven from both sides (E67.15 / #2587).
+		var logBuf bytes.Buffer
+		s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		stage := seedEscalationApprovalRun(t, rr, specYAML)
 		req := httptest.NewRequest(http.MethodPost, "/x", nil)
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, "deleg-ref-1"))
 		w := httptest.NewRecorder()
 		_, ok := s.checkDelegation(w, withAuth(req), stage.RunID, delegation.ActionApprove)
 		if ok && w.Code == 0 {
 			w.WriteHeader(http.StatusOK)
 		}
-		return w
+		return w, &logBuf
 	}
 
 	t.Run("control: no escalation, the approve class IS delegated and its condition is evaluated", func(t *testing.T) {
-		w := call(t, delegationSpec(""))
-		// The refusal names clean_dual_approval, which can only happen if the
-		// approve class reached the decision set and its condition was
-		// evaluated. Without this control the ceiling assertion below would
-		// pass even if the class had never been delegated at all.
-		if !strings.Contains(w.Body.String(), "clean_dual_approval") {
-			t.Fatalf("body = %s, want a refusal naming the evaluated approve condition", w.Body.String())
+		w, logBuf := call(t, delegationSpec(""))
+		// The evaluated approve condition (clean_dual_approval) reaching the
+		// decision set is what this VACUITY CONTROL proves — without it the
+		// ceiling assertion below would pass even if the class had never been
+		// delegated at all. Post-#2587 (E67.15) that condition name rides the 5xx
+		// evaluation cause, which is now REDACTED from the client body and
+		// retained only in the operator log keyed by error_ref. So the control's
+		// discriminating power is preserved through the LOG, not the body: the
+		// body must NOT name the condition, and the operator log MUST — proving
+		// the class was evaluated while proving the disclosure is closed.
+		if strings.Contains(w.Body.String(), "clean_dual_approval") {
+			t.Fatalf("evaluation cause must be redacted from the 5xx body: %s", w.Body.String())
+		}
+		var env errorEnvelope
+		if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode body: %v (%s)", err, w.Body.String())
+		}
+		if env.Error.ErrorRef != "deleg-ref-1" {
+			t.Fatalf("body error_ref = %q, want deleg-ref-1", env.Error.ErrorRef)
+		}
+		rec := findLogRecord(t, logBuf, "http error response")
+		raw, _ := json.Marshal(rec)
+		if rec["error_ref"] != "deleg-ref-1" || !strings.Contains(string(raw), "clean_dual_approval") {
+			t.Fatalf("operator log must retain the evaluated approve condition keyed by error_ref: %s", raw)
 		}
 	})
 
 	t.Run("a fired low ceiling removes the class from the decision set entirely", func(t *testing.T) {
-		w := call(t, delegationSpec(lowCeiling))
+		w, _ := call(t, delegationSpec(lowCeiling))
 		if w.Code != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
 		}

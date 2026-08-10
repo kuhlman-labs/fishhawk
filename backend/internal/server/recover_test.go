@@ -381,6 +381,80 @@ func TestRecoverRun_HappyPath(t *testing.T) {
 	}
 }
 
+// TestRecoverRun_ScopeAmendmentCreateFails_RedactsCauseJoinsInLog is the
+// CONDITION-1 producer proof at the REAL recover.go call site (E67.15 / #2587,
+// scope amendment 2b00f2ab). It drives handleRecoverRun with add_scope_files
+// so createApprovedScopeAmendment runs, injects a DB failure into the scope-
+// amendment Create (a distinctive sentinel that ONLY the post-validation branch
+// can produce — ValidatePaths passes on these valid paths), and asserts the
+// join in ONE record: the 500 client body carries error_ref and NOT the cause,
+// and a SINGLE operator log record carries that SAME ref together with the full
+// cause. This exercises recover.go:365-372 — the operator-named-amendment
+// branch that routes its DB cause through internalCauseKey with a static
+// message — the exact site whose leak the change closes.
+func TestRecoverRun_ScopeAmendmentCreateFails_RedactsCauseJoinsInLog(t *testing.T) {
+	const causeSentinel = "pgx: SQLSTATE 42P01 recover-create-branch-sentinel relation does not exist"
+	const reqID = "recover-cond1-ref"
+
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	sa.createErr = errors.New(causeSentinel)
+	au := &recoverAuditRepo{}
+	var logBuf bytes.Buffer
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		Logger:             slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+	_ = parent
+
+	// Drive the real handler with a request id in context so error_ref is minted
+	// on this path (postRecover calls the handler directly, no middleware).
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+parent.ID.String()+"/recover",
+		strings.NewReader(`{"add_scope_files":[{"path":"docs/extra.md"}],"reason":"drive the amendment-create branch"}`))
+	req.SetPathValue("run_id", parent.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, reqID))
+	req = withAuth(req)
+	w := httptest.NewRecorder()
+	s.handleRecoverRun(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	// The client body carries the ref and NOT the cause / internal channel key.
+	if strings.Contains(w.Body.String(), causeSentinel) {
+		t.Errorf("raw DB cause leaked into the recover 500 body: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), internalCauseKey) {
+		t.Errorf("internal cause key leaked into the recover 500 body: %s", w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, w.Body.String())
+	}
+	if env.Error.Code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", env.Error.Code)
+	}
+	if env.Error.ErrorRef != reqID {
+		t.Fatalf("body error_ref = %q, want %q", env.Error.ErrorRef, reqID)
+	}
+
+	// ONE operator log record joins the SAME ref with the full cause.
+	rec := findLogRecord(t, &logBuf, "http error response")
+	if rec["error_ref"] != reqID {
+		t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
+	}
+	// The cause is the createApprovedScopeAmendment-wrapped error; the operator
+	// gets the full chain including the distinctive DB sentinel.
+	if cause, _ := rec["cause"].(string); !strings.Contains(cause, causeSentinel) {
+		t.Errorf("log cause = %v, want it to carry the full DB cause %q joined to the ref", rec["cause"], causeSentinel)
+	}
+}
+
 // TestRecoverRun_InheritsParentWorkingDir pins the sibling mint site of
 // E48.100 / #2547: an operator-recovery child executes against the same
 // checkout the run it recovers is anchored to, so it inherits the parent's
