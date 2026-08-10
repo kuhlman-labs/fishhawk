@@ -56,6 +56,21 @@ Migration `0053_stages_awaiting_host_dispatch` widens `stages_state_check` to ad
 
 This slice is purely additive — nothing writes `awaiting_host_dispatch` yet (the park writer, marker endpoint, and MCP consumers land in sibling slices), so the tree stays green standalone.
 
+## `succeeded` is an absorbing run state (#2586)
+
+No code path moves a run out of run state `succeeded`. Enforcement points:
+
+- **One write site.** `runs.state` is written by exactly one query, `UpdateRunState` (`queries.sql`). Every other `UPDATE runs` in the tree touches other columns.
+- **Two gated callers, both under a row lock.** `postgresRepo.TransitionRun` and `postgresRepo.RetryRun` (`postgres.go`) are the only callers, each inside `pgx.BeginFunc` + `LockRunForUpdate` (`SELECT … FOR UPDATE`). `TransitionRun` is gated by `ValidRunTransition`, which returns false whenever `from.IsTerminal()` — and `State.IsTerminal()` includes `StateSucceeded`. `RetryRun` is gated by `ValidRunRetryTransition`, whose `runRetryTransitions` table holds only `failed → running`.
+- **`ReviveRun` refuses outright.** A non-`failed` run gets `ErrReviveNotApplicable` before any mutation (`revive.go`).
+- **No deletion path.** There is no production `DELETE FROM runs`.
+
+Note the STAGE machine is separate and does NOT have this property: `stageFixupTransitions` carries a `succeeded → pending` edge (the #780 fix-up re-open). Runs and stages have separate tables; only the run-level ones are constrained here.
+
+**Downstream reader.** `server.guardDecompositionWaveOrder` (#2546) snapshots a decomposed child's SIBLING run states with `ListRuns` and then compare-and-swaps a DIFFERENT row (the child's stage). Nothing locks across the two, so that guard's soundness rests on this property rather than on serialization: a dependency the snapshot saw as `succeeded` cannot have regressed by CAS time, so the only sibling-run-state drift the window admits moves a dependency TOWARD satisfaction and yields at worst a spurious, retryable refusal. The property says nothing about the guard's other input — the parent plan's `depends_on` set can still be revised inside the same window; see `backend/internal/server/README.md` for that uncovered residual.
+
+**Relaxing `runRetryTransitions` re-opens that question.** Adding an out-of-`succeeded` entry makes the dangerous window direction reachable and must be paired with real serialization in the guard (or an explicit re-derivation of its correctness). Pinned by `TestRunSucceededIsAbsorbing` (exhaustive closure over every declared `State`, plus a white-box assertion that the table carries no `succeeded` key, so the edit itself fails) and `TestPostgres_SucceededRunNeverLeavesSucceeded` (real Postgres; each attempted escape asserts both the `InvalidTransitionError` and the re-read committed row).
+
 ## Stage-row gate persistence (#213, #254)
 
 The dispatcher captures the workflow-spec gate shape on each stage row at create time, alongside the existing `gate_sla` / `requires_approval` columns from #207.

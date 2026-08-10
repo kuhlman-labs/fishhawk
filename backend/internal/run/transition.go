@@ -49,6 +49,35 @@ func ValidRunTransition(from, to State) bool {
 // stageRetryTransitions pattern exactly: a separate table consulted
 // only by RetryRun, so it does not loosen ValidRunTransition for
 // ordinary callers.
+//
+// `succeeded` IS DELIBERATELY ABSENT FROM THIS TABLE, and its absence is
+// LOAD-BEARING FOR A DOWNSTREAM READER (#2586). runs.state is written by
+// exactly one query (UpdateRunState, queries.sql), reached by exactly two
+// repository methods — postgresRepo.TransitionRun (gated by
+// ValidRunTransition, which returns false for any terminal `from`, and
+// State.IsTerminal() includes StateSucceeded) and postgresRepo.RetryRun
+// (gated by ValidRunRetryTransition, i.e. this table) — each inside a
+// SELECT ... FOR UPDATE transaction; ReviveRun refuses any non-failed run
+// outright (revive.go), and there is no run-deletion path. Together those
+// make run state `succeeded` ABSORBING: no code path moves a run out of it.
+//
+// server.guardDecompositionWaveOrder (#2546) depends on that. It snapshots
+// a decomposed child's SIBLING run states with ListRuns and then CASes a
+// DIFFERENT row (the child's stage). No lock spans the two rows, so the
+// guard's snapshot is not atomic with that CAS; its soundness rests on
+// `succeeded` being absorbing rather than on any serialization — a sibling
+// the snapshot saw as succeeded cannot have regressed by CAS time, so the
+// only SIBLING-RUN-STATE drift the window admits moves a dependency TOWARD
+// satisfaction and can therefore only cause a spurious refusal (fail
+// closed, cleared by a retry). It does NOT cover a parent-plan revision
+// changing depends_on inside the same window — see the guard's doc comment.
+//
+// ADDING AN OUT-OF-SUCCEEDED ENTRY HERE RE-OPENS THAT WINDOW and must be
+// paired with real serialization in the guard (or an explicit re-derivation
+// of its correctness). TestRunSucceededIsAbsorbing (transition_test.go) and
+// TestPostgres_SucceededRunNeverLeavesSucceeded (postgres_test.go) pin the
+// property; the first reads this table white-box, so it fails on the table
+// edit itself and not only on a reachable pair.
 var runRetryTransitions = map[State]map[State]struct{}{
 	StateFailed: {
 		StateRunning: {},
@@ -310,6 +339,12 @@ func ValidStageRetryTransition(from, to StageState) bool {
 // the two. The repo's TransitionStage consults this table in addition
 // to ValidStageTransition so the fix-up edge is admissible there
 // without loosening the normal machine for ordinary callers.
+//
+// NOTE this is the STAGE fix-up table, not the run one: it carries a
+// succeeded → pending edge, so a STAGE can leave succeeded. That has no
+// bearing on the run-level absorbing-succeeded property recorded above
+// runRetryTransitions — runs and stages are separate state machines with
+// separate tables, and no run-level table admits an out-of-succeeded edge.
 var stageFixupTransitions = map[StageState]map[StageState]struct{}{
 	StageStateAwaitingApproval: {
 		StageStatePending: {},

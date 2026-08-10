@@ -180,6 +180,13 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// decomposition / out-of-range slice — refusing there would wedge every
 	// legitimate dispatch behind an unresolvable plan) but fail-CLOSED on an
 	// ERRORED read (retryable 500, never a silent admit).
+	//
+	// Do NOT infer atomicity from the held stage-admission lock: that lock is
+	// keyed to THIS stage and serializes no sibling-RUN write, so the guard's
+	// sibling snapshot is not atomic with the CAS below. What makes the window
+	// safe is that run state 'succeeded' is absorbing — see the "Atomicity of
+	// the predicate vs the CAS (#2586)" section on guardDecompositionWaveOrder,
+	// including the plan-revision window that argument does NOT cover.
 	if depErr, derr := s.guardDecompositionWaveOrder(r.Context(), runRow); derr != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
 			"could not resolve the run's decomposition dependencies to validate wave order",

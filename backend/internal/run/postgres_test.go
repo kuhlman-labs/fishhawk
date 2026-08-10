@@ -771,6 +771,72 @@ func TestPostgres_TransitionRun_AfterTerminal(t *testing.T) {
 	}
 }
 
+// TestPostgres_SucceededRunNeverLeavesSucceeded is the cross-layer proof of the
+// absorbing-succeeded property (#2586), taken at the ONLY surface that writes
+// runs.state. TestRunSucceededIsAbsorbing pins the in-memory tables; this test
+// drives a real run through the real postgres repository and attempts every
+// escape the repository exposes.
+//
+// Reading the row back after each attempt is MANDATORY, not decorative: the
+// control's effect is COMMITTED STATE. An error-identity-only assertion would
+// still pass if a relaxed gate wrote the row and the write were then reported as
+// an error for some other reason, so the persisted state is the load-bearing
+// assertion. (The counterfactual — adding StateSucceeded → StateRunning to
+// runRetryTransitions — turns the RetryRun case red on exactly that re-read.)
+//
+// The property is consumed by server.guardDecompositionWaveOrder, whose
+// sibling-state snapshot is not atomic with its stage CAS: a dependency that has
+// reached `succeeded` cannot regress inside that window.
+func TestPostgres_SucceededRunNeverLeavesSucceeded(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+
+	r := makeRun(t, repo)
+	if _, err := repo.TransitionRun(ctx, r.ID, run.StateRunning); err != nil {
+		t.Fatalf("pending → running: %v", err)
+	}
+	settled, err := repo.TransitionRun(ctx, r.ID, run.StateSucceeded)
+	if err != nil {
+		t.Fatalf("running → succeeded: %v", err)
+	}
+	if settled.State != run.StateSucceeded {
+		t.Fatalf("setup: state = %q, want succeeded", settled.State)
+	}
+
+	// Every escape the repository exposes: the ordinary transition path into
+	// each non-succeeded state, plus the run-level retry override.
+	escapes := []struct {
+		name string
+		call func() (*run.Run, error)
+	}{
+		{"TransitionRun→running", func() (*run.Run, error) { return repo.TransitionRun(ctx, r.ID, run.StateRunning) }},
+		{"TransitionRun→failed", func() (*run.Run, error) { return repo.TransitionRun(ctx, r.ID, run.StateFailed) }},
+		{"TransitionRun→cancelled", func() (*run.Run, error) { return repo.TransitionRun(ctx, r.ID, run.StateCancelled) }},
+		{"RetryRun→running", func() (*run.Run, error) { return repo.RetryRun(ctx, r.ID, run.StateRunning) }},
+	}
+	for _, esc := range escapes {
+		t.Run(esc.name, func(t *testing.T) {
+			_, err := esc.call()
+			var ite run.InvalidTransitionError
+			if !errors.As(err, &ite) {
+				t.Errorf("err = %v, want InvalidTransitionError", err)
+			} else if ite.Kind != "run" || ite.From != string(run.StateSucceeded) {
+				t.Errorf("ite = %+v, want kind=run from=succeeded", ite)
+			}
+			// COMMITTED STATE after the attempt returned — the assertion the
+			// error identity cannot substitute for.
+			cur, gerr := repo.GetRun(ctx, r.ID)
+			if gerr != nil {
+				t.Fatalf("get run: %v", gerr)
+			}
+			if cur.State != run.StateSucceeded {
+				t.Errorf("persisted state = %q after %s, want succeeded (run left an absorbing state)", cur.State, esc.name)
+			}
+		})
+	}
+}
+
 func TestPostgres_ConcurrentTransition_ExactlyOneWins(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := run.NewPostgresRepository(pool)
