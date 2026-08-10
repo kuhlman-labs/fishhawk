@@ -5128,6 +5128,56 @@ func TestGetPlan_OverCapAdvisory_ReachesPlanWarningsField(t *testing.T) {
 	}
 }
 
+// TestGetPlan_NearCapAdvisory_ReachesPlanWarningsField is the #2492 per-layer
+// selection assertion, mirroring TestGetPlan_OverCapAdvisory_ReachesPlanWarningsField:
+// a server-side PlanWarningsPayload carrying the near-cap advisory (the exact
+// string server.(*Server).nearCapWarning emits, naming the scanned count, the
+// resolved cap AND the remaining headroom) round-trips through the audit log and
+// surfaces via the real getPlan/loadPlanWarnings path in GetPlanOutput.PlanWarnings.
+//
+// It pins the DECODE + field wiring on this side of the boundary. The genuine
+// producer->consumer span — that runPlanWarnings PRODUCES exactly the string
+// getPlan DELIVERS — is asserted end to end by
+// TestE2E_PlanWarnings_NearCapAdvisory_ShipToGetPlan in
+// backend/internal/integration/mcp, which drives the real ship-plan path into
+// the real get_plan surface (runPlanWarnings and getPlan are unexported in their
+// own packages, so only the integration package can reach both).
+func TestGetPlan_NearCapAdvisory_ReachesPlanWarningsField(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	// The near-cap advisory string, byte-for-byte as
+	// server.(*Server).nearCapWarning emits it (plan_warnings.go): scanned count 9
+	// against the resolved cap of 10, leaving 1 file of headroom.
+	const count, capLimit, headroom = 9, 10, 1
+	nearCapAdvisory := fmt.Sprintf(
+		"plan scope declares %d files against the implement-stage max_files_changed cap of %d — only %d file(s) of headroom remain. "+
+			"Once that headroom is spent, the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any "+
+			"further file, so a correct mid-stage fix that needs an un-scoped file has no path in without a re-plan or a governed cap raise.",
+		count, capLimit, headroom,
+	)
+	seedPlanWarningsAudit(fb, runID, server.PlanWarningsPayload{Warnings: []string{nearCapAdvisory}})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if len(out.PlanWarnings) != 1 {
+		t.Fatalf("len(PlanWarnings) = %d, want 1: %v", len(out.PlanWarnings), out.PlanWarnings)
+	}
+	got := out.PlanWarnings[0]
+	if !strings.Contains(got, fmt.Sprintf("declares %d files against the implement-stage max_files_changed cap of %d", count, capLimit)) ||
+		!strings.Contains(got, fmt.Sprintf("only %d file(s) of headroom remain", headroom)) {
+		t.Errorf("PlanWarnings[0] = %q, want it to name count=%d cap=%d headroom=%d", got, count, capLimit, headroom)
+	}
+}
+
 // TestGetPlan_PlanWarnings_NewestEntryWins mirrors the sibling sweeps: a
 // schema-retry run writes two plan_warnings entries; the authoritative one
 // is the newest (last, sequence-ascending).

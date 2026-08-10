@@ -333,12 +333,17 @@ func overCapPlanBody(t *testing.T, numFiles int, overCap *bool) []byte {
 	return body
 }
 
-// hasOverCapWarning reports whether any warning names the scanned count and the
-// cap in the #2053 over-cap advisory shape.
+// hasOverCapWarning reports whether any warning is the #2053 over-cap advisory
+// naming the scanned count and the cap. It matches the over-cap advisory's
+// SPECIFIC "declares N files, exceeding the ... cap of M" phrasing rather than
+// the looser "declares N files" + "cap of M" pair, so the #2492 near-cap
+// advisory (which also names a count and a cap, in "declares N files against the
+// ... cap of M" form) is NOT a false positive — the two advisories are mutually
+// exclusive and a test asserting one must be able to reject the other.
 func hasOverCapWarning(warnings []string, count, capLimit int) bool {
+	needle := fmt.Sprintf("declares %d files, exceeding the implement-stage max_files_changed cap of %d", count, capLimit)
 	for _, w := range warnings {
-		if strings.Contains(w, fmt.Sprintf("declares %d files", count)) &&
-			strings.Contains(w, fmt.Sprintf("cap of %d", capLimit)) {
+		if strings.Contains(w, needle) {
 			return true
 		}
 	}
@@ -388,11 +393,20 @@ func TestRunPlanWarnings_OverCap_FlagMatrix(t *testing.T) {
 					t.Errorf("recorded warnings = %v, want one naming count=%d and cap=%d", entries[0].Warnings, tc.numFiles, capLimit)
 				}
 			} else {
-				if got != nil {
-					t.Fatalf("want nil result for an under-cap plan; got %+v", got)
+				// Under cap: the count-derived OVER-CAP advisory must not fire,
+				// whatever the over_cap flag says — that is what these rows pin. The
+				// #2492 near-cap advisory legitimately DOES fire here (1 file under a
+				// cap of 2 leaves 1 file of headroom, within nearCapMargin), and a cap
+				// this small cannot express an under-cap plan that is also outside the
+				// near-cap band, so assert the over-cap advisory's ABSENCE specifically
+				// rather than total silence.
+				if got != nil && hasOverCapWarning(got.Warnings, tc.numFiles, capLimit) {
+					t.Errorf("over-cap advisory fired for an under-cap plan; warnings = %v", got.Warnings)
 				}
-				if len(entries) != 0 {
-					t.Fatalf("plan_warnings entries = %d, want 0 for an under-cap plan", len(entries))
+				for _, e := range entries {
+					if hasOverCapWarning(e.Warnings, tc.numFiles, capLimit) {
+						t.Errorf("recorded over-cap advisory for an under-cap plan; entries = %v", entries)
+					}
 				}
 			}
 		})
@@ -831,8 +845,13 @@ func TestRunPlanWarnings_IrreducibleDoesNotSuppressOverCapAdvisory(t *testing.T)
 // irreducible field is never read for an under-cap plan (the count decides
 // over/under first).
 func TestRunPlanWarnings_IrreducibleUnderCapIsNoOp(t *testing.T) {
-	s, au, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
-	body := overCapIrreducibleBody(t, 1, "compile-atomic", "Go receiver rule") // 1 file, cap 2 → under cap
+	// Cap 10 (planWarningsNearCapSpec), not cap 2: a 1-file plan under cap 2 is
+	// within nearCapMargin and would fire the #2492 near-cap advisory, so it is no
+	// longer a total no-op. Under cap 10 the plan has 9 files of headroom — well
+	// clear of the near-cap band — so this stays the genuine no-op it pins: an
+	// under-cap plan reads neither the irreducible field nor the near-cap band.
+	s, au, runRow := newScopePrecheckServer(t, planWarningsNearCapSpec)
+	body := overCapIrreducibleBody(t, 1, "compile-atomic", "Go receiver rule") // 1 file, cap 10 → under cap, ample headroom
 
 	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
 	if got != nil {
@@ -934,5 +953,378 @@ workflows:
 				t.Errorf("want no phase-cap advisory when the cap is unresolved; got %q", w)
 			}
 		}
+	}
+}
+
+// --- near-cap advisory (#2492) ---
+
+// planWarningsNearCapSpec is a feature_change workflow whose implement stage
+// declares max_files_changed = 10 — a larger cap than planWarningsCapSpec's 2 so
+// the near-cap threshold boundary (headroom 0..5) can be walked with a distinct
+// scope.files count per row (an at-cap row seeds count == 10, a headroom-3 row
+// count 7, etc.), which a cap of 2 cannot express.
+var planWarningsNearCapSpec = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 10
+`)
+
+// nearCapPlanBody builds a schema-valid standard_v1 plan whose top-level
+// scope.files has numFiles entries (the count the near-cap advisory measures
+// headroom against) and, when numSubPlans >= 1, a decomposition of that many
+// sub-plans each carrying its OWN disjoint scope.file. The top-level count and
+// the sub-plan count are controlled INDEPENDENTLY on purpose: the near-cap
+// advisory measures headroom against the top-level scope.files, while the
+// shared-budget clause keys on len(decomposition.sub_plans) — so a fixture must
+// be able to set a near-cap top-level count with or without a decomposition.
+func nearCapPlanBody(t *testing.T, numFiles, numSubPlans int) []byte {
+	t.Helper()
+	fileMaps := make([]any, 0, numFiles)
+	for i := 0; i < numFiles; i++ {
+		fileMaps = append(fileMaps, map[string]any{
+			"path":      fmt.Sprintf("backend/internal/near/f%d.go", i),
+			"operation": "modify",
+		})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": fileMaps}
+	})
+	if numSubPlans >= 1 {
+		subMaps := make([]any, 0, numSubPlans)
+		sum := 0
+		for i := 0; i < numSubPlans; i++ {
+			subMaps = append(subMaps, map[string]any{
+				"title":                        fmt.Sprintf("Slice %d", i),
+				"scope_hint":                   fmt.Sprintf("slice %d", i),
+				"scope":                        map[string]any{"files": []any{map[string]any{"path": fmt.Sprintf("backend/internal/near/s%d.go", i), "operation": "modify"}}},
+				"predicted_runtime_minutes":    10,
+				"predicted_runtime_confidence": "medium",
+			})
+			sum += 10
+		}
+		m["decomposition"] = map[string]any{
+			"rationale": "scope exceeded single-stage budget",
+			"sub_plans": subMaps,
+		}
+		// Keep the parent runtime equal to the sub-plan sum so the (unrelated)
+		// runtime-compression advisory never fires, isolating the near-cap
+		// assertion.
+		m["predicted_runtime_minutes"] = sum
+	}
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return body
+}
+
+// hasNearCapWarning reports whether any warning is the #2492 near-cap advisory
+// naming the scanned count, the resolved cap, AND the remaining headroom. The
+// headroom substring is what distinguishes it from the over-cap advisory (which
+// also names "declares N files" and "cap of M"): the two advisories are mutually
+// exclusive, so a test asserting one must be able to reject the other.
+func hasNearCapWarning(warnings []string, count, capLimit, headroom int) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, fmt.Sprintf("declares %d files against the implement-stage max_files_changed cap of %d", count, capLimit)) &&
+			strings.Contains(w, fmt.Sprintf("only %d file(s) of headroom remain", headroom)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSharedBudgetClause reports whether any warning carries the decomposition
+// shared-budget clause naming the slice count — the 'more prominently for a
+// decomposed plan' half of the #2492 done-means.
+func hasSharedBudgetClause(warnings []string, slices int) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, fmt.Sprintf("decomposed into %d slices that ALL draw against this ONE whole-plan budget", slices)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasAnySharedBudgetClause reports whether any warning carries the shared-budget
+// clause for ANY slice count. The non-decomposed near-cap row uses this (rather
+// than the count-specific hasSharedBudgetClause) so that deleting the `slices >=
+// 2` guard — which would render "decomposed into 0 slices ..." for a
+// non-decomposed plan — is caught as a clean behavioral RED rather than slipping
+// past a count-keyed assertion.
+func hasAnySharedBudgetClause(warnings []string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, "ALL draw against this ONE whole-plan budget") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasHeadroomClause reports whether any warning mentions the near-cap headroom
+// phrasing at all (regardless of the exact numbers) — used by the mutual-
+// exclusion test to prove an over-cap plan fires NO near-cap advisory.
+func hasHeadroomClause(warnings []string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, "of headroom remain") {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunPlanWarnings_NearCap_ThresholdBoundary walks the nearCapMargin
+// threshold against the cap-10 spec. It is the test that pins BOTH halves of
+// 'the warning fires near the cap and is absent on a plan with real headroom',
+// asserting the RENDERED count/cap/headroom numbers (not mere non-emptiness).
+// The headroom-0 row is seeded with count == capLimit (10), NOT count > capLimit
+// — an at-cap plan is admissible (over-cap needs a STRICT excess) but has zero
+// headroom, so this row discriminates near-cap from over-cap rather than
+// duplicating the mutual-exclusion test (binding condition 2).
+//
+//	headroom | seeded count (cap 10) | fires?
+//	   0      |         10 (== cap)   |  yes
+//	   1      |          9            |  yes
+//	   2      |          8            |  yes
+//	   3      |          7            |  yes   (nearCapMargin boundary)
+//	   4      |          6            |  no
+//	   5      |          5            |  no
+func TestRunPlanWarnings_NearCap_ThresholdBoundary(t *testing.T) {
+	const capLimit = 10
+	for _, tc := range []struct {
+		name     string
+		headroom int
+		wantFire bool
+	}{
+		{name: "headroom 0 (at cap) -> fire", headroom: 0, wantFire: true},
+		{name: "headroom 1 -> fire", headroom: 1, wantFire: true},
+		{name: "headroom 2 -> fire", headroom: 2, wantFire: true},
+		{name: "headroom 3 (margin boundary) -> fire", headroom: 3, wantFire: true},
+		{name: "headroom 4 -> silent", headroom: 4, wantFire: false},
+		{name: "headroom 5 -> silent", headroom: 5, wantFire: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, runRow := newScopePrecheckServer(t, planWarningsNearCapSpec)
+			count := capLimit - tc.headroom
+			body := nearCapPlanBody(t, count, 0) // non-decomposed: no shared-budget clause
+
+			got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+
+			entries := planWarningsEntries(t, au)
+			if tc.wantFire {
+				if got == nil {
+					t.Fatal("want a non-nil result when the near-cap advisory fires")
+				}
+				if !hasNearCapWarning(got.Warnings, count, capLimit, tc.headroom) {
+					t.Errorf("returned warnings = %v, want one naming count=%d cap=%d headroom=%d", got.Warnings, count, capLimit, tc.headroom)
+				}
+				if len(entries) != 1 {
+					t.Fatalf("plan_warnings entries = %d, want 1", len(entries))
+				}
+				if !hasNearCapWarning(entries[0].Warnings, count, capLimit, tc.headroom) {
+					t.Errorf("recorded warnings = %v, want one naming count=%d cap=%d headroom=%d", entries[0].Warnings, count, capLimit, tc.headroom)
+				}
+			} else {
+				if got != nil {
+					t.Fatalf("want nil result for a plan with real headroom (%d); got %+v", tc.headroom, got)
+				}
+				if len(entries) != 0 {
+					t.Fatalf("plan_warnings entries = %d, want 0 for a plan with real headroom", len(entries))
+				}
+			}
+		})
+	}
+}
+
+// TestRunPlanWarnings_NearCap_DecomposedPlanNamesSharedBudget pins the
+// 'more prominently for a decomposed plan' requirement as an OBSERVABLE
+// difference: a 5-sub-plan decomposition at headroom 1 fires the near-cap
+// advisory AND carries the shared-budget clause naming 5 slices, while a
+// non-decomposed plan at the SAME headroom fires the advisory WITHOUT that
+// clause. The counterfactual for the decomposition guard is the non-decomposed
+// row (deleting the guard makes the clause render there too).
+func TestRunPlanWarnings_NearCap_DecomposedPlanNamesSharedBudget(t *testing.T) {
+	const capLimit = 10
+	const headroom = 1
+	count := capLimit - headroom
+
+	t.Run("decomposed -> shared-budget clause present", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, planWarningsNearCapSpec)
+		body := nearCapPlanBody(t, count, 5)
+
+		got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+		if got == nil {
+			t.Fatal("want a non-nil result for a near-cap decomposed plan")
+		}
+		if !hasNearCapWarning(got.Warnings, count, capLimit, headroom) {
+			t.Errorf("returned warnings = %v, want the near-cap advisory naming count=%d cap=%d headroom=%d", got.Warnings, count, capLimit, headroom)
+		}
+		if !hasSharedBudgetClause(got.Warnings, 5) {
+			t.Errorf("returned warnings = %v, want the shared-budget clause naming 5 slices", got.Warnings)
+		}
+		if entries := planWarningsEntries(t, au); len(entries) != 1 {
+			t.Fatalf("plan_warnings entries = %d, want 1", len(entries))
+		}
+	})
+
+	t.Run("non-decomposed -> shared-budget clause absent", func(t *testing.T) {
+		s, _, runRow := newScopePrecheckServer(t, planWarningsNearCapSpec)
+		body := nearCapPlanBody(t, count, 0)
+
+		got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+		if got == nil {
+			t.Fatal("want a non-nil result for a near-cap non-decomposed plan")
+		}
+		if !hasNearCapWarning(got.Warnings, count, capLimit, headroom) {
+			t.Errorf("returned warnings = %v, want the near-cap advisory naming count=%d cap=%d headroom=%d", got.Warnings, count, capLimit, headroom)
+		}
+		if hasAnySharedBudgetClause(got.Warnings) {
+			t.Errorf("returned warnings = %v, must NOT carry the shared-budget clause for a non-decomposed plan", got.Warnings)
+		}
+	})
+}
+
+// TestRunPlanWarnings_NearCap_OverCapPlanFiresOnlyOverCapAdvisory pins mutual
+// exclusion (binding condition — the over-cap advisory owns the over-cap case):
+// an over-cap plan (count 12 > cap 10) fires the over-cap advisory and NO
+// near-cap advisory. The counterfactual for the `over` early return is this test
+// (deleting it makes the over-cap plan ALSO render a near-cap advisory, with a
+// negative headroom).
+func TestRunPlanWarnings_NearCap_OverCapPlanFiresOnlyOverCapAdvisory(t *testing.T) {
+	const capLimit = 10
+	s, au, runRow := newScopePrecheckServer(t, planWarningsNearCapSpec)
+	body := nearCapPlanBody(t, 12, 0) // 12 > cap 10 -> over cap
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil {
+		t.Fatal("want a non-nil result for an over-cap plan")
+	}
+	if !hasOverCapWarning(got.Warnings, 12, capLimit) {
+		t.Errorf("want the over-cap advisory naming count=12 cap=%d; warnings = %v", capLimit, got.Warnings)
+	}
+	if hasHeadroomClause(got.Warnings) {
+		t.Errorf("an over-cap plan must fire NO near-cap advisory (the two are mutually exclusive); warnings = %v", got.Warnings)
+	}
+	if entries := planWarningsEntries(t, au); len(entries) != 1 {
+		t.Fatalf("plan_warnings entries = %d, want 1", len(entries))
+	}
+}
+
+// TestRunPlanWarnings_NearCap_FailOpenLegs pins one sub-test per fail-open leg,
+// mirroring the over-cap fail-open tests: each seeds a state where the cap
+// cannot be resolved and asserts NO near-cap advisory is emitted (got nil, no
+// entry) — the settle is never blocked. All four share the `!ok` early return in
+// nearCapWarning, whose counterfactual is this test.
+func TestRunPlanWarnings_NearCap_FailOpenLegs(t *testing.T) {
+	// A non-decomposed near-cap-shaped body (9 files) so the ONLY advisory that
+	// could fire is the near-cap one — if the cap resolved, a fail-open leg would
+	// otherwise be masked by an unrelated warning.
+	nearBody := func(t *testing.T) []byte { return nearCapPlanBody(t, 9, 0) }
+
+	t.Run("nil RunRepo", func(t *testing.T) {
+		au := newAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au}) // RunRepo intentionally nil.
+		got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), nearBody(t))
+		if got != nil {
+			t.Fatalf("want nil result with no RunRepo (cap unresolvable); got %+v", got)
+		}
+		if entries := planWarningsEntries(t, au); len(entries) != 0 {
+			t.Fatalf("plan_warnings entries = %d, want 0 (fail-open)", len(entries))
+		}
+	})
+
+	t.Run("GetRun error", func(t *testing.T) {
+		s, au, _ := newScopePrecheckServer(t, planWarningsNearCapSpec)
+		// A random run id the orchestrator repo never seeded -> GetRun ErrNotFound.
+		got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), nearBody(t))
+		if got != nil {
+			t.Fatalf("want nil result when GetRun errors; got %+v", got)
+		}
+		if entries := planWarningsEntries(t, au); len(entries) != 0 {
+			t.Fatalf("plan_warnings entries = %d, want 0 (fail-open)", len(entries))
+		}
+	})
+
+	t.Run("no implement stage", func(t *testing.T) {
+		specNoImplement := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+		s, au, runRow := newScopePrecheckServer(t, specNoImplement)
+		got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), nearBody(t))
+		if got != nil {
+			t.Fatalf("want nil result when the workflow has no implement stage; got %+v", got)
+		}
+		if entries := planWarningsEntries(t, au); len(entries) != 0 {
+			t.Fatalf("plan_warnings entries = %d, want 0 (fail-open)", len(entries))
+		}
+	})
+
+	t.Run("no max_files_changed constraint", func(t *testing.T) {
+		specNoCap := []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`)
+		s, au, runRow := newScopePrecheckServer(t, specNoCap)
+		got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), nearBody(t))
+		if got != nil {
+			t.Fatalf("want nil result when no max_files_changed cap is configured; got %+v", got)
+		}
+		if entries := planWarningsEntries(t, au); len(entries) != 0 {
+			t.Fatalf("plan_warnings entries = %d, want 0 (fail-open)", len(entries))
+		}
+	})
+}
+
+// TestRunPlanWarnings_NearCap_AbsentWhenAmpleHeadroom pins that the near-cap leg
+// did not convert the write-only-when-non-empty audit contract into an always-
+// write one: a far-under-cap warning-free plan (count 2, cap 10, headroom 8 >
+// nearCapMargin) still writes NO plan_warnings entry at all, keeping
+// TestShipPlan's happy-path audit-count assertion green.
+func TestRunPlanWarnings_NearCap_AbsentWhenAmpleHeadroom(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, planWarningsNearCapSpec)
+	body := nearCapPlanBody(t, 2, 0) // headroom 8, well over the margin
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got != nil {
+		t.Fatalf("want nil result for a far-under-cap warning-free plan; got %+v", got)
+	}
+	if entries := planWarningsEntries(t, au); len(entries) != 0 {
+		t.Fatalf("plan_warnings entries = %d, want 0 (write-only-when-non-empty contract intact)", len(entries))
 	}
 }
