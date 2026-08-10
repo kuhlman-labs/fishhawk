@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -420,6 +421,68 @@ func TestRecoverRun_InheritsParentWorkingDir(t *testing.T) {
 				t.Errorf("recovery child working_dir = %q, want %q (inherited from parent)", child.WorkingDir, tc.binding)
 			}
 		})
+	}
+}
+
+// TestRecoverRun_InheritanceSurvivesChildParamsFrom is the no-regression pin
+// for the mint site whose hand-copied inheritance list was already the most
+// complete (E67.17 / #2589). Routing it through run.ChildParamsFrom must
+// leave every field it carried carrying the same value, and must NOT sweep
+// RetryAttempt into the helper's inherited set: operator recovery carries the
+// parent's attempt UNCHANGED (not parent+1) so it never consumes the
+// on_ci_failure cap. RetryAttempt is seeded to 2 by construction, so a helper
+// that derived parent+1 — or that zeroed it — is distinguishable from one
+// that leaves the site to set it.
+func TestRecoverRun_InheritanceSurvivesChildParamsFrom(t *testing.T) {
+	s, rr, _, _ := newRecoverServer(t)
+	parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+	// Seeded by construction, before the handler runs.
+	parent.RetryAttempt = 2
+	parent.MaxRetriesSnapshot = 4
+	parent.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{
+		Contexts: []string{"ci/recover-pin"},
+		Sources:  []string{"branch_protection"},
+	}
+	parent.IssueContext = &run.IssueContext{
+		Number: 2589,
+		Title:  "Inherit run-from-run fields by construction",
+	}
+
+	w := postRecover(t, s, parent.ID.String(), `{"reason":"recover after a category-B failure"}`, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	child, err := rr.GetRun(context.Background(), resp.ID)
+	if err != nil {
+		t.Fatalf("GetRun child: %v", err)
+	}
+
+	if child.RetryAttempt != parent.RetryAttempt {
+		t.Errorf("recovery child retry_attempt = %d, want %d (carried UNCHANGED so recovery"+
+			" never consumes the on_ci_failure cap)", child.RetryAttempt, parent.RetryAttempt)
+	}
+	if child.MaxRetriesSnapshot != parent.MaxRetriesSnapshot {
+		t.Errorf("recovery child max_retries_snapshot = %d, want %d",
+			child.MaxRetriesSnapshot, parent.MaxRetriesSnapshot)
+	}
+	if !reflect.DeepEqual(child.RequiredChecksSnapshot, parent.RequiredChecksSnapshot) {
+		t.Errorf("recovery child required_checks_snapshot = %#v, want %#v",
+			child.RequiredChecksSnapshot, parent.RequiredChecksSnapshot)
+	}
+	if child.IssueContext == nil || child.IssueContext.Number != parent.IssueContext.Number {
+		t.Errorf("recovery child issue_context = %#v, want the parent's %#v",
+			child.IssueContext, parent.IssueContext)
+	}
+	if !bytes.Equal(child.WorkflowSpec, parent.WorkflowSpec) {
+		t.Errorf("recovery child workflow_spec = %d bytes, want the parent's %d",
+			len(child.WorkflowSpec), len(parent.WorkflowSpec))
+	}
+	if child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Errorf("recovery child parent_run_id = %v, want %s", child.ParentRunID, parent.ID)
 	}
 }
 

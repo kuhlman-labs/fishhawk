@@ -986,11 +986,14 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		MaxRetriesSnapshot:     p.MaxRetriesSnapshot,
 		RunnerKind:             p.RunnerKind,
 		// Carry the minted working_dir through (E48.100 / #2547) so the
-		// retry-inheritance assertion can witness it.
-		WorkingDir: p.WorkingDir,
-		State:      run.StatePending,
-		CreatedAt:  time.Now().UTC(),
-		UpdatedAt:  time.Now().UTC(),
+		// retry-inheritance assertion can witness it. IssueContext is
+		// carried for the same reason (E67.17 / #2589 delta 2): a fake
+		// that drops the field makes the assertion pass vacuously.
+		IssueContext: p.IssueContext,
+		WorkingDir:   p.WorkingDir,
+		State:        run.StatePending,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
 	}
 	s.created = append(s.created, r)
 	return r, nil
@@ -2994,6 +2997,129 @@ func TestHandle_CIFailureRetry_InheritsParentWorkingDir(t *testing.T) {
 			}
 			if got := runs.created[1].WorkingDir; got != tc.binding {
 				t.Errorf("retry child working_dir = %q, want %q (inherited from parent)", got, tc.binding)
+			}
+		})
+	}
+}
+
+// TestHandle_CIFailureRetry_ChildInheritsIssueContext pins delta 2 of
+// E67.17 / #2589. Before ChildParamsFrom, IssueContext appeared nowhere in
+// handleCIFailureRetry: the retry child was minted with a nil cached issue
+// context and the prompt builder fell back to a GitHub refetch that a run
+// carrying no installation cannot make. A retry works the SAME issue as the
+// run it retries, so it now reuses the parent's cached context — matching
+// handleRecoverRun, which already did. The nil-context sibling is the paired
+// control: an uncached parent still mints a nil child context, so the bound
+// case cannot pass by stamping a constant. Deleting the IssueContext row +
+// copy from ChildParamsFrom turns the cached case red and leaves the sibling
+// green.
+func TestHandle_CIFailureRetry_ChildInheritsIssueContext(t *testing.T) {
+	cached := &run.IssueContext{
+		Number: 2589,
+		Title:  "Inherit run-from-run fields by construction",
+		Body:   "the parent's cached issue body",
+		URL:    "https://github.com/kuhlman-labs/fishhawk/issues/2589",
+	}
+	cases := []struct {
+		name string
+		ic   *run.IssueContext
+	}{
+		{"cached_parent_child_inherits", cached},
+		{"uncached_parent_child_nil", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, runs, _ := newDispatcherWithStubs(t)
+			d.Artifacts = &stubArtifacts{}
+			d.IssueNotifier = &stubIssueNotifier{}
+			parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+			// Seeded by construction, before the handler runs.
+			parent.IssueContext = tc.ic
+
+			if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 2 {
+				t.Fatalf("runs.created = %d, want 2 (parent + retry child)", len(runs.created))
+			}
+			got := runs.created[1].IssueContext
+			if tc.ic == nil {
+				if got != nil {
+					t.Errorf("retry child issue_context = %#v, want nil (uncached parent)", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("retry child issue_context = nil, want the parent's cached context")
+			}
+			if got.Number != tc.ic.Number || got.Title != tc.ic.Title {
+				t.Errorf("retry child issue_context = {number:%d title:%q}, want {number:%d title:%q}",
+					got.Number, got.Title, tc.ic.Number, tc.ic.Title)
+			}
+		})
+	}
+}
+
+// TestHandle_CIFailureRetry_ChildDropsEmptyTriggerRefAndZeroInstallationID
+// pins the KEPT normalization (E67.17 / #2589 delta 3 — a decision, not a
+// change). Handle stamps `InstallationID: &installationID` from the raw
+// event, so a webhook run with no App installation persists a
+// pointer-to-ZERO; a pointer-to-empty-string trigger_ref is the same shape.
+// ChildParamsFrom inherits both verbatim, so handleCIFailureRetry normalizes
+// them back to nil after the call rather than handing the retry child a bogus
+// installation id where it currently gets nil and falls back to the operator
+// token. The non-degenerate sibling asserts REAL values ARE carried, so the
+// normalization cannot be satisfied by unconditionally nilling the fields.
+// Deleting the two `params.X = nil` lines turns the degenerate case red.
+func TestHandle_CIFailureRetry_ChildDropsEmptyTriggerRefAndZeroInstallationID(t *testing.T) {
+	emptyRef := ""
+	zeroInstall := int64(0)
+	realRef := "issue:1247"
+	realInstall := int64(42)
+	cases := []struct {
+		name         string
+		triggerRef   *string
+		installation *int64
+		wantRef      *string
+		wantInstall  *int64
+	}{
+		{"degenerate_parent_child_gets_nil", &emptyRef, &zeroInstall, nil, nil},
+		{"real_parent_child_carries_values", &realRef, &realInstall, &realRef, &realInstall},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, runs, _ := newDispatcherWithStubs(t)
+			d.Artifacts = &stubArtifacts{}
+			d.IssueNotifier = &stubIssueNotifier{}
+			parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+			// Seeded by construction, before the handler runs.
+			parent.TriggerRef = tc.triggerRef
+			parent.InstallationID = tc.installation
+
+			if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 2 {
+				t.Fatalf("runs.created = %d, want 2 (parent + retry child)", len(runs.created))
+			}
+			child := runs.created[1]
+
+			switch {
+			case tc.wantRef == nil && child.TriggerRef != nil:
+				t.Errorf("retry child trigger_ref = %q, want nil (parent held a pointer to \"\")", *child.TriggerRef)
+			case tc.wantRef != nil && child.TriggerRef == nil:
+				t.Errorf("retry child trigger_ref = nil, want %q", *tc.wantRef)
+			case tc.wantRef != nil && *child.TriggerRef != *tc.wantRef:
+				t.Errorf("retry child trigger_ref = %q, want %q", *child.TriggerRef, *tc.wantRef)
+			}
+
+			switch {
+			case tc.wantInstall == nil && child.InstallationID != nil:
+				t.Errorf("retry child installation_id = %d, want nil (parent held a pointer to 0)", *child.InstallationID)
+			case tc.wantInstall != nil && child.InstallationID == nil:
+				t.Errorf("retry child installation_id = nil, want %d", *tc.wantInstall)
+			case tc.wantInstall != nil && *child.InstallationID != *tc.wantInstall:
+				t.Errorf("retry child installation_id = %d, want %d", *child.InstallationID, *tc.wantInstall)
 			}
 		})
 	}
