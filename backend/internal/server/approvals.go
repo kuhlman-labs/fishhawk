@@ -448,6 +448,25 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// A local assigned only under the gate makes that unreachable by
 	// construction rather than by a second check.
 	var sliceAddScopeFiles map[string][]string
+	// addScopeFiles and removeScopeFiles are the FLAT siblings of the per-slice
+	// channel above, re-homed onto plan-block locals for the identical reason
+	// (#2598). Both were previously threaded to approveActionParams straight off
+	// req — add_scope_files verbatim, and remove_scope_files via a write-back
+	// onto req.RemoveScopeFiles — and req outlives this block and feeds
+	// approveActionParams UNCONDITIONALLY. So a direct HTTP approve of a NON-plan
+	// stage (implement, review) on the same run recorded raw, un-trimmed,
+	// un-validated lists on its approval_submitted row, because every gate that
+	// validates them (checkRemoveScopeFiles, checkDecomposedAddScopeFiles) runs
+	// only inside this block. loadApprovalAddScopeFiles /
+	// loadApprovalRemoveScopeFiles then fold those lists into implement scope and
+	// into the cap arithmetic. The removal channel is the sharper of the two:
+	// validateRemoveScopeFiles' would-empty-a-non-empty-scope refusal is
+	// plan-block-only, so an approve naming every scope path off the plan stage
+	// would empty the effective scope and re-enable the runner's `git add -A`
+	// fallback. Declared HERE and assigned ONLY inside the block, so non-plan
+	// recording is unreachable by construction rather than by a second check.
+	var addScopeFiles []string
+	var removeScopeFiles []string
 	if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
 		if !s.checkPlanReviewSettled(w, r, stage) {
 			return
@@ -462,13 +481,15 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		// Thread the trimmed removal paths back into the request so every
-		// downstream consumer (checkPlanScopeCap, writeApprovalAudit, the
-		// prompt-builder subtraction) subtracts the normalized scope path rather
-		// than the raw whitespace-padded input (#1726). Without this a value like
+		// Carry the trimmed removal paths to every downstream consumer
+		// (checkPlanScopeCap, writeApprovalAudit, the prompt-builder subtraction)
+		// so each subtracts the normalized scope path rather than the raw
+		// whitespace-padded input (#1726). Without this a value like
 		// " backend/b.go " passes the trimmed presence/empty checks yet fails to
-		// subtract the actual scope entry backend/b.go downstream.
-		req.RemoveScopeFiles = trimmedRemove
+		// subtract the actual scope entry backend/b.go downstream. Assigned to the
+		// plan-block local (see its declaration above), never written back onto
+		// req, so no non-plan-stage approve can carry this channel (#2598).
+		removeScopeFiles = trimmedRemove
 		// Single-owner-file gate (#2103): refuse an approve that supplies
 		// add_scope_files on a DECOMPOSED plan, because an added path fans into
 		// EVERY slice's effective scope (no per-slice add channel), guaranteeing
@@ -481,6 +502,10 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !s.checkDecomposedAddScopeFiles(w, r, stage, req.AddScopeFiles) {
 			return
 		}
+		// Carry the gate-cleared flat adds to the downstream consumers via the
+		// plan-block local, never written back onto req, for the same reason as
+		// the removal above and the per-slice map below (#2598).
+		addScopeFiles = req.AddScopeFiles
 		// Per-slice add channel (#2515): the decomposed-plan counterpart of the
 		// flat add refused just above. Every ownership violation is enumerated
 		// and refused PRE-Submit — before any approval row is inserted — for the
@@ -509,7 +534,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		// the flattened union rides in alongside add_scope_files so the number
 		// the gate reports stays equal to the scope the prompt builder assembles.
 		if !s.checkPlanScopeCap(w, r, stage, req.Comment,
-			unionScopeAdds(req.AddScopeFiles, sliceAdds), req.RemoveScopeFiles) {
+			unionScopeAdds(addScopeFiles, sliceAdds), removeScopeFiles) {
 			return
 		}
 		// Budget gate (#986): refuse an approve whose plan predicts a
@@ -619,8 +644,8 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		Comment:             req.Comment,
 		CommentPtr:          commentPtr,
 		ApproverGithubLogin: req.ApproverGithubLogin,
-		AddScopeFiles:       req.AddScopeFiles,
-		RemoveScopeFiles:    req.RemoveScopeFiles,
+		AddScopeFiles:       addScopeFiles,
+		RemoveScopeFiles:    removeScopeFiles,
 		SliceAddScopeFiles:  sliceAddScopeFiles,
 		BindingAssertions:   req.BindingAssertions,
 		ClaimsConcernIDs:    req.ClaimsConcernIDs,

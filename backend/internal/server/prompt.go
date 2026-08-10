@@ -4103,10 +4103,88 @@ func appendRecoveryResumeReason(conditions, recoveryReason *string) *string {
 	return &combined
 }
 
+// approvalEntryStageIsPlan reports whether an approval_submitted entry was
+// recorded on a PLAN stage — the one stage whose approve runs the gates that
+// validate the three approve-time scope channels (add_scope_files,
+// remove_scope_files, add_scope_files_to_slice). It is the loader-side SECOND
+// WALL for #2598: the recording-side fix (plan-block locals in
+// handleSubmitApproval) makes non-plan recording unreachable by construction
+// going forward, and THAT is the control; this wall exists so a row a PRE-fix
+// non-plan approve may already have written stops folding into implement scope.
+//
+// It FAILS OPEN deliberately: an entry is dropped ONLY on positive confirmation
+// that its recording stage is a non-plan stage (GetStage succeeded, the resolved
+// type is non-empty, and it is not plan). Every other outcome folds the entry
+// exactly as before — s.cfg.RunRepo == nil, a payload with no stage_id key, an
+// unparseable stage_id, a GetStage error, and a resolved stage with an EMPTY
+// type. Fail-closed would drop legitimate folds for every hand-built or legacy
+// audit row that omits stage_id. Those degrade branches are reachable only by
+// synthetic rows in practice: writeApprovalAudit (and its slash-command sibling
+// writeSlashApprovalAudit) stamp stage_id unconditionally on every row the
+// server writes, so for a real approve this filter is decisive.
+func (s *Server) approvalEntryStageIsPlan(ctx context.Context, entry *audit.Entry) bool {
+	if s.cfg.RunRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: approval stage-type filter degraded, no run repo — folding",
+			slog.String("audit_entry_id", entry.ID.String()),
+		)
+		return true
+	}
+	var payload struct {
+		StageID string `json:"stage_id"`
+	}
+	if err := json.Unmarshal(entry.Payload, &payload); err != nil || payload.StageID == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: approval stage-type filter degraded, no stage_id on payload — folding",
+			slog.String("audit_entry_id", entry.ID.String()),
+		)
+		return true
+	}
+	stageID, err := uuid.Parse(payload.StageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: approval stage-type filter degraded, unparseable stage_id — folding",
+			slog.String("audit_entry_id", entry.ID.String()),
+			slog.String("stage_id", payload.StageID),
+		)
+		return true
+	}
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil || stage == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: approval stage-type filter degraded, stage lookup failed — folding",
+			slog.String("audit_entry_id", entry.ID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		return true
+	}
+	if stage.Type == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: approval stage-type filter degraded, empty resolved stage type — folding",
+			slog.String("audit_entry_id", entry.ID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+		return true
+	}
+	if stage.Type != run.StageTypePlan {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: dropped approve-time scope channel recorded off the plan stage",
+			slog.String("audit_entry_id", entry.ID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("stage_type", string(stage.Type)),
+		)
+		return false
+	}
+	return true
+}
+
 // loadApprovalAddScopeFiles scans the run's approval_submitted audit entries
 // (newest-first) for the first entry where decision=="approve" and returns its
 // structured add_scope_files slice (#824). Returns nil when none is found.
 // Best-effort: WARN-logs and returns nil on any error.
+//
+// A candidate row recorded off a PLAN stage is skipped (#2598,
+// approvalEntryStageIsPlan) and the scan continues to an older legitimate row.
 func (s *Server) loadApprovalAddScopeFiles(ctx context.Context, runID uuid.UUID) []string {
 	if s.cfg.AuditRepo == nil {
 		return nil
@@ -4128,6 +4206,9 @@ func (s *Server) loadApprovalAddScopeFiles(ctx context.Context, runID uuid.UUID)
 			continue
 		}
 		if payload.Decision == "approve" && len(payload.AddScopeFiles) > 0 {
+			if !s.approvalEntryStageIsPlan(ctx, entries[i]) {
+				continue
+			}
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded structured add_scope_files for implement scope",
 				slog.String("run_id", runID.String()),
@@ -4224,6 +4305,9 @@ func (s *Server) resolveApprovalFlatAddScopeFiles(ctx context.Context, runRow *r
 // loadApprovalAddScopeFiles; the map is CANONICAL index-keyed form (the gate
 // canonicalises before recording), so the key is strconv.Itoa(slice_index).
 // Best-effort: WARN-logs and returns nil on any error.
+//
+// A candidate row recorded off a PLAN stage is skipped (#2598,
+// approvalEntryStageIsPlan) and the scan continues to an older legitimate row.
 func (s *Server) loadApprovalSliceAddScopeFiles(ctx context.Context, runID uuid.UUID) map[string][]string {
 	if s.cfg.AuditRepo == nil {
 		return nil
@@ -4245,6 +4329,9 @@ func (s *Server) loadApprovalSliceAddScopeFiles(ctx context.Context, runID uuid.
 			continue
 		}
 		if payload.Decision == "approve" && len(payload.AddScopeFilesToSlice) > 0 {
+			if !s.approvalEntryStageIsPlan(ctx, entries[i]) {
+				continue
+			}
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded per-slice add_scope_files for implement scope",
 				slog.String("run_id", runID.String()),
@@ -4305,6 +4392,9 @@ func (s *Server) resolveApprovalSliceAddScopeFiles(ctx context.Context, runRow *
 // returns its paths (#1726). The inverse of loadApprovalAddScopeFiles: the
 // prompt builder subtracts these from the effective scope. Best-effort:
 // WARN-logs and returns nil on any error.
+//
+// A candidate row recorded off a PLAN stage is skipped (#2598,
+// approvalEntryStageIsPlan) and the scan continues to an older legitimate row.
 func (s *Server) loadApprovalRemoveScopeFiles(ctx context.Context, runID uuid.UUID) []string {
 	if s.cfg.AuditRepo == nil {
 		return nil
@@ -4326,6 +4416,9 @@ func (s *Server) loadApprovalRemoveScopeFiles(ctx context.Context, runID uuid.UU
 			continue
 		}
 		if payload.Decision == "approve" && len(payload.RemoveScopeFiles) > 0 {
+			if !s.approvalEntryStageIsPlan(ctx, entries[i]) {
+				continue
+			}
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded structured remove_scope_files for implement scope",
 				slog.String("run_id", runID.String()),
