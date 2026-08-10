@@ -217,3 +217,50 @@ Operator `add_scope_files` fold as a pre-approved amendment on the EXISTING impl
 The `plan_reused_from` entry carries `source:"decomposition_child_recovery"`; the parked parent then reconciles on the re-driven child's next terminal transition through the unchanged `maybeAdvanceDecomposedParent` path (park-on-recoverable — see `backend/internal/orchestrator/README.md`).
 
 Discoverability: `next_actions` (`fishhawk-mcp/next_actions.go`) points a failed decomposition child (`decomposed_from != nil`) with a category-B implement failure at `fishhawk_resume_run` against that CHILD's own id (in-place, `consumes:none` — no new run), superseding the older "point resume at the parent" guidance, which would replan from scratch.
+
+## Run-from-run child params (E67.17 / #2589)
+
+`childparams.go` holds `run.ChildParamsFrom(parent *Run) CreateRunParams` — the ONLY sanctioned construction point for a run minted FROM another run.
+
+**Why.** Five successive mint sites hand-copied a subset of the parent's fields into `CreateRunParams`. Each new struct field had to be remembered at every site, and `working_dir` was dropped three times that way (#2482 / #2547 / #2483). The helper inverts the default: inheritance is automatic, and a call site states only what makes it distinct — so every divergence is a visible, reviewable line rather than a silent omission.
+
+### The three run-from-run mint sites
+
+| Site | What it sets after the call |
+|---|---|
+| `orchestrator.(*Orchestrator).fanoutIfDecomposed` | `DecomposedFrom`, `SliceIndex`, and a NARROWED per-slice `IssueContext` that overrides the inherited one |
+| `webhook.(*Dispatcher).handleCIFailureRetry` | `RetryAttempt = parent+1`, plus the kept `TriggerRef` / `InstallationID` normalization (below) |
+| `server.(*Server).handleRecoverRun` | `RetryAttempt` carried UNCHANGED (recovery never consumes the `on_ci_failure` cap) and the request's optional `IdempotencyKey` |
+
+The other two non-test `CreateRunParams` literals — `server.(*Server).CreateRunForTrigger` (POST /v0/runs + the campaign driver) and `webhook.(*Dispatcher).Handle` (the fresh webhook dispatch) — build their params from the REQUEST/EVENT. They have no parent to inherit from and are allow-listed, not converted.
+
+### The inheritance table
+
+`childParamsInheritance` in `childparams.go` carries one row per `CreateRunParams` field: a mode and a one-sentence reason. It is the decision record, and it is enforced.
+
+- **`inherited`** — copied verbatim from the parent row. `Repo`, `WorkflowID`, `WorkflowSHA`, `TriggerSource`, `TriggerRef`, `InstallationID`, `RunnerKind`, `WorkflowSpec`, `WorkingDir`, `RequiredChecksSnapshot`, `MaxRetriesSnapshot`, `IssueContext`.
+- **`derived`** — computed from the parent, never copied. Today only `ParentRunID = &parent.ID`; a verbatim copy of `parent.ParentRunID` would point the child at its GRANDparent.
+- **`notInherited`** — deliberately left zero for the site to set. `RetryAttempt`, `DecomposedFrom`, `SliceIndex`, `IdempotencyKey`, `UpstreamRunID`, `Drive`.
+
+`Drive` is deliberately NOT inherited: that preserves today's behavior at all three sites (no site sets it), so a child of a driven parent stays operator-driven. Changing that is a separate product decision.
+
+A nil parent returns the zero `CreateRunParams` rather than panicking — these call sites sit inside HTTP handlers and webhook dispatch, where a nil-deref is a 500 on the whole request.
+
+### The three behavior decisions this consolidation made
+
+1. **A decomposition child now carries the parent's `RequiredChecksSnapshot` and `MaxRetriesSnapshot`.** `fanoutIfDecomposed` omitted both, so every fan-out child was minted with a nil protection snapshot and `MaxRetriesSnapshot` 0 (the migration default 1 on read). A child implements against the same protected branch and the same retry cap as the run that decomposed it. Pinned by `TestFanout_ChildInheritsRequiredChecksAndMaxRetriesSnapshot` and, through Postgres, by `TestDecomposition_E2E_ChildrenInheritWorkingDir`.
+2. **A CI-failure retry child now carries the parent's `IssueContext`.** `IssueContext` appeared nowhere in `webhook/dispatcher.go`; the nil was an omission of the same class, not a deliberate trigger for a fresh GitHub refetch — and `handleRecoverRun` already inherited it. Pinned by `TestHandle_CIFailureRetry_ChildInheritsIssueContext`.
+3. **The retry site's `TriggerRef` / `InstallationID` nil-normalization is KEPT** (a decision, not a change). `Handle` stamps `InstallationID: &installationID` from the raw event, so a webhook run with no App installation persists a pointer-to-ZERO; a pointer-to-empty-string `trigger_ref` is the same shape. Inheriting either verbatim would hand the retry child a bogus installation id where it currently gets nil and falls back to the operator token. Pinned by `TestHandle_CIFailureRetry_ChildDropsEmptyTriggerRefAndZeroInstallationID` so the decision cannot be silently deleted later.
+
+### The three pins
+
+1. **Schema coverage, two-sided** (`TestChildParamsFrom_InheritanceTableCoversEveryField`). Every `CreateRunParams` field must have a table row — adding a field without deciding its inheritance FAILS naming the field — and every table row must name a real field, so a rename cannot leave the decision record dangling.
+2. **Mode-vs-behavior** (`TestChildParamsFrom_TableModesMatchBehavior`, guarded by `TestChildParamsFixture_EveryFieldNonZero`). The table is binding, not decorative: `inherited` fields must deep-equal the parent, `notInherited` fields must be zero, `derived` fields get an explicit per-field assertion and an UNRECOGNISED derived field fails rather than being skipped. The shared parent fixture is guarded non-zero in every field the table names, so no equality or zero assertion can pass vacuously.
+3. **USE, not just correctness** (`childparams_gate_test.go`). An AST gate walks the backend module's non-test Go sources and fails, naming `file:line`, on any hand-rolled `run.CreateRunParams` composite literal or `var` declaration outside an allow-list keyed by **(file path, ENCLOSING FUNCTION)**. Keying on the function is load-bearing: `dispatcher.go` must stay closed for `handleCIFailureRetry` while `Handle` stays open. Detection is AST-based because a line regex misses `&run.CreateRunParams{}`, an aliased import, an elided element type inside `[]run.CreateRunParams{{…}}`, and `var p run.CreateRunParams`. It fails CLOSED: a missing backend tree, an unparseable file, a walk error, zero files scanned, and zero literals found are all failures, never skips. `TestChildParamsAllowListEntriesStillMatch` fails on a dead allow-list entry.
+
+### Limitations
+
+- **Backend module only.** No other module imports `run.CreateRunParams`. A future runner- or CLI-side mint would not be seen; widen `collectChildParamsLiterals` if that changes.
+- **Non-test sources only.** A test legitimately builds `CreateRunParams` by hand (fakes, fixtures, the detector table itself), so `_test.go` files are skipped.
+- **Type identity is resolved syntactically, not by `go/types`.** The qualifier is bound per file from the import spec, so `rundb.CreateRunParams` (the sqlc row type under `run/db`) and a same-named local type in a package that does not import `run` both correctly miss. A dot-import of the run package would evade it; the repo has none.
+- **The vacuity guard and the allow-list are COUPLED, and a future author must update BOTH.** `TestNoHandRolledChildRunParamsLiteral` fails when it finds ZERO literals anywhere (the blind-gate guard: a detector that silently sees nothing is indistinguishable from a passing gate), and today the only literals outside the helper are the two allow-listed request-driven mints. So if `CreateRunForTrigger` and `Handle` are ever both refactored away — folded into a shared constructor, say — the vacuity guard trips ("found 0 constructions: the detector is not seeing the real literals") at the same moment `TestChildParamsAllowListEntriesStillMatch` trips on the now-dead entries. The two messages point in OPPOSITE directions: one says the detector is broken, the other says the allow-list is stale. Neither is wrong, and fixing only one leaves the other red. The correct response to that pair is to remove the dead allow-list entries AND re-anchor the vacuity guard on whatever construction sites remain (or, if the helper is the only one left, assert on it explicitly).

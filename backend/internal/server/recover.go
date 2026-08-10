@@ -294,30 +294,15 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Mint the recovery run, mirroring handleCIFailureRetry's
-	// inheritance — except RetryAttempt, carried UNCHANGED so
-	// operator recovery never consumes the on_ci_failure cap.
-	pid := parent.ID
-	createParams := run.CreateRunParams{
-		Repo:                   parent.Repo,
-		WorkflowID:             parent.WorkflowID,
-		WorkflowSHA:            parent.WorkflowSHA,
-		TriggerSource:          parent.TriggerSource,
-		TriggerRef:             parent.TriggerRef,
-		InstallationID:         parent.InstallationID,
-		ParentRunID:            &pid,
-		RequiredChecksSnapshot: parent.RequiredChecksSnapshot,
-		WorkflowSpec:           parent.WorkflowSpec,
-		RetryAttempt:           parent.RetryAttempt,
-		MaxRetriesSnapshot:     parent.MaxRetriesSnapshot,
-		RunnerKind:             parent.RunnerKind,
-		IssueContext:           parent.IssueContext,
-		// Inherit the parent's bound local checkout (E48.100 / #2547),
-		// mirroring the runner_kind inheritance above: a recovery child
-		// executes against the same checkout the run it recovers is anchored
-		// to, so the #2483 binding survives the mint.
-		WorkingDir: parent.WorkingDir,
-	}
+	// Mint the recovery run. Every shared parent field — repo, workflow,
+	// trigger, runner_kind, working_dir, workflow_spec, the issue context
+	// and the required-checks / max-retries snapshots — arrives from
+	// run.ChildParamsFrom (E67.17 / #2589), so this site states only what
+	// makes an operator recovery distinct.
+	createParams := run.ChildParamsFrom(parent)
+	// Carried UNCHANGED (not parent+1) so operator recovery never
+	// consumes the on_ci_failure cap.
+	createParams.RetryAttempt = parent.RetryAttempt
 	if idempKey != "" {
 		k := idempKey
 		createParams.IdempotencyKey = &k

@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -168,16 +169,25 @@ func seedParentRun(t *testing.T, ctx context.Context, runRepo runpkg.Repository,
 // the unbound shape every other caller seeds.
 func seedParentRunWithWorkingDir(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte, installationID *int64, reviewKind runpkg.ExecutorKind, workflowSpec []byte, workingDir string) parentRunFixture {
 	t.Helper()
-
-	r, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
-		Repo:           "kuhlman-labs/fishhawk",
-		WorkflowID:     "feature_change",
-		WorkflowSHA:    "deadbeef",
-		TriggerSource:  runpkg.TriggerCLI,
+	return seedParentRunWithParams(t, ctx, runRepo, artifactRepo, planBytes, reviewKind, runpkg.CreateRunParams{
 		InstallationID: installationID,
 		WorkflowSpec:   workflowSpec,
 		WorkingDir:     workingDir,
 	})
+}
+
+// seedParentRunWithParams is the general form: the caller supplies the
+// parent's create params (the repo / workflow / trigger identity is filled in
+// here) so an inheritance test can seed the snapshot and issue-context
+// columns a fan-out child must carry (E67.17 / #2589).
+func seedParentRunWithParams(t *testing.T, ctx context.Context, runRepo runpkg.Repository, artifactRepo artifact.Repository, planBytes []byte, reviewKind runpkg.ExecutorKind, params runpkg.CreateRunParams) parentRunFixture {
+	t.Helper()
+
+	params.Repo = "kuhlman-labs/fishhawk"
+	params.WorkflowID = "feature_change"
+	params.WorkflowSHA = "deadbeef"
+	params.TriggerSource = runpkg.TriggerCLI
+	r, err := runRepo.CreateRun(ctx, params)
 	if err != nil {
 		t.Fatalf("CreateRun: %v", err)
 	}
@@ -245,12 +255,19 @@ func seedParentRunWithWorkingDir(t *testing.T, ctx context.Context, runRepo runp
 }
 
 // TestDecomposition_E2E_ChildrenInheritWorkingDir crosses the orchestrator
-// mint → run.CreateRunParams → the runs.working_dir column → the ListRuns
-// decode (E48.100 / #2547). The fan-out unit test only witnesses the params
-// handed to a fake, so it cannot see a dropped column mapping; here every
-// child row is READ BACK from Postgres and must carry the parent's exact
-// binding. The unbound sibling asserts the same read-back is empty for an
-// unbound parent, so the bound case cannot pass by stamping a constant.
+// mint → run.ChildParamsFrom → run.CreateRunParams → the runs columns → the
+// ListRuns decode (E48.100 / #2547, widened for E67.17 / #2589). The fan-out
+// unit test only witnesses the params handed to a fake, so it cannot see a
+// value lost in persistence or decoding; here every child row is READ BACK
+// from Postgres and must carry the parent's exact working_dir binding, its
+// max_retries_snapshot, its workflow_spec, its required_checks_snapshot
+// (delta 1's persistence half) and — through the derived per-slice context —
+// its issue_context identity, which is the issue_context COLUMN round-trip
+// the retry site's delta 2 rides on.
+//
+// The unbound/empty sibling asserts the same read-backs are empty for a
+// parent carrying none of them, so no bound case can pass by stamping a
+// constant.
 //
 // The rest of the span — persisted child row → GET /v0/runs/{id} → the MCP
 // resolver — is pinned by TestResolveWorkingDirForRun_DecomposedChild_E2E in
@@ -259,12 +276,26 @@ func seedParentRunWithWorkingDir(t *testing.T, ctx context.Context, runRepo runp
 // here.
 func TestDecomposition_E2E_ChildrenInheritWorkingDir(t *testing.T) {
 	bound := t.TempDir()
+	boundSnapshot := &runpkg.RequiredChecksSnapshot{
+		Contexts: []string{"ci/e2e-inherit"},
+		Sources:  []string{"branch_protection"},
+	}
+	boundIssue := &runpkg.IssueContext{
+		Number: 2589,
+		Title:  "Inherit run-from-run fields by construction",
+		Body:   "the parent's cached issue body",
+		URL:    "https://github.com/kuhlman-labs/fishhawk/issues/2589",
+	}
 	cases := []struct {
-		name    string
-		binding string
+		name       string
+		binding    string
+		maxRetries int
+		spec       []byte
+		snapshot   *runpkg.RequiredChecksSnapshot
+		issue      *runpkg.IssueContext
 	}{
-		{"bound_parent_children_inherit", bound},
-		{"unbound_parent_children_empty", ""},
+		{"bound_parent_children_inherit", bound, 3, []byte("version: \"2\"\n"), boundSnapshot, boundIssue},
+		{"unbound_parent_children_empty", "", 0, nil, nil, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -281,8 +312,14 @@ func TestDecomposition_E2E_ChildrenInheritWorkingDir(t *testing.T) {
 				Logger:    slog.Default(),
 			}
 
-			fx := seedParentRunWithWorkingDir(t, ctx, runRepo, artifactRepo,
-				decomposedPlanContent(t), nil, runpkg.ExecutorAgent, nil, tc.binding)
+			fx := seedParentRunWithParams(t, ctx, runRepo, artifactRepo,
+				decomposedPlanContent(t), runpkg.ExecutorAgent, runpkg.CreateRunParams{
+					WorkingDir:             tc.binding,
+					MaxRetriesSnapshot:     tc.maxRetries,
+					WorkflowSpec:           tc.spec,
+					RequiredChecksSnapshot: tc.snapshot,
+					IssueContext:           tc.issue,
+				})
 			parentID := fx.runID
 
 			outcome, err := o.Advance(ctx, parentID)
@@ -300,10 +337,43 @@ func TestDecomposition_E2E_ChildrenInheritWorkingDir(t *testing.T) {
 			if got := len(children); got != 2 {
 				t.Fatalf("children = %d, want 2", got)
 			}
+			// A zero MaxRetriesSnapshot is persisted as the migration's
+			// column default of 1, so the unbound sibling expects 1 back.
+			wantMaxRetries := tc.maxRetries
+			if wantMaxRetries == 0 {
+				wantMaxRetries = 1
+			}
 			for i, child := range children {
 				if child.WorkingDir != tc.binding {
 					t.Errorf("child %d working_dir read back from Postgres = %q, want %q",
 						i, child.WorkingDir, tc.binding)
+				}
+				if child.MaxRetriesSnapshot != wantMaxRetries {
+					t.Errorf("child %d max_retries_snapshot read back from Postgres = %d, want %d",
+						i, child.MaxRetriesSnapshot, wantMaxRetries)
+				}
+				if !bytes.Equal(child.WorkflowSpec, tc.spec) {
+					t.Errorf("child %d workflow_spec read back from Postgres = %q, want %q",
+						i, child.WorkflowSpec, tc.spec)
+				}
+				if !reflect.DeepEqual(child.RequiredChecksSnapshot, tc.snapshot) {
+					t.Errorf("child %d required_checks_snapshot read back from Postgres = %#v, want %#v",
+						i, child.RequiredChecksSnapshot, tc.snapshot)
+				}
+				// The fan-out site OVERRIDES the inherited issue context with
+				// the narrowed per-slice one, which carries the parent
+				// issue's number/url/title. Asserting the identity here is
+				// what proves the issue_context column round-trips.
+				if child.IssueContext == nil {
+					t.Fatalf("child %d issue_context read back from Postgres = nil, want the derived per-slice context", i)
+				}
+				wantNumber, wantURL := 0, ""
+				if tc.issue != nil {
+					wantNumber, wantURL = tc.issue.Number, tc.issue.URL
+				}
+				if child.IssueContext.Number != wantNumber || child.IssueContext.URL != wantURL {
+					t.Errorf("child %d issue_context read back from Postgres = {number:%d url:%q}, want {number:%d url:%q}",
+						i, child.IssueContext.Number, child.IssueContext.URL, wantNumber, wantURL)
 				}
 			}
 		})

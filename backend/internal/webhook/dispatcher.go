@@ -1915,28 +1915,25 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 	if parent.InstallationID != nil {
 		installationID = *parent.InstallationID
 	}
-	parentID := parent.ID
-	params := run.CreateRunParams{
-		Repo:                   parent.Repo,
-		WorkflowID:             parent.WorkflowID,
-		WorkflowSHA:            parent.WorkflowSHA,
-		TriggerSource:          parent.TriggerSource,
-		ParentRunID:            &parentID,
-		RequiredChecksSnapshot: parent.RequiredChecksSnapshot,
-		WorkflowSpec:           parent.WorkflowSpec,
-		RetryAttempt:           parent.RetryAttempt + 1,
-		// Carry the parent's snapshotted cap forward so a chained
-		// retry chain sees the same N/M values on every row (#280).
-		MaxRetriesSnapshot: parent.MaxRetriesSnapshot,
-		// Inherit the parent's runner_kind — retries run in the
-		// same backend as the run they're retrying (ADR-022).
-		RunnerKind: parent.RunnerKind,
-		// Inherit the parent's bound local checkout for the same reason
-		// (E48.100 / #2547): a retry executes against the same checkout the
-		// run it retries is anchored to, so the #2483 binding is inherited at
-		// mint instead of being lost and re-resolved from the caller's cwd.
-		WorkingDir: parent.WorkingDir,
-	}
+	// Every parent field a retry child shares — repo, workflow, trigger,
+	// runner_kind, working_dir, workflow_spec, the required-checks and
+	// max-retries snapshots, and the cached issue context — arrives from
+	// run.ChildParamsFrom (E67.17 / #2589), so this site states only what
+	// makes a CI-failure retry distinct.
+	params := run.ChildParamsFrom(parent)
+	// The retry's position in the chain: one past the run it retries
+	// (#279). Cap-checked in step 5 above.
+	params.RetryAttempt = parent.RetryAttempt + 1
+	// Normalize two degenerate parent values back to nil rather than
+	// inheriting them verbatim. Handle stamps `InstallationID:
+	// &installationID` from the raw event, so a webhook run with no App
+	// installation persists a pointer-to-ZERO; handing that to the retry
+	// child would give it a bogus installation id where it currently gets
+	// nil and falls back to the operator token. A pointer-to-empty-string
+	// trigger_ref is the same shape. Deliberate and kept — pinned by
+	// TestHandle_CIFailureRetry_ChildDropsEmptyTriggerRefAndZeroInstallationID.
+	params.TriggerRef = nil
+	params.InstallationID = nil
 	if triggerRef != "" {
 		params.TriggerRef = &triggerRef
 	}

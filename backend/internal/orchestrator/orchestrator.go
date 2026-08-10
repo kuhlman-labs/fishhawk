@@ -1911,34 +1911,19 @@ func (o *Orchestrator) fanoutIfDecomposed(ctx context.Context, parent *run.Run, 
 		// The index is the sub_plan's position in dependency order.
 		idx := i
 		childCtx := childIssueContextFromSubPlan(parent, sub)
-		child, err := o.Runs.CreateRun(ctx, run.CreateRunParams{
-			Repo:           parent.Repo,
-			WorkflowID:     parent.WorkflowID,
-			WorkflowSHA:    parent.WorkflowSHA,
-			TriggerSource:  parent.TriggerSource,
-			TriggerRef:     parent.TriggerRef,
-			InstallationID: parent.InstallationID,
-			ParentRunID:    &parentID,
-			DecomposedFrom: &parentID,
-			SliceIndex:     &idx,
-			RunnerKind:     parent.RunnerKind,
-			IssueContext:   childCtx,
-			// Inherit the parent's bound local checkout (E48.100 / #2547).
-			// A child executes against the SAME checkout its parent's branch
-			// lineage is anchored to, so the #2483 binding is inherited at
-			// mint rather than re-supplied per stage verb — without this every
-			// fan-out child row is minted working_dir NULL and each child's
-			// stage verbs fall through to the calling process's cwd (#1866).
-			// An unbound parent (github_actions, or a legacy row) yields an
-			// empty child value exactly as before.
-			WorkingDir: parent.WorkingDir,
-			// Inherit the parent's cached workflow spec so the child's
-			// implement-stage prompt resolves the policy max_stage_runtime
-			// (30m for feature_change) instead of the runner's 15m default.
-			// Without this the decomposition budget is defeated: oversized
-			// plans split to fit 30m, then each child times out at 15m.
-			WorkflowSpec: parent.WorkflowSpec,
-		})
+		// Every parent field a fan-out child shares — repo, workflow,
+		// trigger, runner_kind, working_dir, workflow_spec, and the
+		// required-checks / max-retries snapshots — arrives from
+		// run.ChildParamsFrom (E67.17 / #2589), so this site states only
+		// what makes a decomposition child distinct.
+		params := run.ChildParamsFrom(parent)
+		params.DecomposedFrom = &parentID
+		params.SliceIndex = &idx
+		// The narrowed per-slice context OVERRIDES the inherited one: the
+		// child's plan-less implement prompt needs the sub_plan's scope
+		// hint as its body, not the parent issue's full text.
+		params.IssueContext = childCtx
+		child, err := o.Runs.CreateRun(ctx, params)
 		if err != nil {
 			return false, fmt.Errorf("create child run for sub_plan %q: %w", sub.Title, err)
 		}

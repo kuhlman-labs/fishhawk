@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -58,11 +59,14 @@ func (r *fanoutRunsRepo) CreateRun(_ context.Context, p run.CreateRunParams) (*r
 		WorkflowSpec:   p.WorkflowSpec,
 		// Carry the minted working_dir through (E48.100 / #2547) so the
 		// fan-out inheritance assertion can witness it; a fake that drops
-		// the field makes the assertion pass vacuously.
-		WorkingDir: p.WorkingDir,
-		State:      run.StatePending,
-		CreatedAt:  time.Now().UTC(),
-		UpdatedAt:  time.Now().UTC(),
+		// the field makes the assertion pass vacuously. The two snapshot
+		// fields are carried for the same reason (E67.17 / #2589 delta 1).
+		RequiredChecksSnapshot: p.RequiredChecksSnapshot,
+		MaxRetriesSnapshot:     p.MaxRetriesSnapshot,
+		WorkingDir:             p.WorkingDir,
+		State:                  run.StatePending,
+		CreatedAt:              time.Now().UTC(),
+		UpdatedAt:              time.Now().UTC(),
 	}
 	r.createdRuns = append(r.createdRuns, rr)
 	r.stubRuns.mu.Lock()
@@ -457,6 +461,83 @@ func TestAdvance_FanoutUnboundParentMintsEmptyWorkingDir(t *testing.T) {
 		if child.WorkingDir != "" {
 			t.Errorf("child %d working_dir = %q, want empty (unbound parent)", i, child.WorkingDir)
 		}
+	}
+}
+
+// TestFanout_ChildInheritsRequiredChecksAndMaxRetriesSnapshot pins delta 1
+// of E67.17 / #2589: before ChildParamsFrom, fanoutIfDecomposed omitted both
+// fields, so every decomposition child was minted with a nil protection
+// snapshot and MaxRetriesSnapshot 0 (the migration default 1 on read). A
+// child implements against the same protected branch and the same retry cap
+// as the run that decomposed it, so both are now inherited. The nil/zero
+// sibling is the paired control: a parent carrying neither still mints
+// children carrying neither, so the bound case cannot pass by stamping a
+// constant. Deleting either field from ChildParamsFrom turns the bound case
+// red and leaves the sibling green.
+func TestFanout_ChildInheritsRequiredChecksAndMaxRetriesSnapshot(t *testing.T) {
+	cases := []struct {
+		name     string
+		snapshot *run.RequiredChecksSnapshot
+		maxRetry int
+	}{
+		{"parent_with_snapshots_children_inherit", &run.RequiredChecksSnapshot{
+			Contexts: []string{"ci/fanout-delta-1"},
+			Sources:  []string{"branch_protection"},
+		}, 3},
+		{"parent_without_snapshots_children_empty", nil, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := newFanoutRunsRepo()
+			parent, stages := rs.seed(t, "example/repo", nil, []stageSeed{
+				{Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+				{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+			})
+			// Seeded by construction, before the fan-out runs.
+			parent.RequiredChecksSnapshot = tc.snapshot
+			parent.MaxRetriesSnapshot = tc.maxRetry
+			planStage := stages[0]
+
+			schemaV := "standard_v1"
+			arts := &fakeArtifacts{
+				byStage: map[uuid.UUID][]*artifact.Artifact{
+					planStage.ID: {{
+						ID:            uuid.New(),
+						StageID:       planStage.ID,
+						Kind:          artifact.KindPlan,
+						SchemaVersion: &schemaV,
+						Content:       decomposedPlanBytes(t, []string{"Part A", "Part B"}),
+						ContentHash:   "deadbeef",
+						CreatedAt:     time.Now().UTC(),
+					}},
+				},
+			}
+
+			o := &Orchestrator{Runs: rs, Logger: slog.Default(), Artifacts: arts, Audit: &recordingAudit{}}
+			out, err := o.Advance(context.Background(), parent.ID)
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if out != OutcomeDecomposed {
+				t.Fatalf("Advance outcome = %q, want %q", out, OutcomeDecomposed)
+			}
+
+			rs.mu.Lock()
+			defer rs.mu.Unlock()
+			if got := len(rs.createdRuns); got != 2 {
+				t.Fatalf("createdRuns = %d, want 2", got)
+			}
+			for i, child := range rs.createdRuns {
+				if !reflect.DeepEqual(child.RequiredChecksSnapshot, tc.snapshot) {
+					t.Errorf("child %d required_checks_snapshot = %#v, want %#v (inherited from parent)",
+						i, child.RequiredChecksSnapshot, tc.snapshot)
+				}
+				if child.MaxRetriesSnapshot != tc.maxRetry {
+					t.Errorf("child %d max_retries_snapshot = %d, want %d (inherited from parent)",
+						i, child.MaxRetriesSnapshot, tc.maxRetry)
+				}
+			}
+		})
 	}
 }
 
