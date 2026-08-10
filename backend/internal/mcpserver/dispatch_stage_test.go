@@ -119,6 +119,29 @@ func TestDispatchStage_ReturnsAwaitPointer(t *testing.T) {
 	}
 }
 
+// TestDispatchStage_AwaitPointerNamesAmendmentRelease is the #2588 behavioural
+// pin for proposal 3: the pointer dispatch returns must advertise what the wait
+// can now OBSERVE — a mid-stage scope amendment — so this verb no longer
+// recommends a follow-up call blind to the one event it exists to enable. A
+// doc-only revert to "block until the dispatched stage settles" fails here
+// instead of drifting silently.
+func TestDispatchStage_AwaitPointerNamesAmendmentRelease(t *testing.T) {
+	next := awaitStageNextStep(uuid.New().String(), uuid.New().String(), "implement")
+	if next == nil {
+		t.Fatal("awaitStageNextStep returned nil")
+	}
+	lower := strings.ToLower(next.Reason)
+	for _, want := range []string{
+		"scope amendment",       // the event the wait now observes
+		"amendment_pending",     // the status it surfaces as
+		"list_scope_amendments", // and that no companion poll is needed
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("await next_step reason must carry %q; got %q", want, next.Reason)
+		}
+	}
+}
+
 // --- argv parity with the synchronous run_stage path ---
 
 // captureAllArgv records the argv of EVERY runStageCommand invocation (dispatch

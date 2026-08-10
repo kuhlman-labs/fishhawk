@@ -47,8 +47,19 @@ type AwaitStageInput struct {
 //   - "run_terminal" — the run reached a terminal state while the stage was
 //     still unsettled (ADR-036 backstop); a final read found it still
 //     unsettled, so it most likely never will. Do not re-arm blindly.
+//   - "amendment_pending" — the SECOND release condition (#2588): the awaited
+//     stage filed a mid-stage scope amendment that is still pending. The stage
+//     has NOT settled (it stays `running` — filing an amendment does not park
+//     it), so Terminal is false and State carries the raw running state;
+//     PendingAmendment carries the row to decide and NextStep the pre-filled
+//     fishhawk_decide_scope_amendment call.
+//
+// Settledness WINS over amendment_pending, and the guarantee is enforced rather
+// than asserted: the amendment probe re-reads the stage before resolving and
+// prefers `settled` if the stage settled while the amendment list was in
+// flight. See awaitStageAmendmentRelease.
 type AwaitStageOutput struct {
-	Status string `json:"status" jsonschema:"one of settled, timeout, run_terminal"`
+	Status string `json:"status" jsonschema:"one of settled, timeout, run_terminal, amendment_pending"`
 	Stage  string `json:"stage" jsonschema:"the resolved stage type"`
 	// StageID is the resolved stage UUID — the durable ADR-037 handle, echoed so
 	// a resuming caller can re-issue against the same stage.
@@ -77,6 +88,16 @@ type AwaitStageOutput struct {
 	// TimeoutCapSeconds is the timeout cap actually applied: 7200 when long_wait
 	// or a progressToken was in effect, else 600 (#2490). Present on every path.
 	TimeoutCapSeconds int `json:"timeout_cap_seconds" jsonschema:"the timeout cap actually applied to this call (600 by default, 7200 when long_wait or a progressToken was in effect)"`
+	// PendingAmendment carries the WHOLE amendment row on the amendment_pending
+	// status (#2588) — id, paths+operations, reason, requested_at and the #983
+	// cap headroom — so the operator decides without a second
+	// fishhawk_list_scope_amendments call. Reuses ScopeAmendmentItem; no new
+	// exported type.
+	PendingAmendment *ScopeAmendmentItem `json:"pending_amendment,omitempty" jsonschema:"the pending mid-stage scope amendment that released the wait (status amendment_pending): id, requested paths + operations, the agent's reason, and the #983 cap headroom. Decide it with fishhawk_decide_scope_amendment"`
+	// NextStep is the pre-filled fishhawk_decide_scope_amendment call for
+	// PendingAmendment (#2588), reusing the SuggestedAction shape from
+	// next_actions.go so the operator acts in one hop.
+	NextStep *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single call to make on the amendment_pending status: fishhawk_decide_scope_amendment with run_id + amendment_id pre-filled"`
 }
 
 // awaitStageDefaultStageType is the stage type awaited when the caller omits
@@ -101,6 +122,9 @@ operator had to hand-roll a poll loop. Reuses the #1252 ?wait long-poll — a
 single call your MCP client backgrounds exactly as it backgrounds
 fishhawk_run_stage, with no polling.
 
+There are TWO release conditions: the stage SETTLES, or the awaited stage
+files a mid-stage scope amendment that is still pending (#2588).
+
 "Settled" is deliberately BROADER than "terminal": the wait resolves the
 moment the stage reaches a terminal state (succeeded / failed / cancelled) OR
 a parked-for-operator state (awaiting_approval / awaiting_children /
@@ -113,9 +137,27 @@ can legitimately be awaiting_host_dispatch, which IS settled — so a wait
 against a never-dispatched stage returns immediately, and the raw state says
 why.)
 
+A pending scope amendment does NOT park the stage: it stays 'running' — there
+is no awaiting_scope_decision transition on this path, and that state now
+carries a decomposition-parent meaning (#2548). So settledness alone would
+never release, and the wait would hold past the agent's ~5-minute poll window.
+The wait releases on the pending amendment instead; the stage state does not
+change.
+
 Statuses:
   - "settled"      — the stage settled; state carries the raw state and
                      terminal is true.
+  - "amendment_pending" — the awaited stage filed a mid-stage scope amendment
+                     that is still pending. The stage is STILL RUNNING
+                     (terminal is false; state carries the raw running state).
+                     pending_amendment carries the whole row — id, paths,
+                     reason, cap headroom — and next_step is a pre-filled
+                     fishhawk_decide_scope_amendment call, so no separate
+                     fishhawk_list_scope_amendments lookup is needed. Decide
+                     PROMPTLY: the agent polls ~5 minutes per request and then
+                     proceeds AS IF DENIED. Settledness wins the race — a
+                     stage that has settled resolves 'settled' even with an
+                     amendment still pending.
   - "timeout"      — nothing settled within the window. The wait holds no
                      server state, so a cut-short call is a safe no-op to
                      re-issue; poll_interval_seconds names the fallback
@@ -207,6 +249,15 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 		return nil, awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds), nil
 	}
 
+	// Second release condition (#2588), probed on the FAST PATH before the first
+	// tick: an amendment already pending when the wait is armed — the shape an
+	// operator re-arming after a timeout hits — releases IMMEDIATELY rather than
+	// after a poll interval. Evaluated AFTER the settled check above so a settled
+	// stage can never surface as amendment_pending.
+	if out, done := r.awaitStageAmendmentRelease(ctx, runID, stageUUID, stageType, sw.State, start, heartbeat, capSeconds); done {
+		return nil, out, nil
+	}
+
 	// Nothing settled yet: check the run-terminal backstop once before the loop
 	// so a run already terminal at call time resolves without a poll tick.
 	if out, done := r.awaitStageRunTerminalBackstop(ctx, runID, stageUUID, stageType, start, heartbeat, capSeconds); done {
@@ -257,6 +308,14 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 			if sw.Terminal {
 				return nil, awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds), nil
 			}
+			// Second release condition (#2588) on every tick, after the settled
+			// check and before the ADR-036 backstop. pollCtx (not ctx) so a
+			// deadline hit cancels the probe with everything else — an errored
+			// probe yields nil and the loop's pollCtx.Done() arm produces the
+			// resumable timeout.
+			if out, done := r.awaitStageAmendmentRelease(pollCtx, runID, stageUUID, stageType, sw.State, start, heartbeat, capSeconds); done {
+				return nil, out, nil
+			}
 			if out, done := r.awaitStageRunTerminalBackstop(pollCtx, runID, stageUUID, stageType, start, heartbeat, capSeconds); done {
 				return nil, out, nil
 			}
@@ -298,6 +357,115 @@ func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, 
 			"Do not re-arm blindly: check fishhawk_get_run_status for the final run state first.",
 			stageType, runID, runRow.State),
 	}, true
+}
+
+// awaitStagePendingAmendment probes the run's mid-stage scope amendments for a
+// PENDING one filed by the awaited stage (#2588), returning nil when there is
+// none. It reuses the EXISTING apiClient.ListScopeAmendments read (the same
+// GET /v0/runs/{run_id}/scope-amendments fishhawk_list_scope_amendments hits),
+// so this adds no REST surface.
+//
+// BEST-EFFORT by construction, mirroring awaitStageRunTerminalBackstop: any
+// list error returns nil, so the normal poll/timeout path stays in charge and
+// the wait NEVER fails on this probe. Losing an advisory signal beats killing
+// an hours-long wait on a transient list error.
+//
+// The match is STRICT on both fields. Status must be exactly "pending" (a
+// decided amendment is not actionable and must not release a re-armed wait),
+// and StageID must equal the awaited stage — the backend's amendment row
+// carries a non-pointer, non-omitempty stage_id, so equality is a complete
+// predicate rather than one that silently drops rows, and a sibling stage's
+// request can never release this wait. stageID is a string because that is
+// what ScopeAmendmentItem.StageID carries; awaitStageAmendmentPendingOutput
+// takes the same type for the same reason.
+//
+// The endpoint returns items oldest-first, so the first match is the oldest
+// pending request — the one closest to its ~5-minute expiry.
+func (r *runResolver) awaitStagePendingAmendment(ctx context.Context, runID uuid.UUID, stageID string) *ScopeAmendmentItem {
+	items, err := r.api.ListScopeAmendments(ctx, runID)
+	if err != nil {
+		return nil
+	}
+	for i := range items {
+		if items[i].Status == "pending" && items[i].StageID == stageID {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+// awaitStageAmendmentRelease is the #2588 second release condition, shaped like
+// awaitStageRunTerminalBackstop: it returns (output, true) to resolve the wait
+// and (zero, false) to keep polling.
+//
+// Settledness WINS, and the claim is MADE TRUE rather than asserted. The
+// caller's stage read and this probe's amendment-list read are not atomic: the
+// stage can settle between them, so an ordering that returned amendment_pending
+// on the strength of the caller's now-stale read would report a running stage
+// that has in fact settled. So after finding a pending amendment this re-reads
+// the stage (wait=0) and prefers `settled`. The extra read is paid only on the
+// rare tick that actually finds a pending amendment, never on the common path.
+//
+// The re-read is best-effort in the same direction as the probe: if it fails,
+// the amendment release stands. That is the honest resolution — a pending
+// amendment is known to exist, settledness merely could not be confirmed — and
+// the operator's next re-arm reads the settled stage.
+//
+// state is the raw stage state from the caller's read, carried onto the
+// amendment_pending output so Terminal/State stay the honest settledness
+// signal. stageUUID is uuid.UUID only because the api-client reads require it;
+// both helpers below key on its string form, matching ScopeAmendmentItem.
+func (r *runResolver) awaitStageAmendmentRelease(ctx context.Context, runID, stageUUID uuid.UUID, stageType, state string, start time.Time, heartbeat bool, capSeconds int) (AwaitStageOutput, bool) {
+	item := r.awaitStagePendingAmendment(ctx, runID, stageUUID.String())
+	if item == nil {
+		return AwaitStageOutput{}, false
+	}
+	if sw, err := r.api.GetRunStageWait(ctx, runID, stageUUID, 0); err == nil && sw != nil && sw.Terminal {
+		return awaitStageSettledOutput(stageType, sw, start, heartbeat, capSeconds), true
+	}
+	return awaitStageAmendmentPendingOutput(stageType, stageUUID.String(), runID, state, item, start, heartbeat, capSeconds), true
+}
+
+// awaitStageAmendmentPendingOutput builds the amendment_pending response
+// (#2588). Terminal is FALSE and State carries the raw (normally "running")
+// stage state: the stage genuinely has not settled, and the flag stays the
+// honest settledness signal rather than being borrowed to mean "the wait
+// released". The row plus a pre-filled fishhawk_decide_scope_amendment
+// next_step ride out so the operator decides in one hop.
+func awaitStageAmendmentPendingOutput(stageType, stageID string, runID uuid.UUID, state string, item *ScopeAmendmentItem, start time.Time, heartbeat bool, capSeconds int) AwaitStageOutput {
+	paths := make([]string, 0, len(item.Paths))
+	for _, p := range item.Paths {
+		paths = append(paths, fmt.Sprintf("%s (%s)", p.Path, p.Operation))
+	}
+	pathList := strings.Join(paths, ", ")
+	if pathList == "" {
+		pathList = "(no paths listed)"
+	}
+	return AwaitStageOutput{
+		Status:            "amendment_pending",
+		Stage:             stageType,
+		StageID:           stageID,
+		State:             state,
+		Terminal:          false,
+		WaitedSeconds:     time.Since(start).Seconds(),
+		Heartbeat:         heartbeat,
+		TimeoutCapSeconds: capSeconds,
+		PendingAmendment:  item,
+		NextStep: &SuggestedAction{
+			Action: "fishhawk_decide_scope_amendment",
+			Params: map[string]string{
+				"run_id":       runID.String(),
+				"amendment_id": item.ID,
+			},
+			Precondition: "the awaited stage filed this scope amendment and it is still pending",
+			Consumes:     "none",
+			Reason:       "the agent is blocked on this decision and proceeds as if denied when its ~5-minute window elapses",
+		},
+		Message: fmt.Sprintf("stage %q is still running and filed scope amendment %s for %s. Reason: %s. "+
+			"Decide it now with fishhawk_decide_scope_amendment (run_id + amendment_id are pre-filled on next_step): "+
+			"the agent polls ~5 minutes per request and then proceeds AS IF DENIED.",
+			stageType, item.ID, pathList, item.Reason),
+	}
 }
 
 // awaitStageSettledOutput builds the resolved response for a settled stage. It

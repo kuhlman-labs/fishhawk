@@ -106,13 +106,17 @@ non-terminal stage_wait_status IMMEDIATELY instead of blocking to terminal.
 Workflow after dispatch:
 
   1. fishhawk_dispatch_stage --stage implement ...   (returns the handle now)
-  2. fishhawk_await_stage --stage implement ...      (one terminal wait on the
-     handle — returned as next_step, pre-filled with run_id + stage_id).
-     Hand-polling fishhawk_get_run_status on the advertised poll_interval_seconds
-     is the documented fallback, not the primary path.
-  3. between polls/waits, when a scope_amendment_pending surfaces, call
-     fishhawk_decide_scope_amendment — so the runner's amendment poll resolves
-     before its window elapses, with no failed-stage retry.
+  2. fishhawk_await_stage --stage implement ...      (one wait on the handle —
+     returned as next_step, pre-filled with run_id + stage_id). It releases on
+     EITHER release condition: the stage settles, or the agent files a
+     mid-stage scope amendment (#2588). Hand-polling fishhawk_get_run_status on
+     the advertised poll_interval_seconds is the documented fallback, not the
+     primary path.
+  3. on an "amendment_pending" release, call fishhawk_decide_scope_amendment —
+     the amendment row and a pre-filled next_step ride out on that response, so
+     no companion fishhawk_list_scope_amendments poll is needed. Decide before
+     the runner's ~5-minute amendment window elapses, and no failed-stage retry
+     is needed. Then re-arm fishhawk_await_stage for the settlement.
 
 This is the DEFAULT verb for a local IMPLEMENT stage (#1247): the implement
 stage is the one stage type that can file a mid-stage scope amendment, and a
@@ -128,8 +132,10 @@ mid-stage scope-amendment channel, NOT the non-blocking part. A client that
 BACKGROUNDS long tool calls already gets clean async semantics from the
 blocking verbs (fishhawk_run_stage / fishhawk_run_children) for free — so such
 a client should not reach for dispatch just to wait. When you do dispatch,
-fishhawk_await_stage is the single terminal wait to call on the handle; it
-needs no poll loop.
+fishhawk_await_stage is the single wait to call on the handle; it needs no poll
+loop, and since #2588 it OBSERVES that amendment channel — it releases with
+status "amendment_pending" carrying the amendment row, so the channel this verb
+exists to enable no longer requires hand-polling to see.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage (this tool is local-only by design, ADR-024 Q5).
@@ -466,6 +472,8 @@ func awaitStageNextStep(runID, stageID, stage string) *SuggestedAction {
 		},
 		Precondition: "a runner was dispatched on this (run_id, stage_id) handle",
 		Consumes:     "none",
-		Reason:       "block until the dispatched stage settles, instead of hand-polling fishhawk_get_run_status",
+		Reason: "block until the dispatched stage settles OR the agent files a mid-stage scope amendment " +
+			"(status amendment_pending, carrying the amendment to decide, #2588) — no hand-polled " +
+			"fishhawk_get_run_status loop and no companion fishhawk_list_scope_amendments poll",
 	}
 }

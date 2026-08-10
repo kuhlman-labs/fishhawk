@@ -730,6 +730,488 @@ func TestAwaitStage_SuppliedTokenRaisesCapAndEmits(t *testing.T) {
 	}
 }
 
+// --- second release condition: a pending mid-stage scope amendment (#2588) ---
+
+// seedAmendment appends one scope-amendment row for (runID, stageID) with the
+// given status to the fake's list fixture and returns its id.
+func seedAmendment(fb *fakeBackend, runID, stageID uuid.UUID, status string, paths ...string) uuid.UUID {
+	amendmentID := uuid.New()
+	p := make([]ScopeAmendmentPath, 0, len(paths))
+	for _, path := range paths {
+		p = append(p, ScopeAmendmentPath{Path: path, Operation: "modify"})
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.amendmentsByRun[runID] = append(fb.amendmentsByRun[runID], ScopeAmendmentItem{
+		ID:      amendmentID.String(),
+		RunID:   runID.String(),
+		StageID: stageID.String(),
+		Paths:   p,
+		Reason:  "the coupled registration table must change too",
+		Status:  status,
+	})
+	return amendmentID
+}
+
+func amendmentReads(fb *fakeBackend, runID uuid.UUID) int {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return fb.amendmentsReadsByRun[runID]
+}
+
+// TestAwaitStage_ReleasesOnPendingAmendmentMidPoll is the #2588 done-means: an
+// implement stage that stays `running` (filing an amendment does NOT park it)
+// files a mid-stage amendment, and the armed wait releases with
+// amendment_pending — carrying the row and a pre-filled decide next_step — well
+// inside the timeout, instead of holding until the agent's ~5-minute window has
+// elapsed and the request has resolved as if denied. This is the assertion the
+// pre-#2588 code fails.
+func TestAwaitStage_ReleasesOnPendingAmendmentMidPoll(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	// The stage NEVER settles. The amendment appears at the second list read
+	// (read 1 is the fast-path probe, read 2 the first poll tick), so the
+	// release can only come from the poll-loop probe.
+	var amendmentID uuid.UUID
+	fb.amendmentsFlip = func(rid uuid.UUID, reads int) {
+		if rid == runID && reads == 2 {
+			amendmentID = uuid.New()
+			fb.amendmentsByRun[rid] = append(fb.amendmentsByRun[rid], ScopeAmendmentItem{
+				ID:      amendmentID.String(),
+				RunID:   rid.String(),
+				StageID: stageID.String(),
+				Paths: []ScopeAmendmentPath{
+					{Path: "backend/internal/mcpserver/tools_test.go", Operation: "modify"},
+					{Path: "docs/new.md", Operation: "create"},
+				},
+				Reason: "the coupled registration table must change too",
+				Status: "pending",
+			})
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	// A large timeout: if the amendment did not release the wait this would run
+	// to the deadline, so a prompt return IS the proof.
+	started := time.Now()
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("Status = %q, want amendment_pending", out.Status)
+	}
+	if elapsed := time.Since(started); elapsed > 30*time.Second {
+		t.Errorf("wait took %s; it must release well before the agent's ~5-minute amendment window", elapsed)
+	}
+	if out.Terminal {
+		t.Error("Terminal = true, want false — the stage has NOT settled, only the wait released")
+	}
+	if out.State != "running" {
+		t.Errorf("State = %q, want the raw running state", out.State)
+	}
+	if out.PendingAmendment == nil {
+		t.Fatal("PendingAmendment = nil; the amendment row must ride out so no second lookup is needed")
+	}
+	if out.PendingAmendment.ID != amendmentID.String() {
+		t.Errorf("PendingAmendment.ID = %q, want %s", out.PendingAmendment.ID, amendmentID)
+	}
+	if len(out.PendingAmendment.Paths) != 2 || out.PendingAmendment.Paths[1].Path != "docs/new.md" {
+		t.Errorf("PendingAmendment.Paths = %+v, want the two requested paths", out.PendingAmendment.Paths)
+	}
+	if out.PendingAmendment.Reason != "the coupled registration table must change too" {
+		t.Errorf("PendingAmendment.Reason = %q, want the agent's reason echoed", out.PendingAmendment.Reason)
+	}
+	if out.NextStep == nil {
+		t.Fatal("NextStep = nil; the decide call must be pre-filled so the operator acts in one hop")
+	}
+	if out.NextStep.Action != "fishhawk_decide_scope_amendment" {
+		t.Errorf("NextStep.Action = %q, want fishhawk_decide_scope_amendment", out.NextStep.Action)
+	}
+	if got := out.NextStep.Params["run_id"]; got != runID.String() {
+		t.Errorf("NextStep.Params[run_id] = %q, want %s", got, runID)
+	}
+	if got := out.NextStep.Params["amendment_id"]; got != amendmentID.String() {
+		t.Errorf("NextStep.Params[amendment_id] = %q, want %s", got, amendmentID)
+	}
+	if !strings.Contains(strings.ToLower(out.Message), "as if denied") || !strings.Contains(out.Message, amendmentID.String()) {
+		t.Errorf("message should name the amendment id and the proceed-as-if-denied urgency; got %q", out.Message)
+	}
+}
+
+// TestAwaitStage_ReleasesOnAmendmentAlreadyPendingAtArmTime covers the FAST
+// PATH probe: an operator whose wait timed out re-arms it against an amendment
+// that is ALREADY pending, and it must release immediately rather than after a
+// poll interval. Proven by the ?wait values on the wire: every stage read
+// carries wait=0 (the arm read + the settledness re-check), so no poll tick
+// (which issues ?wait=15) was ever taken.
+func TestAwaitStage_ReleasesOnAmendmentAlreadyPendingAtArmTime(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	amendmentID := seedAmendment(fb, runID, stageID, "pending", "backend/internal/mcpserver/onboarding.go")
+	r := newResolver(srv, nil)
+	// A poll interval long enough that a tick would never fire inside the test:
+	// releasing at all is proof the FAST-PATH probe fired.
+	r.reviewPollInterval = 30 * time.Second
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("Status = %q, want amendment_pending on the fast path", out.Status)
+	}
+	if out.PendingAmendment == nil || out.PendingAmendment.ID != amendmentID.String() {
+		t.Fatalf("PendingAmendment = %+v, want the seeded amendment %s", out.PendingAmendment, amendmentID)
+	}
+	fb.mu.Lock()
+	waits := append([]int(nil), fb.stageWaitWaitsByStageID[stageID]...)
+	fb.mu.Unlock()
+	// Two stage reads: the arm read, then the settledness re-check the
+	// amendment release performs before resolving. Neither is a poll tick.
+	if len(waits) != 2 {
+		t.Errorf("stage reads = %d (%v), want 2 (arm read + settledness re-check)", len(waits), waits)
+	}
+	for i, w := range waits {
+		if w > 0 {
+			t.Errorf("read[%d] ?wait = %d; a fast-path release must take no poll tick (which issues ?wait=15)", i, w)
+		}
+	}
+	if got := amendmentReads(fb, runID); got != 1 {
+		t.Errorf("amendment list reads = %d, want 1 (one probe, not a loop)", got)
+	}
+}
+
+// TestAwaitStage_SettledStageWinsOverPendingAmendment pins the ORDERING: the
+// settled check runs before the amendment probe, so a stage that has settled
+// with an amendment still pending resolves `settled`, never amendment_pending.
+//
+// The status assertion alone does NOT discriminate the ordering — the release's
+// own settledness re-check (see the interleaving test below) would recover
+// `settled` even with the probe moved first. The ordering is pinned on the
+// observable it uniquely controls: a settled stage costs ZERO amendment-list
+// reads, because the wait short-circuits before the probe. Moving the probe
+// above the sw.Terminal check drives that count to 1.
+func TestAwaitStage_SettledStageWinsOverPendingAmendment(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "succeeded", true)
+	seedAmendment(fb, runID, stageID, "pending", "docs/whatever.md")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" {
+		t.Fatalf("Status = %q, want settled — settledness wins over a pending amendment", out.Status)
+	}
+	if out.PendingAmendment != nil {
+		t.Errorf("PendingAmendment = %+v, want nil on the settled resolve", out.PendingAmendment)
+	}
+	if got := amendmentReads(fb, runID); got != 0 {
+		t.Errorf("amendment list reads = %d, want 0 — a settled stage must short-circuit BEFORE the probe", got)
+	}
+}
+
+// TestAwaitStage_SettledDuringAmendmentProbeWinsTheRace drives the
+// INTERLEAVING the pre-seeded settled-wins test above cannot discriminate: the
+// stage reads NON-TERMINAL when the wait checks it, and SETTLES while the
+// amendment-list read is in flight. Ordering alone does not deliver
+// "settledness always wins" here — the release must re-check settledness after
+// the probe finds a pending amendment and prefer settled. Deleting that
+// re-check makes this return amendment_pending for a stage that has in fact
+// settled.
+func TestAwaitStage_SettledDuringAmendmentProbeWinsTheRace(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	seedAmendment(fb, runID, stageID, "pending", "docs/whatever.md")
+	// The stage settles DURING the first amendment-list read: the flip runs
+	// under fb.mu inside that handler, after the wait's own stage read already
+	// reported running. The list still returns the pending amendment.
+	fb.amendmentsFlip = func(rid uuid.UUID, reads int) {
+		if rid == runID && reads == 1 {
+			env := fb.stageWaitByStageID[stageID]
+			env.State = "succeeded"
+			env.Terminal = true
+			fb.stageWaitByStageID[stageID] = env
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" {
+		t.Fatalf("Status = %q, want settled — a stage that settled while the amendment list was in flight must not surface as amendment_pending", out.Status)
+	}
+	if out.State != "succeeded" || !out.Terminal {
+		t.Errorf("State/Terminal = %q/%v, want succeeded/true from the re-check read", out.State, out.Terminal)
+	}
+	if out.PendingAmendment != nil {
+		t.Errorf("PendingAmendment = %+v, want nil on the settled resolve", out.PendingAmendment)
+	}
+}
+
+// TestAwaitStage_AmendmentReleaseSurvivesReCheckReadFailure covers the
+// settledness re-check's own failure branch: when the re-read fails, the
+// amendment release still stands (a pending amendment is KNOWN to exist;
+// settledness merely could not be confirmed) rather than failing the wait or
+// dereferencing a nil envelope.
+func TestAwaitStage_AmendmentReleaseSurvivesReCheckReadFailure(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	amendmentID := seedAmendment(fb, runID, stageID, "pending", "docs/whatever.md")
+	// Arm a 500 on the settledness RE-CHECK read (stage read 2): the arm read
+	// (read 1) already succeeded, so the failure lands only on the re-check.
+	fb.stageWaitFlip = func(sid uuid.UUID, reads int) {
+		if sid == stageID && reads == 2 {
+			fb.stageWaitStatusByStageID[sid] = 500
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage returned an error despite a best-effort re-check failure: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("Status = %q, want amendment_pending — a failed re-check leaves the amendment release in charge", out.Status)
+	}
+	if out.PendingAmendment == nil || out.PendingAmendment.ID != amendmentID.String() {
+		t.Fatalf("PendingAmendment = %+v, want the seeded amendment %s", out.PendingAmendment, amendmentID)
+	}
+}
+
+// TestAwaitStage_AmendmentMessageWithNoPaths covers the message's own degrade
+// branch: a row carrying no paths must render "(no paths listed)" rather than a
+// dangling "for ." — the message is what the operator reads to decide.
+func TestAwaitStage_AmendmentMessageWithNoPaths(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	// Seeded with NO paths by construction (the variadic is empty), so the red
+	// lands on the message assertion, not on fixture setup.
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	seedAmendment(fb, runID, stageID, "pending")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("Status = %q, want amendment_pending", out.Status)
+	}
+	if !strings.Contains(out.Message, "(no paths listed)") {
+		t.Errorf("message should degrade to the no-paths placeholder; got %q", out.Message)
+	}
+}
+
+// TestAwaitStage_DecidedAmendmentDoesNotRelease pins the strict status
+// predicate: already-decided (approved / denied) amendments are not actionable
+// and must not release a re-armed wait. Deleting the Status=="pending" filter
+// makes this release instead of timing out.
+func TestAwaitStage_DecidedAmendmentDoesNotRelease(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	seedAmendment(fb, runID, stageID, "approved", "docs/a.md")
+	seedAmendment(fb, runID, stageID, "denied", "docs/b.md")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fb.stageWaitFlip = func(sid uuid.UUID, reads int) {
+		if sid == stageID && reads == 3 {
+			cancel()
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(ctx, nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout — a DECIDED amendment must not release the wait", out.Status)
+	}
+}
+
+// TestAwaitStage_AmendmentForAnotherStageDoesNotRelease pins the strict
+// stage_id predicate: a sibling stage's pending amendment on the SAME run must
+// not release this stage's wait. Deleting the StageID equality filter makes
+// this release instead of timing out.
+func TestAwaitStage_AmendmentForAnotherStageDoesNotRelease(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	siblingID := seedStageWait(fb, runID, "acceptance", "running", false)
+	seedAmendment(fb, runID, siblingID, "pending", "docs/sibling.md")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fb.stageWaitFlip = func(sid uuid.UUID, reads int) {
+		if sid == stageID && reads == 3 {
+			cancel()
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(ctx, nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout — a SIBLING stage's amendment must not release this wait", out.Status)
+	}
+}
+
+// TestAwaitStage_AmendmentListErrorDoesNotFailTheWait proves the probe is
+// best-effort: a 500-ing scope-amendments endpoint must neither fail nor abort
+// the wait — the stage still settles mid-poll. Replacing the nil-on-error
+// return with a returned error fails this.
+func TestAwaitStage_AmendmentListErrorDoesNotFailTheWait(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	fb.amendmentsStatus = 500
+	fb.stageWaitFlip = settleStageWaitAt(fb, stageID, 3, "succeeded")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage returned an error despite a best-effort amendment probe: %v", err)
+	}
+	if out.Status != "settled" {
+		t.Fatalf("Status = %q, want settled (the poll path stayed in charge through a 500-ing probe)", out.Status)
+	}
+	if got := amendmentReads(fb, runID); got < 2 {
+		t.Errorf("amendment list reads = %d, want >= 2 (the failing probe kept being attempted, not disabled)", got)
+	}
+}
+
+// TestAwaitStage_RunTerminalStillWinsWhenNoAmendment is the regression pin that
+// the ADR-036 backstop is unchanged when the probe finds nothing: the amendment
+// probe is inserted BEFORE the backstop, so a probe that swallowed the
+// no-amendment case incorrectly (or resolved on it) would shadow run_terminal.
+func TestAwaitStage_RunTerminalStillWinsWhenNoAmendment(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedStageWait(fb, runID, "implement", "running", false)
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "failed"}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "run_terminal" {
+		t.Fatalf("Status = %q, want run_terminal (the backstop must still fire when no amendment is pending)", out.Status)
+	}
+}
+
+// TestAwaitStageToolDescription_NamesAmendmentRelease pins the tool text: the
+// verb must advertise its SECOND release condition, and must not imply the
+// settled-state set is the only one.
+func TestAwaitStageToolDescription_NamesAmendmentRelease(t *testing.T) {
+	ctx := context.Background()
+	_, srv := newFakeBackend(t)
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitStage(server, newResolver(srv, nil))
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_await_stage" {
+			desc = tool.Description
+			break
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_await_stage not registered")
+	}
+	lower := strings.ToLower(desc)
+	for _, want := range []string{
+		"two release conditions",
+		"amendment_pending",
+		"as if denied",
+		"does not park the stage",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("await_stage description must carry %q; got:\n%s", want, desc)
+		}
+	}
+}
+
 // TestAwaitStageProgressMessage pins the pure heartbeat-message helper.
 func TestAwaitStageProgressMessage(t *testing.T) {
 	got := awaitStageProgressMessage("implement", 12*time.Second)
