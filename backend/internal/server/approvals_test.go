@@ -8484,7 +8484,13 @@ func TestSubmitApproval_OverCapApprove_Refused(t *testing.T) {
 	s, ar, rr, au := newApprovalServer(t)
 	stage := rr.seedStage(run.StageStateAwaitingApproval)
 
-	overBy := 1
+	// overBy is a DISTINCTIVE, non-trivial overflow (not 1) so the overflow
+	// assertion below cannot be satisfied vacuously: `strings.Contains(body,
+	// "1")` was trivially true against the actual byte count (which contains a
+	// "1") and nearly any digit-bearing body (#2583 fix-up). The overflow is now
+	// pinned to the STRUCTURED details key, so the arithmetic
+	// bytes-minus-cap==overflow is genuinely asserted.
+	overBy := 137
 	n := prompt.MaxApprovalConditionBytes + overBy
 	w := submitApproval(t, s, stage.ID, approveBodyWithComment(t, "approve", n))
 
@@ -8498,14 +8504,19 @@ func TestSubmitApproval_OverCapApprove_Refused(t *testing.T) {
 	if !strings.Contains(body, `"comment"`) {
 		t.Errorf("body missing field=comment: %s", body)
 	}
-	// Message/details name the actual byte count, the cap, and the overflow.
+	// The details name the actual byte count, the cap, and the overflow — each
+	// pinned to its STRUCTURED JSON key so the assertion is non-vacuous. The
+	// envelope is emitted by a plain json.Encoder (no indent), so keys serialize
+	// as `"<key>":<int>` with no space after the colon. The `"bytes":<n>` match
+	// cannot alias `"max_bytes":<cap>` because the quote immediately precedes
+	// `bytes` only in the former.
 	for _, want := range []string{
-		fmt.Sprintf("%d", n),
-		fmt.Sprintf("%d", prompt.MaxApprovalConditionBytes),
-		fmt.Sprintf("%d", overBy),
+		fmt.Sprintf(`"bytes":%d`, n),
+		fmt.Sprintf(`"max_bytes":%d`, prompt.MaxApprovalConditionBytes),
+		fmt.Sprintf(`"overflow_bytes":%d`, overBy),
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("refusal body missing %q (actual/cap/overflow); got:\n%s", want, body)
+			t.Errorf("refusal body missing %q (actual/cap/overflow details); got:\n%s", want, body)
 		}
 	}
 	// COMMITTED-STATE assertion: no approval row inserted, no advance, no audit.
