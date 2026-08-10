@@ -7682,6 +7682,21 @@ func sliceAddRefusal(t *testing.T, p *plan.Plan, body string) (*httptest.Respons
 	return submitApproval(t, s, stage.ID, body), app, au, stage
 }
 
+// assertNoApprovalSubmittedAudit asserts the second half of the pre-Submit
+// invariant every refusal on this channel promises: no approval_submitted audit
+// entry was appended. The no-approval-row assertion alone does NOT pin it — an
+// implementation that appended the approval audit while still returning the
+// refusal status would satisfy a row-count-only check, so the recorded state is
+// read directly.
+func assertNoApprovalSubmittedAudit(t *testing.T, au *approvalAuditFake) {
+	t.Helper()
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" {
+			t.Errorf("unexpected approval_submitted audit entry after a refusal: the refusal is PRE-Submit, so it must record neither an approval row NOR an approval audit entry (payload: %s)", e.Payload)
+		}
+	}
+}
+
 // assertSliceAddValidationFailed asserts a 400 validation_failed carrying the
 // add_scope_files_to_slice field and the given details.reason, plus the two
 // pre-Submit invariants shared by every refusal on this channel: NO approval
@@ -7707,11 +7722,7 @@ func assertSliceAddValidationFailed(t *testing.T, w *httptest.ResponseRecorder, 
 	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
 		t.Errorf("approval rows after 400 = %d (err=%v), want 0 (refused before insert)", len(rows), err)
 	}
-	for _, e := range au.appended {
-		if e.Category == "approval_submitted" {
-			t.Errorf("unexpected approval_submitted audit entry after a refusal")
-		}
-	}
+	assertNoApprovalSubmittedAudit(t, au)
 	return env.Error.Details
 }
 
@@ -7743,11 +7754,7 @@ func TestSliceAddScopeFiles_FlatPlan_Returns422(t *testing.T) {
 	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
 		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
 	}
-	for _, e := range au.appended {
-		if e.Category == "approval_submitted" {
-			t.Errorf("unexpected approval_submitted audit entry after a refusal")
-		}
-	}
+	assertNoApprovalSubmittedAudit(t, au)
 }
 
 // TestSliceAddScopeFiles_NoPlanArtifact_FailsClosed pins refusal (2): a run
@@ -7756,9 +7763,14 @@ func TestSliceAddScopeFiles_FlatPlan_Returns422(t *testing.T) {
 // is refused 422 with reason plan_indeterminate, never let through. Seeded BY
 // CONSTRUCTION (a plan-stage run with no artifact), so the RED under a deleted
 // guard lands on the status assertion, not on fixture setup.
+//
+// The refusal is pinned to the promised PRE-Submit behavior on BOTH surfaces —
+// no approval row AND no approval_submitted audit entry — so an implementation
+// that appended the approval audit while still returning 422 fails here rather
+// than passing on the status code alone.
 func TestSliceAddScopeFiles_NoPlanArtifact_FailsClosed(t *testing.T) {
 	art := newFakeArtifactRepo()
-	s, rr, _, app := newBudgetCheckServer(t, art)
+	s, rr, au, app := newBudgetCheckServer(t, art)
 	r := rr.seedRun()
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 
@@ -7780,14 +7792,17 @@ func TestSliceAddScopeFiles_NoPlanArtifact_FailsClosed(t *testing.T) {
 	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
 		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
 	}
+	assertNoApprovalSubmittedAudit(t, au)
 }
 
 // TestSliceAddScopeFiles_PlanLoadError_FailsClosed pins refusal (3): a plan
 // READ FAILURE (distinct from an absent plan) is likewise indeterminate and
-// fails closed, diverging deliberately from the fail-OPEN sibling gates.
+// fails closed, diverging deliberately from the fail-OPEN sibling gates. Pinned
+// to the same two pre-Submit surfaces as its sibling above: no approval row and
+// no approval_submitted audit entry.
 func TestSliceAddScopeFiles_PlanLoadError_FailsClosed(t *testing.T) {
 	art := newFakeArtifactRepo()
-	s, rr, _, app := newBudgetCheckServer(t, art)
+	s, rr, au, app := newBudgetCheckServer(t, art)
 	p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
 	_, stage := seedBudgetRun(t, rr, art, p)
 	art.listErr = errors.New("artifact store unavailable")
@@ -7810,6 +7825,7 @@ func TestSliceAddScopeFiles_PlanLoadError_FailsClosed(t *testing.T) {
 	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
 		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
 	}
+	assertNoApprovalSubmittedAudit(t, au)
 }
 
 // TestSliceAddScopeFiles_UnresolvableKey_Returns400 pins refusal (4): a key
@@ -8121,6 +8137,47 @@ func TestSliceAddScopeFiles_NoMap_ByteIdenticalApprove(t *testing.T) {
 	payload := findApprovalSubmittedPayload(t, au.appended)
 	if _, ok := payload["add_scope_files_to_slice"]; ok {
 		t.Errorf("no-add approve must omit add_scope_files_to_slice, got %#v", payload["add_scope_files_to_slice"])
+	}
+}
+
+// TestSliceAddScopeFiles_NonPlanStageApprove_RecordsNothing pins the
+// plan-stage-only recording invariant (#2515 fixup, implement-review concern).
+// checkSliceAddScopeFiles — which canonicalises the map and enumerates every
+// ownership/shape refusal — runs ONLY inside the `approve && plan` block, so
+// the field must reach the approval_submitted payload from the plan stage
+// alone. Threading it unconditionally would let a direct HTTP approve of a
+// NON-plan stage on the same run record a RAW, un-canonicalised map: the
+// numeric key here is in the canonical shape loadApprovalSliceAddScopeFiles
+// reads back, and the paths are exactly the non-repo-relative ones
+// isRepoRelativePath refuses at the plan gate — so such a row would fold
+// "/etc/passwd" into a decomposed child's implement scope, bypassing every
+// enumerated refusal.
+//
+// The approve itself still succeeds (200): the field is IGNORED off the plan
+// stage, not an error — this is a recording-surface narrowing, not a new
+// refusal. The assertion therefore reads the COMMITTED audit payload rather
+// than a status code, since a status-only assertion would stay green with the
+// guard deleted.
+func TestSliceAddScopeFiles_NonPlanStageApprove_RecordsNothing(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+	// A NON-plan stage on the same run. Implement (rather than deploy) keeps the
+	// fixture free of the deploy gate's write:deploy scope + pre-flight, which
+	// would refuse before the params construction under test is even reached.
+	stage.Type = run.StageTypeImplement
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["/etc/passwd","../x"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the field is ignored off the plan stage, not refused):\n%s",
+			w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if got, ok := payload["add_scope_files_to_slice"]; ok {
+		t.Errorf("a NON-plan-stage approve recorded add_scope_files_to_slice = %#v; the gate that validates this channel runs on the plan stage alone, so an ungated map must never reach the approval_submitted payload", got)
 	}
 }
 

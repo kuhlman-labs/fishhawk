@@ -85,7 +85,11 @@ type approvalRequest struct {
 	// declared scope.files, an invalid path, and (fail-closed) a plan not
 	// positively confirmed decomposed. Recorded on the approval_submitted audit
 	// payload in canonical form and folded at implement-prompt-build time into
-	// ONLY the requesting child's own slice. Declared here so the
+	// ONLY the requesting child's own slice. The gate runs on the PLAN stage
+	// alone, so this field is recordable from the plan stage alone: an approve
+	// of any other stage type ignores it entirely rather than recording an
+	// ungated raw map (see the sliceAddScopeFiles local in
+	// handleSubmitApproval). Declared here so the
 	// DisallowUnknownFields decode accepts it; callers omit it (omitempty) and
 	// stay byte-identical to today.
 	AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice,omitempty"`
@@ -425,6 +429,25 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// falls through to live resolution rather than a shadowing empty
 	// audit).
 	var resolvedModel *ResolvedModel
+	// sliceAddScopeFiles carries the CANONICAL per-slice add map
+	// checkSliceAddScopeFiles produced, or nil. It is declared HERE, outside
+	// the plan block, and assigned ONLY inside it, so the per-slice channel is
+	// recordable from the PLAN STAGE ALONE — the one stage whose approve runs
+	// the gate (#2515 fixup).
+	//
+	// This is deliberately NOT the write-back-onto-req threading
+	// remove_scope_files uses: req outlives this block and feeds
+	// approveActionParams unconditionally, so threading req.AddScopeFilesToSlice
+	// would let a direct HTTP approve of a NON-plan stage (implement, review,
+	// deploy) on the same run record a RAW, un-canonicalised, un-validated map
+	// on its approval_submitted row — including the non-repo-relative paths
+	// ("/etc/passwd", "../x") isRepoRelativePath refuses at the plan gate.
+	// loadApprovalSliceAddScopeFiles scans by run + category with NO stage-type
+	// filter, so numeric-keyed entries from such a row would then fold into a
+	// decomposed child's implement scope, bypassing every enumerated refusal.
+	// A local assigned only under the gate makes that unreachable by
+	// construction rather than by a second check.
+	var sliceAddScopeFiles map[string][]string
 	if decision == approval.DecisionApprove && stage.Type == run.StageTypePlan {
 		if !s.checkPlanReviewSettled(w, r, stage) {
 			return
@@ -467,12 +490,13 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			return
 		}
-		// Thread the CANONICAL (index-keyed, trimmed, sorted, deduped) map back
-		// into the request so every downstream consumer — writeApprovalAudit and
-		// the prompt-side fold that reads it back — sees one canonical form
-		// regardless of whether the operator keyed by title or by index, exactly
-		// as req.RemoveScopeFiles is threaded above.
-		req.AddScopeFilesToSlice = sliceAdds
+		// Carry the CANONICAL (index-keyed, trimmed, sorted, deduped) map to the
+		// downstream consumers — writeApprovalAudit and the prompt-side fold that
+		// reads it back — so both see one canonical form regardless of whether
+		// the operator keyed by title or by index. Assigned to the plan-block
+		// local (see its declaration above), never written back onto req, so no
+		// non-plan-stage approve can carry this channel.
+		sliceAddScopeFiles = sliceAdds
 		// Scope-cap gate (#983): refuse an approve whose effective scope
 		// (plan scope.files ∪ add_scope_files ∖ remove_scope_files) exceeds
 		// the implement stage's max_files_changed, unless the comment carries
@@ -597,7 +621,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		ApproverGithubLogin: req.ApproverGithubLogin,
 		AddScopeFiles:       req.AddScopeFiles,
 		RemoveScopeFiles:    req.RemoveScopeFiles,
-		SliceAddScopeFiles:  req.AddScopeFilesToSlice,
+		SliceAddScopeFiles:  sliceAddScopeFiles,
 		BindingAssertions:   req.BindingAssertions,
 		ClaimsConcernIDs:    req.ClaimsConcernIDs,
 		DelegatedRule:       delegatedRule,
@@ -709,7 +733,10 @@ type approveActionParams struct {
 	// SliceAddScopeFiles is the CANONICAL (index-keyed) per-slice add map the
 	// #2515 gate produced, or nil when the approve carried none. Recorded on the
 	// approval_submitted payload; the in-process campaign auto-driver leaves it
-	// nil (it never targets a single slice).
+	// nil (it never targets a single slice). Only the HTTP handler's PLAN-stage
+	// branch ever sets it — the gate that canonicalises and validates the map
+	// runs there and nowhere else, so a non-plan-stage approve passes nil and
+	// records nothing on this channel.
 	SliceAddScopeFiles map[string][]string
 	BindingAssertions  []bindingAssertion
 	ClaimsConcernIDs   []string

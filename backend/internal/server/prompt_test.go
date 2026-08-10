@@ -9800,3 +9800,73 @@ func TestResolveApprovalAddScopeFiles_NoSliceMap_ByteIdentical(t *testing.T) {
 		t.Errorf("resolveApprovalAddScopeFiles = %v, want %v (per-slice channel must be inert)", got, flat)
 	}
 }
+
+// TestLoadApprovalSliceAddScopeFiles_BestEffortDegrades pins
+// loadApprovalSliceAddScopeFiles' two best-effort branches — the
+// ListForRunByCategory failure (WARN-and-nil) and the per-entry unmarshal skip
+// — which are load-bearing by ABSENCE: this loader runs at implement
+// prompt-BUILD time, so a regression that turned either degrade into a hard
+// failure or a panic would take down the prompt build for every run whose audit
+// read hiccuped, not just one carrying a per-slice map. Neither is reachable
+// through the HTTP fold tests (both need an injected repo failure or a
+// deliberately corrupt payload), so they are driven directly.
+func TestLoadApprovalSliceAddScopeFiles_BestEffortDegrades(t *testing.T) {
+	runID := uuid.New()
+	good := map[string][]string{"1": {"backend/only-slice-1.go"}}
+
+	// corruptEntry is an approval_submitted row whose payload is not decodable
+	// JSON — the shape a truncated/garbled write would leave behind.
+	corruptEntry := func() *audit.Entry {
+		rid := runID
+		return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: []byte(`{"decision":"approve","add_scope_files_to_slice":`)}
+	}
+
+	newServer := func(repo *feedbackAuditRepo) *Server {
+		return New(Config{Addr: "127.0.0.1:0", RunRepo: newPromptRunRepo(), AuditRepo: repo})
+	}
+
+	t.Run("list error degrades to nil", func(t *testing.T) {
+		s := newServer(&feedbackAuditRepo{
+			listErr: errors.New("audit store unavailable"),
+			byRunID: map[uuid.UUID][]*audit.Entry{
+				// Seeded deliberately: the entry WOULD fold if the read
+				// succeeded, so a nil result here is attributable to the error
+				// branch rather than to an empty fixture.
+				runID: {makeApproveWithSliceAddScopeFilesEntry(runID, good)},
+			},
+		})
+		if got := s.loadApprovalSliceAddScopeFiles(context.Background(), runID); got != nil {
+			t.Errorf("loadApprovalSliceAddScopeFiles on a list error = %v, want nil (best-effort WARN-and-nil, never a hard failure)", got)
+		}
+	})
+
+	t.Run("undecodable entry is skipped, not fatal", func(t *testing.T) {
+		// The corrupt entry is NEWEST (last in the ascending slice), so the
+		// newest-first scan visits it BEFORE the good one. A skip that broke out
+		// of the loop — or a decode that propagated the error — would return nil
+		// here, so this discriminates the `continue` from any other handling.
+		s := newServer(&feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeApproveWithSliceAddScopeFilesEntry(runID, good), corruptEntry()},
+		}})
+		got := s.loadApprovalSliceAddScopeFiles(context.Background(), runID)
+		if !reflect.DeepEqual(got, good) {
+			t.Errorf("loadApprovalSliceAddScopeFiles = %v, want %v (an undecodable newer entry must be skipped, and the older decodable one still folds)", got, good)
+		}
+	})
+
+	t.Run("only undecodable entries yields nil", func(t *testing.T) {
+		s := newServer(&feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {corruptEntry()},
+		}})
+		if got := s.loadApprovalSliceAddScopeFiles(context.Background(), runID); got != nil {
+			t.Errorf("loadApprovalSliceAddScopeFiles = %v, want nil when every entry is undecodable", got)
+		}
+	})
+
+	t.Run("unwired AuditRepo yields nil", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: newPromptRunRepo()})
+		if got := s.loadApprovalSliceAddScopeFiles(context.Background(), runID); got != nil {
+			t.Errorf("loadApprovalSliceAddScopeFiles with a nil AuditRepo = %v, want nil", got)
+		}
+	})
+}

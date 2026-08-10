@@ -10212,8 +10212,11 @@ paths:
                     path, or an empty path list. This channel ADDS a path to one
                     slice and does NOT MOVE a path already owned by another
                     slice — that needs a re-plan of the decomposition. Honored
-                    only on `approve`; ignored on `reject`. Omitting the field
-                    is byte-identical to today.
+                    only on `approve` AND only on a PLAN stage: the gate that
+                    validates and canonicalises the map runs there, so an
+                    approve of any other stage type IGNORES the field (still
+                    `200`) rather than recording an ungated map. Ignored on
+                    `reject`. Omitting the field is byte-identical to today.
                 binding_assertions:
                   type: array
                   items:
