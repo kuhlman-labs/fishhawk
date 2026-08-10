@@ -84,6 +84,15 @@ var detachedTerminateGrace = 5 * time.Second
 // merely launched — so the interleaving it exercises is deterministic.
 var detachedSpawnPreStartHook func(runID string)
 
+// detachedPreKillHook is a test seam that fires in terminateRunners AFTER the
+// post-TERM waitHandleDone grace elapses and BEFORE the pre-KILL handleExited
+// re-check. It exists so the pre-KILL skip branch — a child that reports exited
+// in the window between the grace timer firing and the KILL — can be exercised
+// deterministically (close h.done from the hook) instead of by sleeping and
+// hoping for that race. Nil in production; the call site nil-checks it. Follows
+// the detachedSpawnPreStartHook precedent above.
+var detachedPreKillHook func(*detachedRunnerHandle)
+
 // runStateProbe reads a run's live state. cancelRun hands one to
 // terminateRunners so the tombstone it records can admit a later re-dispatch
 // the moment the run leaves the cancelled state.
@@ -241,6 +250,28 @@ func (reg *detachedRunnerRegistry) deregister(h *detachedRunnerHandle) {
 // returns how many children it confirmed exited plus one warning per child
 // that never reported done (naming run id, stage id and pid).
 //
+// Before EACH signal it checks handleExited(h) — a non-blocking read of the
+// handle's done channel. A handle whose reaper has already closed done is a
+// confirmed-dead child: it is SKIPPED — not signalled, not counted in reaped
+// (it was not reaped BY US, we found it already gone), and not warned about.
+// This mirrors the runner-side holderAlreadyExited precedent
+// (runner/cmd/fishhawk-runner/lockholder.go, #2582), which treats a
+// confirmed-gone holder as eviction success rather than as a survivor; the MCP
+// side owns the handle and so reaches the same conclusion by the cheaper route,
+// needing no signal to learn the child is gone.
+//
+// SCOPE of the guard (#2584). done is closed only inside deregister, which the
+// spawn goroutine defers behind the WHOLE of reapDetachedRunner (run_stage.go),
+// whose non-zero-exit path runs a bounded-backoff report loop (reapReportBackoff)
+// with a fresh context per attempt. Throughout that loop the child is dead but
+// done is still OPEN, so handleExited reports 'not exited' and the dead pid is
+// signalled exactly as before — this guard does NOT collapse that ~132s
+// reporting-loop window. It makes the skip correct wherever the close DOES land
+// in time: a deregister completing AFTER terminateRunners took its snapshot
+// (most plausibly while blocked in the grace for an EARLIER handle of the same
+// multi-handle run) leaves a closed-but-still-in-snapshot handle, and the guard
+// stops us signalling, blocking on, and falsely warning about that dead child.
+//
 // probe is the live-state read the tombstone keeps so a later re-dispatch of a
 // revived run is admitted immediately; nil is accepted (the TTL is then the
 // only release).
@@ -261,9 +292,23 @@ func (reg *detachedRunnerRegistry) terminateRunners(runID string, probe runState
 	reaped := 0
 	var warnings []string
 	for _, h := range handles {
+		// Already-exited before we signal at all: skip without counting or
+		// warning — it was reaped by its own child exit, not by us.
+		if handleExited(h) {
+			continue
+		}
 		runStageSignalGroup(h.cmd, syscall.SIGTERM)
 		if waitHandleDone(h, detachedTerminateGrace) {
 			reaped++
+			continue
+		}
+		if detachedPreKillHook != nil {
+			detachedPreKillHook(h)
+		}
+		// The child can exit in the window between the grace timer firing and
+		// the KILL. Re-check before escalating: a now-exited handle is skipped,
+		// still without counting or warning.
+		if handleExited(h) {
 			continue
 		}
 		runStageSignalGroup(h.cmd, syscall.SIGKILL)
@@ -271,11 +316,29 @@ func (reg *detachedRunnerRegistry) terminateRunners(runID string, probe runState
 			reaped++
 			continue
 		}
+		// Reachable only by a handle still un-exited at BOTH signal points that
+		// never reported done.
 		warnings = append(warnings, fmt.Sprintf(
 			"detached runner for stage %s (pid %d) did not exit after TERM and KILL; "+
 				"it may still hold the lineage lock — kill pid %d by hand", h.stageID, h.pid, h.pid))
 	}
 	return reaped, warnings
+}
+
+// handleExited answers immediately whether the reaper has already reported the
+// child exited: a non-blocking receive on h.done, which the reaper closes after
+// cmd.Wait returns. It complements waitHandleDone, which waits a grace for the
+// same signal. Reading a closed channel this way needs no additional mutex —
+// under the Go memory model a channel close is synchronized before a receive
+// that observes it (https://go.dev/ref/mem#chan), so terminateRunners observing
+// the close never races the reaper goroutine that performed it.
+func handleExited(h *detachedRunnerHandle) bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // waitHandleDone waits up to grace for the reaper to report the child exited.
