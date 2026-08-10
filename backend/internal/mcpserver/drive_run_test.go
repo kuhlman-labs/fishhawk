@@ -679,7 +679,7 @@ func TestDriveRun_ScopeAmendmentPending_Decision(t *testing.T) {
 		t.Fatalf("stopped_reason = %q, want decision_required:scope_amendment_requested", out.StoppedReason)
 	}
 	if defaultDrivePollInterval > 30*time.Second {
-		t.Errorf("default drive poll interval %v exceeds the ~5-minute amendment window budget of 30s", defaultDrivePollInterval)
+		t.Errorf("default drive poll interval %v exceeds the ~15-minute amendment window budget of 30s", defaultDrivePollInterval)
 	}
 }
 

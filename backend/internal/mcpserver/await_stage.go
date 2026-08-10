@@ -140,7 +140,7 @@ why.)
 A pending scope amendment does NOT park the stage: it stays 'running' — there
 is no awaiting_scope_decision transition on this path, and that state now
 carries a decomposition-parent meaning (#2548). So settledness alone would
-never release, and the wait would hold past the agent's ~5-minute poll window.
+never release, and the wait would hold past the agent's ` + amendmentPollWindowAdjective() + ` poll window.
 The wait releases on the pending amendment instead; the stage state does not
 change.
 
@@ -154,10 +154,13 @@ Statuses:
                      reason, cap headroom — and next_step is a pre-filled
                      fishhawk_decide_scope_amendment call, so no separate
                      fishhawk_list_scope_amendments lookup is needed. Decide
-                     PROMPTLY: the agent polls ~5 minutes per request and then
-                     proceeds AS IF DENIED. Settledness wins the race — a
-                     stage that has settled resolves 'settled' even with an
-                     amendment still pending.
+                     PROMPTLY: the agent polls ` + amendmentPollWindowText() + ` per request; if the
+                     window elapses with no decision the request EXPIRES
+                     UNDECIDED — it stays pending server-side and is NOT a
+                     denial, so a late decision is still honored on a
+                     fishhawk_retry_stage of the same stage. Settledness wins
+                     the race — a stage that has settled resolves 'settled'
+                     even with an amendment still pending.
   - "timeout"      — nothing settled within the window. The wait holds no
                      server state, so a cut-short call is a safe no-op to
                      re-issue; poll_interval_seconds names the fallback
@@ -380,7 +383,8 @@ func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, 
 // takes the same type for the same reason.
 //
 // The endpoint returns items oldest-first, so the first match is the oldest
-// pending request — the one closest to its ~5-minute expiry.
+// pending request — the one closest to expiring undecided at the
+// amendmentPollWindow cap.
 func (r *runResolver) awaitStagePendingAmendment(ctx context.Context, runID uuid.UUID, stageID string) *ScopeAmendmentItem {
 	items, err := r.api.ListScopeAmendments(ctx, runID)
 	if err != nil {
@@ -459,12 +463,12 @@ func awaitStageAmendmentPendingOutput(stageType, stageID string, runID uuid.UUID
 			},
 			Precondition: "the awaited stage filed this scope amendment and it is still pending",
 			Consumes:     "none",
-			Reason:       "the agent is blocked on this decision and proceeds as if denied when its ~5-minute window elapses",
+			Reason:       "the agent is blocked on this decision and its " + amendmentPollWindowText() + " poll window expires UNDECIDED (an expiry is not a denial — the request stays pending)",
 		},
 		Message: fmt.Sprintf("stage %q is still running and filed scope amendment %s for %s. Reason: %s. "+
 			"Decide it now with fishhawk_decide_scope_amendment (run_id + amendment_id are pre-filled on next_step): "+
-			"the agent polls ~5 minutes per request and then proceeds AS IF DENIED.",
-			stageType, item.ID, pathList, item.Reason),
+			"the agent polls %s per request and then the request EXPIRES UNDECIDED (it stays pending — an expiry is not a denial, so decide now).",
+			stageType, item.ID, pathList, item.Reason, amendmentPollWindowText()),
 	}
 }
 

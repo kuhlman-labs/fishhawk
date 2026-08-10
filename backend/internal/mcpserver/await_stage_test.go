@@ -763,8 +763,8 @@ func amendmentReads(fb *fakeBackend, runID uuid.UUID) int {
 // implement stage that stays `running` (filing an amendment does NOT park it)
 // files a mid-stage amendment, and the armed wait releases with
 // amendment_pending — carrying the row and a pre-filled decide next_step — well
-// inside the timeout, instead of holding until the agent's ~5-minute window has
-// elapsed and the request has resolved as if denied. This is the assertion the
+// inside the timeout, instead of holding until the agent's ~15-minute window has
+// elapsed and the request has expired undecided. This is the assertion the
 // pre-#2588 code fails.
 func TestAwaitStage_ReleasesOnPendingAmendmentMidPoll(t *testing.T) {
 	fb, srv := newFakeBackend(t)
@@ -808,7 +808,7 @@ func TestAwaitStage_ReleasesOnPendingAmendmentMidPoll(t *testing.T) {
 		t.Fatalf("Status = %q, want amendment_pending", out.Status)
 	}
 	if elapsed := time.Since(started); elapsed > 30*time.Second {
-		t.Errorf("wait took %s; it must release well before the agent's ~5-minute amendment window", elapsed)
+		t.Errorf("wait took %s; it must release well before the agent's ~15-minute amendment window", elapsed)
 	}
 	if out.Terminal {
 		t.Error("Terminal = true, want false — the stage has NOT settled, only the wait released")
@@ -840,8 +840,14 @@ func TestAwaitStage_ReleasesOnPendingAmendmentMidPoll(t *testing.T) {
 	if got := out.NextStep.Params["amendment_id"]; got != amendmentID.String() {
 		t.Errorf("NextStep.Params[amendment_id] = %q, want %s", got, amendmentID)
 	}
-	if !strings.Contains(strings.ToLower(out.Message), "as if denied") || !strings.Contains(out.Message, amendmentID.String()) {
-		t.Errorf("message should name the amendment id and the proceed-as-if-denied urgency; got %q", out.Message)
+	// Post-#2601 contract: the message frames a lapsed window as an EXPIRY, not a
+	// denial. Require the amendment id AND an expiry marker, and assert the
+	// retired "as if denied" wording is ABSENT.
+	if !strings.Contains(strings.ToLower(out.Message), "expire") || !strings.Contains(out.Message, amendmentID.String()) {
+		t.Errorf("message should name the amendment id and the expiry framing; got %q", out.Message)
+	}
+	if strings.Contains(strings.ToLower(out.Message), "as if denied") {
+		t.Errorf("message must not carry the retired proceed-as-denied wording; got %q", out.Message)
 	}
 }
 
@@ -1203,12 +1209,17 @@ func TestAwaitStageToolDescription_NamesAmendmentRelease(t *testing.T) {
 	for _, want := range []string{
 		"two release conditions",
 		"amendment_pending",
-		"as if denied",
+		"expires",
 		"does not park the stage",
 	} {
 		if !strings.Contains(lower, want) {
 			t.Errorf("await_stage description must carry %q; got:\n%s", want, desc)
 		}
+	}
+	// The retired proceed-as-denied wording must be gone from the operator-facing
+	// tool description (#2601 / #2617).
+	if strings.Contains(lower, "as if denied") {
+		t.Errorf("await_stage description must not carry the retired 'as if denied' wording; got:\n%s", desc)
 	}
 }
 

@@ -1737,10 +1737,14 @@ func writeFixupPriorDiff(b *strings.Builder, t Trigger) {
 // amendment at agent exit lives in
 // runner/cmd/fishhawk-runner/main.go::detectUndecidedScopeAmendments.
 //
-// The ~15-minute figure is the ONE window number: the operator-facing
-// fishhawk_decide_scope_amendment tool doc
-// (backend/internal/mcpserver/scope_amendment.go) quotes the same figure, and
-// this prompt is what the agent actually follows.
+// The ~15-minute figure below is the one the agent actually follows. It is
+// MIRRORED by the mcpserver package constant amendmentPollWindowMinutes in
+// backend/internal/mcpserver/amendment_window.go, from which the operator-facing
+// fishhawk_decide_scope_amendment / fishhawk_await_stage / fishhawk_dispatch_stage
+// tool docs render the same figure. That constant unifies the mcpserver Go
+// surfaces only — it cannot render this prompt text or the operator READMEs — so
+// a correction to the number is three edits (here, the constant, the READMEs),
+// kept honest by the mcpserver guard test rather than a single source of truth.
 func writeScopeAmendments(b *strings.Builder) {
 	b.WriteString("### Mid-stage scope amendments\n\n")
 	b.WriteString("If, while implementing, you discover a file that MUST change but is not in the effective scope.files (a coupled test, a registration table, a doc companion), do NOT edit it — an undeclared edit is dropped from the commit and an undeclared created file fails the stage. Instead, request an operator-gated scope amendment:\n")
