@@ -4139,18 +4139,57 @@ func (s *Server) loadApprovalAddScopeFiles(ctx context.Context, runID uuid.UUID)
 	return nil
 }
 
-// resolveApprovalAddScopeFiles returns the structured add_scope_files paths
-// for an implement-stage prompt, resolving across the decomposition fan-out
-// boundary (#824, mirroring resolveApprovalConditions / #677). It reads the
-// run's own approval_submitted entries first; for a decomposed child with no
-// gate of its own that yields nil, so it falls back to the PARENT run's paths
-// so folded paths reach implement-only decomposed children.
+// resolveApprovalAddScopeFiles is the SOLE fold source for approve-time
+// scope.files additions. Every consumer reads it: the enforced implement scope
+// (mergeStructuredScopeFiles, on both the dispatch and render prompt paths),
+// the agent-facing shown set (shownScopeFilesForPrompt), the reviewer drift
+// baseline (amendedScopeFilesForReview), and trace.go's
+// operator-deliberate-add provenance sets. It returns the FLAT add_scope_files
+// paths (#824) unioned with the paths the per-slice channel (#2515) targeted at
+// THIS run's own slice — routing the per-slice channel through this one
+// function is what makes every consumer inherit it with no new call site to
+// miss. A run with no SliceIndex, or a slice with no recorded entry, unions
+// nothing and returns the identical result as before #2515.
+func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.Run) []string {
+	flat := s.resolveApprovalFlatAddScopeFiles(ctx, runRow)
+	slicePaths := s.resolveApprovalSliceAddScopeFiles(ctx, runRow)
+	if len(slicePaths) == 0 {
+		return flat
+	}
+	seen := make(map[string]struct{}, len(flat)+len(slicePaths))
+	out := make([]string, 0, len(flat)+len(slicePaths))
+	for _, p := range flat {
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	for _, p := range slicePaths {
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out
+}
+
+// resolveApprovalFlatAddScopeFiles returns the structured FLAT add_scope_files
+// paths for an implement-stage prompt, resolving across the decomposition
+// fan-out boundary (#824, mirroring resolveApprovalConditions / #677). It reads
+// the run's own approval_submitted entries first; for a decomposed child with
+// no gate of its own that yields nil, so it falls back to the PARENT run's
+// paths so folded paths reach implement-only decomposed children.
 //
 // CI-retry / category-B recovery children (#978) carry ParentRunID instead
 // of DecomposedFrom and get the same single-level fallback: the parent's
 // folded paths were part of its effective scope and must reach the
 // recovery implement stage too.
-func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.Run) []string {
+//
+// Split out of resolveApprovalAddScopeFiles when the per-slice channel (#2515)
+// joined the fold; the walk itself is unchanged.
+func (s *Server) resolveApprovalFlatAddScopeFiles(ctx context.Context, runRow *run.Run) []string {
 	if paths := s.loadApprovalAddScopeFiles(ctx, runRow.ID); len(paths) > 0 {
 		return paths
 	}
@@ -4176,6 +4215,88 @@ func (s *Server) resolveApprovalAddScopeFiles(ctx context.Context, runRow *run.R
 			slog.String("parent_run_id", runRow.ParentRunID.String()),
 		)
 	}
+	return paths
+}
+
+// loadApprovalSliceAddScopeFiles scans the run's approval_submitted audit
+// entries (newest-first) for the first approve carrying a non-empty
+// add_scope_files_to_slice map and returns it (#2515). The per-slice mirror of
+// loadApprovalAddScopeFiles; the map is CANONICAL index-keyed form (the gate
+// canonicalises before recording), so the key is strconv.Itoa(slice_index).
+// Best-effort: WARN-logs and returns nil on any error.
+func (s *Server) loadApprovalSliceAddScopeFiles(ctx context.Context, runID uuid.UUID) map[string][]string {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: list approval_submitted for add_scope_files_to_slice failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	for i := len(entries) - 1; i >= 0; i-- {
+		var payload struct {
+			Decision             string              `json:"decision"`
+			AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice"`
+		}
+		if err := json.Unmarshal(entries[i].Payload, &payload); err != nil {
+			continue
+		}
+		if payload.Decision == "approve" && len(payload.AddScopeFilesToSlice) > 0 {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: loaded per-slice add_scope_files for implement scope",
+				slog.String("run_id", runID.String()),
+				slog.Int("slice_count", len(payload.AddScopeFilesToSlice)),
+			)
+			return payload.AddScopeFilesToSlice
+		}
+	}
+	return nil
+}
+
+// resolveApprovalSliceAddScopeFiles returns the per-slice add_scope_files paths
+// targeted at THIS run's own slice (#2515), or nil.
+//
+// It returns paths ONLY for a decomposition fan-out child — DecomposedFrom AND
+// SliceIndex both non-nil — and selects solely m[strconv.Itoa(*SliceIndex)], so
+// a path added to one slice reaches that slice and NO other. That single
+// selection is what upholds single-owner-file across the channel; folding the
+// whole map would reproduce the exact add/add fan-in #2103's refusal names.
+//
+// It reads the run's own approval_submitted rows first, then falls back to the
+// decomposition parent's — the same single-level fan-out walk
+// resolveApprovalFlatAddScopeFiles does, and the one that matters in practice
+// since the gate that records the map lives on the PARENT's plan stage.
+//
+// A run with a nil SliceIndex folds NOTHING, deliberately: a plan-stage-less
+// recovery child of a decomposed parent (#2027 case 1) inherits the parent's
+// FULL declared scope, and folding the union there would widen its scope beyond
+// what any single slice was granted. An out-of-range persisted SliceIndex
+// likewise folds nothing (no such key) rather than falling back to another
+// slice's paths.
+func (s *Server) resolveApprovalSliceAddScopeFiles(ctx context.Context, runRow *run.Run) []string {
+	if runRow.DecomposedFrom == nil || runRow.SliceIndex == nil {
+		return nil
+	}
+	m := s.loadApprovalSliceAddScopeFiles(ctx, runRow.ID)
+	if len(m) == 0 {
+		m = s.loadApprovalSliceAddScopeFiles(ctx, *runRow.DecomposedFrom)
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	paths := m[strconv.Itoa(*runRow.SliceIndex)]
+	if len(paths) == 0 {
+		return nil
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+		"prompt: folded per-slice add_scope_files for this child's own slice",
+		slog.String("child_run_id", runRow.ID.String()),
+		slog.Int("slice_index", *runRow.SliceIndex),
+		slog.Int("count", len(paths)),
+	)
 	return paths
 }
 

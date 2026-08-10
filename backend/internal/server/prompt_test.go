@@ -9523,3 +9523,280 @@ func TestResolveHeldCommitExemption_WithholdsForBuildRequiredPark(t *testing.T) 
 		t.Fatalf("control: the SAME park without build-required paths must still emit the held-commit fields; got keys %v", controlKeys)
 	}
 }
+
+// makeApproveWithSliceAddScopeFilesEntry builds an approval_submitted audit
+// entry carrying the CANONICAL index-keyed per-slice add map (#2515) — the
+// exact shape writeApprovalAudit records.
+func makeApproveWithSliceAddScopeFilesEntry(runID uuid.UUID, m map[string][]string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"decision":                 "approve",
+		"add_scope_files_to_slice": m,
+	})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "approval_submitted", RunID: &rid, Payload: payload}
+}
+
+// TestResolveApprovalAddScopeFiles_SliceChannel_TargetsOnlyOwnSlice is the
+// #2515 done-means and the LOAD-BEARING single-owner-file assertion: a
+// three-slice decomposition with a per-slice add recorded against slice 1 must
+// put the added path in the slice-1 child's effective implement scope and in NO
+// other slice's. The sibling slices' resolved scopes are asserted BYTE-IDENTICAL
+// to a control run with no per-slice map, so a fold that leaked the whole map
+// (the exact add/add fan-in #2103's refusal names) turns this red.
+func TestResolveApprovalAddScopeFiles_SliceChannel_TargetsOnlyOwnSlice(t *testing.T) {
+	const addedPath = "backend/internal/server/restored.go"
+
+	newParentPlan := func() *plan.Plan {
+		return &plan.Plan{
+			PlanVersion: "standard_v1",
+			Summary:     "parent plan",
+			Scope: plan.Scope{
+				Files: []plan.ScopeFile{
+					{Path: "pkg/a/a.go", Operation: plan.FileOpModify},
+					{Path: "pkg/b/b.go", Operation: plan.FileOpModify},
+					{Path: "pkg/c/c.go", Operation: plan.FileOpModify},
+				},
+			},
+			Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+			Decomposition: &plan.Decomposition{
+				Rationale: "scope split",
+				SubPlans: []plan.SubPlanSummary{
+					{Title: "Part A", ScopeHint: "A.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+					{Title: "Part B", ScopeHint: "B.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
+					{Title: "Part C", ScopeHint: "C.", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/c/c.go", Operation: plan.FileOpModify}}}},
+				},
+			},
+		}
+	}
+
+	// seed wires a parent decomposed plan + three fan-out children (slice 0/1/2)
+	// and returns the server plus the children's implement stage ids, indexed by
+	// slice. sliceMap is the per-slice add map recorded on the PARENT's approval
+	// row; nil records no map at all (the control).
+	seed := func(t *testing.T, sliceMap map[string][]string) (*Server, []uuid.UUID) {
+		t.Helper()
+		rr := newPromptRunRepo()
+		sf := newSigningFake()
+		art := newFakeArtifactRepo()
+
+		parentRunID := uuid.New()
+		parentPlanStageID := uuid.New()
+
+		planBytes, err := json.Marshal(newParentPlan())
+		if err != nil {
+			t.Fatalf("marshal parent plan: %v", err)
+		}
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID:       parentPlanStageID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       planBytes,
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+		rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+			parentRunID: {{ID: parentPlanStageID, RunID: parentRunID, Type: run.StageTypePlan}},
+		}
+		rr.getRuns[parentRunID] = &run.Run{ID: parentRunID, Repo: "o/r"}
+
+		stageIDs := make([]uuid.UUID, 3)
+		for i := 0; i < 3; i++ {
+			childRunID := uuid.New()
+			childStageID := uuid.New()
+			idx := i
+			rr.getRuns[childRunID] = &run.Run{
+				ID:             childRunID,
+				Repo:           "o/r",
+				WorkflowID:     "feature_change",
+				TriggerSource:  run.TriggerCLI,
+				ParentRunID:    &parentRunID,
+				DecomposedFrom: &parentRunID,
+				SliceIndex:     &idx,
+			}
+			rr.getStages[childStageID] = &run.Stage{ID: childStageID, RunID: childRunID, Type: run.StageTypeImplement}
+			stageIDs[i] = childStageID
+		}
+
+		auditByRun := map[uuid.UUID][]*audit.Entry{}
+		if sliceMap != nil {
+			auditByRun[parentRunID] = []*audit.Entry{
+				makeApproveWithSliceAddScopeFilesEntry(parentRunID, sliceMap),
+			}
+		}
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			RunRepo:      rr,
+			SigningRepo:  sf,
+			ArtifactRepo: art,
+			AuditRepo:    &feedbackAuditRepo{byRunID: auditByRun},
+		})
+		s.promptIssueGetterOverride = &stubIssueGetter{}
+		return s, stageIDs
+	}
+
+	// renderScope returns the child's effective scope.files paths plus the
+	// rendered prompt TEXT (where the agent-facing "Operator-added scope files"
+	// section lives).
+	renderScope := func(t *testing.T, s *Server, stageID uuid.UUID) ([]string, string) {
+		t.Helper()
+		w := promptRenderRequest(t, s, stageID)
+		if w.Code != http.StatusOK {
+			t.Fatalf("prompt-render status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp struct {
+			Prompt     string `json:"prompt"`
+			ScopeFiles []struct {
+				Path string `json:"path"`
+			} `json:"scope_files"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode prompt-render: %v\n%s", err, w.Body.String())
+		}
+		paths := make([]string, 0, len(resp.ScopeFiles))
+		for _, f := range resp.ScopeFiles {
+			paths = append(paths, f.Path)
+		}
+		return paths, resp.Prompt
+	}
+
+	// Control: identical fixture with NO per-slice map recorded.
+	control, controlStages := seed(t, nil)
+	controlScopes := make([][]string, 3)
+	for i := 0; i < 3; i++ {
+		controlScopes[i], _ = renderScope(t, control, controlStages[i])
+	}
+	const operatorAddedHeading = "Operator-added scope files (approved — in-scope, do NOT request an amendment)"
+
+	// Per-slice add targeted at slice 1 ONLY.
+	s, stageIDs := seed(t, map[string][]string{"1": {addedPath}})
+
+	for i := 0; i < 3; i++ {
+		got, promptText := renderScope(t, s, stageIDs[i])
+		has := false
+		for _, p := range got {
+			if p == addedPath {
+				has = true
+			}
+		}
+		if i == 1 {
+			if !has {
+				t.Errorf("slice-1 child scope_files missing the per-slice add %q; got %v", addedPath, got)
+			}
+			// The agent must SEE the added path as operator-added so it does not
+			// file a redundant mid-stage amendment for an already-folded path.
+			// Assert it appears INSIDE that section, not merely anywhere in the
+			// prompt (the enforced scope list also names it).
+			hdr := strings.Index(promptText, operatorAddedHeading)
+			if hdr < 0 {
+				t.Fatalf("slice-1 child prompt missing the %q section:\n%s", operatorAddedHeading, promptText)
+			}
+			if !strings.Contains(promptText[hdr:], addedPath) {
+				t.Errorf("slice-1 child prompt's operator-added section missing %q:\n%s", addedPath, promptText[hdr:])
+			}
+			continue
+		}
+		if strings.Contains(promptText, operatorAddedHeading) {
+			t.Errorf("slice-%d child prompt renders an operator-added section; the per-slice add must not reach a sibling slice", i)
+		}
+		if has {
+			t.Errorf("slice-%d child scope_files contains %q — the per-slice add fanned into a sibling slice (single-owner-file violated); got %v", i, addedPath, got)
+		}
+		if !reflect.DeepEqual(got, controlScopes[i]) {
+			t.Errorf("slice-%d child scope_files = %v, want byte-identical to the no-map control %v", i, got, controlScopes[i])
+		}
+	}
+}
+
+// TestResolveApprovalSliceAddScopeFiles_Guards pins the fold's defensive
+// branches one by one, against a parent row carrying a recorded per-slice map:
+// a run with a nil SliceIndex folds NOTHING (the recovery-child case — folding
+// the union would widen its scope past any single slice's grant); a
+// non-decomposed run folds nothing; an out-of-range persisted SliceIndex folds
+// nothing rather than falling back to another slice; and a slice with no entry
+// in the map folds nothing.
+func TestResolveApprovalSliceAddScopeFiles_Guards(t *testing.T) {
+	parentRunID := uuid.New()
+	// BOTH slice 0 and slice 1 carry entries, deliberately: a guard that
+	// degraded a nil or out-of-range SliceIndex to slice 0 (or clamped it to a
+	// neighbour) would then fold slice 0's paths, so each "folds nothing" case
+	// below actually discriminates instead of passing vacuously.
+	recorded := map[string][]string{
+		"0": {"backend/slice-0.go"},
+		"1": {"backend/only-slice-1.go"},
+	}
+
+	newServer := func() *Server {
+		rr := newPromptRunRepo()
+		return New(Config{
+			Addr:    "127.0.0.1:0",
+			RunRepo: rr,
+			AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+				parentRunID: {makeApproveWithSliceAddScopeFilesEntry(parentRunID, recorded)},
+			}},
+		})
+	}
+
+	idx := func(i int) *int { return &i }
+
+	cases := []struct {
+		name string
+		row  *run.Run
+		want []string
+	}{
+		{
+			name: "decomposed child on the targeted slice folds its own entry",
+			row:  &run.Run{ID: uuid.New(), DecomposedFrom: &parentRunID, SliceIndex: idx(1)},
+			want: []string{"backend/only-slice-1.go"},
+		},
+		{
+			name: "nil SliceIndex folds nothing",
+			row:  &run.Run{ID: uuid.New(), DecomposedFrom: &parentRunID, SliceIndex: nil},
+			want: nil,
+		},
+		{
+			name: "non-decomposed run folds nothing",
+			row:  &run.Run{ID: uuid.New(), DecomposedFrom: nil, SliceIndex: idx(0)},
+			want: nil,
+		},
+		{
+			name: "out-of-range SliceIndex folds nothing (no fallback to another slice)",
+			row:  &run.Run{ID: uuid.New(), DecomposedFrom: &parentRunID, SliceIndex: idx(7)},
+			want: nil,
+		},
+		{
+			name: "slice with no recorded entry folds nothing",
+			row:  &run.Run{ID: uuid.New(), DecomposedFrom: &parentRunID, SliceIndex: idx(2)},
+			want: nil,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := newServer()
+			got := s.resolveApprovalSliceAddScopeFiles(context.Background(), c.row)
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("resolveApprovalSliceAddScopeFiles = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestResolveApprovalAddScopeFiles_NoSliceMap_ByteIdentical asserts the
+// per-slice channel is inert for a run that never used it: the flat
+// add_scope_files fold returns exactly what it returned before #2515.
+func TestResolveApprovalAddScopeFiles_NoSliceMap_ByteIdentical(t *testing.T) {
+	runID := uuid.New()
+	flat := []string{"backend/flat-a.go", "backend/flat-b.go"}
+	rr := newPromptRunRepo()
+	s := New(Config{
+		Addr:    "127.0.0.1:0",
+		RunRepo: rr,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{
+			runID: {makeApproveWithScopeFilesEntry(runID, flat)},
+		}},
+	})
+	got := s.resolveApprovalAddScopeFiles(context.Background(), &run.Run{ID: runID})
+	if !reflect.DeepEqual(got, flat) {
+		t.Errorf("resolveApprovalAddScopeFiles = %v, want %v (per-slice channel must be inert)", got, flat)
+	}
+}

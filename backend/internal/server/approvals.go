@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -71,6 +74,21 @@ type approvalRequest struct {
 	// DisallowUnknownFields decode accepts it; callers omit it (omitempty) and
 	// stay byte-identical to today.
 	RemoveScopeFiles []string `json:"remove_scope_files,omitempty"`
+	// AddScopeFilesToSlice is the per-slice counterpart of AddScopeFiles for a
+	// DECOMPOSED plan (#2515). Flat add_scope_files is refused outright on a
+	// decomposed plan (#2103) because a folded path fans into EVERY slice; this
+	// map targets exactly ONE slice per path, keyed by the sub-plan TITLE or its
+	// 0-based decimal index. The gate (checkSliceAddScopeFiles) canonicalises it
+	// to index-keyed form and refuses — pre-Submit, before any approval row is
+	// inserted — an unresolvable/ambiguous key, two keys naming one slice, a path
+	// under two slices, a path whose ownership overlaps a DIFFERENT slice's
+	// declared scope.files, an invalid path, and (fail-closed) a plan not
+	// positively confirmed decomposed. Recorded on the approval_submitted audit
+	// payload in canonical form and folded at implement-prompt-build time into
+	// ONLY the requesting child's own slice. Declared here so the
+	// DisallowUnknownFields decode accepts it; callers omit it (omitempty) and
+	// stay byte-identical to today.
+	AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice,omitempty"`
 	// BindingAssertions is an OPTIONAL list of operator-declared,
 	// deterministic binding-assertion checks (#1171). Each is a typed
 	// substring assertion (file_contains | test_asserts) the operator
@@ -440,6 +458,21 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		if !s.checkDecomposedAddScopeFiles(w, r, stage, req.AddScopeFiles) {
 			return
 		}
+		// Per-slice add channel (#2515): the decomposed-plan counterpart of the
+		// flat add refused just above. Every ownership violation is enumerated
+		// and refused PRE-Submit — before any approval row is inserted — for the
+		// same ADR-036 reason as its siblings, and placed here so this
+		// categorical (no-override) gate precedes the override-able cap error.
+		sliceAdds, ok := s.checkSliceAddScopeFiles(w, r, stage, req.AddScopeFilesToSlice)
+		if !ok {
+			return
+		}
+		// Thread the CANONICAL (index-keyed, trimmed, sorted, deduped) map back
+		// into the request so every downstream consumer — writeApprovalAudit and
+		// the prompt-side fold that reads it back — sees one canonical form
+		// regardless of whether the operator keyed by title or by index, exactly
+		// as req.RemoveScopeFiles is threaded above.
+		req.AddScopeFilesToSlice = sliceAdds
 		// Scope-cap gate (#983): refuse an approve whose effective scope
 		// (plan scope.files ∪ add_scope_files ∖ remove_scope_files) exceeds
 		// the implement stage's max_files_changed, unless the comment carries
@@ -447,7 +480,12 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		// checkPlanReviewSettled: a refused approval must insert no row so
 		// a retry after re-scope or with the override flows normally
 		// (post-Submit, the idempotent-first-wins retry would skip gates).
-		if !s.checkPlanScopeCap(w, r, stage, req.Comment, req.AddScopeFiles, req.RemoveScopeFiles) {
+		//
+		// A per-slice add consumes cap headroom exactly like a flat add (#2515):
+		// the flattened union rides in alongside add_scope_files so the number
+		// the gate reports stays equal to the scope the prompt builder assembles.
+		if !s.checkPlanScopeCap(w, r, stage, req.Comment,
+			unionScopeAdds(req.AddScopeFiles, sliceAdds), req.RemoveScopeFiles) {
 			return
 		}
 		// Budget gate (#986): refuse an approve whose plan predicts a
@@ -559,6 +597,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		ApproverGithubLogin: req.ApproverGithubLogin,
 		AddScopeFiles:       req.AddScopeFiles,
 		RemoveScopeFiles:    req.RemoveScopeFiles,
+		SliceAddScopeFiles:  req.AddScopeFilesToSlice,
 		BindingAssertions:   req.BindingAssertions,
 		ClaimsConcernIDs:    req.ClaimsConcernIDs,
 		DelegatedRule:       delegatedRule,
@@ -667,12 +706,17 @@ type approveActionParams struct {
 	ApproverGithubLogin string
 	AddScopeFiles       []string
 	RemoveScopeFiles    []string
-	BindingAssertions   []bindingAssertion
-	ClaimsConcernIDs    []string
-	DelegatedRule       string
-	ResolvedModel       *ResolvedModel
-	PlanModel           string
-	ReviewModel         string
+	// SliceAddScopeFiles is the CANONICAL (index-keyed) per-slice add map the
+	// #2515 gate produced, or nil when the approve carried none. Recorded on the
+	// approval_submitted payload; the in-process campaign auto-driver leaves it
+	// nil (it never targets a single slice).
+	SliceAddScopeFiles map[string][]string
+	BindingAssertions  []bindingAssertion
+	ClaimsConcernIDs   []string
+	DelegatedRule      string
+	ResolvedModel      *ResolvedModel
+	PlanModel          string
+	ReviewModel        string
 	// PredicateResolution, when non-nil, carries the forge-resolved
 	// min_permission / member_of values a satisfied approval-gate predicate
 	// resolution produced (E39.5 / #1710). The HTTP handler stashes it from
@@ -815,7 +859,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 				// vote), and the stage stays awaiting_approval until the
 				// baseline is readable again. No predicate_snapshot — nothing
 				// about the effective requirement is known to snapshot.
-				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
 				return &approveActionResult{Stage: p.Stage}, nil
 			}
@@ -825,7 +869,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -955,7 +999,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.BindingAssertions, p.ClaimsConcernIDs, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -1636,7 +1680,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, sliceAddScopeFiles map[string][]string, bindingAssertions []bindingAssertion, claimsConcernIDs []string, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -1684,6 +1728,17 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	// the prompt builder reads this back via loadApprovalAddScopeFiles.
 	if app.Decision == approval.DecisionApprove && len(addScopeFiles) > 0 {
 		auditPayload["add_scope_files"] = addScopeFiles
+	}
+	// Per-slice scope add (#2515): record the CANONICAL index-keyed map the gate
+	// produced, so the prompt builder reads it back via
+	// loadApprovalSliceAddScopeFiles and folds only the entry keyed to the
+	// requesting child's own slice_index. The index — not the title — is the
+	// durable join key: it matches the runs.slice_index column the fan-out
+	// children carry, and a title-keyed request records byte-identically to the
+	// equivalent index-keyed one. The key is omitted on a no-add approve so
+	// prompt-hash replay stays byte-identical to today.
+	if app.Decision == approval.DecisionApprove && len(sliceAddScopeFiles) > 0 {
+		auditPayload["add_scope_files_to_slice"] = sliceAddScopeFiles
 	}
 	// Gate-time scope removal (#1726): record the authoritative paths removed
 	// from the implement scope, plus the before/after effective-scope file
@@ -2358,6 +2413,428 @@ func (s *Server) checkDecomposedAddScopeFiles(w http.ResponseWriter, r *http.Req
 		"add_scope_files on a decomposed plan fans into EVERY sub-plan slice, violating single-owner-file and guaranteeing an add/add fan-in conflict; there is no per-slice add channel and no override. Re-plan the decomposition so each added file is declared in exactly one slice's scope.files",
 		details)
 	return false
+}
+
+// errCodeSliceAddRequiresDecomposed is the ONE new error code the per-slice
+// add channel introduces (#2515). Every other refusal on this channel is a
+// shape/ownership violation and reuses the existing 400 validation_failed code
+// with details.field = add_scope_files_to_slice — so the channel adds exactly
+// one code, not two, and the API docs enumerate the same single addition.
+const errCodeSliceAddRequiresDecomposed = "plan_slice_add_scope_files_requires_decomposed_plan"
+
+// normalizeOwnershipPath renders a scope path in the form ownership containment
+// is compared on: whitespace-trimmed with every trailing '/' removed. A
+// trailing slash marks a DIRECTORY on this channel (the #824 add_scope_files
+// convention the request body inherits), so "pkg/foo/" and "pkg/foo" name the
+// same owned subtree and must compare equal.
+func normalizeOwnershipPath(p string) string {
+	return strings.TrimRight(strings.TrimSpace(p), "/")
+}
+
+// scopePathsOverlap reports whether two scope paths overlap in OWNERSHIP —
+// identical, or one an ANCESTOR of the other (binding condition 1). String
+// equality is NOT sufficient here: a slice may own a DIRECTORY (trailing
+// slash), so handing a file INSIDE that directory to a different slice passes
+// every equality check while both slices stage the same file at fan-in —
+// exactly the add/add conflict single-owner-file exists to prevent.
+//
+// Containment is compared on path SEGMENT boundaries, so "pkg/foo" does not
+// spuriously conflict with the sibling "pkg/foobar". Two paths that both
+// normalize to empty (degenerate) compare equal; an empty against a non-empty
+// never overlaps.
+func scopePathsOverlap(a, b string) bool {
+	na, nb := normalizeOwnershipPath(a), normalizeOwnershipPath(b)
+	if na == "" || nb == "" {
+		return na == nb
+	}
+	if na == nb {
+		return true
+	}
+	return strings.HasPrefix(nb, na+"/") || strings.HasPrefix(na, nb+"/")
+}
+
+// unionScopeAdds flattens a canonical per-slice add map into flat and returns
+// the deduped union, so a slice-targeted add consumes scope-cap headroom
+// exactly like a flat add (#2515). flat is never mutated; the per-slice paths
+// are appended in canonical (index, then path) order so the result is
+// deterministic across runs despite Go's randomized map iteration.
+func unionScopeAdds(flat []string, perSlice map[string][]string) []string {
+	if len(perSlice) == 0 {
+		return flat
+	}
+	out := make([]string, 0, len(flat)+len(perSlice))
+	seen := make(map[string]struct{}, len(flat)+len(perSlice))
+	for _, p := range flat {
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	keys := make([]string, 0, len(perSlice))
+	for k := range perSlice {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		ni, erri := strconv.Atoi(keys[i])
+		nj, errj := strconv.Atoi(keys[j])
+		if erri == nil && errj == nil {
+			return ni < nj
+		}
+		return keys[i] < keys[j]
+	})
+	for _, k := range keys {
+		for _, p := range perSlice[k] {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// sliceAddScopeFilesError is validateSliceAddScopeFiles's typed refusal: a
+// human-readable message plus the `details` map the 400 response carries. It
+// is a value type rather than a bare error so the gate renders the offending
+// key/path and the resolvable slice list without re-deriving them.
+type sliceAddScopeFilesError struct {
+	msg     string
+	details map[string]any
+}
+
+func (e *sliceAddScopeFilesError) Error() string { return e.msg }
+
+// sliceIndexTitles renders the decomposition's slices as an ordered
+// [{index,title}] list for an error's details, in DECLARED index order (never
+// Go map order) so the message is byte-stable across runs.
+func sliceIndexTitles(subPlans []plan.SubPlanSummary) []map[string]any {
+	out := make([]map[string]any, 0, len(subPlans))
+	for i, sp := range subPlans {
+		out = append(out, map[string]any{"index": i, "title": sp.Title})
+	}
+	return out
+}
+
+// validateSliceAddScopeFiles resolves an add_scope_files_to_slice request map
+// against the plan's decomposition and returns the CANONICAL index-keyed map
+// (#2515), or a typed refusal naming the offending key/path.
+//
+// Key resolution is deterministic and title-first: a key that exactly matches
+// one sub-plan TITLE (after trimming) resolves to that slice; otherwise it must
+// parse as a 0-based decimal index within range. Explicit intent beats
+// positional coincidence, so a plan whose sub-plan title is literally "0"
+// resolves a "0" key by TITLE, not by index.
+//
+// CANONICAL FORM (one rule, pinned by test — the byte-identical
+// title-vs-index recording and prompt-hash replay stability both depend on
+// exactly one): each key becomes strconv.Itoa(index), and each path list is
+// trimmed, deduped, then SORTED lexicographically. Sorting (rather than
+// preserving input order) is what makes two requests naming the same paths in
+// different orders record byte-identically.
+//
+// Refusals, each with its own test:
+//
+//	(a) a key resolving to no slice (unresolvable), or matching a DUPLICATE
+//	    title (ambiguous — refused rather than silently first-wins);
+//	(b) two keys resolving to the SAME slice;
+//	(c) a path whose ownership OVERLAPS a path under a DIFFERENT key in this
+//	    same request (containment, not equality — binding condition 1);
+//	(d) a path whose ownership OVERLAPS a DIFFERENT slice's declared
+//	    scope.files (single-owner-file against the plan itself);
+//	(e) an empty/whitespace or non-repo-relative path;
+//	(f) a key whose path list is empty after trimming.
+//
+// Every scan iterates slices by INDEX, never the request map directly, so the
+// first refusal a given input produces is stable across runs.
+func validateSliceAddScopeFiles(m map[string][]string, subPlans []plan.SubPlanSummary) (map[string][]string, *sliceAddScopeFilesError) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+
+	titleIdx := make(map[string][]int, len(subPlans))
+	for i, sp := range subPlans {
+		t := strings.TrimSpace(sp.Title)
+		if t == "" {
+			continue
+		}
+		titleIdx[t] = append(titleIdx[t], i)
+	}
+
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	type sliceTarget struct {
+		key string
+		idx int
+	}
+	claimedBy := make(map[int]string, len(keys))
+	targets := make([]sliceTarget, 0, len(keys))
+	for _, k := range keys {
+		trimmed := strings.TrimSpace(k)
+		var idx int
+		switch matches := titleIdx[trimmed]; {
+		case len(matches) > 1:
+			return nil, &sliceAddScopeFilesError{
+				msg: fmt.Sprintf("add_scope_files_to_slice key %q is AMBIGUOUS: %d sub-plans share that title, so the target slice cannot be resolved; key by the 0-based slice index instead",
+					k, len(matches)),
+				details: map[string]any{
+					"field":  "add_scope_files_to_slice",
+					"key":    k,
+					"reason": "slice_key_ambiguous",
+					"slices": sliceIndexTitles(subPlans),
+				},
+			}
+		case len(matches) == 1:
+			idx = matches[0]
+		default:
+			n, err := strconv.Atoi(trimmed)
+			if err != nil || n < 0 || n >= len(subPlans) {
+				return nil, &sliceAddScopeFilesError{
+					msg: fmt.Sprintf("add_scope_files_to_slice key %q resolves to no slice: it matches no sub-plan title and is not a 0-based index in [0,%d); key by an exact sub-plan title or its index",
+						k, len(subPlans)),
+					details: map[string]any{
+						"field":  "add_scope_files_to_slice",
+						"key":    k,
+						"reason": "slice_key_unresolvable",
+						"slices": sliceIndexTitles(subPlans),
+					},
+				}
+			}
+			idx = n
+		}
+		if prior, dup := claimedBy[idx]; dup {
+			return nil, &sliceAddScopeFilesError{
+				msg: fmt.Sprintf("add_scope_files_to_slice keys %q and %q both resolve to slice %d (%q); name each slice at most once",
+					prior, k, idx, subPlans[idx].Title),
+				details: map[string]any{
+					"field":       "add_scope_files_to_slice",
+					"keys":        []string{prior, k},
+					"slice_index": idx,
+					"reason":      "duplicate_slice_key",
+					"slices":      sliceIndexTitles(subPlans),
+				},
+			}
+		}
+		claimedBy[idx] = k
+		targets = append(targets, sliceTarget{key: k, idx: idx})
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i].idx < targets[j].idx })
+
+	cleaned := make(map[int][]string, len(targets))
+	out := make(map[string][]string, len(targets))
+	for _, tg := range targets {
+		seen := make(map[string]struct{}, len(m[tg.key]))
+		paths := make([]string, 0, len(m[tg.key]))
+		for _, raw := range m[tg.key] {
+			p := strings.TrimSpace(raw)
+			if p == "" {
+				return nil, &sliceAddScopeFilesError{
+					msg: fmt.Sprintf("add_scope_files_to_slice key %q lists an empty path; every entry must name a non-empty repo-relative path", tg.key),
+					details: map[string]any{
+						"field":       "add_scope_files_to_slice",
+						"key":         tg.key,
+						"slice_index": tg.idx,
+						"reason":      "empty_path",
+					},
+				}
+			}
+			if !isRepoRelativePath(p) {
+				return nil, &sliceAddScopeFilesError{
+					msg: fmt.Sprintf("add_scope_files_to_slice path %q (key %q) must be repo-relative (no leading '/' or '..')", p, tg.key),
+					details: map[string]any{
+						"field":       "add_scope_files_to_slice",
+						"key":         tg.key,
+						"path":        p,
+						"slice_index": tg.idx,
+						"reason":      "path_not_repo_relative",
+					},
+				}
+			}
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			paths = append(paths, p)
+		}
+		if len(paths) == 0 {
+			return nil, &sliceAddScopeFilesError{
+				msg: fmt.Sprintf("add_scope_files_to_slice key %q carries no paths; omit the key or name at least one path", tg.key),
+				details: map[string]any{
+					"field":       "add_scope_files_to_slice",
+					"key":         tg.key,
+					"slice_index": tg.idx,
+					"reason":      "empty_path_list",
+				},
+			}
+		}
+		sort.Strings(paths)
+		cleaned[tg.idx] = paths
+		out[strconv.Itoa(tg.idx)] = paths
+	}
+
+	// (c) Cross-key ownership overlap WITHIN this request. Containment, not
+	// equality: one key naming a directory and another a file inside it is the
+	// same add/add fan-in as naming the identical path twice.
+	for a := 0; a < len(targets); a++ {
+		for b := a + 1; b < len(targets); b++ {
+			ia, ib := targets[a].idx, targets[b].idx
+			for _, pa := range cleaned[ia] {
+				for _, pb := range cleaned[ib] {
+					if !scopePathsOverlap(pa, pb) {
+						continue
+					}
+					return nil, &sliceAddScopeFilesError{
+						msg: fmt.Sprintf("add_scope_files_to_slice paths %q (slice %d, %q) and %q (slice %d, %q) overlap in ownership; a path may be added to exactly ONE slice (single-owner-file)",
+							pa, ia, subPlans[ia].Title, pb, ib, subPlans[ib].Title),
+						details: map[string]any{
+							"field":        "add_scope_files_to_slice",
+							"path":         pa,
+							"other_path":   pb,
+							"slice_index":  ia,
+							"other_slice":  ib,
+							"reason":       "path_under_two_slices",
+							"slices":       sliceIndexTitles(subPlans),
+							"overlap_kind": overlapKind(pa, pb),
+						},
+					}
+				}
+			}
+		}
+	}
+
+	// (d) Ownership against the plan's OWN per-slice scopes. This is the
+	// refusal the motivating incident (#2515) lands on: a file already declared
+	// in slice A that the operator wants alongside slice B's files. The channel
+	// ADDS, it does not MOVE — so the message names the owning slice and the
+	// remedy rather than leaving an operator to discover it at the gate.
+	for _, tg := range targets {
+		for _, p := range cleaned[tg.idx] {
+			for j, sp := range subPlans {
+				if j == tg.idx || sp.Scope == nil {
+					continue
+				}
+				for _, f := range sp.Scope.Files {
+					if !scopePathsOverlap(p, f.Path) {
+						continue
+					}
+					return nil, &sliceAddScopeFilesError{
+						msg: fmt.Sprintf("add_scope_files_to_slice path %q (requested for slice %d, %q) is already owned by slice %d (%q), whose declared scope.files carries %q. This channel ADDS a path to one slice; it does NOT MOVE a path between slices, so the add is refused rather than leaving two slices staging the same file. Remedy: re-plan the decomposition (fishhawk_revise_plan, or reject the plan with a re-plan) so %q is declared in the slice that needs it",
+							p, tg.idx, subPlans[tg.idx].Title, j, sp.Title, f.Path, p),
+						details: map[string]any{
+							"field":            "add_scope_files_to_slice",
+							"path":             p,
+							"requested_slice":  tg.idx,
+							"owning_slice":     j,
+							"owning_title":     sp.Title,
+							"owning_path":      f.Path,
+							"reason":           "path_owned_by_another_slice",
+							"channel_semantic": "add_not_move",
+							"remedy":           "re-plan the decomposition so the path is declared in the slice that needs it; this channel does not move a path between slices",
+							"slices":           sliceIndexTitles(subPlans),
+							"overlap_kind":     overlapKind(p, f.Path),
+						},
+					}
+				}
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// overlapKind labels HOW two overlapping paths overlap, so an operator reading
+// the refusal can tell an exact duplicate from a directory-containment
+// conflict (the case string equality would have missed).
+func overlapKind(a, b string) string {
+	na, nb := normalizeOwnershipPath(a), normalizeOwnershipPath(b)
+	switch {
+	case na == nb:
+		return "identical"
+	case strings.HasPrefix(nb, na+"/"):
+		return "ancestor_directory"
+	default:
+		return "descendant_path"
+	}
+}
+
+// checkSliceAddScopeFiles enforces the per-slice add channel's contract on a
+// plan-stage approve (#2515), PRE-Submit — before any approval row is inserted,
+// for the same ADR-036 reason as its siblings: a refused approve records no row
+// so a corrected retry flows normally.
+//
+// Returns (nil, true) — byte-identical to today — when the map is absent or
+// empty. Otherwise it loads the run's plan and:
+//
+//   - a load error or a nil/indeterminate plan → 422
+//     plan_slice_add_scope_files_requires_decomposed_plan with
+//     details.reason = plan_indeterminate. FAIL CLOSED, mirroring
+//     checkDecomposedAddScopeFiles' divergence from the fail-open sibling
+//     gates: the single-owner-file invariant this channel upholds is
+//     categorical, so a slice-targeted add must never be recorded without
+//     POSITIVE confirmation the plan is decomposed (there would otherwise be no
+//     slice to target and the recorded map would be unresolvable at fold time).
+//     The fail-closed guarantee is universal — an unwired ArtifactRepo/RunRepo
+//     makes loadApprovedPlanForRun return (nil, nil), which is treated as
+//     indeterminate, not as a carve-out.
+//   - a positively FLAT plan (Decomposition == nil) → the same 422 with
+//     details.reason = plan_not_decomposed and a message pointing at plain
+//     add_scope_files, which is the correct channel there.
+//   - a decomposed plan → validateSliceAddScopeFiles; a refusal renders 400
+//     validation_failed carrying the offending key/path plus the ordered
+//     {index,title} slice list, so the operator can retry with a resolvable key
+//     in one shot.
+//
+// No audit entry is appended on refusal: the 400-class validation refusals
+// elsewhere on this handler (remove_scope_files) do not audit either, and no
+// approval row is inserted, so there is nothing to reconcile.
+func (s *Server) checkSliceAddScopeFiles(w http.ResponseWriter, r *http.Request, stage *run.Stage, addScopeFilesToSlice map[string][]string) (map[string][]string, bool) {
+	if len(addScopeFilesToSlice) == 0 {
+		return nil, true
+	}
+
+	approvedPlan, err := s.loadApprovedPlanForRun(r.Context(), stage.RunID)
+	if err != nil || approvedPlan == nil {
+		if err != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "slice-add-scope-files gate: load plan failed",
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", err.Error()),
+			)
+		}
+		s.writeError(w, r, http.StatusUnprocessableEntity, errCodeSliceAddRequiresDecomposed,
+			"add_scope_files_to_slice was supplied but the run's plan could not be confirmed DECOMPOSED; the approve is refused so a slice-targeted add cannot be recorded against a plan with no resolvable slices. Retry once the plan is loadable",
+			map[string]any{
+				"stage_id": stage.ID.String(),
+				"reason":   "plan_indeterminate",
+			})
+		return nil, false
+	}
+
+	if approvedPlan.Decomposition == nil {
+		s.writeError(w, r, http.StatusUnprocessableEntity, errCodeSliceAddRequiresDecomposed,
+			"add_scope_files_to_slice targets one slice of a DECOMPOSED plan, but this run's plan is flat (no decomposition); use the plain add_scope_files field instead",
+			map[string]any{
+				"stage_id": stage.ID.String(),
+				"reason":   "plan_not_decomposed",
+			})
+		return nil, false
+	}
+
+	canonical, verr := validateSliceAddScopeFiles(addScopeFilesToSlice, approvedPlan.Decomposition.SubPlans)
+	if verr != nil {
+		details := verr.details
+		if details == nil {
+			details = map[string]any{"field": "add_scope_files_to_slice"}
+		}
+		details["stage_id"] = stage.ID.String()
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", verr.Error(), details)
+		return nil, false
+	}
+	return canonical, true
 }
 
 // checkPeriodicBudgetTier enforces the escalating periodic-budget

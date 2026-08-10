@@ -91,6 +91,17 @@ func (s *Server) effectiveScopePathSet(ctx context.Context, runID uuid.UUID, ext
 	for _, p := range s.loadApprovalAddScopeFiles(ctx, runID) {
 		seen[p] = struct{}{}
 	}
+	// A PRIOR approval's per-slice adds (#2515) count in the effective set too:
+	// the prompt builder folds each slice's entry into that child's scope, so
+	// omitting them here would make the number the cap gate reports smaller than
+	// the scope actually assembled. Additive — a run with no per-slice map
+	// contributes nothing and the set stays byte-identical to today. Map
+	// iteration order is irrelevant: this is a set, and the result is sorted.
+	for _, paths := range s.loadApprovalSliceAddScopeFiles(ctx, runID) {
+		for _, p := range paths {
+			seen[p] = struct{}{}
+		}
+	}
 
 	if s.cfg.ScopeAmendmentRepo != nil {
 		items, err := s.cfg.ScopeAmendmentRepo.ListByRun(ctx, runID)

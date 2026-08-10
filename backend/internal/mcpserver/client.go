@@ -791,6 +791,12 @@ type approvalRequest struct {
 	// backend requires the field be declared here too; reject and removal-less
 	// approve callers pass nil (omitempty).
 	RemoveScopeFiles []string `json:"remove_scope_files,omitempty"`
+	// AddScopeFilesToSlice is the per-slice scope add for a DECOMPOSED plan
+	// (#2515): a map of sub-plan title (or 0-based index) to the repo-relative
+	// paths folded into THAT slice's scope.files only. The DisallowUnknownFields
+	// decoder on the backend requires the field be declared here too; reject and
+	// flat-plan approve callers pass nil (omitempty).
+	AddScopeFilesToSlice map[string][]string `json:"add_scope_files_to_slice,omitempty"`
 	// BindingAssertions is the operator-declared binding-assertion list (#1171)
 	// the backend validates pre-Submit and records on the approval audit
 	// payload. The DisallowUnknownFields decoder requires the field be declared
@@ -839,6 +845,10 @@ type approvalResult struct {
 // inverse structured scope removal (#1726) subtracted from the implement
 // stage's scope.files on approve (a scope REPLACE = addScopeFiles +
 // removeScopeFiles in one call); nil on reject and removal-less approve.
+// `addScopeFilesToSlice` is the per-slice add channel for a DECOMPOSED plan
+// (#2515) — sub-plan title (or 0-based index) to the paths folded into THAT
+// slice alone; nil on reject, on a flat plan (use addScopeFiles), and on a
+// slice-targeting-less approve.
 // `bindingAssertions` is the
 // operator-declared binding-assertion list (#1171) the backend validates
 // pre-Submit and records on the approval audit payload; nil on reject and
@@ -878,23 +888,39 @@ type approvalResult struct {
 //     (the {index,title} of every inheriting slice). Pre-insert: re-plan
 //     the decomposition so each added file lands in exactly one slice's
 //     scope.files. Also fails closed when add_scope_files is non-empty and
-//     the plan cannot be confirmed non-decomposed)
+//     the plan cannot be confirmed non-decomposed. The per-slice counterpart —
+//     add_scope_files_to_slice (#2515) — is the channel that DOES work on a
+//     decomposed plan)
+//   - 422 plan_slice_add_scope_files_requires_decomposed_plan (#2515: the ONE
+//     new code the per-slice channel introduces. add_scope_files_to_slice was
+//     supplied but the plan is positively FLAT (details.reason
+//     plan_not_decomposed — use plain add_scope_files) or could not be
+//     confirmed decomposed (details.reason plan_indeterminate, fail-closed).
+//     Pre-insert, no override)
+//   - 400 validation_failed with details.field = add_scope_files_to_slice
+//     (#2515 shape/ownership refusals, reusing the existing code: an
+//     unresolvable or ambiguous slice key, two keys naming one slice, a path
+//     under two slices, a path whose ownership overlaps a DIFFERENT slice's
+//     declared scope.files — this channel ADDS and does not MOVE, so re-plan
+//     the decomposition — an invalid path, or an empty path list. details
+//     carry the offending key/path plus the ordered {index,title} slice list)
 //   - 422 plan_invalid_model (#1013: the RESOLVED implement model — the
 //     ladder of deployment default < spec executor.model < plan
 //     model_recommendation < implement_model override — is not in the
 //     deployment's per-adapter allow-list; details carry model,
 //     model_source, and adapter. Pre-insert: retry with an allowed
 //     implement_model, or widen the allow-list)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, implementModel string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, implementModel string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
-		Decision:            decision,
-		Comment:             comment,
-		ApproverGithubLogin: approverGithubLogin,
-		AddScopeFiles:       addScopeFiles,
-		RemoveScopeFiles:    removeScopeFiles,
-		BindingAssertions:   bindingAssertions,
-		ClaimsConcernIDs:    claimsConcernIDs,
-		ImplementModel:      implementModel,
+		Decision:             decision,
+		Comment:              comment,
+		ApproverGithubLogin:  approverGithubLogin,
+		AddScopeFiles:        addScopeFiles,
+		RemoveScopeFiles:     removeScopeFiles,
+		AddScopeFilesToSlice: addScopeFilesToSlice,
+		BindingAssertions:    bindingAssertions,
+		ClaimsConcernIDs:     claimsConcernIDs,
+		ImplementModel:       implementModel,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)

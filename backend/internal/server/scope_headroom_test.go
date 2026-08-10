@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -192,4 +194,67 @@ func TestEffectiveScopeHeadroom_AmendmentStatusFiltering(t *testing.T) {
 	if count != 2 {
 		t.Errorf("count = %d, want 2 (plan file + approved amendment only)", count)
 	}
+}
+
+// TestEffectiveScopeHeadroom_CountsPriorSliceAdds is the #2515 cap-arithmetic
+// pin: a PRIOR approval's per-slice adds count in the effective set, because the
+// prompt builder folds each slice's entry into that child's scope — so omitting
+// them here would make the number the cap gate reports smaller than the scope
+// actually assembled. The control (no per-slice entry seeded) proves the count
+// is attributable to the recorded map and not to the plan alone.
+func TestEffectiveScopeHeadroom_CountsPriorSliceAdds(t *testing.T) {
+	scopeFiles := []plan.ScopeFile{
+		{Path: "backend/a.go", Operation: plan.FileOpModify},
+		{Path: "backend/b.go", Operation: plan.FileOpModify},
+	}
+
+	t.Run("control: no recorded per-slice map", func(t *testing.T) {
+		s, _, _, runRow, _ := newHeadroomServer(t, specImplementPathConstraints, scopeFiles)
+		count, _, ok := s.effectiveScopeHeadroom(context.Background(), runRow.ID, nil)
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		if count != 2 {
+			t.Errorf("count = %d, want 2 (plan scope only)", count)
+		}
+	})
+
+	t.Run("prior per-slice adds are counted", func(t *testing.T) {
+		s, _, _, runRow, _ := newHeadroomServer(t, specImplementPathConstraints, scopeFiles)
+		au := s.cfg.AuditRepo.(*auditFake)
+		rid := runRow.ID
+		payload, err := json.Marshal(map[string]any{
+			"decision": "approve",
+			"add_scope_files_to_slice": map[string][]string{
+				"0": {"backend/slice0.go"},
+				"1": {"backend/slice1.go"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		au.seeded = append(au.seeded, &audit.Entry{
+			ID:       uuid.New(),
+			RunID:    &rid,
+			Category: "approval_submitted",
+			Payload:  payload,
+		})
+
+		paths, _, ok := s.effectiveScopePathSet(context.Background(), runRow.ID, nil, nil)
+		if !ok {
+			t.Fatal("ok = false, want true")
+		}
+		got := map[string]bool{}
+		for _, p := range paths {
+			got[p] = true
+		}
+		for _, want := range []string{"backend/a.go", "backend/b.go", "backend/slice0.go", "backend/slice1.go"} {
+			if !got[want] {
+				t.Errorf("effective set missing %q; got %v", want, paths)
+			}
+		}
+		if len(paths) != 4 {
+			t.Errorf("count = %d, want 4 (plan scope + both slices' recorded adds)", len(paths))
+		}
+	})
 }

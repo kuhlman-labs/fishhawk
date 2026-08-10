@@ -1641,7 +1641,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, "", "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)
@@ -7634,5 +7634,625 @@ func TestApprovePlan_PredictedRuntimeStamp_UnsatisfiedCapabilityStillApproves(t 
 	}
 	if unstamped.PredictedRuntimeMinutes != 0 {
 		t.Errorf("run.PredictedRuntimeMinutes = %d, want 0 (nothing recorded)", unstamped.PredictedRuntimeMinutes)
+	}
+}
+
+// --- Per-slice add-scope-files channel (#2515) -------------------------
+
+// sliceScope renders a per-sub-plan scope from the given paths (all modify), so
+// a decomposition fixture can declare which slice OWNS which file — the set the
+// per-slice add channel's single-owner-file check compares against.
+func sliceScope(paths ...string) *plan.Scope {
+	files := make([]plan.ScopeFile, 0, len(paths))
+	for _, p := range paths {
+		files = append(files, plan.ScopeFile{Path: p, Operation: plan.FileOpModify})
+	}
+	return &plan.Scope{Files: files}
+}
+
+// decomposedPlanWithScopedSlices returns an under-budget standard_v1 plan whose
+// decomposition carries one sub-plan per (title, scope) pair, in the order
+// given — so a test can pin the DECLARED index order the error details echo.
+func decomposedPlanWithScopedSlices(titles []string, scopes []*plan.Scope) *plan.Plan {
+	subs := make([]plan.SubPlanSummary, 0, len(titles))
+	for i, ti := range titles {
+		sp := plan.SubPlanSummary{Title: ti, PredictedRuntimeMinutes: 5}
+		if i < len(scopes) {
+			sp.Scope = scopes[i]
+		}
+		subs = append(subs, sp)
+	}
+	return &plan.Plan{
+		PlanVersion:             "standard_v1",
+		PredictedRuntimeMinutes: 5,
+		Decomposition: &plan.Decomposition{
+			Rationale: "split for size",
+			SubPlans:  subs,
+		},
+	}
+}
+
+// sliceAddRefusal drives one add_scope_files_to_slice approve against a
+// decomposed plan and returns the recorder, asserting nothing itself.
+func sliceAddRefusal(t *testing.T, p *plan.Plan, body string) (*httptest.ResponseRecorder, *fakeApprovalRepo, *approvalAuditFake, *run.Stage) {
+	t.Helper()
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, p)
+	return submitApproval(t, s, stage.ID, body), app, au, stage
+}
+
+// assertSliceAddValidationFailed asserts a 400 validation_failed carrying the
+// add_scope_files_to_slice field and the given details.reason, plus the two
+// pre-Submit invariants shared by every refusal on this channel: NO approval
+// row was inserted and NO approval_submitted audit entry was appended.
+func assertSliceAddValidationFailed(t *testing.T, w *httptest.ResponseRecorder, app *fakeApprovalRepo, au *approvalAuditFake, stage *run.Stage, wantReason string) map[string]any {
+	t.Helper()
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["field"].(string); got != "add_scope_files_to_slice" {
+		t.Errorf("details.field = %q, want add_scope_files_to_slice", got)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != wantReason {
+		t.Errorf("details.reason = %q, want %q\nmessage: %s", got, wantReason, env.Error.Message)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 400 = %d (err=%v), want 0 (refused before insert)", len(rows), err)
+	}
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" {
+			t.Errorf("unexpected approval_submitted audit entry after a refusal")
+		}
+	}
+	return env.Error.Details
+}
+
+// TestSliceAddScopeFiles_FlatPlan_Returns422 pins refusal (1): a positively
+// FLAT plan cannot host a slice-targeted add, so the approve is refused 422
+// plan_slice_add_scope_files_requires_decomposed_plan with reason
+// plan_not_decomposed and a message pointing at plain add_scope_files.
+func TestSliceAddScopeFiles_FlatPlan_Returns422(t *testing.T) {
+	p := &plan.Plan{PlanVersion: "standard_v1", PredictedRuntimeMinutes: 5}
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/a.go"]}}`)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "plan_slice_add_scope_files_requires_decomposed_plan" {
+		t.Fatalf("code = %q, want plan_slice_add_scope_files_requires_decomposed_plan", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != "plan_not_decomposed" {
+		t.Errorf("details.reason = %q, want plan_not_decomposed", got)
+	}
+	if !strings.Contains(env.Error.Message, "add_scope_files") {
+		t.Errorf("message must point at the plain add_scope_files channel: %q", env.Error.Message)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+	}
+	for _, e := range au.appended {
+		if e.Category == "approval_submitted" {
+			t.Errorf("unexpected approval_submitted audit entry after a refusal")
+		}
+	}
+}
+
+// TestSliceAddScopeFiles_NoPlanArtifact_FailsClosed pins refusal (2): a run
+// whose plan cannot be positively confirmed DECOMPOSED —
+// loadApprovedPlanForRun returns (nil, nil) for a run with no plan artifact —
+// is refused 422 with reason plan_indeterminate, never let through. Seeded BY
+// CONSTRUCTION (a plan-stage run with no artifact), so the RED under a deleted
+// guard lands on the status assertion, not on fixture setup.
+func TestSliceAddScopeFiles_NoPlanArtifact_FailsClosed(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, _, app := newBudgetCheckServer(t, art)
+	r := rr.seedRun()
+	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/a.go"]}}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (fail closed on indeterminate plan):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "plan_slice_add_scope_files_requires_decomposed_plan" {
+		t.Errorf("code = %q, want plan_slice_add_scope_files_requires_decomposed_plan", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != "plan_indeterminate" {
+		t.Errorf("details.reason = %q, want plan_indeterminate", got)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+	}
+}
+
+// TestSliceAddScopeFiles_PlanLoadError_FailsClosed pins refusal (3): a plan
+// READ FAILURE (distinct from an absent plan) is likewise indeterminate and
+// fails closed, diverging deliberately from the fail-OPEN sibling gates.
+func TestSliceAddScopeFiles_PlanLoadError_FailsClosed(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, _, app := newBudgetCheckServer(t, art)
+	p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+	_, stage := seedBudgetRun(t, rr, art, p)
+	art.listErr = errors.New("artifact store unavailable")
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/a.go"]}}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (fail closed on a plan read failure):\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	if env.Error.Code != "plan_slice_add_scope_files_requires_decomposed_plan" {
+		t.Errorf("code = %q, want plan_slice_add_scope_files_requires_decomposed_plan", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["reason"].(string); got != "plan_indeterminate" {
+		t.Errorf("details.reason = %q, want plan_indeterminate", got)
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+		t.Errorf("approval rows after 422 = %d (err=%v), want 0", len(rows), err)
+	}
+}
+
+// TestSliceAddScopeFiles_UnresolvableKey_Returns400 pins refusal (4): a key
+// that names neither a sub-plan title nor an in-range 0-based index is refused,
+// and the error lists the valid slices in DECLARED index order (not Go map
+// order) so the operator can retry with a resolvable key in one shot.
+func TestSliceAddScopeFiles_UnresolvableKey_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices([]string{"zulu", "alpha", "mike"}, nil)
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"no-such-slice":["backend/a.go"]}}`)
+
+	details := assertSliceAddValidationFailed(t, w, app, au, stage, "slice_key_unresolvable")
+	if got, _ := details["key"].(string); got != "no-such-slice" {
+		t.Errorf("details.key = %q, want no-such-slice", got)
+	}
+	slices, ok := details["slices"].([]any)
+	if !ok || len(slices) != 3 {
+		t.Fatalf("details.slices = %v, want 3 entries", details["slices"])
+	}
+	wantOrder := []string{"zulu", "alpha", "mike"}
+	for i, raw := range slices {
+		m, _ := raw.(map[string]any)
+		if got, _ := m["title"].(string); got != wantOrder[i] {
+			t.Errorf("details.slices[%d].title = %q, want %q (declared index order, not map order)", i, got, wantOrder[i])
+		}
+		if got, _ := m["index"].(float64); int(got) != i {
+			t.Errorf("details.slices[%d].index = %v, want %d", i, m["index"], i)
+		}
+	}
+}
+
+// TestSliceAddScopeFiles_OutOfRangeIndexKey_Returns400 pins the numeric half of
+// refusal (4): a well-formed decimal key outside [0, len(sub_plans)) resolves
+// to no slice and is refused rather than silently clamped.
+func TestSliceAddScopeFiles_OutOfRangeIndexKey_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"7":["backend/a.go"]}}`)
+	assertSliceAddValidationFailed(t, w, app, au, stage, "slice_key_unresolvable")
+}
+
+// TestSliceAddScopeFiles_AmbiguousTitleKey_Returns400 pins the ambiguity half
+// of refusal (4): a title shared by two sub-plans cannot resolve to ONE slice,
+// so the key is refused rather than silently first-wins. The schema declares
+// titles unique, so this is the defensive backstop for a plan that violates it.
+func TestSliceAddScopeFiles_AmbiguousTitleKey_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices([]string{"dup", "dup"}, nil)
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"dup":["backend/a.go"]}}`)
+	details := assertSliceAddValidationFailed(t, w, app, au, stage, "slice_key_ambiguous")
+	if got, _ := details["key"].(string); got != "dup" {
+		t.Errorf("details.key = %q, want dup", got)
+	}
+}
+
+// TestSliceAddScopeFiles_TwoKeysOneSlice_Returns400 pins refusal (5): an index
+// key and that same slice's TITLE both resolve to slice 0, which would silently
+// merge two path lists into one slice. Refused, naming both keys.
+func TestSliceAddScopeFiles_TwoKeysOneSlice_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/a.go"],"slice-a":["backend/b.go"]}}`)
+	details := assertSliceAddValidationFailed(t, w, app, au, stage, "duplicate_slice_key")
+	if got, _ := details["slice_index"].(float64); int(got) != 0 {
+		t.Errorf("details.slice_index = %v, want 0", details["slice_index"])
+	}
+}
+
+// TestSliceAddScopeFiles_SamePathTwoSlices_Returns400 pins refusal (6): one
+// path named under two DIFFERENT slices is the add/add fan-in single-owner-file
+// exists to prevent, refused naming the path and both slices.
+func TestSliceAddScopeFiles_SamePathTwoSlices_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/shared.go"],"1":["backend/shared.go"]}}`)
+	details := assertSliceAddValidationFailed(t, w, app, au, stage, "path_under_two_slices")
+	if got, _ := details["path"].(string); got != "backend/shared.go" {
+		t.Errorf("details.path = %q, want backend/shared.go", got)
+	}
+	if got, _ := details["overlap_kind"].(string); got != "identical" {
+		t.Errorf("details.overlap_kind = %q, want identical", got)
+	}
+}
+
+// TestSliceAddScopeFiles_ContainmentWithinRequest_Returns400 is binding
+// condition 1's within-request direction: slice 0 is handed a DIRECTORY and
+// slice 1 a file INSIDE it. String equality sees two distinct paths; ownership
+// containment sees the same file staged by two slices, so the add is refused.
+func TestSliceAddScopeFiles_ContainmentWithinRequest_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/pkg/foo/"],"1":["backend/pkg/foo/inner.go"]}}`)
+	details := assertSliceAddValidationFailed(t, w, app, au, stage, "path_under_two_slices")
+	if got, _ := details["overlap_kind"].(string); got != "ancestor_directory" {
+		t.Errorf("details.overlap_kind = %q, want ancestor_directory", got)
+	}
+}
+
+// TestSliceAddScopeFiles_PathOwnedByAnotherSlice_Returns400 pins refusal (7)
+// AND binding condition 2: the MOTIVATING incident (#2515) — a file already
+// declared in slice 0's scope that the operator wants alongside slice 1's files
+// — is still REFUSED, and the refusal is actionable: it names the owning slice,
+// states this channel ADDS and does not MOVE, and names the remedy.
+func TestSliceAddScopeFiles_PathOwnedByAnotherSlice_Returns400(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"docs slice", "tools slice"},
+		[]*plan.Scope{sliceScope("README.md"), sliceScope("backend/tools.go")},
+	)
+	w, app, au, stage := sliceAddRefusal(t, p,
+		`{"decision":"approve","add_scope_files_to_slice":{"tools slice":["README.md"]}}`)
+
+	details := assertSliceAddValidationFailed(t, w, app, au, stage, "path_owned_by_another_slice")
+	if got, _ := details["owning_slice"].(float64); int(got) != 0 {
+		t.Errorf("details.owning_slice = %v, want 0", details["owning_slice"])
+	}
+	if got, _ := details["owning_title"].(string); got != "docs slice" {
+		t.Errorf("details.owning_title = %q, want 'docs slice'", got)
+	}
+	if got, _ := details["channel_semantic"].(string); got != "add_not_move" {
+		t.Errorf("details.channel_semantic = %q, want add_not_move", got)
+	}
+	if got, _ := details["remedy"].(string); got == "" {
+		t.Errorf("details.remedy must name the remedy, got empty")
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	for _, want := range []string{"docs slice", "does NOT MOVE", "re-plan"} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Errorf("message missing %q (must name the owner, the add-not-move semantic, and the remedy):\n%s", want, env.Error.Message)
+		}
+	}
+}
+
+// TestSliceAddScopeFiles_ContainmentAgainstPlanScope_Returns400 is binding
+// condition 1's plan-scope direction, both ways round: a request path INSIDE
+// another slice's declared directory, and a request DIRECTORY containing
+// another slice's declared file. Equality misses both.
+func TestSliceAddScopeFiles_ContainmentAgainstPlanScope_Returns400(t *testing.T) {
+	t.Run("request path inside another slice's declared directory", func(t *testing.T) {
+		p := decomposedPlanWithScopedSlices(
+			[]string{"dir owner", "other"},
+			[]*plan.Scope{sliceScope("backend/pkg/foo/"), sliceScope("backend/other.go")},
+		)
+		w, app, au, stage := sliceAddRefusal(t, p,
+			`{"decision":"approve","add_scope_files_to_slice":{"1":["backend/pkg/foo/inner.go"]}}`)
+		details := assertSliceAddValidationFailed(t, w, app, au, stage, "path_owned_by_another_slice")
+		if got, _ := details["owning_slice"].(float64); int(got) != 0 {
+			t.Errorf("details.owning_slice = %v, want 0", details["owning_slice"])
+		}
+	})
+
+	t.Run("request directory containing another slice's declared file", func(t *testing.T) {
+		p := decomposedPlanWithScopedSlices(
+			[]string{"file owner", "other"},
+			[]*plan.Scope{sliceScope("backend/pkg/foo/inner.go"), sliceScope("backend/other.go")},
+		)
+		w, app, au, stage := sliceAddRefusal(t, p,
+			`{"decision":"approve","add_scope_files_to_slice":{"1":["backend/pkg/foo/"]}}`)
+		details := assertSliceAddValidationFailed(t, w, app, au, stage, "path_owned_by_another_slice")
+		if got, _ := details["owning_slice"].(float64); int(got) != 0 {
+			t.Errorf("details.owning_slice = %v, want 0", details["owning_slice"])
+		}
+	})
+}
+
+// TestSliceAddScopeFiles_SiblingPrefix_Accepted is the containment check's
+// non-conflict control: "backend/pkg/foo" must NOT conflict with the sibling
+// "backend/pkg/foobar" — containment is compared on path SEGMENT boundaries,
+// not raw string prefixes. Without that boundary the approve would be refused.
+func TestSliceAddScopeFiles_SiblingPrefix_Accepted(t *testing.T) {
+	p := decomposedPlanWithScopedSlices(
+		[]string{"foobar owner", "other"},
+		[]*plan.Scope{sliceScope("backend/pkg/foobar/x.go"), sliceScope("backend/other.go")},
+	)
+	art := newFakeArtifactRepo()
+	s, rr, au, app := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files_to_slice":{"1":["backend/pkg/foo/new.go"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (sibling prefix is not containment):\n%s", w.Code, w.Body.String())
+	}
+	if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 1 {
+		t.Errorf("approval rows = %d (err=%v), want 1", len(rows), err)
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["add_scope_files_to_slice"]; !ok {
+		t.Errorf("approval_submitted payload missing add_scope_files_to_slice: %#v", payload)
+	}
+}
+
+// TestSliceAddScopeFiles_InvalidPath_Returns400 pins refusal (8): a path that
+// is not repo-relative — a leading '/' and a '..' traversal segment, one case
+// each — is refused.
+func TestSliceAddScopeFiles_InvalidPath_Returns400(t *testing.T) {
+	for name, body := range map[string]string{
+		"leading slash": `{"decision":"approve","add_scope_files_to_slice":{"0":["/etc/passwd"]}}`,
+		"dot dot":       `{"decision":"approve","add_scope_files_to_slice":{"0":["../outside.go"]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+			w, app, au, stage := sliceAddRefusal(t, p, body)
+			assertSliceAddValidationFailed(t, w, app, au, stage, "path_not_repo_relative")
+		})
+	}
+}
+
+// TestSliceAddScopeFiles_EmptyPathList_Returns400 pins refusal (9): a key whose
+// list is empty (or empties after trimming) carries no instruction, so it is
+// refused rather than silently recorded as a no-op entry.
+func TestSliceAddScopeFiles_EmptyPathList_Returns400(t *testing.T) {
+	t.Run("literally empty", func(t *testing.T) {
+		p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+		w, app, au, stage := sliceAddRefusal(t, p,
+			`{"decision":"approve","add_scope_files_to_slice":{"0":[]}}`)
+		assertSliceAddValidationFailed(t, w, app, au, stage, "empty_path_list")
+	})
+	t.Run("whitespace-only entry", func(t *testing.T) {
+		p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+		w, app, au, stage := sliceAddRefusal(t, p,
+			`{"decision":"approve","add_scope_files_to_slice":{"0":["   "]}}`)
+		assertSliceAddValidationFailed(t, w, app, au, stage, "empty_path")
+	})
+}
+
+// TestSliceAddScopeFiles_CanonicalRecording pins the ONE canonical form the
+// channel records (binding condition 3's second inconsistency): keys become the
+// 0-based INDEX even when the operator keyed by TITLE, and each path list is
+// trimmed, deduped and SORTED — so a title-keyed request and the equivalent
+// index-keyed request record BYTE-IDENTICAL payloads regardless of the order
+// the operator listed the paths in. Prompt-hash replay stability depends on it.
+func TestSliceAddScopeFiles_CanonicalRecording(t *testing.T) {
+	newPlan := func() *plan.Plan {
+		return decomposedPlanWithScopedSlices([]string{"first slice", "second slice"}, nil)
+	}
+
+	record := func(t *testing.T, body string) string {
+		t.Helper()
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newBudgetCheckServer(t, art)
+		_, stage := seedBudgetRun(t, rr, art, newPlan())
+		w := submitApproval(t, s, stage.ID, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		payload := findApprovalSubmittedPayload(t, au.appended)
+		raw, ok := payload["add_scope_files_to_slice"]
+		if !ok {
+			t.Fatalf("approval_submitted payload missing add_scope_files_to_slice: %#v", payload)
+		}
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			t.Fatalf("marshal recorded map: %v", err)
+		}
+		return string(encoded)
+	}
+
+	// Title-keyed, paths listed OUT of lexical order and with a duplicate +
+	// surrounding whitespace.
+	byTitle := record(t, `{"decision":"approve","add_scope_files_to_slice":{"second slice":[" backend/z.go ","backend/a.go","backend/z.go"]}}`)
+	// Index-keyed, already sorted.
+	byIndex := record(t, `{"decision":"approve","add_scope_files_to_slice":{"1":["backend/a.go","backend/z.go"]}}`)
+
+	if byTitle != byIndex {
+		t.Errorf("title-keyed recording %s != index-keyed recording %s (one canonical form required)", byTitle, byIndex)
+	}
+	if want := `{"1":["backend/a.go","backend/z.go"]}`; byIndex != want {
+		t.Errorf("recorded map = %s, want %s (index-keyed, trimmed, deduped, SORTED)", byIndex, want)
+	}
+}
+
+// TestSliceAddScopeFiles_TitleWinsOverIndex pins the documented key-resolution
+// precedence: an exact sub-plan TITLE match wins over the positional index, so
+// a plan whose sub-plan title is literally "1" resolves the key "1" by TITLE
+// (slice 0 here), not by position. Explicit intent beats coincidence.
+func TestSliceAddScopeFiles_TitleWinsOverIndex(t *testing.T) {
+	p := decomposedPlanWithScopedSlices([]string{"1", "other"}, nil)
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","add_scope_files_to_slice":{"1":["backend/a.go"]}}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	raw, _ := json.Marshal(payload["add_scope_files_to_slice"])
+	if want := `{"0":["backend/a.go"]}`; string(raw) != want {
+		t.Errorf("recorded map = %s, want %s (title match wins over index)", raw, want)
+	}
+}
+
+// TestSliceAddScopeFiles_NoMap_ByteIdenticalApprove asserts the gate does not
+// over-fire: a decomposed plan approved with NO add_scope_files_to_slice flows
+// normally and records no add_scope_files_to_slice key at all (the omission
+// that keeps prompt-hash replay byte-identical to pre-#2515).
+func TestSliceAddScopeFiles_NoMap_ByteIdenticalApprove(t *testing.T) {
+	art := newFakeArtifactRepo()
+	s, rr, au, _ := newBudgetCheckServer(t, art)
+	p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+	_, stage := seedBudgetRun(t, rr, art, p)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["add_scope_files_to_slice"]; ok {
+		t.Errorf("no-add approve must omit add_scope_files_to_slice, got %#v", payload["add_scope_files_to_slice"])
+	}
+}
+
+// TestSliceAddScopeFiles_CountsTowardScopeCap pins the cap-headroom
+// interaction (binding condition 4): a slice-targeted add consumes
+// max_files_changed headroom exactly like a flat add, so an add that pushes the
+// effective scope over the cap is refused 422 plan_violates_scope_cap. A
+// control approve WITHOUT the per-slice add on the identical fixture passes,
+// so the 422 is attributable to the per-slice paths and not to the plan alone.
+func TestSliceAddScopeFiles_CountsTowardScopeCap(t *testing.T) {
+	// Cap is 3 (specImplementPathConstraints); the decomposed plan's top-level
+	// scope declares exactly 3, leaving zero headroom.
+	newCapServer := func(t *testing.T) (*Server, *run.Stage) {
+		t.Helper()
+		rr := newOrchestratorRepo()
+		art := newFakeArtifactRepo()
+		app := newFakeApprovalRepo()
+		au := newApprovalAuditFake()
+		o := &orchestrator.Orchestrator{Runs: rr}
+		runRow := rr.seedRun()
+		runRow.WorkflowID = "feature_change"
+		runRow.WorkflowSpec = specImplementPathConstraints
+		stage := rr.seedStage(runRow.ID, 0, run.StageStateAwaitingApproval)
+		p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+		p.Scope = plan.Scope{Files: scopeCapFiles(3)}
+		seedBudgetPlanArtifact(t, art, stage.ID, p)
+		s := New(Config{
+			Addr:         "127.0.0.1:0",
+			ApprovalRepo: app,
+			RunRepo:      rr,
+			AuditRepo:    au,
+			Orchestrator: o,
+			ArtifactRepo: art,
+		})
+		return s, stage
+	}
+
+	t.Run("control: no per-slice add stays under cap", func(t *testing.T) {
+		s, stage := newCapServer(t)
+		w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (3 files vs cap 3):\n%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("per-slice add consumes headroom", func(t *testing.T) {
+		s, stage := newCapServer(t)
+		w := submitApproval(t, s, stage.ID,
+			`{"decision":"approve","add_scope_files_to_slice":{"0":["backend/extra.go"]}}`)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422 (4 effective files vs cap 3):\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"plan_violates_scope_cap"`) {
+			t.Errorf("body missing plan_violates_scope_cap: %s", w.Body.String())
+		}
+	})
+}
+
+// TestSliceAddScopeFiles_FlatAddRefusalUnchanged is the #2103 regression pin:
+// adding the per-slice channel must NOT loosen the flat add_scope_files refusal
+// on a decomposed plan, nor its fail-closed indeterminate branch.
+func TestSliceAddScopeFiles_FlatAddRefusalUnchanged(t *testing.T) {
+	t.Run("decomposed plan still refuses flat add", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, au, app := newBudgetCheckServer(t, art)
+		p := decomposedPlanWithScopedSlices([]string{"slice-a", "slice-b"}, nil)
+		_, stage := seedBudgetRun(t, rr, art, p)
+
+		w := submitApproval(t, s, stage.ID,
+			`{"decision":"approve","add_scope_files":["backend/a.go"]}`)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"plan_add_scope_files_fans_into_slices"`) {
+			t.Errorf("body missing plan_add_scope_files_fans_into_slices: %s", w.Body.String())
+		}
+		var foundGate bool
+		for _, e := range au.appended {
+			if e.Category == "plan_add_scope_files_fans_into_slices" {
+				foundGate = true
+			}
+		}
+		if !foundGate {
+			t.Errorf("expected the #2103 gate audit entry, got %+v", au.appended)
+		}
+		if rows, err := app.ListForStage(context.Background(), stage.ID); err != nil || len(rows) != 0 {
+			t.Errorf("approval rows = %d (err=%v), want 0", len(rows), err)
+		}
+	})
+
+	t.Run("indeterminate plan still fails closed on flat add", func(t *testing.T) {
+		art := newFakeArtifactRepo()
+		s, rr, _, _ := newBudgetCheckServer(t, art)
+		r := rr.seedRun()
+		stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
+
+		w := submitApproval(t, s, stage.ID,
+			`{"decision":"approve","add_scope_files":["backend/a.go"]}`)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), `"plan_indeterminate"`) {
+			t.Errorf("body missing the fail-closed indeterminate reason: %s", w.Body.String())
+		}
+	})
+}
+
+// TestScopePathsOverlap is the ownership-containment unit table (binding
+// condition 1). It pins that equality is NOT the comparison: a directory
+// contains its files in BOTH directions, trailing slashes normalise, and
+// sibling prefixes never conflict.
+func TestScopePathsOverlap(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"pkg/foo.go", "pkg/foo.go", true},
+		{"pkg/foo/", "pkg/foo", true},
+		{"pkg/foo/", "pkg/foo/inner.go", true},
+		{"pkg/foo/inner.go", "pkg/foo/", true},
+		{"pkg/foo", "pkg/foo/inner.go", true},
+		{"pkg/foo/a/b.go", "pkg/foo", true},
+		{"pkg/foo", "pkg/foobar", false},
+		{"pkg/foo/", "pkg/foobar/x.go", false},
+		{"pkg/foobar", "pkg/foo/x.go", false},
+		{"pkg/a.go", "pkg/b.go", false},
+		{"", "pkg/a.go", false},
+		{"", "", true},
+	}
+	for _, c := range cases {
+		if got := scopePathsOverlap(c.a, c.b); got != c.want {
+			t.Errorf("scopePathsOverlap(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
 	}
 }
