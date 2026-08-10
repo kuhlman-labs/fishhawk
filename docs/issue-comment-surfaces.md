@@ -517,8 +517,12 @@ Notes:
   `plan.Warnings()` (previously unit-tested but uncalled in production) its
   first production caller: notably a multi-slice decomposition where every
   sub-plan omits `depends_on` (the shape that wedged #1551's first
-  attempt), plus a sub-plan runtime-sum compression signal and an
-  expensive-test-strategy-vs-budget signal — with payload `{warnings}`.
+  attempt), plus a sub-plan runtime-sum compression signal, an
+  expensive-test-strategy-vs-budget signal, the count-derived over-cap
+  advisory (#2053), and the NEAR-cap advisory (#2492) — the plan's scope
+  lands within a few files of the implement `max_files_changed` cap, naming
+  the remaining headroom (more emphatically for a decomposed plan) — with
+  payload `{warnings}`.
   Advisory + fail-open (an unparseable plan or an audit-append failure
   writes no entry and never blocks the upload) and — the one divergence
   from the sibling plan-gate sweeps — written ONLY when `Warnings()`

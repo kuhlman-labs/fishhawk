@@ -14,6 +14,16 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/splitfiling"
 )
 
+// nearCapMargin is the policy threshold (#2492): a plan whose scanned
+// scope.files count leaves this many files of headroom or fewer under the
+// resolved implement-stage max_files_changed cap (but is NOT itself over cap)
+// fires the near-cap advisory. It is a POLICY value pinned by
+// TestRunPlanWarnings_NearCap_ThresholdBoundary (fires at headroom 0..3, silent
+// at 4+), NOT a derived one — it is deliberately small so a plan with real
+// headroom never fires and changing it requires editing the test that states the
+// intent. Taken directly from the issue's proposed ~3-file margin.
+const nearCapMargin = 3
+
 // categoryPlanWarnings is the audit-log category for the entry
 // runPlanWarnings writes when plan.Warnings() fires at least one advisory
 // for an uploaded plan (#1684). Unlike plan_scope_precheck/
@@ -94,6 +104,18 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		warnings = append(warnings, w)
 	}
 
+	// NEAR-cap advisory (#2492), appended immediately AFTER the count-derived
+	// over-cap advisory and BEFORE phaseCapWarnings/irreducibleWarning: it is the
+	// same count-derived cap family and belongs adjacent to it, and its position
+	// keeps the #2053 ordering guarantee intact — the over-cap advisory is still
+	// emitted first and unchanged. nearCapWarning returns "" whenever the plan is
+	// already OVER cap (the over-cap advisory owns that case), so this append is a
+	// no-op for every over-cap plan and cannot alter the existing over-cap/
+	// irreducible/phase-cap warnings slice.
+	if w := s.nearCapWarning(ctx, runID, &parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
+
 	// #2412 advisories, appended AFTER the count-derived over-cap advisory so the
 	// count advisory is emitted FIRST and unchanged — the ordering is the
 	// observable proof that irreducible/phase-cap advisories do not SUPPRESS the
@@ -151,6 +173,69 @@ func (s *Server) overCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan
 			"narrow the scope or split the work into a decomposition before approving.",
 		count, capLimit,
 	)
+}
+
+// nearCapWarning computes the NEAR-cap plan-gate advisory (#2492) for a parsed
+// plan, or "" when the plan is not near cap, is already over cap, or the cap
+// cannot be resolved. It makes the SHARED whole-plan budget visible at the one
+// gate where the operator can act on it: a plan whose scope.files lands within
+// nearCapMargin of the resolved implement-stage max_files_changed cap is told
+// how many files of headroom remain and that spending that headroom (via an
+// approval-time add_scope_files or a mid-stage scope amendment) leaves a correct
+// mid-stage fix no path in without a re-plan or a governed cap raise.
+//
+// It routes through the SAME shared overCapByCount cap resolution as the over-cap
+// advisory and the authoritative reject, so the three can never disagree on the
+// resolved cap. The three guards are ordered so mutual exclusion is STRUCTURAL,
+// not a second check:
+//
+//	(a) !ok    — the cap is unresolved (nil RunRepo, GetRun error, no spec/
+//	             implement stage, or a zero/unresolved cap): fail open exactly as
+//	             every sibling advisory does.
+//	(b) over   — the plan is ALREADY over cap: overCapWarning/overCapSplitRejection
+//	             own that case, so returning "" here makes the near-cap and over-cap
+//	             advisories mutually exclusive BY CONSTRUCTION.
+//	(c) capLimit-count > nearCapMargin — the plan has real headroom: no advisory.
+//
+// Otherwise (count <= capLimit AND capLimit-count <= nearCapMargin) it renders the
+// advisory. It reads ONLY the scanned count and resolved cap via overCapByCount —
+// never parsedPlan.OverCap.
+//
+// DECOMPOSITION-AWARE: when the plan carries a decomposition of >= 2 sub-plans, a
+// second sentence names the slice count and states plainly that all N slices draw
+// against this ONE whole-plan budget — the 'more prominently for a decomposed
+// plan' half of the issue's done-means. A single-slice or absent decomposition
+// renders only the base sentence.
+func (s *Server) nearCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
+	count, capLimit, over, ok := s.overCapByCount(ctx, runID, parsedPlan)
+	if !ok {
+		return ""
+	}
+	if over {
+		return ""
+	}
+	headroom := capLimit - count
+	if headroom > nearCapMargin {
+		return ""
+	}
+	msg := fmt.Sprintf(
+		"plan scope declares %d files against the implement-stage max_files_changed cap of %d — only %d file(s) of headroom remain. "+
+			"Once that headroom is spent, the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any "+
+			"further file, so a correct mid-stage fix that needs an un-scoped file has no path in without a re-plan or a governed cap raise.",
+		count, capLimit, headroom,
+	)
+	slices := 0
+	if parsedPlan.Decomposition != nil {
+		slices = len(parsedPlan.Decomposition.SubPlans)
+	}
+	if slices >= 2 {
+		msg += fmt.Sprintf(
+			" This plan is decomposed into %d slices that ALL draw against this ONE whole-plan budget, so the headroom is shared — "+
+				"the first slice to need an extra file spends it for every other slice.",
+			slices,
+		)
+	}
+	return msg
 }
 
 // phaseCapWarnings emits one plan-gate advisory per split_proposal PHASE whose
