@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -243,5 +244,91 @@ func TestAwaitStageAmendmentMessageRendersWindowConstant(t *testing.T) {
 	}
 	if strings.Contains(out.Message, "~15 minutes") {
 		t.Errorf("Message still contains a hardcoded ~15 minutes after the constant moved to 17: %q", out.Message)
+	}
+}
+
+// TestToolDescriptionsRenderWindowConstant is the companion discrimination test
+// for the REGISTER-TIME tool descriptions — the surface #2627 correctly names as
+// uncovered. The three descriptions that state the amendment poll window
+// (fishhawk_await_stage, fishhawk_dispatch_stage, fishhawk_decide_scope_amendment)
+// build their text INSIDE registerAwaitStage / registerDispatchStage /
+// registerDecideScopeAmendment by concatenating amendmentPollWindowAdjective() /
+// amendmentPollWindowText() — evaluated on EVERY registration call, NOT at
+// package init (correcting #2627's package-init premise). So mutating the var and
+// re-registering the tool set through the real ListTools round-trip observes the
+// mutated figure, exactly as the runtime-Message discrimination test above does.
+//
+// The gap this closes: the pre-existing guards (TestNoRetiredProceedAsDeniedWording,
+// TestNoStaleAmendmentWindowFigure) trip only on the retired proceed-as-denied
+// wording and the retired ~5-minute figure, so a hardcoded CURRENT figure
+// (e.g. "~15-minute" written as a literal instead of rendered from the constant)
+// passes every existing test. This test catches that: it moves the var and
+// asserts each description FOLLOWS.
+//
+// Two independently reporting arms:
+//   - POSITIVE: each of the three named descriptions must contain the MUTATED
+//     rendering (a description that hardcodes the figure would not move, red here).
+//   - GENERIC NEGATIVE: NO registered description at all — not just the three —
+//     may still carry the PRE-mutation rendering after the mutation, so a future
+//     fourth description that hardcodes the current figure trips it without anyone
+//     remembering to extend a list.
+//
+// Per condition 2 the mutation value is derived (orig+2), never a hardcoded 17:
+// a literal target would make both arms vacuous if the window were ever
+// legitimately set to that value. The var is restored via t.Cleanup and the
+// package uses no t.Parallel(), so the mutation cannot leak across tests.
+func TestToolDescriptionsRenderWindowConstant(t *testing.T) {
+	orig := amendmentPollWindowMinutes
+	t.Cleanup(func() { amendmentPollWindowMinutes = orig })
+
+	// Derive both the pre-mutation (stale) and mutated renderings from orig so the
+	// test carries no hardcoded figure and stays correct if the window ever moves.
+	staleText := fmt.Sprintf("~%d minutes", orig)
+	staleAdj := fmt.Sprintf("~%d-minute", orig)
+	mutated := orig + 2
+	mutatedText := fmt.Sprintf("~%d minutes", mutated)
+	mutatedAdj := fmt.Sprintf("~%d-minute", mutated)
+
+	amendmentPollWindowMinutes = mutated
+	descByName := listToolDescriptions(t)
+
+	// POSITIVE arm: the three descriptions that render the figure must follow the
+	// mutated value. await_stage renders BOTH forms (the adjectival poll window and
+	// the per-request phrasing); dispatch_stage renders the adjectival amendment
+	// window; decide_scope_amendment renders the per-request phrasing.
+	positive := []struct {
+		tool string
+		want []string
+	}{
+		{"fishhawk_await_stage", []string{mutatedAdj, mutatedText}},
+		{"fishhawk_dispatch_stage", []string{mutatedAdj}},
+		{"fishhawk_decide_scope_amendment", []string{mutatedText}},
+	}
+	for _, p := range positive {
+		desc, ok := descByName[p.tool]
+		if !ok {
+			// Fail loud on a missing entry (e.g. a rename) so the assertion cannot
+			// pass vacuously against an empty string.
+			t.Fatalf("%s not registered: no description in ListTools", p.tool)
+		}
+		for _, want := range p.want {
+			if !strings.Contains(desc, want) {
+				t.Errorf("%s description must render the window figure from the constant (contain %q); a hardcoded figure would not move. got:\n%s", p.tool, want, desc)
+			}
+		}
+	}
+
+	// GENERIC NEGATIVE arm: after the mutation, NO registered description may still
+	// carry the pre-mutation rendering — this extends the guard past the three
+	// known sites to any description that hardcodes the current figure. t.Errorf
+	// (not Fatalf) so every offending description is named. Only "~N minutes" /
+	// "~N-minute" match; a "15s" heartbeat cadence in another description does not.
+	for tool, desc := range descByName {
+		if strings.Contains(desc, staleText) {
+			t.Errorf("%s description still contains the pre-mutation figure %q after the constant moved to %d — it hardcodes the figure instead of rendering it", tool, staleText, mutated)
+		}
+		if strings.Contains(desc, staleAdj) {
+			t.Errorf("%s description still contains the pre-mutation figure %q after the constant moved to %d — it hardcodes the figure instead of rendering it", tool, staleAdj, mutated)
+		}
 	}
 }

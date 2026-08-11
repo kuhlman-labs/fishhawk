@@ -12,12 +12,25 @@ import (
 // request EXPIRES UNDECIDED (it stays pending server-side; an expiry is NOT a
 // denial, and a late decision is still honored on a fishhawk_retry_stage).
 //
-// It is deliberately a var, not a const, for exactly one reason: the
-// discrimination test TestAwaitStageAmendmentMessageRendersWindowConstant
-// reassigns it to a different value and asserts the rendered
-// fishhawk_await_stage Message and next_step Reason follow it — which proves
-// those sites RENDER the figure from here rather than hardcoding "~15 minutes"
-// (a hardcoded literal would still say 15 and fail once the var moved to 17).
+// It is deliberately a var, not a const, for exactly one reason: two
+// discrimination tests reassign it to a different value and assert the rendered
+// text follows, which proves those sites RENDER the figure from here rather than
+// hardcoding it (a hardcoded literal would still say 15 and fail once the var
+// moved). Each test reaches a distinct surface:
+//
+//   - TestAwaitStageAmendmentMessageRendersWindowConstant — the RUNTIME-rendered
+//     amendment_pending Message and next_step Reason (built per response in
+//     awaitStageAmendmentPendingOutput).
+//   - TestToolDescriptionsRenderWindowConstant — the three REGISTER-TIME tool
+//     descriptions that state the figure (fishhawk_await_stage,
+//     fishhawk_dispatch_stage, fishhawk_decide_scope_amendment), plus a generic
+//     sweep asserting NO registered description carries the stale figure after a
+//     mutation. Those descriptions are built INSIDE registerAwaitStage /
+//     registerDispatchStage / registerDecideScopeAmendment by concatenating
+//     amendmentPollWindowAdjective() / amendmentPollWindowText() — evaluated on
+//     every registration call, NOT at package init, which is what makes them
+//     reachable by a var mutation (correcting #2627's package-init premise).
+//
 // Production code never mutates it.
 //
 // SCOPE OF THIS CONSTANT — deliberately NOT a single source of truth. It
