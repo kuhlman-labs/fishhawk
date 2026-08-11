@@ -542,7 +542,7 @@ Outcomes (200):
 - `integrated` — every slice merged cleanly; the parent implement stage resolved `succeeded` and the consolidated PR opened. Carries `consolidated_branch` + `pull_request_url`.
 - `slice_conflict` — a slice branch failed to merge; the parent implement stage failed recoverable (category `B`), preserving the E24.2 contract. Carries `conflicting_slice_index` + `conflicting_child_run_id`.
 
-A non-conflict failure returns `slice_integration_error` (502) with the cause in `details.error` — the diagnosability the event-driven fan-in path lacks.
+A non-conflict failure returns `slice_integration_error` (502); as a 5xx the cause is redacted from the body and retained in the operator log keyed by `error_ref` (E67.15 / #2587), which the tool surfaces so the operator can correlate — the diagnosability the event-driven fan-in path lacks.
 
 Implementation: `backend/internal/server/consolidate.go::handleConsolidateRun`, registered as the MCP verb in `tools.go`.
 It composes the **exported** orchestrator primitives `IntegrateSlices` → `TransitionStage` → `Advance`, mirroring
@@ -772,7 +772,7 @@ Inputs:
 
 Audit-on-active-run is **best-effort**: filing still succeeds with no run in flight, and the response's `audited` flag reports whether an entry was written. Returns the created item — `type`, `title`, `number`, `url`, `provider`, the resolved `applied_labels` / `complexity` / `status` / `board_column`, and `audited`.
 
-**Auth:** a write tool — the backend requires an authenticated caller (anonymous requests are rejected). Error surfaces propagated as tool errors: `validation_failed` (400 — repo not `owner/name`, missing `type`/`summary`, unknown fields; the empty `type`/`summary`/`repo` cases are also caught locally before the HTTP hop), `authentication_required` (401), `work_item_invalid` (422 — the request violates the type's conventions), `provider_unimplemented` (501 — the configured provider id is not registered, e.g. the interface-only `jira`; details name it), `work_item_filing_failed` (502 — the provider rejected the filing). The CLI mirror is `fishhawk file-issue`.
+**Auth:** a write tool — the backend requires an authenticated caller (anonymous requests are rejected). Error surfaces propagated as tool errors: `validation_failed` (400 — repo not `owner/name`, missing `type`/`summary`, unknown fields; the empty `type`/`summary`/`repo` cases are also caught locally before the HTTP hop), `authentication_required` (401), `work_item_invalid` (422 — the request violates the type's conventions), `provider_unimplemented` (501 — the configured provider id is not registered, e.g. the interface-only `jira`; details name it), `work_item_filing_failed` (502 — the provider rejected the filing). On the 502 the raw provider cause is REDACTED from the body (it can carry storage / third-party-endpoint internals); the tool surfaces the `error_ref` and points at the operator log where the full cause is retained (E67.15 / #2587), instead of appending `details.error` verbatim as it did before. The CLI mirror is `fishhawk file-issue`.
 
 ## Product feedback (`fishhawk_report_product_issue`, [#1006](https://github.com/kuhlman-labs/fishhawk/issues/1006))
 

@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -1678,6 +1680,94 @@ func TestCreateCampaign_UnknownProvider_501(t *testing.T) {
 	}
 	if code := decodeCampaignError(t, w); code != "provider_unimplemented" {
 		t.Errorf("code = %q, want provider_unimplemented", code)
+	}
+}
+
+// TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog is the CALL-SITE
+// behavioural proof for campaigns.go demanded by operator condition 3 of E67.29
+// / #2631. The AST guard (raw_cause_guard_test.go) can prove this site no longer
+// passes a raw cause as the MESSAGE, but a syntactic package scan cannot prove
+// the cause is actually routed through internalCauseKey, nor that the operator
+// log retains it. So this drives the REAL handleCreateCampaign and asserts both
+// halves of the join at once:
+//
+//   - the client 501 body carries the static message, the product-owned
+//     provider/registered detail keys, error_ref, and NEITHER the cause text nor
+//     the literal "__cause" channel key;
+//   - ONE operator log record carries that SAME error_ref together with the full
+//     cause.
+//
+// Counterfactual: drop internalCauseKey from the campaigns.go call site and the
+// log-cause assertion goes RED while the body assertions stay green — which is
+// precisely the hole the AST guard alone leaves open.
+func TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog(t *testing.T) {
+	// A distinctive unregistered provider id: it is what UnknownProviderError
+	// renders into its message, so finding it in the log proves the CAUSE (not
+	// merely the allow-listed `provider` detail) survived into the record.
+	const providerID = "never_registered_campaign_cause_sentinel"
+	const reqID = "campaign-cond3-ref"
+
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		return workmgmt.Conventions{Provider: providerID}, nil
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	var logBuf bytes.Buffer
+	s := New(Config{
+		CampaignRepo: newFakeCampaignRepo(),
+		Logger:       slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/campaigns",
+		strings.NewReader(`{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, reqID))
+	w := httptest.NewRecorder()
+	s.handleCreateCampaign(w, withAuth(req))
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", w.Code, w.Body.String())
+	}
+
+	// (a) The client body: no cause, no internal channel key.
+	body := w.Body.String()
+	if strings.Contains(body, internalCauseKey) {
+		t.Errorf("internal cause key leaked into the campaign 501 body: %s", body)
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "provider_unimplemented" {
+		t.Errorf("code = %q, want provider_unimplemented", code)
+	}
+	if _, present := details[internalCauseKey]; present {
+		t.Errorf("details still carry %q: %v", internalCauseKey, details)
+	}
+	// The product-owned keys DO survive the default-deny allow-list (condition 2).
+	if details["provider"] != providerID {
+		t.Errorf("details[provider] = %v, want %q (an admitted, product-owned key)", details["provider"], providerID)
+	}
+	if _, present := details["registered"]; !present {
+		t.Errorf("details[registered] was dropped; it is an admitted, product-owned key: %v", details)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, body)
+	}
+	if env.Error.ErrorRef != reqID {
+		t.Fatalf("body error_ref = %q, want %q", env.Error.ErrorRef, reqID)
+	}
+	if env.Error.Message != "the resolved work-item provider is not implemented" {
+		t.Errorf("message = %q, want the static literal", env.Error.Message)
+	}
+
+	// (b) ONE operator log record joins the SAME ref with the full cause.
+	rec := soleLogRecord(t, &logBuf, "http error response")
+	if rec["error_ref"] != reqID {
+		t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
+	}
+	cause, _ := rec["cause"].(string)
+	if !strings.Contains(cause, providerID) {
+		t.Errorf("log cause = %v, want it to carry the provider cause %q joined to the ref", rec["cause"], providerID)
 	}
 }
 

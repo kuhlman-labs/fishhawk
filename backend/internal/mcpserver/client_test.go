@@ -20,12 +20,15 @@ import (
 // warning) surface the real cause; an empty/nil Details map renders the
 // concise form with no "details:" suffix.
 func TestAPIError_Error(t *testing.T) {
-	t.Run("with details surfaces the cause", func(t *testing.T) {
+	t.Run("with details surfaces the allow-listed keys", func(t *testing.T) {
+		// Post-#2587 a 5xx body carries only allow-listed structured keys (the
+		// raw cause is redacted server-side), so the rendered suffix surfaces
+		// those keys — the rendering mechanism itself is unchanged.
 		e := &apiError{
 			StatusCode: 502,
 			Code:       "slice_integration_error",
 			Message:    "integrate-wave failed",
-			Details:    map[string]any{"error": "merge conflict in foo.go"},
+			Details:    map[string]any{"run_id": "run-abc"},
 		}
 		got := e.Error()
 		if !strings.Contains(got, "slice_integration_error") {
@@ -34,8 +37,36 @@ func TestAPIError_Error(t *testing.T) {
 		if !strings.Contains(got, "details:") {
 			t.Errorf("missing details suffix in %q", got)
 		}
-		if !strings.Contains(got, "merge conflict in foo.go") {
-			t.Errorf("details cause not surfaced in %q", got)
+		if !strings.Contains(got, "run-abc") {
+			t.Errorf("details key not surfaced in %q", got)
+		}
+	})
+	t.Run("with error_ref appends the ref", func(t *testing.T) {
+		e := &apiError{
+			StatusCode: 502,
+			Code:       "work_item_filing_failed",
+			Message:    "provider could not file the work item",
+			ErrorRef:   "req-xyz789",
+		}
+		got := e.Error()
+		if !strings.Contains(got, "error_ref=req-xyz789") {
+			t.Errorf("missing error_ref suffix in %q", got)
+		}
+		if strings.Contains(got, "details:") {
+			t.Errorf("no details, but a details suffix rendered: %q", got)
+		}
+	})
+	t.Run("error_ref and details both render", func(t *testing.T) {
+		e := &apiError{
+			StatusCode: 502,
+			Code:       "work_item_filing_failed",
+			Message:    "boom",
+			Details:    map[string]any{"provider": "github_projects"},
+			ErrorRef:   "req-both",
+		}
+		got := e.Error()
+		if !strings.Contains(got, "github_projects") || !strings.Contains(got, "error_ref=req-both") {
+			t.Errorf("want both details and error_ref in %q", got)
 		}
 	})
 	t.Run("empty details omits the suffix", func(t *testing.T) {

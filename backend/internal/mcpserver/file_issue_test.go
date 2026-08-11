@@ -213,10 +213,14 @@ func TestFileIssue_BoardingBestEffort_DecodesThroughMirror(t *testing.T) {
 	}
 }
 
-func TestFileIssue_FilingFailed_SurfacesDetailsError(t *testing.T) {
+func TestFileIssue_FilingFailed_SurfacesErrorRef(t *testing.T) {
 	fb, srv := newFileIssueFakeBackend(t)
 	fb.status = http.StatusBadGateway
-	fb.errBody = `{"error":{"code":"work_item_filing_failed","message":"provider could not file the work item","details":{"error":"workmgmt/github: create issue: 403 Resource not accessible by integration"}}}`
+	// Post-#2587 the backend redacts the raw provider cause out of a 5xx body
+	// and hands back only error_ref; the operator recovers the cause from the
+	// server log keyed by that ref. The fixture is the SHIPPED 5xx shape: no
+	// details.error, an error_ref set.
+	fb.errBody = `{"error":{"code":"work_item_filing_failed","message":"provider could not file the work item","error_ref":"req-abc123"}}`
 	r := newResolver(srv, nil)
 
 	_, _, err := r.fileIssue(context.Background(), nil, FileIssueInput{
@@ -225,9 +229,12 @@ func TestFileIssue_FilingFailed_SurfacesDetailsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("want a tool error on a 502")
 	}
-	// The operator must see the provider cause, not a bare HTTP 502.
-	if !strings.Contains(err.Error(), "create issue: 403 Resource not accessible by integration") {
-		t.Errorf("err = %v, want the surfaced details.error cause", err)
+	// The operator must see the correlation handle plus a pointer to the log.
+	if !strings.Contains(err.Error(), "error_ref=req-abc123") {
+		t.Errorf("err = %v, want the surfaced error_ref", err)
+	}
+	if !strings.Contains(err.Error(), "server log") {
+		t.Errorf("err = %v, want the where-to-look pointer", err)
 	}
 }
 

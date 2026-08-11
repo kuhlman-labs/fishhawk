@@ -477,6 +477,7 @@ rate-limit / timeout, or an ad-hoc run with no repository to resolve against —
 | Question | Look here |
 |---|---|
 | What does v0 ship? | `docs/MVP_SPEC.md` §9, §13 |
+| 5xx error-cause redaction (E67.15 / #2587) | `backend/internal/server/errors.go` — `writeError` redacts 5xx `details` to a default-deny allow-list, sets `error_ref` (= `X-Request-ID`), and logs the full cause keyed by that ref; 4xx unchanged. Long form: `backend/internal/server/README.md`. |
 | Why a decision was made | The corresponding closed ADR issue (`gh issue list --label adr --state closed`) |
 | Voice / naming for new surfaces | `docs/BRAND_FOUNDATIONS.md` §5–§7 |
 | Autonomy tier of a change | `docs/METHODOLOGY.md` |

@@ -427,8 +427,23 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var unk *workmgmt.UnknownProviderError
 		if errors.As(err, &unk) {
+			// Static literal message (E67.15 / #2587): the same product-owned
+			// facts ride the allow-listed provider/registered detail keys, so
+			// nothing is lost from the CALLER's view, and unk.Error() as the
+			// message is a raw-cause syntax the AST guard flags. The cause
+			// itself rides internalCauseKey so writeError still joins it to
+			// error_ref in the operator log rather than dropping it (E67.29 /
+			// #2631, operator condition 3) — the AST guard can prove the
+			// message is static but not that the cause is retained, which is
+			// what TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog
+			// asserts behaviourally.
 			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
-				unk.Error(), map[string]any{"provider": unk.ID, "registered": unk.Known})
+				"the resolved work-item provider is not implemented",
+				map[string]any{
+					"provider":       unk.ID,
+					"registered":     unk.Known,
+					internalCauseKey: unk.Error(),
+				})
 			return
 		}
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
