@@ -2926,3 +2926,44 @@ func TestFixupStageAs_DoesNotMutateCallerConcernIDs(t *testing.T) {
 		t.Errorf("operator concern rows = %d, want 1 (mint happened)", got)
 	}
 }
+
+// TestFixupStage_OperatorConcern_RefusedMintsNoOrphan pins the no-orphan
+// ordering (#2623): mintOperatorConcern runs INSIDE fixupStageAs only AFTER
+// run.FixupStage's transition has committed, so a budget/ceiling/not-applicable
+// refusal — which returns from FixupStage with an error BEFORE the mint — leaves
+// the concern store untouched. There is no delete verb to unwind a minted row, so
+// a future refactor that hoisted the mint ABOVE the transition guard would have
+// every refused operator-concern fix-up wedge the open-concern gate with an
+// unremovable row. The budget is exhausted here by SEEDING a prior
+// stage_fixup_triggered entry (priorPasses=1, MaxPasses=1) rather than running a
+// real first pass, so no legitimate row precedes the refusal and the store must be
+// exactly EMPTY after the 422 — the strongest possible discriminator (0 vs the 1
+// orphan a hoisted mint would leave).
+func TestFixupStage_OperatorConcern_RefusedMintsNoOrphan(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	// A prior triggered pass with no refund exhausts the normal budget (1),
+	// without minting any row of its own.
+	seedFixupTriggeredSeq(au, stage.RunID, stage.ID, 10)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer that must not orphan a concern row", Reason: "r"})
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (budget exhausted):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "fixup_budget_exhausted") {
+		t.Errorf("body missing fixup_budget_exhausted code: %s", w.Body.String())
+	}
+
+	// The no-orphan invariant: the refused pass minted NOTHING. Reddens iff the
+	// mint is hoisted above run.FixupStage's transition guard.
+	if rows := operatorConcernRows(cr); len(rows) != 0 {
+		t.Fatalf("operator concern rows = %d, want 0 — a refused fix-up must not orphan a minted concern (there is no delete verb to unwind one)", len(rows))
+	}
+	// And the refused pass wrote no trigger entry (the seeded prior lives in
+	// au.seeded, not au.appended).
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("stage_fixup_triggered appended despite the 422 refusal")
+		}
+	}
+}
