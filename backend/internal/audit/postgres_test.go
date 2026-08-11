@@ -1461,3 +1461,226 @@ func TestPostgres_AppendChained_ParentAwaitingChildScopeDecisionConcurrent(t *te
 		prev = &h
 	}
 }
+
+// approvalConditionsTruncatedParams builds an approval_conditions_truncated
+// ChainAppendParams keyed on sourceEntryID — the value the 0068 index constrains
+// via payload->>'source_entry_id'. The extra tag varies the rest of the payload
+// so a duplicate-key collision is proven to key on source_entry_id, not on
+// whole-payload equality.
+func approvalConditionsTruncatedParams(runID, sourceEntryID uuid.UUID, tag string) audit.ChainAppendParams {
+	kind := audit.ActorSystem
+	p, _ := json.Marshal(map[string]any{
+		"source_entry_id": sourceEntryID.String(),
+		"source":          "approval_submitted",
+		"original_bytes":  13000,
+		"cap_bytes":       12000,
+		"dropped_bytes":   1000,
+		"tag":             tag,
+	})
+	return audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "approval_conditions_truncated",
+		ActorKind: &kind,
+		Payload:   p,
+	}
+}
+
+// TestIsApprovalConditionsTruncatedDuplicate pins each recognition branch of the
+// constraint-specific helper (#2622), mirroring TestIsMergeVerdictDuplicate and
+// TestIsParentAwaitingChildScopeDecisionDuplicate: the sentinel and its wrapped
+// form, a real pgconn 23505 on the 0068 index (bare and wrapped) → true; nil, an
+// unrelated error, a 23505 on a DIFFERENT constraint, and a non-23505 on the
+// index → false. A pure unit test (no Postgres).
+func TestIsApprovalConditionsTruncatedDuplicate(t *testing.T) {
+	idx := audit.ApprovalConditionsTruncatedOnceIndex
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unrelated error", errors.New("boom"), false},
+		{"sentinel", audit.ErrApprovalConditionsTruncatedDuplicate, true},
+		{"wrapped sentinel", fmt.Errorf("audit: append: %w", audit.ErrApprovalConditionsTruncatedDuplicate), true},
+		{"pg 23505 on the index", &pgconn.PgError{Code: "23505", ConstraintName: idx}, true},
+		{"wrapped pg 23505 on the index", fmt.Errorf("audit: append: %w", &pgconn.PgError{Code: "23505", ConstraintName: idx}), true},
+		{"pg 23505 on a different constraint", &pgconn.PgError{Code: "23505", ConstraintName: "audit_entries_run_id_sequence_key"}, false},
+		{"pg non-23505 on the index", &pgconn.PgError{Code: "23503", ConstraintName: idx}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := audit.IsApprovalConditionsTruncatedDuplicate(tt.err); got != tt.want {
+				t.Errorf("IsApprovalConditionsTruncatedDuplicate(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPostgres_AppendChained_ApprovalConditionsTruncatedUniquePerSource is the
+// done-means / real-DB behavioral assertion of the shipped 0068 partial unique
+// index (#2622): a SECOND approval_conditions_truncated AppendChained for the
+// SAME (run, source_entry_id) is rejected with an
+// audit.IsApprovalConditionsTruncatedDuplicate-recognized error, and exactly one
+// row survives. A comment-only or no-op touch of the index cannot satisfy this.
+func TestPostgres_AppendChained_ApprovalConditionsTruncatedUniquePerSource(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	sourceEntry := uuid.New()
+
+	first, err := repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, sourceEntry, "first"))
+	if err != nil {
+		t.Fatalf("first AppendChained: %v", err)
+	}
+	_, err = repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, sourceEntry, "second"))
+	if err == nil {
+		t.Fatal("second AppendChained for the same (run, source_entry_id) succeeded, want a duplicate error")
+	}
+	if !audit.IsApprovalConditionsTruncatedDuplicate(err) {
+		t.Fatalf("second AppendChained error not recognized as an approval-conditions-truncated duplicate: %v", err)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "approval_conditions_truncated")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("surviving approval_conditions_truncated rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].Sequence != first.Sequence {
+		t.Errorf("surviving row sequence = %d, want the first append's %d", rows[0].Sequence, first.Sequence)
+	}
+}
+
+// TestPostgres_AppendChained_ApprovalConditionsTruncatedDistinctSources is the
+// done-means test for the index KEY (#2622): two DIFFERENT source_entry_id
+// values under the SAME run both persist. It goes RED if the index is mistakenly
+// keyed on run_id alone — a shape the mere presence of a migration file would
+// otherwise satisfy — because the second distinct-source append would then
+// collide, suppressing a genuinely second over-cap approve comment's truncation.
+func TestPostgres_AppendChained_ApprovalConditionsTruncatedDistinctSources(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	if _, err := repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, uuid.New(), "commentA")); err != nil {
+		t.Fatalf("AppendChained for first source entry: %v", err)
+	}
+	if _, err := repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, uuid.New(), "commentB")); err != nil {
+		t.Fatalf("AppendChained for a SECOND distinct source entry under the same run: %v — the 0068 key must be (run_id, source_entry_id), not run_id alone", err)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "approval_conditions_truncated")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("approval_conditions_truncated rows for two distinct source entries = %d, want 2 (index must not collapse distinct over-cap comments)", len(rows))
+	}
+}
+
+// TestPostgres_AppendChained_ApprovalConditionsTruncatedConcurrent is the REAL
+// concurrency proof (#2622). N goroutines each AppendChained an
+// approval_conditions_truncated entry for the SAME (run, source_entry_id); the
+// FOR-UPDATE run-row serialization + the 0068 partial unique index make this
+// deterministic — exactly one wins, every loser hits the constraint-specific
+// duplicate, no panic/deadlock.
+func TestPostgres_AppendChained_ApprovalConditionsTruncatedConcurrent(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	sourceEntry := uuid.New()
+
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, sourceEntry, fmt.Sprintf("g%d", i)))
+		}(i)
+	}
+	wg.Wait()
+
+	var success, dupes int
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			success++
+		case audit.IsApprovalConditionsTruncatedDuplicate(e):
+			dupes++
+		default:
+			t.Fatalf("unexpected AppendChained error (want nil or an approval-conditions-truncated duplicate): %v", e)
+		}
+	}
+	if success != 1 {
+		t.Errorf("successful concurrent appends = %d, want exactly 1", success)
+	}
+	if dupes != n-1 {
+		t.Errorf("approval-conditions-truncated-duplicate losers = %d, want %d", dupes, n-1)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "approval_conditions_truncated")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("surviving approval_conditions_truncated rows = %d, want exactly 1", len(rows))
+	}
+}
+
+// TestPostgres_AppendChained_ApprovalConditionsTruncatedChainIntact proves the
+// rolled-back loser of a 0068 collision leaves the run's audit chain linear and
+// re-verifiable (#2622): after a deliberate same-key collision, ListForRun over
+// the run shows a linear prev_hash chain whose every entry re-computes via
+// ComputeEntryHash — no fork, no gap.
+func TestPostgres_AppendChained_ApprovalConditionsTruncatedChainIntact(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	sourceEntry := uuid.New()
+
+	if _, err := repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, sourceEntry, "first")); err != nil {
+		t.Fatalf("first AppendChained: %v", err)
+	}
+	// A second same-key append collides and rolls back inside its transaction.
+	if _, err := repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, sourceEntry, "second")); err == nil {
+		t.Fatal("second same-key AppendChained succeeded, want a duplicate collision")
+	}
+	// A further append under a DIFFERENT source key must still link cleanly onto
+	// the surviving chain head (not onto the rolled-back loser).
+	if _, err := repo.AppendChained(context.Background(), approvalConditionsTruncatedParams(runID, uuid.New(), "third")); err != nil {
+		t.Fatalf("post-collision distinct-key AppendChained: %v", err)
+	}
+
+	all, err := repo.ListForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListForRun: %v", err)
+	}
+	var prev *string
+	for i, e := range all {
+		if (e.PrevHash == nil) != (prev == nil) || (e.PrevHash != nil && prev != nil && *e.PrevHash != *prev) {
+			t.Fatalf("chain link broken at index %d: prev_hash=%v, want %v", i, e.PrevHash, prev)
+		}
+		recomputed, herr := audit.ComputeEntryHash(audit.HashInputs{
+			RunID:        e.RunID,
+			StageID:      e.StageID,
+			Timestamp:    e.Timestamp,
+			Category:     e.Category,
+			ActorKind:    e.ActorKind,
+			ActorSubject: e.ActorSubject,
+			Payload:      e.Payload,
+			PrevHash:     e.PrevHash,
+		})
+		if herr != nil {
+			t.Fatalf("ComputeEntryHash at index %d: %v", i, herr)
+		}
+		if recomputed != e.EntryHash {
+			t.Fatalf("entry-hash mismatch at index %d after a rolled-back collision: stored %s recomputed %s", i, e.EntryHash, recomputed)
+		}
+		h := e.EntryHash
+		prev = &h
+	}
+}

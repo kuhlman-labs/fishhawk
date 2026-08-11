@@ -1132,16 +1132,19 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	// 0067 (#2594, E67.19) is now the latest migration (the
+	// 0068 (#2622, E67.25) is now the latest migration (the
+	// audit_entries_approval_conditions_truncated_once_idx partial unique index,
+	// index-only). Roll it back FIRST, then 0067 (#2594, E67.19; the
 	// audit_entries_parent_awaiting_child_scope_decision_once_idx partial unique
-	// index, index-only). Roll it back FIRST, then 0066 (#2489, E48.62; adds
+	// index, index-only), then 0066 (#2489, E48.62; adds
 	// runs.predicted_runtime_minutes), then 0065 (#2482, E66.42;
 	// runs.working_dir), then 0064 (#2437, E66.20; drops oauth_clients.provider),
 	// then 0063 (#2433, E66.18; the four OAuth AS storage tables), then 0062 (the
 	// audit_entries_merge_verdict_recorded_once_idx partial unique index,
 	// index-only), then 0061 (users.provider), so this test's historical
 	// assertions, which pin 0060 as the one-step-rollback target, stay valid.
-	// 0067's own up/down reversal is pinned by
+	// 0068's own up/down reversal is pinned by
+	// TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal, 0067's by
 	// TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal, 0066's by
 	// TestMigrateDown_RunsPredictedRuntimeMinutesReversal, 0065's by
 	// TestMigrateDown_RunsWorkingDirReversal, 0064's by
@@ -1149,6 +1152,9 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 	// TestMigrateDown_OAuthASStorageReversal, 0062's by
 	// TestMigrateDown_MergeVerdictUniqueReversal, and 0061's by
 	// TestMigrateDown_UsersProviderReversal below.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067): %v", err)
 	}
@@ -2004,25 +2010,29 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 		t.Fatalf("seed gitlab user: %v", err)
 	}
 
-	// Roll back 0067 (the index-only parent-awaiting-child uniqueness), 0066
+	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness),
+	// 0067 (the index-only parent-awaiting-child uniqueness), 0066
 	// (runs.predicted_runtime_minutes), 0065 (runs.working_dir), 0064
 	// (oauth_clients.provider drop), 0063 (the OAuth AS storage tables) and 0062
 	// (the index-only merge-verdict uniqueness) first so the next one-step down
 	// targets 0061 — the reversal under test.
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0067 to reach 0062): %v", err)
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0061): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0066 to reach 0062): %v", err)
+		t.Fatalf("MigrateDown (roll back 0067 to reach 0061): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0065 to reach 0062): %v", err)
+		t.Fatalf("MigrateDown (roll back 0066 to reach 0061): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0064 to reach 0062): %v", err)
+		t.Fatalf("MigrateDown (roll back 0065 to reach 0061): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
-		t.Fatalf("MigrateDown (roll back 0063 to reach 0062): %v", err)
+		t.Fatalf("MigrateDown (roll back 0064 to reach 0061): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0063 to reach 0061): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0062 to reach 0061): %v", err)
@@ -2100,10 +2110,14 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 		t.Errorf("index def = %q, want a UNIQUE index (0062)", idxDef)
 	}
 
-	// Roll back 0067 (the index-only parent-awaiting-child uniqueness), 0066
+	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness),
+	// 0067 (the index-only parent-awaiting-child uniqueness), 0066
 	// (runs.predicted_runtime_minutes), 0065 (runs.working_dir), 0064
 	// (oauth_clients.provider drop) and 0063 (the OAuth AS storage tables) first
 	// so the next one-step down targets 0062 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0062): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0062): %v", err)
 	}
@@ -2150,8 +2164,9 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 // audit_entries_parent_awaiting_child_scope_decision_once_idx must be PRESENT
 // after MigrateUp — UNIQUE, partial on the parent_awaiting_child_scope_decision
 // category, and keyed on BOTH run_id and payload->>'child_stage_id' — and ABSENT
-// after one MigrateDown (index-only, clean DROP INDEX). 0067 is the head, so no
-// preparatory step-downs are needed. Mirrors TestMigrateDown_MergeVerdictUniqueReversal.
+// after one MigrateDown (index-only, clean DROP INDEX). 0068 (#2622) now sits
+// above 0067, so one preparatory step-down (roll back 0068) is taken first.
+// Mirrors TestMigrateDown_MergeVerdictUniqueReversal.
 func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T) {
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
@@ -2186,8 +2201,12 @@ func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T
 		t.Errorf("index def = %q, want payload->>'child_stage_id' as a key expression — a run_id-only key would collapse distinct parked children (0067)", idxDef)
 	}
 
-	// One MigrateDown drops exactly that index (index-only rollback); 0067 is
-	// the head, so no preparatory step-downs are needed.
+	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness)
+	// first so the next one-step down targets 0067 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0067): %v", err)
+	}
+	// One MigrateDown then drops exactly that index (index-only rollback).
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067): %v", err)
 	}
@@ -2210,6 +2229,166 @@ func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T
 	}
 	if auditTable != 1 {
 		t.Errorf("'audit_entries' table count after MigrateDown = %d, want 1 (0067 is index-only)", auditTable)
+	}
+}
+
+// TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal pins 0068 (#2622,
+// E67.25): the partial unique index
+// audit_entries_approval_conditions_truncated_once_idx must be PRESENT after
+// MigrateUp — UNIQUE, partial on the approval_conditions_truncated category, and
+// keyed on BOTH run_id and payload->>'source_entry_id' — and ABSENT after one
+// MigrateDown (index-only, clean DROP INDEX). 0068 is the head, so no preparatory
+// step-downs are needed. Mirrors
+// TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal.
+//
+// This is the PLAIN reversal fixture; the NULL-distinct safety of the migration
+// against the duplicate rows this bug already produced is a SEPARATE two-phase
+// fixture, TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeylessDuplicates
+// (kept distinct per binding condition 2).
+func TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	// Present after MigrateUp: UNIQUE, partial on the category, and keyed on
+	// BOTH run_id and the source_entry_id json expression (the shape that fails
+	// if the index were keyed on run_id alone).
+	var idxDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT indexdef FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_approval_conditions_truncated_once_idx'`,
+	).Scan(&idxDef); err != nil {
+		t.Fatalf("query audit_entries_approval_conditions_truncated_once_idx after MigrateUp (missing?): %v", err)
+	}
+	if !strings.Contains(idxDef, "UNIQUE") {
+		t.Errorf("index def = %q, want a UNIQUE index (0068)", idxDef)
+	}
+	if !strings.Contains(idxDef, "approval_conditions_truncated") {
+		t.Errorf("index def = %q, want partial WHERE category = 'approval_conditions_truncated' (0068)", idxDef)
+	}
+	if !strings.Contains(idxDef, "run_id") {
+		t.Errorf("index def = %q, want run_id as a key expression (0068)", idxDef)
+	}
+	if !strings.Contains(idxDef, "source_entry_id") {
+		t.Errorf("index def = %q, want payload->>'source_entry_id' as a key expression — a run_id-only key would suppress a second distinct over-cap comment's truncation (0068)", idxDef)
+	}
+
+	// One MigrateDown drops exactly that index (index-only rollback); 0068 is
+	// the head, so no preparatory step-downs are needed.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068): %v", err)
+	}
+	var idxCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_approval_conditions_truncated_once_idx'`,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after MigrateDown: %v", err)
+	}
+	if idxCount != 0 {
+		t.Errorf("audit_entries_approval_conditions_truncated_once_idx count after MigrateDown = %d, want 0 (0068 reverted)", idxCount)
+	}
+	// audit_entries itself survives (0068 is index-only; the table predates it).
+	var auditTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'audit_entries'`,
+	).Scan(&auditTable); err != nil {
+		t.Fatalf("query audit_entries table after MigrateDown: %v", err)
+	}
+	if auditTable != 1 {
+		t.Errorf("'audit_entries' table count after MigrateDown = %d, want 1 (0068 is index-only)", auditTable)
+	}
+}
+
+// TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeylessDuplicates
+// is the DISTINCT two-phase fixture required by binding condition 2 (#2622): it
+// proves migration 0068's CREATE UNIQUE INDEX cannot fail loud on the very
+// duplicate rows this bug already produced, because every pre-0068
+// approval_conditions_truncated row lacks the source_entry_id payload key,
+// payload->>'source_entry_id' yields SQL NULL, and NULLs are DISTINCT in a
+// PostgreSQL unique index.
+//
+// Two-phase setup (it deliberately does NOT reuse the plain reversal path):
+// MigrateUp to the 0068 head, then step DOWN once to 0067 so the index is absent,
+// insert two key-less approval_conditions_truncated rows for the SAME run (the
+// pre-fix accumulation), then step UP again to re-apply 0068. The re-apply must
+// REACH the index-exists assertion rather than erroring at migrate time. The
+// audit_entries append-only triggers block UPDATE/DELETE only — a plain INSERT of
+// the seed rows is permitted — so the two-phase seeding works against them.
+func TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeylessDuplicates(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	// Phase 1: step down to 0067 so the 0068 index is absent while we seed the
+	// pre-fix key-less duplicate rows.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to seed pre-fix rows): %v", err)
+	}
+
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	runID := uuid.New()
+	if _, err := pool.Exec(context.Background(),
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	// Two approval_conditions_truncated rows for the SAME run, both WITHOUT a
+	// source_entry_id payload key — exactly the duplicate accumulation the bug
+	// produced. They index as NULL under 0068 and, being NULL-distinct, coexist.
+	for i, hash := range []string{"h1", "h2"} {
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO audit_entries (id, run_id, category, payload, entry_hash)
+			 VALUES ($1, $2, 'approval_conditions_truncated', '{"source":"approval_submitted"}'::jsonb, $3)`,
+			uuid.New(), runID, hash,
+		); err != nil {
+			t.Fatalf("seed key-less duplicate row %d: %v", i, err)
+		}
+	}
+	pool.Close()
+
+	// Phase 2: re-apply 0068. This MUST succeed despite the two key-less rows.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply 0068 over two pre-existing key-less duplicates) failed — the index must tolerate NULL-keyed duplicates: %v", err)
+	}
+
+	pool2, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("re-Connect: %v", err)
+	}
+	defer pool2.Close()
+
+	// The index exists again, and both seeded rows survived (index-only, no data
+	// migration).
+	var idxCount int
+	if err := pool2.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = 'audit_entries_approval_conditions_truncated_once_idx'`,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after re-apply: %v", err)
+	}
+	if idxCount != 1 {
+		t.Errorf("audit_entries_approval_conditions_truncated_once_idx count after re-apply = %d, want 1", idxCount)
+	}
+	var rowCount int
+	if err := pool2.QueryRow(context.Background(),
+		`SELECT count(*) FROM audit_entries WHERE run_id = $1 AND category = 'approval_conditions_truncated'`, runID,
+	).Scan(&rowCount); err != nil {
+		t.Fatalf("count seeded rows after re-apply: %v", err)
+	}
+	if rowCount != 2 {
+		t.Errorf("seeded key-less rows after re-apply = %d, want 2 (both NULL-keyed rows coexist; 0068 is index-only)", rowCount)
 	}
 }
 
@@ -2284,10 +2463,14 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 		}
 	}
 
-	// Roll back 0067 (the index-only parent-awaiting-child uniqueness), 0066
+	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness),
+	// 0067 (the index-only parent-awaiting-child uniqueness), 0066
 	// (runs.predicted_runtime_minutes), 0065 (runs.working_dir) and 0064
 	// (oauth_clients.provider drop) first so the next one-step down targets
 	// 0063 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0063): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0063): %v", err)
 	}
@@ -2425,9 +2608,13 @@ func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
 		}
 	}
 
-	// Roll back 0067 (the index-only parent-awaiting-child uniqueness), 0066
+	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness),
+	// 0067 (the index-only parent-awaiting-child uniqueness), 0066
 	// (runs.predicted_runtime_minutes) and 0065 (runs.working_dir) first so the
 	// next one-step down targets 0064 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0064): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0064): %v", err)
 	}
@@ -2496,8 +2683,12 @@ func TestMigrateDown_RunsPredictedRuntimeMinutesReversal(t *testing.T) {
 		t.Errorf("runs.predicted_runtime_minutes count after MigrateUp = %d, want 1 (0066 added it)", n)
 	}
 
-	// Roll back 0067 (the index-only parent-awaiting-child uniqueness) first so
-	// the next one-step down targets 0066 — the reversal under test.
+	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness)
+	// and 0067 (the index-only parent-awaiting-child uniqueness) first so the
+	// next one-step down targets 0066 — the reversal under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0066): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0066): %v", err)
 	}
@@ -2547,10 +2738,14 @@ func TestMigrateDown_RunsWorkingDirReversal(t *testing.T) {
 		t.Errorf("runs.working_dir count after MigrateUp = %d, want 1 (0065 added it)", n)
 	}
 
-	// Roll back 0067 (the index-only parent-awaiting-child uniqueness) and 0066
+	// Roll back 0068 (the index-only approval-conditions-truncated uniqueness),
+	// 0067 (the index-only parent-awaiting-child uniqueness) and 0066
 	// (runs.predicted_runtime_minutes) first so the next one-step down targets
 	// 0065 — the reversal under test. Exactly one MigrateDown then drops the
 	// column.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0065): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0065): %v", err)
 	}
@@ -2643,6 +2838,9 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 	// inert) then 0042 (drop idempotency_key — inert) then 0041 (drop
 	// operator_agent — inert), all leaving the paused rows untouched, to reach
 	// 0040, the normalizing rollback under test.
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 (drop the approval-conditions-truncated uniqueness index) failed): %v", err)
+	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 (drop the parent-awaiting-child uniqueness index) failed): %v", err)
 	}
@@ -2775,6 +2973,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re-applying the backfill.
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0053): %v", err)
@@ -2924,6 +3125,9 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 	// re: stages) then 0055 (account_members + account_id + endpoint
 	// relocation, inert re: stages) then 0054 (the runner_kind CHECK widening,
 	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0053): %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0053): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
@@ -3003,6 +3207,9 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 	// NOT yet exist).
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
+	}
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0068 to reach 0054): %v", err)
 	}
 	if err := postgres.MigrateDown(url); err != nil {
 		t.Fatalf("MigrateDown (roll back 0067 to reach 0054): %v", err)

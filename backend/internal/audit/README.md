@@ -99,6 +99,45 @@ suppressing a legitimate second-park signal. The #2591 implementer MUST widen th
 key to carry an episode component (or emit a distinct category) before allowing
 re-park; do not rely on this index to surface a second park.
 
+## At-most-one approval_conditions_truncated per (run, source approval comment) (0068 / #2622)
+
+The `approval_conditions_truncated` category (`server/prompt.go`'s
+`loadApprovalConditions` → `appendApprovalConditionsTruncatedAudit`, #2583) is
+gated to **at most one row per (run, source approval comment)** by migration
+0068's partial unique index
+`audit_entries_approval_conditions_truncated_once_idx` (`ON audit_entries
+(run_id, (payload->>'source_entry_id')) WHERE category =
+'approval_conditions_truncated'`). The emitter appends this entry on EVERY
+implement-prompt build that loads a legacy over-cap approve comment, and prompt
+construction for a stage repeats (retries, prompt-render fetches), so without the
+index one truncation would accumulate N entries and the observability surface
+(added by #2583 so a dropped operator condition is visible) would report one
+dropped condition as five.
+
+The key is `(run_id, source_entry_id)`, NOT `run_id` alone: `source_entry_id` is
+the id of the `approval_submitted` entry whose comment was truncated, so a run
+that carries two DISTINCT over-cap approve comments across a re-plan cycle still
+records each genuine truncation ONCE under its own key. A `run_id`-only key would
+silently suppress the second drop — the same class of audit lie in the other
+direction.
+
+The single emitter distinguishes the benign already-recorded collision from an
+unrelated integrity failure with `IsApprovalConditionsTruncatedDuplicate(err)` in
+`postgres.go`, which matches ONLY a `unique_violation` on
+`ApprovalConditionsTruncatedOnceIndex` — or the
+`ErrApprovalConditionsTruncatedDuplicate` sentinel that fakes return — and
+deliberately does NOT swallow a 23505 on any other constraint (mirrors the
+merge-verdict and parent-awaiting narrowings above). On that collision the emitter
+logs INFO (the benign already-recorded outcome) and still returns the capped
+conditions; every other append error keeps its WARN. Both paths are non-fatal — a
+bookkeeping append never blocks prompt construction.
+
+**Safe against the duplicates the bug already produced.** Every pre-0068 row lacks
+the `source_entry_id` payload key, so `payload->>'source_entry_id'` yields SQL
+NULL and — NULLs being distinct in a PostgreSQL unique index — any number of
+key-less rows coexist. `CREATE UNIQUE INDEX` therefore never sees a collision
+among the pre-existing accumulated rows and cannot fail loud at migrate time.
+
 ## Frozen HashInputs (deliberate)
 
 `account_id` is **not** part of the canonical hash (`chain.go`

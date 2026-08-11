@@ -3708,6 +3708,12 @@ func (s *Server) loadLastDecomposeRejectionReason(ctx context.Context, runID uui
 // for a comment stored BEFORE the gate existed, or via a channel that bypasses
 // it (e.g. the in-process auto-driver). The entry makes that residual, silent
 // truncation VISIBLE in the run record rather than dropping the tail unseen.
+//
+// The append is idempotent per (run, source approval comment): at most one entry
+// per (run_id, source_entry_id) is enforced by migration 0068's partial unique
+// index (#2622). Prompt construction for a stage repeats (retries, prompt-render
+// fetches), so without the index one truncation would accumulate N entries and
+// the observability surface would report one dropped condition as five.
 const CategoryApprovalConditionsTruncated = "approval_conditions_truncated"
 
 // loadApprovalConditions scans the run's approval_submitted audit entries
@@ -3715,7 +3721,11 @@ const CategoryApprovalConditionsTruncated = "approval_conditions_truncated"
 // comment payload key is non-empty. Returns the comment string (capped at
 // prompt.MaxApprovalConditionBytes) or nil when none is found. When the stored
 // comment exceeds the cap it is truncated AND an approval_conditions_truncated
-// audit entry is appended (best-effort) so the residual drop is visible.
+// audit entry is appended (best-effort) so the residual drop is visible. That
+// append is idempotent per (run, source approval comment): repeated prompt
+// builds for the same stage record AT MOST ONE entry per truncated source
+// comment, enforced by migration 0068's partial unique index (#2622), rather
+// than one entry per build.
 // Best-effort: WARN-logs and returns nil on any error.
 func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *string {
 	if s.cfg.AuditRepo == nil {
@@ -3746,7 +3756,7 @@ func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *s
 				slog.Bool("truncated", truncated),
 			)
 			if truncated {
-				s.appendApprovalConditionsTruncatedAudit(ctx, runID, len(payload.Comment))
+				s.appendApprovalConditionsTruncatedAudit(ctx, runID, entries[i].ID, len(payload.Comment))
 			}
 			return &c
 		}
@@ -3757,18 +3767,33 @@ func (s *Server) loadApprovalConditions(ctx context.Context, runID uuid.UUID) *s
 // appendApprovalConditionsTruncatedAudit records the residual truncation of a
 // stored over-cap approve-with-conditions comment (#2583). Best-effort: a
 // WARN-logged append failure never blocks prompt construction, matching the
-// surrounding loader style. Payload records the original size, the cap, and the
+// surrounding loader style. Payload records the original size, the cap, the
 // dropped-byte count, tagged source="approval_submitted" (the channel the
-// truncated comment was read from).
-func (s *Server) appendApprovalConditionsTruncatedAudit(ctx context.Context, runID uuid.UUID, originalBytes int) {
+// truncated comment was read from), AND source_entry_id — the id of the
+// approval_submitted entry whose comment was truncated. source_entry_id is the
+// key of migration 0068's partial unique index (#2622): it makes the append
+// idempotent per (run, source approval comment) so repeated prompt builds do not
+// multiply the entry, while a SECOND, genuinely different over-cap approve
+// comment in the same run still records its own truncation under its own key.
+//
+// On a 0068 collision (this truncation was already recorded on an earlier prompt
+// build) AppendChained returns an audit.IsApprovalConditionsTruncatedDuplicate
+// error; that is the benign already-recorded outcome, logged at INFO and NOT
+// WARN. Every other append error keeps the WARN. No pre-read fast path is added:
+// the append is reached only on the rare legacy over-cap path, so a doomed
+// INSERT that rolls back is cheaper than an unconditional ListForRunByCategory
+// scan on every truncating build, and a read-then-append would reintroduce the
+// check-then-append race #2594 was filed to eliminate.
+func (s *Server) appendApprovalConditionsTruncatedAudit(ctx context.Context, runID, sourceEntryID uuid.UUID, originalBytes int) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
 	payload, _ := json.Marshal(map[string]any{
-		"original_bytes": originalBytes,
-		"cap_bytes":      prompt.MaxApprovalConditionBytes,
-		"dropped_bytes":  originalBytes - prompt.MaxApprovalConditionBytes,
-		"source":         "approval_submitted",
+		"original_bytes":  originalBytes,
+		"cap_bytes":       prompt.MaxApprovalConditionBytes,
+		"dropped_bytes":   originalBytes - prompt.MaxApprovalConditionBytes,
+		"source":          "approval_submitted",
+		"source_entry_id": sourceEntryID.String(),
 	})
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
@@ -3776,6 +3801,15 @@ func (s *Server) appendApprovalConditionsTruncatedAudit(ctx context.Context, run
 		Category:  CategoryApprovalConditionsTruncated,
 		Payload:   payload,
 	}); err != nil {
+		if audit.IsApprovalConditionsTruncatedDuplicate(err) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: approval_conditions_truncated already recorded for this approval comment",
+				slog.String("run_id", runID.String()),
+				slog.String("source_entry_id", sourceEntryID.String()),
+				slog.Int("original_bytes", originalBytes),
+			)
+			return
+		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: append approval_conditions_truncated audit failed",
 			slog.String("run_id", runID.String()),

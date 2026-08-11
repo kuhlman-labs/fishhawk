@@ -98,6 +98,42 @@ func IsParentAwaitingChildScopeDecisionDuplicate(err error) bool {
 		IsDuplicateOnConstraint(err, ParentAwaitingChildScopeDecisionOnceIndex)
 }
 
+// ApprovalConditionsTruncatedOnceIndex is the name of the partial unique index
+// (migration 0068, #2622) enforcing at most one approval_conditions_truncated
+// audit entry per (run, source approval comment): CREATE UNIQUE INDEX ... ON
+// audit_entries (run_id, (payload->>'source_entry_id')) WHERE category =
+// 'approval_conditions_truncated'. loadApprovalConditions
+// (server/prompt.go::appendApprovalConditionsTruncatedAudit) appends this entry
+// on every implement-prompt build that loads a legacy over-cap approve comment,
+// and prompt construction repeats (retries, prompt-render fetches), so one
+// truncation would otherwise accumulate N entries; the emitter scopes its benign
+// already-recorded catch to a collision on THIS index specifically (see
+// IsApprovalConditionsTruncatedDuplicate), so an unrelated 23505 stays a hard
+// error.
+const ApprovalConditionsTruncatedOnceIndex = "audit_entries_approval_conditions_truncated_once_idx"
+
+// ErrApprovalConditionsTruncatedDuplicate is a sentinel a fake Repository can
+// return from AppendChained to simulate the already-recorded outcome (the
+// deterministic loser of the ApprovalConditionsTruncatedOnceIndex collision).
+// IsApprovalConditionsTruncatedDuplicate recognizes it alongside a real
+// driver-surfaced unique_violation on that index, so the emitter's benign path
+// can be exercised without importing pgconn or standing up real Postgres.
+var ErrApprovalConditionsTruncatedDuplicate = errors.New("audit: duplicate approval_conditions_truncated entry")
+
+// IsApprovalConditionsTruncatedDuplicate reports whether err is the SPECIFIC
+// benign already-recorded collision: a unique_violation on the
+// ApprovalConditionsTruncatedOnceIndex partial unique index, or the
+// ErrApprovalConditionsTruncatedDuplicate sentinel (for fakes). It deliberately
+// does NOT match a 23505 on any OTHER constraint touched by the AppendChained
+// insert (the entry-hash / (run_id, sequence) uniqueness): swallowing those
+// would treat an unrelated integrity failure as the benign repeated-build case
+// and silently drop a real error (mirrors the #1983 merge-verdict and #2594
+// parent-awaiting narrowings above).
+func IsApprovalConditionsTruncatedDuplicate(err error) bool {
+	return errors.Is(err, ErrApprovalConditionsTruncatedDuplicate) ||
+		IsDuplicateOnConstraint(err, ApprovalConditionsTruncatedOnceIndex)
+}
+
 type postgresRepo struct {
 	pool *pgxpool.Pool
 }
