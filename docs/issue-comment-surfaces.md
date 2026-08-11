@@ -380,6 +380,17 @@ Notes:
 - The typed-reply approval path (`+1` / `lgtm` per E17.4) does NOT post its
   own slash reply (`silent=true`) — the user's typed reply *is* the
   acknowledgment. The plan-on-issue comment edit covers the broadcast.
+- **The one case where the slash-command reply surface deliberately posts
+  NOTHING at all** (E67.24 / #2621): an over-cap approve comment arriving on
+  the typed-reply (`silent=true`) channel is refused before `Submit` (#2583 —
+  the comment would become a binding approval condition, so it must not be
+  silently truncated), and the refusal posts no reply, because a passer-by
+  `+1` that happens to exceed the cap should not draw an unsolicited bot
+  comment. The standing-in machine record is the `approval_comment_refused`
+  audit category (`Server.writeApprovalCommentRefusedAudit`, also written on
+  the non-silent slash variant with `silent:false`) — so the drop is visible
+  in the run record even though no comment exists to point at. A trace, not
+  a response: the suppression is intentional and stays.
 - The review-lifecycle audit categories — `plan_reviewed` /
   `implement_reviewed` (terminal verdicts), `plan_review_skipped` /
   `implement_review_skipped` (degraded gate), `plan_review_started` /
