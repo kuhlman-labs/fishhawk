@@ -7,13 +7,27 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
+
+// setHTTPShutdownTimeout overrides the package-level httpShutdownTimeout for a
+// timing-sensitive test and returns a restore closure — modeled on
+// backend/internal/claudecode's setKillGrace. Swapping a package var is safe
+// here ONLY because no test in package main calls t.Parallel(); a future
+// parallel test would race this swap and must instead thread the timeout
+// explicitly.
+func setHTTPShutdownTimeout(d time.Duration) func() {
+	prev := httpShutdownTimeout
+	httpShutdownTimeout = d
+	return func() { httpShutdownTimeout = prev }
+}
 
 func TestValidateLoopbackAddr(t *testing.T) {
 	// stubLookup answers a fixed host->IPs map; any other host errors so
@@ -166,6 +180,15 @@ func (b bearerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 // asserts a bearer-less client is rejected.
 func TestServeHTTP_RoundTrip(t *testing.T) {
 	const token = "tok_roundtrip"
+
+	// Route the graceful-shutdown timeout and this test's own outer guard
+	// through one timescale base so both scale by a single factor and their
+	// ratio (outer strictly greater than inner) holds at any factor — the
+	// property that makes the 'serveHTTP did not return' branch below mean a
+	// wedge rather than a slow runner (AGENTS.md wall-clock-boundary rule,
+	// #2628). Capture the production default BEFORE overriding it.
+	base := httpShutdownTimeout
+	defer setHTTPShutdownTimeout(timescale.D(base))()
 	// Build through the extracted cross-package entry point mcpserver.NewServer
 	// (E66.7 / #2408) — the same construction path main.go's newServer now uses
 	// — so this seam test exercises the binary->package boundary and the
@@ -293,7 +316,9 @@ func TestServeHTTP_RoundTrip(t *testing.T) {
 		if err != nil {
 			t.Errorf("serveHTTP returned %v after cancel", err)
 		}
-	case <-time.After(httpShutdownTimeout + time.Second):
+	// Outer guard derives from the SAME base as the overridden inner shutdown
+	// timeout (timescale.D), so it stays strictly greater than it at any factor.
+	case <-time.After(timescale.D(base + time.Second)):
 		t.Error("serveHTTP did not return after ctx cancel")
 	}
 }
@@ -306,9 +331,135 @@ func TestServeHTTP_RejectsNonLoopbackAddr(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_ShutdownTimeoutFiresOnWedgedConn is the discrimination test for
+// #2628: it proves the graceful-shutdown bound still FIRES on a genuinely
+// wedged shutdown rather than merely having been enlarged to always pass.
+//
+// The wedge is a deterministically ACTIVE connection: a fully-received tool
+// call whose handler blocks. net/http.Server.Shutdown closes idle connections
+// but WAITS for active ones, so while the handler blocks the connection stays
+// in StateActive and Shutdown cannot complete — it hits the (scaled, short)
+// shutdown deadline and serveHTTP returns the context.DeadlineExceeded that
+// srv.Shutdown yields verbatim on ctx.Done and serveHTTP propagates unwrapped.
+//
+// The counterfactual is the block itself (see the marked select): remove it and
+// the handler returns immediately, the connection returns to idle, Shutdown
+// reaps it, and serveHTTP returns nil — flipping the DeadlineExceeded assertion
+// RED. The standalone SSE GET is disabled on the client so the ONLY active
+// connection is the tool-call POST, keeping the block load-bearing (a bare or
+// partial connection would sit in StateNew, which Shutdown also refuses to reap
+// under 5s, and so would NOT discriminate the block).
+func TestServeHTTP_ShutdownTimeoutFiresOnWedgedConn(t *testing.T) {
+	const token = "tok_wedge"
+
+	// A deliberately SHORT scaled shutdown timeout: this test consumes it in
+	// full, so keep the base small (200ms → 1s at CI factor 5).
+	base := 200 * time.Millisecond
+	defer setHTTPShutdownTimeout(timescale.D(base))()
+
+	entered := make(chan struct{}) // the named observable: handler reached
+	release := make(chan struct{}) // closed in cleanup to unblock the handler
+	var enterOnce sync.Once
+
+	newServer := func() *mcp.Server {
+		srv := mcp.NewServer(&mcp.Implementation{Name: "wedge", Version: "0"}, nil)
+		mcp.AddTool(srv, &mcp.Tool{Name: "block", Description: "blocks until released"},
+			func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, struct{}, error) {
+				enterOnce.Do(func() { close(entered) })
+				// THE CONTROL: hold the request open so the connection stays
+				// StateActive and Shutdown cannot reap it. Deleting this select
+				// is the counterfactual — the handler then returns immediately,
+				// the connection goes idle, Shutdown returns nil, and the
+				// DeadlineExceeded assertion below goes RED.
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+				return nil, struct{}{}, nil
+			})
+		return srv
+	}
+
+	// Bind a loopback port to learn an addr, then close it so serveHTTP can
+	// re-bind the same addr (as TestServeHTTP_RoundTrip does).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- serveHTTP(ctx, addr, token, newServer)
+	}()
+	waitForListener(t, addr)
+
+	// Drive a blocking tool call in the background. Its request context is
+	// context.Background(), NOT the serveHTTP ctx — cancelling serveHTTP must
+	// not tear down the in-flight request, or the connection would leave
+	// StateActive and the wedge would dissolve.
+	sessionCh := make(chan *mcp.ClientSession, 1)
+	connectErr := make(chan error, 1)
+	go func() {
+		httpClient := &http.Client{
+			Transport: bearerRoundTripper{token: token, base: http.DefaultTransport},
+		}
+		client := mcp.NewClient(&mcp.Implementation{Name: "wedge-client", Version: "0"}, nil)
+		session, cerr := client.Connect(context.Background(), &mcp.StreamableClientTransport{
+			Endpoint:             "http://" + addr,
+			HTTPClient:           httpClient,
+			DisableStandaloneSSE: true,
+		}, nil)
+		if cerr != nil {
+			connectErr <- cerr
+			return
+		}
+		sessionCh <- session
+		_, _ = session.CallTool(context.Background(), &mcp.CallToolParams{Name: "block"})
+	}()
+
+	// Cleanup: unblock the handler and close the session so no goroutine leaks.
+	t.Cleanup(func() {
+		close(release)
+		select {
+		case session := <-sessionCh:
+			_ = session.Close()
+		default:
+		}
+	})
+
+	// Wait on the observable — the handler was reached, so the request is fully
+	// received and the connection is StateActive — before cancelling. No sleep.
+	select {
+	case <-entered:
+	case cerr := <-connectErr:
+		t.Fatalf("client connect: %v", cerr)
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("blocking tool handler was never entered")
+	}
+
+	cancel() // trigger the graceful-shutdown path with the wedge in place
+
+	select {
+	case err := <-serveErr:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("serveHTTP = %v, want context.DeadlineExceeded from the wedged shutdown", err)
+		}
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("serveHTTP did not return within the scaled shutdown budget")
+	}
+}
+
 func waitForListener(t *testing.T, addr string) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	// The liveness deadline is a spawn/reap wait, so it scales with the factor
+	// (AGENTS.md). The 10ms poll interval and 100ms per-attempt dial timeout are
+	// sub-boundary sampling granularity, not assertion bounds, and stay unscaled:
+	// a dial that times out simply retries until the scaled deadline.
+	deadline := time.Now().Add(timescale.D(3 * time.Second))
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err == nil {

@@ -32,7 +32,13 @@ import (
 
 // httpShutdownTimeout bounds the graceful Shutdown on ctx cancellation
 // so a wedged in-flight request can't hang the listener close forever.
-const httpShutdownTimeout = 5 * time.Second
+//
+// It is a var, not a const, ONLY so a timing-sensitive test can override
+// it via a save/restore helper (setHTTPShutdownTimeout) — the shipped
+// default is unchanged at 5s. This mirrors backend/internal/claudecode's
+// `var killGrace = 5 * time.Second`, overridden by that package's
+// setKillGrace helper for the same reason.
+var httpShutdownTimeout = 5 * time.Second
 
 // validateLoopbackAddr returns a normalized host:port that is guaranteed
 // to bind only to a loopback interface, or an error naming the offending
