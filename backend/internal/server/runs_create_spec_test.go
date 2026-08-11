@@ -299,7 +299,7 @@ func TestCreateRun_WorkflowSpec_StageCreateFails_Returns500(t *testing.T) {
 	if env.Error.ErrorRef != "create-ref-1" {
 		t.Errorf("body error_ref = %q, want create-ref-1", env.Error.ErrorRef)
 	}
-	rec := findLogRecord(t, &logBuf, "http error response")
+	rec := soleLogRecord(t, &logBuf, "http error response")
 	raw, _ := json.Marshal(rec)
 	if rec["error_ref"] != "create-ref-1" || !strings.Contains(string(raw), "create stages failed") {
 		t.Errorf("operator log must retain the full cause keyed by error_ref: %s", raw)

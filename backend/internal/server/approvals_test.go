@@ -7508,7 +7508,7 @@ workflows:
 		if env.Error.ErrorRef != "deleg-ref-1" {
 			t.Fatalf("body error_ref = %q, want deleg-ref-1", env.Error.ErrorRef)
 		}
-		rec := findLogRecord(t, logBuf, "http error response")
+		rec := soleLogRecord(t, logBuf, "http error response")
 		raw, _ := json.Marshal(rec)
 		if rec["error_ref"] != "deleg-ref-1" || !strings.Contains(string(raw), "clean_dual_approval") {
 			t.Fatalf("operator log must retain the evaluated approve condition keyed by error_ref: %s", raw)

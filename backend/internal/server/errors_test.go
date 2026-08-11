@@ -129,7 +129,7 @@ func TestWriteError_5xxLogsFullCauseKeyedByErrorRef(t *testing.T) {
 	}
 
 	// One record joins error_ref and the full cause.
-	rec4 := findLogRecord(t, buf, "http error response")
+	rec4 := soleLogRecord(t, buf, "http error response")
 	if rec4["error_ref"] != "corr-4" {
 		t.Errorf("log error_ref = %v, want corr-4", rec4["error_ref"])
 	}
@@ -236,10 +236,18 @@ func TestSplitInternalCause(t *testing.T) {
 	}
 }
 
-// findLogRecord scans the JSON log buffer for the first record whose msg field
-// matches want and returns it decoded.
-func findLogRecord(t *testing.T, buf *bytes.Buffer, want string) map[string]any {
+// soleLogRecord scans the JSON log buffer for records whose msg field matches
+// want and returns the single match decoded. It asserts the ONE-record
+// invariant every caller relies on rather than returning the first hit: the
+// chokepoint's contract is that a 5xx emits EXACTLY ONE "http error response"
+// record joining error_ref to the full cause, so an implementation that emitted
+// the record twice (once redacted for the client path, once with the cause)
+// would satisfy a first-match helper while splitting the correlation across two
+// lines and re-disclosing the cause on an extra record. Counting here makes
+// that failure mode observable at every call site at once.
+func soleLogRecord(t *testing.T, buf *bytes.Buffer, want string) map[string]any {
 	t.Helper()
+	var matches []map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
 		if line == "" {
 			continue
@@ -249,9 +257,11 @@ func findLogRecord(t *testing.T, buf *bytes.Buffer, want string) map[string]any 
 			continue
 		}
 		if rec["msg"] == want {
-			return rec
+			matches = append(matches, rec)
 		}
 	}
-	t.Fatalf("no log record with msg=%q in:\n%s", want, buf.String())
-	return nil
+	if len(matches) != 1 {
+		t.Fatalf("want EXACTLY ONE log record with msg=%q, got %d in:\n%s", want, len(matches), buf.String())
+	}
+	return matches[0]
 }

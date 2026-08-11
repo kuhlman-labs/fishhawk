@@ -1761,7 +1761,7 @@ func TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog(t *testing.T) {
 	}
 
 	// (b) ONE operator log record joins the SAME ref with the full cause.
-	rec := findLogRecord(t, &logBuf, "http error response")
+	rec := soleLogRecord(t, &logBuf, "http error response")
 	if rec["error_ref"] != reqID {
 		t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
 	}

@@ -444,7 +444,7 @@ func TestRecoverRun_ScopeAmendmentCreateFails_RedactsCauseJoinsInLog(t *testing.
 	}
 
 	// ONE operator log record joins the SAME ref with the full cause.
-	rec := findLogRecord(t, &logBuf, "http error response")
+	rec := soleLogRecord(t, &logBuf, "http error response")
 	if rec["error_ref"] != reqID {
 		t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
 	}
@@ -489,7 +489,7 @@ func assertRedactedCauseJoinsInLog(t *testing.T, w *httptest.ResponseRecorder, l
 	if env.Error.Message != wantMsg {
 		t.Errorf("message = %q, want %q (wrong branch produced this 500)", env.Error.Message, wantMsg)
 	}
-	rec := findLogRecord(t, logBuf, "http error response")
+	rec := soleLogRecord(t, logBuf, "http error response")
 	if rec["error_ref"] != reqID {
 		t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
 	}
