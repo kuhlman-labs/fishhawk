@@ -57,6 +57,48 @@ any OTHER constraint (hash-chain / entry-hash / `(run_id, sequence)`
 uniqueness) is deliberately NOT swallowed, so an unrelated failure stays a
 hard error rather than being mistaken for the concurrent-merge race.
 
+## At-most-one parent_awaiting_child_scope_decision per (run, child stage) (0067 / #2594)
+
+The `parent_awaiting_child_scope_decision` category (a decomposition parent's
+signal that a child parked awaiting a scope-completeness decision, #2548) is
+gated to **at most one row per (parent run, child stage)** by migration 0067's
+partial unique index
+`audit_entries_parent_awaiting_child_scope_decision_once_idx` (`ON audit_entries
+(run_id, (payload->>'child_stage_id')) WHERE category =
+'parent_awaiting_child_scope_decision'`). This closes the check-then-append race
+between the category's TWO emitters — `server`'s park-time
+`emitParentAwaitingChildScopeDecision` and `orchestrator`'s sibling-settle
+`surfaceParkedChildren` — which previously de-duplicated with a read in only one
+of them; two concurrent sibling terminal transitions, or the park-time emitter
+racing a sibling settle, could both land an entry for the same child stage.
+`AppendChainedTx`'s `SELECT … FOR UPDATE` on the run row serializes the appends,
+so the race-loser's insert deterministically violates the index at the single
+choke point both emitters share.
+
+The key is `(run_id, child_stage_id)`, NOT `run_id` alone: one parent
+legitimately carries ONE entry per parked child stage, so keying on `run_id`
+alone would collapse distinct parked children into one signal.
+
+Both emitters distinguish that benign collision from an unrelated integrity
+failure with `IsParentAwaitingChildScopeDecisionDuplicate(err)` in `postgres.go`,
+which matches ONLY a `unique_violation` on
+`ParentAwaitingChildScopeDecisionOnceIndex` — or the
+`ErrParentAwaitingChildScopeDecisionDuplicate` sentinel that fakes return — and
+deliberately does NOT swallow a 23505 on any other constraint (mirrors the
+merge-verdict narrowing above). On that collision the emitter logs INFO (the
+benign already-recorded outcome) and neither unwinds the park nor the parent's
+dispatch top-up.
+
+**#2591 caveat — this key has NO episode component.** It enforces at-most-one
+entry per parent run per child stage for the ENTIRE life of the run, not per park
+episode, which matches today's done-means because a child stage parks exactly
+once. If **#2591** (amend-and-resume for a parked child) lands and a child can be
+RE-PARKED within the same parent run, the second park's advisory entry will hit
+the duplicate-tolerant branch, log INFO, and append nothing — silently
+suppressing a legitimate second-park signal. The #2591 implementer MUST widen the
+key to carry an episode component (or emit a distinct category) before allowing
+re-park; do not rely on this index to surface a second park.
+
 ## Frozen HashInputs (deliberate)
 
 `account_id` is **not** part of the canonical hash (`chain.go`

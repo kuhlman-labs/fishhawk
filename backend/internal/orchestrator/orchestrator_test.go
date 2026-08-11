@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -4599,6 +4600,37 @@ func (f *failingAppendAudit) ListForRunByCategory(ctx context.Context, runID uui
 	return f.recordingAudit.ListForRunByCategory(ctx, runID, category)
 }
 
+// dupAppendAudit returns the parent-awaiting-child-scope-decision duplicate
+// sentinel (the 0067 race-loser) from every AppendChained — the benign
+// already-recorded outcome — without recording. The pre-read still sees an empty
+// chain, so the child reaches the append.
+type dupAppendAudit struct{ *recordingAudit }
+
+func (d *dupAppendAudit) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
+	return nil, audit.ErrParentAwaitingChildScopeDecisionDuplicate
+}
+
+// dupThenRecordAudit returns the duplicate sentinel on the FIRST AppendChained
+// and records every subsequent one. It drives the two-pending-children case: the
+// first child's append is the benign race-loser, and the second child must STILL
+// get its own entry — proving the duplicate branch CONTINUES rather than
+// returning.
+type dupThenRecordAudit struct {
+	*recordingAudit
+	calls int
+}
+
+func (d *dupThenRecordAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	d.mu.Lock()
+	d.calls++
+	first := d.calls == 1
+	d.mu.Unlock()
+	if first {
+		return nil, audit.ErrParentAwaitingChildScopeDecisionDuplicate
+	}
+	return d.recordingAudit.AppendChained(ctx, p)
+}
+
 // TestSurfaceParkedChildren_DegradeBranches covers EVERY defensive branch of
 // the parent-side signal. Each asserts the same contract: the degrade NEVER
 // unwinds the parent's parked state or the dispatch top-up — the signal is
@@ -4689,4 +4721,67 @@ func TestSurfaceParkedChildren_DegradeBranches(t *testing.T) {
 			t.Errorf("the signal must still name the parked child, got %v", payload["child_run_id"])
 		}
 	})
+}
+
+// TestSurfaceParkedChildren_DuplicateIsBenign pins the store-layer idempotency
+// branch (#2594): when AppendChained returns the parent-awaiting duplicate
+// sentinel (the 0067 race-loser), surfaceParkedChildren logs at INFO — the
+// benign already-recorded outcome — and does NOT emit the append-failure WARN,
+// and never unwinds the parent's parked state or the dispatch top-up. The
+// existing append_error_does_not_unwind case keeps pinning the WARN side for
+// non-duplicate errors.
+func TestSurfaceParkedChildren_DuplicateIsBenign(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	o.Audit = &dupAppendAudit{recordingAudit: &recordingAudit{}}
+	var logBuf bytes.Buffer
+	o.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	parent, parentStages := seedFanInParent(t, rs, int64Ptr(55))
+	seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	o.maybeAdvanceDecomposedParent(context.Background(), parent.ID)
+
+	if parentStages[0].State != run.StageStateAwaitingChildren {
+		t.Errorf("parent stage = %q, want it still parked despite the duplicate sentinel", parentStages[0].State)
+	}
+	logs := logBuf.String()
+	if !strings.Contains(logs, "parent already carries the awaiting-child-scope-decision signal for this child stage") {
+		t.Errorf("want the benign INFO log for the duplicate sentinel; got:\n%s", logs)
+	}
+	if strings.Contains(logs, "append parent_awaiting_child_scope_decision failed") {
+		t.Errorf("the duplicate sentinel must NOT produce the append-failure WARN; got:\n%s", logs)
+	}
+}
+
+// TestSurfaceParkedChildren_DuplicateDoesNotDropSiblingEntry is the load-bearing
+// behavioural test of the duplicate branch (#2594, approval condition): with TWO
+// pending parked children, the FIRST append returns the duplicate sentinel and
+// the SECOND child must STILL get its own entry — the duplicate branch must
+// `continue`, never `return`.
+func TestSurfaceParkedChildren_DuplicateDoesNotDropSiblingEntry(t *testing.T) {
+	o, rs, _ := newOrchestrator(t)
+	rec := &recordingAudit{}
+	o.Audit = &dupThenRecordAudit{recordingAudit: rec}
+	parent, _ := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), nil) // NO parent stages
+	childA, _ := seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	childB, _ := seedParkedBuildRequiredSlice(t, rs, parent.ID, int64Ptr(55), 1)
+
+	// Drive the emitter directly with a deterministic child order: A's append is
+	// the race-loser (sentinel), B's must still record.
+	o.surfaceParkedChildren(context.Background(), parent.ID, []*run.Run{childA, childB})
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.appended) != 1 {
+		t.Fatalf("recorded appends = %d, want exactly 1 (child A was the benign duplicate, child B must still record)", len(rec.appended))
+	}
+	var p struct {
+		ChildRunID string `json:"child_run_id"`
+	}
+	if err := json.Unmarshal(rec.appended[0].Payload, &p); err != nil {
+		t.Fatalf("decode recorded payload: %v", err)
+	}
+	if p.ChildRunID != childB.ID.String() {
+		t.Errorf("recorded entry names child %q, want the SECOND child %q — the duplicate branch must continue to the sibling, not return", p.ChildRunID, childB.ID)
+	}
 }

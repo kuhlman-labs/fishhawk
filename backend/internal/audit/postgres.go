@@ -63,6 +63,41 @@ func IsMergeVerdictDuplicate(err error) bool {
 		IsDuplicateOnConstraint(err, MergeVerdictRecordedOnceIndex)
 }
 
+// ParentAwaitingChildScopeDecisionOnceIndex is the name of the partial unique
+// index (migration 0067, #2594) enforcing at most one
+// parent_awaiting_child_scope_decision audit entry per (parent run, child
+// stage): CREATE UNIQUE INDEX ... ON audit_entries (run_id,
+// (payload->>'child_stage_id')) WHERE category =
+// 'parent_awaiting_child_scope_decision'. Both emitters (server's park-time
+// emitParentAwaitingChildScopeDecision and orchestrator's sibling-settle
+// surfaceParkedChildren) scope their benign concurrent-race catch to a collision
+// on THIS index specifically (see IsParentAwaitingChildScopeDecisionDuplicate),
+// so an unrelated 23505 stays a hard error.
+const ParentAwaitingChildScopeDecisionOnceIndex = "audit_entries_parent_awaiting_child_scope_decision_once_idx"
+
+// ErrParentAwaitingChildScopeDecisionDuplicate is a sentinel a fake Repository
+// can return from AppendChained to simulate losing the concurrent
+// parent-awaiting-child-scope-decision race (the deterministic race-loser of the
+// ParentAwaitingChildScopeDecisionOnceIndex collision).
+// IsParentAwaitingChildScopeDecisionDuplicate recognizes it alongside a real
+// driver-surfaced unique_violation on that index, so both emitters' benign paths
+// can be exercised without importing pgconn or standing up real Postgres.
+var ErrParentAwaitingChildScopeDecisionDuplicate = errors.New("audit: duplicate parent_awaiting_child_scope_decision entry")
+
+// IsParentAwaitingChildScopeDecisionDuplicate reports whether err is the
+// SPECIFIC benign parent-awaiting-child-scope-decision-race collision: a
+// unique_violation on the ParentAwaitingChildScopeDecisionOnceIndex partial
+// unique index, or the ErrParentAwaitingChildScopeDecisionDuplicate sentinel
+// (for fakes). It deliberately does NOT match a 23505 on any OTHER constraint
+// touched by the AppendChained insert (the entry-hash / (run_id, sequence)
+// uniqueness): swallowing those would treat an unrelated integrity failure as
+// the benign concurrent-park race and silently drop a real error (mirrors the
+// #1983 merge-verdict narrowing above).
+func IsParentAwaitingChildScopeDecisionDuplicate(err error) bool {
+	return errors.Is(err, ErrParentAwaitingChildScopeDecisionDuplicate) ||
+		IsDuplicateOnConstraint(err, ParentAwaitingChildScopeDecisionOnceIndex)
+}
+
 type postgresRepo struct {
 	pool *pgxpool.Pool
 }
