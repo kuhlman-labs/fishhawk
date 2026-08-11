@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -10210,7 +10211,8 @@ func TestLoadApprovalConditions_OverCap_AppendsTruncatedAudit(t *testing.T) {
 	dropped := 500
 	original := prompt.MaxApprovalConditionBytes + dropped
 	ar := newStoringAuditRepo()
-	ar.byRunID[runID] = []*audit.Entry{makeApproveWithCommentEntry(runID, strings.Repeat("a", original))}
+	sourceEntry := makeApproveWithCommentEntry(runID, strings.Repeat("a", original))
+	ar.byRunID[runID] = []*audit.Entry{sourceEntry}
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
 
 	got := s.loadApprovalConditions(context.Background(), runID)
@@ -10230,6 +10232,7 @@ func TestLoadApprovalConditions_OverCap_AppendsTruncatedAudit(t *testing.T) {
 		CapBytes      int    `json:"cap_bytes"`
 		DroppedBytes  int    `json:"dropped_bytes"`
 		Source        string `json:"source"`
+		SourceEntryID string `json:"source_entry_id"`
 	}
 	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
 		t.Fatalf("unmarshal truncated payload: %v", err)
@@ -10245,6 +10248,11 @@ func TestLoadApprovalConditions_OverCap_AppendsTruncatedAudit(t *testing.T) {
 	}
 	if payload.Source != "approval_submitted" {
 		t.Errorf("source = %q, want approval_submitted", payload.Source)
+	}
+	// source_entry_id is the 0068 index key: it must be the id of the
+	// approval_submitted entry whose comment was truncated (#2622).
+	if payload.SourceEntryID != sourceEntry.ID.String() {
+		t.Errorf("source_entry_id = %q, want the seeded approve entry's id %q", payload.SourceEntryID, sourceEntry.ID.String())
 	}
 }
 
@@ -10280,5 +10288,220 @@ func TestLoadApprovalConditions_TruncatedAuditAppendFailure_NonFatal(t *testing.
 	got := s.loadApprovalConditions(context.Background(), runID)
 	if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
 		t.Fatalf("append failure must not block prompt build; got %v", got)
+	}
+}
+
+// indexedAuditRepo wraps storingAuditRepo and enforces migration 0068's partial
+// unique index in memory: an AppendChained for category
+// approval_conditions_truncated whose (run_id, payload source_entry_id) pair is
+// already stored returns audit.ErrApprovalConditionsTruncatedDuplicate and stores
+// NOTHING; everything else delegates to storingAuditRepo. It is the in-process
+// stand-in for the real 0068 index so the emitter's duplicate-tolerant branch can
+// be driven without Postgres (the emitter→index seam itself is proven end to end
+// against real Postgres in TestLoadApprovalConditions_RealPostgres_RepeatedLoads_Deduplicated).
+type indexedAuditRepo struct {
+	*storingAuditRepo
+}
+
+func newIndexedAuditRepo() *indexedAuditRepo {
+	return &indexedAuditRepo{storingAuditRepo: newStoringAuditRepo()}
+}
+
+func (a *indexedAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryApprovalConditionsTruncated {
+		var incoming struct {
+			SourceEntryID string `json:"source_entry_id"`
+		}
+		_ = json.Unmarshal(p.Payload, &incoming)
+		for _, e := range a.byRunID[p.RunID] {
+			if e.Category != CategoryApprovalConditionsTruncated {
+				continue
+			}
+			var stored struct {
+				SourceEntryID string `json:"source_entry_id"`
+			}
+			_ = json.Unmarshal(e.Payload, &stored)
+			if stored.SourceEntryID == incoming.SourceEntryID {
+				return nil, audit.ErrApprovalConditionsTruncatedDuplicate
+			}
+		}
+	}
+	return a.storingAuditRepo.AppendChained(ctx, p)
+}
+
+// TestLoadApprovalConditions_RepeatedLoads_AppendsOneTruncatedAudit is the
+// issue's headline done-means (#2622): loadApprovalConditions called THREE times
+// against ONE seeded over-cap comment records exactly ONE
+// approval_conditions_truncated entry (not three), and every call still returns
+// the capped conditions. Driven through indexedAuditRepo, which enforces the 0068
+// key in memory; with the plain storing fake this would be three entries.
+func TestLoadApprovalConditions_RepeatedLoads_AppendsOneTruncatedAudit(t *testing.T) {
+	runID := uuid.New()
+	original := prompt.MaxApprovalConditionBytes + 500
+	ar := newIndexedAuditRepo()
+	ar.byRunID[runID] = []*audit.Entry{makeApproveWithCommentEntry(runID, strings.Repeat("a", original))}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	for i := 0; i < 3; i++ {
+		got := s.loadApprovalConditions(context.Background(), runID)
+		if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+			t.Fatalf("call %d: expected capped conditions; got %v", i, got)
+		}
+	}
+
+	if n := countStoredCategory(t, ar.storingAuditRepo, runID, CategoryApprovalConditionsTruncated); n != 1 {
+		t.Fatalf("approval_conditions_truncated entries after 3 loads = %d, want exactly 1 (repeated builds must not multiply the entry)", n)
+	}
+}
+
+// TestLoadApprovalConditions_DuplicateAppend_LogsInfoNotWarn pins the
+// duplicate-tolerant branch (#2622): a 0068 collision is the benign
+// already-recorded outcome — logged at INFO, NOT the append-failure WARN — and
+// the prompt still gets the capped conditions.
+func TestLoadApprovalConditions_DuplicateAppend_LogsInfoNotWarn(t *testing.T) {
+	runID := uuid.New()
+	original := prompt.MaxApprovalConditionBytes + 100
+	store := newStoringAuditRepo()
+	store.byRunID[runID] = []*audit.Entry{makeApproveWithCommentEntry(runID, strings.Repeat("a", original))}
+	ar := &dupAuditRepo{storingAuditRepo: store}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar, Logger: logger})
+
+	got := s.loadApprovalConditions(context.Background(), runID)
+	if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+		t.Fatalf("duplicate append must not block prompt build; got %v", got)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "already recorded for this approval comment") {
+		t.Errorf("expected the INFO already-recorded message in the log; got:\n%s", out)
+	}
+	if strings.Contains(out, "append approval_conditions_truncated audit failed") {
+		t.Errorf("the WARN append-failure message must be ABSENT on a benign duplicate; got:\n%s", out)
+	}
+}
+
+// dupAuditRepo returns the 0068 duplicate sentinel from every truncation append,
+// simulating the race-loser / already-recorded outcome. The ListForRunByCategory
+// read of its seeded entries keeps working (inherited from storingAuditRepo).
+type dupAuditRepo struct {
+	*storingAuditRepo
+}
+
+func (a *dupAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryApprovalConditionsTruncated {
+		return nil, audit.ErrApprovalConditionsTruncatedDuplicate
+	}
+	return a.storingAuditRepo.AppendChained(context.Background(), p)
+}
+
+// TestLoadApprovalConditions_DistinctOverCapComments_AppendOneEach is the
+// run_id-only-key counterfactual (#2622): two approval_submitted entries with
+// DIFFERENT ids and different over-cap comments, loaded across a re-plan cycle,
+// must each record their OWN truncation entry with a distinct source_entry_id. It
+// goes RED if the key is narrowed to run_id alone (the second would be suppressed).
+func TestLoadApprovalConditions_DistinctOverCapComments_AppendOneEach(t *testing.T) {
+	runID := uuid.New()
+	ar := newIndexedAuditRepo()
+
+	first := makeApproveWithCommentEntry(runID, strings.Repeat("a", prompt.MaxApprovalConditionBytes+100))
+	ar.byRunID[runID] = []*audit.Entry{first}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	if got := s.loadApprovalConditions(context.Background(), runID); got == nil {
+		t.Fatal("first load returned nil conditions")
+	}
+
+	// A re-plan cycle appends a SECOND, genuinely different over-cap approve
+	// comment (newer, so it wins loadApprovalConditions' newest-first scan).
+	second := makeApproveWithCommentEntry(runID, strings.Repeat("b", prompt.MaxApprovalConditionBytes+200))
+	ar.byRunID[runID] = append(ar.byRunID[runID], second)
+
+	if got := s.loadApprovalConditions(context.Background(), runID); got == nil {
+		t.Fatal("second load returned nil conditions")
+	}
+
+	entries, err := ar.ListForRunByCategory(context.Background(), runID, CategoryApprovalConditionsTruncated)
+	if err != nil {
+		t.Fatalf("list truncated: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("approval_conditions_truncated entries for two distinct over-cap comments = %d, want 2 (run_id-only key would suppress the second)", len(entries))
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		var p struct {
+			SourceEntryID string `json:"source_entry_id"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		seen[p.SourceEntryID] = true
+	}
+	if !seen[first.ID.String()] || !seen[second.ID.String()] {
+		t.Errorf("source_entry_id set = %v, want both %q and %q", seen, first.ID.String(), second.ID.String())
+	}
+}
+
+// TestLoadApprovalConditions_RealPostgres_RepeatedLoads_Deduplicated is the
+// CONDITION 1 emitter→index seam proof (#2622). Unlike the in-memory-fake tests
+// above (whose payload key and dedup rule are asserted separately), this drives a
+// loadApprovalConditions-produced payload through the REAL Postgres audit
+// repository and the REAL 0068 partial unique index: three repeated prompt builds
+// against one over-cap comment must leave exactly ONE persisted
+// approval_conditions_truncated row. It exists to catch the NULL-distinct
+// degradation the store tests cannot: if a refactor desynchronizes the emitter's
+// payload key from the index's key expression, payload->>'source_entry_id'
+// evaluates to NULL, NULL-distinct semantics make the unique index match nothing,
+// dedup silently becomes a no-op — and every hand-built-payload store test still
+// passes. Do NOT delete this as redundant with the store-layer tests; it is what
+// makes the seam proof DIRECT rather than transitive.
+func TestLoadApprovalConditions_RealPostgres_RepeatedLoads_Deduplicated(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	auditRepo := audit.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+
+	// Seed a legacy over-cap approve-with-conditions comment through the real
+	// AppendChained path, exactly as the approval gate once did.
+	overCap := strings.Repeat("a", prompt.MaxApprovalConditionBytes+500)
+	approvePayload, _ := json.Marshal(map[string]any{"decision": "approve", "comment": overCap})
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     r.ID,
+		Timestamp: time.Now().UTC(),
+		Category:  "approval_submitted",
+		Payload:   approvePayload,
+	}); err != nil {
+		t.Fatalf("seed approval_submitted: %v", err)
+	}
+
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: auditRepo})
+
+	// Three repeated prompt builds (retries / prompt-render fetches).
+	for i := 0; i < 3; i++ {
+		got := s.loadApprovalConditions(ctx, r.ID)
+		if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+			t.Fatalf("call %d: expected capped conditions; got %v", i, got)
+		}
+	}
+
+	rows, err := auditRepo.ListForRunByCategory(ctx, r.ID, CategoryApprovalConditionsTruncated)
+	if err != nil {
+		t.Fatalf("list truncated rows: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("persisted approval_conditions_truncated rows after 3 real-Postgres loads = %d, want exactly 1 — the emitter payload key and the 0068 index key must agree (a NULL-distinct degradation would leave 3)", len(rows))
 	}
 }

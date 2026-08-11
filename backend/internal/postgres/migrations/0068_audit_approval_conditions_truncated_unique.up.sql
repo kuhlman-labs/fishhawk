@@ -1,0 +1,41 @@
+-- 0068: at-most-one approval_conditions_truncated audit entry per (run, source
+-- approval comment) (E67.25 / #2622).
+--
+-- loadApprovalConditions (server/prompt.go) appends an
+-- approval_conditions_truncated audit entry on EVERY implement-prompt build that
+-- loads a legacy over-cap approve-with-conditions comment (#2583). Prompt
+-- construction for a stage happens more than once (retries, prompt-render
+-- fetches), so ONE truncated comment accumulated N entries in the run's audit
+-- chain. The entry exists (#2583) so a dropped operator condition is VISIBLE in
+-- the run record; five entries for one truncation tells the operator something
+-- false. This partial unique index makes the repeated append idempotent per
+-- truncated source comment at the DB level.
+--
+-- The key is (run_id, source_entry_id), NOT run_id alone: a run can carry two
+-- DISTINCT over-cap approve comments across a re-plan cycle, and each genuine
+-- truncation must still be reported ONCE. source_entry_id is the id of the
+-- approval_submitted audit entry whose comment was truncated — keying on the
+-- SOURCE approval entry means a genuinely second truncation from a different
+-- approval still records. A run_id-only key would silently suppress the second
+-- drop, which is the same class of audit lie in the other direction.
+--
+-- Partial on category: run_id is nullable (run-less "global" chain rows set it
+-- NULL), but approval_conditions_truncated is a strictly per-run category so its
+-- rows always carry a non-null run_id, and the WHERE predicate excludes every
+-- other category and every run-less row — so the index is well-defined and
+-- constrains only the intended rows. Every OTHER category must stay
+-- unconstrained. IF NOT EXISTS keeps re-application idempotent.
+--
+-- payload->>'source_entry_id' is an IMMUTABLE jsonb expression, a precondition
+-- for indexing it. A payload missing source_entry_id indexes as NULL, and NULLs
+-- are distinct in a PostgreSQL unique index (NULLS NOT DISTINCT is opt-in and is
+-- NOT used here), so any number of key-less rows coexist. This is PRECISELY why
+-- this migration CANNOT fail loud on the duplicate rows the bug itself already
+-- produced: every pre-0068 row lacks the source_entry_id key and indexes as
+-- NULL, so CREATE UNIQUE INDEX never sees a collision among them.
+--
+-- Index-only and additive: the rollback (0068 down) restores the prior
+-- unconditional-append behaviour with no schema residue and no data migration.
+CREATE UNIQUE INDEX IF NOT EXISTS audit_entries_approval_conditions_truncated_once_idx
+    ON audit_entries (run_id, (payload->>'source_entry_id'))
+    WHERE category = 'approval_conditions_truncated';
