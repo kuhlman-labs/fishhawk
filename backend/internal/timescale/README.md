@@ -46,6 +46,21 @@ non-boundary helper modes that already carry a large fixed margin and assert no
 wall-clock upper bound (e.g. claudecode's `slow`/`slow_brief`), nor any
 production duration.
 
+### When the boundary is a production constant
+
+Sometimes the duration that competes with the test's bound is itself a
+**production constant** — a graceful-shutdown timeout, a kill grace. The
+production duration is still never scaled: the shipped default must stay
+byte-identical. Instead, demote the constant to an unexported package `var`,
+add a save/restore helper that swaps it for the duration of one test, and have
+the test override it with `D(base)` (capturing `base` from the production
+default first) so every competing bound — the inner timeout and the test's own
+outer guard — derives from the same factor and their ratio holds at any scale.
+Two in-tree instances: claudecode's `var killGrace` / `setKillGrace`, and
+fishhawk-mcp's `var httpShutdownTimeout` / `setHTTPShutdownTimeout` (#2628).
+Because the override is test-only, the shipped default is unchanged — this does
+not contradict the "nor any production duration" line above.
+
 ## Env inheritance invariant
 
 The three test-helper re-exec builders (procgroup, claudecode, codex) all append
