@@ -649,6 +649,56 @@ func TestGateView_StageKindFilterScoping(t *testing.T) {
 	}
 }
 
+// TestGateView_OperatorConcern_RendersMintedConcern (#2623, binding condition 2)
+// drives a REAL operator-concern-only fix-up through handleFixupStage, then reads
+// the GATE VIEW consumer — not just the single-run concerns block — and asserts
+// the minted operator concern renders in the OPEN section with its full verbatim
+// note (no elision) and a fix-up join keyed off the trigger payload's concern_ids
+// / operator_concern_id. A defect in the gate-view consumer that dropped the
+// operator concern would pass a run-concerns-block-only test but fail here.
+func TestGateView_OperatorConcern_RendersMintedConcern(t *testing.T) {
+	// fixupServerWithConcerns wires the approvalRunRepo (which GetRun resolves for
+	// the gate view's existence check) plus the audit + concern fakes the gate
+	// view reads — the same *Server drives both the fix-up and the gate view.
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+
+	const text = "CodeQL high alert: the gate view must surface this operator instruction as an OPEN concern until it is addressed."
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: text, Reason: "required CodeQL gate"}); w.Code != http.StatusOK {
+		t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	minted := operatorConcernRows(cr)
+	if len(minted) != 1 {
+		t.Fatalf("operator concern rows = %d, want 1", len(minted))
+	}
+
+	resp := decodeGateView(t, callGateView(s, stage.RunID, "", gateViewReadIdentity()))
+	if len(resp.Open) != 1 {
+		t.Fatalf("gate-view Open = %d, want 1 (the minted operator concern must be visible)", len(resp.Open))
+	}
+	oc := resp.Open[0]
+	if oc.ID != minted[0].ID {
+		t.Errorf("gate-view open id = %s, want the minted id %s", oc.ID, minted[0].ID)
+	}
+	if oc.Category != operatorConcernCategory || oc.Severity != string(operatorConcernSeverity) {
+		t.Errorf("gate-view open category/severity = %s/%s, want %s/%s", oc.Category, oc.Severity, operatorConcernCategory, operatorConcernSeverity)
+	}
+	if oc.State != string(concern.StateAddressedPending) {
+		t.Errorf("gate-view open state = %q, want addressed_pending", oc.State)
+	}
+	if oc.Note != text {
+		t.Errorf("gate-view open note = %q, want the full verbatim text (no elision)", oc.Note)
+	}
+	// The fix-up join proves the trigger payload's concern_ids / operator_concern_id
+	// wiring reaches the gate-view consumer: the minted id matched a trigger.
+	if len(oc.Fixups) != 1 {
+		t.Fatalf("gate-view open Fixups = %d, want 1 (the operator concern's routing pass)", len(oc.Fixups))
+	}
+	if oc.Fixups[0].Reason != "required CodeQL gate" {
+		t.Errorf("gate-view fixup reason = %q, want the operator's routing reason", oc.Fixups[0].Reason)
+	}
+}
+
 // --- helpers -------------------------------------------------------------
 
 // oneCategoryErrAudit wraps auditFake to fail ListForRunByCategory for exactly

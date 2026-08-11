@@ -2580,3 +2580,349 @@ func TestFixupStage_ModelValidity_FailOpenNoOracle(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (nil oracle → fail open):\n%s", w.Code, w.Body.String())
 	}
 }
+
+// --- Operator concern minted as a durable concern (#2623) --------------------
+
+// operatorConcernRows returns every store row carrying the operator category —
+// the durable concern(s) mintOperatorConcern created (#2623).
+func operatorConcernRows(cr *fakeConcernRepo) []*concern.Concern {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	var out []*concern.Concern
+	for _, r := range cr.rows {
+		if r.Category == operatorConcernCategory {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// payloadStrings coerces a decoded JSON array field into a []string, failing the
+// test if the field is absent or not an array of strings.
+func payloadStrings(t *testing.T, payload map[string]any, key string) []string {
+	t.Helper()
+	raw, ok := payload[key].([]any)
+	if !ok {
+		t.Fatalf("payload[%q] = %v, want a JSON array", key, payload[key])
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("payload[%q] entry %v is not a string", key, v)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// markPendingErrConcernRepo wraps fakeConcernRepo to fail MarkAddressedPending —
+// the durable-store degrade branch the base fake cannot express (InsertRaised
+// succeeds so the row exists; only the transition fails).
+type markPendingErrConcernRepo struct {
+	*fakeConcernRepo
+	markErr error
+}
+
+func (r *markPendingErrConcernRepo) MarkAddressedPending(ctx context.Context, ids []uuid.UUID, reason string) error {
+	if r.markErr != nil {
+		return r.markErr
+	}
+	return r.fakeConcernRepo.MarkAddressedPending(ctx, ids, reason)
+}
+
+// lastForRunAudit wraps auditFake to return a chosen LastForRun result, so the
+// OriginReviewSequence derivation (LastForRun+1) and its ErrNotFound/0 fallback
+// are both exercisable (the base fake always errors "not used").
+type lastForRunAudit struct {
+	*auditFake
+	entry *audit.Entry
+	err   error
+}
+
+func (a *lastForRunAudit) LastForRun(_ context.Context, _ uuid.UUID) (*audit.Entry, error) {
+	return a.entry, a.err
+}
+
+// TestFixupStage_OperatorConcern_MintsDurableConcern is the #2623 headline:
+// an operator-concern-only fix-up mints EXACTLY one durable concern row (implement
+// stage kind, the target run/stage ids, category operator, severity high, the
+// verbatim note) and transitions it to addressed_pending carrying the operator's
+// fix-up reason as state_reason (condition 3); its id rides the trigger payload's
+// concern_ids AND its own operator_concern_id key. The row-existence assertions
+// and the addressed_pending assertion are kept SEPARATE so the two counterfactuals
+// (delete the mint → no row; delete the routedIDs widening → row exists but stays
+// raised and is absent from concern_ids) redden distinct assertions (condition 5).
+func TestFixupStage_OperatorConcern_MintsDurableConcern(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+
+	const text = "CodeQL high: sanitize the path before os.Open in backend/internal/server/upload.go"
+	const reason = "required CodeQL gate has no Fishhawk review concern"
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: text, Reason: reason})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// (i) Exactly one durable row minted, with the expected fields — the INSERT
+	// half (reddens iff the mint call site is deleted).
+	rows := operatorConcernRows(cr)
+	if len(rows) != 1 {
+		t.Fatalf("operator concern rows = %d, want exactly 1 minted", len(rows))
+	}
+	row := rows[0]
+	if row.StageKind != concern.StageKindImplement {
+		t.Errorf("minted StageKind = %q, want implement", row.StageKind)
+	}
+	if row.RunID != stage.RunID || row.StageID != stage.ID {
+		t.Errorf("minted run/stage = %s/%s, want %s/%s", row.RunID, row.StageID, stage.RunID, stage.ID)
+	}
+	if row.Category != operatorConcernCategory || row.Severity != string(operatorConcernSeverity) {
+		t.Errorf("minted category/severity = %s/%s, want %s/%s", row.Category, row.Severity, operatorConcernCategory, operatorConcernSeverity)
+	}
+	if row.Note != text {
+		t.Errorf("minted note = %q, want the verbatim text", row.Note)
+	}
+	if row.ReviewerModel != nil {
+		t.Errorf("minted ReviewerModel = %v, want nil (an operator concern has no reviewer)", row.ReviewerModel)
+	}
+
+	// (ii) The addressed_pending TRANSITION half (reddens iff the routedIDs
+	// widening is deleted — the row would remain in `raised`), carrying the
+	// operator's fix-up reason as state_reason (condition 3).
+	if row.State != concern.StateAddressedPending {
+		t.Errorf("minted State = %q, want addressed_pending (the routed transition)", row.State)
+	}
+	if row.StateReason != reason {
+		t.Errorf("minted StateReason = %q, want the fix-up reason %q", row.StateReason, reason)
+	}
+
+	// (iii) The minted id is on BOTH audit keys.
+	payload := latestFixupTriggeredPayload(t, au)
+	if payload["operator_concern_id"] != row.ID.String() {
+		t.Errorf("payload.operator_concern_id = %v, want the minted id %s", payload["operator_concern_id"], row.ID)
+	}
+	ids := payloadStrings(t, payload, "concern_ids")
+	if len(ids) != 1 || ids[0] != row.ID.String() {
+		t.Errorf("payload.concern_ids = %v, want exactly the minted id %s", ids, row.ID)
+	}
+}
+
+// TestFixupStage_OperatorConcernWithConcernIDs_MarksBothAddressedPending: an
+// operator_concern supplied ALONGSIDE a concern_id marks BOTH ids
+// addressed_pending and lists both in concern_ids.
+func TestFixupStage_OperatorConcernWithConcernIDs_MarksBothAddressedPending(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	reviewer := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "reviewer's concern")
+
+	const text = "also bump the timeout per the operator steer"
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs:      []string{reviewer.ID.String()},
+		OperatorConcern: text,
+		Reason:          "route both",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	if reviewer.State != concern.StateAddressedPending {
+		t.Errorf("reviewer concern State = %q, want addressed_pending", reviewer.State)
+	}
+	minted := operatorConcernRows(cr)
+	if len(minted) != 1 {
+		t.Fatalf("operator concern rows = %d, want 1", len(minted))
+	}
+	if minted[0].State != concern.StateAddressedPending {
+		t.Errorf("minted operator concern State = %q, want addressed_pending", minted[0].State)
+	}
+
+	ids := payloadStrings(t, latestFixupTriggeredPayload(t, au), "concern_ids")
+	wantSet := map[string]bool{reviewer.ID.String(): false, minted[0].ID.String(): false}
+	for _, id := range ids {
+		if _, ok := wantSet[id]; ok {
+			wantSet[id] = true
+		}
+	}
+	for id, seen := range wantSet {
+		if !seen {
+			t.Errorf("concern_ids %v missing %s (both the reviewer + minted ids must be routed)", ids, id)
+		}
+	}
+}
+
+// TestFixupStage_OperatorConcern_MintedConcernIsOpen pins the run-read concerns
+// block / merge-gate source: the minted row is returned by ListOpenByRun. Reddens
+// iff the mint is deleted (an empty store returns nothing).
+func TestFixupStage_OperatorConcern_MintedConcernIsOpen(t *testing.T) {
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+
+	const text = "address the missed edge case the CI check flagged"
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: text, Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	open, err := cr.ListOpenByRun(context.Background(), stage.RunID)
+	if err != nil {
+		t.Fatalf("ListOpenByRun: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("ListOpenByRun = %d rows, want 1 (the minted operator concern is OPEN)", len(open))
+	}
+	if open[0].Category != operatorConcernCategory || open[0].Note != text {
+		t.Errorf("open concern = {%s, %q}, want the minted operator concern", open[0].Category, open[0].Note)
+	}
+}
+
+// TestFixupStage_OperatorConcern_InsertError_Degrades: an InsertRaised store
+// error degrades to the pre-#2623 untracked delivery — no operator_concern_id
+// key, no minted id in concern_ids, and the fix-up still returns 200.
+func TestFixupStage_OperatorConcern_InsertError_Degrades(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	cr.insertErr = errors.New("store down")
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer that cannot be minted", Reason: "r"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (insert failure must not fail the fix-up):\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	if _, present := payload["operator_concern_id"]; present {
+		t.Errorf("operator_concern_id present despite the insert failure: %v", payload["operator_concern_id"])
+	}
+	if ids := payloadStrings(t, payload, "concern_ids"); len(ids) != 0 {
+		t.Errorf("concern_ids = %v, want empty (nothing minted to route)", ids)
+	}
+	if rows := operatorConcernRows(cr); len(rows) != 0 {
+		t.Errorf("operator concern rows = %d, want 0 (insert errored)", len(rows))
+	}
+}
+
+// TestFixupStage_OperatorConcern_NilConcernRepo_ByteUnchanged: with NO
+// ConcernRepo wired the payload is byte-unchanged from the pre-#2623 shape — no
+// operator_concern_id key, empty concern_ids — and the fix-up still succeeds.
+func TestFixupStage_OperatorConcern_NilConcernRepo_ByteUnchanged(t *testing.T) {
+	s, repo, au := fixupServer(t) // no ConcernRepo
+	stage := seedImplementGateStage(repo)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer on a store-less deployment", Reason: "r"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := latestFixupTriggeredPayload(t, au)
+	if _, present := payload["operator_concern_id"]; present {
+		t.Errorf("operator_concern_id present with no ConcernRepo wired: %v", payload["operator_concern_id"])
+	}
+	if ids := payloadStrings(t, payload, "concern_ids"); len(ids) != 0 {
+		t.Errorf("concern_ids = %v, want empty", ids)
+	}
+}
+
+// TestFixupStage_OperatorConcern_LastForRunErrNotFound_StillMints: an
+// AuditRepo.LastForRun returning audit.ErrNotFound (a run with no entries) does
+// not block the mint — the row is still created with the OriginReviewSequence 0
+// fallback.
+func TestFixupStage_OperatorConcern_LastForRunErrNotFound_StillMints(t *testing.T) {
+	repo := newApprovalRunRepo()
+	cr := newFakeConcernRepo()
+	au := &lastForRunAudit{auditFake: newAuditFake(), err: audit.ErrNotFound}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, ConcernRepo: cr})
+	stage := seedImplementGateStage(repo)
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer on a fresh run", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := operatorConcernRows(cr)
+	if len(rows) != 1 {
+		t.Fatalf("operator concern rows = %d, want 1 (minted despite ErrNotFound)", len(rows))
+	}
+	if rows[0].OriginReviewSequence != 0 {
+		t.Errorf("OriginReviewSequence = %d, want 0 (the ErrNotFound fallback)", rows[0].OriginReviewSequence)
+	}
+}
+
+// TestFixupStage_OperatorConcern_OriginSequenceFromLastForRun: on a run WITH
+// audit entries the mint predicts LastForRun.Sequence+1 (the sequence the
+// trigger append is about to take).
+func TestFixupStage_OperatorConcern_OriginSequenceFromLastForRun(t *testing.T) {
+	repo := newApprovalRunRepo()
+	cr := newFakeConcernRepo()
+	au := &lastForRunAudit{auditFake: newAuditFake(), entry: &audit.Entry{Sequence: 41}}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, ConcernRepo: cr})
+	stage := seedImplementGateStage(repo)
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer with prior history", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rows := operatorConcernRows(cr)
+	if len(rows) != 1 {
+		t.Fatalf("operator concern rows = %d, want 1", len(rows))
+	}
+	if rows[0].OriginReviewSequence != 42 {
+		t.Errorf("OriginReviewSequence = %d, want 42 (LastForRun 41 + 1)", rows[0].OriginReviewSequence)
+	}
+}
+
+// TestFixupStage_OperatorConcern_MarkAddressedPendingError_RowStaysRaised: a
+// MarkAddressedPending store error leaves the minted row in `raised` (the insert
+// committed, the transition did not) and the fix-up still returns 200.
+func TestFixupStage_OperatorConcern_MarkAddressedPendingError_RowStaysRaised(t *testing.T) {
+	repo := newApprovalRunRepo()
+	base := newFakeConcernRepo()
+	cr := &markPendingErrConcernRepo{fakeConcernRepo: base, markErr: errors.New("mark failed")}
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, ConcernRepo: cr})
+	stage := seedImplementGateStage(repo)
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer whose transition fails", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (mark failure must not fail the fix-up):\n%s", w.Code, w.Body.String())
+	}
+	rows := operatorConcernRows(base)
+	if len(rows) != 1 {
+		t.Fatalf("operator concern rows = %d, want 1 (insert committed)", len(rows))
+	}
+	if rows[0].State != concern.StateRaised {
+		t.Errorf("minted State = %q, want raised (the transition errored)", rows[0].State)
+	}
+}
+
+// TestFixupStageAs_DoesNotMutateCallerConcernIDs (#2623 condition 1) pins the
+// slice-aliasing fix: fixupStageAs must NOT write the minted operator-concern id
+// THROUGH into the caller's ConcernIDs backing array. The caller slice is built
+// with SPARE CAPACITY (len 1, cap 4) — exactly the shape where `routedIDs :=
+// p.ConcernIDs` (an alias, not a copy) would let append write into index 1 of the
+// caller's array. fixupActionParams is shared with the auto-drive and
+// acceptance-triage callers, so this is a real corruption, not a style note. With
+// slices.Clone the caller's backing array is untouched.
+func TestFixupStageAs_DoesNotMutateCallerConcernIDs(t *testing.T) {
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	existing := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "reviewer concern")
+
+	concernIDs := make([]uuid.UUID, 1, 4) // len 1, cap 4 — spare capacity
+	concernIDs[0] = existing.ID
+	backing := concernIDs[:cap(concernIDs)] // a view over the full backing array
+	before := backing[1]                    // uuid.Nil — the slot append would clobber
+
+	if _, err := s.fixupStageAs(context.Background(), testOperatorIdentity(), fixupActionParams{
+		StageID:         stage.ID,
+		Options:         run.FixupOptions{PriorPassCount: 0, MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling},
+		ConcernIDs:      concernIDs,
+		OperatorConcern: "operator steer that mints a fresh id",
+		Reason:          "r",
+	}); err != nil {
+		t.Fatalf("fixupStageAs: %v", err)
+	}
+
+	if backing[1] != before {
+		t.Errorf("fixupStageAs wrote the minted id through into the caller's backing array (aliasing bug): backing[1] = %s, want unchanged %s", backing[1], before)
+	}
+	// Sanity: the append DID happen (on the clone) — both ids routed, mint landed.
+	if existing.State != concern.StateAddressedPending {
+		t.Errorf("existing concern State = %q, want addressed_pending (the clone still routed it)", existing.State)
+	}
+	if got := len(operatorConcernRows(cr)); got != 1 {
+		t.Errorf("operator concern rows = %d, want 1 (mint happened)", got)
+	}
+}

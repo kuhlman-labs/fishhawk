@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -61,11 +62,16 @@ const defaultMaxFixupPasses = 1
 // stop: merge-with-follow-up or a fresh run), not fixup_budget_exhausted.
 const defaultFixupCeiling = 3
 
-// operatorConcernCategory / operatorConcernSeverity classify the synthetic
-// concern the handler builds from a free-text operator_concern (#1311). The
-// category is "operator" (it is operator-authored, not reviewer-emitted) and
-// the severity is high so it renders as a binding instruction — the
-// approval-gate steer is MANDATORY, not advisory.
+// operatorConcernCategory / operatorConcernSeverity classify the concern the
+// handler builds from a free-text operator_concern (#1311). The category is
+// "operator" (it is operator-authored, not reviewer-emitted) and the severity
+// is high so it renders as a binding instruction — the approval-gate steer is
+// MANDATORY, not advisory. Since #2623 the instruction is ALSO minted as a
+// DURABLE concern row (mintOperatorConcern) carrying this same category/severity
+// and tracked to closure exactly like an id-routed concern — so an agent that
+// silently skips it leaves an OPEN concern the operator sees at the gate. The
+// mint is best-effort (a nil store or insert failure degrades to the pre-#2623
+// untracked delivery); the audit payload remains authoritative.
 const (
 	operatorConcernCategory                            = "operator"
 	operatorConcernSeverity planreview.ConcernSeverity = planreview.SeverityHigh
@@ -111,7 +117,12 @@ type fixupRequest struct {
 	// that would trip ADR-035). At least one of concern_ids, concerns, or
 	// operator_concern is required; operator_concern alone is admitted on a
 	// zero-concern gate-open stage (it does NOT require a recorded
-	// approve_with_concerns verdict).
+	// approve_with_concerns verdict). Since #2623 it is ALSO minted as a durable
+	// concern (mintOperatorConcern) and tracked to closure exactly like an
+	// id-routed one: it is marked addressed_pending, threaded into the re-review's
+	// delta-verification section, and surfaces as an OPEN concern at the gate if
+	// the agent does not address it. The mint is best-effort — a nil store or an
+	// insert failure degrades to the pre-#2623 untracked delivery.
 	OperatorConcern string `json:"operator_concern"`
 	// ForceAdditionalPass is the bounded operator override (#860): when
 	// true it grants ONE fix-up pass beyond the normal budget
@@ -632,18 +643,44 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 		return nil, err
 	}
 
+	// Mint the free-text operator instruction into the durable concern store
+	// (#2623), AFTER run.FixupStage's transition has committed so a
+	// budget/ceiling/not-applicable refusal can never leave an orphan open
+	// concern row on the run (there is no delete verb to unwind one). The minted
+	// id folds into the routed-id set below so it inherits addressed_pending,
+	// delta-verification resolution, and the gate-view fixups[] join for free.
+	operatorConcernID, minted := s.mintOperatorConcern(ctx, dec.Stage.RunID, dec.Stage.ID, p.OperatorConcern)
+	// Clone the routed-id set before appending: `routedIDs := p.ConcernIDs` would
+	// ALIAS the caller's backing array and write the minted id through into it
+	// whenever cap exceeds len — and fixupActionParams is shared with the
+	// non-HTTP auto-drive and acceptance-triage callers. slices.Clone makes the
+	// non-mutation guarantee true regardless of the caller slice's capacity.
+	routedIDs := slices.Clone(p.ConcernIDs)
+	if minted {
+		routedIDs = append(routedIDs, operatorConcernID)
+	}
+
 	// Audit first so the fix-up intent (and the selected concerns the
 	// prompt renderer reads back) is recorded even if the orchestrator
-	// handoff below fails. Same posture as the retry handler.
-	s.writeFixupAudit(ctx, id, dec, p.Selected, p.ConcernIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern)
+	// handoff below fails. Same posture as the retry handler. The routed-id set
+	// (now including any minted operator-concern id) rides `concern_ids`; the
+	// minted id is ALSO recorded on its own `operator_concern_id` key so the
+	// gate-view fixups[] join attributes the pass to the operator concern.
+	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID)
 
 	// Mark the routed concerns addressed_pending in the durable store
-	// (#964), recording the operator's reason. AFTER the audit append so
-	// the trigger entry is the durable record; best-effort like the
-	// append — a failure warn-logs and never unwinds the committed
-	// transition.
-	if len(p.ConcernIDs) > 0 && s.cfg.ConcernRepo != nil {
-		if merr := s.cfg.ConcernRepo.MarkAddressedPending(ctx, p.ConcernIDs, p.Reason); merr != nil {
+	// (#964), recording the operator's fix-up reason as state_reason. AFTER the
+	// audit append so the trigger entry is the durable record; best-effort like
+	// the append — a failure warn-logs and never unwinds the committed
+	// transition. The guard keys on the WIDENED routedIDs (relaxed from
+	// p.ConcernIDs, #2623), so an operator-concern-only pass whose sole routed id
+	// is the freshly minted one still transitions it raised -> addressed_pending.
+	// The state_reason is deliberately p.Reason (the operator's fix-up `reason`),
+	// identical to how an id-routed concern is stamped and empty when the operator
+	// supplied no reason — decided rather than left to fall out of whatever is
+	// non-nil (#2623 condition 3).
+	if len(routedIDs) > 0 && s.cfg.ConcernRepo != nil {
+		if merr := s.cfg.ConcernRepo.MarkAddressedPending(ctx, routedIDs, p.Reason); merr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"fixup: mark concerns addressed_pending failed",
 				slog.String("run_id", dec.Stage.RunID.String()),
@@ -685,6 +722,67 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	s.notifyStatusUpdate(ctx, dec.Stage.RunID, "stage_fixup")
 
 	return dec, nil
+}
+
+// mintOperatorConcern persists a free-text operator instruction as a durable
+// concern row (#2623) so its non-compliance becomes detectable: the minted row
+// inherits the open-concern surfaces, the addressed_pending transition, the
+// re-review delta-verification resolution, and the gate-view fixups[] join that
+// every id-routed concern already has — an agent that skips it leaves an OPEN
+// concern the operator sees at the gate instead of silence.
+//
+// Returns (uuid.Nil, false) when there is nothing to mint (empty text) or no
+// store is wired (nil ConcernRepo). Best-effort like persistReviewConcerns: an
+// insert error (or an empty/nil result row) warn-logs and returns false, so the
+// fix-up — whose transition run.FixupStage has already committed — degrades to
+// exactly the pre-#2623 untracked delivery rather than failing. The concern
+// store is a derived index over the authoritative audit payload.
+func (s *Server) mintOperatorConcern(ctx context.Context, runID, stageID uuid.UUID, text string) (uuid.UUID, bool) {
+	if text == "" || s.cfg.ConcernRepo == nil {
+		return uuid.Nil, false
+	}
+	// OriginReviewSequence is a PREDICTION of the sequence the
+	// stage_fixup_triggered append (written just after this mint) will take:
+	// LastForRun + 1. The mint precedes that append so the minted id can ride the
+	// trigger payload's concern_ids, which is what the gate view's fixups[] join
+	// reads. This field drives ListByRun display ordering and gateViewRound's
+	// strict `t.sequence < reviewSeq` round grouping ONLY — never routing, state,
+	// or resolution matching — so the 0 fallback (nil AuditRepo or ANY read
+	// failure, including audit.ErrNotFound on a run with no entries) and any
+	// concurrent-append skew are cosmetic. +1 places the row immediately before
+	// its own trigger and makes gateViewRound count exactly the PRIOR passes'
+	// triggers (this pass's own trigger, at the same sequence, is excluded).
+	var originSeq int64
+	if s.cfg.AuditRepo != nil {
+		if last, lerr := s.cfg.AuditRepo.LastForRun(ctx, runID); lerr == nil && last != nil {
+			originSeq = last.Sequence + 1
+		}
+	}
+	rows, err := s.cfg.ConcernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "", // an operator concern has no reviewer -> stored NULL
+		OriginReviewSequence: originSeq,
+		Concerns: []concern.RaisedConcern{{
+			Severity: string(operatorConcernSeverity),
+			Category: operatorConcernCategory,
+			Note:     text,
+		}},
+	})
+	if err != nil || len(rows) == 0 || rows[0] == nil {
+		errStr := "insert returned no rows"
+		if err != nil {
+			errStr = err.Error()
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"fixup: mint operator concern failed — degrading to pre-#2623 untracked delivery",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", errStr))
+		return uuid.Nil, false
+	}
+	return rows[0].ID, true
 }
 
 // recordDriveFixupRepark stamps the drive engine's
@@ -990,11 +1088,16 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // non-empty the fix-up landed via the ADR-040 delegated path (#1026) and
 // the payload records `delegated: "<rule>"`. When operatorConcern is non-empty
 // the fix-up carried a free-text operator instruction (#1311); the raw trimmed
-// text is recorded as `operator_concern` for audit clarity (the synthetic
-// concern it became already rides the `concerns` field the prompt renderer
-// reads). Best-effort: the transition is already committed, so a failure here
-// logs but doesn't unwind.
-func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string) {
+// text is recorded as `operator_concern` for audit clarity. Since #2623 that
+// instruction is ALSO minted as a durable concern tracked to closure exactly
+// like an id-routed one: its minted id rides `concern_ids` (folded in by the
+// caller) AND is recorded on its own `operator_concern_id` key (when non-nil)
+// so the gate-view fixups[] join attributes the routing pass to the operator
+// concern; the synthetic concern the prompt renderer reads back still rides the
+// `concerns` field. The mint is best-effort, so operatorConcernID is uuid.Nil
+// (and the key omitted) when the mint degraded. Best-effort: the transition is
+// already committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -1070,6 +1173,14 @@ func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.Fixu
 	// trigger entry for the audit trail.
 	if operatorConcern != "" {
 		fields["operator_concern"] = operatorConcern
+	}
+	// #2623: the durable concern minted from the operator instruction. Recorded
+	// on its own key (in ADDITION to riding `concern_ids`) so the gate-view
+	// fixups[] join can attribute this routing pass to the operator concern.
+	// Omitted when the mint degraded (uuid.Nil), keeping the pre-#2623 payload
+	// byte-identical on the nil-store / insert-failure path.
+	if operatorConcernID != uuid.Nil {
+		fields["operator_concern_id"] = operatorConcernID.String()
 	}
 
 	payload, _ := json.Marshal(fields)
