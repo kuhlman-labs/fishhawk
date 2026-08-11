@@ -7,12 +7,59 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// TestAPIError_RendersErrorRef is the CLI half of the cross-boundary redaction
+// proof (E67.15 / #2587, FIX 3). It decodes a SERVER-PRODUCED 5xx envelope —
+// captured into testdata/5xx_envelope.golden.json by the backend integration
+// test's -update flag, NOT a hand-written mirror — through the same envelope
+// path the client uses, and asserts the operator-visible APIError string
+// surfaces the correlation handle and no raw cause. Go's internal-package rule
+// bars cli/ from importing backend/internal/server, so this cannot be a live
+// cross-module test; the golden is the server-produced artifact instead.
+// Refresh: `go test ./backend/internal/server/ -run TestErrorRedaction_ServerToMCPConsumer -update`.
+// Counterfactual: delete the error_ref rendering in APIError.Error() and this
+// goes RED.
+func TestAPIError_RendersErrorRef(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "5xx_envelope.golden.json"))
+	if err != nil {
+		t.Fatalf("read golden (refresh with backend -update): %v", err)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("decode golden envelope: %v", err)
+	}
+	if env.Error.ErrorRef == "" {
+		t.Fatal("server-produced golden carries no error_ref — the wire contract regressed")
+	}
+	apiErr := &APIError{
+		StatusCode: http.StatusBadGateway,
+		Code:       env.Error.Code,
+		Message:    env.Error.Message,
+		Details:    env.Error.Details,
+		ErrorRef:   env.Error.ErrorRef,
+	}
+	got := apiErr.Error()
+	if !strings.Contains(got, "error_ref="+env.Error.ErrorRef) {
+		t.Errorf("APIError.Error() = %q, want it to surface error_ref=%s", got, env.Error.ErrorRef)
+	}
+	if !strings.Contains(got, "work_item_filing_failed") {
+		t.Errorf("APIError.Error() = %q, want the code", got)
+	}
+	// The server-produced artifact itself must carry no raw cause.
+	for _, planted := range []string{"ghe.internal.example.com", "SQLSTATE", "SECRET_PAYLOAD"} {
+		if strings.Contains(string(raw), planted) {
+			t.Errorf("golden envelope leaked a raw-cause fragment %q: %s", planted, raw)
+		}
+	}
+}
 
 // fakeBackend builds a httptest.Server with handlers shaped like
 // the production endpoints. Tests can drive each one's behavior via

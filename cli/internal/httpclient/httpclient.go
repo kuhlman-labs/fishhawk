@@ -49,22 +49,35 @@ type APIError struct {
 	Code       string
 	Message    string
 	Details    map[string]any
+	// ErrorRef is the 5xx correlation handle (E67.15 / #2587): the backend's
+	// error_ref envelope field, equal to the response X-Request-ID. On a 5xx
+	// the backend redacts the raw cause out of the body and keeps it only in
+	// the operator's server log keyed by this ref, so the CLI surfaces the ref
+	// to give an operator a way to correlate. Empty on 4xx / a pre-#2587 backend.
+	ErrorRef string
 }
 
 func (e *APIError) Error() string {
+	var base string
 	if e.Code == "" {
-		return fmt.Sprintf("fishhawk: HTTP %d", e.StatusCode)
+		base = fmt.Sprintf("fishhawk: HTTP %d", e.StatusCode)
+	} else {
+		base = fmt.Sprintf("fishhawk: HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
 	}
-	return fmt.Sprintf("fishhawk: HTTP %d (%s): %s", e.StatusCode, e.Code, e.Message)
+	if e.ErrorRef != "" {
+		base += fmt.Sprintf(" (error_ref=%s)", e.ErrorRef)
+	}
+	return base
 }
 
 // errorEnvelope mirrors the wire shape the backend always emits on
 // non-2xx responses.
 type errorEnvelope struct {
 	Error struct {
-		Code    string         `json:"code"`
-		Message string         `json:"message"`
-		Details map[string]any `json:"details"`
+		Code     string         `json:"code"`
+		Message  string         `json:"message"`
+		Details  map[string]any `json:"details"`
+		ErrorRef string         `json:"error_ref"`
 	} `json:"error"`
 }
 
@@ -576,6 +589,7 @@ func (c *Client) exportRaw(ctx context.Context, basePath string, p ExportAuditPa
 			apiErr.Code = env.Error.Code
 			apiErr.Message = env.Error.Message
 			apiErr.Details = env.Error.Details
+			apiErr.ErrorRef = env.Error.ErrorRef
 		}
 		return nil, apiErr
 	}
@@ -823,6 +837,7 @@ func (c *Client) PreviewReleaseNotes(ctx context.Context, repo, from, to string)
 			apiErr.Code = env.Error.Code
 			apiErr.Message = env.Error.Message
 			apiErr.Details = env.Error.Details
+			apiErr.ErrorRef = env.Error.ErrorRef
 		}
 		return "", apiErr
 	}
@@ -1144,6 +1159,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 			apiErr.Code = env.Error.Code
 			apiErr.Message = env.Error.Message
 			apiErr.Details = env.Error.Details
+			apiErr.ErrorRef = env.Error.ErrorRef
 		}
 		return apiErr
 	}

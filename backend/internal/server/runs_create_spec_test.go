@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -259,6 +260,10 @@ func TestCreateRun_WorkflowSpec_StageCreateFails_Returns500(t *testing.T) {
 	repo := newFakeRepo()
 	repo.createStageErr = errors.New("disk full")
 	s := newServer(t, repo)
+	// Capture the operator log so the redacted-cause contract can be proven from
+	// both sides.
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	body, _ := json.Marshal(map[string]any{
 		"repo":           "x/y",
@@ -269,13 +274,35 @@ func TestCreateRun_WorkflowSpec_StageCreateFails_Returns500(t *testing.T) {
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	// Inject a request id so error_ref is minted on this direct-handler path.
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, "create-ref-1"))
 	w := httptest.NewRecorder()
 	s.handleCreateRun(w, withAuth(req))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "create stages failed") {
-		t.Errorf("body missing diagnostic: %s", w.Body.String())
+	// Post-#2587 (E67.15): the storage cause is REDACTED from the client-facing
+	// 5xx body. This assertion previously read the cause out of the body — that
+	// it went red is EVIDENCE the disclosure is closed, not a regression. Prove
+	// BOTH halves of the new contract: the cause is absent from the body, and the
+	// operator still obtains it from the log record keyed by the same error_ref.
+	if strings.Contains(w.Body.String(), "create stages failed") || strings.Contains(w.Body.String(), "disk full") {
+		t.Errorf("storage cause must be redacted from the 5xx body: %s", w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, w.Body.String())
+	}
+	if env.Error.Code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", env.Error.Code)
+	}
+	if env.Error.ErrorRef != "create-ref-1" {
+		t.Errorf("body error_ref = %q, want create-ref-1", env.Error.ErrorRef)
+	}
+	rec := findLogRecord(t, &logBuf, "http error response")
+	raw, _ := json.Marshal(rec)
+	if rec["error_ref"] != "create-ref-1" || !strings.Contains(string(raw), "create stages failed") {
+		t.Errorf("operator log must retain the full cause keyed by error_ref: %s", raw)
 	}
 }
 

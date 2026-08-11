@@ -364,7 +364,12 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	if len(amendPaths) > 0 {
 		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, newImplement.ID, amendPaths, req.Reason,
 			"operator-named scope amendment at category-B recovery of run "+parent.ID.String(), id.Subject); err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
+			// Static message + the cause via internalCauseKey (E67.15 / #2587):
+			// the raw err is a DB-layer cause and must not reach the caller, but
+			// writeError logs it joined to error_ref for the operator.
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not record the operator-named scope amendment",
+				map[string]any{internalCauseKey: err.Error()})
 			return
 		}
 	}
@@ -375,7 +380,10 @@ func (s *Server) handleRecoverRun(w http.ResponseWriter, r *http.Request) {
 	if len(inheritedPaths) > 0 {
 		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, newImplement.ID, inheritedPaths, "",
 			"inherited APPROVED scope amendment from parent run "+parent.ID.String(), id.Subject); err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
+			// Static message + cause via internalCauseKey (E67.15 / #2587); see above.
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not record the inherited scope amendment",
+				map[string]any{internalCauseKey: err.Error()})
 			return
 		}
 	}
@@ -590,7 +598,10 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 	if len(amendPaths) > 0 {
 		if err := s.createApprovedScopeAmendment(r.Context(), child.ID, implementStage.ID, amendPaths, reason,
 			"operator-named scope amendment at in-place recovery of decomposition child "+child.ID.String(), id.Subject); err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error", err.Error(), nil)
+			// Static message + cause via internalCauseKey (E67.15 / #2587); see above.
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"could not record the operator-named scope amendment",
+				map[string]any{internalCauseKey: err.Error()})
 			return
 		}
 	}

@@ -381,6 +381,210 @@ func TestRecoverRun_HappyPath(t *testing.T) {
 	}
 }
 
+// TestRecoverRun_ScopeAmendmentCreateFails_RedactsCauseJoinsInLog is the
+// CONDITION-1 producer proof at the REAL recover.go call site (E67.15 / #2587,
+// scope amendment 2b00f2ab). It drives handleRecoverRun with add_scope_files
+// so createApprovedScopeAmendment runs, injects a DB failure into the scope-
+// amendment Create (a distinctive sentinel that ONLY the post-validation branch
+// can produce — ValidatePaths passes on these valid paths), and asserts the
+// join in ONE record: the 500 client body carries error_ref and NOT the cause,
+// and a SINGLE operator log record carries that SAME ref together with the full
+// cause. This exercises recover.go:365-372 — the operator-named-amendment
+// branch that routes its DB cause through internalCauseKey with a static
+// message — the exact site whose leak the change closes.
+func TestRecoverRun_ScopeAmendmentCreateFails_RedactsCauseJoinsInLog(t *testing.T) {
+	const causeSentinel = "pgx: SQLSTATE 42P01 recover-create-branch-sentinel relation does not exist"
+	const reqID = "recover-cond1-ref"
+
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	sa.createErr = errors.New(causeSentinel)
+	au := &recoverAuditRepo{}
+	var logBuf bytes.Buffer
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		Logger:             slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	parent, _, _ := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+	_ = parent
+
+	// Drive the real handler with a request id in context so error_ref is minted
+	// on this path (postRecover calls the handler directly, no middleware).
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+parent.ID.String()+"/recover",
+		strings.NewReader(`{"add_scope_files":[{"path":"docs/extra.md"}],"reason":"drive the amendment-create branch"}`))
+	req.SetPathValue("run_id", parent.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, reqID))
+	req = withAuth(req)
+	w := httptest.NewRecorder()
+	s.handleRecoverRun(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	// The client body carries the ref and NOT the cause / internal channel key.
+	if strings.Contains(w.Body.String(), causeSentinel) {
+		t.Errorf("raw DB cause leaked into the recover 500 body: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), internalCauseKey) {
+		t.Errorf("internal cause key leaked into the recover 500 body: %s", w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, w.Body.String())
+	}
+	if env.Error.Code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", env.Error.Code)
+	}
+	if env.Error.ErrorRef != reqID {
+		t.Fatalf("body error_ref = %q, want %q", env.Error.ErrorRef, reqID)
+	}
+
+	// ONE operator log record joins the SAME ref with the full cause.
+	rec := findLogRecord(t, &logBuf, "http error response")
+	if rec["error_ref"] != reqID {
+		t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
+	}
+	// The cause is the createApprovedScopeAmendment-wrapped error; the operator
+	// gets the full chain including the distinctive DB sentinel.
+	if cause, _ := rec["cause"].(string); !strings.Contains(cause, causeSentinel) {
+		t.Errorf("log cause = %v, want it to carry the full DB cause %q joined to the ref", rec["cause"], causeSentinel)
+	}
+}
+
+// assertRedactedCauseJoinsInLog is the shared three-part assertion for a
+// recover.go internalCauseKey call site (RESIDUAL 3, E67.29 / #2631): the 500
+// body carries error_ref but NEITHER the cause NOR the literal "__cause"
+// channel key, and ONE operator log record joins that SAME ref with the full
+// cause. Each caller passes its OWN sentinel, so a copy-pasted wrong key
+// literal at one call site cannot be masked by another branch passing.
+func assertRedactedCauseJoinsInLog(t *testing.T, w *httptest.ResponseRecorder, logBuf *bytes.Buffer, reqID, causeSentinel, wantMsg string) {
+	t.Helper()
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if strings.Contains(body, causeSentinel) {
+		t.Errorf("raw cause leaked into the 500 body: %s", body)
+	}
+	if strings.Contains(body, internalCauseKey) {
+		t.Errorf("internal cause key leaked into the 500 body: %s", body)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, body)
+	}
+	if env.Error.Code != "internal_error" {
+		t.Errorf("code = %q, want internal_error", env.Error.Code)
+	}
+	if env.Error.ErrorRef != reqID {
+		t.Fatalf("body error_ref = %q, want %q", env.Error.ErrorRef, reqID)
+	}
+	// Pin the branch-specific static message: the inherited fold and the
+	// operator-named fold share a handler, so without this a test could pass
+	// having driven the WRONG branch.
+	if env.Error.Message != wantMsg {
+		t.Errorf("message = %q, want %q (wrong branch produced this 500)", env.Error.Message, wantMsg)
+	}
+	rec := findLogRecord(t, logBuf, "http error response")
+	if rec["error_ref"] != reqID {
+		t.Errorf("log error_ref = %v, want %q (must equal the body ref)", rec["error_ref"], reqID)
+	}
+	if cause, _ := rec["cause"].(string); !strings.Contains(cause, causeSentinel) {
+		t.Errorf("log cause = %v, want it to carry the full cause %q joined to the ref", rec["cause"], causeSentinel)
+	}
+}
+
+// TestRecoverRun_InheritedAmendmentCreateFails_RedactsCauseJoinsInLog covers the
+// SECOND recover.go internalCauseKey branch (recover.go ~383): the INHERITED
+// amendment fold, reached by seeding an APPROVED amendment on the parent's
+// implement stage and sending NO add_scope_files — so amendPaths is empty and
+// only inheritedPaths drives createApprovedScopeAmendment. Its own sentinel
+// distinguishes it from the operator-named branch above (RESIDUAL 3, #2631).
+func TestRecoverRun_InheritedAmendmentCreateFails_RedactsCauseJoinsInLog(t *testing.T) {
+	const causeSentinel = "pgx: SQLSTATE 42P01 recover-INHERITED-branch-sentinel relation does not exist"
+	const reqID = "recover-inherited-ref"
+
+	rr := newRecoverRepo()
+	sa := newFakeScopeAmendmentRepo()
+	au := &recoverAuditRepo{}
+	var logBuf bytes.Buffer
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            rr,
+		ScopeAmendmentRepo: sa,
+		AuditRepo:          au,
+		Logger:             slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	parent, _, parentImpl := seedRecoverableParent(rr, run.StageStateFailed, failureCat(run.FailureB))
+
+	// Seed an APPROVED amendment on the PARENT's implement stage so
+	// resolveInheritedApprovedAmendments returns a non-empty inherited set.
+	// Seeded directly (not via Create) so the createErr hook below fires only on
+	// the handler's own inherited-fold Create, not on this fixture setup.
+	inherited := &scopeamendment.Amendment{
+		ID:          uuid.New(),
+		RunID:       parent.ID,
+		StageID:     parentImpl.ID,
+		Paths:       []scopeamendment.PathEntry{{Path: "docs/inherited.md", Operation: scopeamendment.OperationModify}},
+		Status:      scopeamendment.StatusApproved,
+		RequestedAt: time.Now().UTC(),
+	}
+	sa.mu.Lock()
+	sa.rows[inherited.ID] = inherited
+	sa.order = append(sa.order, inherited.ID)
+	sa.mu.Unlock()
+
+	// Arm the failure only AFTER the fixture is in place.
+	sa.createErr = errors.New(causeSentinel)
+
+	// NO add_scope_files: amendPaths is empty, so the operator-named branch is
+	// skipped and the inherited branch is the one that fails.
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+parent.ID.String()+"/recover",
+		strings.NewReader(`{"reason":"drive the inherited-amendment create branch"}`))
+	req.SetPathValue("run_id", parent.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, reqID))
+	req = withAuth(req)
+	w := httptest.NewRecorder()
+	s.handleRecoverRun(w, req)
+
+	assertRedactedCauseJoinsInLog(t, w, &logBuf, reqID, causeSentinel, "could not record the inherited scope amendment")
+}
+
+// TestRecoverDecompositionChild_AmendmentCreateFails_RedactsCauseJoinsInLog
+// covers the THIRD recover.go internalCauseKey branch (recover.go ~601), in
+// handleRecoverDecompositionChild's in-place operator-amendment fold. Its own
+// sentinel keeps it independent of the two handleRecoverRun branches
+// (RESIDUAL 3, E67.29 / #2631).
+func TestRecoverDecompositionChild_AmendmentCreateFails_RedactsCauseJoinsInLog(t *testing.T) {
+	const causeSentinel = "pgx: SQLSTATE 42P01 recover-DECOMP-CHILD-branch-sentinel relation does not exist"
+	const reqID = "recover-decomp-child-ref"
+
+	s, rr, sa, _, art := newDecompositionRecoverServer(t)
+	child, _ := seedRecoverableDecompositionChild(t, rr, art, failureCat(run.FailureB))
+
+	// Re-point the server's logger at a buffer so the log join is readable.
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Arm the DB failure only after the fixture is seeded.
+	sa.createErr = errors.New(causeSentinel)
+
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+child.ID.String()+"/recover",
+		strings.NewReader(`{"add_scope_files":[{"path":"docs/extra.md"}],"reason":"drive the decomposition-child amendment-create branch"}`))
+	req.SetPathValue("run_id", child.ID.String())
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyRequestID, reqID))
+	req = withAuth(req)
+	w := httptest.NewRecorder()
+	s.handleRecoverRun(w, req)
+
+	assertRedactedCauseJoinsInLog(t, w, &logBuf, reqID, causeSentinel, "could not record the operator-named scope amendment")
+}
+
 // TestRecoverRun_InheritsParentWorkingDir pins the sibling mint site of
 // E48.100 / #2547: an operator-recovery child executes against the same
 // checkout the run it recovers is anchored to, so it inherits the parent's

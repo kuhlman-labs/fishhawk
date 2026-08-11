@@ -172,15 +172,20 @@ func (r *runResolver) fileIssue(ctx context.Context, _ *mcp.CallToolRequest, in 
 
 	item, err := r.api.FileWorkItem(ctx, req)
 	if err != nil {
-		// Surface the backend's details.error on the remaining genuine 502
-		// paths (CreateIssue / installation-resolution failure) so the
-		// operator gets the provider cause instead of a bare
-		// "HTTP 502 (work_item_filing_failed)" (#1107). Mirrors the
-		// Details-extraction precedent in resume_run.go / tools.go.
+		// Surface the backend's error_ref on the genuine 502 paths (CreateIssue
+		// / installation-resolution failure) so the operator gets a correlation
+		// handle instead of a bare "HTTP 502 (work_item_filing_failed)" (#1107,
+		// E67.15 / #2587). The raw provider cause is no longer disclosed in
+		// details.error — the backend redacts it on 5xx (it can carry storage or
+		// third-party-endpoint internals) and keeps the full cause in its server
+		// log keyed by this ref; point the operator there. apiError.Error()
+		// already appends "(error_ref=…)", so the ref is in err.Error(); this
+		// extra hop adds the where-to-look pointer.
 		var ae *apiError
 		if errors.As(err, &ae) {
-			if cause, ok := ae.Details["error"].(string); ok && cause != "" {
-				return nil, FileIssueOutput{}, fmt.Errorf("file work item: %w: %s", err, cause)
+			if ae.ErrorRef != "" {
+				return nil, FileIssueOutput{}, fmt.Errorf(
+					"file work item: %w: the full provider cause is in the server log under error_ref=%s", err, ae.ErrorRef)
 			}
 		}
 		return nil, FileIssueOutput{}, fmt.Errorf("file work item: %w", err)
