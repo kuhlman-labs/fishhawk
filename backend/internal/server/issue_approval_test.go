@@ -2,13 +2,19 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
@@ -1211,9 +1217,10 @@ func (r *orchestratorRepoFailingList) ListRuns(_ context.Context, _ run.ListRuns
 
 // slashApprovalFixture stands up the run/stage/repos/notifier a slash-command
 // approval test needs, returning the server, the approval repo (to read
-// committed state), and the GitHub recorder (to read reply text). Mirrors
+// committed state), the GitHub recorder (to read reply text), and the chained
+// audit fake (to read recorded audit entries, E67.24 / #2621). Mirrors
 // TestHandleApprovalCommand_PlanApprove_PostsSlashReplyAndStatus's setup.
-func slashApprovalFixture(t *testing.T) (*Server, *fakeApprovalRepo, *slashGitHubRecorder) {
+func slashApprovalFixture(t *testing.T) (*Server, *fakeApprovalRepo, *slashGitHubRecorder, *auditCompleteAuditFake) {
 	t.Helper()
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
@@ -1245,7 +1252,244 @@ func slashApprovalFixture(t *testing.T) (*Server, *fakeApprovalRepo, *slashGitHu
 		Audit:       au,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
-	return s, ar, gh
+	return s, ar, gh, au
+}
+
+// refusalEntries returns the recorded approval_comment_refused audit entries
+// (E67.24 / #2621). Reads the fake's recorded chain rather than a log line, so
+// the assertion is on the durable record an operator would query.
+func refusalEntries(t *testing.T, au *auditCompleteAuditFake) []*audit.Entry {
+	t.Helper()
+	all, err := au.ListForRun(context.Background(), uuid.Nil)
+	if err != nil {
+		t.Fatalf("ListForRun: %v", err)
+	}
+	var out []*audit.Entry
+	for _, e := range all {
+		if e.Category == CategoryApprovalCommentRefused {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// auditFakeFailingAppend makes AppendChained fail so the best-effort posture of
+// the refusal breadcrumb can be asserted. Every other method comes through the
+// embedded fake.
+type auditFakeFailingAppend struct {
+	*auditCompleteAuditFake
+}
+
+func (f *auditFakeFailingAppend) AppendChained(_ context.Context, _ audit.ChainAppendParams) (*audit.Entry, error) {
+	return nil, errors.New("audit append boom")
+}
+
+// TestHandleApprovalCommand_OverCapApprove_SilentReplyComment_NoSubmitNoReplyBreadcrumb
+// is the E67.24 / #2621 core proof: an over-cap approve arriving on the SILENT
+// reply-comment channel records no approval row, posts NO reply (the deliberate
+// suppression is preserved, not quietly replaced by a reply), and leaves exactly
+// one approval_comment_refused breadcrumb carrying silent=true and the byte
+// figures. Counterfactual (i): deleting the refusal block makes the committed-
+// state assertion go RED (the over-cap comment would be recorded).
+func TestHandleApprovalCommand_OverCapApprove_SilentReplyComment_NoSubmitNoReplyBreadcrumb(t *testing.T) {
+	s, ar, gh, au := slashApprovalFixture(t)
+
+	n := prompt.MaxApprovalConditionBytes + 1
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Source:         webhook.ApprovalSourceReplyComment,
+		Comment:        strings.Repeat("a", n),
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+
+	// COMMITTED-STATE: no approval row recorded.
+	if len(ar.all) != 0 {
+		t.Fatalf("approval rows = %d, want 0 (over-cap reply-comment approve must not Submit)", len(ar.all))
+	}
+	// The silent suppression is intact: NO comment posted (CONDITION 2 — the
+	// breadcrumb is a trace, not a reply).
+	if calls := gh.calls(); len(calls) != 0 {
+		t.Errorf("posted %d comments, want 0 on the silent channel; bodies %v", len(calls), commentBodies(calls))
+	}
+
+	entries := refusalEntries(t, au)
+	if len(entries) != 1 {
+		t.Fatalf("approval_comment_refused entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		StageID       string `json:"stage_id"`
+		Decision      string `json:"decision"`
+		Surface       string `json:"surface"`
+		Approver      string `json:"approver"`
+		Silent        bool   `json:"silent"`
+		Reason        string `json:"reason"`
+		Bytes         int    `json:"bytes"`
+		MaxBytes      int    `json:"max_bytes"`
+		OverflowBytes int    `json:"overflow_bytes"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.StageID == "" || entries[0].StageID == nil {
+		t.Errorf("entry must be stage-anchored; payload stage_id = %q, entry stage_id = %v", payload.StageID, entries[0].StageID)
+	}
+	if payload.Decision != string(approval.DecisionApprove) {
+		t.Errorf("decision = %q, want approve", payload.Decision)
+	}
+	if payload.Surface != string(approval.SurfaceGitHubReplyComment) {
+		t.Errorf("surface = %q, want %q", payload.Surface, approval.SurfaceGitHubReplyComment)
+	}
+	if payload.Approver != "alice" {
+		t.Errorf("approver = %q, want alice", payload.Approver)
+	}
+	if !payload.Silent {
+		t.Errorf("silent = false, want true on the reply-comment channel")
+	}
+	if payload.Reason != "over_cap_approve_comment" {
+		t.Errorf("reason = %q, want over_cap_approve_comment", payload.Reason)
+	}
+	if payload.Bytes != n || payload.MaxBytes != prompt.MaxApprovalConditionBytes || payload.OverflowBytes != 1 {
+		t.Errorf("byte figures = (%d, %d, %d), want (%d, %d, 1)",
+			payload.Bytes, payload.MaxBytes, payload.OverflowBytes, n, prompt.MaxApprovalConditionBytes)
+	}
+}
+
+// TestHandleApprovalCommand_OverCapApprove_SilentBreadcrumbReadableViaAuditEndpoint
+// closes the operator's CONDITION 1 readability claim empirically rather than by
+// inference: after the silent refusal, GET /v0/runs/{run_id}/audit?category=
+// approval_comment_refused (no allow_unknown) returns 200 with the row — proving
+// the new category survives the endpoint's registry-backed category filter
+// (#1764) and is therefore reachable by fishhawk_await_audit too.
+func TestHandleApprovalCommand_OverCapApprove_SilentBreadcrumbReadableViaAuditEndpoint(t *testing.T) {
+	s, _, _, au := slashApprovalFixture(t)
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Source:         webhook.ApprovalSourceReplyComment,
+		Comment:        strings.Repeat("a", prompt.MaxApprovalConditionBytes+1),
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	entries := refusalEntries(t, au)
+	if len(entries) != 1 {
+		t.Fatalf("approval_comment_refused entries = %d, want 1", len(entries))
+	}
+	runID := entries[0].RunID
+	if runID == nil {
+		t.Fatal("recorded entry carries no run id")
+	}
+
+	req := httptest.NewRequest(http.MethodGet,
+		fmt.Sprintf("/v0/runs/%s/audit?category=%s", runID, CategoryApprovalCommentRefused), nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (category must pass the registry-backed filter):\n%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("filtered read returned %d items, want 1:\n%s", len(got.Items), w.Body.String())
+	}
+	if got.Items[0].Category != CategoryApprovalCommentRefused {
+		t.Errorf("category = %q, want %q", got.Items[0].Category, CategoryApprovalCommentRefused)
+	}
+}
+
+// TestHandleApprovalCommand_OverCapApprove_SilentAuditAppendFails_StillRefuses
+// pins the breadcrumb's best-effort posture: an AppendChained failure must not
+// unwind the refusal into an admission, must not turn the silent channel
+// talkative, and must not surface an error to the webhook receiver.
+func TestHandleApprovalCommand_OverCapApprove_SilentAuditAppendFails_StillRefuses(t *testing.T) {
+	s, ar, gh, au := slashApprovalFixture(t)
+	s.cfg.AuditRepo = &auditFakeFailingAppend{auditCompleteAuditFake: au}
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Source:         webhook.ApprovalSourceReplyComment,
+		Comment:        strings.Repeat("a", prompt.MaxApprovalConditionBytes+1),
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand returned %v, want nil (a failed breadcrumb never unwinds)", err)
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approval rows = %d, want 0 (the refusal still stands)", len(ar.all))
+	}
+	if calls := gh.calls(); len(calls) != 0 {
+		t.Errorf("posted %d comments, want 0; bodies %v", len(calls), commentBodies(calls))
+	}
+}
+
+// TestHandleApprovalCommand_OverCapReject_SilentReplyComment_RecordedNoBreadcrumb
+// is the reject-exemption negative control (approval CONDITION 4): an over-cap
+// REJECT on the silent channel is NOT refused — its comment feeds the advisory
+// PriorRejectionFeedback channel, not binding conditions — so the approval row IS
+// recorded and NO breadcrumb is written. Deleting validateApprovalComment's
+// decision != approve exemption makes this go RED on the committed-state read.
+func TestHandleApprovalCommand_OverCapReject_SilentReplyComment_RecordedNoBreadcrumb(t *testing.T) {
+	s, ar, _, au := slashApprovalFixture(t)
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionReject,
+		Source:         webhook.ApprovalSourceReplyComment,
+		Comment:        strings.Repeat("a", prompt.MaxApprovalConditionBytes+1),
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("approval rows = %d, want 1 (an over-cap reject stays admissible)", len(ar.all))
+	}
+	if ar.all[0].Decision != approval.DecisionReject {
+		t.Errorf("decision = %q, want reject", ar.all[0].Decision)
+	}
+	if n := len(refusalEntries(t, au)); n != 0 {
+		t.Errorf("approval_comment_refused entries = %d, want 0 (a reject is never refused)", n)
+	}
+}
+
+// TestHandleApprovalCommand_AtCapApprove_SilentReplyComment_NoBreadcrumb pins the
+// `>` not `>=` boundary on the silent channel: an exactly-at-cap reply-comment
+// approve is recorded and writes no breadcrumb.
+func TestHandleApprovalCommand_AtCapApprove_SilentReplyComment_NoBreadcrumb(t *testing.T) {
+	s, ar, _, au := slashApprovalFixture(t)
+
+	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
+		Repo:           "x/y",
+		IssueNumber:    42,
+		InstallationID: 99,
+		SenderLogin:    "alice",
+		Decision:       webhook.MatchActionApprove,
+		Source:         webhook.ApprovalSourceReplyComment,
+		Comment:        strings.Repeat("a", prompt.MaxApprovalConditionBytes),
+	}); err != nil {
+		t.Fatalf("HandleApprovalCommand: %v", err)
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("approval rows = %d, want 1 (at-cap reply-comment approve is admitted)", len(ar.all))
+	}
+	if n := len(refusalEntries(t, au)); n != 0 {
+		t.Errorf("approval_comment_refused entries = %d, want 0 at exactly the cap", n)
+	}
 }
 
 // TestHandleApprovalCommand_OverCapApprove_RefusedNoSubmit pins per-failure-mode
@@ -1253,9 +1497,11 @@ func slashApprovalFixture(t *testing.T) (*Server, *fakeApprovalRepo, *slashGitHu
 // is refused BEFORE Submit — ApprovalRepo.Submit is NOT called (committed-state
 // read: len(ar.all)==0) — and a reply names the cap. Deleting the
 // issue_approval.go refusal makes this go RED on the no-Submit assertion (the
-// over-cap comment would be recorded), not merely on reply text.
+// over-cap comment would be recorded), not merely on reply text. E67.24 / #2621
+// extends it with the breadcrumb assertion (silent=false), so the two channels
+// are pinned as differing ONLY in the reply.
 func TestHandleApprovalCommand_OverCapApprove_RefusedNoSubmit(t *testing.T) {
-	s, ar, gh := slashApprovalFixture(t)
+	s, ar, gh, au := slashApprovalFixture(t)
 
 	n := prompt.MaxApprovalConditionBytes + 1
 	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{
@@ -1285,13 +1531,32 @@ func TestHandleApprovalCommand_OverCapApprove_RefusedNoSubmit(t *testing.T) {
 		t.Errorf("expected a reply naming the cap %d; got bodies %v",
 			prompt.MaxApprovalConditionBytes, commentBodies(gh.calls()))
 	}
+	// E67.24 / #2621: the non-silent channel leaves the same breadcrumb, flagged
+	// silent=false — so an audit consumer needn't know which surface refused.
+	entries := refusalEntries(t, au)
+	if len(entries) != 1 {
+		t.Fatalf("approval_comment_refused entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		Silent  bool   `json:"silent"`
+		Surface string `json:"surface"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload.Silent {
+		t.Errorf("silent = true, want false on the slash channel")
+	}
+	if payload.Surface != string(approval.SurfaceGitHubComment) {
+		t.Errorf("surface = %q, want %q", payload.Surface, approval.SurfaceGitHubComment)
+	}
 }
 
 // TestHandleApprovalCommand_AtCapApprove_Recorded pins per-failure-mode test 6:
 // an exactly-at-cap slash approve is recorded normally (the > not >= boundary
 // on the slash channel too).
 func TestHandleApprovalCommand_AtCapApprove_Recorded(t *testing.T) {
-	s, ar, _ := slashApprovalFixture(t)
+	s, ar, _, _ := slashApprovalFixture(t)
 
 	n := prompt.MaxApprovalConditionBytes
 	if err := s.HandleApprovalCommand(context.Background(), webhook.ApprovalCommandParams{

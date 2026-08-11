@@ -17,6 +17,19 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
+// CategoryApprovalCommentRefused is the audit category emitted when the
+// issue-comment approval channel refuses an over-cap approve comment before
+// Submit (#2583's refusal, made observable by E67.24 / #2621). It exists for the
+// SILENT branch above all: a reply-comment ("+1") refusal deliberately posts no
+// reply, so without this entry an operator's approval evaporated with no reply,
+// no approval row, and no trace anywhere. The entry is written on the non-silent
+// slash channel too, so the server-side record of a refusal is identical on both
+// surfaces and an audit consumer needn't know which one refused — the payload's
+// `silent` flag says whether a reply also went out. Same posture as
+// CategoryApprovalConditionsTruncated (prompt.go): a best-effort breadcrumb for
+// a drop that would otherwise be invisible.
+const CategoryApprovalCommentRefused = "approval_comment_refused"
+
 // HandleApprovalCommand implements webhook.ApprovalCommandHandler
 // for /fishhawk approve and /fishhawk reject (#238). Mirrors the
 // HTTP approval handler's checks (role authorization, blocking-
@@ -134,7 +147,14 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	// comment feeds advisory PriorRejectionFeedback, not binding conditions).
 	// Honors the reply-comment silent suppression: a passer-by "+1" that happens
 	// to exceed the cap should not draw an unsolicited reply.
-	if ok, msg, _ := validateApprovalComment(decision, p.Comment); !ok {
+	//
+	// E67.24 (#2621): the refusal is recorded as an approval_comment_refused
+	// audit entry on BOTH channels, carrying a `silent` flag, so the drop is
+	// visible in the run record rather than invisible. The suppression itself is
+	// unchanged — a silent refusal still posts NO comment; the breadcrumb is a
+	// trace, not a reply.
+	if ok, msg, details := validateApprovalComment(decision, p.Comment); !ok {
+		s.writeApprovalCommentRefusedAudit(ctx, stage, subject, decision, p.Source, silent, details)
 		if !silent {
 			s.replyApproval(ctx, p, msg)
 		}
@@ -415,6 +435,54 @@ func (s *Server) writeSlashApprovalAudit(ctx context.Context, stage *run.Stage, 
 			"slash-command approval: audit append failed",
 			slog.String("run_id", stage.RunID.String()),
 			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// writeApprovalCommentRefusedAudit records an over-cap approve-comment refusal
+// on the issue-comment approval channel (E67.24 / #2621). Modelled on
+// writeSlashApprovalAudit's chain entry and appendApprovalConditionsTruncatedAudit's
+// best-effort posture: an append failure WARN-logs and never changes the
+// handler's return value or its reply behavior — the refusal already happened,
+// and unwinding it because a breadcrumb failed would trade a visible drop for an
+// invisible admission. `details` is validateApprovalComment's own details map,
+// so the recorded byte figures are the exact ones the refusal message names.
+func (s *Server) writeApprovalCommentRefusedAudit(ctx context.Context, stage *run.Stage, subject string, decision approval.Decision, source webhook.ApprovalSource, silent bool, details map[string]any) {
+	if s.cfg.AuditRepo == nil {
+		// Defence-in-depth: approvalCommandConfigured already requires an
+		// AuditRepo, so this branch is unreachable from the handler.
+		return
+	}
+	actorKind := audit.ActorKind("user")
+	approver := subject
+	auditPayload := map[string]any{
+		"stage_id": stage.ID.String(),
+		"decision": string(decision),
+		"surface":  string(approvalSurfaceForSource(source)),
+		"approver": approver,
+		"silent":   silent,
+		"reason":   "over_cap_approve_comment",
+	}
+	for _, k := range []string{"bytes", "max_bytes", "overflow_bytes"} {
+		if v, ok := details[k]; ok {
+			auditPayload[k] = v
+		}
+	}
+	payload, _ := json.Marshal(auditPayload)
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        stage.RunID,
+		StageID:      &stage.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryApprovalCommentRefused,
+		ActorKind:    &actorKind,
+		ActorSubject: &approver,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"slash-command approval: append approval_comment_refused audit failed",
+			slog.String("run_id", stage.RunID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.Bool("silent", silent),
 			slog.String("error", err.Error()))
 	}
 }

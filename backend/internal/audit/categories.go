@@ -44,9 +44,12 @@ import "sort"
 // #2412 added split_filing_refused, the on-approval hook's refusal marker when a
 // split_proposal has a phase whose own declared scope.files count exceeds the
 // resolved implement cap (the hook files ZERO children rather than emit a lead
-// phase that would itself fail the implement cap). When a
-// new canonical category is introduced, add it here so operators can await
-// it without the allow_unknown escape hatch;
+// phase that would itself fail the implement cap). E67.24 / #2621 added
+// approval_comment_refused, the issue-comment approval channel's marker for an
+// over-cap approve comment refused before Submit — the breadcrumb that makes the
+// deliberately SILENT reply-comment refusal (no reply, no approval row) visible
+// in the run record. When a new canonical category is introduced, add it here so
+// operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
 // non-test backend audit-write emits a category absent from this map.
 var KnownCategories = map[string]struct{}{
@@ -60,6 +63,7 @@ var KnownCategories = map[string]struct{}{
 	"anchor_ping_posted":                      {},
 	"api_token_issued":                        {},
 	"api_token_revoked":                       {},
+	"approval_comment_refused":                {},
 	"approval_conditions_truncated":           {},
 	"approval_predicate_rejected":             {},
 	"approval_sla_elapsed":                    {},
