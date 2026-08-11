@@ -1,0 +1,53 @@
+-- 0067: at-most-one parent_awaiting_child_scope_decision audit entry per
+-- (parent run, child stage) (E67.19 / #2594).
+--
+-- When a decomposition child parks in awaiting_scope_decision for a
+-- build-required shortfall, the PARENT run carries a
+-- parent_awaiting_child_scope_decision audit entry so the wait is discoverable
+-- (#2548). That entry is emitted from BOTH triggers: at PARK time
+-- (server/build_required_park.go::emitParentAwaitingChildScopeDecision) and,
+-- when a SIBLING settles, from
+-- orchestrator.go::surfaceParkedChildren. The orchestrator de-duplicated per
+-- child stage with a read (ListForRunByCategory) followed by an append with no
+-- atomicity between them, and the park-time emitter appended unconditionally
+-- with no read at all — so two concurrent sibling terminal transitions, or the
+-- park-time emitter racing a sibling-settle emitter, could both land an entry
+-- for the SAME child stage. This partial unique index makes that race
+-- impossible at the DB level.
+--
+-- The key is (run_id, child_stage_id), NOT run_id alone: one parent legitimately
+-- carries ONE entry PER parked child stage — a fan-out with three parked
+-- children must show three entries. Keying on run_id alone would collapse
+-- distinct parked children into one signal and hide two of three parked slices.
+--
+-- #2591 CAVEAT — NO EPISODE COMPONENT: this key has no lifecycle/episode
+-- component, so it enforces at-most-one entry per parent run per child stage for
+-- the ENTIRE life of the run, not per park episode. That matches this issue's
+-- done-means because a child stage parks exactly once today. If #2591
+-- (amend-and-resume for a parked child) lands and a child can be RE-PARKED
+-- within the same parent run, the second park's advisory entry will hit the
+-- duplicate-tolerant branch, log INFO, and append nothing — silently suppressing
+-- a legitimate second-park signal. The #2591 implementer MUST widen the key to
+-- carry an episode component (or emit a distinct category) before allowing
+-- re-park; do NOT rely on this index to surface a second park.
+--
+-- Partial on category: run_id is nullable (run-less "global" chain rows set it
+-- NULL), but parent_awaiting_child_scope_decision is a strictly per-run category
+-- so its rows always carry a non-null run_id, and the WHERE predicate excludes
+-- every other category and every run-less row — so the index is well-defined and
+-- constrains only the intended rows. IF NOT EXISTS keeps re-application
+-- idempotent (mirroring the migration harness's idempotence assertions).
+--
+-- payload->>'child_stage_id' is an IMMUTABLE jsonb expression, a precondition
+-- for indexing it. A payload missing child_stage_id indexes as NULL, and NULLs
+-- are distinct in a PostgreSQL unique index, so the index constrains only
+-- well-formed entries — both emitters always set the key.
+--
+-- Fail-loud on a pre-existing duplicate: if any (parent run, child stage)
+-- already holds two or more rows, CREATE UNIQUE INDEX fails at migrate time —
+-- the correct fail-closed surfacing. The audit_entries append-only no-delete
+-- triggers make silent de-duping impossible anyway, and the category (#2548) is
+-- only days old, so pre-alpha environments carry no such durable data.
+CREATE UNIQUE INDEX IF NOT EXISTS audit_entries_parent_awaiting_child_scope_decision_once_idx
+    ON audit_entries (run_id, (payload->>'child_stage_id'))
+    WHERE category = 'parent_awaiting_child_scope_decision';

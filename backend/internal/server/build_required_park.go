@@ -32,9 +32,17 @@ import (
 //     is the only cover for the case where the parked child is the LAST
 //     non-terminal sibling and no further terminal transition ever fires
 //     maybeAdvanceDecomposedParent again; and
-//   - de-duplicated per child stage from maybeAdvanceDecomposedParent when a
-//     SIBLING settles, so an operator driving the fan-out sees it on the
-//     parent's chain at the point they are reading it.
+//   - from maybeAdvanceDecomposedParent when a SIBLING settles, so an operator
+//     driving the fan-out sees it on the parent's chain at the point they are
+//     reading it.
+//
+// At most one entry exists per (parent run, child stage), enforced at the store
+// layer by migration 0067's partial unique index — not by a best-effort read in
+// one emitter. Both emitters funnel through AppendChained's per-run
+// SELECT ... FOR UPDATE, so the race-loser's insert deterministically hits the
+// index and is treated as the benign already-recorded outcome. (Caveat: the key
+// has no episode component, so a re-park within the same run — #2591's proposed
+// amend-and-resume — would be silently suppressed until the key is widened.)
 //
 // Payload: {parent_stage_id, child_run_id, child_stage_id, child_slice_index,
 // shortfall_class, build_required_paths, owning_slices}. The attribution
@@ -187,6 +195,23 @@ func (s *Server) emitParentAwaitingChildScopeDecision(ctx context.Context, child
 		ActorKind: &systemKind,
 		Payload:   payload,
 	}); err != nil {
+		// The 0067 partial unique index (run_id, child_stage_id) makes the
+		// at-most-one property TRUE across BOTH emitters: a sibling-settle
+		// emitter (or another park-time emitter) that already recorded this
+		// child stage makes our insert the deterministic race-loser, which
+		// surfaces as a unique_violation on that index. That is the benign
+		// already-recorded outcome — log INFO and return, NOT the WARN below.
+		// Every other append error keeps the WARN. The park itself is untouched
+		// on both paths — a failed or superseded append must never unwind the
+		// thing preserving the slice's work.
+		if audit.IsParentAwaitingChildScopeDecisionDuplicate(err) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"parent already carries the awaiting-child-scope-decision signal for this child stage",
+				slog.String("parent_run_id", parentRunID.String()),
+				slog.String("child_run_id", childRun.ID.String()),
+				slog.String("child_stage_id", childStageID.String()))
+			return
+		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"build-required park: append "+CategoryParentAwaitingChildScopeDecision+" failed",
 			slog.String("child_run_id", childRun.ID.String()),

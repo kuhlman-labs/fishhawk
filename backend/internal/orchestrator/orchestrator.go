@@ -2581,7 +2581,10 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 // emits the same category at PARK time. The two emitters are deliberately
 // duplicated rather than shared — package server already imports this package's
 // siblings, and the audit-category registry (backend/internal/audit) hardcodes
-// its strings for the same import-cycle reason.
+// its strings for the same import-cycle reason. The no-duplicate property across
+// both emitters is enforced by migration 0067's partial unique index on
+// (run_id, child_stage_id), recognized via
+// audit.IsParentAwaitingChildScopeDecisionDuplicate.
 const categoryParentAwaitingChildScopeDecision = "parent_awaiting_child_scope_decision"
 
 // shortfallClassBuildRequired mirrors server.ShortfallClassBuildRequired — see
@@ -2590,12 +2593,19 @@ const shortfallClassBuildRequired = "build_required"
 
 // surfaceParkedChildren emits one parent_awaiting_child_scope_decision entry per
 // non-terminal child whose implement stage is parked in awaiting_scope_decision
-// for a build-required shortfall, DE-DUPLICATED by child stage id so repeated
-// sibling settles never spam the parent's chain.
+// for a build-required shortfall.
+//
+// The no-duplicate property — at most one entry per (parent run, child stage) —
+// is enforced at the store layer by migration 0067's partial unique index,
+// across BOTH this emitter and the park-time one in
+// server/build_required_park.go. The pre-read of ListForRunByCategory below is
+// now a best-effort FAST PATH that avoids a doomed insert in the common case, no
+// longer the correctness mechanism: on a genuine race the loser's insert hits
+// the index and is treated as the benign already-recorded outcome.
 //
 // It is the sibling-settle half of the dual emission (#2548); the park-time half
-// lives in server/pullrequest.go and is what covers the case where the parked
-// child is the LAST non-terminal sibling, since this function is only ever
+// lives in server/build_required_park.go and is what covers the case where the
+// parked child is the LAST non-terminal sibling, since this function is only ever
 // reached from maybeAdvanceDecomposedParent, i.e. from completeRun on some
 // child's TERMINAL transition.
 //
@@ -2707,6 +2717,26 @@ func (o *Orchestrator) surfaceParkedChildren(ctx context.Context, parentRunID uu
 			ActorKind: &systemKind,
 			Payload:   payload,
 		}); aerr != nil {
+			// The 0067 partial unique index (run_id, child_stage_id) is what
+			// makes the no-duplicate property TRUE across BOTH emitters; the
+			// pre-read above is now only a fast path that skips a doomed insert
+			// in the common case. When the park-time emitter (or a concurrent
+			// sibling settle) already recorded this child stage, our insert is
+			// the deterministic race-loser and surfaces as a unique_violation on
+			// that index — the benign already-recorded outcome. Mark it recorded
+			// (so a second pending entry for the same stage in this call is
+			// skipped) and CONTINUE to the next pending child; every other
+			// append error keeps the WARN and also continues, never unwinding
+			// the dispatch top-up or the parent's parked state.
+			if audit.IsParentAwaitingChildScopeDecisionDuplicate(aerr) {
+				recorded[p.stage.ID.String()] = struct{}{}
+				o.logger().LogAttrs(ctx, slog.LevelInfo, "parent already carries the awaiting-child-scope-decision signal for this child stage",
+					slog.String("parent_run_id", parentRunID.String()),
+					slog.String("child_run_id", p.child.ID.String()),
+					slog.String("child_stage_id", p.stage.ID.String()),
+				)
+				continue
+			}
 			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: append parent_awaiting_child_scope_decision failed",
 				slog.String("parent_run_id", parentRunID.String()),
 				slog.String("child_run_id", p.child.ID.String()),

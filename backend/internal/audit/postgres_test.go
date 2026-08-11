@@ -1261,3 +1261,203 @@ func TestPostgres_AppendChained_MergeVerdictConcurrent(t *testing.T) {
 		t.Errorf("surviving merge_verdict_recorded rows = %d, want exactly 1", len(rows))
 	}
 }
+
+// parentAwaitingParams builds a parent_awaiting_child_scope_decision
+// ChainAppendParams keyed on childStageID — the value the 0067 index constrains
+// via payload->>'child_stage_id'. The extra tag varies the rest of the payload
+// so a duplicate-key collision is proven to key on child_stage_id, not on
+// whole-payload equality.
+func parentAwaitingParams(runID, childStageID uuid.UUID, tag string) audit.ChainAppendParams {
+	kind := audit.ActorSystem
+	p, _ := json.Marshal(map[string]any{
+		"child_stage_id":       childStageID.String(),
+		"shortfall_class":      "build_required",
+		"build_required_paths": []string{tag},
+	})
+	return audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "parent_awaiting_child_scope_decision",
+		ActorKind: &kind,
+		Payload:   p,
+	}
+}
+
+// TestIsParentAwaitingChildScopeDecisionDuplicate pins each recognition branch
+// of the constraint-specific helper (#2594), mirroring TestIsMergeVerdictDuplicate:
+// the sentinel and its wrapped form, a real pgconn 23505 on the 0067 index (bare
+// and wrapped) → true; nil, an unrelated error, a 23505 on a DIFFERENT
+// constraint, and a non-23505 on the index → false. A pure unit test (no Postgres).
+func TestIsParentAwaitingChildScopeDecisionDuplicate(t *testing.T) {
+	idx := audit.ParentAwaitingChildScopeDecisionOnceIndex
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unrelated error", errors.New("boom"), false},
+		{"sentinel", audit.ErrParentAwaitingChildScopeDecisionDuplicate, true},
+		{"wrapped sentinel", fmt.Errorf("audit: append: %w", audit.ErrParentAwaitingChildScopeDecisionDuplicate), true},
+		{"pg 23505 on the index", &pgconn.PgError{Code: "23505", ConstraintName: idx}, true},
+		{"wrapped pg 23505 on the index", fmt.Errorf("audit: append: %w", &pgconn.PgError{Code: "23505", ConstraintName: idx}), true},
+		{"pg 23505 on a different constraint", &pgconn.PgError{Code: "23505", ConstraintName: "audit_entries_run_id_sequence_key"}, false},
+		{"pg non-23505 on the index", &pgconn.PgError{Code: "23503", ConstraintName: idx}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := audit.IsParentAwaitingChildScopeDecisionDuplicate(tt.err); got != tt.want {
+				t.Errorf("IsParentAwaitingChildScopeDecisionDuplicate(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPostgres_AppendChained_ParentAwaitingChildScopeDecisionUniquePerChildStage
+// is the done-means / real-DB behavioral assertion of the shipped 0067 partial
+// unique index (#2594): a SECOND parent_awaiting_child_scope_decision
+// AppendChained for the SAME (run, child stage) is rejected with an
+// audit.IsParentAwaitingChildScopeDecisionDuplicate-recognized error, and exactly
+// one row survives. A comment-only or no-op touch of the index cannot satisfy this.
+func TestPostgres_AppendChained_ParentAwaitingChildScopeDecisionUniquePerChildStage(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	childStage := uuid.New()
+
+	first, err := repo.AppendChained(context.Background(), parentAwaitingParams(runID, childStage, "first"))
+	if err != nil {
+		t.Fatalf("first AppendChained: %v", err)
+	}
+	_, err = repo.AppendChained(context.Background(), parentAwaitingParams(runID, childStage, "second"))
+	if err == nil {
+		t.Fatal("second AppendChained for the same (run, child stage) succeeded, want a duplicate error")
+	}
+	if !audit.IsParentAwaitingChildScopeDecisionDuplicate(err) {
+		t.Fatalf("second AppendChained error not recognized as a parent-awaiting-child-scope-decision duplicate: %v", err)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "parent_awaiting_child_scope_decision")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("surviving parent_awaiting_child_scope_decision rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].Sequence != first.Sequence {
+		t.Errorf("surviving row sequence = %d, want the first append's %d", rows[0].Sequence, first.Sequence)
+	}
+}
+
+// TestPostgres_AppendChained_ParentAwaitingChildScopeDecisionDistinctChildStages
+// is the done-means test for the index KEY (#2594): two DIFFERENT child stages
+// under the SAME parent both persist. It goes RED if the index is mistakenly
+// keyed on run_id alone — a shape the mere presence of a migration file would
+// otherwise satisfy — because the second distinct-child append would then collide.
+func TestPostgres_AppendChained_ParentAwaitingChildScopeDecisionDistinctChildStages(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	if _, err := repo.AppendChained(context.Background(), parentAwaitingParams(runID, uuid.New(), "childA")); err != nil {
+		t.Fatalf("AppendChained for first child stage: %v", err)
+	}
+	if _, err := repo.AppendChained(context.Background(), parentAwaitingParams(runID, uuid.New(), "childB")); err != nil {
+		t.Fatalf("AppendChained for a SECOND distinct child stage under the same parent: %v — the 0067 key must be (run_id, child_stage_id), not run_id alone", err)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "parent_awaiting_child_scope_decision")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("parent_awaiting_child_scope_decision rows for two distinct child stages = %d, want 2 (index must not collapse distinct parked children)", len(rows))
+	}
+}
+
+// TestPostgres_AppendChained_ParentAwaitingChildScopeDecisionConcurrent is the
+// REAL concurrency proof (#2594). N goroutines each AppendChained a
+// parent_awaiting_child_scope_decision entry for the SAME (parent run, child
+// stage); the FOR-UPDATE run-row serialization + the 0067 partial unique index
+// make this deterministic — exactly one wins, every loser hits the
+// constraint-specific duplicate, no panic/deadlock — and the parent's chain
+// re-verifies linearly via ComputeEntryHash, proving the rolled-back losers left
+// no fork or gap. This single test covers BOTH racing pairs the issue names
+// (two sibling-settle emitters, and park-time vs sibling-settle), because both
+// converge on this AppendChained path.
+func TestPostgres_AppendChained_ParentAwaitingChildScopeDecisionConcurrent(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	childStage := uuid.New()
+
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = repo.AppendChained(context.Background(), parentAwaitingParams(runID, childStage, fmt.Sprintf("g%d", i)))
+		}(i)
+	}
+	wg.Wait()
+
+	var success, dupes int
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			success++
+		case audit.IsParentAwaitingChildScopeDecisionDuplicate(e):
+			dupes++
+		default:
+			t.Fatalf("unexpected AppendChained error (want nil or a parent-awaiting duplicate): %v", e)
+		}
+	}
+	if success != 1 {
+		t.Errorf("successful concurrent appends = %d, want exactly 1", success)
+	}
+	if dupes != n-1 {
+		t.Errorf("parent-awaiting-duplicate losers = %d, want %d", dupes, n-1)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "parent_awaiting_child_scope_decision")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("surviving parent_awaiting_child_scope_decision rows = %d, want exactly 1", len(rows))
+	}
+
+	// Chain integrity: the full parent chain re-verifies linearly — every entry
+	// re-hashes via ComputeEntryHash over its own read-back fields, proving the
+	// rolled-back losers' inserts left no fork or gap.
+	all, err := repo.ListForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListForRun: %v", err)
+	}
+	var prev *string
+	for i, e := range all {
+		if (e.PrevHash == nil) != (prev == nil) || (e.PrevHash != nil && prev != nil && *e.PrevHash != *prev) {
+			t.Fatalf("chain link broken at index %d: prev_hash=%v, want %v", i, e.PrevHash, prev)
+		}
+		recomputed, herr := audit.ComputeEntryHash(audit.HashInputs{
+			RunID:        e.RunID,
+			StageID:      e.StageID,
+			Timestamp:    e.Timestamp,
+			Category:     e.Category,
+			ActorKind:    e.ActorKind,
+			ActorSubject: e.ActorSubject,
+			Payload:      e.Payload,
+			PrevHash:     e.PrevHash,
+		})
+		if herr != nil {
+			t.Fatalf("ComputeEntryHash at index %d: %v", i, herr)
+		}
+		if recomputed != e.EntryHash {
+			t.Fatalf("entry-hash mismatch at index %d after a rolled-back collision: stored %s recomputed %s", i, e.EntryHash, recomputed)
+		}
+		h := e.EntryHash
+		prev = &h
+	}
+}

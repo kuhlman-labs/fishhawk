@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -329,6 +332,15 @@ func (a *appendErrAudit) AppendChained(context.Context, audit.ChainAppendParams)
 	return nil, errors.New("append boom")
 }
 
+// dupAudit returns the parent-awaiting-child-scope-decision duplicate sentinel
+// from AppendChained — the race-loser the 0067 index produces — so the emitter's
+// benign branch is exercised without real Postgres.
+type dupAudit struct{ auditCapture }
+
+func (a *dupAudit) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
+	return nil, audit.ErrParentAwaitingChildScopeDecisionDuplicate
+}
+
 // TestEmitParentAwaitingChildScopeDecision_DegradeBranches covers EVERY
 // defensive branch of the park-time emitter. Each asserts the same contract: a
 // failure here NEVER unwinds the park, which is the thing preserving the
@@ -431,4 +443,41 @@ func TestEmitParentAwaitingChildScopeDecision_DegradeBranches(t *testing.T) {
 			t.Errorf("child_slice_index must be omitted when the child carries none: %v", p)
 		}
 	})
+}
+
+// TestEmitParentAwaitingChildScopeDecision_DuplicateIsBenign pins the store-layer
+// idempotency branch (#2594): when AppendChained returns the
+// parent-awaiting-child-scope-decision duplicate sentinel (the 0067 race-loser),
+// the emitter logs at INFO — the benign already-recorded outcome — and does NOT
+// emit the WARN it emits for every OTHER append error. The park is untouched on
+// both paths; the existing append_error_does_not_unwind case keeps pinning the
+// WARN side for non-duplicate errors.
+func TestEmitParentAwaitingChildScopeDecision_DuplicateIsBenign(t *testing.T) {
+	buildPark := func() run.ScopeCompletenessPark {
+		return run.ScopeCompletenessPark{
+			HeldCommitSHA:      "1111111111111111111111111111111111111111",
+			RunBranch:          "fishhawk/run-parent/slice-0",
+			BuildRequiredPaths: []string{"backend/internal/server/prompt.go"},
+		}
+	}
+
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := &dupAudit{}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	parent := rr.seedRun()
+	rr.seedStage(parent.ID, 1, run.StageStateAwaitingChildren)
+	child := seedGuardChild(rr, parent.ID, 0, run.StateRunning)
+
+	// Must return cleanly (park already landed) on the duplicate sentinel.
+	s.emitParentAwaitingChildScopeDecision(context.Background(), child, uuid.New(), buildPark())
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, "parent already carries the awaiting-child-scope-decision signal for this child stage") {
+		t.Errorf("want the benign INFO log for the duplicate sentinel; got:\n%s", logs)
+	}
+	if strings.Contains(logs, "append "+CategoryParentAwaitingChildScopeDecision+" failed") {
+		t.Errorf("the duplicate sentinel must NOT produce the append-failure WARN; got:\n%s", logs)
+	}
 }
