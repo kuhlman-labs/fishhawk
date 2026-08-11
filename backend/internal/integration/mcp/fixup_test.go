@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -404,6 +405,172 @@ func TestE2E_Fixup_OperatorConcernRoutedToPrompt(t *testing.T) {
 	if !strings.Contains(rendered, operatorConcern) {
 		t.Errorf("rendered prompt missing the operator's verbatim instruction %q:\n%s", operatorConcern, rendered)
 	}
+}
+
+// TestE2E_Fixup_OperatorConcernMintedToDurableStore is the #2623 cross-boundary
+// integration: the real fishhawk-mcp binary calls fishhawk_fixup_stage with ONLY
+// an operator_concern against the real backend over a real Postgres concern store
+// (concern.NewPostgresRepository), and asserts the durable addressed_pending row,
+// its appearance on BOTH gate consumers (the run-status concerns block AND the
+// gate view — binding condition 2), and the unchanged verbatim prompt render.
+// Per-layer units each pass while that seam breaks (cf. #618). Distinct from
+// TestE2E_Fixup_OperatorConcernRoutedToPrompt, which wires NO ConcernRepo and so
+// pins the untracked-delivery degrade.
+func TestE2E_Fixup_OperatorConcernMintedToDurableStore(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	concernRepo := concern.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ConcernRepo:  concernRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// Implement stage parked at the review gate with NO recorded implement-review
+	// concern (the zero-concern gate-open CodeQL case).
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	const operatorConcern = "CodeQL high alert: sanitize the user-supplied path before passing it to os.Open in backend/internal/server/upload.go"
+	const reason = "required CodeQL gate has no Fishhawk review concern"
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_fixup_stage",
+		Arguments: map[string]any{
+			"stage_id":         stage.ID.String(),
+			"operator_concern": operatorConcern,
+			"reason":           reason,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("operator-concern fix-up tool returned error: %s", toolContentString(t, result))
+	}
+
+	// 1. The durable concern store holds exactly one addressed_pending row.
+	rows, err := concernRepo.ListByRun(ctx, fx.runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("concern rows = %d, want 1 minted operator concern", len(rows))
+	}
+	row := rows[0]
+	if row.StageKind != concern.StageKindImplement || row.Category != "operator" ||
+		row.Severity != string(planreview.SeverityHigh) || row.Note != operatorConcern {
+		t.Errorf("minted concern = %+v, want {implement, operator, high, verbatim note}", row)
+	}
+	if row.State != concern.StateAddressedPending {
+		t.Errorf("minted concern State = %q, want addressed_pending", row.State)
+	}
+	if row.StateReason != reason {
+		t.Errorf("minted concern StateReason = %q, want the fix-up reason", row.StateReason)
+	}
+
+	// 2. The run-status concerns block reports it OPEN.
+	var runStatus struct {
+		Concerns *struct {
+			Open  int `json:"open"`
+			Items []struct {
+				ID       string `json:"id"`
+				Category string `json:"category"`
+				State    string `json:"state"`
+			} `json:"items"`
+		} `json:"concerns"`
+	}
+	getRunJSON(t, ctx, httpSrv.URL, fx.operatorTok, fx.runID, &runStatus)
+	if runStatus.Concerns == nil || runStatus.Concerns.Open != 1 || len(runStatus.Concerns.Items) != 1 {
+		t.Fatalf("run-status concerns block = %+v, want exactly 1 open", runStatus.Concerns)
+	}
+	if runStatus.Concerns.Items[0].ID != row.ID.String() || runStatus.Concerns.Items[0].Category != "operator" ||
+		runStatus.Concerns.Items[0].State != string(concern.StateAddressedPending) {
+		t.Errorf("run-status open concern = %+v, want the minted operator concern", runStatus.Concerns.Items[0])
+	}
+
+	// 3. The GATE VIEW reports it OPEN with its full note and a fix-up join
+	// (binding condition 2 — the second gate consumer, not just the run block).
+	gate := getGateViewJSON(t, ctx, httpSrv.URL, fx.operatorTok, fx.runID)
+	if len(gate.Open) != 1 {
+		t.Fatalf("gate-view open = %d, want 1", len(gate.Open))
+	}
+	gc := gate.Open[0]
+	if gc.ID != row.ID.String() || gc.Note != operatorConcern || gc.State != string(concern.StateAddressedPending) {
+		t.Errorf("gate-view open concern = %+v, want the minted operator concern with full note", gc)
+	}
+	if len(gc.Fixups) != 1 || gc.Fixups[0].Reason != reason {
+		t.Errorf("gate-view open concern Fixups = %+v, want 1 join carrying the routing reason (via operator_concern_id/concern_ids)", gc.Fixups)
+	}
+
+	// 4. The prompt still renders the operator's verbatim instruction under the
+	// binding Fix-up concerns heading — unchanged by the mint.
+	rendered := getPromptRender(t, ctx, httpSrv.URL, stage.ID)
+	for _, want := range []string{"### Fix-up concerns", "MANDATORY", "win on conflict", operatorConcern} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered prompt missing %q:\n%s", want, rendered)
+		}
+	}
+}
+
+// gateViewView is the minimal decode of GET /v0/runs/{run_id}/gate-view the
+// #2623 integration test reads.
+type gateViewView struct {
+	Open []struct {
+		ID     string `json:"id"`
+		Note   string `json:"note"`
+		State  string `json:"state"`
+		Fixups []struct {
+			Reason  string `json:"reason"`
+			Outcome string `json:"outcome"`
+		} `json:"fixups"`
+	} `json:"open"`
+}
+
+// getGateViewJSON GETs /v0/runs/{id}/gate-view with the operator bearer token
+// (read:audit) and decodes the gate-view response.
+func getGateViewJSON(t *testing.T, ctx context.Context, baseURL, token string, runID uuid.UUID) gateViewView {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		baseURL+"/v0/runs/"+runID.String()+"/gate-view", nil)
+	if err != nil {
+		t.Fatalf("build gate-view request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("gate-view request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("gate-view status %d: %s", resp.StatusCode, raw)
+	}
+	var out gateViewView
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode gate-view response: %v", err)
+	}
+	return out
 }
 
 // TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope is the cross-boundary

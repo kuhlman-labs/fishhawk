@@ -32,7 +32,7 @@ type FixupStageInput struct {
 	ImplementModel string `json:"implement_model,omitempty" jsonschema:"optional operator/driver model override for THIS fix-up pass; default (empty) inherits the run's resolved implement model. Validated against the deployment per-adapter allow-list — a disallowed value returns fixup_invalid_model (422)."`
 	// OperatorConcern is the free-text operator instruction routed back with NO
 	// pre-existing review concern (#1311).
-	OperatorConcern string `json:"operator_concern,omitempty" jsonschema:"optional free-text operator instruction delivered to the agent as a binding instruction with NO pre-existing review concern. Use for a required CI/CodeQL/SAST finding, an ad-hoc steer, or a missed edge case on a clean approve-with-zero-concerns diff. Folded into the routed concern set as a [high/operator] concern. At least one of concern_ids/concerns/operator_concern is required; operator_concern alone is admitted on a zero-concern gate-open stage. A whitespace-only or over-length (>4000 bytes) value returns validation_failed (400)."`
+	OperatorConcern string `json:"operator_concern,omitempty" jsonschema:"optional free-text operator instruction delivered to the agent as a binding instruction with NO pre-existing review concern. Use for a required CI/CodeQL/SAST finding, an ad-hoc steer, or a missed edge case on a clean approve-with-zero-concerns diff. Folded into the routed concern set as a [high/operator] concern AND minted as a durable concern tracked to closure (#2623): if the agent does not address it, it stays open and surfaces as an OPEN concern at the gate — no longer silently dropped. At least one of concern_ids/concerns/operator_concern is required; operator_concern alone is admitted on a zero-concern gate-open stage. A whitespace-only or over-length (>4000 bytes) value returns validation_failed (400)."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -114,8 +114,13 @@ Inputs:
     the routed set as a [high/operator] binding concern and delivered to the
     agent on the run branch (sole-writer; no foreign hand-commit). It needs
     NO recorded approve_with_concerns verdict: operator_concern ALONE is
-    admitted on a zero-concern gate-open stage. A whitespace-only or
-    over-length (>4000 bytes) value returns validation_failed.
+    admitted on a zero-concern gate-open stage. Since #2623 it is ALSO minted
+    as a DURABLE concern tracked to closure exactly like an id-routed one: it is
+    marked addressed_pending, threaded into the re-review's delta-verification,
+    and will surface as an OPEN concern at the gate (in the run's concerns block
+    and the gate view) if the agent does not address it — so a skipped operator
+    instruction is no longer silently dropped. The mint is best-effort. A
+    whitespace-only or over-length (>4000 bytes) value returns validation_failed.
   - reason   : optional operator note, recorded on the audit entry and
     as the routed concerns' state_reason.
   - allow_create : optional repo-relative paths the fix-up will CREATE.

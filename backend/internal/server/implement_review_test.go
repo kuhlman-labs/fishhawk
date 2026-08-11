@@ -3607,3 +3607,220 @@ func TestBackstopFixupReReview_TriggeredListError_FailsClosed(t *testing.T) {
 		t.Errorf("reviewer invocations = %d, want 0 (triggered-list error must fail closed, not dispatch)", len(reviewer.calls))
 	}
 }
+
+// --- Operator concern in the re-review leg (#2623) ---------------------------
+//
+// These pin the behaviour the minted operator concern INHERITS from the durable
+// store: it is threaded into the delta-verification prompt on the same footing
+// as an id-routed concern, a re-review that ignores it leaves it OPEN (the
+// done-means), and confirmed/reopened resolutions drive it to its terminal
+// states through applyConcernResolutions.
+
+// fixupReviewServer wires fixupServerWithConcerns's fix-up-capable run repo
+// (approvalRunRepo — the one whose TransitionStage admits the fix-up re-park
+// edge, #762) PLUS the reviewer, workflow spec, and approved-plan artifact that
+// runImplementReviews reads. This lets a done-means test mint an operator
+// concern through the REAL fix-up handler AND then drive the REAL implement
+// re-review loop against the same run (#2623) — orchestratorRepo (the
+// newImplementReviewServer harness) cannot, as its TransitionStage rejects the
+// awaiting_approval → pending fix-up edge. Returns the server, the concern
+// store, the run row, and the implement gate stage.
+func fixupReviewServer(t *testing.T, reviewer PlanReviewer) (*Server, *fakeConcernRepo, *run.Run, *run.Stage) {
+	t.Helper()
+	repo := newApprovalRunRepo()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	art := newFakeArtifactRepo()
+
+	// Implement stage parked at its review gate (the fix-up precondition), plus a
+	// succeeded plan stage on the SAME run carrying an approved standard_v1 plan
+	// artifact so loadApprovedPlanForRun resolves and the review dispatches.
+	implStage := repo.seedGatelessStage(run.StageStateAwaitingApproval)
+	runRow := &run.Run{
+		ID:           implStage.RunID,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		Repo:         "kuhlman-labs/example",
+		WorkflowSpec: specImplementGatingReviewers,
+	}
+	repo.seedRun(runRow)
+
+	planStage := repo.seedStageOnRun(implStage.RunID, run.StageTypePlan, run.StageStateSucceeded)
+	seedBudgetPlanArtifact(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:                "standard_v1",
+		Summary:                    "Add foo helper",
+		PredictedRuntimeMinutes:    10,
+		PredictedRuntimeConfidence: plan.RuntimeConfidenceMedium,
+		Scope: plan.Scope{
+			Files: []plan.ScopeFile{
+				{Path: "backend/internal/foo/foo.go", Operation: plan.FileOpModify},
+			},
+		},
+	})
+
+	s := New(Config{
+		Addr:          "127.0.0.1:0",
+		RunRepo:       repo,
+		AuditRepo:     au,
+		ConcernRepo:   cr,
+		ArtifactRepo:  art,
+		PlanReviewers: singleReviewerSet{reviewer},
+	})
+	return s, cr, runRow, implStage
+}
+
+// TestImplementReview_OperatorConcern_ThreadedIntoPriorConcerns renders the
+// implement-review prompt with a minted operator concern in addressed_pending and
+// asserts it appears in the "### Prior concerns (delta verification)" section with
+// its stable id — so the binding "you MUST emit exactly one entry in
+// concern_resolutions" rule covers it.
+func TestImplementReview_OperatorConcern_ThreadedIntoPriorConcerns(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, _, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	ctx := context.Background()
+
+	// A minted operator concern in addressed_pending (the mintOperatorConcern
+	// output shape: category operator, severity high, routed back).
+	opConcern := seedConcernRow(t, cr, runRow.ID, implStage.ID, concern.StageKindImplement, 100, "operator: sanitize the path before os.Open")
+	opConcern.Category = operatorConcernCategory
+	opConcern.Severity = string(operatorConcernSeverity)
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{opConcern.ID}, "required CodeQL gate"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+
+	if s.runImplementReviews(ctx, runRow.ID, implStage.ID,
+		policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	reviewer.mu.Lock()
+	defer reviewer.mu.Unlock()
+	if len(reviewer.calls) != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1", len(reviewer.calls))
+	}
+	got := reviewer.calls[0]
+	for _, want := range []string{
+		"### Prior concerns (delta verification)",
+		opConcern.ID.String(),
+		"state: addressed_pending",
+		"operator: sanitize the path before os.Open",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("delta-verification section missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestImplementReview_OperatorConcern_NoResolution_StaysOpen is THE DONE-MEANS
+// test (#2623): a fix-up carrying an operator_concern the agent does not address
+// leaves an OPEN concern after re-review. It mints the concern through the REAL
+// fix-up handler (postFixup), then DRIVES THE REAL RE-REVIEW LOOP
+// (runImplementReviews) with a gating approve verdict that carries NO
+// concern_resolutions — the agent stayed silent. Routing through the loop rather
+// than calling applyConcernResolutions directly (its no-op-on-empty resolution
+// step) exercises EVERY post-verdict close channel the loop runs — the resolution
+// step AND resolveConditionClaimedPlanConcerns AND any future auto-close-on-
+// approve behaviour — so the silent-drop contract is verified where it actually
+// lives, not narrowed to one seam. Asserts ListOpenByRun STILL reports the
+// operator concern OPEN: silence does not close it. Reddens iff the mint call
+// site is deleted (an empty store has no open concern after re-review); a
+// regression that closed the concern through the loop would also flip it.
+func TestImplementReview_OperatorConcern_NoResolution_StaysOpen(t *testing.T) {
+	// A gating approve verdict with NO ConcernResolutions is the silent-skip
+	// case: the re-review approved without resolving the routed operator concern.
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, cr, runRow, implStage := fixupReviewServer(t, reviewer)
+	ctx := context.Background()
+
+	// Mint the operator concern through the REAL fix-up handler — the production
+	// path, not a direct store seed. The implement stage is parked at its review
+	// gate (fixupReviewServer), so the commit-yourself flow admits it.
+	const text = "the agent will silently skip this operator instruction"
+	if w := postFixup(t, s, implStage.ID, fixupRequest{OperatorConcern: text, Reason: "required gate"}); w.Code != http.StatusOK {
+		t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// Drive the REAL re-review loop with the resolution-less approve verdict.
+	if s.runImplementReviews(ctx, runRow.ID, implStage.ID,
+		policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}, nil, "", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	// Guard against a vacuous pass: the loop must have GENUINELY dispatched the
+	// reviewer (not early-returned at a nil plan / nil reviewer / no-reviewers
+	// spec), or "the concern stayed open" would prove nothing.
+	reviewer.mu.Lock()
+	calls := len(reviewer.calls)
+	reviewer.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("reviewer invoked %d times, want 1 (the re-review loop must actually run)", calls)
+	}
+
+	open, err := cr.ListOpenByRun(ctx, runRow.ID)
+	if err != nil {
+		t.Fatalf("ListOpenByRun: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("ListOpenByRun = %d, want 1 (an unaddressed operator concern stays OPEN after the real re-review loop)", len(open))
+	}
+	if open[0].Category != operatorConcernCategory || open[0].State != concern.StateAddressedPending {
+		t.Errorf("open concern = {%s, %s}, want {operator, addressed_pending} (silence did not close it)", open[0].Category, open[0].State)
+	}
+}
+
+// TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions proves the
+// operator concern participates in the resolution payload on the same footing as
+// an id-routed one: a `reopened` verdict drives it to StateReopened, a `confirmed`
+// verdict to StateAddressed, through applyConcernResolutions.
+func TestImplementReview_OperatorConcern_ReopenedAndConfirmedResolutions(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("reopened", func(t *testing.T) {
+		s, repo, _, cr := fixupServerWithConcerns(t)
+		stage := seedImplementGateStage(repo)
+		if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer to reopen", Reason: "r"}); w.Code != http.StatusOK {
+			t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		id := operatorConcernRows(cr)[0].ID
+		s.applyConcernResolutions(ctx, stage.RunID, stage.ID, []planreview.ConcernResolution{
+			{ID: id.String(), Resolution: "reopened", Note: "still not fixed"},
+		})
+		if got := operatorConcernRows(cr)[0].State; got != concern.StateReopened {
+			t.Errorf("state = %q, want reopened", got)
+		}
+	})
+
+	t.Run("confirmed", func(t *testing.T) {
+		s, repo, _, cr := fixupServerWithConcerns(t)
+		stage := seedImplementGateStage(repo)
+		if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer to confirm", Reason: "r"}); w.Code != http.StatusOK {
+			t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		id := operatorConcernRows(cr)[0].ID
+		s.applyConcernResolutions(ctx, stage.RunID, stage.ID, []planreview.ConcernResolution{
+			{ID: id.String(), Resolution: "confirmed", Note: "diff resolves it"},
+		})
+		if got := operatorConcernRows(cr)[0].State; got != concern.StateAddressed {
+			t.Errorf("state = %q, want addressed", got)
+		}
+	})
+}
+
+// TestImplementReview_OperatorConcernOnlyFixup_CountsAsRoutedRound pins the
+// changed classification (#2623): after an operator-concern-only fix-up,
+// hasFixupRoutedConcern(priorConcernsForReview(...)) is TRUE, so the re-review
+// takes the delta-diff / fixupPass path it previously missed. Reddens iff the
+// mint is deleted (no addressed_pending prior concern → false).
+func TestImplementReview_OperatorConcernOnlyFixup_CountsAsRoutedRound(t *testing.T) {
+	s, repo, _, _ := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	ctx := context.Background()
+
+	if w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "operator-only steer", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("fix-up status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	prior := s.priorConcernsForReview(ctx, stage.RunID, stage.ID)
+	if !hasFixupRoutedConcern(prior) {
+		t.Errorf("hasFixupRoutedConcern = false, want true (an operator-concern-only fix-up is a routed round)")
+	}
+}

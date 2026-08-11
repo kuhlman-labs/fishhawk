@@ -11483,6 +11483,18 @@ paths:
                     `validation_failed`, `field: operator_concern`) rather than
                     silently dropped or truncated. The raw text is recorded on
                     the `stage_fixup_triggered` audit entry as `operator_concern`.
+                    Since #2623 the instruction is ALSO minted as a DURABLE
+                    concern tracked to closure exactly like an id-routed one: it
+                    is marked `addressed_pending`, threaded into the re-review's
+                    delta verification, and its minted id is recorded on the
+                    `stage_fixup_triggered` payload's `operator_concern_id` key
+                    (and folded into `concern_ids`). If the agent does not
+                    address it, it surfaces as an OPEN concern at the gate (the
+                    run's concerns block and the gate view) instead of being
+                    silently dropped. The mint is best-effort: a store outage
+                    degrades to the prior untracked delivery (the
+                    `operator_concern_id` key is omitted) and never fails the
+                    fix-up.
       responses:
         '200':
           description: Stage re-opened for the fix-up pass; refreshed Stage row in body.
