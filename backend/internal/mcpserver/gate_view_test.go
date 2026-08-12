@@ -293,3 +293,76 @@ func TestGetGateView_LiveValidationRoundTrips(t *testing.T) {
 		}
 	})
 }
+
+// TestGetGateView_ConcernEvidenceWireDecode pins the cross-boundary wire seam
+// for #2353: the client's GateViewConcern / GateViewSettledConcern json tags
+// must byte-match the server's gateViewConcern / gateViewSettledConcern. A
+// mismatched tag is silent — it yields an empty field, not a decode error — so
+// the backend body here is RAW JSON with the server's exact key spelling rather
+// than a marshalled client struct, which would make a typo self-cancelling.
+func TestGetGateView_ConcernEvidenceWireDecode(t *testing.T) {
+	runID := uuid.New()
+	const openEvidence = "the concern row is minted without new_evidence; see backend/internal/server/trace.go:4557"
+	const settledEvidence = "waived on the strength of this evidence, which the ledger then dropped"
+	openRef := uuid.New().String()
+	settledRef := uuid.New().String()
+
+	var body any
+	if err := json.Unmarshal([]byte(`{
+	  "run_id": "`+runID.String()+`",
+	  "open": [{
+	    "id": "`+uuid.New().String()+`",
+	    "stage_kind": "implement",
+	    "severity": "high",
+	    "category": "correctness",
+	    "state": "raised",
+	    "note": "`+gateViewNote96Plus+`",
+	    "new_evidence": "`+openEvidence+`",
+	    "settled_ref": "`+openRef+`",
+	    "has_suggested_patch": false
+	  }],
+	  "settled": [{
+	    "id": "`+uuid.New().String()+`",
+	    "stage_kind": "implement",
+	    "state": "waived",
+	    "severity": "medium",
+	    "category": "scope",
+	    "note": "settled row",
+	    "new_evidence": "`+settledEvidence+`",
+	    "settled_ref": "`+settledRef+`"
+	  }],
+	  "suppressed_relitigations": [],
+	  "history_incomplete": false
+	}`), &body); err != nil {
+		t.Fatalf("build backend body: %v", err)
+	}
+	srv, _ := newGateViewBackend(t, http.StatusOK, body)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("tool error: %+v", res.Content)
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out GetGateViewOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode tool output: %v\n%s", err, raw)
+	}
+	if len(out.GateView.Open) != 1 || len(out.GateView.Settled) != 1 {
+		t.Fatalf("open=%d settled=%d, want 1 each", len(out.GateView.Open), len(out.GateView.Settled))
+	}
+	if got := out.GateView.Open[0].NewEvidence; got != openEvidence {
+		t.Errorf("open concern new_evidence = %q, want %q verbatim", got, openEvidence)
+	}
+	if got := out.GateView.Open[0].SettledRef; got != openRef {
+		t.Errorf("open concern settled_ref = %q, want %q", got, openRef)
+	}
+	if got := out.GateView.Settled[0].NewEvidence; got != settledEvidence {
+		t.Errorf("settled concern new_evidence = %q, want %q verbatim", got, settledEvidence)
+	}
+	if got := out.GateView.Settled[0].SettledRef; got != settledRef {
+		t.Errorf("settled concern settled_ref = %q, want %q", got, settledRef)
+	}
+}

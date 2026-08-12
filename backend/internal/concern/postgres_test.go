@@ -166,6 +166,92 @@ func TestPostgres_SuggestedPatch_RoundTrips(t *testing.T) {
 	}
 }
 
+// TestPostgres_NewEvidenceAndSettledRef_RoundTripAllQueries covers migration
+// 0069's two additive columns (E60.8 / #2353) through EVERY hand-edited sqlc
+// query: InsertReviewConcern, GetReviewConcernsByIDs, ListReviewConcernsByRun,
+// ListOpenReviewConcernsByRun and UpdateReviewConcernState's RETURNING.
+//
+// This breadth is the point. The ./db package was hand-edited rather than
+// regenerated (a local `sqlc generate` churns every db package in the repo), so
+// a column list and its Scan destination list can disagree — and that is a
+// RUNTIME "expected N destination arguments in Scan, not M" failure, not a
+// compile error. A round-trip that exercised only one query would leave the
+// other four broken and green.
+func TestPostgres_NewEvidenceAndSettledRef_RoundTripAllQueries(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	const evidence = "the fixup reverted backend/internal/server/gateview.go:441 to the pre-fix mapping; see the diff at HEAD~1"
+	settledRef := uuid.New().String()
+
+	rows := h.insert(t, 11,
+		concern.RaisedConcern{
+			Severity: "high", Category: "correctness", Note: "evidenced",
+			NewEvidence: evidence, SettledRef: settledRef,
+		},
+		concern.RaisedConcern{Severity: "low", Category: "scope", Note: "bare"},
+	)
+	if len(rows) != 2 {
+		t.Fatalf("len = %d, want 2", len(rows))
+	}
+	// 1. InsertReviewConcern's RETURNING.
+	if rows[0].NewEvidence != evidence {
+		t.Errorf("InsertRaised[0].NewEvidence = %q, want %q verbatim", rows[0].NewEvidence, evidence)
+	}
+	if rows[0].SettledRef != settledRef {
+		t.Errorf("InsertRaised[0].SettledRef = %q, want %q verbatim", rows[0].SettledRef, settledRef)
+	}
+	if rows[1].NewEvidence != "" || rows[1].SettledRef != "" {
+		t.Errorf("InsertRaised[1] = (%q, %q), want both empty (the no-evidence concern)",
+			rows[1].NewEvidence, rows[1].SettledRef)
+	}
+
+	// 2. GetReviewConcernsByIDs.
+	got, err := h.repo.GetByIDs(ctx, []uuid.UUID{rows[0].ID, rows[1].ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	if got[0].NewEvidence != evidence || got[0].SettledRef != settledRef {
+		t.Errorf("GetByIDs[0] = (%q, %q), want (%q, %q)",
+			got[0].NewEvidence, got[0].SettledRef, evidence, settledRef)
+	}
+	if got[1].NewEvidence != "" || got[1].SettledRef != "" {
+		t.Errorf("GetByIDs[1] = (%q, %q), want both empty", got[1].NewEvidence, got[1].SettledRef)
+	}
+
+	// 3. ListReviewConcernsByRun and 4. ListOpenReviewConcernsByRun. Both rows
+	// are still open, so the two lists carry the same pair.
+	for name, list := range map[string]func() ([]*concern.Concern, error){
+		"ListByRun":     func() ([]*concern.Concern, error) { return h.repo.ListByRun(ctx, h.runID) },
+		"ListOpenByRun": func() ([]*concern.Concern, error) { return h.repo.ListOpenByRun(ctx, h.runID) },
+	} {
+		all, err := list()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		byID := make(map[uuid.UUID]*concern.Concern, len(all))
+		for _, c := range all {
+			byID[c.ID] = c
+		}
+		if c := byID[rows[0].ID]; c == nil || c.NewEvidence != evidence || c.SettledRef != settledRef {
+			t.Errorf("%s evidenced row = %+v, want NewEvidence=%q SettledRef=%q", name, c, evidence, settledRef)
+		}
+		if c := byID[rows[1].ID]; c == nil || c.NewEvidence != "" || c.SettledRef != "" {
+			t.Errorf("%s bare row = %+v, want both fields empty", name, c)
+		}
+	}
+
+	// 5. UpdateReviewConcernState's RETURNING (via ApplyResolution): a state
+	// transition must not blank the evidence it returns.
+	waived, err := h.repo.ApplyResolution(ctx, rows[0].ID, concern.StateWaived, "operator judged non-blocking")
+	if err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	if waived.NewEvidence != evidence || waived.SettledRef != settledRef {
+		t.Errorf("ApplyResolution returned (%q, %q), want (%q, %q) — the settled ledger reads this row",
+			waived.NewEvidence, waived.SettledRef, evidence, settledRef)
+	}
+}
+
 func TestPostgres_GetByIDs_InputOrderAndNotFound(t *testing.T) {
 	h := newHarness(t)
 	a := h.insert(t, 1)[0]

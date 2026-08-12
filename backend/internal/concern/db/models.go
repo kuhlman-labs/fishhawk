@@ -79,6 +79,8 @@ type ReviewConcern struct {
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	SuggestedPatch       string             `json:"suggested_patch"`
+	NewEvidence          string             `json:"new_evidence"`
+	SettledRef           string             `json:"settled_ref"`
 }
 
 type Run struct {

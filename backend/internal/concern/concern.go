@@ -172,8 +172,21 @@ type Concern struct {
 	// Persisted verbatim; it is the input to the near-deterministic fix-up
 	// apply path.
 	SuggestedPatch string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// NewEvidence is the reviewer's supporting evidence for the concern,
+	// mirroring planreview.Concern.NewEvidence (#1913). Named for its
+	// re-litigation-disarm role — a non-empty NewEvidence lets a re-raise of a
+	// settled concern through the guard — but reviewers write substantive
+	// backing here on first-round concerns too, which is why every operator
+	// read surface renders it (E60.8 / #2353). Empty is the common case;
+	// every row minted before migration 0069 reads ''.
+	NewEvidence string
+	// SettledRef is the stable id of the settled concern this one re-raises,
+	// mirroring planreview.Concern.SettledRef (#1913). Empty for a concern
+	// that re-raises nothing (the common case), and '' for every row minted
+	// before migration 0069.
+	SettledRef string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // RaisedConcern is one concern as decoded from a review verdict, before
@@ -186,6 +199,13 @@ type RaisedConcern struct {
 	// SuggestedPatch is the reviewer-emitted unified diff carried through
 	// from the decoded verdict (#1165); empty when absent.
 	SuggestedPatch string
+	// NewEvidence and SettledRef mirror planreview.Concern's fields of the
+	// same names (#1913), carried through from the decoded verdict so the
+	// persisted row — and every surface reading it — keeps the reviewer's
+	// supporting evidence and re-raise lineage (E60.8 / #2353). Empty is the
+	// common case for both.
+	NewEvidence string
+	SettledRef  string
 }
 
 // InsertRaisedParams bundles the inputs to InsertRaised: every concern

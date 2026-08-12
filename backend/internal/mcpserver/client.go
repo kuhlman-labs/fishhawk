@@ -377,19 +377,25 @@ type GateView struct {
 // the reviewer's complete prose — the surface elides nothing (no compaction
 // levers apply).
 type GateViewConcern struct {
-	ID                   string               `json:"id"`
-	StageKind            string               `json:"stage_kind"`
-	Round                int                  `json:"round,omitempty"`
-	OriginReviewSequence int64                `json:"origin_review_sequence"`
-	ReviewerModel        string               `json:"reviewer_model,omitempty"`
-	Severity             string               `json:"severity"`
-	Category             string               `json:"category"`
-	State                string               `json:"state"`
-	StateReason          string               `json:"state_reason,omitempty"`
-	Note                 string               `json:"note"`
-	HasSuggestedPatch    bool                 `json:"has_suggested_patch"`
-	Fixups               []GateViewFixup      `json:"fixups,omitempty"`
-	Resolutions          []GateViewResolution `json:"resolutions,omitempty"`
+	ID                   string `json:"id"`
+	StageKind            string `json:"stage_kind"`
+	Round                int    `json:"round,omitempty"`
+	OriginReviewSequence int64  `json:"origin_review_sequence"`
+	ReviewerModel        string `json:"reviewer_model,omitempty"`
+	Severity             string `json:"severity"`
+	Category             string `json:"category"`
+	State                string `json:"state"`
+	StateReason          string `json:"state_reason,omitempty"`
+	Note                 string `json:"note"`
+	// NewEvidence / SettledRef mirror the server's gateViewConcern (E60.8 /
+	// #2353): the reviewer's supporting evidence and the re-raise lineage tag.
+	// The json tags MUST byte-match the backend — a typo silently yields an
+	// empty field rather than a decode error.
+	NewEvidence       string               `json:"new_evidence,omitempty"`
+	SettledRef        string               `json:"settled_ref,omitempty"`
+	HasSuggestedPatch bool                 `json:"has_suggested_patch"`
+	Fixups            []GateViewFixup      `json:"fixups,omitempty"`
+	Resolutions       []GateViewResolution `json:"resolutions,omitempty"`
 }
 
 // GateViewFixup is one fix-up routing claim joined to its outcome.
@@ -419,6 +425,10 @@ type GateViewSettledConcern struct {
 	ReviewerModel string `json:"reviewer_model,omitempty"`
 	Note          string `json:"note"`
 	StateReason   string `json:"state_reason,omitempty"`
+	// NewEvidence / SettledRef mirror the server's gateViewSettledConcern
+	// (E60.8 / #2353). Same byte-match requirement as GateViewConcern.
+	NewEvidence string `json:"new_evidence,omitempty"`
+	SettledRef  string `json:"settled_ref,omitempty"`
 }
 
 // GateViewSuppressedRelitig is one suppressed relitigation (#1913).

@@ -4559,6 +4559,13 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 			Category:       c.Category,
 			Note:           c.Note,
 			SuggestedPatch: c.SuggestedPatch,
+			// Carry the reviewer's supporting evidence and re-raise lineage
+			// into the durable row (E60.8 / #2353). This is the single point
+			// where both were being discarded: the audit payload kept them,
+			// but the gate view reads THESE rows, so a well-evidenced concern
+			// rendered as a bare assertion.
+			NewEvidence: c.NewEvidence,
+			SettledRef:  c.SettledRef,
 		})
 	}
 	if len(raised) == 0 {

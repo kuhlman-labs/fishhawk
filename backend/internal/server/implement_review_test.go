@@ -3048,6 +3048,59 @@ func seedSettledKind(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID
 // asserting the observable outcome: a suppressed re-raise mints NO open row and
 // appends exactly one concern_relitigation_suppressed entry; every fail-open
 // branch mints the row and appends NO suppression entry.
+// TestPersistReviewConcerns_CarriesEvidenceOntoMintedRow pins the persistence
+// boundary #2353 was lost at: persistReviewConcerns decoded a verdict whose
+// concern carried new_evidence and settled_ref, then built a RaisedConcern
+// literal with neither — so the audit payload kept them while the durable row
+// (which the gate view reads) did not. Asserting only that a row was MINTED,
+// as the guard matrix below does, passes with both fields dropped.
+func TestPersistReviewConcerns_CarriesEvidenceOntoMintedRow(t *testing.T) {
+	// evidenceConcernRepo, not guardServer's bare fakeConcernRepo: that shared
+	// fake predates these two columns and drops them, which would make this test
+	// fail on a FAKE gap rather than on the production mapping under test. The
+	// real repository's round-trip is pinned against Postgres by
+	// concern.TestPostgres_NewEvidenceAndSettledRef_RoundTripAllQueries.
+	cr := evidenceConcernRepo{newFakeConcernRepo()}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: newAuditFake(), ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+	const evidence = "gofmt -l reports backend/internal/server/trace.go at HEAD; the fixup never ran it"
+	// A settled_ref pointing at nothing resolvable: the relitigation guard
+	// falls open (unknown ref → insert), so the row mints and both fields must
+	// survive onto it.
+	ref := uuid.New().String()
+
+	minted := s.persistReviewConcerns(context.Background(), runID, stageID, concern.StageKindImplement, "m", 300,
+		[]planreview.Concern{
+			{Severity: "high", Category: "correctness", Note: "evidenced", NewEvidence: evidence, SettledRef: ref},
+			{Severity: "low", Category: "style", Note: "bare"},
+		})
+	if len(minted) != 2 {
+		t.Fatalf("minted %d rows, want 2", len(minted))
+	}
+	if minted[0].NewEvidence != evidence {
+		t.Errorf("minted[0].NewEvidence = %q, want %q — the reviewer's evidence was dropped at the persistence boundary",
+			minted[0].NewEvidence, evidence)
+	}
+	if minted[0].SettledRef != ref {
+		t.Errorf("minted[0].SettledRef = %q, want %q", minted[0].SettledRef, ref)
+	}
+	if minted[1].NewEvidence != "" || minted[1].SettledRef != "" {
+		t.Errorf("minted[1] = (%q, %q), want both empty for a concern carrying neither",
+			minted[1].NewEvidence, minted[1].SettledRef)
+	}
+
+	// Read back through the repository, not just the returned slice: the row the
+	// gate view later reads is the STORED one.
+	stored, err := cr.GetByIDs(context.Background(), []uuid.UUID{minted[0].ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	if stored[0].NewEvidence != evidence || stored[0].SettledRef != ref {
+		t.Errorf("stored row = (%q, %q), want (%q, %q)",
+			stored[0].NewEvidence, stored[0].SettledRef, evidence, ref)
+	}
+}
+
 func TestPersistReviewConcerns_RelitigationGuardMatrix(t *testing.T) {
 	ctx := context.Background()
 

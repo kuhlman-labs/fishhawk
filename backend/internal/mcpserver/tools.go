@@ -552,10 +552,22 @@ type PlanVerification struct {
 
 // PlanReviewConcern is one flagged issue within a review verdict,
 // decoded from a plan_reviewed audit entry (ADR-027).
+// NewEvidence and SettledRef ride on the same audit payload as Note and are
+// decoded here, so every consumer of this one struct — fishhawk_await_review,
+// fishhawk_get_plan's reviews[], and fishhawk_get_run_status's review block —
+// carries the reviewer's evidence (E60.8 / #2353). Because the decode is the
+// audit payload itself and not the persisted concern row, these are populated
+// RETROACTIVELY for runs that predate migration 0069.
 type PlanReviewConcern struct {
 	Severity string `json:"severity"`
 	Category string `json:"category"`
 	Note     string `json:"note"`
+	// NewEvidence is the reviewer's supporting evidence for the concern.
+	// Omitted when the reviewer supplied none.
+	NewEvidence string `json:"new_evidence,omitempty" jsonschema:"the reviewer's supporting evidence for this concern — the substantiation behind the note; absent when the reviewer supplied none"`
+	// SettledRef is the stable id of the settled concern this one re-raises
+	// (#1913). Omitted when the concern re-raises nothing.
+	SettledRef string `json:"settled_ref,omitempty" jsonschema:"stable id of the settled concern this one re-raises (the re-litigation lineage tag); absent when the concern re-raises nothing"`
 }
 
 // PlanReview is one review-agent verdict decoded from a plan_reviewed

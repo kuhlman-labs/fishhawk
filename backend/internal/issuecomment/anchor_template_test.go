@@ -995,3 +995,82 @@ func TestAssembleAnchor_EconomicsDroppedFirst(t *testing.T) {
 		}
 	}
 }
+
+// evidencedReviewedEntry builds a *_reviewed audit entry whose concerns carry
+// the reviewer's new_evidence (#1913) on the wire. reviewedEntry above emits
+// only severity/category/note, so a local builder is used rather than widening
+// that shared helper's signature.
+func evidencedReviewedEntry(t *testing.T, seq int64, stageType string, concerns []anchorReviewConcern) *audit.Entry {
+	t.Helper()
+	cs := make([]map[string]string, 0, len(concerns))
+	for _, c := range concerns {
+		cs = append(cs, map[string]string{
+			"severity": c.severity, "category": c.category, "note": c.note, "new_evidence": c.evidence,
+		})
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"reviewer_model": "gpt-5.6-sol",
+		"verdict":        "reject",
+		"concerns":       cs,
+	})
+	return &audit.Entry{Sequence: seq, Category: stageType + "_reviewed", Payload: payload, Timestamp: time.Unix(seq, 0).UTC()}
+}
+
+func evidenceAnchorBody(t *testing.T, concerns []anchorReviewConcern) string {
+	t.Helper()
+	return RenderAnchorBody(AnchorInput{
+		Run:    anchorRun(),
+		Stages: []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}},
+		Audit: []*audit.Entry{
+			startedEntry(10, "plan"),
+			evidencedReviewedEntry(t, 11, "plan", concerns),
+		},
+		ExternalURL: "https://app.example",
+		Now:         time.Now(),
+	})
+}
+
+// TestRenderAnchorBody_ConcernEvidenceSubLine is the issue-anchor leg of #2353:
+// the sticky issue comment's per-reviewer verdict block rendered `note` alone,
+// so the same well-evidenced rejection read as contentless there too.
+func TestRenderAnchorBody_ConcernEvidenceSubLine(t *testing.T) {
+	const evidence = "backend/internal/issuecomment/anchor_template.go:500 formats severity/category/note and nothing else"
+	body := evidenceAnchorBody(t, []anchorReviewConcern{
+		{severity: "high", category: "correctness", note: "boom", evidence: evidence},
+	})
+	if !strings.Contains(body, "- **high** (correctness): boom\n  - evidence: "+evidence+"\n") {
+		t.Errorf("anchor missing the indented evidence sub-line under the concern:\n%s", body)
+	}
+}
+
+// TestRenderAnchorBody_OmitsBlankConcernEvidence pins the suppression: a
+// concern with no evidence (or whitespace-only evidence) must render NOTHING —
+// never a dangling "evidence:" label, which reads as "the reviewer supplied no
+// evidence" when the truth is that this concern never had any.
+func TestRenderAnchorBody_OmitsBlankConcernEvidence(t *testing.T) {
+	for name, evidence := range map[string]string{"empty": "", "whitespace_only": "  \n\t "} {
+		t.Run(name, func(t *testing.T) {
+			body := evidenceAnchorBody(t, []anchorReviewConcern{
+				{severity: "high", category: "correctness", note: "boom", evidence: evidence},
+			})
+			if !strings.Contains(body, "- **high** (correctness): boom") {
+				t.Fatalf("concern line missing entirely:\n%s", body)
+			}
+			if strings.Contains(body, "evidence:") {
+				t.Errorf("blank evidence rendered a labelled line:\n%s", body)
+			}
+		})
+	}
+}
+
+// TestRenderAnchorBody_ConcernEvidenceCollapsesNewlines pins the one shaping
+// rule: multi-line evidence is whitespace-collapsed so it stays inside the
+// markdown list item instead of breaking out of it. Nothing is truncated.
+func TestRenderAnchorBody_ConcernEvidenceCollapsesNewlines(t *testing.T) {
+	body := evidenceAnchorBody(t, []anchorReviewConcern{
+		{severity: "high", category: "correctness", note: "boom", evidence: "line one\nline two\n\nline three"},
+	})
+	if !strings.Contains(body, "  - evidence: line one line two line three\n") {
+		t.Errorf("multi-line evidence not collapsed onto one list line:\n%s", body)
+	}
+}
