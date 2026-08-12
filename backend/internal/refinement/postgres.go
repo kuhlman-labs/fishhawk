@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,6 +15,33 @@ import (
 
 	refinementdb "github.com/kuhlman-labs/fishhawk/backend/internal/refinement/db"
 )
+
+// ErrFiledItemOutOfRange is returned by RecordFiledItem when Ordinal or
+// IssueNumber falls outside the range the refinement_filed_items INT columns
+// (migration 0048) can hold. It is a typed sentinel rather than a bare
+// fmt.Errorf because the DB independently rejects SOME of these values —
+// ordinal carries CHECK (ordinal >= 0) — so error PRESENCE alone cannot tell
+// the guard apart from the constraint; callers and tests assert identity with
+// errors.Is. Follows the package's file-local sentinel convention (ErrNotFound
+// in repository.go, ErrFilingRepoMismatch in filing.go).
+var ErrFiledItemOutOfRange = errors.New("refinement: filed item field out of range")
+
+// filedItemInt32 range-checks v before narrowing it to the int32 width of the
+// refinement_filed_items INT columns. The upper-bound comparison sits in the
+// same dataflow path as the conversion — the sanitizer shape CodeQL's
+// go/incorrect-integer-conversion recognizes (alert #8). min is 0 for ordinal
+// (0 is the epic) and 1 for issue number, matching the p.IssueNumber <= 0
+// precedent in backend/internal/workmgmt/github/provider.go.
+//
+// On a 32-bit target an int cannot exceed math.MaxInt32, so the above-max cases
+// degenerate into below-min cases there and the upper bound is vacuously
+// unreachable; the both-bounds claim holds on 64-bit builds.
+func filedItemInt32(field string, v, min int) (int32, error) {
+	if v < min || v > math.MaxInt32 {
+		return 0, fmt.Errorf("%w: %s %d outside [%d, %d]", ErrFiledItemOutOfRange, field, v, min, math.MaxInt32)
+	}
+	return int32(v), nil
+}
 
 // postgresRepo is the production Repository implementation, backed by
 // sqlc-generated queries and a pgxpool connection.
@@ -165,13 +193,27 @@ func (r *postgresRepo) CompleteFilingSession(ctx context.Context, draftID uuid.U
 // RecordFiledItem durably records one ordinal->issue mapping. The unique
 // (draft_id, ordinal) constraint rejects a duplicate record (surfaced wrapped)
 // — the residual never-double-record backstop.
+//
+// Ordinal and IssueNumber are range-checked BEFORE the insert so an
+// out-of-range value fails with ErrFiledItemOutOfRange instead of silently
+// wrapping into the INT columns. issue_number carries no DB CHECK, so an
+// unguarded wrap would COMMIT a corrupt ledger row and poison the resume map
+// filed[it.Ordinal] = it.IssueNumber in filing.go.
 func (r *postgresRepo) RecordFiledItem(ctx context.Context, p FiledItemParams) (*FiledItem, error) {
+	ord, err := filedItemInt32("ordinal", p.Ordinal, 0)
+	if err != nil {
+		return nil, err
+	}
+	num, err := filedItemInt32("issue number", p.IssueNumber, 1)
+	if err != nil {
+		return nil, err
+	}
 	q := refinementdb.New(r.pool)
 	row, err := q.CreateRefinementFiledItem(ctx, refinementdb.CreateRefinementFiledItemParams{
 		ID:          uuid.New(),
 		DraftID:     p.DraftID,
-		Ordinal:     int32(p.Ordinal),
-		IssueNumber: int32(p.IssueNumber),
+		Ordinal:     ord,
+		IssueNumber: num,
 		IssueUrl:    p.IssueURL,
 	})
 	if err != nil {

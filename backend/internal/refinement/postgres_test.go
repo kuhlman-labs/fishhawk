@@ -3,6 +3,7 @@ package refinement
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -464,6 +465,174 @@ func TestPostgres_ListFiledItems_OrdinalOrdered(t *testing.T) {
 	}
 	if items[1].IssueNumber != 101 {
 		t.Errorf("ordinal 1 issue number = %d, want 101", items[1].IssueNumber)
+	}
+}
+
+// ---- int32 narrowing guard (E48.48 / #2181, CodeQL alert #8) --------------
+
+// TestFiledItemInt32_Bounds is the pure, DB-free table test for the helper's
+// own logic. The over-max value is built at RUNTIME (over := math.MaxInt32;
+// over++) rather than as the untyped constant expression math.MaxInt32+1,
+// which is a compile-time overflow when assigned to an int on a 32-bit target.
+// On a 32-bit target an int cannot exceed math.MaxInt32, so the above-max cases
+// degenerate into below-min cases there and the upper bound is vacuously
+// unreachable; the both-bounds claim holds on 64-bit builds.
+func TestFiledItemInt32_Bounds(t *testing.T) {
+	over := math.MaxInt32
+	over++
+
+	accepts := []struct {
+		name  string
+		field string
+		v     int
+		min   int
+		want  int32
+	}{
+		{"ordinal zero is the epic", "ordinal", 0, 0, 0},
+		{"ordinal at max", "ordinal", math.MaxInt32, 0, math.MaxInt32},
+		{"issue number one", "issue number", 1, 1, 1},
+		{"issue number at max", "issue number", math.MaxInt32, 1, math.MaxInt32},
+	}
+	for _, tc := range accepts {
+		t.Run("accept/"+tc.name, func(t *testing.T) {
+			got, err := filedItemInt32(tc.field, tc.v, tc.min)
+			if err != nil {
+				t.Fatalf("filedItemInt32(%q, %d, %d) = err %v, want nil", tc.field, tc.v, tc.min, err)
+			}
+			if got != tc.want {
+				t.Errorf("filedItemInt32(%q, %d, %d) = %d, want %d", tc.field, tc.v, tc.min, got, tc.want)
+			}
+		})
+	}
+
+	rejects := []struct {
+		name  string
+		field string
+		v     int
+		min   int
+	}{
+		{"ordinal above max", "ordinal", over, 0},
+		{"ordinal negative", "ordinal", -1, 0},
+		{"issue number above max", "issue number", over, 1},
+		{"issue number zero", "issue number", 0, 1},
+		{"issue number negative", "issue number", -1, 1},
+	}
+	for _, tc := range rejects {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			_, err := filedItemInt32(tc.field, tc.v, tc.min)
+			if !errors.Is(err, ErrFiledItemOutOfRange) {
+				t.Fatalf("filedItemInt32(%q, %d, %d) = err %v, want ErrFiledItemOutOfRange", tc.field, tc.v, tc.min, err)
+			}
+		})
+	}
+}
+
+// seedFilingLedger persists a draft + its filing session and returns the draft
+// id, so a guard test can call RecordFiledItem against a real FK target.
+func seedFilingLedger(t *testing.T, repo Repository) uuid.UUID {
+	t.Helper()
+	draftID := seedFilingDraft(t, repo)
+	if _, err := repo.CreateFilingSession(context.Background(), FilingSessionParams{
+		DraftID: draftID, SessionID: uuid.New(), Repo: "o/r",
+	}); err != nil {
+		t.Fatalf("CreateFilingSession: %v", err)
+	}
+	return draftID
+}
+
+// assertNoFiledItems reads the ledger back and asserts nothing was committed.
+func assertNoFiledItems(t *testing.T, repo Repository, draftID uuid.UUID) {
+	t.Helper()
+	items, err := repo.ListFiledItems(context.Background(), draftID)
+	if err != nil {
+		t.Fatalf("ListFiledItems: %v", err)
+	}
+	if len(items) != 0 {
+		t.Errorf("ListFiledItems = %d rows, want 0 — the guard must prevent the insert", len(items))
+	}
+}
+
+// TestPostgres_RecordFiledItem_RejectsOrdinalAboveInt32 drives the real
+// params -> sqlc -> Postgres INT path with an ordinal above math.MaxInt32.
+//
+// NOTE on what each assertion proves here: an ordinal above math.MaxInt32
+// narrows to a NEGATIVE int32, which migration 0048's CHECK (ordinal >= 0)
+// rejects INDEPENDENTLY of this guard. So the zero-row assertion is
+// CORROBORATION, not proof that the guard prevented a commit — with the guard
+// deleted the DB would refuse the insert anyway. The errors.Is identity
+// assertion is what discriminates the guard: the constraint violation does not
+// wrap ErrFiledItemOutOfRange. Only the ISSUE NUMBER modes below demonstrate a
+// wrapped row actually committing, because issue_number carries no CHECK.
+func TestPostgres_RecordFiledItem_RejectsOrdinalAboveInt32(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := seedFilingLedger(t, repo)
+
+	over := math.MaxInt32
+	over++
+	_, err := repo.RecordFiledItem(context.Background(), FiledItemParams{
+		DraftID: draftID, Ordinal: over, IssueNumber: 100, IssueURL: "u",
+	})
+	if !errors.Is(err, ErrFiledItemOutOfRange) {
+		t.Fatalf("RecordFiledItem ordinal %d = err %v, want ErrFiledItemOutOfRange", over, err)
+	}
+	assertNoFiledItems(t, repo, draftID)
+}
+
+// TestPostgres_RecordFiledItem_RejectsNegativeOrdinal pins the ordinal
+// below-min branch. As above, migration 0048's CHECK (ordinal >= 0) would also
+// reject this insert, so error IDENTITY — not presence — is the discriminator.
+func TestPostgres_RecordFiledItem_RejectsNegativeOrdinal(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := seedFilingLedger(t, repo)
+
+	_, err := repo.RecordFiledItem(context.Background(), FiledItemParams{
+		DraftID: draftID, Ordinal: -1, IssueNumber: 100, IssueURL: "u",
+	})
+	if !errors.Is(err, ErrFiledItemOutOfRange) {
+		t.Fatalf("RecordFiledItem ordinal -1 = err %v, want ErrFiledItemOutOfRange", err)
+	}
+}
+
+// TestPostgres_RecordFiledItem_RejectsIssueNumberAboveInt32 is the mode with
+// real durability impact: issue_number carries NO DB CHECK, so with the guard
+// deleted the value wraps to a negative int32, the row COMMITS, and
+// RecordFiledItem returns nil — corrupting the resume map in filing.go. Here
+// the zero-row read-back IS proof of the guard's effect, not corroboration.
+func TestPostgres_RecordFiledItem_RejectsIssueNumberAboveInt32(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := seedFilingLedger(t, repo)
+
+	over := math.MaxInt32
+	over++
+	_, err := repo.RecordFiledItem(context.Background(), FiledItemParams{
+		DraftID: draftID, Ordinal: 0, IssueNumber: over, IssueURL: "u",
+	})
+	if !errors.Is(err, ErrFiledItemOutOfRange) {
+		t.Fatalf("RecordFiledItem issue number %d = err %v, want ErrFiledItemOutOfRange", over, err)
+	}
+	assertNoFiledItems(t, repo, draftID)
+}
+
+// TestPostgres_RecordFiledItem_RejectsNonPositiveIssueNumber covers both
+// below-min issue numbers (0 and -1). issue_number has no DB CHECK, so without
+// the guard both would COMMIT a nonsensical ledger row and return nil — the
+// zero-row read-back is proof of effect here too.
+func TestPostgres_RecordFiledItem_RejectsNonPositiveIssueNumber(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+
+	for _, num := range []int{0, -1} {
+		draftID := seedFilingLedger(t, repo)
+		_, err := repo.RecordFiledItem(context.Background(), FiledItemParams{
+			DraftID: draftID, Ordinal: 0, IssueNumber: num, IssueURL: "u",
+		})
+		if !errors.Is(err, ErrFiledItemOutOfRange) {
+			t.Fatalf("RecordFiledItem issue number %d = err %v, want ErrFiledItemOutOfRange", num, err)
+		}
+		assertNoFiledItems(t, repo, draftID)
 	}
 }
 
