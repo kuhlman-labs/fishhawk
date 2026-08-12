@@ -236,14 +236,14 @@ func TestResolveAuthority_V2ParsedSpec(t *testing.T) {
 }
 
 // TestResolveAuthority_V2ParsedSpec_NilReviewersBlock is the RESOLVED half
-// of the unchanged-default claim (#2215 acceptance criterion 4). The docs
-// say an absent reviewers block "defaults to {human:1}", but no consumer
-// materializes that literal — Stage.Reviewers stays nil and each consumer
-// interprets nil itself. What is actually true, and what this asserts, is
-// that nil and {Human:1} are OBSERVATIONALLY EQUIVALENT at the resolver:
-// both are gateless, because with zero agent reviewers the human count
-// cannot change the mode. That equivalence is why the documented default
-// has never been visible, and it is unchanged by this slice.
+// of the absent-block contract. An absent reviewers block configures NO
+// reviewers: Stage.Reviewers stays nil and each consumer interprets that nil
+// directly — nothing materializes a {human:1} literal, and since E52.12 /
+// #2322 the documentation no longer claims one. What this asserts is that
+// nil and {Human:1} are OBSERVATIONALLY EQUIVALENT at the resolver: both are
+// gateless, because with zero agent reviewers the human count cannot change
+// the mode. That equivalence is why a materialized default would have been
+// inert, and it is why the correction is documentation-only.
 func TestResolveAuthority_V2ParsedSpec_NilReviewersBlock(t *testing.T) {
 	if rv := parseV2Reviewers(t, ""); rv != nil {
 		t.Fatalf("parsed Reviewers = %+v, want nil for an absent block", rv)
@@ -254,6 +254,61 @@ func TestResolveAuthority_V2ParsedSpec_NilReviewersBlock(t *testing.T) {
 	}
 	if got := planreview.ResolveAuthority(spec.ReviewersConfig{}); got != planreview.AuthorityGateless {
 		t.Errorf("ResolveAuthority(zero value, the nil substitute) = %q, want %q — nil and {human:1} must stay indistinguishable", got, planreview.AuthorityGateless)
+	}
+}
+
+// specWithReviewersAtVersion renders a workflow document at the given major
+// whose plan stage carries the given reviewers YAML block. The v0/v1/v2
+// grammars agree on this stage shape, so one template drives every major.
+func specWithReviewersAtVersion(version, reviewersBlock string) []byte {
+	return []byte(`version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+` + reviewersBlock + `        produces:
+          - artifact: plan
+            schema: standard_v1
+`)
+}
+
+// TestResolveAuthority_ParsedSpec_NoReviewersBlockGatelessOnEveryMajor is the
+// cross-layer done-means test for E52.12 / #2322. The correction this issue
+// ships asserts, on every documented surface, that an absent `reviewers`
+// block configures no reviewers and the stage resolves GATELESS — on v0 and
+// v1 as well as v2. Documentation is not enforced by compilation, so that
+// claim is pinned here behaviorally, end to end: real schema-validated bytes
+// at each major go through spec.ParseBytes (the parse layer) and the parsed
+// result's nil substitute goes through ResolveAuthority (the authority layer).
+//
+// This is the integration test the cross-boundary rule requires — the change
+// spans the schema, parse and authority-resolution layers, and asserting each
+// in isolation would not catch a severed seam between them. It goes RED if
+// anyone materializes a {human:1} default at any major, which is exactly the
+// regression the corrected documentation now forbids.
+func TestResolveAuthority_ParsedSpec_NoReviewersBlockGatelessOnEveryMajor(t *testing.T) {
+	// Each major is exercised at a version string its own enum accepts:
+	// v0/v1 require a minor-qualified version, v2 takes the bare major.
+	for _, version := range []string{"0.7", "1.6", "2"} {
+		t.Run("v"+version, func(t *testing.T) {
+			s, err := spec.ParseBytes(specWithReviewersAtVersion(version, ""))
+			if err != nil {
+				t.Fatalf("spec.ParseBytes(v%s): %v", version, err)
+			}
+			rv := s.Workflows["feature_change"].Stages[0].Reviewers
+			if rv != nil {
+				t.Fatalf("parsed Reviewers = %+v, want nil for an absent block at major %s", rv, version)
+			}
+			// nil is interpreted directly by every consumer; the zero value
+			// is what dereferencing it yields. Zero agent reviewers is what
+			// makes the stage gateless — no human approval is conferred.
+			if got := planreview.ResolveAuthority(spec.ReviewersConfig{}); got != planreview.AuthorityGateless {
+				t.Errorf("ResolveAuthority(nil substitute at major %s) = %q, want %q", version, got, planreview.AuthorityGateless)
+			}
+		})
 	}
 }
 

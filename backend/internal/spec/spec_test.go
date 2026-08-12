@@ -4053,16 +4053,17 @@ workflows:
 }
 
 // TestParse_V2NoReviewersBlockLeavesNil pins the parse-layer half of the
-// unchanged-default claim: a v2 stage with no reviewers block leaves
+// absent-block contract: a v2 stage with no reviewers block leaves
 // Stage.Reviewers nil, exactly as on v0/v1. The RESOLVED half — what a nil
 // block actually means to the consumers — is asserted end to end in
 // planreview (TestResolveAuthority_V2ParsedSpec_NilReviewersBlock) and in
 // delegation (TestImplementReviewAuthority_NilReviewersBlockFromV2Spec),
 // because a nil check here establishes nothing about resolved behavior.
-// Note the finding recorded there: no consumer materializes a literal
-// {human:1} for a nil block; nil and {human:1} are OBSERVATIONALLY
-// EQUIVALENT (both resolve gateless), which is why the documented default
-// has never been visible.
+// The settled reading (E52.12 / #2322): an absent block configures NO
+// reviewers — Reviewers stays nil, the effective agent count is 0, and the
+// stage resolves gateless. No consumer materializes a {human:1} default and
+// the documentation no longer claims one; a human approval requirement comes
+// from a stage gate of type approval, not from reviewers.human.
 func TestParse_V2NoReviewersBlockLeavesNil(t *testing.T) {
 	s, err := spec.ParseBytes([]byte(`version: "2"
 workflows:
@@ -4081,6 +4082,49 @@ workflows:
 	}
 	if rv := s.Workflows["feature_change"].Stages[0].Reviewers; rv != nil {
 		t.Errorf("Stage.Reviewers = %+v, want nil for an absent reviewers block", rv)
+	}
+}
+
+// TestParse_NoReviewersBlockIsGatelessOnEveryMajor is the parse-layer half of
+// the done-means test for E52.12 / #2322: the corrected documentation asserts
+// that an absent `reviewers` block configures NO reviewers on EVERY shipped
+// workflow major, not just on v2. A documentation correction is not enforced
+// by compilation, so the shipped truth claim is pinned behaviorally here and
+// in planreview (TestResolveAuthority_ParsedSpec_NoReviewersBlockGatelessOnEveryMajor),
+// which crosses the parse -> authority-resolution boundary the claim rests on.
+//
+// This goes RED the moment anyone materializes a {human:1} default at parse
+// time — precisely the change the corrected docs now forbid.
+func TestParse_NoReviewersBlockIsGatelessOnEveryMajor(t *testing.T) {
+	// Each major is exercised at a version string its own enum accepts:
+	// v0/v1 require a minor-qualified version, v2 takes the bare major.
+	for _, version := range []string{"0.7", "1.6", "2"} {
+		t.Run("v"+version, func(t *testing.T) {
+			s, err := spec.ParseBytes([]byte(`version: "` + version + `"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`))
+			if err != nil {
+				t.Fatalf("ParseBytes(v%s): %v", version, err)
+			}
+			if rv := s.Workflows["feature_change"].Stages[0].Reviewers; rv != nil {
+				t.Errorf("Stage.Reviewers = %+v, want nil for an absent reviewers block at major %s — no {human:1} default is materialized", rv, version)
+			}
+			// The zero value is what a nil block stands in for at every
+			// consumer that dereferences it. Its effective agent count
+			// being 0 is what makes the stage resolve gateless.
+			if n := (spec.ReviewersConfig{}).AgentCount(); n != 0 {
+				t.Errorf("ReviewersConfig{}.AgentCount() = %d, want 0 — the nil substitute must configure no agent reviewers", n)
+			}
+		})
 	}
 }
 
@@ -4184,9 +4228,24 @@ workflows:
 //
 // v2 is deliberately ABSENT: it is the LIVE major the E52 children are still
 // editing, so pinning it would be a changelog, not an invariant.
+//
+// RE-PINNED by E52.12 / #2322 for a DESCRIPTION-ONLY correction to the frozen
+// v0 and v1 majors. The `$defs.reviewers_config.description` on each asserted
+// that an absent reviewers block "defaults to {human:1}" — a claim no code has
+// ever honoured (no consumer materializes it, and ResolveAuthorityWithSource
+// short-circuits on AgentCount()==0 before reading Human). The stale text was
+// itself the defect, and leaving it on the two majors an operator reads
+// directly would have shipped the correction only on the live major. NO
+// property, enum, constraint, required list or $defs entry changed on either
+// frozen major — a JSON Schema `description` is an annotation (Draft 2020-12),
+// so every document that validated before still validates. This is the path
+// the pin's own failure message prescribes: justify editing a shipped major in
+// the PR body, then update the pin. Both digests below were read off the
+// failing run of the accessor each pins, never hand-computed and never copied
+// between majors or from v2.
 var frozenMajorSchemaHashes = map[int]string{
-	0: "8573453693a052f6375cef454310e455d6ffc93f0eb650f624c58562d4d3ff73",
-	1: "26848b2499c67863ef9948f669aa88bfa7aeb27165537187188e0ec82eef648c",
+	0: "e55f960ddc754de42fc453130cfcc6ef0db08ee21f5bd7f61c1fd39f37bc9163",
+	1: "3337bc9902f6cf38cd54eb7aec91f570952fbfcd8aeb7b21dea7dd0c139d3e03",
 }
 
 // frozenMajors is the pin table: one entry per frozen major, pairing the
