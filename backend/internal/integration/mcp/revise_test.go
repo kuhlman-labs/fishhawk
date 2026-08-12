@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -646,5 +647,185 @@ func TestE2E_Revise_ScopeRetryExhausted_ParksWithBudgetRefund(t *testing.T) {
 	decodeStructured(t, revise2, &revise2Out)
 	if revise2Out.Stage.State == string(runpkg.StageStateAwaitingApproval) {
 		t.Errorf("revise pass 2 left the stage at awaiting_approval; it was not admitted")
+	}
+}
+
+// advanceCountingRunRepo wraps a run.Repository and counts GetRun calls. The
+// orchestrator's Advance calls GetRun EXACTLY ONCE at its entry (and does not
+// re-enter for a plan stage), so when this decorator backs ONLY the
+// orchestrator's Runs — the server's own RunRepo stays the unwrapped
+// fx.runRepo — the GetRun count equals the number of Advance invocations. It
+// is how the concurrent E2E test pins "exactly one re-dispatch" (approval
+// condition 3), which a committed-row count alone cannot prove.
+type advanceCountingRunRepo struct {
+	runpkg.Repository
+	mu    sync.Mutex
+	count int
+}
+
+func (r *advanceCountingRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*runpkg.Run, error) {
+	r.mu.Lock()
+	r.count++
+	r.mu.Unlock()
+	return r.Repository.GetRun(ctx, id)
+}
+
+func (r *advanceCountingRunRepo) advances() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.count
+}
+
+// TestE2E_Revise_ConcurrentScopeRetryShips_GrantsExactlyOneRefusal is the #2518
+// cross-layer concurrency proof: it fires TWO genuinely concurrent signed plan
+// ships of the SAME undeclared-narrowing (distinct summaries so distinct
+// content hashes — neither dedups to an early idempotent return, so both reach
+// the count→append budget window) for the SAME stage, released by one barrier,
+// crossing the HTTP handler → the server helper → the atomic audit primitive →
+// Postgres in one exercise. It asserts the deterministic invariants that hold
+// across every interleaving:
+//
+//   - EXACTLY ONE plan_scope_retry entry — the atomic budget guard admits one
+//     refusal even when both ships race the window.
+//   - AT MOST ONE re-dispatch (approval condition 3): one committed budget row
+//     proves the budget was consumed once; the orchestrator Advance count
+//     proves the stage was NOT advanced twice. Under genuine concurrency the
+//     count is 0-OR-1, never 2: the budget entry-winner's re-open
+//     (FailStage→RetryStage→Advance) can lose the stage-CAS race to the
+//     loser's fall-through, in which case the refusal degrades to
+//     park-with-evidence (the documented FailStage fail-open leg — the entry
+//     stays committed, the stage parks at the gate) and no re-dispatch fires.
+//     Asserting EXACTLY one would encode that coin flip; the invariant that
+//     matters — and the one a broken budget guard violates (two entries ⇒ two
+//     re-dispatches) — is <= 1.
+//   - the run is not terminally failed — a refusal is never a way to lose a
+//     plan.
+//   - the plan_scope_regression evidence is still recorded.
+//
+// The FINAL stage state is deliberately NOT asserted for the same coin-flip
+// reason: the loser's fall-through and the winner's re-open race on the stage
+// CAS.
+func TestE2E_Revise_ConcurrentScopeRetryShips_GrantsExactlyOneRefusal(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const kept = "backend/internal/webhook/dispatcher.go"
+	const droppedA = "backend/internal/webhook/helper.go"
+	const droppedB = "backend/internal/webhook/helper_test.go"
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	// The orchestrator's Runs is wrapped to count Advance; the server's own
+	// RunRepo stays the UNWRAPPED fx.runRepo, so only the orchestrator's
+	// Advance bumps the count.
+	countingRuns := &advanceCountingRunRepo{Repository: fx.runRepo}
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+		Orchestrator: &orchestrator.Orchestrator{Runs: countingRuns},
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	schema := "standard_v1"
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &schema,
+		Content: regressionPlanJSON("base plan", []string{kept, droppedA, droppedB}), ContentHash: "concbase2518",
+	}); err != nil {
+		t.Fatalf("seed base plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	callRevise(t, ctx, session, fx.runID, "narrow to the dispatcher; keep everything else")
+	walkToRunning(t, ctx, fx, planStage.ID)
+
+	// Baseline the Advance count AFTER the revise + walk setup, so the
+	// assertion below measures ONLY the ships' re-dispatches — not any Advance
+	// the revise path itself may have driven.
+	baseAdvances := countingRuns.advances()
+
+	// Two concurrent signed ships, distinct summaries (distinct hashes) but
+	// both undeclared narrowings to [kept]. One start barrier releases both.
+	summaries := []string{"concurrent narrowing A", "concurrent narrowing B"}
+	codes := make([]int, len(summaries))
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	for i := range summaries {
+		done.Add(1)
+		go func(i int) {
+			defer done.Done()
+			start.Wait()
+			resp := shipPlanSigned(t, ctx, httpSrv.URL, fx.runID, planStage.ID, fx.signingPriv,
+				regressionPlanJSON(summaries[i], []string{kept}))
+			codes[i] = resp.StatusCode
+			_ = resp.Body.Close()
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+
+	for i, c := range codes {
+		if c != http.StatusCreated {
+			t.Errorf("ship %d status = %d, want 201", i, c)
+		}
+	}
+
+	// Invariant 1: exactly ONE plan_scope_retry entry.
+	retryEntries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, "plan_scope_retry")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(plan_scope_retry): %v", err)
+	}
+	if len(retryEntries) != 1 {
+		t.Fatalf("plan_scope_retry entries = %d, want exactly 1 (the atomic budget guard admits one refusal)", len(retryEntries))
+	}
+
+	// Invariant 2 (approval condition 3): AT MOST one re-dispatch. One row
+	// proves the budget was consumed once; the Advance count proves the stage
+	// was NOT advanced twice. It is 0-or-1 under concurrency (see the doc
+	// comment): a broken budget guard that committed two entries would drive
+	// two re-dispatches, which this refutes; the entry-winner losing the stage
+	// CAS to the loser's fall-through legitimately yields 0.
+	if got := countingRuns.advances() - baseAdvances; got > 1 {
+		t.Errorf("orchestrator Advance count = %d, want <= 1 (one budget consumption must never drive two re-dispatches)", got)
+	}
+
+	// Invariant 3: the run is not terminally failed.
+	r, err := fx.runRepo.GetRun(ctx, fx.runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if r.State == runpkg.StateFailed {
+		t.Errorf("run state = failed; a refusal must never become a new way to lose a plan")
+	}
+
+	// Invariant 4: the regression evidence is still recorded.
+	regEntries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, "plan_scope_regression")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(plan_scope_regression): %v", err)
+	}
+	if len(regEntries) == 0 {
+		t.Errorf("plan_scope_regression entries = 0; the evidence must survive the concurrent refusal")
 	}
 }

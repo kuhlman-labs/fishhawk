@@ -66,10 +66,41 @@ func (r *recordingOrchestratorRepo) sawTransitionTo(to run.StageState) bool {
 // and returns entries by category.
 type storingAuditFake struct {
 	*auditFake
+	// budgetMu serializes the whole check-and-consume in AppendChainedUnderBudget
+	// so concurrent callers cannot both pass the count — the in-memory analogue
+	// of the production row lock + post-lock count. It is a DIFFERENT mutex from
+	// auditFake.mu (which guards the slice), so the check-and-consume can call
+	// ListForRunByCategory / AppendChained without self-deadlocking.
+	budgetMu sync.Mutex
 }
 
 func newStoringAuditFake() *storingAuditFake {
 	return &storingAuditFake{auditFake: newAuditFake()}
+}
+
+// AppendChainedUnderBudget gives storingAuditFake the audit.RetryBudgetAppender
+// capability so the handler-level tests exercise consumeRetryBudget's ATOMIC
+// path rather than its non-atomic fallback (#2518). The check-and-consume is
+// serialized by budgetMu and counts via the fake's own ListForRunByCategory —
+// so a fake that faults that read (e.g. via a category-scoped list error)
+// surfaces the fault through the primitive, exactly as the real repo would.
+func (a *storingAuditFake) AppendChainedUnderBudget(ctx context.Context, p audit.ChainAppendParams, maxEntries int, stamp func(attempt int) (json.RawMessage, error)) (*audit.Entry, error) {
+	a.budgetMu.Lock()
+	defer a.budgetMu.Unlock()
+	existing, err := a.ListForRunByCategory(ctx, p.RunID, p.Category)
+	if err != nil {
+		return nil, err
+	}
+	count := len(existing)
+	if count >= maxEntries {
+		return nil, audit.ErrRetryBudgetExhausted
+	}
+	payload, err := stamp(count + 1)
+	if err != nil {
+		return nil, err
+	}
+	p.Payload = payload
+	return a.AppendChained(ctx, p)
 }
 
 // ListForRunByCategory returns the stored AppendChained entries for the
@@ -466,19 +497,51 @@ func (r *advanceFailRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, e
 	return r.recordingOrchestratorRepo.GetRun(ctx, id)
 }
 
-// categoryFailAuditFake errors on AppendChained for ONE category, leaving
-// every other append (plan_generated, plan_scope_regression, …) working — so
-// the AppendChained fail-open leg is exercised without breaking the ship.
-type categoryFailAuditFake struct {
+// budgetErrAuditFake faults the ATOMIC retry-budget primitive with a
+// NON-exhaustion error, leaving every other repo method (plan_generated /
+// plan_scope_regression appends, plan_revised reads) working via the embedded
+// storingAuditFake. It exercises consumeRetryBudget's decline-on-error leg
+// (#2518) — the atomic check-and-consume could not commit, so the budget entry
+// is never written and the caller falls through. calls counts invocations so a
+// test can prove the primitive fired (not a fixture-setup skip).
+type budgetErrAuditFake struct {
 	*storingAuditFake
-	failCategory string
+	mu    sync.Mutex
+	calls int
 }
 
-func (a *categoryFailAuditFake) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
-	if p.Category == a.failCategory {
-		return nil, fmt.Errorf("append %s failed", p.Category)
+func (a *budgetErrAuditFake) AppendChainedUnderBudget(_ context.Context, _ audit.ChainAppendParams, _ int, _ func(int) (json.RawMessage, error)) (*audit.Entry, error) {
+	a.mu.Lock()
+	a.calls++
+	a.mu.Unlock()
+	return nil, fmt.Errorf("retry-budget primitive unavailable")
+}
+
+func (a *budgetErrAuditFake) callCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+// legacyAuditFake is a full audit.Repository that does NOT implement
+// audit.RetryBudgetAppender (it embeds the base *auditFake, not
+// storingAuditFake), so a server wired with it takes consumeRetryBudget's
+// non-atomic count-then-append FALLBACK (#2518). failListCategory faults
+// ListForRunByCategory for ONE category, exercising the fallback's fail-closed
+// read-error leg — the leg that reddens when the legacy zero-on-read-error
+// swallow is restored (approval condition 2). The base auditFake already
+// stores AppendChained entries and reads them back by category, so the
+// fallback's count-then-append works against it.
+type legacyAuditFake struct {
+	*auditFake
+	failListCategory string
+}
+
+func (a *legacyAuditFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.failListCategory != "" && category == a.failListCategory {
+		return nil, fmt.Errorf("list %s unavailable", category)
 	}
-	return a.storingAuditFake.AppendChained(ctx, p)
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
 }
 
 // seedReviseBase makes the NEXT plan ship read as a REVISE pass against
@@ -796,12 +859,12 @@ func TestShipPlan_ScopeRetry_FailOpenLegs(t *testing.T) {
 			want: legResult{wantEntries: 0, wantState: run.StageStateAwaitingApproval},
 		},
 		{
-			name: "plan_scope_retry append failure parks at the gate",
+			name: "atomic budget-consume failure parks at the gate",
 			build: func(t *testing.T) (*Server, *recordingOrchestratorRepo, *storingAuditFake, *run.Run, *run.Stage, ed25519.PrivateKey) {
 				rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
 				art, sf := newFakeArtifactRepo(), newSigningFake()
 				inner := newStoringAuditFake()
-				au := &categoryFailAuditFake{storingAuditFake: inner, failCategory: categoryPlanScopeRetry}
+				au := &budgetErrAuditFake{storingAuditFake: inner}
 				s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
 					AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
 					Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
@@ -1065,41 +1128,23 @@ func TestShipPlan_ScopeRetry_SeamToPromptRender(t *testing.T) {
 	}
 }
 
-// categoryListFailAuditFake errors on ListForRunByCategory for ONE category,
-// leaving every other read (plan_revised, …) working — so the budget-read
-// failure is exercised without breaking the rest of the ship.
-type categoryListFailAuditFake struct {
-	*storingAuditFake
-	failCategory string
-	listCalls    int
-}
-
-func (a *categoryListFailAuditFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
-	if category == a.failCategory {
-		a.listCalls++
-		return nil, fmt.Errorf("list %s unavailable", category)
-	}
-	return a.storingAuditFake.ListForRunByCategory(ctx, runID, category)
-}
-
-// TestShipPlan_ScopeRetry_BudgetReadError_Parks is the COUNTERFACTUAL for the
-// FAIL-CLOSED budget read. countScopeRetries used to swallow a read error and
-// report 0, so a PERSISTENT audit-list failure would grant a refusal on every
-// corrective ship — the one-shot budget would never exhaust and the plan would
-// never degrade to park-with-evidence, breaking the bounded-refusal contract.
-// Restoring the swallow (return 0, nil on error) makes the first ship refuse
-// and this test goes red on BOTH the entry count and the stage state.
+// TestShipPlan_ScopeRetry_BudgetReadError_Parks is the COUNTERFACTUAL for
+// consumeRetryBudget's decline-on-non-exhaustion-error leg (#2518). The atomic
+// check-and-consume primitive faults (a read/write failure, NOT exhaustion);
+// consumeRetryBudget must DECLINE — an unreadable/unwritable budget is an
+// unbounded one, and granting on it would refuse every corrective ship so the
+// one-shot would never exhaust. Deleting the non-exhaustion decline in
+// consumeRetryBudget lets a faulting primitive grant the refusal (re-opening
+// the stage with no entry), so this test goes red on the stage state.
 //
-// The failure is seeded BY CONSTRUCTION (a repo that errors on the
-// plan_scope_retry list), not by driving the gate into its own guard, so the
-// RED lands on the behavioural assertion. Both ships are identical undeclared
-// narrowings — the same input paired with itself — so nothing but the guard
-// can distinguish them.
+// The failure is seeded BY CONSTRUCTION (a repo whose atomic primitive errors),
+// not by driving the gate into its own guard, so the RED lands on the
+// behavioural assertion.
 func TestShipPlan_ScopeRetry_BudgetReadError_Parks(t *testing.T) {
 	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
 	art, sf := newFakeArtifactRepo(), newSigningFake()
 	inner := newStoringAuditFake()
-	au := &categoryListFailAuditFake{storingAuditFake: inner, failCategory: categoryPlanScopeRetry}
+	au := &budgetErrAuditFake{storingAuditFake: inner}
 	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
 		AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
 		Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
@@ -1110,8 +1155,8 @@ func TestShipPlan_ScopeRetry_BudgetReadError_Parks(t *testing.T) {
 	if wp.Code != http.StatusCreated {
 		t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
 	}
-	if au.listCalls == 0 {
-		t.Fatal("the plan_scope_retry budget was never read; the fault never fired")
+	if au.callCount() == 0 {
+		t.Fatal("the atomic retry-budget primitive was never invoked; the fault never fired")
 	}
 	if n := countScopeRetryEntries(t, inner, runRow.ID); n != 0 {
 		t.Errorf("plan_scope_retry entries = %d, want 0 (an unreadable budget is an unbounded one — refuse to refuse)", n)
@@ -1127,6 +1172,221 @@ func TestShipPlan_ScopeRetry_BudgetReadError_Parks(t *testing.T) {
 	if entry := lastScopeRegressionEntry(t, inner.auditFake); !entry.Regressed {
 		t.Errorf("Regressed = false; the degraded path must still record the regression for the refund")
 	}
+}
+
+// TestConsumeRetryBudget_Concurrent_GrantsExactlyOne drives the server helper
+// DIRECTLY (approval condition 6: no stage-transition assertion that could
+// contradict the wiring). N goroutines behind a start barrier consume the same
+// (run, category) budget against the atomic in-memory fake; exactly one is
+// granted (attempt 1) and exactly one entry is committed.
+func TestConsumeRetryBudget_Concurrent_GrantsExactlyOne(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	au := newStoringAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr})
+	runRow := rr.seedRun()
+	stageID := uuid.New() // consumeRetryBudget records it in the payload only.
+
+	stamp := func(attempt int) (json.RawMessage, error) {
+		return json.Marshal(map[string]any{"attempt": attempt})
+	}
+	const n = 16
+	var start sync.WaitGroup
+	start.Add(1)
+	var done sync.WaitGroup
+	grants := make([]bool, n)
+	attempts := make([]int, n)
+	for i := 0; i < n; i++ {
+		done.Add(1)
+		go func(i int) {
+			defer done.Done()
+			start.Wait()
+			grants[i], attempts[i] = s.consumeRetryBudget(context.Background(), runRow.ID, stageID, categoryPlanScopeRetry, 1, stamp)
+		}(i)
+	}
+	start.Done()
+	done.Wait()
+
+	granted := 0
+	for i := range grants {
+		if grants[i] {
+			granted++
+			if attempts[i] != 1 {
+				t.Errorf("granted goroutine %d attempt = %d, want 1", i, attempts[i])
+			}
+		}
+	}
+	if granted != 1 {
+		t.Errorf("granted = %d, want exactly 1", granted)
+	}
+	if got := countScopeRetryEntries(t, au, runRow.ID); got != 1 {
+		t.Errorf("committed plan_scope_retry entries = %d, want exactly 1", got)
+	}
+}
+
+// TestShipPlan_SchemaRetry_BudgetError_FailsB is the named test for the #2518
+// SCHEMA-path semantic change (approval condition 7). Previously
+// countSchemaRetries swallowed a read error and reported 0, so a persistent
+// audit failure granted a retry on every ship and the one-shot never
+// exhausted. Under the atomic primitive an unreadable/unwritable budget
+// DECLINES the retry, and the upload takes the pre-existing fail-B path: 400
+// WITHOUT retry_scheduled, no plan_schema_retry entry, stage failed-B, run
+// advanced to terminal failed. It is ALSO the COUNTERFACTUAL for
+// consumeRetryBudget's decline-on-non-exhaustion-error leg on the schema path:
+// deleting that decline schedules a retry here instead of failing-B.
+func TestShipPlan_SchemaRetry_BudgetError_FailsB(t *testing.T) {
+	rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+	art, sf := newFakeArtifactRepo(), newSigningFake()
+	inner := newStoringAuditFake()
+	au := &budgetErrAuditFake{storingAuditFake: inner}
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+		AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
+	runRow := rr.seedRun()
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, invalidPlanBytes(), "")
+	if wp.Code != http.StatusBadRequest {
+		t.Fatalf("plan status = %d, want 400:\n%s", wp.Code, wp.Body.String())
+	}
+	if au.callCount() == 0 {
+		t.Fatal("the atomic retry-budget primitive was never invoked; the fault never fired")
+	}
+	var resp struct {
+		Error struct {
+			Details struct {
+				RetryScheduled bool `json:"retry_scheduled"`
+			} `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(wp.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Error.Details.RetryScheduled {
+		t.Errorf("retry_scheduled set on a budget-error upload; want fail-B")
+	}
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed (budget error → fail-B)", got)
+	}
+	if got := rr.runs[runRow.ID].State; got != run.StateFailed {
+		t.Errorf("run state = %q, want failed (fail-B advances the run)", got)
+	}
+	entries, _ := inner.ListForRunByCategory(context.Background(), runRow.ID, "plan_schema_retry")
+	if len(entries) != 0 {
+		t.Errorf("plan_schema_retry entries = %d, want 0 (a declined budget writes nothing)", len(entries))
+	}
+}
+
+// TestShipPlan_ScopeRetry_LegacyFallback_StillBounds covers the m4 leg: an
+// AuditRepo that does NOT implement audit.RetryBudgetAppender takes
+// consumeRetryBudget's non-atomic count-then-append fallback, which must still
+// (a) grant exactly one refusal, (b) exhaust the one-shot, and (c) FAIL CLOSED
+// on a budget read error. Leg (c) is the counterfactual for the fallback's
+// fail-closed read guard (approval condition 2): restoring the legacy
+// zero-on-read-error swallow makes the read-error ship refuse instead of
+// declining, reddening the entry-count and stage-state assertions.
+func TestShipPlan_ScopeRetry_LegacyFallback_StillBounds(t *testing.T) {
+	// buildLegacy wires a server whose AuditRepo is the non-capability
+	// legacyAuditFake and seeds a revise base so a narrowing ship reaches the
+	// refusal. failList, when set, faults the plan_scope_retry budget read.
+	buildLegacy := func(t *testing.T, failList string) (*Server, *recordingOrchestratorRepo, *legacyAuditFake, *run.Run, *run.Stage, ed25519.PrivateKey) {
+		t.Helper()
+		rr := &recordingOrchestratorRepo{orchestratorRepo: newOrchestratorRepo()}
+		art, sf := newFakeArtifactRepo(), newSigningFake()
+		au := &legacyAuditFake{auditFake: newAuditFake(), failListCategory: failList}
+		s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, TraceStore: newTraceStoreFake(),
+			AuditRepo: au, RunRepo: rr, ArtifactRepo: art,
+			Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
+		runRow := rr.seedRun()
+		st := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+		st.RequiresApproval = true
+		priv, _ := sf.issue(t, runRow.ID)
+		// Seed the revise base directly (seedReviseBase wants a *storingAuditFake;
+		// this path uses the base auditFake, so inline the two records).
+		sv := "standard_v1"
+		if _, err := art.Create(context.Background(), artifact.CreateParams{
+			StageID: st.ID, Kind: artifact.KindPlan, SchemaVersion: &sv,
+			Content: narrowingBase(t), ContentHash: fmt.Sprintf("legacy-base-%s", st.ID),
+		}); err != nil {
+			t.Fatalf("seed base plan artifact: %v", err)
+		}
+		revPayload, _ := json.Marshal(map[string]any{"conditions": "keep everything else"})
+		human := audit.ActorKind("human")
+		if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+			RunID: runRow.ID, StageID: &st.ID, Category: CategoryPlanRevised,
+			ActorKind: &human, Payload: revPayload,
+		}); err != nil {
+			t.Fatalf("seed plan_revised: %v", err)
+		}
+		return s, rr, au, runRow, st, priv
+	}
+	narrowed := removalPlanBody(t, []string{"b/a.go", "b/b.go"}, nil)
+	// countLegacy reads through the BASE auditFake, bypassing the
+	// legacyAuditFake fault so it can count committed rows even on the
+	// read-error leg (the fault is what the server hits, not the assertion).
+	countLegacy := func(t *testing.T, au *legacyAuditFake, runID uuid.UUID) int {
+		t.Helper()
+		entries, err := au.auditFake.ListForRunByCategory(context.Background(), runID, categoryPlanScopeRetry)
+		if err != nil {
+			t.Fatalf("list plan_scope_retry: %v", err)
+		}
+		return len(entries)
+	}
+
+	t.Run("grants exactly one refusal via the fallback", func(t *testing.T) {
+		s, rr, au, runRow, planStage, priv := buildLegacy(t, "")
+		wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+		if wp.Code != http.StatusCreated {
+			t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+		}
+		if n := countLegacy(t, au, runRow.ID); n != 1 {
+			t.Errorf("plan_scope_retry entries = %d, want 1 (the fallback grants one refusal)", n)
+		}
+		if rr.sawTransitionTo(run.StageStateAwaitingApproval) {
+			t.Errorf("stage reached awaiting_approval; the fallback refusal must spend zero passes")
+		}
+	})
+
+	t.Run("exhausts the one-shot via the fallback", func(t *testing.T) {
+		s, rr, au, runRow, planStage, priv := buildLegacy(t, "")
+		// Pre-seed one plan_scope_retry entry so the fallback count is at the cap.
+		seedPayload, _ := json.Marshal(map[string]any{"attempt": 1})
+		system := audit.ActorKind("system")
+		if _, err := au.AppendChained(context.Background(), audit.ChainAppendParams{
+			RunID: runRow.ID, StageID: &planStage.ID, Category: categoryPlanScopeRetry,
+			ActorKind: &system, Payload: seedPayload,
+		}); err != nil {
+			t.Fatalf("seed plan_scope_retry: %v", err)
+		}
+		wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+		if wp.Code != http.StatusCreated {
+			t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+		}
+		if n := countLegacy(t, au, runRow.ID); n != 1 {
+			t.Errorf("plan_scope_retry entries = %d, want 1 (no new entry once the fallback budget is spent)", n)
+		}
+		if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+			t.Errorf("stage state = %q, want awaiting_approval (fallback exhaustion parks)", got)
+		}
+	})
+
+	t.Run("fails closed on a fallback budget read error", func(t *testing.T) {
+		s, rr, au, runRow, planStage, priv := buildLegacy(t, categoryPlanScopeRetry)
+		wp := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, narrowed, "")
+		if wp.Code != http.StatusCreated {
+			t.Fatalf("plan status = %d, want 201:\n%s", wp.Code, wp.Body.String())
+		}
+		if n := countLegacy(t, au, runRow.ID); n != 0 {
+			t.Errorf("plan_scope_retry entries = %d, want 0 (an unreadable fallback budget declines)", n)
+		}
+		if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+			t.Errorf("stage state = %q, want awaiting_approval (fail-closed degrade parks)", got)
+		}
+		if st := rr.runs[runRow.ID].State; st == run.StateFailed {
+			t.Errorf("run state = failed; the fallback degrade must never fail the run terminally")
+		}
+	})
 }
 
 // TestShipPlan_ScopeRetry_OverConsumedBudget_StillExhausts pins the direction

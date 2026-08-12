@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -387,6 +388,29 @@ func AppendChainedTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams) (*Entr
 	return rowToEntry(row), nil
 }
 
+// AppendChainedUnderBudget implements RetryBudgetAppender: the atomic
+// check-and-consume append (#2518). It is a thin pgx.BeginFunc wrapper
+// delegating to AppendChainedUnderBudgetTx, exactly as AppendChained wraps
+// AppendChainedTx. TxOptions are deliberately NOT set — the atomic count is
+// correct ONLY at the server-default READ COMMITTED isolation (see
+// AppendChainedUnderBudgetTx's ordering note; a REPEATABLE READ snapshot would
+// predate the row lock and could count zero after the lock is granted).
+func (r *postgresRepo) AppendChainedUnderBudget(ctx context.Context, p ChainAppendParams, maxEntries int, stamp func(attempt int) (json.RawMessage, error)) (*Entry, error) {
+	var result *Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		entry, err := AppendChainedUnderBudgetTx(ctx, tx, p, maxEntries, stamp)
+		if err != nil {
+			return err
+		}
+		result = entry
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (r *postgresRepo) Get(ctx context.Context, id uuid.UUID) (*Entry, error) {
 	q := auditdb.New(r.pool)
 	row, err := q.GetAuditEntry(ctx, id)
@@ -539,3 +563,10 @@ func rowToEntry(r auditdb.AuditEntry) *Entry {
 
 // Compile-time check that postgresRepo implements Repository.
 var _ Repository = (*postgresRepo)(nil)
+
+// Compile-time check that the production repo carries the atomic
+// retry-budget capability (#2518). A production repo that silently lost
+// AppendChainedUnderBudget would make the server helper fall back to its
+// non-atomic count-then-append leg; this turns that regression into a build
+// failure rather than a runtime degrade.
+var _ RetryBudgetAppender = (*postgresRepo)(nil)
