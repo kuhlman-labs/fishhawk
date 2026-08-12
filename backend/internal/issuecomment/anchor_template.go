@@ -498,6 +498,7 @@ func renderStageReviews(stageType string, entries []*audit.Entry) string {
 		fmt.Fprintf(&b, "<details><summary>%s</summary>\n\n", v.summaryToken())
 		for _, c := range v.concerns {
 			fmt.Fprintf(&b, "- **%s** (%s): %s\n", c.severity, c.category, c.note)
+			writeConcernEvidence(&b, c.evidence)
 		}
 		if v.freeForm != "" {
 			fmt.Fprintf(&b, "\n%s\n", v.freeForm)
@@ -660,6 +661,27 @@ type anchorReviewConcern struct {
 	severity string
 	category string
 	note     string
+	// evidence is the reviewer's supporting evidence (planreview.Concern's
+	// new_evidence, #1913), rendered as an indented sub-line under the concern
+	// (E60.8 / #2353) so a well-backed concern does not read as a bare
+	// assertion on the markdown surfaces. Empty for most concerns.
+	evidence string
+}
+
+// writeConcernEvidence appends the indented `  - evidence: …` sub-line for one
+// concern to b, and appends NOTHING when the evidence is blank after trimming.
+// A blank labelled line is worse than omission — it reads as "the reviewer
+// supplied no evidence" when the truth may be that this concern never had any.
+// Shared by the issue anchor's per-reviewer verdict block and the advisory PR
+// review body so the two surfaces cannot drift.
+//
+// The prose is whitespace-collapsed (never truncated): a multi-line evidence
+// rendered verbatim would break out of the markdown list item.
+func writeConcernEvidence(b *strings.Builder, evidence string) {
+	if strings.TrimSpace(evidence) == "" {
+		return
+	}
+	fmt.Fprintf(b, "  - evidence: %s\n", strings.Join(strings.Fields(evidence), " "))
 }
 
 type anchorReviewVerdict struct {
@@ -770,9 +792,10 @@ func decodeAnchorVerdict(payload []byte) anchorReviewVerdict {
 		Verdict       string `json:"verdict"`
 		FreeForm      string `json:"free_form"`
 		Concerns      []struct {
-			Severity string `json:"severity"`
-			Category string `json:"category"`
-			Note     string `json:"note"`
+			Severity    string `json:"severity"`
+			Category    string `json:"category"`
+			Note        string `json:"note"`
+			NewEvidence string `json:"new_evidence"`
 		} `json:"concerns"`
 	}
 	v := anchorReviewVerdict{}
@@ -789,7 +812,9 @@ func decodeAnchorVerdict(payload []byte) anchorReviewVerdict {
 	}
 	v.freeForm = p.FreeForm
 	for _, c := range p.Concerns {
-		v.concerns = append(v.concerns, anchorReviewConcern{severity: c.Severity, category: c.Category, note: c.Note})
+		v.concerns = append(v.concerns, anchorReviewConcern{
+			severity: c.Severity, category: c.Category, note: c.Note, evidence: c.NewEvidence,
+		})
 	}
 	return v
 }

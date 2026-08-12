@@ -323,6 +323,136 @@ func TestGateView_MalformedPayload_SkippedWarnOnly(t *testing.T) {
 
 // --- behavioral done-means ----------------------------------------------
 
+// evidenceConcernRepo makes the package's shared in-memory fakeConcernRepo
+// faithful for the two #2353 columns. That fake builds its concern.Concern
+// literal field-by-field and predates new_evidence / settled_ref, so it drops
+// them — an artifact of the FAKE, not of the production repository (whose
+// round-trip is pinned against real Postgres by
+// concern.TestPostgres_NewEvidenceAndSettledRef_RoundTripAllQueries).
+//
+// It is wrapped rather than amended in place because fakeConcernRepo lives in
+// backend/internal/server/fixup_test.go, outside this change's declared scope.
+// The rows are pointers into the fake's own slice, so writing through them
+// fixes the STORED rows too — every later read (GetByIDs, ListByRun,
+// ListOpenByRun) sees the evidence.
+type evidenceConcernRepo struct{ *fakeConcernRepo }
+
+func (f evidenceConcernRepo) InsertRaised(ctx context.Context, p concern.InsertRaisedParams) ([]*concern.Concern, error) {
+	rows, err := f.fakeConcernRepo.InsertRaised(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	for i, row := range rows {
+		row.NewEvidence = p.Concerns[i].NewEvidence
+		row.SettledRef = p.Concerns[i].SettledRef
+	}
+	return rows, nil
+}
+
+// evidenceGateViewServer is gateViewServer with the evidence-faithful concern
+// repo wired in.
+func evidenceGateViewServer(t *testing.T) (*Server, *fakeRepo, evidenceConcernRepo) {
+	t.Helper()
+	repo := newFakeRepo()
+	cr := evidenceConcernRepo{newFakeConcernRepo()}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: newAuditFake(), ConcernRepo: cr})
+	return s, repo, cr
+}
+
+// seedGateConcernWithEvidence seeds one concern carrying the #2353 evidence
+// fields. A separate helper rather than two more positional parameters on the
+// already-11-argument seedGateConcern, whose call sites are unrelated to this
+// change.
+func seedGateConcernWithEvidence(t *testing.T, cr evidenceConcernRepo, runID, stageID uuid.UUID,
+	seq int64, note, evidence, settledRef string) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "m",
+		OriginReviewSequence: seq,
+		Concerns: []concern.RaisedConcern{{
+			Severity: "high", Category: "correctness", Note: note,
+			NewEvidence: evidence, SettledRef: settledRef,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("seed concern with evidence: %v", err)
+	}
+	return rows[0]
+}
+
+// TestGateView_RendersConcernEvidence is the done-means for the gate-view leg
+// of #2353: fishhawk_get_gate_view is the surface the operator reads when
+// deciding whether a concern is worth blocking on, and until now it rendered
+// `note` alone, so a concern whose substance sat in new_evidence read as an
+// unsupported assertion. Both the OPEN list and the SETTLED ledger must carry
+// new_evidence AND settled_ref verbatim.
+func TestGateView_RendersConcernEvidence(t *testing.T) {
+	s, repo, cr := evidenceGateViewServer(t)
+	runID := seedGateRun(t, repo)
+	const openEvidence = "backend/internal/server/gateview.go:441 maps SuggestedPatch but not NewEvidence; the field is dropped at the render boundary"
+	const settledEvidence = "reproduced on run 90e0ea6a: the concern minted with new_evidence='' despite the verdict carrying it"
+	openRef := uuid.New().String()
+	settledRef := uuid.New().String()
+
+	seedGateConcernWithEvidence(t, cr, runID, uuid.New(), 10, "evidenced open concern", openEvidence, openRef)
+	settled := seedGateConcernWithEvidence(t, cr, runID, uuid.New(), 11, "evidenced settled concern", settledEvidence, settledRef)
+	settled.State = concern.StateWaived
+	settled.StateReason = "operator waived"
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if len(resp.Open) != 1 {
+		t.Fatalf("Open = %d, want 1: %+v", len(resp.Open), resp.Open)
+	}
+	if resp.Open[0].NewEvidence != openEvidence {
+		t.Errorf("Open[0].new_evidence = %q, want %q verbatim", resp.Open[0].NewEvidence, openEvidence)
+	}
+	if resp.Open[0].SettledRef != openRef {
+		t.Errorf("Open[0].settled_ref = %q, want %q", resp.Open[0].SettledRef, openRef)
+	}
+	if len(resp.Settled) != 1 {
+		t.Fatalf("Settled = %d, want 1: %+v", len(resp.Settled), resp.Settled)
+	}
+	if resp.Settled[0].NewEvidence != settledEvidence {
+		t.Errorf("Settled[0].new_evidence = %q, want %q verbatim", resp.Settled[0].NewEvidence, settledEvidence)
+	}
+	if resp.Settled[0].SettledRef != settledRef {
+		t.Errorf("Settled[0].settled_ref = %q, want %q", resp.Settled[0].SettledRef, settledRef)
+	}
+
+	// The evidence must be in the raw JSON body under the wire names the MCP
+	// client decodes — the struct-level assertions above would still pass with a
+	// mistyped json tag, which is the seam that silently yields an empty field.
+	body := getGateView(t, s, runID, "").Body.String()
+	for _, want := range []string{`"new_evidence":"` + openEvidence + `"`, `"settled_ref":"` + openRef + `"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("gate-view body missing %s\nbody: %s", want, body)
+		}
+	}
+}
+
+// TestGateView_OmitsEmptyConcernEvidence is the suppression counterpart: a
+// concern with neither field must omit BOTH keys entirely rather than emitting
+// `"new_evidence":""`. An empty labelled field reads as "the reviewer supplied
+// no evidence" when the truth is that this concern never had any, and it also
+// keeps the payload byte-identical for the common no-evidence concern.
+func TestGateView_OmitsEmptyConcernEvidence(t *testing.T) {
+	s, repo, cr := evidenceGateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedGateConcernWithEvidence(t, cr, runID, uuid.New(), 10, "bare open concern", "", "")
+	settled := seedGateConcernWithEvidence(t, cr, runID, uuid.New(), 11, "bare settled concern", "", "")
+	settled.State = concern.StateWaived
+
+	body := getGateView(t, s, runID, "").Body.String()
+	for _, absent := range []string{"new_evidence", "settled_ref"} {
+		if strings.Contains(body, absent) {
+			t.Errorf("gate-view body carries %q for concerns with no evidence — omitempty is not applied\nbody: %s", absent, body)
+		}
+	}
+}
+
 // TestGateView_FullNoteByteIdentical proves no elision: a >96-byte note round-
 // trips byte-identical on both an OPEN and a SETTLED concern.
 func TestGateView_FullNoteByteIdentical(t *testing.T) {

@@ -150,3 +150,47 @@ func TestRenderPRReviewBody(t *testing.T) {
 		}
 	})
 }
+
+// TestRenderPRReviewBody_ConcernEvidence is the advisory-PR-review leg of
+// #2353. It is the other sticky comment surface the issue names, and it shares
+// the anchor's concern-line shape — so it shared the omission too.
+func TestRenderPRReviewBody_ConcernEvidence(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New()}
+	const evidence = "the counterfactual was never run: deleting the guard leaves TestFoo green"
+
+	t.Run("renders the evidence sub-line", func(t *testing.T) {
+		entry := implementReviewedEntry(t, 7, planreview.ImplementReviewedPayload{
+			ReviewerModel: "gpt-5.6-sol",
+			Verdict:       planreview.VerdictReject,
+			Concerns: []planreview.Concern{
+				{Severity: planreview.SeverityHigh, Category: "correctness", Note: "unverified control", NewEvidence: evidence},
+			},
+		})
+		got := issuecomment.RenderPRReviewBody(entry, runRow, "https://app.example")
+		if !strings.Contains(got, "- **high** (correctness): unverified control\n  - evidence: "+evidence+"\n") {
+			t.Errorf("PR review body missing the indented evidence sub-line:\n%s", got)
+		}
+	})
+
+	// Suppression: a concern with no evidence renders NO labelled line. A blank
+	// "evidence:" would read as "the reviewer supplied none" when the truth is
+	// that this concern never had any.
+	for name, blank := range map[string]string{"empty": "", "whitespace_only": " \n\t"} {
+		t.Run("omits blank evidence/"+name, func(t *testing.T) {
+			entry := implementReviewedEntry(t, 8, planreview.ImplementReviewedPayload{
+				ReviewerModel: "gpt-5.6-sol",
+				Verdict:       planreview.VerdictReject,
+				Concerns: []planreview.Concern{
+					{Severity: planreview.SeverityHigh, Category: "correctness", Note: "unverified control", NewEvidence: blank},
+				},
+			})
+			got := issuecomment.RenderPRReviewBody(entry, runRow, "https://app.example")
+			if !strings.Contains(got, "- **high** (correctness): unverified control") {
+				t.Fatalf("concern line missing entirely:\n%s", got)
+			}
+			if strings.Contains(got, "evidence:") {
+				t.Errorf("blank evidence rendered a labelled line:\n%s", got)
+			}
+		})
+	}
+}

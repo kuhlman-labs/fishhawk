@@ -71,7 +71,17 @@ type gateViewConcern struct {
 	// Note is the FULL reviewer prose — deliberately NOT elided (the whole
 	// point of this surface). The MCP tool passes it through with none of the
 	// compaction levers applied.
-	Note              string               `json:"note"`
+	Note string `json:"note"`
+	// NewEvidence is the reviewer's supporting evidence for the concern
+	// (E60.8 / #2353), rendered in full alongside the note — without it a
+	// well-evidenced rejection reads as an unsupported assertion. omitempty:
+	// the (common) no-evidence concern leaves the payload byte-identical, and
+	// every row minted before migration 0069 carries ''.
+	NewEvidence string `json:"new_evidence,omitempty"`
+	// SettledRef is the stable id of the settled concern this one re-raises
+	// (#1913), so the operator can follow the re-raise lineage. Omitted when
+	// the concern re-raises nothing.
+	SettledRef        string               `json:"settled_ref,omitempty"`
 	HasSuggestedPatch bool                 `json:"has_suggested_patch"`
 	Fixups            []gateViewFixup      `json:"fixups,omitempty"`
 	Resolutions       []gateViewResolution `json:"resolutions,omitempty"`
@@ -114,6 +124,12 @@ type gateViewSettledConcern struct {
 	ReviewerModel string    `json:"reviewer_model,omitempty"`
 	Note          string    `json:"note"`
 	StateReason   string    `json:"state_reason,omitempty"`
+	// NewEvidence / SettledRef mirror gateViewConcern's fields (E60.8 /
+	// #2353): the settled ledger is the surface the operator re-reads when
+	// deciding whether a re-raise is legitimate, so the evidence that backed
+	// the original concern must survive into it. Both omitempty.
+	NewEvidence string `json:"new_evidence,omitempty"`
+	SettledRef  string `json:"settled_ref,omitempty"`
 }
 
 // gateViewSuppressedRelitig mirrors concernRelitigationSuppressedPayload on
@@ -297,6 +313,8 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 			ReviewerModel: derefStr(c.ReviewerModel),
 			Note:          c.Note,
 			StateReason:   c.StateReason,
+			NewEvidence:   c.NewEvidence,
+			SettledRef:    c.SettledRef,
 		})
 	}
 
@@ -449,6 +467,8 @@ func gateViewOpenConcern(c *concern.Concern, h gateViewHistory) gateViewConcern 
 		State:                string(c.State),
 		StateReason:          c.StateReason,
 		Note:                 c.Note,
+		NewEvidence:          c.NewEvidence,
+		SettledRef:           c.SettledRef,
 		HasSuggestedPatch:    c.SuggestedPatch != "",
 	}
 	if c.StageKind == concern.StageKindImplement {

@@ -1473,6 +1473,21 @@ components:
         note:
           type: string
           description: The FULL reviewer prose — deliberately not elided.
+        new_evidence:
+          type: string
+          description: |
+            The reviewer's supporting evidence for this concern (#2353) — the
+            substantiation behind `note`. Optional: OMITTED when the reviewer
+            supplied none (the common case), and omitted for every concern
+            minted before migration 0069, whose evidence remains recoverable
+            from the originating `plan_reviewed` / `implement_reviewed` audit
+            payload.
+        settled_ref:
+          type: string
+          description: |
+            Stable id of the settled concern this one re-raises — the
+            re-litigation lineage tag (#1913). Optional: omitted when the
+            concern re-raises nothing.
         has_suggested_patch: { type: boolean }
         fixups:
           type: array
@@ -1546,6 +1561,17 @@ components:
           type: string
           description: The FULL reviewer prose — not elided.
         state_reason: { type: string }
+        new_evidence:
+          type: string
+          description: |
+            The reviewer's supporting evidence for this concern (#2353).
+            Optional, omitted when empty — same semantics as
+            `GateViewConcern.new_evidence`.
+        settled_ref:
+          type: string
+          description: |
+            Stable id of the settled concern this one re-raises (#1913).
+            Optional, omitted when empty.
 
     GateViewSuppressedRelitigation:
       type: object

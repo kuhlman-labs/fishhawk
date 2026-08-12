@@ -1761,3 +1761,32 @@ func TestRegisterTools_RegistersAwaitReview(t *testing.T) {
 	// types at registration.
 	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
 }
+
+// TestAwaitReview_CarriesConcernEvidence is the done-means for the surface
+// #2353 was reported from: fishhawk_await_review is what the operator reads
+// when a reviewer rejects, and it rendered `note` alone — so a rejection whose
+// substance sat in new_evidence read as an unsupported assertion.
+//
+// The payload is seeded with RAW WIRE KEYS, so this exercises the actual decode
+// (a json-tag typo goes RED here). It also proves the RETROACTIVE reach of this
+// leg: nothing is persisted, the fields are read straight off the
+// implement_reviewed audit payload, so runs that predate migration 0069 gain
+// the evidence on this surface too.
+func TestAwaitReview_CarriesConcernEvidence(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	const evidence = "run 90e0ea6a's gate view showed note-only; the verdict payload carried 340 bytes of new_evidence"
+	settledRef := uuid.New().String()
+	seedRawReviewAudit(fb, runID, "implement_reviewed",
+		concernEvidenceWirePayload("reject", evidence, settledRef))
+	r := newResolver(srv, nil)
+
+	_, out, err := r.awaitReview(context.Background(), nil, AwaitReviewInput{RunID: runID.String(), Stage: "implement"})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "complete" {
+		t.Fatalf("Status = %q, want complete", out.Status)
+	}
+	assertConcernEvidenceDecoded(t, "await_review", out.Reviews, evidence, settledRef)
+}

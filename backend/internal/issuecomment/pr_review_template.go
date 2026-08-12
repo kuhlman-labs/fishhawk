@@ -54,6 +54,7 @@ func RenderPRReviewBody(entry *audit.Entry, runRow *run.Run, externalURL string)
 			severity: string(c.Severity),
 			category: c.Category,
 			note:     c.Note,
+			evidence: c.NewEvidence,
 		})
 	}
 
@@ -78,6 +79,7 @@ func RenderPRReviewBody(entry *audit.Entry, runRow *run.Run, externalURL string)
 				cat = "general"
 			}
 			fmt.Fprintf(&b, "- **%s** (%s): %s\n", sev, cat, c.note)
+			writeConcernEvidence(&b, c.evidence)
 		}
 	}
 

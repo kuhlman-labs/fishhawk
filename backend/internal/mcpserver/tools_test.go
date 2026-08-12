@@ -3676,6 +3676,116 @@ func seedImplementReviewAudit(fb *fakeBackend, runID uuid.UUID, review PlanRevie
 	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], entry)
 }
 
+// concernEvidenceWirePayload is a *_reviewed audit payload built from RAW WIRE
+// KEYS rather than from a marshalled PlanReview (E60.8 / #2353). Seeding
+// through the typed struct would make a json-tag typo self-cancelling — the
+// same wrong key would be written and read — so the one seam under test, the
+// decode of `new_evidence` / `settled_ref` off the real payload, would not be
+// exercised at all.
+func concernEvidenceWirePayload(verdict, evidence, settledRef string) map[string]any {
+	return map[string]any{
+		"reviewer_kind":  "agent",
+		"reviewer_model": "gpt-5.6-sol",
+		"authority":      "advisory",
+		"verdict":        verdict,
+		"concerns": []any{
+			map[string]any{
+				"severity":     "high",
+				"category":     "correctness",
+				"note":         "the control is deleted but the test stays green",
+				"new_evidence": evidence,
+				"settled_ref":  settledRef,
+			},
+			map[string]any{
+				"severity": "low",
+				"category": "style",
+				"note":     "a concern the reviewer supplied no evidence for",
+			},
+		},
+	}
+}
+
+// seedRawReviewAudit appends a *_reviewed audit entry carrying an arbitrary
+// wire payload, so a decode test can drive real JSON keys.
+func seedRawReviewAudit(fb *fakeBackend, runID uuid.UUID, category string, payload map[string]any) {
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		Category: category,
+		Payload:  decoded,
+	})
+}
+
+// assertConcernEvidenceDecoded checks the shared PlanReviewConcern decode
+// carried both fields onto the first concern and left the second (which the
+// payload gave neither) empty.
+func assertConcernEvidenceDecoded(t *testing.T, surface string, reviews []PlanReview, evidence, settledRef string) {
+	t.Helper()
+	if len(reviews) != 1 || len(reviews[0].Concerns) != 2 {
+		t.Fatalf("%s: reviews = %+v, want 1 review with 2 concerns", surface, reviews)
+	}
+	c := reviews[0].Concerns[0]
+	if c.NewEvidence != evidence {
+		t.Errorf("%s: concern.new_evidence = %q, want %q verbatim", surface, c.NewEvidence, evidence)
+	}
+	if c.SettledRef != settledRef {
+		t.Errorf("%s: concern.settled_ref = %q, want %q", surface, c.SettledRef, settledRef)
+	}
+	if bare := reviews[0].Concerns[1]; bare.NewEvidence != "" || bare.SettledRef != "" {
+		t.Errorf("%s: no-evidence concern = (%q, %q), want both empty",
+			surface, bare.NewEvidence, bare.SettledRef)
+	}
+}
+
+// TestGetPlan_ConcernEvidenceDecoded is condition 6's explicit criterion for
+// fishhawk_get_plan. get_plan, get_run_status and await_review all render
+// reviews[] from ONE decode (runResolver.decodeReviewVerdicts into
+// PlanReviewConcern), but "covered transitively" is a claim worth an assertion
+// on the surface the operator actually reads — get_plan's reviews[] is where a
+// plan-gate rejection's evidence has to appear.
+func TestGetPlan_ConcernEvidenceDecoded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	const evidence = "backend/internal/server/trace.go:4557 builds the RaisedConcern literal without either field"
+	settledRef := uuid.New().String()
+	planStageID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+	seedRawReviewAudit(fb, runID, "plan_reviewed", concernEvidenceWirePayload("reject", evidence, settledRef))
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	assertConcernEvidenceDecoded(t, "get_plan", out.Reviews, evidence, settledRef)
+}
+
+// TestGetRunStatus_ConcernEvidenceDecoded is condition 6's criterion for the
+// other shared-decode surface: fishhawk_get_run_status's implement review block.
+func TestGetRunStatus_ConcernEvidenceDecoded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	const evidence = "the gate view rendered note alone; the substance sat in new_evidence"
+	settledRef := uuid.New().String()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	seedRawReviewAudit(fb, runID, "implement_reviewed", concernEvidenceWirePayload("reject", evidence, settledRef))
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	assertConcernEvidenceDecoded(t, "get_run_status", out.ImplementReviews, evidence, settledRef)
+}
+
 // seedSecurityFindingsAudit adds an implement_security_findings audit entry
 // (#1096) to the fake's per-run audit map, carrying the findings under the
 // cross-slice "findings" key. Round-tripped through JSON so the handler's

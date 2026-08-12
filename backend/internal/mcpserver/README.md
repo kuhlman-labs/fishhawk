@@ -389,6 +389,13 @@ The `next_actions` `deploy_gate_parked` arm points at `fishhawk_approve_deploy` 
 
 `fishhawk_fixup_stage` (E22.X / [#762](https://github.com/kuhlman-labs/fishhawk/issues/762)) routes one or more **advisory implement-review concerns** ([ADR-027](https://github.com/kuhlman-labs/fishhawk/issues/703) `approve_with_concerns`) back to the implement agent for a single fix-up pass, instead of the operator hand-editing the PR branch. It wraps `POST /v0/stages/{stage_id}/fixup`.
 
+**Reviewer evidence on the concern surfaces ([#2353](https://github.com/kuhlman-labs/fishhawk/issues/2353)).** A reviewer concern may carry `new_evidence` (the substantiation behind `note`) and `settled_ref` (the re-raise lineage tag, #1913). Both are now decoded and surfaced, and the surfaces split by SOURCE, which is what decides how far back the fix reaches:
+
+- `PlanReviewConcern` — ONE struct backing `fishhawk_await_review`, `fishhawk_get_plan`'s `reviews[]`, and `fishhawk_get_run_status`'s `implement_reviews[]`. It decodes the `plan_reviewed` / `implement_reviewed` audit payload directly, so these three carry the evidence **RETROACTIVELY**, including for runs that predate migration 0069.
+- `GateViewConcern` / `GateViewSettledConcern` — the `fishhawk_get_gate_view` mirrors. These read PERSISTED concern rows, so they carry evidence only for concerns minted after 0069. Their json tags MUST byte-match the backend's `gateViewConcern` / `gateViewSettledConcern`: a mismatched tag is SILENT (an empty field, never a decode error), which is why the wire test drives raw server-shaped JSON rather than a marshalled client struct.
+
+Both fields are `omitempty` on every surface — the common no-evidence concern leaves the payload byte-identical.
+
 **Run-status concerns block `short_summary` ([#2488](https://github.com/kuhlman-labs/fishhawk/issues/2488)).** Each item in `fishhawk_get_run_status`'s `run.concerns.items[]` (mirror `RunConcernItem`) now carries a `short_summary` — a **bounded** note-derived recognition label (at most 100 bytes, whitespace-collapsed to one line, `...`-marked when the note is cut, equal to the whole collapsed note when it already fits, **absent** when the note is blank after collapsing). It lets ONE default `fishhawk_get_run_status` call map each concern `id` to a recognisable defect without a second `fishhawk_list_audit` and correlation by array ordering. It is present **regardless of `include_review_prose`** (like verdicts/severities/concern keys). It is **not a unique key** — two concerns whose notes share a long prefix may share a label — so route fix-ups by `id`; the full untruncated note stays on `fishhawk_get_gate_view` and the originating `*_reviewed` audit entry.
 
 Inputs:
