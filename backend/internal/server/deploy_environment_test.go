@@ -238,6 +238,47 @@ func TestLastWinsAllowedEnvironments(t *testing.T) {
 	}
 }
 
+// (j) FAIL-CLOSED on an unresolvable spec (E23.18 / #2324 high/security). When
+// deploySpecStageForRun cannot resolve the deploy stage at record time — here an
+// ABSENT (empty) cached spec, which trips its len(WorkflowSpec)==0 guard — the
+// membership re-check cannot run. The operator-supplied --environment= value is
+// operator-controlled input on an audit surface, so a validation that cannot run
+// MUST fail closed: deployApprovedEnvironment returns "" rather than publishing
+// the unchecked "prod". The seeded approve is gate-admitted BY CONSTRUCTION (in
+// production it can only exist because checkDeployPreflight validated it against
+// the immutable cached spec), so the RED of the counterfactual lands on the
+// behavioral assertion, not on a fixture-setup guard.
+//
+// COUNTERFACTUAL: deleting the `if !ok { return "" }` guard in
+// deployApprovedEnvironment reddens the deployApprovedEnvironment assertion below
+// — the fail-open path publishes "prod" (the unchecked approved value) instead of
+// "". The end-to-end deployEnvironmentForStage assertion then confirms no
+// unverified environment reaches the deploy record.
+func TestDeployApprovedEnvironment_UnresolvableSpec_FailsClosed(t *testing.T) {
+	rr := newApprovalRunRepo()
+	// An ABSENT cached spec: deploySpecStageForRun returns ok=false at its
+	// len(WorkflowSpec)==0 guard, so the membership re-check cannot run.
+	stage, runRow := seedDeployRun(rr, "release", "")
+	ar := newFakeApprovalRepo()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		ApprovalRepo: ar,
+	})
+	seedStageEnvApproval(ar, stage.ID, approval.DecisionApprove, "--environment=prod")
+
+	// deployApprovedEnvironment fails closed: the unchecked value is not published.
+	if got := s.deployApprovedEnvironment(context.Background(), runRow.ID, stage.ID); got != "" {
+		t.Errorf("deployApprovedEnvironment = %q, want %q (unresolvable spec must fail closed, never publish the unchecked approved value)", got, "")
+	}
+	// End-to-end: the published audit-surface label is empty too (the derivation
+	// fallback also cannot resolve the absent spec), so no unverified environment
+	// reaches the deploy record.
+	if got := s.deployEnvironmentForStage(context.Background(), runRow.ID, stage.ID); got != "" {
+		t.Errorf("deployEnvironmentForStage = %q, want %q (no unverified environment reaches the record)", got, "")
+	}
+}
+
 // TestDeployEnvironment_TwoDeployStages_GateAndRecordAgree pins binding
 // condition 2: on a spec with TWO deploy stages carrying DIFFERENT
 // allowed_environments, the approval gate and the deploy record resolve from the

@@ -5431,7 +5431,11 @@ func (s *Server) deployEnvironmentForStage(ctx context.Context, runID, stageID u
 //   - no APPROVE approval carries an `--environment=` flag (a reject-decision
 //     flag and a flag-less approve are both ignored);
 //   - the approved value is not a member of the gate's allow-list (a value the
-//     gate would have refused must never be published).
+//     gate would have refused must never be published);
+//   - the deploy stage's spec cannot be resolved at record time (fail-closed:
+//     this audit surface carries operator-controlled input, so a value that
+//     cannot be re-validated against the gate's allow-list must never be
+//     published — #2324 high/security).
 //
 // Last-approve-wins mirrors the gate: the approval that advanced the stage is
 // the one that passed the pre-flight, and ListForStage is submitted_at-ascending
@@ -5459,14 +5463,21 @@ func (s *Server) deployApprovedEnvironment(ctx context.Context, runID, stageID u
 	if env == "" {
 		return ""
 	}
-	// Re-check the approved environment against the gate's last-wins allow-list.
-	// A non-member returns "" so the record falls back to the derivation rather
-	// than publishing an environment the gate would have refused.
-	if st, ok := s.deploySpecStageForRun(ctx, runID); ok {
-		allowed := lastWinsAllowedEnvironments(st)
-		if len(allowed) > 0 && !sliceContains(allowed, env) {
-			return ""
-		}
+	// Re-check the approved environment against the gate's last-wins allow-list —
+	// the SAME fold the gate admitted it against. This is an audit surface
+	// carrying operator-controlled input, so a validation that cannot RUN must
+	// fail CLOSED: an unresolvable spec (ok=false — absent/unparseable at resolve
+	// time) returns "" rather than publishing the unchecked value (#2324
+	// high/security), and the caller falls back to the (also-spec-derived)
+	// derivation. When the spec resolves, a non-member likewise returns "" so an
+	// environment the gate would have refused is never published.
+	st, ok := s.deploySpecStageForRun(ctx, runID)
+	if !ok {
+		return ""
+	}
+	allowed := lastWinsAllowedEnvironments(st)
+	if len(allowed) > 0 && !sliceContains(allowed, env) {
+		return ""
 	}
 	return env
 }
