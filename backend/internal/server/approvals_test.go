@@ -94,6 +94,7 @@ type approvalRunRepo struct {
 	stages         map[uuid.UUID]*run.Stage
 	runs           map[uuid.UUID]*run.Run
 	getErr         error
+	listStagesErr  error
 	transitionErr  error
 	transitions    []approvalTransition
 	rejectionFails bool
@@ -287,6 +288,9 @@ func (r *approvalRunRepo) CreateStage(context.Context, run.CreateStageParams) (*
 func (r *approvalRunRepo) ListStagesForRun(_ context.Context, runID uuid.UUID) ([]*run.Stage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.listStagesErr != nil {
+		return nil, r.listStagesErr
+	}
 	var out []*run.Stage
 	for _, st := range r.stages {
 		if st.RunID == runID {
@@ -5330,11 +5334,19 @@ workflows:
 // seedDeployRun stands up a deploy stage parked at awaiting_deploy_approval and
 // its run (carrying specYAML as the cached workflow spec) on a shared run id.
 func seedDeployRun(rr *approvalRunRepo, workflowID, specYAML string) (*run.Stage, *run.Run) {
+	return seedDeployRunAtSequence(rr, workflowID, specYAML, 0)
+}
+
+// seedDeployRunAtSequence is seedDeployRun generalized over the deploy row's
+// Sequence, so a fixture can place the deploy row at a non-zero position (e.g. a
+// plan-filtered child whose deploy stage is not first). seedDeployRun delegates
+// with seq=0 so its ~30 existing call sites are untouched.
+func seedDeployRunAtSequence(rr *approvalRunRepo, workflowID, specYAML string, seq int) (*run.Stage, *run.Run) {
 	runID := uuid.New()
 	st := &run.Stage{
 		ID:               uuid.New(),
 		RunID:            runID,
-		Sequence:         0,
+		Sequence:         seq,
 		Type:             run.StageTypeDeploy,
 		ExecutorKind:     run.ExecutorAgent,
 		ExecutorRef:      "deploy",
@@ -5355,6 +5367,103 @@ func seedDeployRun(rr *approvalRunRepo, workflowID, specYAML string) (*run.Stage
 	}
 	rr.seedRun(runRow)
 	return st, runRow
+}
+
+// seedSecondDeployStage seeds a SECOND deploy-stage ROW (at first.Sequence+1) on
+// the run that `first` belongs to, so a two-deploy-stage fixture carries BOTH
+// rows and the deploy ordinal is well-defined (E23.19 / #2642). `state` lets the
+// caller park it at awaiting_deploy_approval (gate tests), awaiting_deployment
+// (record-boundary tests), or dispatched (trigger tests). The row is seeded BY
+// CONSTRUCTION so a counterfactual RED lands on the behavioral assertion, not on
+// a fixture-setup guard.
+func seedSecondDeployStage(rr *approvalRunRepo, first *run.Stage, state run.StageState) *run.Stage {
+	st := &run.Stage{
+		ID:               uuid.New(),
+		RunID:            first.RunID,
+		Sequence:         first.Sequence + 1,
+		Type:             run.StageTypeDeploy,
+		ExecutorKind:     run.ExecutorAgent,
+		ExecutorRef:      "deploy",
+		State:            state,
+		RequiresApproval: true,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	rr.mu.Lock()
+	rr.stages[st.ID] = st
+	rr.mu.Unlock()
+	return st
+}
+
+// TestDeployStageForRunStage pins the pure stage-scoped selection helper
+// (E23.19 / #2642): a persisted stage ROW resolves to the SPEC deploy stage at
+// its DEPLOY ORDINAL, independent of repo row ordering, and every bad state
+// (seeded by construction) returns ok=false.
+func TestDeployStageForRunStage(t *testing.T) {
+	rid := uuid.New()
+	twoDeploy := spec.Workflow{Stages: []spec.Stage{
+		{ID: "deploy_staging", Type: spec.StageTypeDeploy},
+		{ID: "deploy_prod", Type: spec.StageTypeDeploy},
+	}}
+	depRow := func(seq int) *run.Stage {
+		return &run.Stage{ID: uuid.New(), RunID: rid, Sequence: seq, Type: run.StageTypeDeploy}
+	}
+	row0 := depRow(0)
+	row1 := depRow(1)
+
+	// ordinal 0 → first deploy spec stage; ordinal 1 → second.
+	if got, ok := deployStageForRunStage(twoDeploy, []*run.Stage{row0, row1}, row0); !ok || got.ID != "deploy_staging" {
+		t.Errorf("ordinal 0 → (%q, %v), want (deploy_staging, true)", got.ID, ok)
+	}
+	if got, ok := deployStageForRunStage(twoDeploy, []*run.Stage{row0, row1}, row1); !ok || got.ID != "deploy_prod" {
+		t.Errorf("ordinal 1 → (%q, %v), want (deploy_prod, true)", got.ID, ok)
+	}
+
+	// SHUFFLED row order still resolves correctly — proves the helper's own
+	// sort-by-Sequence, not the caller's row ordering, is load-bearing.
+	if got, ok := deployStageForRunStage(twoDeploy, []*run.Stage{row1, row0}, row1); !ok || got.ID != "deploy_prod" {
+		t.Errorf("shuffled rows, ordinal 1 → (%q, %v), want (deploy_prod, true)", got.ID, ok)
+	}
+	if got, ok := deployStageForRunStage(twoDeploy, []*run.Stage{row1, row0}, row0); !ok || got.ID != "deploy_staging" {
+		t.Errorf("shuffled rows, ordinal 0 → (%q, %v), want (deploy_staging, true)", got.ID, ok)
+	}
+
+	// PLAN-FILTERED child: the spec's deploy stage is at INDEX 2 (behind a plan
+	// and an implement stage), but FilterOutPlanStages drops the plan stage and
+	// renumbers densely, so the run carries an implement row (Seq 0) and a deploy
+	// row (Seq 1). The deploy ordinal is 0, so the deploy row resolves to the
+	// spec's (only) deploy stage — the case an index-keyed lookup gets wrong
+	// (Seq 1 would land on the implement spec stage).
+	planFiltered := spec.Workflow{Stages: []spec.Stage{
+		{ID: "plan", Type: spec.StageTypePlan},
+		{ID: "implement", Type: spec.StageTypeImplement},
+		{ID: "deploy", Type: spec.StageTypeDeploy},
+	}}
+	implRow := &run.Stage{ID: uuid.New(), RunID: rid, Sequence: 0, Type: run.StageTypeImplement}
+	filteredDeployRow := &run.Stage{ID: uuid.New(), RunID: rid, Sequence: 1, Type: run.StageTypeDeploy}
+	if got, ok := deployStageForRunStage(planFiltered, []*run.Stage{implRow, filteredDeployRow}, filteredDeployRow); !ok || got.ID != "deploy" {
+		t.Errorf("plan-filtered child → (%q, %v), want (deploy, true)", got.ID, ok)
+	}
+
+	// A non-deploy row → ok=false (the guard rejects a non-deploy stage).
+	if _, ok := deployStageForRunStage(planFiltered, []*run.Stage{implRow, filteredDeployRow}, implRow); ok {
+		t.Error("non-deploy row resolved ok=true, want false")
+	}
+	// A nil stage → ok=false.
+	if _, ok := deployStageForRunStage(twoDeploy, []*run.Stage{row0, row1}, nil); ok {
+		t.Error("nil stage resolved ok=true, want false")
+	}
+	// A row absent from rows → ok=false (row1 is not in the passed slice).
+	if _, ok := deployStageForRunStage(twoDeploy, []*run.Stage{row0}, row1); ok {
+		t.Error("row absent from rows resolved ok=true, want false")
+	}
+	// An ordinal beyond the spec's deploy-stage count → ok=false. A
+	// single-deploy spec with a second deploy ROW: row1's ordinal (1) has no
+	// counterpart, so the caller must fail closed.
+	oneDeploy := spec.Workflow{Stages: []spec.Stage{{ID: "deploy", Type: spec.StageTypeDeploy}}}
+	if _, ok := deployStageForRunStage(oneDeploy, []*run.Stage{row0, row1}, row1); ok {
+		t.Error("ordinal beyond spec deploy count resolved ok=true, want false")
+	}
 }
 
 // seedStageOnRun adds an extra stage (e.g. a succeeded review stage) to an
@@ -5859,6 +5968,47 @@ func TestDeployGate_FailClosed_NilRunRepo(t *testing.T) {
 	}
 	if body := decodeErrorEnvelope(t, w); body.Code != "deploy_preflight_unevaluable" {
 		t.Errorf("error code = %q, want deploy_preflight_unevaluable", body.Code)
+	}
+}
+
+// FAIL CLOSED: the reason-dispatch helper's default arm. resolveDeploySpecStage
+// returns only the six enumerated reasons today, so this branch is unreachable
+// through the real resolver — it is defensive hardening for a future reason
+// constant added without a matching case (#2642 fix-up). Because the branch
+// cannot be reached via checkDeployPreflight without a resolver seam, the helper
+// is exercised directly with an out-of-range reason value: it must WRITE a 422
+// deploy_preflight_unevaluable refusal and return true (refuse), never fall
+// through to constraint collection. Deleting the default arm stops the helper
+// compiling (missing return), so this test — and the whole package — go red.
+func TestDeployGate_FailClosed_UnknownResolveReason(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: newApprovalAuditFake()})
+	stage := &run.Stage{ID: uuid.New(), RunID: uuid.New(), Type: run.StageTypeDeploy}
+	runRow := &run.Run{ID: stage.RunID}
+	// A reason value past the last enumerated constant — the case a default arm
+	// exists to catch. deployStageResolveOrdinalUnmatched is the highest defined
+	// reason; +1 is guaranteed unenumerated.
+	unknown := deployStageResolveOrdinalUnmatched + 1
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(""))
+	w := httptest.NewRecorder()
+	if !s.refuseDeployForResolveReason(w, withAuth(req), stage, runRow, unknown, nil) {
+		t.Fatal("refuseDeployForResolveReason returned false (proceed) for an unrecognized reason; it must fail closed")
+	}
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", w.Code)
+	}
+	if body := decodeErrorEnvelope(t, w); body.Code != "deploy_preflight_unevaluable" {
+		t.Errorf("error code = %q, want deploy_preflight_unevaluable", body.Code)
+	}
+
+	// Control: the OK reason proceeds (returns false) and writes nothing, so the
+	// helper's refuse path is what produced the 422 above, not an unconditional
+	// write.
+	okW := httptest.NewRecorder()
+	if s.refuseDeployForResolveReason(okW, withAuth(req), stage, runRow, deployStageResolveOK, nil) {
+		t.Fatal("refuseDeployForResolveReason returned true for deployStageResolveOK; OK must proceed")
+	}
+	if okW.Code != http.StatusOK || okW.Body.Len() != 0 {
+		t.Errorf("OK reason wrote a response (code=%d, body=%q); it must write nothing", okW.Code, okW.Body.String())
 	}
 }
 

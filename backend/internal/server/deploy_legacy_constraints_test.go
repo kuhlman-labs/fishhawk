@@ -26,10 +26,10 @@ import (
 //
 //   - approvals.go preflightDeploy assigns `allowedEnvs = c.AllowedEnvironments`
 //     inside the loop, so the LAST entry wins → only `prod` is permitted.
-//   - trace.go deployEnvironmentForRun returns the FIRST non-empty entry's
-//     first element → `staging`.
+//   - trace.go deployEnvironmentFromSpecStage returns the FIRST non-empty
+//     entry's first element → `staging`.
 //
-// E23.18 / #2324 UPDATE: deployEnvironmentForRun is now only the FALLBACK the
+// E23.18 / #2324 UPDATE: deployEnvironmentFromSpecStage is now only the FALLBACK the
 // deploy record uses when NO explicit `--environment=` approval is recorded. So
 // this first-wins/last-wins disagreement survives ONLY on that no-explicit-approval
 // fallback path — the assertion below still pins it there. When an explicit
@@ -93,16 +93,18 @@ func TestDeployGate_LegacyDuplicateAllowedEnvironments_LastWinsUnchanged(t *test
 	})
 }
 
-// TestDeployEnvironmentForRun_LegacyDuplicate_FirstWinsUnchanged pins the
+// TestDeployEnvironmentFromSpecStage_LegacyDuplicate_FirstWinsUnchanged pins the
 // FIFTH constraint consumer on the SAME document. It deliberately asserts the
-// OPPOSITE answer from the gate above: deployEnvironmentForRun is first-wins,
-// so it reports `staging` on a document whose gate permits only `prod`. That
-// disagreement is the existing behaviour, and locking it is the point.
-func TestDeployEnvironmentForRun_LegacyDuplicate_FirstWinsUnchanged(t *testing.T) {
+// OPPOSITE answer from the gate above: deployEnvironmentFromSpecStage is
+// first-wins, so it reports `staging` on a document whose gate permits only
+// `prod`. That disagreement is the existing behaviour, and locking it is the
+// point. Renamed only to follow the deployEnvironmentForRun →
+// deployEnvironmentFromSpecStage rename (#2642); the asserted value is unchanged.
+func TestDeployEnvironmentFromSpecStage_LegacyDuplicate_FirstWinsUnchanged(t *testing.T) {
 	s, _, rr, _ := newApprovalServer(t)
-	_, runRow := seedDeployRun(rr, "release", deploySpecLegacyDuplicateEnvs)
-	if got := s.deployEnvironmentForRun(context.Background(), runRow.ID); got != "staging" {
-		t.Errorf("deployEnvironmentForRun = %q, want %q (FIRST-wins, deliberately the opposite of the gate's last-wins %q)",
+	stage, runRow := seedDeployRun(rr, "release", deploySpecLegacyDuplicateEnvs)
+	if got := s.deployEnvironmentFromSpecStage(context.Background(), runRow.ID, stage.ID); got != "staging" {
+		t.Errorf("deployEnvironmentFromSpecStage = %q, want %q (FIRST-wins, deliberately the opposite of the gate's last-wins %q)",
 			got, "staging", "prod")
 	}
 }
@@ -291,12 +293,12 @@ func TestV2MultiKindConstraints_EnforcementEquivalentToV1(t *testing.T) {
 			t.Errorf("deploy pre-flight for --environment=%s: v1 status %d, v2 status %d", env, v1Code, v2Code)
 		}
 	}
-	// (5) deployEnvironmentForRun — the fifth consumer, on the same pair.
+	// (5) deployEnvironmentFromSpecStage — the fifth consumer, on the same pair.
 	sd, _, rrd, _ := newApprovalServer(t)
-	_, v1Deploy := seedDeployRun(rrd, "release", multiKindV1DeploySpec)
-	_, v2Deploy := seedDeployRun(rrd, "release", multiKindV2DeploySpec)
-	if got, want := sd.deployEnvironmentForRun(ctx, v2Deploy.ID), sd.deployEnvironmentForRun(ctx, v1Deploy.ID); got != want {
-		t.Errorf("deployEnvironmentForRun(v2) = %q, want %q", got, want)
+	v1Stage, v1Deploy := seedDeployRun(rrd, "release", multiKindV1DeploySpec)
+	v2Stage, v2Deploy := seedDeployRun(rrd, "release", multiKindV2DeploySpec)
+	if got, want := sd.deployEnvironmentFromSpecStage(ctx, v2Deploy.ID, v2Stage.ID), sd.deployEnvironmentFromSpecStage(ctx, v1Deploy.ID, v1Stage.ID); got != want {
+		t.Errorf("deployEnvironmentFromSpecStage(v2) = %q, want %q", got, want)
 	}
 }
 

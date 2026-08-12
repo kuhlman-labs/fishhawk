@@ -5380,45 +5380,46 @@ func (s *Server) advanceDeployStageTerminal(ctx context.Context, stageID uuid.UU
 	}
 }
 
-// deploySpecStageForRun resolves the SPEC deploy stage the record side keys on
-// from the run's cached workflow spec (E23.18 / #2324). It shares
-// firstDeployStage with the approval gate (checkDeployPreflight), so the record
-// cannot key on a different stage than the gate that admitted the approval.
-// (Distinct from deployStageForRun in deploy_rollback.go, which returns the
-// persisted run.Stage ROW; this returns the parsed spec.Stage carrying the
-// pre-flight constraints.) Best-effort: every failure (nil/absent spec, parse
-// error, workflow not in spec, no deploy stage) returns ok=false rather than
-// erroring, since the environment label is best-effort and the authoritative
-// outcome fields are external_run_url + outcome.
-func (s *Server) deploySpecStageForRun(ctx context.Context, runID uuid.UUID) (spec.Stage, bool) {
+// deploySpecStageForStage resolves the SPEC deploy stage the record side keys
+// on for a SPECIFIC stage row (E23.19 / #2642). It loads the run and the stage
+// row and delegates to the shared resolveDeploySpecStage, so the record keys on
+// the SAME stage the gate that admitted the approval did — and, on a
+// multi-deploy-stage workflow, on the stage actually being deployed (by its
+// deploy ordinal) rather than the first deploy stage. (Distinct from
+// deployStageForRun in deploy_rollback.go, which returns the persisted run.Stage
+// ROW; this returns the parsed spec.Stage carrying the pre-flight constraints.)
+// Best-effort: every failure (run/stage lookup failure, nil/absent spec, parse
+// error, workflow not in spec, or a deploy ordinal with no spec counterpart)
+// returns ok=false rather than erroring, since the environment label is
+// best-effort and the authoritative outcome fields are external_run_url +
+// outcome.
+func (s *Server) deploySpecStageForStage(ctx context.Context, runID, stageID uuid.UUID) (spec.Stage, bool) {
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
-	if err != nil || len(runRow.WorkflowSpec) == 0 {
-		return spec.Stage{}, false
-	}
-	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
 	if err != nil {
 		return spec.Stage{}, false
 	}
-	wf, ok := parsed.Workflows[runRow.WorkflowID]
-	if !ok {
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
 		return spec.Stage{}, false
 	}
-	return firstDeployStage(wf)
+	st, reason, _ := s.resolveDeploySpecStage(ctx, runRow, stage)
+	return st, reason == deployStageResolveOK
 }
 
 // deployEnvironmentForStage resolves the environment label for a deploy record
-// (E23.18 / #2324): the environment the operator ACTUALLY approved
-// (deployApprovedEnvironment), falling back to the spec derivation
-// (deployEnvironmentForRun) only when no explicit --environment= approval is
-// recorded. Both deploy-record sites (ResolveDeploymentFromPollState and
-// ResolveDeploymentRollbackFromPollState) call this so the deployment artifact
-// body and the deployment_outcome_recorded audit carry the approved label, not
-// a schema-order-derived one.
+// (E23.18 / #2324, stage-scoped E23.19 / #2642): the environment the operator
+// ACTUALLY approved (deployApprovedEnvironment), falling back to the spec
+// derivation (deployEnvironmentFromSpecStage) only when no explicit
+// --environment= approval is recorded. Both deploy-record sites
+// (ResolveDeploymentFromPollState and ResolveDeploymentRollbackFromPollState)
+// call this so the deployment artifact body and the deployment_outcome_recorded
+// audit carry the approved label, not a schema-order-derived one — and, on a
+// multi-deploy-stage workflow, the label of the stage actually being deployed.
 func (s *Server) deployEnvironmentForStage(ctx context.Context, runID, stageID uuid.UUID) string {
 	if env := s.deployApprovedEnvironment(ctx, runID, stageID); env != "" {
 		return env
 	}
-	return s.deployEnvironmentForRun(ctx, runID)
+	return s.deployEnvironmentFromSpecStage(ctx, runID, stageID)
 }
 
 // deployApprovedEnvironment returns the environment the operator approved on the
@@ -5471,7 +5472,7 @@ func (s *Server) deployApprovedEnvironment(ctx context.Context, runID, stageID u
 	// high/security), and the caller falls back to the (also-spec-derived)
 	// derivation. When the spec resolves, a non-member likewise returns "" so an
 	// environment the gate would have refused is never published.
-	st, ok := s.deploySpecStageForRun(ctx, runID)
+	st, ok := s.deploySpecStageForStage(ctx, runID, stageID)
 	if !ok {
 		return ""
 	}
@@ -5482,18 +5483,19 @@ func (s *Server) deployApprovedEnvironment(ctx context.Context, runID, stageID u
 	return env
 }
 
-// deployEnvironmentForRun derives the deployed environment label from the run's
-// cached workflow spec — the deploy stage's FIRST allowed_environments entry.
-// This is the FALLBACK used by deployEnvironmentForStage only when no explicit
-// `--environment=` approval is recorded (the genuinely single-environment case);
-// it is NOT the primary answer, and it does NOT reflect the operator's choice on
-// a multi-environment stage. First-wins here is retained deliberately as the
-// #2218-characterized fallback fold (a duplicate-kind document reports its first
-// entry). Best-effort: an unparseable/absent spec yields "" rather than failing
-// the resolve, since the authoritative outcome fields are external_run_url +
-// outcome, not the environment label.
-func (s *Server) deployEnvironmentForRun(ctx context.Context, runID uuid.UUID) string {
-	st, ok := s.deploySpecStageForRun(ctx, runID)
+// deployEnvironmentFromSpecStage derives the deployed environment label from the
+// run's cached workflow spec — the deploy stage's FIRST allowed_environments
+// entry, resolved for THIS stage row (E23.19 / #2642). This is the FALLBACK used
+// by deployEnvironmentForStage only when no explicit `--environment=` approval is
+// recorded (the genuinely single-environment case); it is NOT the primary
+// answer, and it does NOT reflect the operator's choice on a multi-environment
+// stage. First-wins here is retained deliberately as the #2218-characterized
+// fallback fold (a duplicate-kind document reports its first entry). Best-effort:
+// an unparseable/absent spec yields "" rather than failing the resolve, since the
+// authoritative outcome fields are external_run_url + outcome, not the
+// environment label.
+func (s *Server) deployEnvironmentFromSpecStage(ctx context.Context, runID, stageID uuid.UUID) string {
+	st, ok := s.deploySpecStageForStage(ctx, runID, stageID)
 	if !ok {
 		return ""
 	}

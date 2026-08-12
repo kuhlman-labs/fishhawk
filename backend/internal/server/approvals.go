@@ -3683,29 +3683,15 @@ func (s *Server) checkDeployPreflight(w http.ResponseWriter, r *http.Request, st
 			map[string]any{"error": err.Error()})
 		return false
 	}
-	if len(runRow.WorkflowSpec) == 0 {
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: the run carries no cached workflow spec; an unverifiable deploy is denied (fail-closed)", nil)
-		return false
-	}
-	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
-	if err != nil {
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: the cached workflow spec does not parse; an unverifiable deploy is denied (fail-closed)",
-			map[string]any{"error": err.Error()})
-		return false
-	}
-	wf, ok := parsed.Workflows[runRow.WorkflowID]
-	if !ok {
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: the run's workflow is not in its cached spec; an unverifiable deploy is denied (fail-closed)",
-			map[string]any{"workflow_id": runRow.WorkflowID})
-		return false
-	}
-	deployStage, foundDeploy := firstDeployStage(wf)
-	if !foundDeploy {
-		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
-			"deploy pre-flight cannot be evaluated: no deploy stage found in the run's workflow; an unverifiable deploy is denied (fail-closed)", nil)
+	// Resolve the SPEC deploy stage for THIS stage row through the shared
+	// selection chokepoint (E23.19 / #2642) — the SAME resolver the record and
+	// trigger reach, so the gate cannot admit against one stage while they key
+	// on another. On a multi-deploy-stage workflow this keys on the stage
+	// actually being approved (by its deploy ordinal), not the first deploy
+	// stage. The typed reason preserves each precondition's distinct refusal
+	// message (operator binding condition 3).
+	deployStage, reason, rerr := s.resolveDeploySpecStage(ctx, runRow, stage)
+	if s.refuseDeployForResolveReason(w, r, stage, runRow, reason, rerr) {
 		return false
 	}
 
@@ -3871,20 +3857,173 @@ func sliceContains(xs []string, want string) bool {
 	return false
 }
 
-// firstDeployStage selects the deploy stage a workflow's gate and deploy
-// record both key on: the FIRST stage whose type is deploy (E23.18 / #2324).
-// It is the ONE implementation of that selection — the pre-execution gate
-// (checkDeployPreflight) and the record-side resolver (deployStageForRun) both
-// call it, so neither can drift to a different stage than the other. First-stage
-// keying is the shared, pre-existing behavior in multi-deploy-stage workflows;
-// centralizing it here does NOT change or endorse it (that latent defect is
-// tracked separately, out of #2324's scope). Returns ok=false when the workflow
-// declares no deploy stage.
-func firstDeployStage(wf spec.Workflow) (spec.Stage, bool) {
-	for _, st := range wf.Stages {
-		if st.Type == spec.StageTypeDeploy {
-			return st, true
+// deployStageResolveReason classifies why resolveDeploySpecStage could not
+// return a deploy spec stage (E23.19 / #2642). It exists so the deploy GATE
+// (checkDeployPreflight) can keep its per-precondition refusal messages while
+// the record (deploySpecStageForStage) and trigger (resolveDeployDelegate)
+// sides collapse every non-OK reason to one fail-closed outcome. Routing the
+// selection through a single chokepoint WITHOUT a typed reason would silently
+// coarsen the gate's diagnostics (operator binding condition 3); the typed
+// reason keeps one selection implementation AND the gate still tells the
+// operator WHICH precondition failed.
+type deployStageResolveReason int
+
+const (
+	deployStageResolveOK               deployStageResolveReason = iota
+	deployStageResolveNoSpec                                    // the run carries no cached workflow spec
+	deployStageResolveSpecParse                                 // the cached spec does not parse
+	deployStageResolveWorkflowMissing                           // the run's workflow is not in its cached spec
+	deployStageResolveRowsUnavailable                           // the run's stage rows could not be listed
+	deployStageResolveOrdinalUnmatched                          // no deploy spec stage at the stage row's deploy ordinal
+)
+
+// refuseDeployForResolveReason maps a resolveDeploySpecStage reason to the
+// deploy gate's fail-closed refusal (E23.19 / #2642). It returns false ONLY for
+// deployStageResolveOK — meaning the caller may proceed to constraint
+// collection with the resolved spec stage; for every other reason it writes the
+// precondition's distinct 422 refusal (operator binding condition 3) and
+// returns true so checkDeployPreflight refuses.
+//
+// The trailing default arm is load-bearing, not decorative: a future reason
+// constant added to resolveDeploySpecStage without a matching case here must
+// STILL refuse rather than proceed with a zero-value spec.Stage. Deleting it
+// stops this function compiling (missing return) — the fail-closed posture is
+// STRUCTURAL (ADR-038), not contingent on a future editor extending the switch.
+func (s *Server) refuseDeployForResolveReason(w http.ResponseWriter, r *http.Request, stage *run.Stage, runRow *run.Run, reason deployStageResolveReason, rerr error) bool {
+	switch reason {
+	case deployStageResolveOK:
+		return false
+	case deployStageResolveNoSpec:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run carries no cached workflow spec; an unverifiable deploy is denied (fail-closed)", nil)
+		return true
+	case deployStageResolveSpecParse:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the cached workflow spec does not parse; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"error": rerr.Error()})
+		return true
+	case deployStageResolveWorkflowMissing:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run's workflow is not in its cached spec; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"workflow_id": runRow.WorkflowID})
+		return true
+	case deployStageResolveRowsUnavailable:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: the run's stage rows could not be listed; an unverifiable deploy is denied (fail-closed)",
+			map[string]any{"error": rerr.Error()})
+		return true
+	case deployStageResolveOrdinalUnmatched:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			"deploy pre-flight cannot be evaluated: no deploy stage in the run's workflow matches this stage row's deploy position; an unverifiable deploy is denied (fail-closed)", nil)
+		return true
+	default:
+		s.refuseDeploy(w, r, stage, "deploy_preflight_unevaluable",
+			fmt.Sprintf("deploy pre-flight cannot be evaluated: unrecognized deploy-stage resolve reason %d; an unverifiable deploy is denied (fail-closed)", reason), nil)
+		return true
+	}
+}
+
+// resolveDeploySpecStage is the ONE deploy-stage selection chokepoint the gate
+// (checkDeployPreflight), the record (deploySpecStageForStage), and the trigger
+// (resolveDeployDelegate) all reach, so none can key on a different deploy stage
+// than the others (E23.19 / #2642). It parses the run's cached spec, looks up
+// the run's workflow, lists the run's stage rows, and resolves the SPEC deploy
+// stage matching `stage`'s deploy ordinal via deployStageForRunStage.
+//
+// The returned reason lets the gate keep distinct refusal messages; the record
+// and trigger treat any non-OK reason as fail-closed. The error is non-nil only
+// for SpecParse and RowsUnavailable, carrying the underlying error for the
+// gate's refusal detail.
+func (s *Server) resolveDeploySpecStage(ctx context.Context, runRow *run.Run, stage *run.Stage) (spec.Stage, deployStageResolveReason, error) {
+	if len(runRow.WorkflowSpec) == 0 {
+		return spec.Stage{}, deployStageResolveNoSpec, nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		return spec.Stage{}, deployStageResolveSpecParse, err
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return spec.Stage{}, deployStageResolveWorkflowMissing, nil
+	}
+	rows, err := s.cfg.RunRepo.ListStagesForRun(ctx, stage.RunID)
+	if err != nil {
+		return spec.Stage{}, deployStageResolveRowsUnavailable, err
+	}
+	st, ok := deployStageForRunStage(wf, rows, stage)
+	if !ok {
+		return spec.Stage{}, deployStageResolveOrdinalUnmatched, nil
+	}
+	return st, deployStageResolveOK, nil
+}
+
+// deployStageForRunStage selects the SPEC deploy stage that corresponds to a
+// specific persisted stage ROW, keyed on the row's DEPLOY ORDINAL among the
+// run's stage rows (E23.19 / #2642). This replaces the former first-match
+// firstDeployStage: a workflow may legally declare more than one deploy stage
+// (the stage `type` enum includes deploy and $defs/workflow/properties/stages
+// is an unconstrained array), and first-match gated and labelled EVERY deploy
+// against the FIRST deploy stage — so a legal second deploy stage was checked
+// against the wrong allowed_environments and mislabelled.
+//
+// The key is the deploy ORDINAL, not stage.Sequence-as-spec-index, because two
+// production paths create a run's stages from a plan-FILTERED subset of the
+// spec (webhook/dispatcher.go CI-retry children and server/recover.go recovery
+// children, both via webhook.FilterOutPlanStages), which renumbers Sequence
+// densely from 0 over the subset. FilterOutPlanStages drops ONLY plan stages
+// and preserves relative order, so the k-th deploy ROW is always the k-th
+// deploy SPEC stage — while an index-keyed lookup would land on a non-deploy
+// spec stage and refuse EVERY deploy on a retry/recovery child (fail-closed,
+// but a functional regression). webhook.CreateStagesFromSpec creates exactly
+// one row per spec stage in spec order, establishing the row↔spec-order
+// correspondence the ordinal relies on.
+//
+// It sorts a COPY of rows by Sequence itself (ties broken by stage ID for a
+// total, stable order) rather than trusting the repo's ordering: the in-package
+// fake ListStagesForRun iterates a Go map, whose order is randomized, so
+// depending on repo order would make selection flaky.
+//
+// Returns ok=false on: a nil stage; a non-deploy stage; a stage absent from
+// rows; or a workflow declaring fewer than k+1 deploy stages (a row/spec
+// disagreement the caller must fail closed on).
+func deployStageForRunStage(wf spec.Workflow, rows []*run.Stage, stage *run.Stage) (spec.Stage, bool) {
+	if stage == nil || stage.Type != run.StageTypeDeploy {
+		return spec.Stage{}, false
+	}
+	sorted := make([]*run.Stage, len(rows))
+	copy(sorted, rows)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].Sequence != sorted[j].Sequence {
+			return sorted[i].Sequence < sorted[j].Sequence
 		}
+		return sorted[i].ID.String() < sorted[j].ID.String()
+	})
+	// k = the number of deploy-typed rows preceding this stage in sorted order
+	// (its deploy ordinal). The walk also proves the stage is present in rows.
+	k := 0
+	found := false
+	for _, st := range sorted {
+		if st.ID == stage.ID {
+			found = true
+			break
+		}
+		if st.Type == run.StageTypeDeploy {
+			k++
+		}
+	}
+	if !found {
+		return spec.Stage{}, false
+	}
+	// Return the k-th deploy stage in SPEC order.
+	seen := 0
+	for _, sp := range wf.Stages {
+		if sp.Type != spec.StageTypeDeploy {
+			continue
+		}
+		if seen == k {
+			return sp, true
+		}
+		seen++
 	}
 	return spec.Stage{}, false
 }

@@ -387,8 +387,12 @@ func (*Server) dispatchRollbackWebhook(ctx context.Context, runRow *run.Run, sta
 }
 
 // deployStageForRun returns the run's deploy stage, or nil when the run has
-// none. The deploy stage type is unique within a workflow in v0, so the first
-// match is authoritative.
+// none. The rollback request is run-scoped and carries NO stage identity, so
+// first-match is the only selection available here; on a multi-deploy-stage
+// workflow it resolves the FIRST deploy stage. A workflow may legally declare
+// more than one deploy stage (the stage type is NOT schema-unique), so this is
+// a known limitation of the run-scoped rollback path, tracked by #2642 — the
+// stage-scoped gate/record/trigger selection lives in resolveDeploySpecStage.
 func (s *Server) deployStageForRun(ctx context.Context, runID uuid.UUID) (*run.Stage, error) {
 	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
 	if err != nil {
@@ -405,7 +409,11 @@ func (s *Server) deployStageForRun(ctx context.Context, runID uuid.UUID) (*run.S
 // deployDelegateForRun reads the run's cached workflow spec and returns the
 // delegating deploy stage's executor.delegate config. Unlike slice-1's
 // resolveDeployDelegate it never mutates stage state — the rollback handler maps
-// the error to an HTTP response, not a stage failure.
+// the error to an HTTP response, not a stage failure. The rollback request is
+// run-scoped and carries no stage identity, so first-match is the only selection
+// available here; on a multi-deploy-stage workflow it resolves the FIRST
+// delegating deploy stage — a run-scoped limitation tracked by #2642, not the
+// schema-uniqueness the earlier comment implied.
 func deployDelegateForRun(runRow *run.Run) (*spec.DelegateConfig, error) {
 	if len(runRow.WorkflowSpec) == 0 {
 		return nil, errors.New("run carries no cached workflow spec")
