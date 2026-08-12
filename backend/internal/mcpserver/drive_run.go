@@ -724,11 +724,13 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 			}
 			// Acceptance-dispatch admission (#1928): before recording + spawning
 			// an acceptance dispatch, ask the backend to short-circuit an
-			// all-skip-with-basis / empty-criteria / out-of-scope plan. On a hit
-			// the stage settles server-side (a passed verdict, no preview) — record
-			// NO act, spawn nothing, and let the next poll observe the terminal
-			// stage. Fail OPEN on a TRANSPORT error (network / 5xx): append a warning
-			// and fall through to today's record+spawn path (which opens no NEW
+			// all-skip-with-basis / empty-criteria plan (a not_validated verdict,
+			// #2347) or an out-of-scope plan (an acceptance_skipped_out_of_scope
+			// marker, no verdict). On a hit the stage settles server-side with no
+			// preview — record NO act, spawn nothing, and let the next poll observe
+			// the terminal stage. Fail OPEN on a TRANSPORT error (network / 5xx):
+			// append a warning and fall through to today's record+spawn path (which
+			// opens no NEW
 			// code-execution surface); a short_circuited:false result is the normal
 			// no-op with no warning. A 4xx admission REJECTION (403
 			// cross_run_admission etc.) is NOT fail-open — it halts the drive so a
@@ -749,7 +751,7 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 				if admission != nil && admission.ShortCircuited {
 					out.StepsTaken = append(out.StepsTaken, DriveStep{
 						Kind: "dispatch", Stage: "acceptance", Delegated: false,
-						Note: fmt.Sprintf("acceptance short-circuited server-side (%s); no runner spawned, no act recorded", shortCircuitLabel(admission)),
+						Note: acceptanceShortCircuitWarning(admission, false) + " No runner spawned, no act recorded.",
 					})
 					spawned[disp.ID] = true
 					driveSleep(ctx, pollInterval)

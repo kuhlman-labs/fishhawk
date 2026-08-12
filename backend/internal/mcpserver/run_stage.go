@@ -495,9 +495,7 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 				warnings = append(warnings,
 					fmt.Sprintf("post-short-circuit stage fetch failed: %v", fetchErr))
 			}
-			warnings = append(warnings, fmt.Sprintf(
-				"acceptance stage short-circuited to a passed verdict server-side (%s) with no runner spawn and no preview.",
-				shortCircuitLabel(admission)))
+			warnings = append(warnings, acceptanceShortCircuitWarning(admission, false))
 			return nil, RunStageOutput{
 				StageState:      stageState,
 				Warnings:        warnings,
@@ -952,6 +950,38 @@ func shortCircuitLabel(res *AcceptanceAdmissionResult) string {
 		return res.Basis
 	}
 	return res.Kind
+}
+
+// acceptanceShortCircuitWarning renders the operator-facing warning shared by
+// all three host-dispatch verbs (fishhawk_dispatch_stage / fishhawk_run_stage /
+// fishhawk_drive_run) for a fired acceptance-admission short-circuit. It derives
+// the wording from what the orchestrator actually recorded rather than
+// hardcoding an outcome (#2458): a basis-bearing hit (res.Basis != "" — the two
+// verdict-recording predicates, empty-criteria and all-skip-with-basis) names
+// the recorded verdict via the package-mirrored acceptanceVerdictNotValidated
+// constant (#2347) and states that zero criteria were verified; the out-of-scope
+// hit (res.Basis == "") records an auditCategoryAcceptanceSkippedOutOfScope
+// MARKER and no verdict at all, so it names the marker instead of a verdict —
+// rendering not_validated there would swap one inaccuracy for another. Neither
+// branch contains the word "passed": no short-circuit path ever records a passed
+// verdict. noSpawnEvidence appends the dispatch verb's "no spawn evidence
+// recorded" clause (run_stage/drive_run never record spawn evidence in the first
+// place, so they pass false).
+func acceptanceShortCircuitWarning(res *AcceptanceAdmissionResult, noSpawnEvidence bool) string {
+	var msg string
+	if res.Basis != "" {
+		msg = fmt.Sprintf(
+			"acceptance stage short-circuited server-side to a %s verdict (%s) with no runner spawn and no preview — ZERO acceptance criteria were verified; the run is merge-eligible but this is NOT a validated pass: acknowledge that in your merge verdict (#2347)",
+			acceptanceVerdictNotValidated, shortCircuitLabel(res))
+	} else {
+		msg = fmt.Sprintf(
+			"acceptance stage short-circuited server-side (%s) with no runner spawn and no preview — the approved plan declared verification.out_of_scope with zero acceptance_criteria, so an %s marker was recorded and NO verdict; ZERO acceptance criteria were verified",
+			shortCircuitLabel(res), auditCategoryAcceptanceSkippedOutOfScope)
+	}
+	if noSpawnEvidence {
+		msg += "; no spawn evidence recorded"
+	}
+	return msg + "."
 }
 
 // resolveRunnerBinary resolves the fishhawk-runner binary path shared by

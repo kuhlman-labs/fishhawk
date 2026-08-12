@@ -10,12 +10,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
+
+// passedWordRe is a word-boundary, case-insensitive match for "passed" (#2458
+// binding condition 2): it must trip on "Passed" but NOT on "surpassed" or
+// "passed_criteria" (the underscore is a \w char, so no boundary follows "d").
+var passedWordRe = regexp.MustCompile(`(?i)\bpassed\b`)
 
 // --- helpers ---
 
@@ -2262,12 +2270,15 @@ func TestRunStage_AcceptanceShortCircuit_NoSpawn(t *testing.T) {
 	}
 	var noted bool
 	for _, w := range out.Warnings {
-		if strings.Contains(w, "short-circuited to a passed verdict") {
+		if strings.Contains(w, plan.AcceptanceVerdictNotValidated) {
 			noted = true
+		}
+		if passedWordRe.MatchString(w) {
+			t.Errorf("short-circuit warning must not name a passed verdict (#2458): %q", w)
 		}
 	}
 	if !noted {
-		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
+		t.Errorf("missing the short-circuit note naming %q; warnings: %v", plan.AcceptanceVerdictNotValidated, out.Warnings)
 	}
 }
 
@@ -2717,15 +2728,73 @@ func TestRunStage_AcceptanceShortCircuit_PostFetchFailure(t *testing.T) {
 		if strings.Contains(w, "post-short-circuit stage fetch failed") {
 			fetchWarn = true
 		}
-		if strings.Contains(w, "short-circuited to a passed verdict") {
+		if strings.Contains(w, plan.AcceptanceVerdictNotValidated) {
 			scNote = true
+		}
+		if passedWordRe.MatchString(w) {
+			t.Errorf("short-circuit warning must not name a passed verdict (#2458): %q", w)
 		}
 	}
 	if !fetchWarn {
 		t.Errorf("missing the degraded-fetch warning; warnings: %v", out.Warnings)
 	}
 	if !scNote {
-		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
+		t.Errorf("missing the short-circuit note naming %q; warnings: %v", plan.AcceptanceVerdictNotValidated, out.Warnings)
+	}
+}
+
+// TestAcceptanceShortCircuitWarning_Renders (#2458) pins the shared renderer's
+// wording against the three admission shapes the backend can return. The
+// basis-bearing expectation is plan.AcceptanceVerdictNotValidated — the SAME
+// constant backend/internal/orchestrator's emitAcceptanceOutcomeShortCircuit
+// marshals into the acceptance_outcome_recorded payload, not a duplicated
+// literal — so a future change to the recorded verdict fails this test until
+// the warning follows it. The out-of-scope case must name the
+// acceptance_skipped_out_of_scope marker and NO verdict (that path records no
+// verdict at all, #1657); no case may contain the word "passed" (the exact
+// defect #2458 closed: no short-circuit path ever records a passed verdict).
+func TestAcceptanceShortCircuitWarning_Renders(t *testing.T) {
+	cases := []struct {
+		name            string
+		res             *AcceptanceAdmissionResult
+		noSpawnEvidence bool
+	}{
+		{name: "out_of_scope_skip", res: &AcceptanceAdmissionResult{Kind: "out_of_scope_skip", Basis: ""}},
+		{name: "empty_criteria", res: &AcceptanceAdmissionResult{Kind: "empty_criteria", Basis: plan.AcceptanceBasisEmptyCriteria}},
+		{name: "all_skip_with_basis", res: &AcceptanceAdmissionResult{Kind: "all_skip_with_basis", Basis: plan.AcceptanceBasisAllSkipWithBasis}},
+		{name: "basis_bearing_no_spawn_evidence", res: &AcceptanceAdmissionResult{Kind: "empty_criteria", Basis: plan.AcceptanceBasisEmptyCriteria}, noSpawnEvidence: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := acceptanceShortCircuitWarning(tc.res, tc.noSpawnEvidence)
+
+			if passedWordRe.MatchString(got) {
+				t.Errorf("rendered warning must not contain the word %q: %s", "passed", got)
+			}
+			if !strings.Contains(strings.ToLower(got), "zero acceptance criteria were verified") {
+				t.Errorf("rendered warning must state zero criteria were verified: %s", got)
+			}
+
+			if tc.res.Basis != "" {
+				if !strings.Contains(got, plan.AcceptanceVerdictNotValidated) {
+					t.Errorf("basis-bearing warning must name %q: %s", plan.AcceptanceVerdictNotValidated, got)
+				}
+			} else {
+				if strings.Contains(got, plan.AcceptanceVerdictNotValidated) {
+					t.Errorf("out-of-scope warning must NOT name a verdict: %s", got)
+				}
+				if !strings.Contains(got, auditCategoryAcceptanceSkippedOutOfScope) {
+					t.Errorf("out-of-scope warning must name the skip marker %q: %s", auditCategoryAcceptanceSkippedOutOfScope, got)
+				}
+			}
+
+			if tc.noSpawnEvidence && !strings.Contains(got, "no spawn evidence recorded") {
+				t.Errorf("noSpawnEvidence=true must keep the 'no spawn evidence recorded' clause: %s", got)
+			}
+			if !tc.noSpawnEvidence && strings.Contains(got, "no spawn evidence recorded") {
+				t.Errorf("noSpawnEvidence=false must NOT carry the 'no spawn evidence recorded' clause: %s", got)
+			}
+		})
 	}
 }
 
@@ -2773,9 +2842,9 @@ func TestRunStage_HTTPTransportRefusesOmittedWorkingDir(t *testing.T) {
 // no-state ordering control to the ACCEPTANCE verb's EARLIEST state-committing
 // side effect: the acceptance-dispatch admission POST (#1928). For an acceptance
 // run_stage the admission call precedes the host-dispatch marker AND can settle
-// the stage server-side (short-circuit to a passed verdict), so it — not the
-// marker — is the earliest observable side effect. working_dir is resolved at
-// step (1z), ahead of the admission call, so an omitted working_dir over HTTP
+// the stage server-side (short-circuit to a not_validated verdict, #2347), so
+// it — not the marker — is the earliest observable side effect. working_dir is
+// resolved at step (1z), ahead of the admission call, so an omitted working_dir over HTTP
 // must refuse BEFORE any admission POST fires.
 //
 // The assertion lands on state (admissionCalledByID == 0), not error identity:

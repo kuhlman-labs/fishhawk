@@ -17,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
 
 // drive_run_test.go pins the fishhawk_drive_run loop (#1700) per-stop-mode
@@ -3768,11 +3769,23 @@ func TestDriveRun_AcceptanceShortCircuit_NoSpawn_ContinuesToMerge(t *testing.T) 
 	if admissionN < 1 {
 		t.Errorf("admission endpoint calls = %d, want >= 1", admissionN)
 	}
-	// A short-circuit DriveStep was appended.
+	// A short-circuit DriveStep was appended, naming the recorded not_validated
+	// verdict (#2347) and never the word "passed" (#2458): no short-circuit
+	// path ever records a passed verdict.
 	var noted bool
 	for _, s := range out.StepsTaken {
-		if s.Kind == "dispatch" && s.Stage == "acceptance" && strings.Contains(s.Note, "short-circuited server-side") {
-			noted = true
+		if s.Kind != "dispatch" || s.Stage != "acceptance" {
+			continue
+		}
+		if !strings.Contains(s.Note, "short-circuited server-side") {
+			continue
+		}
+		noted = true
+		if !strings.Contains(s.Note, plan.AcceptanceVerdictNotValidated) {
+			t.Errorf("short-circuit DriveStep note must name %q: %q", plan.AcceptanceVerdictNotValidated, s.Note)
+		}
+		if passedWordRe.MatchString(s.Note) {
+			t.Errorf("short-circuit DriveStep note must not name a passed verdict (#2458): %q", s.Note)
 		}
 	}
 	if !noted {
