@@ -1051,10 +1051,11 @@ func wireDTOLiterals(n ast.Node) []wireDTOLiteral {
 // container type typ (its spelled type at the top level, or the element/key/
 // value type handed down by a parent during recursion). It recurses into a
 // nil-Type element that is itself a container so a nested
-// `[][]ElidedField{{{...}}}` is covered.
+// `[][]ElidedField{{{...}}}` — or a pointer-wrapped one, `[]*[]ElidedField{{{...}}}`,
+// since unwrapContainerType strips the pointer — is covered.
 func wireDTOImplicitElements(lit *ast.CompositeLit, typ ast.Expr) []wireDTOLiteral {
 	var out []wireDTOLiteral
-	switch t := unparenType(typ).(type) {
+	switch t := unwrapContainerType(typ).(type) {
 	case *ast.ArrayType:
 		for _, el := range lit.Elts {
 			e := el
@@ -1098,15 +1099,24 @@ func resolveImplicitElement(expr ast.Expr, elemType ast.Expr) []wireDTOLiteral {
 	return out
 }
 
-// unparenType strips enclosing parentheses from a type expression so a
-// `([]ElidedField)` container is resolved like the bare form.
-func unparenType(expr ast.Expr) ast.Expr {
+// unwrapContainerType strips enclosing parentheses AND pointer indirections from
+// a type expression, so a `([]ElidedField)` or a `*[]ElidedField` container is
+// resolved to the underlying array/map like the bare form. The pointer unwrap
+// mirrors wireDTOTypeIdent's *ast.StarExpr handling, so parent-driven recursion
+// descends THROUGH a pointer-wrapped container — `[]*[]ElidedField{{{...}}}`,
+// whose element type is `*[]ElidedField` — into its implicitly-typed inner
+// elements instead of stopping at the pointer and leaving the inner literal
+// undetected (#2652 fix-up).
+func unwrapContainerType(expr ast.Expr) ast.Expr {
 	for {
-		p, ok := expr.(*ast.ParenExpr)
-		if !ok {
+		switch t := expr.(type) {
+		case *ast.ParenExpr:
+			expr = t.X
+		case *ast.StarExpr:
+			expr = t.X
+		default:
 			return expr
 		}
-		expr = p.X
 	}
 }
 
@@ -1280,6 +1290,33 @@ func TestWireDTOLiteralMatch(t *testing.T) {
 		{
 			name: "nested slice recursion",
 			src:  "package p\nvar _ = [][]ElidedField{\n\t{\n\t\t{Field: \"f\"},\n\t},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3", "ElidedField:4"},
+		},
+		{
+			// Pins the KeyValueExpr branch of the ArrayType arm: an INDEXED element
+			// (`[]T{0: {...}}`) is a KeyValueExpr whose Key is the integer index (not
+			// a DTO position) and whose Value is the element. Dropping the kv.Value
+			// unwrap, or resolving kv.Key against the element type, reddens this row.
+			name: "indexed slice element resolves via KeyValueExpr value",
+			src:  "package p\nvar _ = []ElidedField{\n\t0: {Field: \"f\"},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3"},
+		},
+		{
+			// Pins unwrapContainerType's ParenExpr stripping on the RECURSION path:
+			// the outer Elt is a parenthesized `([]ElidedField)`, so descending into
+			// the middle literal's own element requires stripping the paren. Without
+			// it the innermost `{Field: "f"}` (line 4) goes undetected.
+			name: "parenthesized element type recurses",
+			src:  "package p\nvar _ = []([]ElidedField){\n\t{\n\t\t{Field: \"f\"},\n\t},\n}\n",
+			want: []string{"ElidedField:2", "ElidedField:3", "ElidedField:4"},
+		},
+		{
+			// Pins the #2652 fix-up: the outer Elt is a pointer-wrapped container
+			// `*[]ElidedField`, so parent-driven recursion must strip the pointer to
+			// reach the innermost `{Field: "f"}` (line 4). Without the StarExpr unwrap
+			// in unwrapContainerType the recursion stops at the pointer and drops it.
+			name: "pointer-wrapped container recurses",
+			src:  "package p\nvar _ = []*[]ElidedField{\n\t{\n\t\t{Field: \"f\"},\n\t},\n}\n",
 			want: []string{"ElidedField:2", "ElidedField:3", "ElidedField:4"},
 		},
 		// --- negative: the positive control (must return ZERO findings) --------
