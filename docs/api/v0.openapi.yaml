@@ -10576,7 +10576,18 @@ paths:
               409 with `blocking_checks_not_passed` when any declared
               blocking check wasn't `pass`. ADR-017 / #249 moved that
               gate to GitHub branch protection; the approval API no
-              longer reads stage_check state.)
+              longer reads stage_check state.) The same code also
+              covers a RACED SECOND APPROVAL (E50.15 / #2656): the
+              approve advance is a compare-and-swap anchored on the
+              state this request observed when it loaded the stage,
+              so an approval that a concurrent approval already
+              advanced is refused here instead of silently re-running
+              the post-approval side effects (split-proposal child
+              filing, live-validation walk filing). `details` carries
+              `stage_id`, `from` (the state this request observed)
+              and `state` (the drifted actual state). The losing
+              approval row and its `approval_submitted` audit entry
+              are still recorded — only the advance is refused.
             - `review_stage_managed_by_github` — the target stage is
               a review stage. ADR-018 / #311 moved review-stage
               approval onto GitHub: the `pull_request.closed`
