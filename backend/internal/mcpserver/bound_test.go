@@ -976,6 +976,29 @@ func TestElisions_BelowFloorAdvertisement_ReportsCouldNotHonour(t *testing.T) {
 // asserts every composite literal of Elisions / ElidedField outside the test
 // files occurs inside wire() / wireField(). A second construction path bypasses
 // the validation pass, so it must fail the package tests.
+//
+// The enclosing scope is DERIVED from the declaration being walked — each
+// *ast.FuncDecl is inspected under its own name and every other declaration
+// under an explicit package-scope sentinel — never carried across the walk in a
+// mutable variable. The earlier shape remembered the last FuncDecl name and
+// never restored it, so a package-level literal placed lexically AFTER wire()
+// or wireField() inherited an allowed producer's name and escaped the pin
+// outright, while one placed after any other function was reported against the
+// wrong scope (#2514). Deriving the scope per declaration makes the verdict
+// independent of source position.
+//
+// What this pin does NOT establish: it matches a composite literal whose Type
+// is an *ast.Ident, so it sees `Elisions{...}`, `ElidedField{...}` and the
+// address-of form `&Elisions{...}` (the & is a UnaryExpr wrapping a still
+// Ident-typed literal) — and it does NOT see a compound-typed construction such
+// as `[]ElidedField{...}`, whose Type is an *ast.ArrayType, nor that literal's
+// implicitly-typed inner elements (`{{Field: "f"}}`), which carry no Type node
+// at all. Both limits were measured, not inferred; widening the match to that
+// class is deliberately out of scope for #2514. So the guarantee is "an
+// Ident-typed literal is caught at any source position", not "no second
+// construction path exists". This is defence in depth behind
+// validateWireElisions, which runs inside wire() and is the actual runtime
+// enforcement — not a substitute for it.
 func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 	// Enumerate the package DIRECTORY, not a hard-coded file list, or a newly
 	// added production file would escape the discipline. _test.go files are
@@ -987,6 +1010,11 @@ func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 	}
 	fset := token.NewFileSet()
 	allowedIn := map[string]bool{"wire": true, "wireField": true}
+	// packageScope is the scope reported for a literal in a non-function
+	// declaration. Its spelling is deliberately not a valid Go identifier, so it
+	// can never equal an *ast.Ident name and can never collide its way back into
+	// allowedIn.
+	const packageScope = "package scope (no enclosing function)"
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
@@ -996,12 +1024,16 @@ func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		var enclosing string
-		ast.Inspect(file, func(n ast.Node) bool {
-			switch node := n.(type) {
-			case *ast.FuncDecl:
-				enclosing = node.Name.Name
-			case *ast.CompositeLit:
+		// inspectDecl reports every Elisions / ElidedField literal under decl,
+		// attributed to enclosing. The scope is a PARAMETER — supplied by the
+		// caller from the declaration it is about to walk — so it cannot leak
+		// from one declaration into the next.
+		inspectDecl := func(decl ast.Node, enclosing string) {
+			ast.Inspect(decl, func(n ast.Node) bool {
+				node, ok := n.(*ast.CompositeLit)
+				if !ok {
+					return true
+				}
 				id, ok := node.Type.(*ast.Ident)
 				if !ok || (id.Name != "Elisions" && id.Name != "ElidedField") {
 					return true
@@ -1010,9 +1042,20 @@ func TestProjectionIsSoleProducerOfWireDTO(t *testing.T) {
 					t.Errorf("%s:%d: %s composite literal in %q — the wire DTO has exactly one producer, (elisionLedger).wire()/wireField(), so every entry passes validateWireElisions",
 						name, fset.Position(node.Pos()).Line, id.Name, enclosing)
 				}
+				return true
+			})
+		}
+		for _, decl := range file.Decls {
+			// Inspect the whole FuncDecl, not just its Body: a nil body (an
+			// assembly or external declaration) is skipped by ast.Walk, and
+			// receivers, signatures and nested func literals stay attributed to
+			// the named function that owns them.
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				inspectDecl(fn, fn.Name.Name)
+				continue
 			}
-			return true
-		})
+			inspectDecl(decl, packageScope)
+		}
 	}
 }
 
