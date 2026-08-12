@@ -495,8 +495,11 @@ type AcceptanceCriterion struct {
 	// against the localhost preview (its trigger needs an external event the
 	// default-deny egress sandbox cannot produce). When true, ExpectationBasis
 	// is required (enforced by the schema's presence-aware if/then). A plan
-	// whose every criterion is so marked short-circuits acceptance dispatch to a
-	// passed verdict (AcceptanceBasisAllSkipWithBasis). Additive-optional (#1748).
+	// whose every criterion is so marked short-circuits acceptance dispatch to
+	// an AcceptanceVerdictNotValidated verdict (basis
+	// AcceptanceBasisAllSkipWithBasis), NEVER a passed one (#2347): the
+	// short-circuit spawns no runner and verifies ZERO criteria, so the run is
+	// merge-eligible but is NOT a validated pass. Additive-optional (#1748).
 	SkipExpected bool `json:"skip_expected,omitempty"`
 	// ExpectationBasis cites where the criterion's expectation is actually
 	// validated (e.g. the integration/e2e test with a fake). Required when
