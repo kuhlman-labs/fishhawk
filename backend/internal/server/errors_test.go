@@ -37,6 +37,79 @@ func driveWriteError(t *testing.T, s *Server, reqID string, status int, code, ms
 	return rec
 }
 
+// writeErrorNoMiddleware calls s.writeError DIRECTLY on a bare
+// httptest.NewRequest, with NO requestID wrapper. Bypassing the middleware IS
+// the point: requestID mints an id whenever X-Request-ID is empty or
+// over-length (middleware.go), so no input to driveWriteError can make
+// RequestIDFrom(r.Context()) return "". A request context that never passed
+// through the middleware is the only way to reach the empty-ref edge, and it
+// seeds that state BY CONSTRUCTION — the test never calls RequestIDFrom in its
+// own setup to establish it. The state is unreachable in production today
+// (every route is wrapped by requestID), so the tests below guard a future
+// refactor that drops or reorders that wrapper.
+func writeErrorNoMiddleware(t *testing.T, s *Server, status int, code, msg string, details map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/anything", nil)
+	rec := httptest.NewRecorder()
+	s.writeError(rec, req, status, code, msg, details)
+	return rec
+}
+
+// TestWriteError_5xxWithoutRequestIDOmitsErrorRef pins the no-request-id edge
+// of writeError (E67.30 / #2636): when RequestIDFrom returns "", the 5xx body
+// OMITS the error_ref member entirely rather than shipping it present-and-empty
+// — the claim errorBody.ErrorRef's doc comment makes and that
+// TestWriteError_5xxSetsErrorRefFromRequestID cannot reach, since it drives
+// every call through the real middleware. Assertions are on the SHIPPED bytes,
+// so a comment-only touch of errors.go cannot satisfy them. Counterfactuals:
+// deleting `,omitempty` from errorBody.ErrorRef's json tag renders
+// `"error_ref":""` and (1) deleting `bodyRef = ref` in favor of a non-empty
+// placeholder fabricates a ref on this path — each fails both the byte-exact
+// comparison and the raw-substring guard.
+func TestWriteError_5xxWithoutRequestIDOmitsErrorRef(t *testing.T) {
+	tests := []struct {
+		name    string
+		details map[string]any
+		want    string
+	}{
+		{
+			name:    "nil details",
+			details: nil,
+			want:    `{"error":{"code":"internal_error","message":"boom"}}` + "\n",
+		},
+		{
+			// An allow-listed key proves the 5xx redaction path still ran and
+			// that ONLY error_ref is missing from the envelope.
+			name:    "allow-listed detail survives",
+			details: map[string]any{"run_id": "r1"},
+			want:    `{"error":{"code":"internal_error","message":"boom","details":{"run_id":"r1"}}}` + "\n",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, buf := errServerWithLog(t)
+			rec := writeErrorNoMiddleware(t, s, http.StatusInternalServerError,
+				"internal_error", "boom", tc.details)
+
+			if got := rec.Body.String(); got != tc.want {
+				t.Errorf("5xx body without a request id is not byte-exact:\n got: %q\nwant: %q", got, tc.want)
+			}
+			// Guard on the key NAME too, so a present-but-empty `"error_ref":""`
+			// fails on the substring alone and not only on byte equality.
+			if strings.Contains(rec.Body.String(), "error_ref") {
+				t.Errorf("error_ref must be omitted when no request id is present: %s", rec.Body.String())
+			}
+
+			// The operator-side record is still emitted, degraded to an
+			// un-correlatable-but-present line rather than suppressed.
+			logged := soleLogRecord(t, buf, "http error response")
+			if ref, ok := logged["error_ref"].(string); !ok || ref != "" {
+				t.Errorf("log error_ref = %v, want the empty string", logged["error_ref"])
+			}
+		})
+	}
+}
+
 // TestWriteError_5xxDropsNonAllowlistedDetails is counterfactual (1): the 5xx
 // allow-list drops every non-allow-listed detail key. The bad state is seeded
 // BY CONSTRUCTION — a literal details map — not by calling the control in setup.
