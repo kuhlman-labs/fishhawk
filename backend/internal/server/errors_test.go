@@ -239,6 +239,159 @@ func TestWriteError_AlwaysStripsInternalCauseKey(t *testing.T) {
 	}
 }
 
+// TestWriteError_4xxLogsInternalCauseToOperator pins the fold of the
+// internalCauseKey channel into the operator log at a NON-5xx status
+// (E67.31 / #2637). Before this change the `cause` attribute was appended only
+// inside writeError's `status >= 500` branch while the body strip was already
+// unconditional, so a 4xx call site handing a cause through the channel lost it
+// entirely — neither the caller nor the operator saw it. The assertions read
+// EMITTED STATE (the captured slog record) and SHIPPED BYTES, never a comment:
+// a comment-only touch of errors.go fails the log-attribute assertion.
+//
+// The asymmetry this test encodes: at 4xx the LOG RECORD carries error_ref (the
+// request id, from writeError's unconditional attr slice) while the BODY omits
+// it, so correlation is operator-side only. Case (d) is the 5xx control — the
+// pre-existing behavior (cause AND pre-redaction details in the record,
+// error_ref in the body) must be unregressed by widening the append.
+//
+// Every planted cause is a literal in the table, seeded BY CONSTRUCTION: the
+// test never calls splitInternalCause or writeError in setup to establish it,
+// so a counterfactual RED lands on the behavioral assertion, not on fixtures.
+func TestWriteError_4xxLogsInternalCauseToOperator(t *testing.T) {
+	const planted4xx = "storage: update scope amendment: pgx: SQLSTATE 42P01 at ghe.internal.example.com"
+	const planted5xx = "workmgmt/github: create issue: https://ghe.internal.example.com 500 42P01"
+
+	tests := []struct {
+		name    string
+		reqID   string
+		status  int
+		code    string
+		msg     string
+		details map[string]any
+		// wantBody is the byte-exact shipped response body.
+		wantBody string
+		// wantCause is the expected `cause` log attribute; "" means the key
+		// must be ABSENT from the record entirely (not present-and-empty).
+		wantCause string
+		// wantBodyRef is the expected error_ref member of the body ("" = omitted).
+		wantBodyRef string
+		// wantLoggedDetails names a key that must appear under the record's
+		// pre-redaction `details` attribute; "" means no `details` attribute.
+		wantLoggedDetails string
+	}{
+		{
+			// (a) The whole point: 4xx WITH a cause alongside a legitimate
+			// detail key. Body verbatim and cause-free; log carries the cause.
+			name:    "4xx with cause: stripped from body, folded into the log",
+			reqID:   "corr-4xx-a",
+			status:  http.StatusBadRequest,
+			code:    "validation_failed",
+			msg:     "bad",
+			details: map[string]any{"field": "repo", internalCauseKey: planted4xx},
+			wantBody: `{"error":{"code":"validation_failed","message":"bad",` +
+				`"details":{"field":"repo"}}}` + "\n",
+			wantCause:   planted4xx,
+			wantBodyRef: "",
+		},
+		{
+			// (b) No internalCauseKey at all: the record must carry NO `cause`
+			// key, so the common-path record is unchanged by this widening.
+			name:      "4xx with no cause key: no cause attribute",
+			reqID:     "corr-4xx-b",
+			status:    http.StatusBadRequest,
+			code:      "validation_failed",
+			msg:       "bad",
+			details:   map[string]any{"field": "repo"},
+			wantBody:  `{"error":{"code":"validation_failed","message":"bad","details":{"field":"repo"}}}` + "\n",
+			wantCause: "",
+		},
+		{
+			// (c) internalCauseKey PRESENT but EMPTY: the retained `cause != ""`
+			// guard must suppress the attribute entirely. An empty attribute
+			// (`"cause":""`) is a distinct regression from a missing one, so
+			// this asserts ABSENCE of the key, not an empty value.
+			name:      "4xx with empty cause value: still no cause attribute",
+			reqID:     "corr-4xx-c",
+			status:    http.StatusBadRequest,
+			code:      "validation_failed",
+			msg:       "bad",
+			details:   map[string]any{"field": "repo", internalCauseKey: ""},
+			wantBody:  `{"error":{"code":"validation_failed","message":"bad","details":{"field":"repo"}}}` + "\n",
+			wantCause: "",
+		},
+		{
+			// (d) 5xx CONTROL — unregressed: the record still carries BOTH the
+			// cause AND the pre-redaction details, and the body still carries
+			// error_ref. `details` remains deliberately 5xx-gated.
+			name:    "5xx control: cause, pre-redaction details, and a body error_ref",
+			reqID:   "corr-5xx-d",
+			status:  http.StatusInternalServerError,
+			code:    "internal_error",
+			msg:     "boom",
+			details: map[string]any{"run_id": "r9", internalCauseKey: planted5xx},
+			wantBody: `{"error":{"code":"internal_error","message":"boom",` +
+				`"details":{"run_id":"r9"},"error_ref":"corr-5xx-d"}}` + "\n",
+			wantCause:         planted5xx,
+			wantBodyRef:       "corr-5xx-d",
+			wantLoggedDetails: "run_id",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s, buf := errServerWithLog(t)
+			rec := driveWriteError(t, s, tc.reqID, tc.status, tc.code, tc.msg, tc.details)
+
+			// SHIPPED BYTES: byte-exact, so a stray error_ref, a surviving
+			// "__cause" member, or a leaked cause all fail here.
+			if got := rec.Body.String(); got != tc.wantBody {
+				t.Errorf("body not byte-exact:\n got: %q\nwant: %q", got, tc.wantBody)
+			}
+			if strings.Contains(rec.Body.String(), internalCauseKey) {
+				t.Errorf("internal cause key leaked into the body: %s", rec.Body.String())
+			}
+			if tc.wantCause != "" && strings.Contains(rec.Body.String(), tc.wantCause) {
+				t.Errorf("cause leaked into the body: %s", rec.Body.String())
+			}
+			if tc.wantBodyRef == "" && strings.Contains(rec.Body.String(), "error_ref") {
+				t.Errorf("error_ref must be absent from a 4xx body: %s", rec.Body.String())
+			}
+
+			// EMITTED STATE: exactly one record, carrying error_ref at EVERY
+			// status (it is unconditional) and the cause per the branch.
+			logged := soleLogRecord(t, buf, "http error response")
+			if logged["error_ref"] != tc.reqID {
+				t.Errorf("log error_ref = %v, want %q", logged["error_ref"], tc.reqID)
+			}
+			if tc.wantCause == "" {
+				if _, present := logged["cause"]; present {
+					t.Errorf("log record must carry NO cause key, got %#v", logged["cause"])
+				}
+			} else {
+				if cause, _ := logged["cause"].(string); cause != tc.wantCause {
+					t.Errorf("log cause = %#v, want the full planted cause %q", logged["cause"], tc.wantCause)
+				}
+			}
+
+			// `details` stays 5xx-gated: present with the pre-redaction keys on
+			// the control, absent on every 4xx case.
+			if tc.wantLoggedDetails == "" {
+				if _, present := logged["details"]; present {
+					t.Errorf("4xx record must carry no details attribute, got %#v", logged["details"])
+				}
+			} else {
+				d, ok := logged["details"].(map[string]any)
+				if !ok {
+					t.Fatalf("5xx record details = %#v, want a map", logged["details"])
+				}
+				if _, present := d[tc.wantLoggedDetails]; !present {
+					t.Errorf("5xx record details missing %q: %#v", tc.wantLoggedDetails, d)
+				}
+			}
+		})
+	}
+}
+
 // TestRedactableDetailKeys_ExcludesErrorAndAdmitsSurveyedKeys pins the SHIPPED
 // allow-list table's observable effect (DONE-MEANS): "error" is dropped and
 // every surveyed key survives a redaction round-trip. A comment-only or no-op
