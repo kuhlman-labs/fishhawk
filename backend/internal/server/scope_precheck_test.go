@@ -247,6 +247,59 @@ func TestScopePrecheck_GeneratedPathsExemptFromScannedCount(t *testing.T) {
 	}
 }
 
+// TestScopePrecheck_MinChangedFilesReported is the #2415 done-means assertion:
+// the plan_scope_precheck payload carries min_changed_files, and for a
+// rename-shaped scope (declared delete+create pairs) it DIFFERS from
+// scanned_files — 2 creates + 2 deletes give scanned_files 4 but a minimum
+// physical count of 2 (each pair can collapse into one rename row). A no-op or
+// comment-only touch of the payload struct that failed to populate the field
+// would leave it 0 and fail this test.
+func TestScopePrecheck_MinChangedFilesReported(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/new1.go", Operation: plan.FileOpCreate},
+		{Path: "backend/new2.go", Operation: plan.FileOpCreate},
+		{Path: "backend/old1.go", Operation: plan.FileOpDelete},
+		{Path: "backend/old2.go", Operation: plan.FileOpDelete},
+	})
+
+	s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+
+	got := lastScopePrecheckEntry(t, au)
+	if got.ScannedFiles != 4 {
+		t.Errorf("ScannedFiles = %d, want 4", got.ScannedFiles)
+	}
+	if got.MinChangedFiles != 2 {
+		t.Errorf("MinChangedFiles = %d, want 2 (2 delete+create pairs collapse to 2 rename rows)", got.MinChangedFiles)
+	}
+	if got.MinChangedFiles == got.ScannedFiles {
+		t.Errorf("min_changed_files (%d) must DIFFER from scanned_files (%d) for a rename-shaped scope", got.MinChangedFiles, got.ScannedFiles)
+	}
+}
+
+// TestScopePrecheck_MinChangedFilesExemptsGenerated asserts min_changed_files
+// applies the same generated/vendored exemption as scanned_files (#2415): a
+// generated-path-heavy scope reports both counts exempted.
+func TestScopePrecheck_MinChangedFilesExemptsGenerated(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := scopePlanBody(t, []plan.ScopeFile{
+		{Path: "backend/internal/audit/db/queries.sql.go", Operation: plan.FileOpDelete},
+		{Path: "backend/internal/audit/db/models.go", Operation: plan.FileOpCreate},
+		{Path: "backend/real.go", Operation: plan.FileOpModify},
+	})
+
+	s.runScopePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+
+	got := lastScopePrecheckEntry(t, au)
+	if got.ScannedFiles != 1 {
+		t.Errorf("ScannedFiles = %d, want 1 (db paths exempt)", got.ScannedFiles)
+	}
+	// The db create+delete pair is exempt, leaving only the single real modify.
+	if got.MinChangedFiles != 1 {
+		t.Errorf("MinChangedFiles = %d, want 1 (generated create/delete exempt)", got.MinChangedFiles)
+	}
+}
+
 func TestScopePrecheck_CleanScopeWritesEmptyViolations(t *testing.T) {
 	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
 	body := scopePlanBody(t, []plan.ScopeFile{

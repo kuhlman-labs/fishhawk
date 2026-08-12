@@ -889,8 +889,22 @@ type approvalResult struct {
 //   - 422 plan_violates_scope_cap (#983: effective scope.files — plan
 //     scope plus add_scope_files — exceeds the implement stage's
 //     max_files_changed; re-scope the plan or include
-//     --override-scope-cap in the comment. Also pre-insert and
-//     override-retryable, same as plan_violates_budget)
+//     --override-scope-cap in the comment. Pre-insert. The override
+//     retry succeeds ONLY when the scope's minimum physical changed-file
+//     count fits the cap; when min_changed_files already exceeds the cap
+//     the override is refused (see plan_scope_cap_override_unavailable))
+//   - 422 plan_scope_cap_override_unavailable (#2415: an approve carrying
+//     --override-scope-cap was REFUSED because the effective scope's
+//     minimum physical changed-file count already exceeds the
+//     run-immutable max_files_changed cap — the override clears only the
+//     declared-scope pre-check, but the implement stage re-checks the real
+//     diff against a cap fixed for the run, so no override can make this
+//     scope land. Pre-insert (no approval row), and a
+//     plan_scope_cap_override_refused audit entry is written. details carry
+//     stage_id, scoped_files, min_changed_files, max_files_changed,
+//     add_scope_files_count, remove_scope_files_count. Remediation: drop
+//     declared paths via remove_scope_files, or raise max_files_changed
+//     through a governed spec change and start a fresh run)
 //   - 422 plan_add_scope_files_fans_into_slices (#2103: add_scope_files
 //     was supplied on a DECOMPOSED plan; an added path fans into EVERY
 //     sub-plan slice, violating single-owner-file and guaranteeing an

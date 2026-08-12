@@ -258,3 +258,190 @@ func TestEffectiveScopeHeadroom_CountsPriorSliceAdds(t *testing.T) {
 		}
 	})
 }
+
+// TestMinPhysicalFileCount table-drives the #2415 minimum-physical-file
+// estimator on every branch: modify-only (no pairing), equal creates/deletes
+// (full rename pairing), unequal creates/deletes (max wins), generated/vendored
+// exemption (parity with policy.CountedFileCount), unknown-op paths (an
+// add_scope_files/amendment path with no ops entry counts one each), the empty
+// set, and the HONEST-LIMIT case where an UNDECLARED create paired with a
+// declared delete makes the estimate OVER-count the true physical diff.
+func TestMinPhysicalFileCount(t *testing.T) {
+	cases := []struct {
+		name  string
+		paths []string
+		ops   map[string]plan.FileOperation
+		want  int
+	}{
+		{
+			name:  "empty set",
+			paths: nil,
+			ops:   nil,
+			want:  0,
+		},
+		{
+			name:  "all modify, no pairing",
+			paths: []string{"a.go", "b.go", "c.go"},
+			ops:   map[string]plan.FileOperation{"a.go": plan.FileOpModify, "b.go": plan.FileOpModify, "c.go": plan.FileOpModify},
+			want:  3,
+		},
+		{
+			name:  "equal creates and deletes pair to N",
+			paths: []string{"new1.go", "new2.go", "old1.go", "old2.go"},
+			ops: map[string]plan.FileOperation{
+				"new1.go": plan.FileOpCreate, "new2.go": plan.FileOpCreate,
+				"old1.go": plan.FileOpDelete, "old2.go": plan.FileOpDelete,
+			},
+			// others=0, max(2,2)=2 — two delete+create pairs can each collapse
+			// into one rename row.
+			want: 2,
+		},
+		{
+			name:  "unequal creates and deletes take the max",
+			paths: []string{"n1.go", "n2.go", "n3.go", "o1.go"},
+			ops: map[string]plan.FileOperation{
+				"n1.go": plan.FileOpCreate, "n2.go": plan.FileOpCreate, "n3.go": plan.FileOpCreate,
+				"o1.go": plan.FileOpDelete,
+			},
+			// others=0, max(3,1)=3 — only one pair can collapse; two creates
+			// remain unpaired.
+			want: 3,
+		},
+		{
+			name:  "modifies plus a balanced rename pair",
+			paths: []string{"keep.go", "new.go", "old.go"},
+			ops: map[string]plan.FileOperation{
+				"keep.go": plan.FileOpModify,
+				"new.go":  plan.FileOpCreate,
+				"old.go":  plan.FileOpDelete,
+			},
+			// others=1, max(1,1)=1 → 2.
+			want: 2,
+		},
+		{
+			name:  "generated and vendored paths exempt",
+			paths: []string{"backend/internal/x/db/queries.sql.go", "vendor/foo/bar.go", "backend/real.go"},
+			ops: map[string]plan.FileOperation{
+				"backend/internal/x/db/queries.sql.go": plan.FileOpModify,
+				"vendor/foo/bar.go":                    plan.FileOpModify,
+				"backend/real.go":                      plan.FileOpModify,
+			},
+			// Only backend/real.go is counted — the db/ and vendor/ paths are
+			// exempt exactly as policy.CountedFileCount exempts them.
+			want: 1,
+		},
+		{
+			name:  "unknown-op paths count one each",
+			paths: []string{"declared.go", "added1.go", "added2.go"},
+			ops:   map[string]plan.FileOperation{"declared.go": plan.FileOpModify},
+			// added1/added2 have no ops entry (an add_scope_files/amendment
+			// path) → treated as non-pairing modifies, one each.
+			want: 3,
+		},
+		{
+			name:  "honest limit: undeclared create over-counts a real rename",
+			paths: []string{"old.go", "new.go"},
+			// Only the delete is declared; the create carries no ops entry, so
+			// the estimator cannot pair them. deletes=1, others=1 → 2, while
+			// git would emit ONE rename row (physical 1). The estimate is a
+			// generous OVER-count here — never an under-count — so the refusal
+			// it feeds can only over-refuse, never admit an over-cap landing.
+			ops:  map[string]plan.FileOperation{"old.go": plan.FileOpDelete},
+			want: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := minPhysicalFileCount(tc.paths, tc.ops); got != tc.want {
+				t.Errorf("minPhysicalFileCount() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEffectiveScopePathSetWithOps_ConsistentOpsMap asserts the ops map the
+// #2415 helper returns is consistent with its returned path set: every key is a
+// surviving path, a removed plan path is absent from BOTH, and each plan-
+// declared surviving path carries its declared operation. It also proves an
+// add_scope_files path is present in the path set but carries NO ops entry (the
+// non-pairing-modify case minPhysicalFileCount reads).
+func TestEffectiveScopePathSetWithOps_ConsistentOpsMap(t *testing.T) {
+	scopeFiles := []plan.ScopeFile{
+		{Path: "backend/keep.go", Operation: plan.FileOpModify},
+		{Path: "backend/old.go", Operation: plan.FileOpDelete},
+		{Path: "backend/drop.go", Operation: plan.FileOpCreate},
+	}
+	s, _, _, runRow, _ := newHeadroomServer(t, specImplementPathConstraints, scopeFiles)
+
+	paths, ops, maxFiles, ok := s.effectiveScopePathSetWithOps(
+		context.Background(), runRow.ID,
+		[]string{"backend/added.go"}, // add
+		[]string{"backend/drop.go"},  // remove a declared create
+	)
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if maxFiles != 3 {
+		t.Errorf("maxFiles = %d, want 3", maxFiles)
+	}
+
+	pathSet := map[string]bool{}
+	for _, p := range paths {
+		pathSet[p] = true
+	}
+	// The removed declared path is gone from the path set AND the ops map.
+	if pathSet["backend/drop.go"] {
+		t.Errorf("removed path still in path set: %v", paths)
+	}
+	if _, present := ops["backend/drop.go"]; present {
+		t.Errorf("removed path still in ops map: %v", ops)
+	}
+	// Every ops key is a surviving path.
+	for k := range ops {
+		if !pathSet[k] {
+			t.Errorf("ops key %q is not in the returned path set %v", k, paths)
+		}
+	}
+	// Declared surviving paths carry their declared operation.
+	if ops["backend/keep.go"] != plan.FileOpModify {
+		t.Errorf("ops[keep] = %q, want modify", ops["backend/keep.go"])
+	}
+	if ops["backend/old.go"] != plan.FileOpDelete {
+		t.Errorf("ops[old] = %q, want delete", ops["backend/old.go"])
+	}
+	// The add_scope_files path is in the set but carries no ops entry.
+	if !pathSet["backend/added.go"] {
+		t.Errorf("added path missing from path set: %v", paths)
+	}
+	if _, present := ops["backend/added.go"]; present {
+		t.Errorf("add_scope_files path unexpectedly has an ops entry: %v", ops)
+	}
+}
+
+// TestEffectiveScopePathSetWithOps_FailOpenLegs asserts the single ok=false
+// fail-open contract (#2415): whenever paths do not resolve, ops is nil too —
+// there is no distinct "ops unavailable" state, so ok governs the whole
+// resolution.
+func TestEffectiveScopePathSetWithOps_FailOpenLegs(t *testing.T) {
+	t.Run("missing spec", func(t *testing.T) {
+		s, _, _, runRow, _ := newHeadroomServer(t, nil, []plan.ScopeFile{{Path: "a.go", Operation: plan.FileOpModify}})
+		paths, ops, _, ok := s.effectiveScopePathSetWithOps(context.Background(), runRow.ID, nil, nil)
+		if ok || paths != nil || ops != nil {
+			t.Errorf("want (nil,nil,_,false) on missing spec; got paths=%v ops=%v ok=%v", paths, ops, ok)
+		}
+	})
+	t.Run("missing plan", func(t *testing.T) {
+		s, _, _, runRow, _ := newHeadroomServer(t, specImplementPathConstraints, nil)
+		paths, ops, _, ok := s.effectiveScopePathSetWithOps(context.Background(), runRow.ID, nil, nil)
+		if ok || paths != nil || ops != nil {
+			t.Errorf("want (nil,nil,_,false) on missing plan; got paths=%v ops=%v ok=%v", paths, ops, ok)
+		}
+	})
+	t.Run("missing run", func(t *testing.T) {
+		s, _, _, _, _ := newHeadroomServer(t, specImplementPathConstraints, nil)
+		paths, ops, _, ok := s.effectiveScopePathSetWithOps(context.Background(), uuid.New(), nil, nil)
+		if ok || paths != nil || ops != nil {
+			t.Errorf("want (nil,nil,_,false) on missing run; got paths=%v ops=%v ok=%v", paths, ops, ok)
+		}
+	})
+}

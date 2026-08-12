@@ -613,7 +613,7 @@ type GetPlanOutput struct {
 	// multi-slice decomposition with every sub_plan omitting depends_on
 	// (the shape that wedged #1551's first attempt), plus the sub-plan
 	// runtime-sum and expensive-gate-vs-budget advisories.
-	PlanWarnings []string `json:"plan_warnings,omitempty" jsonschema:"plan-gate soft advisories (#1684): notably flags a multi-slice decomposition where every sub_plan omits depends_on — if any slice forms a producer->consumer chain, all slices run in parallel in wave 0 and the consumer can fail typecheck against the not-yet-integrated symbol (the shape that wedged #1551's first attempt). Also flags a sub-plan predicted_runtime_minutes sum less than the parent's (possible scope compression) and an expensive test_strategy gate paired with an under-budgeted predicted_runtime_minutes. Flags an over-cap plan (scope.files exceeds the implement-stage max_files_changed cap) and, one step earlier, a NEAR-cap plan (#2492): scope.files lands within a few files of the cap, so it names the count, cap and remaining headroom and warns that once that headroom is spent the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any further file (stated more emphatically for a decomposed plan, where all slices draw against the ONE whole-plan budget). On a near-cap advisory: approve knowing there is no amendment headroom for a mid-stage fix, or narrow the scope / re-plan first. Advisory, never blocks approval. Absent when no advisory fired or on older runs predating this pass"`
+	PlanWarnings []string `json:"plan_warnings,omitempty" jsonschema:"plan-gate soft advisories (#1684): notably flags a multi-slice decomposition where every sub_plan omits depends_on — if any slice forms a producer->consumer chain, all slices run in parallel in wave 0 and the consumer can fail typecheck against the not-yet-integrated symbol (the shape that wedged #1551's first attempt). Also flags a sub-plan predicted_runtime_minutes sum less than the parent's (possible scope compression) and an expensive test_strategy gate paired with an under-budgeted predicted_runtime_minutes. Flags an over-cap plan (scope.files exceeds the implement-stage max_files_changed cap) and, one step earlier, a NEAR-cap plan (#2492): scope.files lands within a few files of the cap, so it names the count, cap and remaining headroom and warns that once that headroom is spent the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any further file (stated more emphatically for a decomposed plan, where all slices draw against the ONE whole-plan budget). On a near-cap advisory: approve knowing there is no amendment headroom for a mid-stage fix, or narrow the scope / re-plan first. Also flags an UNLANDABLE plan (#2415): when the scope's minimum PHYSICAL changed-file count exceeds the cap the plan cannot land in this run even with --override-scope-cap (which is refused at approval), so it names the two levers — remove_scope_files, or a governed cap raise plus a fresh run. Advisory, never blocks approval. Absent when no advisory fired or on older runs predating this pass"`
 	// Reachability surfaces the runner-side symbol-reachability sweep (#2056):
 	// the plan's split_proposal phase partition validated against the compiler's
 	// view of the working tree, with per-phase declared-vs-derived file counts
@@ -823,11 +823,15 @@ type ScopePrecheckViolation struct {
 // ScannedFiles is the number of scope.files the pre-check evaluated.
 type ScopePrecheck struct {
 	Violations   []ScopePrecheckViolation `json:"violations,omitempty" jsonschema:"path-constraint mismatches; empty when the plan's scope.files satisfy the implement stage's forbidden_paths/allowed_paths/max_files_changed"`
-	ScannedFiles int                      `json:"scanned_files" jsonschema:"number of scope.files the pre-check evaluated"`
+	ScannedFiles int                      `json:"scanned_files" jsonschema:"number of scope.files the pre-check evaluated (the declared entry count, generated/vendored paths exempted). This is NOT the number the implement stage's hard gate counts — read min_changed_files for that"`
 	// MaxFilesChanged is the resolved implement-stage cap (#983).
 	// Omitted (0) on payloads from older backends and when no cap is
 	// configured.
-	MaxFilesChanged int `json:"max_files_changed,omitempty" jsonschema:"the implement stage's resolved max_files_changed cap; read headroom as max_files_changed - scanned_files before approving (add_scope_files and mid-stage amendments consume it). A non-empty violations[] containing a max_files_changed entry means this plan cannot pass the implement stage it configures as scoped — re-scope, decompose, or approve with --override-scope-cap. Absent when no cap is configured or the backend predates #983"`
+	MaxFilesChanged int `json:"max_files_changed,omitempty" jsonschema:"the implement stage's resolved max_files_changed cap; read headroom as max_files_changed - min_changed_files (NOT scanned_files) before approving, because the implement stage's hard gate counts PHYSICAL changed files. A non-empty violations[] containing a max_files_changed entry means this plan cannot pass the implement stage it configures as scoped — re-scope or decompose. --override-scope-cap clears only THIS declared-scope pre-check and is REFUSED at approval when min_changed_files already exceeds the cap (the implement stage re-checks the real diff against a cap fixed for the run). Absent when no cap is configured or the backend predates #983"`
+	// MinChangedFiles is the minimum PHYSICAL changed-file count the
+	// implement stage's max_files_changed gate approximates (#2415).
+	// Omitted (0) on payloads from backends predating #2415.
+	MinChangedFiles int `json:"min_changed_files,omitempty" jsonschema:"the MINIMUM number of physical changed files the implement stage's max_files_changed hard gate would count for this scope (#2415) — the number to read headroom against, NOT scanned_files. It collapses each declared delete+create PAIR git could detect as a rename into one physical file (the plan schema has no rename operation, so a byte-preserving rename is declared as a delete plus a create), so it can be lower than scanned_files. It is a lower bound: an over-cap min_changed_files means the plan cannot land in this run even with --override-scope-cap. Absent (0) on backends predating #2415"`
 }
 
 // registerGetPlan wires the fishhawk_get_plan tool. The handler
@@ -3369,7 +3373,14 @@ decision stands, the stage state is unchanged, and the budget/scope
 gates did NOT re-run. Never read a duplicate as an effective
 approval. The 422 budget/scope-cap refusals fire BEFORE any approval
 row is recorded, so retrying with --override-budget /
---override-scope-cap in the reason flows normally.
+--override-scope-cap in the reason flows normally — but
+--override-scope-cap clears ONLY the declared-scope pre-check, not the
+landing: when scope_precheck.min_changed_files already exceeds
+max_files_changed the override is itself REFUSED (422
+plan_scope_cap_override_unavailable), because the implement stage
+re-checks the real diff against a cap that is fixed for the run. In
+that case drop declared paths via remove_scope_files, or raise
+max_files_changed through a governed spec change and start a fresh run.
 
 binding_assertions (#1171, optional): declare deterministic,
 machine-checkable conditions alongside (or instead of) free-text in

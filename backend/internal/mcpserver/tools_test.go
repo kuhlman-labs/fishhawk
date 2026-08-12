@@ -4716,6 +4716,46 @@ func TestGetPlan_ScopePrecheck_ExemptedCountReachesSurface(t *testing.T) {
 	}
 }
 
+// TestGetPlan_ScopePrecheck_MinChangedFilesReachesSurface is the #2415 seam
+// assertion: min_changed_files, written on the server-side
+// ScopePrecheckPayload, round-trips through the backend-write -> mcp-read JSON
+// contract and reaches fishhawk_get_plan's scope_precheck. A seeded value that
+// DIFFERS from scanned_files proves the field is carried independently and not
+// aliased to the declared count.
+func TestGetPlan_ScopePrecheck_MinChangedFilesReachesSurface(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	seedScopePrecheckAudit(fb, runID, server.ScopePrecheckPayload{
+		WorkflowID:       "feature_change",
+		ImplementStageID: "implement",
+		ScannedFiles:     4,
+		MaxFilesChanged:  3,
+		MinChangedFiles:  2, // rename-shaped: differs from scanned_files
+		Violations:       []policy.Violation{},
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.ScopePrecheck == nil {
+		t.Fatal("ScopePrecheck is nil; want populated")
+	}
+	if out.ScopePrecheck.MinChangedFiles != 2 {
+		t.Errorf("MinChangedFiles = %d, want 2 (carried across the boundary independent of scanned_files)", out.ScopePrecheck.MinChangedFiles)
+	}
+	if out.ScopePrecheck.ScannedFiles != 4 {
+		t.Errorf("ScannedFiles = %d, want 4", out.ScopePrecheck.ScannedFiles)
+	}
+}
+
 func TestGetPlan_ScopePrecheck_NewestEntryWins(t *testing.T) {
 	// A schema-retry run writes two plan_scope_precheck entries; the
 	// authoritative one is the newest (last, sequence-ascending). The

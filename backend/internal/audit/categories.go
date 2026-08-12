@@ -48,7 +48,12 @@ import "sort"
 // approval_comment_refused, the issue-comment approval channel's marker for an
 // over-cap approve comment refused before Submit — the breadcrumb that makes the
 // deliberately SILENT reply-comment refusal (no reply, no approval row) visible
-// in the run record. When a new canonical category is introduced, add it here so
+// in the run record. E32.45 / #2415 added plan_scope_cap_override_refused, the
+// plan-gate marker for a --override-scope-cap approve REFUSED because the scope's
+// minimum physical changed-file count already exceeds the run-immutable
+// max_files_changed cap — the override cannot authorize a landing the implement
+// stage re-check will reject, so the gate fails fast at approval instead of after
+// a full implement run. When a new canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
 // non-test backend audit-write emits a category absent from this map.
@@ -145,6 +150,7 @@ var KnownCategories = map[string]struct{}{
 	"plan_revised":                            {},
 	"plan_schema_retry":                       {},
 	"plan_scope_cap_override_acknowledged":    {},
+	"plan_scope_cap_override_refused":         {},
 	"plan_scope_precheck":                     {},
 	"plan_scope_regression":                   {},
 	"plan_scope_retry":                        {},

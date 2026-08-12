@@ -1328,3 +1328,187 @@ func TestRunPlanWarnings_NearCap_AbsentWhenAmpleHeadroom(t *testing.T) {
 		t.Fatalf("plan_warnings entries = %d, want 0 (write-only-when-non-empty contract intact)", len(entries))
 	}
 }
+
+// scopeOpPlanBody builds a schema-valid standard_v1 plan whose top-level
+// scope.files carries `creates` create entries, `deletes` delete entries, and
+// `modifies` modify entries (all under backend/internal/ so nothing is
+// generated/vendored-exempt). It drives the #2415 physical-count advisories: a
+// balanced creates==deletes set is the rename-shaped scope whose declared count
+// is over cap but whose minimum physical count fits it.
+func scopeOpPlanBody(t *testing.T, creates, deletes, modifies int) []byte {
+	t.Helper()
+	fileMaps := make([]any, 0, creates+deletes+modifies)
+	add := func(op string, n int, prefix string) {
+		for i := 0; i < n; i++ {
+			fileMaps = append(fileMaps, map[string]any{
+				"path":      fmt.Sprintf("backend/internal/op/%s%d.go", prefix, i),
+				"operation": op,
+			})
+		}
+	}
+	add("create", creates, "new")
+	add("delete", deletes, "old")
+	add("modify", modifies, "mod")
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": fileMaps}
+	})
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return body
+}
+
+// hasPhysicalCountClause reports whether any warning names the minimum physical
+// count (#2415). The advisories report BOTH counts unconditionally, so this
+// clause must appear on the over-cap and near-cap advisories even when the two
+// counts coincide.
+func hasPhysicalCountClause(warnings []string, minPhysical int) bool {
+	needle := fmt.Sprintf("minimum physical count is %d", minPhysical)
+	for _, w := range warnings {
+		if strings.Contains(w, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasUnlandableClause reports whether any warning is the #2415 unlandable
+// advisory naming the minimum physical count and cap.
+func hasUnlandableClause(warnings []string, minPhysical, capLimit int) bool {
+	needle := fmt.Sprintf("minimum physical changed-file count is %d, exceeding the implement-stage max_files_changed cap of %d", minPhysical, capLimit)
+	for _, w := range warnings {
+		if strings.Contains(w, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRunPlanWarnings_OverCap_NamesBothCounts asserts the #2415 requirement that
+// the over-cap advisory names BOTH the declared count and the minimum physical
+// count, unconditionally. A 3-modify over-cap plan (cap 2) has declared count 3
+// and physical count 3 — coincident — and the advisory must still spell out the
+// physical count so the operator learns the two numbers exist.
+func TestRunPlanWarnings_OverCap_NamesBothCounts(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec) // cap 2
+	body := overCapPlanBody(t, 3, nil)
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil {
+		t.Fatal("want a non-nil result for an over-cap plan")
+	}
+	if !hasOverCapWarning(got.Warnings, 3, 2) {
+		t.Errorf("missing over-cap advisory naming declared count 3 / cap 2: %v", got.Warnings)
+	}
+	if !hasPhysicalCountClause(got.Warnings, 3) {
+		t.Errorf("over-cap advisory must name the minimum physical count (3) even when it equals the declared count: %v", got.Warnings)
+	}
+}
+
+// TestRunPlanWarnings_NearCap_NamesBothCounts asserts the near-cap advisory also
+// names the minimum physical count unconditionally (#2415). A 9-modify plan
+// against cap 10 has physical count 9.
+func TestRunPlanWarnings_NearCap_NamesBothCounts(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, planWarningsNearCapSpec) // cap 10
+	body := nearCapPlanBody(t, 9, 0)
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil {
+		t.Fatal("want a non-nil result for a near-cap plan")
+	}
+	if !hasNearCapWarning(got.Warnings, 9, 10, 1) {
+		t.Errorf("missing near-cap advisory: %v", got.Warnings)
+	}
+	if !hasPhysicalCountClause(got.Warnings, 9) {
+		t.Errorf("near-cap advisory must name the minimum physical count (9): %v", got.Warnings)
+	}
+}
+
+// TestRunPlanWarnings_Unlandable_FiresWhenMinOverCap asserts capUnlandableWarning
+// fires when the plan's minimum physical count exceeds the cap — the state in
+// which --override-scope-cap is refused (#2415). A 3-modify plan (cap 2) has
+// physical count 3 > 2.
+func TestRunPlanWarnings_Unlandable_FiresWhenMinOverCap(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec) // cap 2
+	body := overCapPlanBody(t, 3, nil)
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if !hasUnlandableClause(got.Warnings, 3, 2) {
+		t.Errorf("want the unlandable advisory naming physical 3 / cap 2: %v", got.Warnings)
+	}
+}
+
+// TestRunPlanWarnings_Unlandable_SilentForRenameShapedScope is the key #2415
+// discrimination: a rename-shaped scope whose DECLARED count is over cap but
+// whose minimum PHYSICAL count fits the cap keeps the override, so the unlandable
+// advisory is SILENT while the over-cap-by-count advisory still fires. Scope = 2
+// creates + 2 deletes = 4 declared entries (over cap 2) but physical max(2,2)=2
+// (== cap). It also pins the #2053 non-regression: overCapByCount's over-decision
+// is still purely len(scope.files) > cap, so the over-cap advisory fires FIRST
+// for an over-declared/under-physical plan.
+func TestRunPlanWarnings_Unlandable_SilentForRenameShapedScope(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec) // cap 2
+	body := scopeOpPlanBody(t, 2, 2, 0)                            // 4 declared, physical 2
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil {
+		t.Fatal("want a non-nil result (the over-cap-by-count advisory still fires)")
+	}
+	// The count-derived over-cap advisory (declared 4 > cap 2) still fires: the
+	// over-decision is unchanged by the physical estimate (#2053).
+	if !hasOverCapWarning(got.Warnings, 4, 2) {
+		t.Errorf("over-cap-by-count advisory must still fire for an over-declared plan: %v", got.Warnings)
+	}
+	// The over-cap advisory is emitted FIRST (the #2053 ordering guarantee).
+	if idx := indexOfSubstr(got.Warnings, "declares 4 files, exceeding"); idx != 0 {
+		t.Errorf("over-cap advisory index = %d, want 0 (must be emitted first): %v", idx, got.Warnings)
+	}
+	// But the unlandable advisory is SILENT — physical count 2 fits cap 2, so
+	// --override-scope-cap would still work.
+	for _, w := range got.Warnings {
+		if strings.Contains(w, "CANNOT land in THIS run") {
+			t.Errorf("unlandable advisory must be silent for a rename-shaped scope whose physical count fits: %v", got.Warnings)
+		}
+	}
+}
+
+// TestRunPlanWarnings_Unlandable_SilentWhenCapUnresolved asserts the fail-open
+// leg: a nil RunRepo makes the cap unresolvable, so the unlandable advisory
+// (like every sibling) is silent and the settle is never blocked.
+func TestRunPlanWarnings_Unlandable_SilentWhenCapUnresolved(t *testing.T) {
+	au := newAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au}) // no RunRepo
+	body := overCapPlanBody(t, 5, nil)
+
+	if w := s.capUnlandableWarning(context.Background(), uuid.New(), mustParsePlan(t, body)); w != "" {
+		t.Errorf("capUnlandableWarning must be silent when the cap is unresolved; got %q", w)
+	}
+}
+
+// indexOfSubstr returns the index of the first warning containing sub, or -1.
+func indexOfSubstr(warnings []string, sub string) int {
+	for i, w := range warnings {
+		if strings.Contains(w, sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+// mustParsePlan decodes a schema-valid plan body into a *plan.Plan for the
+// direct capUnlandableWarning unit call.
+func mustParsePlan(t *testing.T, body []byte) *plan.Plan {
+	t.Helper()
+	var p plan.Plan
+	if err := json.Unmarshal(body, &p); err != nil {
+		t.Fatalf("decode plan: %v", err)
+	}
+	return &p
+}
