@@ -3208,47 +3208,114 @@ func (s *Server) checkRemoveScopeFiles(w http.ResponseWriter, r *http.Request, s
 // dedupes — exceeds the implement stage's resolved max_files_changed
 // and the comment lacks --override-scope-cap.
 //
-// Override-able rather than hard-fail because declared scope is an
-// upper bound on the eventual diff, not a prediction: the post-implement
-// gate counts actual diff files, and the cap may legitimately be about
-// to change. --override-scope-cap mirrors checkPlanBudget's
+// Override posture is now CONDITIONAL (#2415). Declared scope is an upper
+// bound on the eventual diff, not a prediction, so --override-scope-cap still
+// clears the DECLARED-scope pre-check when the landing can plausibly fit. But
+// the override never reached the implement stage's max_files_changed
+// re-evaluation, which counts the REAL physical diff: an over-cap change was
+// approved with the override and then failed category-B at implement, after a
+// full run. So when the plan PROVABLY cannot land — its minimum physical
+// changed-file count (minPhysicalFileCount, the most generous reading of the
+// number the hard gate counts) already exceeds the cap — the override is
+// REFUSED at the plan gate (422 plan_scope_cap_override_unavailable) instead of
+// granting a per-run exception the implement stage will not honor.
+//
+// The refusal is safe to make CATEGORICAL within a run because the cap is
+// IMMUTABLE there: this gate resolves it via resolveImplementConstraints and
+// the post-implement gate via loadStageConstraintsFromCache, and BOTH parse the
+// same runRow.WorkflowSpec snapshot cached at run creation with the same
+// min-wins merge — raising .fishhawk/workflows.yaml cannot change an in-flight
+// run's cap, so an override that cannot fit today can never fit later in that
+// run. --override-scope-cap otherwise mirrors checkPlanBudget's
 // --override-budget posture, acknowledged via a
-// plan_scope_cap_override_acknowledged audit entry.
+// plan_scope_cap_override_acknowledged audit entry recording that it covers the
+// declared-scope pre-check ONLY.
 //
 // Fail-open matching checkPlanBudget: any read failure, absent spec, or
-// missing plan skips the check (effectiveScopeHeadroom WARN-logs), so a
+// missing plan skips the check (effectiveScopePathSetWithOps WARN-logs), so a
 // degraded backend can never brick the approval gate. A cap of 0 means
 // no cap is configured — nothing to enforce.
 func (s *Server) checkPlanScopeCap(w http.ResponseWriter, r *http.Request, stage *run.Stage, comment string, addScopeFiles, removeScopeFiles []string) bool {
 	// Subtract the gate-time removals (#1726) so a cap overflow can be
 	// reconciled entirely at the gate (remove or remove+add-replace) without a
-	// re-plan. Use the shared effectiveScopePathSet directly (the same helper
-	// effectiveScopeHeadroom wraps) so the removal is threaded without widening
-	// effectiveScopeHeadroom's signature for its other callers.
-	paths, maxFiles, ok := s.effectiveScopePathSet(r.Context(), stage.RunID, addScopeFiles, removeScopeFiles)
+	// re-plan. Use effectiveScopePathSetWithOps so the per-path declared
+	// operations are available for the minimum-physical-count estimate (#2415);
+	// the three early returns below stay byte-identical to the prior gate.
+	paths, ops, maxFiles, ok := s.effectiveScopePathSetWithOps(r.Context(), stage.RunID, addScopeFiles, removeScopeFiles)
 	effectiveCount := len(paths)
 	if !ok || maxFiles <= 0 || effectiveCount <= maxFiles {
 		return true
 	}
 
-	auditPayload, _ := json.Marshal(map[string]any{
+	// The minimum PHYSICAL changed-file count the hard gate counts (#2415).
+	// Reported on every headroom surface below alongside the declared count,
+	// unconditionally — an operator reasoning about headroom must always know
+	// WHICH number the implement gate uses, even when the two coincide.
+	minPhysical := minPhysicalFileCount(paths, ops)
+
+	basePayload := map[string]any{
 		"stage_id":                 stage.ID.String(),
 		"scoped_files":             effectiveCount,
+		"min_changed_files":        minPhysical,
 		"max_files_changed":        maxFiles,
 		"add_scope_files_count":    len(addScopeFiles),
 		"remove_scope_files_count": len(removeScopeFiles),
-	})
+	}
 	systemKind := audit.ActorKind("system")
 
 	if strings.Contains(comment, "--override-scope-cap") {
+		// The override PROVABLY cannot authorize the landing: even the most
+		// generous physical-count reading is over cap, and the cap is fixed for
+		// this run. Refuse instead of granting an exception the implement stage
+		// will not honor.
+		if minPhysical > maxFiles {
+			if s.cfg.AuditRepo != nil {
+				refusedPayload, _ := json.Marshal(basePayload)
+				if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+					RunID:     stage.RunID,
+					StageID:   &stage.ID,
+					Timestamp: time.Now().UTC(),
+					Category:  "plan_scope_cap_override_refused",
+					ActorKind: &systemKind,
+					Payload:   refusedPayload,
+				}); err != nil {
+					s.cfg.Logger.Error("audit append failed for scope-cap override refusal",
+						"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
+				}
+			}
+			s.writeError(w, r, http.StatusUnprocessableEntity, "plan_scope_cap_override_unavailable",
+				"--override-scope-cap cannot authorize this landing. The effective declared scope is "+
+					strconv.Itoa(effectiveCount)+" files and its minimum physical changed-file count is "+
+					strconv.Itoa(minPhysical)+", both against the implement stage's constraints.max_files_changed cap of "+
+					strconv.Itoa(maxFiles)+". The override clears only the declared-scope pre-check; the implement stage "+
+					"re-evaluates constraints.max_files_changed against the REAL diff, and that cap is fixed for this run "+
+					"(the run-row spec snapshot), so an override that cannot fit today can never fit later in this run. "+
+					"Drop declared paths the change will not touch via remove_scope_files, or raise "+
+					"constraints.max_files_changed through a governed spec change and start a fresh run.",
+				basePayload)
+			return false
+		}
+		// Override honored: the declared scope is over cap but the minimum
+		// physical count still fits, so the landing can plausibly succeed.
+		// Record that the override covers the declared-scope pre-check ONLY.
 		if s.cfg.AuditRepo != nil {
+			ackPayload := map[string]any{
+				"stage_id":                 stage.ID.String(),
+				"scoped_files":             effectiveCount,
+				"min_changed_files":        minPhysical,
+				"max_files_changed":        maxFiles,
+				"add_scope_files_count":    len(addScopeFiles),
+				"remove_scope_files_count": len(removeScopeFiles),
+				"note":                     "override covers the declared-scope pre-check only; the implement stage re-evaluates max_files_changed against the real diff",
+			}
+			ackJSON, _ := json.Marshal(ackPayload)
 			if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 				RunID:     stage.RunID,
 				StageID:   &stage.ID,
 				Timestamp: time.Now().UTC(),
 				Category:  "plan_scope_cap_override_acknowledged",
 				ActorKind: &systemKind,
-				Payload:   auditPayload,
+				Payload:   ackJSON,
 			}); err != nil {
 				s.cfg.Logger.Error("audit append failed for scope-cap override",
 					"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
@@ -3258,28 +3325,34 @@ func (s *Server) checkPlanScopeCap(w http.ResponseWriter, r *http.Request, stage
 	}
 
 	if s.cfg.AuditRepo != nil {
+		violationPayload, _ := json.Marshal(basePayload)
 		if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 			RunID:     stage.RunID,
 			StageID:   &stage.ID,
 			Timestamp: time.Now().UTC(),
 			Category:  "plan_violates_scope_cap",
 			ActorKind: &systemKind,
-			Payload:   auditPayload,
+			Payload:   violationPayload,
 		}); err != nil {
 			s.cfg.Logger.Error("audit append failed for scope-cap violation",
 				"run_id", stage.RunID, "stage_id", stage.ID, "error", err.Error())
 		}
 	}
 
+	msg := "effective scope.files (plan scope plus add_scope_files minus remove_scope_files) exceeds the implement " +
+		"stage's max_files_changed; re-scope the plan, remove paths via remove_scope_files, or include " +
+		"--override-scope-cap in the comment"
+	if minPhysical > maxFiles {
+		// Tell the operator up front that the override will NOT help here — its
+		// minimum physical count already exceeds the cap, so the override path
+		// would be refused too.
+		msg += ". Note: this scope's minimum physical changed-file count (" + strconv.Itoa(minPhysical) +
+			") already exceeds the cap, so --override-scope-cap will be refused — raise constraints.max_files_changed " +
+			"through a governed spec change and start a fresh run, or drop declared paths via remove_scope_files"
+	}
 	s.writeError(w, r, http.StatusUnprocessableEntity, "plan_violates_scope_cap",
-		"effective scope.files (plan scope plus add_scope_files minus remove_scope_files) exceeds the implement stage's max_files_changed; re-scope the plan, remove paths via remove_scope_files, or include --override-scope-cap in the comment",
-		map[string]any{
-			"stage_id":                 stage.ID.String(),
-			"scoped_files":             effectiveCount,
-			"max_files_changed":        maxFiles,
-			"add_scope_files_count":    len(addScopeFiles),
-			"remove_scope_files_count": len(removeScopeFiles),
-		})
+		msg,
+		basePayload)
 	return false
 }
 

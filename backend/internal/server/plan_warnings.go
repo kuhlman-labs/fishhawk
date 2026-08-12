@@ -116,6 +116,16 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		warnings = append(warnings, w)
 	}
 
+	// UNLANDABLE advisory (#2415), appended immediately AFTER nearCapWarning and
+	// BEFORE phaseCapWarnings so the #2053 ordering guarantee holds (the
+	// count-derived over-cap advisory is still emitted FIRST and unchanged). It
+	// fires only when the plan's minimum PHYSICAL changed-file count exceeds the
+	// cap — the state in which --override-scope-cap is refused at approval and the
+	// plan cannot land in this run at all.
+	if w := s.capUnlandableWarning(ctx, runID, &parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
+
 	// #2412 advisories, appended AFTER the count-derived over-cap advisory so the
 	// count advisory is emitted FIRST and unchanged — the ordering is the
 	// observable proof that irreducible/phase-cap advisories do not SUPPRESS the
@@ -168,11 +178,34 @@ func (s *Server) overCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan
 	if !ok || !over {
 		return ""
 	}
+	// Name BOTH counts unconditionally (#2415): the declared count the over-cap
+	// decision reads AND the minimum physical count the implement gate actually
+	// counts. Reported even when they coincide so the operator always knows the
+	// two numbers exist and which one the hard gate uses.
 	return fmt.Sprintf(
-		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d — "+
+		"plan scope declares %d files, exceeding the implement-stage max_files_changed cap of %d. "+
+			"The implement gate counts PHYSICAL changed files (a rename counts once; generated */db/*.go and "+
+			"vendor/ paths are exempt), and this scope's minimum physical count is %d against the cap — "+
 			"narrow the scope or split the work into a decomposition before approving.",
-		count, capLimit,
+		count, capLimit, planMinChangedFiles(parsedPlan),
 	)
+}
+
+// planMinChangedFiles runs the minimum-physical-file estimator
+// (minPhysicalFileCount, #2415) over a parsed plan's own scope.Files. It is the
+// plan-settle-time counterpart of the approval gate's estimate: the plan gate
+// and the approval gate share ONE formula so the number the plan_warnings
+// advisories quote equals the number the scope-cap gate refuses on. Like the
+// estimator it feeds, the bound is minimal only over DECLARED operations (see
+// minPhysicalFileCount's honest-limit note).
+func planMinChangedFiles(parsedPlan *plan.Plan) int {
+	paths := make([]string, 0, len(parsedPlan.Scope.Files))
+	ops := make(map[string]plan.FileOperation, len(parsedPlan.Scope.Files))
+	for _, f := range parsedPlan.Scope.Files {
+		paths = append(paths, f.Path)
+		ops[f.Path] = f.Operation
+	}
+	return minPhysicalFileCount(paths, ops)
 }
 
 // nearCapWarning computes the NEAR-cap plan-gate advisory (#2492) for a parsed
@@ -220,9 +253,11 @@ func (s *Server) nearCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan
 	}
 	msg := fmt.Sprintf(
 		"plan scope declares %d files against the implement-stage max_files_changed cap of %d — only %d file(s) of headroom remain. "+
-			"Once that headroom is spent, the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any "+
+			"The implement gate counts PHYSICAL changed files (a rename counts once; generated */db/*.go and vendor/ paths are exempt), "+
+			"and this scope's minimum physical count is %d. "+
+			"Once the headroom is spent, the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any "+
 			"further file, so a correct mid-stage fix that needs an un-scoped file has no path in without a re-plan or a governed cap raise.",
-		count, capLimit, headroom,
+		count, capLimit, headroom, planMinChangedFiles(parsedPlan),
 	)
 	slices := 0
 	if parsedPlan.Decomposition != nil {
@@ -236,6 +271,41 @@ func (s *Server) nearCapWarning(ctx context.Context, runID uuid.UUID, parsedPlan
 		)
 	}
 	return msg
+}
+
+// capUnlandableWarning emits the plan-gate advisory that a plan CANNOT land in
+// THIS run at all (#2415). It fires only when the cap resolves AND the plan's
+// minimum PHYSICAL changed-file count (planMinChangedFiles) exceeds it — the
+// state in which --override-scope-cap is refused at approval, because the
+// implement stage re-checks the real diff against a cap that is fixed for the
+// run. It states plainly that the override will not help and names the only two
+// levers: drop declared paths via remove_scope_files, or raise
+// max_files_changed through a governed spec change and start a fresh run.
+//
+// It routes cap resolution through the SAME overCapByCount as every sibling
+// advisory (take capLimit/ok, ignore count/over), so the advisories never
+// disagree on the resolved cap. Fail-open: "" when the cap is unresolved
+// (ok=false) or the minimum physical count fits the cap — plan settle never
+// blocked. It uses the PHYSICAL count, not the declared count, so a rename-
+// shaped plan whose declared count is over cap but whose physical count fits
+// (the override-still-works case) stays silent.
+func (s *Server) capUnlandableWarning(ctx context.Context, runID uuid.UUID, parsedPlan *plan.Plan) string {
+	_, capLimit, _, ok := s.overCapByCount(ctx, runID, parsedPlan)
+	if !ok {
+		return ""
+	}
+	minPhysical := planMinChangedFiles(parsedPlan)
+	if minPhysical <= capLimit {
+		return ""
+	}
+	return fmt.Sprintf(
+		"plan scope's minimum physical changed-file count is %d, exceeding the implement-stage max_files_changed cap of %d — "+
+			"this plan CANNOT land in THIS run even with --override-scope-cap. The override clears only the declared-scope "+
+			"pre-check; the implement stage re-checks the real diff against a cap that is fixed for the run. Drop declared paths "+
+			"the change will not touch via remove_scope_files, or raise max_files_changed through a governed spec change and start "+
+			"a fresh run.",
+		minPhysical, capLimit,
+	)
 }
 
 // phaseCapWarnings emits one plan-gate advisory per split_proposal PHASE whose

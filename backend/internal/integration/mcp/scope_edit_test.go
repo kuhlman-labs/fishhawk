@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -469,4 +470,271 @@ func TestE2E_SliceScopeAdd_AtPlanGate(t *testing.T) {
 			t.Errorf("sibling slice-0 child ScopeFiles contains %q — the per-slice add fanned into another slice (single-owner-file violated): %v", addedFile, sibling)
 		}
 	}
+}
+
+// scopeCapOverrideSpec is a feature_change spec whose implement stage caps
+// max_files_changed at 3 — the tight cap the #2415 override cases drive against.
+var scopeCapOverrideSpec = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 3
+`)
+
+// opScopedPlanJSON builds a schema-valid standard_v1 plan whose scope.files
+// carry the given per-operation paths, so a rename-shaped scope (creates+deletes)
+// can be seeded. Paths are positional within each operation bucket.
+func opScopedPlanJSON(summary string, creates, deletes, modifies []string) []byte {
+	files := make([]map[string]any, 0, len(creates)+len(deletes)+len(modifies))
+	for _, f := range creates {
+		files = append(files, map[string]any{"path": f, "operation": "create"})
+	}
+	for _, f := range deletes {
+		files = append(files, map[string]any{"path": f, "operation": "delete"})
+	}
+	for _, f := range modifies {
+		files = append(files, map[string]any{"path": f, "operation": "modify"})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"plan_version":     "standard_v1",
+		"ticket_reference": map[string]any{"type": "github_issue", "url": "https://github.com/x/y/issues/1", "id": "x/y#1"},
+		"generated_by":     map[string]any{"agent": "claude-code", "model": "claude-opus-4-8", "timestamp": "2026-06-15T00:00:00Z"},
+		"summary":          summary,
+		"scope":            map[string]any{"files": files},
+		"approach":         []map[string]any{{"step": 1, "description": "Do the thing."}},
+		"verification":     map[string]any{"test_strategy": "Run the tests.", "rollback_plan": "Revert the PR."},
+		// Under the 15m default budget so the budget gate (which runs before the
+		// scope-cap gate) never fires — the scope-cap outcome is the sole variable.
+		"predicted_runtime_minutes":    10,
+		"predicted_runtime_confidence": "high",
+	})
+	return body
+}
+
+// TestE2E_ScopeCapOverride_RefusedAcknowledgedAndFieldReachesGetPlan is the
+// #2415 cross-boundary done-means. It drives the seam per-layer unit tests
+// cannot cover together — the REAL fishhawk-mcp binary → the backend approval
+// handler → the Postgres audit store — for BOTH override outcomes on one fixture
+// spec, plus the end-to-end field pin the change exists for: the
+// minimum-physical-count travels the server pre-check payload → audit
+// persistence → get_plan → MCP response through the real ship path.
+func TestE2E_ScopeCapOverride_RefusedAcknowledgedAndFieldReachesGetPlan(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	// seedGatedRun creates a run carrying scopeCapOverrideSpec with a plan stage
+	// holding the given plan artifact, parked at the approval gate.
+	seedGatedRun := func(t *testing.T, planBytes []byte) (uuid.UUID, uuid.UUID) {
+		t.Helper()
+		r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo:          "kuhlman-labs/fishhawk",
+			WorkflowID:    "feature_change",
+			WorkflowSHA:   "deadbeef",
+			TriggerSource: runpkg.TriggerCLI,
+			WorkflowSpec:  scopeCapOverrideSpec,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:            r.ID,
+			Sequence:         1,
+			Type:             runpkg.StageTypePlan,
+			ExecutorKind:     runpkg.ExecutorAgent,
+			ExecutorRef:      "fishhawk/runner@v1",
+			RequiresApproval: true,
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(plan): %v", err)
+		}
+		schema := "standard_v1"
+		if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+			StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &schema,
+			Content: planBytes, ContentHash: "capovr" + r.ID.String()[:8],
+		}); err != nil {
+			t.Fatalf("seed plan artifact: %v", err)
+		}
+		parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+		return r.ID, planStage.ID
+	}
+
+	auditCategories := func(t *testing.T, runID uuid.UUID, category string) int {
+		t.Helper()
+		entries, err := auditRepo.ListForRunByCategory(ctx, runID, category)
+		if err != nil {
+			t.Fatalf("ListForRunByCategory(%s): %v", category, err)
+		}
+		return len(entries)
+	}
+
+	t.Run("override refused when min physical over cap", func(t *testing.T) {
+		// 4 all-modify files vs cap 3: over BOTH the declared and the physical
+		// count, so the override cannot authorize the landing.
+		runID, planStageID := seedGatedRun(t, opScopedPlanJSON("all-modify over cap", nil, nil,
+			[]string{"backend/a.go", "backend/b.go", "backend/c.go", "backend/d.go"}))
+
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{
+			Name: "fishhawk_approve_plan",
+			Arguments: map[string]any{
+				"run_id": runID.String(),
+				"reason": "force it through --override-scope-cap",
+			},
+		})
+		if err != nil {
+			t.Fatalf("CallTool approve (override refused): %v", err)
+		}
+		if !result.IsError {
+			t.Fatalf("approve must return a tool error; got success: %s", toolContentString(t, result))
+		}
+		if txt := toolContentString(t, result); !strings.Contains(txt, "plan_scope_cap_override_unavailable") {
+			t.Errorf("error text missing the 422 code: %s", txt)
+		}
+		// Committed state: no approval row, a refused audit entry, no ack.
+		approvals, err := approvalRepo.ListForStage(ctx, planStageID)
+		if err != nil {
+			t.Fatalf("ListForStage: %v", err)
+		}
+		if len(approvals) != 0 {
+			t.Errorf("approval rows = %d, want 0 (override refusal is pre-insert)", len(approvals))
+		}
+		if n := auditCategories(t, runID, "plan_scope_cap_override_refused"); n != 1 {
+			t.Errorf("plan_scope_cap_override_refused entries = %d, want 1", n)
+		}
+		if n := auditCategories(t, runID, "plan_scope_cap_override_acknowledged"); n != 0 {
+			t.Errorf("plan_scope_cap_override_acknowledged entries = %d, want 0 on a refusal", n)
+		}
+	})
+
+	t.Run("override acknowledged when min physical fits", func(t *testing.T) {
+		// Rename-shaped: 2 create + 2 delete = 4 declared (over cap 3) but a
+		// minimum physical count of 2 (<= 3), so the override legitimately works.
+		runID, planStageID := seedGatedRun(t, opScopedPlanJSON("rename-shaped",
+			[]string{"backend/new0.go", "backend/new1.go"},
+			[]string{"backend/old0.go", "backend/old1.go"}, nil))
+
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{
+			Name: "fishhawk_approve_plan",
+			Arguments: map[string]any{
+				"run_id": runID.String(),
+				"reason": "byte-preserving rename, real diff fits --override-scope-cap",
+			},
+		})
+		if err != nil {
+			t.Fatalf("CallTool approve (override acknowledged): %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("approve must succeed for a rename-shaped scope; got error: %s", toolContentString(t, result))
+		}
+		approvals, err := approvalRepo.ListForStage(ctx, planStageID)
+		if err != nil {
+			t.Fatalf("ListForStage: %v", err)
+		}
+		if len(approvals) != 1 {
+			t.Errorf("approval rows = %d, want 1 after the override succeeds", len(approvals))
+		}
+		if n := auditCategories(t, runID, "plan_scope_cap_override_acknowledged"); n != 1 {
+			t.Errorf("plan_scope_cap_override_acknowledged entries = %d, want 1", n)
+		}
+		if n := auditCategories(t, runID, "plan_scope_cap_override_refused"); n != 0 {
+			t.Errorf("plan_scope_cap_override_refused entries = %d, want 0 when the override works", n)
+		}
+	})
+
+	t.Run("min_changed_files reaches get_plan through the real ship path", func(t *testing.T) {
+		// A NEW run whose cap (5) admits the ship (a 4-declared plan is under cap
+		// by count, so overCapSplitRejection does not fire) — this exercises the
+		// REAL handleShipPlan -> runScopePrecheck computation of min_changed_files,
+		// not a seeded payload.
+		r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo:          "kuhlman-labs/fishhawk",
+			WorkflowID:    "feature_change",
+			WorkflowSHA:   "deadbeef",
+			TriggerSource: runpkg.TriggerCLI,
+			WorkflowSpec:  scopeEditWorkflowSpec, // cap 5
+		})
+		if err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		issued, err := signingRepo.Issue(ctx, r.ID, time.Hour)
+		if err != nil {
+			t.Fatalf("Issue signing key: %v", err)
+		}
+		planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:            r.ID,
+			Sequence:         1,
+			Type:             runpkg.StageTypePlan,
+			ExecutorKind:     runpkg.ExecutorAgent,
+			ExecutorRef:      "fishhawk/runner@v1",
+			RequiresApproval: true,
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(plan): %v", err)
+		}
+		walkToRunning(t, ctx, fx, planStage.ID)
+
+		// Rename-shaped: 2 create + 2 delete = scanned_files 4, min_changed_files 2.
+		resp := shipPlanSigned(t, ctx, httpSrv.URL, r.ID, planStage.ID, issued.PrivateKey,
+			opScopedPlanJSON("rename-shaped shipped",
+				[]string{"backend/internal/x/new0.go", "backend/internal/x/new1.go"},
+				[]string{"backend/internal/x/old0.go", "backend/internal/x/old1.go"}, nil))
+		_ = resp.Body.Close()
+		if resp.StatusCode != 201 {
+			t.Fatalf("ship plan status = %d, want 201", resp.StatusCode)
+		}
+
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{
+			Name:      "fishhawk_get_plan",
+			Arguments: map[string]any{"run_id": r.ID.String()},
+		})
+		if err != nil {
+			t.Fatalf("CallTool fishhawk_get_plan: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("get_plan returned error: %s", toolContentString(t, result))
+		}
+		var out struct {
+			ScopePrecheck struct {
+				ScannedFiles    int `json:"scanned_files"`
+				MinChangedFiles int `json:"min_changed_files"`
+			} `json:"scope_precheck"`
+		}
+		decodeStructured(t, result, &out)
+		if out.ScopePrecheck.ScannedFiles != 4 {
+			t.Errorf("scope_precheck.scanned_files = %d, want 4", out.ScopePrecheck.ScannedFiles)
+		}
+		if out.ScopePrecheck.MinChangedFiles != 2 {
+			t.Errorf("scope_precheck.min_changed_files = %d, want 2 (reached the operator across every layer)", out.ScopePrecheck.MinChangedFiles)
+		}
+	})
 }

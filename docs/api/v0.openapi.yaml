@@ -10648,14 +10648,36 @@ paths:
               replacing) paths. Refused BEFORE any
               approval row is recorded, so a retry after re-scoping
               (or carrying the override) flows normally. `details`
-              includes `scoped_files`, `max_files_changed`,
-              `add_scope_files_count`, and `remove_scope_files_count`;
+              includes `scoped_files`, `min_changed_files`,
+              `max_files_changed`, `add_scope_files_count`, and
+              `remove_scope_files_count`;
               the refusal appends a
               `plan_violates_scope_cap` audit entry, the override a
               `plan_scope_cap_override_acknowledged` entry. Declared
               scope is an upper bound on the eventual diff, so the
-              override exists for legitimately-forced cases (e.g. the
-              cap itself is about to change).
+              override exists for legitimately-forced cases (e.g. a
+              rename-shaped scope whose real diff fits) — but see
+              `plan_scope_cap_override_unavailable`: when the scope's
+              minimum physical changed-file count already exceeds the
+              cap the override is itself refused.
+            - `plan_scope_cap_override_unavailable` — #2415: an approve
+              carrying `--override-scope-cap` was REFUSED because the
+              effective scope's minimum physical changed-file count
+              (`min_changed_files`) already exceeds the resolved
+              `max_files_changed`. The override clears only the
+              declared-scope pre-check, but the implement stage
+              re-evaluates `max_files_changed` against the REAL diff,
+              and that cap is fixed for the run (both gates read the
+              same `runs.workflow_spec` snapshot) — so no override can
+              make this scope land. Refused BEFORE any approval row is
+              recorded (stage untouched), appending a
+              `plan_scope_cap_override_refused` audit entry. `details`
+              includes `stage_id`, `scoped_files`, `min_changed_files`,
+              `max_files_changed`, `add_scope_files_count`, and
+              `remove_scope_files_count`. To unblock: drop declared
+              paths the change will not touch via `remove_scope_files`,
+              or raise `max_files_changed` through a governed spec
+              change and start a fresh run.
             - `plan_add_scope_files_fans_into_slices` — #2103: the
               request supplied `add_scope_files` on a DECOMPOSED plan
               (one carrying `decomposition.sub_plans`). An operator-added

@@ -37,12 +37,24 @@ const categoryPlanScopePrecheck = "plan_scope_precheck"
 // cap (#983; 0 = no cap configured) so downstream surfaces can render
 // headroom (scanned_files vs cap) even when violations is empty — the
 // 29/30 near-miss a violations-only payload makes invisible.
+//
+// MinChangedFiles is the minimum PHYSICAL changed-file count the
+// post-implement max_files_changed gate measures (#2415), estimated by
+// minPhysicalFileCount over scope.files. It is reported ALWAYS (not
+// omitempty) alongside scanned_files so an operator reading headroom knows
+// WHICH number the hard gate uses even when the two coincide: scanned_files
+// is the declared entry count (generated/vendored paths exempted), while
+// min_changed_files collapses each declared delete+create PAIR git could
+// detect as a rename into one physical file. The two differ mainly because
+// the plan schema has no rename operation, so a byte-preserving rename must
+// be declared as a delete plus a create.
 type ScopePrecheckPayload struct {
 	WorkflowID       string             `json:"workflow_id"`
 	ImplementStageID string             `json:"implement_stage_id"`
 	Violations       []policy.Violation `json:"violations"`
 	ScannedFiles     int                `json:"scanned_files"`
 	MaxFilesChanged  int                `json:"max_files_changed"`
+	MinChangedFiles  int                `json:"min_changed_files"`
 }
 
 // runScopePrecheck evaluates an uploaded plan's scope.files against the
@@ -129,6 +141,7 @@ func (s *Server) runScopePrecheck(ctx context.Context, runID, stageID uuid.UUID,
 		Violations:       violations,
 		ScannedFiles:     policy.CountedFileCount(diff),
 		MaxFilesChanged:  constraints.MaxFilesChanged,
+		MinChangedFiles:  planMinChangedFiles(parsedPlan),
 	}
 	payload, _ := json.Marshal(result)
 	systemKind := audit.ActorKind("system")

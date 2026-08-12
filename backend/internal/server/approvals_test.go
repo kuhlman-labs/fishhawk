@@ -4027,15 +4027,32 @@ func scopeCapFiles(n int) []plan.ScopeFile {
 	return out
 }
 
+// renameShapedScope is a scope whose DECLARED entry count is over cap but whose
+// minimum PHYSICAL count fits it: 2 creates + 2 deletes = 4 declared entries but
+// max(2,2)=2 physical files, since git can collapse each declared delete+create
+// pair into one rename row. It is the fixture for the case where
+// --override-scope-cap legitimately still works (#2415).
+func renameShapedScope() []plan.ScopeFile {
+	return []plan.ScopeFile{
+		{Path: "backend/new0.go", Operation: plan.FileOpCreate},
+		{Path: "backend/new1.go", Operation: plan.FileOpCreate},
+		{Path: "backend/old0.go", Operation: plan.FileOpDelete},
+		{Path: "backend/old1.go", Operation: plan.FileOpDelete},
+	}
+}
+
 // TestSubmitApproval_ScopeCap_OverCapPlanAlone_Returns422AndRetryWithOverrideSucceeds
-// is the #983 end-to-end gate test: an over-cap plan (4 files vs cap 3)
-// is refused 422 plan_violates_scope_cap, the refusal appends the audit
-// entry and inserts NO approval row (PRE-Submit — the ADR-036
-// stranded-retry hazard), and an immediate retry with
+// is the #983 end-to-end gate test, reworked to a RENAME-shaped scope (#2415) so
+// the override branch that legitimately succeeds keeps a pin: 4 declared entries
+// (2 create + 2 delete) vs cap 3 is over cap BY DECLARED COUNT, so a plain
+// approve is refused 422 plan_violates_scope_cap (with min_changed_files in
+// details), the refusal appends the audit entry and inserts NO approval row
+// (PRE-Submit — the ADR-036 stranded-retry hazard). But the scope's minimum
+// PHYSICAL count is 2 (<= cap 3), so an immediate retry with
 // --override-scope-cap succeeds, advances the stage, and lands
-// plan_scope_cap_override_acknowledged.
+// plan_scope_cap_override_acknowledged carrying min_changed_files.
 func TestSubmitApproval_ScopeCap_OverCapPlanAlone_Returns422AndRetryWithOverrideSucceeds(t *testing.T) {
-	s, app, _, au, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(4))
+	s, app, _, au, stage := newScopeCapServer(t, specImplementPathConstraints, renameShapedScope())
 
 	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
 	if w.Code != http.StatusUnprocessableEntity {
@@ -4047,6 +4064,10 @@ func TestSubmitApproval_ScopeCap_OverCapPlanAlone_Returns422AndRetryWithOverride
 	if !strings.Contains(w.Body.String(), `"scoped_files":4`) ||
 		!strings.Contains(w.Body.String(), `"max_files_changed":3`) {
 		t.Errorf("details missing scoped_files/max_files_changed: %s", w.Body.String())
+	}
+	// The minimum physical count (2) is reported in details unconditionally.
+	if !strings.Contains(w.Body.String(), `"min_changed_files":2`) {
+		t.Errorf("details missing min_changed_files:2: %s", w.Body.String())
 	}
 	if stage.State != run.StageStateAwaitingApproval {
 		t.Errorf("stage.State = %q, want awaiting_approval (refusal must not advance)", stage.State)
@@ -4070,7 +4091,8 @@ func TestSubmitApproval_ScopeCap_OverCapPlanAlone_Returns422AndRetryWithOverride
 		t.Errorf("expected plan_violates_scope_cap audit entry, got %+v", au.appended)
 	}
 
-	// Immediate retry with the override must flow through Submit normally.
+	// Immediate retry with the override must flow through Submit normally,
+	// because the minimum physical count (2) fits the cap (3).
 	w = submitApproval(t, s, stage.ID, `{"decision":"approve","comment":"cap is about to change --override-scope-cap"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("override retry status = %d, want 200:\n%s", w.Code, w.Body.String())
@@ -4084,14 +4106,112 @@ func TestSubmitApproval_ScopeCap_OverCapPlanAlone_Returns422AndRetryWithOverride
 	if rows != 1 {
 		t.Errorf("approval rows = %d, want 1 after override retry", rows)
 	}
-	var foundAck bool
+	var ackPayload []byte
 	for _, e := range au.appended {
 		if e.Category == "plan_scope_cap_override_acknowledged" {
-			foundAck = true
+			ackPayload = e.Payload
 		}
 	}
-	if !foundAck {
-		t.Errorf("expected plan_scope_cap_override_acknowledged audit entry, got %+v", au.appended)
+	if ackPayload == nil {
+		t.Fatalf("expected plan_scope_cap_override_acknowledged audit entry, got %+v", au.appended)
+	}
+	// The acknowledged payload carries min_changed_files and the
+	// declared-scope-pre-check-only note (#2415).
+	if !strings.Contains(string(ackPayload), `"min_changed_files":2`) {
+		t.Errorf("ack payload missing min_changed_files:2: %s", ackPayload)
+	}
+	if !strings.Contains(string(ackPayload), "declared-scope pre-check only") {
+		t.Errorf("ack payload missing the pre-check-only note: %s", ackPayload)
+	}
+}
+
+// TestSubmitApproval_ScopeCap_OverrideRefusedWhenMinPhysicalOverCap is the
+// #2415 refusal test AND the counterfactual vehicle for the new control (the
+// `minPhysical > maxFiles` branch in checkPlanScopeCap). The bad state is seeded
+// BY CONSTRUCTION — 4 all-modify files against cap 3 is definitionally over BOTH
+// the declared and the physical count — so deleting the refusal branch reddens
+// on the behavioral assertions (the 422 code, the zero approval rows, the
+// unchanged stage state, and the refused-audit entry), not on fixture setup.
+// Because the control's effect is COMMITTED STATE (a granted override inserts an
+// approval row and advances the stage to succeeded), the test reads that state
+// after the call returns rather than stopping at the error code.
+func TestSubmitApproval_ScopeCap_OverrideRefusedWhenMinPhysicalOverCap(t *testing.T) {
+	s, app, _, au, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(4))
+
+	w := submitApproval(t, s, stage.ID,
+		`{"decision":"approve","comment":"force it through --override-scope-cap"}`)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_scope_cap_override_unavailable"`) {
+		t.Errorf("body missing plan_scope_cap_override_unavailable: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"min_changed_files":4`) ||
+		!strings.Contains(w.Body.String(), `"max_files_changed":3`) {
+		t.Errorf("details missing both counts: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "constraints.max_files_changed") {
+		t.Errorf("message must name constraints.max_files_changed: %s", w.Body.String())
+	}
+	// COMMITTED-STATE assertions: the refusal is PRE-insert, so nothing advanced.
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage.State = %q, want awaiting_approval (override refusal must not advance)", stage.State)
+	}
+	app.mu.Lock()
+	rows := len(app.all)
+	app.mu.Unlock()
+	if rows != 0 {
+		t.Fatalf("approval rows = %d, want 0 (override refusal must insert nothing)", rows)
+	}
+	var foundRefused, foundAck, foundSubmitted bool
+	for _, e := range au.appended {
+		switch e.Category {
+		case "plan_scope_cap_override_refused":
+			foundRefused = true
+		case "plan_scope_cap_override_acknowledged":
+			foundAck = true
+		case "approval_submitted":
+			foundSubmitted = true
+		}
+	}
+	if !foundRefused {
+		t.Errorf("expected plan_scope_cap_override_refused audit entry, got %+v", au.appended)
+	}
+	if foundAck {
+		t.Errorf("must NOT acknowledge the override when the landing is unavailable")
+	}
+	if foundSubmitted {
+		t.Errorf("must NOT record approval_submitted on an override refusal")
+	}
+}
+
+// TestSubmitApproval_ScopeCap_NoOverrideMinOverCap_MessageWarnsOverrideWontHelp
+// covers the no-override, min-physical-over-cap path (#2415): a plain over-cap
+// approve still returns plan_violates_scope_cap with min_changed_files in
+// details, and — because the minimum physical count already exceeds the cap —
+// the message tells the operator up front that --override-scope-cap will be
+// refused.
+func TestSubmitApproval_ScopeCap_NoOverrideMinOverCap_MessageWarnsOverrideWontHelp(t *testing.T) {
+	s, _, _, au, stage := newScopeCapServer(t, specImplementPathConstraints, scopeCapFiles(4))
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"plan_violates_scope_cap"`) {
+		t.Errorf("body missing plan_violates_scope_cap: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"min_changed_files":4`) {
+		t.Errorf("details missing min_changed_files:4: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "override-scope-cap will be refused") {
+		t.Errorf("message must warn the override will not help: %s", w.Body.String())
+	}
+	for _, e := range au.appended {
+		if e.Category == "plan_scope_cap_override_refused" || e.Category == "plan_scope_cap_override_acknowledged" {
+			t.Errorf("unexpected override audit entry on a no-override refusal: %s", e.Category)
+		}
 	}
 }
 
