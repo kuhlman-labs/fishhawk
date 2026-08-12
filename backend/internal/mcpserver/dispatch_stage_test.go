@@ -15,6 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 )
 
 // The dispatch tests reuse the shared withFakeRunner / captureArgv /
@@ -1139,12 +1141,15 @@ func TestDispatchStage_AcceptanceShortCircuit_NoSpawn(t *testing.T) {
 	}
 	var noted bool
 	for _, w := range out.Warnings {
-		if strings.Contains(w, "short-circuited to a passed verdict") {
+		if strings.Contains(w, plan.AcceptanceVerdictNotValidated) {
 			noted = true
+		}
+		if passedWordRe.MatchString(w) {
+			t.Errorf("short-circuit warning must not name a passed verdict (#2458): %q", w)
 		}
 	}
 	if !noted {
-		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
+		t.Errorf("missing the short-circuit note naming %q; warnings: %v", plan.AcceptanceVerdictNotValidated, out.Warnings)
 	}
 }
 
@@ -1535,15 +1540,18 @@ func TestDispatchStage_AcceptanceShortCircuit_PostFetchFailure(t *testing.T) {
 		if strings.Contains(w, "post-short-circuit stage fetch failed") {
 			fetchWarn = true
 		}
-		if strings.Contains(w, "short-circuited to a passed verdict") {
+		if strings.Contains(w, plan.AcceptanceVerdictNotValidated) {
 			scNote = true
+		}
+		if passedWordRe.MatchString(w) {
+			t.Errorf("short-circuit warning must not name a passed verdict (#2458): %q", w)
 		}
 	}
 	if !fetchWarn {
 		t.Errorf("missing the degraded-fetch warning; warnings: %v", out.Warnings)
 	}
 	if !scNote {
-		t.Errorf("missing the short-circuit note; warnings: %v", out.Warnings)
+		t.Errorf("missing the short-circuit note naming %q; warnings: %v", plan.AcceptanceVerdictNotValidated, out.Warnings)
 	}
 }
 

@@ -64,9 +64,10 @@ type acceptanceAdmissionResponse struct {
 // fishhawk_drive_run) calls BEFORE spawning a runner for an acceptance stage. It
 // evaluates the approved plan's three disjoint short-circuit predicates via
 // orchestrator.TryShortCircuitAcceptance; on a hit the acceptance stage settles
-// straight to succeeded (a passed verdict / skip marker recorded, NO runner
-// dispatched) and the response carries short_circuited:true + the refreshed
-// stage.
+// straight to succeeded (a not_validated verdict for the two basis-bearing
+// predicates, #2347, or a skip marker for the out-of-scope predicate — NO
+// runner dispatched either way) and the response carries short_circuited:true +
+// the refreshed stage.
 //
 // Auth mirrors handleRetryStage: an authenticated identity is required
 // (401 anonymous), the write:stages scope gates a token identity (403), and an

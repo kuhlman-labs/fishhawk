@@ -359,12 +359,13 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// predicate: when the approved plan declares ZERO acceptance_criteria AND
 	// ZERO out_of_scope, there is no observable criterion to validate and no
 	// out_of_scope justification, so short-circuit the acceptance stage straight
-	// to succeeded — but record a REAL passed verdict
-	// (acceptance_outcome_recorded, verdict=passed, basis=empty-criteria) rather
-	// than an acceptance_skipped_out_of_scope marker, so downstream next_actions
-	// surfaces acceptance_passed and auto-close/merge proceed identically. The two
-	// predicates are disjoint by construction (E38.3 requires out_of_scope>0; #1728
-	// requires out_of_scope==0), so at most one fires.
+	// to succeeded — but record a REAL verdict
+	// (acceptance_outcome_recorded, verdict=not_validated, basis=empty-criteria,
+	// #2347) rather than an acceptance_skipped_out_of_scope marker, so downstream
+	// next_actions surfaces acceptance_not_validated and auto-close/merge proceed
+	// on that merge-eligible-but-unvalidated basis. The two predicates are
+	// disjoint by construction (E38.3 requires out_of_scope>0; #1728 requires
+	// out_of_scope==0), so at most one fires.
 	if next.Type == run.StageTypeAcceptance && o.Artifacts != nil {
 		sc, _, err := o.tryShortCircuitAcceptanceCore(ctx, r, stages, next)
 		if err != nil {

@@ -264,9 +264,11 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// (5b) Acceptance-dispatch admission (#1928). For an acceptance stage, ask
 	// the backend to evaluate the approved plan's short-circuit predicates
 	// BEFORE recording spawn evidence or spawning a runner: an
-	// all-skip-with-basis / empty-criteria / out-of-scope plan settles the stage
-	// server-side to a passed verdict with no preview, so spawning a runner would
-	// only fail category-C acceptance_target_unreachable — the #1928 parity gap.
+	// all-skip-with-basis / empty-criteria plan settles the stage server-side to
+	// a not_validated verdict (#2347), and an out-of-scope plan settles it to an
+	// acceptance_skipped_out_of_scope marker with no verdict at all — either way
+	// with no preview, so spawning a runner would only fail category-C
+	// acceptance_target_unreachable — the #1928 parity gap.
 	// Fail OPEN on a TRANSPORT error (network / 5xx): append a warning and proceed
 	// to record+spawn as today; a short_circuited:false result is the normal no-op
 	// and adds NO warning (the reconciliation binding condition). A 4xx admission
@@ -310,9 +312,7 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 				warnings = append(warnings,
 					fmt.Sprintf("post-short-circuit stage fetch failed (stage_wait_status omitted): %v", fetchErr))
 			}
-			warnings = append(warnings, fmt.Sprintf(
-				"acceptance stage short-circuited to a passed verdict server-side (%s) with no runner spawn and no preview; no spawn evidence recorded.",
-				shortCircuitLabel(admission)))
+			warnings = append(warnings, acceptanceShortCircuitWarning(admission, true))
 			return nil, DispatchStageOutput{
 				RunID:           runUUID.String(),
 				StageID:         resolvedStageID,
